@@ -62559,27 +62559,88 @@ def _class_surface_ssa_program(
                 ):
                     late_tensor_names.add(str(caller_name))
                     changed = True
-        late_tensor_module = IRModule(
-            {
-                name: lowered_module.functions[name]
-                for name in late_tensor_names
-            },
-            tensor_tables={
-                name: lowered_module.tensor_tables[name]
-                for name in late_tensor_names
-                if name in lowered_module.tensor_tables
-            },
+        def _late_formal_geometry():
+            return tuple(
+                (
+                    (name, int(formal.id)),
+                    None if descriptor is None else (
+                        descriptor.metadata_state, descriptor.shape,
+                        descriptor.shape_value_id, descriptor.rank_value_id,
+                        descriptor.element_count_value_id,
+                    ),
+                )
+                for name in sorted(late_tensor_names)
+                if name in lowered_module.functions
+                for formal in lowered_module.functions[name].args
+                if not (formal.accounting or {}).get('heap_owner')
+                and (formal.accounting or {}).get('tensor_extent_for') is None
+                for descriptor in (
+                    lowered_module.tensor_tables[name].by_id(int(formal.id))
+                    if name in lowered_module.tensor_tables else None,
+                )
+            )
+
+        # The rank-two `(data * multiplier + index).sum().item()` region
+        # receives its exact input shape/rank/count during this late pass,
+        # after its raw sum was deferred on an unresolved descriptor. Retry
+        # only the existing affected call closure when that booked formal
+        # geometry changes; settle the private owner after it stops changing.
+        pending_late_names = set(late_tensor_names)
+        late_shortfalls_by_function = {}
+        first_late_pass = True
+        while first_late_pass or pending_late_names:
+            first_late_pass = False
+            prior_formals = dict(_late_formal_geometry())
+            late_tensor_module = IRModule(
+                {
+                    name: lowered_module.functions[name]
+                    for name in pending_late_names
+                },
+                tensor_tables={
+                    name: lowered_module.tensor_tables[name]
+                    for name in pending_late_names
+                    if name in lowered_module.tensor_tables
+                },
+            )
+            current_shortfalls = lower_tensor_calls_to_repository_ssa(
+                late_tensor_module, tensor_ssa_reference,
+                finalize_private_owners=False,
+            )
+            for name in pending_late_names:
+                late_shortfalls_by_function.pop(name, None)
+            for item in current_shortfalls:
+                late_shortfalls_by_function.setdefault(item.function, []).append(item)
+            for name, function in late_tensor_module.functions.items():
+                lowered_module.functions.setdefault(name, function)
+            for name, table in late_tensor_module.tensor_tables.items():
+                lowered_module.tensor_tables.setdefault(name, table)
+            propagate_repository_ssa_call_metadata(lowered_module)
+            settle_repository_ssa_static_extent_operands(lowered_module)
+            revised_formals = dict(_late_formal_geometry())
+            changed_formal_names = {
+                name for (name, formal_id), geometry in revised_formals.items()
+                if geometry != prior_formals.get((name, formal_id))
+            }
+            pending_late_names = set(changed_formal_names)
+            changed = True
+            while changed:
+                changed = False
+                for caller_name in late_tensor_names - pending_late_names:
+                    caller = lowered_module.functions[caller_name]
+                    if any(
+                        str(instruction.attributes.get('callee') or '')
+                        in pending_late_names
+                        for block in caller.blocks.values()
+                        for instruction in block.instrs
+                        if str(instruction.op).casefold() == 'call'
+                    ):
+                        pending_late_names.add(caller_name)
+                        changed = True
+        late_tensor_shortfalls = tuple(
+            item
+            for name in sorted(late_shortfalls_by_function)
+            for item in late_shortfalls_by_function[name]
         )
-        late_tensor_shortfalls = lower_tensor_calls_to_repository_ssa(
-            late_tensor_module, tensor_ssa_reference,
-            finalize_private_owners=False,
-        )
-        for name, function in late_tensor_module.functions.items():
-            lowered_module.functions.setdefault(name, function)
-        for name, table in late_tensor_module.tensor_tables.items():
-            lowered_module.tensor_tables.setdefault(name, table)
-        propagate_repository_ssa_call_metadata(lowered_module)
-        settle_repository_ssa_static_extent_operands(lowered_module)
         # A computed result may first acquire its shape/rank/count while the
         # late tensor slice is lowering. Its caller's owner lifetime is proved
         # only after all affected functions and call edges are back on this
@@ -62715,6 +62776,14 @@ def _class_surface_ssa_program(
         lowered_module.metadata[
             "post_aggregate_frame_reconciliations"
         ] = tuple(post_aggregate_frame_reconciliations)
+
+    # _ascending_order gains two caller-owned heap formals during late tensor
+    # lowering, after the earlier frame-tail fixed point. Its already-linked
+    # root Call still names the old five inputs while the callee declares
+    # seven. Complete that exact propagated storage tail before the heap
+    # projector reads the live call edge.
+    compile_substage("complete late propagated call frame tails")
+    _complete_propagated_frame_tails(all_functions)
 
     # Native heap cell/owner contracts cross the SAME exact linked call edge
     # as its values. Raw ptr alone cannot state pointer-cell storage at the

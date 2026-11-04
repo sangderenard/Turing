@@ -1888,6 +1888,277 @@ def _concord_scalar_kernel_operand(
     return fact
 
 
+def _scalar_elementwise_execution(module, function, instruction, fact, *, book):
+    """Return direct execution proof cells for one scalar/span extent receipt.
+
+    The original raw binary can remain executable (checked int64 lane), or
+    tensor lowering can replace it with the selected scalar kernel.  A full
+    binary_double Call does not qualify: its second pointer formal cannot
+    receive the booked scalar operand.
+    """
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+    from .concordance_declarations import KERNEL_INPUT_CONVERSION, SCALAR_KERNEL_OPERAND, SSA_VALUE, SSAValueFact
+    from .ssa_record_return_state import function_scope_of, posted_ssa_value_fact
+
+    operation, source_id, scalar_id, _shape, _rank, count_id = fact
+    signature = c_tensor_opcode(operation)
+    if signature is None or signature[0] != "binary" or instruction.res is None:
+        return None
+    if instruction.op != "Call":
+        if (c_tensor_opcode(_SHAPED_SSA_OPERATIONS.get(
+                instruction.op, instruction.op)) == signature
+                and tuple(int(arg.id) for arg in instruction.args)
+                in ((source_id, scalar_id), (scalar_id, source_id))):
+            return ()
+        return None
+    callee = str(instruction.attributes.get("callee") or "")
+    physical = posted_ssa_value_fact(function, int(instruction.res.id), book=book)
+    kernel_dtype = {"binary_scalar_double": "float64",
+                    "binary_scalar_int64": "int64"}.get(callee)
+    selected = module.functions.get(callee)
+    args = instruction.args
+    scalar_physical = (
+        posted_ssa_value_fact(function, int(args[1].id), book=book)
+        if len(args) == 6 else None
+    )
+    table = module.tensor_tables.get(function.name)
+    result_descriptor = None if table is None else table.by_id(int(instruction.res.id))
+    if (kernel_dtype is None or physical is None
+            or physical.physical_dtype != kernel_dtype
+            or scalar_physical is None
+            or scalar_physical.physical_dtype != kernel_dtype
+            or scalar_physical.storage != "scalar"
+            or scalar_physical.rank != 0
+            or selected is None or len(selected.args) != 6
+            or selected.metadata.get("ssa_output_argument") != 2
+            or len(args) != 6
+            or instruction.attributes.get("ssa_output_argument") != 2
+            or int(args[0].id) != source_id
+            or int(args[3].id) != count_id
+            or result_descriptor is None
+            or type(result_descriptor.data_value_id) is not int
+            or int(result_descriptor.data_value_id) != int(args[2].id)):
+        return None
+    scope = function_scope_of(function)
+    position_ref = book.latest_ref(SCALAR_KERNEL_OPERAND, (
+        str(function.name), int(instruction.res.id),
+    ))
+    position_fact = (None if position_ref is None else book.page(
+        SCALAR_KERNEL_OPERAND).cell(position_ref.row, position_ref.column))
+    if (not isinstance(position_fact, tuple) or len(position_fact) != 2
+            or position_fact[0] != "scalar_operand"
+            or position_fact[1] not in (0, 1)):
+        return None
+    position = position_fact[1]
+    position_causes = {cause for cause, _stage in book.edges_into(position_ref)}
+    # Check the exact SSA_VALUE cells cited when this Call was selected.
+    # Later revisions can change a latest_ref without changing the direct
+    # cause of this already published scalar-operand receipt.
+    def cited_value(owner, value_id):
+        row = (function_scope_of(owner), int(value_id))
+        return any(
+            cause.page == SSA_VALUE and cause.row == row
+            and isinstance(book.page(SSA_VALUE).cell(cause.row, cause.column), SSAValueFact)
+            for cause in position_causes
+        )
+
+    if (any(not cited_value(function, value.id) for value in (*args, instruction.res))
+            or any(not cited_value(selected, selected.args[index].id)
+                   for index in (0, 1, 2))):
+        return None
+    definitions = tuple(
+        (block.name, candidate) for block in function.blocks.values()
+        for candidate in block.instrs if candidate.res is not None
+    )
+
+    def unique_const(value_id):
+        matches = tuple(candidate for _block, candidate in definitions
+                        if int(candidate.res.id) == int(value_id)
+                        and candidate.op == "Const")
+        return matches[0].attributes.get("constant") if len(matches) == 1 else None
+
+    if (unique_const(args[4].id) != signature[1]
+            or unique_const(args[5].id) != (1 if position == 0 else 0)):
+        return None
+    if int(args[1].id) == scalar_id:
+        return (position_ref,)
+    conversion = book.latest_ref(KERNEL_INPUT_CONVERSION, (
+        scope, next((block.name for block in function.blocks.values()
+                     if any(candidate is instruction for candidate in block.instrs)), ""),
+        int(instruction.res.id), position,
+    ))
+    conversion_fact = (None if conversion is None else book.page(
+        KERNEL_INPUT_CONVERSION).cell(conversion.row, conversion.column))
+    casts = tuple(candidate for _block, candidate in definitions
+                  if int(candidate.res.id) == int(args[1].id)
+                  and candidate.op == "Cast")
+    if (not isinstance(conversion_fact, tuple) or len(conversion_fact) != 5
+            or conversion_fact[0] != scalar_id
+            or conversion_fact[1] != int(args[1].id)
+            or conversion_fact[3:] != (kernel_dtype, callee)
+            or len(casts) != 1 or len(casts[0].args) != 1
+            or int(casts[0].args[0].id) != scalar_id
+            or casts[0].attributes.get("target_dtype") != kernel_dtype):
+        return None
+    return (position_ref, conversion)
+
+
+def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(), _ancestors=()):
+    """Read exact local extents or the existing transported metadata binding.
+
+    _ascending_order combines a local scaled input with computed ordinals.
+    Requiring both operands' geometry to be returned by an earlier region
+    excludes the local span. Its actual extent operations are equally exact
+    SSA evidence; no source name, display shape or default extent is needed.
+    """
+    from .concordance_declarations import (
+        BindingKind, CONTROL_VALUE_BINDING, ControlBinding,
+        TENSOR_ELEMENTWISE_EXTENT_BINDING,
+        TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+    )
+    from .ssa_record_return_state import (
+        function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+    )
+
+    book = identity_book(module)
+    if value_id in _ancestors:
+        return None
+    table = module.tensor_tables.get(function.name)
+    descriptor = None if table is None else table.by_id(int(value_id))
+    physical = posted_ssa_value_fact(function, int(value_id), book=book)
+    if (descriptor is None or descriptor.metadata_state != "dynamic"
+            or physical is None or physical.storage != "span"
+            or not isinstance(physical.rank, int) or physical.rank <= 0):
+        return None
+    ids = tuple(getattr(descriptor, field) for field in (
+        "shape_value_id", "rank_value_id", "element_count_value_id",
+    ))
+    if any(type(identity) is not int for identity in ids):
+        return None
+    values = {int(value.id): value for value in function.args}
+    definitions = {}
+    for block in function.blocks.values():
+        instructions = (*block.instrs, *pending) if len(function.blocks) == 1 else block.instrs
+        for index, instruction in enumerate(instructions):
+            if instruction.res is not None:
+                identity = int(instruction.res.id)
+                definitions.setdefault(identity, []).append((block.name, index, instruction))
+                values[identity] = instruction.res
+    if any(identity not in values for identity in ids):
+        return None
+    metadata = tuple(values[identity] for identity in ids)
+    cells = tuple(ssa_value_identity_cell(function, identity, book=book)
+                  for identity in (int(value_id), *ids))
+    if any(cell is None for cell in cells):
+        return None
+    for index, cell in enumerate(cells[1:]):
+        fact = book.page(cell.page).cell(cell.row, cell.column)
+        if (fact.physical_dtype != "int32"
+                or fact.storage != ("span" if index == 0 else "scalar")
+                or fact.rank != (1 if index == 0 else 0)):
+            return None
+    kinds = ("shape", "rank", "element_count")
+    inherited = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, (
+        function_scope_of(function), function.name, value_id,
+    ))
+    if inherited is not None:
+        fact = book.page(inherited.page).cell(inherited.row, inherited.column)
+        source_definitions = definitions.get(int(value_id), ())
+        if (not isinstance(fact, tuple) or len(fact) != 6
+                or not isinstance(fact[0], str)
+                or any(type(identity) is not int for identity in fact[1:])
+                or tuple(fact[3:]) != ids or len(source_definitions) != 1):
+            return None
+        instruction = source_definitions[0][2]
+        scalar = posted_ssa_value_fact(function, fact[2], book=book)
+        execution = _scalar_elementwise_execution(
+            module, function, instruction, fact, book=book,
+        )
+        if (execution is None or scalar is None
+                or scalar.storage != "scalar" or scalar.rank != 0):
+            return None
+        evidence = _dynamic_tensor_geometry_evidence(
+            module, function, fact[1], pending=pending,
+            _ancestors=(*_ancestors, value_id),
+        )
+        causes = {cause for cause, _ in book.edges_into(inherited)}
+        if (evidence is not None and tuple(int(value.id) for value in evidence[0]) == ids
+                and set(evidence[1]) <= causes
+                and set(execution) <= causes):
+            return metadata, (*cells, inherited, *evidence[1], *execution)
+        return None
+    local = tuple(definitions.get(identity, ()) for identity in ids)
+    if all(len(matches) == 1 for matches in local):
+        for kind, matches in zip(kinds, local, strict=True):
+            instruction = matches[0][2]
+            if (str(instruction.attributes.get("tensor_operation") or instruction.op) != "extent"
+                    or instruction.attributes.get("extent_kind") != kind
+                    or len(instruction.args) != 1 or int(instruction.args[0].id) != value_id):
+                return None
+        source_definitions = definitions.get(int(value_id), ())
+        if len(source_definitions) == 1:
+            source_block, source_index, _instruction = source_definitions[0]
+            if not all(matches[0][0] == source_block and source_index < matches[0][1]
+                       for matches in local):
+                return None
+            return metadata, cells
+        if not any(int(value.id) == value_id for value in function.args):
+            return None
+        binding = book.latest_ref(CONTROL_VALUE_BINDING, (function_scope_of(function), value_id))
+        fact = None if binding is None else book.page(binding.page).cell(binding.row, binding.column)
+        if (isinstance(fact, ControlBinding)
+                and fact.kind in {BindingKind.PARAMETER_SEED, BindingKind.FIELD_INCUMBENT}
+                and fact.ssa_value.row == (function_scope_of(function), value_id)):
+            return metadata, (*cells, binding)
+        return None
+    if not all(any(int(formal.id) == identity for formal in function.args) for identity in ids):
+        return None
+    if any((value.accounting or {}).get("tensor_extent_for") != value_id
+           or (value.accounting or {}).get("tensor_extent_kind") != kind
+           for value, kind in zip(metadata, kinds, strict=True)):
+        return None
+    proofs = []
+    for row in book.page(TENSOR_METADATA_CALL_BINDING).rows():
+        if row[4] != function.name:
+            continue
+        binding = book.latest_ref(TENSOR_METADATA_CALL_BINDING, row)
+        pairs = tuple(zip(*book.page(binding.page).cell(binding.row, binding.column), strict=True))
+        caller = module.functions.get(str(row[1]))
+        if caller is None or row[0] != function_scope_of(caller):
+            continue
+        block = None if caller is None else caller.blocks.get(str(row[2]))
+        calls = () if block is None else tuple(instruction for instruction in block.instrs
+            if instruction.op == "Call" and instruction.res is not None
+            and int(instruction.res.id) == row[3]
+            and instruction.attributes.get("callee") == function.name)
+        if len(calls) != 1 or len(calls[0].args) != len(function.args):
+            continue
+        live_pairs = tuple((int(actual.id), int(formal.id)) for actual, formal in zip(
+            calls[0].args, function.args, strict=True,
+        ))
+        if any(pair not in live_pairs for pair in pairs):
+            continue
+        predecessors = tuple(cause for cause, _stage in book.edges_into(binding)
+                             if cause.page == TENSOR_METADATA_RESULT_BINDING
+                             and cause.row[0] == row[0]
+                             and cause.row[3] == value_id)
+        if len(predecessors) != 1:
+            continue
+        # The producer result belongs to the caller occurrence that is
+        # passed into this exact callee tensor formal. Equal numeric IDs in
+        # another Call or scope do not establish that data edge.
+        if sum(actual_id == predecessors[0].row[3] and formal_id == value_id
+               for actual_id, formal_id in live_pairs) != 1:
+            continue
+        projected = book.page(predecessors[0].page).cell(
+            predecessors[0].row, predecessors[0].column,
+        )[2]
+        if all(pairs.count((actual, formal)) == 1
+               for actual, formal in zip(projected, ids, strict=True)):
+            proofs.extend((binding, predecessors[0]))
+    return (metadata, tuple(dict.fromkeys((*cells, *proofs)))) if proofs else None
+
+
 def _post_reduction_domain(
     module: IRModule, function: Any, row: tuple, fact: tuple, values: Any,
 ) -> None:
@@ -5672,6 +5943,30 @@ def lower_tensor_calls_to_repository_ssa(
                 function_scope_of,
                 ssa_value_identity_cell,
             )
+            incumbent = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, (
+                function_scope_of(function), function.name, int(result.id),
+            ))
+            if incumbent is not None:
+                carrier_id, owner_id, count_id, dtype = book.page(
+                    TENSOR_OWNED_HEAP_BINDING,
+                ).cell(incumbent.row, incumbent.column)
+                allocations = tuple(
+                    instruction for block in function.blocks.values()
+                    for instruction in (*block.instrs, *prefix)
+                    if instruction.res is not None and int(instruction.res.id) == carrier_id
+                )
+                descriptor = tensor_table.by_id(int(result.id))
+                if (count_id != int(count.id) or dtype != str(element_dtype)
+                        or len(allocations) != 1 or allocations[0].op != "Alloca"
+                        or allocations[0].attributes.get("allocation_kind") != "owned_heap"
+                        or tuple(int(value.id) for value in allocations[0].args) != (count_id, owner_id)
+                        or descriptor is None or descriptor.data_value_id != carrier_id
+                        or descriptor.heap_owner_value_id != owner_id):
+                    raise ValueError("owned dynamic tensor disagrees with its incumbent allocation")
+                # Checked scalar arithmetic stays raw SSA and is visited on
+                # whole-program retries. Its one heap identity is already
+                # booked; revisiting the operation must not allocate it again.
+                return allocations[0].res
             owner = fresh(
                 dtype="ptr", shape=(1,), physical={
                     "physical_dtype": "ptr", "storage": "span",
@@ -9719,17 +10014,80 @@ def lower_tensor_calls_to_repository_ssa(
                             else "temporary"
                         ),
                     )
+                from .ssa_record_return_state import function_scope_of, posted_ssa_value_fact
+                scalar_geometry = None
+                if opcode_contract is not None and opcode_contract[0] == "binary" and len(data_args) == 2:
+                    facts = tuple(posted_ssa_value_fact(function, int(value.id), book=book)
+                                  for value in data_args)
+                    from .concordance_declarations import BindingKind, CONTROL_VALUE_BINDING, ControlBinding
+                    for operand, fact in zip(data_args, facts, strict=True):
+                        descriptor = tensor_table.by_id(int(operand.id))
+                        binding_ref = book.latest_ref(CONTROL_VALUE_BINDING, (
+                            function_scope_of(function), int(operand.id),
+                        ))
+                        binding = (None if binding_ref is None else book.page(
+                            binding_ref.page).cell(binding_ref.row, binding_ref.column))
+                        # Only the actual declared input/field owns local
+                        # extent queries. REGION_RESULT and CALL_RESULT formals
+                        # await their producer's transported metadata instead.
+                        if (descriptor is not None
+                                and descriptor.metadata_state == "unresolved"
+                                and fact is not None and fact.storage == "span"
+                                and type(fact.rank) is int and fact.rank > 0
+                                and int(operand.id) in function_argument_ids
+                                and isinstance(binding, ControlBinding)
+                                and binding.kind in {BindingKind.PARAMETER_SEED, BindingKind.FIELD_INCUMBENT}
+                                and binding.ssa_value.row == (function_scope_of(function), int(operand.id))):
+                            ensure_dynamic(prefix, operand)
+                    span_positions = [index for index, fact in enumerate(facts)
+                                      if fact is not None and fact.storage == "span"
+                                      and type(fact.rank) is int and fact.rank > 0]
+                    if len(span_positions) == 1:
+                        span_position = span_positions[0]
+                        span = data_args[span_position]
+                        scalar = data_args[1 - span_position]
+                        scalar_fact = facts[1 - span_position]
+                        descriptor = tensor_table.by_id(int(span.id))
+                        if scalar_fact is not None and scalar_fact.storage == "scalar" and scalar_fact.rank == 0:
+                            # data * multiplier keeps data's geometry. Read a
+                            # declared input before computing its result, never
+                            # extent(result) after leaving storage unresolved.
+                            evidence = _dynamic_tensor_geometry_evidence(
+                                module, function, int(span.id), pending=prefix,
+                            )
+                            if evidence is not None:
+                                scalar_geometry = (span, scalar, evidence)
+                                _post_scalar_kernel_operand(
+                                    module, function,
+                                    (str(function.name), int(result.id)),
+                                    ("scalar_operand", int(1 - span_position)),
+                                    (result, scalar),
+                                )
+                                result.accounting = {
+                                    **dict(result.accounting or {}),
+                                    "tensor_metadata_state": "dynamic",
+                                    **dict(zip(("tensor_shape_value_id", "tensor_rank_value_id",
+                                                "tensor_element_count_value_id"),
+                                               (int(value.id) for value in evidence[0]), strict=True)),
+                                }
+                                dynamic_extents[int(result.id)] = dict(zip(
+                                    ("shape", "rank", "element_count"), evidence[0], strict=True,
+                                ))
+                    source_descriptor = tensor_table.by_id(int(source.id)) if source is not None else None
                 if (
                     ((opcode_contract is not None
                       and opcode_contract[0] == "binary"
                       and len(data_args) == 2)
                      or (operation == "sum" and len(data_args) == 1))
-                    and source is not None
-                    and source_descriptor is not None
-                    and source_descriptor.metadata_state == "unresolved"
-                    and int((source.accounting or {}).get(
-                        "program_abi_rank", 0
-                    ) or 0) > 0
+                    and any(
+                        (descriptor := tensor_table.by_id(int(operand.id))) is not None
+                        and descriptor.metadata_state == "unresolved"
+                        and (fact := posted_ssa_value_fact(
+                            function, int(operand.id), book=book,
+                        )) is not None and fact.storage == "span"
+                        and type(fact.rank) is int and fact.rank > 0
+                        for operand in data_args
+                    )
                 ):
                     # In root(bits).unsqueeze(1) + 1 and the weighted
                     # compact_codewords Mul, a positive-rank source first
@@ -9739,6 +10097,7 @@ def lower_tensor_calls_to_repository_ssa(
                     # axis. Minting extent(result) here reads before its
                     # definition. Leave the authored operation for the
                     # existing whole-program retry and exact Call binding.
+                    rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue
                 if (
@@ -9752,10 +10111,6 @@ def lower_tensor_calls_to_repository_ssa(
                         for value in data_args
                     )
                 ):
-                    from .concordance_declarations import (
-                        TENSOR_METADATA_CALL_BINDING,
-                        TENSOR_METADATA_RESULT_BINDING,
-                    )
                     from .ssa_record_return_state import (
                         posted_ssa_value_fact, ssa_value_identity_cell,
                     )
@@ -9770,87 +10125,31 @@ def lower_tensor_calls_to_repository_ssa(
                         else None
                         for fact in operand_facts
                     )
-                    if set(mixed_ranks) in ({1, 2}, {2}):
-                        wide = data_args[mixed_ranks.index(2)]
-                        narrow = (
-                            data_args[mixed_ranks.index(1)]
-                            if 1 in mixed_ranks else data_args[1]
-                        )
+                    if all(type(rank) is int and rank > 0 for rank in mixed_ranks):
+                        broadcast_rank = max(mixed_ranks)
+                        wide_position = mixed_ranks.index(broadcast_rank)
+                        wide = data_args[wide_position]
+                        narrow = data_args[1 - wide_position]
+                        narrow_rank = mixed_ranks[1 - wide_position]
                         wide_descriptor = tensor_table.by_id(int(wide.id))
                         narrow_descriptor = tensor_table.by_id(int(narrow.id))
                         descriptors = (wide_descriptor, narrow_descriptor)
-                        metadata_ids = tuple(
-                            tuple(getattr(descriptor, field) for field in (
-                                "shape_value_id", "rank_value_id",
-                                "element_count_value_id",
-                            )) if descriptor is not None else ()
-                            for descriptor in descriptors
+                        wide_evidence = (
+                            _dynamic_tensor_geometry_evidence(module, function, int(wide.id), pending=prefix)
+                            if wide_descriptor is not None and wide_descriptor.metadata_state == "dynamic"
+                            else None
                         )
-                        binding_rows = []
-                        for binding_row in book.page(
-                            TENSOR_METADATA_CALL_BINDING
-                        ).rows():
-                            if binding_row[4] != function.name:
-                                continue
-                            binding_cell = book.latest_ref(
-                                TENSOR_METADATA_CALL_BINDING, binding_row,
-                            )
-                            actual_ids, formal_ids = book.page(
-                                TENSOR_METADATA_CALL_BINDING
-                            ).cell(binding_cell.row, binding_cell.column)
-                            if len(actual_ids) != len(formal_ids):
-                                continue
-                            actual_to_formal = dict(zip(
-                                map(int, actual_ids), map(int, formal_ids),
-                            ))
-                            result_causes = tuple(
-                                cause for cause, _ in book.edges_into(binding_cell)
-                                if cause.page == TENSOR_METADATA_RESULT_BINDING
-                                and cause.row[3] in (
-                                    int(wide.id), int(narrow.id),
-                                )
-                            )
-                            dynamic_ids = {
-                                int(value.id) for value, descriptor in (
-                                    (wide, wide_descriptor),
-                                    (narrow, narrow_descriptor),
-                                ) if descriptor is not None
-                                and descriptor.metadata_state == "dynamic"
-                            }
-                            if (
-                                len(result_causes) == len(dynamic_ids)
-                                and {cause.row[3] for cause in result_causes}
-                                == dynamic_ids
-                                and all(
-                                    tuple(actual_to_formal.get(int(actual))
-                                          for actual in book.page(
-                                              TENSOR_METADATA_RESULT_BINDING
-                                          ).cell(cause.row, cause.column)[2])
-                                    == metadata_ids[
-                                        0 if cause.row[3] == int(wide.id) else 1
-                                    ]
-                                    for cause in result_causes
-                                )
-                            ):
-                                binding_rows.append((binding_cell, *result_causes))
-                        def metadata_formals(group):
-                            found = tuple(next((formal for formal in function.args
-                                                if int(formal.id) == int(value_id)),
-                                               None) for value_id in group)
-                            return found if all(value is not None for value in found) else ()
-
-                        wide_metadata = (
-                            metadata_formals(metadata_ids[0])
-                            if wide_descriptor is not None
-                            and wide_descriptor.metadata_state == "dynamic"
-                            else ()
+                        narrow_evidence = (
+                            _dynamic_tensor_geometry_evidence(module, function, int(narrow.id), pending=prefix)
+                            if narrow_descriptor is not None and narrow_descriptor.metadata_state == "dynamic"
+                            else None
                         )
-                        narrow_metadata = (
-                            metadata_formals(metadata_ids[1])
-                            if narrow_descriptor is not None
-                            and narrow_descriptor.metadata_state == "dynamic"
-                            else ()
-                        )
+                        wide_metadata = () if wide_evidence is None else wide_evidence[0]
+                        narrow_metadata = () if narrow_evidence is None else narrow_evidence[0]
+                        geometry_cells = tuple(dict.fromkeys(
+                            cell for evidence in (wide_evidence, narrow_evidence)
+                            if evidence is not None for cell in evidence[1]
+                        ))
                         static_operands = tuple(
                             (value, descriptor, fact)
                             for value, descriptor, fact in (
@@ -9873,8 +10172,7 @@ def lower_tensor_calls_to_repository_ssa(
                             for _value, descriptor, fact in static_operands
                         )
                         if not (
-                            len(binding_rows) == 1
-                            and all(descriptor is not None
+                            all(descriptor is not None
                                     and descriptor.metadata_state
                                     in {"dynamic", "static"}
                                     for descriptor in descriptors)
@@ -9895,6 +10193,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 "mixed binary has no exact dynamic/static metadata "
                                 "binding and terminal guard topology",
                             ))
+                            rewritten.extend(prefix)
                             rewritten.append(instruction)
                             continue
                         from .authored_broadcast_reference import (
@@ -9912,13 +10211,18 @@ def lower_tensor_calls_to_repository_ssa(
                         vector32 = {
                             "physical_dtype": "int32", "storage": "span", "rank": 1,
                         }
-                        index0, index0_def = constant(0, "int64")
-                        index1, index1_def = constant(1, "int64")
-                        output_shape, output_def = int_vector((0, 0), physical=vector32)
-                        rank, rank_def = constant(2, "int32", physical=scalar32)
+                        axis_indices = []
+                        for axis in range(broadcast_rank):
+                            index, index_def = constant(axis, "int64")
+                            axis_indices.append(index)
+                            prefix.append(index_def)
+                        output_shape, output_def = int_vector(
+                            (0,) * broadcast_rank, physical=vector32,
+                        )
+                        rank, rank_def = constant(broadcast_rank, "int32", physical=scalar32)
                         start, start_def = constant(0, "int32", physical=scalar32)
                         prefix.extend((
-                            index0_def, index1_def, output_def, rank_def,
+                            output_def, rank_def,
                             start_def,
                         ))
                         # The authored byte-weight tensor in compact_codewords
@@ -9968,26 +10272,28 @@ def lower_tensor_calls_to_repository_ssa(
                                 )
                             static_cells.append(static_cell)
                         aligned = narrow_metadata[0]
-                        alignment_values = ()
-                        if 1 in mixed_ranks:
+                        alignment_values = []
+                        padding = broadcast_rank - narrow_rank
+                        if padding:
                             aligned, aligned_def = int_vector(
-                                (1, 0), physical=vector32,
+                                (1,) * padding + (0,) * narrow_rank, physical=vector32,
                             )
-                            narrow_address = fresh(dtype="ptr")
-                            narrow_dim = fresh(dtype="int32", physical=scalar32)
-                            aligned_address = fresh(dtype="ptr")
-                            prefix.extend((
-                                aligned_def,
-                                Instr("GetElementPtr", [narrow_metadata[0], index0],
-                                      narrow_address),
-                                Instr("Load", [narrow_address], narrow_dim),
-                                Instr("GetElementPtr", [aligned, index1],
-                                      aligned_address),
-                                Instr("Store", [narrow_dim, aligned_address], None),
-                            ))
-                            alignment_values = (
-                                narrow_address, narrow_dim, aligned_address,
-                            )
+                            prefix.append(aligned_def)
+                            for axis in range(narrow_rank):
+                                narrow_address = fresh(dtype="ptr")
+                                narrow_dim = fresh(dtype="int32", physical=scalar32)
+                                aligned_address = fresh(dtype="ptr")
+                                prefix.extend((
+                                    Instr("GetElementPtr", [narrow_metadata[0], axis_indices[axis]],
+                                          narrow_address),
+                                    Instr("Load", [narrow_address], narrow_dim),
+                                    Instr("GetElementPtr", [aligned, axis_indices[padding + axis]],
+                                          aligned_address),
+                                    Instr("Store", [narrow_dim, aligned_address], None),
+                                ))
+                                alignment_values.extend((
+                                    narrow_address, narrow_dim, aligned_address,
+                                ))
                         helper, actuals, imported_cells = authored_broadcast_call_actuals(
                             reference, {"rank": rank, "start": start,
                                         "left": wide_metadata[0], "right": aligned,
@@ -10012,7 +10318,7 @@ def lower_tensor_calls_to_repository_ssa(
                         prefix.extend((zero_def, Instr("Eq", [status, zero], invalid),
                                        guard))
                         dimensions = []
-                        for index in (index0, index1):
+                        for index in axis_indices:
                             address = fresh(dtype="ptr")
                             dimension = fresh(dtype="int32", physical=scalar32)
                             prefix.extend((
@@ -10020,25 +10326,55 @@ def lower_tensor_calls_to_repository_ssa(
                                 Instr("Load", [address], dimension),
                             ))
                             dimensions.append(dimension)
-                        widened = [fresh(dtype="int64", physical={
-                            "physical_dtype": "int64", "storage": "scalar", "rank": 0,
-                        }) for _ in dimensions]
-                        prefix.extend(Instr("Cast", [dimension], value,
-                                            attributes={"source_dtype": "int32",
-                                                        "target_dtype": "int64"})
-                                      for dimension, value in zip(dimensions, widened))
-                        product = fresh(dtype="int64", physical={
-                            "physical_dtype": "int64", "storage": "scalar", "rank": 0,
-                        })
+                        # Geometry is int32. Check each product before the next
+                        # multiplication, so arbitrary rank cannot overflow an
+                        # int64 intermediate. An empty axis seeds zero before
+                        # the chain; large dimensions on another axis cannot
+                        # spuriously reject an empty tensor.
+                        zero32, zero32_def = constant(0, "int32", physical=scalar32)
+                        one32, one32_def = constant(1, "int32", physical=scalar32)
+                        prefix.extend((zero32_def, one32_def))
+                        count_values = [zero32, one32]
+                        empty = None
+                        for dimension in dimensions:
+                            is_zero = fresh(dtype="bool", physical={
+                                "physical_dtype": "bool", "storage": "scalar", "rank": 0,
+                            })
+                            prefix.append(Instr("Eq", [dimension, zero32], is_zero))
+                            count_values.append(is_zero)
+                            if empty is None:
+                                empty = is_zero
+                            else:
+                                combined = fresh(dtype="bool", physical={
+                                    "physical_dtype": "bool", "storage": "scalar", "rank": 0,
+                                })
+                                prefix.append(Instr("LOr", [empty, is_zero], combined))
+                                count_values.append(combined)
+                                empty = combined
                         count = fresh(dtype="int32", physical=scalar32)
-                        prefix.extend((
-                            Instr("Mul", widened, product),
-                            Instr("Cast", [product], count, attributes={
-                                "source_dtype": "int64", "target_dtype": "int32",
-                                "conversion_kind": "integer_conversion",
-                                "overflow": "trap", "binding": "broadcast-count-narrowing",
-                            }),
-                        ))
+                        prefix.append(Instr("Select", [empty, zero32, one32], count))
+                        count_values.append(count)
+                        for dimension in dimensions:
+                            widened = [fresh(dtype="int64", physical={
+                                "physical_dtype": "int64", "storage": "scalar", "rank": 0,
+                            }) for _ in range(2)]
+                            prefix.extend(Instr("Cast", [value], widened_value,
+                                                attributes={"source_dtype": "int32",
+                                                            "target_dtype": "int64"})
+                                          for value, widened_value in zip((count, dimension), widened))
+                            product = fresh(dtype="int64", physical={
+                                "physical_dtype": "int64", "storage": "scalar", "rank": 0,
+                            })
+                            count = fresh(dtype="int32", physical=scalar32)
+                            prefix.extend((
+                                Instr("Mul", widened, product),
+                                Instr("Cast", [product], count, attributes={
+                                    "source_dtype": "int64", "target_dtype": "int32",
+                                    "conversion_kind": "integer_conversion",
+                                    "overflow": "trap", "binding": "broadcast-count-narrowing",
+                                }),
+                            ))
+                            count_values.extend((*widened, product, count))
                         result.accounting = {
                             **dict(result.accounting or {}),
                             "tensor_metadata_state": "dynamic",
@@ -10046,6 +10382,17 @@ def lower_tensor_calls_to_repository_ssa(
                             "tensor_rank_value_id": int(rank.id),
                             "tensor_element_count_value_id": int(count.id),
                         }
+                        existing_result = tensor_table.by_id(int(result.id))
+                        if existing_result is not None and existing_result.metadata_state == "unresolved":
+                            # The first visit registered this raw binary before
+                            # its other operand's Call metadata arrived. The
+                            # geometry writer now settles that same descriptor;
+                            # updating accounting alone leaves its IDs empty.
+                            tensor_table.tensors[int(result.id)] = dataclasses.replace(
+                                existing_result, metadata_state="dynamic", byte_size=None,
+                                shape_value_id=int(output_shape.id),
+                                rank_value_id=int(rank.id), element_count_value_id=int(count.id),
+                            )
                         for operand, values in ((wide, wide_metadata),
                                                 (narrow, narrow_metadata)):
                             dynamic_extents[int(operand.id)] = dict(zip(
@@ -10061,9 +10408,9 @@ def lower_tensor_calls_to_repository_ssa(
                             wide, narrow, wide_metadata, narrow_metadata,
                             aligned, output_shape, rank, count, status,
                             invalid, helper, imported_cells,
-                            (*binding_rows[0], *static_cells),
-                            (index0, index1, *alignment_values,
-                             *dimensions, *widened, product),
+                            (*geometry_cells, *static_cells),
+                            (*axis_indices, *alignment_values,
+                             *dimensions, *count_values),
                         ))
                 from .ssa_record_return_state import posted_ssa_value_fact
                 result_physical = posted_ssa_value_fact(
@@ -10083,7 +10430,8 @@ def lower_tensor_calls_to_repository_ssa(
                     result,
                     storage="temporary",
                     metadata_state=(
-                        "static" if scalar_result else source_descriptor.metadata_state
+                        "static" if scalar_result else "dynamic" if scalar_geometry is not None
+                        else source_descriptor.metadata_state
                         if source_descriptor is not None
                         and not tuple(result.shape)
                         else None
@@ -10120,96 +10468,27 @@ def lower_tensor_calls_to_repository_ssa(
                         mixed_count = mixed_runtime_geometry.get(int(result.id))
                         if mixed_count is not None:
                             return mixed_count
-                        from .concordance_declarations import (
-                            TENSOR_ELEMENTWISE_EXTENT_BINDING,
-                            TENSOR_METADATA_CALL_BINDING,
-                            TENSOR_METADATA_RESULT_BINDING,
-                            TENSOR_SSA_LOWERING,
-                        )
-                        from .identity_concordance import Derived, Mode
-                        from .ssa_record_return_state import (
-                            function_scope_of, posted_ssa_value_fact,
-                            ssa_value_identity_cell,
-                        )
-
-                        signature = c_tensor_opcode(operation)
-                        scalar = next((operand for operand in data_args
-                                       if source is not None
-                                       and int(operand.id) != int(source.id)), None)
-                        scalar_fact = (
-                            posted_ssa_value_fact(function, int(scalar.id), book=book)
-                            if scalar is not None else None
-                        )
-                        ids = (
-                            result_descriptor.shape_value_id,
-                            result_descriptor.rank_value_id,
-                            result_descriptor.element_count_value_id,
-                        )
-                        matching_bindings = []
-                        if (
-                            signature is not None and signature[0] == "binary"
-                            and len(data_args) == 2 and source is not None
-                            and scalar_fact is not None
-                            and scalar_fact.storage == "scalar"
-                            and scalar_fact.rank == 0
-                            and source_descriptor is not None
-                            and source_descriptor.metadata_state == "dynamic"
-                            and ids == (
-                                source_descriptor.shape_value_id,
-                                source_descriptor.rank_value_id,
-                                source_descriptor.element_count_value_id,
-                            )
-                            and all(item is not None for item in ids)
-                        ):
-                            for binding_row in book.page(
-                                TENSOR_METADATA_CALL_BINDING
-                            ).rows():
-                                if binding_row[4] != function.name:
-                                    continue
-                                binding_ref = book.latest_ref(
-                                    TENSOR_METADATA_CALL_BINDING, binding_row,
-                                )
-                                binding_fact = book.page(
-                                    TENSOR_METADATA_CALL_BINDING
-                                ).cell(binding_ref.row, binding_ref.column)
-                                result_causes = tuple(
-                                    cause for cause, _stage in book.edges_into(
-                                        binding_ref
-                                    ) if cause.page == TENSOR_METADATA_RESULT_BINDING
-                                    and cause.row[3] == int(source.id)
-                                )
-                                if (len(result_causes) == 1
-                                        and binding_fact[1] == ids):
-                                    matching_bindings.append((
-                                        binding_ref, result_causes[0],
-                                    ))
-                        if len(matching_bindings) == 1:
-                            count_formals = tuple(
-                                formal for formal in function.args
-                                if int(formal.id) == int(ids[2])
-                            )
+                        if scalar_geometry is not None:
+                            from .concordance_declarations import SCALAR_KERNEL_OPERAND, TENSOR_ELEMENTWISE_EXTENT_BINDING, TENSOR_SSA_LOWERING
+                            from .identity_concordance import Derived, Mode
+                            from .ssa_record_return_state import ssa_value_identity_cell
+                            span, scalar, evidence = scalar_geometry
+                            metadata, geometry_causes = evidence
                             causes = tuple(dict.fromkeys((
-                                matching_bindings[0][0],
-                                matching_bindings[0][1],
-                                *(ssa_value_identity_cell(
-                                    function, int(value_id), book=book,
-                                ) for value_id in (
-                                    int(source.id), int(scalar.id), int(result.id),
-                                    *map(int, ids),
+                                *geometry_causes,
+                                book.latest_ref(SCALAR_KERNEL_OPERAND, (
+                                    str(function.name), int(result.id),
                                 )),
+                                *(ssa_value_identity_cell(function, int(value.id), book=book)
+                                  for value in (span, scalar, result, *metadata)),
                             )))
-                            if (len(count_formals) == 1
-                                    and all(cell is not None for cell in causes)):
-                                book.post(
-                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
-                                    (function_scope_of(function), function.name,
-                                     int(result.id)),
-                                    (str(operation), int(source.id),
-                                     int(scalar.id), *map(int, ids)),
-                                    stage=TENSOR_SSA_LOWERING,
-                                    provenance=Derived(causes), mode=Mode.CONCORD,
-                                )
-                                return count_formals[0]
+                            if all(cell is not None for cell in causes):
+                                book.post(TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                    (function_scope_of(function), function.name, int(result.id)),
+                                    (str(operation), int(span.id), int(scalar.id),
+                                     *(int(value.id) for value in metadata)),
+                                    stage=TENSOR_SSA_LOWERING, provenance=Derived(causes), mode=Mode.CONCORD)
+                                return metadata[2]
                         shortfalls.append(TensorSSALoweringShortfall(
                             function_name, block_name, operation,
                             "binary result runtime extent has no exact operand geometry binding",
@@ -11645,8 +11924,14 @@ def lower_tensor_calls_to_repository_ssa(
                         binary_output = result
                         if (
                             kind == "binary" and count is not None
-                            and int(result.id) in mixed_runtime_geometry
-                            and has_private_region_result(result)
+                            and (int(result.id) in mixed_runtime_geometry
+                                 and has_private_region_result(result)
+                                 or scalar_geometry is not None and (
+                                     not any(item.op == "Ret" and any(int(value.id) == int(result.id)
+                                             for value in item.args)
+                                             for item_block in function.blocks.values()
+                                             for item in item_block.instrs)
+                                     or has_private_region_result(result)))
                         ):
                             binary_output = own_dynamic_tensor(
                                 result, count, kernel_dtype, prefix,
@@ -11659,6 +11944,83 @@ def lower_tensor_calls_to_repository_ssa(
                                     "unary_double", [source, result, count, opcode_ssa], result,
                                     instruction, output_argument=1,
                                 ))
+                            elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None and _int64_lane_checked(instruction, operation, result):
+                                emitted.append(instruction)
+                            elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None:
+                                # A declared runtime span and scalar may both
+                                # spell shape=(). The booked physical ranks,
+                                # not that display spelling, select the
+                                # existing scalar kernel. Passing the scalar
+                                # to binary_double's pointer formal read an
+                                # unallocated span in input_scalar_float_geometry.
+                                array, scalar, _evidence = scalar_geometry
+                                scalar_position = next(
+                                    position for position, operand in enumerate(data_args)
+                                    if int(operand.id) == int(scalar.id)
+                                )
+                                if not int64_binary and str(scalar.dtype).casefold() != "float64":
+                                    promoted = fresh(shape=(), dtype="float64")
+                                    prefix.append(Instr(
+                                        "Cast", [scalar], promoted,
+                                        attributes={
+                                            "source_dtype": str(scalar.dtype),
+                                            "target_dtype": "float64",
+                                            "scalar_kernel_operand": True,
+                                        },
+                                    ))
+                                    _post_scalar_kernel_input_conversion(
+                                        book, function, str(block_name),
+                                        int(result.id), int(scalar_position),
+                                        scalar, promoted,
+                                    )
+                                    scalar = promoted
+                                reverse, reverse_def = constant(
+                                    1 if scalar_position == 0 else 0, "int32"
+                                )
+                                prefix.append(reverse_def)
+                                selected = reference.module.functions.get(
+                                    scalar_kernel
+                                )
+                                if selected is None:
+                                    raise ValueError(
+                                        "selected scalar kernel has no repository SSA definition"
+                                    )
+                                link_repository_function(scalar_kernel, selected)
+                                emitted.append(call(
+                                    scalar_kernel,
+                                    [array, scalar, binary_output, count,
+                                     opcode_ssa, reverse],
+                                    result, instruction, output_argument=2,
+                                ))
+                                # The scalar-operand receipt predates kernel
+                                # selection. Concord the same fact from the
+                                # exact opcode/reverse constants and selected
+                                # native input/output formals as well; the
+                                # extent receipt already cites this page.
+                                from .concordance_declarations import SCALAR_KERNEL_OPERAND, TENSOR_SSA_LOWERING
+                                from .identity_concordance import Derived, Mode
+                                from .ssa_record_return_state import ssa_value_identity_cell
+                                scalar_row = (str(function.name), int(result.id))
+                                scalar_fact = ("scalar_operand", int(scalar_position))
+                                call_cells = tuple(dict.fromkeys(
+                                    ssa_value_identity_cell(function, int(value.id), book=book)
+                                    for value in (array, scalar, binary_output,
+                                                  count, opcode_ssa, reverse, result)
+                                ))
+                                formal_cells = tuple(
+                                    ssa_value_identity_cell(
+                                        selected, int(selected.args[position].id), book=book,
+                                    ) for position in (0, 1, 2)
+                                )
+                                if any(cell is None for cell in (*call_cells, *formal_cells)):
+                                    raise ValueError("selected scalar kernel lacks exact SSA cells")
+                                book.post(
+                                    SCALAR_KERNEL_OPERAND, scalar_row, scalar_fact,
+                                    stage=TENSOR_SSA_LOWERING,
+                                    provenance=Derived(tuple(dict.fromkeys(
+                                        (*call_cells, *formal_cells)))),
+                                    mode=Mode.CONCORD,
+                                )
                             elif kind == "binary" and len(data_args) == 2:
                                 left_constant = constants.get(
                                     int(data_args[0].id)
@@ -11692,7 +12054,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     emitted.append(call(
                                         scalar_kernel,
                                         [
-                                            data_args[1], scalar, result,
+                                            data_args[1], scalar, binary_output,
                                             count, opcode_ssa, reverse,
                                         ],
                                         result,
@@ -11766,7 +12128,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     prefix.append(reverse_def)
                                     emitted.append(call(
                                         scalar_kernel,
-                                        [array, scalar, result, count, opcode_ssa, reverse],
+                                        [array, scalar, binary_output, count, opcode_ssa, reverse],
                                         result,
                                         instruction,
                                         output_argument=2,

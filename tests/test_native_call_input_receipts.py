@@ -129,6 +129,51 @@ def test_exact_binding_propagates_late_returned_record_storage():
     assert call.args[-1].accounting['propagated_formal_id'] == 7
 
 
+def test_late_owned_heap_tail_uses_declared_binding_schema_and_reaches_root():
+    # A nested tensor result acquires caller-owned storage after source-link
+    # Calls were built. The source helper already carries two such formals;
+    # the root Call still names only its original data input.
+    root_data = SSAValue(20, 'int64', shape=(4,))
+    helper_data = SSAValue(1, 'int64', shape=(4,))
+    first = SSAValue(7, 'ptr', shape=(1,), accounting={
+        'heap_owner': True, 'compiler_frame_storage': 'helper',
+    })
+    second = SSAValue(8, 'ptr', shape=(1,), accounting={
+        'heap_owner': True, 'compiler_frame_storage': 'helper',
+    })
+    call = Instr('Call', [root_data], None, attributes={
+        'callee': 'helper', 'callee_input_ids': (1,),
+        'plan_callsite_id': 9, 'source_linked': True,
+    })
+    root = Function('root', [root_data], {
+        'entry': BasicBlock('entry', [call]),
+    })
+    helper = Function('helper', [helper_data, first, second], {
+        'entry': BasicBlock('entry', []),
+    })
+    _post_value_roots('root', root_data)
+    _post_value_roots('helper', helper_data, first, second)
+    # A different formal's booked argument binding makes the page present.
+    # The late owner has no caller-qualified binding and must use the
+    # declared page schema, then the incumbent frame-tail mint.
+    _post_caller_storage_binding(
+        'helper', helper_data, 3, 'root', root_data, root_data,
+    )
+
+    assert _complete_propagated_frame_tails({
+        'root': root, 'helper': helper,
+    }) == 2
+    assert call.attributes['callee_input_ids'] == (1, 7, 8)
+    assert tuple(value.id for value in call.args[1:]) == tuple(
+        value.id for value in root.args[1:]
+    )
+    assert all(value.accounting['propagated_formal_id'] == formal
+               for value, formal in zip(call.args[1:], (7, 8)))
+    page = current_identity_book().page('propagated_frame_tail_concordance')
+    assert all(page.latest(('root', 9, 'helper', formal))[0] == actual.id
+               for formal, actual in zip((7, 8), call.args[1:]))
+
+
 def test_exact_binding_reuses_concorded_late_sequence_storage():
     value = SSAValue(5, 'float64')
     sequence_column = SSAValue(7, 'float64')

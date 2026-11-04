@@ -4157,6 +4157,7 @@ def emit_ssa_module_to_c(
                 if result_descriptor is not None:
                     if physical_book is not None:
                         from .concordance_declarations import (
+                            TENSOR_ELEMENTWISE_EXTENT_BINDING,
                             TENSOR_RUNTIME_BROADCAST_VALIDITY,
                         )
                         geometry_cell = physical_book.latest_ref(
@@ -4179,6 +4180,27 @@ def emit_ssa_module_to_c(
                             )) else ()
                             if geometry_ids == descriptor_ids:
                                 broadcast_geometry = (geometry_ids, geometry_cell)
+                        if geometry_cell is None:
+                            # data * scalar has the exact source geometry,
+                            # posted by tensor lowering before allocation.
+                            # Consume that binding through the same owned span
+                            # path as a checked two-span broadcast.
+                            geometry_cell = physical_book.latest_ref(
+                                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                (function_scope, fn, result_id),
+                            )
+                            if geometry_cell is not None:
+                                geometry_fact = physical_book.page(
+                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                ).cell(geometry_cell.row, geometry_cell.column)
+                                geometry_ids = tuple(map(int, geometry_fact[3:6]))
+                                descriptor_ids = (
+                                    result_descriptor.shape_value_id,
+                                    result_descriptor.rank_value_id,
+                                    result_descriptor.element_count_value_id,
+                                )
+                                if geometry_ids == descriptor_ids:
+                                    broadcast_geometry = (geometry_ids, geometry_cell)
                     candidate = owned_tensor_carriers.get((
                         fn, int(result_descriptor.data_value_id),
                     ))

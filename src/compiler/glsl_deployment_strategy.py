@@ -7581,7 +7581,12 @@ def _build_shell_hierarchy_plan(
                     proven = planned_scalar_dtypes().get(int(current))
                     if proven is not None:
                         dtype = str(proven)
-                    elif posted is not None and posted.get("dtype"):
+                    # The rank-two `(... + index).sum().item()` source has
+                    # sum12's parent10 settled int64, while the sum descriptor
+                    # still says `unknown`. That absence cannot outrank the
+                    # exact value operand's element type.
+                    elif (posted is not None and posted.get("dtype")
+                          and str(posted["dtype"]).casefold() != "unknown"):
                         dtype = str(posted["dtype"])
                     elif value_parent in _shape_dtype_cache:
                         dtype = _shape_dtype_cache[value_parent][1]

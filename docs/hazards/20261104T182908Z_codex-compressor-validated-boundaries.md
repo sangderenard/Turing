@@ -1,0 +1,5 @@
+2026-11-04 Fully lowered private scalar nonescape proof (MEASURED, validation checkout):
+
+- The final compatibility gate's `test_scalar_nonescape_requires_posted_numeric_scalar_storage` raised `StopIteration` after the late tensor fixed point. Untouched canonical still passed the old selector. Current private mixed broadcast publishes nonescape output `(10,10,None)` with a static int64 scalar descriptor (shape `()`) and SSA_VALUE10 physical int64/scalar/rank0. The old test selected only outputs with no tensor descriptor, so it found no target.
+- The nonescape audit previously checked the numeric scalar SSA fact only when the descriptor was absent. For this exact static scalar descriptor whose data carrier is the same output identity, it now checks the same posted numeric scalar layout and descriptor dtype agreement. It does not change the owner or alias policy.
+- The focused test selects the exact scalar SSA fact and checks both descriptor-present and descriptor-absent forms. Forged span/rank and ptr physical facts are rejected in each form. The focused test passed 1/1 in 18.88 seconds. No full compressor run was made.
