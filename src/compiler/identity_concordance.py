@@ -1533,6 +1533,7 @@ class CorrelationTable:
         found.extend(self._repository_ssa_signature_findings(module))
         found.extend(self._scope_local_accounting_findings(module))
         found.extend(self._tensor_metadata_result_binding_findings(module))
+        found.extend(self._tensor_runtime_reshape_validity_findings(module))
         found.extend(self._tensor_owned_heap_binding_findings(module))
         found.extend(self._tensor_heap_owner_call_binding_findings(module))
         found.extend(self._tensor_heap_consumer_nonescape_findings(module))
@@ -5643,6 +5644,234 @@ class CorrelationTable:
                 found.append(Finding(
                     "tensor-heap-release-binding", str(row[1]), int(row[2]),
                     "private tensor release lacks exact call, owner, last-use or terminal proof",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_runtime_reshape_validity_findings(module: Any) -> list[Finding]:
+        """A runtime reshape view must retain its guarded native geometry."""
+
+        from .concordance_declarations import (
+            SSA_BLOCK, SSA_CONTROL_EDGE, SSA_VALUE,
+            TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_RESHAPE_VALIDITY,
+        )
+        from .native_faults import RESHAPE_INVALID_SHAPE
+        from .ssa_record_return_state import (
+            function_scope_of, ssa_block_identity_cell,
+        )
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_RESHAPE_VALIDITY)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, row)
+            fact = page.cell(ref.row, ref.column)
+            valid = (
+                isinstance(row, tuple) and len(row) == 3
+                and isinstance(fact, tuple) and len(fact) == 12
+                and all(type(item) is int for item in fact[:10])
+                and all(isinstance(item, str) for item in fact[10:])
+            )
+            function = module.functions.get(str(row[1])) if valid else None
+            valid = (valid and function is not None
+                     and function_scope_of(function) == row[0]
+                     and fact[10] in function.blocks
+                     and fact[11] in function.blocks)
+            if valid:
+                (source, width, narrowed, source_count, safe_width,
+                 remainder, quotient, shape, rank, invalid,
+                 fault_name, pass_name) = fact
+                table = module.tensor_tables.get(function.name)
+                descriptor = None if table is None else table.by_id(row[2])
+                valid = (
+                    descriptor is not None
+                    and descriptor.metadata_state == "dynamic"
+                    and descriptor.storage == "view"
+                    and descriptor.alias_of == source
+                    and descriptor.data_value_id == source
+                    and (descriptor.shape_value_id,
+                         descriptor.rank_value_id,
+                         descriptor.element_count_value_id)
+                    == (shape, rank, source_count)
+                )
+            if valid:
+                definitions = {}
+                for block in function.blocks.values():
+                    for instruction in block.instrs:
+                        if instruction.res is not None:
+                            definitions.setdefault(int(instruction.res.id), []).append(
+                                (block, instruction)
+                            )
+
+                def definition(value_id, op, arguments=None):
+                    matches = definitions.get(value_id, ())
+                    return (matches[0][1] if len(matches) == 1
+                            and matches[0][1].op == op
+                            and (arguments is None or tuple(
+                                int(value.id) for value in matches[0][1].args
+                            ) == arguments)
+                            else None)
+
+                cast = definition(narrowed, "Cast", (width,))
+                extent = definition(source_count, "extent", (source,))
+                safe = definition(safe_width, "Max")
+                rem = definition(remainder, "Mod", (source_count, safe_width))
+                div = definition(quotient, "FloorDiv", (source_count, safe_width))
+                vector = definition(shape, "Const")
+                rank_def = definition(rank, "Const")
+                predicate = definition(invalid, "Or")
+                valid = (
+                    cast is not None and cast.attributes.get("binding")
+                    == "tensor-reshape-width"
+                    and cast.attributes.get("conversion_kind")
+                    == "integer_conversion"
+                    and cast.attributes.get("overflow") == "trap"
+                    and extent is not None
+                    and extent.attributes.get("extent_kind") == "element_count"
+                    and safe is not None and len(safe.args) == 2
+                    and int(safe.args[0].id) == narrowed
+                    and len(definitions.get(int(safe.args[1].id), ())) == 1
+                    and definitions[int(safe.args[1].id)][0][1].attributes.get(
+                        "constant") == 1
+                    and rem is not None and div is not None
+                    and vector is not None
+                    and tuple(vector.attributes.get("values", ())) == (0, 0)
+                    and rank_def is not None
+                    and rank_def.attributes.get("constant") == 2
+                    and predicate is not None and len(predicate.args) == 2
+                )
+            if valid:
+                predicate_defs = tuple(
+                    definitions.get(int(value.id), ())
+                    for value in predicate.args
+                )
+                valid = all(len(items) == 1 for items in predicate_defs)
+                if valid:
+                    predicates = tuple(items[0][1] for items in predicate_defs)
+                    width_guard = next((item for item in predicates
+                                        if item.op == "Le"), None)
+                    remainder_guard = next((item for item in predicates
+                                            if item.op == "Ne"), None)
+                    valid = (
+                        width_guard is not None and remainder_guard is not None
+                        and len(width_guard.args) == len(remainder_guard.args) == 2
+                        and int(width_guard.args[0].id) == narrowed
+                        and int(remainder_guard.args[0].id) == remainder
+                        and int(width_guard.args[1].id)
+                        == int(remainder_guard.args[1].id)
+                        and len(definitions.get(
+                            int(width_guard.args[1].id), ())) == 1
+                        and definitions[int(width_guard.args[1].id)][0][1]
+                        .attributes.get("constant") == 0
+                    )
+            if valid:
+                stores = tuple(
+                    instruction for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Store" and len(instruction.args) == 2
+                    and instruction.attributes.get("binding")
+                    == "tensor-reshape-shape"
+                )
+                slots = {}
+                for store in stores:
+                    address = definition(int(store.args[1].id), "GetElementPtr")
+                    if address is None or len(address.args) != 2 or int(
+                        address.args[0].id
+                    ) != shape:
+                        continue
+                    index = definition(int(address.args[1].id), "Const")
+                    if index is not None:
+                        slots.setdefault(index.attributes.get("constant"), []).append(
+                            int(store.args[0].id)
+                        )
+                valid = slots.get(0) == [quotient] and slots.get(1) == [narrowed]
+            if valid:
+                guarded = tuple(
+                    (block, instruction) for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "CondBr" and len(instruction.args) == 1
+                    and int(instruction.args[0].id) == invalid
+                    and instruction.attributes.get("true_target") == fault_name
+                    and instruction.attributes.get("false_target") == pass_name
+                    and instruction.attributes.get("runtime_reshape_error")
+                    == RESHAPE_INVALID_SHAPE
+                )
+                fault = function.blocks[fault_name]
+                passed = function.blocks[pass_name]
+                valid = (
+                    len(guarded) == 1
+                    and guarded[0][0].successors == [fault_name, pass_name]
+                    and not fault.successors
+                    and any(item.op == "Call" and not item.args
+                            and item.res is None
+                            and item.attributes.get("callee")
+                            == "turing_validation_error"
+                            and item.attributes.get("error_code")
+                            == RESHAPE_INVALID_SHAPE
+                            for item in fault.instrs)
+                    and any(item.op == "Trap"
+                            and item.attributes.get("fault_exit") is True
+                            for item in fault.instrs)
+                    and passed.instrs
+                )
+            if valid:
+                before = ssa_block_identity_cell(
+                    function, guarded[0][0].name, book=book,
+                )
+                failed = ssa_block_identity_cell(function, fault_name, book=book)
+                passing = ssa_block_identity_cell(function, pass_name, book=book)
+                block_cells = (before, failed, passing)
+                edges = tuple(book.latest_ref(SSA_CONTROL_EDGE, (
+                    row[0], function.name, first, second, arm,
+                )) for first, second, arm in (
+                    (before, failed, "body"),
+                    (before, passing, "orelse"),
+                )) if all(block_cells) else ()
+                causes = {source for source, _stage in book.edges_into(ref)}
+                valid = (
+                    all(block_cells) and len(edges) == 2
+                    and all(edge is not None for edge in edges)
+                    and set((*block_cells, *edges)) <= causes
+                    and all(any(source_cell.page == SSA_VALUE
+                                and source_cell.row == (row[0], value_id)
+                                for source_cell in causes)
+                            for value_id in (*fact[:3], row[2], *fact[3:10]))
+                )
+            if valid:
+                result_bindings = tuple(
+                    binding_row for binding_row in book.page(
+                        TENSOR_METADATA_RESULT_BINDING
+                    ).rows()
+                    if binding_row[2:] == (function.name, int(row[2]))
+                )
+                expected_bindings = {
+                    (function_scope_of(caller), int(call.res.id),
+                     function.name, int(row[2]))
+                    for caller in module.functions.values()
+                    for block in caller.blocks.values()
+                    for call in block.instrs
+                    if call.op == "Call" and call.res is not None
+                    and call.attributes.get("callee") == function.name
+                    and int(row[2]) in tuple(map(
+                        int, call.attributes.get("output_ids", ()),
+                    ))
+                }
+                valid = set(result_bindings) == expected_bindings and all(
+                    book.page(TENSOR_METADATA_RESULT_BINDING).latest(
+                        binding_row)[1] == (shape, rank, source_count)
+                    and ref in {source for source, _stage in book.edges_into(
+                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                        binding_row)
+                    )}
+                    for binding_row in result_bindings
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-runtime-reshape-validity", str(row[1]),
+                    int(row[2]) if isinstance(row, tuple) and len(row) == 3
+                    else None,
+                    "runtime reshape lacks exact view geometry, checked width, "
+                    "guarded SSA control or metadata result proof",
                 ))
         return found
 

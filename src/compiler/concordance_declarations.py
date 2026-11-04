@@ -4579,6 +4579,16 @@ TENSOR_METADATA_RESULT_BINDING = declare_page("tensor_metadata_result_binding", 
     RowField("caller_scope", K.SCOPE), RowField("call_result", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)                              # DERIVED(call, callee/caller output cells); CONCORD
+#: A two-axis runtime reshape (-1, width) of one exact tensor storage.
+#: Fact is (source, width, narrowed_width, source_count, safe_width, remainder, quotient,
+#: shape_vector, rank, invalid_predicate, fault_block, passing_block).
+#: The guarded quotient is a view dimension, while the source count is the
+#: unchanged element count. Its branch and fault are live SSA, not a static
+#: target-shape guess or an alternative tensor ABI.
+TENSOR_RUNTIME_RESHAPE_VALIDITY = declare_page("tensor_runtime_reshape_validity", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("result", K.VALUE_ID),
+), tuple)                              # DERIVED(SSA values/control edges); CONCORD
 #: A dynamic tensor's logical element identity, native data carrier, and
 #: allocation owner. Fact is (data id, owner id, count id, element dtype).
 #: The unique owned-heap Alloca defines the carrier from the exact count and

@@ -22,3 +22,9 @@ def test_runtime_reshape_fault_is_a_python_value_error(detail):
 
 def test_unknown_native_fault_remains_generic():
     assert type(validation_fault(RESHAPE_INVALID_SHAPE + 1, "unknown")) is RuntimeError
+
+
+def test_existing_thread_fault_code_remains_generic():
+    # The thread table and C synchronization path already use code 97.
+    assert RESHAPE_INVALID_SHAPE != 97
+    assert type(validation_fault(97, "thread synchronization failed")) is RuntimeError
