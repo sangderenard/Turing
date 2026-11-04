@@ -295,6 +295,38 @@ def _propagate_scalar_dtypes(functions) -> None:
                 (ref.row, ref.column)
             )
 
+        def declared_llvm_integer_division(instruction, result_id: int):
+            """The imported LLVM declaration for an integer division result.
+
+            Python ``Div`` produces a float, but the repository kernel's
+            ``sdiv``/``udiv`` is a typed integer operation.  Its own
+            repository value cell, not the SSA handler spelling, owns that
+            physical width.
+            """
+            if instruction.attributes.get("llvm_opcode") not in {"sdiv", "udiv"}:
+                return None
+            from .identity_concordance import ConcordanceRefusal
+            from .concordance_declarations import REPOSITORY_KERNEL_VALUE
+
+            source, fact = value_cell(result_id)
+            if source is None or fact is None or fact.dtype not in integers:
+                raise ConcordanceRefusal(
+                    f"LLVM integer division lacks its declared result: {(scope, result_id)!r}"
+                )
+            if not any(
+                cause.page == REPOSITORY_KERNEL_VALUE
+                for cause, _stage in book.edges_into(source)
+            ):
+                raise ConcordanceRefusal(
+                    f"LLVM integer division lacks its repository value: {(scope, result_id)!r}"
+                )
+            if any(dtype_of.get(int(arg.id)) != fact.dtype for arg in instruction.args):
+                raise ConcordanceRefusal(
+                    f"LLVM integer division operand width disagrees with its declaration: "
+                    f"{(scope, result_id)!r}"
+                )
+            return str(fact.dtype)
+
         operator_page = book.pages.get(OPERATOR_RESULT_TYPE.name)
         operation_domain_cells: dict[int, Any] = {}
 
@@ -565,10 +597,27 @@ def _propagate_scalar_dtypes(functions) -> None:
                             declared_float(instruction)
                             or python_float_result_dtype(operand_dtypes)
                         )
+                declared_llvm_division = declared_llvm_integer_division(
+                    instruction, result_id,
+                ) if instruction.op == "Div" else None
                 operation_claim = operation_domain(instruction, result_id)
                 if operation_claim is not None:
                     inferred, operation_cell = operation_claim
                     operation_domain_cells[result_id] = operation_cell
+                    if (declared_llvm_division is not None
+                            and inferred != declared_llvm_division):
+                        from .identity_concordance import ConcordanceRefusal
+
+                        raise ConcordanceRefusal(
+                            "LLVM integer division disagrees with its numeric domain: "
+                            f"{(scope, result_id)!r}"
+                        )
+                elif declared_llvm_division is not None:
+                    # Program: broadcast_int64.  Wrong record: LLVM `sdiv
+                    # i32` result 505 was read as Python Div and changed to
+                    # float64, then Mul 523/Add 524 poisoned Phi 525.  The
+                    # exact imported repository value keeps its i32 width.
+                    inferred = declared_llvm_division
                 elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
                     inferred = (
                         declared_float(instruction)
@@ -605,6 +654,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                     if (
                         (instruction.op == "Const"
                          or result_id in declared_load_ids
+                         or declared_llvm_division == declared
                          or (
                              instruction.op == "Cast"
                              and instruction.attributes.get("target_dtype")
