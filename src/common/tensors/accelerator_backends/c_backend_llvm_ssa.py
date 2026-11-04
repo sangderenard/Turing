@@ -54,7 +54,8 @@ PRECOMPILE_INTERNAL_OPERATORS = frozenset({
 
 # Explicit output-buffer positions in the authored low-level SSA signatures.
 # Multi-result kernels carry ordered (name, argument position) pairs.
-# Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
+# Scalar-returning helpers (binary_value, sum_double, sum_int64,
+# count_true_double) carry
 # a repository-SSA ``return_value`` instead and therefore do not appear here.
 C_SSA_OUTPUT_ARGUMENTS = {
     "fill_double": 0,
@@ -77,6 +78,8 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "pad_double_nd": 1,
     "slice_copy_double": 1,
     "index_select_double": 1,
+    "index_select_int64_indices_int64": 1,
+    "index_select_double_indices_int64": 1,
     "gather_values_double": 1,
     "scatter_sum_double": 1,
     "scatter_reduce_double": 1,
@@ -108,6 +111,8 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "pad_double_nd": (2, 3, 4),
     "slice_copy_double": (2,),
     "index_select_double": (2, 5),
+    "index_select_int64_indices_int64": (2,),
+    "index_select_double_indices_int64": (2,),
     "gather_values_double": (2,),
     "index_assign_double": (1, 3, 4),
     "index_set_double": (2, 4, 5),
@@ -128,10 +133,13 @@ C_SSA_I32_POINTER_ARGUMENTS = {
 }
 
 C_SSA_I64_POINTER_ARGUMENTS = {
+    "sum_int64": (0,),
     "binary_int64": (0, 1, 2),
     "binary_scalar_int64": (0, 2),
     "broadcast_int64": (0, 1),
     "cast_int64_to_double_values": (0,),
+    "index_select_int64_indices_int64": (0, 1, 5),
+    "index_select_double_indices_int64": (5,),
     "create_arange_int64": (3,),
     "scatter_sum_double": (5,),
     "scatter_reduce_double": (5,),
@@ -217,6 +225,7 @@ C_SSA_EXTERNAL_PRIMITIVES = frozenset({
     "llvm.trunc.f64", "llvm.memcpy.p0.p0.i64", "llvm.memset.p0.i64",
     "log", "pow", "sin", "sinh", "tan", "tanh",
     "llvm.maxnum.f64", "llvm.minnum.f64", "llvm.pow.f64",
+    "turing_validation_error",
 })
 
 
@@ -251,6 +260,8 @@ _C_FUNCTION_ROLES = {
     "repeat_interleave_double": "tensor_kernel",
     "tile_double": "tensor_kernel",
     "index_select_double": "tensor_kernel",
+    "index_select_int64_indices_int64": "tensor_kernel",
+    "index_select_double_indices_int64": "tensor_kernel",
     "gather_values_double": "tensor_kernel",
     "scatter_sum_double": "tensor_kernel",
     "scatter_reduce_double": "private_helper",
@@ -277,6 +288,7 @@ _C_FUNCTION_ROLES = {
     "mean_dim": "tensor_kernel",
     "gather_pairs_2d": "tensor_kernel",
     "sum_double": "tensor_kernel",
+    "sum_int64": "tensor_kernel",
     "create_arange": "tensor_kernel",
     "create_arange_int64": "tensor_kernel",
     "topk_double": "tensor_kernel",
@@ -321,6 +333,7 @@ declare double @cosh(double)
 declare double @asinh(double)
 declare double @acosh(double)
 declare double @atanh(double)
+declare void @turing_validation_error(i32)
 
 define internal void @fill_double(ptr %out, double %value, i32 %n) {
 entry:
@@ -1340,6 +1353,204 @@ exit:
   ret void
 }
 
+define internal void @index_select_int64_indices_int64(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.more = icmp slt i32 %before.axis, %dim
+  br i1 %before.more, label %before.body, label %after.init
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.init:
+  %after.first = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.first, %after.init ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.init ], [ %after.next, %after.body ]
+  %after.more = icmp slt i32 %after.axis, %ndim
+  br i1 %after.more, label %after.body, label %copy.init
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+copy.init:
+  %dim64 = sext i32 %dim to i64
+  %source.count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %source.count = load i32, ptr %source.count.ptr, align 4
+  %source.count64 = sext i32 %source.count to i64
+  %after64 = sext i32 %after to i64
+  %index.count64 = sext i32 %index.count to i64
+  %copy.bytes = mul i64 %after64, 8
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %copy.init ], [ %batch.next, %batch.latch ]
+  %batch.more = icmp slt i32 %batch, %before
+  br i1 %batch.more, label %item.header, label %exit
+
+item.header:
+  %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
+  %item.more = icmp slt i32 %item, %index.count
+  br i1 %item.more, label %item.load, label %batch.latch
+
+item.load:
+  %item64 = sext i32 %item to i64
+  %index.ptr = getelementptr inbounds i64, ptr %indices, i64 %item64
+  %raw.index = load i64, ptr %index.ptr, align 8
+  %negative = icmp slt i64 %raw.index, 0
+  %wrapped = add i64 %raw.index, %source.count64
+  %selected = select i1 %negative, i64 %wrapped, i64 %raw.index
+  %below = icmp slt i64 %selected, 0
+  %above = icmp sge i64 %selected, %source.count64
+  %invalid = or i1 %below, %above
+  br i1 %invalid, label %fault, label %copy
+
+fault:
+  call void @turing_validation_error(i32 101)
+  br label %exit
+
+copy:
+  %batch64 = sext i32 %batch to i64
+  %output.batch.base = mul i64 %batch64, %index.count64
+  %output.item.base = add i64 %output.batch.base, %item64
+  %output.index = mul i64 %output.item.base, %after64
+  %source.batch.base = mul i64 %batch64, %source.count64
+  %source.item.base = add i64 %source.batch.base, %selected
+  %source.index = mul i64 %source.item.base, %after64
+  %source.ptr = getelementptr inbounds i64, ptr %input, i64 %source.index
+  %output.ptr = getelementptr inbounds i64, ptr %output, i64 %output.index
+  call void @llvm.memcpy.p0.p0.i64(ptr %output.ptr, ptr %source.ptr, i64 %copy.bytes, i1 false)
+  br label %item.latch
+
+item.latch:
+  %item.next = add nsw i32 %item, 1
+  br label %item.header
+
+batch.latch:
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
+define internal void @index_select_double_indices_int64(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.more = icmp slt i32 %before.axis, %dim
+  br i1 %before.more, label %before.body, label %after.init
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.init:
+  %after.first = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.first, %after.init ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.init ], [ %after.next, %after.body ]
+  %after.more = icmp slt i32 %after.axis, %ndim
+  br i1 %after.more, label %after.body, label %copy.init
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+copy.init:
+  %dim64 = sext i32 %dim to i64
+  %source.count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %source.count = load i32, ptr %source.count.ptr, align 4
+  %source.count64 = sext i32 %source.count to i64
+  %after64 = sext i32 %after to i64
+  %index.count64 = sext i32 %index.count to i64
+  %copy.bytes = mul i64 %after64, 8
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %copy.init ], [ %batch.next, %batch.latch ]
+  %batch.more = icmp slt i32 %batch, %before
+  br i1 %batch.more, label %item.header, label %exit
+
+item.header:
+  %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
+  %item.more = icmp slt i32 %item, %index.count
+  br i1 %item.more, label %item.load, label %batch.latch
+
+item.load:
+  %item64 = sext i32 %item to i64
+  %index.ptr = getelementptr inbounds i64, ptr %indices, i64 %item64
+  %raw.index = load i64, ptr %index.ptr, align 8
+  %negative = icmp slt i64 %raw.index, 0
+  %wrapped = add i64 %raw.index, %source.count64
+  %selected = select i1 %negative, i64 %wrapped, i64 %raw.index
+  %below = icmp slt i64 %selected, 0
+  %above = icmp sge i64 %selected, %source.count64
+  %invalid = or i1 %below, %above
+  br i1 %invalid, label %fault, label %copy
+
+fault:
+  call void @turing_validation_error(i32 101)
+  br label %exit
+
+copy:
+  %batch64 = sext i32 %batch to i64
+  %output.batch.base = mul i64 %batch64, %index.count64
+  %output.item.base = add i64 %output.batch.base, %item64
+  %output.index = mul i64 %output.item.base, %after64
+  %source.batch.base = mul i64 %batch64, %source.count64
+  %source.item.base = add i64 %source.batch.base, %selected
+  %source.index = mul i64 %source.item.base, %after64
+  %source.ptr = getelementptr inbounds double, ptr %input, i64 %source.index
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index
+  call void @llvm.memcpy.p0.p0.i64(ptr %output.ptr, ptr %source.ptr, i64 %copy.bytes, i1 false)
+  br label %item.latch
+
+item.latch:
+  %item.next = add nsw i32 %item, 1
+  br label %item.header
+
+batch.latch:
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
 define internal void @gather_values_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
     ptr %indices, i32 %index.count) {
@@ -2219,6 +2430,28 @@ loop.body:
 
 exit:
   ret double %sum
+}
+
+define internal i64 @sum_int64(ptr %a, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %sum = phi i64 [ 0, %entry ], [ %sum.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds i64, ptr %a, i64 %i64
+  %value = load i64, ptr %a.ptr, align 8
+  %sum.next = add i64 %sum, %value
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret i64 %sum
 }
 
 define internal void @create_arange(double %start, double %step, i32 %n, ptr %out) {
@@ -3357,6 +3590,18 @@ TRANSLATIONS = (
         "single-axis indexed selection",
     ),
     CBackendLLVMSSA(
+        "index_select_int64_indices_int64",
+        "index_select_int64_indices_int64",
+        ("slice",),
+        "single-axis int64 selection preserving int64 lanes",
+    ),
+    CBackendLLVMSSA(
+        "index_select_double_indices_int64",
+        "index_select_double_indices_int64",
+        ("slice",),
+        "single-axis int64 selection preserving float64 lanes",
+    ),
+    CBackendLLVMSSA(
         "gather_values_double",
         "gather_values_double",
         ("gather",),
@@ -3479,6 +3724,12 @@ TRANSLATIONS = (
         "sum_double",
         ("sum",),
         "flat scalar reduction",
+    ),
+    CBackendLLVMSSA(
+        "sum_int64",
+        "sum_int64",
+        ("sum",),
+        "fixed-width int64 flat scalar reduction",
     ),
     CBackendLLVMSSA(
         "create_arange",
@@ -4400,6 +4651,8 @@ def c_backend_repository_ssa_reference():
         "c_backend_llvm_ssa.LLVM_SSA_MODULE",
         C_SSA_EXTERNAL_PRIMITIVES,
         {"ensure_tensor": SSATensorProgram.constant},
+        (__package__ + ".c_backend", str(Path(__file__).with_name("c_backend.py")),
+         "CTensorOperations"),
     )
 
 

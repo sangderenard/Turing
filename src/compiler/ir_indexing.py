@@ -32,7 +32,10 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
     """
 
     from .concordance_declarations import ADDRESS, CONTROL_SSA_FINISH
-    from .ssa_record_return_state import mint_ssa_value
+    from .ssa_record_return_state import (
+        mint_ssa_value, posted_ssa_value_fact,
+    )
+    from .identity_concordance import current_identity_book
 
     for function in functions.values():
 
@@ -66,6 +69,28 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                 for selector in selectors
             )
 
+        def carries_span_selector(instruction: Instr) -> bool:
+            canonical_op = str(
+                instruction.attributes.get("tensor_operation")
+                or instruction.attributes.get("tensor")
+                or instruction.op
+            )
+            selectors = (
+                instruction.args[1:]
+                if canonical_op in _GATHER else
+                instruction.args[1:-1]
+                if canonical_op in _SCATTER else ()
+            )
+            return any(
+                (fact := posted_ssa_value_fact(
+                    function, int(selector.id), book=current_identity_book(),
+                )) is not None
+                and fact.storage == "span"
+                and fact.rank is not None
+                and int(fact.rank) > 0
+                for selector in selectors
+            )
+
         # base value each store's result aliases, so later uses read the same
         # storage the store mutated in place.
         aliases: dict[int, SSAValue] = {}
@@ -77,7 +102,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     or instruction.attributes.get("tensor")
                     or instruction.op
                 )
-                if carries_slice_selector(instruction):
+                if (carries_slice_selector(instruction)
+                        or carries_span_selector(instruction)):
                     # A Python slice (or ``...``) is not an address operand. Keep the
                     # semantic indexing operation until tensor/layout
                     # settlement can normalize its retained axes into a

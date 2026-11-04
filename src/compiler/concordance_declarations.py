@@ -4478,6 +4478,23 @@ NUMERICAL_CONSTRUCTOR_CODE_REFERENCE = declare_page(
 NUMERICAL_CONSTRUCTOR_DEFAULT = declare_page(
     "numerical_constructor_default", (RowField("call", K.PAGE_REF),), tuple,
 )
+#: Selected backend source fragments proving which aggregate members return
+#: its raw tensor type, and the authored ensure_tensor branch that reboxes it.
+NATIVE_TENSOR_FAMILY_SOURCE = declare_page("native_tensor_family_source", (
+    RowField("reference", K.NAME), RowField("operation", K.NAME),
+    RowField("member", K.INDEX),
+), tuple)
+#: Exact source aggregate leaf -> selected raw backend family, native output
+#: formal, aggregate layout/member and original receiver. No Any annotation is
+#: changed by this selected-native representation receipt.
+NATIVE_TENSOR_RESULT_FAMILY = declare_page("native_tensor_result_family", (
+    RowField("scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
+#: ensure_tensor's storage-preserving wrapper, derived from its exact receiver,
+#: raw argument, selected family receipt and revised result identity.
+NATIVE_TENSOR_WRAP = declare_page("native_tensor_wrap", (
+    RowField("scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
 #: A compiler-only reference whose object declares neither a module nor a
 #: name: there is no definition to derive from.
 STATIC_SYMBOL_UNDECLARED = declare_reason("static_symbol_undeclared")

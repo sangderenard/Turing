@@ -51,6 +51,9 @@ _REAL_TRANSLATED_SYMBOLS = {
     "pad_double_nd",
     "slice_copy_double",
     "index_select_double",
+    "index_select_int64_indices_int64",
+    "index_select_double_indices_int64",
+    "sum_int64",
     "gather_values_double",
     "scatter_reduce_double",
     "scatter_sum_double",
@@ -615,6 +618,64 @@ def test_handwritten_index_select_ssa_matches_real_c_kernel(llvm_engine):
     assert list(llvm_output) == [
         c_output[index] for index in range(output_count)
     ]
+
+
+@pytest.mark.parametrize("dtype", ["int64", "double"])
+def test_int64_selector_index_select_preserves_native_lanes(llvm_engine, dtype):
+    shape = [2, 3]
+    selectors = [-1, 0]
+    if dtype == "int64":
+        values = [2**53 + 1, -17, 2**62 + 5, 42, 77, -2]
+        c_type = "long long"
+        lane_type = ctypes.c_int64
+        symbol = "index_select_int64_indices_int64"
+    else:
+        values = [1.25, -17.5, 3.0, 42.125, 77.25, -2.5]
+        c_type = "double"
+        lane_type = ctypes.c_double
+        symbol = "index_select_double_indices_int64"
+    expected = values[3:] + values[:3]
+    c_output = ffi.new(f"{c_type}[]", len(expected))
+    getattr(C, symbol)(
+        ffi.new(f"{c_type}[]", values),
+        c_output,
+        ffi.new("int[]", shape),
+        2,
+        0,
+        ffi.new("long long[]", selectors),
+        len(selectors),
+    )
+    llvm_output = (lane_type * len(expected))()
+    _llvm_function(
+        llvm_engine, symbol,
+        ctypes.POINTER(lane_type), ctypes.POINTER(lane_type),
+        ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int64), ctypes.c_int32,
+    )(
+        (lane_type * len(values))(*values), llvm_output,
+        (ctypes.c_int32 * len(shape))(*shape), 2, 0,
+        (ctypes.c_int64 * len(selectors))(*selectors), len(selectors),
+    )
+    assert list(c_output) == expected
+    assert list(llvm_output) == expected
+
+
+@pytest.mark.parametrize("values", [
+    [2**53 + 1, 7],
+    [2**63 - 1, 1],
+    [-2**63, -1],
+    [],
+])
+def test_sum_int64_matches_numpy_fixed_width_accumulation(llvm_engine, values):
+    expected = int(np.sum(np.asarray(values, dtype=np.int64)))
+    c_input = ffi.new("long long[]", values)
+    c_result = C.sum_int64(c_input, len(values))
+    llvm_result = _llvm_function(
+        llvm_engine, "sum_int64", ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int32, result_type=ctypes.c_int64,
+    )((ctypes.c_int64 * len(values))(*values), len(values))
+    assert c_result == expected
+    assert llvm_result == expected
 
 
 @pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min"])

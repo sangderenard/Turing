@@ -25243,6 +25243,15 @@ def _post_ssa_block_geometry(book, scope, function):
         if cell is not None:
             materialized.setdefault(str(row[2]), []).append(cell)
     metadata_bindings = {}
+    incoming_metadata_bindings = []
+    for incoming_row in book.page(TENSOR_METADATA_CALL_BINDING).rows():
+        if len(incoming_row) != 5 or str(incoming_row[4]) != str(function.name):
+            continue
+        incoming = book.latest_ref(TENSOR_METADATA_CALL_BINDING, incoming_row)
+        incoming_fact = book.page(TENSOR_METADATA_CALL_BINDING).cell(
+            incoming.row, incoming.column,
+        )
+        incoming_metadata_bindings.append((incoming, set(incoming_fact[1])))
     for row in book.page(TENSOR_METADATA_CALL_BINDING).scope_rows(scope):
         if len(row) < 5 or str(row[1]) != str(function.name):
             continue
@@ -25312,6 +25321,13 @@ def _post_ssa_block_geometry(book, scope, function):
             *rebound.get(str(label), ()),
             *materialized.get(str(label), ()),
             *metadata_bindings.get(str(label), ()),
+            # A computed input's exact Call binding can replace this callee's
+            # local extent queries with metadata formals. Their value IDs
+            # remain live, so SSA_VALUE alone cannot explain the changed
+            # instruction geometry. The incoming binding owns that change.
+            *(cell for cell, formals in incoming_metadata_bindings
+              if any(int(value.id) in formals for instruction in block.instrs
+                     for value in instruction.args)),
             *release_cells,
             *block_call_bindings,
             *(function_outputs if any(
@@ -30285,6 +30301,81 @@ def lower_control_sections_to_ssa(
         payload_candidates = (
             (indexed_base_ids & scalar_use_ids) - declared_sequence_ids
         )
+        # Program: huffman.length_limited_huffman_code_lengths receives
+        # ``weights`` as member 0 of _validated_frequency_state's return,
+        # then indexes it to form ``leaves`` and uses both in tensor
+        # arithmetic. Wrong record: both full spans became possible record
+        # row payloads; the Indexed view then sought a storage root for the
+        # call member, which has no local instruction result. The member's
+        # VALUE_SHAPE derives from COPY_VALUE_SHAPE. The view's own resolved
+        # shape state has an exact Indexed/base edge to that member and the
+        # incumbent physical reader proves its numeric span. Exclude only
+        # these concorded spans; unresolved record layouts still reach the
+        # storage-root test.
+        from .concordance_declarations import COPY_VALUE_SHAPE, VALUE_SHAPE
+        from .identity_concordance import concordant_shape_transformation_sources
+
+        candidate_book = current_identity_book()
+
+        def proven_span(value_id: int) -> bool:
+            if lexical_read_scope is None:
+                return False
+            copy_cell = candidate_book.latest_ref(
+                COPY_VALUE_SHAPE, (tuple(lexical_read_scope), int(value_id)),
+            )
+            shape_cell = candidate_book.latest_ref(
+                VALUE_SHAPE, (str(hierarchy_plan.name), int(value_id)),
+            )
+            if copy_cell is None or shape_cell is None:
+                return False
+            copy_fact = candidate_book.page(COPY_VALUE_SHAPE).cell(
+                copy_cell.row, copy_cell.column,
+            )
+            shape_fact = candidate_book.page(VALUE_SHAPE).cell(
+                shape_cell.row, shape_cell.column,
+            )
+            shape_causes = {
+                source for source, _ in candidate_book.edges_into(shape_cell)
+            }
+            return (
+                copy_cell in shape_causes
+                and str(copy_fact.storage) == str(shape_fact.storage) == "span"
+                and bool(tuple(shape_fact.shape))
+                and tuple(copy_fact.shape) == tuple(shape_fact.shape)
+            )
+
+        indexed_results = {
+            int(instruction.res.id): instruction
+            for instruction in semantic_instructions
+            if instruction.res is not None
+            and str(instruction.op) == "Indexed"
+            and instruction.args
+        }
+
+        def proven_indexed_span(value_id: int) -> bool:
+            instruction = indexed_results.get(int(value_id))
+            if instruction is None or not proven_span(int(instruction.args[0].id)):
+                return False
+            base_id = int(instruction.args[0].id)
+            edges = concordant_shape_transformation_sources(
+                shape_scope, int(value_id), operation="Indexed", role="base",
+            ) if shape_scope is not None else ()
+            physical = _runtime_rank_physical(
+                candidate_book, shape_scope, instruction.res,
+            )
+            return (
+                len(edges) == 1
+                and edges[0][2] == tuple(shape_scope)
+                and int(edges[0][3]) == base_id
+                and physical is not None
+                and physical[0].get("storage") == "span"
+                and int(physical[0].get("rank", 0)) > 0
+            )
+
+        payload_candidates = {
+            value_id for value_id in payload_candidates
+            if not proven_span(value_id) and not proven_indexed_span(value_id)
+        }
         storage_roots = _post_storage_roots(
             storage_book, storage_scope, lexical_read_scope,
             formals=storage_formals, instructions=semantic_instructions,

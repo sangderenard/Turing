@@ -38,6 +38,10 @@ class SSATensorCodeReference:
     # Constructor source declarations produce compile-time SSA constants.
     # They have no runtime kernel entrypoint in ``operations``.
     compile_time_constructors: Mapping[str, object] = field(default_factory=dict)
+    # Source declaration of the selected Python backend: module, file, class.
+    # Consumers inspect its raw tensor type and operation returns without
+    # importing or initializing the backend runtime.
+    backend_source: tuple[str, str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not self.source_identity:

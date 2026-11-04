@@ -127,6 +127,24 @@ void index_select_double(
     const int* indices,
     int index_count);
 
+void index_select_int64_indices_int64(
+    const int64_t* input,
+    int64_t* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count);
+
+void index_select_double_indices_int64(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count);
+
 void scatter_sum_double(
     const double* input,
     double* output,
@@ -229,6 +247,7 @@ void broadcast_int64(
     int input_ndim, const int* output_shape, int output_ndim);
 void cast_int64_to_double_values(
     const int64_t* input, double* output, int n);
+int64_t sum_int64(const int64_t* input, int n);
 void create_arange_int64(
     int64_t start, int64_t step, int n, int64_t* output);
 void topk_int64_dim(

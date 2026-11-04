@@ -817,15 +817,16 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
         }
         page = book.page(TENSOR_METADATA_RESULT_BINDING)
         for row in tuple(page.rows()):
-            if row[:3] != (function_scope_of(function), int(call_id), callee_name):
+            if row[0] != function_scope_of(function):
                 continue
+            direct = row[:3] == (function_scope_of(function), int(call_id), callee_name)
             prior = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
             output_id, formal_ids, caller_ids = page.cell(prior.row, prior.column)
             if not any(int(value_id) in replacements for value_id in caller_ids):
                 continue
             if not all(
                 int(value_id) in replacements
-                and replacements[int(value_id)][1] == int(formal_id)
+                and (not direct or replacements[int(value_id)][1] == int(formal_id))
                 for value_id, formal_id in zip(caller_ids, formal_ids, strict=True)
             ):
                 raise ValueError("computed metadata has an incomplete aggregate fold")
@@ -838,6 +839,20 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
             )
             if any(cell is None for cell in rebinding_cells):
                 raise ValueError("computed metadata fold lacks its exact rebinding")
+            incoming = None
+            if not direct:
+                # A downstream result can already return this metadata triple
+                # through its own input formals. Folding the upstream triple
+                # must revise that derived view too, before deleting its IDs.
+                incoming = next((book.latest_ref(TENSOR_METADATA_CALL_BINDING, candidate)
+                    for candidate in book.page(TENSOR_METADATA_CALL_BINDING).rows()
+                    if candidate[:2] == (row[0], function.name)
+                    and candidate[3:] == (row[1], row[2])
+                    and all(pair in tuple(zip(
+                        *book.page(TENSOR_METADATA_CALL_BINDING).latest(candidate), strict=True,
+                    )) for pair in zip(current_ids, formal_ids, strict=True))), None)
+                if incoming is None:
+                    raise ValueError("transitive metadata fold lacks its exact incoming Call binding")
             occurrences = list(function.args)
             for block in function.blocks.values():
                 for instruction in block.instrs:
@@ -863,7 +878,9 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 TENSOR_METADATA_RESULT_BINDING, row,
                 (int(output_id), tuple(map(int, formal_ids)), current_ids),
                 stage=AGGREGATE_ABI_LEGALIZATION,
-                provenance=Derived((prior, *rebinding_cells)), mode=Mode.REVISE,
+                provenance=Derived((prior, *rebinding_cells,
+                                    *((incoming,) if incoming is not None else ()))),
+                mode=Mode.REVISE,
             )
             # The same projected values can already be actuals of a later
             # planned Call. The fold rewrites its live operands; revise the
@@ -882,6 +899,23 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                                for actual_id in actual_ids) == 1
                            for old_id in caller_ids):
                     raise ValueError("computed metadata Call fold is incomplete")
+                consumers = tuple(instruction for block in function.blocks.values()
+                                  for instruction in block.instrs
+                                  if instruction.op == "Call" and instruction.res is not None
+                                  and int(instruction.res.id) == call_row[3]
+                                  and instruction.attributes.get("callee") == call_row[4])
+                if len(consumers) != 1:
+                    continue
+                data_ids = {int(value.id) for value in consumers[0].args}
+                source_results = tuple(book.latest_ref(TENSOR_METADATA_RESULT_BINDING, candidate)
+                    for candidate in page.rows()
+                    if candidate[0] == row[0] and candidate[3] in data_ids
+                    and page.latest(candidate)[2] == current_ids)
+                if len(source_results) != 1:
+                    # Its data result is a downstream geometry view that the
+                    # same loop has not revised yet. That row owns this Call's
+                    # forwarding, and will revisit it after its own revision.
+                    continue
                 revised_actuals = tuple(
                     replacements[int(value_id)][0]
                     if int(value_id) in caller_ids else int(value_id)
@@ -892,8 +926,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     (revised_actuals, tuple(map(int, formal_input_ids))),
                     stage=AGGREGATE_ABI_LEGALIZATION,
                     provenance=Derived((previous_call, *rebinding_cells,
-                                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
-                                                        row))),
+                                        source_results[0])),
                     mode=Mode.REVISE,
                 )
 
@@ -1329,7 +1362,10 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         # retaining it invents an output parameter on the
                         # native call after its callee's outputs were folded.
                         from .ir_identities import _post_dead_structural_retirement
-                        from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
+                        from .concordance_declarations import (
+                            AGGREGATE_PASSTHROUGH_REBINDING,
+                            DEAD_STRUCTURAL_RETIREMENT,
+                        )
                         from .ssa_record_return_state import function_scope_of
 
                         _post_dead_structural_retirement(
@@ -1340,6 +1376,14 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                                     (function_scope_of(function), int(binding[1])),
                                 ),) if cell is not None
                             ),
+                        )
+                        # Input metadata was bound to this exact aggregate
+                        # Call before its identity return was folded. Keep
+                        # the existing retirement receipt on the surviving
+                        # void Call, so replay/audit can still identify it.
+                        call.attributes["aggregate_retired_result"] = book.latest_ref(
+                            DEAD_STRUCTURAL_RETIREMENT,
+                            (function_scope_of(function), int(call.res.id)),
                         )
                         call.res = None
                         call.attributes["result_convention"] = "void"

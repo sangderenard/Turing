@@ -3757,6 +3757,22 @@ def emit_ssa_module_to_c(
                             (projection.value, owned_carrier)
                             for projection in projections
                         )
+                    # Guarded topk returns a runtime logical count, while its
+                    # exact output-capacity receipt bounds allocation by the
+                    # input span. This is already a storage requirement; do
+                    # not demand the output count before the Call computes it.
+                    from .concordance_declarations import TENSOR_OUTPUT_CAPACITY_BOUND
+                    from .identity_concordance import identity_book
+                    from .ssa_record_return_state import function_scope_of
+                    capacity_owner = fn if sparse_output_formal else record.callee
+                    capacity_id = (int(projections[0].value.id)
+                                   if sparse_output_formal else int(output.id))
+                    capacity = identity_book(module).page(TENSOR_OUTPUT_CAPACITY_BOUND).latest((
+                        function_scope_of(module.functions[capacity_owner]), capacity_id,
+                    ))
+                    capacity_count = (math.prod(capacity.capacity_shape)
+                                      if capacity is not None and capacity.capacity_shape
+                                      else None)
                     runtime_slot = (
                         extent_slot(
                             fn if sparse_output_formal else record.callee,
@@ -3764,12 +3780,14 @@ def emit_ssa_module_to_c(
                             else int(output.id),
                             "element_count", None,
                         )
-                        if owned_carrier is None and not shape and _runtime_sized_span(
+                        if owned_carrier is None and capacity_count is None
+                        and not shape and _runtime_sized_span(
                             projections[0].value if sparse_output_formal
                             else output
                         ) else None
                     )
-                    if (owned_carrier is None and not shape and runtime_slot is None
+                    if (owned_carrier is None and capacity_count is None
+                            and not shape and runtime_slot is None
                             and (_runtime_sized_span(output)
                                  or any(_runtime_sized_span(projection.value)
                                         for projection in projections))):
@@ -3778,7 +3796,11 @@ def emit_ssa_module_to_c(
                             "has no exact caller element-count storage origin",
                         ))
                         continue
-                    if runtime_slot is not None:
+                    if capacity_count is not None and owned_carrier is None:
+                        storage = activation_array(element_type, capacity_count)
+                        projected_expression = storage
+                        projected_address = storage
+                    elif runtime_slot is not None:
                         # A runtime-sized span result is owned storage of
                         # its element count, never one scalar slot.
                         storage = runtime_activation_array(
@@ -6495,7 +6517,35 @@ def emit_ssa_module_to_c(
                                 f"public storage origin in {fn}",
                             ))
                             continue
-                        expressions[result_id] = f"extents[{slot}]"
+                        # Private rank-one gather's extent(indices) is both
+                        # a native index_count actual and a region metadata
+                        # output. The output destination is prebound in
+                        # addresses, but it is not written until Ret. Passing
+                        # that address to index_select read an uninitialized
+                        # count. Materialize this SSA int32 result from the
+                        # public int64 extent slot now; Ret later publishes
+                        # this same cell to the output destination.
+                        extent_local = f"t{result_id}"
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        body.append(
+                            f"        int32_t {extent_local} = 0;"
+                        )
+                        body.append(
+                            f"        if (extents[{slot}] < 0 || "
+                            f"extents[{slot}] > INT32_MAX) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u); "
+                            f"else {extent_local} = "
+                            f"(int32_t)(extents[{slot}]);"
+                        )
+                        expressions[result_id] = extent_local
+                        addresses[result_id] = f"&{extent_local}"
+                        object_expressions[id(instruction.res)] = extent_local
+                        object_addresses[id(instruction.res)] = f"&{extent_local}"
                         integer_ids.add(result_id)
                         continue
                     if kind == "shape":
@@ -7639,7 +7689,12 @@ def emit_ssa_module_to_c(
                         f"        if ({block} == NULL) abort();",
                         f"        *((void **){block}) = *((void **)({owner_cell}));",
                         f"        *((void **)({owner_cell})) = {block};",
-                        f"        double *t{result_id} = (double *)"
+                        # The private gather's owned Alloca declares int64
+                        # elements.  A hard-coded double pointer gave that
+                        # same arena two C element types even though the
+                        # checked heap layout already states its sole type.
+                        f"        {layout.c_storage_type} *t{result_id} = "
+                        f"({layout.c_storage_type} *)"
                         f"((char *){block} + 8);",
                     ))
                     if instruction.attributes.get("zero_initialize"):
