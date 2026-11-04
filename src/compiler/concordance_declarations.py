@@ -4531,7 +4531,7 @@ SSA_CALL_SHAPE_EVIDENCE = declare_page("ssa_call_shape_evidence", (
 ), str)
 TENSOR_METADATA_CALL_BINDING = declare_page("tensor_metadata_call_binding", (
     RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
-    RowField("block", K.NAME), RowField("instruction", K.INDEX),
+    RowField("block", K.NAME), RowField("call_result", K.VALUE_ID),
     RowField("callee", K.NAME),
 ), tuple)                              # DERIVED(shape/value cells); REVISE
 #: A region's computed tensor result metadata projected through its exact
@@ -4543,6 +4543,42 @@ TENSOR_METADATA_RESULT_BINDING = declare_page("tensor_metadata_result_binding", 
     RowField("caller_scope", K.SCOPE), RowField("call_result", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)                              # DERIVED(call, callee/caller output cells); CONCORD
+#: A dynamic tensor's logical element identity, native data carrier, and
+#: allocation owner. Fact is (data id, owner id, count id, element dtype).
+#: The unique owned-heap Alloca defines the carrier from the exact count and
+#: owner; these are distinct identities, never a reinterpretation of the
+#: logical tensor's semantic dtype.
+TENSOR_OWNED_HEAP_BINDING = declare_page("tensor_owned_heap_binding", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("tensor", K.VALUE_ID),
+), tuple)                              # DERIVED(tensor, carrier, owner, count); CONCORD
+#: A caller-owned mutable owner cell passed to one exact allocating region
+#: Call. Fact is (callee tensor id, caller owner actual, callee owner formal).
+TENSOR_HEAP_OWNER_CALL_BINDING = declare_page("tensor_heap_owner_call_binding", (
+    RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
+    RowField("call_result", K.VALUE_ID), RowField("callee", K.NAME),
+    RowField("tensor", K.VALUE_ID),
+), tuple)                              # DERIVED(call, tensor, actual, formal); CONCORD
+#: A private caller frame's explicit owner release after the last tensor use
+#: and before its terminal return. Fact is (producer Call result, logical
+#: tensor id, release block name). The native release instruction is the
+#: executable effect; this page accounts for its exact lifetime decision.
+TENSOR_HEAP_RELEASE_BINDING = declare_page("tensor_heap_release_binding", (
+    RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
+    RowField("owner_actual", K.VALUE_ID),
+), tuple)                              # DERIVED(call, tensor, owner, block); CONCORD
+#: One private owned tensor consumer is proved not to return the consumed
+#: storage. Fact is (callee name, logical input id, consumed formal ids,
+#: ((returned tensor id, native data id, alias id or None), ...)). This is
+#: posted from the exact Call binding and the callee's live tensor table;
+#: metadata outputs are excluded only by TENSOR_METADATA_RESULT_BINDING.
+TENSOR_HEAP_CONSUMER_NONESCAPE = declare_page(
+    "tensor_heap_consumer_nonescape", (
+        RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
+        RowField("call_result", K.VALUE_ID),
+        RowField("owner_actual", K.VALUE_ID),
+    ), tuple,
+)                                       # DERIVED(call, output SSA, metadata); CONCORD
 @dataclass(frozen=True)
 class TensorOutputCapacityBound:
     """Allocation capacity from one guarded tensor input, not logical shape."""

@@ -1792,6 +1792,10 @@ class SSATensorDescriptor:
     strides_value_id: int | None = None
     rank_value_id: int | None = None
     element_count_value_id: int | None = None
+    # An owned runtime tensor has a distinct native data carrier and a
+    # caller-controlled heap owner. The logical tensor id and dtype remain
+    # the element type; neither is an address spelling.
+    heap_owner_value_id: int | None = None
     layout: str = "dense-row-major"
     storage: str = "temporary"
     metadata_state: str = "static"
@@ -1835,6 +1839,13 @@ class SSATensorDescriptor:
             )
         if not self.shape and self.shape_value_id is not None and self.rank_value_id is None:
             raise ValueError("a dynamic SSA tensor shape requires a rank value")
+        if self.heap_owner_value_id is not None:
+            if self.metadata_state != "dynamic":
+                raise ValueError("an owned heap tensor requires dynamic extent metadata")
+            if self.data_value_id == self.tensor_id:
+                raise ValueError("an owned heap tensor requires a distinct native data carrier")
+            if self.element_count_value_id is None:
+                raise ValueError("an owned heap tensor requires an exact allocation count")
 
     @property
     def static_rank(self) -> int | None:
@@ -1860,6 +1871,7 @@ class SSATensorDescriptor:
             "strides_value_id": self.strides_value_id,
             "rank_value_id": self.rank_value_id,
             "element_count_value_id": self.element_count_value_id,
+            "heap_owner_value_id": self.heap_owner_value_id,
             "layout": self.layout,
             "storage": self.storage,
             "metadata_state": self.metadata_state,
