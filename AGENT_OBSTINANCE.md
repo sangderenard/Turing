@@ -21,6 +21,18 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — changing a shape audit before checking the live binding
+
+The agent was asked to fix recurring type failures at their shared writers.
+After retaining a shape receiver, it assumed a final audit failure came from
+record aliases and changed the audit to follow those aliases before printing
+the actual extent and control binding. The changed audit still failed and
+wasted one nine-second compilation plus the subsequent inspection. The extent
+already used the authored receiver id; its control binding remained unresolved
+after record materialization. The audit change was removed, with canonical
+source untouched. Observing the live instruction and both binding records
+before changing their reader would have prevented this departure.
+
 ## 2026-11-04 — guessing at a new aggregate regression before observing its writer
 
 The root agent was correcting missing authored return-class evidence for the

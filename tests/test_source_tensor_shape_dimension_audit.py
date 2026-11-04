@@ -100,3 +100,52 @@ def test_live_shape_extent_uses_authored_receiver_result_and_axis():
     assert any("live extent call" in item.detail for item in findings(module))
     extent.args[0] = receiver
     assert findings(module) == []
+
+
+def test_record_field_shape_receiver_survives_folding_and_becomes_bound_input():
+    from dataclasses import dataclass
+    from src.compiler.concordance_declarations import CONTROL_VALUE_BINDING, SSA_VALUE
+    from src.compiler.identity_concordance import identity_book
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [],
+        "records": {"Table": {"identity": "Table", "fields": {
+            "lengths": {"storage": "span", "dtype": "int64", "rank": 1,
+                        "mutable": False},
+        }}},
+        "bindings": [{"function": "root", "parameter": "table", "record": "Table"}],
+    })
+    module, _, _ = lower_ast_source_to_ssa(
+        "@dataclass\n"
+        "class Table:\n"
+        "    lengths: AbstractTensor\n"
+        "    def size(self) -> int:\n"
+        "        return self.lengths.shape[0] + self.lengths.sum().item()\n"
+        "def root(table: Table) -> int:\n"
+        "    return table.size()\n",
+        "root", name="record_extent_audit", extraction_contract=contract,
+        python_bindings={"AbstractTensor": AbstractTensor, "dataclass": dataclass},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _: None, progress_bars=False,
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    book = identity_book(module)
+    live = [(function, instruction)
+            for function in module.functions.values()
+            for block in function.blocks.values() for instruction in block.instrs
+            if instruction.attributes.get("source_shape_dimension_cell")]
+    assert len(live) == 1
+    function, instruction = live[0]
+    source = instruction.attributes["source_shape_dimension_cell"]
+    receiver = book.page(SOURCE_TENSOR_SHAPE_DIMENSION).cell(source.row, source.column)[0]
+    scope = function_scope_of(function)
+    binding = book.page(CONTROL_VALUE_BINDING).latest((scope, int(receiver.row[1])))
+    fact = book.page(SSA_VALUE).cell(binding.ssa_value.row, binding.ssa_value.column)
+    assert (binding.kind.value, fact.physical_dtype, fact.storage, fact.rank) == (
+        "field_incumbent", "int64", "span", 1,
+    )
+    assert binding.ssa_value.row[1] == instruction.args[0].id
