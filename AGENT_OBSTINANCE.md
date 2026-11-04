@@ -21,6 +21,18 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — guessing at a new aggregate regression before observing its writer
+
+The root agent was correcting missing authored return-class evidence for the
+compressor's converted weights. Its signature-ingestion change exposed a
+missing topk aggregate dtype. It added two NamedTuple exclusions based on an
+inferred duplicate-class explanation before tracing the actual declaration
+and layout cells. Both exclusions left the failure unchanged and wasted two
+roughly twelve-second probes plus review. They were removed from the validation
+checkout; canonical source was unaffected. Observing the exact annotation,
+class and layout records before changing either reader would have prevented
+these speculative edits.
+
 ## 2026-11-04 — audit continued after an unreadable hazard receipt
 
 The root agent was required to read the newest hazards before verification.

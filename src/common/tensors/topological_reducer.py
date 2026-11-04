@@ -25581,10 +25581,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 "callee_ref", attributes.get("method_ref")
             )
             return_declaration_cell = None
+            intrinsic_return_sources = ()
             returned_class = (
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
             )
+            if returned_class is None:
+                from ...compiler.intrinsic_result_layouts import intrinsic_return_class
+                returned_class, intrinsic_return_sources = intrinsic_return_class(
+                    target_graph, int(_node_id),
+                )
+                if intrinsic_return_sources:
+                    return_declaration_cell = next(cell for cell in intrinsic_return_sources
+                                                   if cell.page == _FUNCTION_RETURN_ANNOTATION)
             declared_element = (
                 None if callee_reference is None
                 else returned_element_by_reference.get(int(callee_reference))
@@ -25741,6 +25750,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         cell for cell in (
                             node_identity_cell(target_graph, int(_node_id)),
                             return_declaration_cell,
+                            *intrinsic_return_sources,
                         ) if cell is not None
                     ))
                     _concord_source_value_class(
