@@ -2946,11 +2946,39 @@ class _ControlSSABuilder(TiledObject):
                 # octets.shape[0] before its optional-count branch. The
                 # control seed had unknown dtype and no physical fields,
                 # although its exact singleton VALUE_TYPE_ABI declares an
-                # int64 span/rank1. Adopt that declaration before the first
-                # SSA_VALUE post; _contract_physical then records its view.
+                # int64 span/rank1. The region signature may already have
+                # posted this graph id as an unknown SSA_VALUE. Revise that
+                # same row from its exact ABI rather than asking _value_cell
+                # to return the incumbent unknown cell unchanged.
                 value.dtype = str(seed_arms[0].dtype)
                 seed_sources = tuple(seed_arms[0].source_cells)
-                self._value_cell(value, seed_abi_cell, *seed_sources)
+                seed_canonical = self._canonical_cell(value_id)
+                seed_physical = _contract_physical(
+                    self._book(), value, seed_canonical,
+                )
+                if seed_physical is None or seed_physical[1] != seed_abi_cell:
+                    raise ConcordanceRefusal(
+                        f"parameter {value_id} singleton ABI has no exact "
+                        "physical view at its canonical identity"
+                    )
+                prior_seed_cell = self._book().latest_ref(
+                    SSA_VALUE, (self._scope(), value_id),
+                )
+                if prior_seed_cell is not None:
+                    prior_seed = self._book().page(SSA_VALUE).cell(
+                        prior_seed_cell.row, prior_seed_cell.column,
+                    )
+                    for field, expected in seed_physical[0].items():
+                        actual = getattr(prior_seed, field, None)
+                        if actual is not None and actual != expected:
+                            raise ConcordanceRefusal(
+                                f"parameter {value_id} {field} {actual!r} "
+                                f"disagrees with singleton ABI {expected!r}"
+                            )
+                self._revise_value(
+                    value, seed_canonical, seed_abi_cell, *seed_sources,
+                    physical=seed_physical[0],
+                )
             self._bind(
                 value_id, value, BindingKind.PARAMETER_SEED,
                 binding_cell, seed_abi_cell, *seed_sources,
