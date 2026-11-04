@@ -1106,6 +1106,33 @@ def test_dynamic_sequence_append_slice_reserves_clipped_result_before_copy():
     )
 
 
+def test_dynamic_append_fixed_helper_uses_exact_ptr_column_formal():
+    # The real _header bytearray has an int64 row in a ptr heap carrier.
+    descriptor = SSASequenceDescriptor(
+        sequence_id=15,
+        column_value_ids=(15,),
+        length_address_id=151,
+        capacity_value_id=152,
+        status_address_id=153,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=154,
+    )
+    lowering = lower_sequence_append(descriptor, function_name="header_append")
+    assert lowering.complete, lowering.shortfalls
+    fixed = next(function for function in lowering.functions
+                 if function.name.endswith("__fixed"))
+    column = next(value for value in fixed.args if value.id == 15)
+    assert column.dtype == "ptr"
+    stores = [instruction for block in fixed.blocks.values()
+              for instruction in block.instrs
+              if instruction.op == "GetElementPtr"
+              and instruction.args[0].id == column.id]
+    assert stores
+    assert all(instruction.args[0] is column for instruction in stores)
+    assert all(instruction.args[0].dtype == "ptr" for instruction in stores)
+
+
 def test_sequence_pack_bits_is_nested_iterative_memory_ssa():
     destination = _sequence(15, 150)
     source = SSASequenceDescriptor(
