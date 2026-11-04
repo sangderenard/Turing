@@ -422,6 +422,15 @@ def _propagate_scalar_dtypes(functions) -> None:
             if instruction.op == "Call" and instruction.res is not None
             and instruction.attributes.get("result_convention") == "ssa.aggregate"
         }
+        from .concordance_declarations import TENSOR_METADATA_RESULT_BINDING
+        metadata_output_ids = {
+            int(value_id)
+            for row in book.page(TENSOR_METADATA_RESULT_BINDING).rows()
+            if row[0] == scope
+            for value_id in book.page(
+                TENSOR_METADATA_RESULT_BINDING
+            ).latest(row)[2]
+        }
         declared_load_ids = {
             int(instruction.res.id) for instruction in instructions
             if instruction.op == "Load" and instruction.res is not None
@@ -431,7 +440,9 @@ def _propagate_scalar_dtypes(functions) -> None:
             # source output69 retains an int placeholder with int64 on its
             # identity book; its existing projection settlement still applies.
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
-                 not in aggregate_result_ids)
+                 not in aggregate_result_ids
+                 or (instruction.attributes.get("computed_tensor_metadata")
+                     and int(instruction.res.id) in metadata_output_ids))
             and dtype_of.get(int(instruction.res.id), "") in _DECLARED_LITERAL_DTYPES
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
                  not in heap_element_of)
@@ -592,10 +603,20 @@ def _propagate_scalar_dtypes(functions) -> None:
                 ):
                     declared = dtype_of.get(result_id, "")
                     if (
-                        (instruction.op == "Const" or result_id in declared_load_ids)
+                        (instruction.op == "Const"
+                         or result_id in declared_load_ids
+                         or (
+                             instruction.op == "Cast"
+                             and instruction.attributes.get("target_dtype")
+                             == declared
+                         ))
                         and declared in _DECLARED_LITERAL_DTYPES
                         and inferred == declared
                     ):
+                        # AbstractTensor.arange(bit_count) explicitly narrows
+                        # its checked int64 count to the native kernel's
+                        # int32 count. Cast declares that target width; it
+                        # is not an inferred Python integer to widen back.
                         # Source-linked native object SET reaches the dynamic
                         # store's i32 status cell. Widening its raw typed Loads
                         # alone changed both incoming statuses to i64 while

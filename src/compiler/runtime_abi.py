@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping
 
 SCHEMA = "turing-runtime-abi-v1"
 COMPUTED_OUTPUT_SCHEMA = "turing-runtime-abi-v2"
+OWNED_OUTPUT_SCHEMA = "turing-runtime-abi-v3"
 
 #: A stored callable field crosses the native boundary as two method inputs,
 #: a C function pointer and an opaque context handle, which the host supplies
@@ -72,6 +73,8 @@ def runtime_abi_description(
     output_capacity_sources: Iterable[tuple[int, int]] = (),
     output_length_sources: Iterable[tuple[int, int]] = (),
     output_shape_sources: Iterable[tuple[int, int]] = (),
+    output_heap_sequences: Iterable[tuple[int, int, int, int, str]] = (),
+    release_entry: str | None = None,
 ) -> dict[str, Any]:
     """Describe the buffer and extent vectors of one compiled entry.
 
@@ -105,6 +108,13 @@ def runtime_abi_description(
     capacities = relations(output_capacity_sources)
     lengths = relations(output_length_sources)
     result_shapes = relations(output_shape_sources)
+    owned = tuple((int(data), int(length), int(capacity), int(owner), str(dtype))
+                  for data, length, capacity, owner, dtype in output_heap_sequences)
+    owned_ids = {item[0] for item in owned}
+    if len(owned_ids) != len(owned) or owned_ids & (set(capacities) | set(lengths) | set(result_shapes)):
+        raise ValueError("owned output identity has conflicting allocation contracts")
+    if bool(owned) != bool(release_entry):
+        raise ValueError("owned outputs require their native release entry")
     if set(lengths) & set(result_shapes):
         raise ValueError("a result cannot take both a logical length and a shape vector")
     from ..transmogrifier.dtype_layout import layout_for
@@ -126,6 +136,28 @@ def runtime_abi_description(
         if not ((ranks[source_index] == 0 and shape == () and expected_count == 1)
                 or (ranks[source_index] == 1 and shape == (expected_count,))):
             raise ValueError("native output extent port has the wrong fixed size")
+    owned_records = {}
+    for data, length, capacity, owner, dtype in owned:
+        if len({data, length, capacity, owner}) != 4 or any(
+            value_id not in index_of for value_id in (data, length, capacity, owner)
+        ):
+            raise ValueError("owned output requires four distinct public descriptor ports")
+        for value_id in (data, length, capacity, owner):
+            index = index_of[value_id]
+            if roles[index] not in {"output", "inout"} or shapes[index] not in {(), (1,)}:
+                raise ValueError("owned output descriptor port is not one writable native cell")
+        if any(dtypes[index_of[value_id]] not in {"ptr", "uintp"} for value_id in (data, owner)):
+            raise ValueError("owned output data and owner must be native pointer cells")
+        if any(layout_for(dtypes[index_of[value_id]]).kind not in {"int", "uint"}
+               for value_id in (length, capacity)):
+            raise ValueError("owned output length and capacity must be integers")
+        layout = layout_for(dtype)
+        if layout.kind not in {"bool", "int", "uint", "float", "complex"} or layout.byte_size > 8:
+            raise ValueError("owned output element layout is not a fixed native value")
+        owned_records[data] = {
+            "element_dtype": dtype, "length_buffer": index_of[length],
+            "capacity_buffer": index_of[capacity], "owner_buffer": index_of[owner],
+        }
     buffers = []
     for index, value_id in enumerate(order):
         static = shapes[index]
@@ -144,9 +176,14 @@ def runtime_abi_description(
             record["logical_length_from"] = index_of[lengths[value_id]]
         if value_id in result_shapes:
             record["logical_shape_from"] = index_of[result_shapes[value_id]]
+        if value_id in owned_records:
+            record["owned_sequence"] = owned_records[value_id]
+            record["owned_sequence"]["standalone_length_prefix"] = "uint64"
+            record["storage"] = "owned_heap_pointer_cell"
+            record["shape"] = [1]
         if runtime_sized and value_id in sources:
             record["extents_from"] = index_of[sources[value_id]]
-        elif runtime_sized and value_id not in capacities:
+        elif runtime_sized and value_id not in capacities and value_id not in owned_ids:
             record["extents_from"] = "fed"
         buffers.append(record)
     extents = []
@@ -162,8 +199,8 @@ def runtime_abi_description(
             "kind": str(kind),
             "axis": None if axis is None else int(axis),
         })
-    return {
-        "schema": (COMPUTED_OUTPUT_SCHEMA
+    description = {
+        "schema": (OWNED_OUTPUT_SCHEMA if owned else COMPUTED_OUTPUT_SCHEMA
                    if capacities or lengths or result_shapes else SCHEMA),
         "entry": str(entry),
         "backend": str(backend),
@@ -171,6 +208,13 @@ def runtime_abi_description(
         "buffers": buffers,
         "extents": {"type": str(extent_type), "order": extents},
     }
+    if owned:
+        description["release_entry"] = {
+            "entry": str(release_entry),
+            "signature": f"void {release_entry}(void **buffers)",
+            "lifetime": "consume results before releasing their native owners",
+        }
+    return description
 
 
 def apply_native_result_extents(
@@ -213,6 +257,51 @@ def apply_native_result_extents(
             raise ValueError("native result shape exceeds its proven capacity")
         views[output] = allocated.reshape(-1)[:count].reshape(shape)
     buffers.update(views)
+
+
+def copy_owned_sequence_results(
+    buffers: Mapping[int, Any],
+    sequences: Iterable[tuple[int, int, int, int, str]],
+) -> dict[int, Any]:
+    """Read an incumbent owned-heap sequence before releasing its owner.
+
+    Ports are data-pointer cell, length, capacity, owner and element dtype,
+    derived from the returned sequence descriptor. The caller keeps the
+    native owner alive through this copy and releases it even on failure.
+    """
+    import ctypes
+    import numpy as np
+
+    copied = {}
+    for data_id, length_id, capacity_id, owner_id, dtype in sequences:
+        def integer_cell(value_id):
+            cell = np.asarray(buffers[int(value_id)])
+            if cell.size != 1 or cell.dtype.kind not in {"i", "u"}:
+                raise ValueError("owned sequence metadata is not one integer cell")
+            return int(cell.reshape(-1)[0])
+
+        count, capacity = integer_cell(length_id), integer_cell(capacity_id)
+        address, owner = integer_cell(data_id), integer_cell(owner_id)
+        element = np.dtype(dtype)
+        if (element.hasobject or element.kind not in {"b", "i", "u", "f", "c"}
+                or element.itemsize > 8):
+            raise ValueError("owned sequence has no fixed native element layout")
+        if not 0 <= count <= capacity:
+            raise ValueError("owned sequence length exceeds its native capacity")
+        if not 0 <= address <= np.iinfo(np.uintp).max or not 0 <= owner <= np.iinfo(np.uintp).max:
+            raise ValueError("owned sequence address exceeds native pointer width")
+        if count > np.iinfo(np.intp).max // element.itemsize:
+            raise ValueError("owned sequence byte count exceeds host address width")
+        if count and (address == 0 or owner == 0):
+            raise ValueError("nonempty owned sequence has no live arena and owner")
+        if count:
+            octets = (ctypes.c_ubyte * (count * element.itemsize)).from_address(address)
+            copied[int(data_id)] = np.ctypeslib.as_array(octets).view(element).copy()
+        else:
+            copied[int(data_id)] = np.empty((0,), dtype=element)
+        for value_id in (length_id, capacity_id):
+            copied[int(value_id)] = np.asarray(buffers[int(value_id)]).copy()
+    return copied
 
 
 def public_buffer_contract(

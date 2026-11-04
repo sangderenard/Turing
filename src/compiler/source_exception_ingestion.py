@@ -293,8 +293,13 @@ class FailureArms:
                 result += lowered
             elif isinstance(statement, ast.Raise):
                 packet = self.raised_record(statement, context, retain_message_operand=True)
-                result.append(ast.copy_location(ast.Expr(value=self.intrinsic(
-                    "exception_raise", (packet,))), statement))
+                terminal = self.intrinsic("exception_raise", (packet,))
+                # The generated call still represents this exact authored
+                # Raise.  Keep its source cell through the later A-normal
+                # hoist, which moves the call into an Assign.
+                from ..transmogrifier.graph.graph_express2 import post_source_span
+                terminal._turing_authored_raise_cell = post_source_span(None, statement)
+                result.append(ast.copy_location(ast.Expr(value=terminal), statement))
             elif isinstance(statement, (ast.If, ast.For, ast.While, ast.With)):
                 incoming_bound = set(self.bound)
                 if isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):

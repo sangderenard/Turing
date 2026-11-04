@@ -44,6 +44,51 @@ def test_mixed_representation_phi_is_not_implicitly_reinterpreted():
     assert backedge.dtype == 'int64'
 
 
+def test_explicit_integer_cast_keeps_declared_narrow_target():
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGEST_SOURCE, SCALAR_INTEGER_WIDTH, SSA_VALUE,
+        IntegerWidthDecision, SSAValueFact, SSAValueOrigin,
+    )
+    from src.compiler.identity_concordance import (
+        Derived, Mode, Novel, begin_identity_book, end_identity_book,
+    )
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    source = SSAValue(1, 'int64')
+    narrowed = SSAValue(2, 'int32')
+    function = Function('explicit_narrow', [source], {
+        'entry': BasicBlock('entry', [
+            Instr('Cast', [source], narrowed, attributes={
+                'source_dtype': 'int64', 'target_dtype': 'int32',
+                'conversion_kind': 'integer_conversion', 'overflow': 'trap',
+            }),
+            Instr('Ret', [narrowed], None),
+        ])
+    })
+    book, token = begin_identity_book()
+    try:
+        scope = function_scope_of(function)
+        origin = book.post(
+            SSA_VALUE, (scope, source.id),
+            SSAValueFact('int64', (), SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        book.post(
+            SSA_VALUE, (scope, narrowed.id),
+            SSAValueFact('int32', (), SSAValueOrigin.MINTED),
+            stage=INGESTION, provenance=Derived((origin,)),
+            mode=Mode.CONCORD,
+        )
+        _propagate_scalar_dtypes({function.name: function})
+        assert narrowed.dtype == 'int32'
+        width = book.page(SCALAR_INTEGER_WIDTH).latest((scope, narrowed.id))
+        assert width.decision is IntegerWidthDecision.KEPT_DECLARED
+        assert width.dtype == 'int32'
+    finally:
+        end_identity_book(token)
+
+
 def test_accepted_component_keeps_its_owner_settlement_off_ambient_book():
     from src.compiler.identity_concordance import begin_identity_book, end_identity_book
 

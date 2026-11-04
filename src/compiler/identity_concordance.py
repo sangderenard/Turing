@@ -1532,6 +1532,7 @@ class CorrelationTable:
         found.extend(self._region_instruction_residency_findings(module))
         found.extend(self._repository_ssa_signature_findings(module))
         found.extend(self._scope_local_accounting_findings(module))
+        found.extend(self._tensor_metadata_result_binding_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -1582,6 +1583,10 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
+        found.extend(self._source_bytes_concat_class_findings(module))
+        found.extend(self._source_eager_bytes_return_findings(module))
+        found.extend(self._source_owned_sequence_return_findings(module))
+        found.extend(self._public_owned_sequence_return_findings(module))
         found.extend(self._runtime_result_abi_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._source_closed_aggregate_length_findings(module))
@@ -3511,6 +3516,8 @@ class CorrelationTable:
         from .concordance_declarations import (
             COMPILE_POLICY, C_OPERATOR_SAFETY, SOURCE_EXCEPTION_OPERATION,
             SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, SOURCE_EXCEPTION_INGESTION, SOURCE_EXCEPTION_NODE, INGESTION_VALUE, SOURCE_SPAN,
+            GUARDED_CALL_ACTUAL_RANGE, SOURCE_INTRINSIC_ADMISSION, PROCESS_GRAPH_OPERANDS,
+            CANONICAL_VALUE,
         )
         from ..transmogrifier.operator_safety import OPERATOR_FAILURE_ARMS
         from .thread_operations import PROCESS_OPERATORS
@@ -3540,6 +3547,56 @@ class CorrelationTable:
                     or not {row[0], conversion} <= {source for source, _stage in book.edges_into(cell)}):
                 found.append(Finding("exception-ingestion-node", "<source>", None,
                                      "generated exception node lacks its ingestion conversion"))
+        for row in book.page(SOURCE_EXCEPTION_OPERATION).rows():
+            cell = book.latest_ref(SOURCE_EXCEPTION_OPERATION, row)
+            operation = fact(cell)
+            if not operation or operation[0] != "exception_raise":
+                continue
+            causes = {source for source, _stage in book.edges_into(cell)}
+            authored_raises = tuple(source for source in causes
+                                    if source.page == SOURCE_SPAN and fact(source).kind == "Raise")
+            # A converted bare Raise is already a terminal operation at
+            # ingestion.  Its direct authored source and conversion cause
+            # must survive the later reducer's same-fact concordance post.
+            if authored_raises and (
+                len(authored_raises) != 1
+                or row[0] not in causes
+                or operation[7] not in causes
+                or operation[7].page != SOURCE_PROCESS_OPERATION
+                or fact(operation[7])[0] != "exception_raise"
+                or not any(source.page == SOURCE_EXCEPTION_INGESTION
+                           and authored_raises[0] in {
+                               prior for prior, _stage in book.edges_into(source)
+                           } for source in causes)
+            ):
+                found.append(Finding("exception-raise-origin", "<source>", None,
+                                     "terminal exception operation lost its authored Raise or conversion"))
+        from .concorded_literals import origin_cell
+        for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows():
+            cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
+            causes = {source for source, _stage in book.edges_into(cell)}
+            admissions = tuple(source for source in causes
+                               if source.page == SOURCE_INTRINSIC_ADMISSION)
+            if not admissions:
+                continue  # Existing function-table actuals have a separate binding proof.
+            calls = tuple(source for source in causes
+                          if source.page == CANONICAL_VALUE
+                          and source.row[-1] == row[1])
+            operands = tuple(source for source in causes
+                             if source.page == PROCESS_GRAPH_OPERANDS)
+            try:
+                call_origin = origin_cell(book, calls[0]) if len(calls) == 1 else None
+            except ValueError:
+                call_origin = None
+            if (len(admissions) != 1 or len(calls) != 1 or len(operands) != 1
+                    or call_origin != admissions[0].row[0]
+                    or operands[0].row[-1] != row[1]
+                    or not any(source.page == SOURCE_SPAN
+                               and fact(source).kind in {"If", "While"}
+                               for source in causes)
+                    or not any(parent in causes for parent, _role in fact(operands[0]))):
+                found.append(Finding("intrinsic-guarded-actual-origin", str(row[0]), row[1],
+                                     "intrinsic range lacks exact call, operand, or dominating guard evidence"))
         for name, fn in module.functions.items():
             # A linked _read_header's ExceptionNone/Make/Raise instructions
             # retain SOURCE_EXCEPTION_OPERATION in its accepted owner book.
@@ -4854,6 +4911,120 @@ class CorrelationTable:
                             "accounting-foreign-value-id", str(name), int(value.id),
                             f"accounting.{key}={int(named)} names no value of this function",
                         ))
+        return found
+
+    @staticmethod
+    def _tensor_metadata_result_binding_findings(module: Any) -> list[Finding]:
+        """Computed metadata must traverse one exact aggregate call output."""
+
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        found = []
+        page = book.page(TENSOR_METADATA_RESULT_BINDING)
+        keys = (
+            "tensor_shape_value_id", "tensor_rank_value_id",
+            "tensor_element_count_value_id",
+        )
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
+            fact = page.cell(ref.row, ref.column)
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 3
+                and fact[0] == row[3]
+                and all(isinstance(ids, tuple) and len(ids) == 3
+                        and all(type(item) is int for item in ids)
+                        for ids in fact[1:])
+            )
+            caller = next((function for function in module.functions.values()
+                           if function_scope_of(function) == row[0]
+                           and any(instruction.op == "Call"
+                                   and instruction.res is not None
+                                   and int(instruction.res.id) == row[1]
+                                   and instruction.attributes.get("callee") == row[2]
+                                   for block in function.blocks.values()
+                                   for instruction in block.instrs)), None)
+            callee = module.functions.get(row[2])
+            valid = valid and caller is not None and callee is not None
+            if valid:
+                call = next(instruction for block in caller.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.op == "Call" and instruction.res is not None
+                            and int(instruction.res.id) == row[1]
+                            and instruction.attributes.get("callee") == row[2])
+                caller_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+                callee_ids = tuple(map(int, call.attributes.get("callee_output_ids", ())))
+                valid = (
+                    len(caller_ids) == len(callee_ids)
+                    and all(
+                        sum(1 for actual, formal in zip(caller_ids, callee_ids)
+                            if actual == actual_id and formal == formal_id) == 1
+                        for actual_id, formal_id in zip(fact[2], fact[1])
+                    )
+                )
+                returned = [instruction for block in callee.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.op == "Ret"]
+                valid = valid and len(returned) == 1 and tuple(
+                    int(value.id) for value in returned[0].args
+                ) == callee_ids
+                projections = [instruction for block in caller.blocks.values()
+                               for instruction in block.instrs
+                               if instruction.op == "Load"
+                               and instruction.res is not None]
+                addresses = {
+                    int(instruction.res.id): instruction
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "GetElementPtr"
+                    and instruction.res is not None
+                    and instruction.args
+                    and int(instruction.args[0].id) == row[1]
+                }
+                valid = valid and all(
+                    actual_id in caller_ids and sum(
+                        1 for projection in projections
+                        if int(projection.res.id) == actual_id
+                        and projection.attributes.get("source_output_id") == actual_id
+                        and projection.attributes.get("aggregate_index")
+                        == caller_ids.index(actual_id)
+                        and len(projection.args) == 1
+                        and int(projection.args[0].id) in addresses
+                        and addresses[int(projection.args[0].id)].attributes.get(
+                            "aggregate_index"
+                        ) == caller_ids.index(actual_id)
+                    ) == 1
+                    for actual_id in fact[2]
+                )
+                result = next((projection.res for projection in projections
+                               if int(projection.res.id) == row[3]), None)
+                valid = valid and result is not None and all(
+                    (result.accounting or {}).get(key) == value_id
+                    for key, value_id in zip(keys, fact[2])
+                )
+                required_rows = {
+                    (function_scope_of(function), value_id)
+                    for function, value_id in (
+                        (caller, row[1]), (callee, row[3]),
+                        *((callee, value_id) for value_id in fact[1]),
+                        *((caller, value_id) for value_id in fact[2]),
+                    )
+                }
+                cited_rows = {
+                    source.row for source, _stage in book.edges_into(ref)
+                    if source.page == SSA_VALUE
+                }
+                valid = valid and required_rows <= cited_rows
+            if not valid:
+                found.append(Finding(
+                    "tensor-metadata-result-binding-disagreement",
+                    str(row[2]), int(row[3]),
+                    "computed shape/rank/count lacks exact callee Ret, "
+                    "caller aggregate projection, or cited value cells",
+                ))
         return found
 
     @staticmethod
@@ -9191,6 +9362,400 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_bytes_concat_class_findings(module: Any) -> list[Finding]:
+        """Audit each early bytes Add class against its exact operands."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS, SOURCE_VALUE_CLASS,
+        )
+        from .source_bytes_concat_class import _class_matches_operand
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_VALUE_CLASS)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_VALUE_CLASS, row)
+            fact = page.cell(cell.row, cell.column)
+            if not (
+                isinstance(fact, tuple) and len(fact) >= 3
+                and fact[2] == "source bytes concatenation"
+            ):
+                continue
+            # Canonical read-scope forks relay this immutable class receipt.
+            # Validate the original Add proof, then the exact class-revision
+            # path; a same-numbered value in another scope cannot enter it.
+            seen = set()
+            while cell not in seen:
+                seen.add(cell)
+                predecessors = tuple(
+                    parent for parent, _ in book.edges_into(cell)
+                    if parent.page == SOURCE_VALUE_CLASS
+                )
+                if len(predecessors) != 1:
+                    break
+                predecessor = predecessors[0]
+                if page.cell(predecessor.row, predecessor.column) != fact:
+                    break
+                cell = predecessor
+            causes = {parent for parent, _ in book.edges_into(cell)}
+            snapshots = tuple(c for c in causes if c.page == PROCESS_GRAPH_OPERANDS)
+            results = tuple(c for c in causes if c.page == CANONICAL_VALUE)
+            classes = tuple(c for c in causes if c.page == SOURCE_VALUE_CLASS)
+            valid = (
+                fact[:2] == ("builtins.bytes", 1)
+                and len(snapshots) == 1 and len(results) == 1
+                and len(classes) == 2
+                and snapshots[0].row == results[0].row
+            )
+            if valid:
+                result = results[0]
+                operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    snapshots[0].row, snapshots[0].column,
+                )
+                result_fact = book.page(CANONICAL_VALUE).cell(
+                    result.row, result.column,
+                )
+                valid = (
+                    len(row) == 2 and row[1] == result.row[1]
+                    and result in {p for p, _ in book.edges_into(snapshots[0])}
+                    and "value:BinOp" in result_fact
+                    and "value:Add" in result_fact
+                    and isinstance(operands, tuple) and len(operands) == 2
+                    and tuple(role for _, role in operands) == ("lhs", "rhs")
+                )
+                if valid:
+                    matched = set()
+                    for parent, _ in operands:
+                        candidates = [
+                            proof for proof in classes
+                            if book.page(SOURCE_VALUE_CLASS).cell(
+                                proof.row, proof.column,
+                            )[:1] == ("builtins.bytes",)
+                            and _class_matches_operand(book, proof, parent)
+                        ]
+                        if len(candidates) != 1:
+                            valid = False
+                            break
+                        matched.add(candidates[0])
+                    valid = valid and matched == set(classes)
+            if not valid:
+                found.append(Finding(
+                    "source-bytes-concat-class", str(row[0]), int(row[1]),
+                    "bytes Add class lacks exact canonical operands and class proofs",
+                ))
+        return found
+
+    @staticmethod
+    def _source_eager_bytes_return_findings(module: Any) -> list[Finding]:
+        """Check a late callee class against its exact reached call result."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, FUNCTION_ADDRESS, SEMANTIC_OUTPUT,
+            SOURCE_ACTIVITY_SCOPE, SOURCE_CALL_RESULT_IDENTITY,
+            SOURCE_FUNCTION_REACHABILITY, SOURCE_VALUE_CLASS,
+        )
+        from .source_bytes_concat_class import _class_matches_operand
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_CALL_RESULT_IDENTITY)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CALL_RESULT_IDENTITY, row)
+            causes = {parent for parent, _ in book.edges_into(cell)}
+            outputs = tuple(c for c in causes if c.page == SEMANTIC_OUTPUT)
+            if not outputs:
+                continue  # Incumbent reducer call result has its own writer.
+            result_fact = page.cell(cell.row, cell.column)
+            reached = tuple(c for c in causes
+                            if c.page == SOURCE_FUNCTION_REACHABILITY)
+            calls = tuple(c for c in causes if c.page == CANONICAL_VALUE)
+            addresses = tuple(c for c in causes if c.page == FUNCTION_ADDRESS)
+            reach_calls = tuple(
+                parent for parent, _ in book.edges_into(reached[0])
+                if parent.page == CANONICAL_VALUE
+            ) if len(reached) == 1 else ()
+            returned = tuple(c for c in calls if c not in reach_calls)
+            caller_class = book.latest_ref(SOURCE_VALUE_CLASS, row)
+            valid = (
+                isinstance(result_fact, tuple) and len(result_fact) == 3
+                and result_fact[1:] == ("builtins.bytes", 1)
+                and len(outputs) == 1 and len(reached) == 1
+                and len(calls) == 2 and len(reach_calls) == 1
+                and len(returned) == 1
+                and len(addresses) in (1, 2)
+                and reached[0].row[:2] == row
+                and book.page(SOURCE_FUNCTION_REACHABILITY).cell(
+                    reached[0].row, reached[0].column,
+                ) is True
+                and any(book.page(FUNCTION_ADDRESS).cell(
+                    address.row, address.column,
+                ) == result_fact[0] for address in addresses)
+                and caller_class is not None
+                and cell in {parent for parent, _ in book.edges_into(
+                    caller_class
+                )}
+                and book.page(SOURCE_VALUE_CLASS).cell(
+                    caller_class.row, caller_class.column,
+                )[:2] == ("builtins.bytes", 1)
+            )
+            if valid:
+                output = outputs[0]
+                output_fact = book.page(SEMANTIC_OUTPUT).cell(
+                    output.row, output.column,
+                )
+                class_cells = tuple(c for c in causes
+                                    if c.page == SOURCE_VALUE_CLASS)
+                call = reach_calls[0]
+                valid = (
+                    call.row[1] == row[1]
+                    and call in {parent for parent, _ in book.edges_into(
+                        reached[0]
+                    )}
+                    and output.row[1] == 0
+                    and book.page(SOURCE_ACTIVITY_SCOPE).latest(
+                        (output.row[0],)
+                    ) == reached[0].row[2]
+                    and isinstance(output_fact, tuple)
+                    and len(output_fact) == 2
+                    and output_fact[1] == returned[0].row[1]
+                    and returned[0] in {
+                        parent for parent, _ in book.edges_into(output)
+                    }
+                    and len(class_cells) == 1
+                    and book.page(SOURCE_VALUE_CLASS).cell(
+                        class_cells[0].row, class_cells[0].column,
+                    )[:2] == ("builtins.bytes", 1)
+                    and _class_matches_operand(
+                        book, class_cells[0], returned[0],
+                    )
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-eager-bytes-return", str(row[0]), int(row[1]),
+                    "call return class lacks exact reachability, output or class proof",
+                ))
+        return found
+
+    @staticmethod
+    def _source_owned_sequence_return_findings(module: Any) -> list[Finding]:
+        """Check a bytes concat's operand chain and authored return slot."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, PROCESS_GRAPH_OPERANDS,
+            RETURN_SITE_SLOT, SOURCE_OWNED_SEQUENCE_RETURN,
+            SOURCE_VALUE_CLASS, SourceOwnedSequenceReturn,
+        )
+        from .concorded_literals import origin_cell
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_OWNED_SEQUENCE_RETURN)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_OWNED_SEQUENCE_RETURN, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = (
+                isinstance(fact, SourceOwnedSequenceReturn)
+                and fact.result_cell.page == CANONICAL_VALUE
+                and fact.result_cell.row == row
+                and fact.return_slot_cell.page == RETURN_SITE_SLOT
+                and len(fact.operand_cells) > 0
+                and len(fact.class_cells) > 0
+            )
+            if valid:
+                causes = {parent for parent, _stage in book.edges_into(cell)}
+                valid = {
+                    fact.result_cell, fact.return_slot_cell,
+                    *fact.operand_cells, *fact.class_cells,
+                } <= causes
+            if valid:
+                try:
+                    returned = book.page(RETURN_SITE_SLOT).cell(
+                        fact.return_slot_cell.row,
+                        fact.return_slot_cell.column,
+                    )
+                    valid = (
+                        returned.page == CANONICAL_VALUE
+                        and origin_cell(book, returned)
+                        == origin_cell(book, fact.result_cell)
+                    )
+                    operations = {}
+                    for operand_cell in fact.operand_cells:
+                        if operand_cell.page != PROCESS_GRAPH_OPERANDS:
+                            valid = False
+                            break
+                        result = book.latest_ref(
+                            CANONICAL_VALUE, operand_cell.row,
+                        )
+                        operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                            operand_cell.row, operand_cell.column,
+                        )
+                        result_fact = (
+                            () if result is None else
+                            book.page(CANONICAL_VALUE).cell(
+                                result.row, result.column,
+                            )
+                        )
+                        if (
+                            result is None
+                            or result not in {
+                                parent for parent, _stage in book.edges_into(
+                                    operand_cell
+                                )
+                            }
+                            or not isinstance(operands, tuple)
+                            or len(operands) != 2
+                            or tuple(role for _parent, role in operands)
+                            != ("lhs", "rhs")
+                            or "value:BinOp" not in result_fact
+                            or "value:Add" not in result_fact
+                        ):
+                            valid = False
+                            break
+                        operations[result.row] = (result, operands)
+                    leaves = []
+                    visited = set()
+
+                    def walk(subject):
+                        if subject.row in visited:
+                            return False
+                        if subject.row not in operations:
+                            leaves.append(subject)
+                            return True
+                        visited.add(subject.row)
+                        return all(walk(parent) for parent, _role in (
+                            operations[subject.row][1]
+                        ))
+
+                    if valid:
+                        valid = (
+                            walk(fact.result_cell)
+                            and visited == set(operations)
+                            and len(leaves) == len(fact.class_cells)
+                        )
+                    if valid:
+                        for leaf, class_cell in zip(
+                            leaves, fact.class_cells, strict=True,
+                        ):
+                            class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                                class_cell.row, class_cell.column,
+                            ) if class_cell.page == SOURCE_VALUE_CLASS else None
+                            class_sources = tuple(
+                                parent for parent, _stage
+                                in book.edges_into(class_cell)
+                                if parent.page in {CANONICAL_VALUE,
+                                                   INGESTION_VALUE}
+                            )
+                            if (
+                                not isinstance(class_fact, tuple)
+                                or class_fact[:1] != ("builtins.bytes",)
+                                or len(class_sources) != 1
+                                or origin_cell(book, class_sources[0])
+                                != origin_cell(book, leaf)
+                            ):
+                                valid = False
+                                break
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "source-owned-sequence-return", str(row[0]), int(row[1]),
+                    "owned bytes return lacks exact Add, class or return-site proof",
+                ))
+        return found
+
+    @staticmethod
+    def _public_owned_sequence_return_findings(module: Any) -> list[Finding]:
+        """Check the source-owned return's native descriptor and owner."""
+
+        from .concordance_declarations import (
+            PUBLIC_OWNED_SEQUENCE_RETURN, SEQUENCE_DESCRIPTOR,
+            SOURCE_OWNED_SEQUENCE_RETURN, SSA_VALUE,
+            PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
+        )
+        from .concorded_literals import origin_cell
+        from .ssa_storage_requirements import _sequence_descriptor_identity
+        from ..transmogrifier.ssa import SSASequenceCapacityPolicy
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(PUBLIC_OWNED_SEQUENCE_RETURN)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(PUBLIC_OWNED_SEQUENCE_RETURN, row)
+            fact = page.cell(cell.row, cell.column)
+            function = module.functions.get(str(row[0]))
+            table = (getattr(module, "sequence_tables", {}) or {}).get(
+                str(row[0])
+            )
+            valid = (
+                isinstance(fact, PublicOwnedSequenceReturn)
+                and function is not None and table is not None
+                and fact.source_cell.page == SOURCE_OWNED_SEQUENCE_RETURN
+                and fact.descriptor_cell.page == SEQUENCE_DESCRIPTOR
+                and fact.descriptor_cell.row == (table.owner, int(row[1]))
+                and fact.owner_cell.page == SSA_VALUE
+            )
+            if valid:
+                causes = {parent for parent, _stage in book.edges_into(cell)}
+                descriptor = table.sequences.get(int(row[1]))
+                source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
+                    fact.source_cell.row, fact.source_cell.column,
+                )
+                identity = _sequence_descriptor_identity(table, int(row[1]))
+                valid = (
+                    {fact.source_cell, fact.descriptor_cell,
+                     fact.owner_cell} <= causes
+                    and isinstance(source, SourceOwnedSequenceReturn)
+                    and descriptor is not None
+                    and identity is not None
+                    and identity[1] == fact.descriptor_cell
+                    and descriptor.capacity_policy
+                    is SSASequenceCapacityPolicy.DYNAMIC
+                    and descriptor.heap_owner_value_id is not None
+                    and int(fact.owner_cell.row[-1])
+                    == int(descriptor.heap_owner_value_id)
+                    and fact.owner_cell in {
+                        parent for parent, _stage in book.edges_into(
+                            fact.descriptor_cell
+                        )
+                    }
+                )
+            if valid:
+                try:
+                    owner = next(
+                        value for value in function.args
+                        if int(value.id) == int(descriptor.heap_owner_value_id)
+                    )
+                    valid = (
+                        origin_cell(book, source.result_cell) == identity[3]
+                        and owner.dtype == "ptr" and owner.shape == (1,)
+                        and bool((owner.accounting or {}).get("heap_owner"))
+                        and any(
+                            instruction.op == "Ret"
+                            and not instruction.attributes.get("fault_exit")
+                            and any(int(value.id) == int(row[1])
+                                    for value in instruction.args)
+                            for block in function.blocks.values()
+                            for instruction in block.instrs
+                        )
+                    )
+                except (StopIteration, TypeError, ValueError):
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "public-owned-sequence-return", str(row[0]), int(row[1]),
+                    "owned return lacks exact source, descriptor, owner or Ret proof",
+                ))
+        return found
+
+    @staticmethod
     def _runtime_result_abi_findings(module: Any) -> list[Finding]:
         """Check a native result ABI against the exact source/SSA bound."""
 
@@ -9199,7 +9764,9 @@ class CorrelationTable:
         from .concordance_declarations import (
             ArtifactFact, ArtifactPart, Backend, EMISSION_ARTIFACT,
         )
-        from .ssa_storage_requirements import public_sequence_capacity_sources
+        from .ssa_storage_requirements import (
+            public_owned_sequence_returns, public_sequence_capacity_sources,
+        )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None:
@@ -9233,7 +9800,9 @@ class CorrelationTable:
                 or fact.byte_length != len(payload)
                 or description.get("entry") != str(entry)
                 or description.get("backend") != "c"
-                or description.get("schema") != "turing-runtime-abi-v2"
+                or description.get("schema") not in {
+                    "turing-runtime-abi-v2", "turing-runtime-abi-v3",
+                }
             ):
                 issue("runtime ABI description hash, entry or schema disagrees")
                 continue
@@ -9252,6 +9821,96 @@ class CorrelationTable:
             api_cell = book.latest_ref(EMISSION_ARTIFACT, (
                 str(entry), backend, ArtifactPart.API_CONTRACT,
             ))
+            if description["schema"] == "turing-runtime-abi-v3":
+                owners = []
+                for function_name in module.functions:
+                    candidates = public_owned_sequence_returns(
+                        module, str(function_name),
+                    )
+                    if candidates and all(
+                        proof in causes
+                        for ports in candidates
+                        for proof in (
+                            ports.public_cell, ports.source_cell,
+                            ports.descriptor_cell, ports.owner_cell,
+                            ports.return_slot_cell,
+                        )
+                    ):
+                        owners.append((function_name, candidates))
+                release_cell = book.latest_ref(EMISSION_ARTIFACT, (
+                    str(entry), backend, ArtifactPart.OWNED_RESULT_RELEASE,
+                ))
+                if len(owners) != 1 or release_cell is None:
+                    issue("owned runtime ABI has no unique source owner or release")
+                    continue
+                _owner, ports = owners[0]
+                release_fact = page.cell(release_cell.row, release_cell.column)
+                release_name = description.get("release_entry", {}).get(
+                    "entry"
+                )
+                expected_tuples = tuple(
+                    (item.data_id, item.length_id, item.capacity_id,
+                     item.owner_id, item.element_dtype)
+                    for item in ports
+                )
+                expected_owned = {
+                    item.data_id: {
+                        "element_dtype": item.element_dtype,
+                        "length_buffer": buffer_index.get(item.length_id),
+                        "capacity_buffer": buffer_index.get(item.capacity_id),
+                        "owner_buffer": buffer_index.get(item.owner_id),
+                        "standalone_length_prefix": "uint64",
+                    }
+                    for item in ports
+                }
+                actual_owned = {
+                    int(buffer["value_id"]): buffer["owned_sequence"]
+                    for buffer in description["buffers"]
+                    if "owned_sequence" in buffer
+                }
+                release_causes = {
+                    parent for parent, _stage in book.edges_into(release_cell)
+                }
+                required = {
+                    order_cell, api_cell, release_cell,
+                    *(proof for item in ports for proof in (
+                        item.public_cell, item.source_cell,
+                        item.descriptor_cell, item.owner_cell,
+                        item.return_slot_cell,
+                    )),
+                }
+                if (
+                    None in required or not required <= causes
+                    or not isinstance(release_fact, ArtifactFact)
+                    or release_fact.location != (
+                        release_name, expected_tuples,
+                    )
+                    or not release_fact.sha256
+                    or release_fact.byte_length <= 0
+                    or not {item.public_cell for item in ports}
+                    <= release_causes
+                    or actual_owned != expected_owned
+                    or any(None in record.values()
+                           for record in expected_owned.values())
+                    or description["release_entry"] != {
+                        "entry": release_name,
+                        "signature": f"void {release_name}(void **buffers)",
+                        "lifetime": (
+                            "consume results before releasing their native owners"
+                        ),
+                    }
+                    or any("capacity_from" in buffer
+                           or "logical_length_from" in buffer
+                           or "logical_shape_from" in buffer
+                           for buffer in description["buffers"])
+                    or page.cell(order_cell.row, order_cell.column).location
+                    != order
+                    or order_cell not in {
+                        parent for parent, _stage in book.edges_into(api_cell)
+                    }
+                ):
+                    issue("owned runtime ABI ports, release or proof disagree")
+                continue
             # `entry_name` is an exported symbol and may differ from the
             # source function key. The exact descriptor cells cited by the
             # artifact select one owning root; a name coincidence does not.

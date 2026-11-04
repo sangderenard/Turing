@@ -1518,6 +1518,41 @@ SOURCE_SEQUENCE_CAPACITY_BOUND = declare_page(
         RowField("destination_value_id", K.VALUE_ID),
     ), SourceSequenceCapacityBound,
 )
+
+
+@dataclass(frozen=True)
+class SourceOwnedSequenceReturn:
+    """An authored bytes concat returned from its exact source slot."""
+
+    result_cell: Ref
+    return_slot_cell: Ref
+    operand_cells: tuple[Ref, ...]
+    class_cells: tuple[Ref, ...]
+
+
+SOURCE_OWNED_SEQUENCE_RETURN = declare_page(
+    "source_owned_sequence_return", (
+        RowField("source_scope", K.SCOPE),
+        RowField("result_value_id", K.VALUE_ID),
+    ), SourceOwnedSequenceReturn,
+)
+
+
+@dataclass(frozen=True)
+class PublicOwnedSequenceReturn:
+    """The owned source return's native descriptor and owner cell."""
+
+    source_cell: Ref
+    descriptor_cell: Ref
+    owner_cell: Ref
+
+
+PUBLIC_OWNED_SEQUENCE_RETURN = declare_page(
+    "public_owned_sequence_return", (
+        RowField("function", K.NAME),
+        RowField("sequence_id", K.VALUE_ID),
+    ), PublicOwnedSequenceReturn,
+)
 SOURCE_CONTROL_SPECIALIZATION = declare_page(
     "source_control_specialization_concordance", (
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
@@ -3198,6 +3233,7 @@ class ArtifactPart(Enum):
     API_CONTRACT = "api_contract"
     BUFFER_ORDER = "buffer_order"
     RUNTIME_ABI = "runtime_abi"
+    OWNED_RESULT_RELEASE = "owned_result_release"
     #: ``(symbol, LLVM_MODULE, KERNEL_SOURCE)``: the authored text of a
     #: kernel pulled in by symbol, NOVEL(AUTHORED_KERNEL_TEXT).
     KERNEL_SOURCE = "kernel_source"
@@ -3977,7 +4013,7 @@ class IntegerWidthFact:
 
 SCALAR_INTEGER_WIDTH = declare_page("scalar_integer_width", (
     RowField("function_scope", K.SCOPE), RowField("ssa_id", K.VALUE_ID),
-), IntegerWidthFact)                   # DERIVED(declared Const/Load ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
+), IntegerWidthFact)                   # DERIVED(declared Const/Load/Cast ssa_value) | NOVEL(INFERRED_INTEGER_WIDEN); CONCORD
 
 LINKED_VALUE_ABI_SETTLEMENT = declare_stage("linked_value_abi_settlement")
 #: A copy's statement with no book cell to derive from (a ProgramABI contract
@@ -4498,6 +4534,36 @@ TENSOR_METADATA_CALL_BINDING = declare_page("tensor_metadata_call_binding", (
     RowField("block", K.NAME), RowField("instruction", K.INDEX),
     RowField("callee", K.NAME),
 ), tuple)                              # DERIVED(shape/value cells); REVISE
+#: A region's computed tensor result metadata projected through its exact
+#: aggregate call. Row names the caller Call result and its selected result
+#: identity. Fact is (callee result id, (callee shape, rank, count ids),
+#: (caller shape, rank, count ids)); every caller id is a Load from that call's
+#: positional aggregate output, never a copied callee-local integer id.
+TENSOR_METADATA_RESULT_BINDING = declare_page("tensor_metadata_result_binding", (
+    RowField("caller_scope", K.SCOPE), RowField("call_result", K.VALUE_ID),
+    RowField("callee", K.NAME), RowField("result", K.VALUE_ID),
+), tuple)                              # DERIVED(call, callee/caller output cells); CONCORD
+@dataclass(frozen=True)
+class TensorOutputCapacityBound:
+    """Allocation capacity from one guarded tensor input, not logical shape."""
+
+    input_cell: Ref
+    selection_input_cell: Ref
+    axis_bound_cell: Ref
+    selection_cell: Ref
+    output_cell: Ref
+    shape_cell: Ref
+    rank_cell: Ref
+    count_cell: Ref
+    layout_cell: Ref
+    guard_cells: tuple[Ref, ...]
+    axis: int
+    capacity_shape: tuple[int, ...]
+
+
+TENSOR_OUTPUT_CAPACITY_BOUND = declare_page("tensor_output_capacity_bound", (
+    RowField("function_scope", K.SCOPE), RowField("output", K.VALUE_ID),
+), TensorOutputCapacityBound)           # DERIVED(exact layout, guarded input, computed extents)
 #: ``propagate_repository_ssa_call_metadata``: the functions of a module that
 #: mention one value id of one source owner's id space, ``(owner scope, id)``
 #: -> sorted function names, DERIVED(the value's ``ssa_value`` cell in each).

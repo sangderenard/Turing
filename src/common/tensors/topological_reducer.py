@@ -5828,6 +5828,21 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     # constant bounds that value (the same value id: a rebinding is a new
     # id) wherever such a statement reads it.
     guard_cache: dict = {}
+    from ...compiler.concordance_declarations import SOURCE_SPAN
+    from ...compiler.concorded_literals import origin_cell as _range_origin_cell
+    from ...transmogrifier.graph.graph_express2 import source_span_row
+
+    def source_span_cell(unit, node_id):
+        """Follow a process value to its one authored source occurrence."""
+
+        identity = node_identity_cell(unit.wrapper, int(node_id))
+        try:
+            origin = _range_origin_cell(book, identity)
+        except ValueError:
+            return None
+        spans = tuple(source for source, _stage in book.edges_into(origin)
+                      if source.page == SOURCE_SPAN)
+        return spans[0] if len(spans) == 1 else None
 
     def guards_of(unit):
         if id(unit) in guard_cache:
@@ -5872,6 +5887,17 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                         return
                     excluded = excluded | carried
                 covered[id(node)] = excluded
+                # A clean read-scope fork copies the AST object while keeping
+                # its authored SOURCE_SPAN identity.  The guarded topk Call
+                # after two raising Ifs was absent from this id-keyed map,
+                # even though its ingestion cell derives from that same
+                # span.  Index the existing guard region by the source cell
+                # as well; never recover an occurrence by coordinates.
+                row = source_span_row(None, node)
+                if row is not None:
+                    span = book.latest_ref(SOURCE_SPAN, row)
+                    if span is not None:
+                        covered[span] = excluded
                 for child in ast.iter_child_nodes(node):
                     visit(child, excluded)
 
@@ -5927,6 +5953,37 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             ]
 
         def walk(statements):
+            def terminal_raise(body):
+                if isinstance(body[-1], ast.Raise):
+                    return True, None
+                # Exception ingestion hoists an authored Raise into an
+                # exception_raise Assign followed by an inert read of its
+                # result.  The source exception operation was posted at the
+                # call's ingestion from that exact authored Raise span.
+                if len(body) < 2 or not isinstance(body[-2], ast.Assign) or not isinstance(body[-1], ast.Expr):
+                    return False, None
+                assignment, trailing = body[-2:]
+                if (len(assignment.targets) != 1
+                        or not isinstance(assignment.targets[0], ast.Name)
+                        or not isinstance(assignment.value, ast.Call)
+                        or not isinstance(trailing.value, ast.Name)
+                        or trailing.value.id != assignment.targets[0].id):
+                    return False, None
+                call_id = nodes_by_expression.get(id(assignment.value))
+                if call_id is None:
+                    return False, None
+                from ...compiler.concorded_literals import origin_cell
+                from ...compiler.concordance_declarations import SOURCE_EXCEPTION_OPERATION
+                try:
+                    origin = origin_cell(book, node_identity_cell(unit.wrapper, call_id))
+                except ValueError:
+                    return False, None
+                receipt = book.latest_ref(SOURCE_EXCEPTION_OPERATION, (origin,))
+                if receipt is None or book.page(SOURCE_EXCEPTION_OPERATION).cell(
+                        receipt.row, receipt.column)[0] != "exception_raise":
+                    return False, None
+                return True, receipt
+
             for index, statement in enumerate(statements):
                 if (
                     isinstance(statement, ast.While)
@@ -5942,7 +5999,8 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     # a constant holds.  The ``else`` arm is not the body.
                     held = conjuncts(nodes_by_expression[id(statement.test)])
                     if held:
-                        guards.append((region(statement.body), tuple(held)))
+                        guard_span = book.latest_ref(SOURCE_SPAN, source_span_row(None, statement))
+                        guards.append((region(statement.body), tuple(held), (guard_span,)))
                 if (
                     isinstance(statement, ast.If)
                     and id(statement.test) in nodes_by_expression
@@ -5955,18 +6013,23 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     # constant holds, exactly as in a ``while`` body.
                     held = conjuncts(nodes_by_expression[id(statement.test)])
                     if held:
-                        guards.append((region(statement.body), tuple(held)))
+                        guard_span = book.latest_ref(SOURCE_SPAN, source_span_row(None, statement))
+                        guards.append((region(statement.body), tuple(held), (guard_span,)))
+                terminal, terminal_cell = terminal_raise(statement.body) if (
+                    isinstance(statement, ast.If) and statement.body
+                ) else (False, None)
                 if (
                     isinstance(statement, ast.If)
                     and not statement.orelse
-                    and statement.body
-                    and isinstance(statement.body[-1], ast.Raise)
+                    and terminal
                     and id(statement.test) in nodes_by_expression
                 ):
                     disjuncts = leaves(nodes_by_expression[id(statement.test)])
                     if disjuncts:
+                        guard_span = book.latest_ref(SOURCE_SPAN, source_span_row(None, statement))
                         guards.append((
                             region(statements[index + 1:]), tuple(disjuncts),
+                            tuple(filter(None, (guard_span, terminal_cell))),
                         ))
                 for field in ("body", "orelse", "finalbody", "handlers"):
                     nested = getattr(statement, field, None)
@@ -6087,7 +6150,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         finally:
             summary_active.discard((id(callee.G), int(c)))
 
-    def guarded(unit, site_id, value_key, interval, site_ast=None):
+    def guarded(unit, site_id, value_key, interval, site_ast=None, *, with_proof=False):
         """``interval`` of ``value_key`` as read at ``site_id``.
 
         ``site_ast``: the authored expression of the read when the site's
@@ -6098,12 +6161,23 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             site_ast if site_ast is not None
             else unit.G.nodes.get(site_id, {}).get("expr_obj")
         )
+        def answer(value, reads, proofs=()):
+            return (value, reads, tuple(dict.fromkeys(proofs))) if with_proof else (value, reads)
+
         if site is None:
-            return interval, ()
+            return answer(interval, ())
+        site_span = source_span_cell(unit, site_id) if site_ast is None else None
+        if site_ast is not None:
+            row = source_span_row(None, site_ast)
+            site_span = None if row is None else book.latest_ref(SOURCE_SPAN, row)
         low = high = None
         read = []
-        for dominated, disjuncts in guards_of(unit):
-            if id(site) not in dominated or value_key in dominated[id(site)]:
+        proof = []
+        for dominated, disjuncts, guard_cells in guards_of(unit):
+            ownership = dominated.get(id(site))
+            if ownership is None and site_span is not None:
+                ownership = dominated.get(site_span)
+            if ownership is None or value_key in ownership:
                 continue
             for kind, lhs, rhs in disjuncts:
                 for value, constant, flipped in ((lhs, rhs, False), (rhs, lhs, True)):
@@ -6127,6 +6201,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                         low = summary[0] if low is None else max(low, summary[0])
                         high = summary[1] if high is None else min(high, summary[1])
                         read.append(unit.key(constant))
+                        proof.extend(guard_cells)
                         continue
                     relation = {
                         "less": "greater", "less_equal": "greater_equal",
@@ -6146,10 +6221,11 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     else:
                         high = c - 1 if high is None else min(high, c - 1)
                     read.append(unit.key(constant))
+                    proof.extend(guard_cells)
         if low is None and high is None:
-            return interval, ()
+            return answer(interval, ())
         if interval is None:
-            return None, tuple(read)
+            return answer(None, tuple(read), proof)
         # Program: Token Orchard ``structure_rebuild``: a read under guards
         # that cannot all hold (``kind == 2`` on a path where ``kind`` was
         # proven 3).  Wrong record: the meet was empty (low > high) and was
@@ -6158,15 +6234,15 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         # new; it keeps the interval it had before the guards.
         if interval == _INT_RANGE_TOP:
             if low is None or high is None or low > high:
-                return _INT_RANGE_TOP, ()
-            return (low, high), tuple(read)
+                return answer(_INT_RANGE_TOP, ())
+            return answer((low, high), tuple(read), proof)
         met = (
             interval[0] if low is None else max(interval[0], low),
             interval[1] if high is None else min(interval[1], high),
         )
         if met[0] > met[1]:
-            return interval, ()
-        return met, tuple(read)
+            return answer(interval, ())
+        return answer(met, tuple(read), proof)
 
     # Every callsite's actual for every formal; a callsite that leaves a
     # formal unbound (its default, a ``*args`` spread we cannot place) makes
@@ -6646,18 +6722,75 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     display_reads.append(
                         (unit.key(int(parent)), unit, int(display_id))
                     )
+    # An admitted intrinsic has no function-table callee, so its integer
+    # actuals never enter formal_actuals above.  Read the exact call and
+    # operand identities from the book before applying the same dominating
+    # raising-guard rule.  The public guarded topk(k=k) source otherwise
+    # carried no callsite interval even though the source control excludes
+    # negative and over-bound k before the intrinsic call.
+    intrinsic_actuals = []
+    intrinsic_causes = {}
+    from ...compiler.concordance_declarations import (
+        PROCESS_GRAPH_OPERANDS, SOURCE_INTRINSIC_ADMISSION,
+    )
+    from ...compiler.concorded_literals import origin_cell
+    from ...compiler.process_graph_facts import local_value
+    for unit in units:
+        for call_id, data in unit.G.nodes(data=True):
+            if not isinstance(data.get("expr_obj"), ast.Call):
+                continue
+            call_cell = node_identity_cell(unit.wrapper, int(call_id))
+            try:
+                origin = origin_cell(book, call_cell)
+            except ValueError:
+                continue
+            admission = book.latest_ref(SOURCE_INTRINSIC_ADMISSION, (origin,))
+            if admission is None:
+                continue
+            admitted = book.page(SOURCE_INTRINSIC_ADMISSION).cell(
+                admission.row, admission.column,
+            )
+            if (not isinstance(admitted, tuple) or len(admitted) != 3
+                    or not isinstance(admitted[1], dict)
+                    or admitted[1].get("action") != "intrinsic"):
+                continue
+            operand_cell = book.latest_ref(
+                PROCESS_GRAPH_OPERANDS,
+                (_operand_position_scope(unit.wrapper), int(call_id)),
+            )
+            if operand_cell is None:
+                continue
+            edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                operand_cell.row, operand_cell.column,
+            )
+            for parent_cell, role in edges:
+                if str(role) in {"callee", "func", "definition"}:
+                    continue
+                try:
+                    actual_id = local_value(unit.wrapper, parent_cell)
+                except ValueError:
+                    continue
+                actual = unit.key(int(actual_id))
+                if actual not in class_cells:
+                    continue
+                intrinsic_actuals.append((actual, unit, int(call_id)))
+                intrinsic_causes[(actual, int(call_id))] = (
+                    call_cell, operand_cell, admission, parent_cell,
+                )
     for actuals, unclassed in (
         *((group, False) for group in formal_actuals.values()),
         *((group, False) for group in formal_member_actuals.values()),
+        (intrinsic_actuals, True),
         # A display member may have no class row of its own (an
         # unannotated formal): its guards alone bound it there.
         (display_reads, True),
     ):
         for actual, caller, call_id in actuals:
-            interval, used = guarded(
+            interval, used, guard_proofs = guarded(
                 caller, call_id, actual,
                 _INT_RANGE_TOP if unclassed and current(actual) is None
                 else current(actual),
+                with_proof=True,
             )
             if not used or interval is None or interval == _INT_RANGE_TOP:
                 continue
@@ -6672,6 +6805,8 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 provenance=_Derived(tuple(dict.fromkeys(
                     cell for cell in (
                         call_cell,
+                        *intrinsic_causes.get((actual, int(call_id)), ()),
+                        *guard_proofs,
                         *(book.latest_ref(SOURCE_INT_RANGE, read)
                           for read in (actual, *used)),
                     )

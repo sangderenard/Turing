@@ -21,6 +21,28 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-03 — hazards read after starting a new checkout's validation gate
+
+The agent was required to read newest hazards before tests. It started the
+five-test frozen validation gate after copying the source receipts but before
+reading their complete text, treating earlier agent summaries as sufficient.
+The gate passed, and the later hazards review required no test changes, but
+the required ordering was lost and a separate review was necessary. Reading
+the copied hazards before launching pytest would have prevented the omission.
+
+## 2026-11-03 — classifying concatenation before reading its incumbent lowering
+
+The agent was told to repair compressor type identities through the existing
+compiler systems. After observing a bytes Add in a numerical region, it added
+a metadata-only classification before reading the entire existing concat
+lowering. That lowering consumes the retained Add instructions and replaces
+them with resident sequence operations. The new classification removed those
+instructions, so the native four-fragment tail returned empty bytes. Several
+bounded runs and a control-SSA inspection were needed to locate the omission.
+The classification, enum and cache changes were removed; the existing concat
+lowering was restored. Reading the producer and its consumer together before
+changing admission would have prevented this departure.
+
 ## 2026-11-03 — broad scheduler in a focused linked-unit regression
 
 The agent was told to test the exact linked caller and callee units with a

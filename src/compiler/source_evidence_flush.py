@@ -16,6 +16,7 @@ from .concordance_declarations import (
     SOURCE_AGGREGATE_LAYOUT, SOURCE_CALL_ACTIVITY_CORRIDOR,
     SOURCE_CALL_ACTUAL_FORMAL, SOURCE_CALL_FIELD_EFFECT_COMPLETION,
     SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+    SOURCE_CALL_RESULT_IDENTITY, SEMANTIC_OUTPUT, SOURCE_ACTIVITY_SCOPE,
     SOURCE_CALL_TUPLE_MEMBER_PROJECTION_DEMAND,
     SOURCE_CALL_FIELD_STATE_TRANSFER, SOURCE_CALL_OBJECT_ALIAS,
     SOURCE_FUNCTION_EXIT_FIELD_STATE, SOURCE_FUNCTION_REACHABILITY,
@@ -29,6 +30,8 @@ from .concordance_declarations import (
 from .identity_concordance import Derived, Mode, current_identity_book
 from .source_guarded_callable import post_guarded_callables
 from .source_class_domain_forward import post_formal_return_class_domains
+from .source_bytes_concat_class import post_bytes_concat_classes
+from .source_call_return_class import post_reached_bytes_return_classes
 from .source_tuple_member_demand import post_tuple_member_demands
 from .source_guarded_payload import post_guarded_mapping_payloads
 from .source_mapping_get import post_mapping_get_reads
@@ -36,6 +39,7 @@ from .source_mapping_get import post_mapping_get_reads
 
 _FAMILY = (
     SOURCE_FUNCTION_REACHABILITY, SOURCE_CALL_ACTUAL_FORMAL,
+    SOURCE_CALL_RESULT_IDENTITY, SEMANTIC_OUTPUT, SOURCE_ACTIVITY_SCOPE,
     SOURCE_PARAMETER_MEMORY_CONTRACT, SOURCE_CALL_FIELD_EFFECT_COMPLETION,
     SOURCE_CALL_OBJECT_ALIAS,
     SOURCE_FUNCTION_EXIT_FIELD_STATE, REDUCER_FIELD_STATE,
@@ -132,6 +136,8 @@ def flush_source_evidence(source_graph, *, book=None):
         print(f"{progress} round={round_number} guarded evidence", flush=True)
         post_guarded_mapping_payloads(book)
         post_guarded_callables(source_graph, book)
+        post_bytes_concat_classes(function_table, book)
+        post_reached_bytes_return_classes(function_table, book)
         print(f"{progress} round={round_number} call and tuple domains", flush=True)
         post_formal_return_class_domains(book)
         post_tuple_member_demands(function_table, book=book)
