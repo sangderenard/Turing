@@ -494,3 +494,24 @@ late tensor slice; its 27.40-second focused test produced two unrelated
 broadcast-helper resident-shape audit conflicts. Retrying only the changed
 formal's exact Call closure resolved the rank-two and rank-three cases.
 The direct writer hook and call-closure selection should have been used first.
+
+## 2026-11-04 — pairwise Meowdoku probe printed the whole compiler trace
+
+The agent was assigned a bounded authored-law slice with compact visible
+output. Its first scratch probe left the compiler's detailed progress stream
+enabled, producing about 2,693 lines and truncating the tool output. The
+useful terminal result was a five-second source-link refusal on the diagnostic
+`.item()` return. The later saved-module probe printed only the entry,
+shortfall count, and first direct-Wasm shortfalls. A focused probe should
+capture the compiler progress stream internally and print bounded selected
+evidence to stdout.
+
+## 2026-11-04 — implicit Windows encoding damaged the handoff text
+
+The root agent was preparing the requested Meowdoku handoff. It read UTF-8
+prose with Path.read_text's platform default and rewrote it as UTF-8. This
+introduced mojibake; the next default-encoding read failed at byte 0x9d. The
+failed report update and explicit restoration cost extra work before the
+handoff could be published. The original UTF-8 text was restored and copied
+again. Explicit encoding='utf-8' on every prose read and write would have
+prevented both the corrupted copy and the failed follow-up read.
