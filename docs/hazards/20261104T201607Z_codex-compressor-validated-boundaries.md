@@ -1,0 +1,14 @@
+# 2026-11-04 — runtime input TopK selection and changed-geometry completion
+
+Validation checkout only. No full compressor lowering was run for this slice.
+
+The bounded public source `k=values.shape[1]; topk(values,k,dim=0).indices.sum().item()` has an int64 span of unknown rank-2 extents. Its source shape-dimension receipt proves k is a runtime nonnegative axis extent but supplies no finite int64 upper bound. The prior named TopK branch required a static bound and did not publish output geometry. The new `TENSOR_RUNTIME_TOPK_SELECTION` row cites that source dimension and the input's exact metadata cells. SSA loads the input axis extent, widens it, takes Min with k, checks the int32 native selection, copies output geometry, and computes count with a zero-axis seed and checked multiplication. Both selected outputs use existing owned heap bindings. The audit verifies the live program, source and metadata causes, and carrier/count relation.
+
+Public rank-2 native width 0/1/2/4 and int64 values above 2**53 passed; forged selection and descriptor count were rejected. A rank-3 case with a nonselected zero axis `(2,0,3)` returned 0 and a nonzero `(2,1,3)` case returned 6, one focused test in 9.02 seconds. An unproved scalar k retained the named `SSALoweringIncompleteError` in 8.09 seconds. Existing static named-leaf native cases passed 2/2 in 11.90 seconds.
+
+Local precompile previously reported a computed-region TopK shortfall before its producer's later Call metadata arrived. The extracted incumbent changed-geometry Call closure now runs before precompile and whole-source shortfalls are finalized, revisiting only functions with changed descriptor geometry and their live callers. It preserves per-function shortfalls and attaches the module's identity book to each narrowed slice. Its first pass now preserves the original module function order. A direct native ensure_tensor fixture passed after the order restoration. Earlier unordered-set slice construction produced a zeroed wrapper output in a separate run.
+
+The actual bounded `_ascending_order` fixture advanced through runtime TopK metadata to strict owner finalization. Its `ensure_tensor` wrapper still has a cached independent descriptor for output20 while its exact `NATIVE_TENSOR_WRAP` record requires view20 of raw19. The strict finalizer rejects the borrowed Ret19. The failed module is saved at `build/topk_ascending_owner_frontier.pkl`; the owner/descriptor correction is in progress separately. The current receipt does not claim actual `_ascending_order` native parity.
+
+After the extracted completion loop and function-order correction, the focused dynamic unary extent and dynamic input computed broadcast files passed 9/9 in 160.24 seconds. This covers the existing rank-1/2/3 and float/native cases in those two files. The actual ascending owner/finalizer boundary remains separate and red pending its exact Call/formal proof.
+

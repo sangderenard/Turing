@@ -86,6 +86,225 @@ class TensorSSALoweringShortfall:
     reason: str
 
 
+def _own_dynamic_tensor_output(
+    module: IRModule, function, book, tensor_table, fresh, register_tensor,
+    result: SSAValue, count: SSAValue, element_dtype: str,
+    prefix: list[Instr],
+) -> SSAValue:
+    """Bind one logical dynamic result to native heap storage."""
+    from .ssa_heap_allocation import heap_allocate
+    from .concordance_declarations import (
+        TENSOR_OWNED_HEAP_BINDING,
+        TENSOR_HEAP_OWNER_CALL_BINDING,
+        TENSOR_SSA_LOWERING as _HEAP_TENSOR_STAGE,
+    )
+    from .identity_concordance import Derived, Mode
+    from .ssa_record_return_state import (
+        function_scope_of,
+        ssa_value_identity_cell,
+    )
+    incumbent = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, (
+        function_scope_of(function), function.name, int(result.id),
+    ))
+    if incumbent is not None:
+        carrier_id, owner_id, count_id, dtype = book.page(
+            TENSOR_OWNED_HEAP_BINDING,
+        ).cell(incumbent.row, incumbent.column)
+        allocations = tuple(
+            instruction for block in function.blocks.values()
+            for instruction in (*block.instrs, *prefix)
+            if instruction.res is not None and int(instruction.res.id) == carrier_id
+        )
+        descriptor = tensor_table.by_id(int(result.id))
+        if (count_id != int(count.id) or dtype != str(element_dtype)
+                or len(allocations) != 1 or allocations[0].op != "Alloca"
+                or allocations[0].attributes.get("allocation_kind") != "owned_heap"
+                or tuple(int(value.id) for value in allocations[0].args) != (count_id, owner_id)
+                or descriptor is None or descriptor.data_value_id != carrier_id
+                or descriptor.heap_owner_value_id != owner_id):
+            raise ValueError("owned dynamic tensor disagrees with its incumbent allocation")
+        # Checked scalar arithmetic stays raw SSA and is visited on
+        # whole-program retries. Its one heap identity is already
+        # booked; revisiting the operation must not allocate it again.
+        return allocations[0].res
+    owner = fresh(
+        dtype="ptr", shape=(1,), physical={
+            "physical_dtype": "ptr", "storage": "span",
+            "rank": 1,
+        },
+    )
+    owner.accounting = {
+        **dict(owner.accounting or {}),
+        "heap_owner": True,
+    }
+    function.args.append(owner)
+    from .precompile_to_ssa import _mint_ssa_id
+    from .concordance_declarations import (
+        TENSOR_LOWERING_VALUE,
+    )
+    region_calls = tuple(
+        (caller, region_call)
+        for caller in module.functions.values()
+        for region_block in caller.blocks.values()
+        for region_call in region_block.instrs
+        if region_call.op == "Call"
+        and region_call.attributes.get("callee")
+        == function.name
+        and region_call.res is not None
+    )
+    if not region_calls:
+        raise ValueError(
+            "owned dynamic tensor has no exact caller"
+        )
+    owner_call_rows = []
+    for caller, region_call in region_calls:
+        call_cell = ssa_value_identity_cell(
+            caller, int(region_call.res.id), book=book,
+        )
+        tensor_cell = ssa_value_identity_cell(
+            function, int(result.id), book=book,
+        )
+        formal_cell = ssa_value_identity_cell(
+            function, int(owner.id), book=book,
+        )
+        if any(cell is None for cell in (
+            call_cell, tensor_cell, formal_cell,
+        )):
+            raise ValueError(
+                "owned dynamic tensor call lacks exact SSA cells"
+            )
+        caller_scope = function_scope_of(caller)
+        actual = SSAValue(
+            _mint_ssa_id(
+                book, caller_scope,
+                TENSOR_LOWERING_VALUE,
+                (call_cell, tensor_cell, formal_cell),
+                dtype="ptr", shape=(1,),
+                stage=_HEAP_TENSOR_STAGE,
+                physical={
+                    "physical_dtype": "ptr",
+                    "storage": "span", "rank": 1,
+                },
+            ),
+            dtype="ptr", shape=(1,),
+            accounting={
+                "physical_dtype": "ptr",
+                "heap_owner": True,
+                "compiler_frame_storage": caller.name,
+            },
+        )
+        caller.args.append(actual)
+        region_call.args.append(actual)
+        # weighted_native_probe's private reduction output adds an
+        # owner after the region cut. Keep its exact feed slot with
+        # the Call actual; computed metadata later inserts ahead of
+        # that slot. Otherwise an int32 extent is read as the ptr
+        # owner and late feed settlement retypes the owner.
+        for key, appended in (
+            ("feed_ids", int(actual.id)),
+            ("feed_shapes", tuple(actual.shape or ())),
+            ("feed_dtypes", str(actual.dtype)),
+        ):
+            prior = tuple(region_call.attributes.get(key, ()))
+            if len(prior) != len(region_call.args) - 1:
+                raise ValueError(
+                    "owned tensor has no complete exact region feed"
+                )
+            region_call.attributes[key] = (*prior, appended)
+        input_ids = region_call.attributes.get(
+            "callee_input_ids"
+        )
+        if input_ids is None:
+            # The planned region's original Call has
+            # positional formals but no explicit id
+            # list. The appended owner makes the
+            # existing positions an exact published
+            # binding; every formal is named here.
+            input_ids = tuple(
+                int(formal.id)
+                for formal in function.args[:-1]
+            )
+        region_call.attributes[
+            "callee_input_ids"
+        ] = (*tuple(map(int, input_ids)),
+             int(owner.id))
+        actual_cell = ssa_value_identity_cell(
+            caller, int(actual.id), book=book,
+        )
+        if actual_cell is None:
+            raise ValueError(
+                "owned dynamic tensor caller has no owner cell"
+            )
+        owner_call_rows.append((
+            (caller_scope, caller.name,
+             int(region_call.res.id), function.name,
+             int(result.id)),
+            (int(result.id), int(actual.id),
+             int(owner.id)),
+            (call_cell, tensor_cell,
+             actual_cell, formal_cell),
+        ))
+    carrier = fresh(dtype="ptr", physical={
+        "physical_dtype": "ptr", "storage": "scalar",
+        "rank": 0,
+    })
+    allocation = heap_allocate(
+        count, owner, carrier,
+        element_dtype=element_dtype,
+    )
+    descriptor = register_tensor(
+        result, storage="temporary",
+    )
+    tensor_table.tensors[int(result.id)] = (
+        dataclasses.replace(
+            descriptor,
+            data_value_id=int(carrier.id),
+            heap_owner_value_id=int(owner.id),
+            dtype=str(element_dtype),
+        )
+    )
+    page_sources = tuple(
+        cell for cell in (
+            ssa_value_identity_cell(
+                function, int(value.id), book=book,
+            )
+            for value in (
+                result, carrier, owner, count,
+            )
+        ) if cell is not None
+    )
+    if len(page_sources) != 4:
+        raise ValueError(
+            "owned dynamic tensor lacks exact SSA cells"
+        )
+    book.post(
+        TENSOR_OWNED_HEAP_BINDING,
+        (function_scope_of(function), function.name,
+         int(result.id)),
+        (int(carrier.id), int(owner.id),
+         int(count.id), str(element_dtype)),
+        stage=_HEAP_TENSOR_STAGE,
+        provenance=Derived(page_sources),
+        mode=Mode.CONCORD,
+    )
+    producer_cell = book.latest_ref(
+        TENSOR_OWNED_HEAP_BINDING,
+        (function_scope_of(function), function.name,
+         int(result.id)),
+    )
+    for row, fact, causes in owner_call_rows:
+        book.post(
+            TENSOR_HEAP_OWNER_CALL_BINDING,
+            row, fact,
+            stage=_HEAP_TENSOR_STAGE,
+            provenance=Derived((
+                *causes, producer_cell,
+            )),
+            mode=Mode.CONCORD,
+        )
+    prefix.append(allocation)
+    return carrier
+
 def wire_repository_ssa_region_products(module: IRModule) -> bool:
     """Connect region outputs to later region feeds inside each function.
 
@@ -197,6 +416,627 @@ def wire_repository_ssa_region_products(module: IRModule) -> bool:
     return changed
 
 
+def _bind_source_return_owned_producers(module: IRModule, book) -> bool:
+    """Give a booked source-returned dynamic kernel output its existing heap owner."""
+
+    from .concordance_declarations import (
+        CALL_RECORD, TENSOR_LOWERING_VALUE, TENSOR_OWNED_HEAP_BINDING,
+        TENSOR_SSA_LOWERING,
+    )
+    from .precompile_to_ssa import _mint_ssa_id
+    from .ssa_call_input_adapters import _infer_pointer_storage
+    from .ssa_record_return_state import (
+        function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+    )
+
+    if getattr(module, "call_table", None) is None:
+        return False
+    changed = False
+    for outer in tuple(module.functions.values()):
+        source_calls = tuple(
+            instruction for block in outer.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Call"
+            and instruction.attributes.get("source_linked")
+            and instruction.res is not None
+        )
+        for source_call in source_calls:
+            source_name = str(source_call.attributes.get("callee") or "")
+            source = module.functions.get(source_name)
+            record_ref = book.latest_ref(
+                CALL_RECORD, (module.call_table.owner, outer.name),
+            )
+            if source is None or record_ref is None:
+                continue
+            records = book.page(CALL_RECORD).cell(
+                record_ref.row, record_ref.column,
+            )
+            matched = tuple(
+                record for record in records
+                if record.callee_symbol == source_name
+                and record.callsite_id == source_call.attributes.get(
+                    "plan_callsite_id"
+                )
+            )
+            if len(matched) != 1 or len(matched[0].result_bindings) != 1:
+                continue
+            source_id, caller_id = map(int, matched[0].result_bindings[0])
+            if any(
+                ret.op == "Ret"
+                and any(int(value.id) == caller_id for value in ret.args)
+                for block in outer.blocks.values() for ret in block.instrs
+            ):
+                continue
+            source_returns = tuple(
+                ret for block in source.blocks.values()
+                for ret in block.instrs if ret.op == "Ret"
+                and any(int(value.id) == source_id for value in ret.args)
+            )
+            if len(source_returns) != 1:
+                continue
+            region_calls = tuple(
+                call for block in source.blocks.values()
+                for call in block.instrs
+                if call.op == "Call" and call.res is not None
+                and source_id in tuple(map(
+                    int, call.attributes.get("output_ids", ()),
+                ))
+                and str(call.attributes.get("callee") or "")
+                    in module.tensor_tables
+            )
+            if len(region_calls) != 1:
+                continue
+            region_call = region_calls[0]
+            producer_name = str(region_call.attributes["callee"])
+            producer = module.functions.get(producer_name)
+            table = module.tensor_tables.get(producer_name)
+            descriptor = None if table is None else table.by_id(source_id)
+            if producer is None or descriptor is None:
+                continue
+            owned_row = (function_scope_of(producer), producer_name, source_id)
+            if book.latest_ref(TENSOR_OWNED_HEAP_BINDING, owned_row) is not None:
+                continue
+            if (descriptor.metadata_state != "dynamic"
+                    or descriptor.element_count_value_id is None
+                    or int(descriptor.data_value_id) != source_id):
+                continue
+            producer_calls = tuple(
+                (block, call) for block in producer.blocks.values()
+                for call in block.instrs
+                if call.op == "Call" and call.res is not None
+                and int(call.res.id) == source_id
+            )
+            if len(producer_calls) != 1:
+                continue
+            producer_block, native_call = producer_calls[0]
+            native_name = str(native_call.attributes.get("callee") or "")
+            selected = module.functions.get(native_name)
+            position = None if selected is None else selected.metadata.get(
+                "ssa_output_argument"
+            )
+            if (selected is None or not isinstance(position, int)
+                    or position < 0 or position >= len(selected.args)
+                    or position >= len(native_call.args)
+                    or int(native_call.args[position].id) != source_id):
+                continue
+            _infer_pointer_storage({native_name: selected})
+            formal = selected.args[position]
+            formal_fact = posted_ssa_value_fact(
+                selected, int(formal.id), book=book,
+            )
+            result_cell = ssa_value_identity_cell(producer, source_id, book=book)
+            formal_cell = ssa_value_identity_cell(
+                selected, int(formal.id), book=book,
+            )
+            region_cell = ssa_value_identity_cell(
+                source, int(region_call.res.id), book=book,
+            )
+            count = next((value for value in producer.args
+                          if int(value.id) == int(
+                              descriptor.element_count_value_id)), None)
+            if (formal_fact is None or formal_fact.physical_dtype is None
+                    or result_cell is None or formal_cell is None
+                    or region_cell is None or count is None):
+                continue
+            causes = (result_cell, formal_cell, region_cell, record_ref)
+            scope = function_scope_of(producer)
+
+            def fresh(*, dtype="unknown", shape=(), physical=None):
+                value_id = _mint_ssa_id(
+                    book, scope, TENSOR_LOWERING_VALUE, causes,
+                    dtype=dtype, shape=tuple(shape or ()),
+                    stage=TENSOR_SSA_LOWERING, physical=physical,
+                )
+                return SSAValue(value_id, dtype=dtype, shape=tuple(shape or ()))
+
+            prefix: list[Instr] = []
+            carrier = _own_dynamic_tensor_output(
+                module, producer, book, table, fresh,
+                lambda value, storage: table.by_id(int(value.id)),
+                native_call.res, count, str(formal_fact.physical_dtype),
+                prefix,
+            )
+            native_call.args[position] = carrier
+            insert_at = producer_block.instrs.index(native_call)
+            producer_block.instrs[insert_at:insert_at] = prefix
+            changed = True
+    return changed
+
+
+def _publish_source_owned_return_bindings(module: IRModule, book) -> bool:
+    """Carry one allocated arena through an exact ordinary source result."""
+
+    from .concordance_declarations import (
+        CALL_RECORD, TENSOR_HEAP_OWNER_CALL_BINDING,
+        TENSOR_LOWERING_VALUE, TENSOR_METADATA_RESULT_BINDING,
+        TENSOR_OWNED_HEAP_BINDING, TENSOR_SOURCE_OWNED_RETURN,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode
+    from .precompile_to_ssa import _mint_ssa_id
+    from .ssa_record_return_state import (
+        function_scope_of, metadata_result_caller_value,
+        ssa_value_identity_cell,
+    )
+
+    if getattr(module, "call_table", None) is None:
+        return False
+    changed = False
+    for outer in module.functions.values():
+        outer_scope = function_scope_of(outer)
+        for block in outer.blocks.values():
+            for source_call in tuple(block.instrs):
+                if (source_call.op != "Call" or source_call.res is None
+                        or not source_call.attributes.get("source_linked")
+                        or source_call.attributes.get("result_convention")
+                            != "ssa.aggregate"):
+                    continue
+                source_name = str(source_call.attributes.get("callee") or "")
+                source = module.functions.get(source_name)
+                record_ref = book.latest_ref(
+                    CALL_RECORD, (module.call_table.owner, outer.name),
+                )
+                if source is None or record_ref is None:
+                    continue
+                records = book.page(CALL_RECORD).cell(
+                    record_ref.row, record_ref.column,
+                )
+                bound = tuple(
+                    record for record in records
+                    if record.callee_symbol == source_name
+                    and record.callsite_id == source_call.attributes.get(
+                        "plan_callsite_id"
+                    )
+                )
+                if len(bound) != 1 or len(bound[0].result_bindings) != 1:
+                    continue
+                source_id, caller_id = map(int, bound[0].result_bindings[0])
+                row = (outer_scope, outer.name, int(source_call.res.id),
+                       source_name, source_id)
+                if book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, row) is not None:
+                    continue
+                source_scope = function_scope_of(source)
+                outer_result_ref = book.latest_ref(
+                    TENSOR_METADATA_RESULT_BINDING,
+                    (outer_scope, int(source_call.res.id),
+                     source_name, source_id),
+                )
+                if outer_result_ref is None:
+                    continue
+                projected = metadata_result_caller_value(
+                    module, outer, source_call, outer_result_ref, book=book,
+                )
+                if projected is None or projected[0] != caller_id:
+                    continue
+                region_rows = tuple(
+                    candidate for candidate in book.page(
+                        TENSOR_HEAP_OWNER_CALL_BINDING
+                    ).rows()
+                    if candidate[0] == source_scope
+                    and candidate[1] == source_name
+                    and int(candidate[4]) == source_id
+                )
+                if len(region_rows) != 1:
+                    continue
+                owner_row = region_rows[0]
+                owner_ref = book.latest_ref(
+                    TENSOR_HEAP_OWNER_CALL_BINDING, owner_row,
+                )
+                owner_fact = book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
+                    owner_ref.row, owner_ref.column,
+                )
+                source_owner = int(owner_fact[1])
+                producer_name = str(owner_row[3])
+                producer = module.functions.get(producer_name)
+                producer_table = module.tensor_tables.get(producer_name)
+                producer_descriptor = (None if producer_table is None else
+                                       producer_table.by_id(source_id))
+                if producer is None or producer_descriptor is None:
+                    continue
+                owned_ref = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, (
+                    function_scope_of(producer), producer_name, source_id,
+                ))
+                if owned_ref is None:
+                    continue
+                owned = book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                    owned_ref.row, owned_ref.column,
+                )
+                if (int(owned[0]) != int(producer_descriptor.data_value_id)
+                        or int(owned[1]) != int(owner_fact[2])):
+                    raise ValueError("source return lost its owned producer")
+                region_calls = tuple(
+                    call for source_block in source.blocks.values()
+                    for call in source_block.instrs
+                    if call.op == "Call" and call.res is not None
+                    and int(call.res.id) == int(owner_row[2])
+                    and call.attributes.get("callee") == producer_name
+                )
+                if len(region_calls) != 1:
+                    continue
+                region_call = region_calls[0]
+                source_result_ref = book.latest_ref(
+                    TENSOR_METADATA_RESULT_BINDING,
+                    (source_scope, int(region_call.res.id),
+                     producer_name, source_id),
+                )
+                source_table = module.tensor_tables.get(source_name)
+                source_descriptor = (None if source_table is None else
+                                     source_table.by_id(source_id))
+                if (source_result_ref is None or source_descriptor is None
+                        or source_descriptor.metadata_state != "dynamic"
+                        or source_descriptor.element_count_value_id is None
+                        or tuple(map(int, region_call.attributes.get(
+                            "callee_output_ids", ())))[:1]
+                            != (int(owned[0]),)):
+                    continue
+                formal_ids = tuple(map(int, source_call.attributes.get(
+                    "callee_input_ids", ())))
+                if len(formal_ids) != len(source_call.args):
+                    continue
+                owner_actuals = tuple(
+                    actual for formal_id, actual in zip(
+                        formal_ids, source_call.args, strict=True,
+                    ) if formal_id == source_owner
+                )
+                if len(owner_actuals) != 1:
+                    continue
+                caller_owner = int(owner_actuals[0].id)
+                if not any(
+                    int(formal_id) == source_owner
+                    and kind in {"caller_storage", "caller_value", "caller_alias"}
+                    and type(actual_id) is int
+                    and int(actual_id) == caller_owner
+                    for formal_id, kind, actual_id in bound[0].frame_bindings
+                ):
+                    # The late frame binder owns this relation. A live Call
+                    # operand without its CALL_RECORD is not an owner proof.
+                    continue
+                if any(
+                    ret.op == "Ret"
+                    and any(int(value.id) == caller_id for value in ret.args)
+                    for caller_block in outer.blocks.values()
+                    for ret in caller_block.instrs
+                ):
+                    raise ValueError("owned source tensor escapes its caller")
+
+                def projection(function, call, data_id):
+                    matches = tuple(
+                        (projection_block, index, instruction)
+                        for projection_block in function.blocks.values()
+                        for index, instruction in enumerate(
+                            projection_block.instrs
+                        )
+                        if instruction.op == "Load"
+                        and instruction.res is not None
+                        and int(instruction.res.id) == data_id
+                        and instruction.attributes.get("aggregate_index") == 0
+                        and instruction.attributes.get("source_output_id")
+                            == data_id
+                        and instruction.args
+                        and any(
+                            gep.op == "GetElementPtr"
+                            and gep.res is instruction.args[0]
+                            and gep.args and gep.args[0] is call.res
+                            for gep in projection_block.instrs
+                        )
+                    )
+                    return matches[0] if len(matches) == 1 else None
+
+                source_projection = projection(source, region_call, source_id)
+                caller_projection = projection(outer, source_call, caller_id)
+                if source_projection is None or caller_projection is None:
+                    continue
+                source_cells = tuple(
+                    ssa_value_identity_cell(source, int(value.id), book=book)
+                    for value in (source_projection[2].res,
+                                  source_projection[2].args[0],
+                                  source.args[formal_ids.index(source_owner)])
+                )
+                caller_cells = tuple(
+                    ssa_value_identity_cell(outer, int(value.id), book=book)
+                    for value in (caller_projection[2].res,
+                                  caller_projection[2].args[0],
+                                  owner_actuals[0])
+                )
+                causes = tuple(dict.fromkeys((
+                    owned_ref, owner_ref, source_result_ref,
+                    outer_result_ref, record_ref,
+                    *projected[1], *source_cells, *caller_cells,
+                )))
+                if any(cell is None for cell in causes):
+                    raise ValueError("owned source return lacks exact SSA causes")
+
+                def loaded_carrier(function, source_projection, sources):
+                    projection_block, index, instruction = source_projection
+                    ptr_id = _mint_ssa_id(
+                        book, function_scope_of(function),
+                        TENSOR_LOWERING_VALUE, sources,
+                        dtype="ptr", shape=(), stage=TENSOR_SSA_LOWERING,
+                        physical={"physical_dtype": "ptr",
+                                  "storage": "scalar", "rank": 0},
+                    )
+                    carrier = SSAValue(ptr_id, dtype="ptr", shape=())
+                    projection_block.instrs.insert(index + 1, Instr(
+                        "Load", [instruction.args[0]], carrier,
+                        attributes={"aggregate_index": 0,
+                                    "source_output_id": int(instruction.res.id),
+                                    "source_owned_carrier": True},
+                    ))
+                    return carrier
+
+                source_carrier = loaded_carrier(
+                    source, source_projection, causes,
+                )
+                caller_carrier = loaded_carrier(
+                    outer, caller_projection, (
+                        *causes,
+                        ssa_value_identity_cell(
+                            source, int(source_carrier.id), book=book,
+                        ),
+                    ),
+                )
+                source_table.tensors[source_id] = dataclasses.replace(
+                    source_descriptor,
+                    data_value_id=int(source_carrier.id),
+                    heap_owner_value_id=source_owner,
+                )
+                caller_metadata = book.page(
+                    TENSOR_METADATA_RESULT_BINDING
+                ).cell(outer_result_ref.row, outer_result_ref.column)[2]
+                caller_table = module.tensor_tables.setdefault(
+                    outer.name, SSATensorTable(),
+                )
+                incumbent = caller_table.by_id(caller_id)
+                if incumbent is not None:
+                    raise ValueError("owned source caller has conflicting descriptor")
+                caller_table.register(dataclasses.replace(
+                    source_descriptor, tensor_id=caller_id,
+                    data_value_id=int(caller_carrier.id),
+                    heap_owner_value_id=caller_owner,
+                    shape_value_id=int(caller_metadata[0]),
+                    rank_value_id=int(caller_metadata[1]),
+                    element_count_value_id=int(caller_metadata[2]),
+                    storage="temporary",
+                ))
+                carrier_causes = tuple(
+                    ssa_value_identity_cell(function, int(value.id), book=book)
+                    for function, value in (
+                        (source, source_carrier), (outer, caller_carrier),
+                    )
+                )
+                transport_causes = tuple(
+                    ssa_value_identity_cell(function, value_id, book=book)
+                    for function, value_id in (
+                        (source, int(source_descriptor.element_count_value_id)),
+                        (outer, int(caller_metadata[2])),
+                        (outer, int(source_call.res.id)),
+                    )
+                )
+                if any(cell is None for cell in transport_causes):
+                    raise ValueError("owned source return lacks count or Call proof")
+                book.post(TENSOR_SOURCE_OWNED_RETURN, row, (
+                    int(source_carrier.id), source_owner,
+                    int(caller_carrier.id), caller_owner,
+                    caller_id, int(source_descriptor.element_count_value_id),
+                    str(owned[3]),
+                ), stage=TENSOR_SSA_LOWERING,
+                    provenance=Derived((*causes, *carrier_causes,
+                                        *transport_causes)),
+                    mode=Mode.CONCORD)
+                changed = True
+    return changed
+
+
+# In _ascending_order, region4's aggregate fold changed tensor22's returned
+# shape/rank/count from 4054/4057/4060 to 4192/4195/4198. Its source Ret
+# used the new IDs, while the source descriptor and ordinary caller still
+# described the old ones. Carry only that exact booked fold through the
+# source result, owned count, and dependent metadata Call proof.
+def _refresh_source_return_passthrough_metadata(module: IRModule, book) -> bool:
+    """Follow an exact aggregate metadata fold through a source return."""
+
+    from .concordance_declarations import (
+        AGGREGATE_PASSTHROUGH_REBINDING, CALL_RECORD, SSA_VALUE,
+        TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        TENSOR_SOURCE_OWNED_RETURN,
+        TENSOR_SSA_LOWERING,
+    )
+    from .identity_concordance import Derived, Mode, Ref
+    from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
+
+    changed = False
+    result_page = book.page(TENSOR_METADATA_RESULT_BINDING)
+    return_page = book.page(TENSOR_SOURCE_OWNED_RETURN)
+    fields = ("shape_value_id", "rank_value_id", "element_count_value_id")
+    accounting_keys = (
+        "tensor_shape_value_id", "tensor_rank_value_id",
+        "tensor_element_count_value_id",
+    )
+    for source in module.functions.values():
+        source_ids = tuple(map(int, (source.metadata or {}).get(
+            "source_output_value_ids", (),
+        )))
+        if len(source_ids) != 1 or (source.metadata or {}).get(
+            "source_region_integral"
+        ):
+            continue
+        source_id = source_ids[0]
+        table = module.tensor_tables.get(source.name)
+        descriptor = None if table is None else table.by_id(source_id)
+        returns = tuple(instruction for block in source.blocks.values()
+                        for instruction in block.instrs if instruction.op == "Ret")
+        if descriptor is None or descriptor.metadata_state != "dynamic" or len(returns) != 1:
+            continue
+        ret_ids = tuple(int(value.id) for value in returns[0].args)
+        if len(ret_ids) != 4 or ret_ids[0] != source_id:
+            continue
+        current_ids = ret_ids[1:]
+        old_ids = tuple(getattr(descriptor, field) for field in fields)
+        if old_ids == current_ids:
+            continue
+        scope = function_scope_of(source)
+        upstream = tuple(
+            row for row in result_page.rows()
+            if row[0] == scope and int(row[3]) == source_id
+            and tuple(result_page.latest(row)[2]) == current_ids
+        )
+        if len(upstream) != 1:
+            raise ValueError("source Ret metadata has no unique computed producer")
+        upstream_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, upstream[0])
+        if upstream_ref.column < 1:
+            raise ValueError("source metadata changed without aggregate revision")
+        predecessor = Ref(TENSOR_METADATA_RESULT_BINDING,
+                          upstream_ref.row, upstream_ref.column - 1)
+        upstream_causes = {
+            parent for parent, _stage in book.edges_into(upstream_ref)
+        }
+        rebinding_refs = tuple(
+            parent for parent in upstream_causes
+            if parent.page == AGGREGATE_PASSTHROUGH_REBINDING
+        )
+        semantic = returns[0].args[0]
+        if (tuple(result_page.cell(predecessor.row, predecessor.column)[2])
+                != old_ids or predecessor not in upstream_causes
+                or len(rebinding_refs) != 3
+                or {int(ref.row[1]) for ref in rebinding_refs} != set(old_ids)
+                or tuple((semantic.accounting or {}).get(key)
+                         for key in accounting_keys) != current_ids
+                or any(ssa_value_identity_cell(source, value_id, book=book)
+                       is None for value_id in current_ids)):
+            raise ValueError("source metadata fold lacks exact Ret ancestry")
+        table.tensors[source_id] = dataclasses.replace(
+            descriptor,
+            **dict(zip(fields, current_ids, strict=True)),
+        )
+        changed = True
+        for caller in module.functions.values():
+            record_ref = (book.latest_ref(
+                CALL_RECORD, (module.call_table.owner, caller.name),
+            ) if getattr(module, "call_table", None) is not None else None)
+            if record_ref is None:
+                continue
+            records = book.page(CALL_RECORD).cell(record_ref.row,
+                                                   record_ref.column)
+            for block in caller.blocks.values():
+                for call in block.instrs:
+                    if (call.op != "Call" or call.res is None
+                            or not call.attributes.get("source_linked")
+                            or call.attributes.get("callee") != source.name):
+                        continue
+                    bound = tuple(record for record in records
+                                  if record.callee_symbol == source.name
+                                  and record.callsite_id == call.attributes.get(
+                                      "plan_callsite_id")
+                                  and len(record.result_bindings) == 1
+                                  and int(record.result_bindings[0][0]) == source_id)
+                    if len(bound) != 1:
+                        raise ValueError("source metadata fold lost its Call record")
+                    caller_id = int(bound[0].result_bindings[0][1])
+                    row = (function_scope_of(caller), int(call.res.id),
+                           source.name, source_id)
+                    prior = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
+                    if prior is None:
+                        continue
+                    previous = result_page.cell(prior.row, prior.column)
+                    caller_ids = tuple(map(int, previous[2]))
+                    if (tuple(previous[1]) != old_ids
+                            or tuple(map(int, call.attributes.get(
+                                "callee_output_ids", ()))) != (source_id, *old_ids)
+                            or tuple(map(int, call.attributes.get(
+                                "output_ids", ()))) != (caller_id, *caller_ids)):
+                        raise ValueError("source Call has conflicting old metadata projection")
+                    proof = tuple(dict.fromkeys((
+                        prior, upstream_ref, record_ref,
+                        *rebinding_refs,
+                        ssa_value_identity_cell(caller, int(call.res.id), book=book),
+                        ssa_value_identity_cell(source, source_id, book=book),
+                        ssa_value_identity_cell(caller, caller_id, book=book),
+                        *(ssa_value_identity_cell(source, value_id, book=book)
+                          for value_id in current_ids),
+                        *(ssa_value_identity_cell(caller, value_id, book=book)
+                          for value_id in caller_ids),
+                    )))
+                    if any(cell is None for cell in proof):
+                        raise ValueError("source metadata fold lacks exact SSA cells")
+                    book.post(
+                        TENSOR_METADATA_RESULT_BINDING, row,
+                        (source_id, current_ids, caller_ids),
+                        stage=TENSOR_SSA_LOWERING,
+                        provenance=Derived(proof), mode=Mode.REVISE,
+                    )
+                    call.attributes["callee_output_ids"] = (source_id, *current_ids)
+                    latest_result = book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                                    row)
+                    binding_page = book.page(TENSOR_METADATA_CALL_BINDING)
+                    for binding_row in binding_page.rows():
+                        if binding_row[0] != function_scope_of(caller):
+                            continue
+                        binding_ref = book.latest_ref(
+                            TENSOR_METADATA_CALL_BINDING, binding_row,
+                        )
+                        binding_fact = binding_page.cell(
+                            binding_ref.row, binding_ref.column,
+                        )
+                        if prior not in {
+                            parent for parent, _stage in book.edges_into(
+                                binding_ref)
+                        }:
+                            continue
+                        if tuple(binding_fact[0]) != caller_ids:
+                            raise ValueError(
+                                "source metadata consumer has conflicting actuals"
+                            )
+                        book.post(
+                            TENSOR_METADATA_CALL_BINDING, binding_row,
+                            binding_fact, stage=TENSOR_SSA_LOWERING,
+                            provenance=Derived((binding_ref, latest_result)),
+                            mode=Mode.CONCORD,
+                        )
+                    return_row = (function_scope_of(caller), caller.name,
+                                  int(call.res.id), source.name, source_id)
+                    return_ref = book.latest_ref(TENSOR_SOURCE_OWNED_RETURN,
+                                                 return_row)
+                    if return_ref is None:
+                        continue
+                    return_fact = return_page.cell(return_ref.row,
+                                                   return_ref.column)
+                    if int(return_fact[5]) != int(old_ids[2]):
+                        raise ValueError("source owned count conflicts with aggregate fold")
+                    return_sources = tuple(dict.fromkeys((
+                        return_ref, latest_result, upstream_ref, record_ref,
+                        *rebinding_refs,
+                        *(parent for parent, _stage in book.edges_into(return_ref)),
+                        ssa_value_identity_cell(source, current_ids[2], book=book),
+                    )))
+                    book.post(
+                        TENSOR_SOURCE_OWNED_RETURN, return_row,
+                        (*return_fact[:5], current_ids[2], return_fact[6]),
+                        stage=TENSOR_SSA_LOWERING,
+                        provenance=Derived(return_sources), mode=Mode.REVISE,
+                    )
+    return changed
+
+
 def publish_computed_region_result_metadata(
     module: IRModule, *, finalize_private_owners: bool = True,
 ) -> bool:
@@ -216,21 +1056,31 @@ def publish_computed_region_result_metadata(
     )
     from .identity_concordance import Derived, Mode
     from .precompile_to_ssa import _mint_ssa_id
-    from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
+    from .ssa_record_return_state import (
+        function_scope_of, metadata_result_caller_value,
+        ssa_value_identity_cell,
+    )
 
     book = identity_book(module)
-    changed = False
+    changed = _bind_source_return_owned_producers(module, book)
+    changed |= _refresh_source_return_passthrough_metadata(module, book)
     pending_input_bindings = []
     keys = (
         "tensor_shape_value_id", "tensor_rank_value_id",
         "tensor_element_count_value_id",
     )
-    for callee_name, callee in tuple(module.functions.items()):
-        if "__planned_region_" not in callee_name:
-            continue
+    # A source function can return a computed region value. Publish region
+    # outputs first, then read their projected metadata at the source Ret.
+    # The caller's existing geometry fixed point revisits source functions
+    # whose upstream Call has not yet acquired that result binding.
+    function_items = tuple(module.functions.items())
+    for callee_name, callee in (
+        *(item for item in function_items
+          if (item[1].metadata or {}).get("source_region_integral")),
+        *(item for item in function_items
+          if not (item[1].metadata or {}).get("source_region_integral")),
+    ):
         table = module.tensor_tables.get(callee_name)
-        if table is None:
-            continue
         returns = [
             instruction for block in callee.blocks.values()
             for instruction in block.instrs if instruction.op == "Ret"
@@ -238,10 +1088,49 @@ def publish_computed_region_result_metadata(
         if len(returns) != 1:
             continue
         returned = returns[0]
+        source_outputs = tuple(map(int, (callee.metadata or {}).get(
+            "source_output_value_ids", (),
+        )))
+        if (source_outputs and len(returned.args) == 1
+                and (table is None or table.by_id(int(returned.args[0].id)) is None)):
+            from .ssa_record_return_state import posted_ssa_value_fact
+            source_output = returned.args[0]
+            source_id = int(source_output.id)
+            source_metadata = tuple((source_output.accounting or {}).get(key)
+                                    for key in keys)
+            source_scope = function_scope_of(callee)
+            upstream = tuple(
+                row for row in book.page(TENSOR_METADATA_RESULT_BINDING).rows()
+                if row[0] == source_scope and row[3] == source_id
+                and book.page(TENSOR_METADATA_RESULT_BINDING).latest(row)[2]
+                    == source_metadata
+            )
+            physical = posted_ssa_value_fact(callee, source_id, book=book)
+            if (source_outputs == (source_id,)
+                    and len(upstream) == 1
+                    and all(type(value_id) is int for value_id in source_metadata)
+                    and physical is not None and physical.storage == "span"
+                    and isinstance(physical.rank, int) and physical.rank > 0
+                    and all(ssa_value_identity_cell(callee, value_id, book=book)
+                            is not None for value_id in source_metadata)):
+                table = module.tensor_tables.setdefault(
+                    callee_name, SSATensorTable(),
+                )
+                table.register(SSATensorDescriptor(
+                    tensor_id=source_id, data_value_id=source_id,
+                    dtype=str(physical.dtype), shape=tuple(source_output.shape or ()),
+                    shape_value_id=source_metadata[0],
+                    rank_value_id=source_metadata[1],
+                    element_count_value_id=source_metadata[2],
+                    storage="output", metadata_state="dynamic",
+                    arena_id=source_id, allocation_owner=source_id,
+                ))
+        if table is None:
+            continue
         original_outputs = tuple(returned.args)
         region_outputs = tuple(map(int, (
             (callee.metadata or {}).get("source_region_integral") or {}
-        ).get("output_value_ids", ())))
+        ).get("output_value_ids", ()) or source_outputs))
         # A late tensor slice can publish this region's metadata before a
         # sibling consumer is part of that partial module. On the full
         # module the Ret already has metadata values, and the booked result
@@ -328,6 +1217,95 @@ def publish_computed_region_result_metadata(
         ))
         if any(value_id not in callee_values for value_id in metadata_ids):
             continue
+        if source_outputs and not (callee.metadata or {}).get("source_region_integral"):
+            from .concordance_declarations import CALL_RECORD
+            for caller in module.functions.values():
+                records = tuple(module.call_table.get(caller.name, ()))
+                record_ref = book.latest_ref(CALL_RECORD, (
+                    module.call_table.owner, caller.name,
+                ))
+                for block in caller.blocks.values():
+                    for call in tuple(block.instrs):
+                        if (call.op != "Call" or call.res is None
+                                or call.attributes.get("callee") != callee_name
+                                or not call.attributes.get("source_linked")
+                                or call.attributes.get("result_convention") == "ssa.aggregate"):
+                            continue
+                        caller_id = int(call.res.id)
+                        matching = tuple(record for record in records
+                                         if record.callee_symbol == callee_name
+                                         and record.callsite_id == call.attributes.get(
+                                             "plan_callsite_id")
+                                         and record.result_bindings == ((
+                                             int(source_outputs[0]), caller_id,
+                                         ),))
+                        original_cell = ssa_value_identity_cell(
+                            caller, caller_id, book=book,
+                        )
+                        upstream_row = next((row for row in book.page(
+                            TENSOR_METADATA_RESULT_BINDING
+                        ).rows() if row[0] == function_scope_of(callee)
+                            and row[3] == int(source_outputs[0])
+                            and book.page(TENSOR_METADATA_RESULT_BINDING).latest(
+                                row)[2] == computed[int(source_outputs[0])]), None)
+                        upstream_ref = (None if upstream_row is None else
+                                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                                        upstream_row))
+                        if not matching:
+                            # A frame-aliased or otherwise non-materialized
+                            # source return has no direct result binding to
+                            # project through this aggregate output contract.
+                            continue
+                        if (len(matching) != 1 or record_ref is None
+                                or original_cell is None or upstream_ref is None
+                                or matching[0] not in book.page(CALL_RECORD).cell(
+                                    record_ref.row, record_ref.column)):
+                            raise ValueError(
+                                "source tensor return has no exact linked result binding"
+                            )
+                        caller_scope = function_scope_of(caller)
+                        causes = (record_ref, original_cell, upstream_ref)
+                        aggregate = SSAValue(_mint_ssa_id(
+                            book, caller_scope, TENSOR_LOWERING_VALUE, causes,
+                            dtype="ssa.aggregate", shape=(),
+                            stage=TENSOR_SSA_LOWERING,
+                        ), dtype="ssa.aggregate", accounting={
+                            "ssa_aggregate_outputs": (caller_id,),
+                        })
+                        index = SSAValue(_mint_ssa_id(
+                            book, caller_scope, TENSOR_LOWERING_VALUE, causes,
+                            dtype="int64", shape=(),
+                            stage=TENSOR_SSA_LOWERING,
+                            physical={"physical_dtype": "int64",
+                                      "storage": "scalar", "rank": 0},
+                        ), dtype="int64")
+                        address = SSAValue(_mint_ssa_id(
+                            book, caller_scope, ADDRESS, causes,
+                            dtype="ptr", shape=(),
+                            stage=TENSOR_SSA_LOWERING,
+                        ), dtype="ptr")
+                        result = call.res
+                        call.res = aggregate
+                        call.attributes = {
+                            **dict(call.attributes),
+                            "result_convention": "ssa.aggregate",
+                            "output_ids": (caller_id,),
+                            "callee_output_ids": (int(source_outputs[0]),),
+                            "output_positions": (0,),
+                            "computed_source_metadata_outputs": True,
+                        }
+                        position = block.instrs.index(call) + 1
+                        block.instrs[position:position] = [
+                            Instr("Const", [], index,
+                                  attributes={"constant": 0}),
+                            Instr("GetElementPtr", [aggregate, index], address,
+                                  attributes={"aggregate_index": 0,
+                                              "source_output_id": caller_id}),
+                            Instr("Load", [address], result,
+                                  attributes={"aggregate_index": 0,
+                                              "source_output_id": caller_id}),
+                        ]
+                        changed = True
         calls = [
             (caller, block, call)
             for caller in module.functions.values()
@@ -343,6 +1321,19 @@ def publish_computed_region_result_metadata(
         prior_projections = {}
         for caller, _block, call in calls:
             output_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+            expected_outputs = semantic_outputs
+            if call.attributes.get("computed_source_metadata_outputs"):
+                bound = tuple(record for record in module.call_table.get(
+                    caller.name, (),
+                ) if record.callee_symbol == callee_name
+                    and record.callsite_id == call.attributes.get("plan_callsite_id")
+                    and tuple(int(callee_id) for callee_id, _caller_id
+                              in record.result_bindings) == semantic_outputs)
+                if len(bound) != 1:
+                    raise ValueError("source metadata lost its exact Call result binding")
+                expected_outputs = tuple(int(caller_id)
+                                         for _callee_id, caller_id
+                                         in bound[0].result_bindings)
             facts = {}
             for output_id, callee_ids in computed.items():
                 row = (function_scope_of(caller), int(call.res.id),
@@ -351,7 +1342,7 @@ def publish_computed_region_result_metadata(
                 if prior is None or tuple(prior[1]) != tuple(callee_ids):
                     break
                 facts[output_id] = prior
-            if output_ids == semantic_outputs:
+            if output_ids == expected_outputs:
                 if not facts:
                     prior_projections[id(call)] = None
                     continue
@@ -384,7 +1375,7 @@ def publish_computed_region_result_metadata(
             if (
                 len(facts) != len(computed)
                 or not call.attributes.get("computed_tensor_metadata_outputs")
-                or output_ids != (*semantic_outputs, *projected_ids)
+                or output_ids != (*expected_outputs, *projected_ids)
             ):
                 prior_projections = {}
                 break
@@ -504,6 +1495,33 @@ def publish_computed_region_result_metadata(
                     "ssa_aggregate_outputs": call.attributes["output_ids"],
                 }
             for output_id, callee_ids in computed.items():
+                caller_data_id = int(call.attributes["output_ids"][
+                    semantic_outputs.index(output_id)
+                ])
+                source_call_proofs = ()
+                if call.attributes.get("computed_source_metadata_outputs"):
+                    from .concordance_declarations import CALL_RECORD
+                    record_ref = book.latest_ref(CALL_RECORD, (
+                        module.call_table.owner, caller.name,
+                    ))
+                    upstream_rows = tuple(
+                        upstream_row for upstream_row in book.page(
+                            TENSOR_METADATA_RESULT_BINDING
+                        ).rows() if upstream_row[0] == callee_scope
+                        and upstream_row[3] == output_id
+                        and book.page(TENSOR_METADATA_RESULT_BINDING).latest(
+                            upstream_row)[2] == callee_ids
+                    )
+                    if record_ref is None or len(upstream_rows) != 1:
+                        raise ValueError(
+                            "source tensor metadata lost its linked return proof"
+                        )
+                    source_call_proofs = (
+                        record_ref,
+                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                        upstream_rows[0]),
+                        ssa_value_identity_cell(caller, caller_data_id, book=book),
+                    )
                 caller_metadata = tuple(int(projected[item].id)
                                         for item in callee_ids)
                 row = (caller_scope, int(call.res.id),
@@ -516,6 +1534,7 @@ def publish_computed_region_result_metadata(
                       for item in callee_ids),
                     *(ssa_value_identity_cell(caller, item, book=book)
                       for item in caller_metadata),
+                    *source_call_proofs,
                 )))
                 if replay:
                     if book.page(TENSOR_METADATA_RESULT_BINDING).latest(row) != (
@@ -533,6 +1552,33 @@ def publish_computed_region_result_metadata(
                                                  if cell is not None)),
                         mode=Mode.CONCORD,
                     )
+                projected_data = metadata_result_caller_value(
+                    module, caller, call,
+                    book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row),
+                    book=book,
+                )
+                if projected_data is None or projected_data[0] != caller_data_id:
+                    raise ValueError(
+                        "computed metadata lost its exact caller data identity"
+                    )
+                if call.attributes.get("computed_source_metadata_outputs"):
+                    source_projection = tuple(
+                        instruction for instruction in block.instrs
+                        if instruction.op == "Load"
+                        and instruction.res is not None
+                        and int(instruction.res.id) == caller_data_id
+                        and instruction.attributes.get("aggregate_index")
+                            == semantic_outputs.index(output_id)
+                    )
+                    if len(source_projection) != 1:
+                        raise ValueError(
+                            "source tensor metadata lost its exact result projection"
+                        )
+                    source_projection[0].res.accounting = {
+                        **dict(source_projection[0].res.accounting or {}),
+                        "tensor_metadata_state": "dynamic",
+                        **dict(zip(keys, caller_metadata, strict=True)),
+                    }
                 # A later region consuming this computed tensor receives
                 # its metadata by the existing actual/formal call ABI. The
                 # output projection above is the first point at which those
@@ -549,7 +1595,7 @@ def publish_computed_region_result_metadata(
                             continue
                         feeds = tuple(map(int, downstream.attributes.get("feed_ids", ())))
                         positions = tuple(index for index, actual in enumerate(downstream.args)
-                                          if int(actual.id) == output_id)
+                                          if int(actual.id) == caller_data_id)
                         if len(positions) != 1:
                             continue
                         position = positions[0]
@@ -560,13 +1606,13 @@ def publish_computed_region_result_metadata(
                             continue
                         target_tensor_id = int(target.args[position].id)
                         alias_cell = None
-                        if target_tensor_id != output_id:
+                        if target_tensor_id != caller_data_id:
                             from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
                             alias_cell = book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING, (
                                 function_scope_of(caller), target_tensor_id,
                             ))
                             if (alias_cell is None or book.page(alias_cell.page).cell(
-                                    alias_cell.row, alias_cell.column)[0] != output_id):
+                                    alias_cell.row, alias_cell.column)[0] != caller_data_id):
                                 continue
                         if downstream_block is block and (
                             downstream_block.instrs.index(downstream)
@@ -752,26 +1798,35 @@ def publish_computed_region_result_metadata(
                                 int(downstream.res.id), target.name,
                             )
                         )
-                        if len(owner_rows) > 1:
-                            raise ValueError(
-                                "computed metadata has multiple owner call bindings"
-                            )
-                        owner_fact = (
+                        owner_facts = tuple(
                             book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(
-                                owner_rows[0]
-                            ) if owner_rows else None
+                                owner_row
+                            ) for owner_row in owner_rows
                         )
-                        owner_tail = bool(owner_fact)
-                        if owner_tail and (
-                            int(downstream.args[-1].id) != int(owner_fact[1])
-                            or int(target.args[-1].id) != int(owner_fact[2])
-                        ):
-                            raise ValueError(
-                                "computed metadata found owner outside its exact call tail"
-                            )
-                        if owner_tail:
-                            target.args[-1:-1] = fresh_formals
-                            downstream.args[-1:-1] = metadata_actuals
+                        owner_pairs = tuple(
+                            (int(fact[1]), int(fact[2]))
+                            for fact in owner_facts
+                        )
+                        # One aggregate producer may own both values and
+                        # indices. The booked owner pairs must be precisely
+                        # the live aligned call/formal tail before metadata
+                        # can be inserted ahead of those owner ports.
+                        owner_tail_size = len(owner_pairs)
+                        if owner_tail_size:
+                            live_tail = tuple(zip(
+                                (int(value.id) for value in downstream.args[-owner_tail_size:]),
+                                (int(value.id) for value in target.args[-owner_tail_size:]),
+                                strict=True,
+                            ))
+                            if (len(set(owner_pairs)) != owner_tail_size
+                                    or len(set(live_tail)) != owner_tail_size
+                                    or set(live_tail) != set(owner_pairs)):
+                                raise ValueError(
+                                    "computed metadata found owner outside its exact call tail"
+                                )
+                        if owner_tail_size:
+                            target.args[-owner_tail_size:-owner_tail_size] = fresh_formals
+                            downstream.args[-owner_tail_size:-owner_tail_size] = metadata_actuals
                         else:
                             target.args.extend(fresh_formals)
                             downstream.args.extend(metadata_actuals)
@@ -828,8 +1883,9 @@ def publish_computed_region_result_metadata(
                             downstream.attributes[
                                 "callee_input_ids"
                             ] = (
-                                (*old[:-1], *new, old[-1])
-                                if owner_tail else (*old, *new)
+                                (*old[:-owner_tail_size], *new,
+                                 *old[-owner_tail_size:])
+                                if owner_tail_size else (*old, *new)
                             )
                         metadata_feed_ids = tuple(
                             int(value.id) for value in metadata_actuals
@@ -853,18 +1909,19 @@ def publish_computed_region_result_metadata(
                         downstream.attributes = {
                             **dict(downstream.attributes),
                             "feed_ids": (
-                                (*feeds[:-1], *metadata_feed_ids, feeds[-1])
-                                if owner_tail else (*feeds, *metadata_feed_ids)
+                                (*feeds[:-owner_tail_size], *metadata_feed_ids,
+                                 *feeds[-owner_tail_size:])
+                                if owner_tail_size else (*feeds, *metadata_feed_ids)
                             ),
                             "feed_shapes": (
-                                (*old_feed_shapes[:-1], *metadata_feed_shapes,
-                                 old_feed_shapes[-1])
-                                if owner_tail else (*old_feed_shapes, *metadata_feed_shapes)
+                                (*old_feed_shapes[:-owner_tail_size], *metadata_feed_shapes,
+                                 *old_feed_shapes[-owner_tail_size:])
+                                if owner_tail_size else (*old_feed_shapes, *metadata_feed_shapes)
                             ),
                             "feed_dtypes": (
-                                (*old_feed_dtypes[:-1], *metadata_feed_dtypes,
-                                 old_feed_dtypes[-1])
-                                if owner_tail else (*old_feed_dtypes, *metadata_feed_dtypes)
+                                (*old_feed_dtypes[:-owner_tail_size], *metadata_feed_dtypes,
+                                 *old_feed_dtypes[-owner_tail_size:])
+                                if owner_tail_size else (*old_feed_dtypes, *metadata_feed_dtypes)
                             ),
                         }
                         integral = dict(target.metadata.get("source_region_integral", {}))
@@ -1096,6 +2153,7 @@ def publish_computed_region_result_metadata(
     # existing whole-program tensor retry could lower it.  Section linking
     # publishes metadata now; the complete module runs this same strict owner
     # proof after that retry. No release receipt is invented while deferred.
+    changed |= _publish_source_owned_return_bindings(module, book)
     if not finalize_private_owners:
         return changed
 
@@ -1111,17 +2169,49 @@ def publish_computed_region_result_metadata(
         TENSOR_HEAP_OWNER_CALL_BINDING,
         TENSOR_HEAP_RELEASE_BINDING,
         TENSOR_HEAP_CONSUMER_NONESCAPE,
+        TENSOR_SOURCE_OWNED_RETURN,
     )
     from .ssa_heap_allocation import heap_release
     from .ssa_record_return_state import ssa_block_identity_cell
     from .identity_concordance import CorrelationTable
+    from .identity_concordance import Ref
+    from .concordance_declarations import (
+        AGGREGATE_PASSTHROUGH_REBINDING, DEAD_STRUCTURAL_RETIREMENT,
+    )
+    source_returns = tuple(
+        (row, book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, row),
+         book.page(TENSOR_SOURCE_OWNED_RETURN).latest(row))
+        for row in book.page(TENSOR_SOURCE_OWNED_RETURN).rows()
+    )
+    owner_contexts = []
     for owner_row in tuple(book.page(TENSOR_HEAP_OWNER_CALL_BINDING).rows()):
+        owner_fact = book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(owner_row)
+        forwarded = tuple(
+            source_ref for source_row, source_ref, source_fact in source_returns
+            if (source_row[3], int(source_row[4]), int(source_fact[1]))
+            == (str(owner_row[1]), int(owner_row[4]), int(owner_fact[1]))
+        )
+        if forwarded:
+            # This owner is a source function's formal. The exact returned
+            # carrier forwards its cell to each calling frame; releasing it
+            # here would invalidate the caller's borrowed result.
+            continue
+        owner_contexts.append((
+            owner_row,
+            book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, owner_row),
+            owner_fact,
+        ))
+    for source_row, source_ref, source_fact in source_returns:
+        owner_contexts.append((
+            (source_row[0], source_row[1], source_row[2],
+             source_row[3], source_fact[4]),
+            source_ref,
+            (source_fact[4], source_fact[3], source_fact[1]),
+        ))
+    for owner_row, owner_origin, owner_fact in owner_contexts:
         caller = module.functions.get(str(owner_row[1]))
         if caller is None:
             raise ValueError("owned tensor release lost its exact caller")
-        owner_fact = book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(
-            owner_row
-        )
         tensor_id, owner_actual_id, _owner_formal_id = map(int, owner_fact)
         release_row = (
             function_scope_of(caller), caller.name, owner_actual_id,
@@ -1274,14 +2364,83 @@ def publish_computed_region_result_metadata(
                 raise ValueError(
                     "private owned tensor consumer has no return layout"
                 )
+            # `_ascending_order`: ensure_tensor's planned wrapper returns
+            # borrowed indices19 to the same owning caller. Aggregate
+            # legalization retired that Call to void and rebound view20 to
+            # the caller's raw19. The later cast consumes raw19 and returns
+            # distinct storage22. This exact retired/rebound identity can
+            # remain live until that cast; it does not transfer the owner.
+            reborrow = None
+            if consumer.res is None:
+                retired = consumer.attributes.get("aggregate_retired_result")
+                passthroughs = tuple(consumer.attributes.get(
+                    "aggregate_output_passthrough_bindings", (),
+                ))
+                if (not isinstance(retired, Ref)
+                        or retired.page != DEAD_STRUCTURAL_RETIREMENT
+                        or book.latest_ref(retired.page, retired.row) != retired
+                        or book.page(retired.page).cell(retired.row, retired.column)
+                            != ("Call", "None")
+                        or consumer.attributes.get("result_convention") != "void"
+                        or tuple(consumer.attributes.get("output_ids", ()))
+                        or tuple(consumer.attributes.get("callee_output_ids", ()))
+                        or len(passthroughs) != 1
+                        or len(passthroughs[0]) != 6):
+                    raise ValueError(
+                        "private owned tensor void consumer lacks exact retirement"
+                    )
+                retirement_causes = {
+                    source for source, _stage in book.edges_into(retired)
+                }
+                prior_calls = tuple(source for source in retirement_causes
+                                    if source.page == SSA_VALUE
+                                    and source.row[0] == function_scope_of(caller))
+                rebindings = tuple(source for source in retirement_causes
+                                   if source.page == AGGREGATE_PASSTHROUGH_REBINDING)
+                if len(prior_calls) != 1 or len(rebindings) != 1:
+                    raise ValueError(
+                        "private owned tensor retirement lost its prior Call or rebinding"
+                    )
+                prior_call, rebinding = prior_calls[0], rebindings[0]
+                alias_id = int(rebinding.row[1])
+                rebinding_causes = {
+                    source for source, _stage in book.edges_into(rebinding)
+                }
+                binding_fact = book.page(AGGREGATE_PASSTHROUGH_REBINDING).cell(
+                    rebinding.row, rebinding.column,
+                )
+                if (retirement_causes != {prior_call, rebinding}
+                        or not all(any(
+                            source.page == SSA_VALUE
+                            and source.row == (function_scope_of(caller), value_id)
+                            for source in rebinding_causes
+                        ) for value_id in (alias_id, tensor_id))
+                        or book.latest_ref(prior_call.page, prior_call.row) != prior_call
+                        or book.latest_ref(rebinding.page, rebinding.row) != rebinding
+                        or rebinding.row != (function_scope_of(caller), alias_id)
+                        or binding_fact != (tensor_id, target.name, alias_id)
+                        or passthroughs[0][4] != "exact_callee_output_formal"
+                        or any(int(value.id) == alias_id
+                               for caller_block in caller.blocks.values()
+                               for live in caller_block.instrs
+                               for value in live.args)
+                        or any(int(value.id) in {tensor_id, alias_id, owner_actual_id}
+                               for value in returns[0][1].args)):
+                    raise ValueError(
+                        "private owned tensor reborrow escapes its owning caller"
+                    )
+                reborrow = (prior_call, rebinding, retired)
+            metadata_result_id = (
+                int(consumer.res.id) if consumer.res is not None
+                else int(reborrow[0].row[1]) if reborrow is not None else None
+            )
             metadata_rows = tuple(
                 metadata_row for metadata_row in book.page(
                     TENSOR_METADATA_RESULT_BINDING
                 ).rows()
-                if consumer.res is not None
+                if metadata_result_id is not None
                 and metadata_row[:3] == (
-                    function_scope_of(caller),
-                    int(consumer.res.id), target.name,
+                    function_scope_of(caller), metadata_result_id, target.name,
                 )
             )
             metadata_ids = {
@@ -1291,6 +2450,20 @@ def publish_computed_region_result_metadata(
                     TENSOR_METADATA_RESULT_BINDING
                 ).latest(metadata_row)[1]
             }
+            if reborrow is not None:
+                data_outputs = tuple(
+                    int(output.id) for output in target_returns[0].args
+                    if int(output.id) not in metadata_ids
+                )
+                if (len(data_outputs) != 1
+                        or data_outputs[0] not in consumed_formals
+                        or passthroughs[0][:4] != (
+                            0, alias_id, data_outputs[0], tensor_id,
+                        )):
+                    raise ValueError(
+                        "private owned tensor reborrow lacks exact data output"
+                    )
+                reborrow = (*reborrow, data_outputs[0])
             output_layouts = []
             output_cells = []
             for output in target_returns[0].args:
@@ -1328,6 +2501,11 @@ def publish_computed_region_result_metadata(
                 if (
                     int(descriptor.data_value_id) in consumed_formals
                     or descriptor.alias_of in consumed_formals
+                ) and not (
+                    reborrow is not None
+                    and int(output.id) == reborrow[3]
+                    and int(descriptor.data_value_id) == reborrow[3]
+                    and descriptor.alias_of is None
                 ):
                     raise ValueError(
                         "private owned tensor consumer may return its storage"
@@ -1350,12 +2528,13 @@ def publish_computed_region_result_metadata(
                             "private tensor consumer layout lacks an SSA cell"
                         )
                     output_cells.append(cell)
-            if consumer.res is None:
+            if consumer.res is None and reborrow is None:
                 raise ValueError(
                     "private owned tensor consumer lacks a Call result"
                 )
             consumer_cell = ssa_value_identity_cell(
-                caller, int(consumer.res.id), book=book,
+                caller, (int(consumer.res.id) if consumer.res is not None
+                         else int(reborrow[0].row[1])), book=book,
             )
             tensor_cell = ssa_value_identity_cell(
                 caller, tensor_id, book=book,
@@ -1370,7 +2549,8 @@ def publish_computed_region_result_metadata(
             )
             nonescape_row = (
                 function_scope_of(caller), caller.name,
-                int(consumer.res.id), owner_actual_id,
+                int(consumer.res.id) if consumer.res is not None
+                else int(reborrow[0].row[1]), owner_actual_id,
             )
             book.post(
                 TENSOR_HEAP_CONSUMER_NONESCAPE, nonescape_row,
@@ -1378,9 +2558,11 @@ def publish_computed_region_result_metadata(
                  tuple(sorted(consumed_formals)), tuple(output_layouts)),
                 stage=TENSOR_SSA_LOWERING,
                 provenance=Derived(tuple(dict.fromkeys((
-                    book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, owner_row),
+                    owner_origin,
                     consumer_cell, tensor_cell, *output_cells,
                     *metadata_cells,
+                    *((reborrow[1], reborrow[2])
+                      if reborrow is not None else ()),
                 )))),
                 mode=Mode.CONCORD,
             )
@@ -1390,7 +2572,7 @@ def publish_computed_region_result_metadata(
         owner_actual = owner_actuals[0]
         block.instrs.insert(return_position, heap_release(owner_actual))
         release_sources = (
-            book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, owner_row),
+            owner_origin,
             ssa_value_identity_cell(caller, int(owner_row[2]), book=book),
             ssa_value_identity_cell(caller, tensor_id, book=book),
             ssa_value_identity_cell(caller, owner_actual_id, book=book),
@@ -2065,7 +3247,8 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
         TENSOR_RUNTIME_BROADCAST_VALIDITY,
     )
     from .ssa_record_return_state import (
-        function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        function_scope_of, metadata_result_caller_value,
+        posted_ssa_value_fact, ssa_value_identity_cell,
     )
 
     book = identity_book(module)
@@ -2210,22 +3393,35 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
             continue
         predecessors = tuple(cause for cause, _stage in book.edges_into(binding)
                              if cause.page == TENSOR_METADATA_RESULT_BINDING
-                             and cause.row[0] == row[0]
-                             and cause.row[3] == value_id)
-        if len(predecessors) != 1:
+                             and cause.row[0] == row[0])
+        projected_producers = []
+        for predecessor in predecessors:
+            producer_calls = tuple(
+                instruction for producer_block in caller.blocks.values()
+                for instruction in producer_block.instrs
+                if instruction.op == "Call" and instruction.res is not None
+                and int(instruction.res.id) == predecessor.row[1]
+                and instruction.attributes.get("callee") == predecessor.row[2]
+            )
+            if len(producer_calls) != 1:
+                continue
+            projection = metadata_result_caller_value(
+                module, caller, producer_calls[0], predecessor, book=book,
+            )
+            if projection is not None and sum(
+                actual_id == projection[0] and formal_id == value_id
+                for actual_id, formal_id in live_pairs
+            ) == 1:
+                projected_producers.append((predecessor, projection[1]))
+        if len(projected_producers) != 1:
             continue
-        # The producer result belongs to the caller occurrence that is
-        # passed into this exact callee tensor formal. Equal numeric IDs in
-        # another Call or scope do not establish that data edge.
-        if sum(actual_id == predecessors[0].row[3] and formal_id == value_id
-               for actual_id, formal_id in live_pairs) != 1:
-            continue
-        projected = book.page(predecessors[0].page).cell(
-            predecessors[0].row, predecessors[0].column,
+        predecessor, projection_cells = projected_producers[0]
+        projected = book.page(predecessor.page).cell(
+            predecessor.row, predecessor.column,
         )[2]
         if all(pairs.count((actual, formal)) == 1
                for actual, formal in zip(projected, ids, strict=True)):
-            proofs.extend((binding, predecessors[0]))
+            proofs.extend((binding, predecessor, *projection_cells))
     return (metadata, tuple(dict.fromkeys((*cells, *proofs)))) if proofs else None
 
 
@@ -5775,10 +6971,61 @@ def lower_tensor_calls_to_repository_ssa(
             data_value_id: int | None = None,
             extent_ids_from: SSATensorDescriptor | None = None,
             extent_values: tuple[SSAValue, SSAValue, SSAValue] | None = None,
+            alias_proof: Any = None,
         ) -> SSATensorDescriptor:
             tensor_id = int(value.id)
             existing = tensor_table.by_id(tensor_id)
             if existing is not None:
+                if alias_proof is not None:
+                    # _ascending_order's ensure_tensor requested view20 of
+                    # raw19 after a placeholder output20 already existed.
+                    # Returning that placeholder left data20 independently
+                    # owned although NATIVE_TENSOR_WRAP proved data19. The
+                    # exact wrapping receipt refines this same identity;
+                    # it cannot replace an allocated carrier or other alias.
+                    from .concordance_declarations import (
+                        NATIVE_TENSOR_WRAP, TENSOR_OWNED_HEAP_BINDING,
+                    )
+                    from .identity_concordance import Ref
+                    from .ssa_record_return_state import function_scope_of
+
+                    scope = function_scope_of(function)
+                    owner = tensor_table.by_id(alias_of) if alias_of is not None else None
+                    wrapping = (book.page(NATIVE_TENSOR_WRAP).cell(
+                        alias_proof.row, alias_proof.column,
+                    ) if isinstance(alias_proof, Ref)
+                        and alias_proof.page == NATIVE_TENSOR_WRAP else None)
+                    if (owner is None or storage != "view"
+                            or not isinstance(wrapping, tuple) or len(wrapping) != 5
+                            or book.latest_ref(NATIVE_TENSOR_WRAP, (scope, tensor_id)) != alias_proof
+                            or wrapping[1].row != (scope, int(alias_of))
+                            or wrapping[3].row != (scope, tensor_id)
+                            or data_value_id != owner.data_value_id
+                            or existing.data_value_id not in {tensor_id, owner.data_value_id}
+                            or existing.alias_of not in {None, alias_of}
+                            or existing.heap_owner_value_id is not None
+                            or book.latest_ref(TENSOR_OWNED_HEAP_BINDING,
+                                               (scope, function.name, tensor_id)) is not None
+                            or existing.arena_id not in {None, tensor_id, owner.arena_id}
+                            or existing.allocation_owner not in {
+                                None, tensor_id, owner.allocation_owner,
+                            }
+                            or any(
+                                emitted.op == "Alloca" and emitted.res is not None
+                                and int(emitted.res.id) == existing.data_value_id
+                                for emitted_block in function.blocks.values()
+                                for emitted in emitted_block.instrs
+                            )
+                            or existing.dtype != owner.dtype):
+                        raise ValueError("native wrapper alias conflicts with incumbent storage")
+                    existing = dataclasses.replace(
+                        existing, data_value_id=owner.data_value_id,
+                        storage="view", alias_of=owner.tensor_id,
+                        arena_id=owner.arena_id, allocation_owner=owner.allocation_owner,
+                        owns_allocation=False, element_offset=owner.element_offset,
+                        byte_offset=owner.byte_offset,
+                    )
+                    tensor_table.tensors[tensor_id] = existing
                 # _ascending_order's Neg17 was registered before Add16's
                 # metadata arrived. A later shape-preserving request supplied
                 # all three exact source16 extents, but this incumbent return
@@ -6032,219 +7279,10 @@ def lower_tensor_calls_to_repository_ssa(
             result: SSAValue, count: SSAValue, element_dtype: str,
             prefix: list[Instr],
         ) -> SSAValue:
-            """Bind one logical dynamic result to native heap storage."""
-            from .ssa_heap_allocation import heap_allocate
-            from .concordance_declarations import (
-                TENSOR_OWNED_HEAP_BINDING,
-                TENSOR_HEAP_OWNER_CALL_BINDING,
-                TENSOR_SSA_LOWERING as _HEAP_TENSOR_STAGE,
+            return _own_dynamic_tensor_output(
+                module, function, book, tensor_table, fresh, register_tensor,
+                result, count, element_dtype, prefix,
             )
-            from .identity_concordance import Derived, Mode
-            from .ssa_record_return_state import (
-                function_scope_of,
-                ssa_value_identity_cell,
-            )
-            incumbent = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, (
-                function_scope_of(function), function.name, int(result.id),
-            ))
-            if incumbent is not None:
-                carrier_id, owner_id, count_id, dtype = book.page(
-                    TENSOR_OWNED_HEAP_BINDING,
-                ).cell(incumbent.row, incumbent.column)
-                allocations = tuple(
-                    instruction for block in function.blocks.values()
-                    for instruction in (*block.instrs, *prefix)
-                    if instruction.res is not None and int(instruction.res.id) == carrier_id
-                )
-                descriptor = tensor_table.by_id(int(result.id))
-                if (count_id != int(count.id) or dtype != str(element_dtype)
-                        or len(allocations) != 1 or allocations[0].op != "Alloca"
-                        or allocations[0].attributes.get("allocation_kind") != "owned_heap"
-                        or tuple(int(value.id) for value in allocations[0].args) != (count_id, owner_id)
-                        or descriptor is None or descriptor.data_value_id != carrier_id
-                        or descriptor.heap_owner_value_id != owner_id):
-                    raise ValueError("owned dynamic tensor disagrees with its incumbent allocation")
-                # Checked scalar arithmetic stays raw SSA and is visited on
-                # whole-program retries. Its one heap identity is already
-                # booked; revisiting the operation must not allocate it again.
-                return allocations[0].res
-            owner = fresh(
-                dtype="ptr", shape=(1,), physical={
-                    "physical_dtype": "ptr", "storage": "span",
-                    "rank": 1,
-                },
-            )
-            owner.accounting = {
-                **dict(owner.accounting or {}),
-                "heap_owner": True,
-            }
-            function.args.append(owner)
-            from .precompile_to_ssa import _mint_ssa_id
-            from .concordance_declarations import (
-                TENSOR_LOWERING_VALUE,
-            )
-            region_calls = tuple(
-                (caller, region_call)
-                for caller in module.functions.values()
-                for region_block in caller.blocks.values()
-                for region_call in region_block.instrs
-                if region_call.op == "Call"
-                and region_call.attributes.get("callee")
-                == function.name
-                and region_call.res is not None
-            )
-            if not region_calls:
-                raise ValueError(
-                    "owned dynamic tensor has no exact caller"
-                )
-            owner_call_rows = []
-            for caller, region_call in region_calls:
-                call_cell = ssa_value_identity_cell(
-                    caller, int(region_call.res.id), book=book,
-                )
-                tensor_cell = ssa_value_identity_cell(
-                    function, int(result.id), book=book,
-                )
-                formal_cell = ssa_value_identity_cell(
-                    function, int(owner.id), book=book,
-                )
-                if any(cell is None for cell in (
-                    call_cell, tensor_cell, formal_cell,
-                )):
-                    raise ValueError(
-                        "owned dynamic tensor call lacks exact SSA cells"
-                    )
-                caller_scope = function_scope_of(caller)
-                actual = SSAValue(
-                    _mint_ssa_id(
-                        book, caller_scope,
-                        TENSOR_LOWERING_VALUE,
-                        (call_cell, tensor_cell, formal_cell),
-                        dtype="ptr", shape=(1,),
-                        stage=_HEAP_TENSOR_STAGE,
-                        physical={
-                            "physical_dtype": "ptr",
-                            "storage": "span", "rank": 1,
-                        },
-                    ),
-                    dtype="ptr", shape=(1,),
-                    accounting={
-                        "physical_dtype": "ptr",
-                        "heap_owner": True,
-                        "compiler_frame_storage": caller.name,
-                    },
-                )
-                caller.args.append(actual)
-                region_call.args.append(actual)
-                # weighted_native_probe's private reduction output adds an
-                # owner after the region cut. Keep its exact feed slot with
-                # the Call actual; computed metadata later inserts ahead of
-                # that slot. Otherwise an int32 extent is read as the ptr
-                # owner and late feed settlement retypes the owner.
-                for key, appended in (
-                    ("feed_ids", int(actual.id)),
-                    ("feed_shapes", tuple(actual.shape or ())),
-                    ("feed_dtypes", str(actual.dtype)),
-                ):
-                    prior = tuple(region_call.attributes.get(key, ()))
-                    if len(prior) != len(region_call.args) - 1:
-                        raise ValueError(
-                            "owned tensor has no complete exact region feed"
-                        )
-                    region_call.attributes[key] = (*prior, appended)
-                input_ids = region_call.attributes.get(
-                    "callee_input_ids"
-                )
-                if input_ids is None:
-                    # The planned region's original Call has
-                    # positional formals but no explicit id
-                    # list. The appended owner makes the
-                    # existing positions an exact published
-                    # binding; every formal is named here.
-                    input_ids = tuple(
-                        int(formal.id)
-                        for formal in function.args[:-1]
-                    )
-                region_call.attributes[
-                    "callee_input_ids"
-                ] = (*tuple(map(int, input_ids)),
-                     int(owner.id))
-                actual_cell = ssa_value_identity_cell(
-                    caller, int(actual.id), book=book,
-                )
-                if actual_cell is None:
-                    raise ValueError(
-                        "owned dynamic tensor caller has no owner cell"
-                    )
-                owner_call_rows.append((
-                    (caller_scope, caller.name,
-                     int(region_call.res.id), function.name,
-                     int(result.id)),
-                    (int(result.id), int(actual.id),
-                     int(owner.id)),
-                    (call_cell, tensor_cell,
-                     actual_cell, formal_cell),
-                ))
-            carrier = fresh(dtype="ptr", physical={
-                "physical_dtype": "ptr", "storage": "scalar",
-                "rank": 0,
-            })
-            allocation = heap_allocate(
-                count, owner, carrier,
-                element_dtype=element_dtype,
-            )
-            descriptor = register_tensor(
-                result, storage="temporary",
-            )
-            tensor_table.tensors[int(result.id)] = (
-                dataclasses.replace(
-                    descriptor,
-                    data_value_id=int(carrier.id),
-                    heap_owner_value_id=int(owner.id),
-                    dtype=str(element_dtype),
-                )
-            )
-            page_sources = tuple(
-                cell for cell in (
-                    ssa_value_identity_cell(
-                        function, int(value.id), book=book,
-                    )
-                    for value in (
-                        result, carrier, owner, count,
-                    )
-                ) if cell is not None
-            )
-            if len(page_sources) != 4:
-                raise ValueError(
-                    "owned dynamic tensor lacks exact SSA cells"
-                )
-            book.post(
-                TENSOR_OWNED_HEAP_BINDING,
-                (function_scope_of(function), function.name,
-                 int(result.id)),
-                (int(carrier.id), int(owner.id),
-                 int(count.id), str(element_dtype)),
-                stage=_HEAP_TENSOR_STAGE,
-                provenance=Derived(page_sources),
-                mode=Mode.CONCORD,
-            )
-            producer_cell = book.latest_ref(
-                TENSOR_OWNED_HEAP_BINDING,
-                (function_scope_of(function), function.name,
-                 int(result.id)),
-            )
-            for row, fact, causes in owner_call_rows:
-                book.post(
-                    TENSOR_HEAP_OWNER_CALL_BINDING,
-                    row, fact,
-                    stage=_HEAP_TENSOR_STAGE,
-                    provenance=Derived((
-                        *causes, producer_cell,
-                    )),
-                    mode=Mode.CONCORD,
-                )
-            prefix.append(allocation)
-            return carrier
 
         def has_private_region_result(result: SSAValue) -> bool:
             """Whether each exact region output is consumed before caller Ret.
@@ -6324,6 +7362,7 @@ def lower_tensor_calls_to_repository_ssa(
         # lowers ``extent`` its own way; nothing here is float- or
         # backend-specific.
         dynamic_extents: dict[int, dict[str, SSAValue]] = {}
+
 
         def ensure_dynamic(
             prefix: list[Instr], tensor: SSAValue
@@ -6541,6 +7580,10 @@ def lower_tensor_calls_to_repository_ssa(
                             data_value_id=owner.data_value_id,
                             metadata_state=owner.metadata_state,
                             extent_ids_from=owner,
+                            alias_proof=book.latest_ref(
+                                NATIVE_TENSOR_WRAP,
+                                (function_scope_of(function), int(result.id)),
+                            ),
                         )
                         aliases[int(result.id)] = raw
                         continue
@@ -6904,8 +7947,10 @@ def lower_tensor_calls_to_repository_ssa(
                     from .concordance_declarations import (
                         CALLSITE_RETURN_MEMBER, CANONICAL_VALUE,
                         GUARDED_CALL_ACTUAL_RANGE, PROCESS_GRAPH_OPERANDS,
-                        SSA_VALUE, TENSOR_OUTPUT_CAPACITY_BOUND,
-                        TensorOutputCapacityBound, TENSOR_SSA_LOWERING,
+                        SSA_VALUE, SOURCE_TENSOR_SHAPE_DIMENSION,
+                        TENSOR_OUTPUT_CAPACITY_BOUND, TENSOR_RUNTIME_TOPK_SELECTION,
+                        TensorOutputCapacityBound, TensorRuntimeTopkSelection,
+                        TENSOR_SSA_LOWERING,
                     )
                     from .concorded_literals import (
                         MISSING as MISSING_LITERAL, literal_from_identity,
@@ -6981,6 +8026,7 @@ def lower_tensor_calls_to_repository_ssa(
                     selected_count = None
                     selected_axis = None
                     dynamic_guard = None
+                    runtime_dimension_proof = None
                     if (static_shape and all(member_shapes)
                             and (k_literal is None or dim_literal is None)):
                         raise ValueError(
@@ -7042,6 +8088,101 @@ def lower_tensor_calls_to_repository_ssa(
                             ))
                             rewritten.append(instruction)
                             continue
+                    elif not static_shape and member_shapes == ((), ()):
+                        # _ascending_order reads k from weights.shape[0]. Its
+                        # source dimension receipt proves nonnegative k, while
+                        # the current input descriptor supplies the axis at
+                        # runtime. An empty display shape proves no capacity.
+                        from .ssa_record_return_state import posted_ssa_value_fact
+                        source_fact = posted_ssa_value_fact(
+                            function, int(source.id), book=book,
+                        )
+                        if (source_fact is None or source_fact.storage != "span"
+                                or not isinstance(source_fact.rank, int)
+                                or source_fact.rank <= 0
+                                or not isinstance(dim_literal, int)
+                                or not -source_fact.rank <= dim_literal < source_fact.rank):
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "runtime named topk lacks exact input rank or literal axis",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                        selected_axis = dim_literal % source_fact.rank
+                        k_cell = ssa_value_identity_cell(
+                            function, int(by_role["kw:k"].id), book=book,
+                        )
+                        k_origins = {
+                            cause.row
+                            for cause, _ in book.edges_into(k_cell)
+                            if cause.page == CANONICAL_VALUE
+                        } if k_cell is not None else set()
+                        matching_dimensions = tuple(
+                            cell for row in book.page(
+                                SOURCE_TENSOR_SHAPE_DIMENSION
+                            ).rows()
+                            if (cell := book.latest_ref(
+                                SOURCE_TENSOR_SHAPE_DIMENSION, row
+                            )) is not None
+                            and row in k_origins
+                            and tuple(book.page(
+                                SOURCE_TENSOR_SHAPE_DIMENSION
+                            ).cell(cell.row, cell.column))[3] >= 0
+                        )
+                        if len(set(matching_dimensions)) == 1:
+                            runtime_dimension_proof = matching_dimensions[0]
+                        if runtime_dimension_proof is None:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "runtime named topk k lacks exact nonnegative source dimension",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                    if runtime_dimension_proof is not None:
+                        input_descriptor = tensor_table.by_id(int(source.id))
+                        has_metadata = (
+                            input_descriptor is not None
+                            and input_descriptor.metadata_state == "dynamic"
+                            and all(value_id is not None for value_id in (
+                                input_descriptor.shape_value_id,
+                                input_descriptor.rank_value_id,
+                                input_descriptor.element_count_value_id,
+                            ))
+                        )
+                        if not has_metadata:
+                            from .concordance_declarations import (
+                                BindingKind, CONTROL_VALUE_BINDING, ControlBinding,
+                            )
+                            binding_ref = book.latest_ref(
+                                CONTROL_VALUE_BINDING,
+                                (function_scope_of(function), int(source.id)),
+                            )
+                            binding = (None if binding_ref is None else
+                                       book.page(CONTROL_VALUE_BINDING).cell(
+                                           binding_ref.row, binding_ref.column))
+                            declared_input = (
+                                int(source.id) in function_argument_ids
+                                and isinstance(binding, ControlBinding)
+                                and binding.kind in {
+                                    BindingKind.PARAMETER_SEED,
+                                    BindingKind.FIELD_INCUMBENT,
+                                }
+                                and binding.ssa_value.row == (
+                                    function_scope_of(function), int(source.id),
+                                )
+                            )
+                            if declared_input and (
+                                input_descriptor is None
+                                or input_descriptor.metadata_state == "unresolved"
+                            ):
+                                register_tensor(source, storage="input")
+                            else:
+                                shortfalls.append(TensorSSALoweringShortfall(
+                                    function_name, block_name, operation,
+                                    "runtime named topk awaits exact transported input metadata",
+                                ))
+                                rewritten.append(instruction)
+                                continue
                     prefix = []
                     dynamic = ensure_dynamic(prefix, source)
                     def prove_native_actual(actual, formal, *, storage, rank, extra_sources=()):
@@ -7087,7 +8228,7 @@ def lower_tensor_calls_to_repository_ssa(
                         return converted
                     native_k = by_role["kw:k"]
                     native_dim = by_role["kw:dim"]
-                    if selected_axis is not None:
+                    if selected_axis is not None and static_shape:
                         # Keep the selected count as ordinary SSA, so the
                         # native actual computes the same bounded count that
                         # the two booked output leaves state. The bound and
@@ -7106,11 +8247,170 @@ def lower_tensor_calls_to_repository_ssa(
                                 selected_axis, str(native_dim.dtype),
                             )
                             prefix.append(dim_definition)
+                    runtime_selection = None
+                    if runtime_dimension_proof is not None:
+                        from .ssa_call_input_adapters import _numeric_conversion_attributes
+                        scalar32 = {"physical_dtype": "int32", "storage": "scalar", "rank": 0}
+                        scalar64 = {"physical_dtype": "int64", "storage": "scalar", "rank": 0}
+                        axis_index, axis_index_def = constant(
+                            selected_axis, "int64", physical=scalar64,
+                        )
+                        axis_address = fresh(dtype="ptr")
+                        axis_extent = fresh(dtype="int32", physical=scalar32)
+                        axis_extent64 = fresh(dtype="int64", physical=scalar64)
+                        bounded_k = fresh(dtype="int64", physical=scalar64)
+                        selected32 = fresh(dtype="int32", physical=scalar32)
+                        prefix.extend((
+                            axis_index_def,
+                            Instr(Handler.GetElementPtr.value,
+                                  [dynamic["shape"], axis_index], axis_address),
+                            Instr(Handler.Load.value, [axis_address], axis_extent),
+                            Instr(Handler.Cast.value, [axis_extent], axis_extent64,
+                                  attributes={**_numeric_conversion_attributes(
+                                      "int32", "int64"),
+                                      "source_dtype": "int32", "target_dtype": "int64"}),
+                            Instr("Min", [native_k, axis_extent64], bounded_k,
+                                  attributes={"source_operator": "topk"}),
+                            Instr(Handler.Cast.value, [bounded_k], selected32,
+                                  attributes={**_numeric_conversion_attributes(
+                                      "int64", "int32"),
+                                      "source_dtype": "int64", "target_dtype": "int32"}),
+                        ))
+                        native_k = selected32
+                        native_dim, native_dim_def = constant(
+                            selected_axis, "int32", physical=scalar32,
+                        )
+                        prefix.append(native_dim_def)
+                        runtime_selection = (
+                            axis_extent, bounded_k, selected32,
+                        )
                     actuals = [
                         source, dynamic["shape"], dynamic["rank"],
                         i32_actual(native_dim),
                         i32_actual(native_k),
                     ]
+                    if runtime_selection is not None:
+                        input_rank = int(source_fact.rank)
+                        shape_value, shape_definition = int_vector(
+                            (0,) * input_rank, physical={
+                                "physical_dtype": "int32", "storage": "span", "rank": 1,
+                            },
+                        )
+                        prefix.append(shape_definition)
+                        other_extents = []
+                        for axis in range(input_rank):
+                            index, index_def = constant(axis, "int64", physical=scalar64)
+                            input_address = fresh(dtype="ptr")
+                            output_address = fresh(dtype="ptr")
+                            prefix.extend((
+                                index_def,
+                                Instr(Handler.GetElementPtr.value,
+                                      [shape_value, index], output_address),
+                            ))
+                            if axis == selected_axis:
+                                extent_value = runtime_selection[2]
+                            else:
+                                prefix.append(Instr(
+                                    Handler.GetElementPtr.value,
+                                    [dynamic["shape"], index], input_address,
+                                ))
+                                extent_value = fresh(dtype="int32", physical=scalar32)
+                                prefix.append(Instr(
+                                    Handler.Load.value, [input_address], extent_value,
+                                ))
+                                other_extents.append(extent_value)
+                            prefix.append(Instr(
+                                Handler.Store.value,
+                                [extent_value, output_address], None,
+                            ))
+                        rank_value, rank_definition = constant(
+                            input_rank, "int32", physical=scalar32,
+                        )
+                        prefix.append(rank_definition)
+                        element_count = runtime_selection[2]
+                        if other_extents:
+                            # Same checked count program as runtime broadcast:
+                            # seed zero when any axis is empty, then narrow
+                            # after each wide product. A later zero axis must
+                            # not spuriously overflow an earlier product.
+                            dimensions = (runtime_selection[2], *other_extents)
+                            zero32, zero_def = constant(0, "int32", physical=scalar32)
+                            one32, one_def = constant(1, "int32", physical=scalar32)
+                            prefix.extend((zero_def, one_def))
+                            empty = None
+                            for dimension in dimensions:
+                                is_zero = fresh(dtype="bool", physical={
+                                    "physical_dtype": "bool", "storage": "scalar", "rank": 0,
+                                })
+                                prefix.append(Instr("Eq", [dimension, zero32], is_zero))
+                                if empty is None:
+                                    empty = is_zero
+                                else:
+                                    either = fresh(dtype="bool", physical={
+                                        "physical_dtype": "bool", "storage": "scalar", "rank": 0,
+                                    })
+                                    prefix.append(Instr("LOr", [empty, is_zero], either))
+                                    empty = either
+                            element_count = fresh(dtype="int32", physical=scalar32)
+                            prefix.append(Instr(
+                                "Select", [empty, zero32, one32], element_count,
+                            ))
+                            for dimension in dimensions:
+                                widened_count = fresh(dtype="int64", physical=scalar64)
+                                widened_dimension = fresh(dtype="int64", physical=scalar64)
+                                product = fresh(dtype="int64", physical=scalar64)
+                                narrowed = fresh(dtype="int32", physical=scalar32)
+                                prefix.extend((
+                                    Instr("Cast", [element_count], widened_count,
+                                          attributes={"source_dtype": "int32",
+                                                      "target_dtype": "int64"}),
+                                    Instr("Cast", [dimension], widened_dimension,
+                                          attributes={"source_dtype": "int32",
+                                                      "target_dtype": "int64"}),
+                                    Instr("Mul", [widened_count, widened_dimension], product),
+                                    Instr("Cast", [product], narrowed, attributes={
+                                        **_numeric_conversion_attributes(
+                                            "int64", "int32"),
+                                        "source_dtype": "int64", "target_dtype": "int32",
+                                    }),
+                                ))
+                                element_count = narrowed
+                        for name, member_id in zip(named_outputs, outputs, strict=True):
+                            output_formal = book.latest_ref(
+                                SSA_VALUE,
+                                (function_scope_of(kernel), int(named_outputs[name])),
+                            )
+                            if output_formal is None or str(book.page(SSA_VALUE).cell(
+                                output_formal.row, output_formal.column,
+                            ).dtype) != "int64":
+                                raise ValueError("runtime topk output has no int64 formal")
+                            tensor_table.register(SSATensorDescriptor(
+                                tensor_id=member_id, data_value_id=member_id,
+                                dtype="int64", shape=(), strides=(),
+                                storage="temporary", metadata_state="dynamic",
+                                shape_value_id=int(shape_value.id),
+                                rank_value_id=int(rank_value.id),
+                                element_count_value_id=int(element_count.id),
+                                arena_id=member_id, allocation_owner=member_id,
+                                owns_allocation=True, byte_size=None,
+                            ))
+                            member_fact_cell = ssa_value_identity_cell(
+                                function, member_id, book=book,
+                            )
+                            member_fact = book.page(SSA_VALUE).cell(
+                                member_fact_cell.row, member_fact_cell.column,
+                            )
+                            member_value = SSAValue(
+                                member_id, dtype=member_fact.dtype, shape=(),
+                                accounting={
+                                    "physical_dtype": member_fact.physical_dtype,
+                                    "program_abi_storage": "span",
+                                    "program_abi_rank": input_rank,
+                                },
+                            )
+                            own_dynamic_tensor(
+                                member_value, element_count, "int64", prefix,
+                            )
                     if dynamic_guard:
                         # The guarded source interval proves k nonnegative;
                         # the same Min result supplies both the native k and
@@ -7215,6 +8515,53 @@ def lower_tensor_calls_to_repository_ssa(
                                     *dynamic_guard,
                                 )))), mode=Mode.CONCORD,
                             )
+                    if runtime_selection is not None:
+                        from .identity_concordance import Derived, Mode
+                        scope = function_scope_of(function)
+                        def exact(value):
+                            cell = ssa_value_identity_cell(
+                                function, int(value.id), book=book,
+                            )
+                            if cell is None:
+                                raise ValueError("runtime topk selection lost an SSA cell")
+                            return cell
+                        for member_id in outputs:
+                            output_cell = ssa_value_identity_cell(
+                                function, member_id, book=book,
+                            )
+                            if output_cell is None:
+                                raise ValueError("runtime topk leaf has no SSA cell")
+                            selection = TensorRuntimeTopkSelection(
+                                exact(source), exact(dynamic["shape"]),
+                                exact(dynamic["rank"]),
+                                exact(dynamic["element_count"]),
+                                exact(by_role["kw:k"]),
+                                exact(runtime_selection[0]),
+                                exact(runtime_selection[1]), output_cell,
+                                exact(shape_value), exact(rank_value),
+                                exact(element_count), layout_proof[0],
+                                runtime_dimension_proof, selected_axis,
+                            )
+                            book.post(
+                                TENSOR_RUNTIME_TOPK_SELECTION,
+                                (scope, function.name, member_id), selection,
+                                stage=TENSOR_SSA_LOWERING,
+                                provenance=Derived(tuple(dict.fromkeys((
+                                    selection.input_cell,
+                                    selection.input_shape_cell,
+                                    selection.input_rank_cell,
+                                    selection.input_count_cell,
+                                    selection.selection_input_cell,
+                                    selection.axis_extent_cell,
+                                    selection.selection_cell,
+                                    selection.output_cell,
+                                    selection.shape_cell,
+                                    selection.rank_cell,
+                                    selection.count_cell,
+                                    selection.layout_cell,
+                                    selection.nonnegative_cell,
+                                )))), mode=Mode.CONCORD,
+                            )
                     attributes = {
                         key: value for key, value in instruction.attributes.items()
                         if key not in {"tensor_candidate", "tensor_operation", "tensor"}
@@ -7267,7 +8614,7 @@ def lower_tensor_calls_to_repository_ssa(
                             reference, operation, function, kernel, source,
                             layout_proof[0], member, slot, book=book,
                         )
-                        if not dynamic_guard:
+                        if not dynamic_guard and runtime_selection is None:
                             # The selected literal k/axis proved these extents
                             # above. Publish the output owner here, before a
                             # later region receives the leaf as a formal.
@@ -13044,6 +14391,182 @@ def lower_tensor_calls_to_repository_ssa(
     settle_repository_ssa_static_extent_operands(module)
     legalize_aggregate_output_views(module)
     return tuple(shortfalls)
+
+
+def complete_tensor_call_closure(
+    module: IRModule,
+    reference: SSATensorCodeReference,
+    *,
+    finalize_private_owners: bool = False,
+    initial_all: bool = False,
+) -> tuple[TensorSSALoweringShortfall, ...]:
+    """Settle the incumbent affected Call closure before reporting shortfalls.
+
+    A computed region can first register unresolved tensor geometry, then
+    publish its shape/rank/count through a later Call metadata edge. Revisit
+    only functions whose exact descriptor identities changed and their live
+    callers. This is the same closure used by whole-program late lowering;
+    local precompile must finish it before shortfalls become terminal.
+    """
+
+    from .ssa_record_return_state import posted_ssa_value_fact
+    from .authored_broadcast_reference import (
+        retained_authored_broadcast_reference,
+    )
+
+    reference = retained_authored_broadcast_reference(reference, module)
+    module.metadata["tensor_ssa_reference"] = reference
+    propagate_repository_ssa_call_metadata(module)
+
+    def raw_binary_span_ready(function: Function, instruction: Instr) -> bool:
+        operation = _SHAPED_SSA_OPERATIONS.get(str(instruction.op))
+        signature = None if operation is None else c_tensor_opcode(operation)
+        if signature is None or signature[0] != "binary":
+            return False
+        return any(
+            (fact := posted_ssa_value_fact(
+                function, int(argument.id), book=identity_book(module),
+            )) is not None
+            and fact.physical_dtype is not None
+            and fact.storage == "span"
+            and fact.rank is not None and fact.rank > 0
+            for argument in instruction.args
+        )
+
+    affected = {
+        str(name)
+        for name, function in module.functions.items()
+        if any(
+            instruction.attributes.get("recovered_structural_input_view")
+            or str(instruction.op) in {"Indexed", "IndexedStore"}
+            or any(instruction.attributes.get(key) is not None
+                   for key in ("tensor_operation", "tensor", "tensor_candidate"))
+            or raw_binary_span_ready(function, instruction)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+    }
+
+    def close_callers(names: set[str]) -> set[str]:
+        result = set(names)
+        changed = True
+        while changed:
+            changed = False
+            for caller_name, caller in module.functions.items():
+                if str(caller_name) in result:
+                    continue
+                if any(
+                    str(instruction.attributes.get("callee") or "") in result
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if str(instruction.op).casefold() == "call"
+                ):
+                    result.add(str(caller_name))
+                    changed = True
+        return result
+
+    affected = close_callers(affected)
+
+    def value_geometry() -> dict[tuple[str, int], tuple | None]:
+        geometry = {}
+        for name in sorted(affected):
+            if name not in module.functions:
+                continue
+            function = module.functions[name]
+            table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+            value_ids = {
+                int(formal.id) for formal in function.args
+                if not (formal.accounting or {}).get("heap_owner")
+                and (formal.accounting or {}).get("tensor_extent_for") is None
+            }
+            if table is not None:
+                value_ids.update(
+                    int(identity) for identity, descriptor in table.tensors.items()
+                    if descriptor.metadata_state == "dynamic"
+                )
+            for identity in sorted(value_ids):
+                descriptor = None if table is None else table.by_id(identity)
+                geometry[(name, identity)] = (
+                    None if descriptor is None else (
+                        descriptor.metadata_state, descriptor.shape,
+                        descriptor.shape_value_id, descriptor.rank_value_id,
+                        descriptor.element_count_value_id,
+                    )
+                )
+        return geometry
+
+    # Local precompile originally linked every function on its first pass.
+    # Keep that coverage; only changed geometry and its exact callers are
+    # revisited after the initial pass. Whole-program late work starts with
+    # the already selected tensor slice.
+    pending = set(module.functions) if initial_all else set(affected)
+    shortfalls_by_function: dict[str, list[TensorSSALoweringShortfall]] = {}
+    first_pass = True
+    while first_pass or pending:
+        first_pass = False
+        prior_geometry = value_geometry()
+        slice_module = IRModule(
+            {name: function for name, function in module.functions.items()
+             if name in pending},
+            call_table=module.call_table,
+            metadata={
+                "identity_book": identity_book(module),
+                "tensor_ssa_reference": reference,
+            },
+            tensor_tables={
+                name: module.tensor_tables[name]
+                for name in pending
+                if name in (getattr(module, "tensor_tables", {}) or {})
+            },
+        )
+        current = lower_tensor_calls_to_repository_ssa(
+            slice_module, reference, finalize_private_owners=False,
+        )
+        # Program: a mixed broadcast in one narrowed Call slice imports an
+        # authored helper with its accepted owner book.  The next slice used
+        # the original reference and compiled a second helper under the same
+        # function name; the live function and imported formal cells then had
+        # different artifact digests.  The slice's recorded augmentation is
+        # the one reference for every subsequent slice and the parent module.
+        reference = retained_authored_broadcast_reference(
+            reference, slice_module,
+        )
+        module.metadata["tensor_ssa_reference"] = reference
+        for name in pending:
+            shortfalls_by_function.pop(name, None)
+        for item in current:
+            shortfalls_by_function.setdefault(item.function, []).append(item)
+        for name, function in slice_module.functions.items():
+            resident = module.functions.get(name)
+            if (
+                resident is not None and resident is not function
+                and (
+                    resident.metadata.get("accepted_ssa_component")
+                    or function.metadata.get("accepted_ssa_component")
+                )
+            ):
+                raise ValueError(
+                    f"accepted repository SSA function has two owners: {name}"
+                )
+            module.functions.setdefault(name, function)
+        for name, table in slice_module.tensor_tables.items():
+            module.tensor_tables.setdefault(name, table)
+        publish_computed_region_result_metadata(
+            module, finalize_private_owners=False,
+        )
+        propagate_repository_ssa_call_metadata(module)
+        settle_repository_ssa_static_extent_operands(module)
+        changed_names = {
+            name for (name, value_id), geometry in value_geometry().items()
+            if geometry != prior_geometry.get((name, value_id))
+        }
+        pending = close_callers(changed_names) & affected
+    if finalize_private_owners:
+        publish_computed_region_result_metadata(module)
+    return tuple(
+        item for name in sorted(shortfalls_by_function)
+        for item in shortfalls_by_function[name]
+    )
 
 
 __all__ = [

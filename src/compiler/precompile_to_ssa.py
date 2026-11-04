@@ -25247,6 +25247,7 @@ def _post_ssa_block_geometry(book, scope, function):
         CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
         SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
         TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
+        TENSOR_METADATA_RESULT_BINDING,
     )
     from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
     result = {}
@@ -25300,6 +25301,26 @@ def _post_ssa_block_geometry(book, scope, function):
         if book.latest_ref(FUNCTION_OUTPUT, row) is not None
     )
     for label, block in function.blocks.items():
+        result_metadata_cells = tuple(
+            book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
+            for row in book.page(TENSOR_METADATA_RESULT_BINDING).scope_rows(scope)
+            if any(
+                instruction.op in {"Call", "call"}
+                and instruction.res is not None
+                and int(instruction.res.id) == int(row[1])
+                and instruction.attributes.get("callee") == row[2]
+                for instruction in block.instrs
+            ) or any(
+                instruction.op in {"Ret", "ret", "Return", "return"}
+                and int(row[3]) in {int(value.id) for value in instruction.args}
+                and set(map(int, book.page(
+                    TENSOR_METADATA_RESULT_BINDING
+                ).latest(row)[2])).issubset({
+                    int(value.id) for value in instruction.args
+                })
+                for instruction in block.instrs
+            )
+        )
         # Program: root arange -> cast -> sum. The owner release is a
         # resultless Call inserted before Ret after the prior entry geometry
         # was posted. Its SSA operands were already cited by that earlier
@@ -25348,6 +25369,7 @@ def _post_ssa_block_geometry(book, scope, function):
             *rebound.get(str(label), ()),
             *materialized.get(str(label), ()),
             *metadata_bindings.get(str(label), ()),
+            *result_metadata_cells,
             # A computed input's exact Call binding can replace this callee's
             # local extent queries with metadata formals. Their value IDs
             # remain live, so SSA_VALUE alone cannot explain the changed
@@ -34057,8 +34079,8 @@ def lower_control_sections_to_ssa(
     tensor_reference_shortfalls = ()
     if tensor_ssa_reference is not None:
         from .tensor_ssa_lowering import (
+            complete_tensor_call_closure,
             legalize_aggregate_adapters,
-            lower_tensor_calls_to_repository_ssa,
             propagate_repository_ssa_call_metadata,
         )
 
@@ -34072,8 +34094,9 @@ def lower_control_sections_to_ssa(
                 f"{item.function}:{item.block}",
                 item.reason,
             )
-            for item in lower_tensor_calls_to_repository_ssa(
+            for item in complete_tensor_call_closure(
                 module, tensor_ssa_reference, finalize_private_owners=False,
+                initial_all=True,
             )
         )
         report(
@@ -34419,8 +34442,8 @@ def lower_precompile_and_control_to_ssa(
     tensor_reference_shortfalls = ()
     if tensor_ssa_reference is not None:
         from .tensor_ssa_lowering import (
+            complete_tensor_call_closure,
             legalize_aggregate_adapters,
-            lower_tensor_calls_to_repository_ssa,
             propagate_repository_ssa_call_metadata,
         )
 
@@ -34431,8 +34454,9 @@ def lower_precompile_and_control_to_ssa(
                 f"{item.function}:{item.block}",
                 item.reason,
             )
-            for item in lower_tensor_calls_to_repository_ssa(
+            for item in complete_tensor_call_closure(
                 module, tensor_ssa_reference, finalize_private_owners=False,
+                initial_all=True,
             )
         )
     from .ir_indexing import lower_indexing_to_ssa_addressing

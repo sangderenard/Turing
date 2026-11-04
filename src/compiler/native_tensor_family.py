@@ -235,7 +235,7 @@ def wrap_family(function, receiver, raw, *, book):
 
 def family_findings(module):
     """Audit exact native member/formal and wrapper edges, including stale slots."""
-    from .identity_concordance import Finding
+    from .identity_concordance import Finding, Ref
     book = (getattr(module, "metadata", {}) or {}).get("identity_book")
     if book is None:
         return []
@@ -262,8 +262,25 @@ def family_findings(module):
                                  "raw backend family lost its source, exact member or output formal"))
     for row in book.page(NATIVE_TENSOR_WRAP).rows():
         cell = book.latest_ref(NATIVE_TENSOR_WRAP, row)
-        family, raw, receiver, result, receiver_proof = book.page(cell.page).cell(cell.row, cell.column)
-        family_fact = book.page(family.page).cell(family.row, family.column)
+        wrapping = book.page(cell.page).cell(cell.row, cell.column)
+        if (not isinstance(wrapping, tuple) or len(wrapping) != 5
+                or not all(isinstance(value, Ref) for value in wrapping)
+                or wrapping[0].page != NATIVE_TENSOR_RESULT_FAMILY
+                or any(value.page != SSA_VALUE for value in wrapping[1:4])
+                or wrapping[4].page not in {SSA_VALUE, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI}):
+            found.append(Finding("native-tensor-wrap", str(row[0]), row[1],
+                                 "wrapper lacks its typed source identity references"))
+            continue
+        family, raw, receiver, result, receiver_proof = wrapping
+        try:
+            family_fact = book.page(family.page).cell(family.row, family.column)
+        except (KeyError, IndexError, TypeError):
+            family_fact = None
+        if (not isinstance(family_fact, tuple) or len(family_fact) != 8
+                or not isinstance(family_fact[7], Ref)):
+            found.append(Finding("native-tensor-wrap", str(row[0]), row[1],
+                                 "wrapper lacks its exact result family receiver"))
+            continue
         sources = {source for source, _stage in book.edges_into(cell)}
         receiver_valid = family_fact[7].row == receiver.row and receiver_proof == receiver
         if receiver_proof.page == SOURCE_VALUE_CLASS:
@@ -281,4 +298,28 @@ def family_findings(module):
                 or not {family, raw, receiver, result, receiver_proof} <= sources):
             found.append(Finding("native-tensor-wrap", str(row[0]), row[1],
                                  "wrapper no longer names its exact raw value and receiver"))
+        # The Huffman wrapper's Ret was correctly rewritten to raw19, but
+        # cached descriptor20 still claimed separately owned data20. The
+        # aggregate legalizer reads that descriptor, so the source wrapping
+        # proof must agree with its exact region output storage as well.
+        for name, function in module.functions.items():
+            region = (function.metadata or {}).get("source_region_integral") or {}
+            if (function_scope_of(function) != row[0]
+                    or row[1] not in tuple(map(int, region.get("output_value_ids", ())))
+                    or int(raw.row[-1]) not in {int(value.id) for value in function.args}):
+                continue
+            table = module.tensor_tables.get(name)
+            owner = None if table is None else table.by_id(int(raw.row[-1]))
+            wrapped = None if table is None else table.by_id(int(row[1]))
+            if (owner is None or wrapped is None
+                    or wrapped.storage != "view"
+                    or wrapped.data_value_id != owner.data_value_id
+                    or wrapped.alias_of != owner.tensor_id
+                    or wrapped.owns_allocation
+                    or wrapped.arena_id != owner.arena_id
+                    or wrapped.allocation_owner != owner.allocation_owner):
+                found.append(Finding(
+                    "native-tensor-wrap-storage", str(name), int(row[1]),
+                    "native wrapping receipt disagrees with its descriptor storage alias",
+                ))
     return found

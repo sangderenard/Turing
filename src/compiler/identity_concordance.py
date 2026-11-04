@@ -1539,10 +1539,12 @@ class CorrelationTable:
         found.extend(self._tensor_elementwise_extent_binding_findings(module))
         found.extend(self._tensor_owned_heap_binding_findings(module))
         found.extend(self._tensor_heap_owner_call_binding_findings(module))
+        found.extend(self._tensor_source_owned_return_findings(module))
         found.extend(self._tensor_heap_consumer_nonescape_findings(module))
         found.extend(self._tensor_heap_release_binding_findings(module))
         found.extend(self._tensor_metadata_call_binding_findings(module))
         found.extend(self._tensor_output_capacity_bound_findings(module))
+        found.extend(self._tensor_runtime_topk_selection_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -5166,6 +5168,328 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _tensor_runtime_topk_selection_findings(module: Any) -> list[Finding]:
+        """A runtime named leaf uses the checked selection and owned count."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_TENSOR_SHAPE_DIMENSION, SSA_VALUE,
+            TENSOR_OWNED_HEAP_BINDING, TENSOR_RUNTIME_TOPK_SELECTION,
+            TensorRuntimeTopkSelection,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_TOPK_SELECTION)
+        found: list[Finding] = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_RUNTIME_TOPK_SELECTION, row)
+            fact = page.cell(ref.row, ref.column)
+            valid = isinstance(fact, TensorRuntimeTopkSelection)
+            if valid:
+                required = (
+                    fact.input_cell, fact.input_shape_cell,
+                    fact.input_rank_cell, fact.input_count_cell,
+                    fact.selection_input_cell, fact.axis_extent_cell,
+                    fact.selection_cell, fact.output_cell,
+                    fact.shape_cell, fact.rank_cell, fact.count_cell,
+                    fact.layout_cell, fact.nonnegative_cell,
+                )
+                causes = {source for source, _ in book.edges_into(ref)}
+                valid = (
+                    set(required) <= causes
+                    and row[1] in module.functions
+                    and function_scope_of(module.functions[row[1]]) == row[0]
+                    and all(cell.page == SSA_VALUE
+                            and cell.row[0] == row[0]
+                            for cell in required[:11])
+                    and fact.output_cell.row[-1] == row[2]
+                    and fact.layout_cell.page.name == "source_aggregate_layout"
+                    and fact.nonnegative_cell.page == SOURCE_TENSOR_SHAPE_DIMENSION
+                    and isinstance(fact.axis, int) and fact.axis >= 0
+                )
+            if valid:
+                k_causes = {
+                    _canonical_identity_base(book, source)
+                    for source, _ in book.edges_into(fact.selection_input_cell)
+                    if source.page == CANONICAL_VALUE
+                }
+                dimension_origin = book.latest_ref(
+                    CANONICAL_VALUE, fact.nonnegative_cell.row,
+                )
+                input_fact = book.page(SSA_VALUE).cell(
+                    fact.input_cell.row, fact.input_cell.column,
+                )
+                descriptor = (getattr(module, "tensor_tables", {}) or {}).get(row[1])
+                descriptor = None if descriptor is None else descriptor.tensors.get(row[2])
+                input_descriptor = (getattr(module, "tensor_tables", {}) or {}).get(row[1])
+                input_descriptor = (None if input_descriptor is None else
+                                    input_descriptor.tensors.get(
+                                        fact.input_cell.row[-1]))
+                owned = book.latest_ref(
+                    TENSOR_OWNED_HEAP_BINDING, row,
+                )
+                owner_fact = (
+                    book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                        owned.row, owned.column)
+                    if owned is not None else None
+                )
+                valid = (
+                    dimension_origin is not None
+                    and _canonical_identity_base(book, dimension_origin) in k_causes
+                    and input_fact.storage == "span"
+                    and isinstance(input_fact.rank, int)
+                    and 0 <= fact.axis < input_fact.rank
+                    and input_descriptor is not None
+                    and input_descriptor.metadata_state == "dynamic"
+                    and input_descriptor.shape_value_id
+                        == fact.input_shape_cell.row[-1]
+                    and input_descriptor.rank_value_id
+                        == fact.input_rank_cell.row[-1]
+                    and input_descriptor.element_count_value_id
+                        == fact.input_count_cell.row[-1]
+                    and descriptor is not None
+                    and descriptor.metadata_state == "dynamic"
+                    and descriptor.shape_value_id == fact.shape_cell.row[-1]
+                    and descriptor.rank_value_id == fact.rank_cell.row[-1]
+                    and descriptor.element_count_value_id == fact.count_cell.row[-1]
+                    and owned is not None
+                    and isinstance(owner_fact, tuple)
+                    and len(owner_fact) == 4
+                    and owner_fact[2] == fact.count_cell.row[-1]
+                    and descriptor.data_value_id == owner_fact[0]
+                    and descriptor.heap_owner_value_id == owner_fact[1]
+                )
+                if valid:
+                    scalar32_ids = (
+                        fact.axis_extent_cell, fact.rank_cell,
+                        fact.count_cell,
+                    )
+                    scalar64_ids = (
+                        fact.selection_input_cell, fact.selection_cell,
+                    )
+                    shape_ids = (fact.input_shape_cell, fact.shape_cell)
+                    latest_output = book.latest_ref(
+                        SSA_VALUE, fact.output_cell.row,
+                    )
+                    pending_output = [latest_output]
+                    seen_output = set()
+                    while pending_output:
+                        current = pending_output.pop()
+                        if current is None or current in seen_output:
+                            continue
+                        seen_output.add(current)
+                        pending_output.extend(
+                            source for source, _ in book.edges_into(current)
+                            if source.page == SSA_VALUE
+                            and source.row == fact.output_cell.row
+                        )
+                    physical = lambda cell: book.page(SSA_VALUE).cell(
+                        cell.row, cell.column,
+                    )
+                    valid = (
+                        all((value := physical(cell)).physical_dtype == "int32"
+                            and value.storage == "scalar" and value.rank == 0
+                            for cell in scalar32_ids)
+                        and all((value := physical(cell)).physical_dtype == "int64"
+                                and value.storage == "scalar" and value.rank == 0
+                                for cell in scalar64_ids)
+                        and all((value := physical(cell)).physical_dtype == "int32"
+                                and value.storage == "span" and value.rank == 1
+                                for cell in shape_ids)
+                        and fact.output_cell in seen_output
+                        and (output_value := physical(latest_output)).physical_dtype
+                            == owner_fact[3]
+                        and output_value.storage == "span"
+                        and output_value.rank == input_fact.rank
+                    )
+            if valid:
+                function = module.functions.get(row[1])
+                instructions = tuple(
+                    instruction for block in function.blocks.values()
+                    for instruction in block.instrs
+                ) if function is not None else ()
+                by_result = {}
+                for instruction in instructions:
+                    if instruction.res is not None:
+                        by_result.setdefault(int(instruction.res.id), []).append(instruction)
+                def one(value_id, op):
+                    matches = by_result.get(int(value_id), ())
+                    return matches[0] if len(matches) == 1 and matches[0].op == op else None
+                axis_load = one(fact.axis_extent_cell.row[-1], "Load")
+                selected = one(fact.selection_cell.row[-1], "Min")
+                shape_seed = one(fact.shape_cell.row[-1], "Const")
+                rank_seed = one(fact.rank_cell.row[-1], "Const")
+                selected_cast = tuple(
+                    instruction for instruction in instructions
+                    if instruction.op == "Cast" and instruction.res is not None
+                    and tuple(arg.id for arg in instruction.args)
+                    == (fact.selection_cell.row[-1],)
+                    and instruction.attributes.get("target_dtype") == "int32"
+                    and instruction.attributes.get("overflow") == "trap"
+                )
+                valid = (
+                    axis_load is not None and selected is not None
+                    and shape_seed is not None and rank_seed is not None
+                    and shape_seed.attributes.get("values")
+                        == tuple(0 for _ in range(input_fact.rank))
+                    and rank_seed.attributes.get("constant") == input_fact.rank
+                    and len(selected_cast) == 1
+                    and selected.attributes.get("source_operator") == "topk"
+                    and len(selected.args) == 2
+                    and selected.args[0].id == fact.selection_input_cell.row[-1]
+                    and one(selected.args[1].id, "Cast") is not None
+                    and one(selected.args[1].id, "Cast").args[0].id
+                        == fact.axis_extent_cell.row[-1]
+                )
+                if valid:
+                    def const_int(value_id):
+                        definition = one(value_id, "Const")
+                        value = None if definition is None else definition.attributes.get("constant")
+                        return value if type(value) is int else None
+                    def gep(base_id, axis):
+                        return tuple(
+                            instruction for instruction in instructions
+                            if instruction.op == "GetElementPtr"
+                            and instruction.res is not None
+                            and len(instruction.args) == 2
+                            and instruction.args[0].id == base_id
+                            and const_int(instruction.args[1].id) == axis
+                        )
+                    input_gep = gep(fact.input_shape_cell.row[-1], fact.axis)
+                    native_calls = tuple(
+                        instruction for instruction in instructions
+                        if instruction.op == "Call"
+                        and instruction.attributes.get("callee") == "topk_int64_dim"
+                        and row[2] in tuple(map(int,
+                            instruction.attributes.get("output_ids", ())))
+                    )
+                    valid = (
+                        len(input_gep) == len(native_calls) == 1
+                        and axis_load.args[0].id == input_gep[0].res.id
+                        and len(native_calls[0].args) == 5
+                        and tuple(value.id for value in native_calls[0].args[:3])
+                            == (fact.input_cell.row[-1],
+                                fact.input_shape_cell.row[-1],
+                                fact.input_rank_cell.row[-1])
+                        and native_calls[0].args[4].id
+                            == selected_cast[0].res.id
+                        and const_int(native_calls[0].args[3].id) == fact.axis
+                    )
+                if valid:
+                    selected32 = selected_cast[0].res.id
+                    other_extents = []
+                    for axis in range(input_fact.rank):
+                        destinations = gep(fact.shape_cell.row[-1], axis)
+                        stores = tuple(
+                            instruction for instruction in instructions
+                            if instruction.op == "Store" and len(instruction.args) == 2
+                            and len(destinations) == 1
+                            and instruction.args[1].id == destinations[0].res.id
+                        )
+                        if len(stores) != 1:
+                            valid = False
+                            break
+                        if axis == fact.axis:
+                            valid = stores[0].args[0].id == selected32
+                        else:
+                            copied = one(stores[0].args[0].id, "Load")
+                            source_addresses = gep(fact.input_shape_cell.row[-1], axis)
+                            valid = (
+                                copied is not None
+                                and len(source_addresses) == 1
+                                and copied.args[0].id == source_addresses[0].res.id
+                            )
+                            if valid:
+                                other_extents.append(copied.res.id)
+                        if not valid:
+                            break
+                    count_id = selected32
+                    if valid and other_extents:
+                        dimensions = (selected32, *other_extents)
+                        zero_tests = tuple(
+                            next((instruction for instruction in instructions
+                                  if instruction.op == "Eq" and instruction.res is not None
+                                  and len(instruction.args) == 2
+                                  and instruction.args[0].id == dimension
+                                  and const_int(instruction.args[1].id) == 0), None)
+                            for dimension in dimensions
+                        )
+                        valid = all(test is not None for test in zero_tests)
+                        empty_id = zero_tests[0].res.id if valid else None
+                        if valid:
+                            for test in zero_tests[1:]:
+                                disjunctions = tuple(
+                                    instruction for instruction in instructions
+                                    if instruction.op == "LOr" and instruction.res is not None
+                                    and tuple(arg.id for arg in instruction.args)
+                                        == (empty_id, test.res.id)
+                                )
+                                if len(disjunctions) != 1:
+                                    valid = False
+                                    break
+                                empty_id = disjunctions[0].res.id
+                        if valid:
+                            seeds = tuple(
+                                instruction for instruction in instructions
+                                if instruction.op == "Select" and instruction.res is not None
+                                and len(instruction.args) == 3
+                                and instruction.args[0].id == empty_id
+                                and const_int(instruction.args[1].id) == 0
+                                and const_int(instruction.args[2].id) == 1
+                            )
+                            valid = len(seeds) == 1
+                            if valid:
+                                count_id = seeds[0].res.id
+                        if valid:
+                            for dimension in dimensions:
+                                wide_count = tuple(
+                                    instruction for instruction in instructions
+                                    if instruction.op == "Cast" and instruction.res is not None
+                                    and tuple(arg.id for arg in instruction.args) == (count_id,)
+                                    and instruction.attributes.get("target_dtype") == "int64"
+                                )
+                                wide_dimension = tuple(
+                                    instruction for instruction in instructions
+                                    if instruction.op == "Cast" and instruction.res is not None
+                                    and tuple(arg.id for arg in instruction.args) == (dimension,)
+                                    and instruction.attributes.get("target_dtype") == "int64"
+                                )
+                                if len(wide_count) != 1 or len(wide_dimension) != 1:
+                                    valid = False
+                                    break
+                                products = tuple(
+                                    instruction for instruction in instructions
+                                    if instruction.op == "Mul" and instruction.res is not None
+                                    and tuple(arg.id for arg in instruction.args)
+                                        == (wide_count[0].res.id,
+                                            wide_dimension[0].res.id)
+                                )
+                                if len(products) != 1:
+                                    valid = False
+                                    break
+                                narrow = tuple(
+                                    instruction for instruction in instructions
+                                    if instruction.op == "Cast" and instruction.res is not None
+                                    and tuple(arg.id for arg in instruction.args)
+                                        == (products[0].res.id,)
+                                    and instruction.attributes.get("target_dtype") == "int32"
+                                    and instruction.attributes.get("overflow") == "trap"
+                                )
+                                if len(narrow) != 1:
+                                    valid = False
+                                    break
+                                count_id = narrow[0].res.id
+                    valid = valid and count_id == fact.count_cell.row[-1]
+            if not valid:
+                found.append(Finding(
+                    "tensor-runtime-topk-selection-disagreement",
+                    str(row[1]), int(row[2]),
+                    "runtime topk lacks exact source dimension, checked Min, "
+                    "dynamic output geometry, owner, or direct causes",
+                ))
+        return found
+
+    @staticmethod
     def _tensor_metadata_call_binding_findings(module: Any) -> list[Finding]:
         """An input binding names one live Call by its SSA result identity."""
 
@@ -5174,7 +5498,9 @@ class CorrelationTable:
             TENSOR_METADATA_CALL_BINDING,
             TENSOR_METADATA_RESULT_BINDING, TENSOR_SHAPE_CONCORDANCE,
         )
-        from .ssa_record_return_state import function_scope_of
+        from .ssa_record_return_state import (
+            function_scope_of, metadata_result_caller_value,
+        )
 
         book = identity_book(module)
         page = book.page(TENSOR_METADATA_CALL_BINDING)
@@ -5341,20 +5667,33 @@ class CorrelationTable:
                         instruction.args, callee.args, strict=True,
                     ))
                     for result_row in result_page.rows():
-                        if (result_row[0] != row[0]
-                                or result_row[3] not in {
-                                    int(actual.id) for actual, _ in source_pairs
-                                }):
+                        if result_row[0] != row[0]:
                             continue
                         predecessor = book.latest_ref(
                             TENSOR_METADATA_RESULT_BINDING, result_row,
                         )
+                        producers = tuple(
+                            producer for producer_block in caller.blocks.values()
+                            for producer in producer_block.instrs
+                            if producer.op == "Call" and producer.res is not None
+                            and int(producer.res.id) == result_row[1]
+                            and producer.attributes.get("callee") == result_row[2]
+                        )
+                        if len(producers) != 1:
+                            continue
+                        data_projection = metadata_result_caller_value(
+                            module, caller, producers[0], predecessor, book=book,
+                        )
+                        if (data_projection is None or data_projection[0] not in {
+                                int(actual.id) for actual, _ in source_pairs
+                        }):
+                            continue
                         result_fact = result_page.cell(
                             predecessor.row, predecessor.column,
                         )
                         data_matches = tuple(
                             formal for actual, formal in source_pairs
-                            if int(actual.id) == result_row[3]
+                            if int(actual.id) == data_projection[0]
                         )
                         projected = (
                             tuple(result_fact[2])
@@ -5509,6 +5848,7 @@ class CorrelationTable:
             SSA_VALUE, TENSOR_HEAP_OWNER_CALL_BINDING,
             TENSOR_HEAP_RELEASE_BINDING,
             TENSOR_OWNED_HEAP_BINDING,
+            TENSOR_SOURCE_OWNED_RETURN,
         )
         from .ssa_record_return_state import function_scope_of
 
@@ -5586,10 +5926,22 @@ class CorrelationTable:
                 release = book.latest_ref(TENSOR_HEAP_RELEASE_BINDING, (
                     row[0], row[1], fact[1],
                 ))
+                forwarded = tuple(
+                    book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, candidate)
+                    for candidate in book.page(TENSOR_SOURCE_OWNED_RETURN).rows()
+                    if candidate[3] == row[1]
+                    and int(candidate[4]) == int(row[4])
+                    and int(book.page(TENSOR_SOURCE_OWNED_RETURN).latest(
+                        candidate)[1]) == fact[1]
+                )
                 valid = (
-                    release is not None
-                    and cell in {source for source, _stage
-                                 in book.edges_into(release)}
+                    (release is not None
+                     and cell in {source for source, _stage
+                                  in book.edges_into(release)})
+                    or (release is None and bool(forwarded)
+                        and all(cell in {source for source, _stage
+                                         in book.edges_into(ref)}
+                                for ref in forwarded))
                 )
             if not valid:
                 found.append(Finding(
@@ -5599,12 +5951,368 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _tensor_source_owned_return_findings(module: Any) -> list[Finding]:
+        """An authored source return forwards one allocated arena and owner."""
+
+        from .concordance_declarations import (
+            CALL_RECORD, SSA_VALUE, TENSOR_HEAP_OWNER_CALL_BINDING,
+            TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_OWNED_HEAP_BINDING,
+            TENSOR_SOURCE_OWNED_RETURN,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+
+        book = identity_book(module)
+        page = book.page(TENSOR_SOURCE_OWNED_RETURN)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, row)
+            fact = None if cell is None else page.cell(cell.row, cell.column)
+            caller = module.functions.get(str(row[1])) if len(row) == 5 else None
+            source = module.functions.get(str(row[3])) if len(row) == 5 else None
+            valid = (
+                cell is not None and len(row) == 5
+                and caller is not None and source is not None
+                and row[0] == function_scope_of(caller)
+                and type(row[2]) is int and type(row[4]) is int
+                and isinstance(fact, tuple) and len(fact) == 7
+                and all(type(value_id) is int for value_id in fact[:6])
+                and isinstance(fact[6], str)
+            )
+            if valid:
+                calls = tuple(
+                    instruction for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == row[2]
+                    and instruction.attributes.get("callee") == source.name
+                    and instruction.attributes.get("source_linked")
+                )
+                returns = tuple(
+                    instruction for block in source.blocks.values()
+                    for instruction in block.instrs if instruction.op == "Ret"
+                )
+                record_ref = (book.latest_ref(
+                    CALL_RECORD, (module.call_table.owner, caller.name),
+                ) if getattr(module, "call_table", None) is not None else None)
+                valid = len(calls) == len(returns) == 1 and record_ref is not None
+            if valid:
+                call = calls[0]
+                record_items = book.page(CALL_RECORD).cell(
+                    record_ref.row, record_ref.column,
+                )
+                records = tuple(
+                    record for record in record_items
+                    if record.callee_symbol == source.name
+                    and record.callsite_id == call.attributes.get("plan_callsite_id")
+                    and (row[4], fact[4]) in record.result_bindings
+                )
+                outer_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, (
+                    row[0], row[2], source.name, row[4],
+                ))
+                # This page is itself the source carrier transport proof.
+                # Do not ask metadata_result_caller_value to consume it while
+                # auditing it: the outer CALL_RECORD and live output ports
+                # establish the semantic projection independently.
+                output_pairs = tuple(zip(
+                    call.attributes.get("callee_output_ids", ()),
+                    call.attributes.get("output_ids", ()),
+                ))
+                projected = tuple(
+                    callee_id for callee_id, caller_id in output_pairs
+                    if int(caller_id) == fact[4]
+                    and int(callee_id) in (row[4], fact[0])
+                )
+                source_table = (getattr(module, "tensor_tables", {}) or {}).get(
+                    source.name)
+                caller_table = (getattr(module, "tensor_tables", {}) or {}).get(
+                    caller.name)
+                source_descriptor = (None if source_table is None else
+                                     source_table.by_id(row[4]))
+                caller_descriptor = (None if caller_table is None else
+                                     caller_table.by_id(fact[4]))
+                valid = (
+                    len(records) == 1 and outer_ref is not None
+                    and len(projected) == 1
+                    and len(call.attributes.get("callee_output_ids", ()))
+                        == len(call.attributes.get("output_ids", ()))
+                    and int(row[4]) in {int(value.id) for value in returns[0].args}
+                    and source_descriptor is not None
+                    and caller_descriptor is not None
+                    and source_descriptor.metadata_state == "dynamic"
+                    and caller_descriptor.metadata_state == "dynamic"
+                    and (source_descriptor.data_value_id,
+                         source_descriptor.heap_owner_value_id,
+                         source_descriptor.element_count_value_id,
+                         str(source_descriptor.dtype)) == (
+                            fact[0], fact[1], fact[5], fact[6],
+                         )
+                    and (caller_descriptor.data_value_id,
+                         caller_descriptor.heap_owner_value_id,
+                         str(caller_descriptor.dtype)) == (
+                            fact[2], fact[3], fact[6],
+                         )
+                )
+            if valid:
+                owner_rows = tuple(
+                    candidate for candidate in book.page(
+                        TENSOR_HEAP_OWNER_CALL_BINDING).rows()
+                    if candidate[0:2] == (function_scope_of(source), source.name)
+                    and candidate[4] == row[4]
+                    and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(
+                        candidate)[1] == fact[1]
+                )
+                valid = len(owner_rows) == 1
+            if valid:
+                owner_ref = book.latest_ref(
+                    TENSOR_HEAP_OWNER_CALL_BINDING, owner_rows[0],
+                )
+                producer = module.functions.get(str(owner_rows[0][3]))
+                region_calls = tuple(
+                    instruction for source_block in source.blocks.values()
+                    for instruction in source_block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == owner_rows[0][2]
+                    and instruction.attributes.get("callee") == owner_rows[0][3]
+                )
+                owned_ref = (None if producer is None else book.latest_ref(
+                    TENSOR_OWNED_HEAP_BINDING, (
+                        function_scope_of(producer), producer.name, row[4],
+                    ),
+                ))
+                owned = (None if owned_ref is None else book.page(
+                    TENSOR_OWNED_HEAP_BINDING).cell(
+                        owned_ref.row, owned_ref.column,
+                    ))
+                owned_fields_valid = (
+                    isinstance(owned, tuple) and len(owned) == 4
+                    and all(type(value) is int for value in owned[:3])
+                    and isinstance(owned[3], str)
+                )
+                origin_allocas = (() if not owned_fields_valid else tuple(
+                    instruction for block in producer.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Alloca" and instruction.res is not None
+                    and int(instruction.res.id) == int(owned[0])
+                ))
+                origin_physical = (None if not owned_fields_valid else
+                                   posted_ssa_value_fact(
+                                       producer, int(owned[0]), book=book,
+                                   ))
+                origin_ref = (None if not owned_fields_valid else
+                              ssa_value_identity_cell(
+                                  producer, int(owned[0]), book=book,
+                              ))
+                origin_causes = (() if owned_ref is None else tuple(
+                    parent for parent, _stage in book.edges_into(owned_ref)
+                    if parent.page == SSA_VALUE
+                ))
+                source_result_ref = book.latest_ref(
+                    TENSOR_METADATA_RESULT_BINDING, (
+                        function_scope_of(source), owner_rows[0][2],
+                        owner_rows[0][3], row[4],
+                    ),
+                )
+                owner_bindings = tuple(zip(
+                    call.attributes.get("callee_input_ids", ()), call.args,
+                ))
+                source_result_fact = (None if source_result_ref is None else
+                                      book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                                          source_result_ref.row,
+                                          source_result_ref.column,
+                                      ))
+                owner_actuals = tuple(
+                    actual for formal, actual in owner_bindings
+                    if int(formal) == fact[1] and int(actual.id) == fact[3]
+                )
+                valid = (
+                    owned_ref is not None and source_result_ref is not None
+                    and len(region_calls) == 1
+                    and owned_fields_valid
+                    and len(origin_allocas) == 1
+                    and origin_allocas[0].res.dtype == "ptr"
+                    and origin_physical is not None
+                    and (origin_physical.physical_dtype,
+                         origin_physical.storage,
+                         origin_physical.rank) == ("ptr", "scalar", 0)
+                    and origin_ref is not None
+                    and origin_ref in origin_causes
+                    and owned[1] == book.page(
+                        TENSOR_HEAP_OWNER_CALL_BINDING).cell(
+                            owner_ref.row, owner_ref.column,
+                        )[2]
+                    and str(owned[3]) == fact[6]
+                    and isinstance(source_result_fact, tuple)
+                    and len(source_result_fact) == 3
+                    and len(source_result_fact[2]) == 3
+                    and int(source_result_fact[2][2]) == fact[5]
+                    and len(owner_bindings) == len(call.args)
+                    and len(owner_actuals) == 1
+                    and any(int(formal.id) == fact[1]
+                            and formal.dtype == "ptr" for formal in source.args)
+                    and any(formal == fact[1] and kind in {
+                        "caller_storage", "caller_value", "caller_alias",
+                    } and actual == fact[3]
+                            for formal, kind, actual in records[0].frame_bindings)
+                )
+            if valid:
+                def loaded_projection(function, call, carrier_id, semantic_id):
+                    carrier = tuple(
+                        instruction for block in function.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op == "Load" and instruction.res is not None
+                        and int(instruction.res.id) == carrier_id
+                        and instruction.attributes.get("source_owned_carrier") is True
+                        and instruction.attributes.get("aggregate_index") == 0
+                        and instruction.attributes.get("source_output_id")
+                            == semantic_id
+                    )
+                    if len(carrier) != 1 or len(carrier[0].args) != 1:
+                        return None
+                    pointer = carrier[0].args[0]
+                    addresses = tuple(
+                        instruction for block in function.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op == "GetElementPtr"
+                        and instruction.res is pointer
+                    )
+                    return (carrier[0] if len(addresses) == 1
+                            and addresses[0].args
+                            and addresses[0].args[0] is call.res else None)
+
+                source_load = loaded_projection(
+                    source, region_calls[0], fact[0], row[4],
+                )
+                caller_load = loaded_projection(
+                    caller, call, fact[2], fact[4],
+                )
+                outer_fact = book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                    outer_ref.row, outer_ref.column,
+                )
+                valid = (
+                    source_load is not None and caller_load is not None
+                    and len(outer_fact) == 3
+                    and len(outer_fact[2]) == 3
+                    and caller_descriptor.element_count_value_id
+                        == int(outer_fact[2][2])
+                    and all(
+                        (physical := posted_ssa_value_fact(
+                            function, value_id, book=book,
+                        )) is not None
+                        and physical.physical_dtype == fact[6]
+                        and physical.storage == "span"
+                        and type(physical.rank) is int and physical.rank > 0
+                        for function, value_id in (
+                            (source, row[4]), (caller, fact[4]),
+                        )
+                    )
+                    and all(
+                        (physical := posted_ssa_value_fact(
+                            function, value_id, book=book,
+                        )) is not None
+                        and physical.physical_dtype == "ptr"
+                        and physical.storage == "scalar"
+                        and physical.rank == 0
+                        for function, value_id in (
+                            (source, fact[0]), (caller, fact[2]),
+                        )
+                    )
+                    and all(
+                        (physical := posted_ssa_value_fact(
+                            function, value_id, book=book,
+                        )) is not None
+                        and physical.physical_dtype == "ptr"
+                        and physical.storage == "span"
+                        and physical.rank == 1
+                        for function, value_id in (
+                            (source, fact[1]), (caller, fact[3]),
+                        )
+                    )
+                    and source_load.res.dtype == "ptr"
+                    and caller_load.res.dtype == "ptr"
+                    and all(
+                        instruction.op != "Alloca" or instruction.res is None
+                        or int(instruction.res.id) not in (fact[0], fact[2])
+                        for function in (source, caller)
+                        for block in function.blocks.values()
+                        for instruction in block.instrs
+                    )
+                )
+            if valid:
+                causes = {parent for parent, _stage in book.edges_into(cell)}
+                required = {
+                    owned_ref, owner_ref, source_result_ref, outer_ref,
+                    record_ref,
+                }
+                for function, identities in (
+                    (source, (row[4], fact[0], fact[1], fact[5],
+                              source_load.args[0].id)),
+                    (caller, (row[2], fact[4], fact[2], fact[3],
+                              caller_load.args[0].id)),
+                ):
+                    required.update(
+                        ssa_value_identity_cell(function, int(value_id), book=book)
+                        for value_id in identities
+                    )
+                # Carrier Loads are posted before scalar dtype settlement
+                # and frame linking revise their SSA_VALUE rows. The page
+                # cites their birth cells. Follow only the same value's
+                # explicit revision ancestry to a direct receipt cause.
+                def cited_same_value(needed):
+                    if needed in causes:
+                        return True
+                    if needed.page != SSA_VALUE:
+                        return False
+                    pending, seen = [needed], set()
+                    while pending:
+                        current = pending.pop()
+                        if current in seen:
+                            continue
+                        seen.add(current)
+                        if current in causes:
+                            return True
+                        pending.extend(
+                            parent for parent, _stage in book.edges_into(current)
+                            if parent.page == SSA_VALUE
+                            and parent.row == needed.row
+                        )
+                    return False
+
+                valid = None not in required and all(
+                    cited_same_value(needed) for needed in required
+                )
+            if valid:
+                release_ref = book.latest_ref(TENSOR_HEAP_RELEASE_BINDING, (
+                    row[0], row[1], fact[3],
+                ))
+                release_fact = (None if release_ref is None else book.page(
+                    TENSOR_HEAP_RELEASE_BINDING).cell(
+                        release_ref.row, release_ref.column,
+                    ))
+                valid = (
+                    release_fact == (row[2], fact[4], "entry")
+                    and cell in {parent for parent, _stage in book.edges_into(
+                        release_ref)}
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-source-owned-return", str(row[1]) if len(row) > 1 else "",
+                    int(row[2]) if len(row) > 2 and type(row[2]) is int else -1,
+                    "source tensor return lacks exact carrier, owner, Call or lifetime proof",
+                ))
+        return found
+
+    @staticmethod
     def _tensor_heap_consumer_nonescape_findings(module: Any) -> list[Finding]:
         """A private tensor consumer must return no view of the borrowed data."""
 
         from .concordance_declarations import (
+            AGGREGATE_PASSTHROUGH_REBINDING, DEAD_STRUCTURAL_RETIREMENT,
             SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
             TENSOR_HEAP_OWNER_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_SOURCE_OWNED_RETURN,
         )
         from .ssa_record_return_state import function_scope_of
 
@@ -5626,12 +6334,28 @@ class CorrelationTable:
                      and function_scope_of(caller) == row[0]
                      and "__planned_region_" in callee.name)
             if valid:
+                def is_exact_retired_call(instruction):
+                    retired = instruction.attributes.get("aggregate_retired_result")
+                    return (
+                        instruction.op == "Call" and instruction.res is None
+                        and instruction.attributes.get("callee") == callee.name
+                        and isinstance(retired, Ref)
+                        and retired.page == DEAD_STRUCTURAL_RETIREMENT
+                        and book.latest_ref(retired.page, retired.row) == retired
+                        and book.page(retired.page).cell(retired.row, retired.column)
+                            == ("Call", "None")
+                        and any(source.page == SSA_VALUE
+                                and source.row == (row[0], int(row[2]))
+                                for source, _stage in book.edges_into(retired))
+                    )
                 calls = tuple(
                     instruction for block in caller.blocks.values()
                     for instruction in block.instrs
-                    if instruction.op == "Call" and instruction.res is not None
-                    and int(instruction.res.id) == int(row[2])
-                    and instruction.attributes.get("callee") == callee.name
+                    if ((instruction.op == "Call"
+                         and instruction.res is not None
+                         and int(instruction.res.id) == int(row[2])
+                         and instruction.attributes.get("callee") == callee.name)
+                        or is_exact_retired_call(instruction))
                 )
                 owner_bindings = tuple(
                     book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, candidate)
@@ -5640,9 +6364,19 @@ class CorrelationTable:
                     and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(
                         candidate)[0:2] == (fact[1], int(row[3]))
                 )
+                source_bindings = tuple(
+                    book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, candidate)
+                    for candidate in book.page(TENSOR_SOURCE_OWNED_RETURN).rows()
+                    if candidate[:2] == row[:2]
+                    and book.page(TENSOR_SOURCE_OWNED_RETURN).latest(
+                        candidate)[3:5] == (int(row[3]), fact[1])
+                ) if len(calls) == 1 else ()
+                owner_bindings = (*owner_bindings, *source_bindings)
                 valid = len(calls) == len(owner_bindings) == 1
             if valid:
                 call = calls[0]
+                retired = (call.attributes.get("aggregate_retired_result")
+                           if call.res is None else None)
                 declared = call.attributes.get("callee_input_ids")
                 valid = (isinstance(declared, (tuple, list))
                          and len(declared) == len(call.args))
@@ -5710,9 +6444,67 @@ class CorrelationTable:
                         None if descriptor.alias_of is None
                         else int(descriptor.alias_of),
                     ))
-                valid = (valid and tuple(layouts) == fact[3]
-                         and all(data not in formals and alias not in formals
-                                 for _logical, data, alias in layouts))
+                borrowed = tuple((logical, data, alias)
+                                 for logical, data, alias in layouts
+                                 if data in formals or alias in formals)
+                valid = valid and tuple(layouts) == fact[3]
+                if valid and borrowed:
+                    retirement_causes = {
+                        source for source, _stage in book.edges_into(retired)
+                    } if isinstance(retired, Ref) else set()
+                    rebindings = tuple(source for source in retirement_causes
+                                       if source.page == AGGREGATE_PASSTHROUGH_REBINDING)
+                    passthroughs = tuple(call.attributes.get(
+                        "aggregate_output_passthrough_bindings", (),
+                    ))
+                    valid = (
+                        len(borrowed) == len(layouts) == len(rebindings)
+                        == len(passthroughs) == 1
+                        and borrowed[0] == (formals[0], formals[0], None)
+                        and len(formals) == 1
+                        and call.attributes.get("result_convention") == "void"
+                        and not tuple(call.attributes.get("output_ids", ()))
+                        and not tuple(call.attributes.get("callee_output_ids", ()))
+                        and isinstance(retired, Ref)
+                        and retired in {source for source, _stage in book.edges_into(cell)}
+                        and rebindings[0] in {source for source, _stage in book.edges_into(cell)}
+                    )
+                    if valid:
+                        rebinding = rebindings[0]
+                        alias_id = int(rebinding.row[1])
+                        valid = (
+                            book.latest_ref(rebinding.page, rebinding.row) == rebinding
+                            and len(retirement_causes) == 2
+                            and rebinding in retirement_causes
+                            and sum(source.page == SSA_VALUE
+                                    and source.row == (row[0], int(row[2]))
+                                    for source in retirement_causes) == 1
+                            and all(any(
+                                source.page == SSA_VALUE
+                                and source.row == (row[0], value_id)
+                                for source, _stage in book.edges_into(rebinding)
+                            ) for value_id in (alias_id, fact[1]))
+                            and book.page(rebinding.page).cell(
+                                rebinding.row, rebinding.column,
+                            ) == (fact[1], callee.name, alias_id)
+                            and len(passthroughs[0]) == 6
+                            and passthroughs[0][:5] == (
+                                0, alias_id, formals[0], fact[1],
+                                "exact_callee_output_formal",
+                            )
+                            and not any(int(value.id) == alias_id
+                                        for block in caller.blocks.values()
+                                        for instruction in block.instrs
+                                        for value in instruction.args)
+                            and not any(int(value.id) in {
+                                fact[1], alias_id, int(row[3]),
+                            } for block in caller.blocks.values()
+                                for instruction in block.instrs
+                                if instruction.op == "Ret"
+                                for value in instruction.args)
+                        )
+                else:
+                    valid = valid and not borrowed
             if valid:
                 causes = {source for source, _stage in book.edges_into(cell)}
                 expected = {
@@ -5747,9 +6539,11 @@ class CorrelationTable:
         """A private owned tensor releases its caller cell after its last use."""
 
         from .concordance_declarations import (
-            SSA_CONTROL_EDGE, SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
+            DEAD_STRUCTURAL_RETIREMENT, SSA_CONTROL_EDGE, SSA_VALUE,
+            TENSOR_HEAP_CONSUMER_NONESCAPE,
             TENSOR_HEAP_OWNER_CALL_BINDING,
             TENSOR_HEAP_RELEASE_BINDING,
+            TENSOR_SOURCE_OWNED_RETURN,
         )
         from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
         from .ssa_record_return_state import (
@@ -5859,11 +6653,24 @@ class CorrelationTable:
                         TENSOR_HEAP_OWNER_CALL_BINDING, candidate),)
                     if ref is not None
                 )
+                source_calls = tuple(
+                    ref for candidate in book.page(
+                        TENSOR_SOURCE_OWNED_RETURN).rows()
+                    if candidate[:3] == (row[0], row[1], fact[0])
+                    and candidate[3] == producer.attributes.get("callee")
+                    and book.page(TENSOR_SOURCE_OWNED_RETURN).latest(
+                        candidate)[3:5] == (int(row[2]), fact[1])
+                    for ref in (book.latest_ref(
+                        TENSOR_SOURCE_OWNED_RETURN, candidate),)
+                    if ref is not None
+                )
+                owner_calls = (*owner_calls, *source_calls)
                 valid = (
                     len(owner_calls) == 1
-                    and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
-                        owner_calls[0].row, owner_calls[0].column,
-                    )[1] == int(row[2])
+                    and (owner_calls[0].page == TENSOR_SOURCE_OWNED_RETURN
+                         or book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
+                             owner_calls[0].row, owner_calls[0].column,
+                         )[1] == int(row[2]))
                     and valid
                     and (producer_block is not block
                          or producer_index < release_index)
@@ -5896,10 +6703,26 @@ class CorrelationTable:
                     and any(int(value.id) == fact[1]
                             for value in instruction.args)
                 )
+                def consumer_result_id(instruction):
+                    if instruction.op != "Call":
+                        return None
+                    if instruction.res is not None:
+                        return int(instruction.res.id)
+                    retired = instruction.attributes.get(
+                        "aggregate_retired_result")
+                    if (not isinstance(retired, Ref)
+                            or retired.page != DEAD_STRUCTURAL_RETIREMENT):
+                        return None
+                    original = tuple(
+                        source for source, _stage in book.edges_into(retired)
+                        if source.page == SSA_VALUE and source.row[0] == row[0]
+                    )
+                    return int(original[0].row[1]) if len(original) == 1 else None
+
                 consumer_refs = tuple(
                     book.latest_ref(TENSOR_HEAP_CONSUMER_NONESCAPE, (
-                        row[0], row[1], int(instruction.res.id), int(row[2]),
-                    )) if instruction.op == "Call" and instruction.res is not None
+                        row[0], row[1], call_id, int(row[2]),
+                    )) if (call_id := consumer_result_id(instruction)) is not None
                     else None
                     for instruction in consumers
                 )
@@ -7180,8 +8003,11 @@ class CorrelationTable:
             TENSOR_METADATA_RESULT_BINDING,
             TENSOR_METADATA_CALL_BINDING,
             TENSOR_OWNED_HEAP_BINDING,
+            CALL_RECORD,
         )
-        from .ssa_record_return_state import function_scope_of
+        from .ssa_record_return_state import (
+            function_scope_of, ssa_value_identity_cell,
+        )
 
         book = identity_book(module)
         found = []
@@ -7210,6 +8036,159 @@ class CorrelationTable:
                                    for instruction in block.instrs)), None)
             callee = module.functions.get(row[2])
             valid = valid and caller is not None and callee is not None
+            if valid:
+                source_calls = tuple(
+                    instruction for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == row[1]
+                    and instruction.attributes.get("callee") == row[2]
+                    and instruction.attributes.get("source_linked")
+                    and instruction.attributes.get(
+                        "computed_source_metadata_outputs")
+                )
+                if source_calls:
+                    call = source_calls[0]
+                    records = tuple(record for record in module.call_table.get(
+                        caller.name, (),
+                    ) if record.callee_symbol == callee.name
+                        and record.callsite_id == call.attributes.get(
+                            "plan_callsite_id"))
+                    record_ref = book.latest_ref(CALL_RECORD, (
+                        module.call_table.owner, caller.name,
+                    ))
+                    callee_ids = tuple(map(int, call.attributes.get(
+                        "callee_output_ids", (),
+                    )))
+                    caller_ids = tuple(map(int, call.attributes.get(
+                        "output_ids", (),
+                    )))
+                    upstream = tuple(
+                        candidate for candidate in page.rows()
+                        if candidate[0] == function_scope_of(callee)
+                        and candidate[3] == row[3]
+                        and page.latest(candidate)[2] == fact[1]
+                    )
+                    causes = {source for source, _ in book.edges_into(ref)}
+                    # The late frame-tail binder revises this caller's
+                    # CALL_RECORD with an owner formal after the result
+                    # metadata was projected. Follow that exact same-row
+                    # record ancestry; the result edge still cites the
+                    # historical record that established its data binding.
+                    record_ancestors = set()
+                    pending_records = [record_ref] if record_ref is not None else []
+                    while pending_records:
+                        current_record = pending_records.pop()
+                        if current_record in record_ancestors:
+                            continue
+                        record_ancestors.add(current_record)
+                        pending_records.extend(
+                            parent for parent, _stage in book.edges_into(
+                                current_record)
+                            if parent.page == CALL_RECORD
+                            and parent.row == record_ref.row
+                        )
+                    result_record_causes = tuple(
+                        source for source in causes
+                        if source.page == CALL_RECORD
+                        and record_ref is not None
+                        and source.row == record_ref.row
+                    )
+                    historical_result_records = tuple(
+                        candidate
+                        for source in result_record_causes
+                        for candidate in book.page(CALL_RECORD).cell(
+                            source.row, source.column,
+                        )
+                        if candidate.callee_symbol == callee.name
+                        and candidate.callsite_id == call.attributes.get(
+                            "plan_callsite_id")
+                        and tuple(candidate.result_bindings) == (
+                            (int(row[3]), int(caller_ids[0])),
+                        )
+                    )
+                    returned = tuple(instruction for block in callee.blocks.values()
+                                     for instruction in block.instrs
+                                     if instruction.op == "Ret")
+                    addresses = {
+                        int(instruction.res.id): instruction
+                        for block in caller.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op == "GetElementPtr"
+                        and instruction.res is not None
+                        and instruction.args
+                        and int(instruction.args[0].id) == row[1]
+                    }
+                    projections = tuple(
+                        instruction for block in caller.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op == "Load" and instruction.res is not None
+                        and instruction.args
+                        and int(instruction.args[0].id) in addresses
+                    )
+                    valid = (
+                        len(source_calls) == 1 and len(records) == 1
+                        and len(caller_ids) == 4 and len(callee_ids) == 4
+                        and record_ref is not None
+                        and len(result_record_causes) == 1
+                        and result_record_causes[0] in record_ancestors
+                        and len(historical_result_records) == 1
+                        and records[0] in book.page(CALL_RECORD).cell(
+                            record_ref.row, record_ref.column)
+                        and len(records[0].result_bindings) == 1
+                        and records[0].result_bindings[0] == (
+                            int(row[3]), int(caller_ids[0]),
+                        )
+                        and len(upstream) == 1
+                        and book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                            upstream[0]) in causes
+                        and len(returned) == 1
+                        and tuple(int(value.id) for value in returned[0].args)
+                            == (int(row[3]), *fact[1])
+                        and callee_ids == (int(row[3]), *fact[1])
+                        and caller_ids == (int(caller_ids[0]), *fact[2])
+                        and len(projections) >= 4
+                        and all(sum(
+                            int(projection.res.id) == int(value_id)
+                            and projection.attributes.get("aggregate_index") == position
+                            and addresses[int(projection.args[0].id)].attributes.get(
+                                "aggregate_index") == position
+                            for projection in projections
+                        ) == 1 for position, value_id in enumerate(caller_ids))
+                    )
+                    if valid:
+                        data = next(projection.res for projection in projections
+                                    if int(projection.res.id) == caller_ids[0])
+                        table = module.tensor_tables.get(callee.name)
+                        descriptor = None if table is None else table.by_id(
+                            int(row[3]))
+                        valid = (
+                            descriptor is not None
+                            and descriptor.metadata_state == "dynamic"
+                            and (descriptor.shape_value_id,
+                                 descriptor.rank_value_id,
+                                 descriptor.element_count_value_id) == fact[1]
+                            and all((data.accounting or {}).get(key) == value_id
+                                    for key, value_id in zip(keys, fact[2], strict=True))
+                            and all(
+                                (cell := ssa_value_identity_cell(
+                                    function, int(value_id), book=book,
+                                )) is not None and cell in causes
+                                for function, value_id in (
+                                    (callee, row[3]), (caller, caller_ids[0]),
+                                    *((callee, value_id) for value_id in fact[1]),
+                                    *((caller, value_id) for value_id in fact[2]),
+                                )
+                            )
+                        )
+                    if not valid:
+                        found.append(Finding(
+                            "tensor-metadata-result-binding-disagreement",
+                            str(row[2]), int(row[3]),
+                            "source tensor return lacks its exact Call record, "
+                            "Ret metadata, or caller output projection",
+                        ))
+                    continue
             # A legal aggregate pass-through removes three metadata Loads.
             # The revised result row names their exact caller input actuals,
             # with the predecessor result and three rebinding receipts as

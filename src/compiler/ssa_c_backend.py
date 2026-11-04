@@ -2469,6 +2469,11 @@ def emit_ssa_module_to_c(
         for fn in reachable
         for binding in owned_tensor_data_bindings(module, fn)
     }
+    owned_tensor_results = {
+        (fn, binding.tensor_id): binding
+        for fn in reachable
+        for binding in owned_tensor_data_bindings(module, fn)
+    }
     # Computed result geometry is ordinary caller SSA. Expose those exact
     # values through the incumbent physical output/watch path; copying their
     # IDs into artifact metadata alone would leave no native-written port.
@@ -3536,6 +3541,34 @@ def emit_ssa_module_to_c(
                 producer = producers_by_id.get(value_id)
                 owned_carrier = owned_tensor_carriers.get((fn, value_id))
                 if owned_carrier is not None:
+                    if owned_carrier.inherited:
+                        # Program: root reads make(count)'s owned arena from
+                        # the aggregate's pointer cell.  This Load is the
+                        # booked data carrier; the source Call already owns
+                        # and allocates the arena.  Treating the Load as an
+                        # unallocated dynamic temporary demanded a second
+                        # activation buffer.  Its inherited return receipt
+                        # proves the one physical carrier and owner.
+                        if (
+                            owned_carrier.tensor_id == int(descriptor.tensor_id)
+                            and descriptor.heap_owner_value_id
+                            == owned_carrier.owner_value_id
+                            and producer is not None
+                            and producer.op == "Load"
+                            and producer.attributes.get("source_owned_carrier")
+                            and producer.res is not None
+                            and int(producer.res.id) == value_id
+                            and str(producer.res.dtype) == "ptr"
+                            and owned_carrier.proof_cells
+                        ):
+                            tensor_storage_cells.update(owned_carrier.proof_cells)
+                            continue
+                        shortfalls.append(CEmissionShortfall(
+                            "temporary",
+                            f"inherited owned tensor %t{value_id} has no exact "
+                            f"loaded pointer carrier in {fn}",
+                        ))
+                        continue
                     # The broadcast temporary has a distinct logical tensor
                     # and data carrier. Its audited owned-heap Alloca creates
                     # the runtime arena; a static activation buffer would
@@ -3555,7 +3588,7 @@ def emit_ssa_module_to_c(
                         and int(producer.args[1].id)
                         == owned_carrier.owner_value_id
                     ):
-                        tensor_storage_cells.add(owned_carrier.cell)
+                        tensor_storage_cells.update(owned_carrier.proof_cells)
                         continue
                 if (
                     producer is not None
@@ -3747,15 +3780,131 @@ def emit_ssa_module_to_c(
                     owned_carrier = owned_tensor_carriers.get(
                         (record.callee, int(output.id))
                     )
+                    from .identity_concordance import identity_book
+                    projection_bindings = tuple(
+                        owned_tensor_results.get((fn, int(projection.value.id)))
+                        for projection in projections
+                    )
+                    inherited_projection = None
+                    inherited_semantic_projection = None
+                    if any(binding is not None for binding in projection_bindings):
+                        # The native named output formal belongs to the
+                        # imported kernel. Its exact aggregate projection is
+                        # the caller's logical tensor; that tensor's audited
+                        # owned binding names the arena the kernel writes.
+                        # Reading the callee formal as the storage key lost
+                        # the two runtime topk arenas and demanded a second
+                        # caller allocation without an element-count origin.
+                        inherited_callers = tuple(
+                            binding for binding in projection_bindings
+                            if binding is not None and binding.inherited
+                        )
+                        if (owned_carrier is not None and owned_carrier.inherited
+                                and len(inherited_callers) == 1
+                                and record.call.res is not None):
+                            # A source Call transfers one arena through a
+                            # pointer output cell. The callee's loaded ptr
+                            # and the caller's later loaded ptr are different
+                            # SSA values; this exact receipt joins them.
+                            from .concordance_declarations import (
+                                TENSOR_SOURCE_OWNED_RETURN,
+                            )
+                            from .ssa_record_return_state import function_scope_of
+
+                            source_owned = owned_carrier
+                            caller_owned = inherited_callers[0]
+                            semantic_projections = tuple(
+                                projection for projection in projections
+                                if int(projection.value.id) == caller_owned.tensor_id
+                            )
+                            carrier_projections = tuple(
+                                projection for projection in projections
+                                if int(projection.value.id) == caller_owned.data_value_id
+                            )
+                            owned_page = identity_book(module).page(
+                                TENSOR_SOURCE_OWNED_RETURN,
+                            )
+                            matches = []
+                            for relation_row in owned_page.rows():
+                                if relation_row[:4] != (
+                                    function_scope_of(function), fn,
+                                    int(record.call.res.id), record.callee,
+                                ):
+                                    continue
+                                relation = owned_page.latest(relation_row)
+                                if (
+                                    int(relation_row[4]) == source_owned.tensor_id
+                                    and tuple(relation) == (
+                                        source_owned.data_value_id,
+                                        source_owned.owner_value_id,
+                                        caller_owned.data_value_id,
+                                        caller_owned.owner_value_id,
+                                        caller_owned.tensor_id,
+                                        source_owned.count_value_id,
+                                        source_owned.element_dtype,
+                                    )
+                                    and caller_owned.element_dtype
+                                        == source_owned.element_dtype
+                                    and len(semantic_projections)
+                                        == len(carrier_projections) == 1
+                                    and semantic_projections[0].position
+                                        == carrier_projections[0].position == 0
+                                    and semantic_projections[0].address
+                                        is carrier_projections[0].address
+                                ):
+                                    matches.append(identity_book(module).latest_ref(
+                                        TENSOR_SOURCE_OWNED_RETURN, relation_row,
+                                    ))
+                            if (len(matches) == 1
+                                    and matches[0] in source_owned.proof_cells
+                                    and matches[0] in caller_owned.proof_cells):
+                                inherited_projection = matches[0]
+                                inherited_semantic_projection = semantic_projections[0]
+                                owned_carrier = caller_owned
+                        if (inherited_projection is None
+                                and (not sparse_output_formal
+                                     or any(binding is None for binding in projection_bindings)
+                                     or len({binding.cell for binding in projection_bindings}) != 1
+                                     or owned_carrier is not None)):
+                            shortfalls.append(CEmissionShortfall(
+                                "Call", f"aggregate output {output.id} in {fn} "
+                                "has conflicting owned projection storage",
+                            ))
+                            continue
+                        if inherited_projection is None:
+                            owned_carrier = projection_bindings[0]
+                        from .ssa_record_return_state import ssa_value_identity_cell
+                        native_cell = ssa_value_identity_cell(
+                            module.functions[record.callee], int(output.id),
+                            book=identity_book(module),
+                        )
+                        native_fact = (None if native_cell is None else
+                                       identity_book(module).page(native_cell.page).cell(
+                                           native_cell.row, native_cell.column))
+                        if (native_fact is None
+                                or native_fact.physical_dtype != (
+                                    "ptr" if inherited_projection is not None
+                                    else owned_carrier.element_dtype
+                                )):
+                            shortfalls.append(CEmissionShortfall(
+                                "Call", f"aggregate output {output.id} in {fn} "
+                                "disagrees with owned projection element type",
+                            ))
+                            continue
+                        tensor_storage_cells.add(native_cell)
                     if owned_carrier is not None:
                         # A computed tensor's owned allocation lives behind
                         # its pointer carrier. The caller allocates one
                         # pointer cell, not an element buffer of logical rank.
                         shape = ()
-                        tensor_storage_cells.add(owned_carrier.cell)
+                        tensor_storage_cells.update(owned_carrier.proof_cells)
                         owned_tensor_projection_sources.extend(
                             (projection.value, owned_carrier)
-                            for projection in projections
+                            for projection in (
+                                (inherited_semantic_projection,)
+                                if inherited_semantic_projection is not None
+                                else projections
+                            )
                         )
                     # Guarded topk returns a runtime logical count, while its
                     # exact output-capacity receipt bounds allocation by the
@@ -3796,7 +3945,26 @@ def emit_ssa_module_to_c(
                             "has no exact caller element-count storage origin",
                         ))
                         continue
-                    if capacity_count is not None and owned_carrier is None:
+                    if projection_bindings and all(
+                        binding is owned_carrier for binding in projection_bindings
+                    ) and owned_carrier is not None:
+                        if inherited_projection is not None:
+                            # The caller carrier Load follows this Call. Its
+                            # value cannot be passed back as the Call's output
+                            # destination before it exists. Allocate the
+                            # single pointer cell that the Call writes.
+                            local_tensor_declarations.append(
+                                f"    void *{local_name} = NULL;"
+                            )
+                            projected_expression = local_name
+                            projected_address = f"&{local_name}"
+                            tensor_storage_cells.add(inherited_projection)
+                        else:
+                            # Alloca emits this arena before the native Call;
+                            # the aggregate projection is that same pointer.
+                            projected_expression = f"t{owned_carrier.data_value_id}"
+                            projected_address = projected_expression
+                    elif capacity_count is not None and owned_carrier is None:
                         storage = activation_array(element_type, capacity_count)
                         projected_expression = storage
                         projected_address = storage
@@ -4520,7 +4688,7 @@ def emit_ssa_module_to_c(
                     else runtime_activation_array(result_type, count)
                 )
             if owned_result is not None:
-                tensor_storage_cells.add(owned_result.cell)
+                tensor_storage_cells.update(owned_result.proof_cells)
             store = (
                 f"(({result_type} *)({destination}))[{index}] = "
                 f"({result_type})({expression});"
@@ -4960,23 +5128,37 @@ def emit_ssa_module_to_c(
                             f"exact native carrier publication in {fn}",
                         ))
                         continue
-                    carrier = next(
-                        (
-                            instruction.res for block in function.blocks.values()
-                            for instruction in block.instrs
-                            if instruction.op == "Alloca"
-                            and instruction.res is not None
-                            and int(instruction.res.id) == binding.data_value_id
-                        ),
-                        None,
-                    )
-                    if carrier is None:
-                        shortfalls.append(CEmissionShortfall(
-                            "Ret", f"owned tensor %{source_value.id} has no "
-                            f"live carrier Alloca in {fn}",
-                        ))
-                        continue
-                    arena = heap_data(carrier)
+                    carrier = values_by_id.get(binding.data_value_id)
+                    producer = producers_by_id.get(binding.data_value_id)
+                    if binding.inherited:
+                        # A source function returns an arena allocated below
+                        # its own frame. Its audited inherited carrier is the
+                        # loaded pointer projection of that exact Call output,
+                        # already a value. Loading it again would read the
+                        # first tensor element as an address.
+                        if (carrier is None or producer is None
+                                or producer.op != "Load"
+                                or str(carrier.dtype) != "ptr"):
+                            shortfalls.append(CEmissionShortfall(
+                                "Ret", f"inherited tensor %{source_value.id} "
+                                f"has no exact loaded pointer carrier in {fn}",
+                            ))
+                            continue
+                        # The aggregate projection retains its pointer CELL
+                        # in the C frame.  ``operand(carrier)`` is that cell's
+                        # address here, not the loaded arena.  Publishing it
+                        # made the caller read pointer-cell bytes as tensor
+                        # elements.  The incumbent heap reader performs the
+                        # one load from the exact inherited output cell.
+                        arena = heap_data(carrier)
+                    else:
+                        if carrier is None or producer is None or producer.op != "Alloca":
+                            shortfalls.append(CEmissionShortfall(
+                                "Ret", f"owned tensor %{source_value.id} has no "
+                                f"live carrier Alloca in {fn}",
+                            ))
+                            continue
+                        arena = heap_data(carrier)
                     if arena is None:
                         continue
                     from .identity_concordance import identity_book
@@ -4998,7 +5180,7 @@ def emit_ssa_module_to_c(
                         ))
                         continue
                     owned_publication_causes.extend(
-                        (binding.cell, *physical_causes)
+                        (*binding.proof_cells, *physical_causes)
                     )
                     publications.append(
                         f"        *((void **)({destination})) = (void *)({arena});"
@@ -6980,7 +7162,7 @@ def emit_ssa_module_to_c(
                                 rendered_args = None
                                 break
                             rendered_args[formal_slot] = f"(*((void **)({cell_address})))"
-                            call_tensor_storage_cells.add(binding.cell)
+                            call_tensor_storage_cells.update(binding.proof_cells)
                             continue
                         # The in-place convention: an actual that IS the
                         # call's own result (or one of this function's own
@@ -7450,7 +7632,7 @@ def emit_ssa_module_to_c(
                                     addresses[result_id] = addresses[
                                         carrier_id
                                     ]
-                                    call_tensor_storage_cells.add(binding.cell)
+                                    call_tensor_storage_cells.update(binding.proof_cells)
                     if call_tensor_storage_cells:
                         span.take(UnitKind.CALL, instruction=instruction,
                                   extra_cells=tuple(call_tensor_storage_cells))

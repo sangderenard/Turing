@@ -142,6 +142,9 @@ def analyze_aggregate_abi(
         name: _function_values(module.functions[name]) for name in selected
     }
     from .ssa_storage_requirements import owned_tensor_data_bindings
+    from .concordance_declarations import TENSOR_SOURCE_OWNED_RETURN
+    from .identity_concordance import identity_book
+    from .ssa_record_return_state import function_scope_of
 
     owned_outputs = {
         name: {
@@ -250,10 +253,56 @@ def analyze_aggregate_abi(
                 output_positions = tuple(range(len(caller_output_ids)))
             if len(callee_output_ids) != len(caller_output_ids):
                 callee_output_ids = caller_output_ids
+            # An ordinary source Call keeps semantic output ids in its Call
+            # and RESULT_BINDING. A source-owned return publishes its arena
+            # through a distinct loaded ptr carrier at aggregate position 0.
+            # The audited page joins those views; canonicalize only the native
+            # output ID read by the aggregate ABI, never the semantic Call.
+            source_owned = identity_book(module).page(
+                TENSOR_SOURCE_OWNED_RETURN,
+            )
+            physical_output_ids = list(callee_output_ids)
+            for index, (position, caller_id, callee_id) in enumerate(zip(
+                output_positions, caller_output_ids, callee_output_ids,
+            )):
+                relation_row = (
+                    function_scope_of(function), caller_name,
+                    int(call.res.id), callee, callee_id,
+                )
+                relation_ref = identity_book(module).latest_ref(
+                    TENSOR_SOURCE_OWNED_RETURN, relation_row,
+                )
+                if relation_ref is None:
+                    continue
+                relation = source_owned.cell(
+                    relation_ref.row, relation_ref.column,
+                )
+                source_binding = owned_outputs.get(callee, {}).get(callee_id)
+                caller_binding = owned_outputs.get(caller_name, {}).get(caller_id)
+                if (
+                    position != 0
+                    or source_binding is None or caller_binding is None
+                    or not source_binding.inherited
+                    or not caller_binding.inherited
+                    or relation_ref not in source_binding.proof_cells
+                    or relation_ref not in caller_binding.proof_cells
+                    or tuple(relation) != (
+                        source_binding.data_value_id,
+                        source_binding.owner_value_id,
+                        caller_binding.data_value_id,
+                        caller_binding.owner_value_id,
+                        caller_id, source_binding.count_value_id,
+                        source_binding.element_dtype,
+                    )
+                ):
+                    raise ValueError(
+                        "source owned aggregate output lacks exact carrier relation"
+                    )
+                physical_output_ids[index] = source_binding.data_value_id
             selected_by_position = {
                 position: (caller_id, callee_id)
                 for position, caller_id, callee_id in zip(
-                    output_positions, caller_output_ids, callee_output_ids
+                    output_positions, caller_output_ids, physical_output_ids
                 )
             }
             # Call records may omit outputs already carried by an in/out
@@ -306,7 +355,7 @@ def analyze_aggregate_abi(
             order = output_order.setdefault(callee, [])
             candidates = output_candidates.setdefault(callee, {})
             callee_values = values.get(callee, {})
-            for output_id in callee_output_ids:
+            for output_id in physical_output_ids:
                 if output_id not in order:
                     order.append(output_id)
                 candidate = callee_values.get(output_id)
@@ -802,12 +851,171 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
         SEQUENCE_DESCRIPTOR, AGGREGATE_ABI_LEGALIZATION,
         TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_RUNTIME_VIEW_GEOMETRY,
         TENSOR_METADATA_RESULT_BINDING, AGGREGATE_PASSTHROUGH_REBINDING,
-        TENSOR_METADATA_CALL_BINDING,
+        TENSOR_METADATA_CALL_BINDING, REGION_SIGNATURE, NATIVE_TENSOR_WRAP,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
-    from .ssa_record_return_state import function_scope_of
+    from .ssa_record_return_state import (
+        function_scope_of, metadata_result_caller_value,
+        ssa_value_identity_cell,
+    )
 
     book = current_identity_book()
+
+    def bind_rebound_region_input(function, source, replacement, rebinding):
+        """Keep a later planned Call's exact formal after a proven view fold.
+
+        _ascending_order's region3 folds view20 to raw19. Region4 already
+        consumed view20 with a complete runtime metadata triple. Its live
+        actual becomes raw19, while its original feed and formal stay 20.
+        The region signature, producer result binding and rebinding jointly
+        prove that same input; the metadata descriptors prove each port.
+        """
+        source_id = int(source.id) if isinstance(source, SSAValue) else int(source)
+        replacement_id = (int(replacement.id) if isinstance(replacement, SSAValue)
+                          else int(replacement))
+        scope = function_scope_of(function)
+        wrapping = book.latest_ref(NATIVE_TENSOR_WRAP,
+                                   (scope, source_id))
+        if wrapping is None:
+            return
+        wrap_fact = book.page(NATIVE_TENSOR_WRAP).cell(
+            wrapping.row, wrapping.column,
+        )
+        if (not isinstance(wrap_fact, tuple) or len(wrap_fact) != 5
+                or wrap_fact[1].row != (scope, replacement_id)):
+            raise ValueError("rebound tensor lacks selected native wrap identity")
+        for block in function.blocks.values():
+            for consumer in block.instrs:
+                if consumer.op != "Call" or consumer.res is None:
+                    continue
+                target = module.functions.get(str(consumer.attributes.get("callee") or ""))
+                region = consumer.attributes.get("region_index")
+                feeds = tuple(consumer.attributes.get("feed_ids", ()))
+                if target is None or type(region) is not int or not feeds:
+                    continue
+                affected = tuple(index for index, feed in enumerate(feeds)
+                                 if int(feed) == source_id)
+                if not affected:
+                    continue
+                signature_ref = book.latest_ref(REGION_SIGNATURE, (scope, region))
+                signature = (None if signature_ref is None else
+                             book.page(REGION_SIGNATURE).cell(
+                                 signature_ref.row, signature_ref.column))
+                target_table = module.tensor_tables.get(target.name)
+                formal_descriptor = (None if target_table is None else
+                                     target_table.by_id(source_id))
+                # Ordinary static tensor and sequence passthroughs keep the
+                # incumbent fold. This extra input receipt belongs only to
+                # an already booked dynamic tensor result and its exact
+                # downstream dynamic formal.
+                if (formal_descriptor is None
+                        or formal_descriptor.metadata_state != "dynamic"):
+                    continue
+                if (len(affected) != 1 or signature is None
+                        or tuple(signature.feeds).count(source_id) != 1
+                        or len(consumer.args) != len(target.args)
+                        or len(consumer.args) != len(feeds)
+                        or int(consumer.args[affected[0]].id) != replacement_id
+                        or int(target.args[affected[0]].id) != source_id
+                        ):
+                    continue
+                fields = ("shape_value_id", "rank_value_id",
+                          "element_count_value_id")
+                formal_ids = tuple(getattr(formal_descriptor, field)
+                                   for field in fields)
+                result_matches = []
+                for result_row in book.page(TENSOR_METADATA_RESULT_BINDING).rows():
+                    if result_row[0] != scope:
+                        continue
+                    result_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                                 result_row)
+                    result_fact = book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                        result_ref.row, result_ref.column)
+                    producers = tuple(
+                        instruction for source_block in function.blocks.values()
+                        for instruction in source_block.instrs
+                        if instruction.op == "Call" and instruction.res is not None
+                        and int(instruction.res.id) == result_row[1]
+                        and instruction.attributes.get("callee") == result_row[2]
+                    )
+                    if len(producers) != 1:
+                        continue
+                    projected = metadata_result_caller_value(
+                        module, function, producers[0], result_ref, book=book,
+                    )
+                    if projected is not None and projected[0] == replacement_id:
+                        result_matches.append((result_ref, projected[1],
+                                               tuple(result_fact[2])))
+                if len(result_matches) != 1:
+                    continue
+                actual_ids = result_matches[0][2]
+                if (len(actual_ids) != 3
+                        or any(type(value_id) is not int for value_id in
+                               (*actual_ids, *formal_ids))
+                        or any(sum(int(actual.id) == actual_id
+                                   and int(formal.id) == formal_id
+                                   for actual, formal in zip(
+                                       consumer.args, target.args, strict=True)) != 1
+                               for actual_id, formal_id in zip(
+                                   actual_ids, formal_ids, strict=True))):
+                    continue
+                rebound = book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
+                                          (scope, source_id))
+                if rebound != rebinding:
+                    raise ValueError("rebound region Call lost its exact alias")
+                proof = tuple(dict.fromkeys((
+                    signature_ref, result_matches[0][0],
+                    *result_matches[0][1], rebinding, wrapping,
+                    ssa_value_identity_cell(function, int(consumer.res.id), book=book),
+                    *(ssa_value_identity_cell(function, actual_id, book=book)
+                      for actual_id in actual_ids),
+                    *(ssa_value_identity_cell(target, formal_id, book=book)
+                      for formal_id in formal_ids),
+                )))
+                if any(cell is None for cell in proof):
+                    raise ValueError("rebound region Call lacks exact SSA cells")
+                row = (scope, function.name, block.name,
+                       int(consumer.res.id), target.name)
+                prior_binding = book.latest_ref(TENSOR_METADATA_CALL_BINDING, row)
+                if prior_binding is None:
+                    book.post(
+                        TENSOR_METADATA_CALL_BINDING, row,
+                        (actual_ids, formal_ids), stage=AGGREGATE_ABI_LEGALIZATION,
+                        provenance=Derived(proof), mode=Mode.CONCORD,
+                    )
+                elif book.page(TENSOR_METADATA_CALL_BINDING).cell(
+                    prior_binding.row, prior_binding.column,
+                ) != (actual_ids, formal_ids):
+                    raise ValueError("rebound region conflicts with booked Call metadata")
+                keys = ("tensor_shape_value_id", "tensor_rank_value_id",
+                        "tensor_element_count_value_id")
+                for occurrence in (
+                    *target.args,
+                    *(value for target_block in target.blocks.values()
+                      for instruction in target_block.instrs
+                      for value in (*instruction.args,
+                                    *((instruction.res,) if instruction.res is not None else ()))
+                      if int(value.id) == source_id),
+                ):
+                    if int(occurrence.id) != source_id:
+                        continue
+                    prior = dict(occurrence.accounting or {})
+                    if any(prior.get(key) not in (None, formal_id)
+                           for key, formal_id in zip(keys, formal_ids, strict=True)):
+                        raise ValueError("rebound region formal metadata disagrees")
+                    occurrence.accounting = {
+                        **prior, "tensor_metadata_state": "dynamic",
+                        **dict(zip(keys, formal_ids, strict=True)),
+                    }
+                prior_declared = consumer.attributes.get("callee_input_ids")
+                exact_formals = tuple(int(value.id) for value in target.args)
+                if (prior_declared is not None
+                        and tuple(map(int, prior_declared)) != exact_formals):
+                    raise ValueError("rebound region Call has conflicting input binding")
+                consumer.attributes["callee_input_ids"] = exact_formals
+                consumer.attributes["feed_ids"] = tuple(
+                    int(value.id) for value in consumer.args
+                )
 
     def project_metadata_passthrough(function, call_id, callee_name, bindings):
         """Carry one computed metadata triple through exact aggregate folds."""
@@ -1318,6 +1526,13 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         via=(callee_name, int(caller_id)),
                         sources=binding_cells,
                     )
+                    bind_rebound_region_input(
+                        function, projection.value, replacement,
+                        book.latest_ref(
+                            AGGREGATE_PASSTHROUGH_REBINDING,
+                            (function_scope_of(function), int(projection.value.id)),
+                        ),
+                    )
                     passthrough_bindings.append((
                         int(output_position), int(caller_id),
                         int(callee_id), int(actual.id),
@@ -1407,6 +1622,24 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         f"attributes={dict(call.attributes)!r}",
                         file=sys.stderr,
                     )
+    # The first fold can precede computed metadata publication. Revisit its
+    # exact native-wrap rebinding when the incumbent aggregate legalizer is
+    # called again on the settled module; the projection is already gone,
+    # while the booked rebinding and authored region signature remain.
+    for function in module.functions.values():
+        scope = function_scope_of(function)
+        for row in tuple(book.page(AGGREGATE_PASSTHROUGH_REBINDING).rows()):
+            if row[0] != scope or book.latest_ref(
+                NATIVE_TENSOR_WRAP, (scope, int(row[1])),
+            ) is None:
+                continue
+            rebinding = book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING, row)
+            fact = book.page(AGGREGATE_PASSTHROUGH_REBINDING).cell(
+                rebinding.row, rebinding.column,
+            )
+            bind_rebound_region_input(
+                function, int(row[1]), int(fact[0]), rebinding,
+            )
     return changed
 
 

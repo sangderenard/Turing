@@ -21,6 +21,32 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — widening source-return ownership before observing the producer
+
+The agent was assigned exact owned tensor transport across an ordinary source
+Call and was told to observe the producer before changing its admission. It
+expanded `has_private_region_result` based on a final dynamic descriptor,
+assuming the cast kernel would consult that predicate during its rewrite.
+The predicate was invoked for the cast but its new cross-source condition did
+not yield an owned carrier. The first trace printed into the fixture's
+redirected stdout, hiding that invocation and prompting an incorrect interim
+report. Two bounded lowerings and the repeated trace cost roughly one minute
+without advancing the source-return ABI. The predicate change was removed and
+the interim report corrected. Printing the exact first rewrite, descriptor
+and predicate result to an unredirected stream before editing would have
+prevented the departure.
+
+## 2026-11-04 — inserting owner logic into a module without its call edge
+
+The agent was assigned source-return owner transport through the exact outer
+CALL_RECORD. It inserted a late tensor-lowering prepass that searched for the
+source-linked Call before observing the module passed at that phase. Both
+visits of the planned cast region had a dynamic descriptor but no source-linked
+Call in their module slice, so the prepass did nothing. The edit cost a bounded
+lowering and profile trace, about thirty seconds, plus review of 120 inert
+lines. The prepass was removed. Inspecting the full-module publisher's call
+context before selecting a writer seam would have prevented the departure.
+
 ## 2026-11-04 — changing a shape audit before checking the live binding
 
 The agent was asked to fix recurring type failures at their shared writers.
@@ -515,3 +541,83 @@ failed report update and explicit restoration cost extra work before the
 handoff could be published. The original UTF-8 text was restored and copied
 again. Explicit encoding='utf-8' on every prose read and write would have
 prevented both the corrupted copy and the failed follow-up read.
+
+## 2026-11-04 — broad call tracing delayed the topk owner witness
+
+The agent needed one bounded `_ascending_order` finalizer witness. It installed a
+`sys.settrace` call filter for every Python call, even though only the owner
+publisher frame mattered. The test took 109.08 seconds instead of the prior
+48.73-second bounded run. The trap also assumed `target_returns` contained
+pairs, raising `TypeError` while printing after the useful Call and descriptor
+facts. The measured cost was roughly 60 seconds and one incomplete witness;
+the owner agent received the printed identity facts. A direct wrapper or trace
+limited to the exact publisher frame would have avoided this overhead.
+
+## 2026-11-04 — CALL_RECORD read used caller name without table owner
+
+The agent inspected a saved source-owned tensor module to explain an
+elementwise audit finding. Its scratch script chose the first CALL_RECORD row
+whose caller name matched root, without requiring the module's actual
+`call_table.owner`. That row's first revision was empty, so the agent wrongly
+reported a missing semantic result binding. Root read the exact attached
+table row and found that revision already contained `(4, 1)`; a later
+revision only changed owner-formal binding. The wrong report cost one
+additional read and coordination correction. Matching the complete
+`(table.owner, caller.name)` row before comparing revisions would have
+prevented it.
+
+## 2026-11-04 — default pytest traceback overwhelmed a bounded owner check
+
+The root agent needed compact terminal evidence from two focused tests. It
+used pytest's default traceback instead of --tb=short. The expected owner
+refusal expanded the large publisher function into 1,360 output lines and
+about 20,092 tokens; tool output was truncated. The useful terminal refusal
+was still visible, but reading the excess added review cost. Future focused
+compiler gates use --tb=short and print selected raising-frame identities
+when the short traceback does not contain the required evidence.
+
+## 2026-11-04 — aggregate reborrow reader ran before its proof was complete
+
+The owner agent's first aggregate Call-binding helper ran on every passthrough
+and required a complete dynamic tensor descriptor immediately. The planned
+region was still being assembled, so the focused public test refused at
+`rebound region input lacks exact Call signature` after 14.36 seconds. The
+reader also initially selected a producer metadata row by numeric data ID,
+although the existing `metadata_result_caller_value` reader handles distinct
+source and caller IDs. The helper was narrowed to exact native-wrap rebinding,
+replayed after metadata publication, and changed to use that incumbent
+projection reader. The 8.05-second real reborrow audit test then passed.
+
+## 2026-11-04 — source owner Call record patched after its frame binder
+
+The source-owned return receipt required a late owner formal in the outer
+CALL_RECORD. The agent first revised that record inside the tensor result
+publisher and reran the bounded source once (29.61 seconds) without tracing
+the frame binder that had appended the live Call argument. Root identified
+`_complete_propagated_frame_tails` as the first writer: it updated the Call
+arguments but omitted the CALL_RECORD frame binding. The publisher revision
+was removed, and the binder now posts the exact record from its FRAME_TAIL
+proof. Inspecting that first writer before editing would have avoided the
+extra run and the transient duplicate-record path.
+
+## 2026-11-04 — source-return audit patch matched the neighboring owner audit
+
+The source-return audit needed to follow the two loaded carriers' exact
+SSA_VALUE revision chains. The agent applied the hunk to an identical
+`required <= causes` line in the neighboring owner-call audit instead of
+anchoring it to the source-return method. A 4.5-second saved-module replay
+still found the source-return refusal. The unintended hunk was removed, and
+the same-row ancestry check was placed in the source-return audit. The next
+saved-module replay returned no source-return finding.
+
+## 2026-11-04 — assumed arena carrier physical fields before reading them
+
+The root agent told teammates an owned arena carrier had the numerical
+element's int64/span/rank-one physical fields without reading that carrier's
+SSA_VALUE. The measured origin Alloca carrier actually records ptr/scalar/
+rank-zero; the numerical element dtype lives in TENSOR_OWNED_HEAP_BINDING and
+the logical tensor descriptor. The assumption cost extra coordination and a
+measurement by the owner agent. No publisher change followed the assumption;
+the source audit was corrected to compare carriers with that measured origin.
+Reading the exact origin cell before naming its physical layout would have
+prevented the mistaken instruction.

@@ -4656,6 +4656,18 @@ TENSOR_HEAP_OWNER_CALL_BINDING = declare_page("tensor_heap_owner_call_binding", 
     RowField("call_result", K.VALUE_ID), RowField("callee", K.NAME),
     RowField("tensor", K.VALUE_ID),
 ), tuple)                              # DERIVED(call, tensor, actual, formal); CONCORD
+#: A source Call returns a tensor whose native carrier was allocated in a
+#: planned region below that source function. Row identifies the exact outer
+#: Call and semantic source return. Fact is (source carrier, source owner
+#: actual, caller carrier, caller owner actual, caller semantic result,
+#: source count, element dtype). The region's owned binding and owner Call,
+#: source Ret and metadata result, outer CALL_RECORD and live owner forwarding
+#: are direct causes. This is an inherited carrier, not a local Alloca.
+TENSOR_SOURCE_OWNED_RETURN = declare_page("tensor_source_owned_return", (
+    RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
+    RowField("call_result", K.VALUE_ID), RowField("source", K.NAME),
+    RowField("source_tensor", K.VALUE_ID),
+), tuple)                              # DERIVED(region allocation/source Call); CONCORD
 #: A private caller frame's explicit owner release after the last tensor use
 #: and before its terminal return. Fact is (producer Call result, logical
 #: tensor id, release block name). The native release instruction is the
@@ -4664,8 +4676,11 @@ TENSOR_HEAP_RELEASE_BINDING = declare_page("tensor_heap_release_binding", (
     RowField("caller_scope", K.SCOPE), RowField("caller", K.NAME),
     RowField("owner_actual", K.VALUE_ID),
 ), tuple)                              # DERIVED(call, tensor, owner, block); CONCORD
-#: One private owned tensor consumer is proved not to return the consumed
-#: storage. Fact is (callee name, logical input id, consumed formal ids,
+#: One private owned tensor consumer is proved to keep the borrowed storage
+#: in its owning caller. A borrowed callee return is admitted only when its
+#: Call is retired to void and an exact aggregate rebinding leaves no live
+#: alias; a later distinct-storage consumer still precedes owner release.
+#: Fact is (callee name, logical input id, consumed formal ids,
 #: ((returned tensor id, native data id, alias id or None), ...)). This is
 #: posted from the exact Call binding and the callee's live tensor table;
 #: metadata outputs are excluded only by TENSOR_METADATA_RESULT_BINDING.
@@ -4697,6 +4712,31 @@ class TensorOutputCapacityBound:
 TENSOR_OUTPUT_CAPACITY_BOUND = declare_page("tensor_output_capacity_bound", (
     RowField("function_scope", K.SCOPE), RowField("output", K.VALUE_ID),
 ), TensorOutputCapacityBound)           # DERIVED(exact layout, guarded input, computed extents)
+
+@dataclass(frozen=True)
+class TensorRuntimeTopkSelection:
+    """Runtime input axis and nonnegative k determine one named output extent."""
+
+    input_cell: Ref
+    input_shape_cell: Ref
+    input_rank_cell: Ref
+    input_count_cell: Ref
+    selection_input_cell: Ref
+    axis_extent_cell: Ref
+    selection_cell: Ref
+    output_cell: Ref
+    shape_cell: Ref
+    rank_cell: Ref
+    count_cell: Ref
+    layout_cell: Ref
+    nonnegative_cell: Ref
+    axis: int
+
+
+TENSOR_RUNTIME_TOPK_SELECTION = declare_page("tensor_runtime_topk_selection", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("output", K.VALUE_ID),
+), TensorRuntimeTopkSelection)          # DERIVED(source dimension/guard, SSA selection)
 #: ``propagate_repository_ssa_call_metadata``: the functions of a module that
 #: mention one value id of one source owner's id space, ``(owner scope, id)``
 #: -> sorted function names, DERIVED(the value's ``ssa_value`` cell in each).

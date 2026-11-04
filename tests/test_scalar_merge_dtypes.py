@@ -44,6 +44,50 @@ def test_mixed_representation_phi_is_not_implicitly_reinterpreted():
     assert backedge.dtype == 'int64'
 
 
+def test_typed_pointer_field_does_not_inherit_aggregate_container_dtype():
+    from src.compiler.concordance_declarations import (
+        INGESTION, INGEST_SOURCE, SSA_VALUE, SSAValueFact, SSAValueOrigin,
+    )
+    from src.compiler.identity_concordance import (
+        Mode, Novel, begin_identity_book, end_identity_book,
+    )
+
+    aggregate = SSAValue(1, 'ssa.aggregate')
+    index = SSAValue(2, 'int64')
+    address = SSAValue(3, 'ptr')
+    carrier = SSAValue(4, 'ptr', accounting={
+        'physical_dtype': 'ptr', 'program_abi_storage': 'scalar',
+        'program_abi_rank': 0,
+    })
+    function = Function('typed_pointer_aggregate_field', [aggregate, index], {
+        'entry': BasicBlock('entry', [
+            Instr('GetElementPtr', [aggregate, index], address,
+                  attributes={'aggregate_index': 0}),
+            Instr('Load', [address], carrier),
+            Instr('Ret', [carrier], None),
+        ]),
+    })
+    book, token = begin_identity_book()
+    try:
+        for value in (aggregate, index, address, carrier):
+            physical = ({'physical_dtype': value.dtype, 'storage': 'scalar', 'rank': 0}
+                        if value.dtype != 'ssa.aggregate' else {})
+            book.post(
+                SSA_VALUE, (function.name, value.id),
+                SSAValueFact(value.dtype, (), SSAValueOrigin.ADOPTED_GRAPH_ID,
+                             **physical),
+                stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
+        _propagate_scalar_dtypes({function.name: function})
+        assert carrier.dtype == 'ptr'
+        fact = book.page(SSA_VALUE).latest((function.name, carrier.id))
+        assert fact.dtype == fact.physical_dtype == 'ptr'
+        assert (fact.storage, fact.rank) == ('scalar', 0)
+    finally:
+        end_identity_book(token)
+
+
 def test_explicit_integer_cast_keeps_declared_narrow_target():
     from src.compiler.concordance_declarations import (
         INGESTION, INGEST_SOURCE, SCALAR_INTEGER_WIDTH, SSA_VALUE,
