@@ -621,3 +621,16 @@ measurement by the owner agent. No publisher change followed the assumption;
 the source audit was corrected to compare carriers with that measured origin.
 Reading the exact origin cell before naming its physical layout would have
 prevented the mistaken instruction.
+
+## 2026-11-04 — refreshed a historical Call cause while adding physical proof
+
+The agent was asked to carry the newly posted float64 SSA physical cell into
+the unchanged source-result metadata row. It instead added every newly seen
+publisher cause, including a newer CALL_RECORD, to that row. The result then
+had two direct Call-record causes where the exact caller-data reader requires
+the single historical semantic binding and proves its ancestry to the live
+record. Three focused tests failed before lowering completed, costing a
+38.14-second run and review of the failure. The refresh was narrowed to new
+SSA_VALUE cells; the existing CALL_RECORD cause remained intact. Checking the
+reader's direct-cause contract before posting an unchanged fact would have
+prevented the departure.

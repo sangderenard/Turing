@@ -426,7 +426,8 @@ def _bind_source_return_owned_producers(module: IRModule, book) -> bool:
     from .precompile_to_ssa import _mint_ssa_id
     from .ssa_call_input_adapters import _infer_pointer_storage
     from .ssa_record_return_state import (
-        function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        function_scope_of, posted_ssa_value_fact, revise_ssa_value,
+        ssa_value_identity_cell,
     )
 
     if getattr(module, "call_table", None) is None:
@@ -538,6 +539,32 @@ def _bind_source_return_owned_producers(module: IRModule, book) -> bool:
                     or result_cell is None or formal_cell is None
                     or region_cell is None or count is None):
                 continue
+            result_fact = posted_ssa_value_fact(
+                producer, source_id, book=book,
+            )
+            if (result_fact is None or result_fact.storage != "span"
+                    or type(result_fact.rank) is not int
+                    or result_fact.rank <= 0
+                    or result_fact.physical_dtype not in (
+                        None, formal_fact.physical_dtype,
+                    )):
+                raise ValueError(
+                    "source-owned kernel result disagrees with selected output storage"
+                )
+            # make(count).to_dtype(float64) acquires its private output
+            # after the original cast visit. The selected cast output formal
+            # proves float64, but result4's SSA_VALUE still has no physical
+            # dtype. Post that exact kernel edge before the owned carrier and
+            # later source/caller Call transport read the logical result.
+            result_cell = revise_ssa_value(
+                producer, source_id, dtype=result_fact.dtype,
+                shape=result_fact.shape,
+                stage=TENSOR_SSA_LOWERING, sources=(formal_cell,), book=book,
+                physical={"physical_dtype": formal_fact.physical_dtype},
+            )
+            native_call.res.accounting = _accounting_view(
+                producer, native_call.res, module,
+            )
             causes = (result_cell, formal_cell, region_cell, record_ref)
             scope = function_scope_of(producer)
 
@@ -1537,11 +1564,35 @@ def publish_computed_region_result_metadata(
                     *source_call_proofs,
                 )))
                 if replay:
-                    if book.page(TENSOR_METADATA_RESULT_BINDING).latest(row) != (
+                    same_fact = (
                         int(output_id), callee_ids, caller_metadata,
-                    ):
+                    )
+                    if book.page(TENSOR_METADATA_RESULT_BINDING).latest(row) != same_fact:
                         raise ValueError(
                             "computed region result changed its booked projection"
+                        )
+                    # The float64 source-owned cast posts its selected
+                    # output physical dtype after this metadata tuple was
+                    # first projected. Its source4 and caller1 SSA_VALUE
+                    # cells advance, but the tuple does not. Concord those
+                    # new exact cells on the incumbent result row so its
+                    # direct proof describes the current semantic values.
+                    prior_result = book.latest_ref(
+                        TENSOR_METADATA_RESULT_BINDING, row,
+                    )
+                    prior_causes = {
+                        parent for parent, _stage in book.edges_into(prior_result)
+                    }
+                    new_sources = tuple(
+                        cell for cell in sources
+                        if cell is not None and cell.page == SSA_VALUE
+                        and cell not in prior_causes
+                    )
+                    if new_sources:
+                        book.post(
+                            TENSOR_METADATA_RESULT_BINDING, row, same_fact,
+                            stage=TENSOR_SSA_LOWERING,
+                            provenance=Derived(new_sources), mode=Mode.CONCORD,
                         )
                 else:
                     book.post(
@@ -14423,14 +14474,20 @@ def complete_tensor_call_closure(
         signature = None if operation is None else c_tensor_opcode(operation)
         if signature is None or signature[0] != "binary":
             return False
+        # In make(count) -> root, Add3 first reaches this closure before
+        # source Call metadata gives its input1 an extent. The input's posted
+        # physical dtype is still absent, while Add3's own SSA_VALUE already
+        # proves a float64 span. Keep this exact raw operation in the affected
+        # Call closure so the later input descriptor revision revisits it.
         return any(
             (fact := posted_ssa_value_fact(
-                function, int(argument.id), book=identity_book(module),
+                function, int(value.id), book=identity_book(module),
             )) is not None
             and fact.physical_dtype is not None
             and fact.storage == "span"
             and fact.rank is not None and fact.rank > 0
-            for argument in instruction.args
+            for value in (*instruction.args,
+                          *((instruction.res,) if instruction.res is not None else ()))
         )
 
     affected = {
