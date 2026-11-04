@@ -5980,6 +5980,32 @@ class ProcessGraph(TiledObject):
             from ...compiler.concordance_declarations import SOURCE_EXCEPTION_NODE
             book.post(SOURCE_EXCEPTION_NODE, (identity,), conversion, stage=INGESTION,
                       provenance=Derived((identity, conversion)), mode=Mode.CONCORD)
+        authored_raise = getattr(node, "_turing_authored_raise_cell", None)
+        if authored_raise is not None:
+            from ...compiler.concordance_declarations import (
+                SOURCE_EXCEPTION_OPERATION, SOURCE_PROCESS_OPERATION, SOURCE_SPAN,
+            )
+            from ...compiler.thread_operations import PROCESS_OPERATORS, PROCESS_RESULT_DTYPES
+            dispatch = getattr(node, "_turing_dispatch_operation", None)
+            if (not isinstance(node, ast.Call) or not isinstance(dispatch, dict)
+                    or dispatch.get("operation") != "exception_raise"
+                    or conversion is None or authored_raise.page != SOURCE_SPAN
+                    or book.page(SOURCE_SPAN).cell(authored_raise.row, authored_raise.column).kind != "Raise"
+                    or authored_raise not in {source for source, _stage in book.edges_into(conversion)}):
+                raise ValueError("converted terminal raise lost its exact authored occurrence")
+            semantic = PROCESS_OPERATORS["exception_raise"]
+            process = book.post(SOURCE_PROCESS_OPERATION, (identity,), (
+                "exception_raise", semantic, PROCESS_RESULT_DTYPES[semantic],
+                dispatch["source_identity"], tuple(dispatch.get("control_scopes", ())),
+            ), stage=INGESTION, provenance=Derived((identity, authored_raise, conversion)),
+                mode=Mode.CONCORD)
+            book.post(SOURCE_EXCEPTION_OPERATION, (identity,), (
+                "exception_raise", dispatch.get("exception_type"),
+                dispatch.get("exception_message"), int(dispatch.get("error_code", 100)),
+                None, None, bool(dispatch.get("suppress_context", False)), process,
+            ), stage=INGESTION,
+                provenance=Derived((identity, process, authored_raise, conversion)),
+                mode=Mode.CONCORD)
         resource = getattr(node, '_turing_resource_contract', None)
         if resource is not None:
             from ...compiler.concordance_declarations import SOURCE_RESOURCE_SCOPE

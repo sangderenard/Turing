@@ -12930,13 +12930,32 @@ def _sequence_concat_ops(
         int(mutation.sequence_value_id)
         for mutation in _source_sequence_snapshots(graph_obj)
     }
+    from .identity_concordance import current_identity_book as _concat_book
+    from .source_evidence_resolver import ClassEvidence as _ConcatClassEvidence, require_class as _concat_class
+    concat_book = _concat_book()
+    concat_class_scope = (
+        graph_obj.graph.get("source_numeric_scope")
+        or graph_obj.graph.get("authored_function_identity")
+        or graph_obj.graph.get("source_numeric_base_scope")
+    )
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         attributes = data.get("attributes") or {}
         kind = str(attributes.get("aggregate_kind") or "")
+        value_id = int(data.get("value_id", node_id))
+        if concat_class_scope is not None:
+            evidence = _concat_class(concat_class_scope, value_id, book=concat_book)
+            if isinstance(evidence, _ConcatClassEvidence) and evidence.class_identity in {
+                "builtins.list", "builtins.bytes", "builtins.bytearray",
+            }:
+                # compress_octets' called byte fragments had exact source
+                # classes while this older reader consulted only shallow
+                # aggregate attributes. Read the same class authority as the
+                # eager pass, retaining Add for the incumbent SSA concat
+                # rewrite rather than emitting arithmetic over its storage.
+                kind = evidence.class_identity.removeprefix("builtins.")
         if kind not in sequence_kinds:
             continue
-        value_id = int(data.get("value_id", node_id))
         if (
             attributes.get("producer_kind") == "aggregate_materialization"
             and value_id not in snapshot_destinations
@@ -31938,11 +31957,117 @@ def _class_surface_ssa_program(
         # elementwise extent and the slice copy stopped there (``len(ys)``
         # 1 for 4; clean audit).  Rule: a concatenation is born here and
         # holds its operands' rows; with no proven bound it is DYNAMIC.
+        # Program: `header + encoded_length + coded_commands + coded_literals`
+        # returns the final concat. The old output-history exclusion left
+        # that unbounded fresh arena FIXED without capacity. Its operands
+        # and return slot already have exact source identities; admit only
+        # that proven bytes chain to the incumbent owned-heap path.
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS as _OWN_OPERANDS,
+            RETURN_SITE_SLOT as _OWN_RETURN_SITE_SLOT,
+            SOURCE_OWNED_SEQUENCE_RETURN as _OWN_SOURCE_RETURN,
+            SourceOwnedSequenceReturn as _SourceOwnedSequenceReturn,
+        )
+        from .concorded_literals import origin_cell as _owned_origin
+        from .source_evidence_resolver import require_class as _owned_class
+
+        owned_source_returns = []
+        concat_by_result = {
+            int(result): (int(lhs), int(rhs))
+            for result, lhs, rhs, kind, lhs_scalar, rhs_scalar
+            in sequence_concats
+            if kind == "bytes" and lhs_scalar is None and rhs_scalar is None
+        }
+
+        def _owned_concat_proof(value_id, active=frozenset()):
+            if value_id in active:
+                return None
+            operands = concat_by_result.get(int(value_id))
+            if operands is None:
+                evidence = _owned_class(
+                    late_numeric_scope, int(value_id), book=late_book,
+                )
+                if getattr(evidence, "class_identity", None) != "builtins.bytes":
+                    return None
+                return (), (evidence.class_cell,)
+            result_cell = _identity_cell(graph_obj, int(value_id))
+            lhs_cell = _identity_cell(graph_obj, operands[0])
+            rhs_cell = _identity_cell(graph_obj, operands[1])
+            operand_cell = late_book.latest_ref(
+                _OWN_OPERANDS, (late_type_scope, int(value_id)),
+            )
+            if None in (result_cell, lhs_cell, rhs_cell, operand_cell):
+                return None
+            operand_fact = late_book.page(_OWN_OPERANDS).cell(
+                operand_cell.row, operand_cell.column,
+            )
+            if (
+                tuple(operand_fact) != ((lhs_cell, "lhs"), (rhs_cell, "rhs"))
+                or result_cell not in {
+                    parent for parent, _stage in late_book.edges_into(
+                        operand_cell
+                    )
+                }
+            ):
+                return None
+            lhs_proof = _owned_concat_proof(operands[0], active | {value_id})
+            rhs_proof = _owned_concat_proof(operands[1], active | {value_id})
+            if lhs_proof is None or rhs_proof is None:
+                return None
+            return (
+                (*lhs_proof[0], *rhs_proof[0], operand_cell),
+                (*lhs_proof[1], *rhs_proof[1]),
+            )
+
+        if late_book is not None and late_type_scope is not None:
+            for result_id in sorted(output_history_ids & concat_by_result.keys()):
+                if result_id in sequence_capacity_bounds:
+                    continue
+                result_cell = _identity_cell(graph_obj, result_id)
+                proof = _owned_concat_proof(result_id)
+                if result_cell is None or proof is None:
+                    continue
+                return_slots = []
+                for row in late_book.page(_OWN_RETURN_SITE_SLOT).rows():
+                    cell = late_book.latest_ref(_OWN_RETURN_SITE_SLOT, row)
+                    fact = late_book.page(_OWN_RETURN_SITE_SLOT).cell(
+                        cell.row, cell.column,
+                    )
+                    if not hasattr(fact, "page") or fact.page != result_cell.page:
+                        continue
+                    try:
+                        same = _owned_origin(late_book, fact) == _owned_origin(
+                            late_book, result_cell,
+                        )
+                    except ValueError:
+                        continue
+                    if same:
+                        return_slots.append(cell)
+                if len(return_slots) != 1:
+                    continue
+                operand_cells, class_cells = proof
+                if not class_cells or any(cell is None for cell in class_cells):
+                    continue
+                receipt = late_book.post(
+                    _OWN_SOURCE_RETURN, (late_type_scope, result_id),
+                    _SourceOwnedSequenceReturn(
+                        result_cell, return_slots[0],
+                        tuple(operand_cells), tuple(class_cells),
+                    ),
+                    stage=SHELL_HANDOFF,
+                    provenance=_LateDerived(tuple(dict.fromkeys((
+                        result_cell, return_slots[0],
+                        *operand_cells, *class_cells,
+                    )))),
+                    mode=Mode.CONCORD,
+                )
+                owned_source_returns.append((result_id, receipt))
         dynamic_sequence_ids.update(
             int(result_id)
             for result_id, *_operands in sequence_concats
             if int(result_id) not in sequence_capacity_bounds
-            and int(result_id) not in output_history_ids
+            and (int(result_id) not in output_history_ids
+                 or int(result_id) in dict(owned_source_returns))
         )
         grown = True
         while grown:
@@ -33033,6 +33158,59 @@ def _class_surface_ssa_program(
                 ),
                 *sequence_capacity_sources,
             )))
+            # The source return receipt admitted this fresh bytes concat to
+            # the existing owned-heap path. Complete that one identity with
+            # its actual SSA descriptor and owner before any public reader
+            # can expose it across the C boundary.
+            from .concordance_declarations import (
+                PUBLIC_OWNED_SEQUENCE_RETURN as _PUBLIC_OWNED_RETURN,
+                PublicOwnedSequenceReturn as _PublicOwnedSequenceReturn,
+                SEQUENCE_DESCRIPTOR as _PUBLIC_SEQUENCE_DESCRIPTOR,
+                SSA_VALUE as _PUBLIC_SSA_VALUE,
+            )
+            owned_table = module_ir.sequence_tables.get(symbol)
+            if owned_table is not None:
+                for sequence_id, source_receipt in owned_source_returns:
+                    descriptor = owned_table.sequences.get(sequence_id)
+                    descriptor_cell = late_book.latest_ref(
+                        _PUBLIC_SEQUENCE_DESCRIPTOR,
+                        (owned_table.owner, sequence_id),
+                    )
+                    if (
+                        descriptor is None or descriptor_cell is None
+                        or descriptor.heap_owner_value_id is None
+                        or str(descriptor.capacity_policy.value) != "dynamic"
+                        or not any(
+                            instruction.op == "Ret"
+                            and not instruction.attributes.get("fault_exit")
+                            and any(int(value.id) == sequence_id
+                                    for value in instruction.args)
+                            for block in module_ir.functions[symbol].blocks.values()
+                            for instruction in block.instrs
+                        )
+                    ):
+                        continue
+                    owner_id = int(descriptor.heap_owner_value_id)
+                    owner_cells = tuple(
+                        parent for parent, _stage in late_book.edges_into(
+                            descriptor_cell
+                        )
+                        if parent.page == _PUBLIC_SSA_VALUE
+                        and int(parent.row[-1]) == owner_id
+                    )
+                    if len(owner_cells) != 1:
+                        continue
+                    late_book.post(
+                        _PUBLIC_OWNED_RETURN, (symbol, sequence_id),
+                        _PublicOwnedSequenceReturn(
+                            source_receipt, descriptor_cell, owner_cells[0],
+                        ),
+                        stage=SHELL_HANDOFF,
+                        provenance=_LateDerived((
+                            source_receipt, descriptor_cell, owner_cells[0],
+                        )),
+                        mode=Mode.CONCORD,
+                    )
             # The bytes slice's authored return is caller-owned fixed
             # workspace. Its capacity follows the exact input sequence
             # bound, while its logical length remains the helper's written

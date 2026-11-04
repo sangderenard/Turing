@@ -1290,32 +1290,45 @@ class CModuleExecution:
     _pointers: Any = field(default=None, repr=False)
     _extents: Any = field(default=None, repr=False)
     _capacity_buffers: dict[int, Any] = field(default_factory=dict, repr=False)
+    _owned_result_cells: dict[int, Any] = field(default_factory=dict, repr=False)
 
     def run(self) -> "CModuleExecution":
         self.buffers.update(self._capacity_buffers)
-        self.artifact.reset_validation_error()
-        self.artifact.entry()(self._pointers, self._extents)
-        validation_error = self.artifact.take_validation_error()
-        if validation_error:
-            from .native_faults import validation_fault
+        self.buffers.update(self._owned_result_cells)
+        try:
+            self.artifact.reset_validation_error()
+            self.artifact.entry()(self._pointers, self._extents)
+            validation_error = self.artifact.take_validation_error()
+            if validation_error:
+                from .native_faults import validation_fault
 
-            raise validation_fault(
-                validation_error,
-                f"native tile runtime validation failed with code {validation_error}",
-            )
-        if self.artifact.external_slots:
-            from .external_functions import check_external_faults
+                raise validation_fault(
+                    validation_error,
+                    f"native tile runtime validation failed with code {validation_error}",
+                )
+            if self.artifact.external_slots:
+                from .external_functions import check_external_faults
 
-            check_external_faults(self.artifact)
-        if self.artifact.output_length_sources or self.artifact.output_shape_sources:
-            from .runtime_abi import apply_native_result_extents
+                check_external_faults(self.artifact)
+            if self.artifact.output_length_sources or self.artifact.output_shape_sources:
+                from .runtime_abi import apply_native_result_extents
 
-            self.artifact.runtime_abi()
-            apply_native_result_extents(
-                self.buffers, self._capacity_buffers,
-                length_sources=self.artifact.output_length_sources,
-                shape_sources=self.artifact.output_shape_sources,
-            )
+                self.artifact.runtime_abi()
+                apply_native_result_extents(
+                    self.buffers, self._capacity_buffers,
+                    length_sources=self.artifact.output_length_sources,
+                    shape_sources=self.artifact.output_shape_sources,
+                )
+            if self.artifact.output_heap_sequences:
+                from .runtime_abi import copy_owned_sequence_results
+
+                self.artifact.runtime_abi()
+                self.buffers.update(copy_owned_sequence_results(
+                    self.buffers, self.artifact.output_heap_sequences,
+                ))
+        finally:
+            if self.artifact.output_heap_sequences:
+                self.artifact.release_owned_results(self._pointers)
         return self
 
 
@@ -1367,6 +1380,8 @@ class CModuleArtifact:
     output_capacity_sources: tuple[tuple[int, int], ...] = ()
     output_length_sources: tuple[tuple[int, int], ...] = ()
     output_shape_sources: tuple[tuple[int, int], ...] = ()
+    output_heap_sequences: tuple[tuple[int, int, int, int, str], ...] = ()
+    release_entry_name: str | None = None
     #: Per public buffer: its rank (independent of any static shape) and its
     #: role (input / output / inout / other).  Read by ``runtime_abi``.
     buffer_ranks: tuple[int, ...] = ()
@@ -1435,9 +1450,11 @@ class CModuleArtifact:
             output_capacity_sources=self.output_capacity_sources,
             output_length_sources=self.output_length_sources,
             output_shape_sources=self.output_shape_sources,
+            output_heap_sequences=self.output_heap_sequences,
+            release_entry=self.release_entry_name,
         )
         if (self.output_capacity_sources or self.output_length_sources
-                or self.output_shape_sources):
+                or self.output_shape_sources or self.output_heap_sequences):
             from .concordance_declarations import EMISSION_ARTIFACT, ArtifactPart, Backend
             from .identity_concordance import ConcordanceRefusal
 
@@ -1663,6 +1680,16 @@ class CModuleArtifact:
             reset.argtypes, reset.restype = [], None
             reset()
 
+    def release_owned_results(self, pointers) -> None:
+        """Invoke the emitted wrapper over the incumbent native heap owner."""
+        self.runtime_abi()
+        if not self.release_entry_name:
+            raise ValueError("owned results have no native release entry")
+        self.entry()
+        release = getattr(self._library, self.release_entry_name)
+        release.argtypes, release.restype = [ctypes.POINTER(ctypes.c_void_p)], None
+        release(pointers)
+
     def take_validation_error(self) -> int:
         if not self.needs_validation_runtime:
             return 0
@@ -1696,8 +1723,12 @@ class CModuleArtifact:
         shapes = self.buffer_shapes or tuple(() for _ in self.buffer_order)
         ranks = self.buffer_ranks or tuple(len(shape) for shape in shapes)
         if (self.output_capacity_sources or self.output_length_sources
-                or self.output_shape_sources):
+                or self.output_shape_sources or self.output_heap_sequences):
             self.runtime_abi()
+        for sequence in self.output_heap_sequences:
+            for value_id in sequence[:4]:
+                # These are descriptor cells, not the arena they will name.
+                shape_overrides[int(value_id)] = (1,)
         for output_id, source_id in self.output_capacity_sources:
             source = feed_values.get(int(source_id))
             if source is None:
@@ -1775,6 +1806,11 @@ class CModuleArtifact:
                     *self.output_length_sources, *self.output_shape_sources,
                 )
             },
+            _owned_result_cells={
+                int(value_id): buffers[int(value_id)]
+                for sequence in self.output_heap_sequences
+                for value_id in sequence[:4]
+            },
         )
 
     def compile_standalone(
@@ -1832,7 +1868,7 @@ class CModuleArtifact:
         # never the old rankless one-cell default.
         computed_buffers = (
             self.prepare_execution(feeds).buffers
-            if self.output_capacity_sources else None
+            if self.output_capacity_sources or self.output_heap_sequences else None
         )
         with initial_state_path.open("wb") as stream:
             for value_id, dtype, shape in zip(
@@ -1885,6 +1921,26 @@ class CModuleArtifact:
                     f"extent ({value_id}, {kind!r}, {axis!r}) cannot be measured"
                 )
         extent_literals = ", ".join(map(str, extent_values or (0,)))
+        owned_transfers = []
+        for data_id, length_id, capacity_id, owner_id, dtype in self.output_heap_sequences:
+            data_index, length_index, capacity_index, owner_index = (
+                self.buffer_order.index(value_id)
+                for value_id in (data_id, length_id, capacity_id, owner_id)
+            )
+            element_size = np.dtype(_numpy_dtype(dtype)).itemsize
+            owned_transfers.extend((
+                f"        if (writing && i == {data_index}) {{",
+                f"            int64_t length = *((int64_t *)buffers[{length_index}]);",
+                f"            int64_t capacity = *((int64_t *)buffers[{capacity_index}]);",
+                f"            void *arena = *((void **)buffers[{data_index}]);",
+                f"            void *owner = *((void **)buffers[{owner_index}]);",
+                "            if (length < 0 || length > capacity || (length && (!arena || !owner))) return 0;",
+                "            uint64_t logical_count = (uint64_t)length;",
+                "            if (fwrite(&logical_count, sizeof(logical_count), 1, stream) != 1) return 0;",
+                f"            if (logical_count && fwrite(arena, {element_size}, (size_t)logical_count, stream) != (size_t)logical_count) return 0;",
+                "            continue;",
+                "        }",
+            ))
         host_source = "\n".join((
             "#include <errno.h>",
             "#include <stdint.h>",
@@ -1894,6 +1950,8 @@ class CModuleArtifact:
             "#include <time.h>",
             "",
             f"void {self.name}(void **buffers, long long *extents);",
+            *((f"void {self.release_entry_name}(void **buffers);",)
+              if self.output_heap_sequences else ()),
             *(("#include \"turing_validation_runtime.h\"",) if self.needs_validation_runtime else ()),
             "static int invoke_entry(void **buffers, long long *extents) {",
             *(("    turing_validation_error_reset();",) if self.needs_validation_runtime else ()),
@@ -1917,6 +1975,7 @@ class CModuleArtifact:
             "",
             "static int transfer_buffers(FILE *stream, void **buffers, int writing) {",
             "    for (size_t i = 0; i < BUFFER_COUNT; ++i) {",
+            *owned_transfers,
             "        size_t count = element_counts[i];",
             "        size_t size = element_sizes[i];",
             "        size_t done = writing",
@@ -2004,6 +2063,8 @@ class CModuleArtifact:
             "        return 5;",
             "    }",
             "    fclose(output);",
+            *((f"    {self.release_entry_name}(buffers);",)
+              if self.output_heap_sequences else ()),
             "    for (size_t i = 0; i < BUFFER_COUNT; ++i) free(buffers[i]);",
             f"    printf(\"entry={self.name} frames=%llu warmup=%llu buffers=%d elapsed_s=%.9f ns_per_frame=%.3f fps=%.6f\\n\",",
             "        frames, warmup, BUFFER_COUNT, elapsed,",
@@ -2090,6 +2151,18 @@ class CModuleArtifact:
         if self.emission is not None:
             # The host is made from the buffer order and the feeds; the
             # feeds are payload, not cells (plan 100, 4.2).
+            from .concordance_declarations import EMISSION_ARTIFACT, ArtifactPart, Backend
+            host_contract_cells = tuple(
+                cell for cell in (
+                    self.emission.buffer_order,
+                    self.emission.book.latest_ref(EMISSION_ARTIFACT, (
+                        self.name, Backend.C_MODULE, ArtifactPart.RUNTIME_ABI,
+                    )),
+                    self.emission.book.latest_ref(EMISSION_ARTIFACT, (
+                        self.name, Backend.C_MODULE, ArtifactPart.OWNED_RESULT_RELEASE,
+                    )),
+                ) if cell is not None
+            )
             self.emission.build(
                 self.name, source_text=self.source,
                 source_path=module_source_path, command=command,
@@ -2097,7 +2170,7 @@ class CModuleArtifact:
                 variant="standalone",
                 extra_sources=((
                     "host", host_source, host_source_path,
-                    (self.emission.buffer_order,),
+                    host_contract_cells,
                 ), *layout_sources),
             )
         return CStandaloneExecutable(
@@ -2978,6 +3051,18 @@ def emit_ssa_module_to_c(
         """Map the working LLVM backend's authored storage-width contract."""
 
         value = storage_values.get(owner, {}).get(int(value.id), value)
+        if str(value.dtype) == "ptr" and (
+            (value.accounting or {}).get("heap_owner")
+            or (value.accounting or {}).get("heap_element_dtype") is not None
+        ):
+            # The owned concat result is a pointer CELL. Its int64 physical
+            # element contract describes the allocated rows, not the cell's
+            # native value type. The incumbent heap ABI keeps that distinction
+            # in _value_llvm_type; a numeric physical-component width must not
+            # turn its void* value into an int64 value at the public boundary.
+            from .ssa_llvm_backend import _value_llvm_type
+
+            return c_lane_storage_for_llvm_type(_value_llvm_type(value))
         physical = explicit_physical.get(
             physical_find((str(owner), int(value.id))), set()
         )
@@ -3014,6 +3099,8 @@ def emit_ssa_module_to_c(
 
     def solved_buffer_dtype(owner: str, value, held: str) -> str:
         value = storage_values.get(owner, {}).get(int(value.id), value)
+        if str(value.dtype) == "ptr" and held == dtype_layout("ptr").c_storage_type:
+            return "ptr"
         if str(value.dtype).casefold() == "ptrptr_float64":
             return "ptrptr_float64"
         # bool and uint8 share uint8_t memory but different public value
@@ -7953,6 +8040,7 @@ def emit_ssa_module_to_c(
         is_structural_abi_value as _is_structural_abi_value,
         public_sequence_capacity_sources,
         public_sequence_input_ports,
+        public_owned_sequence_returns,
     )
 
     storage_requirements = function_storage_requirements(module, function_name)
@@ -7961,6 +8049,15 @@ def emit_ssa_module_to_c(
     output_extent_sources: list[tuple[int, int]] = []
     sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
     sequence_input_ports = public_sequence_input_ports(module, function_name)
+    owned_sequence_ports = public_owned_sequence_returns(module, function_name)
+    output_heap_sequences = tuple(
+        (ports.data_id, ports.length_id, ports.capacity_id, ports.owner_id,
+         ports.element_dtype) for ports in owned_sequence_ports
+    )
+    owned_port_ids = {
+        value_id for sequence in output_heap_sequences for value_id in sequence[:4]
+    }
+    release_entry_name = f"{name}_release_owned_results" if owned_sequence_ports else None
     output_capacity_sources = tuple(
         (item.output_data_id, item.input_data_id)
         for item in sequence_capacity_relations
@@ -8005,6 +8102,8 @@ def emit_ssa_module_to_c(
         return _is_structural_abi_value(root, value)
 
     def is_private_root_storage(value) -> bool:
+        if int(value.id) in owned_port_ids:
+            return False
         accounting = dict(value.accounting or {})
         return (
             is_compiler_owned_storage(value)
@@ -8458,9 +8557,44 @@ def emit_ssa_module_to_c(
     wrapper.unit(
         UnitKind.RETURN, "\n".join((*entry_lines[len(entry_lines) - wrapper_tail:], "}")),
     )
+    release_lines = []
+    release_units = []
+    if owned_sequence_ports:
+        from .ssa_heap_allocation import require_heap_owner
+        root_values = {int(value.id): value for value in root.args}
+        release_lines.append(f"TURING_EXPORT void {release_entry_name}(void **buffers) {{")
+        release_units.append(wrapper.unit(
+            UnitKind.FUNCTION_HEADER, release_lines[-1], spelling=release_entry_name,
+            extra_cells=tuple(ports.public_cell for ports in owned_sequence_ports),
+        ))
+        released_owners = set()
+        for ports in owned_sequence_ports:
+            require_heap_owner(root_values[ports.owner_id])
+            owner_index = buffer_order.index(ports.owner_id)
+            if ports.owner_id not in released_owners:
+                line = f"    turing_heap_release((void **)buffers[{owner_index}]);"
+                release_lines.append(line)
+                release_units.append(wrapper.unit(
+                    UnitKind.CALL, line, args=(ports.owner_id,),
+                    spelling="turing_heap_release",
+                    extra_cells=(ports.public_cell, ports.descriptor_cell, ports.owner_cell),
+                ))
+                released_owners.add(ports.owner_id)
+            for value_id in (ports.data_id, ports.length_id, ports.capacity_id):
+                index = buffer_order.index(value_id)
+                line = (f"    *((void **)buffers[{index}]) = NULL;" if value_id == ports.data_id
+                        else f"    *((int64_t *)buffers[{index}]) = 0;")
+                release_lines.append(line)
+                release_units.append(wrapper.unit(
+                    UnitKind.STATEMENT, line, args=(value_id,),
+                    extra_cells=(ports.public_cell, ports.descriptor_cell),
+                ))
+        release_lines.append("}")
+        release_units.append(wrapper.unit(UnitKind.RETURN, "}", spelling=release_entry_name))
     wrapper_finished = wrapper.finish("\n".join((
         *((root_definition,) if function_name in recorders else ()),
         wrapper_header, *entry_lines, "}",
+        *release_lines,
     )))
 
     source = "\n".join((
@@ -8510,6 +8644,7 @@ def emit_ssa_module_to_c(
         wrapper_header,
         *entry_lines,
         "}",
+        *release_lines,
         "",
     ))
     # MODULE_TEXT derives from every reachable function's finished row (the
@@ -8552,6 +8687,15 @@ def emit_ssa_module_to_c(
         buffer_shapes=buffer_shapes, buffer_order_cell=buffer_order_cell,
         unit_cells=(wrapper_header_unit, *formal_units), stage=EMISSION_C,
     )
+    release_cell = None
+    if owned_sequence_ports:
+        release_cell = post_artifact_part(
+            emission, name, Backend.C_MODULE, ArtifactPart.OWNED_RESULT_RELEASE,
+            data="\n".join(release_lines),
+            location=(release_entry_name, output_heap_sequences),
+            sources=(*release_units, *(ports.public_cell for ports in owned_sequence_ports)),
+            stage=EMISSION_C,
+        )
     from .runtime_abi import public_buffer_contract, runtime_abi_description
 
     public_ranks, public_roles = public_buffer_contract(
@@ -8564,12 +8708,12 @@ def emit_ssa_module_to_c(
     } | {
         value_id for ports in sequence_input_ports
         for value_id in (ports.length_id, ports.capacity_id)
-    }
+    } | owned_port_ids
     public_roles = tuple(
         "inout" if value_id in native_written_members else role
         for value_id, role in zip(buffer_order, public_roles, strict=True)
     )
-    if sequence_capacity_relations:
+    if sequence_capacity_relations or owned_sequence_ports:
         description = runtime_abi_description(
             entry=name, backend="c", extent_type="int64_t",
             buffer_order=buffer_order, buffer_dtypes=buffer_dtypes,
@@ -8578,14 +8722,21 @@ def emit_ssa_module_to_c(
             output_extent_sources=output_extent_sources,
             output_capacity_sources=output_capacity_sources,
             output_length_sources=output_length_sources,
+            output_heap_sequences=output_heap_sequences,
+            release_entry=release_entry_name,
         )
         post_artifact_part(
             emission, name, Backend.C_MODULE, ArtifactPart.RUNTIME_ABI,
             data=repr(description), location=(description,),
-            sources=(buffer_order_cell, api_contract_cell, *(
+            sources=(buffer_order_cell, api_contract_cell,
+                     *((release_cell,) if release_cell is not None else ()), *(
                 cell for item in sequence_capacity_relations
                 for cell in (item.bound_cell, item.output_descriptor_cell,
                              item.input_descriptor_cell)
+            ), *(
+                cell for ports in owned_sequence_ports
+                for cell in (ports.public_cell, ports.source_cell, ports.descriptor_cell,
+                             ports.owner_cell, ports.return_slot_cell)
             )), stage=EMISSION_C,
         )
     return CModuleArtifact(
@@ -8604,6 +8755,8 @@ def emit_ssa_module_to_c(
         output_extent_sources=tuple(output_extent_sources),
         output_capacity_sources=output_capacity_sources,
         output_length_sources=output_length_sources,
+        output_heap_sequences=output_heap_sequences,
+        release_entry_name=release_entry_name,
         buffer_ranks=public_ranks,
         buffer_roles=public_roles,
         precision_sections=precision_present,

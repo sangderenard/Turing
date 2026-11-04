@@ -59,6 +59,99 @@ class PublicSequenceInputPorts:
     source_class_cell: Any
 
 
+@dataclass(frozen=True, slots=True)
+class PublicOwnedSequencePorts:
+    """Native ports of one exact source-returned owned sequence."""
+
+    data_id: int
+    length_id: int
+    capacity_id: int
+    owner_id: int
+    element_dtype: str
+    public_cell: Any
+    source_cell: Any
+    descriptor_cell: Any
+    owner_cell: Any
+    return_slot_cell: Any
+
+
+def public_owned_sequence_returns(
+    module: Any, function_name: str,
+) -> tuple[PublicOwnedSequencePorts, ...]:
+    """Read the completed source return, descriptor, and heap owner chain."""
+
+    from .concordance_declarations import (
+        PUBLIC_OWNED_SEQUENCE_RETURN, SOURCE_OWNED_SEQUENCE_RETURN,
+        PublicOwnedSequenceReturn, SourceOwnedSequenceReturn,
+    )
+    from .identity_concordance import CorrelationTable
+    from ..transmogrifier.ssa import SSASequenceCapacityPolicy
+
+    function = module.functions.get(str(function_name))
+    table = (getattr(module, "sequence_tables", {}) or {}).get(str(function_name))
+    book = None if table is None else table.book
+    if function is None or book is None:
+        return ()
+    if (
+        CorrelationTable._source_owned_sequence_return_findings(module)
+        or CorrelationTable._public_owned_sequence_return_findings(module)
+    ):
+        return ()
+    arguments = {int(value.id): value for value in function.args}
+    returned = {
+        int(value.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+        and not instruction.attributes.get("fault_exit")
+        for value in instruction.args
+    }
+    result = []
+    page = book.page(PUBLIC_OWNED_SEQUENCE_RETURN)
+    for row in page.rows():
+        if not isinstance(row, tuple) or row[0] != str(function_name):
+            continue
+        cell = book.latest_ref(PUBLIC_OWNED_SEQUENCE_RETURN, row)
+        fact = page.cell(cell.row, cell.column)
+        if not isinstance(fact, PublicOwnedSequenceReturn):
+            continue
+        source = book.page(SOURCE_OWNED_SEQUENCE_RETURN).cell(
+            fact.source_cell.row, fact.source_cell.column,
+        )
+        descriptor = table.sequences.get(int(row[1]))
+        if (
+            not isinstance(source, SourceOwnedSequenceReturn)
+            or descriptor is None
+            or descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
+            or descriptor.heap_owner_value_id is None
+            or len(descriptor.column_value_ids) != 1
+            or len(descriptor.column_dtypes) != 1
+            or int(descriptor.column_value_ids[0]) != int(row[1])
+            or int(row[1]) not in returned
+        ):
+            continue
+        data_id = int(row[1])
+        length_id = int(descriptor.length_address_id)
+        capacity_id = int(descriptor.capacity_value_id)
+        owner_id = int(descriptor.heap_owner_value_id)
+        if (
+            any(value_id not in arguments for value_id in (
+                data_id, length_id, capacity_id, owner_id,
+            ))
+            or not (arguments[owner_id].accounting or {}).get("heap_owner")
+            or (arguments[data_id].accounting or {}).get(
+                "heap_owner_value_id"
+            ) != owner_id
+        ):
+            continue
+        result.append(PublicOwnedSequencePorts(
+            data_id, length_id, capacity_id, owner_id,
+            str(descriptor.column_dtypes[0]), cell, fact.source_cell,
+            fact.descriptor_cell, fact.owner_cell, source.return_slot_cell,
+        ))
+    return tuple(result)
+
+
 def _sequence_descriptor_identity(table: Any, sequence_id: int):
     """Follow one descriptor through its contract to one ingestion origin."""
 
@@ -693,8 +786,9 @@ def function_storage_requirements(
 
 
 __all__ = [
-    "PublicSequenceCapacitySource", "PublicSequenceInputPorts", "SSAStorageRequirement",
+    "PublicSequenceCapacitySource", "PublicSequenceInputPorts",
+    "PublicOwnedSequencePorts", "SSAStorageRequirement",
     "function_storage_requirements", "public_sequence_capacity_sources",
-    "public_sequence_input_ports",
+    "public_sequence_input_ports", "public_owned_sequence_returns",
     "is_compiler_owned_storage", "module_storage_requirements",
 ]
