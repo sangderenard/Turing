@@ -1579,6 +1579,7 @@ class CorrelationTable:
         found.extend(self._source_call_parameter_default_findings(module))
         found.extend(self._numerical_constructor_default_findings(module))
         found.extend(self._materialized_byte_row_findings(module))
+        found.extend(self._specialized_literal_materialized_row_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._numerical_dtype_operand_findings(module))
@@ -8259,6 +8260,156 @@ class CorrelationTable:
                         "materialized-byte-row", str(row), None,
                         "byte materialization row lacks exact protocol, class, "
                         "identity or operand proof",
+                    ))
+        return found
+
+    @staticmethod
+    def _specialized_literal_materialized_row_findings(module: Any) -> list[Finding]:
+        """Check a folded list formal's row dtype against its exact callsite."""
+
+        from .concordance_declarations import (
+            BindingFact, CANONICAL_VALUE, INGESTION_VALUE, NAME_BINDING,
+            PLANNER_SPECIALIZATION_PAGE, PROCESS_GRAPH_OPERANDS,
+            SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY, SOURCE_VALUE_CLASS,
+            SpecializationFact, SpecializationSource,
+        )
+        from .concorded_literals import origin_cell
+        from .planner_concordance_posts import _class_proves_value
+        from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SEQUENCE_ROW_DTYPE)
+
+        def binding_proves(binding: Ref, value: Ref) -> bool:
+            """Follow only formal-binding revisions/forks to the value."""
+
+            try:
+                wanted = origin_cell(book, value)
+            except ValueError:
+                return False
+            pending, seen = [binding], set()
+            while pending:
+                current = pending.pop()
+                if current in seen or current.page != NAME_BINDING:
+                    continue
+                seen.add(current)
+                for source, _stage in book.edges_into(current):
+                    if source.page == NAME_BINDING:
+                        pending.append(source)
+                    elif source.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                        try:
+                            if origin_cell(book, source) == wanted:
+                                return True
+                        except ValueError:
+                            pass
+            return False
+
+        for row in page.rows():
+            for column, fact in page.history(row):
+                if not (isinstance(fact, tuple) and len(fact) == 2
+                        and fact[1] == "specialized literal materialization"):
+                    continue
+                receipt = Ref(SEQUENCE_ROW_DTYPE, row, column)
+                causes = {source for source, _stage in book.edges_into(receipt)}
+
+                def one(declaration: Any) -> Ref | None:
+                    matches = tuple(source for source in causes
+                                    if source.page == declaration)
+                    return matches[0] if len(matches) == 1 else None
+
+                materializer = tuple(
+                    source for source in causes
+                    if source.page == CANONICAL_VALUE and source.row == row
+                )
+                operands = one(PROCESS_GRAPH_OPERANDS)
+                identity = one(SOURCE_PYTHON_IDENTITY)
+                specialization = one(PLANNER_SPECIALIZATION_PAGE)
+                binding = one(NAME_BINDING)
+                classes = tuple(source for source in causes
+                                if source.page == SOURCE_VALUE_CLASS)
+                valid = (
+                    isinstance(row, tuple) and len(row) == 2
+                    and len(materializer) == 1
+                    and operands is not None and operands.row == row
+                    and identity is not None and specialization is not None
+                    and binding is not None and bool(classes)
+                    and specialization.row == (row[0], binding.row[1])
+                    and binding.row == (row[0], binding.row[1], 0)
+                    and materializer[0] in {
+                        source for source, _stage in book.edges_into(operands)
+                    }
+                )
+                if valid:
+                    edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands.row, operands.column,
+                    )
+                    args = tuple(source for source, role in edges
+                                 if role == "arg:0")
+                    binding_fact = book.page(NAME_BINDING).cell(
+                        binding.row, binding.column,
+                    )
+                    spec_fact = book.page(PLANNER_SPECIALIZATION_PAGE).cell(
+                        specialization.row, specialization.column,
+                    )
+                    identity_fact = book.page(SOURCE_PYTHON_IDENTITY).cell(
+                        identity.row, identity.column,
+                    )
+                    valid = (
+                        len(args) == 1 and args[0] in causes
+                        and all(role == "arg:0" or not role.startswith("arg:")
+                                for _source, role in edges)
+                        and isinstance(binding_fact, BindingFact)
+                        and binding_fact.authored
+                        and binding_fact.value_id == args[0].row[1]
+                        and binding_proves(binding, args[0])
+                        and isinstance(spec_fact, SpecializationFact)
+                        and spec_fact.source is SpecializationSource.LITERAL
+                        and type(spec_fact.value) is list and bool(spec_fact.value)
+                        and all(type(item) is int for item in spec_fact.value)
+                        and isinstance(identity_fact, tuple)
+                        and identity_fact[0] == "builtins.list"
+                    )
+                if valid:
+                    actuals = tuple(
+                        source for source, _stage in book.edges_into(
+                            specialization,
+                        ) if source.page == CANONICAL_VALUE
+                    )
+                    try:
+                        same_call = any(
+                            origin_cell(book, source)
+                            == origin_cell(book, materializer[0])
+                            for source, _stage in book.edges_into(identity)
+                            if source.page == CANONICAL_VALUE
+                        )
+                        dtypes = tuple(python_int_literal_dtype(item)
+                                       for item in spec_fact.value)
+                    except (ValueError, TypeError, OverflowError):
+                        same_call, dtypes = False, ()
+                    valid = (
+                        same_call and len(set(dtypes)) == 1
+                        and fact[0] == (dtypes[0],)
+                        and bool(actuals)
+                        and all(
+                            book.page(SOURCE_VALUE_CLASS).cell(
+                                class_cell.row, class_cell.column,
+                            )[0] == "builtins.list"
+                            and any(_class_proves_value(
+                                book, class_cell, actual,
+                            ) for actual in actuals)
+                            for class_cell in classes
+                        )
+                    )
+                if not valid:
+                    found.append(Finding(
+                        "specialized-literal-materialized-row", str(row),
+                        int(row[1]) if isinstance(row, tuple) and len(row) == 2
+                        else None,
+                        "row dtype lacks exact literal, formal, class, "
+                        "materializer or operand proof",
                     ))
         return found
 

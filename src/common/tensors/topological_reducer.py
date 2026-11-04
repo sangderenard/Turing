@@ -1010,7 +1010,9 @@ def indexed_store_site_span(
     return None
 
 
-def specialize_python_precision_widths(graph: Any) -> bool:
+def specialize_python_precision_widths(
+    graph: Any, *, publish_classes_only: bool = False,
+) -> bool:
     """Refresh Precision identity after exact callsite specialization.
 
     Source reduction necessarily sees a generic function before callsite
@@ -1285,6 +1287,14 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 _Derived(class_sources) if class_sources else None
             ),
         )
+    # The _tensor(bytes) callsite's first structural descriptor read happens
+    # before the later Precision refresh. Its exact actual class must already
+    # be in this specialization scope for list(bytes) row typing. The early
+    # caller requests only this incumbent scope/class publication; numeric
+    # Precision rewriting remains at the established refresh stage.
+    if publish_classes_only:
+        return False
+
     # A Precision parameter is where this scope's Precision interval begins:
     # the value enters here already assembled at its concorded width (its
     # limbs are supplied by the caller), so it opens the interval as a pack.

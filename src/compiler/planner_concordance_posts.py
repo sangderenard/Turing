@@ -55,8 +55,10 @@ def materialized_sequence_row_dtype(
     from .concorded_literals import origin_cell
     from .concordance_declarations import (
         BUILTIN_ITERABLE_ELEMENT, INGESTION, INGEST_SOURCE,
-        PLANNER_HIERARCHY, PROCESS_GRAPH_OPERANDS,
-        SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY,
+        NAME_BINDING, PLANNER_HIERARCHY, PLANNER_SPECIALIZATION_PAGE,
+        PROCESS_GRAPH_OPERANDS, SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY,
+        SOURCE_VALUE_CLASS,
+        SpecializationFact, SpecializationSource,
     )
     from .identity_concordance import (
         Novel, Mode, Ref, concord_sequence_row_dtypes,
@@ -126,6 +128,112 @@ def materialized_sequence_row_dtype(
     if len(source_nodes) != 1:
         return None, ()
     source_id = source_nodes[0]
+    attrs = graph.G.nodes[node_id].get("attributes") or {}
+    source_data = graph.G.nodes[source_id]
+    source_attrs = source_data.get("attributes") or {}
+    binding_page = book.page(NAME_BINDING)
+    specialization_page = book.page(PLANNER_SPECIALIZATION_PAGE)
+    formal_bindings = tuple(
+        binding
+        for specialization_row in specialization_page.scope_rows(tuple(lexical_scope))
+        for binding in (
+            book.latest_ref(NAME_BINDING, (
+                tuple(lexical_scope), specialization_row[1], 0,
+            )),
+        )
+        if binding is not None
+        and (binding_fact := binding_page.cell(binding.row, binding.column)) is not None
+        and binding_fact.authored
+        and int(binding_fact.value_id) == source_id
+    )
+    if (
+        identity_fact[0] == "builtins.list"
+        and source_data.get("type") == "Constant"
+        and len(formal_bindings) == 1
+    ):
+        # _tensor([0]) is copied into a distinct callsite fork as a literal
+        # formal. The list class states no element type. The exact copy's
+        # specialization fact contains the authored payload, and the formal
+        # binding joins that fact to this materializer's sole operand.
+        binding = formal_bindings[0]
+        parameter = binding.row[1]
+        specialization = book.latest_ref(
+            PLANNER_SPECIALIZATION_PAGE,
+            (tuple(lexical_scope), str(parameter)),
+        )
+        spec_fact = (
+            book.page(PLANNER_SPECIALIZATION_PAGE).cell(
+                specialization.row, specialization.column,
+            ) if specialization is not None else None
+        )
+        binding_fact = (
+            book.page(NAME_BINDING).cell(binding.row, binding.column)
+            if binding is not None else None
+        )
+        # The formal may have been folded to Constant before its specialized
+        # SOURCE_VALUE_CLASS is published. The callsite's class Ref must prove
+        # the SAME actual canonical value cited by this literal fact.
+        actual_classes = tuple(
+            class_cell
+            for class_cell in tuple(
+                (graph.G.graph.get("planner_parameter_class_cells") or {})
+                .get(str(parameter)) or ()
+            )
+            if isinstance(class_cell, Ref)
+            and class_cell.page == SOURCE_VALUE_CLASS
+            and book.page(SOURCE_VALUE_CLASS).cell(
+                class_cell.row, class_cell.column,
+            )[0] == "builtins.list"
+            and any(
+                source.page == arguments[0].page
+                and _class_proves_value(book, class_cell, source)
+                for source, _stage in book.edges_into(specialization)
+            )
+        ) if specialization is not None else ()
+        if (
+            isinstance(spec_fact, SpecializationFact)
+            and spec_fact.source == SpecializationSource.LITERAL
+            and type(spec_fact.value) is list
+            and spec_fact.value
+            and type(source_attrs.get("value")) is list
+            and len(source_attrs["value"]) == len(spec_fact.value)
+            and all(
+                type(actual) is type(recorded) and actual == recorded
+                for actual, recorded in zip(
+                    source_attrs["value"], spec_fact.value, strict=True,
+                )
+            )
+            and binding_fact is not None
+            and int(binding_fact.value_id) == source_id
+            and source_attrs.get("producer_kind") == "aggregate_parameter"
+            and bool(actual_classes)
+            and attrs.get("producer_kind") == "aggregate_materialization"
+            and attrs.get("sequence_column_count") == 1
+            and tuple(attrs.get("materialized_source_value_ids") or ())
+                == (source_id,)
+        ):
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            dtypes = tuple(
+                python_int_literal_dtype(value)
+                for value in spec_fact.value
+                if type(value) is int
+            )
+            if len(dtypes) == len(spec_fact.value) and len(set(dtypes)) == 1:
+                causes = tuple(dict.fromkeys((
+                    materializer, arguments[0], identity, operand,
+                    specialization, binding, *actual_classes,
+                )))
+                resolved = concord_sequence_row_dtypes(
+                    tuple(lexical_scope), {node_id: (dtypes[0],)},
+                    source="specialized literal materialization",
+                    sources=causes, stage=PLANNER_HIERARCHY,
+                )
+                receipt = book.latest_ref(
+                    SEQUENCE_ROW_DTYPE, (tuple(lexical_scope), node_id),
+                )
+                if resolved == (dtypes[0],) and isinstance(receipt, Ref):
+                    return resolved[0], (receipt, *causes)
     classes = require_class(numeric_scope, source_id, book=book)
     if (not isinstance(classes, ClassEvidence)
             or not _class_proves_value(book, classes.subject_cell,

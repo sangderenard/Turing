@@ -7094,6 +7094,21 @@ def _build_shell_hierarchy_plan(
                         and not tuple(described.get("shape") or ())
                     ):
                         described_dtype = str(described["dtype"])
+                if (
+                    described_dtype is None
+                    and attributes.get("producer_kind") == "aggregate_materialization"
+                    and not local_tensor_dtype
+                    and not node.get("dtype")
+                ):
+                    # _tensor(bytes) first creates list(bytes). Its exact
+                    # SEQUENCE_ROW_DTYPE proves the list arena element width;
+                    # a Call with no tensor field otherwise skips the
+                    # descriptor reader and reaches the region untyped.
+                    from .planner_concordance_posts import materialized_sequence_row_dtype
+
+                    described_dtype, _row_cells = materialized_sequence_row_dtype(
+                        graph, int(current),
+                    )
                 # A ``Precision[k]`` value (``x: Precision[2]``) is k limbs
                 # of its element type, binary64 unless the descriptor names
                 # one: the numeric descriptor IS its type record. Complex and
@@ -7777,7 +7792,24 @@ def _build_shell_hierarchy_plan(
             _fixed_width_row_width(int(value_id))
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
-                return record, _dtype_producer_cells(graph, int(value_id))
+                extra_cells = ()
+                node = graph.G.nodes.get(int(value_id), {})
+                if (node.get("attributes") or {}).get("producer_kind") == "aggregate_materialization":
+                    from .concordance_declarations import SEQUENCE_ROW_DTYPE
+                    from .identity_concordance import current_identity_book
+
+                    read_scope = graph.G.graph.get("lexical_read_scope")
+                    if read_scope is not None:
+                        row = (tuple(read_scope), int(value_id))
+                        cell = current_identity_book().latest_ref(SEQUENCE_ROW_DTYPE, row)
+                        if cell is not None:
+                            fact = current_identity_book().page(SEQUENCE_ROW_DTYPE).cell(
+                                cell.row, cell.column,
+                            )
+                            if (isinstance(fact, tuple) and len(fact) >= 1
+                                    and tuple(fact[0]) == (str(record[2]),)):
+                                extra_cells = (cell,)
+                return record, _dtype_producer_cells(graph, int(value_id), *extra_cells)
             # zeros((runtime_count,), dtype="float64") already has its
             # explicit target type on the book, even while its geometry is
             # incomplete. Omitting that settled fact here left the constructor
@@ -37032,6 +37064,24 @@ def _callsite_specialized_shell_type(
         caller, int(node_id), specialized, specializations,
         tensor_descriptors, function_table,
     )
+    # _tensor(packet + dictionary) reaches the first descriptor query in the
+    # structural fold below. Its copied formal has an exact caller bytes
+    # class receipt but no specialized numeric scope until the later Precision
+    # refresh. Publish that existing scope/class view before the first read.
+    from ..transmogrifier.graph.python_identity_programs import BUILTIN_ITERABLE_ELEMENTS
+    from ..common.tensors.topological_reducer import specialize_python_precision_widths
+    if (
+        any(
+            str(class_identity) in BUILTIN_ITERABLE_ELEMENTS
+            for class_identity, _limbs in parameter_classes.values()
+        )
+        and any(
+            (data.get("attributes") or {}).get("producer_kind")
+            == "aggregate_materialization"
+            for _value, data in specialized.G.nodes(data=True)
+        )
+    ):
+        specialize_python_precision_widths(specialized, publish_classes_only=True)
     # Save the exact per-callsite ABI view by canonical value identity before
     # structural folding rewrites the formal node's attribute dictionary.
     from ..common.tensors.topological_reducer import node_identity_cell
