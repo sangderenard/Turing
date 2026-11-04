@@ -9,8 +9,14 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import CorrelationTable
-from src.compiler.concordance_declarations import TENSOR_RUNTIME_RESHAPE_VALIDITY
+from src.compiler.concordance_declarations import (
+    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+    TENSOR_RUNTIME_RESHAPE_VALIDITY,
+)
 from src.compiler.identity_concordance import identity_book
+from src.compiler.ssa_record_return_state import (
+    function_scope_of, posted_ssa_value_fact,
+)
 
 
 def _contract(*, shape=None):
@@ -70,9 +76,61 @@ def test_runtime_inferred_axis_keeps_distinct_view_and_returned_metadata():
     assert descriptor.alias_of == storage_id
     assert descriptor.data_value_id == storage_id
     book = identity_book(module)
-    from src.compiler.ssa_record_return_state import function_scope_of
     assert book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY,
                            (function_scope_of(callee), callee.name, view_id))
+    consumer_callee = module.functions[consumer.attributes["callee"]]
+    result_id = int(consumer.attributes["output_ids"][0])
+    result_descriptor = module.tensor_tables[consumer_callee.name].by_id(
+        result_id
+    )
+    assert result_descriptor.metadata_state == "dynamic"
+    assert (
+        result_descriptor.shape_value_id,
+        result_descriptor.rank_value_id,
+        result_descriptor.element_count_value_id,
+    ) == tuple(int(value.id) for value in consumer.args[1:4])
+    assert book.latest_ref(
+        TENSOR_ELEMENTWISE_EXTENT_BINDING,
+        (function_scope_of(consumer_callee), consumer_callee.name, result_id),
+    )
+    result_fact = posted_ssa_value_fact(consumer_callee, result_id, book=book)
+    assert (result_fact.physical_dtype, result_fact.storage, result_fact.rank) == (
+        "int64", "span", 2,
+    )
+
+
+def test_left_scalar_subtraction_keeps_order_and_tensor_extent():
+    source = """def root(bits: AbstractTensor, width: int) -> AbstractTensor:
+    shaped = bits.reshape(-1, width)
+    return 1 - shaped
+"""
+    module, _outputs, exports = _lower(source)
+    assert not CorrelationTable.build(module).findings(module)
+    root = module.functions[exports[0]]
+    consumer = next(
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and str(instruction.attributes.get("callee", "")).endswith(
+            "__planned_region_1"
+        )
+    )
+    callee = module.functions[consumer.attributes["callee"]]
+    result_id = int(consumer.attributes["output_ids"][0])
+    binding = identity_book(module).page(TENSOR_ELEMENTWISE_EXTENT_BINDING).latest(
+        (function_scope_of(callee), callee.name, result_id)
+    )
+    assert binding is not None
+    assert binding[0] == "sub"
+    result_fact = posted_ssa_value_fact(callee, result_id,
+                                         book=identity_book(module))
+    assert (result_fact.physical_dtype, result_fact.storage, result_fact.rank) == (
+        "int64", "span", 2,
+    )
+    assert tuple(int(argument.id) for argument in next(
+        instruction for block in callee.blocks.values()
+        for instruction in block.instrs if instruction.op == "Sub"
+    ).args) == (binding[2], binding[1])
 
 
 def test_exact_static_reshape_keeps_view_and_downstream_tensor_shape():

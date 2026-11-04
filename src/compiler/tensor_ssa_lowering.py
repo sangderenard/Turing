@@ -1068,6 +1068,22 @@ def _int64_lane_checked(instruction: Any, operation: str, result: Any) -> bool:
     )
 
 
+def _int64_binary_kernel(
+    operation: str, result: Any, operands: Any,
+) -> bool:
+    """The existing integer binary repository call's exact element ABI."""
+
+    return (
+        str(operation) in {"add", "sub", "mul", "mod"}
+        and str(result.dtype or "").casefold() in {"int64", "i64", "long"}
+        and all(
+            str(operand.dtype or "").casefold()
+            in {"int", "int32", "i32", "int64", "i64", "long"}
+            for operand in operands
+        )
+    )
+
+
 def _int64_lane_stays_elementwise(
     instruction: Any, operation: str, result: Any, operands: Any,
 ) -> bool:
@@ -6904,9 +6920,14 @@ def lower_tensor_calls_to_repository_ssa(
                     _settle_operand_shapes(
                         function, (instruction.res,), owner_tensor_descriptor,
                     )
+                opcode_contract = c_tensor_opcode(operation)
                 data_positions = (
                     frozenset({0, 1, 2})
-                    if operation == "where" else frozenset({0})
+                    if operation == "where"
+                    else frozenset({0, 1})
+                    if opcode_contract is not None
+                    and opcode_contract[0] == "binary"
+                    else frozenset({0})
                 )
                 data_args = [
                     argument for position, argument in enumerate(args)
@@ -6920,6 +6941,22 @@ def lower_tensor_calls_to_repository_ssa(
                     and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                if opcode_contract is not None and opcode_contract[0] == "binary":
+                    from .ssa_record_return_state import posted_ssa_value_fact
+
+                    span_operands = tuple(
+                        operand for operand in data_args
+                        if (fact := posted_ssa_value_fact(
+                            function, int(operand.id), book=book,
+                        )) is not None
+                        and fact.storage == "span"
+                        and fact.rank is not None and fact.rank > 0
+                    )
+                    if len(span_operands) == 1:
+                        # Operand order remains in data_args for subtraction
+                        # and other noncommutative kernels. This selects only
+                        # the extent-bearing operand as the shape source.
+                        source = span_operands[0]
                 unsettled_span_operands = tuple(
                     operand for operand in data_args
                     if not tuple(operand.shape or ())
@@ -7566,7 +7603,12 @@ def lower_tensor_calls_to_repository_ssa(
                                 ),
                                 book=_opcode_book,
                                 physical={
-                                    "physical_dtype": "float64",
+                                    "physical_dtype": (
+                                        "int64" if opcode_contract[0] == "binary"
+                                        and _int64_binary_kernel(
+                                            operation, result, data_args,
+                                        ) else "float64"
+                                    ),
                                     **_elementwise_result_physical(
                                         _opcode_owner, data_args,
                                         book=_opcode_book,
@@ -7866,6 +7908,102 @@ def lower_tensor_calls_to_repository_ssa(
                         prefix.append(definition)
                         return value
                     if of is None:
+                        return None
+                    if of is result and result_descriptor.metadata_state == "dynamic":
+                        from .concordance_declarations import (
+                            TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                            TENSOR_METADATA_CALL_BINDING,
+                            TENSOR_METADATA_RESULT_BINDING,
+                            TENSOR_SSA_LOWERING,
+                        )
+                        from .identity_concordance import Derived, Mode
+                        from .ssa_record_return_state import (
+                            function_scope_of, posted_ssa_value_fact,
+                            ssa_value_identity_cell,
+                        )
+
+                        signature = c_tensor_opcode(operation)
+                        scalar = next((operand for operand in data_args
+                                       if source is not None
+                                       and int(operand.id) != int(source.id)), None)
+                        scalar_fact = (
+                            posted_ssa_value_fact(function, int(scalar.id), book=book)
+                            if scalar is not None else None
+                        )
+                        ids = (
+                            result_descriptor.shape_value_id,
+                            result_descriptor.rank_value_id,
+                            result_descriptor.element_count_value_id,
+                        )
+                        matching_bindings = []
+                        if (
+                            signature is not None and signature[0] == "binary"
+                            and len(data_args) == 2 and source is not None
+                            and scalar_fact is not None
+                            and scalar_fact.storage == "scalar"
+                            and scalar_fact.rank == 0
+                            and source_descriptor is not None
+                            and source_descriptor.metadata_state == "dynamic"
+                            and ids == (
+                                source_descriptor.shape_value_id,
+                                source_descriptor.rank_value_id,
+                                source_descriptor.element_count_value_id,
+                            )
+                            and all(item is not None for item in ids)
+                        ):
+                            for binding_row in book.page(
+                                TENSOR_METADATA_CALL_BINDING
+                            ).rows():
+                                if binding_row[4] != function.name:
+                                    continue
+                                binding_ref = book.latest_ref(
+                                    TENSOR_METADATA_CALL_BINDING, binding_row,
+                                )
+                                binding_fact = book.page(
+                                    TENSOR_METADATA_CALL_BINDING
+                                ).cell(binding_ref.row, binding_ref.column)
+                                result_causes = tuple(
+                                    cause for cause, _stage in book.edges_into(
+                                        binding_ref
+                                    ) if cause.page == TENSOR_METADATA_RESULT_BINDING
+                                    and cause.row[3] == int(source.id)
+                                )
+                                if (len(result_causes) == 1
+                                        and binding_fact[1] == ids):
+                                    matching_bindings.append((
+                                        binding_ref, result_causes[0],
+                                    ))
+                        if len(matching_bindings) == 1:
+                            count_formals = tuple(
+                                formal for formal in function.args
+                                if int(formal.id) == int(ids[2])
+                            )
+                            causes = tuple(dict.fromkeys((
+                                matching_bindings[0][0],
+                                matching_bindings[0][1],
+                                *(ssa_value_identity_cell(
+                                    function, int(value_id), book=book,
+                                ) for value_id in (
+                                    int(source.id), int(scalar.id), int(result.id),
+                                    *map(int, ids),
+                                )),
+                            )))
+                            if (len(count_formals) == 1
+                                    and all(cell is not None for cell in causes)):
+                                book.post(
+                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                    (function_scope_of(function), function.name,
+                                     int(result.id)),
+                                    (str(operation), int(source.id),
+                                     int(scalar.id), *map(int, ids)),
+                                    stage=TENSOR_SSA_LOWERING,
+                                    provenance=Derived(causes), mode=Mode.CONCORD,
+                                )
+                                return count_formals[0]
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "binary result runtime extent has no exact operand geometry binding",
+                        ))
                         return None
                     # Extent unknown statically: mint it as ordinary SSA.
                     return ensure_dynamic(prefix, of)["element_count"]
@@ -8971,13 +9109,8 @@ def lower_tensor_calls_to_repository_ssa(
                         kind, opcode_value = opcode
                         int64_binary = (
                             kind == "binary"
-                            and operation in {"add", "sub", "mul", "mod"}
-                            and str(result.dtype or "").casefold()
-                            in {"int64", "i64", "long"}
-                            and all(
-                                str(operand.dtype or "").casefold()
-                                in {"int", "int32", "i32", "int64", "i64", "long"}
-                                for operand in data_args
+                            and _int64_binary_kernel(
+                                operation, result, data_args,
                             )
                         )
                         binary_kernel = (

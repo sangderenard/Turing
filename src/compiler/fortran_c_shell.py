@@ -62459,12 +62459,14 @@ def _class_surface_ssa_program(
     # backend receives real tensor projections rather than a pointer table
     # misdeclared as flat numerical storage.
     from .tensor_ssa_lowering import (
+        _SHAPED_SSA_OPERATIONS,
+        c_tensor_opcode,
         legalize_aggregate_adapters,
         legalize_aggregate_output_views,
         lower_tensor_calls_to_repository_ssa,
+        publish_computed_region_result_metadata,
         propagate_repository_ssa_call_metadata,
         settle_repository_ssa_static_extent_operands,
-        publish_computed_region_result_metadata,
     )
     if tensor_ssa_reference is not None:
         # Projected sequence rows only acquire their physical element shape
@@ -62472,6 +62474,21 @@ def _class_surface_ssa_program(
         # metadata across every existing call edge before deciding which
         # unresolved tensor operations need one final lowering attempt.
         propagate_repository_ssa_call_metadata(lowered_module)
+
+        def _raw_binary_span_ready(function, instruction) -> bool:
+            operation = _SHAPED_SSA_OPERATIONS.get(str(instruction.op))
+            signature = None if operation is None else c_tensor_opcode(operation)
+            if signature is None or signature[0] != "binary":
+                return False
+            return any(
+                (fact := _posted_ssa_value_fact(
+                    function, int(argument.id),
+                )) is not None
+                and fact.physical_dtype is not None
+                and fact.storage == "span"
+                and fact.rank is not None and fact.rank > 0
+                for argument in instruction.args
+            )
 
         # Tensor lowering owns both sides of every repository call edge: a
         # dynamic operation may add shape/rank/count formals to a planned
@@ -62495,6 +62512,7 @@ def _class_surface_ssa_program(
                         "tensor_operation", "tensor", "tensor_candidate",
                     )
                 )
+                or _raw_binary_span_ready(function, instruction)
                 for block in function.blocks.values()
                 for instruction in block.instrs
             )
@@ -62535,6 +62553,10 @@ def _class_surface_ssa_program(
             lowered_module.tensor_tables.setdefault(name, table)
         propagate_repository_ssa_call_metadata(lowered_module)
         settle_repository_ssa_static_extent_operands(lowered_module)
+        # A computed result may first acquire its shape/rank/count while the
+        # late tensor slice is lowering. Its caller's owner lifetime is proved
+        # only after all affected functions and call edges are back on this
+        # full module; the same strict publisher checks those live consumers.
         publish_computed_region_result_metadata(lowered_module)
         if late_tensor_shortfalls:
             lowered_module.metadata["late_tensor_lowering_shortfalls"] = tuple(

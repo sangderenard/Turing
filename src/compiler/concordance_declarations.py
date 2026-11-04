@@ -4652,6 +4652,16 @@ TENSOR_OUTPUT_CAPACITY_BOUND = declare_page("tensor_output_capacity_bound", (
 CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
     RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
 ), tuple)
+#: A binary tensor result with one proven scalar operand retains the tensor
+#: operand's exact runtime shape/rank/count formals. The fact records
+#: (canonical operation, tensor operand, scalar operand, shape, rank, count);
+#: the ordered SSA instruction operands remain the execution authority.
+TENSOR_ELEMENTWISE_EXTENT_BINDING = declare_page(
+    "tensor_elementwise_extent_binding", (
+        RowField("scope", K.SCOPE), RowField("function", K.NAME),
+        RowField("result", K.VALUE_ID),
+    ), tuple,
+)
 #: ``Unsourced`` reasons for the three pages above: the value has no
 #: ``ssa_value`` cell in the function that holds it, or the contract changed
 #: over the same cells.
