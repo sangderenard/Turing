@@ -25300,27 +25300,61 @@ def _post_ssa_block_geometry(book, scope, function):
         for row in book.page(FUNCTION_OUTPUT).scope_rows(scope)
         if book.latest_ref(FUNCTION_OUTPUT, row) is not None
     )
+    result_page = book.page(TENSOR_METADATA_RESULT_BINDING)
+    result_rows = tuple(dict.fromkeys((
+        *result_page.scope_rows(scope),
+        *(row for row in result_page.rows()
+          if str(row[2]) == str(function.name)),
+    )))
+    result_cells = tuple(
+        (row, ref, result_page.cell(ref.row, ref.column))
+        for row in result_rows
+        for ref in (book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row),)
+        if ref is not None
+    )
     for label, block in function.blocks.items():
-        result_metadata_cells = tuple(
-            book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
-            for row in book.page(TENSOR_METADATA_RESULT_BINDING).scope_rows(scope)
-            if any(
-                instruction.op in {"Call", "call"}
-                and instruction.res is not None
-                and int(instruction.res.id) == int(row[1])
-                and instruction.attributes.get("callee") == row[2]
-                for instruction in block.instrs
-            ) or any(
-                instruction.op in {"Ret", "ret", "Return", "return"}
-                and int(row[3]) in {int(value.id) for value in instruction.args}
-                and set(map(int, book.page(
-                    TENSOR_METADATA_RESULT_BINDING
-                ).latest(row)[2])).issubset({
-                    int(value.id) for value in instruction.args
-                })
-                for instruction in block.instrs
+        result_metadata_cells = []
+        for result_row, result_ref, result_fact in result_cells:
+            local_projection = result_row[0] == scope and (
+                any(
+                    instruction.op in {"Call", "call"}
+                    and instruction.res is not None
+                    and int(instruction.res.id) == int(result_row[1])
+                    and instruction.attributes.get("callee") == result_row[2]
+                    for instruction in block.instrs
+                ) or any(
+                    instruction.op in {"Ret", "ret", "Return", "return"}
+                    and int(result_row[3]) in {
+                        int(value.id) for value in instruction.args
+                    }
+                    and set(map(int, result_fact[2])).issubset({
+                        int(value.id) for value in instruction.args
+                    })
+                    for instruction in block.instrs
+                )
             )
-        )
+            # Program: _ascending_order's source Ret(22) gains the exact
+            # shape/rank/count suffix after the outer root Call has published
+            # its result binding.  The prior geometry already cited the local
+            # planned-region result row; only the outer Call's newer row
+            # explains this Ret revision.  Its callee triple, not the root's
+            # projected caller triple, is the suffix in this function.
+            incoming_return = (
+                str(result_row[2]) == str(function.name)
+                and any(
+                    instruction.op in {"Ret", "ret", "Return", "return"}
+                    and int(result_row[3]) in {
+                        int(value.id) for value in instruction.args
+                    }
+                    and set(map(int, result_fact[1])).issubset({
+                        int(value.id) for value in instruction.args
+                    })
+                    for instruction in block.instrs
+                )
+            )
+            if local_projection or incoming_return:
+                result_metadata_cells.append(result_ref)
+        result_metadata_cells = tuple(result_metadata_cells)
         # Program: root arange -> cast -> sum. The owner release is a
         # resultless Call inserted before Ret after the prior entry geometry
         # was posted. Its SSA operands were already cited by that earlier
