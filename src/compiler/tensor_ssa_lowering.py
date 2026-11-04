@@ -6675,9 +6675,28 @@ def lower_tensor_calls_to_repository_ssa(
                     # shape as ordinary SSA before descriptor registration;
                     # storage-capacity analysis remains free to prove a
                     # static arena bound through the exact caller edge.
-                    constructor_count = fresh(dtype="int32")
-                    shape_value, shape_definition = int_vector((0,))
-                    rank_value, rank_definition = constant(1, "int32")
+                    # compact_codewords' dynamic zeros result carries this
+                    # constructor shape, rank and count across a planned
+                    # region Call. The int32 Cast and Const definitions are
+                    # their physical declarations; record those on the
+                    # minted SSA cells before the aggregate return projects
+                    # them into the caller.
+                    scalar32 = {
+                        "physical_dtype": "int32", "storage": "scalar",
+                        "rank": 0,
+                    }
+                    constructor_count = fresh(
+                        dtype="int32", physical=scalar32,
+                    )
+                    shape_value, shape_definition = int_vector(
+                        (0,), physical={
+                            "physical_dtype": "int32", "storage": "span",
+                            "rank": 1,
+                        },
+                    )
+                    rank_value, rank_definition = constant(
+                        1, "int32", physical=scalar32,
+                    )
                     zero, zero_definition = constant(0, "int64")
                     shape_address = fresh(dtype="ptr")
                     prefix.extend((
