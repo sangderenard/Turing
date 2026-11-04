@@ -33663,7 +33663,7 @@ def lower_control_sections_to_ssa(
                 item.reason,
             )
             for item in lower_tensor_calls_to_repository_ssa(
-                module, tensor_ssa_reference
+                module, tensor_ssa_reference, finalize_private_owners=False,
             )
         )
         report(
@@ -34022,7 +34022,7 @@ def lower_precompile_and_control_to_ssa(
                 item.reason,
             )
             for item in lower_tensor_calls_to_repository_ssa(
-                module, tensor_ssa_reference
+                module, tensor_ssa_reference, finalize_private_owners=False,
             )
         )
     from .ir_indexing import lower_indexing_to_ssa_addressing

@@ -197,7 +197,9 @@ def wire_repository_ssa_region_products(module: IRModule) -> bool:
     return changed
 
 
-def publish_computed_region_result_metadata(module: IRModule) -> bool:
+def publish_computed_region_result_metadata(
+    module: IRModule, *, finalize_private_owners: bool = True,
+) -> bool:
     """Return a region's computed shape/rank/count through its aggregate Call.
 
     The callee-local metadata IDs cannot be copied into a caller result's
@@ -594,6 +596,15 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             stage=TENSOR_SSA_LOWERING,
             provenance=Derived(binding_sources), mode=Mode.REVISE,
         )
+    # A local source section can publish a reshape's metadata only after
+    # visiting its still-deferred consumer.  For reshape + private arange,
+    # attempting release here previously rejected that consumer before the
+    # existing whole-program tensor retry could lower it.  Section linking
+    # publishes metadata now; the complete module runs this same strict owner
+    # proof after that retry. No release receipt is invented while deferred.
+    if not finalize_private_owners:
+        return changed
+
     # Program: private arange -> cast -> sum returns a scalar. The two heap
     # owners are caller frame cells, and neither tensor escapes. Their
     # allocation outlives every region consumer and is released by the
@@ -3837,6 +3848,7 @@ def _post_scalar_kernel_input_conversion(
 def lower_tensor_calls_to_repository_ssa(
     module: IRModule,
     reference: SSATensorCodeReference,
+    *, finalize_private_owners: bool = True,
 ) -> tuple[TensorSSALoweringShortfall, ...]:
     """Replace tensor calls with fully explicit calls into ``reference``.
 
@@ -9506,7 +9518,9 @@ def lower_tensor_calls_to_repository_ssa(
             if existing_table is not None and existing_table != reference_table:
                 raise ValueError(f"repository SSA tensor-table collision for {name!r}")
             module.tensor_tables[name] = reference_table
-    publish_computed_region_result_metadata(module)
+    publish_computed_region_result_metadata(
+        module, finalize_private_owners=finalize_private_owners,
+    )
     if legalize_aggregate_adapters(module):
         settle_canonical_value_metadata(module)
         settle_shape_preserving_value_metadata(module)
