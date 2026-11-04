@@ -5451,12 +5451,21 @@ def lower_tensor_calls_to_repository_ssa(
                                   and parent.row == input_cell.row):
                                 pending.append(parent)
                     # tensor_octets_to_bytes' `int(count)` consumes a
-                    # planned formal whose exact ABI is scalar int64/rank0.
-                    # Rejecting that arm as an unproved tensor shape minted
-                    # runtime extents for the scalar and sent its result
-                    # through a pointer cast. A complete scalar ABI proves
-                    # the empty shape just as a complete span ABI proves its
-                    # stated extents; neither is inferred from display shape.
+                    # planned formal whose optional ABI has None/no-storage
+                    # and int/scalar arms. Both have a static rank-zero
+                    # geometry, and the shared payload's scoped SSA fact
+                    # proves scalar storage. Rejecting the None arm here
+                    # invented dynamic span extents and routed the scalar
+                    # result through a pointer cast. This proves geometry
+                    # only; the union tag and branch retain presence truth.
+                    scalar_slot = (
+                        shape == () and input_cell is not None
+                        and (slot_fact := shape_book.page(
+                            _INPUT_SSA_VALUE,
+                        ).cell(input_cell.row, input_cell.column)).storage
+                        == "scalar"
+                        and slot_fact.rank == 0
+                    )
                     full_shape_proved = bool(declared_abis) and all(
                         bool(abi.physical_alternatives) and all(
                             (
@@ -5464,10 +5473,11 @@ def lower_tensor_calls_to_repository_ssa(
                                 and tuple(arm.shape) == shape
                                 and arm.rank == len(shape)
                             ) or (
-                                arm.storage == "scalar"
-                                and shape == ()
+                                scalar_slot
+                                and arm.storage in {"scalar", "none"}
                                 and tuple(arm.shape) == ()
                                 and arm.rank == 0
+                                and arm.metadata_state == "static"
                             )
                             for arm in abi.physical_alternatives
                         ) for abi in declared_abis

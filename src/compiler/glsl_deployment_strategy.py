@@ -31444,6 +31444,12 @@ def _fold_callsite_structural_values(
                             else int(effective_abi["rank"])
                         )
                     ),
+                    # Program: ``if count is None`` with a public
+                    # ``int | None`` input. The int64 payload is present
+                    # even for the None arm; it does not prove that arm
+                    # selected. Keep the exact declared alternatives so
+                    # the control predicate reaches the native type tag.
+                    optional="builtins.NoneType" in expectations,
                     type_expectations=expectations,
                 )
             record_abi = (
@@ -32039,12 +32045,10 @@ def _fold_callsite_structural_values(
                 (isinstance(left, _ProgramABIValueFact) and right is None)
                 or (left is None and isinstance(right, _ProgramABIValueFact))
             ):
-                # A program-ABI fact does not reveal a runtime numerical value,
-                # but it does prove that physical, nonoptional storage exists.
-                # This compiler has no tagged optional scalar/span/record ABI;
-                # such a value therefore cannot be Python ``None``.  Restrict
-                # the fold to identity-with-None so no equality or truthiness is
-                # inferred from the schema fact itself.
+                # A program-ABI fact does not reveal a runtime numerical
+                # value. Only a fact without a NoneType alternative proves
+                # that this identity comparison cannot select None; a
+                # tagged union's physical payload exists for both arms.
                 #
                 # The one exception is a fact whose declared Python type IS
                 # ``NoneType``: the contract states the value is None (a
