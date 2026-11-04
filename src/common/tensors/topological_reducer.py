@@ -2035,7 +2035,9 @@ def _concord_aggregate_merge_class(graph: Any, value_id: Any) -> None:
     )
 
 
-def _indexed_store_source(graph: Any, value_id: Any) -> Any:
+def _indexed_store_source(
+    graph: Any, value_id: Any, *, with_path: bool = False,
+) -> Any:
     """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges.
 
     Program: ``out = [0] * count; while i < count: out[i] = i + d; i += 1;
@@ -2064,8 +2066,8 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
     roles = {"IndexedStore": ("base",), "LoopResult": ("value",),
              "Phi": ("body", "orelse")}
 
-    def storage(current: Any, seen: frozenset) -> tuple[Any, bool]:
-        """(the storage ``current`` versions, whether a store was crossed)."""
+    def storage(current: Any, seen: frozenset) -> tuple[Any, bool, tuple]:
+        """Storage root, crossed-store proof, and exact traversed graph edges."""
 
         if (
             not isinstance(current, int)
@@ -2073,7 +2075,7 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
             or current in seen
             or target.nodes[current].get("type") not in roles
         ):
-            return current, False
+            return current, False, ()
         kind = target.nodes[current].get("type")
         parents = target.nodes[current].get("parents") or ()
         arms = [
@@ -2081,18 +2083,24 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
             for wanted in roles[kind]
         ]
         if any(arm is None for arm in arms):
-            return current, False
+            return current, False, ()
         resolved = [storage(arm, seen | {current}) for arm in arms]
-        sources = {source for source, _stored in resolved}
+        sources = {source for source, _stored, _path in resolved}
         crossed = kind == "IndexedStore" or any(
-            stored for _source, stored in resolved
+            stored for _source, stored, _path in resolved
         )
         if len(sources) != 1 or not crossed:
-            return current, False
-        return next(iter(sources)), True
+            return current, False, ()
+        path = ((int(current), str(kind), tuple(
+            (str(role), int(arm)) for role, arm in zip(roles[kind], arms)
+        )),) + tuple(
+            step for _source, _stored, steps in resolved for step in steps
+        )
+        return next(iter(sources)), True, path
 
-    source, crossed = storage(value_id, frozenset())
-    return source if crossed else value_id
+    source, crossed, path = storage(value_id, frozenset())
+    resolved = source if crossed else value_id
+    return (resolved, path) if with_path else resolved
 
 
 def _is_row_collection(graph: Any, value_id: Any) -> bool:
@@ -19133,11 +19141,55 @@ def _normalize_lexical_values(
                     and isinstance(member.ctx, ast.Load)
                     and int(getattr(member, "lineno", -1)) > loop_end
                 }
+                def same_loop_storage_version(initial: int, updated: int) -> bool:
+                    # `broadcast_shape_extents` has `output[i] = ...` in
+                    # three conditional arms.  The lexical name advances to
+                    # Phi30, but every arm's IndexedStore still writes Input1.
+                    # Carrying Phi30 as a *value* changes the next iteration's
+                    # output pointer to the last stored scalar.  Read the
+                    # incumbent exact base-edge resolver, keep the effects,
+                    # and record the full path that proved one storage.
+                    source, path = _indexed_store_source(
+                        graph, int(updated), with_path=True,
+                    )
+                    if source != int(initial) or not path:
+                        return False
+                    from ...compiler.concordance_declarations import (
+                        LOOP_STORAGE_VERSION, REDUCER_LOOP_STORAGE_VERSION,
+                    )
+                    book = current_identity_book()
+                    loop_cell = node_identity_cell(graph, int(loop_id))
+                    initial_cell = node_identity_cell(graph, int(initial))
+                    updated_cell = node_identity_cell(graph, int(updated))
+                    proof = tuple(dict.fromkeys(
+                        (
+                            node_identity_cell(graph, node_id), kind,
+                            tuple((role, node_identity_cell(graph, child_id))
+                                  for role, child_id in edges),
+                        )
+                        for node_id, kind, edges in path
+                    ))
+                    causes = tuple(dict.fromkeys((
+                        loop_cell, initial_cell, updated_cell,
+                        *(cell for cell, _kind, edges in proof
+                          for cell in (cell, *(child for _role, child in edges))),
+                    )))
+                    book.post(
+                        LOOP_STORAGE_VERSION,
+                        (loop_cell, initial_cell, updated_cell), proof,
+                        stage=REDUCER_LOOP_STORAGE_VERSION,
+                        provenance=_Derived(causes), mode=_Mode.CONCORD,
+                    )
+                    return True
+
                 loop_carried_bindings = {
                     name: (before_loop[name], environment[name])
                     for name in before_loop.keys() & environment.keys()
                     if (
                         before_loop[name] != environment[name]
+                        and not same_loop_storage_version(
+                            before_loop[name], environment[name],
+                        )
                         and name not in loop_target_bindings
                         and (
                             name not in overwritten_before_read
