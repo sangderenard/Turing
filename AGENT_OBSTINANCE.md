@@ -653,3 +653,17 @@ record. Three focused tests failed before lowering completed, costing a
 SSA_VALUE cells; the existing CALL_RECORD cause remained intact. Checking the
 reader's direct-cause contract before posting an unchanged fact would have
 prevented the departure.
+
+## 2026-11-04 — broadened a record-field repro into the encoder
+
+The assigned Run53 record-field conflict called for a short real source
+slice. After a direct PackedBitstream parameter slice reached a different
+later sequence shortfall, the agent tried a public `encode_octets(data)`
+wrapper. It expanded to 24 functions and ran for about 93 CPU seconds
+without reaching the declaration reader; the agent stopped that process.
+The extra compilation produced no identifying declaration cells. The next
+slice constructed PackedBitstream from four public tensor fields, which
+lowered eight functions and reached a different later tensor-index dtype
+shortfall. Inspecting the exact class declaration and record-view cells in
+the saved Run53 book before selecting a smaller source call chain would have
+avoided the broad encoder attempt.
