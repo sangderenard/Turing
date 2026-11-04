@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
@@ -18,13 +19,17 @@ from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 from src.compiler.ssa_storage_requirements import public_owned_sequence_returns
 
 
-def test_returned_bytes_views_keep_source_operand_owner_proof(tmp_path):
+@pytest.mark.parametrize("early_return", (False, True))
+def test_returned_bytes_views_keep_source_operand_owner_proof(tmp_path, early_return):
     source = (
         "def root(data: bytes) -> bytes:\n"
         "    header = bytearray()\n"
         "    header.append(2)\n"
         "    for _ in range(1):\n"
-        "        header.append(3)\n"
+        + ("        if not data:\n"
+           "            return bytes(header)\n" if early_return
+           else "        header.append(3)\n")
+        +
         "    return bytes(header) + bytes(data)\n"
     )
     contract = ExtractionContract(
@@ -75,6 +80,17 @@ def test_returned_bytes_views_keep_source_operand_owner_proof(tmp_path):
     finally:
         operand_page.cells[key] = operands
     artifact = emit_ssa_module_to_c(module, function_name)
+    if early_return:
+        # The control merge now settles with one exact storage identity.
+        # Its earlier header arena still lacks a proven capacity; keep that
+        # separate native limitation explicit rather than inventing a bound.
+        assert not artifact.complete
+        assert all(
+            shortfall.operation == "sequence"
+            and "dynamic-growth-unavailable" in shortfall.reason
+            for shortfall in artifact.shortfalls
+        )
+        return
     assert artifact.complete, artifact.shortfalls
     artifact.compile(tmp_path / "owned_bytes_views")
     parameter_id = dict(module.functions[function_name].metadata[
