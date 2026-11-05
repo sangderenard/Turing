@@ -1253,16 +1253,11 @@ def publish_computed_region_result_metadata(
                     or tuple(pairs[0][1] for pairs in selected)
                     != tuple(map(int, local_ids))):
                 return False
-        feed_ids = downstream.attributes.get("feed_ids")
-        if feed_ids is not None:
-            if len(feed_ids) != len(target.args):
-                return False
-            feed_pairs = tuple(
-                (int(feed_id), int(formal.id))
-                for feed_id, formal in zip(feed_ids, target.args, strict=True)
-            )
-            if any(pairs[0] not in feed_pairs for pairs in selected):
-                return False
+        # In compact_codewords region6 -> region8, aggregate passthrough
+        # replaces metadata Call actuals 6687/6690/6693 with 6449/6452/6455
+        # while feed_ids retains the canonical source identities. The revised
+        # Call receipt and live actual/formal ports prove the metadata pair;
+        # feed_ids is not a second storage-actual binding.
         callee_input_ids = downstream.attributes.get("callee_input_ids")
         if callee_input_ids is not None and tuple(map(int, callee_input_ids)) != tuple(
             int(value.id) for value in target.args

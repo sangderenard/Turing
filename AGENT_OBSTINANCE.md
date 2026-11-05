@@ -712,10 +712,16 @@ unrelated failure output.
 The Run59 metadata replay repair was scoped to the three booked shape, rank
 and count Call pairs. The first draft also required every `feed_ids` entry to
 equal its live Call actual. In the authored ascending-order program, the data
-actual is tensor 19 and its separately proved target alias is formal 20; the
-three metadata feeds already agree with the exact Call binding. That extra
-data check made the native gate fail after 32.01 seconds. A bounded raising
-frame capture took 30.01 seconds and showed the booked RESULT cause, local
-descriptor and all three metadata pairs were valid. The untouched checkout
-passed the same native test in 41.32 seconds. The check now applies only to
-the three metadata pairs; the final native gate passed in 33.11 seconds.
+actual is tensor 19 and its separately proved target alias is formal 20. That
+extra check made the native gate fail after 32.01 seconds. A bounded raising
+frame capture took 30.01 seconds; the untouched checkout passed the same
+native test in 41.32 seconds. Narrowing that check to metadata ports made the
+native gate pass in 33.11 seconds, but still treated `feed_ids` as physical
+Call actuals. Run60 then spent 615.269 seconds before refusing valid metadata
+replay. Its booked Call row changed actuals 6687/6690/6693 to
+6449/6452/6455 through three exact aggregate rebinding cells, while
+`feed_ids` correctly retained the canonical source identities. Saved-module
+publisher reproduction took 14.46 seconds. The extra feed comparison is now
+removed; the revised booked Call pairs, direct RESULT cause and live ports
+carry the metadata identity. Reading the established feed/source contract
+before adding that comparison would have avoided both regressions.
