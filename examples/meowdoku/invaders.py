@@ -156,6 +156,9 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     x2 = where(moving & is_inv, x1 + fleet_dx, where(moving, x1 + vx1 * dt, x1))
     y2 = where(moving & is_inv, y1 + fleet_dy, where(moving, y1 + vy1 * dt, y1))
     x2 = where(is_player, x2.clip(0.7, WIDTH - 0.7), x2)
+    # The rocket reports the velocity it actually moved with: zero when a
+    # wall stops it, so a viewer carrying it forward never overshoots.
+    vx_out = where(is_player & moving, (x2 - x1) / dt, vx1)
     gone = (((is_shot | is_bomb) & ((y2 < -0.5) | (y2 > HEIGHT + 0.5)))
             | (is_ufo & ((x2 < -1.5) | (x2 > WIDTH + 1.5))))
     live2 = live1 & ~gone
@@ -204,7 +207,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     pace = where(live4, vx1.abs() + vy1.abs(), 0.0) + where(is_inv & live4, speed, 0.0)
     dt_limit = 0.5 / (pace.max() + 1e-6) + x * 0.0
     residual = f(is_inv & live4).sum() + x * 0.0
-    return (f(live4), x4, y4, vx1, vy1, hp2, boom3, born4,
+    return (f(live4), x4, y4, vx_out, vy1, hp2, boom3, born4,
             score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next,
             residual, dt_limit)
 

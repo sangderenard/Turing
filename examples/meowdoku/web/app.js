@@ -449,8 +449,21 @@ function entityModel(piece, now) {
   // Free-board entities: drawn where the server last put them, carried on by
   // the velocity it reported (at most a frame's worth, so a late reply never
   // flings anything), popping in when born and shrinking when gone.
-  const mesh = state.meshes[piece.mesh], lead = Math.min(now - piece.tRecv, 0.12);
-  const x = piece.sx + piece.vx * lead, z = piece.sz + piece.vz * lead;
+  // The target is the server's position carried on by its velocity for at
+  // most about one tick; the drawn position eases toward it (a ~45 ms time
+  // constant) instead of jumping, so reply-to-reply latency differences and
+  // a released key never show as a snap.
+  const mesh = state.meshes[piece.mesh], lead = Math.min(now - piece.tRecv, 0.05);
+  const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
+  // Each frame the drawn position first moves by the velocity (so a shot
+  // never trails), then only the remaining error is eased away.
+  const frame = piece.drawnAt == null ? 0 : Math.max(0, Math.min(0.1, now - piece.drawnAt));
+  const step = piece.drawnAt == null ? 1 : 1 - Math.exp(-frame / 0.045);
+  piece.drawnAt = now;
+  const px = piece.x + piece.vx * frame, pz = piece.z + piece.vz * frame;
+  const far = Math.hypot(tx - px, tz - pz) > 1.5;                    // a respawn or rewind: go there
+  const x = far || step >= 1 ? tx : px + (tx - px) * step;
+  const z = far || step >= 1 ? tz : pz + (tz - pz) * step;
   let s = Math.min(1, (now - piece.t0) / 0.12), y = 0;
   if (piece.removing != null) s = 1 - ease.in(Math.min(1, (now - piece.removing) / 0.3));
   if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
@@ -524,6 +537,7 @@ function applyState(game) {
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
   status.textContent = `${game.status} · ${game.title}${best}`;
+  $("hud").textContent = `${game.status}${best}`;
   if (game.record && game.record.plays !== state.recordPlays) { state.recordPlays = game.record.plays; if ($("scores").classList.contains("open")) showScores(); }
   const lichess = game.lichess_control;
   $("lichess-stop").disabled = !lichess || lichess.pause_requested;
@@ -810,6 +824,26 @@ async function showScores() {
 $("player").value = rememberedName();
 $("player").addEventListener("change", (e) => setPlayer(e.target.value));
 $("player").addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") e.target.blur(); });
+// ---------------------------------------------------------------- fullscreen
+// The canvas takes the whole screen: the bar hides (so the canvas's top
+// offset falls to 0) and, where the browser allows it, the page goes
+// fullscreen too.  Leaving the browser's fullscreen (Esc) leaves this mode.
+function setImmersive(on) {
+  document.body.classList.toggle("immersive", on);
+  document.documentElement.style.setProperty("--bar-h", on ? "0px" : $("bar").offsetHeight + "px");
+  const root = document.documentElement;
+  if (on && !document.fullscreenElement && root.requestFullscreen) root.requestFullscreen().catch(() => {});
+  if (!on && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+}
+const toggleImmersive = () => setImmersive(!document.body.classList.contains("immersive"));
+$("fullscreen").onclick = toggleImmersive;
+$("fs-exit").onclick = () => setImmersive(false);
+document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && document.body.classList.contains("immersive")) setImmersive(false); });
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
+  if (e.key === "f" || e.key === "F") toggleImmersive();
+  else if (e.key === "Escape" && document.body.classList.contains("immersive")) setImmersive(false);
+});
 $("scores-toggle").onclick = () => { const panel = $("scores"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showScores(); };
 
 // ---------------------------------------------------------------- game picker
