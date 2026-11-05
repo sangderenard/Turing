@@ -745,7 +745,8 @@ class LichessGame(Chess):
             st["status"] = self.note
         elif not snap:
             me = self.client.me.get("username", "…")
-            st["status"] = f"{me} online · waiting for a game (challenging an idle bot every {int(self.client.idle_challenge_every)} s)"
+            pending = self.client.pending
+            st["status"] = f"{me} online · " + (f"challenged {pending['to']}, waiting for an answer" if pending else "seeking a game among the online bots")
         else:
             clocks = ""
             if snap.get("wtime") is not None:

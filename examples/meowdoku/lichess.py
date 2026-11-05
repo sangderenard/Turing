@@ -139,8 +139,11 @@ class LichessBot:
         self.lock = threading.RLock()
         self._stop = threading.Event()
         self.threads: list[threading.Thread] = []
-        self.idle_challenge_every = 90.0
+        self.idle_challenge_every = 90.0            # after a game ends, before seeking again
         self.last_challenge = 0.0
+        self.pending: dict | None = None            # {"id", "to", "at"} of an unanswered challenge
+        self.candidates: list[str] = []             # online bots still to try this round
+        self.seeking = False
 
     # -- identity --------------------------------------------------------
     def connect(self) -> dict:
@@ -224,27 +227,50 @@ class LichessBot:
         else:
             self.api.post(f"/api/challenge/{cid}/decline", {"reason": "variant" if not standard else "generic"})
 
-    def challenge_a_bot(self) -> None:
-        """Pick an online bot and ask for a casual 5+3 game."""
+    def _refill_candidates(self) -> None:
         try:
-            bots = [line for line in self.api.lines("/api/bot/online?nb=50")]
+            bots = [line.get("username") for line in self.api.lines("/api/bot/online?nb=100")]
         except Exception as error:
             self.log(f"[lichess] bot list: {error}")
+            bots = []
+        bots = [b for b in bots if b and b.lower() != str(self.me.get("id", "")).lower()]
+        random.shuffle(bots)
+        self.candidates = bots
+
+    def challenge_a_bot(self) -> None:
+        """Work through the online bots until one accepts: a refusal (the
+        daily bot-vs-bot cap, a closed account) moves straight to the
+        next; a challenge nobody answers in 30 s is cancelled and the next
+        is sent."""
+        now = time.time()
+        if self.pending and now - self.pending["at"] < 30.0:
             return
-        bots = [b for b in bots if b.get("id") != self.me.get("id")]
-        if not bots:
+        if self.pending:
+            try:
+                self.api.post(f"/api/challenge/{self.pending['id']}/cancel")
+            except RuntimeError:
+                pass
+            self.log(f"[lichess] {self.pending['to']} did not answer; next")
+            self.pending = None
+        for _attempt in range(12):
+            if not self.candidates:
+                self._refill_candidates()
+                if not self.candidates:
+                    return
+            target = self.candidates.pop()
+            try:
+                reply = self.api.post(f"/api/challenge/{target}", {"rated": "false", "clock.limit": "300", "clock.increment": "3", "color": "random", "variant": "standard"})
+            except RuntimeError as error:
+                self.log(f"[lichess] {target} refused: {str(error)[-90:]}")
+                continue
+            cid = (reply or {}).get("id") or (reply or {}).get("challenge", {}).get("id")
+            self.pending = {"id": cid, "to": target, "at": now}
+            self.log(f"[lichess] challenged {target}; waiting for an answer")
             return
-        pick = random.choice(bots)
-        try:
-            self.api.post(f"/api/challenge/{pick['username']}", {"rated": "false", "clock.limit": "300", "clock.increment": "3", "color": "random", "variant": "standard"})
-            self.log(f"[lichess] challenged {pick['username']}")
-        except RuntimeError as error:
-            self.log(f"[lichess] challenge to {pick.get('username')} refused: {error}")
-        self.last_challenge = time.time()
 
     def run(self) -> None:
         self.connect()
-        self.last_challenge = time.time() - self.idle_challenge_every + 10
+        self.last_challenge = 0.0                                 # seek a game at once
         while not self._stop.is_set():
             try:
                 for event in self.api.lines("/api/stream/event"):
@@ -254,11 +280,18 @@ class LichessBot:
                     if kind == "challenge":
                         self.accept_or_decline(event["challenge"])
                     elif kind == "gameStart":
+                        self.pending = None
+                        self.seeking = False
                         gid = event["game"]["id"]
                         thread = threading.Thread(target=self.play_game, args=(gid,), name=f"lichess-{gid}", daemon=True)
                         thread.start(); self.threads.append(thread)
                     elif kind == "gameFinish":
-                        pass
+                        self.last_challenge = time.time()     # a breath before seeking again
+                    elif kind in ("challengeDeclined", "challengeCanceled"):
+                        who = event.get("challenge", {}).get("destUser", {}).get("name", "?")
+                        self.log(f"[lichess] {who} declined; next")
+                        self.pending = None
+                        self.last_challenge = 0.0             # seek again at once
                     self._maybe_challenge()
             except Exception as error:
                 self.log(f"[lichess] event stream: {type(error).__name__}: {error}; reconnecting")
@@ -267,7 +300,11 @@ class LichessBot:
 
     def _maybe_challenge(self) -> None:
         live = [g for g in self.games.values() if g.get("status") in ("started", "created")]
-        if not live and time.time() - self.last_challenge > self.idle_challenge_every:
+        if live:
+            self.seeking = False
+            return
+        if time.time() - self.last_challenge > self.idle_challenge_every:
+            self.seeking = True
             self.challenge_a_bot()
 
     def _idle_loop(self) -> None:
