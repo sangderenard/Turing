@@ -10,7 +10,13 @@ prebaked board database) and a JSON API over the games in ``games.py``:
                       {"game": "chess"|"checkers"} | {"game": "wordle", "seed": 3}
     POST /api/action  {"type": "cell", "r", "c", "button"} | {"type": "text", "text"}
                       | {"type": "submit"|"backspace"|"undo"|"reset"}
+                      | {"type": "tick", "move_axis", "fire"}  (free-board games)
     GET  /api/state
+    POST /api/profile {"name": "..."}      -> pick this session's player profile
+    GET  /api/profile                      -> the profile, and the current game's top scores
+
+Finished games (``Game.result()``) are recorded on the session's profile
+(``profiles.py``); every state carries ``player`` and that game's ``record``.
 
 Every call returns the game's state (see ``games.py``); the page animates
 the difference between states.  Meowdoku runs the dt-system law through
@@ -33,15 +39,21 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, LichessGame, MeowdokuGame, Wordle  # noqa: E402
+from meowdoku.invaders import SpaceInvaders  # noqa: E402
+from meowdoku.profiles import Profiles  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
+PROFILES = ROOT / "build" / "meowdoku" / "profiles.json"
 
 
 class Table:
     """One game at a time, picked from the catalog."""
 
-    def __init__(self, web_dir: Path):
+    def __init__(self, web_dir: Path, profiles: Profiles | None = None):
         self.web_dir = web_dir
+        self.profiles = profiles
+        self.player: str | None = None       # this session's profile name
+        self.recorded = None                 # the game object whose result is on the profile
         self.lock = threading.RLock()
         database = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.boards = {board["id"]: board for board in database["boards"]}
@@ -50,7 +62,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -73,6 +85,8 @@ class Table:
             self.game = ChessVsNet()
         elif kind == "lichess":
             self.game = LichessGame()
+        elif kind == "space_invaders":
+            self.game = SpaceInvaders()
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
@@ -86,6 +100,8 @@ class Table:
         elif kind == "text":
             self.game.text(str(payload.get("text", "")))
         elif kind == "tick":
+            if hasattr(self.game, "control"):
+                self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
         elif kind in ("lichess_pause", "lichess_resume"):
@@ -97,12 +113,37 @@ class Table:
                 self.game.client.resume()
         elif kind in ("submit", "backspace", "undo", "reset"):
             getattr(self.game, kind)()
+            if kind in ("undo", "reset"):
+                self.recorded = None if self.game.result() is None else self.recorded
         else:
             raise ValueError(f"unknown action {kind!r}")
         return self.state()
 
     def state(self) -> dict:
-        return self.game.state() if self.game is not None else {"game": None}
+        st = self.game.state() if self.game is not None else {"game": None}
+        self._record()
+        if self.profiles is not None and self.game is not None:
+            st["player"] = self.player
+            st["record"] = self.profiles.best(self.player, self.game.game)
+        return st
+
+    def _record(self) -> None:
+        """Put a finished game's result on the player's profile, once."""
+        if self.profiles is None or self.player is None or self.game is None or self.recorded is self.game:
+            return
+        result = self.game.result()
+        if result is not None:
+            self.profiles.record(self.player, self.game.game, result)
+            self.recorded = self.game
+
+    def set_player(self, payload: dict) -> dict:
+        self.player = self.profiles.ensure(str(payload.get("name", "")))
+        return self.profile()
+
+    def profile(self) -> dict:
+        game = self.game.game if self.game is not None else None
+        return {"player": self.player, "profile": self.profiles.profile(self.player),
+                "game": game, "leaderboard": self.profiles.leaderboard(game) if game else []}
 
 
 COOKIE = "meowdoku_session"
@@ -112,8 +153,9 @@ SESSION_IDLE_SECONDS = 2 * 3600
 class Sessions:
     """session token -> that client's own Table; idle ones expire."""
 
-    def __init__(self, web_dir: Path):
+    def __init__(self, web_dir: Path, profiles: Profiles | None = None):
         self.web_dir = web_dir
+        self.profiles = profiles
         self.lock = threading.Lock()
         self.tables: dict[str, list] = {}       # token -> [Table, last_seen]
         boards = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
@@ -127,7 +169,7 @@ class Sessions:
             fresh = token not in self.tables
             if fresh:
                 token = secrets.token_urlsafe(24)
-                self.tables[token] = [Table(self.web_dir), now]
+                self.tables[token] = [Table(self.web_dir, self.profiles), now]
             entry = self.tables[token]
             entry[1] = now
             return token, entry[0], fresh
@@ -176,6 +218,10 @@ def make_handler(sessions: Sessions):
             if self.path.startswith("/api/catalog"):
                 table = self._table()
                 return self._json(table.catalog())
+            if self.path.startswith("/api/profile"):
+                table = self._table()
+                with table.lock:
+                    return self._json(table.profile())
             return super().do_GET()
 
         def do_POST(self):  # noqa: N802
@@ -188,6 +234,8 @@ def make_handler(sessions: Sessions):
                         return self._json(table.new(payload))
                     if self.path.startswith("/api/action"):
                         return self._json(table.action(payload))
+                    if self.path.startswith("/api/profile"):
+                        return self._json(table.set_player(payload))
             except Exception as error:  # the page shows the refusal
                 return self._json({"error": f"{type(error).__name__}: {error}"}, HTTPStatus.BAD_REQUEST)
             return self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
@@ -205,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
-    sessions = Sessions(web_dir)
+    sessions = Sessions(web_dir, Profiles(PROFILES))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
     try:

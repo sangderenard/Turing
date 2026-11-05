@@ -24,6 +24,7 @@ const M = {
   scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
   rotateX(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); },
   rotateY(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); },
+  rotateZ(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]); },
   perspective(fovy, aspect, near, far) {
     const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
     return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
@@ -391,7 +392,10 @@ function rebuildBoards(game) {
     if (game.hints[i]) return `${name}@hint`;
     return name;
   };
-  state.buttons = litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
+  // A free board has no cells: one floor slab the entities move over.
+  state.buttons = game.board === "free"
+    ? litMesh(box(0, 0, 0, game.width, TILE.height, game.height, state.materialIndex.floor))
+    : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.size : game.rows + (game.hearts != null ? 1.5 : 0);
@@ -441,7 +445,26 @@ function cellPosition(game, cell, rackPiece) {
     return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.size, "rack", rack.size]; }
   return [(cell % game.cols) + 0.5, Math.floor(cell / game.cols) + 0.5, "board"];
 }
+function entityModel(piece, now) {
+  // Free-board entities: drawn where the server last put them, carried on by
+  // the velocity it reported (at most a frame's worth, so a late reply never
+  // flings anything), popping in when born and shrinking when gone.
+  const mesh = state.meshes[piece.mesh], lead = Math.min(now - piece.tRecv, 0.12);
+  const x = piece.sx + piece.vx * lead, z = piece.sz + piece.vz * lead;
+  let s = Math.min(1, (now - piece.t0) / 0.12), y = 0;
+  if (piece.removing != null) s = 1 - ease.in(Math.min(1, (now - piece.removing) / 0.3));
+  if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
+  if (piece.bob) y = 0.06 * Math.sin(now * 5 + piece.sx * 0.7);
+  piece.x = x; piece.z = z;
+  const lean = 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
+  let m = M.translate(x, TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
+  m = M.multiply(m, M.rotateY(piece.spin * now));
+  m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
+  m = M.multiply(m, M.rotateZ(piece.roll));
+  return M.multiply(m, M.scale(scale, scale, scale));
+}
 function pieceModel(piece, now) {
+  if (piece.entity) return entityModel(piece, now);
   const age = now - piece.t0, fam = family(piece.mesh), mesh = state.meshes[piece.mesh];
   let y = 0, spin = 0, s = 1, tilt = 0, x = piece.x, z = piece.z;
   if (piece.removing != null) { const t = Math.min(1, (now - piece.removing) / 0.3); s = 1 - ease.in(t); y = 0.2 * t; }
@@ -490,9 +513,18 @@ function applyState(game) {
     }
   };
   for (const p of game.pieces) place(p, false);
+  for (const e of game.entities || []) {
+    seen.add(e.id);
+    const live = state.pieces.get(e.id);
+    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
+    else state.pieces.set(e.id, { id: e.id, entity: true, sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color,
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, t0: now, removing: null, seed: 0 });
+  }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
-  status.textContent = `${game.status} · ${game.title}`;
+  const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
+  status.textContent = `${game.status} · ${game.title}${best}`;
+  if (game.record && game.record.plays !== state.recordPlays) { state.recordPlays = game.record.plays; if ($("scores").classList.contains("open")) showScores(); }
   const lichess = game.lichess_control;
   $("lichess-stop").disabled = !lichess || lichess.pause_requested;
   $("lichess-resume").disabled = !lichess || !lichess.pause_requested;
@@ -510,6 +542,10 @@ function applyState(game) {
     }
     if (!document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick" }); }, 40);
   }
+  // Real time: the next tick leaves as soon as this one is in (a short breath
+  // for the UI thread), carrying the held controls; the server lands the
+  // wall time between ticks.
+  if (game.input === "realtime" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick", ...controls() }); }, 15);
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
@@ -608,6 +644,29 @@ const newGame = (payload) => {
 };
 
 // ---------------------------------------------------------------- picking and input
+// Real-time controls: held keys, or a held pointer that steers the player
+// toward the finger and fires while down.
+const held = new Set();
+let steer = null;
+function boardPlaneX(clientX, clientY) {
+  const cam = camera(), rect = canvas.getBoundingClientRect();
+  const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
+  const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
+  const t = (TILE.height - near[1]) / (far[1] - near[1]);
+  return t >= 0 ? near[0] + t * (far[0] - near[0]) : null;
+}
+function controls() {
+  let axis = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0), fire = held.has("fire") ? 1 : 0;
+  if (steer != null) {
+    const player = [...state.pieces.values()].find((p) => p.entity && p.mesh === "rocket" && p.removing == null);
+    if (player) axis = Math.max(-1, Math.min(1, (steer - player.x) * 2.5));
+    fire = 1;
+  }
+  return { move_axis: axis, fire };
+}
+const KEY_CONTROL = { ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right", " ": "fire", ArrowUp: "fire", w: "fire", W: "fire" };
+window.addEventListener("keyup", (e) => { const k = KEY_CONTROL[e.key]; if (k) held.delete(k); });
+window.addEventListener("blur", () => held.clear());
 function hit(clientX, clientY) {
   // the pointer's hit on the plane of the button tops: a board cell, a rack cell, or nothing
   const game = state.game; if (!game) return null;
@@ -626,6 +685,7 @@ function hit(clientX, clientY) {
 }
 let press = null, clickTimer = null, lastClick = null;
 canvas.addEventListener("pointerdown", (e) => {
+  if (state.game && state.game.input === "realtime") { steer = boardPlaneX(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return; }
   press = { x: e.clientX, y: e.clientY, t: performance.now(), button: e.button, painted: new Set(), moved: false };
   const h = hit(e.clientX, e.clientY); if (h) press.start = h;
 });
@@ -639,6 +699,7 @@ canvas.addEventListener("pointermove", async (e) => {
     if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];
     return;
   }
+  if (game.input === "realtime") { if (steer != null) steer = boardPlaneX(e.clientX, e.clientY); return; }
   if (!press) return;
   if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) press.moved = true;
   // meowdoku: a swipe paints X marks on every cell it crosses
@@ -654,7 +715,9 @@ canvas.addEventListener("pointermove", async (e) => {
     press.last = to;
   }
 });
+canvas.addEventListener("pointercancel", () => { steer = null; });
 canvas.addEventListener("pointerup", async (e) => {
+  steer = null;
   const game = state.game; const p = press; press = null;
   if (!p || !game || light.follow) return;
   const h = hit(e.clientX, e.clientY);
@@ -688,10 +751,11 @@ canvas.addEventListener("pointerup", async (e) => {
   }
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-document.addEventListener("visibilitychange", () => { if (!document.hidden && state.game && state.game.input === "watch") act({ type: "tick" }); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.game && (state.game.input === "watch" || state.game.input === "realtime")) act({ type: "tick" }); });
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
+  if (game.input === "realtime" && KEY_CONTROL[e.key]) { e.preventDefault(); held.add(KEY_CONTROL[e.key]); return; }
   if (game.input === "text") {
     if (/^[a-zA-Z]$/.test(e.key)) return act({ type: "text", text: game.text + e.key.toUpperCase() });
     if (e.key === "Backspace") return act({ type: "backspace" });
@@ -716,6 +780,37 @@ $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
 $("light").onclick = toggleLight;
+
+// ---------------------------------------------------------------- player profile and scores
+// The name is a label (no password); the browser remembers it and hands it
+// back to the server after a reload, since the server's session is a cookie.
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function rememberedName() { try { return localStorage.getItem("meowdoku_player") || ""; } catch { return ""; } }
+async function setPlayer(name) {
+  name = name.trim(); if (!name) return;
+  try {
+    await api("/api/profile", { name });
+    try { localStorage.setItem("meowdoku_player", name); } catch {}
+    // A ticking game refreshes itself; others read their state once so the
+    // status line shows the new player's best.
+    if (state.game && state.game.input !== "realtime" && state.game.input !== "watch")
+      chain = chain.then(async () => applyState(await (await fetch("/api/state")).json())).catch((e) => console.warn(e));
+    if ($("scores").classList.contains("open")) showScores();
+  } catch (e) { console.warn(e); }
+}
+async function showScores() {
+  const data = await (await fetch("/api/profile")).json(), panel = $("scores");
+  const game = data.game || "this game", mine = data.profile && data.game ? (data.profile.games[data.game] || null) : null;
+  const rows = data.leaderboard.map((r, k) => `<tr class="${r.name === data.player ? "me" : ""}"><td>${k + 1}</td><td>${escapeHtml(r.name)}</td><td class="n">${r.score}</td><td class="muted">${escapeHtml(r.detail)}</td></tr>`).join("");
+  const recent = mine ? mine.recent.slice(0, 8).map((r) => `<tr><td class="n">${r.score}</td><td class="muted">${escapeHtml(r.detail)} · ${new Date(r.at * 1000).toLocaleString()}</td></tr>`).join("") : "";
+  panel.innerHTML = `<h3>Top scores · ${escapeHtml(game)}</h3>` + (rows ? `<table>${rows}</table>` : `<div class="muted">no finished games yet</div>`)
+    + `<h3>${data.player ? escapeHtml(data.player) : "You"}${mine ? ` · ${mine.plays} played` : ""}</h3>`
+    + (data.player ? (recent ? `<table>${recent}</table>` : `<div class="muted">finish a game to record a score</div>`) : `<div class="muted">type a name in Player to keep scores</div>`);
+}
+$("player").value = rememberedName();
+$("player").addEventListener("change", (e) => setPlayer(e.target.value));
+$("player").addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") e.target.blur(); });
+$("scores-toggle").onclick = () => { const panel = $("scores"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showScores(); };
 
 // ---------------------------------------------------------------- game picker
 function fillPickers() {
@@ -761,6 +856,7 @@ function fillPickers() {
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
   for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
   fillPickers();
+  if (rememberedName()) await setPlayer(rememberedName());
   requestAnimationFrame(draw);
   $("new").click();
 })().catch((error) => { status.textContent = String(error); console.error(error); });

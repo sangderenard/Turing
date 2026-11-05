@@ -92,6 +92,12 @@ def export_assets(out: Path) -> dict:
                        ("knight", 0x265E), ("pawn", 0x265F)):
         pack(name, *token_mesh(chr(code), "DejaVu Sans", "normal", depth_ratio=0.45, outline_subdivisions=1))
     pack("disc", *token_mesh("●", "DejaVu Sans", "normal", depth_ratio=0.22, outline_subdivisions=1))
+    # The free-board games' entities: emoji outlines (Segoe UI Emoji), named
+    # by the game that declares them.
+    from meowdoku.invaders import EMOJI, EMOJI_SUBDIVISIONS
+    for name, glyph in EMOJI.items():
+        pack(name, *token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                               outline_subdivisions=EMOJI_SUBDIVISIONS.get(name, 1)))
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),

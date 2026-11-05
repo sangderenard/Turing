@@ -78,6 +78,11 @@ class Game:
     def state(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def result(self) -> dict[str, Any] | None:
+        """A finished game's record for the player's profile: ``score``
+        (higher is better) and ``detail``; None while it goes on."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Meowdoku: the dt-system session behind the protocol
@@ -114,6 +119,13 @@ class MeowdokuGame(Game):
     def reset(self) -> None:
         self.session.reset()
         self.moves = 0
+
+    def result(self) -> dict[str, Any] | None:
+        s = self.session
+        if not s.won:
+            return None
+        return {"score": 100 * int(s.hearts) + 10 * self.n,
+                "detail": f"{self.n}x{self.n} solved with {int(s.hearts)} hearts in {self.moves} moves"}
 
     def state(self) -> dict[str, Any]:
         n, s = self.n, self.session
@@ -502,6 +514,11 @@ class Wordle(Game):
         self.entry = ""
         self.status = "" if not self.won else "got it!"
 
+    def result(self) -> dict[str, Any] | None:
+        if not self.won:
+            return None
+        return {"score": 7 - len(self.guesses), "detail": f"{self.answer.upper()} in {len(self.guesses)}"}
+
     def undo(self) -> None:
         if self.guesses and not self.won:
             self.guesses.pop(); self.moves -= 1
@@ -757,6 +774,14 @@ class ChessArena(Chess):
 
 class ChessVsNet(Chess):
     """You play White; the network answers for Black after each move."""
+
+    def result(self) -> dict[str, Any] | None:
+        end = self.outcome()
+        if end is None:
+            return None
+        score = {"white": 1.0, "draw": 0.5}.get(end, 0.0)
+        said = {"white": "beat the network", "draw": "drew the network"}.get(end, "lost to the network")
+        return {"score": score, "detail": f"{said} in {self.moves} moves"}
 
     game = "chess_vs_net"
     title = "Chess against the network"

@@ -28,6 +28,15 @@
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
+  #player { width: 9em; }
+  #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
+            max-height: 70vh; overflow: auto; background: rgba(22,22,26,0.94); border: 1px solid #3a3a42; border-radius: 8px; padding: 10px 12px; }
+  #scores.open { display: block; }
+  #scores h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
+  #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #scores td { padding: 2px 4px; } #scores td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  #scores tr.me { color: #ffd76a; }
+  #scores .muted { opacity: 0.6; font-size: 12px; }
 </style>
 </head>
 <body data-game="meowdoku">
@@ -45,15 +54,18 @@
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
   <label>Round <input id="round" type="range" min="0" max="4" value="2"></label>
   <label>Crease <input id="crease" type="range" min="0" max="90" value="40"></label>
+  <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
+  <button id="scores-toggle">Scores</button>
   <span id="status">loading…</span>
 </div>
+<div id="scores"></div>
 <canvas id="gl"></canvas>
 <div id="word">
   <input id="entry" type="text" maxlength="5" autocomplete="off" spellcheck="false" placeholder="word">
   <button id="enter">Enter</button>
   <button id="back">⌫</button>
 </div>
-<div id="help">meowdoku: tap or swipe for X, double-tap for a cat · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack</div>
+<div id="help">meowdoku: tap or swipe for X, double-tap for a cat · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go</div>
 <script>
   // Keep the canvas below the control bar as the bar wraps or unwraps.
   (() => { const bar = document.getElementById("bar");

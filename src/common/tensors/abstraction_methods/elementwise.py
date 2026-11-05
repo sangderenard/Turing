@@ -69,6 +69,15 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
             if tape and annotate:
                 tape.annotate(out, **({"forced": True} | annotate))
             return out
+    backend_unary = _BACKEND_UNARY.get(op)
+    if backend_unary is not None and getattr(type(self), "_compare_broadcasts", False):
+        out = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+        out.data = getattr(self, backend_unary)()
+        out = finalize(out)
+        tape = getattr(out, "_tape", None)
+        if tape and annotate:
+            tape.annotate(out, **({"eval_mode": "backend", "v": "v1"} | annotate))
+        return out
     flat = self.reshape(-1).tolist()
     K = self._scalar_kernel(op)
     # tolist() already guarantees plain Python scalars (that is its whole
@@ -158,7 +167,16 @@ _BACKEND_COMPARE = {
     "less_equal": "less_equal_",
     "greater": "greater_",
     "greater_equal": "greater_equal_",
+    # The boolean connectives on two boolean operands, by the same rule and
+    # for the same reason: a pairwise collision mask (86 x 86 lanes, a few
+    # dozen ``&``/``|`` per step) spent 300k Python calls per step walking
+    # the broadcast here -- 120 ms of a 122 ms step.
+    "logical_and": "logical_and_",
+    "logical_or": "logical_or_",
+    "logical_xor": "logical_xor_",
 }
+#: Unary predicates a ``_compare_broadcasts`` backend answers itself.
+_BACKEND_UNARY = {"logical_not": "logical_not_"}
 
 
 # --------------- v2: binary (broadcasting, value-wise) ----------------

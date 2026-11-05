@@ -205,6 +205,21 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.logical_not(self.data)
 
+    def logical_and_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.logical_and(self.data, value)
+
+    def logical_or_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.logical_or(self.data, value)
+
+    def logical_xor_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.logical_xor(self.data, value)
+
     def sqrt_(self):
         import numpy as np
         return np.sqrt(self.data)

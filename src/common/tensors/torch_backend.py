@@ -204,6 +204,21 @@ class PyTorchTensorOperations(AbstractTensor):
         import torch
         return torch.logical_not(self.data)
 
+    def logical_and_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.logical_and(self.data, value)
+
+    def logical_or_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.logical_or(self.data, value)
+
+    def logical_xor_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.logical_xor(self.data, value)
+
     def sqrt_(self):
         import torch
         return torch.sqrt(self.data)
