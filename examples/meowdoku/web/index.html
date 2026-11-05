@@ -13,6 +13,8 @@
   #bar button:hover { background: #30303a; }
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
   #bar input[type=range] { width: 90px; }
+  #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
+  #bar .tool, #hint { align-items: center; }
   #status { margin-left: auto; opacity: 0.85; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
@@ -58,8 +60,14 @@
   <button id="reset">Reset (R)</button>
   <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>
   <button id="lichess-resume" class="lichess-only">Resume Lichess</button>
+  <span class="meowdoku-only" style="gap:4px" role="group" aria-label="Tool">
+    <button id="tool-cat" class="tool active" title="Tap places a cat (C)">Cats (C)</button>
+    <button id="tool-mouse" class="tool" title="Tap marks a mouse: no cat here (M)">Mice (M)</button>
+  </span>
+  <button id="hint" class="meowdoku-only" title="Highlight the next deducible cell; costs no hearts (H)">Hint (H)</button>
+  <label class="meowdoku-only">Palette <select id="palette"></select></label>
   <button id="light">Light: orbit (L)</button>
-  <button id="flat">Flat (C)</button>
+  <button id="flat">Flat (V)</button>
   <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
   <label>Round <input id="round" type="range" min="0" max="4" value="2"></label>
@@ -78,7 +86,7 @@
   <button id="enter">Enter</button>
   <button id="back">⌫</button>
 </div>
-<div id="help">meowdoku: tap or swipe for X, double-tap for a cat · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go · bullet_hell: arrows or WASD fly, space fires; on a phone hold a finger below the ship</div>
+<div id="help">meowdoku: pick Cats or Mice, then tap; swipe paints mice, double-tap is always a cat, Hint lights a deducible cell · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go · bullet_hell: arrows or WASD fly, space fires; on a phone hold a finger below the ship</div>
 <script>
   // Keep the canvas below the control bar as the bar wraps or unwraps.
   (() => { const bar = document.getElementById("bar");

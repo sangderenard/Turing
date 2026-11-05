@@ -254,6 +254,81 @@ def singles_solve(region, solution, *, max_rounds: int | None = None):
     return solved, rounds
 
 
+def next_deduction(region, cats, solution, mice=None):
+    """The next move a player can deduce from the visible rules alone.
+
+    ``region`` is the ``(n, n)`` region map, ``cats`` the ``(n, n)`` 0/1 cats
+    already home (the player's X marks are notes and never premises, so the
+    answer is always sound), ``solution`` the leaf the game scores against
+    (used only as the last-resort reveal).  The same arithmetic as
+    ``singles_solve`` -- a placed cat excludes its row, column, region and
+    eight neighbours; a row, column or region left with one open cell forces
+    a cat there -- read from the player's own board instead of an empty one,
+    and extended by the locked-line eliminations.  Returns
+    ``{"kind": "cat" | "mice", "cells": [flat index, ...], "why": str}``;
+    ``cells`` is empty only when the board is complete.
+    """
+    region = np.asarray(region, dtype=int)
+    cats = np.asarray(cats, dtype=int)
+    n = region.shape[0]
+    marked = np.zeros(n * n, dtype=bool) if mice is None else np.asarray(mice).reshape(-1) > 0
+    rr, cc = np.indices((n, n))
+    excluded = np.zeros((n, n), dtype=bool)
+    reasons: dict[int, str] = {}
+    for r, c in zip(*np.nonzero(cats)):
+        near = (np.abs(rr - r) <= 1) & (np.abs(cc - c) <= 1)
+        for mask, why in ((rr == r, f"row {r + 1}"), (cc == c, f"column {c + 1}"),
+                          (region == region[r, c], "its region"), (near, "touching")):
+            for i in np.flatnonzero(mask.reshape(-1) & ~excluded.reshape(-1) & (cats.reshape(-1) == 0)):
+                reasons[int(i)] = f"the cat at row {r + 1}, column {c + 1} covers it ({why})"
+            excluded |= mask
+    open_ = ~excluded & (cats == 0)
+    lines = [(f"row {r + 1}", (rr == r)) for r in range(n) if not cats[r].any()]
+    lines += [(f"column {c + 1}", (cc == c)) for c in range(n) if not cats[:, c].any()]
+    lines += [("a coloured region", (region == k)) for k in range(n) if not cats[region == k].any()]
+    for name, mask in lines:                                   # singles: one open cell forces a cat
+        cells = np.flatnonzero((mask & open_).reshape(-1))
+        if len(cells) == 1:
+            return {"kind": "cat", "cells": [int(cells[0])], "why": f"{name} has only one open cell left"}
+    # locked lines: a region whose open cells share one row (column) leaves
+    # no room for other cats in that row (column), and a row (column) whose
+    # open cells share one region claims that region.
+    for k in range(n):
+        if cats[region == k].any():
+            continue
+        mask = region == k
+        for axis, label, index in ((rr, "row", rr), (cc, "column", cc)):
+            where = np.unique(axis[mask & open_])
+            if len(where) == 1:
+                other = (index == where[0]) & ~mask & open_ & ~marked.reshape(n, n)
+                if other.any():
+                    return {"kind": "mice", "cells": [int(i) for i in np.flatnonzero(other.reshape(-1))],
+                            "why": f"a coloured region's cat must be in {label} {int(where[0]) + 1}, so the rest of it is mice"}
+    for label, axis in (("row", rr), ("column", cc)):
+        for v in range(n):
+            if (cats[axis == v]).any():
+                continue
+            line = (axis == v) & open_
+            regions = np.unique(region[line])
+            if len(regions) == 1:
+                other = (region == regions[0]) & (axis != v) & open_ & ~marked.reshape(n, n)
+                if other.any():
+                    return {"kind": "mice", "cells": [int(i) for i in np.flatnonzero(other.reshape(-1))],
+                            "why": f"{label} {v + 1}'s cat must be in one region, so that region's other cells are mice"}
+    if reasons and not marked[list(reasons)].all():            # plain exclusions by a placed cat, richest first
+        by_cat: dict[str, list[int]] = {}
+        for i, why in reasons.items():
+            if marked[i]:
+                continue
+            by_cat.setdefault(why.split(" covers")[0], []).append(i)
+        key = max(by_cat, key=lambda k: len(by_cat[k]))
+        return {"kind": "mice", "cells": sorted(by_cat[key]), "why": f"{key} rules these cells out"}
+    todo = np.flatnonzero((np.asarray(solution).reshape(-1) > 0) & (cats.reshape(-1) == 0))
+    if len(todo):
+        return {"kind": "cat", "cells": [int(todo[0])], "why": "no pure deduction left: here is a cat"}
+    return {"kind": "cat", "cells": [], "why": "the board is complete"}
+
+
 _CYCLE = ((0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0), (1, 1))   # R UR U UL L DL D DR
 
 

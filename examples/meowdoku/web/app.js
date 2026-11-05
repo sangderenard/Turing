@@ -801,7 +801,7 @@ function applyState(game) {
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
     pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1;
-  }
+  } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
   const seen = new Set();
   const place = (p, rackPiece) => {
@@ -838,6 +838,7 @@ function applyState(game) {
   const lichess = game.lichess_control;
   $("lichess-stop").disabled = !lichess || lichess.pause_requested;
   $("lichess-resume").disabled = !lichess || !lichess.pause_requested;
+  syncMeowdokuBar(game);
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
   // Watch mode: the server's thread moves; poll again as soon as this reply
@@ -971,6 +972,7 @@ const act = (payload) => {
   return step;
 };
 const newGame = (payload) => {
+  if (payload.game === "meowdoku" && $("palette").value) payload = { ...payload, palette: $("palette").value };
   const step = chain.then(async () => { console.log("[meow] new", JSON.stringify(payload)); applyState(await api("/api/new", payload)); }).catch((e) => console.warn(e));
   chain = step;
   return step;
@@ -1067,14 +1069,20 @@ canvas.addEventListener("pointerup", async (e) => {
     if (p.moved) return;                                                    // the swipe already painted
     if (!h || h.kind !== "board") return;
     const now = performance.now();
-    if (lastClick && lastClick.key === h.key && now - lastClick.t < 320) {   // double tap: a cat
+    const long = p.button === 2 || now - p.t > 450;
+    if (state.tool === "cat" && !long) {                                    // Cats tool: a tap is a cat, at once
+      if (lastClick && lastClick.key === h.key && now - lastClick.t < 320) return;   // the second tap of a double tap
+      lastClick = { key: h.key, t: now };
+      await act({ type: "cell", r: h.r, c: h.c, button: "cat" }); return;
+    }
+    if (long) { await act({ type: "cell", r: h.r, c: h.c, button: "mouse" }); return; }   // right click / long press
+    if (lastClick && lastClick.key === h.key && now - lastClick.t < 320) {   // Mice tool: double tap is a cat
       clearTimeout(clickTimer); clickTimer = null; lastClick = null;
       await act({ type: "cell", r: h.r, c: h.c, button: "double" }); return;
     }
     lastClick = { key: h.key, t: now };
-    const button = p.button === 2 || now - p.t > 450 ? "secondary" : "primary";
     clearTimeout(clickTimer);
-    clickTimer = setTimeout(() => { clickTimer = null; act({ type: "cell", r: h.r, c: h.c, button }); }, 330);
+    clickTimer = setTimeout(() => { clickTimer = null; act({ type: "cell", r: h.r, c: h.c, button: "mouse" }); }, 330);
     return;
   }
   if (game.input === "watch") return;
@@ -1094,6 +1102,22 @@ canvas.addEventListener("pointerup", async (e) => {
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.game && (state.game.input === "watch" || state.game.input === "realtime")) act({ type: "tick" }); });
+// In fullscreen the bar is hidden, and a hidden control takes no key: its
+// shortcuts (undo, reset, new, light, flat, tools, hint) are swallowed here,
+// in the capture phase, before any other handler sees them.  Fullscreen's own
+// keys (F, Escape) and every game's own keys pass; R still restarts a game
+// that has ended, as its status line offers.
+const BAR_KEYS = new Set(["u", "r", "n", "l", "v", "c", "m", "h"]);
+window.addEventListener("keydown", (e) => {
+  if (!document.body.classList.contains("immersive") || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
+  const game = state.game, key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (!BAR_KEYS.has(key)) return;
+  if (game && game.input === "text") return;                       // wordle: letters are the game
+  if (game && game.input === "realtime" && keyControl(e.key)) return; // the game's own keys
+  if (key === "r" && game && game.over) return;
+  e.stopImmediatePropagation();
+}, true);
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
@@ -1106,6 +1130,11 @@ window.addEventListener("keydown", async (e) => {
   if (e.key === "u" || e.key === "U") act({ type: "undo" });
   if (e.key === "r" || e.key === "R") act({ type: "reset" });
   if (e.key === "n" || e.key === "N") $("new").click();
+  if (game.input === "meowdoku") {
+    if (e.key === "c" || e.key === "C") setTool("cat");
+    if (e.key === "m" || e.key === "M") setTool("mouse");
+    if (e.key === "h" || e.key === "H") $("hint").click();
+  }
   if (e.key === "l" || e.key === "L") toggleLight();
 });
 $("undo").onclick = () => act({ type: "undo" });
@@ -1122,11 +1151,11 @@ $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
 $("light").onclick = toggleLight;
-function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (C)" : "Flat (C)"; }
+function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
 $("flat").onclick = toggleFlat;
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
-  if ((e.key === "c" || e.key === "C") && !e.ctrlKey && !e.metaKey && !(state.game && state.game.input === "text")) toggleFlat();
+  if ((e.key === "v" || e.key === "V") && !e.ctrlKey && !e.metaKey && !(state.game && state.game.input === "text")) toggleFlat();
 });
 
 // ---------------------------------------------------------------- player profile and scores
@@ -1191,6 +1220,25 @@ window.addEventListener("keydown", (e) => {
 });
 $("scores-toggle").onclick = () => { const panel = $("scores"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showScores(); };
 
+// ---------------------------------------------------------------- meowdoku tools, hint, palette
+state.tool = "cat";
+function setTool(tool) {
+  state.tool = tool;
+  $("tool-cat").classList.toggle("active", tool === "cat");
+  $("tool-mouse").classList.toggle("active", tool === "mouse");
+}
+$("tool-cat").onclick = () => setTool("cat");
+$("tool-mouse").onclick = () => setTool("mouse");
+$("hint").onclick = () => { if (state.game && state.game.game === "meowdoku") act({ type: "hint" }); };
+$("palette").onchange = (e) => act({ type: "palette", name: e.target.value });
+function syncMeowdokuBar(game) {
+  if (game.game !== "meowdoku") return;
+  const select = $("palette");
+  if (select.options.length !== game.palettes.length) select.innerHTML = game.palettes.map((n) => `<option value="${n}">${n}</option>`).join("");
+  select.value = game.palette_name;
+  $("hint").disabled = game.won || game.lost;
+}
+
 // ---------------------------------------------------------------- game picker
 function fillPickers() {
   const games = state.catalog.games, gameSelect = $("game"), levelSelect = $("level"), boardSelect = $("board");
@@ -1235,6 +1283,7 @@ function fillPickers() {
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
   for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
+  if (assets.meshes.mouse) state.meshes.x_mark = state.meshes.mouse;      // mice are drawn as the mouse glyph
   try {
     pred.program = await TuringWasmProgram.load("motion.wasm", "motion.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }

@@ -74,7 +74,7 @@ class Table:
         # Games are views; the learner and the Lichess client are process-wide
         # background workers that a mode switch never stops.
         if kind == "meowdoku":
-            self.game = MeowdokuGame(self.boards[str(payload["id"])])
+            self.game = MeowdokuGame(self.boards[str(payload["id"])], **({"palette": str(payload["palette"])} if payload.get("palette") else {}))
         elif kind == "chess":
             self.game = Chess("chess")
         elif kind == "checkers":
@@ -118,6 +118,10 @@ class Table:
                 self.game.client.pause_at_idle()
             else:
                 self.game.client.resume()
+        elif kind == "hint":
+            self.game.hint()
+        elif kind == "palette":
+            self.game.set_palette(str(payload.get("name", "")))
         elif kind in ("submit", "backspace", "undo", "reset"):
             getattr(self.game, kind)()
             if kind in ("undo", "reset"):
