@@ -260,69 +260,35 @@ function terrainMesh(width, depth) {
 // fixed; the page only slides it along the board by the scroll, wrapping at
 // one tile (the height map is tileable), so mountains pass beneath in true
 // perspective, lit and shaded by the Phong lights through their own normals.
-// SMALL PLANET.  The land lies on a sphere of radius PLANET.radius centred
-// under the middle of the field.  Across the width the curve is baked into
-// the mesh at load (it never moves sideways); along the length the mesh is
-// cut into PLANET.strip-long strips, and each frame every strip is dropped by
-// d^2 / 2R for its distance d from the field's centre and tilted to the
-// sphere's slope there (atan(d / R)) -- so the land rises over the near
-// horizon, passes beneath, and falls away beyond, shader untouched, no
-// per-vertex work per frame.
-const PLANET = { radius: 36.0, strip: 1.5 };
-function stripsOf(positions, extras, span) {
-  // Partition a triangle soup by each triangle's centroid z into strips,
-  // positions re-centred on the strip (z) and curved across the width (y).
-  const tri = positions.length / 9, strips = new Map(), cx = span[0] / 2;
-  for (let k = 0; k < tri; k++) {
-    const zc = (positions[k * 9 + 2] + positions[k * 9 + 5] + positions[k * 9 + 8]) / 3;
-    const index = Math.floor(zc / PLANET.strip);
-    if (!strips.has(index)) strips.set(index, { index, pos: [], extra: extras.map(() => []) });
-    const s = strips.get(index), centre = (index + 0.5) * PLANET.strip;
-    for (let v = 0; v < 3; v++) {
-      const o = k * 9 + v * 3, x = positions[o], dx = x - cx;
-      s.pos.push(x, positions[o + 1] - (dx * dx) / (2 * PLANET.radius), positions[o + 2] - centre);
-    }
-    extras.forEach(([data, size], e) => { for (let v = 0; v < 3; v++) for (let c = 0; c < size; c++) s.extra[e].push(data[(k * 3 + v) * size + c]); });
-  }
-  return [...strips.values()].map((s) => ({ ...s, centre: (s.index + 0.5) * PLANET.strip }));
-}
 function reliefMesh(exported) {
   if (TERRAIN.relief !== undefined) return TERRAIN.relief;
   if (!exported || !exported.positions) return (TERRAIN.relief = null);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const buffer = (data, loc, size) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); };
-  const strips = stripsOf(exported.positions, [[exported.normals, 3], [exported.uvs, 2]], exported.span).map((s) => {
-    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
-    buffer(s.pos, 0, 3); buffer(s.extra[0], 1, 3); buffer(s.extra[1], 3, 2);
+  buffer(exported.positions, 0, 3); buffer(exported.normals, 1, 3); buffer(exported.uvs, 3, 2);
+  gl.bindVertexArray(null);
+  let shadow = null;
+  if (exported.shadow_positions) {
+    const svao = gl.createVertexArray(); gl.bindVertexArray(svao);
+    buffer(exported.shadow_positions, 0, 3);
     gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre };
-  });
-  const shadows = exported.shadow_positions ? stripsOf(exported.shadow_positions, [], exported.span).map((s) => {
-    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
-    buffer(s.pos, 0, 3);
-    gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre };
-  }) : [];
-  return (TERRAIN.relief = { strips, shadows, tile: exported.tile, span: exported.span });
+    shadow = { vao: svao, count: exported.shadow_positions.length / 3 };
+  }
+  return (TERRAIN.relief = { vao, count: exported.positions.length / 3, tile: exported.tile, span: exported.span, shadow });
 }
-function terrainOrigin(relief) {
+function terrainModel(relief) {
   // Centred across the field; starting one tile above it and sliding down.
-  return [state.extent.width / 2 - relief.span[0] / 2, -0.05, -relief.tile - 2.0 + TERRAIN.scroll];
+  return M.translate(state.extent.width / 2 - relief.span[0] / 2, -0.05, -relief.tile - 2.0 + TERRAIN.scroll);
 }
-function stripModel(relief, strip) {
-  const [x0, y0, z0] = terrainOrigin(relief), z = z0 + strip.centre, d = z - state.extent.depth / 2;
-  const drop = (d * d) / (2 * PLANET.radius), slope = Math.atan(d / PLANET.radius);
-  return M.multiply(M.translate(x0, y0 - drop, z), M.rotateX(slope));
-}
-// The decimated relief into the shadow map (curved the same way): peaks
-// shadow the land and what flies low beneath them, at a fraction of the
-// full mesh's triangles.
-function terrainShadowCasters() {
+// The decimated relief into the shadow map: peaks shadow the land and what
+// flies low beneath them, at a fraction of the full mesh's triangles.
+function terrainShadowCaster() {
   const game = state.game;
-  if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return [];
+  if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return null;
   const relief = reliefMesh(state.assets && state.assets.terrain);
-  return relief ? relief.shadows.map((s) => [s.vao, s.count, stripModel(relief, s)]) : [];
+  return relief && relief.shadow ? [relief.shadow.vao, relief.shadow.count, terrainModel(relief)] : null;
 }
 function drawTerrain(now, drawLit) {
   const game = state.game;
@@ -332,7 +298,7 @@ function drawTerrain(now, drawLit) {
     const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
     TERRAIN.at = now;
     if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
-    for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
+    drawLit(relief.vao, relief.count, terrainModel(relief), state.materialIndex.terrain);
     return;
   }
   const key = `${state.extent.width}x${state.extent.depth}`;
@@ -591,7 +557,13 @@ function uploadMaterials(game) {
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
   // The vital bars: a glass tube each (clear) and its fill (glowing glass).
   // Clouds: white frosted glass (rough, partly transmissive, softly lit from within).
-  records.push(["cloud@glass", [0.97, 0.98, 1.0], { roughness: 0.65, transmission: 0.55, opacity: 0.62, ior: 1.3, emission: [0.10, 0.11, 0.13] }]);
+  // Clouds: thin white frosted glass, low over the land.
+  records.push(["cloud@glass", [0.97, 0.98, 1.0], { roughness: 0.65, transmission: 0.7, opacity: 0.34, ior: 1.25, emission: [0.06, 0.07, 0.08] }]);
+  // Smoke where craft were destroyed: black frosted glass as dense as the old
+  // clouds, thinning as it ages (smoke_0 .. smoke_3).
+  for (let k = 0; k < 4; k++)
+    records.push([`smoke_${k}@glass`, [0.05 + 0.03 * k, 0.05 + 0.03 * k, 0.06 + 0.03 * k],
+      { roughness: 0.75, transmission: 0.3, opacity: 0.66 - 0.14 * k, ior: 1.2 }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
@@ -1910,7 +1882,8 @@ function draw(ms) {
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
   gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
-  for (const [vao, count, model] of [...casters, ...terrainShadowCasters()]) {
+  const terrainCaster = terrainShadowCaster();
+  for (const [vao, count, model] of terrainCaster ? [...casters, terrainCaster] : casters) {
     gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.depth, "uMVP"), false, M.multiply(light.viewProj, model));
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
   }

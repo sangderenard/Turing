@@ -385,6 +385,51 @@ class Pilot:
         return controls_from(game, self.run(self.features(game))[0])
 
 
+class _MirroredView:
+    """The board as a piloted enemy sees it: itself as "the ship" at the
+    bottom (the field flipped top to bottom), the player's ship, shots and
+    missiles as its hostiles, its health as its vitals -- so the policy
+    trained to survive and score as the player flies it unchanged."""
+
+    def __init__(self, game, lane: int):
+        from meowdoku import scroller as sc
+        self.game = game.game
+        self.PLAYER_LANE = lane
+        self.HOSTILE_LANES = ((0, 1), sc.SHOTS, sc.MISSILES)
+        self.HEALTH_MAX = 1.0
+        self._sc, self._real, self._lane = sc, game.session, lane
+        self.session = self
+
+    def column(self, name: str) -> np.ndarray:
+        col = np.array(self._real.column(name), dtype=np.float64, copy=True)
+        sc, k = self._sc, self._lane
+        if name == "y":
+            col = sc.HEIGHT - col
+        elif name == "vy":
+            col = -col
+        elif name == "energy":
+            col[k] = 1.0
+        elif name == "lives":
+            hp, top = float(self._real.column("hp")[k]), sc.BOSS_HP if k == sc.BOSS_LANE else sc.ACE_HP
+            col[...] = max(0.0, min(1.0, hp / top))
+        elif name == "timer":
+            col[0] = self._real.column("timer")[k]
+        return col
+
+
+def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
+    """(x axis, y axis, height axis, fire) for a piloted enemy: the game's
+    policy on the mirrored view, its y answer flipped back to the board."""
+    name = game.game
+    params = _PILOT_WEIGHTS.get(name) or fitting_params(name)
+    if params is None:
+        return 0.0, 0.0, 0.0, 1.0
+    _PILOT_WEIGHTS.setdefault(name, params)
+    view = _MirroredView(game, lane)
+    out = numpy_product(1, *widths_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
+    return (float(out[0]), -float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
+
+
 def pilot_for(game) -> Pilot:
     name = game.game
     if name not in _PILOT_WEIGHTS:

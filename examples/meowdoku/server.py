@@ -176,6 +176,8 @@ class Table:
         result = self.game.result()
         if result is not None:
             self.profiles.record(self.player, self.game.game, result)
+            if result.get("won") and result.get("level"):
+                self.profiles.defeated(self.player, self.game.game, int(result["level"]))
             self.recorded = self.game
 
     def set_player(self, payload: dict) -> dict:

@@ -16,6 +16,16 @@ Lanes (contiguous blocks, so collisions are block against block):
                    faster the higher they float (parallax); never collide
     399..406       missiles: ballistic rounds on engine_toy's trajectory law
     407..412       pickups: weapon power-ups dropped by destroyed enemies
+    413..424       smoke: black clouds left where a craft was destroyed; they
+                   drift back with the scroll, sink toward the land and fade
+
+BOSS: lane 48 (the last enemy lane, reserved) is the level's boss, flown by
+the trained policy on a mirrored view of the board (the server writes its
+``pax``/``pay``/``paz``/``pfire`` controls before each landing).  It arrives
+after BOSS_TIME seconds, or sooner once the player has cruised CALM_TIME
+seconds with the shield above CALM_SHIELD (``calm``).  While it lives and the
+player stays calm, network-flown ACES join every ACE_EVERY seconds.
+Destroying it clears the level (``boss_phase`` 2: a win).
 
 WEAPONS: the ship carries ``weapon`` (basic / laser / missile), ``mult``
 (1..4: 1 + mult shots a volley) and ``fan`` (0..3: the volley's spread).
@@ -83,7 +93,19 @@ BULLETS = (49, 369)
 STARS = (369, 399)
 MISSILES = (399, 407)
 PICKUPS = (407, 413)
-LANES = PICKUPS[1]
+SMOKES = (413, 425)
+LANES = SMOKES[1]
+BOSS_LANE = ENEMIES[1] - 1
+SMOKE = 7.0
+ACE, BOSS_KIND = 3.0, 4.0
+BOSS_TIME = 75.0
+CALM_TIME = 20.0
+CALM_SHIELD = 0.85
+ACE_EVERY = 7.0
+BOSS_HP = 120.0
+ACE_HP = 6.0
+PILOT_SPEED, PILOT_TAU = 6.5, 0.12
+SMOKE_LIFE = 4.0
 #: Weapons (the ship's ``weapon`` column) and pickup kinds (a pickup's ``kind``).
 BASIC, LASER, MISSILE = 0.0, 1.0, 2.0
 SPREAD_UP, MULT_UP, MISSILE_UP, LASER_UP, SHIELD_UP, HEALTH_UP = 1.0, 2.0, 3.0, 4.0, 5.0, 6.0
@@ -155,7 +177,7 @@ CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis
 
 def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind, age, timer,
-                  weapon, mult, fan,
+                  weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
                   score, lives, invuln, clock, spawn_clock, field_w, pace, level,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -165,6 +187,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_player, is_shot, is_enemy = slot == PLAYER, slot == SHOT, slot == ENEMY
     is_bullet, is_star = slot == BULLET, slot == STAR
     is_missile, is_pickup = slot == MISSILE_SLOT, slot == PICKUP
+    is_smoke = slot == SMOKE
+    is_boss_lane = lane == BOSS_LANE
     clock_next = clock + dt
     zero = x * 0.0
 
@@ -212,7 +236,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     # Enemies: one arrives whenever the spawn clock runs out, faster as the
     # run goes on; drifters three times as often as spinners.
     arrive = (spawn_clock <= 0.0) & playing
-    enemy_spawn = first_of(is_enemy & ~live, lane) & arrive
+    enemy_spawn = first_of(is_enemy & ~live & ~is_boss_lane, lane) & arrive
     roll = noise(clock * 3.7 + 1.0)
     new_kind = where(roll < 0.75, DRIFTER, SPINNER)
     tempo = pace * (1.0 + LEVEL_STEP * (level - 1.0))       # arrivals and volleys scale with it
@@ -227,15 +251,26 @@ def scroller_step(lane, slot, rx, ry, rz,
     routine_z = Z_MARGIN + span_z * (1.0 + held_wave)
     routine_vz = where(wave.abs() < 1.0, span_z * DWELL * ROUTINE_RATE * phase.cos(), 0.0)
 
+    # The boss arrives on time, or early once the player has cruised calm;
+    # while it lives and the player stays calm, aces join.
+    shield_now = (f(is_player) * energy).sum()
+    calm_next = where(playing & (shield_now >= CALM_SHIELD), calm + dt, 0.0 * calm)
+    phase0 = (f(is_player) * boss_phase).sum()
+    boss_due = playing & (phase0 == 0.0) & ((clock >= BOSS_TIME) | ((f(is_player) * calm).sum() >= CALM_TIME))
+    boss_spawn = is_boss_lane & ~live & boss_due
+    ace_ready = playing & (phase0 == 1.0) & ((f(is_player) * ace_clock).sum() <= 0.0) & (shield_now >= CALM_SHIELD)
+    ace_spawn = first_of(is_enemy & ~live & ~is_boss_lane & ~enemy_spawn, lane) & ace_ready
+    ace_clock_next = where(ace_ready, ACE_EVERY / tempo, (ace_clock - dt).clip(0.0, 100.0))
+    piloted = (is_boss_lane | (is_enemy & (kind == ACE))) & live
     # One volley per step: the ready enemy in the lowest lane fires, into the
     # first free bullet lanes (drifters an aimed spread, spinners a ring).
-    ready = is_enemy & live & (timer <= 0.0) & (y > 0.3) & playing
+    ready = is_enemy & live & (timer <= 0.0) & (y > 0.3) & playing & (~piloted | (pfire > 0.0))
     shooter = first_of(ready, lane)
     fired = f(shooter).sum() > 0.0
     sx, sy, sz = (f(shooter) * x).sum(), (f(shooter) * y).sum(), (f(shooter) * z).sum()
     skind = (f(shooter) * kind).sum()
     shooter_lane = (f(shooter) * lane).sum()
-    count = where(skind == SPINNER, RING, SPREAD)
+    count = where(skind == SPINNER, RING, where(skind == BOSS_KIND, 5.0, SPREAD))
     free_bullet = is_bullet & ~live
     rank = f(free_bullet).cumsum(dim=0) - 1.0
     bullet_spawn = free_bullet & (rank < count) & fired
@@ -248,21 +283,26 @@ def scroller_step(lane, slot, rx, ry, rz,
     reach_xy = ((px - sx) * (px - sx) + (py - sy) * (py - sy)).sqrt() + 0.5
     climb = where(skind == SPINNER, 0.0, speed * (pz - sz) / reach_xy)
 
-    spawn = shot_spawn | enemy_spawn | bullet_spawn | missile_spawn
-    x1 = where(shot_spawn, shot_x, where(enemy_spawn, enemy_x0, where(bullet_spawn, sx,
-               where(missile_spawn, px + missile_c * 0.3, x))))
-    y1 = where(shot_spawn | missile_spawn, py - MUZZLE, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
-    z1 = where(shot_spawn | missile_spawn, pz, where(enemy_spawn, routine_z, where(bullet_spawn, sz, z)))
-    kind1 = where(enemy_spawn, new_kind, kind)
+    arrival = enemy_spawn | boss_spawn | ace_spawn
+    spawn = shot_spawn | arrival | bullet_spawn | missile_spawn
+    x1 = where(shot_spawn, shot_x, where(enemy_spawn | ace_spawn, enemy_x0, where(boss_spawn, 0.5 * field_w,
+               where(bullet_spawn, sx, where(missile_spawn, px + missile_c * 0.3, x)))))
+    y1 = where(shot_spawn | missile_spawn, py - MUZZLE, where(arrival, -0.8, where(bullet_spawn, sy + 0.2, y)))
+    z1 = where(shot_spawn | missile_spawn, pz, where(arrival, routine_z, where(bullet_spawn, sz, z)))
+    kind1 = where(enemy_spawn, new_kind, where(boss_spawn, BOSS_KIND, where(ace_spawn, ACE, kind)))
     age1 = where(spawn, 0.0, age + dt)
-    hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0), hp)
+    level_hp = 1.0 + 0.5 * (level - 1.0)
+    hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0),
+                where(boss_spawn, BOSS_HP * level_hp, where(ace_spawn, ACE_HP * level_hp, hp)))
     reload_of = where(pw == LASER, LASER_RELOAD, where(pw == MISSILE, MISSILE_RELOAD, RELOAD))
     timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
-                   where(enemy_spawn, 0.8 / tempo,
-                         where(shooter, where(skind == SPINNER, 0.55, 1.5) / tempo, timer - dt)))
+                   where(arrival, 0.8 / tempo,
+                         where(shooter, where(skind == SPINNER, 0.55, where(skind == BOSS_KIND, 0.45,
+                                                                            where(skind == ACE, 1.1, 1.5))) / tempo,
+                               timer - dt)))
     # Enemy paths: drifters fall and sway; spinners descend, hold, then leave.
-    drifter = is_enemy & (kind1 == DRIFTER)
-    spinner = is_enemy & (kind1 == SPINNER)
+    drifter = is_enemy & (kind1 == DRIFTER) & ~is_boss_lane
+    spinner = is_enemy & (kind1 == SPINNER) & ~is_boss_lane
     sway = 1.8 * (clock_next * 1.9 + lane * 0.7).sin()
     vx1 = where(is_player, ship_vx, where(drifter, sway, where(bullet_spawn, speed * angle.cos(),
                 where(shot_spawn, shot_speed * shot_angle.sin(),
@@ -282,6 +322,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     vx1 = where(is_pickup, where(pull, pull_speed * to_x / reach_p, 0.0), vx1)
     vy1 = where(is_pickup, where(pull, pull_speed * to_y / reach_p, 1.2), vy1)
     vz1 = where(is_pickup, where(pull, pull_speed * to_z / reach_p, 0.0), vz1)
+    # Piloted craft (the boss, aces): the shared damped motion law under the
+    # pilot's controls, kept to the upper field.
+    pilot_x, pilot_vx = damped_axis(x1, vx, pax, zero - 1.0, zero + MARGIN, field_w - MARGIN, PILOT_SPEED, PILOT_TAU, REACH, dt)
+    pilot_y, pilot_vy = damped_axis(y1, vy, pay, zero - 1.0, zero + 0.6, zero + 0.55 * HEIGHT, PILOT_SPEED, PILOT_TAU, REACH, dt)
+    pilot_z, pilot_vz = damped_axis(z1, vz, paz, zero - 1.0, zero + Z_MARGIN, zero + DEPTH - Z_MARGIN, PILOT_SPEED, PILOT_TAU, REACH, dt)
+    flown = piloted & ~arrival
+    vx1, vy1, vz1 = where(flown, pilot_vx, vx1), where(flown, pilot_vy, vy1), where(flown, pilot_vz, vz1)
     live1 = live | spawn
     # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
     # the whole step, so position = birth point + velocity x (clock - born).
@@ -292,6 +339,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     x2 = where(is_player & moving, ship_x, where(moving, x1 + vx1 * dt, x1))
     y2 = where(is_player & moving, ship_y, where(moving, y1 + vy1 * dt, y1))
     z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z, where(moving, z1 + vz1 * dt, z1)))
+    x2 = where(flown & moving, pilot_x, x2)
+    y2 = where(flown & moving, pilot_y, y2)
+    z2 = where(flown & moving, pilot_z, z2)
     # Missiles fly engine_toy's trajectory law; height is the law's vertical
     # (y) axis, the field's y its z.
     mx, mz_, my, mvx, mvz_, mvy = trajectory_step(x1, z1, y1, vx1, vz1, vy1, dt, MISSILE_MASS, MISSILE_DIAMETER,
@@ -318,7 +368,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
     exposed = live2 & (invuln <= 0.0)
     bullet_strikes = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
-    rams = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)
+    rams = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)        # the boss lane is an enemy lane
     player_hits = bullet_strikes + rams
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
     hp2 = hp1 - enemy_hits
@@ -361,6 +411,18 @@ def scroller_step(lane, slot, rx, ry, rz,
     age1 = where(drop, 0.0, age1)
     age1 = where(is_player & (damage > 0.0), 0.0, age1)      # the player's age: time since its last hit
     live3 = live3 | drop
+    # Smoke where a craft was destroyed: the first free smoke lane, at the
+    # step's first kill; it drifts back with the scroll, sinks and fades.
+    puff = first_of(is_smoke & ~live3, lane) & (f(killer).sum() > 0.0)
+    x2, y2, z2 = where(puff, kx, x2), where(puff, ky, y2), where(puff, (kz * 0.5).clip(0.15, 1.2), z2)
+    vx1 = where(puff, 0.3 * (noise(clock * 4.1 + 5.0) - 0.5), vx1)
+    vy1 = where(puff, 2.4, vy1)
+    vz1 = where(puff, -0.08, vz1)
+    born1 = where(puff, clock, born1)
+    age1 = where(puff, 0.0, age1)
+    live3 = (live3 | puff) & ~(is_smoke & (age1 > SMOKE_LIFE))
+    boss_killed = (f(killed & is_boss_lane).sum() > 0.0)
+    boss_phase_next = where(boss_killed, 2.0, where(boss_due, 1.0, boss_phase))
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
     invuln_next = where(was_hit, 0.6, where(shielded, 0.25, (invuln - dt).clip(0.0, INVULN)))
     score_next = score + (f(killed) * where(kind1 == SPINNER, 300.0, 100.0)).sum()
@@ -379,13 +441,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
     return (f(live3), x2, y2, z2, vx1, vy1, vz1, hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
-            weapon_next, mult_next, fan_next,
+            weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
-         "weapon", "mult", "fan",
+         "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
          "score", "lives", "invuln", "clock", "spawn_clock")
 SETTINGS = ("field_w", "pace", "level")
 
@@ -417,6 +479,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     missiles, pickups = slice(*MISSILES), slice(*PICKUPS)
     slot[missiles], rx[missiles], ry[missiles], rz[missiles] = MISSILE_SLOT, 0.18, 0.3, 0.25
     slot[pickups], rx[pickups], ry[pickups], rz[pickups] = PICKUP, 0.35, 0.35, 0.4
+    slot[slice(*SMOKES)] = SMOKE
+    rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
     slot[BULLETS[0]:BULLETS[1]], rx[BULLETS[0]:BULLETS[1]], ry[BULLETS[0]:BULLETS[1]] = BULLET, 0.12, 0.12
@@ -431,7 +495,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     x[stars] = rng.uniform(0.2, width - 0.2, STARS[1] - STARS[0])
     y[stars] = rng.uniform(-0.3, HEIGHT + 0.3, STARS[1] - STARS[0])
     vy[stars] = rng.uniform(1.5, 5.0, STARS[1] - STARS[0])
-    z[stars] = rng.uniform(0.0, DEPTH, STARS[1] - STARS[0])
+    z[stars] = rng.uniform(0.05, 1.2, STARS[1] - STARS[0])      # low clouds, close over the land
     vy[stars] = 0.8 + 0.7 * z[stars]          # clouds: higher drifts faster (parallax)
     alive = ((slot == PLAYER) | (slot == STAR)).astype(np.float64)
     return {
@@ -441,6 +505,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "energy": (slot == PLAYER).astype(np.float64), "kind": np.zeros(LANES), "age": np.zeros(LANES),
         "timer": np.zeros(LANES), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
+        **{name: np.zeros(LANES) for name in ("pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock")},
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
@@ -472,10 +537,11 @@ class BulletScroller(EntityGame):
         return 1.0 if (getattr(self, "autopilot", False) or not getattr(self, "learns", True)) else USER_PACE
 
     def drive_settings(self) -> None:
-        """Before each landing: the pace for whoever drives now."""
+        """Before each landing: the pace for whoever drives now, and the pilots."""
         column = self.session.column("pace")
         if column[0] != self.pace():
             column[...] = self.pace()
+        self.fly_pilots()
 
     def motion(self) -> dict[str, Any]:
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
@@ -500,7 +566,9 @@ class BulletScroller(EntityGame):
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
                 "invader": [0.75, 0.35, 0.95], "ufo": [0.95, 0.15, 0.55], "bullet": [1.0, 0.25, 0.35],
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
-                "cloud": [0.96, 0.98, 1.0],
+                "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
+                "smoke_0": [0.04, 0.04, 0.05], "smoke_1": [0.07, 0.07, 0.08], "smoke_2": [0.1, 0.1, 0.11],
+                "smoke_3": [0.13, 0.13, 0.14],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
                 "pickup_S": [0.35, 0.95, 0.45], "pickup_X": [1.0, 0.85, 0.2],
                 "pickup_M": [1.0, 0.5, 0.2], "pickup_L": [0.3, 0.95, 1.0],
@@ -523,8 +591,19 @@ class BulletScroller(EntityGame):
                 laser = float(col["weapon"][0]) == LASER
                 mesh, color, size = "bolt", "laser" if laser else "bolt", 0.24 if laser else 0.2
             elif slot == ENEMY:
-                spinner = col["kind"][k] == SPINNER
-                mesh, color, size = ("ufo", "ufo", 0.55) if spinner else ("invader", "invader", 0.4)
+                kind_k = float(col["kind"][k])
+                if kind_k == BOSS_KIND:
+                    mesh, color, size = "ufo", "boss", 1.35
+                elif kind_k == ACE:
+                    mesh, color, size = "alien", "ace", 0.5
+                elif kind_k == SPINNER:
+                    mesh, color, size = "ufo", "ufo", 0.55
+                else:
+                    mesh, color, size = "invader", "invader", 0.4
+            elif slot == SMOKE:
+                # black smoke, thinning as it ages
+                step = min(3, int(4.0 * float(clock - col["born"][k]) / SMOKE_LIFE))
+                mesh, color, size = "cloud", f"smoke_{step}", 0.42 + 0.1 * step
             elif slot == BULLET:
                 mesh, color, size = "disc", "bullet", 0.13
             elif slot == MISSILE_SLOT:
@@ -535,7 +614,7 @@ class BulletScroller(EntityGame):
                 mesh, color, size = letter, f"pickup_{letter}", 0.34
             else:
                 # A cloud: frosted glass, larger the higher it floats.
-                mesh, color, size = "cloud", "cloud", 0.45 + 0.12 * float(col["z"][k])
+                mesh, color, size = "cloud", "cloud", 0.26 + 0.08 * float(col["z"][k])
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
@@ -548,7 +627,7 @@ class BulletScroller(EntityGame):
                         "lean": 0.0 if slot in (PLAYER, MISSILE_SLOT) else 0.55,
                         "face": bool(slot == MISSILE_SLOT and not exploding),
                         # drawn with the glass (blended), not in the opaque pass
-                        "translucent": bool(slot == STAR),
+                        "translucent": bool(slot in (STAR, SMOKE)),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})
@@ -556,9 +635,37 @@ class BulletScroller(EntityGame):
 
     def result(self) -> dict[str, Any] | None:
         s = self.session
-        if s.state is None or s.column("lives")[0] > 0.0:
+        if s.state is None:
+            return None
+        if float(s.column("boss_phase")[0]) == 2.0:
+            return {"score": float(s.column("score")[0]), "won": True, "level": self.level,
+                    "detail": f"level {self.level} cleared in {s.column('clock')[0]:.0f} s"}
+        if s.column("lives")[0] > 0.0:
             return None
         return {"score": float(s.column("score")[0]), "detail": f"survived {s.column('clock')[0]:.0f} s"}
+
+    def reset(self) -> None:
+        """A cleared level's reset starts the next level."""
+        if self.session.state is not None and float(self.session.column("boss_phase")[0]) == 2.0:
+            self.level += 1
+        super().reset()
+
+    def fly_pilots(self) -> None:
+        """Before each landing: the trained policy flies the boss and the aces
+        on a mirrored view of the board (autopilot.pilot_controls)."""
+        s = self.session
+        if s.state is None:
+            return
+        alive, kind = s.column("alive"), s.column("kind")
+        lanes = [BOSS_LANE] if alive[BOSS_LANE] > 0.0 else []
+        lanes += [int(k) for k in range(ENEMIES[0], BOSS_LANE) if alive[k] > 0.0 and kind[k] == ACE]
+        if not lanes:
+            return
+        from meowdoku.autopilot import pilot_controls
+        for k in lanes:
+            ax, ay, az, fire = pilot_controls(self, k)
+            for name, value in (("pax", ax), ("pay", ay), ("paz", az), ("pfire", fire)):
+                s.column(name)[k] = value
 
     HOSTILE_LANES = (ENEMIES, BULLETS)
     # Lo-fi arcade: the backdrop shows through (no floor slab); the glass
@@ -577,5 +684,11 @@ class BulletScroller(EntityGame):
                 else f"level {self.level} · health {lives} · shield {s.column('energy')[0] * SHIELD_POINTS:.0f}")
         weapon = {BASIC: "blaster", LASER: "laser", MISSILE: "missiles"}.get(float(s.column("weapon")[0]), "blaster")
         head += f" · {weapon} x{1 + int(s.column('mult')[0])} fan {int(s.column('fan')[0])}"
+        phase = float(s.column("boss_phase")[0])
+        if phase == 1.0:
+            boss_hp = float(s.column("hp")[BOSS_LANE])
+            head += f" · BOSS {boss_hp:.0f} hp"
+        elif phase == 2.0:
+            head = f"LEVEL {self.level} CLEARED · " + head
         return (f"{head} · score {score} · {enemies} enemies · {bullets} bullets · "
                 f"tick {seconds * 1000:.0f} ms = {calls} law steps")
