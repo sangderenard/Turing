@@ -412,7 +412,9 @@ function camera() {
   // Frame the whole extent: the half-size that must fit, over the lens'
   // half-angle, with room for the bar and the hearts; a lower camera sees
   // the board foreshortened and backs off a little more.
-  const halfFit = Math.max((ext.depth + 1.2) / 2, (ext.width + 1.2) / (2 * aspect)) * 1.12;
+  // A free board is sized to the screen already, so it is framed tightly.
+  const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
+  const halfFit = Math.max((ext.depth + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
   const dist = halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const target = [ext.width / 2, 0, ext.depth / 2];
   const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
@@ -670,13 +672,11 @@ function boardPlaneX(clientX, clientY) {
   return t >= 0 ? near[0] + t * (far[0] - near[0]) : null;
 }
 function controls() {
-  let axis = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0), fire = held.has("fire") ? 1 : 0;
-  if (steer != null) {
-    const player = [...state.pieces.values()].find((p) => p.entity && p.mesh === "rocket" && p.removing == null);
-    if (player) axis = Math.max(-1, Math.min(1, (steer - player.x) * 2.5));
-    fire = 1;
-  }
-  return { move_axis: axis, fire };
+  // Keys give an axis; a held pointer gives the board x it asks the rocket to
+  // reach.  The law integrates the rocket toward either with damping, so the
+  // page never closes a loop over a position it learned a round trip ago.
+  const axis = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0);
+  return { move_axis: axis, steer_x: steer != null ? Math.max(0, steer) : -1, fire: steer != null || held.has("fire") ? 1 : 0 };
 }
 const KEY_CONTROL = { ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right", " ": "fire", ArrowUp: "fire", w: "fire", W: "fire" };
 window.addEventListener("keyup", (e) => { const k = KEY_CONTROL[e.key]; if (k) held.delete(k); });
@@ -824,6 +824,17 @@ async function showScores() {
 $("player").value = rememberedName();
 $("player").addEventListener("change", (e) => setPlayer(e.target.value));
 $("player").addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") e.target.blur(); });
+// ---------------------------------------------------------------- layout
+// A free board's width follows the screen: after a resize or a fullscreen
+// switch settles, the server widens or narrows the field mid-game.
+let layoutTimer = null;
+new ResizeObserver(() => {
+  clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(() => {
+    if (state.game && state.game.board === "free") act({ type: "layout", aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) });
+  }, 250);
+}).observe(canvas);
+
 // ---------------------------------------------------------------- fullscreen
 // The canvas takes the whole screen: the bar hides (so the canvas's top
 // offset falls to 0) and, where the browser allows it, the page goes
@@ -867,7 +878,7 @@ function fillPickers() {
       const board = chosen[Math.floor(Math.random() * chosen.length)]; boardSelect.value = board.id;
       newGame({ game: "meowdoku", id: board.id });
     } else if (g === "wordle") newGame({ game: "wordle", seed: Math.floor(Math.random() * 100000) });
-    else newGame({ game: g });
+    else newGame({ game: g, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) });
   };
 }
 

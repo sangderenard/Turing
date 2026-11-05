@@ -86,7 +86,7 @@ class Table:
         elif kind == "lichess":
             self.game = LichessGame()
         elif kind == "space_invaders":
-            self.game = SpaceInvaders()
+            self.game = SpaceInvaders(aspect=float(payload.get("aspect") or 0.0))
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
@@ -104,6 +104,9 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
+        elif kind == "layout":
+            if hasattr(self.game, "layout"):
+                self.game.layout(float(payload.get("aspect") or 0.0))
         elif kind in ("lichess_pause", "lichess_resume"):
             if not isinstance(self.game, LichessGame) or self.game.client is None:
                 raise ValueError("Lichess mode is not connected")

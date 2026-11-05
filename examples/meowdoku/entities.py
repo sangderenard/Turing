@@ -74,7 +74,11 @@ class EntitySession:
         before = self.calls()
         self.state, self.controller, results = dt_system(
             self.pieces, self.columns, rounds=1, round_dt=float(seconds), dx=1.0,
-            targets=self.targets, controller=self.controller, state=self.state)
+            targets=self.targets, controller=self.controller, state=self.state,
+            # Play is one continuous run cut into ticks: the next tick's first
+            # attempt is the controller's last proposal, not the whole window
+            # (dt_system's first round has no ceiling of its own).
+            dt_initial=None if self.state is None else min(self.dt, float(seconds)))
         advanced, self.dt, telemetry = results[0]
         if abs(float(advanced) - seconds) > 1e-9 * max(1.0, seconds):
             raise RuntimeError(f"a tick must land as one window: advanced={advanced} of {seconds}")
@@ -122,12 +126,13 @@ class EntityGame(Game):
 
     The page sends ``tick`` actions carrying its held controls; each tick
     lands the wall time since the previous one (capped at ``max_frame``, so a
-    hidden tab or a slow reply never jumps the game).  ``undo`` rewinds."""
+    hidden tab never jumps the game).  ``undo`` rewinds; ``layout`` fits the
+    field to the screen's shape."""
 
     input = "realtime"
     width = 15.0
     height = 13.0
-    max_frame = 0.1
+    max_frame = 0.25          # longer gaps (a hidden tab) are dropped, shorter ones landed whole
     CONTROLS: tuple[str, ...] = ()
 
     def __init__(self, board_id: str = ""):

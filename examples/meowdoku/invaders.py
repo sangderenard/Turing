@@ -19,7 +19,8 @@ Columns (one value per lane; game-wide values are broadcast to every lane):
     lane, slot, home_x, home_y, points, rx, ry, home_hp      static
     alive, x, y, vx, vy, hp, boom, born                       entity state
     score, lives, wave, fleet_dir, clock, ufo_clock           game state
-    move_axis, fire                                           the CONTROLS
+    field_w                                                   the field's width
+    move_axis, steer_x, fire                                  the CONTROLS
 
 Positions are board units, ``x`` across and ``y`` down the board; there are
 no cells.  ``dt_limit`` is the time the fastest live entity takes to cross
@@ -51,10 +52,19 @@ INVADERS = float(FLEET_ROWS * FLEET_COLS)
 
 LIVES = 3.0
 PLAYER_Y = HEIGHT - 0.9
-PLAYER_SPEED = 7.0
-SHOT_SPEED = 15.0
-BOMB_SPEED = 5.5
-UFO_SPEED = 3.2
+PLAYER_SPEED = 9.0
+#: The rocket is integrated, not placed: its velocity relaxes toward the
+#: commanded velocity with time constant SHIP_TAU (the damping), and a held
+#: pointer commands the velocity that would close the gap in SHIP_REACH.
+#: Together a damped second-order approach (damping ratio ~0.85): no
+#: overshoot to speak of, and no network delay inside the loop, since the
+#: pointer's position -- not a speed derived from a stale ship -- is sent.
+SHIP_TAU = 0.05
+SHIP_REACH = 0.15
+SHOT_SPEED = 18.0
+BOMB_SPEED = 7.0
+UFO_SPEED = 4.0
+FLEET_PACE = 0.8
 UFO_Y = 0.75
 FLEET_MARGIN = 0.55
 FLEET_DROP = 0.42
@@ -63,9 +73,10 @@ PLAYER_BOOM = 1.6
 BOOM = 0.35
 
 #: The control record: state column -> the semantic action a shell fills it
-#: from.  ``move_axis`` is -1..1 (keys, or the pointer steering the rocket);
+#: from.  ``move_axis`` is -1..1 (keys); ``steer_x`` is the board x a held
+#: pointer asks the rocket to go to (-1: no pointer, the keys rule);
 #: ``fire`` is held, and a shot leaves whenever the shot lane is free.
-CONTROLS = {"move_axis": "move-axis-x", "fire": "primary-action"}
+CONTROLS = {"move_axis": "move-axis-x", "steer_x": "pointer-board-x", "fire": "primary-action"}
 
 #: Mesh vocabulary: name -> emoji, extruded by ``web_export`` through the
 #: same glyph builder as every other piece (Segoe UI Emoji outlines).
@@ -88,8 +99,8 @@ def _hash(value):
 
 def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
                   alive, x, y, vx, vy, hp, boom, born,
-                  score, lives, wave, fleet_dir, clock, ufo_clock,
-                  move_axis, fire, dt):
+                  score, lives, wave, fleet_dir, clock, ufo_clock, field_w,
+                  move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     n = int(lane.shape[0])
     f = lambda mask: mask.to_dtype("float")  # noqa: E731
@@ -102,9 +113,9 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # The fleet: one heading for every invader; fewer invaders, faster fleet.
     fleet = is_inv & live
     count = f(fleet).sum()
-    speed = (0.45 + 0.12 * wave) * (1.0 + 4.0 * (1.0 - count / INVADERS))
+    speed = (FLEET_PACE + 0.15 * wave) * (1.0 + 4.0 * (1.0 - count / INVADERS))
     step_x = fleet_dir * speed * dt
-    beyond = fleet & ((((x + step_x) > (WIDTH - FLEET_MARGIN)) & (fleet_dir > 0.0))
+    beyond = fleet & ((((x + step_x) > (field_w - FLEET_MARGIN)) & (fleet_dir > 0.0))
                       | (((x + step_x) < FLEET_MARGIN) & (fleet_dir < 0.0)))
     edge = (f(beyond).sum() > 0.0) & playing
     fleet_dir_next = where(edge, -fleet_dir, fleet_dir)
@@ -137,7 +148,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # The saucer: when its clock runs out, from a side the dice pick.
     ufo_spawn = is_ufo & ~live & (ufo_clock <= 0.0) & playing
     from_left = _hash(clock * 1.91 + 2.0) > 0.5
-    ufo_x0 = where(from_left, -0.9, WIDTH + 0.9)
+    ufo_x0 = where(from_left, -0.9, field_w + 0.9)
     ufo_vx0 = where(from_left, UFO_SPEED, -UFO_SPEED)
     ufo_launched = f(ufo_spawn).sum() > 0.0
     ufo_clock_next = where(ufo_launched, 14.0 + 10.0 * _hash(clock * 5.3), ufo_clock - dt)
@@ -145,7 +156,12 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     spawn = shot_spawn | bomb_spawn | ufo_spawn
     x1 = where(shot_spawn, player_x, where(bomb_spawn, shooter_x, where(ufo_spawn, ufo_x0, x)))
     y1 = where(shot_spawn, PLAYER_Y - 0.65, where(bomb_spawn, shooter_y + 0.5, where(ufo_spawn, UFO_Y, y)))
-    vx1 = where(is_player, move_axis * PLAYER_SPEED,
+    # The rocket's damped velocity: relax toward the commanded velocity.
+    steering = steer_x >= 0.0
+    command = where(steering, ((steer_x - x) / SHIP_REACH).clip(-PLAYER_SPEED, PLAYER_SPEED),
+                    move_axis.clip(-1.0, 1.0) * PLAYER_SPEED)
+    ship_v = vx + (command - vx) * (dt / SHIP_TAU).clip(0.0, 1.0)
+    vx1 = where(is_player, ship_v,
                 where(is_inv, fleet_dir_next * speed, where(ufo_spawn, ufo_vx0, where(spawn, 0.0, vx))))
     vy1 = where(shot_spawn, -SHOT_SPEED, where(bomb_spawn, BOMB_SPEED, where(spawn, 0.0, vy)))
     live1 = live | spawn
@@ -155,12 +171,12 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     moving = live1 & playing
     x2 = where(moving & is_inv, x1 + fleet_dx, where(moving, x1 + vx1 * dt, x1))
     y2 = where(moving & is_inv, y1 + fleet_dy, where(moving, y1 + vy1 * dt, y1))
-    x2 = where(is_player, x2.clip(0.7, WIDTH - 0.7), x2)
+    x2 = where(is_player, where(x2 > field_w - 0.7, field_w - 0.7, x2).clip(0.7, 1.0e9), x2)
     # The rocket reports the velocity it actually moved with: zero when a
     # wall stops it, so a viewer carrying it forward never overshoots.
     vx_out = where(is_player & moving, (x2 - x1) / dt, vx1)
     gone = (((is_shot | is_bomb) & ((y2 < -0.5) | (y2 > HEIGHT + 0.5)))
-            | (is_ufo & ((x2 < -1.5) | (x2 > WIDTH + 1.5))))
+            | (is_ufo & ((x2 < -1.5) | (x2 > field_w + 1.5))))
     live2 = live1 & ~gone
 
     # Collisions: overlapping boxes between slots that may touch.  Invaders
@@ -196,7 +212,8 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     cleared = (f(is_inv & live3).sum() == 0.0) & playing
     reform = is_inv & cleared
     live4 = (live3 | respawn | reform) & ~(is_bomb & cleared)
-    x4 = where(respawn, WIDTH / 2.0, where(reform, home_x, x2))
+    x4 = where(respawn, field_w / 2.0, where(reform, home_x, x2))
+    vx4 = where(respawn, 0.0, vx_out)
     y4 = where(reform, home_y + FLEET_DROP * (wave + 1.0).clip(0.0, 4.0), y2)
     born4 = where(respawn | reform, clock_next, born1)
     wave_next = where(cleared, wave + 1.0, wave)
@@ -205,15 +222,18 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # The fastest live mover against the thinnest overlap window (a shot's
     # length plus a brick's): the most a step may move anything.
     pace = where(live4, vx1.abs() + vy1.abs(), 0.0) + where(is_inv & live4, speed, 0.0)
-    dt_limit = 0.5 / (pace.max() + 1e-6) + x * 0.0
+    # ... and no step longer than half the rocket's damping time.
+    dt_limit = (0.5 / (pace.max() + 1e-6)).clip(0.0, 0.5 * SHIP_TAU) + x * 0.0
     residual = f(is_inv & live4).sum() + x * 0.0
-    return (f(live4), x4, y4, vx_out, vy1, hp2, boom3, born4,
+    return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4,
             score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born",
          "score", "lives", "wave", "fleet_dir", "clock", "ufo_clock")
+#: Read by the law, written by the host only (a layout change), never stepped.
+SETTINGS = ("field_w",)
 
 
 class InvadersPiece:
@@ -221,7 +241,7 @@ class InvadersPiece:
 
     entry = "invaders_step"
     argument_names = ("lane", "slot", "home_x", "home_y", "points", "rx", "ry", "home_hp",
-                      *STATE, *CONTROLS, "dt")
+                      *STATE, *SETTINGS, *CONTROLS, "dt")
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):
@@ -241,8 +261,17 @@ class InvadersPiece:
                      for value in produced)
 
 
-def layout() -> dict[str, np.ndarray]:
-    """The static columns: each lane's slot, home and size."""
+def field_width(aspect: float | None) -> float:
+    """The field's width for a screen of ``aspect`` (width / height): the
+    height is fixed, the width follows the screen within arcade limits."""
+    if not aspect or aspect <= 0.0:
+        return WIDTH
+    return float(np.clip(round(HEIGHT * aspect * 0.92 * 2.0) / 2.0, 12.5, 26.0))
+
+
+def layout(width: float = WIDTH) -> dict[str, np.ndarray]:
+    """The static columns: each lane's slot, home and size, for a field ``width`` wide."""
+    WIDTH = width  # noqa: N806  (the layout below is written against the field width)
     slot = np.zeros(LANES)
     home_x = np.full(LANES, WIDTH / 2.0)
     home_y = np.full(LANES, PLAYER_Y)
@@ -274,8 +303,8 @@ def layout() -> dict[str, np.ndarray]:
             "points": points, "rx": rx, "ry": ry, "home_hp": home_hp}
 
 
-def initial_columns() -> dict[str, np.ndarray]:
-    columns = layout()
+def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
+    columns = layout(width)
     slot = columns["slot"]
     starts = (slot == PLAYER) | (slot == INVADER) | (slot == SHIELD)
     columns.update({
@@ -284,7 +313,8 @@ def initial_columns() -> dict[str, np.ndarray]:
         "boom": np.zeros(LANES), "born": np.zeros(LANES),
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES), "wave": np.zeros(LANES),
         "fleet_dir": np.ones(LANES), "clock": np.zeros(LANES), "ufo_clock": np.full(LANES, 12.0),
-        "move_axis": np.zeros(LANES), "fire": np.zeros(LANES),
+        "field_w": np.full(LANES, float(width)),
+        "move_axis": np.zeros(LANES), "steer_x": np.full(LANES, -1.0), "fire": np.zeros(LANES),
     })
     return columns
 
@@ -295,11 +325,29 @@ class SpaceInvaders(EntityGame):
     width, height = WIDTH, HEIGHT
     CONTROLS = tuple(CONTROLS)
 
+    def __init__(self, board_id: str = "", aspect: float | None = None):
+        self.width = field_width(aspect)
+        super().__init__(board_id)
+
     def make_piece(self):
         return InvadersPiece()
 
     def initial_columns(self) -> dict[str, np.ndarray]:
-        return initial_columns()
+        return initial_columns(self.width)
+
+    def layout(self, aspect: float) -> None:
+        """Fit the field to a new screen shape mid-game: the walls move and
+        everything on the field shifts by half the change, so the play stays
+        centred.  A host write between rounds, like the controls."""
+        width = field_width(aspect)
+        if width == self.width:
+            return
+        shift = (width - self.width) / 2.0
+        s = self.session
+        for name in ("x", "home_x"):
+            s.column(name)[...] += shift
+        s.column("field_w")[...] = width
+        self.width = width
 
     def palette(self) -> dict[str, list[float]]:
         return {"rocket": [0.85, 0.88, 0.95], "alien": [0.35, 0.95, 0.35], "invader": [0.75, 0.35, 0.95],
