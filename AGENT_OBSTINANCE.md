@@ -725,3 +725,7 @@ publisher reproduction took 14.46 seconds. The extra feed comparison is now
 removed; the revised booked Call pairs, direct RESULT cause and live ports
 carry the metadata identity. Reading the established feed/source contract
 before adding that comparison would have avoided both regressions.
+
+## 2026-11-05 — treated provisional cast geometry as an early typed-formal requirement
+
+The typed float64-to-int64 cast repair must use the posted source physical span and the selected C/LLVM input/output formals. An initial strict check also required the source tensor descriptor to be settled before the fixed-point metadata pass. In the bounded axis source, the scoped SSA_VALUE already proved float64/span/rank1 and the selected formals had exact imported pointer origins, but the first-pass descriptor was still `unresolved`. This extra descriptor check caused three focused test failures in 48.56 seconds, before numerical execution. A bounded raising-frame capture took 9.8 seconds and showed every typed formal predicate true and only the descriptor-state predicate false. Removing the early descriptor check restored the axis native gate, 1/1 in 8.12 seconds. The owned dynamic result still requires the settled source count and descriptor at its allocation writer.

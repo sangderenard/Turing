@@ -73,6 +73,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "mean_dim": 1,
     "transpose_double": 1,
     "cumsum_dim_double": 1,
+    "cumsum_dim_int64": 1,
     "stack_double": 5,
     "cat_double": 6,
     "pad_double_nd": 1,
@@ -94,6 +95,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "mask_select_double": 2,
     "increment_mask_double": 0,
     "cast_double_to_int_values": 1,
+    "cast_double_to_int64_values": 1,
     "cast_double_to_float_values": 1,
     "cast_double_to_double_values": 1,
     "cast_int64_to_double_values": 1,
@@ -117,6 +119,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "index_assign_double": (1, 3, 4),
     "index_set_double": (2, 4, 5),
     "cumsum_dim_double": (2,),
+    "cumsum_dim_int64": (2,),
     "reduce_dim_double": (2,),
     "scatter_sum_double": (2,),
     "scatter_reduce_double": (2,),
@@ -133,11 +136,13 @@ C_SSA_I32_POINTER_ARGUMENTS = {
 }
 
 C_SSA_I64_POINTER_ARGUMENTS = {
+    "cumsum_dim_int64": (0, 1),
     "sum_int64": (0,),
     "binary_int64": (0, 1, 2),
     "binary_scalar_int64": (0, 2),
     "broadcast_int64": (0, 1),
     "cast_int64_to_double_values": (0,),
+    "cast_double_to_int64_values": (1,),
     "index_select_int64_indices_int64": (0, 1, 5),
     "index_select_double_indices_int64": (5,),
     "create_arange_int64": (3,),
@@ -256,6 +261,7 @@ _C_FUNCTION_ROLES = {
     "broadcast_double": "tensor_kernel",
     "broadcast_int64": "tensor_kernel",
     "cumsum_dim_double": "tensor_kernel",
+    "cumsum_dim_int64": "tensor_kernel",
     "argreduce_dim_double": "tensor_kernel",
     "repeat_interleave_double": "tensor_kernel",
     "tile_double": "tensor_kernel",
@@ -278,6 +284,7 @@ _C_FUNCTION_ROLES = {
     "mask_select_double": "tensor_kernel",
     "increment_mask_double": "tensor_kernel",
     "cast_double_to_int_values": "tensor_kernel",
+    "cast_double_to_int64_values": "tensor_kernel",
     "cast_double_to_float_values": "tensor_kernel",
     "cast_double_to_double_values": "tensor_kernel",
     "cast_int64_to_double_values": "tensor_kernel",
@@ -2317,6 +2324,42 @@ exit:
   ret void
 }
 
+define internal void @cast_double_to_int64_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.latch ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds double, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds i64, ptr %out, i64 %i64
+  %value = load double, ptr %a.ptr, align 8
+  %lower = fcmp oge double %value, -9.2233720368547760e+18
+  %upper = fcmp olt double %value, 9.2233720368547760e+18
+  %valid = and i1 %lower, %upper
+  br i1 %valid, label %convert, label %invalid
+
+convert:
+  %integer = fptosi double %value to i64
+  br label %loop.latch
+
+invalid:
+  br label %loop.latch
+
+loop.latch:
+  %result = phi i64 [ %integer, %convert ], [ -9223372036854775808, %invalid ]
+  store i64 %result, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
 define internal void @cast_double_to_float_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
@@ -2797,6 +2840,93 @@ d.body:
   %value = load double, ptr %input.ptr, align 8
   %accum.next = fadd double %accum, %value
   store double %accum.next, ptr %output.ptr, align 8
+  %d.next = add nsw i32 %d, 1
+  br label %d.header
+
+tail.latch:
+  %tail.next = add nsw i32 %tail, 1
+  br label %tail.header
+
+b.latch:
+  %b.next = add nsw i32 %b, 1
+  br label %b.header
+
+exit:
+  ret void
+}
+
+; compact_codewords scans the int64 lengths field.  add i64 wraps at the
+; working width, matching NumPy's fixed-width cumsum without a double cast.
+define internal void @cumsum_dim_int64(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.continue = icmp slt i32 %before.axis, %dim
+  br i1 %before.continue, label %before.body, label %after.entry
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.entry:
+  %after.start = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.start, %after.entry ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.entry ], [ %after.next, %after.body ]
+  %after.continue = icmp slt i32 %after.axis, %ndim
+  br i1 %after.continue, label %after.body, label %dimensions.ready
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+dimensions.ready:
+  %dim64 = sext i32 %dim to i64
+  %count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %count = load i32, ptr %count.ptr, align 4
+  br label %b.header
+
+b.header:
+  %b = phi i32 [ 0, %dimensions.ready ], [ %b.next, %b.latch ]
+  %b.continue = icmp slt i32 %b, %before
+  br i1 %b.continue, label %tail.header, label %exit
+
+tail.header:
+  %tail = phi i32 [ 0, %b.header ], [ %tail.next, %tail.latch ]
+  %tail.continue = icmp slt i32 %tail, %after
+  br i1 %tail.continue, label %d.header, label %b.latch
+
+d.header:
+  %d = phi i32 [ 0, %tail.header ], [ %d.next, %d.body ]
+  %accum = phi i64 [ 0, %tail.header ], [ %accum.next, %d.body ]
+  %d.continue = icmp slt i32 %d, %count
+  br i1 %d.continue, label %d.body, label %tail.latch
+
+d.body:
+  %b.count = mul nsw i32 %b, %count
+  %bd = add nsw i32 %b.count, %d
+  %bd.after = mul nsw i32 %bd, %after
+  %index = add nsw i32 %bd.after, %tail
+  %index64 = sext i32 %index to i64
+  %input.ptr = getelementptr inbounds i64, ptr %input, i64 %index64
+  %output.ptr = getelementptr inbounds i64, ptr %output, i64 %index64
+  %value = load i64, ptr %input.ptr, align 8
+  %accum.next = add i64 %accum, %value
+  store i64 %accum.next, ptr %output.ptr, align 8
   %d.next = add nsw i32 %d, 1
   br label %d.header
 
@@ -3560,6 +3690,12 @@ TRANSLATIONS = (
         "single-dimension inclusive prefix sum",
     ),
     CBackendLLVMSSA(
+        "cumsum_dim_int64",
+        "cumsum_dim_int64",
+        ("cumsum",),
+        "single-dimension signed-int64 inclusive prefix sum",
+    ),
+    CBackendLLVMSSA(
         "stack_double",
         "stack_double",
         ("stack",),
@@ -3694,6 +3830,12 @@ TRANSLATIONS = (
         "cast_double_to_int_values",
         ("int", "long", "long_cast", "to_dtype"),
         "double-storage integer-value cast",
+    ),
+    CBackendLLVMSSA(
+        "cast_double_to_int64_values",
+        "cast_double_to_int64_values",
+        ("int", "long", "long_cast", "to_dtype"),
+        "float64-storage to signed-int64 storage cast",
     ),
     CBackendLLVMSSA(
         "cast_double_to_float_values",

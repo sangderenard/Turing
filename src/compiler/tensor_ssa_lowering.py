@@ -2968,9 +2968,28 @@ def _int64_lane_checked(instruction: Any, operation: str, result: Any) -> bool:
 
 
 def _int64_binary_kernel(
-    operation: str, result: Any, operands: Any,
+    operation: str, result: Any, operands: Any, *, owner: Any, book: Any,
 ) -> bool:
-    """The existing integer binary repository call's exact element ABI."""
+    """Select the integer kernel only for proven integer-backed operands.
+
+    ``compact_codewords`` casts a double-backed mask to logical int64. Its
+    cast result is still stored as float64 by ``cast_double_to_int_values``;
+    selecting ``binary_int64`` from the semantic dtype alone reinterpreted
+    those bytes as integers. The scoped SSA_VALUE is the storage authority.
+    """
+
+    from .ssa_record_return_state import posted_ssa_value_fact
+
+    def integer_storage(operand: Any) -> bool:
+        physical = posted_ssa_value_fact(owner, int(operand.id), book=book)
+        if physical is None:
+            return False
+        if physical.rank is not None and physical.rank > 0:
+            return physical.storage == "span" and physical.physical_dtype == "int64"
+        return (
+            physical.rank == 0 and physical.storage == "scalar"
+            and physical.physical_dtype in {"int32", "int64"}
+        )
 
     return (
         str(operation) in {"add", "sub", "mul", "mod"}
@@ -2978,6 +2997,7 @@ def _int64_binary_kernel(
         and all(
             str(operand.dtype or "").casefold()
             in {"int", "int32", "i32", "int64", "i64", "long"}
+            and integer_storage(operand)
             for operand in operands
         )
     )
@@ -2985,6 +3005,7 @@ def _int64_binary_kernel(
 
 def _int64_lane_stays_elementwise(
     instruction: Any, operation: str, result: Any, operands: Any,
+    *, owner: Any, book: Any,
 ) -> bool:
     """Whether an int64 tensor op stays the instruction itself.
 
@@ -2999,16 +3020,26 @@ def _int64_lane_stays_elementwise(
     operand needs a broadcast kernel (each is the result's shape or rank 0).
     """
 
+    from .ssa_record_return_state import posted_ssa_value_fact
+
     operands = list(operands or ())
+    def integer_storage(value: Any) -> bool:
+        physical = posted_ssa_value_fact(owner, int(value.id), book=book)
+        return bool(
+            physical is not None
+            and physical.physical_dtype == "int64"
+            and (physical.rank == 0 and physical.storage == "scalar"
+                 or physical.rank is not None and physical.rank > 0
+                 and physical.storage == "span")
+        )
     operation = str(operation)
     int64 = {"int64", "i64", "long"}
     if (
         operation in {"neg", "abs"}
         and len(operands) == 1
-        and all(
-            str(value.dtype or "").casefold() in int64
-            for value in (result, operands[0])
-        )
+        and str(result.dtype or "").casefold() in int64
+        and str(operands[0].dtype or "").casefold() in int64
+        and integer_storage(operands[0])
     ):
         return True
     if not _int64_lane_checked(instruction, operation, result):
@@ -3016,6 +3047,7 @@ def _int64_lane_stays_elementwise(
     shape = tuple(result.shape or ())
     return bool(shape) and all(
         str(value.dtype or "").casefold() in int64 | {"int", "int32", "i32"}
+        and integer_storage(value)
         and (
             tuple(value.shape or ()) == shape
             or (
@@ -6784,6 +6816,13 @@ def lower_tensor_calls_to_repository_ssa(
             ssa_value_identity_cell as _kernel_identity_cell,
         )
         kernel = module.functions.get(callee)
+        if kernel is None:
+            kernel = reference.module.functions.get(callee)
+            if kernel is not None:
+                link_repository_function(callee, kernel)
+        if kernel is not None:
+            from .ssa_call_input_adapters import _infer_pointer_storage
+            _infer_pointer_storage({callee: kernel})
         kernel_owner = lowering_at[0]
         kernel_book = identity_book(module)
         int64_buffer_positions = {
@@ -6791,6 +6830,7 @@ def lower_tensor_calls_to_repository_ssa(
             "binary_scalar_int64": frozenset({0, 2}),
             "broadcast_int64": frozenset({0, 1}),
             "create_arange_int64": frozenset({3}),
+            "cast_double_to_int64_values": frozenset({1}),
         }.get(callee, frozenset())
         for position, value in enumerate((*arguments, result)):
             typed_kernel_physical = (
@@ -6815,21 +6855,45 @@ def lower_tensor_calls_to_repository_ssa(
                     if kernel is not None and formal_position is not None
                     and 0 <= formal_position < len(kernel.args) else None
                 )
-                if kernel_owner is not None:
+                formal_cell = (
+                    None if formal is None else _kernel_identity_cell(
+                        kernel, int(formal.id), book=kernel_book,
+                    )
+                )
+                formal_fact = (
+                    None if formal is None else _posted_kernel_fact(
+                        kernel, int(formal.id), book=kernel_book,
+                    )
+                )
+                expected_physical = typed_kernel_physical or "float64"
+                if (formal_cell is None or formal_fact is None
+                        or formal_fact.physical_dtype != expected_physical):
+                    raise ValueError(
+                        "selected tensor kernel lacks exact typed formal proof"
+                    )
+                current = (
+                    None if kernel_owner is None else _posted_kernel_fact(
+                        kernel_owner, int(value.id), book=kernel_book,
+                    )
+                )
+                # Kernel input formals state what bytes they require; they
+                # cannot turn a caller's existing float64 cast buffer into
+                # int64 storage. A missing input proof remains missing for
+                # the adapter/physical-call gate to resolve or refuse.
+                is_output = position == output_argument or position == len(arguments)
+                if (not is_output and current is not None
+                        and current.physical_dtype is not None
+                        and current.physical_dtype != expected_physical):
+                    raise ValueError(
+                        "selected tensor kernel input physical dtype conflicts with source"
+                    )
+                if kernel_owner is not None and is_output:
                     _revise_kernel_value(
                         kernel_owner, int(value.id), dtype=value.dtype,
                         shape=tuple(value.shape or ()), stage=_KERNEL_STAGE,
-                        sources=(
-                            None if formal is None else _kernel_identity_cell(
-                                kernel, int(formal.id), book=kernel_book,
-                            ),
-                        ),
+                        sources=(formal_cell,),
                         book=kernel_book,
-                        physical={
-                            "physical_dtype": (
-                                typed_kernel_physical or "float64"
-                            ),
-                        },
+                        physical={"physical_dtype": expected_physical},
                     )
                 value.accounting = _accounting_view(kernel_owner, value, module)
         linked_roots.add(callee)
@@ -11399,8 +11463,10 @@ def lower_tensor_calls_to_repository_ssa(
                                     "physical_dtype": (
                                         "int64" if _int64_lane_stays_elementwise(
                                             instruction, operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
                                         ) or opcode_contract[0] == "binary" and _int64_binary_kernel(
                                             operation, result, data_args,
+                                            owner=_opcode_owner, book=_opcode_book,
                                         ) else "float64"
                                     ),
                                     **_elementwise_result_physical(
@@ -12295,6 +12361,97 @@ def lower_tensor_calls_to_repository_ssa(
                         posted_ssa_value_fact as _copy_source_fact,
                     )
                     copy_source_fact = _copy_source_fact(function, source.id, book=book)
+                    if (
+                        operation == "to_dtype"
+                        and dtype_hint in {"int64", "long"}
+                        and (
+                            (source_descriptor is not None
+                             and (source_descriptor.metadata_state == "dynamic"
+                                  or bool(tuple(source_descriptor.shape))))
+                            or (copy_source_fact is not None
+                                and (copy_source_fact.storage == "span"
+                                     or (type(copy_source_fact.rank) is int
+                                         and copy_source_fact.rank > 0)))
+                        )
+                        and (
+                            copy_source_fact is None
+                            or copy_source_fact.storage != "span"
+                            or type(copy_source_fact.rank) is not int
+                            or copy_source_fact.rank < 1
+                            or copy_source_fact.physical_dtype not in {
+                                "float64", "int64",
+                            }
+                            or (copy_source_fact.physical_dtype == "int64"
+                                and copy_source_fact.dtype != "int64")
+                        )
+                    ):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "int64 cast has no proved physical input span",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    # The axis-sum and inverse-mask probes cast a float64
+                    # span to logical int64 and then reduce it. The old
+                    # cast_double_to_int_values writes doubles, so the next
+                    # sum_double loses integer cancellation above 2**53.
+                    # Select genuine int64 storage only from the authored
+                    # target and this source's posted float64 span fact.
+                    genuine_integer_cast = (
+                        operation == "to_dtype"
+                        and dtype_hint in {"int64", "long"}
+                        and copy_source_fact is not None
+                        and copy_source_fact.physical_dtype == "float64"
+                        and copy_source_fact.storage == "span"
+                        and type(copy_source_fact.rank) is int
+                        and copy_source_fact.rank > 0
+                    )
+                    if genuine_integer_cast:
+                        callee = "cast_double_to_int64_values"
+                        selected_cast = reference.module.functions.get(callee)
+                        if (
+                            selected_cast is None
+                            or selected_cast.metadata.get("ssa_output_argument") != 1
+                            or len(selected_cast.args) != 3
+                            or tuple(selected_cast.metadata.get("named_outputs", ()))
+                            != (("out", int(selected_cast.args[1].id)),)
+                        ):
+                            raise ValueError(
+                                "int64 cast lacks selected repository output"
+                            )
+                        from .ssa_call_input_adapters import _infer_pointer_storage
+                        from .ssa_record_return_state import (
+                            posted_ssa_value_fact as _typed_cast_fact,
+                            ssa_value_identity_cell as _typed_cast_cell,
+                        )
+                        link_repository_function(callee, selected_cast)
+                        _infer_pointer_storage({callee: selected_cast})
+                        typed_formals = selected_cast.args[:2]
+                        typed_facts = tuple(_typed_cast_fact(
+                            selected_cast, int(formal.id), book=book,
+                        ) for formal in typed_formals)
+                        typed_cells = tuple(_typed_cast_cell(
+                            selected_cast, int(formal.id), book=book,
+                        ) for formal in typed_formals)
+                        imported_origins = (
+                            selected_cast.metadata.get("llvm_repository_kernel")
+                            or (None, {})
+                        )[1]
+                        pointer_origins = tuple(imported_origins.get(
+                            int(formal.id),
+                        ) for formal in typed_formals)
+                        if (
+                            any(fact is None or cell is None for fact, cell
+                                in zip(typed_facts, typed_cells, strict=True))
+                            or any(origin is None or origin[1] != "argument"
+                                   or not str(origin[2]).startswith("ptr ")
+                                   for origin in pointer_origins)
+                            or typed_facts[0].physical_dtype != "float64"
+                            or typed_facts[1].physical_dtype != "int64"
+                        ):
+                            raise ValueError(
+                                "int64 cast lacks typed source or output formal proof"
+                            )
                     exact_integer_copy = (
                         operation == "to_dtype" and dtype_hint in {"int64", "long"}
                         and str(source.dtype) == "int64"
@@ -12448,6 +12605,13 @@ def lower_tensor_calls_to_repository_ssa(
                                 link_repository_function(callee, selected_kernel)
                                 _infer_pointer_storage({callee: selected_kernel})
                                 output_formal = selected_kernel.args[1]
+                                input_formal = selected_kernel.args[0]
+                                input_fact = _cast_formal_fact(
+                                    selected_kernel, int(input_formal.id), book=book,
+                                )
+                                input_cell = _cast_formal_cell(
+                                    selected_kernel, int(input_formal.id), book=book,
+                                )
                                 output_fact = _cast_formal_fact(
                                     selected_kernel, int(output_formal.id),
                                     book=book,
@@ -12460,16 +12624,58 @@ def lower_tensor_calls_to_repository_ssa(
                                     None if output_fact is None else
                                     output_fact.physical_dtype
                                 )
-                                if output_cell is None or output_physical is None:
+                                source_cell = _cast_formal_cell(
+                                    function, int(source.id), book=book,
+                                )
+                                live_source_fact = _cast_formal_fact(
+                                    function, int(source.id), book=book,
+                                )
+                                imported_origins = (
+                                    selected_kernel.metadata.get(
+                                        "llvm_repository_kernel"
+                                    ) or (None, {})
+                                )[1]
+                                typed_origins = tuple(
+                                    imported_origins.get(int(formal.id))
+                                    for formal in (input_formal, output_formal)
+                                )
+                                if (
+                                    input_cell is None or input_fact is None
+                                    or output_cell is None or output_physical is None
+                                    or source_cell is None or live_source_fact is None
+                                    or live_source_fact.storage != "span"
+                                    or type(live_source_fact.rank) is not int
+                                    or live_source_fact.rank < 1
+                                    or any(origin is None
+                                           or origin[1] != "argument"
+                                           or not str(origin[2]).startswith("ptr ")
+                                           for origin in typed_origins)
+                                    or input_fact.physical_dtype !=
+                                    live_source_fact.physical_dtype
+                                    or (callee == "cast_double_to_int64_values"
+                                        and output_physical != "int64")
+                                ):
                                     raise ValueError(
-                                        "dynamic cast lacks typed kernel output proof"
+                                        "dynamic cast lacks typed output or source span proof"
                                     )
+                                # In compact_codewords, the selected cast wrote
+                                # a double-backed logical int64 result, but its
+                                # SSA_VALUE retained storage/rank=None. The
+                                # following scalar-first subtraction then could
+                                # not recognize that result as a span and lost
+                                # its extent binding. The source's posted span
+                                # rank and this selected output formal prove the
+                                # cast result's physical layout and element type.
                                 _revise_cast_output(
                                     function, int(result.id), dtype=result.dtype,
                                     shape=tuple(result.shape or ()),
                                     stage=_CAST_STAGE,
-                                    sources=(output_cell,), book=book,
-                                    physical={"physical_dtype": output_physical},
+                                    sources=(source_cell, input_cell, output_cell), book=book,
+                                    physical={
+                                        "physical_dtype": output_physical,
+                                        "storage": "span",
+                                        "rank": live_source_fact.rank,
+                                    },
                                 )
                                 result.accounting = _accounting_view(
                                     function, result, module,
@@ -12921,6 +13127,148 @@ def lower_tensor_calls_to_repository_ssa(
                             reduction_output = own_dynamic_tensor(
                                 result, output_count, "float64", prefix,
                             )
+                            # native_weighted_cast_tail's axis sum produces
+                            # logical %27 in this region. Its rank-only SSA
+                            # revision left storage/dtype unknown, although
+                            # the selected reduce_dim_double output formal
+                            # and owned carrier already proved a float64
+                            # span. Publish that physical result here, before
+                            # the following region's to_dtype reads %27.
+                            from .concordance_declarations import (
+                                TENSOR_OWNED_HEAP_BINDING,
+                                TENSOR_REDUCTION_DOMAIN,
+                            )
+                            from .ssa_call_input_adapters import (
+                                _infer_pointer_storage,
+                            )
+                            from .ssa_record_return_state import (
+                                function_scope_of, ssa_value_identity_cell,
+                            )
+                            selected_reduction = reference.module.functions.get(
+                                "reduce_dim_double"
+                            )
+                            if (
+                                selected_reduction is None
+                                or len(selected_reduction.args) != 6
+                                or selected_reduction.metadata.get(
+                                    "ssa_output_argument"
+                                ) != 1
+                                or selected_reduction.metadata.get(
+                                    "named_outputs"
+                                ) != (("out", int(
+                                    selected_reduction.args[1].id
+                                )),)
+                            ):
+                                raise ValueError(
+                                    "runtime reduction lacks selected output formal"
+                                )
+                            link_repository_function(
+                                "reduce_dim_double", selected_reduction,
+                            )
+                            _infer_pointer_storage({
+                                "reduce_dim_double": selected_reduction,
+                            })
+                            input_formal, output_formal = (
+                                selected_reduction.args[:2]
+                            )
+                            formal_facts = tuple(posted_ssa_value_fact(
+                                selected_reduction, int(formal.id), book=book,
+                            ) for formal in (input_formal, output_formal))
+                            formal_cells = tuple(ssa_value_identity_cell(
+                                selected_reduction, int(formal.id), book=book,
+                            ) for formal in (input_formal, output_formal))
+                            origins = (
+                                selected_reduction.metadata.get(
+                                    "llvm_repository_kernel"
+                                ) or (None, {})
+                            )[1]
+                            owned_ref = book.latest_ref(
+                                TENSOR_OWNED_HEAP_BINDING,
+                                (function_scope_of(function), function.name,
+                                 int(result.id)),
+                            )
+                            domain_ref = book.latest_ref(
+                                TENSOR_REDUCTION_DOMAIN,
+                                (function.name, int(result.id)),
+                            )
+                            result_fact = posted_ssa_value_fact(
+                                function, int(result.id), book=book,
+                            )
+                            descriptor = tensor_table.by_id(int(result.id))
+                            owned_fact = (
+                                None if owned_ref is None else
+                                book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                                    owned_ref.row, owned_ref.column,
+                                )
+                            )
+                            if (
+                                any(fact is None or cell is None
+                                    for fact, cell in zip(
+                                        formal_facts, formal_cells, strict=True,
+                                    ))
+                                or any(fact.physical_dtype != "float64"
+                                       for fact in formal_facts)
+                                or any(
+                                    (origin := origins.get(int(formal.id)))
+                                    is None or origin[1] != "argument"
+                                    or not str(origin[2]).startswith("ptr ")
+                                    for formal in (input_formal, output_formal)
+                                )
+                                or source_fact is None
+                                or source_fact.physical_dtype != "float64"
+                                or source_fact.storage != "span"
+                                or result_fact is None
+                                or result_fact.rank != output_rank
+                                or result_fact.physical_dtype not in (
+                                    None, "float64",
+                                )
+                                or result_fact.storage not in (None, "span")
+                                or descriptor is None
+                                or descriptor.data_value_id != int(
+                                    reduction_output.id
+                                )
+                                or owned_fact != (
+                                    int(reduction_output.id),
+                                    descriptor.heap_owner_value_id,
+                                    int(output_count.id), "float64",
+                                )
+                                or domain_ref is None
+                            ):
+                                raise ValueError(
+                                    "runtime reduction output lacks typed owned span proof"
+                                )
+                            source_cell = ssa_value_identity_cell(
+                                function, int(source.id), book=book,
+                            )
+                            geometry_cells = tuple(ssa_value_identity_cell(
+                                function, int(value.id), book=book,
+                            ) for value in (
+                                *extents.values(), output_shape,
+                                output_rank_value, output_count,
+                            ))
+                            if source_cell is None or any(
+                                cell is None for cell in geometry_cells
+                            ):
+                                raise ValueError(
+                                    "runtime reduction output lacks geometry cells"
+                                )
+                            revised = revise_ssa_value(
+                                function, int(result.id), dtype=result.dtype,
+                                shape=tuple(result.shape or ()),
+                                stage=_REDUCTION_STAGE, book=book,
+                                sources=(
+                                    source_cell, *formal_cells,
+                                    *geometry_cells, domain_ref, owned_ref,
+                                ),
+                                physical={
+                                    "physical_dtype": "float64",
+                                    "storage": "span", "rank": output_rank,
+                                },
+                            )
+                            if revised is None:
+                                raise ValueError(
+                                    "runtime reduction output has no SSA identity"
+                                )
                         emitted.append(call(
                             "reduce_dim_double",
                             [source, reduction_output, extents["shape"], extents["rank"], dim, code],
@@ -12984,6 +13332,106 @@ def lower_tensor_calls_to_repository_ssa(
                     # read the uninitialized result.  Returning the cumsum
                     # directly hid it, because the published contract stamped
                     # the shape back on.
+                    from .ssa_record_return_state import posted_ssa_value_fact
+                    scan_source_fact = posted_ssa_value_fact(
+                        function, int(source.id), book=book,
+                    )
+                    scan_kernel_name = {
+                        "float64": "cumsum_dim_double",
+                        "int64": "cumsum_dim_int64",
+                    }.get(
+                        None if scan_source_fact is None else
+                        scan_source_fact.physical_dtype
+                    )
+                    if scan_kernel_name is None:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "static cumsum lacks exact typed span input",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    # The static scan has the same typed-buffer contract as
+                    # the runtime scan.  A known shape does not make an
+                    # int64 span safe to pass to cumsum_dim_double.
+                    from .concordance_declarations import TENSOR_SSA_LOWERING
+                    from .ssa_call_input_adapters import _infer_pointer_storage
+                    from .ssa_record_return_state import (
+                        revise_ssa_value, ssa_value_identity_cell,
+                    )
+                    scan_kernel = reference.module.functions.get(scan_kernel_name)
+                    if (
+                        scan_kernel is None or len(scan_kernel.args) != 5
+                        or scan_kernel.metadata.get(
+                            "ssa_output_argument"
+                        ) != 1
+                        or len(tuple(scan_kernel.metadata.get(
+                            "named_outputs", ()
+                        ))) != 1
+                        or int(tuple(scan_kernel.metadata[
+                            "named_outputs"
+                        ])[0][1]) != int(scan_kernel.args[1].id)
+                    ):
+                        raise ValueError(
+                            "static cumsum lacks selected typed kernel"
+                        )
+                    link_repository_function(scan_kernel_name, scan_kernel)
+                    _infer_pointer_storage({scan_kernel_name: scan_kernel})
+                    scan_formals = scan_kernel.args[:2]
+                    scan_formal_facts = tuple(posted_ssa_value_fact(
+                        scan_kernel, int(formal.id), book=book,
+                    ) for formal in scan_formals)
+                    scan_formal_cells = tuple(ssa_value_identity_cell(
+                        scan_kernel, int(formal.id), book=book,
+                    ) for formal in scan_formals)
+                    scan_origins = (
+                        scan_kernel.metadata.get(
+                            "llvm_repository_kernel") or (None, {})
+                    )[1]
+                    if (
+                        any(fact is None or cell is None for fact, cell in zip(
+                            scan_formal_facts, scan_formal_cells, strict=True,
+                        ))
+                        or any(
+                            (origin := scan_origins.get(int(formal.id))) is None
+                            or origin[1] != "argument"
+                            or not str(origin[2]).startswith("ptr ")
+                            for formal in scan_formals
+                        )
+                        or any(fact.physical_dtype !=
+                               scan_source_fact.physical_dtype
+                               for fact in scan_formal_facts)
+                    ):
+                        raise ValueError(
+                            "static cumsum disagrees with typed kernel formals"
+                        )
+                    scan_result_fact = posted_ssa_value_fact(
+                        function, int(result.id), book=book,
+                    )
+                    if (
+                        scan_result_fact is None
+                        or scan_result_fact.physical_dtype not in (
+                            None, scan_formal_facts[1].physical_dtype,
+                        )
+                    ):
+                        raise ValueError(
+                            "static cumsum result has conflicting physical type"
+                        )
+                    if scan_result_fact.physical_dtype is None:
+                        scan_source_cell = ssa_value_identity_cell(
+                            function, int(source.id), book=book,
+                        )
+                        if scan_source_cell is None or revise_ssa_value(
+                            function, int(result.id), dtype=result.dtype,
+                            shape=tuple(result.shape or ()),
+                            stage=TENSOR_SSA_LOWERING,
+                            sources=(scan_source_cell, *scan_formal_cells),
+                            book=book,
+                            physical={"physical_dtype":
+                                      scan_formal_facts[1].physical_dtype},
+                        ) is None:
+                            raise ValueError(
+                                "static cumsum result lacks typed physical proof"
+                            )
                     if not tuple(result.shape or ()):
                         result.shape = tuple(source.shape)
                         result.dtype = result.dtype or source.dtype
@@ -13010,7 +13458,7 @@ def lower_tensor_calls_to_repository_ssa(
                     dim, dim_def = constant(int(axis) % rank, "int32")
                     prefix.extend((shape_def, ndim_def, dim_def))
                     emitted.append(call(
-                        "cumsum_dim_double", [source, result, shape_value, ndim, dim],
+                        scan_kernel_name, [source, result, shape_value, ndim, dim],
                         result, instruction, output_argument=1,
                     ))
 
@@ -13100,8 +13548,13 @@ def lower_tensor_calls_to_repository_ssa(
                     )
                     if (
                         source_fact is None or result_fact is None
-                        or source_fact.physical_dtype != "float64"
-                        or result_fact.physical_dtype != "float64"
+                        or source_fact.physical_dtype not in {
+                            "float64", "int64",
+                        }
+                        or result_fact.physical_dtype not in {
+                            None, source_fact.physical_dtype,
+                        }
+                        or result_fact.dtype != source_fact.dtype
                         or source_fact.storage != "span"
                         or result_fact.storage != "span"
                         or type(source_rank) is not int or source_rank < 1
@@ -13147,8 +13600,13 @@ def lower_tensor_calls_to_repository_ssa(
                     from .ssa_call_input_adapters import (
                         _infer_pointer_storage,
                     )
+                    selected_kernel_name = (
+                        "cumsum_dim_int64"
+                        if source_fact.physical_dtype == "int64"
+                        else "cumsum_dim_double"
+                    )
                     selected_kernel = reference.module.functions.get(
-                        "cumsum_dim_double"
+                        selected_kernel_name
                     )
                     if (
                         selected_kernel is None
@@ -13167,10 +13625,10 @@ def lower_tensor_calls_to_repository_ssa(
                             "runtime cumsum lacks selected kernel output port"
                         )
                     link_repository_function(
-                        "cumsum_dim_double", selected_kernel,
+                        selected_kernel_name, selected_kernel,
                     )
                     _infer_pointer_storage({
-                        "cumsum_dim_double": selected_kernel,
+                        selected_kernel_name: selected_kernel,
                     })
                     selected_formals = (
                         selected_kernel.args[0], selected_kernel.args[1],
@@ -13181,22 +13639,62 @@ def lower_tensor_calls_to_repository_ssa(
                     typed_cells = tuple(ssa_value_identity_cell(
                         selected_kernel, int(formal.id), book=book,
                     ) for formal in selected_formals)
+                    imported_origins = (
+                        selected_kernel.metadata.get(
+                            "llvm_repository_kernel") or (None, {})
+                    )[1]
+                    pointer_origins = tuple(
+                        imported_origins.get(int(formal.id))
+                        for formal in selected_formals
+                    )
                     if (
                         any(fact is None or cell is None
                             for fact, cell in zip(
                                 typed_facts, typed_cells, strict=True,
                             ))
-                        or any(formal.dtype != "ptr" for formal in selected_formals)
+                        or any(
+                            origin is None or origin[1] != "argument"
+                            or not str(origin[2]).startswith("ptr ")
+                            for origin in pointer_origins
+                        )
                         or typed_facts[0].physical_dtype !=
                         typed_facts[1].physical_dtype
                         or typed_facts[0].physical_dtype !=
                         source_fact.physical_dtype
-                        or typed_facts[1].physical_dtype !=
-                        result_fact.physical_dtype
+                        or result_fact.physical_dtype not in (
+                            None, typed_facts[1].physical_dtype,
+                        )
                     ):
                         raise ValueError(
                             "runtime cumsum physical span disagrees with selected kernel"
                         )
+                    # compact_codewords' lengths.cumsum(dim=0) is a real
+                    # int64 scan.  Its logical result can enter this region
+                    # before physical dtype settlement; the selected typed
+                    # output formal and the source's posted span prove that
+                    # physical result, including the empty-input case.
+                    if result_fact.physical_dtype is None:
+                        from .ssa_record_return_state import revise_ssa_value
+                        source_cell = ssa_value_identity_cell(
+                            function, int(source.id), book=book,
+                        )
+                        if source_cell is None:
+                            raise ValueError(
+                                "runtime cumsum source lacks physical SSA proof"
+                            )
+                        revised = revise_ssa_value(
+                            function, int(result.id), dtype=result.dtype,
+                            shape=tuple(result.shape or ()),
+                            stage=TENSOR_SSA_LOWERING,
+                            sources=(source_cell, *typed_cells), book=book,
+                            physical={
+                                "physical_dtype": typed_facts[1].physical_dtype,
+                            },
+                        )
+                        if revised is None:
+                            raise ValueError(
+                                "runtime cumsum result lacks physical SSA proof"
+                            )
                     result.accounting = {
                         **dict(result.accounting or {}),
                         "tensor_metadata_state": "dynamic",
@@ -13220,7 +13718,7 @@ def lower_tensor_calls_to_repository_ssa(
                     dim, dim_def = constant(normalized_axis, "int32")
                     prefix.append(dim_def)
                     emitted.append(call(
-                        "cumsum_dim_double", [
+                        selected_kernel_name, [
                             source, carrier, extents["shape"],
                             extents["rank"], dim,
                         ], result, instruction, output_argument=1,
@@ -13252,7 +13750,7 @@ def lower_tensor_calls_to_repository_ssa(
                             "cumsum", int(source.id), int(axis_value.id),
                             normalized_axis, *(int(value.id)
                                                for value in evidence[0]),
-                            int(carrier.id), "cumsum_dim_double",
+                            int(carrier.id), selected_kernel_name,
                         ),
                         stage=TENSOR_SSA_LOWERING,
                         provenance=Derived(causes), mode=Mode.CONCORD,
@@ -13795,6 +14293,7 @@ def lower_tensor_calls_to_repository_ssa(
 
                 elif _int64_lane_stays_elementwise(
                     instruction, operation, result, data_args,
+                    owner=function, book=book,
                 ):
                     # Program: ``-tokens`` / ``abs(tokens)`` on an int64
                     # tensor.  Wrong record: the only repository unary kernel
@@ -13821,6 +14320,7 @@ def lower_tensor_calls_to_repository_ssa(
                             kind == "binary"
                             and _int64_binary_kernel(
                                 operation, result, data_args,
+                                owner=function, book=book,
                             )
                         )
                         binary_kernel = (
@@ -13877,7 +14377,7 @@ def lower_tensor_calls_to_repository_ssa(
                                               for owner, values in ((function, tuple(emitted[-1].args)),
                                                                     (selected, tuple(selected.args)))
                                               for value in values))
-                            elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None and _int64_lane_checked(instruction, operation, result):
+                            elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None and int64_binary and _int64_lane_checked(instruction, operation, result):
                                 emitted.append(instruction)
                             elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None:
                                 # A declared runtime span and scalar may both
@@ -13925,6 +14425,68 @@ def lower_tensor_calls_to_repository_ssa(
                                      opcode_ssa, reverse],
                                     result, instruction, output_argument=2,
                                 ))
+                                if int(scalar.id) != int(data_args[scalar_position].id):
+                                    from .concordance_declarations import (
+                                        KERNEL_INPUT_CONVERSION,
+                                        TENSOR_SSA_LOWERING as _SCALAR_STAGE,
+                                    )
+                                    from .ssa_record_return_state import (
+                                        posted_ssa_value_fact,
+                                        revise_ssa_value,
+                                        ssa_value_identity_cell,
+                                    )
+                                    source_scalar = data_args[scalar_position]
+                                    source_scalar_fact = posted_ssa_value_fact(
+                                        function, int(source_scalar.id), book=book,
+                                    )
+                                    selected_scalar = selected.args[1]
+                                    selected_scalar_fact = posted_ssa_value_fact(
+                                        selected, int(selected_scalar.id), book=book,
+                                    )
+                                    conversion_row = (
+                                        function_scope_of(function),
+                                        str(block_name), int(result.id),
+                                        int(scalar_position),
+                                    )
+                                    conversion_cell = book.latest_ref(
+                                        KERNEL_INPUT_CONVERSION,
+                                        conversion_row,
+                                    )
+                                    source_scalar_cell = ssa_value_identity_cell(
+                                        function, int(source_scalar.id), book=book,
+                                    )
+                                    selected_scalar_cell = ssa_value_identity_cell(
+                                        selected, int(selected_scalar.id), book=book,
+                                    )
+                                    if (
+                                        source_scalar_fact is None
+                                        or source_scalar_fact.storage != "scalar"
+                                        or source_scalar_fact.rank != 0
+                                        or selected_scalar_fact is None
+                                        or selected_scalar_fact.physical_dtype
+                                        != kernel_dtype
+                                        or any(cell is None for cell in (
+                                            conversion_cell, source_scalar_cell,
+                                            selected_scalar_cell,
+                                        ))
+                                    ):
+                                        raise ValueError(
+                                            "scalar kernel conversion lacks exact physical proof"
+                                        )
+                                    revise_ssa_value(
+                                        function, int(scalar.id),
+                                        dtype=scalar.dtype,
+                                        shape=tuple(scalar.shape or ()),
+                                        stage=_SCALAR_STAGE,
+                                        sources=(source_scalar_cell,
+                                                 selected_scalar_cell,
+                                                 conversion_cell),
+                                        book=book,
+                                        physical={
+                                            "physical_dtype": kernel_dtype,
+                                            "storage": "scalar", "rank": 0,
+                                        },
+                                    )
                                 # The scalar-operand receipt predates kernel
                                 # selection. Concord the same fact from the
                                 # exact opcode/reverse constants and selected
@@ -13954,6 +14516,57 @@ def lower_tensor_calls_to_repository_ssa(
                                         (*call_cells, *formal_cells)))),
                                     mode=Mode.CONCORD,
                                 )
+                                # The extent binding was posted when the
+                                # source count became available, before the
+                                # selected scalar Call and any scalar input
+                                # conversion existed. Concord that same
+                                # geometry now from the actual Call operands,
+                                # selected formals, scalar role and conversion
+                                # receipt. The audit reads this exact execution
+                                # rather than accepting an early geometry
+                                # claim without its executable witness.
+                                from .concordance_declarations import (
+                                    KERNEL_INPUT_CONVERSION,
+                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                )
+                                extent_row = (
+                                    function_scope_of(function),
+                                    function.name, int(result.id),
+                                )
+                                extent_ref = book.latest_ref(
+                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                    extent_row,
+                                )
+                                scalar_ref = book.latest_ref(
+                                    SCALAR_KERNEL_OPERAND, scalar_row,
+                                )
+                                conversion_ref = book.latest_ref(
+                                    KERNEL_INPUT_CONVERSION,
+                                    (function_scope_of(function),
+                                     str(block_name), int(result.id),
+                                     int(scalar_position)),
+                                )
+                                if extent_ref is not None:
+                                    old_causes = tuple(
+                                        cause for cause, _stage
+                                        in book.edges_into(extent_ref)
+                                    )
+                                    book.post(
+                                        TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                        extent_row,
+                                        book.page(
+                                            TENSOR_ELEMENTWISE_EXTENT_BINDING
+                                        ).cell(extent_row, extent_ref.column),
+                                        stage=TENSOR_SSA_LOWERING,
+                                        provenance=Derived(tuple(dict.fromkeys((
+                                            extent_ref, *old_causes, scalar_ref,
+                                            *((conversion_ref,)
+                                              if conversion_ref is not None
+                                              else ()),
+                                            *call_cells, *formal_cells,
+                                        )))),
+                                        mode=Mode.CONCORD,
+                                    )
                             elif kind == "binary" and len(data_args) == 2:
                                 left_constant = constants.get(
                                     int(data_args[0].id)
@@ -14452,7 +15065,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             broadcasted, storage="temporary"
                                         )
                                         conformed_args.append(broadcasted)
-                                    if _int64_lane_checked(
+                                    if int64_binary and _int64_lane_checked(
                                         instruction, operation, result,
                                     ):
                                         # The operands are conformed by the
@@ -14897,6 +15510,72 @@ def complete_tensor_call_closure(
                     changed = True
         return result
 
+    def include_metadata_producers(names: set[str]) -> set[str]:
+        """Keep the exact producer visible when a consumer retries metadata.
+
+        In ``1 - numeric_valid``, the consumer region's descriptor becomes
+        dynamic after the cast region publishes its result. Its next narrowed
+        slice had the caller and consumer, but omitted the cast producer.
+        The existing metadata reader therefore could not verify the owned
+        output projection cited by the consumer's Call binding. Follow that
+        binding's direct RESULT cause to include its producer in the same
+        incumbent Call closure; no extent or data identity is reconstructed.
+        """
+        from .concordance_declarations import (
+            TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, metadata_result_caller_value,
+        )
+
+        book = identity_book(module)
+        result = set(names)
+        changed = True
+        while changed:
+            changed = False
+            for row in book.page(TENSOR_METADATA_CALL_BINDING).rows():
+                if row[4] not in result:
+                    continue
+                caller = module.functions.get(str(row[1]))
+                if caller is None or row[0] != function_scope_of(caller):
+                    continue
+                block = caller.blocks.get(str(row[2]))
+                live_calls = () if block is None else tuple(
+                    instruction for instruction in block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == int(row[3])
+                    and instruction.attributes.get("callee") == row[4]
+                )
+                binding = book.latest_ref(TENSOR_METADATA_CALL_BINDING, row)
+                if len(live_calls) != 1 or binding is None:
+                    continue
+                predecessors = tuple(
+                    cause for cause, _stage in book.edges_into(binding)
+                    if cause.page == TENSOR_METADATA_RESULT_BINDING
+                    and cause.row[0] == row[0]
+                )
+                for predecessor in predecessors:
+                    producer_calls = tuple(
+                        instruction for producer_block in caller.blocks.values()
+                        for instruction in producer_block.instrs
+                        if instruction.op == "Call" and instruction.res is not None
+                        and int(instruction.res.id) == int(predecessor.row[1])
+                        and instruction.attributes.get("callee")
+                        == predecessor.row[2]
+                    )
+                    if (len(producer_calls) != 1
+                            or metadata_result_caller_value(
+                                module, caller, producer_calls[0],
+                                predecessor, book=book,
+                            ) is None):
+                        continue
+                    producer_name = str(predecessor.row[2])
+                    for name in (str(row[1]), producer_name):
+                        if name in module.functions and name not in result:
+                            result.add(name)
+                            changed = True
+        return result
+
     affected = close_callers(affected)
 
     def value_geometry() -> dict[tuple[str, int], tuple | None]:
@@ -14931,7 +15610,9 @@ def complete_tensor_call_closure(
     # Keep that coverage; only changed geometry and its exact callers are
     # revisited after the initial pass. Whole-program late work starts with
     # the already selected tensor slice.
-    pending = set(module.functions) if initial_all else set(affected)
+    pending = include_metadata_producers(
+        set(module.functions) if initial_all else set(affected)
+    )
     shortfalls_by_function: dict[str, list[TensorSSALoweringShortfall]] = {}
     first_pass = True
     while first_pass or pending:
@@ -14992,7 +15673,9 @@ def complete_tensor_call_closure(
             name for (name, value_id), geometry in value_geometry().items()
             if geometry != prior_geometry.get((name, value_id))
         }
-        pending = close_callers(changed_names) & affected
+        pending = include_metadata_producers(
+            close_callers(changed_names) & affected
+        )
     if finalize_private_owners:
         publish_computed_region_result_metadata(module)
     return tuple(

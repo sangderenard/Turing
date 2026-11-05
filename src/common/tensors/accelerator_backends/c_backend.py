@@ -129,6 +129,9 @@ ffi.cdef("""
     void cumsum_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim);
+    void cumsum_dim_int64(
+        const long long* input, long long* output, const int* shape,
+        int ndim, int dim);
     void argreduce_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int find_max);
@@ -210,6 +213,7 @@ ffi.cdef("""
         void* user_data);
 
     void cast_double_to_int_values(const double* a, double* out, int n);
+    void cast_double_to_int64_values(const double* a, long long* out, int n);
     void cast_double_to_float_values(const double* a, double* out, int n);
     void cast_double_to_double_values(const double* a, double* out, int n);
     void cast_int64_to_double_values(

@@ -1,6 +1,7 @@
 """The live cumsum call and owned geometry must match the scan receipt."""
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -8,7 +9,9 @@ from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
-from src.compiler.concordance_declarations import TENSOR_RUNTIME_SCAN_GEOMETRY
+from src.compiler.concordance_declarations import (
+    SSA_VALUE, TENSOR_RUNTIME_SCAN_GEOMETRY,
+)
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import (
@@ -17,15 +20,15 @@ from src.compiler.identity_concordance import (
 from src.compiler.ssa_record_return_state import ssa_value_identity_cell
 
 
-@pytest.fixture(scope="module")
-def scan_module():
+@pytest.fixture(scope="module", params=("float64", "int64"))
+def scan_module(request):
     contract = ExtractionContract(
         Path(__file__).resolve().parents[1]
         / "extraction_contracts/program_extraction.yaml"
     ).with_program_abi({
         "values": [{
             "function": "root", "parameter": "values", "storage": "span",
-            "dtype": "float64", "rank": 1,
+            "dtype": request.param, "rank": 1,
             "python_type": "src.common.tensors.abstraction.AbstractTensor",
         }],
         "records": {}, "bindings": [],
@@ -97,7 +100,9 @@ def test_runtime_scan_requires_direct_selected_formal_cause(
     book = identity_book(scan_module)
     row, = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).rows()
     receipt = book.latest_ref(TENSOR_RUNTIME_SCAN_GEOMETRY, row)
-    selected = scan_module.functions["cumsum_dim_double"]
+    selected = scan_module.functions[
+        book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).latest(row)[8]
+    ]
     formal = ssa_value_identity_cell(
         selected, int(selected.args[formal_position].id), book=book,
     )
@@ -110,3 +115,72 @@ def test_runtime_scan_requires_direct_selected_formal_cause(
             if not (scope == receipt.key and edge[1] == formal.key)
         ))
         assert CorrelationTable._tensor_runtime_scan_geometry_findings(scan_module)
+
+
+@pytest.mark.parametrize("formal_position", [0, 1])
+def test_runtime_scan_rejects_wrong_typed_kernel_formal(
+    scan_module, formal_position,
+):
+    book = identity_book(scan_module)
+    row, = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).rows()
+    selected = scan_module.functions[
+        book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).latest(row)[8]
+    ]
+    formal = ssa_value_identity_cell(
+        selected, selected.args[formal_position].id, book=book,
+    )
+    page = book.page(SSA_VALUE)
+    original = page.cell(formal.row, formal.column)
+    page.cells[(formal.row, formal.column)] = replace(
+        original, physical_dtype=(
+            "int64" if original.physical_dtype == "float64" else "float64"
+        ),
+    )
+    try:
+        assert CorrelationTable._tensor_runtime_scan_geometry_findings(scan_module)
+    finally:
+        page.cells[(formal.row, formal.column)] = original
+
+
+@pytest.mark.parametrize("resident_dtype", ["int64", "ptr"])
+def test_runtime_scan_resident_dtype_cannot_replace_pointer_origin(
+    scan_module, resident_dtype,
+):
+    book = identity_book(scan_module)
+    row, = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).rows()
+    selected = scan_module.functions[
+        book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).latest(row)[8]
+    ]
+    formal = selected.args[0]
+    original_dtype = formal.dtype
+    symbol, origins = selected.metadata["llvm_repository_kernel"]
+    # An ordinary scalar with the element dtype does not establish a pointer.
+    formal.dtype = resident_dtype
+    selected.metadata["llvm_repository_kernel"] = (
+        symbol, {key: value for key, value in origins.items()
+                 if key != int(formal.id)},
+    )
+    try:
+        assert CorrelationTable._tensor_runtime_scan_geometry_findings(scan_module)
+    finally:
+        formal.dtype = original_dtype
+        selected.metadata["llvm_repository_kernel"] = (symbol, origins)
+
+
+@pytest.mark.parametrize("value_kind", ["source", "result"])
+def test_runtime_scan_rejects_descriptor_with_wrong_element_type(
+    scan_module, value_kind,
+):
+    book = identity_book(scan_module)
+    row, = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).rows()
+    record = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY).latest(row)
+    value_id = record[1] if value_kind == "source" else row[2]
+    table = scan_module.tensor_tables[row[1]]
+    original = table.by_id(value_id)
+    table.tensors[value_id] = replace(
+        original, dtype="int64" if original.dtype == "float64" else "float64",
+    )
+    try:
+        assert CorrelationTable._tensor_runtime_scan_geometry_findings(scan_module)
+    finally:
+        table.tensors[value_id] = original

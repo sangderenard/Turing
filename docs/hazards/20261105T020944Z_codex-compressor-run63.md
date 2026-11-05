@@ -1,4 +1,3 @@
-2026-11-05 TITLE (MEASURED, where): 
 2026-11-05 Exact compressor Run63 (MEASURED, source 9881680c):
 
 - Driver: `$env:PYTHONIOENCODING='utf-8'; $env:ABSTRACT_TENSOR_BACKEND='numpy'; $env:PYTHONPATH='C:/dev/Powershell/turing'; python -u $env:TEMP/compressor_native_63.py`. Public `lower_ast_source_to_ssa`, exact repository `compress_octets`, explicit current C repository reference; no alternative entry or executable checkpoint. Tracked source was clean at launch.

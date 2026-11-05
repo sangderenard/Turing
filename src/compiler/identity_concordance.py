@@ -7279,6 +7279,9 @@ class CorrelationTable:
     def _tensor_runtime_scan_geometry_findings(module: Any) -> list[Finding]:
         """A runtime scan keeps its source geometry and owns its output."""
 
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+            TRANSLATIONS,
+        )
         from .concordance_declarations import (
             CANONICAL_VALUE, SOURCE_LITERAL_VALUE, SSA_VALUE,
             TENSOR_OWNED_HEAP_BINDING, TENSOR_RUNTIME_SCAN_GEOMETRY,
@@ -7293,6 +7296,10 @@ class CorrelationTable:
 
         book = identity_book(module)
         page = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY)
+        scan_kernels = {
+            translation.llvm_symbol for translation in TRANSLATIONS
+            if "cumsum" in translation.abstract_tensor_operations
+        }
         found = []
         for row in page.rows():
             receipt = book.latest_ref(TENSOR_RUNTIME_SCAN_GEOMETRY, row)
@@ -7304,7 +7311,8 @@ class CorrelationTable:
                 and isinstance(record, tuple) and len(record) == 9
                 and record[0] == "cumsum"
                 and all(type(value) is int for value in record[1:8])
-                and record[8] == "cumsum_dim_double"
+                and isinstance(record[8], str)
+                and record[8] in scan_kernels
             )
             if valid:
                 (_tag, source_id, axis_id, axis, shape_id, rank_id,
@@ -7382,6 +7390,24 @@ class CorrelationTable:
                     tuple(selected.metadata.get("named_outputs", ()))
                     if selected is not None else ()
                 )
+                # compact_codewords' int64 scan uses resident int64 formals.
+                # The imported LLVM argument origins prove these are pointers;
+                # the resident dtype alone does not. This is the same origin
+                # record read by the typed Load/Store witness publisher.
+                pointer_origins = (
+                    (selected.metadata.get("llvm_repository_kernel")
+                     or (None, {}))[1] if selected is not None else {}
+                )
+                pointer_formals = tuple(
+                    (
+                        (origin := pointer_origins.get(int(formal.id))) is not None
+                        and isinstance(origin, tuple) and len(origin) >= 3
+                        and origin[1] == "argument"
+                        and str(origin[2]).startswith("ptr ")
+                    )
+                    for formal in (input_formal, output_formal)
+                    if formal is not None
+                )
                 dim_definitions = [instruction for instruction in definitions
                                    if instruction.res is not None
                                    and int(instruction.res.id) ==
@@ -7392,12 +7418,16 @@ class CorrelationTable:
                     source is not None and result is not None
                     and source_fact is not None and result_fact is not None
                     and source_fact.physical_dtype ==
-                    result_fact.physical_dtype == "float64"
+                    result_fact.physical_dtype
+                    and source_fact.physical_dtype in {"float64", "int64"}
+                    and result_fact.dtype == source_fact.dtype
                     and source_fact.storage == result_fact.storage == "span"
                     and type(source_fact.rank) is int and source_fact.rank > 0
                     and result_fact.rank == source_fact.rank
                     and type(axis) is int and 0 <= axis < source_fact.rank
                     and source.metadata_state == result.metadata_state == "dynamic"
+                    and source.dtype == source_fact.physical_dtype
+                    and result.dtype == result_fact.physical_dtype
                     and (source.shape_value_id, source.rank_value_id,
                          source.element_count_value_id) ==
                     (shape_id, rank_id, count_id)
@@ -7407,7 +7437,7 @@ class CorrelationTable:
                     and result.data_value_id == carrier_id
                     and isinstance(owner, tuple) and len(owner) == 4
                     and owner[0] == carrier_id and owner[2] == count_id
-                    and owner[3] == "float64"
+                    and owner[3] == result_fact.physical_dtype
                     and owner_ref in causes
                     and type(authored_axis) is int
                     and (authored_axis if authored_axis >= 0 else
@@ -7421,11 +7451,10 @@ class CorrelationTable:
                     )
                     and set(geometry[1]) <= causes
                     and input_formal_fact is not None
-                    and input_formal_fact.physical_dtype == "float64"
-                    and input_formal.dtype == "ptr"
+                    and input_formal_fact.physical_dtype == source_fact.physical_dtype
                     and output_formal_fact is not None
-                    and output_formal_fact.physical_dtype == "float64"
-                    and output_formal.dtype == "ptr"
+                    and output_formal_fact.physical_dtype == result_fact.physical_dtype
+                    and len(pointer_formals) == 2 and all(pointer_formals)
                     and selected.metadata.get("ssa_output_argument") == 1
                     and len(declared_outputs) == 1
                     and isinstance(declared_outputs[0], tuple)

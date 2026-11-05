@@ -46,6 +46,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "mean_dim",
     "transpose_double",
     "cumsum_dim_double",
+    "cumsum_dim_int64",
     "stack_double",
     "cat_double",
     "pad_double_nd",
@@ -75,6 +76,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     # this list is the independent third party that says so, so it is written
     # out rather than derived from TRANSLATIONS.
     "cast_double_to_int_values",
+    "cast_double_to_int64_values",
     "cast_double_to_float_values",
     "cast_double_to_bool_values",
     "cast_double_to_double_values",
@@ -879,6 +881,30 @@ def test_handwritten_cast_ssa_matches_real_c_kernel(
     )
 
 
+def test_counted_float64_to_int64_cast_matches_numpy_and_llvm(llvm_engine):
+    values = np.asarray([
+        1.9, -1.9, 0.0, -0.0, float("nan"), float("inf"),
+        float("-inf"), float(2**63), np.nextafter(float(2**63), 0.0),
+        float(-(2**63)), float(-(2**63)) * 2.0,
+    ], dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        expected = values.astype(np.int64)
+    c_input = ffi.new("double[]", values.tolist())
+    c_output = ffi.new("long long[]", len(values))
+    C.cast_double_to_int64_values(c_input, c_output, len(values))
+    llvm_output = (ctypes.c_int64 * len(values))()
+    _llvm_function(
+        llvm_engine, "cast_double_to_int64_values",
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int32,
+    )((ctypes.c_double * len(values))(*values), llvm_output, len(values))
+    np.testing.assert_array_equal(
+        np.asarray([c_output[index] for index in range(len(values))], dtype=np.int64),
+        expected,
+    )
+    np.testing.assert_array_equal(np.asarray(llvm_output, dtype=np.int64), expected)
+
+
 def test_handwritten_sum_and_arange_ssa_match_real_c_kernels(llvm_engine):
     values = [1.0, -2.5, 4.25, 8.0]
     c_sum = C.sum_double(_c_array(values), len(values))
@@ -960,6 +986,23 @@ def test_direct_tape_lowering_binds_cumsum_to_real_translated_kernel():
     assert lowered.complete
     assert "call void @cumsum_dim_double" in lowered.llvm_ir
     llvm.parse_assembly(lowered.llvm_ir).verify()
+
+
+def test_signed_int64_scan_c_kernel_preserves_fixed_width_values():
+    for values in (
+        np.array([], dtype=np.int64),
+        np.array([2**53 + 1], dtype=np.int64),
+        np.array([2**53 + 1, -1, 3], dtype=np.int64),
+        np.array([np.iinfo(np.int64).max, 1], dtype=np.int64),
+    ):
+        source = ffi.new("long long[]", values.tolist())
+        result = ffi.new("long long[]", len(values))
+        shape = ffi.new("int[]", [len(values)])
+        C.cumsum_dim_int64(source, result, shape, 1, 0)
+        np.testing.assert_array_equal(
+            np.frombuffer(ffi.buffer(result, 8 * len(values)), dtype=np.int64),
+            np.cumsum(values),
+        )
 
 
 def test_direct_tape_lowering_composes_real_construction_and_reduction_kernels():

@@ -99,6 +99,13 @@ void batched_matmul_indexed_double(
     int n,
     int p);
 
+void cumsum_dim_int64(
+    const int64_t* input,
+    int64_t* output,
+    const int* shape,
+    int ndim,
+    int dim);
+
 void gather_values_double(
     const double* input,
     double* output,
@@ -247,6 +254,8 @@ void broadcast_int64(
     int input_ndim, const int* output_shape, int output_ndim);
 void cast_int64_to_double_values(
     const int64_t* input, double* output, int n);
+void cast_double_to_int64_values(
+    const double* input, int64_t* output, int n);
 int64_t sum_int64(const int64_t* input, int n);
 void create_arange_int64(
     int64_t start, int64_t step, int n, int64_t* output);

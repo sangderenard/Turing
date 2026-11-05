@@ -574,6 +574,29 @@
         }
     }
 
+    // Signed int64 scans use the same modulo-2^64 arithmetic as NumPy's
+    // fixed-width int64 cumsum.  The unsigned accumulator avoids signed C
+    // overflow, and memcpy preserves the resulting two's-complement bits.
+    void cumsum_dim_int64(
+        const int64_t* input, int64_t* output, const int* shape,
+        int ndim, int dim) {
+        int before = 1;
+        int after = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        int count = shape[dim];
+        for (int b = 0; b < before; ++b) {
+            for (int tail = 0; tail < after; ++tail) {
+                uint64_t accum = 0;
+                for (int d = 0; d < count; ++d) {
+                    int index = (b * count + d) * after + tail;
+                    accum += (uint64_t)input[index];
+                    memcpy(&output[index], &accum, sizeof(accum));
+                }
+            }
+        }
+    }
+
     void argreduce_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int find_max) {
@@ -964,6 +987,18 @@
 
     void cast_double_to_int_values(const double* a, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = (double)((long long)a[i]);
+    }
+
+    /* NumPy's float64 -> int64 astype truncates finite in-range values and
+       writes INT64_MIN for NaN, infinity, or an out-of-range value. Guard
+       before the C conversion so those inputs never invoke undefined behavior.
+       The separate double-backed value cast above retains its old ABI. */
+    void cast_double_to_int64_values(const double* a, int64_t* out, int n) {
+        for (int i = 0; i < n; ++i) {
+            const double value = a[i];
+            out[i] = (value >= -0x1p63 && value < 0x1p63)
+                ? (int64_t)value : INT64_MIN;
+        }
     }
 
     void cast_double_to_float_values(const double* a, double* out, int n) {
