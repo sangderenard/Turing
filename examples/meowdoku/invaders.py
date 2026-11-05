@@ -100,6 +100,7 @@ CONTROLS = {"move_axis": "move-axis-x", "steer_x": "pointer-board-x", "fire": "p
 EMOJI = {
     "rocket": "\U0001F680", "alien": "\U0001F47D", "invader": "\U0001F47E", "crab": "\U0001F980",
     "ufo": "\U0001F6F8", "bolt": "⚡", "bomb": "\U0001F4A3", "brick": "\U0001F9F1", "boom": "\U0001F4A5",
+    "frog": "\U0001F438", "star": "⭐",
 }
 #: Outline subdivisions per emoji (the rocket's tail collapses at 1).
 EMOJI_SUBDIVISIONS = {"rocket": 2}
