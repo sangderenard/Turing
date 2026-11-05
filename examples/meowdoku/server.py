@@ -101,8 +101,9 @@ def make_handler(table: Table):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(table.web_dir), **kwargs)
 
-        def log_message(self, format, *args):  # noqa: A002 - quiet static logs
-            if args and "/api/" in str(args[0]):
+        def log_message(self, format, *args):  # noqa: A002 - quiet static and polling logs
+            line = str(args[0]) if args else ""
+            if "/api/" in line and "/api/action" not in line and "/api/state" not in line:
                 sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
         def _json(self, payload: dict, status: int = HTTPStatus.OK) -> None:

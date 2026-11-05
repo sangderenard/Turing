@@ -270,9 +270,22 @@ class LichessBot:
         if not live and time.time() - self.last_challenge > self.idle_challenge_every:
             self.challenge_a_bot()
 
+    def _idle_loop(self) -> None:
+        """The event stream blocks while nothing happens, so the idle
+        challenge runs on its own clock."""
+        while not self._stop.is_set():
+            time.sleep(5)
+            if self.me:
+                try:
+                    self._maybe_challenge()
+                except Exception as error:
+                    self.log(f"[lichess] idle challenge: {error}")
+
     def start(self) -> None:
         thread = threading.Thread(target=self.run, name="lichess-events", daemon=True)
         thread.start(); self.threads.append(thread)
+        idle = threading.Thread(target=self._idle_loop, name="lichess-idle", daemon=True)
+        idle.start(); self.threads.append(idle)
 
     def stop(self) -> None:
         self._stop.set()
