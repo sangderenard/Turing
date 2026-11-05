@@ -78,7 +78,17 @@ is the asset-side one, and a web server can run it.
   today; a modelled cat would be a Pluck `WorldObject` form recipe, which
   the Living Data Map already adapts and the scene-order compiler does not
   yet take.
-- **Puzzle generation at large n.** The generator is random arrangement
-  plus grown regions, retried until a backtracking count proves uniqueness:
-  0.2 s at n=8, 6 s at n=9, over a minute at n=10. The law and the dt round
-  are fine at any n; a constructive generator is the fix.
+- **Puzzle generation at large n: done.** `puzzle.generate_batch(n, batch,
+  seed)` builds `batch` unique puzzles as AbstractTensor arithmetic over
+  `(batch, n, n)` spans: random permutations as ranks of random keys, the
+  no-touch rule as a batched rejection, a random solving order, each cell's
+  elimination moment as a broadcast minimum, and the region as the nearest
+  eligible cat by one masked argmin. Uniqueness is by construction (singles
+  solve the board in that order); the backtracking count is the oracle and
+  agrees 24/24 at n=9 and 11. Measured: 256 boards of 32x32 in 0.5 s, 32 of
+  64x64 in 0.15 s, one 256x256 in 0.06 s; `verify_batch` checks all three
+  rules batched. Randomness is the repository's seeded Xoroshiro128** stream
+  (`AbstractTensor.randn` is reached by no seed). The random generator stays
+  for n <= 8 so existing seeds are unchanged. A 32x32 game plays through
+  the dt system (one move 0.7 s on the numpy backend: the law's pairwise
+  conflict is n^2 x n^2).

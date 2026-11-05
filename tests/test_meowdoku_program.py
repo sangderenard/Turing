@@ -151,3 +151,26 @@ def test_the_record_is_what_the_python_game_hands_over():
     assert set(columns) == set(CONTROLS)
     assert columns["select_row"][7] == 2.0 and columns["primary_action"].sum() == 25.0
     assert MeowdokuControls().select_row == -1.0      # no cell: never selects
+
+
+def test_batched_generator_is_unique_by_the_oracle_and_scales():
+    import time
+    from meowdoku.puzzle import generate as make, generate_batch, verify_batch
+
+    for n in (9, 10, 11):
+        puzzles = generate_batch(n, 12, seed=n)
+        assert verify_batch(puzzles).all()
+        for index in range(puzzles.batch):
+            assert count_arrangements(puzzles.puzzle(index).region_grid(), limit=2) == 1, (n, index)
+    started = time.perf_counter()
+    big = generate_batch(32, 256, seed=0)              # 256 boards of 1024 cells
+    elapsed = time.perf_counter() - started
+    assert verify_batch(big).all() and elapsed < 30.0, elapsed
+    huge = generate_batch(128, 2, seed=1)              # 16,384 cells each
+    assert verify_batch(huge).all()
+    # Deterministic per seed, different across seeds.
+    assert np.array_equal(generate_batch(16, 3, seed=5).region, generate_batch(16, 3, seed=5).region)
+    assert not np.array_equal(generate_batch(16, 3, seed=5).region, generate_batch(16, 3, seed=6).region)
+    # Existing small boards are unchanged: auto still uses the random oracle.
+    assert np.array_equal(make(6, seed=3).region, make(6, seed=3, method="random").region)
+    assert make(32, seed=0).cells == 1024
