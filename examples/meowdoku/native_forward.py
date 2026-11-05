@@ -89,15 +89,22 @@ class NativeEvaluator:
         return self._execution
 
     def _refresh_weights(self) -> None:
-        """Copy the net's current weights into the resident buffers.  Adam
-        writes the parameters in place, so nothing cheaper than the copy
-        (about half a millisecond) proves they are unchanged."""
-        with self.net.lock:
-            for p in PARAMETER_NAMES:
-                np.copyto(self._buffers[p].reshape(-1),
-                          np.asarray(getattr(self.net, p).numpy(), dtype=np.float64).reshape(-1))
+        """Copy the net's weights into the resident buffers when they have
+        changed since the last copy (``ConvValueNet.version`` is bumped by
+        every training step and load)."""
+        version = getattr(self.net, "version", None)
+        if version is not None and version == getattr(self, "_weights_version", object()):
+            return
+        for p in PARAMETER_NAMES:
+            np.copyto(self._buffers[p].reshape(-1),
+                      np.asarray(getattr(self.net, p).numpy(), dtype=np.float64).reshape(-1))
+        self._weights_version = version
 
     def evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        with self.net.lock:                    # one resident execution; the net's lock also orders weight writes
+            return self._evaluate(boards, masks)
+
+    def _evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         execution = self._resident()
         self._refresh_weights()
         planes = self.net.planes(boards)
@@ -114,6 +121,24 @@ class NativeEvaluator:
             values.append(self._value_out.reshape(-1)[:count].copy())
             policies.append(self._policy_out.reshape(self.batch, POLICY)[:count].copy())
         return np.concatenate(values), np.concatenate(policies)
+
+
+class NativeRouter:
+    """Compiled evaluators at a few fixed batch sizes; each request goes to
+    the smallest one that holds it (larger requests run in chunks of the
+    largest), so a single root position is not padded into a batch of 32."""
+
+    def __init__(self, net: ConvValueNet, contract: str = "eigen", batches=(1, 8, 32), directory: Path = BUILD):
+        self.evaluators = {int(b): NativeEvaluator(net, batch=int(b), directory=directory, contract=contract)
+                           for b in sorted(set(batches))}
+        self.compile_seconds = sum(e.compile_seconds for e in self.evaluators.values())
+
+    def evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n = len(boards)
+        for size, evaluator in self.evaluators.items():
+            if n <= size:
+                return evaluator.evaluate(boards, masks)
+        return list(self.evaluators.values())[-1].evaluate(boards, masks)
 
 
 def main(argv=None) -> int:

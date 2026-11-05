@@ -189,6 +189,9 @@ class ConvValueNet:
             self.W6 = param((POLICY_PLANES, c2), math.sqrt(1.0 / c2)); self.b6 = param((POLICY_PLANES, 1), 0.0)
             self.optimizer = Adam(self.parameters(), lr=lr)
         self.last_policy_loss = float("nan")
+        self.version = 0          # bumped by every weight change; the compiled evaluator copies weights only when it moves
+        self._native = None
+        self.native_note = "numpy"
 
     def parameters(self):
         return [self.W1, self.b1, self.W2, self.b2, self.W3, self.b3, self.W4, self.b4,
@@ -222,8 +225,28 @@ class ConvValueNet:
         h3 = h3.maximum(h3 * 0.0)
         return (h3 @ self.W4 + self.b4).tanh(), logits
 
+    def use_native(self, contract: str = "eigen", batches=(1, 8, 32)) -> bool:
+        """Route ``evaluate`` through this forward compiled by the repository
+        compiler under work contract ``contract`` (``native_forward``).  On
+        any compile failure the net stays on the numpy path and
+        ``native_note`` says why."""
+        try:
+            from meowdoku.native_forward import NativeRouter
+            self._native = NativeRouter(self, contract=contract, batches=batches)
+            self.native_note = f"compiled ({contract}, batches {'/'.join(map(str, batches))})"
+            return True
+        except Exception as error:
+            self._native = None
+            self.native_note = f"numpy (compile failed: {type(error).__name__}: {str(error)[:80]})"
+            return False
+
     def evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Values for White and the policy over legal moves (masked softmax)."""
+        if self._native is not None:
+            return self._native.evaluate(boards, masks)
+        return self.evaluate_numpy(boards, masks)
+
+    def evaluate_numpy(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         from src.common.tensors import AbstractTensor as AT
         with self.lock, AT.use_backend("numpy"), AT.autograd.no_grad():
             v, logits = self.forward_both(AT.tensor(self.planes(boards)))
@@ -277,6 +300,7 @@ class ConvValueNet:
             with AT.autograd.no_grad():
                 for p, q in zip(params, self.optimizer.step(params, grads)):
                     AT.copyto(p, q)
+            self.version += 1
             return float(np.asarray(loss.numpy()))
 
     def save(self, path: Path = WEIGHTS) -> None:
@@ -309,6 +333,7 @@ class ConvValueNet:
             for i, p in enumerate(params):
                 if f"p{i}" in data and data[f"p{i}"].shape == tuple(p.shape):
                     AT.copyto(p, AT.tensor(data[f"p{i}"]))
+        self.version += 1
         return True
 
 

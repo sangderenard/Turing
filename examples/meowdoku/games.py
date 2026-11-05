@@ -572,8 +572,13 @@ def self_play():
     """One shared learner per server process (its weights persist on disk)."""
     global _SELF_PLAY
     if _SELF_PLAY is None:
+        import os
         from meowdoku.chess_net import SelfPlay
         _SELF_PLAY = SelfPlay()
+        # The search evaluates through the forward compiled by the repository
+        # compiler under the eigen work contract; MEOWDOKU_NATIVE=0 keeps numpy.
+        if os.environ.get("MEOWDOKU_NATIVE", "1") != "0":
+            _SELF_PLAY.net.use_native("eigen")
     return _SELF_PLAY
 
 
@@ -645,7 +650,8 @@ class Learner:
             f"{p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
             + (f" · loss {p.last_loss:.3f}" if p.games else "")
             + (f" · last: {self.last_result}" if self.last_result else "")
-            + f" · learning {hours * 60:.0f} min")
+            + f" · learning {hours * 60:.0f} min"
+            + f" · eval {p.net.native_note}")
 
 
 _LEARNER = None
