@@ -2003,6 +2003,11 @@ define internal void @unfold2d_double(
     i32 %n, i32 %c, i32 %h, i32 %w,
     i32 %kh.count, i32 %kw.count,
     i32 %sh, i32 %sw, i32 %ph, i32 %pw, i32 %dh, i32 %dw) {
+; im2col in ctensor_ops.c's order (batch, channel, kh, kw, oh, ow) as nested
+; loops: each output row is classified once (padding row or shifted input
+; row) and the inner column loop is branch-free -- an out-of-range column
+; reads a clamped in-row index and is replaced by zero with a select, so no
+; load leaves the row.  No per-element division.
 entry:
   %kh.minus = sub nsw i32 %kh.count, 1
   %kw.minus = sub nsw i32 %kw.count, 1
@@ -2020,71 +2025,117 @@ entry:
   %ow.raw = sdiv i32 %numerator.w, %sw
   %oh.count = add nsw i32 %oh.raw, 1
   %ow.count = add nsw i32 %ow.raw, 1
-  %count.0 = mul nsw i32 %n, %c
-  %count.1 = mul nsw i32 %count.0, %kh.count
-  %count.2 = mul nsw i32 %count.1, %kw.count
-  %count.3 = mul nsw i32 %count.2, %oh.count
-  %count = mul nsw i32 %count.3, %ow.count
-  br label %loop.header
+  %planes = mul nsw i32 %n, %c
+  %plane.size = mul nsw i32 %h, %w
+  br label %plane.header
 
-loop.header:
-  %flat = phi i32 [ 0, %entry ], [ %flat.next, %loop.latch ]
-  %continue = icmp slt i32 %flat, %count
-  br i1 %continue, label %decode, label %exit
+plane.header:
+  %plane = phi i32 [ 0, %entry ], [ %plane.next, %plane.latch ]
+  %plane.continue = icmp slt i32 %plane, %planes
+  br i1 %plane.continue, label %plane.body, label %exit
 
-decode:
-  %ow = srem i32 %flat, %ow.count
-  %q.ow = sdiv i32 %flat, %ow.count
-  %oh = srem i32 %q.ow, %oh.count
-  %q.oh = sdiv i32 %q.ow, %oh.count
-  %kw = srem i32 %q.oh, %kw.count
-  %q.kw = sdiv i32 %q.oh, %kw.count
-  %kh = srem i32 %q.kw, %kh.count
-  %q.kh = sdiv i32 %q.kw, %kh.count
-  %channel = srem i32 %q.kh, %c
-  %batch = sdiv i32 %q.kh, %c
-  %ih.base = mul nsw i32 %oh, %sh
-  %iw.base = mul nsw i32 %ow, %sw
-  %ih.unpadded = sub nsw i32 %ih.base, %ph
-  %iw.unpadded = sub nsw i32 %iw.base, %pw
+plane.body:
+  %input.plane = mul nsw i32 %plane, %plane.size
+  br label %kh.header
+
+kh.header:
+  %kh = phi i32 [ 0, %plane.body ], [ %kh.next, %kh.latch ]
+  %kh.continue = icmp slt i32 %kh, %kh.count
+  br i1 %kh.continue, label %kh.body, label %plane.latch
+
+kh.body:
   %kh.offset = mul nsw i32 %kh, %dh
+  %kh.row.offset = sub nsw i32 %kh.offset, %ph
+  br label %kw.header
+
+kw.header:
+  %kw = phi i32 [ 0, %kh.body ], [ %kw.next, %kw.latch ]
+  %kw.continue = icmp slt i32 %kw, %kw.count
+  br i1 %kw.continue, label %kw.body, label %kh.latch
+
+kw.body:
   %kw.offset = mul nsw i32 %kw, %dw
-  %ih = add nsw i32 %ih.unpadded, %kh.offset
-  %iw = add nsw i32 %iw.unpadded, %kw.offset
+  %column.offset = sub nsw i32 %kw.offset, %pw
+  %column.plane = mul nsw i32 %plane, %kh.count
+  %column.kh = add nsw i32 %column.plane, %kh
+  %column.kw.base = mul nsw i32 %column.kh, %kw.count
+  %column = add nsw i32 %column.kw.base, %kw
+  %row.base = mul nsw i32 %column, %oh.count
+  br label %oh.header
+
+oh.header:
+  %oh = phi i32 [ 0, %kw.body ], [ %oh.next, %oh.latch ]
+  %oh.continue = icmp slt i32 %oh, %oh.count
+  br i1 %oh.continue, label %oh.body, label %kw.latch
+
+oh.body:
+  %ih.base = mul nsw i32 %oh, %sh
+  %ih = add nsw i32 %ih.base, %kh.row.offset
+  %output.row = add nsw i32 %row.base, %oh
+  %output.row.start = mul nsw i32 %output.row, %ow.count
+  %output.row.start64 = sext i32 %output.row.start to i64
+  %output.row.ptr = getelementptr inbounds double, ptr %output, i64 %output.row.start64
   %ih.low = icmp sge i32 %ih, 0
   %ih.high = icmp slt i32 %ih, %h
+  %ih.valid = and i1 %ih.low, %ih.high
+  br i1 %ih.valid, label %copy.entry, label %zero.header
+
+zero.header:
+  %zero.ow = phi i32 [ 0, %oh.body ], [ %zero.ow.next, %zero.body ]
+  %zero.continue = icmp slt i32 %zero.ow, %ow.count
+  br i1 %zero.continue, label %zero.body, label %oh.latch
+
+zero.body:
+  %zero.ow64 = sext i32 %zero.ow to i64
+  %zero.ptr = getelementptr inbounds double, ptr %output.row.ptr, i64 %zero.ow64
+  store double 0.000000e+00, ptr %zero.ptr, align 8
+  %zero.ow.next = add nsw i32 %zero.ow, 1
+  br label %zero.header
+
+copy.entry:
+  %input.row.offset = mul nsw i32 %ih, %w
+  %input.row.start = add nsw i32 %input.plane, %input.row.offset
+  %input.row.start64 = sext i32 %input.row.start to i64
+  %input.row.ptr = getelementptr inbounds double, ptr %input, i64 %input.row.start64
+  br label %copy.header
+
+copy.header:
+  %copy.ow = phi i32 [ 0, %copy.entry ], [ %copy.ow.next, %copy.body ]
+  %copy.continue = icmp slt i32 %copy.ow, %ow.count
+  br i1 %copy.continue, label %copy.body, label %oh.latch
+
+copy.body:
+  %iw.base = mul nsw i32 %copy.ow, %sw
+  %iw = add nsw i32 %iw.base, %column.offset
   %iw.low = icmp sge i32 %iw, 0
   %iw.high = icmp slt i32 %iw, %w
-  %h.valid = and i1 %ih.low, %ih.high
-  %w.valid = and i1 %iw.low, %iw.high
-  %valid = and i1 %h.valid, %w.valid
-  br i1 %valid, label %load, label %zero
-
-load:
-  %input.bc = mul nsw i32 %batch, %c
-  %input.channel = add nsw i32 %input.bc, %channel
-  %input.row.base = mul nsw i32 %input.channel, %h
-  %input.row = add nsw i32 %input.row.base, %ih
-  %input.flat.base = mul nsw i32 %input.row, %w
-  %input.flat = add nsw i32 %input.flat.base, %iw
-  %input.flat64 = sext i32 %input.flat to i64
-  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.flat64
+  %iw.valid = and i1 %iw.low, %iw.high
+  %iw.clamped = select i1 %iw.valid, i32 %iw, i32 0
+  %iw.clamped64 = sext i32 %iw.clamped to i64
+  %input.ptr = getelementptr inbounds double, ptr %input.row.ptr, i64 %iw.clamped64
   %loaded = load double, ptr %input.ptr, align 8
-  br label %store
+  %value = select i1 %iw.valid, double %loaded, double 0.000000e+00
+  %copy.ow64 = sext i32 %copy.ow to i64
+  %copy.ptr = getelementptr inbounds double, ptr %output.row.ptr, i64 %copy.ow64
+  store double %value, ptr %copy.ptr, align 8
+  %copy.ow.next = add nsw i32 %copy.ow, 1
+  br label %copy.header
 
-zero:
-  br label %store
+oh.latch:
+  %oh.next = add nsw i32 %oh, 1
+  br label %oh.header
 
-store:
-  %value = phi double [ %loaded, %load ], [ 0.000000e+00, %zero ]
-  %flat64 = sext i32 %flat to i64
-  %output.ptr = getelementptr inbounds double, ptr %output, i64 %flat64
-  store double %value, ptr %output.ptr, align 8
-  br label %loop.latch
+kw.latch:
+  %kw.next = add nsw i32 %kw, 1
+  br label %kw.header
 
-loop.latch:
-  %flat.next = add nsw i32 %flat, 1
-  br label %loop.header
+kh.latch:
+  %kh.next = add nsw i32 %kh, 1
+  br label %kh.header
+
+plane.latch:
+  %plane.next = add nsw i32 %plane, 1
+  br label %plane.header
 
 exit:
   ret void
