@@ -595,6 +595,14 @@ function drawShield(now, drawLit) {
 }
 
 // ---------------------------------------------------------------- arcade lights
+// The ring can be switched off entirely (the Arcade lights checkbox, kept per
+// browser); off, draw() neither lights nor draws a single bulb.
+function arcadeEnabled() { const box = $("arcade"); return !box || box.checked; }
+(() => {
+  const box = $("arcade"); if (!box) return;
+  try { box.checked = localStorage.getItem("meowdoku_arcade") !== "off"; } catch {}
+  box.addEventListener("change", () => { try { localStorage.setItem("meowdoku_arcade", box.checked ? "on" : "off"); } catch {} box.blur(); });
+})();
 // Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
 // chase.  When the game's declared score rises: a comet walks the ring with a
 // fading tail.  On a win: the whole ring flashes.  Their colour and activity
@@ -1513,7 +1521,12 @@ function draw(ms) {
   // The house light is turned down so the arcade bulbs carry the scene: the
   // sun at ~60%, a softer fill; then each bulb is a point light in its own
   // colour at its own place, as bright as the chase makes it.
-  const bulbs = state.flat ? [] : arcadeBulbs();
+  // With the Arcade lights control off the ring is gone: no bulb lights, no
+  // bulb meshes, and the house light returns to full (the turn-down was for
+  // the bulbs' sake).
+  const arcadeOn = !state.flat && arcadeEnabled();
+  const house = arcadeOn ? 1.0 : 1.6;
+  const bulbs = arcadeOn ? arcadeBulbs() : [];
   const bulbStates = bulbs.map((_, i) => arcadeBulb(i, bulbs, now));
   const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[bulbStates[i].ci],
                                            level: bulbStates[i].level }));
@@ -1524,7 +1537,7 @@ function draw(ms) {
   gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([...keyColour, ...fillColour, 1.0, 0.8, 0.7,
     ...bulbLights.slice(0, count - 3).flatMap((b) => b.colour)]));
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
-    (state.flat ? 2.6 : 1.45 * sun.strength) * sunReach * sunReach, 0.19 * span * span, 0.14 * span * span,
+    (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
     ...bulbLights.slice(0, count - 3).map((b) => ARCADE.lamp * b.level)]));
   gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
   gl.uniform1f(gl.getUniformLocation(P, "uLightCalibration"), 1.0);
