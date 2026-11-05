@@ -143,6 +143,66 @@ void main(){
   vec3 c = uPal[clamp(vMat, 0, ${CEL_PALETTE - 1})];
   FragColor = vec4(pow(c * band, vec3(1.0 / 1.6)), 1.0);
 }`;
+// THE LENS: a planet game is rendered to an offscreen frame, then drawn to the
+// screen through a gentle hyperbolic mapping -- each screen point samples the
+// frame at radius atanh(r tanh k) / k, magnifying the centre and compressing
+// the rim (k from the Curve slider; 0 is off).  Our own pass; the Phong
+// shader and the scene are untouched.
+const LENS_VS = `#version 300 es
+out vec2 vUv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  vUv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const LENS_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uFrame;
+uniform float uK;
+uniform vec2 uAspect;
+out vec4 fragColor;
+float atanh_(float x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
+void main() {
+  vec2 d = (vUv - 0.5) * uAspect;
+  float r = length(d);
+  float scale = 1.0;
+  if (uK > 1e-4 && r > 1e-5) {
+    float t = tanh(uK);
+    scale = atanh_(clamp(r * t / 0.7071, 0.0, 0.9999)) / uK * 0.7071 / r;
+  }
+  vec2 uv = 0.5 + (d * scale) / uAspect;
+  fragColor = (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) ? vec4(0.085, 0.085, 0.1, 1.0) : texture(uFrame, uv);
+}`;
+const lens = { fbo: null, tex: null, depth: null, w: 0, h: 0, program: null, vao: null };
+function lensStrength() { const s = $("curve"); return onPlanet() && s ? Number(s.value) / 100 * 1.2 : 0; }
+function lensTarget(w, h) {
+  if (!lens.program) { lens.program = link(compile(gl.VERTEX_SHADER, LENS_VS), compile(gl.FRAGMENT_SHADER, LENS_FS)); lens.vao = gl.createVertexArray(); }
+  if (lens.w !== w || lens.h !== h) {
+    if (lens.fbo) { gl.deleteFramebuffer(lens.fbo); gl.deleteTexture(lens.tex); gl.deleteRenderbuffer(lens.depth); }
+    lens.tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE15); gl.bindTexture(gl.TEXTURE_2D, lens.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    lens.depth = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, lens.depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    lens.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, lens.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lens.tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, lens.depth);
+    lens.w = w; lens.h = h;
+  }
+  return lens;
+}
+function lensPresent(w, h, k) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  gl.useProgram(lens.program);
+  gl.activeTexture(gl.TEXTURE15); gl.bindTexture(gl.TEXTURE_2D, lens.tex);
+  gl.uniform1i(gl.getUniformLocation(lens.program, "uFrame"), 15);
+  gl.uniform1f(gl.getUniformLocation(lens.program, "uK"), k);
+  gl.uniform2f(gl.getUniformLocation(lens.program, "uAspect"), w >= h ? w / h : 1, w >= h ? 1 : h / w);
+  gl.bindVertexArray(lens.vao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
+  gl.enable(gl.DEPTH_TEST);
+}
 const DEPTH_VS = `#version 300 es
 layout(location=0) in vec3 aPos; uniform mat4 uMVP;
 void main(){ gl_Position = uMVP * vec4(aPos, 1.0); }`;
@@ -274,6 +334,16 @@ function terrainMesh(width, depth) {
 // Two 0.2 rows per visible strip, one 0.6 row per shadow strip; the rigid
 // tilt then leaves (L/2)^2 / 2R ~ 0.0006 units at a seam.
 const PLANET = { radius: 36.0, strip: 0.4, shadowStrip: 0.6 };
+// The field lies on the same sphere as the land: everything drawn over a
+// planet-terrain game drops by the curve at its own board position, so the
+// play layer stays parallel to the surface it flies over (a flat field over
+// curved land looked like the land breaching the clouds in the middle).
+function onPlanet() { const g = state.game; return !state.flat && !!(g && g.scene && g.scene.terrain === true); }
+function planetDrop(x, z) {
+  if (!onPlanet()) return 0;
+  const dx = x - state.extent.width / 2, dz = z - state.extent.depth / 2;
+  return (dx * dx + dz * dz) / (2 * PLANET.radius);
+}
 function stripsOf(positions, extras, span, length = PLANET.strip) {
   // Partition a triangle soup by each triangle's centroid z into strips,
   // positions re-centred on the strip (z) and curved across the width (y).
@@ -598,6 +668,8 @@ function uploadMaterials(game) {
   // Clouds: white frosted glass (rough, partly transmissive, softly lit from within).
   // Clouds: thin white frosted glass, low over the land.
   records.push(["cloud@glass", [0.97, 0.98, 1.0], { roughness: 0.65, transmission: 0.7, opacity: 0.34, ior: 1.25, emission: [0.06, 0.07, 0.08] }]);
+  // Rain clouds (smoke met a cloud): middle-grey glass, middle opacity.
+  records.push(["rain@glass", [0.5, 0.52, 0.56], { roughness: 0.7, transmission: 0.45, opacity: 0.5, ior: 1.25 }]);
   // Smoke where craft were destroyed: black frosted glass as dense as the old
   // clouds, thinning as it ages (smoke_0 .. smoke_3).
   for (let k = 0; k < 4; k++)
@@ -718,7 +790,19 @@ function rebuildBoards(game) {
   const width = game.board === "free" ? game.width : game.cols;
   state.extent = { width, depth: game.board === "free" ? game.height : depth };
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
-  state.glass = litMesh(box(-m, -t, -m, width + m, 0.0, state.extent.depth + m, gm));
+  if (game.scene && game.scene.terrain === true && !state.flat) {
+    // The plate lies on the planet's curve: a fine grid of glass (it never
+    // scrolls, so the curve is baked once).
+    const faces = [], step = 0.5, x0 = -m, x1 = width + m, z0 = -m, z1 = state.extent.depth + m;
+    const at = (x, z) => [x, -planetDrop(x, z), z];
+    for (let x = x0; x < x1 - 1e-6; x += step) for (let z = z0; z < z1 - 1e-6; z += step) {
+      const xa = Math.min(x + step, x1), za = Math.min(z + step, z1);
+      faces.push([at(x, z), at(x, za), at(xa, za), gm], [at(x, z), at(xa, za), at(xa, z), gm]);
+    }
+    state.glass = litMesh(faces);
+  } else {
+    state.glass = litMesh(box(-m, -t, -m, width + m, 0.0, state.extent.depth + m, gm));
+  }
 }
 
 // ---------------------------------------------------------------- camera and light
@@ -824,13 +908,23 @@ function drawVitals(now, drawLit) {
   vitals.shield += ((you.shield || 0) - vitals.shield) * ease;
   vitals.health += ((you.health || 0) - vitals.health) * ease;
   const ext = state.extent, m = GLASS.margin * 0.6 + 0.55, length = ext.depth * 0.86, z1 = ext.depth * 0.93;
+  // Each bar is drawn in short segments laid on the planet's curve.
+  const SEG = 12;
+  const segment = (mesh, x, y, za, zb, w) => {
+    const zc = (za + zb) / 2, len = zb - za;
+    const slope = onPlanet() ? Math.atan((zc - ext.depth / 2) / PLANET.radius) : 0;
+    drawLit(mesh.vao, mesh.count, M.multiply(M.multiply(M.translate(x, y - planetDrop(x, zc), zc), M.rotateX(slope)),
+      M.scale(w, w, len * 1.02)), null);
+  };
   const bar = (x, value, material) => {
-    const w = 0.34, h = 0.34;
-    const tube = vitalBox("bar_tube"), core = vitalBox(material);
-    drawLit(tube.vao, tube.count, M.multiply(M.translate(x, 0.05, z1 - length / 2), M.scale(w, h, length)), null);
+    const w = 0.34;
+    const tube = vitalBox("bar_tube"), core = vitalBox(material), top = z1 - length;
+    for (let i = 0; i < SEG; i++) segment(tube, x, 0.05, top + (i * length) / SEG, top + ((i + 1) * length) / SEG, w);
     const fill = Math.max(0, Math.min(1, value)) * length;
-    if (fill > 0.01) drawLit(core.vao, core.count,
-      M.multiply(M.translate(x, 0.08, z1 - fill / 2), M.scale(w * 0.7, h * 0.7, fill)), null);
+    if (fill > 0.01) {
+      const n = Math.max(1, Math.ceil((fill / length) * SEG)), start = z1 - fill;
+      for (let i = 0; i < n; i++) segment(core, x, 0.08, start + (i * fill) / n, start + ((i + 1) * fill) / n, w * 0.7);
+    }
   };
   bar(-m, vitals.shield, "bar_shield");
   bar(ext.width + m, vitals.health, "bar_health");
@@ -891,7 +985,7 @@ function drawShield(now, drawLit) {
   const lift = hRel == null ? 0 : (ship.h || 0) * DEPTH_LIFT;
   const step = Math.round(charge * (SHIELD_STEPS - 1)), r = ship.size * grow * 1.55 * (1 + 0.12 * flash);
   const globe = shieldGlobe(`shield_${step}`);
-  const model = M.multiply(M.translate(ship.x, TILE.height + 0.04 + lift + ship.size * grow * 0.25, ship.z), M.scale(r, r, r));
+  const model = M.multiply(M.translate(ship.x, TILE.height + 0.04 + lift + ship.size * grow * 0.25 - planetDrop(ship.x, ship.z), ship.z), M.scale(r, r, r));
   drawLit(globe.vao, globe.count, model, null);
 }
 
@@ -985,7 +1079,7 @@ function arcadeBulbs() {
     let s = i / count * perimeter, x, z;
     if (s < x1 - x0) { x = x0 + s; z = z0; } else if ((s -= x1 - x0) < z1 - z0) { x = x1; z = z0 + s; }
     else if ((s -= z1 - z0) < x1 - x0) { x = x1 - s; z = z1; } else { s -= x1 - x0; x = x0; z = z1 - s; }
-    bulbs.push([x, 0.45, z]);                      // on posts, so their light falls onto the tiles
+    bulbs.push([x, 0.45 - planetDrop(x, z), z]);   // on posts, so their light falls onto the tiles
   }
   return bulbs;
 }
@@ -1515,7 +1609,7 @@ function placeEntity(piece, now, x, z, mesh) {
   const grow = hRel == null || state.flat ? 1 : DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel;
   const lift = hRel == null || state.flat ? 0 : (piece.h || 0) * DEPTH_LIFT;
   const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size * grow, scale = scale0 / mesh.extent * Math.max(s, 0.001);
-  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift, z);
+  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll));
@@ -1925,7 +2019,9 @@ function draw(ms) {
     gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.depth, "uMVP"), false, M.multiply(light.viewProj, model));
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
   }
-  gl.disable(gl.POLYGON_OFFSET_FILL); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+  const lensK = lensStrength();
+  gl.disable(gl.POLYGON_OFFSET_FILL); gl.bindFramebuffer(gl.FRAMEBUFFER, lensK > 0 ? lensTarget(w, h).fbo : null); gl.viewport(0, 0, w, h);
+  if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
   // pass 2: the lit scene
   const P = state.programs.phong; gl.useProgram(P);
   const span = Math.max(state.extent.width, state.extent.depth);
@@ -2008,6 +2104,7 @@ function draw(ms) {
   gl.depthMask(true); gl.disable(gl.BLEND);
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);
+  if (lensK > 0) lensPresent(w, h, lensK);
   requestAnimationFrame(draw);
 }
 

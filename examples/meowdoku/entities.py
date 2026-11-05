@@ -584,6 +584,9 @@ class EntityGame(Game):
         st = self.base_state(int(round(self.height)), int(round(self.width)))
         st["board"] = "free"
         st["scene"] = dict(self.SCENE)
+        glow = getattr(self, "emissive", None)
+        if glow:
+            st["emissive"] = dict(glow)            # palette entries that glow (the page's materials)
         if self.SCENE_PREFER:
             st["scene_prefer"] = dict(self.SCENE_PREFER)
         st["width"], st["height"] = self.width, self.height

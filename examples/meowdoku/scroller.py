@@ -18,6 +18,13 @@ Lanes (contiguous blocks, so collisions are block against block):
     407..412       pickups: weapon power-ups dropped by destroyed enemies
     413..424       smoke: black clouds left where a craft was destroyed; they
                    drift back with the scroll, sink toward the land and fade
+    425..428       flashes: lightning, at the striking cloud and the craft struck
+
+STORMS: smoke drifting into the same column as a cloud (overlap on the
+board, any height) turns it into a RAIN cloud (``kind`` RAIN) until it
+scrolls away.  A rain cloud strikes at random (STRIKE_RATE a second); the
+strike chains to every craft within CHAIN_R of the cloud: enemies take
+LIGHTNING_DAMAGE, the player's shield gains LIGHTNING_CHARGE points.
 
 BOSS: lane 48 (the last enemy lane, reserved) is the level's boss, flown by
 the trained policy on a mirrored view of the board (the server writes its
@@ -94,7 +101,15 @@ STARS = (369, 399)
 MISSILES = (399, 407)
 PICKUPS = (407, 413)
 SMOKES = (413, 425)
-LANES = SMOKES[1]
+FLASHES = (425, 429)
+LANES = FLASHES[1]
+FLASH = 8.0
+RAIN = 1.0
+STRIKE_RATE = 0.35
+CHAIN_R = 2.6
+LIGHTNING_DAMAGE = 4.0
+LIGHTNING_CHARGE = 40.0
+FLASH_LIFE = 0.22
 BOSS_LANE = ENEMIES[1] - 1
 SMOKE = 7.0
 ACE, BOSS_KIND = 3.0, 4.0
@@ -188,6 +203,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_bullet, is_star = slot == BULLET, slot == STAR
     is_missile, is_pickup = slot == MISSILE_SLOT, slot == PICKUP
     is_smoke = slot == SMOKE
+    is_flash = slot == FLASH
     is_boss_lane = lane == BOSS_LANE
     clock_next = clock + dt
     zero = x * 0.0
@@ -350,7 +366,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     x2, y2, z2 = where(flying, mx, x2), where(flying, my, y2), where(flying, mz_, z2)
     vx1, vy1, vz1 = where(flying, mvx, vx1), where(flying, mvy, vy1), where(flying, mvz_, vz1)
     # Stars wrap from the bottom back to the top: the scroll.
-    y2 = where(is_star & (y2 > HEIGHT + 0.3), y2 - (HEIGHT + 0.6), y2)
+    wrapped = is_star & (y2 > HEIGHT + 0.3)
+    y2 = where(wrapped, y2 - (HEIGHT + 0.6), y2)
+    soaked_cloud = block_hits(x2, y2, rx, ry, live1 | is_star, None, STARS, SMOKES) > 0.0      # same column, any height
+    kind1 = where(is_star, where(wrapped, 0.0, where(soaked_cloud, RAIN, kind1)), kind1)
     out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
     grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the board is spent
     live2 = live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded
@@ -371,7 +390,17 @@ def scroller_step(lane, slot, rx, ry, rz,
     rams = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)        # the boss lane is an enemy lane
     player_hits = bullet_strikes + rams
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
-    hp2 = hp1 - enemy_hits
+    # Lightning: one rain cloud may strike this step; it chains to every
+    # craft within CHAIN_R of the cloud on the board.
+    raining = is_star & (kind1 == RAIN)
+    strike_dice = noise(clock * 5.7 + lane * 1.31 + 9.0)
+    striker = first_of(raining & (strike_dice < STRIKE_RATE * dt) & playing, lane)
+    striking = f(striker).sum() > 0.0
+    lx, ly, lz = (f(striker) * x2).sum(), (f(striker) * y2).sum(), (f(striker) * z2).sum()
+    reach_l = ((x2 - lx) * (x2 - lx) + (y2 - ly) * (y2 - ly)).sqrt()
+    struck = striking & live2 & (is_enemy | is_player) & (reach_l < CHAIN_R)
+    zapped = f(struck & is_player).sum() > 0.0
+    hp2 = hp1 - enemy_hits - LIGHTNING_DAMAGE * f(struck & is_enemy)
     killed = is_enemy & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
@@ -383,7 +412,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     refill = got_kind(SHIELD_UP)
     since_hit = (f(is_player) * age).sum()
     recharging = playing & (damage <= 0.0) & (since_hit >= SHIELD_PAUSE)
-    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(recharging))
+    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(recharging)
+                         + LIGHTNING_CHARGE * f(zapped))          # lightning charges the shield
     energy_next = where(is_player, (shield_after / SHIELD_POINTS).clip(0.0, 1.0), energy)
     healed = where(got_kind(HEALTH_UP), HEALTH_PICKUP, 0.0)
     health = (lives - wound + healed + HEALTH_REGEN * dt * f(lives > 0.0)).clip(0.0, HEALTH_MAX)
@@ -421,6 +451,20 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(puff, clock, born1)
     age1 = where(puff, 0.0, age1)
     live3 = (live3 | puff) & ~(is_smoke & (age1 > SMOKE_LIFE))
+    nearest_struck = first_of(struck & (where(struck, reach_l, 1.0e9) == where(struck, reach_l, 1.0e9).min()), lane)
+    tx_l, ty_l, tz_l = (f(nearest_struck) * x2).sum(), (f(nearest_struck) * y2).sum(), (f(nearest_struck) * z2).sum()
+    hit_any = f(nearest_struck).sum() > 0.0
+    flash_rank = f(is_flash & ~live3).cumsum(dim=0) - 1.0
+    flash_at_cloud = is_flash & ~live3 & (flash_rank == 0.0) & striking
+    flash_at_craft = is_flash & ~live3 & (flash_rank == 1.0) & striking & hit_any
+    flashing = flash_at_cloud | flash_at_craft
+    x2 = where(flash_at_cloud, lx, where(flash_at_craft, tx_l, x2))
+    y2 = where(flash_at_cloud, ly, where(flash_at_craft, ty_l, y2))
+    z2 = where(flash_at_cloud, lz, where(flash_at_craft, tz_l, z2))
+    vx1, vy1, vz1 = where(flashing, 0.0, vx1), where(flashing, 0.0, vy1), where(flashing, 0.0, vz1)
+    born1 = where(flashing, clock, born1)
+    age1 = where(flashing, 0.0, age1)
+    live3 = (live3 | flashing) & ~(is_flash & (age1 > FLASH_LIFE))
     boss_killed = (f(killed & is_boss_lane).sum() > 0.0)
     boss_phase_next = where(boss_killed, 2.0, where(boss_due, 1.0, boss_phase))
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
@@ -480,6 +524,9 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     slot[missiles], rx[missiles], ry[missiles], rz[missiles] = MISSILE_SLOT, 0.18, 0.3, 0.25
     slot[pickups], rx[pickups], ry[pickups], rz[pickups] = PICKUP, 0.35, 0.35, 0.4
     slot[slice(*SMOKES)] = SMOKE
+    rx[slice(*SMOKES)], ry[slice(*SMOKES)] = 0.5, 0.5
+    rx[slice(*STARS)], ry[slice(*STARS)] = 0.55, 0.45                  # a cloud's footprint on the board
+    slot[slice(*FLASHES)] = FLASH
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
@@ -562,11 +609,16 @@ class BulletScroller(EntityGame):
         self.epoch += 1
         self.width = width
 
+    @property
+    def emissive(self) -> dict[str, list[float]]:
+        return {"lightning": [2.6, 2.8, 3.4]}
+
     def palette(self) -> dict[str, list[float]]:
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
                 "invader": [0.75, 0.35, 0.95], "ufo": [0.95, 0.15, 0.55], "bullet": [1.0, 0.25, 0.35],
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
                 "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
+                "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0],
                 "smoke_0": [0.04, 0.04, 0.05], "smoke_1": [0.07, 0.07, 0.08], "smoke_2": [0.1, 0.1, 0.11],
                 "smoke_3": [0.13, 0.13, 0.14],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
@@ -576,6 +628,7 @@ class BulletScroller(EntityGame):
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln", "weapon")
+        # (clouds and flashes are always shown; flashes glow -- see emissive)
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
         show = (col["alive"] > 0.0) | (col["boom"] > 0.0)
@@ -612,9 +665,13 @@ class BulletScroller(EntityGame):
                 letter = {SPREAD_UP: "S", MULT_UP: "X", MISSILE_UP: "M", LASER_UP: "L",
                           SHIELD_UP: "O", HEALTH_UP: "H"}.get(float(col["kind"][k]), "S")
                 mesh, color, size = letter, f"pickup_{letter}", 0.34
+            elif slot == FLASH:
+                mesh, color, size = "bolt", "lightning", 0.55
             else:
-                # A cloud: frosted glass, larger the higher it floats.
-                mesh, color, size = "cloud", "cloud", 0.26 + 0.08 * float(col["z"][k])
+                # A cloud: frosted glass, larger the higher it floats; grey
+                # when smoke has turned it to rain.
+                rain = float(col["kind"][k]) == RAIN
+                mesh, color, size = "cloud", "rain" if rain else "cloud", (0.34 if rain else 0.26) + 0.08 * float(col["z"][k])
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
@@ -628,9 +685,10 @@ class BulletScroller(EntityGame):
                         "face": bool(slot == MISSILE_SLOT and not exploding),
                         # drawn with the glass (blended), not in the opaque pass
                         "translucent": bool(slot in (STAR, SMOKE)),
+                        "spin": 9.0 if slot == FLASH else (2.5 if mesh == "ufo" else 0.0),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
-                        "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})
+                        "bob": 0.0})
         return out
 
     def result(self) -> dict[str, Any] | None:
