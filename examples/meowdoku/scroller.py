@@ -498,7 +498,7 @@ class BulletScroller(EntityGame):
                         # flight (the page aims it along its velocity each frame).
                         "roll": 0.785 if mesh == "rocket" else 0.0,
                         "lean": 0.0 if slot in (PLAYER, MISSILE_SLOT) else 0.55,
-                        "face": slot == MISSILE_SLOT and not exploding,
+                        "face": bool(slot == MISSILE_SLOT and not exploding),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})
