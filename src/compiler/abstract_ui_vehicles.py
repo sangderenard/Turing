@@ -31,6 +31,53 @@ from .vehicle_balloon_tire import balloon_tire_graph_abi
 ABSTRACT_UI_VEHICLE_VERSION = "abstract-ui-vehicle-slot-v0"
 DEFAULT_CAR_CONFIG = Path(__file__).parents[2] / "configs" / "vehicles" / "fun_car.json"
 WHEEL_NAMES = ("front_left", "front_right", "rear_left", "rear_right")
+
+#: The vehicle's CONTROL RECORD: the 36 values the worker hands the compiled
+#: vehicle each tick, in the order the resident ``controls`` storage buffer
+#: holds them.  Each entry is ``(name, control)``: ``control`` is the
+#: semantic action a shell fills the field from (the viewport control-binding
+#: vocabulary) or None for a field the worker derives from its own state
+#: (transmission, locks, damage).  This record IS ``control_abi``; the WGSL
+#: indices below and the worker's array are both derived from it
+#: (docs/COMMON_CONTROL_RECORD_2026-11-05.md).  The order is the positional
+#: array the page and worker agreed on by hand before; it is kept so that no
+#: published program changes meaning, and it is now written once.
+VEHICLE_CONTROL_RECORD: tuple[tuple[str, str | None], ...] = (
+    ("throttle", "move-forward/backward"),
+    ("steering", "strafe-left/right"),
+    ("brake", "jump"),
+    ("forward_gear_ratio", None), ("reverse_gear_ratio", None), ("transfer_case_ratio", None),
+    ("front_differential_lock", None), ("drive_direction", None),
+    *((f"brake_lock_{wheel}", None) for wheel in WHEEL_NAMES),
+    ("front_drive_share", None), ("rear_differential_lock", None), ("center_transfer_lock", None),
+    ("traction_control_enabled", None), ("abs_enabled", None),
+    ("front_knuckle_steer_angle", None), ("rear_knuckle_steer_angle", None),
+    ("traction_control_authority", None), ("abs_authority", None),
+    ("center_differential_coupling", None),
+    ("front_differential_brake", None), ("rear_differential_brake", None),
+    ("body_shell_active", None),
+    *((f"{wheel}_knuckle_angle", None) for wheel in WHEEL_NAMES),
+    ("tire_pressure_pa", None),
+    *((f"outrigger_force_{axis}", None) for axis in "xyz"),
+    *((f"outrigger_torque_{axis}", None) for axis in "xyz"),
+)
+VEHICLE_CONTROL_INDEX: dict[str, int] = {
+    name: index for index, (name, _control) in enumerate(VEHICLE_CONTROL_RECORD)
+}
+assert len(VEHICLE_CONTROL_INDEX) == len(VEHICLE_CONTROL_RECORD) == 36
+# The terrain kernel reads the four knuckle angles as one lane-indexed run.
+assert [VEHICLE_CONTROL_INDEX[f"{wheel}_knuckle_angle"] for wheel in WHEEL_NAMES] == list(range(
+    VEHICLE_CONTROL_INDEX["front_left_knuckle_angle"],
+    VEHICLE_CONTROL_INDEX["front_left_knuckle_angle"] + 4))
+
+
+def vehicle_control_record_data() -> list[dict[str, Any]]:
+    """The record as published data: one row per control slot."""
+    return [
+        {"name": name, "index": index, "dtype": "float32",
+         **({"control": control} if control is not None else {"source": "worker-state"})}
+        for index, (name, control) in enumerate(VEHICLE_CONTROL_RECORD)
+    ]
 DRAG_VECTOR_NAMES = ("longitudinal", "lateral", "vertical")
 TIRE_RADIAL_RINGDOWN_STAGES = 3
 
@@ -4347,7 +4394,7 @@ def _vehicle_terrain_contact_webgpu(
         "sidewall_deformation_velocity_lateral": wheel_vehicle("tire_deformation_velocity_lateral"),
         "support": "support",
     }
-    expressions["tire_pressure"] = "max(1000.0f, controls[29u])"
+    expressions["tire_pressure"] = f"max(1000.0f, controls[{VEHICLE_CONTROL_INDEX['tire_pressure_pa']}u])"
     missing = set(contact_inputs) - set(expressions)
     if missing:
         raise RuntimeError(f"terrain contact kernel does not populate contact inputs: {sorted(missing)}")
@@ -4508,7 +4555,7 @@ fn vehicle_cage_patch_contact(lane: u32, position: vec3<f32>, velocity: vec3<f32
   let is_shell = lane >= @@SHELL_LANE_START@@u;
   let patch_radius = select(@@CAGE_RADIUS@@, @@SHELL_RADIUS@@, is_shell);
   let squash = sample.height + patch_radius - patch_world.y;
-  let shell_enabled = select(1.0f, controls[24u], is_shell);
+  let shell_enabled = select(1.0f, controls[@@CONTROL_BODY_SHELL_ACTIVE@@u], is_shell);
   let touching = select(0.0f, shell_enabled, sample.valid != 0u && squash > 0.0f
     && squash <= @@CAGE_MAXIMUM_SQUASH@@);
   let forward_axis = rotate_body(vec3<f32>(1.0f, 0.0f, 0.0f), roll, pitch, yaw);
@@ -4549,7 +4596,7 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   // Per-wheel knuckle coordinates are solved from column -> pinion -> rack ->
   // spherical tie-rod length constraints.  The contact frame consumes that
   // joint coordinate directly; it is not a cosmetic steering transform.
-  let steer = controls[25u + lane];
+  let steer = controls[@@CONTROL_KNUCKLE_ANGLE_BASE@@u + lane];
   let rolling_axis = forward_axis * cos(steer) + right_axis * sin(steer);
   let axle = right_axis * cos(steer) - forward_axis * sin(steer);
   var best_score = -1.0e20f; var surface_point = world_hub + down * @@TIRE_RADIUS@@;
@@ -4791,6 +4838,8 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
         "@@PITCH_VELOCITY@@": vehicle("pitch_velocity"),
         "@@YAW_VELOCITY@@": vehicle("yaw_velocity"),
         "@@COMPRESSION_BASE@@": str(vehicle_index["compression_front_left"]),
+        "@@CONTROL_BODY_SHELL_ACTIVE@@": str(VEHICLE_CONTROL_INDEX["body_shell_active"]),
+        "@@CONTROL_KNUCKLE_ANGLE_BASE@@": str(VEHICLE_CONTROL_INDEX["front_left_knuckle_angle"]),
         "@@WHEEL_OMEGA_BASE@@": str(vehicle_index["wheel_omega_front_left"]),
         "@@HUB_CASES@@": "\n".join(hub_cases),
         "@@MAX_STEER@@": _wgsl_number(float(source["controls"]["maximum_steering_angle_degrees"]) * math.pi / 180),
@@ -4915,32 +4964,32 @@ fn assemble_vehicle_graph_inputs(@builtin(global_invocation_id) gid: vec3<u32>) 
     finite_or(reduced_wrench[4u], 0.0f), finite_or(reduced_wrench[5u], 0.0f));
   vehicle_feed[{vi['yaw_cos']}u] = cos(vehicle_feed[{vi['yaw']}u]);
   vehicle_feed[{vi['yaw_sin']}u] = sin(vehicle_feed[{vi['yaw']}u]);
-  vehicle_feed[{vi['throttle']}u] = controls[0u];
-  vehicle_feed[{vi['brake']}u] = controls[2u];
-  vehicle_feed[{vi['forward_gear_ratio']}u] = controls[3u];
-  vehicle_feed[{vi['reverse_gear_ratio']}u] = controls[4u];
-  vehicle_feed[{vi['transfer_case_ratio']}u] = controls[5u];
-  vehicle_feed[{vi['front_differential_lock']}u] = controls[6u];
-  vehicle_feed[{vi['rear_differential_lock']}u] = controls[13u];
-  vehicle_feed[{vi['traction_control_enabled']}u] = controls[15u];
-  vehicle_feed[{vi['abs_enabled']}u] = controls[16u];
-  vehicle_feed[{vi['traction_control_authority']}u] = controls[19u];
-  vehicle_feed[{vi['abs_authority']}u] = controls[20u];
-  vehicle_feed[{vi['center_differential_lock']}u] = controls[21u];
-  vehicle_feed[{vi['front_differential_brake']}u] = controls[22u];
-  vehicle_feed[{vi['rear_differential_brake']}u] = controls[23u];
-  vehicle_feed[{vi['total_force_x']}u] = controls[30u];
-  vehicle_feed[{vi['total_force_y']}u] = controls[31u];
-  vehicle_feed[{vi['total_force_z']}u] = controls[32u];
-  vehicle_feed[{vi['total_torque_x']}u] = controls[33u];
-  vehicle_feed[{vi['total_torque_y']}u] = controls[34u];
-  vehicle_feed[{vi['total_torque_z']}u] = controls[35u];
-  vehicle_feed[{vi['drive_direction']}u] = controls[7u];
-  vehicle_feed[{vi['brake_lock_front_left']}u] = controls[8u];
-  vehicle_feed[{vi['brake_lock_front_right']}u] = controls[9u];
-  vehicle_feed[{vi['brake_lock_rear_left']}u] = controls[10u];
-  vehicle_feed[{vi['brake_lock_rear_right']}u] = controls[11u];
-  let front_share = select(clamp(controls[12u], 0.05f, 0.95f), 0.5f, controls[14u] > 0.5f);
+  vehicle_feed[{vi['throttle']}u] = controls[{VEHICLE_CONTROL_INDEX['throttle']}u];
+  vehicle_feed[{vi['brake']}u] = controls[{VEHICLE_CONTROL_INDEX['brake']}u];
+  vehicle_feed[{vi['forward_gear_ratio']}u] = controls[{VEHICLE_CONTROL_INDEX['forward_gear_ratio']}u];
+  vehicle_feed[{vi['reverse_gear_ratio']}u] = controls[{VEHICLE_CONTROL_INDEX['reverse_gear_ratio']}u];
+  vehicle_feed[{vi['transfer_case_ratio']}u] = controls[{VEHICLE_CONTROL_INDEX['transfer_case_ratio']}u];
+  vehicle_feed[{vi['front_differential_lock']}u] = controls[{VEHICLE_CONTROL_INDEX['front_differential_lock']}u];
+  vehicle_feed[{vi['rear_differential_lock']}u] = controls[{VEHICLE_CONTROL_INDEX['rear_differential_lock']}u];
+  vehicle_feed[{vi['traction_control_enabled']}u] = controls[{VEHICLE_CONTROL_INDEX['traction_control_enabled']}u];
+  vehicle_feed[{vi['abs_enabled']}u] = controls[{VEHICLE_CONTROL_INDEX['abs_enabled']}u];
+  vehicle_feed[{vi['traction_control_authority']}u] = controls[{VEHICLE_CONTROL_INDEX['traction_control_authority']}u];
+  vehicle_feed[{vi['abs_authority']}u] = controls[{VEHICLE_CONTROL_INDEX['abs_authority']}u];
+  vehicle_feed[{vi['center_differential_lock']}u] = controls[{VEHICLE_CONTROL_INDEX['center_differential_coupling']}u];
+  vehicle_feed[{vi['front_differential_brake']}u] = controls[{VEHICLE_CONTROL_INDEX['front_differential_brake']}u];
+  vehicle_feed[{vi['rear_differential_brake']}u] = controls[{VEHICLE_CONTROL_INDEX['rear_differential_brake']}u];
+  vehicle_feed[{vi['total_force_x']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_force_x']}u];
+  vehicle_feed[{vi['total_force_y']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_force_y']}u];
+  vehicle_feed[{vi['total_force_z']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_force_z']}u];
+  vehicle_feed[{vi['total_torque_x']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_torque_x']}u];
+  vehicle_feed[{vi['total_torque_y']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_torque_y']}u];
+  vehicle_feed[{vi['total_torque_z']}u] = controls[{VEHICLE_CONTROL_INDEX['outrigger_torque_z']}u];
+  vehicle_feed[{vi['drive_direction']}u] = controls[{VEHICLE_CONTROL_INDEX['drive_direction']}u];
+  vehicle_feed[{vi['brake_lock_front_left']}u] = controls[{VEHICLE_CONTROL_INDEX['brake_lock_front_left']}u];
+  vehicle_feed[{vi['brake_lock_front_right']}u] = controls[{VEHICLE_CONTROL_INDEX['brake_lock_front_right']}u];
+  vehicle_feed[{vi['brake_lock_rear_left']}u] = controls[{VEHICLE_CONTROL_INDEX['brake_lock_rear_left']}u];
+  vehicle_feed[{vi['brake_lock_rear_right']}u] = controls[{VEHICLE_CONTROL_INDEX['brake_lock_rear_right']}u];
+  let front_share = select(clamp(controls[{VEHICLE_CONTROL_INDEX['front_drive_share']}u], 0.05f, 0.95f), 0.5f, controls[{VEHICLE_CONTROL_INDEX['center_transfer_lock']}u] > 0.5f);
   vehicle_feed[{vi['drive_fraction_front_left']}u] = front_share * 0.5f;
   vehicle_feed[{vi['drive_fraction_front_right']}u] = front_share * 0.5f;
   vehicle_feed[{vi['drive_fraction_rear_left']}u] = (1.0f - front_share) * 0.5f;
@@ -5007,20 +5056,11 @@ fn commit_vehicle_graph_state(@builtin(global_invocation_id) gid: vec3<u32>) {{
     return {
         "schema": "abstract-ui-vehicle-gpu-graph-adapters-v0",
         "authority": "compiler-published-packed-abis",
-        "control_abi": ["throttle", "steering", "brake", "forward_gear_ratio",
-                        "reverse_gear_ratio", "transfer_case_ratio", "front_differential_lock",
-                        "drive_direction", "brake_lock_front_left", "brake_lock_front_right",
-                        "brake_lock_rear_left", "brake_lock_rear_right", "front_drive_share",
-                        "rear_differential_lock", "center_transfer_lock",
-                        "traction_control_enabled", "abs_enabled",
-                        "front_knuckle_steer_angle", "rear_knuckle_steer_angle",
-                        "traction_control_authority", "abs_authority",
-                        "center_differential_coupling",
-                        "front_differential_brake", "rear_differential_brake", "body_shell_active",
-                        "front_left_knuckle_angle", "front_right_knuckle_angle",
-                        "rear_left_knuckle_angle", "rear_right_knuckle_angle", "tire_pressure_pa",
-                        "outrigger_force_x", "outrigger_force_y", "outrigger_force_z",
-                        "outrigger_torque_x", "outrigger_torque_y", "outrigger_torque_z"],
+        # The control record, declared once (VEHICLE_CONTROL_RECORD): the
+        # worker fills the resident buffer by these names and the WGSL above
+        # reads it by the same indices.
+        "control_abi": [name for name, _control in VEHICLE_CONTROL_RECORD],
+        "control_record": vehicle_control_record_data(),
         "assembly": {
             "source": assembly, "entrypoint": "assemble_vehicle_graph_inputs",
             "workgroup_size": [1, 1, 1], "dispatch": [1, 1, 1],
@@ -9137,8 +9177,14 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
                         },
                         "chassis_structure": chassis_structure,
                         "torque_graph": torque_graph},
-            "control_mapping": {"move-forward/backward": "throttle", "strafe-left/right": "steering",
-                                "run": "boost", "jump": "handbrake"},
+            # Which semantic action fills which control: a view of the
+            # record (``control_record`` on the program's graph adapters).
+            # ``run`` scales throttle on the page (``boost``) and is not a
+            # slot of its own; it stays declared here until that composition
+            # moves into the law.
+            "control_mapping": {**{control: name for name, control in VEHICLE_CONTROL_RECORD
+                                   if control is not None}, "run": "boost"},
+            "control_record": vehicle_control_record_data(),
             "pose": {"position": [0.0, float(chassis["clearance"]), 0.0],
                      "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
         }],
@@ -9152,7 +9198,8 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
 
 
 __all__ = [
-    "ABSTRACT_UI_VEHICLE_VERSION", "DEFAULT_CAR_CONFIG", "VEHICLE_STATE_OUTPUTS", "WHEEL_NAMES",
+    "ABSTRACT_UI_VEHICLE_VERSION", "VEHICLE_CONTROL_INDEX", "VEHICLE_CONTROL_RECORD",
+    "vehicle_control_record_data", "DEFAULT_CAR_CONFIG", "VEHICLE_STATE_OUTPUTS", "WHEEL_NAMES",
     "CONTACT_PATCH_OUTPUTS", "CONTACT_PATCH_TENSOR_REDUCER_OUTPUTS", "VehicleConfiguration", "compile_symbolic_vehicle_physics",
     "fit_vehicle_chassis_to_power_unit", "fit_vehicle_chassis_to_body_packaging",
     "fit_vehicle_wheelbase_under_body_mass", "solve_vehicle_body_packaging",

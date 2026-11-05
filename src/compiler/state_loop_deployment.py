@@ -360,7 +360,7 @@ function requestParametricVehiclePipelines(body,reason){
   body.gpuKernelVariant="parametric-live";body.gpuStateDirty=true;
   postMessage({type:"vehicle-gpu-recovered",reason:`live parametric refresh · ${reason}`});return true;
 }
-function residentVehicleControlValues(body){
+function residentVehicleControlValues(body,gpu){
   const t=body.config.transmission,state=body.transmission||{},range=state.transferRange==="l2"?Number(t.ultra_low_range_ratio):
     state.transferRange==="l1"?Number(t.low_range_ratio):state.lowRange?Number(t.ultra_low_range_ratio):1,
     ratio=Number(state.engagedRatio||t.forward_ratios[Math.max(0,Number(state.gear||t.starting_gear)-1)]),
@@ -372,26 +372,37 @@ function residentVehicleControlValues(body){
     centerCoupling=state.centerDiffMode?coupling(state.centerDiffMode):(state.centerDiffLock?1:0),
     frontShare=centerCoupling>=.999 ? .5 : Math.max(.05,Math.min(.95,Number(state.frontDriveShare??defaultFront)));
   if(!Number.isFinite(body.driveDirection))body.driveDirection=0;
-  return new Float32Array([throttle,Number(body.appliedSteering??body.controls?.steering??0),
-    Number(body.effectiveBrake??body.controls?.brake??0),ratio/range,Number(t.reverse_ratio),range,frontCoupling,
-    body.driveDirection,Number(locks.front_left||0),Number(locks.front_right||0),
-    Number(locks.rear_left||0),Number(locks.rear_right||0),frontShare,
-    rearCoupling,centerCoupling>=.999?1:0,
-    state.tractionControlEnabled===false?0:1,state.absEnabled===false?0:1,
-    Number(body.frontKnuckleSteerAngle||0),Number(body.rearKnuckleSteerAngle||0),
-    Math.max(0,Math.min(1,Number(state.tractionControlAuthority??1))),
-    Math.max(0,Math.min(1,Number(state.absAuthority??1))),centerCoupling,
-    state.frontDifferentialBrake?1:0,Math.max(state.rearDifferentialBrake?1:0,Number(
-      body.rearDifferentialBrakeCommand||0)),
-    body.bodyShell==="bare-frame"||(body.config.mechanical_graph?.edges||[]).filter(edge=>edge.identity.startsWith(
+  // The control record, BY NAME: the compiler publishes the slot order
+  // (control_abi, from VEHICLE_CONTROL_RECORD) and the WGSL reads the same
+  // indices, so the worker never keeps a positional array of its own.  A
+  // name the worker does not supply is a loud refusal, never a silent zero.
+  const wrench=[...(body.outriggerWrench?.force||[0,0,0]),...(body.outriggerWrench?.torque||[0,0,0])].map(Number);
+  const values={throttle:throttle,steering:Number(body.appliedSteering??body.controls?.steering??0),
+    brake:Number(body.effectiveBrake??body.controls?.brake??0),forward_gear_ratio:ratio/range,
+    reverse_gear_ratio:Number(t.reverse_ratio),transfer_case_ratio:range,front_differential_lock:frontCoupling,
+    drive_direction:body.driveDirection,brake_lock_front_left:Number(locks.front_left||0),
+    brake_lock_front_right:Number(locks.front_right||0),brake_lock_rear_left:Number(locks.rear_left||0),
+    brake_lock_rear_right:Number(locks.rear_right||0),front_drive_share:frontShare,
+    rear_differential_lock:rearCoupling,center_transfer_lock:centerCoupling>=.999?1:0,
+    traction_control_enabled:state.tractionControlEnabled===false?0:1,abs_enabled:state.absEnabled===false?0:1,
+    front_knuckle_steer_angle:Number(body.frontKnuckleSteerAngle||0),rear_knuckle_steer_angle:Number(body.rearKnuckleSteerAngle||0),
+    traction_control_authority:Math.max(0,Math.min(1,Number(state.tractionControlAuthority??1))),
+    abs_authority:Math.max(0,Math.min(1,Number(state.absAuthority??1))),center_differential_coupling:centerCoupling,
+    front_differential_brake:state.frontDifferentialBrake?1:0,
+    rear_differential_brake:Math.max(state.rearDifferentialBrake?1:0,Number(body.rearDifferentialBrakeCommand||0)),
+    body_shell_active:body.bodyShell==="bare-frame"||(body.config.mechanical_graph?.edges||[]).filter(edge=>edge.identity.startsWith(
       body.bodyShell==="six-body-pin-carrier"?"armor.mount.":"body_shell.mount."))
       .every(edge=>ensureVehicleDamage(body).members[edge.identity]?.failed)?0:1,
-    Number(body.wheelSteerAngles?.front_left??body.frontKnuckleSteerAngle??0),
-    Number(body.wheelSteerAngles?.front_right??body.frontKnuckleSteerAngle??0),
-    Number(body.wheelSteerAngles?.rear_left??body.rearKnuckleSteerAngle??0),
-    Number(body.wheelSteerAngles?.rear_right??body.rearKnuckleSteerAngle??0),
-    Number(ensureVehicleEnergy(body).tirePressurePa||body.config.tires?.pressure_pa||155000),
-    ...[...(body.outriggerWrench?.force||[0,0,0]),...(body.outriggerWrench?.torque||[0,0,0])].map(Number)]);
+    front_left_knuckle_angle:Number(body.wheelSteerAngles?.front_left??body.frontKnuckleSteerAngle??0),
+    front_right_knuckle_angle:Number(body.wheelSteerAngles?.front_right??body.frontKnuckleSteerAngle??0),
+    rear_left_knuckle_angle:Number(body.wheelSteerAngles?.rear_left??body.rearKnuckleSteerAngle??0),
+    rear_right_knuckle_angle:Number(body.wheelSteerAngles?.rear_right??body.rearKnuckleSteerAngle??0),
+    tire_pressure_pa:Number(ensureVehicleEnergy(body).tirePressurePa||body.config.tires?.pressure_pa||155000),
+    outrigger_force_x:wrench[0],outrigger_force_y:wrench[1],outrigger_force_z:wrench[2],
+    outrigger_torque_x:wrench[3],outrigger_torque_y:wrench[4],outrigger_torque_z:wrench[5]};
+  const abi=gpu.adapters.control_abi;
+  return Float32Array.from(abi,name=>{if(!(name in values))throw new Error(`vehicle control record has no value for ${name}`);
+    const value=Number(values[name]);return Number.isFinite(value)?value:0;});
 }
 function initializeResidentVehicleState(gpu,body){
   if(!gpu?.residentGraph)return false;const inputs=gpu.integration.inputs,values=new Float32Array(inputs.length),
@@ -408,7 +419,7 @@ function initializeResidentVehicleState(gpu,body){
       body.tireDeformation?.[name]?.[axis]||0);state[`tire_deformation_velocity_${axis}_${name}`]=Number(
       body.tireDeformation?.[name]?.[`${axis}Velocity`]||0);}});
   inputs.forEach((name,index)=>values[index]=Number(state[name]||0));gpu.device.queue.writeBuffer(gpu.vehicleFeed,0,values);
-  gpu.device.queue.writeBuffer(gpu.controls,0,residentVehicleControlValues(body));body.gpuResidentInitialized=true;
+  gpu.device.queue.writeBuffer(gpu.controls,0,residentVehicleControlValues(body,gpu));body.gpuResidentInitialized=true;
   body.gpuEpoch=Number(body.gpuEpoch||0);body.gpuAppliedSnapshotSerial=Number(body.gpuAppliedSnapshotSerial||0);
   body.gpuStateDirty=false;body.gpuControlsDirty=false;return true;
 }
@@ -487,7 +498,7 @@ function applyResidentVehicleSnapshot(gpu,body,values){
 function residentVehicleStep(body,dt){
   const gpu=vehicleGpu;if(!gpu?.residentGraph||!gpu.terrainReady)throw new Error("resident vehicle GPU graph is not initialized");
   if(!body.gpuResidentInitialized||body.gpuStateDirty)initializeResidentVehicleState(gpu,body);
-  if(body.gpuControlsDirty){gpu.device.queue.writeBuffer(gpu.controls,0,residentVehicleControlValues(body));body.gpuControlsDirty=false;}
+  if(body.gpuControlsDirty){gpu.device.queue.writeBuffer(gpu.controls,0,residentVehicleControlValues(body,gpu));body.gpuControlsDirty=false;}
   if(gpu.dispatchActive)throw new Error("vehicle graph scheduler attempted a concurrent GPU dispatch");gpu.dispatchActive=true;
   try{const encoder=gpu.device.createCommandEncoder(),run=(pipeline,bindGroup,dispatch)=>{const pass=encoder.beginComputePass();
       pass.setPipeline(pipeline);pass.setBindGroup(0,bindGroup);pass.dispatchWorkgroups(...dispatch);pass.end();};

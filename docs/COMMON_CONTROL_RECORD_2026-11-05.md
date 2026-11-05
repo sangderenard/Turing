@@ -278,3 +278,42 @@ the same declaration the row is derived from, keyed by (parameter, field).
 Not done: the car game's `control_abi` migration (its 36 controls onto the
 record, replacing the positional `controls[]` array), and the end-to-end
 page round for Meowdoku, which waits on the compiler items.
+
+## 7. Step 2 status (2026-11-05, night): the car game's controls are the record
+
+- `abstract_ui_vehicles.VEHICLE_CONTROL_RECORD`: the 36 control slots,
+  declared once, each `(name, control)`: `throttle: move-forward/backward`,
+  `steering: strafe-left/right`, `brake: jump`; the other 33 are
+  worker-derived state (transmission, locks, knuckle angles, body shell,
+  tire pressure, outrigger wrench) and say so (`source: worker-state`).
+  `VEHICLE_CONTROL_INDEX` is its slot order; `vehicle_control_record_data()`
+  publishes it as rows on the program's graph adapters (`control_record`)
+  and the vehicle model; `control_abi` is now the record's names and
+  `control_mapping` a view of its semantic actions (plus the page's `run:
+  boost` scaling, which stays declared until that composition moves into
+  the law).
+- Every WGSL read of the resident `controls` buffer is derived from the
+  record: the assembly adapter's 25 feeds and the front-share/center-lock
+  select by `VEHICLE_CONTROL_INDEX[...]`, the terrain kernel's body-shell
+  gate and lane-indexed knuckle angles by two new placeholders filled from
+  the record. No hand-written `controls[Nu]` remains; the module asserts the
+  four knuckle angles are one contiguous run.
+- The worker (`state_loop_deployment.emit_javascript_physics_worker`)
+  builds the buffer BY NAME and in the published `control_abi` order
+  (`residentVehicleControlValues(body, gpu)`), refusing a name it has no
+  value for instead of keeping its own positional array.
+- Proof of no behaviour change: the record-derived indices equal HEAD's
+  literal indices for all 25 assembly feeds and the two select reads
+  (checked against `git show HEAD:`); the rendered worker passes `node
+  --check`; `tests/test_vehicle_control_record.py`: 4 passed.
+- Not run: `test_gpu_terrain_contact_...` renders the full WebGPU program
+  model and stops in `compile_sympy_equations` on current main (the
+  2026-11-03 `post_derived_node_identity` regression, see the Meowdoku
+  handoff), before any of this is reached.
+
+Remaining for the car game: the page's `vehicle-control` message still
+carries only the three shell controls by name (correct, since the rest are
+worker state), and the page still composes `throttle = forward * (running ?
+1.18 : 1)` itself. Binding the three through `TuringControlSampler` and
+moving the boost composition into the law are the next two edits, each with
+its own parity check.
