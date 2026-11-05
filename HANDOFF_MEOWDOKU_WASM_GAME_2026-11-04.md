@@ -326,3 +326,43 @@ so its parity target stays exact.
   resource topology above. The game page (`examples/meowdoku` board on top
   of `emit_core_single_file_page`) is the remaining game-lane step once the
   Meowdoku module emits.
+
+## Finding 5: the board shader, compiled from one authored law to webgl and glsl (2026-11-05)
+
+- `examples/meowdoku/shader.py`: `meowdoku_pixels(u, v, cat, x_mark,
+  region, hearts, n)`, an elementwise AbstractTensor law over the pixel's
+  normalized position and the board sampled there (regions coloured by id,
+  grid lines, an orange cat glyph, an X mark, dimmed when hearts are gone).
+  Masks are comparisons used as numbers with `minimum(1.0)` after sums, the
+  `dom_shader_demo` idiom, so the numpy evaluation and the shader agree.
+  `compile_shader()` captures it with the AOT front end
+  (`tests/wasm_captured_programs.captured_program`) and emits BOTH targets
+  from the one program: `emit_webgl_fragment_module(..., output_layout=
+  "rgba", input_sampling="normalized")` (140 lines of GLSL ES 3.00, seven
+  R32F sampler feeds) and `machine_targets.emit(program, "glsl")` (153
+  lines of compute GLSL). Feeds are mapped to sampler uniforms by the
+  capture's recorded source bindings (`feed_names`), never by position:
+  `program_feed_order` is first use, and `n` is used before `v`.
+- The Python version: `render_reference(feeds)` runs the same law on the
+  numpy backend with the board sampled NEAREST at pixel centres, which is
+  exactly what `texture()` does with a 5x5 R32F texture over the canvas.
+  `session_feeds(session, w, h)` takes the state straight from the Python
+  game (`MeowdokuSession`).
+- `examples/meowdoku/page.py`: one html file binding the module as the
+  compiler's own page runtime does (R32F, NEAREST, CLAMP_TO_EDGE, the
+  module's `feed_bindings` and vertex shader, `turing_resolution`), drawing
+  once and publishing the canvas readback as JSON.
+- `tests/test_meowdoku_shader.py`, 4 passed: both targets complete from the
+  one program; the Python version draws the cat, the region tone, the grid
+  line and the X at the expected pixels and dims without hearts; session
+  feeds come from the game; headless Chrome (swiftshader) draws the
+  compiled fragment shader over a real session and matches the Python
+  version (mean |diff| < 0.01 at 8 bits; < 2 % of pixels differ by more
+  than 0.02, all on feature edges).
+- Seen in the browser: `build/meowdoku/board.html` (two correct cats and an
+  X placed through the Python session) renders identically to
+  `build/meowdoku/board_python.png`, the Python version's image.
+- Not claimed: no GL context on this machine, so the compute (`glsl`)
+  artifact is emitted and inspected, not executed; the page is a renderer
+  of Python-side state, not yet the game loop (that waits on the wasm core
+  items in Findings 3 and 4).
