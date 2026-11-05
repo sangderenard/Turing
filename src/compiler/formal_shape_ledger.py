@@ -8,6 +8,28 @@ from typing import Any
 _FORMAL_LITERAL_CONFLICT = object()
 
 
+def _formal_shape_new_sources(book: Any, row: tuple, previous: Any,
+                              cells: tuple) -> bool:
+    """Whether an unresolved formal has not yet cited these callsite cells."""
+
+    from .concordance_declarations import FORMAL_SHAPE
+
+    previously_read = set()
+    pending = [previous]
+    visited = set()
+    while pending:
+        revision = pending.pop()
+        if revision.key in visited:
+            continue
+        visited.add(revision.key)
+        for source, _stage in book.edges_into(revision):
+            if source.page == FORMAL_SHAPE and source.row == row:
+                pending.append(source)
+            else:
+                previously_read.add(source.key)
+    return bool(cells) and any(cell.key not in previously_read for cell in cells)
+
+
 def _publish_formal_literal(
     function: str, parameter: str, value: Any, caller: str, cells: tuple = (),
 ) -> None:
@@ -152,20 +174,7 @@ def _publish_formal_shape(
         # before the latest revision remains known; looking only at the
         # latest cell's direct edges forgets the first callers and makes a
         # settled polymorphic row report a mutation forever.
-        previously_read = set()
-        pending = [previous]
-        visited = set()
-        while pending:
-            revision = pending.pop()
-            if revision.key in visited:
-                continue
-            visited.add(revision.key)
-            for source, _stage in book.edges_into(revision):
-                if source.page == FORMAL_SHAPE and source.row == row:
-                    pending.append(source)
-                else:
-                    previously_read.add(source.key)
-        if not cells or all(cell.key in previously_read for cell in cells):
+        if not _formal_shape_new_sources(book, row, previous, cells):
             return False
         book.post(
             FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),
@@ -185,6 +194,46 @@ def _publish_formal_shape(
         )
         return True
     return False
+
+
+def _publish_formal_runtime_shape(
+    function: str, parameter: str, descriptor: Any, caller: str,
+    cells: tuple = (),
+) -> bool:
+    """Record an exact positive-rank callsite whose extents are runtime data.
+
+    Such an argument disproves a universal static formal shape even when it
+    follows a static caller.  Its empty display shape is never a scalar shape.
+    """
+
+    from .concordance_declarations import (
+        FORMAL_SHAPE, FORMAL_SHAPE_CONFLICT, PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, authored_function_name,
+        current_identity_book,
+    )
+
+    if (tuple(descriptor.get("shape") or ())
+            or int(descriptor.get("rank") or 0) <= 0
+            or str(descriptor.get("metadata_state") or "") != "dynamic"):
+        raise ValueError("formal runtime shape requires an exact dynamic span")
+    book = current_identity_book()
+    row = (authored_function_name(function), str(parameter))
+    previous = book.latest_ref(FORMAL_SHAPE, row)
+    if previous is not None and isinstance(
+        book.pages[FORMAL_SHAPE.name].latest(row), Unresolved,
+    ) and not _formal_shape_new_sources(book, row, previous, tuple(cells)):
+        return False
+    read = tuple(dict.fromkeys((
+        *((previous,) if previous is not None else ()), *tuple(cells),
+    )))
+    book.post(
+        FORMAL_SHAPE, row, Unresolved(FORMAL_SHAPE_CONFLICT, read=read),
+        stage=PLANNER_TENSOR_SPECIALIZATION, provenance=Derived(read),
+        mode=Mode.REVISE,
+    )
+    return True
 
 
 def _proven_formal_shape(graph: Any, name: Any) -> Any:

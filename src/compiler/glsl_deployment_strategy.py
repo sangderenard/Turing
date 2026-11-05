@@ -218,6 +218,7 @@ from .formal_shape_ledger import (
     _publish_formal_literal as _publish_formal_literal,
     _publish_formal_dynamic as _publish_formal_dynamic,
     _publish_formal_shape as _publish_formal_shape,
+    _publish_formal_runtime_shape as _publish_formal_runtime_shape,
     _proven_formal_shape as _proven_formal_shape,
     _proven_formal_literal as _proven_formal_literal,
 )
@@ -25346,20 +25347,74 @@ def _propagate_callsite_tensor_specializations(
                         # read the shared ('unbroadcast', 1) row and the
                         # (2, 3) reshape answered (), which spun the
                         # return-member fixed point forever.
+                        runtime_span = bool(
+                            tuple(descriptor.get("shape") or ()) == ()
+                            and int(descriptor.get("rank") or 0) > 0
+                            and str(descriptor.get("metadata_state") or "")
+                            == "dynamic"
+                        )
                         if publish_to_function_table and (
-                            descriptor_states_a_shape(descriptor)
+                            descriptor_states_a_shape(descriptor) or runtime_span
                         ):
                             # DERIVED(the caller argument's identity cell),
                             # as the planner-specialization publication is.
-                            formal_shape_changed = _publish_formal_shape(
-                                str(callee.G.graph.get("function_name")),
-                                str(parameter),
-                                descriptor,
-                                str(caller.G.graph.get("function_name")),
-                                _argument_identity_cells(
-                                    caller, int(parent),
-                                )[:1],
+                            argument_cells = _argument_identity_cells(
+                                caller, int(parent),
                             )
+                            if runtime_span:
+                                from .identity_concordance import (
+                                    SHAPE_STATE_PAGE,
+                                    descriptor_from_shape_transformation_state,
+                                    shape_scope_of,
+                                )
+
+                                source_value = int(caller.G.nodes[int(parent)].get(
+                                    "value_id", parent,
+                                ))
+                                source_state = current_identity_book().latest_ref(
+                                    SHAPE_STATE_PAGE,
+                                    (shape_scope_of(caller), source_value),
+                                )
+                                if source_state is None:
+                                    raise ValueError(
+                                        "runtime formal shape lacks caller shape state"
+                                    )
+                                source_fact = current_identity_book().page(
+                                    SHAPE_STATE_PAGE,
+                                ).cell(source_state.row, source_state.column)
+                                posted_source = (
+                                    descriptor_from_shape_transformation_state(
+                                        source_fact[1]
+                                    ) if isinstance(source_fact, tuple)
+                                    and source_fact[0] == "resolved" else None
+                                )
+                                if not isinstance(posted_source, Mapping) or any(
+                                    posted_source.get(field) != descriptor.get(field)
+                                    for field in (
+                                        "shape", "dtype", "rank", "metadata_state",
+                                    )
+                                ):
+                                    raise ValueError(
+                                        "runtime formal shape conflicts with caller shape state"
+                                    )
+                                # _require_tensor(frequencies) first proves a
+                                # (256,) formal. Its later `symbols` callsite
+                                # is a rank-one span with runtime extents;
+                                # that exact caller state withdraws the
+                                # universal static proof before return shaping.
+                                formal_shape_changed = _publish_formal_runtime_shape(
+                                    str(callee.G.graph.get("function_name")),
+                                    str(parameter), descriptor,
+                                    str(caller.G.graph.get("function_name")),
+                                    (*argument_cells, source_state),
+                                )
+                            else:
+                                formal_shape_changed = _publish_formal_shape(
+                                    str(callee.G.graph.get("function_name")),
+                                    str(parameter), descriptor,
+                                    str(caller.G.graph.get("function_name")),
+                                    argument_cells[:1],
+                                )
                             changed |= formal_shape_changed
                             mutation_counts["formal_shapes"] += int(
                                 formal_shape_changed
