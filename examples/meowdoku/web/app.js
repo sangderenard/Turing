@@ -829,10 +829,10 @@ function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"]]) {
-      // An axis the game's motion law does not declare (a platformer's
-      // fall) is carried at its last velocity, never frozen until the next
-      // reply; the server's next word is eased in like any correction.
-      if (!motion[axis]) { ship[pos] += (ship[vel] || 0) * dt; continue; }
+      // Only the engine's own motion law moves the ship here (the same
+      // damped_axis, compiled to wasm).  An axis that law does not declare is
+      // the server's alone: the page never guesses it with physics of its own.
+      if (!motion[axis]) continue;
       const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
         lo: motion[axis][0], hi: motion[axis][1], speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
       ship[pos] = r.x_next; ship[vel] = r.v_next;
@@ -1046,6 +1046,12 @@ function sendTick(game) {
     pred.closed = [];
     if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
     payload.inputs = pred.sent.map((interval) => ({ seq: interval.seq, dur: interval.dur, ...interval.controls }));
+    // CLIENT UPDATES SERVER: the open interval was just cut at zero length, so
+    // the predicted ship stands exactly at the end of interval pred.seq --
+    // where the engine's motion law (motion.wasm) put it.  The server adopts
+    // it for our lane once it has landed that interval, within its bound.
+    if (pred.ship && pred.sent.length)
+      payload.ship = { seq: pred.seq, x: pred.ship.x, y: pred.ship.y, vx: pred.ship.vx, vy: pred.ship.vy };
   }
   if (sock.open) {
     sock.outstanding++;

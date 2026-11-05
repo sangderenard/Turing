@@ -58,6 +58,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import math
 import numpy as np
 
 from meowdoku.games import Game
@@ -376,9 +377,45 @@ class EntityGame(Game):
         return self.MOTION
 
     # verbs -------------------------------------------------------------------
+    #: How far (units) the page's own ship may sit from the server's replay of
+    #: the same inputs and still be adopted.  Beyond it the server keeps its
+    #: own state: that is the keyframe the page eases to, so a disagreement
+    #: is bounded, never interminable.
+    ADOPT_BOUND = 1.0
+
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
         self.intervals = [dict(item) for item in payload.get("inputs") or ()]
+        self.reported = dict(payload["ship"]) if isinstance(payload.get("ship"), dict) else None
+
+    def adopt_reported(self) -> None:
+        """CLIENT UPDATES SERVER.  The page steps its own ship with the same
+        motion law over the same input intervals and reports where that left
+        it (``ship``: seq, x, y, vx, vy at the end of interval ``seq``).  Once
+        the server has landed that interval, it adopts the page's ship for
+        the player's lane on every axis the motion law declares -- the
+        server's replay differs only by drift -- unless the two are more than
+        ADOPT_BOUND apart (then the server's own state stands as the keyframe).
+        Written in place into the dt system's state columns, as ``control``
+        writes the control columns."""
+        ship, self.reported = getattr(self, "reported", None), None
+        motion, k = self.motion(), self.PLAYER_LANE
+        if not ship or not motion or k is None or self.session.state is None or self.ack is None:
+            return
+        if int(ship.get("seq", -1)) != self.ack or self.session.column("alive")[k] <= 0.0:
+            return
+        axes = [(pos, vel) for axis, pos, vel in (("x", "x", "vx"), ("y", "y", "vy")) if motion.get(axis)]
+        try:
+            values = {name: float(ship[name]) for pos, vel in axes for name in (pos, vel)}
+        except (KeyError, TypeError, ValueError):
+            return
+        if not all(np.isfinite(list(values.values()))):
+            return
+        error = math.hypot(*(values[pos] - float(self.session.column(pos)[k]) for pos, _ in axes))
+        self.adopted = error <= self.ADOPT_BOUND
+        if self.adopted:
+            for name, value in values.items():
+                getattr(self.session.state, name)[k] = value
 
     def tick(self) -> None:
         if self.intervals and self.session.state is not None:
@@ -390,6 +427,7 @@ class EntityGame(Game):
                 self.session.control(self.held)
                 self.session.advance(min(self.max_frame, max(0.0, float(interval.get("dur", 0.0)))))
                 self.ack = int(interval["seq"])
+            self.adopt_reported()
             self.intervals = []
             self.last_tick = time.perf_counter()
             self.ticks += 1
