@@ -16232,7 +16232,29 @@ def lower_tensor_calls_to_repository_ssa(
                                             # extent metadata -- never a silent
                                             # mismatched elementwise call.
                                             operand_extents = ensure_dynamic(prefix, operand)
-                                            result_extents = ensure_dynamic(prefix, result)
+                                            # The result is defined by the call
+                                            # being lowered, so ``extent(result)``
+                                            # here would read it before it
+                                            # exists (refused: use-not-
+                                            # dominated).  An elementwise result
+                                            # has its operands' broadcast shape:
+                                            # when another operand already has
+                                            # the result's exact static shape,
+                                            # its extents ARE the result's, and
+                                            # they are defined before this call.
+                                            result_extents = dynamic_extents.get(int(result.id))
+                                            if result_extents is None and not shape_unknown(result):
+                                                peer = next((
+                                                    candidate for candidate in data_args
+                                                    if candidate is not operand
+                                                    and not shape_unknown(candidate)
+                                                    and tuple(candidate.shape or ()) == tuple(result.shape or ())
+                                                ), None)
+                                                if peer is not None:
+                                                    result_extents = ensure_dynamic(prefix, peer)
+                                                    dynamic_extents[int(result.id)] = result_extents
+                                            if result_extents is None:
+                                                result_extents = ensure_dynamic(prefix, result)
                                             # A conformance buffer has the
                                             # result's proven span/rank and the
                                             # selected repository kernel's

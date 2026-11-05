@@ -41,3 +41,29 @@ def test_bool_span_into_converting_helper_lowers():
         progress_bars=False,
     )
     assert exports and exports[0] in module.functions
+
+
+SCALAR_SOURCE = '''
+def helper(m):
+    return m.to_dtype("float64")
+
+def law(x, dt):
+    n = helper(x > 0.5).sum()
+    return x * n, x * 0.0 + 1.0
+'''
+
+
+def test_helper_result_reduced_to_a_scalar_broadcasts_after_its_peer():
+    """``x * helper(mask).sum()``: the scalar arrives dynamic through the
+    call, so the multiply conforms it at run time.  The result's extents are
+    its same-shape peer's (``x``), defined before the call -- not
+    ``extent(result)`` ahead of the result's own definition."""
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        SCALAR_SOURCE, "law", python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        name="helper_scalar_peer", runtime_closure_only=True,
+        extraction_contract=batch_contract("law", ("x", "dt"), 4),
+        root_calls=[{"x": TensorClass("float64"), "dt": TensorClass("float64")}],
+        progress_bars=False,
+    )
+    assert exports and exports[0] in module.functions
