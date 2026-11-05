@@ -46,6 +46,14 @@ LIGHTS = (
 
 OUT_DIR = ROOT / "build" / "meowdoku" / "tiles" / "phong"
 
+#: Fraction of the frame each role's longer side fills (default: the atlas
+#: capture's 80 of 128).
+ROLE_FILL: dict[str, float] = {"cat": 0.98}
+
+#: The Phong program's exposure; its default 0.28 leaves saturated albedos
+#: washed toward tan under three lights.
+EXPOSURE = 0.42
+
 
 def _spectral():
     if str(SPECTRAL_ROOT) not in sys.path:
@@ -96,7 +104,7 @@ def _ortho(half_w: float, half_h: float, near: float, far: float) -> np.ndarray:
 
 def render_phong_sprites(roles: tuple[str, ...] = ("cat", "x_mark", "heart"), *, size: int = 128,
                          content: float = 80.0 / 128.0, out_dir: str | Path = OUT_DIR,
-                         exposure: float | None = None, tilt: tuple[float, float] = (-16.0, 14.0)) -> dict[str, TileSprite]:
+                         exposure: float | None = EXPOSURE, tilt: tuple[float, float] = (-16.0, 14.0)) -> dict[str, TileSprite]:
     """Draw every role's glyph mesh through the Phong program into a hidden
     GL window of ``size`` x ``size`` and read it back as a sprite.  The
     glyph's longer side fills ``content`` of the frame (the atlas capture
@@ -136,7 +144,10 @@ def render_phong_sprites(roles: tuple[str, ...] = ("cat", "x_mark", "heart"), *,
         verts, normals = glyph_mesh(role)
         count = verts.shape[0] * 3
         extent = float(np.abs(verts[..., :2]).max()) or 1.0
-        half = extent / content                                   # longer side fills `content`
+        # The cat emoji is thin outline strokes; it fills its whole frame
+        # so it survives being shrunk to a phone-sized cell.
+        fill = ROLE_FILL.get(role, content)
+        half = extent / fill                                      # longer side fills `fill` of the frame
         depth_extent = float(np.abs(verts[..., 2]).max()) + 1e-3
         # A slight tilt (about x then y) so the caps and the extruded sides
         # both face the light: the head-on view reads as a flat cut-out.
