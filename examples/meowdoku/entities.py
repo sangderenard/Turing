@@ -248,6 +248,8 @@ class EntityGame(Game):
         if self.intervals and self.session.state is not None:
             # Input-timed: each interval is a round with its own controls.
             for interval in self.intervals:
+                if self.ack is not None and int(interval["seq"]) <= self.ack:
+                    continue          # resent and already landed
                 self.held = {name: float(interval[name]) for name in self.CONTROLS if name in interval}
                 self.session.control(self.held)
                 self.session.advance(min(self.max_frame, max(0.0, float(interval.get("dur", 0.0)))))
@@ -285,6 +287,7 @@ class EntityGame(Game):
         st["clock"] = {"tick_s": seconds, "law_calls": calls, "dt": float(self.session.dt)}
         st["status"] = self.describe()
         st["moves"] = self.ticks
+        st["over"] = self.session.state is not None and self.result() is not None
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, **(self.motion() or {})}

@@ -185,6 +185,13 @@ def make_handler(sessions: Sessions):
     web_dir = sessions.web_dir
 
     class Handler(SimpleHTTPRequestHandler):
+        # Keep-alive: a real-time page ticks ~30 times a second, and a new TCP
+        # connection per tick (HTTP/1.0) piles closed sockets up until Windows
+        # refuses (ERR_NO_BUFFER_SPACE).  Every response carries a
+        # Content-Length (_json, the static files, send_error), which is what
+        # HTTP/1.1 persistence needs.
+        protocol_version = "HTTP/1.1"
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 

@@ -300,7 +300,7 @@ function litMesh(faces) {
   const mb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, mb); gl.bufferData(gl.ARRAY_BUFFER, new Int32Array(mat), gl.STATIC_DRAW);
   gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.INT, 0, 0);
   gl.bindVertexArray(null);
-  return { vao, count: pos.length / 3 };
+  return { vao, count: pos.length / 3, buffers: [pb, nb, mb] };
 }
 function box(x0, y0, z0, x1, y1, z1, m) {   // outward faces
   const p = (x, y, z) => [x, y, z];
@@ -364,6 +364,7 @@ function uploadMaterials(game) {
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
+  state.materialsVersion = (state.materialsVersion || 0) + 1;
   storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
 }
 
@@ -387,7 +388,20 @@ function rackLayout(game) {
   const size = game.cols / game.rack.cols;                        // the rack spans the board's width
   return { size, origin: [0, game.rows + 1.0], rows: game.rack.rows, cols: game.rack.cols };
 }
+function disposeMesh(mesh) {
+  if (!mesh) return;
+  for (const buffer of mesh.buffers || []) gl.deleteBuffer(buffer);
+  gl.deleteVertexArray(mesh.vao);
+}
 function rebuildBoards(game) {
+  // Only when the board itself changed: a real-time game replies ~16-30 times
+  // a second with the same board, and every rebuild used to allocate (and
+  // never free) a new set of GPU buffers.
+  const key = JSON.stringify([state.materialsVersion, game.board, game.width, game.height, game.rows, game.cols,
+                              game.cells, game.hints, game.selected, game.hearts != null, game.rack && game.rack.cells]);
+  if (key === state.boardKey) return;
+  state.boardKey = key;
+  disposeMesh(state.buttons); disposeMesh(state.rackButtons); disposeMesh(state.glass);
   const hintOf = (r, c, name) => {
     const i = r * game.cols + c;
     if (game.selected === i) return `${name}@sel`;
@@ -401,9 +415,10 @@ function rebuildBoards(game) {
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.size : game.rows + (game.hearts != null ? 1.5 : 0);
-  state.extent = { width: game.cols, depth };
+  const width = game.board === "free" ? game.width : game.cols;
+  state.extent = { width, depth: game.board === "free" ? game.height : depth };
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
-  state.glass = litMesh(box(-m, -t, -m, game.cols + m, 0.0, depth + m, gm));
+  state.glass = litMesh(box(-m, -t, -m, width + m, 0.0, state.extent.depth + m, gm));
 }
 
 // ---------------------------------------------------------------- camera and light
@@ -503,17 +518,47 @@ function predictFrame(now) {
   const decay = Math.exp(-frame / 0.06);
   pred.offset = [pred.offset[0] * decay, pred.offset[1] * decay];
 }
+// Ticks leave on a steady clock, up to three in flight, outside the action
+// queue -- so the update rate is the clock's, not one round trip's.  Each
+// resends every interval not yet acknowledged; the server skips any it has
+// landed, so a reordered or lost request costs nothing.  A reply older than
+// the newest one applied is dropped.
+const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
-  if (!predicting(game)) return act({ type: "tick", ...controls() });
-  // Close the open interval and send everything closed since the last tick.
-  if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
-  const batch = pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq }));
-  pred.closed = [];
-  pred.sent.push(...batch);
-  if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
-  return act({ type: "tick", ...controls(),
-               inputs: batch.map((interval) => ({ seq: interval.seq, dur: interval.dur, ...interval.controls })) });
+  let payload = { type: "tick", ...controls() };
+  if (predicting(game)) {
+    if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
+    const at = state.time;
+    pred.sent.push(...pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq, closedAt: at })));
+    pred.closed = [];
+    if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
+    payload.inputs = pred.sent.map((interval) => ({ seq: interval.seq, dur: interval.dur, ...interval.controls }));
+  }
+  const id = ++ticks.sent;
+  ticks.inFlight++;
+  return fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+    .then((response) => response.json())
+    .then((data) => {
+      // A restarted server has forgotten this page's session: start the same
+      // game again rather than ticking into refusals.
+      if (data.error && /no game/.test(data.error) && !ticks.restarting) {
+        ticks.restarting = true;
+        newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) })
+          .finally(() => { ticks.restarting = false; });
+        return;
+      }
+      if (data.error || id < ticks.applied || !state.game || data.game !== state.game.game) return;
+      ticks.applied = id;
+      applyState(data);
+    })
+    .catch((error) => console.warn(error))
+    .finally(() => { ticks.inFlight--; });
 }
+setInterval(() => {
+  const game = state.game;
+  if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight >= 3) return;
+  sendTick(game);
+}, 30);
 
 function entityModel(piece, now) {
   // Free-board entities: drawn where the server last put them, carried on by
@@ -523,7 +568,10 @@ function entityModel(piece, now) {
   // most about one tick; the drawn position eases toward it (a ~45 ms time
   // constant) instead of jumping, so reply-to-reply latency differences and
   // a released key never show as a snap.
-  const mesh = state.meshes[piece.mesh], lead = Math.min(now - piece.tRecv, 0.05);
+  // Carried forward from the moment the server's state stands for, for as
+  // long as it takes the next reply to come (constant-velocity motion is
+  // exact; anything else is corrected as it arrives) -- never frozen.
+  const mesh = state.meshes[piece.mesh], lead = Math.min(Math.max(0, now - piece.tRecv), 0.3);
   if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
     // The player's own ship: the prediction, not the server's last word.
     piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
@@ -587,6 +635,7 @@ function applyState(game) {
   document.body.dataset.game = game.game;
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
+    pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1;
   }
   rebuildBoards(game);
   const seen = new Set();
@@ -604,11 +653,19 @@ function applyState(game) {
     }
   };
   for (const p of game.pieces) place(p, false);
+  // The world time this state stands for, on the page's clock: with
+  // input-timed rounds, the moment the last landed interval closed.
+  let stamp = now;
+  if (predicting(game) && game.ack != null) {
+    const landed = pred.sent.find((interval) => interval.seq === game.ack);
+    stamp = landed ? landed.closedAt : (state.lastStamp ?? now);
+  }
+  state.lastStamp = stamp = Math.min(stamp, now);
   for (const e of game.entities || []) {
     seen.add(e.id);
     const live = state.pieces.get(e.id);
-    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
-    else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color,
+    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
+    else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: stamp, mesh: e.mesh, color: e.color,
                                   size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
@@ -638,7 +695,6 @@ function applyState(game) {
   // Real time: the next tick leaves as soon as this one is in (a short breath
   // for the UI thread), carrying the held controls; the server lands the
   // wall time between ticks.
-  if (game.input === "realtime" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) sendTick(game); }, 15);
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
