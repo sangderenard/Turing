@@ -193,6 +193,14 @@ def make_handler(sessions: Sessions):
         # HTTP/1.1 persistence needs.
         protocol_version = "HTTP/1.1"
 
+        def handle(self):
+            # A kept-alive connection the browser drops (a closed tab, a phone
+            # going to sleep) is the normal end of a connection, not an error.
+            try:
+                super().handle()
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(web_dir), **kwargs)
 

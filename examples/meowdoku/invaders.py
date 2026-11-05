@@ -17,7 +17,8 @@ Lanes:
 
 Columns (one value per lane; game-wide values are broadcast to every lane):
     lane, slot, home_x, home_y, points, rx, ry, home_hp      static
-    alive, x, y, vx, vy, hp, boom, born                       entity state
+    alive, x, y, vx, vy, hp, boom, born, owner                entity state (owner:
+                                                              the lane that fired it)
     score, lives, wave, fleet_dir, clock, ufo_clock           game state
     field_w                                                   the field's width
     move_axis, steer_x, fire                                  the CONTROLS
@@ -54,6 +55,12 @@ INVADERS = float(FLEET_ROWS * FLEET_COLS)
 LIVES = 3.0
 PLAYER_Y = HEIGHT - 0.9
 PLAYER_SPEED = 9.0
+#: The rocket as drawn: its half size, its body box (the hitbox) and the
+#: muzzle (where a shot leaves, the nose) -- one geometry for the eye and the
+#: law.
+SHIP_SIZE = 0.9
+SHIP_RX, SHIP_RY = 0.36, 0.55
+MUZZLE = 0.71            # the nose: 0.81 drawn half-sizes, foreshortened by the 0.25 lean
 #: The rocket is integrated, not placed: its velocity relaxes toward the
 #: commanded velocity with time constant SHIP_TAU (the damping), and a held
 #: pointer commands the velocity that would close the gap in SHIP_REACH.
@@ -99,7 +106,7 @@ def _hash(value):
 
 
 def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
-                  alive, x, y, vx, vy, hp, boom, born,
+                  alive, x, y, vx, vy, hp, boom, born, owner,
                   score, lives, wave, fleet_dir, clock, ufo_clock, field_w,
                   move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -145,6 +152,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     first_bomb = free_bomb & (lane == where(free_bomb, lane, 1.0e9).min())
     bomb_spawn = first_bomb & trigger
     shooter_x = (f(shooter) * x).sum()
+    shooter_lane = (f(shooter) * lane).sum()
     shooter_y = (f(shooter) * y).sum()
     # The saucer: when its clock runs out, from a side the dice pick.
     ufo_spawn = is_ufo & ~live & (ufo_clock <= 0.0) & playing
@@ -156,7 +164,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
 
     spawn = shot_spawn | bomb_spawn | ufo_spawn
     x1 = where(shot_spawn, player_x, where(bomb_spawn, shooter_x, where(ufo_spawn, ufo_x0, x)))
-    y1 = where(shot_spawn, PLAYER_Y - 0.65, where(bomb_spawn, shooter_y + 0.5, where(ufo_spawn, UFO_Y, y)))
+    y1 = where(shot_spawn, PLAYER_Y - MUZZLE, where(bomb_spawn, shooter_y + 0.5, where(ufo_spawn, UFO_Y, y)))
     # The rocket: the shared damped motion law (entity_motion.damped_axis),
     # the same text the page runs as WebAssembly to predict its own ship.
     ship_x, ship_v = damped_axis(x, vx, move_axis, steer_x, x * 0.0 + 0.7, field_w - 0.7,
@@ -165,7 +173,10 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
                 where(is_inv, fleet_dir_next * speed, where(ufo_spawn, ufo_vx0, where(spawn, 0.0, vx))))
     vy1 = where(shot_spawn, -SHOT_SPEED, where(bomb_spawn, BOMB_SPEED, where(spawn, 0.0, vy)))
     live1 = live | spawn
-    born1 = where(spawn, clock_next, born)
+    # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
+    # the whole step, so position = birth point + velocity x (clock - born).
+    born1 = where(spawn, clock, born)
+    owner1 = where(shot_spawn, 0.0, where(bomb_spawn, shooter_lane, where(ufo_spawn, -1.0, owner)))
 
     # Motion: the fleet steps as one; everything else flies its velocity.
     moving = live1 & playing
@@ -223,12 +234,12 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # ... and no step longer than half the rocket's damping time.
     dt_limit = (0.5 / (pace.max() + 1e-6)).clip(0.0, 0.5 * SHIP_TAU) + x * 0.0
     residual = f(is_inv & live4).sum() + x * 0.0
-    return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4,
+    return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4, owner1,
             score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born",
+STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner",
          "score", "lives", "wave", "fleet_dir", "clock", "ufo_clock")
 #: Read by the law, written by the host only (a layout change), never stepped.
 SETTINGS = ("field_w",)
@@ -277,6 +288,7 @@ def layout(width: float = WIDTH) -> dict[str, np.ndarray]:
     rx = np.full(LANES, 0.5)
     ry = np.full(LANES, 0.38)
     home_hp = np.ones(LANES)
+    rx[0], ry[0] = SHIP_RX, SHIP_RY                 # the rocket's drawn body
     slot[1], rx[1], ry[1] = SHOT, 0.08, 0.28
     for k in BOMB_LANES:
         slot[k], rx[k], ry[k] = BOMB, 0.16, 0.24
@@ -308,7 +320,7 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     columns.update({
         "alive": starts.astype(np.float64), "x": columns["home_x"].copy(), "y": columns["home_y"].copy(),
         "vx": np.zeros(LANES), "vy": np.zeros(LANES), "hp": columns["home_hp"].copy(),
-        "boom": np.zeros(LANES), "born": np.zeros(LANES),
+        "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES), "wave": np.zeros(LANES),
         "fleet_dir": np.ones(LANES), "clock": np.zeros(LANES), "ufo_clock": np.full(LANES, 12.0),
         "field_w": np.full(LANES, float(width)),
@@ -361,7 +373,7 @@ class SpaceInvaders(EntityGame):
                 "boom": [1.0, 0.55, 0.1]}
 
     def entities(self) -> list[dict[str, Any]]:
-        col = {name: self.session.column(name) for name in ("slot", "alive", "x", "y", "vx", "vy", "hp", "boom", "born", "home_y", "rx")}
+        col = {name: self.session.column(name) for name in ("slot", "alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "home_y", "rx")}
         clock = float(self.session.column("clock")[0])
         out = []
         for k in range(LANES):
@@ -372,7 +384,7 @@ class SpaceInvaders(EntityGame):
             if exploding:
                 mesh, color, size = "boom", "boom", 0.42
             elif slot == PLAYER:
-                mesh, color, size = "rocket", "rocket", 0.46
+                mesh, color, size = "rocket", "rocket", SHIP_SIZE
             elif slot == SHOT:
                 mesh, color, size = "bolt", "bolt", 0.26
             elif slot == BOMB:
@@ -390,10 +402,11 @@ class SpaceInvaders(EntityGame):
                 "id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                 "vx": 0.0 if exploding else float(col["vx"][k]), "vy": 0.0 if exploding else float(col["vy"][k]),
                 "mesh": mesh, "color": color, "size": size,
-                "roll": 0.785 if mesh == "rocket" else 0.0,
+                "roll": 0.785 if mesh == "rocket" else 0.0, "lean": 0.25 if slot == PLAYER else 0.55,
+                "owner": int(col["owner"][k]) if slot in (SHOT, BOMB) and not exploding else -1,
+                "age": clock - float(col["born"][k]),
                 "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 1.0 if slot == INVADER and not exploding else 0.0,
             })
-        del clock
         return out
 
     def result(self) -> dict[str, Any] | None:

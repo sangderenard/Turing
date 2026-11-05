@@ -18,7 +18,9 @@ DELTA, little-endian:
     u16  gone         lanes whose entity disappeared, u16 each
     u16  spawned      new entities: u16 lane, u8 mesh, u8 color,
                       u16 size*1000, i16 roll*1000, i16 spin*1000, u8 bob,
-                      f32 x, y, vx, vy
+                      i16 lean*1000, u16 owner (65535: none -- the lane that
+                      fired a projectile), f32 age (world seconds since it
+                      spawned), f32 x, y, vx, vy
     u16  updated      changed entities: u16 lane, u8 mesh, u8 color,
                       f32 x, y, vx, vy
 
@@ -172,9 +174,12 @@ class SnapshotEncoder:
         parts.append(struct.pack("<H", len(gone)) + b"".join(struct.pack("<H", lane) for lane in gone))
         parts.append(struct.pack("<H", len(spawned)))
         for lane, record, entity in spawned:
-            parts.append(struct.pack("<HBBHhhB4f", lane, record["mesh"], record["color"],
+            owner = int(entity.get("owner", -1))
+            parts.append(struct.pack("<HBBHhhBhHf4f", lane, record["mesh"], record["color"],
                                      int(round(entity["size"] * 1000)), int(round(entity["roll"] * 1000)),
                                      int(round(entity["spin"] * 1000)), 1 if entity.get("bob") else 0,
+                                     int(round(entity.get("lean", 0.55) * 1000)), 65535 if owner < 0 else owner,
+                                     float(entity.get("age", 0.0)),
                                      record["x"], record["y"], record["vx"], record["vy"]))
         parts.append(struct.pack("<H", len(updated)))
         for lane, record in updated:

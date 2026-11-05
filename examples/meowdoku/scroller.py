@@ -14,7 +14,7 @@ Lanes (contiguous blocks, so collisions are block against block):
     49..368        enemy bullets
     369..398       stars: scenery scrolling past, never collide
 
-Columns: lane, slot (static); alive, x, y, vx, vy, hp, boom, born, kind,
+Columns: lane, slot (static); alive, x, y, vx, vy, hp, boom, born, owner, kind,
 age, timer (entity state: ``timer`` is the player's reload and an enemy's
 time to its next volley); score, lives, invuln, clock, spawn_clock, field_w
 (game-wide); move_axis, move_axis_y, steer_x, steer_y, fire (controls).
@@ -55,13 +55,17 @@ BULLET_SPEED = 5.0
 SPREAD = 3.0
 RING = 12.0
 HITBOX = 0.11
+#: The ship as drawn: half size, body box (hitbox), muzzle at the nose.
+SHIP_SIZE = 0.75
+SHIP_RX, SHIP_RY = 0.22, 0.36
+MUZZLE = 0.59           # the nose (0.81 drawn half-sizes, 0.25 lean)
 
 CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "steer_x": "pointer-board-x",
             "steer_y": "pointer-board-y", "fire": "primary-action"}
 
 
 def scroller_step(lane, slot, rx, ry,
-                  alive, x, y, vx, vy, hp, boom, born, kind, age, timer,
+                  alive, x, y, vx, vy, hp, boom, born, owner, kind, age, timer,
                   score, lives, invuln, clock, spawn_clock, field_w,
                   move_axis, move_axis_y, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -108,6 +112,7 @@ def scroller_step(lane, slot, rx, ry,
     fired = f(shooter).sum() > 0.0
     sx, sy = (f(shooter) * x).sum(), (f(shooter) * y).sum()
     skind = (f(shooter) * kind).sum()
+    shooter_lane = (f(shooter) * lane).sum()
     count = where(skind == SPINNER, RING, SPREAD)
     free_bullet = is_bullet & ~live
     rank = f(free_bullet).cumsum(dim=0) - 1.0
@@ -119,7 +124,7 @@ def scroller_step(lane, slot, rx, ry,
 
     spawn = shot_spawn | enemy_spawn | bullet_spawn
     x1 = where(shot_spawn, shot_x, where(enemy_spawn, enemy_x0, where(bullet_spawn, sx, x)))
-    y1 = where(shot_spawn, py - 0.45, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
+    y1 = where(shot_spawn, py - MUZZLE, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
     kind1 = where(enemy_spawn, new_kind, kind)
     age1 = where(spawn, 0.0, age + dt)
     hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0), hp)
@@ -136,7 +141,10 @@ def scroller_step(lane, slot, rx, ry,
                       where(drifter, 1.7, where(spinner, where(age1 < 3.0, 1.0, where(age1 < 10.0, 0.0, 1.6)),
                                                 where(bullet_spawn, speed * angle.sin(), vy)))))
     live1 = live | spawn
-    born1 = where(spawn, clock_next, born)
+    # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
+    # the whole step, so position = birth point + velocity x (clock - born).
+    born1 = where(spawn, clock, born)
+    owner1 = where(shot_spawn, 0.0, where(bullet_spawn, shooter_lane, where(enemy_spawn, -1.0, owner)))
 
     moving = (live1 & playing) | is_star
     x2 = where(is_player & moving, ship_x, where(moving, x1 + vx1 * dt, x1))
@@ -174,17 +182,17 @@ def scroller_step(lane, slot, rx, ry,
     shot_pace = where(is_shot & live3, pace, 0.0).max()
     bullet_pace = where(is_bullet & live3, pace, 0.0).max() + (f(is_player) * pace).sum()
     shot_window = 2.0 * (0.3 + 0.36)
-    bullet_window = 2.0 * (HITBOX + 0.12)
+    bullet_window = 2.0 * (SHIP_RX + 0.12)
     dt_limit = ((0.9 * shot_window / (shot_pace + 1e-6))
                 .clip(0.0, 0.9 * bullet_window / (bullet_pace + 1e-6))
                 .clip(0.0, 0.5 * TAU)) + zero
     residual = f(is_enemy & live3).sum() + zero
-    return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, kind1, age1, timer1,
+    return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, owner1, kind1, age1, timer1,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "kind", "age", "timer",
+STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "kind", "age", "timer",
          "score", "lives", "invuln", "clock", "spawn_clock")
 SETTINGS = ("field_w",)
 
@@ -222,6 +230,7 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     lane = np.arange(LANES, dtype=np.float64)
     slot = np.zeros(LANES)
     rx, ry = np.full(LANES, HITBOX), np.full(LANES, HITBOX)
+    rx[0], ry[0] = SHIP_RX, SHIP_RY
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
     slot[BULLETS[0]:BULLETS[1]], rx[BULLETS[0]:BULLETS[1]], ry[BULLETS[0]:BULLETS[1]] = BULLET, 0.12, 0.12
@@ -238,7 +247,7 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     return {
         "lane": lane, "slot": slot, "rx": rx, "ry": ry,
         "alive": alive, "x": x, "y": y, "vx": np.zeros(LANES), "vy": vy, "hp": np.zeros(LANES),
-        "boom": np.zeros(LANES), "born": np.zeros(LANES), "kind": np.zeros(LANES), "age": np.zeros(LANES),
+        "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0), "kind": np.zeros(LANES), "age": np.zeros(LANES),
         "timer": np.zeros(LANES), "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
         "field_w": np.full(LANES, float(width)),
@@ -284,7 +293,7 @@ class BulletScroller(EntityGame):
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1]}
 
     def entities(self) -> list[dict[str, Any]]:
-        names = ("slot", "alive", "x", "y", "vx", "vy", "boom", "born", "kind", "invuln")
+        names = ("slot", "alive", "x", "y", "vx", "vy", "boom", "born", "owner", "kind", "invuln")
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
         show = (col["alive"] > 0.0) | (col["boom"] > 0.0)
@@ -295,7 +304,7 @@ class BulletScroller(EntityGame):
                 mesh, color, size = "boom", "boom", 0.42
             elif slot == PLAYER:
                 blink = col["invuln"][k] > 0.0 and int(clock * 12) % 2 == 0
-                mesh, color, size = "rocket", "rocket_blink" if blink else "rocket", 0.4
+                mesh, color, size = "rocket", "rocket_blink" if blink else "rocket", SHIP_SIZE
             elif slot == SHOT:
                 mesh, color, size = "bolt", "bolt", 0.2
             elif slot == ENEMY:
@@ -309,7 +318,9 @@ class BulletScroller(EntityGame):
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
                         "mesh": mesh, "color": color, "size": size,
-                        "roll": 0.785 if mesh == "rocket" else 0.0,
+                        "roll": 0.785 if mesh == "rocket" else 0.0, "lean": 0.25 if slot == PLAYER else 0.55,
+                        "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
+                        "age": clock - float(col["born"][k]),
                         "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})
         return out
 

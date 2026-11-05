@@ -566,6 +566,27 @@ function ensureSocket() {
     applySnapshot(new DataView(event.data));
   };
 }
+// A projectile is born at its owner's muzzle.  By the time the page hears of
+// it the server's projectile has flown on, from where the SERVER had the
+// owner -- not where the page draws it (the player's ship is predicted ahead).
+// So it is drawn leaving the owner as drawn, at the muzzle offset the server
+// used, and eased onto its true path over BIRTH_S.
+const BIRTH_S = 0.12;
+function birthOffset(ownerLane, age, x, y, vx, vy, you, stamp) {
+  if (ownerLane === 65535 || age > 0.35) return null;
+  let server, drawn;
+  if (ownerLane === pred.lane && pred.ship) {
+    server = [you.x, you.y];
+    drawn = [pred.ship.x + pred.offset[0], pred.ship.y + pred.offset[1]];
+  } else {
+    const owner = state.pieces.get(sock.lanes.get(ownerLane));
+    if (!owner) return null;
+    server = [owner.sx + owner.vx * (stamp - owner.tRecv), owner.sz + owner.vz * (stamp - owner.tRecv)];
+    drawn = [owner.x, owner.z];
+  }
+  const muzzle = [x - vx * age - server[0], y - vy * age - server[1]];
+  return { dx: drawn[0] + muzzle[0] - x, dz: drawn[1] + muzzle[1] - y };
+}
 function applySnapshot(view) {
   const game = state.game; if (!game || game.input !== "realtime") return;
   const now = state.time;
@@ -585,11 +606,13 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000, bob = u8();
+    const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32();
     drop(lane);
     const id = `${lane}:s${++sock.gen}`;
     sock.lanes.set(lane, id);
-    state.pieces.set(id, { id, entity: true, lane, sx: x, sz: y, x, z: y, vx, vz: vy, tRecv: stamp, mesh, color, size, roll, spin, bob, t0: now, removing: null, seed: 0 });
+    state.pieces.set(id, { id, entity: true, lane, sx: x, sz: y, x, z: y, vx, vz: vy, tRecv: stamp, mesh, color, size, roll, spin, bob, lean,
+                           t0: now, removing: null, seed: 0, birth: birthOffset(ownerLane, age, x, y, vx, vy, you, stamp) });
   }
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], x = f32(), y = f32(), vx = f32(), vy = f32();
@@ -675,11 +698,16 @@ function entityModel(piece, now) {
   return placeEntity(piece, now, x, z, mesh);
 }
 function placeEntity(piece, now, x, z, mesh) {
-  let s = Math.min(1, (now - piece.t0) / 0.12), y = 0;
+  if (piece.birth) {
+    const t = (now - piece.t0) / BIRTH_S;
+    if (t >= 1) piece.birth = null;
+    else { const k = 1 - ease.out(t); x += piece.birth.dx * k; z += piece.birth.dz * k; }
+  }
+  let s = piece.birth ? 1 : Math.min(1, (now - piece.t0) / 0.12), y = 0;
   if (piece.removing != null) s = 1 - ease.in(Math.min(1, (now - piece.removing) / 0.3));
   if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
   if (piece.bob) y = 0.06 * Math.sin(now * 5 + piece.sx * 0.7);
-  const lean = 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
+  const lean = piece.lean ?? 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
   let m = M.translate(x, TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
