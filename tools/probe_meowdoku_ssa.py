@@ -42,8 +42,7 @@ started = time.perf_counter()
 try:
     lowered = lower_ast_source_to_ssa(
         source, ENTRY,
-        python_bindings={"AbstractTensor": AbstractTensor,
-                         "PLACE_CAT": program.PLACE_CAT, "TOGGLE_X": program.TOGGLE_X},
+        python_bindings={"AbstractTensor": AbstractTensor},
         **({'tensor_ssa_reference': REFERENCE()} if REFERENCE else {}),
         name=f"{ENTRY}_batched", runtime_closure_only=True,
         extraction_contract=batch_contract(ENTRY, names, BATCH),

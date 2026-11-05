@@ -34,6 +34,7 @@ def core_contract(
     artifact: Any, module: Any, entry: str, *,
     input_names: Mapping[int, str] | None = None,
     output_names: Mapping[int, str] | None = None,
+    controls: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The invocation contract of ``artifact`` as plain data.
 
@@ -41,9 +42,22 @@ def core_contract(
     metadata unless given by value id.  Element counts come from the
     artifact's own tables (``buffer_shapes`` / ``output_elements``); a buffer
     whose shape is unknown is one cell, as the node harness allocates it.
+
+    ``controls`` maps a parameter name, or a ProgramABI field name a root
+    formal carries in its accounting (``program_abi_field``), to the semantic
+    action or shell resource a shell fills it from; the parameter's
+    descriptor then carries ``"control"`` and a page binds it generically
+    (``TuringWasmProgram.controlFeeds``).  A control naming nothing in the
+    contract is refused by name.
     """
 
     function = module.functions[entry]
+    controls = {str(k): str(v) for k, v in dict(controls or {}).items()}
+    field_of: dict[int, str] = {}
+    for formal in function.args:
+        accounting = dict(getattr(formal, "accounting", None) or {})
+        if accounting.get("program_abi_field") is not None:
+            field_of[int(formal.id)] = str(accounting["program_abi_field"])
     names: dict[int, str] = {
         int(value_id): str(name)
         for name, value_id in tuple(function.metadata.get("parameter_names") or ())
@@ -66,6 +80,9 @@ def core_contract(
             "role": "output" if value_id in output_ids else "input",
             "name": names.get(value_id, f"value_{value_id}"),
         }
+        control = controls.get(descriptor["name"], controls.get(field_of.get(value_id, "")))
+        if control is not None and descriptor["role"] == "input":
+            descriptor["control"] = control
         if kind == "buffer":
             dtype = dtypes.get(value_id, "float64")
             shape = tuple(shapes.get(value_id, ()) or ())
@@ -79,6 +96,12 @@ def core_contract(
             })
             offset += (int(count) * _ITEMSIZE.get(dtype, 8) + 7) // 8 * 8
         parameters.append(descriptor)
+    bound = {p["control"] for p in parameters if "control" in p}
+    unbound = sorted(set(controls.values()) - bound)
+    if unbound:
+        raise ValueError(
+            f"controls {unbound} name no input parameter of {artifact.name}: "
+            f"{sorted(controls)} against {[p['name'] for p in parameters]}")
     return {
         "schema": "turing.wasm-core-abi.v1",
         "entrypoint": artifact.name,
@@ -87,6 +110,7 @@ def core_contract(
         "imports": [list(item) for item in artifact.imports],
         "inputs": [p["name"] for p in parameters if p["role"] == "input"],
         "outputs": [p["name"] for p in parameters if p["role"] == "output"],
+        "controls": {p["name"]: p["control"] for p in parameters if "control" in p},
         "parameters": parameters,
     }
 

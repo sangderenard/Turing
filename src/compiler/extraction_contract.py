@@ -319,6 +319,14 @@ class ProgramABIField:
     precision: int = 1
     complex: bool = False
     rational: bool = False
+    # The field is a program CONTROL: a shell fills it before each round from
+    # the named semantic action (``primary-action``, ``move-forward``,
+    # ``pointer-cell-row`` -- the viewport control-binding vocabulary) or
+    # shell resource (``pointer.x`` -- the shell IO vocabulary).  This is the
+    # one place a program says how a shell fills a value; the host contracts
+    # (``NativeSystem.layout``, ``core_contract``) publish it per slot.  See
+    # docs/COMMON_CONTROL_RECORD_2026-11-05.md.
+    control: str | None = None
 
     @classmethod
     def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
@@ -339,6 +347,7 @@ class ProgramABIField:
             "precision",
             "complex",
             "rational",
+            "control",
         }
         extra = sorted(set(raw) - allowed)
         if extra:
@@ -630,6 +639,17 @@ class ProgramABIField:
                 raise ExtractionContractError(
                     f"{location}.{layer} must be boolean"
                 )
+        control = raw.get("control")
+        if control is not None:
+            if not isinstance(control, str) or not control:
+                raise ExtractionContractError(
+                    f"{location}.control must name a semantic action or shell resource"
+                )
+            if storage not in {"scalar", "span"}:
+                raise ExtractionContractError(
+                    f"{location}.control requires scalar or span storage: a "
+                    "shell writes numbers into a control slot"
+                )
         raw_shape = raw.get("shape")
         shape: tuple[int, ...] | None = None
         if raw_shape is not None:
@@ -684,6 +704,7 @@ class ProgramABIField:
             precision,
             bool(raw.get("complex", False)),
             bool(raw.get("rational", False)),
+            None if control is None else str(control),
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -725,6 +746,8 @@ class ProgramABIField:
             result["row_record"] = self.row_record
         if self.optional:
             result["optional"] = True
+        if self.control is not None:
+            result["control"] = self.control
         if self.encoding is not None:
             result["encoding"] = self.encoding
         if self.scale:

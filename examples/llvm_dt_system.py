@@ -1373,8 +1373,18 @@ def configure_publication_limits(state, targets):
         state.pub_limits_present[start:stop] = targets.error_limits_present
 
 
-def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=DT_CHANNEL_NAMES):
+def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=DT_CHANNEL_NAMES,
+                       controls=None):
     """The state's span fields plus the dt system's own records.
+
+    ``controls`` maps a state column to the semantic action or shell resource
+    a shell fills it from before each round (``{"select_row":
+    "pointer-cell-row", "primary_action": "primary-action"}``).  A control is
+    an ordinary state column -- a piece reads it like any other, the state
+    saves and restores it -- declared with the ``control`` attribute of its
+    ProgramABI field, which the host contracts publish per slot
+    (docs/COMMON_CONTROL_RECORD_2026-11-05.md).  A name that is not a
+    column is refused: a control the laws cannot read is not a control.
 
     ``Targets``, ``STController`` and ``Metrics`` are retained exactly as
     ``extraction_contracts/program_extraction.yaml`` declares them, the same
@@ -1399,10 +1409,18 @@ def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=D
     scalar = lambda dtype: {  # noqa: E731
         "storage": "scalar", "dtype": dtype, "rank": 0, "mutable": False,
     }
+    controls = dict(controls or {})
+    unknown = sorted(set(controls) - set(columns))
+    if unknown:
+        raise ValueError(
+            f"controls {unknown} are not state columns of {tuple(columns)}; a "
+            "control a law cannot read is not a control")
     records["PieceState"] = {
         "identity": "llvm_dt_system.PieceState",
         "fields": {
-            **{name: span(batch) for name in (*columns, "dt")},
+            **{name: ({**span(batch), "control": str(controls[name])} if name in controls
+                      else span(batch))
+               for name in (*columns, "dt")},
             "telemetry": span(len(TELEMETRY_FIELDS)),
             # The system's declared rollback choice rides on the state, so the
             # lowered round reads the same declared field the eager one does.
@@ -1456,7 +1474,7 @@ def dt_system_contract(entry, columns, batch, participants=1, *, channel_names=D
 def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimization="O2",
                    link="static", piece_mode="link", progress=None,
                    trace=False, trace_full_values=False, channel_names=DT_CHANNEL_NAMES,
-                   source_compilation="auto", partitioned_options=None):
+                   source_compilation="auto", partitioned_options=None, controls=None):
     """Lower ``dt_system_over`` to ``backend`` and return the compiled artifact.
 
     The pieces are bound by name (``step_i``) and called by name in the
@@ -1523,7 +1541,7 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         runtime_closure_only=True, name="llvm_dt_system",
         extraction_contract=dt_system_contract(entry, column_names_of(pieces), batch, len(pieces),
-                                              channel_names=channel_names),
+                                              channel_names=channel_names, controls=controls),
         progress=progress,
         retain_linked_piece_bodies=(piece_mode == "inline"),
     )
@@ -1595,7 +1613,8 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
     else:
         raise ValueError(f"unknown backend {backend!r}")
     return NativeSystem(compiled, module, exports[0], pieces,
-                        columns=column_names_of(pieces), batch=batch, channel_names=channel_names)
+                        columns=column_names_of(pieces), batch=batch, channel_names=channel_names,
+                        controls=controls)
 
 
 class NativeSystem:
@@ -1613,11 +1632,15 @@ class NativeSystem:
     """
 
     def __init__(self, artifact, module, entry, pieces, *,
-                 columns=(), batch=1, channel_names=DT_CHANNEL_NAMES):
+                 columns=(), batch=1, channel_names=DT_CHANNEL_NAMES, controls=None):
         self.artifact = artifact
         self.module = module
         self.entry = entry
         self.pieces = pieces
+        #: state column -> the semantic action / shell resource a shell fills
+        #: it from (``dt_system_contract(controls=...)``); the layout joins it
+        #: to the column's slot so a host knows which buffers are its to write.
+        self.controls = dict(controls or {})
         #: the state's span fields, in the order ``PieceState`` takes them
         self.columns = tuple(columns)
         self.channel_names = tuple(channel_names)
@@ -1745,6 +1768,12 @@ class NativeSystem:
             "state_fields": {name: self.buffer_index_of(value_id)
                              for name, value_id in fields.items()},
             "state_field_value_ids": fields,
+            # The controller hookups: which state slots a shell writes before
+            # a round, and from which semantic action or resource.
+            "controls": {name: {"control": action,
+                                "buffer": self.buffer_index_of(fields[name]),
+                                "value_id": fields[name]}
+                         for name, action in self.controls.items() if name in fields},
             "scalars": {name: self.buffer_index_of(value_id)
                         for name, value_id in scalars.items()},
             "total_bytes": (sum(item["count"] * item["itemsize"]

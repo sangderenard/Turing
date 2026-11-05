@@ -10,6 +10,79 @@ export const TURING_MATH_IMPORTS = Object.fromEntries(
   ['pow', 'exp', 'log', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
    'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh'].map(name => [name, Math[name]]));
 
+// A browser sampler over the viewport control-binding vocabulary
+// (abstract_ui_viewports.ViewportControlBinding data: action -> inputs such
+// as "keyboard:KeyW", "pointer:button-0", "gamepad:left-y-negative").  It
+// answers a semantic action with the strongest live input bound to it, the
+// same rule the Living Data Map's viewportInputValue applies, and lets a
+// page add its own resolvers (a board page answers "pointer-cell-row" from
+// its geometry).  Edge-triggered actions are armed by `pulse` and cleared
+// by `settle` after the round that consumed them.
+export class TuringControlSampler {
+  constructor(bindings, resolvers = {}) {
+    this.bindings = bindings;          // [{action, inputs: [...]}, ...]
+    this.resolvers = resolvers;        // action -> (parameter) => value
+    this.keys = new Set();
+    this.pointer = {x: 0, y: 0, buttons: 0};
+    this.pulses = new Map();           // action -> value for the next round
+  }
+
+  attach(target, options = {}) {
+    const keyTarget = options.keyboard || window;
+    keyTarget.addEventListener('keydown', event => this.keys.add(event.code));
+    keyTarget.addEventListener('keyup', event => this.keys.delete(event.code));
+    target.addEventListener('pointermove', event => {
+      const bounds = target.getBoundingClientRect();
+      this.pointer.x = (event.clientX - bounds.left) / Math.max(1, bounds.width);
+      this.pointer.y = (event.clientY - bounds.top) / Math.max(1, bounds.height);
+    });
+    target.addEventListener('pointerdown', event => {
+      this.pointer.buttons |= 1 << event.button;
+      for (const binding of this.bindings) {
+        if (binding.inputs.includes(`pointer:button-${event.button}`)) this.pulse(binding.action, 1);
+      }
+    });
+    target.addEventListener('pointerup', event => { this.pointer.buttons &= ~(1 << event.button); });
+    target.addEventListener('contextmenu', event => event.preventDefault());
+    return this;
+  }
+
+  pulse(action, value = 1) { this.pulses.set(action, value); }
+  settle() { this.pulses.clear(); }
+
+  gamepad() {
+    const pads = typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : [];
+    return Array.from(pads || []).find(pad => pad && pad.connected) || null;
+  }
+
+  sample(action, parameter) {
+    if (action in this.resolvers) return this.resolvers[action](parameter, this);
+    if (this.pulses.has(action)) return this.pulses.get(action);
+    if (action === 'pointer.x') return this.pointer.x;
+    if (action === 'pointer.y') return this.pointer.y;
+    if (action === 'pointer.buttons') return this.pointer.buttons;
+    let value = 0;
+    const pad = this.gamepad();
+    for (const binding of this.bindings) {
+      if (binding.action !== action) continue;
+      for (const input of binding.inputs) {
+        if (input.startsWith('keyboard:') && this.keys.has(input.slice(9))) value = 1;
+        if (input.startsWith('pointer:button-') && (this.pointer.buttons >> Number(input.slice(15))) & 1) value = 1;
+        if (!pad) continue;
+        const leftX = Number(pad.axes[0] || 0), leftY = Number(pad.axes[1] || 0);
+        if (input === 'gamepad:left-y-negative') value = Math.max(value, Math.max(0, -leftY));
+        if (input === 'gamepad:left-y-positive') value = Math.max(value, Math.max(0, leftY));
+        if (input === 'gamepad:left-x-negative') value = Math.max(value, Math.max(0, -leftX));
+        if (input === 'gamepad:left-x-positive') value = Math.max(value, Math.max(0, leftX));
+        const button = /^gamepad:button-(\d+)$/.exec(input);
+        if (button) value = Math.max(value, Number(pad.buttons[Number(button[1])]?.value || 0));
+      }
+      return value < 0.12 ? 0 : value;
+    }
+    return undefined;   // no binding and no resolver: the shell cannot supply it
+  }
+}
+
 export class TuringWasmProgram {
   static async load(moduleUrl, contractUrl) {
     const [contract, instantiated] = await Promise.all([
@@ -57,6 +130,31 @@ export class TuringWasmProgram {
     const view = this.view(parameter);
     if (view.length === 1) return view[0];
     return Array.from(view);
+  }
+
+  // The controller hookups: every input parameter whose contract descriptor
+  // carries "control" (a semantic action such as "primary-action" or
+  // "pointer-cell-row", or a shell resource such as "pointer.x") is filled
+  // from `sample(control, parameter)` unless `feeds` already names it.  A
+  // page supplies the sampler (its devices, its geometry); the program says
+  // only what it needs.  A control the sampler cannot answer (undefined) is
+  // refused by name rather than fed a silent zero.
+  controlFeeds(sample, feeds = {}) {
+    const filled = {...feeds};
+    for (const parameter of this.contract.parameters) {
+      if (!parameter.control || parameter.role === 'output' || parameter.name in filled) continue;
+      const value = sample(parameter.control, parameter);
+      if (value === undefined || value === null) {
+        throw new Error(`control ${parameter.control} for ${parameter.name} is not supplied by this shell`);
+      }
+      filled[parameter.name] = value;
+    }
+    return filled;
+  }
+
+  // One round from the shell's devices: sample the controls, then invoke.
+  invokeWithControls(sample, feeds = {}) {
+    return this.invoke(this.controlFeeds(sample, feeds));
   }
 
   invoke(feeds) {

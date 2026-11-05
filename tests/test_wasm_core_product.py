@@ -118,3 +118,44 @@ def test_the_single_file_page_carries_module_contract_and_binding(core):
     assert json.dumps(contract) in page
     assert "class TuringWasmProgram" in page and "export " not in page.split("<script type=\"module\">")[1]
     assert 'data-feed="x"' in page
+
+
+def test_controls_are_published_per_parameter_and_bound_generically(core, tmp_path):
+    """A parameter declared as a control carries its semantic action in the
+    contract, and the shell binding fills it from a sampler by that action;
+    a control the sampler cannot answer is refused by name."""
+    artifact, module, entry = core
+    contract = core_contract(artifact, module, entry, controls={"v": "move-forward"})
+    by_name = {p["name"]: p for p in contract["parameters"]}
+    assert by_name["v"]["control"] == "move-forward" and "control" not in by_name["x"]
+    assert contract["controls"] == {"v": "move-forward"}
+    with pytest.raises(ValueError, match="name no input parameter"):
+        core_contract(artifact, module, entry, controls={"nothing": "jump"})
+    product = write_core_web_product(tmp_path, artifact, contract, identity="drift-controls")
+    script = (
+        "import {TuringWasmProgram, TuringControlSampler} from %r;\n"
+        "import {readFileSync} from 'node:fs';\n"
+        "const contract = JSON.parse(readFileSync(%r, 'utf8'));\n"
+        "const program = await TuringWasmProgram.fromBytes(readFileSync(%r), contract);\n"
+        "const sampler = new TuringControlSampler([{action: 'move-forward', inputs: ['keyboard:KeyW']}]);\n"
+        "sampler.keys.add('KeyW');\n"
+        "const feeds = program.controlFeeds((action, p) => sampler.sample(action, p), %s);\n"
+        "const result = program.invokeWithControls((action, p) => sampler.sample(action, p), %s);\n"
+        "let refused = null;\n"
+        "try { program.controlFeeds(() => undefined, %s); } catch (error) { refused = String(error.message); }\n"
+        "console.log(JSON.stringify({v: feeds.v, x_next: result.x_next, refused}));\n"
+    ) % (
+        (product / "turing-wasm-shell.js").resolve().as_uri(),
+        str(product / "program.abi.json"), str(product / "program.wasm"),
+        json.dumps({"x": FEEDS["x"].tolist(), "dt": FEEDS["dt"].tolist()}),
+        json.dumps({"x": FEEDS["x"].tolist(), "dt": FEEDS["dt"].tolist()}),
+        json.dumps({"x": FEEDS["x"].tolist(), "dt": FEEDS["dt"].tolist()}),
+    )
+    completed = subprocess.run(
+        [shutil.which("node"), "--input-type=module", "--eval", script],
+        capture_output=True, text=True, check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["v"] == 1                                   # KeyW held: move-forward = 1
+    np.testing.assert_array_equal(result["x_next"], FEEDS["x"] + 0.05 * 1.0)   # v broadcast to the span
+    assert "move-forward" in result["refused"] and "not supplied" in result["refused"]

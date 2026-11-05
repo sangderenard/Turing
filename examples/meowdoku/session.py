@@ -6,9 +6,14 @@ later round hands that same state back, and the caller writes its columns
 in place between rounds.  The dt system owns the state's one contiguous
 span, its save and restore, and the controller kept alive across rounds.
 
+The Python game does one thing with input: it hands a ``MeowdokuControls``
+record to the round (``hand``).  The record's fields are state columns the
+law reads (``program.CONTROLS`` names the semantic action each is filled
+from), so a compiled shell writes the same slots from its devices.
+
 Undo and reset are therefore not game code: a move is preceded by
 ``copy_shallow`` and undone by ``restore``, the same pair ``run_superstep``
-uses for in-round rollback.
+uses for in-round rollback -- and a restored state restores its controls.
 """
 
 from __future__ import annotations
@@ -27,7 +32,8 @@ if str(ROOT / "examples") not in sys.path:
 from src.common.dt_system.dt_controller import STController, Targets  # noqa: E402
 from llvm_dt_system import TELEMETRY_FIELDS, dt_system  # noqa: E402
 from meowdoku.program import (  # noqa: E402
-    PLACE_CAT, TOGGLE_X, MeowdokuPiece, initial_columns, intent_column,
+    CONTROLS, MeowdokuControls, MeowdokuPiece, initial_columns, place_controls,
+    toggle_controls,
 )
 from meowdoku.puzzle import generate  # noqa: E402
 
@@ -63,23 +69,27 @@ class MeowdokuSession:
                 f"tau={telemetry[TAU]}")
         self.telemetry = telemetry
 
-    def move(self, r: int, c: int, action: float) -> None:
+    def hand(self, controls: MeowdokuControls) -> None:
+        """Hand one round's controller state to the dt system and run it."""
+        values = controls.columns(self.puzzle.cells)
         if self.state is None:
-            # Round zero: the state is made from the initial columns.  The
-            # intent for this very first move rides in on those columns.
-            self.columns["intent"][...] = intent_column(self.puzzle.cells, r * self.n + c, action)
+            # Round zero: the state is made from the initial columns, so the
+            # first round's controls ride in on them.
+            for name in CONTROLS:
+                self.columns[name][...] = values[name]
             self._round()
             self.history = [self.state.copy_shallow()]
             return
         self.history.append(self.state.copy_shallow())
-        self.state.intent[...] = intent_column(self.puzzle.cells, r * self.n + c, action)
+        for name in CONTROLS:
+            getattr(self.state, name)[...] = values[name]
         self._round()
 
     def place(self, r: int, c: int) -> None:
-        self.move(r, c, PLACE_CAT)
+        self.hand(place_controls(r, c))
 
     def toggle_x(self, r: int, c: int) -> None:
-        self.move(r, c, TOGGLE_X)
+        self.hand(toggle_controls(r, c))
 
     def undo(self) -> None:
         """Back one move: the dt system's own restore."""
@@ -110,6 +120,11 @@ class MeowdokuSession:
     def _column(self, name: str) -> np.ndarray:
         return np.asarray(getattr(self.state, name) if self.state is not None
                           else self.columns[name])
+
+    @property
+    def controls(self) -> MeowdokuControls:
+        """The controls the state currently holds (restored with it)."""
+        return MeowdokuControls(*(float(self._column(name)[0]) for name in CONTROLS))
 
     @property
     def cat(self) -> np.ndarray:

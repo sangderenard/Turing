@@ -366,3 +366,16 @@ so its parity target stays exact.
   artifact is emitted and inspected, not executed; the page is a renderer
   of Python-side state, not yet the game loop (that waits on the wasm core
   items in Findings 3 and 4).
+
+## Finding 6: the control record (2026-11-05, evening)
+
+Meowdoku now takes its input as a declared control record instead of a
+fabricated `intent` column: four state columns (`select_row`, `select_col`,
+`primary_action`, `secondary_action`), each carrying the semantic action a
+shell fills it from on its ProgramABI field (`control`), handed by the Python
+game as `MeowdokuControls`, derived into the move inside the law. The
+control-driven law lowers on canonical in 8.9 s to complete SSA (15 root
+formals, 16 core parameters). The direct Wasm core shows the same two
+compiler-side items (Finding 3) and their cascades. Design, status and the
+one compiler-lane hop (stamp `program_abi_control` beside
+`program_abi_storage`) are in docs/COMMON_CONTROL_RECORD_2026-11-05.md.

@@ -11,7 +11,11 @@ Columns (state, one cell per lane):
     solution           hidden cat mask (the "mines" the hearts are judged by)
     cat, x_mark        the player's board
     hearts             lives, broadcast to every lane
-    intent             this round's move per cell: 0 none, 1 toggle X, 2 place cat
+    select_row, select_col, primary_action, secondary_action
+                       the CONTROLS: the cell the player points at and the
+                       two edge-triggered actions, broadcast to every lane.
+                       A shell writes them before a round from the semantic
+                       actions ``CONTROLS`` names; the law derives the move.
 
 Published per round:
     cat_next, x_mark_next, hearts_next   the state the dt system lands
@@ -22,15 +26,49 @@ Published per round:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from src.common.tensors import AbstractTensor
 
-NONE, TOGGLE_X, PLACE_CAT = 0.0, 1.0, 2.0
 HEARTS = 3.0
 
+#: The control record: state column -> the semantic action a shell fills it
+#: from (the viewport control-binding vocabulary; ``pointer-cell-*`` is the
+#: pointer resolved to a board cell by the page's board geometry).  This is
+#: what ``dt_system_contract(controls=CONTROLS)`` declares on the PieceState
+#: fields and what every host contract publishes per slot.
+CONTROLS = {
+    "select_row": "pointer-cell-row",
+    "select_col": "pointer-cell-col",
+    "primary_action": "primary-action",
+    "secondary_action": "secondary-action",
+}
+NO_CELL = -1.0
 
-def meowdoku_step(row, col, region, solution, cat, x_mark, hearts, intent, dt):
+
+@dataclass(frozen=True)
+class MeowdokuControls:
+    """One round's controller state, as the Python game hands it over.
+
+    ``select_row``/``select_col`` name the cell under the pointer (``-1``:
+    none); ``primary_action`` places a cat, ``secondary_action`` toggles an
+    X.  Both actions are edge-triggered: a shell sets one for the round in
+    which it fired and clears it after."""
+
+    select_row: float = NO_CELL
+    select_col: float = NO_CELL
+    primary_action: float = 0.0
+    secondary_action: float = 0.0
+
+    def columns(self, cells: int) -> dict[str, np.ndarray]:
+        """The record as state columns: every field broadcast to the lanes."""
+        return {name: np.full(cells, float(getattr(self, name))) for name in CONTROLS}
+
+
+def meowdoku_step(row, col, region, solution, cat, x_mark, hearts,
+                  select_row, select_col, primary_action, secondary_action, dt):
     """Advance the board by one move.  Every operand is an (n*n,) span."""
     cells = int(row.shape[0])
     r1 = row.reshape((cells, 1))
@@ -49,8 +87,13 @@ def meowdoku_step(row, col, region, solution, cat, x_mark, hearts, intent, dt):
 
     remaining = (solution * (1.0 - cat)).sum()
     active = (hearts > 0.0) & (remaining > 0.0)
-    place = active & (intent == PLACE_CAT) & (cat == 0.0)
-    toggle = active & (intent == TOGGLE_X) & (cat == 0.0)
+    # The move, derived from the controls: the pointed cell and which action
+    # fired.  Primary wins when both fire in one round.
+    selected = (row == select_row) & (col == select_col)
+    primary = primary_action > 0.0
+    secondary = (secondary_action > 0.0) & ~primary
+    place = active & selected & primary & (cat == 0.0)
+    toggle = active & selected & secondary & (cat == 0.0)
     # A legal placement obeys the visible rules AND sits on the hidden
     # solution.  Anything else placed costs a heart and lands nothing.
     correct = place & (load == 0.0) & (solution == 1.0)
@@ -70,7 +113,7 @@ class MeowdokuPiece:
 
     entry = "meowdoku_step"
     argument_names = ("row", "col", "region", "solution", "cat", "x_mark",
-                      "hearts", "intent", "dt")
+                      "hearts", *CONTROLS, "dt")
     output_names = ("cat_next", "x_mark_next", "hearts_next", "residual", "dt_limit")
 
     def __init__(self, batch: int):
@@ -95,18 +138,19 @@ class MeowdokuPiece:
 
 
 def initial_columns(puzzle) -> dict[str, np.ndarray]:
-    """Every state column at round zero for ``puzzle``."""
+    """Every state column at round zero for ``puzzle``: no controls yet."""
     cells = puzzle.cells
     columns = puzzle.columns()
     columns["cat"] = np.zeros(cells)
     columns["x_mark"] = np.zeros(cells)
     columns["hearts"] = np.full(cells, HEARTS)
-    columns["intent"] = np.zeros(cells)
+    columns.update(MeowdokuControls().columns(cells))
     return columns
 
 
-def intent_column(cells: int, cell: int, action: float) -> np.ndarray:
-    """One move as an intent span: ``action`` at ``cell``, none elsewhere."""
-    intent = np.zeros(cells)
-    intent[cell] = action
-    return intent
+def place_controls(r: int, c: int) -> MeowdokuControls:
+    return MeowdokuControls(float(r), float(c), 1.0, 0.0)
+
+
+def toggle_controls(r: int, c: int) -> MeowdokuControls:
+    return MeowdokuControls(float(r), float(c), 0.0, 1.0)

@@ -10,8 +10,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "examples"))
 
 from meowdoku.program import (  # noqa: E402
-    HEARTS, PLACE_CAT, TOGGLE_X, MeowdokuPiece, initial_columns, intent_column,
+    CONTROLS, HEARTS, MeowdokuControls, MeowdokuPiece, initial_columns,
+    place_controls, toggle_controls,
 )
+
+PLACE_CAT, TOGGLE_X = "place", "toggle"
 from meowdoku.puzzle import count_arrangements, generate  # noqa: E402
 
 
@@ -29,7 +32,10 @@ class Game:
         self.residual = None
 
     def move(self, r, c, action):
-        self.columns["intent"][...] = intent_column(self.puzzle.cells, r * self.puzzle.n + c, action)
+        # The Python game hands a control record; its fields are columns.
+        controls = (place_controls if action == PLACE_CAT else toggle_controls)(r, c)
+        for name, value in controls.columns(self.puzzle.cells).items():
+            self.columns[name][...] = value
         args = [self.columns[name] if name != "dt" else self.dt
                 for name in self.piece.argument_names]
         out = dict(zip(self.piece.output_names, self.piece(*args)))
@@ -116,4 +122,32 @@ def test_piece_is_admitted_by_the_dt_system():
     piece = require_piece(MeowdokuPiece(25), "meowdoku")
     names = column_names_of([piece])
     assert "dt" not in names and "cat" in names and "hearts" in names
+    assert set(CONTROLS) <= set(names)            # controls are state columns
     assert owned_columns([piece]) == ("cat", "x_mark", "hearts")
+
+
+def test_controls_are_declared_on_the_dt_contract():
+    """The control record reaches the ProgramABI: each control column's
+    PieceState field carries the semantic action a shell fills it from."""
+    from llvm_dt_system import column_names_of, dt_system_contract
+    import pytest
+
+    piece = MeowdokuPiece(25)
+    contract = dt_system_contract("dt_system_over", column_names_of([piece]), 25,
+                                  controls=CONTROLS)
+    fields = contract.program_abi.receipt()["records"]["PieceState"]["fields"]
+    for name, action in CONTROLS.items():
+        assert fields[name]["control"] == action
+        assert fields[name]["storage"] == "span" and fields[name]["shape"] == [25]
+    assert "control" not in fields["cat"]
+    with pytest.raises(ValueError, match="not state columns"):
+        dt_system_contract("dt_system_over", column_names_of([piece]), 25,
+                           controls={"throttle": "move-forward"})
+
+
+def test_the_record_is_what_the_python_game_hands_over():
+    controls = MeowdokuControls(2.0, 3.0, 1.0, 0.0)
+    columns = controls.columns(25)
+    assert set(columns) == set(CONTROLS)
+    assert columns["select_row"][7] == 2.0 and columns["primary_action"].sum() == 25.0
+    assert MeowdokuControls().select_row == -1.0      # no cell: never selects
