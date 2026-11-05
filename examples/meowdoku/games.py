@@ -6,20 +6,26 @@ Nothing here renders.  The state a game returns:
 
     game, id, title, rows, cols
     cells     palette name per cell (rows*cols), the button colours
-    marks     0/1 per cell: Meowdoku's X marks
-    hints     0/1 per cell: legal destinations of the selected piece
+    marks     0/1 per cell: Meowdoku's mice (cells that cannot hold a cat)
+    hints     0/1 per cell: legal destinations of the selected piece, or
+              the cells Meowdoku's hint names
     selected  cell index or None
     pieces    [{id, cell, mesh, color}]: id is stable so the page can
               animate a move; cell may be "hud:k" for the hearts row
     palette   {name: [r, g, b]} linear RGB
     hearts, won, lost, status, moves
-    input     "meowdoku" (tap X, double tap cat, swipe paints X),
+    input     "meowdoku" (the page's tool picks what a tap does: Cats or
+              Mice; double tap is a cat, swipe paints mice),
               "select" (tap a piece, tap a destination), "text" (Wordle)
     text, text_max, rack   the Wordle entry and its letter rack
+    palettes, palette_name, hints_used, hint   Meowdoku's colour schemes
+              (names, the one in use), hints taken, the last hint's text
 
 Actions: ``cell(r, c, button)`` with button in primary / secondary /
-paint / double, ``text(s)``, ``submit()``, ``backspace()``, ``undo()``,
-``reset()``.  Meowdoku wraps the dt-system session; chess and checkers
+paint / double / cat / mouse (cat places a cat, mouse toggles a mouse),
+``text(s)``, ``submit()``, ``backspace()``, ``undo()``, ``reset()``,
+``hint()`` and ``set_palette(name)`` (Meowdoku; neither touches the dt
+system's state).  Meowdoku wraps the dt-system session; chess and checkers
 give piece movement with legal destinations shown before a move is made
 (the "optional move": select, see, then commit); Wordle keeps six guesses
 and a rack coloured by what the guesses taught.
@@ -31,7 +37,7 @@ from typing import Any
 
 import numpy as np
 
-from meowdoku.puzzle import Puzzle
+from meowdoku.puzzle import Puzzle, next_deduction
 from meowdoku.session import MeowdokuSession
 from meowdoku.words import ALL, ANSWERS
 
@@ -83,11 +89,28 @@ class Game:
 # Meowdoku: the dt-system session behind the protocol
 # ---------------------------------------------------------------------------
 
+#: Region colour schemes: (r, g, b) lists in hue order.  Regions take them in
+#: the rank of their ring-relaxed hue, so regions the relaxation put far
+#: apart in hue stay far apart in the scheme.  A board with n regions takes
+#: n evenly spaced entries.  The cat and mouse colours are fixed for
+#: contrast against the tiles (dark cat, pale mouse).
+PALETTES: dict[str, list[tuple[float, float, float]]] = {
+    "Candy": [(0.95, 0.35, 0.35), (1.00, 0.60, 0.15), (0.98, 0.85, 0.20), (0.60, 0.85, 0.25), (0.20, 0.72, 0.40),
+              (0.15, 0.78, 0.85), (0.25, 0.45, 0.95), (0.58, 0.38, 0.90), (0.88, 0.35, 0.82), (0.98, 0.52, 0.68)],
+    # Okabe-Ito (distinguishable under the common colour-vision deficiencies)
+    # plus grey, lavender and sand, spread in lightness as well as hue.
+    "Colour-blind safe": [(0.84, 0.37, 0.00), (0.90, 0.62, 0.00), (0.82, 0.72, 0.55), (0.94, 0.89, 0.26), (0.00, 0.62, 0.45),
+                          (0.62, 0.62, 0.62), (0.34, 0.71, 0.91), (0.00, 0.45, 0.70), (0.75, 0.70, 0.90), (0.80, 0.47, 0.65)],
+    "Pastel": [tuple(hsv(k / 10.0 + 0.02, 0.36, 0.95)) for k in range(10)],
+}
+DEFAULT_PALETTE = "Candy"
+
+
 class MeowdokuGame(Game):
     game = "meowdoku"
     input = "meowdoku"
 
-    def __init__(self, board: dict[str, Any]):
+    def __init__(self, board: dict[str, Any], palette: str = DEFAULT_PALETTE):
         super().__init__(str(board["id"]))
         n = int(board["n"])
         cells = np.arange(n * n)
@@ -97,41 +120,82 @@ class MeowdokuGame(Game):
         self.n = n
         self.session = MeowdokuSession(n=n, puzzle=puzzle)
         self.title = f"Meowdoku {n}x{n} · {board.get('level', '')} · {board.get('type', '')}"
+        self.palette_name = palette if palette in PALETTES else DEFAULT_PALETTE
+        self.hints_used = 0
+        self.hint_cells: list[int] = []
+        self.hint_text = ""
 
     def cell(self, r: int, c: int, button: str) -> None:
-        if button == "double":
+        self.hint_cells, self.hint_text = [], ""
+        if button in ("double", "cat"):
             self.session.place(r, c)
         elif button == "paint":
             if not self.session.x_mark.reshape(self.n, self.n)[r, c]:
                 self.session.toggle_x(r, c)
-        else:                                            # primary or secondary: toggle the X
+        else:                                            # primary, secondary or mouse: toggle the mouse
             self.session.toggle_x(r, c)
         self.moves += 1
 
     def undo(self) -> None:
+        self.hint_cells, self.hint_text = [], ""
         self.session.undo()
 
     def reset(self) -> None:
+        self.hint_cells, self.hint_text = [], ""
         self.session.reset()
         self.moves = 0
+
+    def set_palette(self, name: str) -> None:
+        if name not in PALETTES:
+            raise ValueError(f"unknown palette {name!r}; have {sorted(PALETTES)}")
+        self.palette_name = name
+
+    def hint(self) -> None:
+        """Name the next deducible move without touching the dt system's
+        state: only this game's highlight and counter change."""
+        s = self.session
+        if s.won or s.lost:
+            return
+        found = next_deduction(np.asarray(self.board["region"]).reshape(self.n, self.n),
+                               np.asarray(s.cat).reshape(self.n, self.n), self.board["solution"], s.x_mark)
+        self.hint_cells = found["cells"]
+        self.hints_used += 1
+        what = "cat here" if found["kind"] == "cat" else ("mouse here" if len(found["cells"]) == 1 else "mice here")
+        self.hint_text = f"hint: {what} - {found['why']}"
+
+    def colours(self) -> dict[str, list[float]]:
+        hues = np.asarray(self.board["hues"], dtype=float)
+        rank = np.argsort(np.argsort(hues, kind="stable"), kind="stable")
+        scheme = PALETTES[self.palette_name]
+        picks = [scheme[int(i * len(scheme) / self.n)] for i in range(self.n)]
+        return {f"region{k}": list(picks[int(rank[k])]) for k in range(self.n)}
 
     def state(self) -> dict[str, Any]:
         n, s = self.n, self.session
         st = self.base_state(n, n)
         region = [int(k) for k in self.board["region"]]
-        hues = self.board["hues"]
-        st["palette"] = {f"region{k}": hsv(hues[k], 0.30, 0.90) for k in range(n)}
-        st["palette"].update({"cat": [0.78, 0.34, 0.04], "x": [0.10, 0.10, 0.12], "heart": [0.88, 0.10, 0.16]})
+        st["palette"] = self.colours()
+        st["palette"].update({"cat": [0.10, 0.05, 0.03], "x": [0.97, 0.95, 0.93], "heart": [0.88, 0.10, 0.16]})
+        st["palettes"], st["palette_name"] = list(PALETTES), self.palette_name
         st["cells"] = [f"region{k}" for k in region]
         cat = np.asarray(s.cat, dtype=int).reshape(-1)
         x_mark = np.asarray(s.x_mark, dtype=int).reshape(-1)
         st["marks"] = x_mark.tolist()
+        hints = [0] * (n * n)
+        for i in self.hint_cells:
+            hints[i] = 1
+        st["hints"] = hints
+        st["hints_used"], st["hint"] = self.hints_used, self.hint_text
         st["pieces"] = [{"id": f"cat-{i}", "cell": int(i), "mesh": "cat", "color": "cat"} for i in np.flatnonzero(cat)]
         st["pieces"] += [{"id": f"x-{i}", "cell": int(i), "mesh": "x_mark", "color": "x"} for i in np.flatnonzero(x_mark)]
         st["pieces"] += [{"id": f"heart-{k}", "cell": f"hud:{k}", "mesh": "heart", "color": "heart"} for k in range(int(s.hearts))]
         st["hearts"] = int(s.hearts)
         st["won"], st["lost"] = bool(s.won), bool(s.lost)
-        st["status"] = "solved! all cats home" if s.won else "out of hearts" if s.lost else f"{int(s.hearts)} ♥ · {self.moves} moves"
+        hint_note = f" · {self.hints_used} hint{'s' if self.hints_used != 1 else ''}" if self.hints_used else ""
+        st["status"] = ("solved! all cats home" if s.won else "out of hearts" if s.lost
+                        else f"{int(s.hearts)} ♥ · {self.moves} moves") + hint_note
+        if self.hint_text and not (s.won or s.lost):
+            st["status"] += f" · {self.hint_text}"
         return st
 
 

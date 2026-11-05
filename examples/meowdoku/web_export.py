@@ -91,6 +91,15 @@ def export_assets(out: Path) -> dict:
     for name, code in (("king", 0x265A), ("queen", 0x265B), ("rook", 0x265C), ("bishop", 0x265D),
                        ("knight", 0x265E), ("pawn", 0x265F)):
         pack(name, *token_mesh(chr(code), "DejaVu Sans", "normal", depth_ratio=0.45, outline_subdivisions=1))
+    # Meowdoku's mice: the mouse glyph (U+1F401) from Segoe UI Symbol, a solid
+    # silhouette (Segoe UI Emoji's layers extrude to an outline and a speck);
+    # it takes the X mark's material, and the page draws it in the X's place.
+    # Without the font the page keeps the X mesh.
+    try:
+        pack("mouse", *token_mesh("🐁", "Segoe UI Symbol", "normal", depth_ratio=0.3, outline_subdivisions=2),
+             material_index["x_mark"])
+    except Exception as error:  # noqa: BLE001 - a missing font must not stop the export
+        print(f"[export] no mouse mesh ({error}); the page keeps the X", flush=True)
     pack("disc", *token_mesh("●", "DejaVu Sans", "normal", depth_ratio=0.22, outline_subdivisions=1))
     assets = {
         "meshes": meshes,
