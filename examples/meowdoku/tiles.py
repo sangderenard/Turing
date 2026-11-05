@@ -89,6 +89,22 @@ def region_palette(n: int) -> np.ndarray:
     ], axis=-1)
 
 
+#: Per-role extrusion overrides.  The cat outline has 465 font vertices; at
+#: the ink default (outline_subdivisions 2, profile_segments 10) it is 21,356
+#: triangles and the native renderer's emissive-triangle submission fails
+#: its allocation on this machine (measured 2026-11-05); the X and heart
+#: render at the default.  A coarser profile keeps the cat under the X's
+#: budget class.
+ROLE_GEOMETRY: dict[str, dict[str, Any]] = {
+    "cat": {"outline_subdivisions": 1, "profile_segments": 2},
+}
+
+#: Scene-order runtime for the tiles: four times the renderer's default ray
+#: budget, since a 128x128 tile at one million rays is a sparse frame
+#: (34% of pixels struck; measured on the X mark).
+TILE_RUNTIME: dict[str, Any] = {"total_rays": 4_000_000}
+
+
 def tile_order_package(roles: tuple[str, ...] = ("cat", "x_mark", "heart")) -> dict[str, Any]:
     """The scene-order package for the tile sprites: one ink-on-slate job per
     role, each in the font that has its glyph and in its own material."""
@@ -107,10 +123,12 @@ def tile_order_package(roles: tuple[str, ...] = ("cat", "x_mark", "heart")) -> d
             job = dict(job)
             job["id"] = f"meowdoku_{role}"
             job["font"] = font.scene_order_mapping()
-            job["geometry"] = {**job["geometry"], "material": ROLE_MATERIALS[role]}
+            job["geometry"] = {**job["geometry"], "material": ROLE_MATERIALS[role],
+                               **ROLE_GEOMETRY.get(role, {})}
             jobs.append(job)
     assert package is not None
     package["jobs"] = jobs
+    package["runtime"] = {**package.get("runtime", {}), **TILE_RUNTIME}
     scene_orders.validate_order(package)
     return package
 
@@ -200,15 +218,29 @@ def native_kernels_available() -> bool:
     return probe.returncode == 0
 
 
-def render_tiles(package_path: str | Path, out_dir: str | Path, jobs: tuple[str, ...] = ()) -> dict[str, Any]:
+def render_tiles(package_path: str | Path, out_dir: str | Path, jobs: tuple[str, ...] = (),
+                 passes: int = 1) -> dict[str, Any]:
     """Ray-trace the tiles through spectral-analyzer's native thick-lens
-    BDPT.  Refuses by name when the native kernels are not built."""
+    BDPT.  Refuses by name when the native kernels are not built.
+
+    ``passes`` > 1 renders each job that many times, into ``pass_00``,
+    ``pass_01``, ... under ``out_dir``: the catalog's refinement passes, each
+    an independent exposure of the job's ray budget, which ``load_sprites``
+    averages.  One pass of a 128x128 tile at four million rays strikes about
+    a third of the pixels (measured on the X mark); the average over passes
+    is the converging estimate.
+    """
     if not native_kernels_available():
         raise RuntimeError(
             "spectral-analyzer's native kernels (_spectral_kernels) are not built in "
             f"{SPECTRAL_ROOT}; the renderer needs its csrc C++ build (pybind11) before "
             "tiles can be ray-traced")
-    return _run_scene_orders(Path(package_path), Path(out_dir), "--render", jobs)
+    if passes <= 1:
+        return _run_scene_orders(Path(package_path), Path(out_dir), "--render", jobs)
+    manifests = {}
+    for index in range(int(passes)):
+        manifests = _run_scene_orders(Path(package_path), Path(out_dir) / f"pass_{index:02d}", "--render", jobs)
+    return manifests
 
 
 # ---------------------------------------------------------------------------
@@ -243,13 +275,16 @@ def load_sprites(render_dir: str | Path, package: Mapping[str, Any]) -> dict[str
     capture = render_assets.AtlasCaptureSpec()
     sprites = {}
     for job in package["jobs"]:
-        job_dir = Path(render_dir) / str(job["id"])
-        frames = sorted(job_dir.glob("*.npy")) if job_dir.is_dir() else []
+        job_dirs = [Path(render_dir) / str(job["id"])]
+        job_dirs += sorted(Path(render_dir).glob(f"pass_*/{job['id']}"))
+        # The renderer writes several ``.npy`` sidecars per frame (exposure
+        # weight, priority, field captures, the running sum); the sprite
+        # comes from the linear frames, averaged over every pass found.
+        frames = sorted(p for job_dir in job_dirs for p in job_dir.glob("*_linear.npy")
+                        if not p.name.endswith("_sum_linear.npy"))
         if not frames:
             continue
-        linear = np.load(frames[0])
-        if linear.ndim == 3 and linear.shape[-1] > 3:
-            linear = linear[..., :3]
+        linear = np.mean([np.load(frame)[..., :3] for frame in frames], axis=0)
         token = str(job["token"])
         font = render_assets.FontAssetSpec.from_mapping(job.get("font", package["defaults"]["font"]))
         asset = render_assets.ink_token_asset(token, font=font)

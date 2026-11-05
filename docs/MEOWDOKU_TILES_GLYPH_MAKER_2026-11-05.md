@@ -62,13 +62,21 @@ is the asset-side one, and a web server can run it.
 
 ## What is not here yet
 
-- **Rendering.** `_spectral_kernels.cp311-win_amd64.pyd` is not built in
-  this checkout and no build driver is tracked in the repository; the only
-  instruction found is "rebuild the native extension" in
-  `BDPT_CPP_SIDEDATA_COMPANION.md`. Visual Studio 2019/2022, CMake and Ninja
-  are installed, so the build is feasible; it is a build, so it waits for
-  your word. Until then the three sprites do not exist and the compositor
-  runs on synthetic ones in its test.
+- **Rendering: the three sprites exist.** The native kernels were rebuilt
+  (`spectral-analyzer/csrc/CMakeLists.txt`, reconstructed and tracked). The
+  X rendered in 45 s at the renderer's default million rays; the heart and
+  the cat take four to five minutes each at the tiles' four-million-ray
+  runtime. The cat is extruded coarsely (4,188 triangles; the default
+  21,356 failed the native emissive-triangle allocation). One pass is a
+  sparse frame (a third of the pixels struck), so the sprite bodies are
+  speckled; `render_tiles(passes=N)` renders refinement passes that
+  `load_sprites` averages, and the compositor's authored-outline alpha
+  keeps the shapes crisp regardless. Two renderer facts: it needs
+  `SPECTRAL_SENSOR_STEPS_PER_LAYER=1` from the scene-order entry (pinned by
+  `tiles.py`), and a renderer launched from a detached background shell
+  never starts its GPU work, so renders run in the foreground.
+  `build/meowdoku/tiles/board_160x160.png`: a 160x160 board generated in
+  7.6 s and composed in 0.1 s with the three sprites.
 - **The server.** A Python web server that holds a `MeowdokuSession`,
   serves the composed board (or the compiled shader page) and takes moves is
   a day of plain Python once the sprites exist; the control record and the
@@ -78,17 +86,24 @@ is the asset-side one, and a web server can run it.
   today; a modelled cat would be a Pluck `WorldObject` form recipe, which
   the Living Data Map already adapts and the scene-order compiler does not
   yet take.
-- **Puzzle generation at large n: done.** `puzzle.generate_batch(n, batch,
-  seed)` builds `batch` unique puzzles as AbstractTensor arithmetic over
-  `(batch, n, n)` spans: random permutations as ranks of random keys, the
-  no-touch rule as a batched rejection, a random solving order, each cell's
-  elimination moment as a broadcast minimum, and the region as the nearest
-  eligible cat by one masked argmin. Uniqueness is by construction (singles
-  solve the board in that order); the backtracking count is the oracle and
-  agrees 24/24 at n=9 and 11. Measured: 256 boards of 32x32 in 0.5 s, 32 of
-  64x64 in 0.15 s, one 256x256 in 0.06 s; `verify_batch` checks all three
-  rules batched. Randomness is the repository's seeded Xoroshiro128** stream
-  (`AbstractTensor.randn` is reached by no seed). The random generator stays
-  for n <= 8 so existing seeds are unchanged. A 32x32 game plays through
-  the dt system (one move 0.7 s on the numpy backend: the law's pairwise
-  conflict is n^2 x n^2).
+- **Puzzle generation at large n: done, by relaxation.** `puzzle.generate_batch(n,
+  batch, seed)` builds `batch` puzzles as AbstractTensor arithmetic over
+  `(batch, n, n)` spans. The cat map comes first (ranks of random keys, the
+  no-touch rule a batched rejection) with a random solving order; a cell is
+  eligible for a region when its row's or column's cat is placed earlier,
+  and any partition of eligible cells is solved by singles in that order,
+  so it is unique. The generator starts from the always-valid partition
+  (the last-solved region owns every non-cat cell) and relaxes it: each
+  round, per parity class, every 4-simple non-cat cell with an eligible
+  neighbour region at least two cells smaller moves to the smallest one.
+  Contiguity and uniqueness hold after every round. Measured: oracle-unique
+  24/24 at n=9 and n=11, every region contiguous at every size, 64 boards
+  of 32x32 in 14 s, one 128x128 in 9 s. The order constraint is visible:
+  the last region is about half the board and a few early regions are
+  single cells (the puzzle's openings). An earlier growth-by-wavefront
+  version left cells no eligible region could reach (n > 8), and gating
+  relaxed cells with a singles solver accepted 3% at n=11; both are gone.
+  `singles_solve` is the batched uniqueness certificate, `contiguous_regions`
+  a batched flood. Randomness is the repository's seeded Xoroshiro128**
+  stream. The random generator stays for n <= 8 so existing seeds are
+  unchanged.
