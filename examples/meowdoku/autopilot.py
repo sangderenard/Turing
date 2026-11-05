@@ -754,3 +754,155 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ------------------------------------------------------- learning from play
+# Every decision the server lands in an autopilot game is traced as
+# (observation, controls used) -- the observation the policy sees and the
+# three outputs it would have had to produce.  When a game ends:
+#   * a HUMAN episode is appended to the kept records (human_<game>.npz) and
+#     the policy post-trains on it (with a replay of earlier human episodes,
+#     so one game does not overwrite the rest), then the weights are saved;
+#   * a DEMO episode trains the policy only while demo learning is on for that
+#     game, and only if it scored at least the demo's running average
+#     (self-imitation of its better runs: reinforcement, not self-copying).
+# Training runs on a background thread; the live pilots read the same weights
+# dict, which is updated in place under LEARN_LOCK.
+
+import threading as _threading
+
+LEARN_LOCK = _threading.Lock()
+DEMO_LEARNING: dict[str, bool] = {name: False for name in GAMES}
+LEARN_STATUS: dict[str, dict] = {name: {} for name in GAMES}
+_DEMO_SCORES: dict[str, list[float]] = {name: [] for name in GAMES}
+POST_EPOCHS, REPLAY_ROWS, MIN_ROWS = 4, 4096, 32
+
+
+def human_records_path(game: str) -> Path:
+    return BUILD / f"human_{game}.npz"
+
+
+def target_from(game, controls: dict) -> np.ndarray:
+    """The controls a decision used, as the policy's three outputs.  A held
+    pointer is its axis equivalent under the motion law: the law commands
+    clamp((target - x) / reach, +-speed), i.e. axis = clamp(gap / speed, +-1)."""
+    motion = game.motion() or {}
+    out = np.zeros(OUTPUTS)
+    k = game.PLAYER_LANE
+    for i, (axis_name, steer_name, pos) in enumerate((("move_axis", "steer_x", "x"), ("move_axis_y", "steer_y", "y"))):
+        steer = float(controls.get(steer_name, -1.0))
+        if steer >= 0.0 and motion.get(pos) and k is not None:
+            gap = (steer - float(game.session.column(pos)[k])) / float(motion.get("reach", 1.0))
+            out[i] = max(-1.0, min(1.0, gap / float(motion.get("speed", 1.0))))
+        else:
+            out[i] = max(-1.0, min(1.0, float(controls.get(axis_name, 0.0))))
+    out[2] = 1.0 if float(controls.get("fire", 0.0)) > 0.0 else -1.0
+    return out
+
+
+class PlayTrace:
+    """One episode's decisions, kept by the game while it runs."""
+
+    def __init__(self):
+        self.x: list[np.ndarray] = []
+        self.y: list[np.ndarray] = []
+        self.demo = None                    # True / False once the first decision lands
+
+    def record(self, game, controls: dict, demo: bool) -> None:
+        if game.game not in FEATURE_FUNCTIONS or game.session.state is None:
+            return
+        if self.demo is None:
+            self.demo = demo
+        elif self.demo != demo:            # who drives changed mid-game: keep one kind per episode
+            return
+        self.x.append(np.asarray(FEATURE_FUNCTIONS[game.game](game), dtype=np.float64).reshape(-1))
+        self.y.append(target_from(game, controls))
+
+
+def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: int = 0) -> None:
+    """Fit the live policy on ``x -> y`` (plus replayed human rows), update
+    it in place and save it.  Runs on its own thread."""
+    try:
+        with LEARN_LOCK:
+            live = _PILOT_WEIGHTS.get(name) or load_params(weights_path(name))
+            if live is None:
+                return
+            params = {n: v.copy() for n, v in live.items()}
+        records = human_records_path(name)
+        if records.exists():
+            data = np.load(records)
+            rx, ry = data["x"], data["y"]
+            if kept_tail:                       # this episode is already the records' tail
+                rx, ry = rx[:-kept_tail], ry[:-kept_tail]
+            if len(rx) > REPLAY_ROWS:
+                pick = np.random.default_rng().choice(len(rx), REPLAY_ROWS, replace=False)
+                rx, ry = rx[pick], ry[pick]
+            x, y = np.concatenate([x, rx]), np.concatenate([y, ry])
+        trainer = PolicyTrainer(params, lr=1e-3)
+        rng, loss = np.random.default_rng(), float("nan")
+        for _ in range(POST_EPOCHS):
+            order = rng.permutation(len(x))
+            for at in range(0, len(x), 256):
+                rows = order[at:at + 256]
+                loss = trainer.step(x[rows], y[rows])
+        fitted = trainer.params()
+        with LEARN_LOCK:
+            target = _PILOT_WEIGHTS.setdefault(name, fitted)
+            for n in PARAMS:
+                target[n] = fitted[n]          # the live pilots read this dict
+            save_params(target, weights_path(name))
+        LEARN_STATUS[name] = {"last": label, "rows": int(len(x)), "loss": round(loss, 4), "at": time.strftime("%H:%M:%S")}
+        print(f"[autopilot] {name}: post-trained on {label} ({len(x)} rows, loss {loss:.4f})", flush=True)
+    except Exception as error:  # noqa: BLE001 - learning must never take the game down
+        LEARN_STATUS[name] = {"last": f"failed: {type(error).__name__}: {str(error)[:80]}"}
+        print(f"[autopilot] {name}: post-training failed: {error}", flush=True)
+
+
+def finish_episode(game, trace: PlayTrace) -> None:
+    """A game ended: keep / learn from its trace as described above."""
+    name = game.game
+    if name not in FEATURE_FUNCTIONS or trace.demo is None or len(trace.x) < MIN_ROWS:
+        return
+    x, y = np.stack(trace.x), np.stack(trace.y)
+    score = float(game.session.column("score")[0]) if game.session.state is not None else 0.0
+    if not trace.demo:
+        path = human_records_path(name)
+        with LEARN_LOCK:
+            if path.exists():
+                old = np.load(path)
+                kx, ky = np.concatenate([old["x"], x]), np.concatenate([old["y"], y])
+                episodes = np.concatenate([old["episode_score"], [score]])
+            else:
+                kx, ky, episodes = x, y, np.asarray([score])
+            BUILD.mkdir(parents=True, exist_ok=True)
+            partial = path.with_suffix(".partial.npz")
+            np.savez(partial, x=kx, y=ky, episode_score=episodes)
+            partial.replace(path)
+        _HUMAN_GAMES[name] = int(len(episodes))
+        label = f"human game {len(episodes)} (score {score:.0f}, {len(x)} decisions)"
+        kept_tail = len(x)
+    else:
+        scores = _DEMO_SCORES[name]
+        baseline = float(np.mean(scores[-10:])) if scores else -1.0
+        scores.append(score)
+        if not DEMO_LEARNING.get(name) or score < baseline:
+            LEARN_STATUS[name] = {**LEARN_STATUS.get(name, {}),
+                                  "demo": f"demo run {score:.0f} vs average {max(baseline, 0):.0f}"
+                                          + ("" if DEMO_LEARNING.get(name) else " (learning off)")}
+            return
+        label = f"demo run (score {score:.0f} >= average {max(baseline, 0):.0f})"
+        kept_tail = 0
+    _threading.Thread(target=_post_train, args=(name, x, y, label, kept_tail), name=f"post-train-{name}", daemon=True).start()
+
+
+_HUMAN_GAMES: dict[str, int] = {}
+
+
+def learning_summary(name: str) -> dict:
+    if name not in _HUMAN_GAMES:                  # read the record file once, then count in memory
+        records = human_records_path(name)
+        try:
+            _HUMAN_GAMES[name] = int(len(np.load(records)["episode_score"])) if records.exists() else 0
+        except Exception:  # noqa: BLE001
+            _HUMAN_GAMES[name] = 0
+    return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name], **LEARN_STATUS.get(name, {})}

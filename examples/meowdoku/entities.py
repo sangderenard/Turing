@@ -342,24 +342,48 @@ class EntityGame(Game):
         self.autopilot = bool(on)
         self._pilot_hold = 0.0
 
+    def _trace(self, controls: dict, demo: bool) -> None:
+        """Record one decision for learning (games with an autopilot only)."""
+        from meowdoku.autopilot import FEATURE_FUNCTIONS, PlayTrace
+        if self.game not in FEATURE_FUNCTIONS or self.session.state is None or getattr(self, "_ended", False):
+            return
+        if getattr(self, "trace", None) is None:
+            self.trace = PlayTrace()
+        self.trace.record(self, controls, demo)
+
+    def _end_check(self) -> None:
+        """The first landing after the game is over hands its trace to the learner."""
+        if getattr(self, "_ended", False) or self.session.state is None or self.result() is None:
+            return
+        self._ended = True
+        trace, self.trace = getattr(self, "trace", None), None
+        if trace is not None:
+            from meowdoku.autopilot import finish_episode
+            finish_episode(self, trace)
+
     def _land(self, seconds: float, held: dict) -> None:
         """Land ``seconds`` with ``held`` controls, or with the policy's own
         when the autopilot is on (one decision per PILOT_STEP)."""
         if not self.autopilot or self.pilot is None or self.session.state is None:
             self.held = held
+            if seconds > 0.0:
+                self._trace(held, demo=False)
             self.session.control(held)
             self.session.advance(seconds)
+            self._end_check()
             return
         left = seconds
         while left > 1e-9:
             if self._pilot_hold <= 1e-9:
                 self.held = self.pilot.controls(self)
                 self._pilot_hold = self.PILOT_STEP
+                self._trace(self.held, demo=True)
             step = min(left, self._pilot_hold)
             self.session.control(self.held)
             self.session.advance(step)
             left -= step
             self._pilot_hold -= step
+        self._end_check()
 
     # declared by the game ----------------------------------------------------
     def make_piece(self):
@@ -504,6 +528,7 @@ class EntityGame(Game):
         self.session.reset(self.initial_columns())
         self.last_tick = None
         self.epoch += 1
+        self.trace, self._ended = None, False          # a new episode to learn from
 
     def state(self) -> dict[str, Any]:
         st = self.base_state(int(round(self.height)), int(round(self.width)))
@@ -523,6 +548,9 @@ class EntityGame(Game):
         st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
         st["sync_hint"] = self.sync_hint()
         st["autopilot"] = self.autopilot
+        from meowdoku.autopilot import FEATURE_FUNCTIONS, learning_summary
+        if self.game in FEATURE_FUNCTIONS:
+            st["learning"] = learning_summary(self.game)
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, "adopt_axes": self.adopt_axes(), **(self.motion() or {})}

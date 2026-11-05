@@ -30,6 +30,8 @@
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   .arena-only, #bar .arena-only { display: none; }
+  .pilot-only, #bar .pilot-only { display: none; }
+  body[data-game="space_invaders"] #bar .pilot-only, body[data-game="bullet_hell"] #bar .pilot-only { display: inline-flex; }
   .chessmove-only, #bar .chessmove-only, #position { display: none; }
   body[data-game="chess"] #bar .chessmove-only, body[data-game="chess_vs_net"] #bar .chessmove-only { display: inline-flex; }
   body[data-game="chess"] #position, body[data-game="chess_vs_net"] #position,
@@ -80,6 +82,8 @@
   <input id="move-input" class="chessmove-only" type="text" placeholder="e2e4" autocomplete="off" spellcheck="false" size="7" aria-label="Chess move in UCI, like e2e4">
   <button id="move-submit" class="chessmove-only">Submit move</button>
   <span id="move-result" class="chessmove-only" role="status" aria-live="polite"></span>
+  <button id="demo-learn" class="pilot-only" title="Let the demo player train on its own better runs (each finished demo game that beats its running average)">Start demo learning</button>
+  <span id="learn-status" class="pilot-only" role="status" aria-live="polite"></span>
   <button id="arena-save" class="arena-only" title="Write the network's weights to disk now">Save network</button>
   <button id="arena-stop" class="arena-only" title="Stop self-play training (saves first)">Stop training</button>
   <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>

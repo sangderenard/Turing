@@ -120,6 +120,11 @@ class Table:
             if not hasattr(self.game, "set_autopilot"):
                 raise ValueError("this game has no autopilot")
             self.game.set_autopilot(bool(payload.get("on")))    # the compiled policy plays; the page keeps drawing
+        elif kind == "demo_learning":
+            from meowdoku import autopilot
+            if getattr(self.game, "game", None) not in autopilot.FEATURE_FUNCTIONS:
+                raise ValueError("this game has no autopilot to teach")
+            autopilot.DEMO_LEARNING[self.game.game] = bool(payload.get("on"))
         elif kind == "layout":
             if hasattr(self.game, "layout"):
                 self.game.layout(float(payload.get("aspect") or 0.0))

@@ -1532,6 +1532,12 @@ function applyState(game) {
   if (game.text_board) $("position").textContent =
     `${game.turn} to move${game.check ? " (check)" : ""}${game.outcome ? ` · game over: ${game.outcome}` : ""}\n${game.text_board}`
     + (game.legal_uci && game.legal_uci.length ? `\nlegal: ${game.legal_uci.join(" ")}` : "");
+  if (game.learning) {
+    const L = game.learning;
+    $("demo-learn").textContent = L.demo_learning ? "Stop demo learning" : "Start demo learning";
+    $("learn-status").textContent = `${L.human_games} of your games kept`
+      + (L.last ? ` · trained on ${L.last}${L.at ? " at " + L.at : ""}` : "") + (L.demo ? ` · ${L.demo}` : "");
+  }
   if (game.game === "chess_arena") $("arena-stop").textContent = game.arena_running ? "Stop training" : "Resume training";
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
@@ -1917,6 +1923,7 @@ async function submitMove() {
 }
 $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
+$("demo-learn").onclick = () => act({ type: "demo_learning", on: !(state.game && state.game.learning && state.game.learning.demo_learning) });
 $("arena-save").onclick = () => act({ type: "arena_save" });
 $("arena-stop").onclick = () => act({ type: state.game && state.game.arena_running ? "arena_stop" : "arena_resume" });
 $("lichess-stop").onclick = () => act({ type: "lichess_pause" });
