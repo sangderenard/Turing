@@ -172,6 +172,115 @@ function uploadMesh(mesh) {
   return { vao, count, extent: mesh.extent };
 }
 
+// Client-side corner rounding of the extruded glyph meshes: weld, crease-angle smooth
+// normals, Taubin smoothing of crease vertices only.  Server meshes stay flat.
+const roundParams = { iters: 2, creaseDeg: 40 };
+function roundMesh(mesh, iters, creaseDeg) {
+  const P0 = mesh.positions, T = P0.length / 9, N0 = mesh.normals;
+  if (!T || (P0.length % 9)) return mesh;
+  const lo = [1e30, 1e30, 1e30], hi = [-1e30, -1e30, -1e30];
+  for (let i = 0; i < P0.length; i += 3) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], P0[i+k]); hi[k] = Math.max(hi[k], P0[i+k]); }
+  const ctr = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2), diag = Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) || 1, q = 1e-5 * diag;
+  // 1. weld
+  const key = new Map(), wid = new Int32Array(T * 3), wp = [];
+  for (let i = 0; i < T * 3; i++) {
+    const k = Math.round(P0[i*3]/q) + "," + Math.round(P0[i*3+1]/q) + "," + Math.round(P0[i*3+2]/q);
+    let id = key.get(k); if (id === undefined) { id = wp.length / 3; key.set(k, id); wp.push(P0[i*3], P0[i*3+1], P0[i*3+2]); }
+    wid[i] = id;
+  }
+  const V = wp.length / 3, P = Float64Array.from(wp);
+  // consistent outward orientation of each face by edge propagation (walls are wound inward vs caps)
+  const edges = new Map();
+  for (let f = 0; f < T; f++) for (let e = 0; e < 3; e++) {
+    const a = wid[f*3+e], b = wid[f*3+(e+1)%3], k = Math.min(a, b) * V + Math.max(a, b);
+    let l = edges.get(k); if (!l) edges.set(k, l = []); l.push(f * 3 + e);
+  }
+  const ori = new Int8Array(T), seen = new Uint8Array(T);
+  const geom = (f, out) => { const a = wid[f*3]*3, b = wid[f*3+1]*3, c = wid[f*3+2]*3;
+    const ux = P[b]-P[a], uy = P[b+1]-P[a+1], uz = P[b+2]-P[a+2], vx = P[c]-P[a], vy = P[c+1]-P[a+1], vz = P[c+2]-P[a+2];
+    out[0] = uy*vz-uz*vy; out[1] = uz*vx-ux*vz; out[2] = ux*vy-uy*vx; };
+  const tmp = [0, 0, 0];
+  for (let s = 0; s < T; s++) {
+    if (seen[s]) continue;
+    const comp = [s], stack = [s]; seen[s] = 1; ori[s] = 1;
+    while (stack.length) {
+      const f = stack.pop();
+      for (let e = 0; e < 3; e++) {
+        const a = wid[f*3+e], b = wid[f*3+(e+1)%3];
+        for (const h of edges.get(Math.min(a, b) * V + Math.max(a, b))) {
+          const g = (h / 3) | 0; if (seen[g]) continue;
+          const same = wid[g*3+h%3] === a;     // same directed edge => inconsistent winding
+          ori[g] = same ? -ori[f] : ori[f]; seen[g] = 1; stack.push(g); comp.push(g);
+        }
+      }
+    }
+    let vol = 0;
+    for (const f of comp) { geom(f, tmp); const a = wid[f*3]*3;
+      vol += ori[f] * (tmp[0]*(P[a]-ctr[0]) + tmp[1]*(P[a+1]-ctr[1]) + tmp[2]*(P[a+2]-ctr[2])); }
+    if (vol < 0) for (const f of comp) ori[f] = -ori[f];
+  }
+  // sign relating the stored (render) normal to the outward normal, per face
+  const rs = new Int8Array(T);
+  for (let f = 0; f < T; f++) { geom(f, tmp);
+    rs[f] = (N0[f*9]*tmp[0] + N0[f*9+1]*tmp[1] + N0[f*9+2]*tmp[2]) * ori[f] < 0 ? -1 : 1; }
+  // adjacency
+  const vf = Array.from({ length: V }, () => []), vn = Array.from({ length: V }, () => new Set());
+  for (let f = 0; f < T; f++) for (let e = 0; e < 3; e++) {
+    const a = wid[f*3+e]; vf[a].push(f); vn[a].add(wid[f*3+(e+1)%3]); vn[a].add(wid[f*3+(e+2)%3]);
+  }
+  const cosC = Math.cos(creaseDeg * Math.PI / 180);
+  const faceN = new Float64Array(T * 3);
+  const computeFaceN = () => { for (let f = 0; f < T; f++) { geom(f, tmp); const l = Math.hypot(tmp[0], tmp[1], tmp[2]) || 1;
+    faceN[f*3] = tmp[0]/l*ori[f]; faceN[f*3+1] = tmp[1]/l*ori[f]; faceN[f*3+2] = tmp[2]/l*ori[f]; } };
+  computeFaceN();
+  // 3. Taubin on crease vertices only
+  if (iters > 0) {
+    const crease = new Uint8Array(V);
+    for (let v = 0; v < V; v++) { const fs = vf[v];
+      outer: for (let i = 0; i < fs.length; i++) for (let j = i + 1; j < fs.length; j++) {
+        const a = fs[i]*3, b = fs[j]*3;
+        if (faceN[a]*faceN[b] + faceN[a+1]*faceN[b+1] + faceN[a+2]*faceN[b+2] < cosC) { crease[v] = 1; break outer; } } }
+    const nb = vn.map((s) => Array.from(s)), Q = new Float64Array(P.length);
+    const pass = (lam) => { Q.set(P);
+      for (let v = 0; v < V; v++) { if (!crease[v] || !nb[v].length) continue;
+        let x = 0, y = 0, z = 0; for (const u of nb[v]) { x += P[u*3]; y += P[u*3+1]; z += P[u*3+2]; }
+        const n = nb[v].length; Q[v*3] += lam * (x/n - P[v*3]); Q[v*3+1] += lam * (y/n - P[v*3+1]); Q[v*3+2] += lam * (z/n - P[v*3+2]); }
+      P.set(Q); };
+    for (let it = 0; it < iters; it++) { pass(0.5); pass(-0.53); }
+    computeFaceN();
+  }
+  // 2. crease-angle smooth normals (angle weighted), emitted relative to the stored winding convention
+  const pos = new Float32Array(T * 9), nrm = new Float32Array(T * 9);
+  for (let f = 0; f < T; f++) for (let c = 0; c < 3; c++) {
+    const v = wid[f*3+c], o = f*9 + c*3;
+    pos[o] = P[v*3]; pos[o+1] = P[v*3+1]; pos[o+2] = P[v*3+2];
+    let x = 0, y = 0, z = 0;
+    for (const g of vf[v]) {
+      if (faceN[f*3]*faceN[g*3] + faceN[f*3+1]*faceN[g*3+1] + faceN[f*3+2]*faceN[g*3+2] < cosC) continue;
+      let k = 0; while (wid[g*3+k] !== v) k++;
+      const a = wid[g*3+(k+1)%3]*3, b = wid[g*3+(k+2)%3]*3, vv = v*3;
+      const ux = P[a]-P[vv], uy = P[a+1]-P[vv+1], uz = P[a+2]-P[vv+2], wx = P[b]-P[vv], wy = P[b+1]-P[vv+1], wz = P[b+2]-P[vv+2];
+      const lu = Math.hypot(ux, uy, uz), lw = Math.hypot(wx, wy, wz); if (!lu || !lw) continue;
+      const w = Math.acos(Math.max(-1, Math.min(1, (ux*wx + uy*wy + uz*wz) / (lu * lw))));
+      x += faceN[g*3]*w; y += faceN[g*3+1]*w; z += faceN[g*3+2]*w;
+    }
+    const l = Math.hypot(x, y, z) || 1, s = rs[f] / l;
+    nrm[o] = x*s; nrm[o+1] = y*s; nrm[o+2] = z*s;
+  }
+  return Object.assign({}, mesh, { positions: pos, normals: nrm });
+}
+function rebuildRoundedMeshes() {
+  if (!state.assets) return;
+  const t0 = performance.now();
+  for (const [name, mesh] of Object.entries(state.assets.meshes)) {
+    const old = state.meshes[name];
+    if (old) { gl.bindVertexArray(old.vao); const b = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+      gl.bindVertexArray(null); gl.deleteVertexArray(old.vao); if (b) gl.deleteBuffer(b); }
+    state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
+  }
+  console.log("roundMesh all meshes ms", (performance.now() - t0).toFixed(0));
+}
+
 // Lit geometry with a per-vertex material id: buttons, glass, anything
 // built on the page.  ``faces`` is a list of [a, b, c, materialIndex].
 function litMesh(faces) {
@@ -384,6 +493,9 @@ function applyState(game) {
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
   status.textContent = `${game.status} · ${game.title}`;
+  const lichess = game.lichess_control;
+  $("lichess-stop").disabled = !lichess || lichess.pause_requested;
+  $("lichess-resume").disabled = !lichess || !lichess.pause_requested;
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
   // Watch mode: the server's thread moves; poll again as soon as this reply
@@ -455,7 +567,9 @@ function draw(ms) {
     gl.uniformMatrix4fv(shadowLoc, false, M.multiply(light.viewProj, model));
     gl.bindVertexArray(vao);
     if (materialId != null) gl.vertexAttribI4i(2, materialId, 0, 0, 0);
-    gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
+    // aCullImmune = 1: the extruded meshes' walls are wound inward, so draw both sides
+    // (the shader flips back-face normals).
+    gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, count);
   };
   for (const [vao, count, model, piece] of casters) drawLit(vao, count, model, piece ? state.materialIndex[piece.color] : null);
@@ -590,10 +704,14 @@ window.addEventListener("keydown", async (e) => {
 });
 $("undo").onclick = () => act({ type: "undo" });
 $("reset").onclick = () => act({ type: "reset" });
+$("lichess-stop").onclick = () => act({ type: "lichess_pause" });
+$("lichess-resume").onclick = () => act({ type: "lichess_resume" });
 $("entry").addEventListener("input", (e) => act({ type: "text", text: e.target.value }));
 $("entry").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); act({ type: "submit" }); } });
 $("enter").onclick = () => act({ type: "submit" });
 $("back").onclick = () => act({ type: "backspace" });
+$("round").oninput = (e) => { roundParams.iters = Number(e.target.value); rebuildRoundedMeshes(); };
+$("crease").oninput = (e) => { roundParams.creaseDeg = Number(e.target.value); rebuildRoundedMeshes(); };
 $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
@@ -641,7 +759,7 @@ function fillPickers() {
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
-  for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(mesh);
+  for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
   fillPickers();
   requestAnimationFrame(draw);
   $("new").click();

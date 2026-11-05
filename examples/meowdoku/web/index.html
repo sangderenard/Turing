@@ -14,14 +14,19 @@
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
   #bar input[type=range] { width: 90px; }
   #status { margin-left: auto; opacity: 0.85; }
-  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  /* The canvas starts below the control bar (which wraps to several lines on a
+     phone) so the bar never covers the board; --bar-h is kept live below. */
+  canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: 100vw;
+           height: calc(100vh - var(--bar-h, 0px)); touch-action: none; }
   #word { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
   #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
                 background: #1e1e24; color: #f0f0f3; border: 1px solid #3a3a42; border-radius: 8px; padding: 6px 4px 6px 12px; }
   #word button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 8px 12px; font: inherit; }
   #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; }
-  .meowdoku-only, .wordle-only { display: none; }
-  body[data-game="meowdoku"] .meowdoku-only { display: inline-flex; }
+  /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
+  .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
+  body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
+  body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
 </style>
 </head>
@@ -33,9 +38,13 @@
   <button id="new">New</button>
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
+  <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>
+  <button id="lichess-resume" class="lichess-only">Resume Lichess</button>
   <button id="light">Light: orbit (L)</button>
   <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
+  <label>Round <input id="round" type="range" min="0" max="4" value="2"></label>
+  <label>Crease <input id="crease" type="range" min="0" max="90" value="40"></label>
   <span id="status">loading…</span>
 </div>
 <canvas id="gl"></canvas>
@@ -45,6 +54,12 @@
   <button id="back">⌫</button>
 </div>
 <div id="help">meowdoku: tap or swipe for X, double-tap for a cat · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack</div>
+<script>
+  // Keep the canvas below the control bar as the bar wraps or unwraps.
+  (() => { const bar = document.getElementById("bar");
+    const fit = () => document.documentElement.style.setProperty("--bar-h", bar.offsetHeight + "px");
+    new ResizeObserver(fit).observe(bar); fit(); })();
+</script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
