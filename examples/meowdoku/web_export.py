@@ -152,6 +152,13 @@ def export_assets(out: Path) -> dict:
         if name in EMOJI_BODY_ONLY:
             verts, normals = largest_component(verts, normals)
         pack(name, verts, normals)
+    # The side scroller's own glyphs (the ones the shared table lacks).
+    from meowdoku.sidescroller import EMOJI as SIDE_EMOJI, EMOJI_SUBDIVISIONS as SIDE_SUBDIVISIONS
+    for name, glyph in SIDE_EMOJI.items():
+        if name not in meshes:
+            verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                                        outline_subdivisions=SIDE_SUBDIVISIONS.get(name, 1))
+            pack(name, *largest_component(verts, normals))
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
