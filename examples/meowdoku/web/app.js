@@ -785,7 +785,7 @@ function cellPosition(game, cell, rackPiece) {
 // lands where the server puts it.  What little differs (the two sides'
 // integration step sizes) eases out over ~60 ms.
 const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null };
-const PRED_STEP = 1 / 120;
+const PRED_STEP = 1 / 240;            // the predictor's own rate (PREDICT_HZ)
 window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 function stepShip(ship, input, seconds, motion) {
@@ -811,6 +811,12 @@ function reconcile(game) {
                 if (Math.hypot(...pred.offset) > 1.5) pred.offset = [0, 0]; }
   pred.ship = ship;
 }
+// The predictor runs on its own clock, PREDICT_HZ, unbound from the display's
+// refresh: controls are sampled, input intervals closed and the ship stepped
+// at that rate whether the page draws at 30, 60 or 144 frames a second (or
+// not at all); drawing just reads the latest predicted ship.
+const PREDICT_HZ = 240;
+setInterval(() => predictFrame(performance.now() / 1000), 1000 / PREDICT_HZ);
 function predictFrame(now) {
   const game = state.game;
   const frame = pred.at == null ? 0 : Math.min(0.1, Math.max(0, now - pred.at));
@@ -858,12 +864,19 @@ function ensureSocket() {
   ws.onclose = () => { sock.ws = null; sock.open = false; sock.outstanding = 0; };
   ws.onerror = () => {};
   ws.onmessage = (event) => {
+    // A message for a game the page has left (ticks still in flight when the
+    // player switched games) is dropped: it must never put that game back on
+    // screen, nor restart anything.
+    const current = state.game, live = !!(current && current.input === "realtime");
     if (typeof event.data === "string") {
       const message = JSON.parse(event.data);
-      if (message.meta) { sock.meta = { ...(sock.meta || {}), ...message.meta }; applyState({ ...sock.meta }); }
+      if (message.meta) {
+        if (!live || (message.meta.game && message.meta.game !== current.game)) return;
+        sock.meta = { ...(sock.meta || {}), ...message.meta }; applyState({ ...sock.meta });
+      }
       if (message.error) {
         sock.outstanding = Math.max(0, sock.outstanding - 1);
-        if (/no game/.test(message.error) && !ticks.restarting && state.game) {
+        if (live && /no game/.test(message.error) && !ticks.restarting) {
           ticks.restarting = true;
           newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) }).finally(() => { ticks.restarting = false; });
         }
@@ -871,6 +884,7 @@ function ensureSocket() {
       return;
     }
     sock.outstanding = Math.max(0, sock.outstanding - 1);
+    if (!live) return;
     sock.bytes += event.data.byteLength; sock.frames += 1;
     applySnapshot(new DataView(event.data));
   };
@@ -938,7 +952,7 @@ function sendTick(game) {
   let payload = { type: "tick", ...controls() };
   if (predicting(game)) {
     if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
-    const at = state.time;
+    const at = performance.now() / 1000;
     pred.sent.push(...pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq, closedAt: at })));
     pred.closed = [];
     if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
@@ -1394,7 +1408,6 @@ function draw(ms) {
   gl.viewport(0, 0, w, h); gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
-  predictFrame(now);
   const cam = camera(); updateLight(now);
   const casters = [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
