@@ -1,20 +1,20 @@
-"""The Meowdoku web server: the Python state machine behind the WebGL page.
+"""The Meowdoku web server: the Python state machines behind the WebGL page.
 
-    python examples/meowdoku/server.py --port 8766
+    python examples/meowdoku/server.py --port 8766 --bind 0.0.0.0
 
 Serves ``build/meowdoku/web`` (the exported page, shaders, assets and the
-prebaked board database) and a small JSON API over one ``MeowdokuSession``,
-which runs the game law through the dt system exactly as the pygame runner
-does:
+prebaked board database) and a JSON API over the games in ``games.py``:
 
-    POST /api/new    {"id": "<board id>"}           -> state
-    POST /api/move   {"r": int, "c": int, "button": "primary"|"secondary"} -> state
-    POST /api/undo, /api/reset                      -> state
-    GET  /api/state                                 -> state
+    GET  /api/catalog                      -> games, Meowdoku levels and boards
+    POST /api/new     {"game": "meowdoku", "id": "<board id>"}
+                      {"game": "chess"|"checkers"} | {"game": "wordle", "seed": 3}
+    POST /api/action  {"type": "cell", "r", "c", "button"} | {"type": "text", "text"}
+                      | {"type": "submit"|"backspace"|"undo"|"reset"}
+    GET  /api/state
 
-A state is ``{n, id, cat, x_mark, hearts, won, lost, moves}`` with the
-columns as flat 0/1 lists.  The page animates the difference between
-states; the server never renders anything.
+Every call returns the game's state (see ``games.py``); the page animates
+the difference between states.  Meowdoku runs the dt-system law through
+``MeowdokuSession``; the server never renders anything.
 """
 from __future__ import annotations
 
@@ -26,80 +26,72 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import numpy as np
-
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
-from meowdoku.puzzle import Puzzle  # noqa: E402
-from meowdoku.session import MeowdokuSession  # noqa: E402
+from meowdoku.games import Checkers, Chess, MeowdokuGame, Wordle  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 
 
-class Game:
-    """One session at a time, built from a prebaked board."""
+class Table:
+    """One game at a time, picked from the catalog."""
 
     def __init__(self, web_dir: Path):
         self.web_dir = web_dir
         self.lock = threading.Lock()
-        self.boards = {board["id"]: board for board in json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))["boards"]}
-        self.session: MeowdokuSession | None = None
-        self.board_id: str | None = None
-        self.moves = 0
+        database = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
+        self.boards = {board["id"]: board for board in database["boards"]}
+        self.levels = database["levels"]
+        self.game = None
 
-    def new(self, board_id: str) -> dict:
-        board = self.boards[board_id]
-        n = int(board["n"])
-        cells = np.arange(n * n)
-        puzzle = Puzzle(n, (cells // n).astype(np.float64), (cells % n).astype(np.float64),
-                        np.asarray(board["region"], dtype=np.float64), np.asarray(board["solution"], dtype=np.float64))
-        self.session = MeowdokuSession(n=n, puzzle=puzzle)
-        self.board_id = board_id
-        self.moves = 0
-        return self.state()
+    def catalog(self) -> dict:
+        return {
+            "games": ["meowdoku", "chess", "checkers", "wordle"],
+            "meowdoku": {"levels": self.levels,
+                         "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
+        }
 
-    def move(self, r: int, c: int, button: str) -> dict:
-        if self.session is None:
-            raise ValueError("no game: POST /api/new first")
-        if button == "secondary":
-            self.session.toggle_x(int(r), int(c))
+    def new(self, payload: dict) -> dict:
+        kind = str(payload.get("game", "meowdoku"))
+        if kind == "meowdoku":
+            self.game = MeowdokuGame(self.boards[str(payload["id"])])
+        elif kind == "chess":
+            self.game = Chess("chess")
+        elif kind == "checkers":
+            self.game = Checkers("checkers")
+        elif kind == "wordle":
+            self.game = Wordle(int(payload.get("seed", 0)))
         else:
-            self.session.place(int(r), int(c))
-        self.moves += 1
+            raise ValueError(f"unknown game {kind!r}")
         return self.state()
 
-    def undo(self) -> dict:
-        if self.session is not None:
-            self.session.undo()
-        return self.state()
-
-    def reset(self) -> dict:
-        if self.session is not None:
-            self.session.reset()
-            self.moves = 0
+    def action(self, payload: dict) -> dict:
+        if self.game is None:
+            raise ValueError("no game: POST /api/new first")
+        kind = str(payload.get("type"))
+        if kind == "cell":
+            self.game.cell(int(payload["r"]), int(payload["c"]), str(payload.get("button", "primary")))
+        elif kind == "text":
+            self.game.text(str(payload.get("text", "")))
+        elif kind in ("submit", "backspace", "undo", "reset"):
+            getattr(self.game, kind)()
+        else:
+            raise ValueError(f"unknown action {kind!r}")
         return self.state()
 
     def state(self) -> dict:
-        if self.session is None:
-            return {"n": 0, "id": None}
-        s = self.session
-        return {
-            "n": int(s.n), "id": self.board_id,
-            "cat": np.asarray(s.cat, dtype=int).reshape(-1).tolist(),
-            "x_mark": np.asarray(s.x_mark, dtype=int).reshape(-1).tolist(),
-            "hearts": int(s.hearts), "won": bool(s.won), "lost": bool(s.lost), "moves": self.moves,
-        }
+        return self.game.state() if self.game is not None else {"game": None}
 
 
-def make_handler(game: Game):
+def make_handler(table: Table):
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=str(game.web_dir), **kwargs)
+            super().__init__(*args, directory=str(table.web_dir), **kwargs)
 
         def log_message(self, format, *args):  # noqa: A002 - quiet static logs
-            if "/api/" in str(args[0]) if args else False:
+            if args and "/api/" in str(args[0]):
                 sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
         def _json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
@@ -111,25 +103,28 @@ def make_handler(game: Game):
             self.end_headers()
             self.wfile.write(body)
 
+        def end_headers(self):
+            if not self.path.startswith("/api/"):
+                self.send_header("Cache-Control", "no-cache")          # the page is edited live
+            super().end_headers()
+
         def do_GET(self):  # noqa: N802
             if self.path.startswith("/api/state"):
-                with game.lock:
-                    return self._json(game.state())
+                with table.lock:
+                    return self._json(table.state())
+            if self.path.startswith("/api/catalog"):
+                return self._json(table.catalog())
             return super().do_GET()
 
         def do_POST(self):  # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
             try:
-                with game.lock:
+                with table.lock:
                     if self.path.startswith("/api/new"):
-                        return self._json(game.new(str(payload["id"])))
-                    if self.path.startswith("/api/move"):
-                        return self._json(game.move(payload["r"], payload["c"], str(payload.get("button", "primary"))))
-                    if self.path.startswith("/api/undo"):
-                        return self._json(game.undo())
-                    if self.path.startswith("/api/reset"):
-                        return self._json(game.reset())
+                        return self._json(table.new(payload))
+                    if self.path.startswith("/api/action"):
+                        return self._json(table.action(payload))
             except Exception as error:  # the page shows the refusal
                 return self._json({"error": f"{type(error).__name__}: {error}"}, HTTPStatus.BAD_REQUEST)
             return self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
@@ -147,9 +142,9 @@ def main(argv: list[str] | None = None) -> int:
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
-    game = Game(web_dir)
-    server = ThreadingHTTPServer((args.bind, args.port), make_handler(game))
-    print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({len(game.boards)} prebaked boards)", flush=True)
+    table = Table(web_dir)
+    server = ThreadingHTTPServer((args.bind, args.port), make_handler(table))
+    print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({len(table.boards)} prebaked boards; chess, checkers, wordle)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -6,28 +6,45 @@
 <title>Meowdoku</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #16161a; color: #e8e8ea; font: 14px/1.4 system-ui, sans-serif; }
-  #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 10px; align-items: center; padding: 8px 12px;
+  html, body { margin: 0; height: 100%; background: #16161a; color: #e8e8ea; font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
          background: rgba(22,22,26,0.85); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap; }
-  #bar select, #bar button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 6px 10px; font: inherit; }
+  #bar select, #bar button, #bar input[type=text] { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 5px 9px; font: inherit; }
   #bar button:hover { background: #30303a; }
+  #bar label { display: inline-flex; gap: 6px; align-items: center; }
+  #bar input[type=range] { width: 90px; }
   #status { margin-left: auto; opacity: 0.85; }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #word { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
+  #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
+                background: #1e1e24; color: #f0f0f3; border: 1px solid #3a3a42; border-radius: 8px; padding: 6px 4px 6px 12px; }
+  #word button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 8px 12px; font: inherit; }
   #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; }
+  .meowdoku-only, .wordle-only { display: none; }
+  body[data-game="meowdoku"] .meowdoku-only { display: inline-flex; }
+  body[data-game="wordle"] #word { display: flex; }
 </style>
 </head>
-<body>
+<body data-game="meowdoku">
 <div id="bar">
-  <label>Level <select id="level"></select></label>
-  <label>Board <select id="board"></select></label>
-  <button id="new">New board</button>
+  <label>Game <select id="game"></select></label>
+  <label class="meowdoku-only">Level <select id="level"></select></label>
+  <label class="meowdoku-only">Board <select id="board"></select></label>
+  <button id="new">New</button>
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
   <button id="light">Light: orbit (L)</button>
+  <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
+  <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
   <span id="status">loading…</span>
 </div>
 <canvas id="gl"></canvas>
-<div id="help">left click: cat · right click / long press: X · the hidden solution is the board's prebaked leaf</div>
+<div id="word">
+  <input id="entry" type="text" maxlength="5" autocomplete="off" spellcheck="false" placeholder="word">
+  <button id="enter">Enter</button>
+  <button id="back">⌫</button>
+</div>
+<div id="help">meowdoku: tap or swipe for X, double-tap for a cat · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack</div>
 <script type="module" src="app.js"></script>
 </body>
 </html>

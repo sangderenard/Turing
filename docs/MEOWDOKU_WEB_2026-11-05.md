@@ -59,3 +59,21 @@ to wasm would own exactly these curves and the state diff.
 - Free boards above 7x7 take 40 s each to catalog at export (the full
   tree per board); `--boards` and `--sizes` bound it.
 - No sound, no touch gestures beyond tap and long press.
+
+## Four games, one protocol (later on 2026-11-05)
+
+`games.py` states: `cells` (palette name per button), `marks` (X marks),
+`hints` (legal destinations), `selected`, `pieces` (stable ids; `cell` may
+be `hud:k` for hearts), `palette`, `rack` (Wordle's letters), `input`
+(`meowdoku`, `select`, `text`).  Verbs: `cell(r, c, button)` with primary /
+secondary / paint / double, `text`, `submit`, `backspace`, `undo`, `reset`.
+Chess and checkers light a selected piece's legal destinations before the
+move is committed; Wordle colours its rack from the guesses.  The page
+builds one Phong material per palette colour plus `@hint` and `@sel`
+variants, draws pieces by mesh family (letters and chess glyphs stand,
+discs lie flat), slides moved pieces, and runs every request through one
+queue so replies apply in order.  Controls: game selector, tilt (straight
+down by default), saturation (rewrites the material table), Light (orbit or
+follow the pointer).  Meowdoku: tap or swipe for X, double tap for a cat.
+Verified in the browser on a second server instance; the LAN server holds
+one table, so a second player (or a test) fights the first.

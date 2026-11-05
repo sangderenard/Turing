@@ -35,7 +35,7 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import tiles, tree  # noqa: E402
-from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh  # noqa: E402
+from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh, token_mesh  # noqa: E402
 from meowdoku.puzzle import generate_batch  # noqa: E402
 from meowdoku.tiles import SPECTRAL_ROOT  # noqa: E402
 
@@ -70,15 +70,28 @@ def export_assets(out: Path) -> dict:
         "enamel": tensors["enamel"], "texstack": tensors["texture_stack"],
     }
     meshes = {}
+
+    def pack(name, verts, normals, material=0):
+        meshes[name] = {
+            "positions": np.round(verts.reshape(-1), 5).tolist(),
+            "normals": np.round(np.repeat(normals, 3, axis=0).reshape(-1), 4).tolist(),
+            "material": int(material),
+            "triangles": int(verts.shape[0]),
+            "extent": float(np.abs(verts[..., :2]).max()),
+        }
+
     for role in PHONG_MATERIALS:
         verts, normals = glyph_mesh(role)
-        meshes[role] = {
-            "positions": np.round(verts.reshape(-1), 6).tolist(),
-            "normals": np.round(np.repeat(normals, 3, axis=0).reshape(-1), 6).tolist(),
-            "material": int(material_index[role]),
-            "triangles": int(verts.shape[0]),
-            "extent": float(np.abs(verts).max()),
-        }
+        pack(role, verts, normals, material_index[role])
+    # The other games' pieces: letters A-Z, the six chess pieces (the filled
+    # glyphs U+265A..U+265F), a disc for checkers; DejaVu Sans has all of
+    # them with light outlines.
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        pack(letter, *token_mesh(letter, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
+    for name, code in (("king", 0x265A), ("queen", 0x265B), ("rook", 0x265C), ("bishop", 0x265D),
+                       ("knight", 0x265E), ("pawn", 0x265F)):
+        pack(name, *token_mesh(chr(code), "DejaVu Sans", "normal", depth_ratio=0.45, outline_subdivisions=1))
+    pack("disc", *token_mesh("●", "DejaVu Sans", "normal", depth_ratio=0.22, outline_subdivisions=1))
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
@@ -128,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--boards", type=int, default=12, help="boards per size per style")
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--out", default=str(WEB_DIR))
+    parser.add_argument("--skip-boards", action="store_true", help="keep the existing boards.json")
     args = parser.parse_args(argv)
     out = Path(args.out)
     (out / "shaders").mkdir(parents=True, exist_ok=True)
@@ -139,8 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     assets = export_assets(out)
     print("[export] assets:", {role: mesh["triangles"] for role, mesh in assets["meshes"].items()},
           {name: table["records"] for name, table in assets["materials"].items()}, flush=True)
-    database = export_boards(out, tuple(int(s) for s in args.sizes.split(",")), args.boards, args.seed)
-    print(f"[export] {len(database['boards'])} boards; levels: {database['levels']}", flush=True)
+    if args.skip_boards and (out / "boards.json").exists():
+        print("[export] boards.json kept", flush=True)
+    else:
+        database = export_boards(out, tuple(int(s) for s in args.sizes.split(",")), args.boards, args.seed)
+        print(f"[export] {len(database['boards'])} boards; levels: {database['levels']}", flush=True)
     print(f"[export] -> {out}", flush=True)
     return 0
 

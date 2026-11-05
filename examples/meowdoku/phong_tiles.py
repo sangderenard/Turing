@@ -93,6 +93,36 @@ def _rotation_y(angle: float) -> np.ndarray:
     return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]], np.float32)
 
 
+def token_mesh(token: str, family: str, weight: str = "normal", *, depth_ratio: float = 0.32,
+               outline_subdivisions: int = 2, profile_segments: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Any font token as a centred extruded mesh in its plane basis, through
+    the same ink-on-slate order and glyph builder as the tiles.  Returns
+    ``(verts (T, 3, 3), normals (T, 3))``."""
+    scene_orders, render_assets, _ = tiles.spectral_modules()
+    font = render_assets.FontAssetSpec(family=family, weight=weight)
+    package = render_assets.build_ink_on_slate_order([token], font=font)
+    package["defaults"].get("geometry", {}).pop("depth_m", None)
+    for job in package["jobs"]:
+        job["font"] = font.scene_order_mapping()
+        geometry = {**job["geometry"], "extrusion_depth_ratio": float(depth_ratio),
+                    "outline_subdivisions": int(outline_subdivisions), "profile_segments": int(profile_segments)}
+        geometry.pop("depth_m", None)
+        if profile_segments <= 1:
+            geometry["profile"] = "straight"
+        job["geometry"] = geometry
+    scene_orders.validate_order(package)
+    job = scene_orders.resolved_jobs(package)[0]
+    planes = {str(plane["id"]): plane for plane in job["planes"]}
+    plane = planes[str(job["geometry"].get("embed_plane", job["planes"][0]["id"]))]
+    world = scene_orders._glyph_triangles(job, plane)
+    centre, normal, right, up = scene_orders._plane_basis(plane)
+    local = np.stack([(world - centre) @ right, (world - centre) @ up, (world - centre) @ normal], axis=-1)
+    normals = scene_orders._triangle_normals(local)
+    lo, hi = local.reshape(-1, 3).min(0), local.reshape(-1, 3).max(0)
+    local = local - (lo + hi)[None, None, :] / 2.0
+    return np.ascontiguousarray(local, np.float32), np.ascontiguousarray(normals, np.float32)
+
+
 def _ortho(half_w: float, half_h: float, near: float, far: float) -> np.ndarray:
     m = np.eye(4, dtype=np.float32)
     m[0, 0] = 1.0 / half_w
