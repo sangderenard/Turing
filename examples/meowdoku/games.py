@@ -181,6 +181,17 @@ class BoardGame(Game):
         else:
             self.selected = None
 
+    def peek(self, src: int, dst: int) -> tuple[dict[int, tuple[str, str]], str]:
+        """The position after ``src -> dst`` and the side then to move,
+        without touching this game (a lookahead's successor)."""
+        saved = (self.pieces, self.ids, self.turn)
+        self.pieces, self.ids = dict(self.pieces), dict(self.ids)
+        self.apply_move(src, dst)
+        pieces = self.pieces
+        turn = self.sides[1] if self.turn == self.sides[0] else self.sides[0]
+        self.pieces, self.ids, self.turn = saved
+        return pieces, turn
+
     def undo(self) -> None:
         if self.history:
             self.pieces, self.ids, self.turn = self.history.pop()
@@ -448,4 +459,112 @@ class Wordle(Game):
         return st
 
 
-GAMES = {"meowdoku": MeowdokuGame, "chess": Chess, "checkers": Checkers, "wordle": Wordle}
+# ---------------------------------------------------------------------------
+# The chess network: an arena that plays itself non-stop, and chess against it
+# ---------------------------------------------------------------------------
+
+_SELF_PLAY = None
+
+
+def self_play():
+    """One shared learner per server process (its weights persist on disk)."""
+    global _SELF_PLAY
+    if _SELF_PLAY is None:
+        from meowdoku.chess_net import SelfPlay
+        _SELF_PLAY = SelfPlay()
+    return _SELF_PLAY
+
+
+class ChessArena(Chess):
+    """Network against network.  Every ``tick`` plays one move; when a king
+    falls (or the ply cap is reached) the finished game trains the network
+    and a new game starts.  The page ticks it while it is on screen."""
+
+    game = "chess_arena"
+    title = "Chess arena: the network against itself"
+    input = "watch"
+
+    def __init__(self, board_id: str = "arena"):
+        super().__init__(board_id)
+        self.player = self_play()
+        self.boards, self.materials = [], []
+        self.plies = 0
+        self.last_result = ""
+
+    def tick(self) -> None:
+        from meowdoku.chess_net import MAX_PLIES, encode, king_taken, material
+        if self.plies == 0 and not self.boards:
+            pass
+        self.boards.append(encode(self.pieces, self.turn))
+        self.materials.append(material(self.pieces))
+        move = self.player.choose(self)
+        result = None
+        if move is None:
+            result = "draw"
+        else:
+            Chess.cell(self, *self.rc(move[0]), "primary"); Chess.cell(self, *self.rc(move[1]), "primary")
+            self.plies += 1
+            loser = king_taken(self)
+            if loser:
+                result = "black" if loser == "white" else "white"
+            elif self.plies >= MAX_PLIES:
+                result = "draw"
+        if result:
+            self.player.learn_from(self.boards, self.materials, result)
+            self.last_result = f"{result} in {self.plies} plies"
+            self.pieces, self.ids, self.selected = {}, {}, None
+            self.turn = self.sides[0]
+            self.boards, self.materials, self.plies = [], [], 0
+            self.history = []
+            self.setup()
+
+    def cell(self, r: int, c: int, button: str) -> None:   # the page's taps do nothing here
+        if button == "__move__":
+            return super().cell(r, c, "primary")
+        return None
+
+    def state(self) -> dict:
+        st = super().state()
+        p = self.player
+        rec = p.record
+        st["status"] = (f"game {p.games + 1} · ply {self.plies} · {self.turn} to move · "
+                        f"record W{rec['white']} B{rec['black']} D{rec['draw']}"
+                        + (f" · loss {p.last_loss:.3f}" if p.games else "")
+                        + (f" · last: {self.last_result}" if self.last_result else ""))
+        st["moves"] = self.plies
+        return st
+
+
+class ChessVsNet(Chess):
+    """You play White; the network answers for Black after each move."""
+
+    game = "chess_vs_net"
+    title = "Chess against the network"
+
+    def __init__(self, board_id: str = "vs_net"):
+        super().__init__(board_id)
+        self.player = self_play()
+
+    def cell(self, r: int, c: int, button: str) -> None:
+        before = self.moves
+        super().cell(r, c, button)
+        if self.moves > before and self.turn == "black":
+            from meowdoku.chess_net import king_taken
+            if king_taken(self):
+                return
+            move = self.player.choose(self, greedy=True)
+            if move is not None:
+                super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
+
+    def state(self) -> dict:
+        from meowdoku.chess_net import king_taken
+        st = super().state()
+        loser = king_taken(self)
+        if loser:
+            st["won"] = loser == "black"; st["lost"] = loser == "white"
+            st["status"] = "you took the king" if loser == "black" else "the network took your king"
+        return st
+
+
+GAMES = {"meowdoku": MeowdokuGame, "chess": Chess, "checkers": Checkers, "wordle": Wordle,
+         "chess_arena": ChessArena, "chess_vs_net": ChessVsNet}

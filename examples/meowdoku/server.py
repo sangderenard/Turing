@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
-from meowdoku.games import Checkers, Chess, MeowdokuGame, Wordle  # noqa: E402
+from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, MeowdokuGame, Wordle  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 
@@ -48,7 +48,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -63,6 +63,10 @@ class Table:
             self.game = Checkers("checkers")
         elif kind == "wordle":
             self.game = Wordle(int(payload.get("seed", 0)))
+        elif kind == "chess_arena":
+            self.game = ChessArena()
+        elif kind == "chess_vs_net":
+            self.game = ChessVsNet()
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
@@ -75,6 +79,9 @@ class Table:
             self.game.cell(int(payload["r"]), int(payload["c"]), str(payload.get("button", "primary")))
         elif kind == "text":
             self.game.text(str(payload.get("text", "")))
+        elif kind == "tick":
+            if hasattr(self.game, "tick"):
+                self.game.tick()
         elif kind in ("submit", "backspace", "undo", "reset"):
             getattr(self.game, kind)()
         else:

@@ -383,6 +383,10 @@ function applyState(game) {
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
   status.textContent = `${game.status} · ${game.title}`;
+  // The arena plays itself: while it is the game on screen, ask the server
+  // for one move every few hundred milliseconds (through the same queue).
+  clearTimeout(state.arenaTimer);
+  if (game.input === "watch" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick" }); }, 350);
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
@@ -543,6 +547,7 @@ canvas.addEventListener("pointerup", async (e) => {
     clickTimer = setTimeout(() => { clickTimer = null; act({ type: "cell", r: h.r, c: h.c, button }); }, 330);
     return;
   }
+  if (game.input === "watch") return;
   if (game.input === "select") {
     // tap: select or move; swipe from a piece to a square: select then move
     if (p.moved && p.start && p.start.kind === "board" && h && h.kind === "board" && h.key !== p.start.key) {
@@ -558,6 +563,7 @@ canvas.addEventListener("pointerup", async (e) => {
   }
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.game && state.game.input === "watch") act({ type: "tick" }); });
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;

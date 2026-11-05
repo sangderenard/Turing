@@ -77,3 +77,17 @@ down by default), saturation (rewrites the material table), Light (orbit or
 follow the pointer).  Meowdoku: tap or swipe for X, double tap for a cat.
 Verified in the browser on a second server instance; the LAN server holds
 one table, so a second player (or a test) fights the first.
+
+## The chess network (2026-11-05, late)
+
+`chess_net.py`: encoding 12 x 64 piece planes + side to move; `ValueNet`
+(tanh hidden layer, tanh value head, White's outcome in [-1, 1]) with the
+forward in AbstractTensor on numpy and the gradient from
+`AbstractTensor.autograd.grad`; `SelfPlay` picks moves by valuing every
+legal successor position in one batch (softmax at a temperature while
+learning), trains after each finished game on discounted outcomes plus a
+quarter-weight material term, and saves weights every ten games.  Measured
+from scratch: 300 games in under two minutes; against a random mover 6W 8L
+2D before and 5W 3L 8D after.  The page's `chess_arena` plays network
+against network non-stop (a tick per 350 ms while on screen; record, loss
+and the last result in the status); `chess_vs_net` answers your moves.
