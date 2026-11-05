@@ -160,6 +160,19 @@ class _Draws:
         return AT.tensor(np.ascontiguousarray(self.take(count)).reshape(shape))
 
 
+def _f(mask):
+    """A comparison's bool mask as a float 0/1 tensor: the form every mask
+    is carried in here.  AbstractTensor's &, | and ~ take a per-element
+    Python path on every backend (measured: 7.9 of 9.2 s of a 20-board
+    run); products, maxima, one-minus and sums are backend-vectorised."""
+    return mask.to_dtype("float")
+
+
+def _any(mask_f, dim=None):
+    """Float-mask ANY as a bool (one vectorised comparison)."""
+    return (mask_f.sum(dim=dim) if dim is not None else mask_f.sum()) > 0.0
+
+
 def _rank_of(keys):
     """Each key's rank among its row: a random permutation when the keys are
     random.  Spelled as a comparison count, not a sort: ``rank_i = #{j :
@@ -204,40 +217,39 @@ def singles_solve(region, solution, *, max_rounds: int | None = None):
 
     This is the uniqueness gate for anything that is not unique by
     construction, and the same arithmetic as the game law's own checks.
+    Masks are float 0/1 tensors throughout (see ``_f``).
     """
     from src.common.tensors import AbstractTensor as AT
 
     b, n = int(region.shape[0]), int(region.shape[1])
     index_n = AT.arange(n).to_dtype("float")
-    one_hot = (region.reshape((b, n, n, 1)) == index_n.reshape((1, 1, 1, n))).to_dtype("float")
+    one_hot = _f(region.reshape((b, n, n, 1)) == index_n.reshape((1, 1, 1, n)))
     zero = region * 0.0
-    placed = zero > 1.0
-    excluded = zero > 1.0
+    placed = zero
+    excluded = zero
     rounds = zero[:, 0, 0] * 0.0
     for _round in range(max_rounds or n):
-        candidate = ~(excluded | placed)
-        cand = candidate.to_dtype("float")
-        row_single = cand.sum(dim=2).reshape((b, n, 1)) == 1.0
-        col_single = cand.sum(dim=1).reshape((b, 1, n)) == 1.0
+        cand = (1.0 - excluded) * (1.0 - placed)
+        row_single = _f(cand.sum(dim=2).reshape((b, n, 1)) == 1.0) + zero
+        col_single = _f(cand.sum(dim=1).reshape((b, 1, n)) == 1.0) + zero
         per_region = (one_hot * cand.reshape((b, n, n, 1))).sum(dim=(1, 2))      # (b, n)
-        region_single = (one_hot * per_region.reshape((b, 1, 1, n))).sum(dim=3) == 1.0
-        new = candidate & (row_single | col_single | region_single)
-        if not bool(new.any()):
+        region_single = (one_hot * _f(per_region == 1.0).reshape((b, 1, 1, n))).sum(dim=3)
+        new = cand * row_single.maximum(col_single).maximum(region_single)
+        if not bool(_any(new)):
             break
-        rounds = rounds + new.any(dim=(1, 2)).to_dtype("float")
-        placed = placed | new
-        got = placed.to_dtype("float")
-        row_done = got.sum(dim=2).reshape((b, n, 1)) > 0.0
-        col_done = got.sum(dim=1).reshape((b, 1, n)) > 0.0
-        cats_per_region = (one_hot * got.reshape((b, n, n, 1))).sum(dim=(1, 2))   # (b, n)
-        region_done = (one_hot * cats_per_region.reshape((b, 1, 1, n))).sum(dim=3) > 0.0
+        rounds = rounds + _f(_any(new, dim=(1, 2)))
+        placed = placed.maximum(new)
+        row_done = placed.sum(dim=2).reshape((b, n, 1)) + zero
+        col_done = placed.sum(dim=1).reshape((b, 1, n)) + zero
+        cats_per_region = (one_hot * placed.reshape((b, n, n, 1))).sum(dim=(1, 2))   # (b, n)
+        region_done = (one_hot * cats_per_region.reshape((b, 1, 1, n))).sum(dim=3)
         near = zero
         for dr, dc in _EIGHT:
-            near = near + _shifted(AT, got, dr, dc, zero)
-        excluded = excluded | row_done | col_done | region_done | (near > 0.0)
-    solved = placed.to_dtype("float").sum(dim=(1, 2)) == float(n)
-    agrees = ((placed.to_dtype("float") - solution).abs().sum(dim=(1, 2)) == 0.0) | ~solved
-    if not bool(agrees.all()):
+            near = near + _shifted(AT, placed, dr, dc, zero)
+        excluded = _f((excluded + row_done + col_done + region_done + near) > 0.0)
+    solved = placed.sum(dim=(1, 2)) == float(n)
+    off = (placed - solution).abs().sum(dim=(1, 2)) > 0.0
+    if bool(_any(_f(off) * _f(solved))):
         raise AssertionError("singles placed a cat off the constructed solution: a deduction is unsound")
     return solved, rounds
 
@@ -346,11 +358,11 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
             # 1. cat map: ranks of random keys, redrawn until no two
             #    consecutive rows touch.
             sigma = _rank_of(uniform(b, n))
-            valid = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
-            while not bool(valid.all()):
+            touches = _f((sigma[:, 1:] - sigma[:, :-1]).abs() < 2.0).sum(dim=1)     # (b,) count
+            while bool(_any(touches)):
                 redraw = _rank_of(uniform(b, n))
-                sigma = AT.where(valid.reshape((b, 1)), sigma, redraw)
-                valid = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
+                sigma = AT.where((touches == 0.0).reshape((b, 1)), sigma, redraw)
+                touches = _f((sigma[:, 1:] - sigma[:, :-1]).abs() < 2.0).sum(dim=1)
             is_cat = (sigma.reshape((b, n, 1)) == columns).to_dtype("float")   # (b, n, n)
             zero = is_cat * 0.0
             if style == "free":
@@ -364,15 +376,15 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
                 own_cc = AT.where(is_cat > 0.5, centre_c.reshape((b, n, 1)) + zero, zero)
                 cell_r, cell_c = rr + zero, cc + zero
                 for _round in range(2 * n + 2):
-                    unassigned = region < 0.0
-                    if not bool(unassigned.any()):
+                    unassigned = _f(region < 0.0)
+                    if not bool(_any(unassigned)):
                         break
                     best_score = zero + float(4 * n * n + 1)
                     best = [region, own_cr, own_cc]
                     for dr, dc in _FOUR:
                         nb = [_shifted(AT, m, dr, dc, zero - 1.0) for m in (region, own_cr, own_cc)]
                         score = (cell_r - nb[1]) ** 2 + (cell_c - nb[2]) ** 2
-                        take = unassigned & (nb[0] >= 0.0) & (score < best_score)
+                        take = (unassigned * _f(nb[0] >= 0.0) * _f(score < best_score)) > 0.5
                         best_score = AT.where(take, score, best_score)
                         best = [AT.where(take, new, old) for new, old in zip(nb, best)]
                     region, own_cr, own_cc = best
@@ -398,19 +410,21 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
                     one_hot = (region.reshape((b, n, n, 1)) == regions_k).to_dtype("float")
                     size = one_hot.sum(dim=(1, 2))                                    # (b, n)
                     own_size = (one_hot * size.reshape((b, 1, 1, n))).sum(dim=3)      # (b, n, n)
-                    may_move = _simple_points(AT, region) & (is_cat < 0.5) & (parity_r == pr) & (parity_c == pc)
+                    may_move = (_f(_simple_points(AT, region)) * (1.0 - is_cat)
+                                * _f(parity_r == pr) * _f(parity_c == pc))
                     best_size = zero + huge
                     best_region, best_rank = region, own_rank
                     for dr, dc in _FOUR:
                         nb_region = _shifted(AT, region, dr, dc, zero - 1.0)
                         nb_rank = _shifted(AT, own_rank, dr, dc, zero - 1.0)
                         nb_size = _shifted(AT, own_size, dr, dc, zero + huge)
-                        take = (may_move & (nb_region >= 0.0) & (nb_region != region)
-                                & (nb_rank > eliminated_at) & (nb_size + 1.0 < own_size) & (nb_size < best_size))
+                        take = (may_move * _f(nb_region >= 0.0) * _f(nb_region != region)
+                                * _f(nb_rank > eliminated_at) * _f(nb_size + 1.0 < own_size)
+                                * _f(nb_size < best_size)) > 0.5
                         best_size = AT.where(take, nb_size, best_size)
                         best_region = AT.where(take, nb_region, best_region)
                         best_rank = AT.where(take, nb_rank, best_rank)
-                    if bool((best_region != region).any()):
+                    if bool(_any((best_region - region).abs())):
                         moved = True
                         region, own_rank = best_region, best_rank
                 if moved:
@@ -429,7 +443,7 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
                 one_hot = (region.reshape((b, n, n, 1)) == regions_k).to_dtype("float")
                 size = one_hot.sum(dim=(1, 2))
                 own_size = (one_hot * size.reshape((b, 1, 1, n))).sum(dim=3)
-                not_simple = ~_simple_points(AT, region) & (is_cat < 0.5)
+                not_simple = (1.0 - _f(_simple_points(AT, region))) * (1.0 - is_cat)
                 best_gain = zero - 1.0
                 best_region, best_rank = region, own_rank
                 for dr, dc in _FOUR:
@@ -437,40 +451,42 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
                     nb_rank = _shifted(AT, own_rank, dr, dc, zero - 1.0)
                     nb_size = _shifted(AT, own_size, dr, dc, zero + huge)
                     gain = own_size - nb_size
-                    take = (not_simple & (nb_region >= 0.0) & (nb_region != region)
-                            & (nb_rank > eliminated_at) & (nb_size + 1.0 < own_size) & (gain > best_gain))
+                    take = (not_simple * _f(nb_region >= 0.0) * _f(nb_region != region)
+                            * _f(nb_rank > eliminated_at) * _f(nb_size + 1.0 < own_size)
+                            * _f(gain > best_gain)) > 0.5
                     best_gain = AT.where(take, gain, best_gain)
                     best_region = AT.where(take, nb_region, best_region)
                     best_rank = AT.where(take, nb_rank, best_rank)
                 flat_gain = best_gain.reshape((b, n * n))
-                has = flat_gain.max(dim=1) > 0.0 if hasattr(flat_gain, "max") else None
-                if has is None or not bool(has.any()):
+                has = _f(_any(_f(flat_gain > 0.0), dim=1))                      # (b,) float
+                if not bool(_any(has)):
                     if not moved:
                         break
                     continue
                 pick = (flat_gain * -1.0).argmin(dim=1).to_dtype("float").reshape((b, 1))   # first best per board
-                pick_mask = (cell_index == pick).reshape((b, n, n)) & has.reshape((b, 1, 1))
-                trial = AT.where(pick_mask, best_region, region)
-                trial_rank = AT.where(pick_mask, best_rank, own_rank)
-                receiver = (pick_mask.to_dtype("float") * best_region).sum(dim=(1, 2)).reshape((b, 1, 1))
-                receiver_rank = (pick_mask.to_dtype("float") * best_rank).sum(dim=(1, 2)).reshape((b, 1, 1))
-                reached = is_cat > 0.5
+                pick_mask = _f(cell_index == pick).reshape((b, n, n)) * has.reshape((b, 1, 1))
+                trial = AT.where(pick_mask > 0.5, best_region, region)
+                trial_rank = AT.where(pick_mask > 0.5, best_rank, own_rank)
+                receiver = (pick_mask * best_region).sum(dim=(1, 2)).reshape((b, 1, 1))
+                receiver_rank = (pick_mask * best_rank).sum(dim=(1, 2)).reshape((b, 1, 1))
+                reached = is_cat
                 for _flood in range(n * n):
                     grow = reached
                     for dr, dc in _FOUR:
-                        same = _shifted(AT, trial, dr, dc, zero - 2.0) == trial
-                        grow = grow | (_shifted(AT, reached.to_dtype("float"), dr, dc, zero) > 0.0) & same
-                    if not bool((grow & ~reached).any()):
+                        same = _f(_shifted(AT, trial, dr, dc, zero - 2.0) == trial)
+                        grow = grow.maximum(_shifted(AT, reached, dr, dc, zero) * same)
+                    if not bool(_any(grow - reached)):
                         break
                     reached = grow
-                stranded = ~reached
-                ok_board = has.reshape((b, 1, 1)) & ~(stranded & ~(receiver_rank > eliminated_at)).any(dim=(1, 2)).reshape((b, 1, 1))
-                handed = AT.where(stranded, receiver + zero, trial)
-                handed_rank = AT.where(stranded, receiver_rank + zero, trial_rank)
-                if bool(ok_board.any()):
+                stranded = 1.0 - reached
+                ineligible = (stranded * _f(receiver_rank <= eliminated_at)).sum(dim=(1, 2))   # (b,)
+                ok_board = (has * _f(ineligible == 0.0)).reshape((b, 1, 1))
+                handed = AT.where(stranded > 0.5, receiver + zero, trial)
+                handed_rank = AT.where(stranded > 0.5, receiver_rank + zero, trial_rank)
+                if bool(_any(ok_board)):
                     moved = True
-                    region = AT.where(ok_board, handed, region)
-                    own_rank = AT.where(ok_board, handed_rank, own_rank)
+                    region = AT.where(ok_board > 0.5, handed, region)
+                    own_rank = AT.where(ok_board > 0.5, handed_rank, own_rank)
                 if not moved:
                     break
             regions.append(np.asarray(region.numpy(), dtype=np.float64).reshape(b, n * n))
@@ -485,30 +501,30 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
 def contiguous_regions(puzzles: "PuzzleBatch", *, backend: str = DEFAULT_BACKEND, device=DEFAULT_DEVICE) -> np.ndarray:
     """Per puzzle: every region is one 4-connected piece.  A batched flood
     from each cat over its own region; a region is contiguous when the
-    flood covers it."""
+    flood covers it.  Float masks."""
     from src.common.tensors import AbstractTensor as AT
 
     n, b = puzzles.n, puzzles.batch
     with AT.use_backend(backend, device):
         region = AT.tensor(puzzles.region.reshape(b, n, n))
-        reached = AT.tensor(puzzles.solution.reshape(b, n, n)) > 0.5
+        reached = AT.tensor(puzzles.solution.reshape(b, n, n))
         zero = region * 0.0
         for _round in range(n * n):
             grow = reached
-            got = reached.to_dtype("float")
             for dr, dc in _FOUR:
-                same = _shifted(AT, region, dr, dc, zero - 1.0) == region
-                grow = grow | ((_shifted(AT, got, dr, dc, zero) > 0.0) & same)
-            if not bool((grow & ~reached).any()):
+                same = _f(_shifted(AT, region, dr, dc, zero - 1.0) == region)
+                grow = grow.maximum(_shifted(AT, reached, dr, dc, zero) * same)
+            if not bool(_any(grow - reached)):
                 break
             reached = grow
-        return np.asarray(reached.all(dim=(1, 2)).numpy(), dtype=bool).reshape(b)
+        covered = (1.0 - reached).sum(dim=(1, 2)) == 0.0
+        return np.asarray(covered.numpy(), dtype=bool).reshape(b)
 
 
 def verify_batch(puzzles: PuzzleBatch, *, backend: str = DEFAULT_BACKEND, device=DEFAULT_DEVICE) -> np.ndarray:
     """Per puzzle: the solution obeys all three rules and every region holds
     exactly one cat.  Batched AbstractTensor checks, the same arithmetic the
-    game law uses, not a Python walk."""
+    game law uses, not a Python walk.  Float masks."""
     from src.common.tensors import AbstractTensor as AT
 
     n, b = puzzles.n, puzzles.batch
@@ -516,15 +532,15 @@ def verify_batch(puzzles: PuzzleBatch, *, backend: str = DEFAULT_BACKEND, device
         solution = AT.tensor(puzzles.solution.reshape(b, n, n))
         region = AT.tensor(puzzles.region.reshape(b, n, n))
         index_n = AT.arange(n).to_dtype("float")
-        one_per_row = (solution.sum(dim=2) == 1.0).all(dim=1)
-        one_per_col = (solution.sum(dim=1) == 1.0).all(dim=1)
+        rows_off = _f(solution.sum(dim=2) != 1.0).sum(dim=1)
+        cols_off = _f(solution.sum(dim=1) != 1.0).sum(dim=1)
         sigma = (solution * index_n.reshape((1, 1, n))).sum(dim=2)
-        no_touch = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
-        one_hot = (region.reshape((b, n, n, 1)) == index_n.reshape((1, 1, 1, n))).to_dtype("float")
+        touches = _f((sigma[:, 1:] - sigma[:, :-1]).abs() < 2.0).sum(dim=1)
+        one_hot = _f(region.reshape((b, n, n, 1)) == index_n.reshape((1, 1, 1, n)))
         cats_per_region = (one_hot * solution.reshape((b, n, n, 1))).sum(dim=(1, 2))
-        one_per_region = (cats_per_region == 1.0).all(dim=1)
-        every_region_used = (one_hot.sum(dim=(1, 2)) > 0.0).all(dim=1)
-        ok = one_per_row & one_per_col & no_touch & one_per_region & every_region_used
+        regions_off = _f(cats_per_region != 1.0).sum(dim=1)
+        unused = _f(one_hot.sum(dim=(1, 2)) == 0.0).sum(dim=1)
+        ok = (rows_off + cols_off + touches + regions_off + unused) == 0.0
         return np.asarray(ok.numpy(), dtype=bool).reshape(b)
 
 

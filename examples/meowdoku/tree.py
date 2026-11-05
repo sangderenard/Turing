@@ -10,7 +10,9 @@ solution tree: its leaves are the arrangements, its decision nodes the
 guesses a solver cannot avoid.
 
 Everything vectorised here is AbstractTensor, batched over boards, on the
-torch backend on CUDA by default:
+torch backend on CUDA by default, with every mask a float 0/1 tensor (AND
+is a product, OR a maximum, NOT one-minus, ANY a sum compared with zero;
+AbstractTensor's boolean operators take a per-element Python path):
 
 - ``propagate``: singles to a fixed point for a whole batch at once;
 - ``sample_solutions``: a random walk down every board's tree at once,
@@ -18,8 +20,8 @@ torch backend on CUDA by default:
   resolves a batch of maps to one leaf each and counts the decisions taken;
 - ``solution_tree``: the full tree of one board (recursive over branches,
   AbstractTensor for every mask), enumerated while it fits ``limit_leaves``;
-- ``catalog`` / ``type_table`` / ``select``: the typed records a database
-  is built from.
+- ``catalog`` / ``classify`` / ``levels`` / ``select``: the typed records
+  and the taxonomy a board database is built from.
 """
 from __future__ import annotations
 
@@ -49,12 +51,17 @@ def _shifted(AT, tensor, dr, dc, fill):
 
 
 def _f(mask):
+    """A comparison's bool mask as a float 0/1 tensor."""
     return mask.to_dtype("float")
 
 
+def _any(mask_f, dim=None):
+    return (mask_f.sum(dim=dim) if dim is not None else mask_f.sum()) > 0.0
+
+
 def exclusions(AT, region, one_hot, placed):
-    """Cells excluded by the placed cats: their rows, columns, regions and
-    eight neighbours.  ``placed`` (b, n, n) float 0/1."""
+    """Float mask of cells excluded by the placed cats: their rows, columns,
+    regions and eight neighbours.  ``placed`` (b, n, n) float 0/1."""
     b, n = int(region.shape[0]), int(region.shape[1])
     zero = region * 0.0
     row_done = placed.sum(dim=2).reshape((b, n, 1)) + zero
@@ -64,13 +71,14 @@ def exclusions(AT, region, one_hot, placed):
     near = zero
     for dr, dc in _EIGHT:
         near = near + _shifted(AT, placed, dr, dc, zero)
-    return (row_done + col_done + region_done + near) > 0.0
+    return _f((row_done + col_done + region_done + near) > 0.0)
 
 
 def propagate(AT, region, one_hot, placed, excluded, *, max_rounds: int | None = None):
     """Singles to a fixed point, batched.  Returns ``(placed, excluded,
-    solved, dead, rounds)``: ``solved`` and ``dead`` are per-board booleans
-    (a board that is neither is stalled), ``rounds`` the singles passes.
+    solved, dead, rounds)``: ``solved`` and ``dead`` are per-board float
+    0/1 (a board that is neither is stalled), ``rounds`` the singles
+    passes.
 
     Every deduction is sound, so a solved board's placement is a valid
     arrangement.  A contradiction is a row, column or region with no cat
@@ -80,46 +88,43 @@ def propagate(AT, region, one_hot, placed, excluded, *, max_rounds: int | None =
     b, n = int(region.shape[0]), int(region.shape[1])
     zero = region * 0.0
     rounds = zero[:, 0, 0] * 0.0
-    dead = rounds > 1.0
-    excluded = excluded | exclusions(AT, region, one_hot, placed)
+    dead = rounds * 0.0
+    excluded = excluded.maximum(exclusions(AT, region, one_hot, placed))
     for _round in range(max_rounds or 2 * n):
-        candidate = ~(excluded | (placed > 0.5))
-        cand = _f(candidate)
+        cand = (1.0 - excluded) * (1.0 - placed)
         row_count = cand.sum(dim=2)                                                    # (b, n)
         col_count = cand.sum(dim=1)
         region_count = (one_hot * cand.reshape((b, n, n, 1))).sum(dim=(1, 2))          # (b, n)
-        row_has = placed.sum(dim=2) > 0.5
-        col_has = placed.sum(dim=1) > 0.5
-        region_has = (one_hot * placed.reshape((b, n, n, 1))).sum(dim=(1, 2)) > 0.5
-        starved = ((~row_has & (row_count == 0.0)).any(dim=1) | (~col_has & (col_count == 0.0)).any(dim=1)
-                   | (~region_has & (region_count == 0.0)).any(dim=1))
-        dead = dead | starved
-        row_single = (row_count == 1.0).reshape((b, n, 1)) + zero > 0.5
-        col_single = (col_count == 1.0).reshape((b, 1, n)) + zero > 0.5
-        region_single = (one_hot * _f(region_count == 1.0).reshape((b, 1, 1, n))).sum(dim=3) > 0.5
-        new = candidate & (row_single | col_single | region_single)
-        if not bool(new.any()):
+        row_open = 1.0 - placed.sum(dim=2)
+        col_open = 1.0 - placed.sum(dim=1)
+        region_open = 1.0 - (one_hot * placed.reshape((b, n, n, 1))).sum(dim=(1, 2))
+        starved = ((row_open * _f(row_count == 0.0)).sum(dim=1) + (col_open * _f(col_count == 0.0)).sum(dim=1)
+                   + (region_open * _f(region_count == 0.0)).sum(dim=1))
+        dead = dead.maximum(_f(starved > 0.0))
+        row_single = _f(row_count == 1.0).reshape((b, n, 1)) + zero
+        col_single = _f(col_count == 1.0).reshape((b, 1, n)) + zero
+        region_single = (one_hot * _f(region_count == 1.0).reshape((b, 1, 1, n))).sum(dim=3)
+        new = cand * row_single.maximum(col_single).maximum(region_single)
+        if not bool(_any(new)):
             break
-        rounds = rounds + _f(new.any(dim=(1, 2)))
-        together = placed + _f(new)
+        rounds = rounds + _f(_any(new, dim=(1, 2)))
+        together = placed + new
         near_new = zero
         for dr, dc in _EIGHT:
             near_new = near_new + _shifted(AT, together, dr, dc, zero)
-        conflict = ((together.sum(dim=2) > 1.0).any(dim=1) | (together.sum(dim=1) > 1.0).any(dim=1)
-                    | ((one_hot * together.reshape((b, n, n, 1))).sum(dim=(1, 2)) > 1.0).any(dim=1)
-                    | ((near_new > 0.0) & (together > 0.5) & (_f(new) > 0.5)).any(dim=(1, 2)))
-        dead = dead | conflict
+        conflict = (_f(together.sum(dim=2) > 1.0).sum(dim=1) + _f(together.sum(dim=1) > 1.0).sum(dim=1)
+                    + _f((one_hot * together.reshape((b, n, n, 1))).sum(dim=(1, 2)) > 1.0).sum(dim=1)
+                    + (_f(near_new > 0.0) * new).sum(dim=(1, 2)))
+        dead = dead.maximum(_f(conflict > 0.0))
         placed = together.minimum(zero + 1.0)
-        excluded = excluded | exclusions(AT, region, one_hot, placed)
-    solved = (placed.sum(dim=(1, 2)) == float(n)) & ~dead
+        excluded = excluded.maximum(exclusions(AT, region, one_hot, placed))
+    solved = _f(placed.sum(dim=(1, 2)) == float(n)) * (1.0 - dead)
     return placed, excluded, solved, dead, rounds
 
 
 class _Draws:
     """Uniform draws from one seeded repository PRNG stream (Xoroshiro128**),
-    taken from a buffer refilled in blocks, so a draw of ``count`` values
-    costs ``count`` values of the stream, no more, and the sequence is a
-    function of the seed alone."""
+    taken from a buffer refilled in blocks."""
 
     def __init__(self, seed: int, block: int = 1 << 14):
         from src.common.tensors.abstraction_methods.random import PRNG_ALGO, RANDOM_KIND, random_generator
@@ -168,42 +173,42 @@ def sample_solutions(region_batch, seed: int = 0, *, max_steps: int | None = Non
         zero = region * 0.0
         cell_index = AT.arange(n * n).to_dtype("float").reshape((1, n * n))
         placed = zero
-        excluded = zero > 1.0
+        excluded = zero
         decisions = zero[:, 0, 0] * 0.0
         restarts = decisions * 0.0
-        solved = decisions > 1.0
+        solved = decisions * 0.0
         huge = float(n * n + 1)
         for _step in range(max_steps or 4 * n * n):
             placed, excluded, solved_now, dead, _ = propagate(AT, region, one_hot, placed, excluded)
-            solved = solved | solved_now
-            if bool(solved.all()):
+            solved = solved.maximum(solved_now)
+            if not bool(_any(1.0 - solved)):
                 break
             # Restart the dead boards from the top.
-            dead3 = dead.reshape((b, 1, 1))
-            placed = AT.where(dead3, zero, placed)
-            excluded = AT.where(dead3, zero > 1.0, excluded)
-            decisions = AT.where(dead, decisions * 0.0, decisions)
-            restarts = restarts + _f(dead)
+            keep = (1.0 - dead).reshape((b, 1, 1))
+            placed = placed * keep
+            excluded = excluded * keep
+            decisions = decisions * (1.0 - dead)
+            restarts = restarts + dead
             # Stalled boards guess in their tightest open region.
-            candidate = ~(excluded | (placed > 0.5))
-            cand = _f(candidate)
+            cand = (1.0 - excluded) * (1.0 - placed)
             region_count = (one_hot * cand.reshape((b, n, n, 1))).sum(dim=(1, 2))
-            region_has = (one_hot * placed.reshape((b, n, n, 1))).sum(dim=(1, 2)) > 0.5
-            tightest = AT.where(region_has | (region_count == 0.0), region_count * 0.0 + huge, region_count).argmin(dim=1)
+            region_has = (one_hot * placed.reshape((b, n, n, 1))).sum(dim=(1, 2))
+            closed = _f((region_has + _f(region_count == 0.0)) > 0.0)
+            tightest = (region_count * (1.0 - closed) + closed * huge).argmin(dim=1)
             tightest = tightest.to_dtype("float").reshape((b, 1, 1))
-            in_region = candidate & (region == tightest)
+            in_region = cand * _f(region == tightest)
             draw = draws.uniform(AT, b, n, n)
-            score = AT.where(in_region, draw + 1.0, zero)
+            score = in_region * (draw + 1.0)
             pick = (score.reshape((b, n * n)) * -1.0).argmin(dim=1).to_dtype("float").reshape((b, 1))
-            pick_mask = (cell_index == pick).reshape((b, n, n)) & in_region
-            stalled = ~solved & ~dead & in_region.any(dim=(1, 2))
+            pick_mask = _f(cell_index == pick).reshape((b, n, n)) * in_region
+            stalled = (1.0 - solved) * (1.0 - dead) * _f(_any(in_region, dim=(1, 2)))
             tight_count = (region_count * _f(index_n.reshape((1, n)) == tightest.reshape((b, 1)))).sum(dim=1)
-            decisions = decisions + _f(stalled & (tight_count > 1.0))
-            placed = AT.where(stalled.reshape((b, 1, 1)) & pick_mask, zero + 1.0, placed)
+            decisions = decisions + stalled * _f(tight_count > 1.0)
+            placed = placed.maximum(pick_mask * stalled.reshape((b, 1, 1)))
         return (np.asarray(placed.numpy(), dtype=np.float64).reshape(b, n * n),
                 np.asarray(decisions.numpy(), dtype=np.float64).reshape(b),
                 np.asarray(restarts.numpy(), dtype=np.float64).reshape(b),
-                np.asarray(solved.numpy(), dtype=bool).reshape(b))
+                np.asarray((solved > 0.5).numpy(), dtype=bool).reshape(b))
 
 
 @dataclass
@@ -240,20 +245,20 @@ def solution_tree(region_grid, *, limit_leaves: int = 512,
         def descend(placed, excluded, depth):
             placed, excluded, solved, dead, _ = propagate(AT, region, one_hot, placed, excluded)
             stats.depth = max(stats.depth, depth)
-            if bool(solved.all()):
+            if bool(_any(solved)):
                 stats.leaves += 1
                 columns = (placed * index_n.reshape((1, 1, n))).sum(dim=2)
                 return {"leaf": tuple(int(v) for v in np.asarray(columns.numpy()).reshape(-1))}
-            if bool(dead.all()):
+            if bool(_any(dead)):
                 stats.dead_ends += 1
                 return {"dead": True}
-            candidate = ~(excluded | (placed > 0.5))
-            cand = _f(candidate)
+            cand = (1.0 - excluded) * (1.0 - placed)
             region_count = (one_hot * cand.reshape((1, n, n, 1))).sum(dim=(1, 2))
-            region_has = (one_hot * placed.reshape((1, n, n, 1))).sum(dim=(1, 2)) > 0.5
-            masked = AT.where(region_has | (region_count == 0.0), region_count * 0.0 + float(n * n + 1), region_count)
+            region_has = (one_hot * placed.reshape((1, n, n, 1))).sum(dim=(1, 2))
+            closed = _f((region_has + _f(region_count == 0.0)) > 0.0)
+            masked = region_count * (1.0 - closed) + closed * float(n * n + 1)
             k = int(np.asarray(masked.argmin(dim=1).numpy()).reshape(-1)[0])
-            cells = np.argwhere(np.asarray((candidate & (region == float(k))).numpy()).reshape(n, n))
+            cells = np.argwhere(np.asarray((cand * _f(region == float(k))).numpy()).reshape(n, n) > 0.5)
             branches = []
             for r, c in cells:
                 if stats.leaves >= limit_leaves:
@@ -276,7 +281,7 @@ def solution_tree(region_grid, *, limit_leaves: int = 512,
             stats.decision_regions.append(k)
             return {"region": k, "branches": branches}
 
-        tree = descend(zero, zero > 1.0, 0)
+        tree = descend(zero, zero, 0)
     return tree, stats
 
 
