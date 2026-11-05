@@ -2,8 +2,9 @@
 
     python examples/meowdoku/pretrain.py            # fetch, replay, train, measure
 
-Games come from pgnmentor.com's per-player PGN collections (Kasparov and
-Carlsen, about 2.3 MB zipped), cached under ``build/meowdoku/pgn/``.  Each
+Games come from The Week in Chess (theweekinchess.com), the weekly
+collections of professional games, a few issues at about 2 MB each,
+cached under ``build/meowdoku/pgn/``.  Each
 game is replayed on ``games.Chess`` (full rules: castling, en passant,
 promotion), every position is encoded as the network sees it, and the
 target is the game's result for White discounted toward the end plus the
@@ -35,10 +36,11 @@ from meowdoku.games import Chess  # noqa: E402
 from meowdoku.chess_net import FEATURES, SelfPlay, WEIGHTS, encode, material  # noqa: E402
 
 PGN_DIR = ROOT / "build" / "meowdoku" / "pgn"
-SOURCES = {
-    "Kasparov": "https://www.pgnmentor.com/players/Kasparov.zip",
-    "Carlsen": "https://www.pgnmentor.com/players/Carlsen.zip",
-}
+# The Week in Chess: weekly collections of the world's professional games
+# (candidates, world championships, opens), one zip per issue, each about
+# 2 MB and a few thousand games.
+TWIC_ISSUES = (1560, 1559, 1558, 1557)
+SOURCES = {f"twic{issue}": f"https://theweekinchess.com/zips/twic{issue}g.zip" for issue in TWIC_ISSUES}
 MARKER = WEIGHTS.with_name("chess_net.pretrained.json")
 PIECE = {"K": "king", "Q": "queen", "R": "rook", "B": "bishop", "N": "knight"}
 FILES = "abcdefgh"
@@ -51,10 +53,16 @@ def fetch(progress=print) -> list[Path]:
     paths = []
     for name, url in SOURCES.items():
         target = PGN_DIR / f"{name}.pgn"
+        local_zip = PGN_DIR / f"{name}.zip"                   # a zip placed here by hand is used as is
         if not target.exists():
-            progress(f"[pretrain] downloading {url}")
-            request = urllib.request.Request(url, headers={"User-Agent": "meowdoku-pretrain/1.0 (python-urllib)"})
-            data = urllib.request.urlopen(request, timeout=60).read()
+            if local_zip.exists():
+                data = local_zip.read_bytes()
+            else:
+                progress(f"[pretrain] downloading {url}")
+                request = urllib.request.Request(url, headers={"User-Agent": "meowdoku-pretrain/1.0",
+                                                               "Accept": "application/zip, application/octet-stream, */*"})
+                data = urllib.request.urlopen(request, timeout=60).read()
+                local_zip.write_bytes(data)
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 member = next(n for n in archive.namelist() if n.lower().endswith(".pgn"))
                 target.write_bytes(archive.read(member))
@@ -154,8 +162,8 @@ def dataset(paths: list[Path], max_games: int, progress=print):
             if len(boards) < 10:
                 skipped += 1
                 continue
-            xs.append(np.stack(boards))
-            zs.append(player_targets(None, materials, outcome))
+            xs.append(np.stack(boards).astype(np.float32))
+            zs.append(player_targets(None, materials, outcome).astype(np.float32))
             used += 1
             if used % 200 == 0:
                 progress(f"[pretrain] {used} games, {sum(len(x) for x in xs)} positions, {time.perf_counter() - started:.0f}s")
@@ -179,7 +187,7 @@ def train(player: SelfPlay, x: np.ndarray, z: np.ndarray, epochs: int = 3, batch
     return loss
 
 
-def ensure(player: SelfPlay, progress=print, max_games: int = 1500, epochs: int = 3) -> bool:
+def ensure(player: SelfPlay, progress=print, max_games: int = 2000, epochs: int = 8) -> bool:
     """Pre-train once: skipped when the marker says it has been done."""
     import os
     if MARKER.exists() or os.environ.get("MEOWDOKU_NO_PRETRAIN"):
@@ -194,8 +202,8 @@ def ensure(player: SelfPlay, progress=print, max_games: int = 1500, epochs: int 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--games", type=int, default=1500)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--games", type=int, default=2000)
+    parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--eval", type=int, default=8)
     parser.add_argument("--fresh", action="store_true", help="start from new weights and redo the marker")
     args = parser.parse_args(argv)

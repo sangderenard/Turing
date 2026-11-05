@@ -220,8 +220,11 @@ class SelfPlay:
                       f"{time.perf_counter() - started:.0f}s", flush=True)
 
     # -- measuring: the net as White against a random mover ------------------
-    def versus_random(self, games: int = 10) -> dict[str, int]:
+    def versus_random(self, games: int = 10) -> dict:
+        """The net as White against a random mover: results, and the mean
+        material edge at the end (the finer signal while mates are rare)."""
         score = {"win": 0, "loss": 0, "draw": 0}
+        edges = []
         for g in range(games):
             game = Chess("eval")
             result = "draw"
@@ -236,6 +239,8 @@ class SelfPlay:
                     move = moves[int(self.rng.integers(len(moves)))]
                 game.cell(*game.rc(move[0]), "primary"); game.cell(*game.rc(move[1]), "primary")
             score[result] += 1
+            edges.append(material(game.pieces))
+        score["material_edge"] = round(float(np.mean(edges)), 2) if edges else 0.0
         return score
 
 
