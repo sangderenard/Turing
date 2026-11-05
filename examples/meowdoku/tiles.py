@@ -125,12 +125,22 @@ def write_tile_package(path: str | Path, **options) -> Path:
 
 def _run_scene_orders(package_path: Path, out_dir: Path, mode: str, jobs: tuple[str, ...] = (),
                       timeout: float = 900.0) -> dict[str, Any]:
+    # The renderer runs from spectral-analyzer's root (its imports are
+    # relative), so the caller's paths are made absolute first.
+    package_path, out_dir = Path(package_path).resolve(), Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, str(SPECTRAL_ROOT / "render_scene_order.py"), str(package_path),
                mode, "--out-dir", str(out_dir)]
     for job in jobs:
         command += ["--job", job]
+    # The native lab's recursive sensor exposure takes exactly one mip step
+    # per layer (``run_recursive_sensor_epoch`` refuses more; larger work is
+    # more sensor epochs).  The scene-order entry reads the step count from
+    # the environment with a default of 8, so it is pinned here.
+    environment = dict(os.environ)
+    environment.setdefault("SPECTRAL_SENSOR_STEPS_PER_LAYER", "1")
     completed = subprocess.run(command, cwd=str(SPECTRAL_ROOT), capture_output=True,
-                               text=True, encoding="utf-8", timeout=timeout)
+                               text=True, encoding="utf-8", timeout=timeout, env=environment)
     if completed.returncode != 0:
         raise RuntimeError(f"render_scene_order {mode} failed:\n{completed.stderr[-2000:]}")
     manifests = {}

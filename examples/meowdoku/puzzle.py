@@ -140,33 +140,131 @@ def _rank_of(keys):
     return (keys.reshape((-1, 1, n)) < keys.reshape((-1, n, 1))).to_dtype("float").sum(dim=2)
 
 
-def generate_batch(n: int, batch: int, seed: int = 0, *, jitter: float = 0.35,
+def _shifted(AT, tensor, dr, dc, fill):
+    """``tensor`` (b, n, n) moved by (dr, dc) in {-1, 0, 1}, ``fill`` (a
+    same-shaped tensor) entering at the exposed edge."""
+    if dr == 1:
+        tensor = AT.cat([fill[:, :1, :], tensor[:, :-1, :]], dim=1)
+    elif dr == -1:
+        tensor = AT.cat([tensor[:, 1:, :], fill[:, :1, :]], dim=1)
+    if dc == 1:
+        tensor = AT.cat([fill[:, :, :1], tensor[:, :, :-1]], dim=2)
+    elif dc == -1:
+        tensor = AT.cat([tensor[:, :, 1:], fill[:, :, :1]], dim=2)
+    return tensor
+
+
+_FOUR = ((1, 0), (-1, 0), (0, 1), (0, -1))
+_EIGHT = _FOUR + ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def singles_solve(region, solution, *, max_rounds: int | None = None):
+    """Solve ``(b, n, n)`` boards by singles alone, batched.
+
+    Each round places every cat that is forced: a row, a column or a region
+    with exactly one unexcluded cell.  Each placement excludes its row,
+    column, region and eight neighbours.  Every deduction is sound, so a
+    board that is fully placed has exactly ONE arrangement (and it is
+    ``solution``, which is asserted).  Returns ``(solved, rounds)`` per
+    board: ``solved`` is the uniqueness certificate, ``rounds`` is how many
+    passes of singles it took, a difficulty grade.
+
+    This is the uniqueness gate for anything that is not unique by
+    construction, and the same arithmetic as the game law's own checks.
+    """
+    from src.common.tensors import AbstractTensor as AT
+
+    b, n = int(region.shape[0]), int(region.shape[1])
+    index_n = AT.arange(n).to_dtype("float")
+    one_hot = (region.reshape((b, n, n, 1)) == index_n.reshape((1, 1, 1, n))).to_dtype("float")
+    zero = region * 0.0
+    placed = zero > 1.0
+    excluded = zero > 1.0
+    rounds = zero[:, 0, 0] * 0.0
+    for _round in range(max_rounds or n):
+        candidate = ~(excluded | placed)
+        cand = candidate.to_dtype("float")
+        row_single = cand.sum(dim=2).reshape((b, n, 1)) == 1.0
+        col_single = cand.sum(dim=1).reshape((b, 1, n)) == 1.0
+        per_region = (one_hot * cand.reshape((b, n, n, 1))).sum(dim=(1, 2))      # (b, n)
+        region_single = (one_hot * per_region.reshape((b, 1, 1, n))).sum(dim=3) == 1.0
+        new = candidate & (row_single | col_single | region_single)
+        if not bool(new.any()):
+            break
+        rounds = rounds + new.any(dim=(1, 2)).to_dtype("float")
+        placed = placed | new
+        got = placed.to_dtype("float")
+        row_done = got.sum(dim=2).reshape((b, n, 1)) > 0.0
+        col_done = got.sum(dim=1).reshape((b, 1, n)) > 0.0
+        cats_per_region = (one_hot * got.reshape((b, n, n, 1))).sum(dim=(1, 2))   # (b, n)
+        region_done = (one_hot * cats_per_region.reshape((b, 1, 1, n))).sum(dim=3) > 0.0
+        near = zero
+        for dr, dc in _EIGHT:
+            near = near + _shifted(AT, got, dr, dc, zero)
+        excluded = excluded | row_done | col_done | region_done | (near > 0.0)
+    solved = placed.to_dtype("float").sum(dim=(1, 2)) == float(n)
+    agrees = ((placed.to_dtype("float") - solution).abs().sum(dim=(1, 2)) == 0.0) | ~solved
+    if not bool(agrees.all()):
+        raise AssertionError("singles placed a cat off the constructed solution: a deduction is unsound")
+    return solved, rounds
+
+
+_CYCLE = ((0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0), (1, 1))   # R UR U UL L DL D DR
+
+
+def _simple_points(AT, region):
+    """Cells whose removal keeps their region 4-connected: Yokoi's
+    connectivity number for 4-connectivity equals one.  ``x_k`` is whether
+    the k-th 8-neighbour (cyclic from the right) is in the same region;
+    ``N4 = sum over k in {R, U, L, D} of x_k - x_k x_{k+1} x_{k+2}``.  Checked
+    against a flood fill in the tests."""
+    fill = region * 0.0 - 2.0
+    x = [(_shifted(AT, region, -dr, -dc, fill) == region).to_dtype("float") for dr, dc in _CYCLE]
+    total = region * 0.0
+    for k in (0, 2, 4, 6):
+        total = total + x[k] - x[k] * x[(k + 1) % 8] * x[(k + 2) % 8]
+    return total == 1.0
+
+
+def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = None,
                    chunk_elements: int = 32_000_000) -> PuzzleBatch:
-    """``batch`` unique puzzles of size ``n`` from first principles, batched.
+    """``batch`` unique, contiguous puzzles of size ``n`` from first
+    principles, batched: AbstractTensor arithmetic over ``(batch, n, n)``
+    spans and ``(batch, n, n, n)`` one-hots, never a loop over cells or
+    boards.
 
-    Everything is AbstractTensor arithmetic over ``(batch, n, n)`` spans (and
-    one ``(batch, n, n, n)`` region score), no loop over cells:
+    1. CAT MAP first.  The arrangement is a random permutation ``sigma``
+       (column per row), the rank of random keys; the no-touch rule
+       ``|sigma[r] - sigma[r+1]| >= 2`` is a batched rejection.
+    2. A solving order ``rank`` over the cats.  A non-cat cell ``(r, c)`` is
+       eliminated the moment the cat of row ``r`` or the cat in column ``c``
+       is placed: ``eliminated_at = min(rank[r], rank[rowcat[c]])``.  A cell
+       is ELIGIBLE for region ``k`` when ``rank[k] > eliminated_at``.  Any
+       partition in which every cell is eligible for its region is solved
+       by singles in that order, so it has exactly one arrangement.
+    3. The valid start: the last-solved region owns every non-cat cell
+       (eligible everywhere), every other region is its cat.  Valid,
+       contiguous, unique, and not yet a puzzle.
+    4. RELAXATION.  Each round, each parity class ``(r % 2, c % 2)`` in
+       turn: every non-cat cell that is a 4-simple point of its region
+       (``_simple_points``) and has an eligible 4-neighbour region at least
+       two cells smaller moves to the smallest such neighbour.  Cells of
+       one parity class are never 8-adjacent, so simultaneous moves are
+       independent and every region stays connected; the donor keeps its
+       cat; the receiver gains an adjacent cell.  Validity therefore holds
+       after every round, and the rounds stop when no cell can move.
 
-    1. The arrangement is a random permutation ``sigma`` (column per row),
-       taken as the rank of random keys; the no-touch rule
-       ``|sigma[r] - sigma[r+1]| >= 2`` is a batched rejection: boards that
-       fail are redrawn until every board passes.
-    2. A random solving ORDER ``rank`` over the rows.  A non-cat cell ``(r,
-       c)`` is eliminated the moment the cat of row ``r`` or the cat standing
-       in column ``c`` is placed: ``eliminated_at = min(rank[r],
-       rank[rowcat[c]])``.
-    3. A cell may belong to any region solved after that moment
-       (``rank[k] > eliminated_at``).  Among the eligible regions it takes the
-       nearest cat by jittered squared distance (Voronoi-like, so regions
-       are compact), by one masked argmin.  Cat cells own their own region.
+    What comes out: every region contiguous, every board unique by
+    construction (``count_arrangements`` is the oracle in the tests at the
+    sizes it finishes), sizes as balanced as eligibility allows.  The order
+    constraint is real: an early-solved region can own only cells in rows
+    and columns of earlier cats, so the last region stays the largest
+    (about half the board) and a few early ones are single cells.  Those
+    are the puzzle's openings.
 
-    Solving in that order, every region in turn holds exactly one unexcluded
-    cell, its cat: singles alone solve the board, so the arrangement is
-    unique by construction.  ``count_arrangements`` is the oracle this is
-    checked against in the tests at the sizes the oracle still finishes.
-
-    Chunks of the batch keep the ``(b, n, n, n)`` score under
-    ``chunk_elements`` cells; the chunk loop is the only Python loop.
+    Chunks keep the ``(b, n, n, n)`` one-hot under ``chunk_elements``
+    cells; the chunk loop and the relaxation rounds are the only Python
+    loops.
     """
     from src.common.tensors import AbstractTensor as AT
     from src.common.tensors.abstraction_methods.random import (
@@ -178,8 +276,7 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, jitter: float = 0.35,
     if batch < 1:
         raise ValueError("batch must be at least one puzzle")
     per_chunk = max(1, int(chunk_elements) // (n * n * n))
-    regions = []
-    solutions = []
+    regions, solutions = [], []
     # One seeded stream of the repository's own PRNG (Xoroshiro128**) feeds
     # every draw in order, so a seed names the whole batch exactly.
     # (``AbstractTensor.randn`` is not reached by any seed; measured.)
@@ -193,15 +290,15 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, jitter: float = 0.35,
 
     with AT.use_backend("numpy"):
         index_n = AT.arange(n).to_dtype("float")
-        rr = index_n.reshape((1, n, 1, 1))
-        cc = index_n.reshape((1, 1, n, 1))
-        kk = index_n.reshape((1, 1, 1, n))
+        rr = index_n.reshape((1, n, 1))
+        cc = index_n.reshape((1, 1, n))
         columns = index_n.reshape((1, 1, n))
-        big = float(4 * n * n + 1)
+        regions_k = index_n.reshape((1, 1, 1, n))
+        huge = float(n * n + 1)
         done = 0
         while done < batch:
             b = min(per_chunk, batch - done)
-            # 1. arrangement: ranks of random keys, redrawn until no two
+            # 1. cat map: ranks of random keys, redrawn until no two
             #    consecutive rows touch.
             sigma = _rank_of(uniform(b, n))
             valid = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
@@ -210,21 +307,41 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, jitter: float = 0.35,
                 sigma = AT.where(valid.reshape((b, 1)), sigma, redraw)
                 valid = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
             # 2. solving order and each cell's elimination moment.
-            rank = _rank_of(uniform(b, n))                                 # (b, n)
+            rank = _rank_of(uniform(b, n))                                     # (b, n)
             is_cat = (sigma.reshape((b, n, 1)) == columns).to_dtype("float")   # (b, n, n)
             rank_of_column_cat = (is_cat * rank.reshape((b, n, 1))).sum(dim=1)   # (b, n)
             eliminated_at = rank.reshape((b, n, 1)).minimum(rank_of_column_cat.reshape((b, 1, n)))
-            # 3. nearest eligible cat, by one masked argmin over regions k.
-            eligible = rank.reshape((b, 1, 1, n)) > eliminated_at.reshape((b, n, n, 1))
-            #    Each cat's centre is jittered so region shapes vary between
-            #    boards; the jitter is per cat, not per cell, so it stays a
-            #    Voronoi partition and costs 2n draws per board.
-            centre_r = kk + (uniform(b, 1, 1, n) - 0.5) * (float(jitter) * n)
-            centre_c = sigma.reshape((b, 1, 1, n)) + (uniform(b, 1, 1, n) - 0.5) * (float(jitter) * n)
-            distance = (rr - centre_r) * (rr - centre_r) + (cc - centre_c) * (cc - centre_c)
-            score = AT.where(eligible, distance, big)
-            region = score.argmin(dim=3).to_dtype("float")                 # (b, n, n)
-            region = AT.where(is_cat > 0.5, rr.reshape((1, n, 1)) + region * 0.0, region)
+            zero = is_cat * 0.0
+            # 3. the valid start: everything to the last-solved region.
+            last = ((rank == float(n - 1)).to_dtype("float") * index_n.reshape((1, n))).sum(dim=1)   # (b,)
+            region = AT.where(is_cat > 0.5, rr + zero, last.reshape((b, 1, 1)) + zero)
+            own_rank = AT.where(is_cat > 0.5, rank.reshape((b, n, 1)) + zero, float(n - 1) + zero)
+            parity_r, parity_c = (rr % 2.0) + zero, (cc % 2.0) + zero
+            # 4. relaxation rounds.
+            for _round in range(rounds or 4 * n):
+                moved = False
+                for pr, pc in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)):
+                    one_hot = (region.reshape((b, n, n, 1)) == regions_k).to_dtype("float")
+                    size = one_hot.sum(dim=(1, 2))                                    # (b, n)
+                    own_size = (one_hot * size.reshape((b, 1, 1, n))).sum(dim=3)      # (b, n, n)
+                    may_move = _simple_points(AT, region) & (is_cat < 0.5) & (parity_r == pr) & (parity_c == pc)
+                    best_size = zero + huge
+                    best_region, best_rank = region, own_rank
+                    for dr, dc in _FOUR:
+                        nb_region = _shifted(AT, region, dr, dc, zero - 1.0)
+                        nb_rank = _shifted(AT, own_rank, dr, dc, zero - 1.0)
+                        nb_size = _shifted(AT, own_size, dr, dc, zero + huge)
+                        # Ties between equal-sized neighbours fall to a per-cell draw.
+                        take = (may_move & (nb_region >= 0.0) & (nb_region != region)
+                                & (nb_rank > eliminated_at) & (nb_size + 1.0 < own_size) & (nb_size < best_size))
+                        best_size = AT.where(take, nb_size, best_size)
+                        best_region = AT.where(take, nb_region, best_region)
+                        best_rank = AT.where(take, nb_rank, best_rank)
+                    if bool((best_region != region).any()):
+                        moved = True
+                        region, own_rank = best_region, best_rank
+                if not moved:
+                    break
             regions.append(np.asarray(region.numpy(), dtype=np.float64).reshape(b, n * n))
             solutions.append(np.asarray(is_cat.numpy(), dtype=np.float64).reshape(b, n * n))
             done += b
@@ -232,6 +349,29 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, jitter: float = 0.35,
     row = np.broadcast_to((cells // n).astype(np.float64), (batch, n * n)).copy()
     col = np.broadcast_to((cells % n).astype(np.float64), (batch, n * n)).copy()
     return PuzzleBatch(n, row, col, np.concatenate(regions), np.concatenate(solutions))
+
+
+def contiguous_regions(puzzles: "PuzzleBatch") -> np.ndarray:
+    """Per puzzle: every region is one 4-connected piece.  A batched flood
+    from each cat over its own region; a region is contiguous when the
+    flood covers it."""
+    from src.common.tensors import AbstractTensor as AT
+
+    n, b = puzzles.n, puzzles.batch
+    with AT.use_backend("numpy"):
+        region = AT.tensor(puzzles.region.reshape(b, n, n))
+        reached = AT.tensor(puzzles.solution.reshape(b, n, n)) > 0.5
+        zero = region * 0.0
+        for _round in range(n * n):
+            grow = reached
+            got = reached.to_dtype("float")
+            for dr, dc in _FOUR:
+                same = _shifted(AT, region, dr, dc, zero - 1.0) == region
+                grow = grow | ((_shifted(AT, got, dr, dc, zero) > 0.0) & same)
+            if not bool((grow & ~reached).any()):
+                break
+            reached = grow
+        return np.asarray(reached.all(dim=(1, 2)).numpy(), dtype=bool).reshape(b)
 
 
 def verify_batch(puzzles: PuzzleBatch) -> np.ndarray:

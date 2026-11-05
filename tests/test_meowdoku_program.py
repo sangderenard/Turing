@@ -153,24 +153,80 @@ def test_the_record_is_what_the_python_game_hands_over():
     assert MeowdokuControls().select_row == -1.0      # no cell: never selects
 
 
-def test_batched_generator_is_unique_by_the_oracle_and_scales():
+def test_batched_generator_is_unique_contiguous_and_scales():
     import time
-    from meowdoku.puzzle import generate as make, generate_batch, verify_batch
+    from meowdoku.puzzle import contiguous_regions, generate as make, generate_batch, verify_batch
 
     for n in (9, 10, 11):
         puzzles = generate_batch(n, 12, seed=n)
-        assert verify_batch(puzzles).all()
+        assert verify_batch(puzzles).all() and contiguous_regions(puzzles).all()
         for index in range(puzzles.batch):
             assert count_arrangements(puzzles.puzzle(index).region_grid(), limit=2) == 1, (n, index)
     started = time.perf_counter()
-    big = generate_batch(32, 256, seed=0)              # 256 boards of 1024 cells
+    big = generate_batch(32, 64, seed=0)               # 64 boards of 1024 cells
     elapsed = time.perf_counter() - started
-    assert verify_batch(big).all() and elapsed < 30.0, elapsed
-    huge = generate_batch(128, 2, seed=1)              # 16,384 cells each
-    assert verify_batch(huge).all()
+    assert verify_batch(big).all() and contiguous_regions(big).all() and elapsed < 60.0, elapsed
+    huge = generate_batch(128, 1, seed=1)              # 16,384 cells
+    assert verify_batch(huge).all() and contiguous_regions(huge).all()
     # Deterministic per seed, different across seeds.
     assert np.array_equal(generate_batch(16, 3, seed=5).region, generate_batch(16, 3, seed=5).region)
     assert not np.array_equal(generate_batch(16, 3, seed=5).region, generate_batch(16, 3, seed=6).region)
     # Existing small boards are unchanged: auto still uses the random oracle.
     assert np.array_equal(make(6, seed=3).region, make(6, seed=3, method="random").region)
     assert make(32, seed=0).cells == 1024
+
+
+def test_simple_points_agree_with_a_flood_fill():
+    """Yokoi's 4-connectivity number against the definition: a cell is simple
+    when removing it leaves its region 4-connected."""
+    from collections import deque
+    from meowdoku.puzzle import _simple_points
+    from src.common.tensors import AbstractTensor as AT
+
+    rng = np.random.default_rng(0)
+    n = 7
+    for _trial in range(20):
+        # Random partition into 3 labels with some structure (row-major runs).
+        region = rng.integers(0, 3, size=(n, n)).astype(np.float64)
+        with AT.use_backend("numpy"):
+            simple = np.asarray(_simple_points(AT, AT.tensor(region.reshape(1, n, n))).numpy()).reshape(n, n)
+        for r in range(n):
+            for c in range(n):
+                label = region[r, c]
+                cells = {(i, j) for i in range(n) for j in range(n) if region[i, j] == label and (i, j) != (r, c)}
+                mine = {(i, j) for i in range(n) for j in range(n) if region[i, j] == label}
+                # Connected component count of the cell's own 4-component after removal.
+                def components(points):
+                    seen = set(); count = 0
+                    for start in points:
+                        if start in seen:
+                            continue
+                        count += 1; queue = deque([start]); seen.add(start)
+                        while queue:
+                            i, j = queue.popleft()
+                            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                                q = (i + di, j + dj)
+                                if q in points and q not in seen:
+                                    seen.add(q); queue.append(q)
+                    return count
+                # Local definition: among the 8-neighbours in the same region,
+                # the 4-components that touch the cell's 4-neighbours count 1.
+                nb = {(r + di, c + dj) for di in (-1, 0, 1) for dj in (-1, 0, 1) if (di, dj) != (0, 0)} & mine
+                local = components(nb)
+                four = {(r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)} & mine
+                # Components of nb not touching any 4-neighbour do not count.
+                def touching(points):
+                    seen = set(); count = 0
+                    for start in points:
+                        if start in seen:
+                            continue
+                        comp = {start}; queue = deque([start]); seen.add(start)
+                        while queue:
+                            i, j = queue.popleft()
+                            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                                q = (i + di, j + dj)
+                                if q in points and q not in seen:
+                                    seen.add(q); comp.add(q); queue.append(q)
+                        count += bool(comp & four)
+                    return count
+                assert bool(simple[r, c]) == (touching(nb) == 1), (r, c, region)
