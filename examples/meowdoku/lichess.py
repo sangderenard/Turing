@@ -160,7 +160,8 @@ class LichessBot:
         if self.player is None:
             moves = game.all_legal_moves()
             return move_to_uci(game, *random.choice(moves)) if moves else None
-        move = self.player.choose(game, greedy=True)
+        from meowdoku.search import best_move
+        move = best_move(game, self.player.net)                 # two-ply search over the network
         return move_to_uci(game, *move) if move else None
 
     def play_game(self, game_id: str) -> None:

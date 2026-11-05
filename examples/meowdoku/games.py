@@ -698,7 +698,8 @@ class ChessVsNet(Chess):
         before = self.moves
         super().cell(r, c, button)
         if self.moves > before and self.turn == "black" and self.outcome() is None:
-            move = self.player.choose(self, greedy=True)
+            from meowdoku.search import best_move
+            move = best_move(self, self.player.net)             # two-ply search over the network
             if move is not None:
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
 
