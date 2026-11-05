@@ -314,6 +314,39 @@ class EntityGame(Game):
         self.ack = None           # the last input interval landed
         self.epoch = 0            # bumped when the world jumps (reset, rewind, relayout)
         self.intervals: list[dict] = []
+        self.autopilot = False    # when set, the compiled policy (autopilot.py) supplies the controls
+        self.pilot = None
+        self._pilot_hold = 0.0    # seconds left on the policy's current decision
+
+    #: Seconds one autopilot decision is held (the cadence it was trained at).
+    PILOT_STEP = 1.0 / 30.0
+
+    def set_autopilot(self, on: bool) -> None:
+        """Hand the controls to the trained policy (server side); the page keeps drawing."""
+        if on:
+            from meowdoku.autopilot import pilot_for
+            self.pilot = pilot_for(self)         # refuses when there are no trained weights
+        self.autopilot = bool(on)
+        self._pilot_hold = 0.0
+
+    def _land(self, seconds: float, held: dict) -> None:
+        """Land ``seconds`` with ``held`` controls, or with the policy's own
+        when the autopilot is on (one decision per PILOT_STEP)."""
+        if not self.autopilot or self.pilot is None or self.session.state is None:
+            self.held = held
+            self.session.control(held)
+            self.session.advance(seconds)
+            return
+        left = seconds
+        while left > 1e-9:
+            if self._pilot_hold <= 1e-9:
+                self.held = self.pilot.controls(self)
+                self._pilot_hold = self.PILOT_STEP
+            step = min(left, self._pilot_hold)
+            self.session.control(self.held)
+            self.session.advance(step)
+            left -= step
+            self._pilot_hold -= step
 
     # declared by the game ----------------------------------------------------
     def make_piece(self):
@@ -423,9 +456,8 @@ class EntityGame(Game):
             for interval in self.intervals:
                 if self.ack is not None and int(interval["seq"]) <= self.ack:
                     continue          # resent and already landed
-                self.held = {name: float(interval[name]) for name in self.CONTROLS if name in interval}
-                self.session.control(self.held)
-                self.session.advance(min(self.max_frame, max(0.0, float(interval.get("dur", 0.0)))))
+                held = {name: float(interval[name]) for name in self.CONTROLS if name in interval}
+                self._land(min(self.max_frame, max(0.0, float(interval.get("dur", 0.0)))), held)
                 self.ack = int(interval["seq"])
             self.adopt_reported()
             self.intervals = []
@@ -435,10 +467,9 @@ class EntityGame(Game):
         now = time.perf_counter()
         seconds = 0.0 if self.last_tick is None else min(self.max_frame, now - self.last_tick)
         self.last_tick = now
-        self.session.control(self.held)
         if self.session.state is None:
             seconds = max(seconds, 1.0 / 60.0)      # round zero instantiates the state
-        self.session.advance(seconds)
+        self._land(seconds, self.held)
         self.ticks += 1
 
     def undo(self) -> None:
@@ -468,6 +499,7 @@ class EntityGame(Game):
         st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
         st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
         st["sync_hint"] = self.sync_hint()
+        st["autopilot"] = self.autopilot
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, **(self.motion() or {})}
