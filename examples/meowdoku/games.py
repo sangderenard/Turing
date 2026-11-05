@@ -170,7 +170,7 @@ class BoardGame(Game):
     def cell(self, r: int, c: int, button: str) -> None:
         i = self.idx(r, c)
         if self.selected is not None and i in self.legal_moves(self.selected):
-            self.history.append((dict(self.pieces), dict(self.ids), self.turn))
+            self.history.append((dict(self.pieces), dict(self.ids), self.turn, getattr(self, "rights", None), getattr(self, "ep", None)))
             self.apply_move(self.selected, i)
             self.selected = None
             self.moves += 1
@@ -184,17 +184,22 @@ class BoardGame(Game):
     def peek(self, src: int, dst: int) -> tuple[dict[int, tuple[str, str]], str]:
         """The position after ``src -> dst`` and the side then to move,
         without touching this game (a lookahead's successor)."""
-        saved = (self.pieces, self.ids, self.turn)
+        saved = (self.pieces, self.ids, self.turn, getattr(self, "rights", None), getattr(self, "ep", None))
         self.pieces, self.ids = dict(self.pieces), dict(self.ids)
         self.apply_move(src, dst)
         pieces = self.pieces
         turn = self.sides[1] if self.turn == self.sides[0] else self.sides[0]
-        self.pieces, self.ids, self.turn = saved
+        self.pieces, self.ids, self.turn = saved[:3]
+        if saved[3] is not None:
+            self.rights, self.ep = saved[3], saved[4]
         return pieces, turn
 
     def undo(self) -> None:
         if self.history:
-            self.pieces, self.ids, self.turn = self.history.pop()
+            entry = self.history.pop()
+            self.pieces, self.ids, self.turn = entry[:3]
+            if len(entry) > 3 and entry[3] is not None:
+                self.rights, self.ep = entry[3], entry[4]
             self.selected = None
             self.moves = max(0, self.moves - 1)
 
@@ -228,6 +233,10 @@ class Chess(BoardGame):
     BACK = ("rook", "knight", "bishop", "queen", "king", "bishop", "knight", "rook")
 
     def setup(self) -> None:
+        # castling rights by the rook's home square, and the en passant
+        # target (the square a double-stepping pawn passed over)
+        self.rights = {0, 7, 56, 63}
+        self.ep = None
         counter = 0
         for c, kind in enumerate(self.BACK):
             for r, side in ((0, "black"), (7, "white")):
@@ -236,9 +245,9 @@ class Chess(BoardGame):
             for r, side in ((1, "black"), (6, "white")):
                 self.pieces[self.idx(r, c)] = ("pawn", side); self.ids[self.idx(r, c)] = f"{side}-pawn-{counter}"; counter += 1
 
-    def legal_moves(self, cell: int) -> list[int]:
-        """Pseudo-legal moves: piece movement and captures, pawn double
-        step and promotion; no castling, en passant or check rules."""
+    def pseudo_moves(self, cell: int) -> list[int]:
+        """Piece movement and captures, pawn double step and promotion, with
+        no regard for the king's safety; no castling or en passant."""
         if cell not in self.pieces:
             return []
         kind, side = self.pieces[cell]
@@ -277,7 +286,7 @@ class Chess(BoardGame):
             for dc in (-1, 1):
                 if self.on_board(rr, c + dc):
                     j = self.idx(rr, c + dc)
-                    if j in self.pieces and self.pieces[j][1] == enemy:
+                    if (j in self.pieces and self.pieces[j][1] == enemy) or j == getattr(self, "ep", None):
                         out.append(j)
         elif kind == "knight":
             step(((1, 2), (2, 1), (-1, 2), (-2, 1), (1, -2), (2, -1), (-1, -2), (-2, -1)))
@@ -289,16 +298,107 @@ class Chess(BoardGame):
             slide(((1, 1), (1, -1), (-1, 1), (-1, -1), (1, 0), (-1, 0), (0, 1), (0, -1)))
         elif kind == "king":
             step(((1, 1), (1, -1), (-1, 1), (-1, -1), (1, 0), (-1, 0), (0, 1), (0, -1)))
+            home = 60 if side == "white" else 4
+            if cell == home and not getattr(self, "_probing", False) and not self.in_check(side):
+                for rook, between, path in ((home + 3, (home + 1, home + 2), (home + 1, home + 2)),
+                                            (home - 4, (home - 1, home - 2, home - 3), (home - 1, home - 2))):
+                    if rook in getattr(self, "rights", set()) and self.pieces.get(rook) == ("rook", side) \
+                            and all(b not in self.pieces for b in between) \
+                            and not any(self.attacked(sq, enemy) for sq in path):
+                        out.append(path[1])
         return out
 
-    def apply_move(self, src: int, dst: int) -> None:
+    def apply_move(self, src: int, dst: int, promotion: str = "queen") -> None:
         kind, side = self.pieces.pop(src)
         piece_id = self.ids.pop(src)
-        r, _ = self.rc(dst)
+        r0, c0 = self.rc(src); r, c = self.rc(dst)
+        ep = getattr(self, "ep", None)
+        if kind == "pawn" and dst == ep and c != c0 and dst not in self.pieces:   # en passant takes the passed pawn
+            taken = self.idx(r0, c)
+            self.pieces.pop(taken, None); self.ids.pop(taken, None)
+        if kind == "king" and abs(c - c0) == 2:                                     # castling: the rook hops over
+            rook_from, rook_to = (self.idx(r, 7), self.idx(r, 5)) if c > c0 else (self.idx(r, 0), self.idx(r, 3))
+            if rook_from in self.pieces:
+                self.pieces[rook_to] = self.pieces.pop(rook_from); self.ids[rook_to] = self.ids.pop(rook_from)
         if kind == "pawn" and r in (0, 7):
-            kind = "queen"
+            kind = promotion
         self.pieces[dst] = (kind, side)
         self.ids[dst] = piece_id
+        rights = set(getattr(self, "rights", set()))
+        if kind == "king":
+            rights -= {56, 63} if side == "white" else {0, 7}
+        rights.discard(src); rights.discard(dst)
+        self.rights = rights
+        self.ep = self.idx((r0 + r) // 2, c) if kind == "pawn" and abs(r - r0) == 2 else None
+
+    def attacked(self, cell: int, by: str) -> bool:
+        """Whether ``by`` has a piece whose movement reaches ``cell``
+        (castling is not an attack, so it is left out while probing)."""
+        self._probing = True
+        try:
+            for src, (kind, side) in self.pieces.items():
+                if side == by and cell in self.pseudo_moves(src):
+                    return True
+            return False
+        finally:
+            self._probing = False
+
+    def king_of(self, side: str) -> int | None:
+        for cell, (kind, s) in self.pieces.items():
+            if kind == "king" and s == side:
+                return cell
+        return None
+
+    def in_check(self, side: str) -> bool:
+        king = self.king_of(side)
+        enemy = "black" if side == "white" else "white"
+        return king is not None and self.attacked(king, enemy)
+
+    def legal_moves(self, cell: int) -> list[int]:
+        """Pseudo-legal moves that do not leave the mover's own king
+        attacked: you may not move into check, and in check you must get
+        out of it."""
+        if cell not in self.pieces:
+            return []
+        kind, side = self.pieces[cell]
+        enemy = "black" if side == "white" else "white"
+        out = []
+        saved = (self.pieces, self.ids, getattr(self, "rights", set()), getattr(self, "ep", None))
+        for dst in self.pseudo_moves(cell):
+            self.pieces, self.ids = dict(saved[0]), dict(saved[1])
+            self.apply_move(cell, dst)
+            king = self.king_of(side)
+            if king is not None and not self.attacked(king, enemy):
+                out.append(dst)
+            self.rights, self.ep = saved[2], saved[3]
+        self.pieces, self.ids = saved[0], saved[1]
+        return out
+
+    def all_legal_moves(self) -> list[tuple[int, int]]:
+        return [(src, dst) for src, (kind, side) in list(self.pieces.items()) if side == self.turn
+                for dst in self.legal_moves(src)]
+
+    def outcome(self) -> str | None:
+        """``"white"`` / ``"black"`` for a checkmate's winner, ``"draw"`` for
+        stalemate, else None (the game goes on)."""
+        if self.all_legal_moves():
+            return None
+        if self.in_check(self.turn):
+            return "black" if self.turn == "white" else "white"
+        return "draw"
+
+
+    def state(self) -> dict[str, Any]:
+        st = super().state()
+        end = self.outcome()
+        if end == "draw":
+            st["status"] = f"stalemate · {self.moves} moves"
+        elif end:
+            st["status"] = f"checkmate · {end} wins · {self.moves} moves"
+            st["won"] = end == "white"; st["lost"] = end == "black"
+        elif self.in_check(self.turn):
+            st["status"] = f"{self.turn} to move · check · {self.moves} moves"
+        return st
 
 
 class Checkers(BoardGame):
@@ -476,63 +576,81 @@ def self_play():
 
 
 class ChessArena(Chess):
-    """Network against network.  Every ``tick`` plays one move; when a king
-    falls (or the ply cap is reached) the finished game trains the network
-    and a new game starts.  The page ticks it while it is on screen."""
+    """Network against network, many games at once.
+
+    A background thread steps ``parallel`` games together: one batched
+    evaluation values every legal successor of every game, each game takes
+    its move, finished games train the network as one batch and restart.
+    This object is game 0 of that batch, the one the page shows; the page
+    polls as fast as it likes and animates whatever arrived."""
 
     game = "chess_arena"
     title = "Chess arena: the network against itself"
     input = "watch"
 
-    def __init__(self, board_id: str = "arena"):
+    def __init__(self, board_id: str = "arena", parallel: int = 16, lock=None):
         super().__init__(board_id)
+        import threading
         self.player = self_play()
-        self.boards, self.materials = [], []
-        self.plies = 0
+        self.lock = lock or threading.RLock()
+        self.parallel = max(1, int(parallel))
         self.last_result = ""
+        self.steps_per_second = 0.0
+        self.engine = self.player.batch_engine(self, self.parallel)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="chess-arena", daemon=True)
+        self._thread.start()
 
-    def tick(self) -> None:
-        from meowdoku.chess_net import MAX_PLIES, encode, king_taken, material
-        if self.plies == 0 and not self.boards:
-            pass
-        self.boards.append(encode(self.pieces, self.turn))
-        self.materials.append(material(self.pieces))
-        move = self.player.choose(self)
-        result = None
-        if move is None:
-            result = "draw"
-        else:
-            Chess.cell(self, *self.rc(move[0]), "primary"); Chess.cell(self, *self.rc(move[1]), "primary")
-            self.plies += 1
-            loser = king_taken(self)
-            if loser:
-                result = "black" if loser == "white" else "white"
-            elif self.plies >= MAX_PLIES:
-                result = "draw"
-        if result:
-            self.player.learn_from(self.boards, self.materials, result)
-            self.last_result = f"{result} in {self.plies} plies"
-            self.pieces, self.ids, self.selected = {}, {}, None
-            self.turn = self.sides[0]
-            self.boards, self.materials, self.plies = [], [], 0
-            self.history = []
-            self.setup()
+    def _run(self) -> None:
+        import time
+        # First run ever: pre-train on master games before any self-play.
+        try:
+            from meowdoku.pretrain import ensure
+            self.note = ""
+            ensure(self.player, progress=lambda message: setattr(self, "note", message))
+            self.note = ""
+        except Exception as error:                            # offline, or the source moved: play anyway
+            self.note = f"pre-training skipped: {type(error).__name__}"
+        tick, count = time.perf_counter(), 0
+        while not self._stop.is_set():
+            with self.lock:
+                finished = self.engine.step()
+                if finished:
+                    self.last_result = finished[-1]
+            count += 1
+            now = time.perf_counter()
+            if now - tick >= 1.0:
+                self.steps_per_second = count / (now - tick)
+                tick, count = now, 0
+            time.sleep(0)                                     # let the server thread in
 
-    def cell(self, r: int, c: int, button: str) -> None:   # the page's taps do nothing here
-        if button == "__move__":
-            return super().cell(r, c, "primary")
+    def stop(self) -> None:
+        self._stop.set()
+
+    def tick(self) -> None:                                   # the thread moves; a tick just returns state
+        return None
+
+    def cell(self, r: int, c: int, button: str) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+    def undo(self) -> None:
         return None
 
     def state(self) -> dict:
-        st = super().state()
-        p = self.player
-        rec = p.record
-        st["status"] = (f"game {p.games + 1} · ply {self.plies} · {self.turn} to move · "
-                        f"record W{rec['white']} B{rec['black']} D{rec['draw']}"
-                        + (f" · loss {p.last_loss:.3f}" if p.games else "")
-                        + (f" · last: {self.last_result}" if self.last_result else ""))
-        st["moves"] = self.plies
-        return st
+        with self.lock:
+            st = Chess.state(self)
+            p = self.player
+            rec = p.record
+            note = getattr(self, "note", "")
+            st["status"] = (note + " · " if note else "") + (f"{self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · game {p.games + 1} · "
+                            f"record W{rec['white']} B{rec['black']} D{rec['draw']}"
+                            + (f" · loss {p.last_loss:.3f}" if p.games else "")
+                            + (f" · last: {self.last_result}" if self.last_result else ""))
+            st["moves"] = self.engine.plies(0)
+            return st
 
 
 class ChessVsNet(Chess):
@@ -548,22 +666,10 @@ class ChessVsNet(Chess):
     def cell(self, r: int, c: int, button: str) -> None:
         before = self.moves
         super().cell(r, c, button)
-        if self.moves > before and self.turn == "black":
-            from meowdoku.chess_net import king_taken
-            if king_taken(self):
-                return
+        if self.moves > before and self.turn == "black" and self.outcome() is None:
             move = self.player.choose(self, greedy=True)
             if move is not None:
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
-
-    def state(self) -> dict:
-        from meowdoku.chess_net import king_taken
-        st = super().state()
-        loser = king_taken(self)
-        if loser:
-            st["won"] = loser == "black"; st["lost"] = loser == "white"
-            st["status"] = "you took the king" if loser == "black" else "the network took your king"
-        return st
 
 
 GAMES = {"meowdoku": MeowdokuGame, "chess": Chess, "checkers": Checkers, "wordle": Wordle,

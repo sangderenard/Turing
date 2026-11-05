@@ -40,7 +40,7 @@ class Table:
 
     def __init__(self, web_dir: Path):
         self.web_dir = web_dir
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         database = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.boards = {board["id"]: board for board in database["boards"]}
         self.levels = database["levels"]
@@ -55,6 +55,8 @@ class Table:
 
     def new(self, payload: dict) -> dict:
         kind = str(payload.get("game", "meowdoku"))
+        if self.game is not None and hasattr(self.game, "stop"):
+            self.game.stop()                                   # an arena's thread ends with it
         if kind == "meowdoku":
             self.game = MeowdokuGame(self.boards[str(payload["id"])])
         elif kind == "chess":
@@ -64,7 +66,7 @@ class Table:
         elif kind == "wordle":
             self.game = Wordle(int(payload.get("seed", 0)))
         elif kind == "chess_arena":
-            self.game = ChessArena()
+            self.game = ChessArena(parallel=int(payload.get("parallel", 16)), lock=self.lock)
         elif kind == "chess_vs_net":
             self.game = ChessVsNet()
         else:

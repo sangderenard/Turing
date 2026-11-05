@@ -337,7 +337,8 @@ function pieceModel(piece, now) {
   let y = 0, spin = 0, s = 1, tilt = 0, x = piece.x, z = piece.z;
   if (piece.removing != null) { const t = Math.min(1, (now - piece.removing) / 0.3); s = 1 - ease.in(t); y = 0.2 * t; }
   else if (piece.from) {                                          // a move: slide with a small arc
-    const t = Math.min(1, age / 0.45), k = ease.out(t);
+    const slide = state.game && state.game.input === "watch" ? Math.min(0.45, Math.max(0.08, (state.moveInterval || 0.3) * 0.9)) : 0.45;
+    const t = Math.min(1, age / slide), k = ease.out(t);
     x = piece.from[0] + (piece.x - piece.from[0]) * k; z = piece.from[1] + (piece.z - piece.from[1]) * k; y = 0.5 * Math.sin(Math.PI * t);
     if (t >= 1) piece.from = null;
   }
@@ -385,8 +386,18 @@ function applyState(game) {
   status.textContent = `${game.status} · ${game.title}`;
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
+  // Watch mode: the server's thread moves; poll again as soon as this reply
+  // is in (a short breath so the UI thread keeps up) and time the moves so
+  // the slide animation lasts about as long as a move takes to arrive.
   clearTimeout(state.arenaTimer);
-  if (game.input === "watch" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick" }); }, 350);
+  if (game.input === "watch") {
+    if (previous && previous.game === game.game && game.moves !== previous.moves) {
+      const gap = now - (state.lastMoveAt || now);
+      state.moveInterval = state.moveInterval ? state.moveInterval * 0.7 + gap * 0.3 : gap;
+      state.lastMoveAt = now;
+    }
+    if (!document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick" }); }, 40);
+  }
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
@@ -472,7 +483,7 @@ async function api(path, body) {
 // several, and a late reply must never overwrite a newer state.
 let chain = Promise.resolve();
 const act = (payload) => {
-  const step = chain.then(async () => { console.log("[meow] action", JSON.stringify(payload)); applyState(await api("/api/action", payload)); }).catch((e) => console.warn(e));
+  const step = chain.then(async () => { if (payload.type !== "tick") console.log("[meow] action", JSON.stringify(payload)); applyState(await api("/api/action", payload)); }).catch((e) => console.warn(e));
   chain = step;
   return step;
 };

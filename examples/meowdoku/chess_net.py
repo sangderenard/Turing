@@ -125,17 +125,7 @@ class ValueNet:
 
 
 def legal_moves(game: Chess) -> list[tuple[int, int]]:
-    return [(src, dst) for src, (kind, side) in list(game.pieces.items()) if side == game.turn
-            for dst in game.legal_moves(src)]
-
-
-def king_taken(game: Chess) -> str | None:
-    """The side whose king is gone, or None."""
-    kings = {side for kind, side in game.pieces.values() if kind == "king"}
-    for side in ("white", "black"):
-        if side not in kings:
-            return side
-    return None
+    return game.all_legal_moves()
 
 
 class SelfPlay:
@@ -155,19 +145,26 @@ class SelfPlay:
         self.plies_history: list[int] = []
 
     # -- moving ----------------------------------------------------------
-    def choose(self, game: Chess, greedy: bool = False) -> tuple[int, int] | None:
-        moves = legal_moves(game)
-        if not moves:
-            return None
-        boards = np.stack([encode(*game.peek(src, dst)) for src, dst in moves])
-        values = self.net.values(boards)
-        if game.turn == "black":
-            values = -values                                        # black wants White's value low
+    def pick(self, moves, values, turn: str, greedy: bool):
+        """A move from valued candidates: White takes the highest value,
+        Black the lowest; softmax at the temperature unless greedy."""
+        if turn == "black":
+            values = -values
         if greedy:
             return moves[int(np.argmax(values))]
         logits = (values - values.max()) / max(self.temperature, 1e-3)
         probability = np.exp(logits); probability /= probability.sum()
         return moves[int(self.rng.choice(len(moves), p=probability))]
+
+    def choose(self, game: Chess, greedy: bool = False) -> tuple[int, int] | None:
+        moves = legal_moves(game)
+        if not moves:
+            return None
+        boards = np.stack([encode(*game.peek(src, dst)) for src, dst in moves])
+        return self.pick(moves, self.net.values(boards), game.turn, greedy)
+
+    def batch_engine(self, display: Chess, parallel: int) -> "BatchEngine":
+        return BatchEngine(self, display, parallel)
 
     # -- a whole game ------------------------------------------------------
     def play_game(self, greedy: bool = False) -> tuple[list[np.ndarray], list[float], str]:
@@ -176,14 +173,12 @@ class SelfPlay:
         for _ply in range(MAX_PLIES):
             boards.append(encode(game.pieces, game.turn))
             materials.append(material(game.pieces))
+            end = game.outcome()
+            if end:
+                return boards, materials, end
             move = self.choose(game, greedy)
-            if move is None:
-                break
             game.cell(*game.rc(move[0]), "primary")
             game.cell(*game.rc(move[1]), "primary")
-            loser = king_taken(game)
-            if loser:
-                return boards, materials, ("black" if loser == "white" else "white")
         return boards, materials, "draw"
 
     def targets(self, materials: list[float], result: str) -> np.ndarray:
@@ -195,28 +190,34 @@ class SelfPlay:
         return np.clip(discounted + shaping, -1.0, 1.0)
 
     def learn_from(self, boards, materials, result) -> float:
-        x = np.stack(boards)
-        z = self.targets(materials, result)
+        return self.learn_from_games([(boards, materials, result)])
+
+    def learn_from_games(self, finished) -> float:
+        """One gradient step over every position of several finished games."""
+        x = np.concatenate([np.stack(boards) for boards, _, _ in finished])
+        z = np.concatenate([self.targets(materials, result) for _, materials, result in finished])
         loss = self.net.train_step(x, z, self.lr)
         self.losses.append(loss)
         self.last_loss = loss
-        self.games += 1
-        self.record[result] += 1
-        self.plies_history.append(len(boards))
-        if self.games % 10 == 0:
+        for boards, _, result in finished:
+            self.games += 1
+            self.record[result] += 1
+            self.plies_history.append(len(boards))
+        if self.games % 10 < len(finished):
             self.net.save(self.weights)
         return loss
 
-    def train(self, games: int, report_every: int = 10) -> None:
-        for _ in range(games):
-            started = time.perf_counter()
-            boards, materials, result = self.play_game()
-            loss = self.learn_from(boards, materials, result)
-            if self.games % report_every == 0:
-                recent = self.losses[-report_every:]
-                print(f"[selfplay] game {self.games}: {result:5s} in {len(boards):3d} plies, loss {np.mean(recent):.4f}, "
+    def train(self, games: int, report_every: int = 10, parallel: int = 16) -> None:
+        engine = BatchEngine(self, Chess("arena-0"), parallel)
+        started, target, reported = time.perf_counter(), self.games + games, self.games
+        while self.games < target:
+            finished = engine.step()
+            if finished and self.games - reported >= report_every:
+                reported = self.games
+                recent = self.losses[-3:]
+                print(f"[selfplay] {self.games} games: last {finished[-1]}, loss {np.mean(recent):.4f}, "
                       f"record W{self.record['white']} B{self.record['black']} D{self.record['draw']}, "
-                      f"{time.perf_counter() - started:.1f}s", flush=True)
+                      f"{time.perf_counter() - started:.0f}s", flush=True)
 
     # -- measuring: the net as White against a random mover ------------------
     def versus_random(self, games: int = 10) -> dict[str, int]:
@@ -225,19 +226,81 @@ class SelfPlay:
             game = Chess("eval")
             result = "draw"
             for _ply in range(MAX_PLIES):
+                end = game.outcome()
+                if end:
+                    result = {"white": "win", "black": "loss", "draw": "draw"}[end]; break
                 if game.turn == "white":
                     move = self.choose(game, greedy=True)
                 else:
                     moves = legal_moves(game)
-                    move = moves[int(self.rng.integers(len(moves)))] if moves else None
-                if move is None:
-                    break
+                    move = moves[int(self.rng.integers(len(moves)))]
                 game.cell(*game.rc(move[0]), "primary"); game.cell(*game.rc(move[1]), "primary")
-                loser = king_taken(game)
-                if loser:
-                    result = "loss" if loser == "white" else "win"; break
             score[result] += 1
         return score
+
+
+class BatchEngine:
+    """Many games stepped together.  ``step`` advances every game by one
+    ply: all legal successors of all games are encoded into one batch,
+    valued in one forward pass, each game picks its move; games that end
+    are trained on together and restart.  ``games[0]`` is the display
+    game the page shows."""
+
+    def __init__(self, player: SelfPlay, display: Chess, parallel: int):
+        self.player = player
+        self.games = [display] + [Chess(f"arena-{k}") for k in range(1, parallel)]
+        self.boards = [[] for _ in self.games]
+        self.materials = [[] for _ in self.games]
+        self._plies = [0] * len(self.games)
+        self.pending: list[tuple] = []
+        self.train_every = max(2, parallel // 4)
+
+    def plies(self, index: int) -> int:
+        return self._plies[index]
+
+    def _restart(self, k: int, result: str) -> None:
+        self.pending.append((self.boards[k], self.materials[k], result))
+        game = self.games[k]
+        game.pieces, game.ids, game.selected = {}, {}, None
+        game.turn = game.sides[0]
+        game.history, game.moves = [], 0
+        game.setup()
+        self.boards[k], self.materials[k], self._plies[k] = [], [], 0
+
+    def step(self) -> list[str]:
+        finished: list[str] = []
+        candidates, spans, per_game_moves = [], [], []
+        for k, game in enumerate(self.games):
+            end = game.outcome()
+            if end is None and self._plies[k] >= MAX_PLIES:
+                end = "draw"
+            if end:
+                finished.append(f"{end} in {self._plies[k]} plies")
+                self._restart(k, end)
+                per_game_moves.append(None)
+                spans.append((len(candidates), len(candidates)))
+                continue
+            self.boards[k].append(encode(game.pieces, game.turn))
+            self.materials[k].append(material(game.pieces))
+            moves = legal_moves(game)
+            per_game_moves.append(moves)
+            start = len(candidates)
+            candidates.extend(encode(*game.peek(src, dst)) for src, dst in moves)
+            spans.append((start, len(candidates)))
+        if candidates:
+            values = self.player.net.values(np.stack(candidates))
+            for k, game in enumerate(self.games):
+                moves = per_game_moves[k]
+                if not moves:
+                    continue
+                a, b = spans[k]
+                move = self.player.pick(moves, values[a:b], game.turn, greedy=False)
+                Chess.cell(game, *game.rc(move[0]), "primary"); Chess.cell(game, *game.rc(move[1]), "primary")
+                self._plies[k] += 1
+        if len(self.pending) >= self.train_every:
+            self.player.learn_from_games(self.pending)
+            self.pending = []
+        return finished
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--fresh", action="store_true", help="ignore saved weights")
     parser.add_argument("--eval", type=int, default=10, help="games against a random mover before and after")
+    parser.add_argument("--parallel", type=int, default=16)
     args = parser.parse_args(argv)
     weights = WEIGHTS if not args.fresh else WEIGHTS.with_name("chess_net_fresh.npz")
     if args.fresh and weights.exists():
@@ -255,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[selfplay] weights loaded: {player.loaded}", flush=True)
     before = player.versus_random(args.eval)
     print(f"[selfplay] vs random before: {before}", flush=True)
-    player.train(args.games)
+    player.train(args.games, parallel=args.parallel)
     after = player.versus_random(args.eval)
     print(f"[selfplay] vs random after {args.games} games: {after}", flush=True)
     player.net.save(weights)
