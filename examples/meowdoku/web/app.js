@@ -808,7 +808,8 @@ function reconcile(game) {
   const ship = { ...game.you };
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
   if (before) { pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
-                if (Math.hypot(...pred.offset) > 1.5) pred.offset = [0, 0]; }
+                if (Math.hypot(...pred.offset) > 1.5) pred.offset = [0, 0];
+                syncFaithfulness(Math.hypot(before[0] - ship.x, before[1] - ship.y)); }
   pred.ship = ship;
 }
 // The predictor runs on its own clock, PREDICT_HZ, unbound from the display's
@@ -920,6 +921,7 @@ function applySnapshot(view) {
   if (u8() !== 1) return;
   const flags = u8(), ack = i32();
   const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
+  sync.hint = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -984,11 +986,31 @@ function sendTick(game) {
     .catch((error) => console.warn(error))
     .finally(() => { ticks.inFlight--; });
 }
+// SYNC RELAX for faithful clients.  A page whose predictions keep landing
+// where the server puts the ship (each reply's correction under
+// SYNC.faithful) earns a longer delay between check-ins, 20% more per
+// faithful reply; one visible correction (over SYNC.drift) snaps it back to
+// the fastest.  The relaxed delay never exceeds the server's sync hint -- the
+// longest wait its danger allows (time to contact with the nearest hostile)
+// -- and any change of input is a check-in at once, so a press is never
+// held back by a relaxed clock.  Unpredicted pages keep the fastest clock.
+const SYNC = { fastest: 0.03, longest: 0.25, faithful: 0.01, drift: 0.04, grow: 1.2 };
+const sync = { interval: SYNC.fastest, hint: SYNC.longest, next: 0, streak: 0 };
+window.meowdokuDebug.sync = sync;
+function syncFaithfulness(correction) {
+  if (correction > SYNC.drift) { sync.interval = SYNC.fastest; sync.streak = 0; return; }
+  if (correction < SYNC.faithful) { sync.streak += 1; sync.interval = Math.min(sync.interval * SYNC.grow, SYNC.longest); }
+}
 setInterval(() => {
   const game = state.game;
   if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight + sock.outstanding >= 3) return;
+  const now = performance.now() / 1000;
+  const allowed = predicting(game) ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest;
+  const inputChanged = pred.closed.length > 0;               // a press, release or steer since the last check-in
+  if (now < sync.next && !inputChanged) return;
+  sync.next = now + allowed;
   sendTick(game);
-}, 30);
+}, 5);
 
 function entityModel(piece, now) {
   // Free-board entities: drawn where the server last put them, carried on by
@@ -1343,6 +1365,7 @@ function applyState(game) {
   rebuildBoards(game);
   arcadeEvents(game, now);
   if (game.you) noteShield(game, now);
+  if (game.sync_hint != null) sync.hint = game.sync_hint;
   resultSplash(game);
   const seen = new Set();
   const place = (p, rackPiece) => {

@@ -330,6 +330,40 @@ class EntityGame(Game):
     def describe(self) -> str:
         return ""
 
+    #: Lane ranges ``(start, stop)`` holding things that can hurt the player;
+    #: the sync hint is read from them.
+    HOSTILE_LANES: tuple[tuple[int, int], ...] = ()
+    #: Check-in delay bounds (seconds) the sync hint moves between.
+    SYNC_MIN, SYNC_MAX = 0.03, 0.25
+
+    def sync_hint(self) -> float:
+        """The longest a faithful page may wait between check-ins now.
+
+        The shortest time-to-contact between the player's ship and any live
+        hostile lane (distance over closing speed; a hostile moving away
+        counts at its own speed), times 0.35, clipped to [SYNC_MIN,
+        SYNC_MAX]: with nothing close a page may relax to a quarter second,
+        with a bullet closing it is held near 30 ms so new threats arrive
+        in time.  No hostiles declared, or no ship: SYNC_MAX."""
+        s = self.session
+        if s.state is None or self.PLAYER_LANE is None or not self.HOSTILE_LANES:
+            return self.SYNC_MAX
+        col = s.column
+        k = self.PLAYER_LANE
+        if col("alive")[k] <= 0.0:
+            return self.SYNC_MAX
+        lanes = np.concatenate([np.arange(a, b) for a, b in self.HOSTILE_LANES])
+        live = lanes[col("alive")[lanes] > 0.0]
+        if not len(live):
+            return self.SYNC_MAX
+        dx, dy = col("x")[live] - col("x")[k], col("y")[live] - col("y")[k]
+        dvx, dvy = col("vx")[live] - col("vx")[k], col("vy")[live] - col("vy")[k]
+        distance = np.maximum(np.hypot(dx, dy) - 0.5, 0.0)
+        closing = -(dx * dvx + dy * dvy) / np.maximum(np.hypot(dx, dy), 1e-6)
+        speed = np.maximum(closing, 0.25 * np.hypot(dvx, dvy) + 1e-3)
+        contact = float(np.min(distance / speed))
+        return float(np.clip(0.35 * contact, self.SYNC_MIN, self.SYNC_MAX))
+
     def motion(self) -> dict[str, Any] | None:
         """``MOTION`` as published; a game whose walls move overrides it."""
         return self.MOTION
@@ -387,6 +421,7 @@ class EntityGame(Game):
         st["over"] = self.session.state is not None and self.result() is not None
         st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
         st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
+        st["sync_hint"] = self.sync_hint()
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, **(self.motion() or {})}

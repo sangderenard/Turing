@@ -420,6 +420,8 @@ class SpaceInvaders(EntityGame):
             return None
         return {"score": float(s.column("score")[0]), "detail": f"reached wave {int(s.column('wave')[0]) + 1}"}
 
+    HOSTILE_LANES = ((BOMB_LANES.start, BOMB_LANES.stop), (UFO_LANE, UFO_LANE + 1), (FLEET0, SHIELD0))
+
     def describe(self) -> str:
         s = self.session
         lives, score, wave = int(s.column("lives")[0]), int(s.column("score")[0]), int(s.column("wave")[0])

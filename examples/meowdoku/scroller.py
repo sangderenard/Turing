@@ -336,6 +336,8 @@ class BulletScroller(EntityGame):
             return None
         return {"score": float(s.column("score")[0]), "detail": f"survived {s.column('clock')[0]:.0f} s"}
 
+    HOSTILE_LANES = (ENEMIES, BULLETS)
+
     def describe(self) -> str:
         s = self.session
         lives, score = int(s.column("lives")[0]), int(s.column("score")[0])
