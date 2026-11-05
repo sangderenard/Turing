@@ -45,9 +45,11 @@ RESIDUAL = TELEMETRY_FIELDS.index("residual")
 
 
 class MeowdokuSession:
-    def __init__(self, n: int = 6, seed: int = 0):
-        self.puzzle = generate(n, seed)
-        self.n = n
+    def __init__(self, n: int = 6, seed: int = 0, puzzle=None):
+        # A prebaked puzzle (region map + the leaf the game scores against)
+        # may be handed in; otherwise one is generated for (n, seed).
+        self.puzzle = puzzle if puzzle is not None else generate(n, seed)
+        self.n = int(self.puzzle.n)
         self.columns = initial_columns(self.puzzle)
         self.pieces = [MeowdokuPiece(self.puzzle.cells)]
         self.targets = Targets(cfl=0.5, div_max=1e9, mass_max=1e9,

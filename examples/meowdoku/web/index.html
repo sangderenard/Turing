@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meowdoku</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #16161a; color: #e8e8ea; font: 14px/1.4 system-ui, sans-serif; }
+  #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 10px; align-items: center; padding: 8px 12px;
+         background: rgba(22,22,26,0.85); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap; }
+  #bar select, #bar button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 6px 10px; font: inherit; }
+  #bar button:hover { background: #30303a; }
+  #status { margin-left: auto; opacity: 0.85; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>Level <select id="level"></select></label>
+  <label>Board <select id="board"></select></label>
+  <button id="new">New board</button>
+  <button id="undo">Undo (U)</button>
+  <button id="reset">Reset (R)</button>
+  <span id="status">loading…</span>
+</div>
+<canvas id="gl"></canvas>
+<div id="help">left click: cat · right click / long press: X · the hidden solution is the board's prebaked leaf</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
