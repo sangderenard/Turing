@@ -165,6 +165,10 @@ class Table:
                 "game": game, "leaderboard": self.profiles.leaderboard(game) if game else []}
 
 
+# Browsers scope cookies by host, not port: two servers on one host (live 8766
+# and dev 8767) sharing one cookie name overwrite each other's session token on
+# every request, so each sees "no game" and the page restarts in a loop.  The
+# default port keeps the historical name; any other port gets its own.
 COOKIE = "meowdoku_session"
 SESSION_IDLE_SECONDS = 2 * 3600
 
@@ -352,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
     prepare_predictor(web_dir)
+    global COOKIE
+    if args.port != 8766:
+        COOKIE = f"meowdoku_session_{args.port}"
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)

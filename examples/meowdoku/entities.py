@@ -333,6 +333,13 @@ class EntityGame(Game):
     #: Lane ranges ``(start, stop)`` holding things that can hurt the player;
     #: the sync hint is read from them.
     HOSTILE_LANES: tuple[tuple[int, int], ...] = ()
+    #: The scene contract: which layers of the scene this game has.  The page
+    #: draws a layer only if the game declares it AND the viewer has not
+    #: switched it off; a layer the game leaves out is never drawn.
+    #:   floor  -- the slab the entities move over
+    #:   glass  -- the glass plate under the board
+    #:   arcade -- the ring of arcade lights
+    SCENE: dict[str, bool] = {"floor": True, "glass": True, "arcade": True}
     #: Check-in delay bounds (seconds) the sync hint moves between.
     SYNC_MIN, SYNC_MAX = 0.03, 0.25
 
@@ -409,6 +416,7 @@ class EntityGame(Game):
     def state(self) -> dict[str, Any]:
         st = self.base_state(int(round(self.height)), int(round(self.width)))
         st["board"] = "free"
+        st["scene"] = dict(self.SCENE)
         st["width"], st["height"] = self.width, self.height
         st["palette"] = {"floor": [0.10, 0.11, 0.16], **self.palette()}
         st["cells"] = ["floor"]

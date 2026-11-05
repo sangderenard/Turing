@@ -568,6 +568,19 @@ function resultSplash(game) {
   if (!ended && splash.ended) hideSplash();
   splash.ended = ended;
 }
+// Restarting a forgotten session is a recovery, never a loop: at most one
+// automatic new game per RESTART_GAP_S, doubling while the server keeps
+// answering "no game" (up to 30 s), so a confused session cannot hammer the
+// server with new games.
+const RESTART_GAP_S = 2;
+const restartGate = { at: -Infinity, gap: RESTART_GAP_S };
+function restartAllowed() {
+  const now = performance.now() / 1000;
+  if (ticks.restarting || now - restartGate.at < restartGate.gap) return false;
+  restartGate.gap = now - restartGate.at < 2 * restartGate.gap ? Math.min(30, restartGate.gap * 2) : RESTART_GAP_S;
+  restartGate.at = now;
+  return true;
+}
 function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; }
 
 // ---------------------------------------------------------------- the craft's shield
@@ -598,11 +611,19 @@ function drawShield(now, drawLit) {
 // The ring can be switched off entirely (the Arcade lights checkbox, kept per
 // browser); off, draw() neither lights nor draws a single bulb.
 function arcadeEnabled() { const box = $("arcade"); return !box || box.checked; }
-(() => {
-  const box = $("arcade"); if (!box) return;
-  try { box.checked = localStorage.getItem("meowdoku_arcade") !== "off"; } catch {}
-  box.addEventListener("change", () => { try { localStorage.setItem("meowdoku_arcade", box.checked ? "on" : "off"); } catch {} box.blur(); });
-})();
+// The scene contract: a layer is drawn only if the game declares it (its
+// state's ``scene``; a game that says nothing has every layer) and the
+// viewer's control for it is on.
+function layerOn(name) {
+  const declared = !(state.game && state.game.scene && state.game.scene[name] === false);
+  const control = name === "arcade" ? $("arcade") : $("plate");
+  return declared && (!control || control.checked);
+}
+for (const [id, key] of [["arcade", "meowdoku_arcade"], ["plate", "meowdoku_plate"]]) {
+  const box = $(id); if (!box) continue;
+  try { box.checked = localStorage.getItem(key) !== "off"; } catch {}
+  box.addEventListener("change", () => { try { localStorage.setItem(key, box.checked ? "on" : "off"); } catch {} box.blur(); });
+}
 // Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
 // chase.  When the game's declared score rises: a comet walks the ring with a
 // fading tail.  On a win: the whole ring flashes.  Their colour and activity
@@ -923,7 +944,7 @@ function ensureSocket() {
       }
       if (message.error) {
         sock.outstanding = Math.max(0, sock.outstanding - 1);
-        if (live && /no game/.test(message.error) && !ticks.restarting) {
+        if (live && /no game/.test(message.error) && restartAllowed()) {
           ticks.restarting = true;
           newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) }).finally(() => { ticks.restarting = false; });
         }
@@ -1029,7 +1050,7 @@ function sendTick(game) {
     .then((data) => {
       // A restarted server has forgotten this page's session: start the same
       // game again rather than ticking into refusals.
-      if (data.error && /no game/.test(data.error) && !ticks.restarting) {
+      if (data.error && /no game/.test(data.error) && restartAllowed()) {
         ticks.restarting = true;
         newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) })
           .finally(() => { ticks.restarting = false; });
@@ -1494,7 +1515,8 @@ function draw(ms) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
-  const casters = [[state.buttons.vao, state.buttons.count, M.identity(), null]];
+  const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
+    : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
@@ -1527,7 +1549,7 @@ function draw(ms) {
   // With the Arcade lights control off the ring is gone: no bulb lights, no
   // bulb meshes, and the house light returns to full (the turn-down was for
   // the bulbs' sake).
-  const arcadeOn = !state.flat && arcadeEnabled();
+  const arcadeOn = !state.flat && layerOn("arcade");
   const house = arcadeOn ? 1.0 : 1.6;
   const bulbs = arcadeOn ? arcadeBulbs() : [];
   const bulbStates = bulbs.map((_, i) => arcadeBulb(i, bulbs, now));
@@ -1582,7 +1604,7 @@ function draw(ms) {
   }
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
   drawShield(now, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)

@@ -442,6 +442,9 @@ class SideScroller(EntityGame):
     title = "Runner (free board)"
     height = HEIGHT
     CONTROLS = tuple(CONTROLS)
+    # A side view: the world stands on its own ground tiles, so no slab or
+    # glass plate behind it.
+    SCENE = {"floor": False, "glass": False, "arcade": True}
     PLAYER_LANE = 0
     HOSTILE_LANES = (WALKER_LANES,)
 
