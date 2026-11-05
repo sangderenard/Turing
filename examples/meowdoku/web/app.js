@@ -96,6 +96,27 @@ void main(){ vColor = aColor; gl_Position = uMVP * vec4(aPos, 1.0); }`;
 const FLAT_FS = `#version 300 es
 precision highp float; in vec3 vColor; out vec4 FragColor; uniform float uAlpha;
 void main(){ FragColor = vec4(pow(vColor, vec3(1.0/2.2)), uAlpha); }`;
+// Flat view: pure cel shading.  The key light sits at the camera and shines
+// straight down, so N.z in view space IS the lighting; it is cut into a few
+// hard bands over the palette colour of each vertex's material.  The palette
+// (uPal) is indexed by the same material id the Phong program reads.
+const CEL_PALETTE = 192;
+const CEL_VS = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNorm; layout(location=2) in int aMat;
+uniform mat4 uMVP; uniform mat4 uMV; flat out int vMat; out vec3 vN;
+void main(){ vMat = aMat; vN = mat3(uMV) * aNorm; gl_Position = uMVP * vec4(aPos, 1.0); }`;
+const CEL_FS = `#version 300 es
+precision highp float; in vec3 vN; flat in int vMat; out vec4 FragColor;
+uniform vec3 uPal[${CEL_PALETTE}]; uniform int uOutline;
+void main(){
+  if (uOutline == 1) { FragColor = vec4(0.03, 0.03, 0.04, 1.0); return; }
+  // the extruded walls are wound inward (see uploadMaterials), so flip on back faces
+  vec3 N = normalize(gl_FrontFacing ? vN : -vN);
+  float t = N.z;
+  float band = t > 0.93 ? 1.0 : t > 0.70 ? 0.80 : t > 0.40 ? 0.62 : 0.46;
+  vec3 c = uPal[clamp(vMat, 0, ${CEL_PALETTE - 1})];
+  FragColor = vec4(pow(c * band, vec3(1.0 / 1.6)), 1.0);
+}`;
 const DEPTH_VS = `#version 300 es
 layout(location=0) in vec3 aPos; uniform mat4 uMVP;
 void main(){ gl_Position = uMVP * vec4(aPos, 1.0); }`;
@@ -349,6 +370,11 @@ function uploadMaterials(game) {
   records.push(["glass", [0.80, 0.90, 1.0], { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   const tables = {};
   state.materialIndex = {};
+  state.celPalette = new Float32Array(CEL_PALETTE * 3);
+  {
+    const f = base.pbr.floats_per_record;
+    for (let r = 0; r < Math.min(base.pbr.records, CEL_PALETTE); r++) for (let c = 0; c < 3; c++) state.celPalette[r * 3 + c] = base.pbr.data[r * f + c];
+  }
   for (const [tname, table] of Object.entries(base)) {
     const f = table.floats_per_record, data = Array.from(table.data), template = data.slice(x * f, (x + 1) * f);
     records.forEach(([name, rgb, extra], k) => {
@@ -358,9 +384,19 @@ function uploadMaterials(game) {
         record[3] = extra.roughness ?? 0.72; record[4] = 0.0; record[5] = extra.transmission ?? 0.0;
         record[6] = extra.ior ?? 1.5; record[7] = extra.opacity ?? 1.0;
       }
-      if (tname === "phong") record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
+      if (tname === "phong") {
+        record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
+        // The extruded meshes' walls are wound inward (measured: wall signed volume is
+        // negative, stored normals follow the winding), so seen from outside they are
+        // BACK faces, and the shader paints back faces with the phong record's "inner"
+        // colour (floats 4..6) instead of albedo.  The X-mark template's inner is
+        // (0.055, 0.055, 0.066): every wall of every piece rendered near-black.  The
+        // material is the palette colour on both sides, so inner = albedo.
+        record[4] = rgb[0]; record[5] = rgb[1]; record[6] = rgb[2];
+      }
       data.push(...record);
       state.materialIndex[name] = base.pbr.records + k;
+      if (tname === "pbr" && base.pbr.records + k < CEL_PALETTE) state.celPalette.set(rgb, (base.pbr.records + k) * 3);
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
@@ -432,8 +468,15 @@ function camera() {
   // A free board is sized to the screen already, so it is framed tightly.
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
   const halfFit = Math.max((ext.depth + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
-  const dist = halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const target = [ext.width / 2, 0, ext.depth / 2];
+  if (state.flat) {
+    // Flat view: orthographic, looking straight down; the same framing as the lens below.
+    const eye = [target[0], 60, target[2]], view = M.lookAt(eye, target, [0, 0, -1]);
+    const hh = halfFit, hw = halfFit * aspect, near = 1, far = 120;
+    const proj = new Float32Array([1 / hw,0,0,0, 0,1 / hh,0,0, 0,0,-2 / (far - near),0, 0,0,-(far + near) / (far - near),1]);
+    return { view, proj, viewProj: M.multiply(proj, view), eye };
+  }
+  const dist = halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
   const up = el > 1.45 ? [0, 0, -1] : [0, 1, 0];
   const view = M.lookAt(eye, target, up);
@@ -444,7 +487,8 @@ const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: n
 state.light = light;
 function updateLight(now) {
   const ext = state.extent || { width: 6, depth: 6 }, span = Math.max(ext.width, ext.depth);
-  if (light.follow && light.pointer) light.position = [light.pointer[0], light.height * span * 0.9, light.pointer[1]];
+  if (state.flat) light.position = [ext.width / 2, light.height * span * 0.9, ext.depth / 2];   // co-located with the camera, straight down
+  else if (light.follow && light.pointer) light.position = [light.pointer[0], light.height * span * 0.9, light.pointer[1]];
   else { const a = light.angle + now * 0.18; light.position = [ext.width / 2 + Math.cos(a) * span * light.radius, light.height * span * 0.9, ext.depth / 2 + Math.sin(a) * span * light.radius]; }
   const target = [ext.width / 2, 0, ext.depth / 2];
   const depth = Math.hypot(...sub(light.position, target));
@@ -453,6 +497,8 @@ function updateLight(now) {
 }
 
 // ---------------------------------------------------------------- pieces and animation
+// Flat view: pieces lie on the tiles, squashed along the extrusion axis.
+const FLAT_THICK = 0.04, FLAT_LIFT = 0.02, FLAT_OUTLINE = 1.07;
 const ease = { out: (t) => 1 - (1 - t) ** 3, in: (t) => t ** 3, bounce(t) { return t < 0.85 ? t / 0.85 : 1 + 0.15 * Math.sin((t - 0.85) / 0.15 * Math.PI) * (1 - t); } };
 const LEAN = { cat: 0.35, x_mark: 0.35, heart: 0.35, disc: 0.0, letter: 0.3, chess: 0.55 };
 const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : mesh);
@@ -707,12 +753,13 @@ function placeEntity(piece, now, x, z, mesh) {
   if (piece.removing != null) s = 1 - ease.in(Math.min(1, (now - piece.removing) / 0.3));
   if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
   if (piece.bob) y = 0.06 * Math.sin(now * 5 + piece.sx * 0.7);
-  const lean = piece.lean ?? 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
-  let m = M.translate(x, TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
+  if (state.flat) y = 0;
+  const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
+  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll));
-  return M.multiply(m, M.scale(scale, scale, scale));
+  return M.multiply(m, M.scale(scale, scale, state.flat ? scale * FLAT_THICK : scale));
 }
 function pieceModel(piece, now) {
   if (piece.entity) return entityModel(piece, now);
@@ -733,12 +780,15 @@ function pieceModel(piece, now) {
   else { const t = Math.min(1, age / 0.4); y = 1.2 * (1 - ease.out(t)); s = 0.6 + 0.4 * ease.out(t); }   // letters, chess, discs drop in
   const scale0 = piece.size * (piece.cellSize || 1);
   const scale = scale0 / mesh.extent * s;
-  const lean = LEAN[fam] ?? 0.35;
-  const rest = (piece.place === "hud" ? 0.0 : TILE.height * (piece.cellSize || 1)) + scale0 * Math.sin(lean + tilt) + 0.04 * s;
+  const flat = state.flat;
+  if (flat) { y = 0; tilt = 0; }                                   // no hop, no lean
+  const lean = flat ? 0 : LEAN[fam] ?? 0.35;
+  const base = piece.place === "hud" ? 0.0 : TILE.height * (piece.cellSize || 1);
+  const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s;
   let m = M.translate(x, rest + y, z);
   m = M.multiply(m, M.rotateY(spin));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean + tilt));
-  m = M.multiply(m, M.scale(scale, scale, scale));
+  m = M.multiply(m, M.scale(scale, scale, flat ? scale * FLAT_THICK : scale));
   return m;
 }
 function applyState(game) {
@@ -826,6 +876,7 @@ function draw(ms) {
     casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
   }
   for (const key of removed) state.pieces.delete(key);
+  if (state.flat) { drawFlat(cam, casters); requestAnimationFrame(draw); return; }
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
   gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
@@ -880,6 +931,28 @@ function draw(ms) {
   gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
   gl.bindVertexArray(null);
   requestAnimationFrame(draw);
+}
+
+// Flat view: no shadow pass, no glass, no bulb.  Each piece is drawn twice: first a
+// slightly enlarged, slightly lower, near-black copy (the outline), then the
+// cel-shaded piece over it.
+function drawFlat(cam, casters) {
+  const P = state.programs.cel; gl.useProgram(P);
+  gl.uniform3fv(gl.getUniformLocation(P, "uPal[0]"), state.celPalette);
+  const mvpLoc = gl.getUniformLocation(P, "uMVP"), mvLoc = gl.getUniformLocation(P, "uMV"), outLoc = gl.getUniformLocation(P, "uOutline");
+  const drawOne = (vao, count, model, materialId, outline) => {
+    const mv = M.multiply(cam.view, model);
+    gl.uniformMatrix4fv(mvpLoc, false, M.multiply(cam.proj, mv)); gl.uniformMatrix4fv(mvLoc, false, mv);
+    gl.uniform1i(outLoc, outline ? 1 : 0);
+    gl.bindVertexArray(vao);
+    if (materialId != null) gl.vertexAttribI4i(2, materialId, 0, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, count);
+  };
+  for (const [vao, count, model, piece] of casters) if (!piece) drawOne(vao, count, model, null, false);
+  const grow = M.scale(FLAT_OUTLINE, FLAT_OUTLINE, 1), drop = M.translate(0, -0.006, 0);
+  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, M.multiply(drop, M.multiply(model, grow)), null, true);
+  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, model, state.materialIndex[piece.color], false);
+  gl.bindVertexArray(null);
 }
 
 // ---------------------------------------------------------------- server
@@ -1049,6 +1122,12 @@ $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
 $("light").onclick = toggleLight;
+function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (C)" : "Flat (C)"; }
+$("flat").onclick = toggleFlat;
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
+  if ((e.key === "c" || e.key === "C") && !e.ctrlKey && !e.metaKey && !(state.game && state.game.input === "text")) toggleFlat();
+});
 
 // ---------------------------------------------------------------- player profile and scores
 // The name is a label (no password); the browser remembers it and hands it
@@ -1148,6 +1227,7 @@ function fillPickers() {
   state.assets = assets; state.catalog = catalog;
   state.programs.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
   state.programs.flat = link(compile(gl.VERTEX_SHADER, FLAT_VS), compile(gl.FRAGMENT_SHADER, FLAT_FS));
+  state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
   state.shadowMap = buildShadowMap(); state.bulb = buildSphere();
   arrayTexture(4, [0, 255, 128, 255]); arrayTexture(5, [255, 255, 255, 0]); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
