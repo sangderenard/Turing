@@ -6861,7 +6861,7 @@ class CorrelationTable:
         )
         from .native_faults import RESHAPE_INVALID_SHAPE
         from .ssa_record_return_state import (
-            function_scope_of, ssa_block_identity_cell,
+            function_scope_of, posted_ssa_value_fact, ssa_block_identity_cell,
         )
 
         book = identity_book(module)
@@ -6898,6 +6898,37 @@ class CorrelationTable:
                          descriptor.element_count_value_id)
                     == (shape, rank, source_count)
                 )
+            if valid:
+                # The checked reshape aliases its source carrier. When the
+                # source's physical span is known, the result's physical
+                # dtype must derive from that exact source and this view row.
+                source_fact = posted_ssa_value_fact(
+                    function, source, book=book,
+                )
+                result_fact = posted_ssa_value_fact(
+                    function, row[2], book=book,
+                )
+                if (source_fact is not None
+                        and source_fact.physical_dtype is not None):
+                    source_ref = book.latest_ref(SSA_VALUE, (row[0], source))
+                    result_ref = book.latest_ref(SSA_VALUE, (row[0], row[2]))
+                    result_causes = (
+                        set() if result_ref is None else {
+                            cause for cause, _ in book.edges_into(result_ref)
+                        }
+                    )
+                    valid = (
+                        source_fact.storage == "span"
+                        and source_fact.rank is not None
+                        and source_fact.rank >= 1
+                        and result_fact is not None
+                        and result_fact.physical_dtype
+                        == source_fact.physical_dtype
+                        and result_fact.storage == "span"
+                        and result_fact.rank == 2
+                        and source_ref in result_causes
+                        and ref in result_causes
+                    )
             if valid:
                 definitions = {}
                 for block in function.blocks.values():
@@ -7495,7 +7526,8 @@ class CorrelationTable:
         from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
         from .concordance_declarations import (
             CALL_INPUT_CONVERSION, KERNEL_INPUT_CONVERSION,
-            SSA_CONTROL_EDGE, SSA_VALUE,
+            SSA_CONSTANT_MATERIALIZATION, SSA_CONTROL_EDGE, SSA_VALUE,
+            TENSOR_LOWERING_VALUE,
             TENSOR_RUNTIME_BROADCAST_VALIDITY,
             TENSOR_OWNED_HEAP_BINDING,
         )
@@ -7789,6 +7821,39 @@ class CorrelationTable:
                         shape_def = definition(triple[0], "Const")
                         rank_defn = definition(triple[1], "Const")
                         count_defn = definition(triple[2], "Const")
+                        # This exact static count can be dead in the native
+                        # program while the broadcast proof still needs it.
+                        # Read its typed literal receipt, never infer a
+                        # replacement identity from the display shape.
+                        count_rows = tuple(
+                            candidate for candidate in book.page(
+                                SSA_CONSTANT_MATERIALIZATION,
+                            ).scope_rows(row[0])
+                            if candidate[1] == function.name
+                            and candidate[3] == triple[2]
+                        )
+                        count_receipt = (
+                            book.latest_ref(SSA_CONSTANT_MATERIALIZATION, count_rows[0])
+                            if len(count_rows) == 1 else None
+                        )
+                        count_cell = book.latest_ref(SSA_VALUE, (row[0], triple[2]))
+                        count_mint = None if count_cell is None else book.mint_of(count_cell)
+                        count_fact = posted_ssa_value_fact(function, triple[2], book=book)
+                        booked_count = (
+                            count_receipt is not None and count_cell is not None
+                            and count_mint is not None
+                            and count_mint[0] == TENSOR_LOWERING_VALUE
+                            and book.page(SSA_CONSTANT_MATERIALIZATION).cell(
+                                count_receipt.row, count_receipt.column,
+                            ) == ("Const", "int32", repr(prod(descriptor.shape)))
+                            and count_cell in {
+                                cause for cause, _ in book.edges_into(count_receipt)
+                            }
+                            and count_fact is not None
+                            and (count_fact.dtype, count_fact.physical_dtype,
+                                 count_fact.storage, count_fact.rank)
+                            == ("int32", "int32", "scalar", 0)
+                        )
                         valid = (
                             physical.storage == "span"
                             and physical.rank == len(descriptor.shape)
@@ -7800,9 +7865,9 @@ class CorrelationTable:
                             and rank_defn is not None
                             and rank_defn.attributes.get("constant")
                             == len(descriptor.shape)
-                            and count_defn is not None
-                            and count_defn.attributes.get("constant")
-                            == prod(descriptor.shape)
+                            and (booked_count if count_defn is None else
+                                 count_defn.attributes.get("constant")
+                                 == prod(descriptor.shape))
                         )
                         if not valid:
                             break
@@ -9674,7 +9739,9 @@ class CorrelationTable:
 
         from .concordance_declarations import (
             SSA_CONSTANT_MATERIALIZATION, SSA_VALUE,
+            TENSOR_LOWERING_VALUE, TENSOR_REDUCTION_DOMAIN,
         )
+        from .ssa_record_return_state import function_scope_of
         from ..transmogrifier.dtype_layout import python_int_literal_dtype
 
         book = dict(getattr(module, "metadata", {}) or {}).get(
@@ -9701,6 +9768,127 @@ class CorrelationTable:
             try:
                 literal = ast.literal_eval(str(literal_repr))
             except (ValueError, SyntaxError, TypeError):
+                continue
+            materialization_cell = book.latest_ref(
+                SSA_CONSTANT_MATERIALIZATION, row)
+            materialization_sources = {
+                source for source, _stage in
+                book.edges_into(materialization_cell)
+            }
+            reduction_sources = tuple(
+                source for source in materialization_sources
+                if source.page == TENSOR_REDUCTION_DOMAIN
+            )
+            if reduction_sources:
+                # A runtime rank-one int64 sum produces a scalar. Its output
+                # shape (), rank 0, and count 1 are explicit int32 helper
+                # constants. Dead-code pruning may remove their Const
+                # instructions, but the selected reduction and each original
+                # SSA value remain direct causes of these literal receipts.
+                reduction_ref, = reduction_sources[:1]
+                reduction = book.page(TENSOR_REDUCTION_DOMAIN).cell(
+                    reduction_ref.row, reduction_ref.column,
+                )
+                expected = (
+                    {int(reduction[8]): ((), "span", 1),
+                     int(reduction[9]): (0, "scalar", 0),
+                     int(reduction[10]): (1, "scalar", 0)}
+                    if isinstance(reduction, tuple) and len(reduction) == 11
+                    and reduction[0] == "axis-runtime"
+                    and type(reduction[1]) is int
+                    and reduction[2] == "sum"
+                    and reduction[3] == 0
+                    and reduction[4] is False
+                    else {}
+                )
+                selected = (getattr(module, "functions", {}) or {}).get(
+                    "sum_dim_int64"
+                )
+                formal_refs = tuple(
+                    book.latest_ref(SSA_VALUE, (
+                        function_scope_of(selected), int(formal.id),
+                    ))
+                    for formal in selected.args[:2]
+                ) if selected is not None else ()
+                value_row = (scope, int(value_id))
+                value_ref = book.latest_ref(SSA_VALUE, value_row)
+                value_fact = values.latest(value_row)
+                payload = expected.get(int(value_id))
+                valid = (
+                    len(reduction_sources) == 1
+                    and reduction_ref == book.latest_ref(
+                        TENSOR_REDUCTION_DOMAIN, reduction_ref.row)
+                    and isinstance(reduction_ref.row, tuple)
+                    and len(reduction_ref.row) == 2
+                    and reduction_ref.row[0] == str(function_name)
+                    and str(operation).casefold() == "const"
+                    and str(dtype) == "int32"
+                    and payload is not None and literal == payload[0]
+                    and value_ref in materialization_sources
+                    and len(formal_refs) == 2
+                    and all(ref is not None and ref in materialization_sources
+                            for ref in formal_refs)
+                    and value_fact is not None
+                    and getattr(value_fact, "dtype", None) == "int32"
+                    and getattr(value_fact, "physical_dtype", None) == "int32"
+                    and getattr(value_fact, "storage", None) == payload[1]
+                    and getattr(value_fact, "rank", None) == payload[2]
+                )
+                if not valid:
+                    found.append(Finding(
+                        "ssa-constant-materialization-disagreement",
+                        str(function_name), int(value_id),
+                        "explicit reduction helper literal lacks its exact "
+                        "typed domain, selected formals, or SSA value cause",
+                    ))
+                continue
+            value_row = (scope, int(value_id))
+            value_cell = book.latest_ref(SSA_VALUE, value_row)
+            mint = None if value_cell is None else book.mint_of(value_cell)
+            if mint is not None and mint[0] == TENSOR_LOWERING_VALUE:
+                scalar_domains = tuple(
+                    candidate for candidate in book.page(TENSOR_REDUCTION_DOMAIN).rows()
+                    if candidate[0] == str(function_name)
+                    and (domain := book.page(TENSOR_REDUCTION_DOMAIN).latest(candidate))
+                    and len(domain) == 11 and domain[0] == "axis-runtime"
+                    and int(value_id) in domain[8:11]
+                    and (result := values.latest((scope, candidate[1]))) is not None
+                    and result.physical_dtype == "int64"
+                    and result.storage == "scalar" and result.rank == 0
+                )
+                if scalar_domains:
+                    found.append(Finding(
+                        "ssa-constant-materialization-disagreement",
+                        str(function_name), int(value_id),
+                        "scalar reduction helper lost its owning domain cause",
+                    ))
+                    continue
+                # Machine geometry literals have an explicitly declared
+                # int32 SSA domain. Applying the Python-int default here
+                # would discard that domain after DCE removed the Const.
+                value_fact = values.latest(value_row)
+                vector = isinstance(literal, tuple)
+                members = literal if vector else (literal,)
+                valid = (
+                    str(operation).casefold() == "const" and dtype == "int32"
+                    and value_cell in materialization_sources
+                    and value_fact is not None
+                    and value_fact.dtype == value_fact.physical_dtype == "int32"
+                    and (value_fact.storage, value_fact.rank)
+                    == (("span", 1) if vector else ("scalar", 0))
+                    and tuple(value_fact.shape)
+                    == ((len(literal),) if vector else ())
+                    and all(type(member) is int
+                            and -(1 << 31) <= member < (1 << 31)
+                            for member in members)
+                )
+                if not valid:
+                    found.append(Finding(
+                        "ssa-constant-materialization-disagreement",
+                        str(function_name), int(value_id),
+                        "explicit geometry literal differs from its minted "
+                        "int32 domain, shape, or exact SSA cause",
+                    ))
                 continue
             if type(literal) is not int:
                 continue
@@ -10410,7 +10598,8 @@ class CorrelationTable:
         """Check all-axis views and control-owned runtime axis geometry."""
 
         from .concordance_declarations import (
-            CELL_SET, SSA_VALUE, TENSOR_OWNED_HEAP_BINDING,
+            CELL_SET, SSA_CONSTANT_MATERIALIZATION, SSA_VALUE,
+            TENSOR_OWNED_HEAP_BINDING,
             TENSOR_REDUCTION_DOMAIN,
         )
         from .ssa_heap_allocation import validate_heap_allocation
@@ -10545,16 +10734,70 @@ class CorrelationTable:
                                      found_definitions[0].op == operation)
                                 else None)
 
+                    def scalar_geometry_literal(value_id, literal):
+                        rows = tuple(
+                            candidate for candidate in book.page(
+                                SSA_CONSTANT_MATERIALIZATION
+                            ).scope_rows(scope)
+                            if len(candidate) == 4
+                            and candidate[1] == function.name
+                            and candidate[3] == int(value_id)
+                        )
+                        if len(rows) != 1:
+                            return False
+                        receipt = book.latest_ref(
+                            SSA_CONSTANT_MATERIALIZATION, rows[0],
+                        )
+                        causes = {
+                            cause for cause, _ in book.edges_into(receipt)
+                        } if receipt is not None else set()
+                        selected = module.functions.get("sum_dim_int64")
+                        selected_formals = (
+                            tuple(book.latest_ref(SSA_VALUE, (
+                                function_scope_of(selected), int(formal.id),
+                            )) for formal in selected.args[:2])
+                            if selected is not None else ()
+                        )
+                        return (
+                            receipt is not None
+                            and book.page(SSA_CONSTANT_MATERIALIZATION).cell(
+                                receipt.row, receipt.column,
+                            ) == ("Const", "int32", repr(literal))
+                            and book.latest_ref(TENSOR_REDUCTION_DOMAIN, row)
+                            in causes
+                            and book.latest_ref(
+                                SSA_VALUE, (scope, int(value_id)),
+                            ) in causes
+                            and len(selected_formals) == 2
+                            and all(ref is not None and ref in causes
+                                    for ref in selected_formals)
+                        )
+
                     output_vector = definition(output_shape, "Const")
                     rank_value = definition(output_rank, "Const")
-                    valid = (
-                        output_vector is not None
-                        and tuple(output_vector.attributes.get("values", ()))
-                        == (0,) * expected_rank
-                        and rank_value is not None
-                        and rank_value.attributes.get("constant")
-                        == expected_rank
+                    scalar_integer = (
+                        source_fact.physical_dtype == "int64"
+                        and expected_rank == 0
                     )
+                    if scalar_integer:
+                        valid = (
+                            scalar_geometry_literal(output_shape, ())
+                            and scalar_geometry_literal(output_rank, 0)
+                            and scalar_geometry_literal(output_count, 1)
+                            and (output_vector is None or
+                                 output_vector.attributes.get("values") == ())
+                            and (rank_value is None or
+                                 rank_value.attributes.get("constant") == 0)
+                        )
+                    else:
+                        valid = (
+                            output_vector is not None
+                            and tuple(output_vector.attributes.get("values", ()))
+                            == (0,) * expected_rank
+                            and rank_value is not None
+                            and rank_value.attributes.get("constant")
+                            == expected_rank
+                        )
                 if valid:
                     dimension_ids = []
                     for source_axis in range(rank):
@@ -10606,8 +10849,16 @@ class CorrelationTable:
                     if valid:
                         if not dimension_ids:
                             count_def = definition(output_count, "Const")
-                            valid = (count_def is not None and
-                                     count_def.attributes.get("constant") == 1)
+                            valid = (
+                                scalar_geometry_literal(output_count, 1)
+                                if scalar_integer else
+                                count_def is not None
+                                and count_def.attributes.get("constant") == 1
+                            )
+                            valid = valid and (
+                                count_def is None or
+                                count_def.attributes.get("constant") == 1
+                            )
                         elif len(dimension_ids) == 1:
                             valid = output_count == dimension_ids[0]
                         else:
@@ -12149,8 +12400,9 @@ class CorrelationTable:
             REPOSITORY_KERNEL_VALUE, SOURCE_CALLABLE_SIGNATURE,
             SOURCE_CALL_PARAMETER_DEFAULT, SOURCE_INTRINSIC_ADMISSION,
             SOURCE_PARAMETER_DEFAULT, PROCESS_GRAPH_OPERANDS,
-            SSA_VALUE, CANONICAL_VALUE, PROVEN_LITERAL,
+            SSA_VALUE, CANONICAL_VALUE, PROVEN_LITERAL, VALUE_TYPE_ABI,
             SpecializationFact, SpecializationSource,
+            ValueTypeABIFact,
         )
         book = (getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None:
@@ -12202,6 +12454,7 @@ class CorrelationTable:
                 and retained.source_identity
                 == selected_reference.source_identity
             )
+        validated_constructor_declarations = set()
         for row in declarations.rows():
             cell = book.latest_ref(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE, row)
             fact = declarations.latest(row)
@@ -12236,6 +12489,8 @@ class CorrelationTable:
                         "numerical-constructor-code-reference", str(row), None,
                         "literal constructor lacks selected source signature",
                     ))
+                else:
+                    validated_constructor_declarations.add(row)
                 continue
             op = code_reference.operation(row[1]) if len(row) == 2 else None
             valid = (
@@ -12272,8 +12527,11 @@ class CorrelationTable:
                         and signature.page == SOURCE_CALLABLE_SIGNATURE
                         and default.page == SOURCE_PARAMETER_DEFAULT
                         and declaration.page == NUMERICAL_CONSTRUCTOR_CODE_REFERENCE
-                        and declaration.row
-                        == (selected_reference.source_identity, "ensure_tensor")
+                        # The selected broadcast-augmented reference retains
+                        # the base constructor declaration already validated
+                        # above. Read that exact cell; its source identity
+                        # need not be the helper digest qualified identity.
+                        and declaration.row in validated_constructor_declarations
                         and declarations.latest(declaration.row) == (signature,)
                         and isinstance(dtype, str)
                         and {row[0], payload_ssa, result_ssa, operand,
@@ -12371,6 +12629,57 @@ class CorrelationTable:
                                 parent for parent, _ in book.edges_into(result_ssa)
                                 if parent.page.name == "shape_transformation_state"
                             )
+                            if not source_states:
+                                # In the weighted literal, source ABI
+                                # settlement precedes SSA birth: the birth
+                                # cites its exact VALUE_TYPE_ABI arm, whose
+                                # source cells include the selected shape
+                                # state. Follow only that same canonical
+                                # call's unique physical arm into the
+                                # existing default transformation check.
+                                abi_parents = tuple(
+                                    parent for parent, _ in book.edges_into(
+                                        result_ssa,
+                                    )
+                                    if parent.page == VALUE_TYPE_ABI
+                                    and parent.row == row[0].row
+                                )
+                                if len(abi_parents) == 1:
+                                    abi_ref = abi_parents[0]
+                                    abi_fact = book.page(VALUE_TYPE_ABI).cell(
+                                        abi_ref.row, abi_ref.column,
+                                    )
+                                    if (isinstance(abi_fact, ValueTypeABIFact)
+                                            and len(abi_fact.physical_alternatives)
+                                            == 1):
+                                        arm = abi_fact.physical_alternatives[0]
+                                        abi_causes = {
+                                            parent for parent, _ in
+                                            book.edges_into(abi_ref)
+                                        }
+                                        candidate_states = tuple(
+                                            cell for cell in arm.source_cells
+                                            if cell.page.name
+                                            == "shape_transformation_state"
+                                            and cell.row[1]
+                                            == result_ssa.row[1]
+                                        )
+                                        if (
+                                            abi_fact.alternatives
+                                            == (arm.identity,)
+                                            and not abi_fact.tags
+                                            and (arm.storage, arm.dtype,
+                                                 arm.shape, arm.rank,
+                                                 arm.metadata_state)
+                                            == ("span", dtype,
+                                                (len(source_literal),), 1,
+                                                "static")
+                                            and row[0] in arm.source_cells
+                                            and set(arm.source_cells)
+                                            <= abi_causes
+                                            and len(candidate_states) == 1
+                                        ):
+                                            source_states = candidate_states
                             upstream_default = False
                             if len(source_states) == 1:
                                 state = source_states[0]

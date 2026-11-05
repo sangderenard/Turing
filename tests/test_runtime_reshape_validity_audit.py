@@ -8,13 +8,15 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
 from src.compiler.concordance_declarations import (
-    TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_RESHAPE_VALIDITY,
+    SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
+    TENSOR_RUNTIME_RESHAPE_VALIDITY,
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import (
     CorrelationTable, EDGE_PAGE, identity_book,
 )
+from src.compiler.ssa_record_return_state import function_scope_of
 
 
 def _runtime_reshape_module():
@@ -145,3 +147,56 @@ def test_runtime_reshape_metadata_result_cites_validated_view():
         result_page.stamps.update(binding_stamps)
         result_page.row_columns[binding] = columns
         result_page._reindex()
+
+
+def test_runtime_reshape_physical_view_cites_exact_source_and_receipt():
+    module = _runtime_reshape_module()
+    book = identity_book(module)
+    validity_page = book.page(TENSOR_RUNTIME_RESHAPE_VALIDITY)
+    row, = tuple(validity_page.rows())
+    function = module.functions[row[1]]
+    scope = function_scope_of(function)
+    source_ref = book.latest_ref(SSA_VALUE, (scope, validity_page.latest(row)[0]))
+    result_ref = book.latest_ref(SSA_VALUE, (scope, row[2]))
+    validity_ref = book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, row)
+    assert source_ref is not None and result_ref is not None
+    assert validity_ref is not None
+    source_fact = book.page(SSA_VALUE).cell(source_ref.row, source_ref.column)
+    result_fact = book.page(SSA_VALUE).cell(result_ref.row, result_ref.column)
+    assert (source_fact.physical_dtype, source_fact.storage) == (
+        "int64", "span",
+    )
+    assert (result_fact.physical_dtype, result_fact.storage, result_fact.rank) == (
+        "int64", "span", 2,
+    )
+    assert {source_ref, validity_ref} <= {
+        cause for cause, _ in book.edges_into(result_ref)
+    }
+    assert not CorrelationTable._tensor_runtime_reshape_validity_findings(module)
+
+    value_page = book.page(SSA_VALUE)
+    value_page.cells[(result_ref.row, result_ref.column)] = replace(
+        result_fact, physical_dtype=None,
+    )
+    try:
+        assert CorrelationTable._tensor_runtime_reshape_validity_findings(module)
+    finally:
+        value_page.cells[(result_ref.row, result_ref.column)] = result_fact
+
+    edge_page = book.page(EDGE_PAGE)
+    edge_row = next(
+        (result_ref.key, source.key, stage.name)
+        for source, stage in book.edges_into(result_ref)
+        if source == validity_ref
+    )
+    edge_fact = edge_page.cells.pop((edge_row, 0))
+    edge_stamp = edge_page.stamps.pop((edge_row, 0))
+    edge_page.row_columns.pop(edge_row)
+    edge_page.scopes[result_ref.key].pop(edge_row)
+    try:
+        assert CorrelationTable._tensor_runtime_reshape_validity_findings(module)
+    finally:
+        edge_page.cells[(edge_row, 0)] = edge_fact
+        edge_page.stamps[(edge_row, 0)] = edge_stamp
+        edge_page.row_columns[edge_row] = [0]
+        edge_page.scopes[result_ref.key][edge_row] = None

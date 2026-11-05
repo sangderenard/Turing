@@ -6860,14 +6860,48 @@ def lower_tensor_calls_to_repository_ssa(
 
     def constant(value: Any, dtype: str, *, physical=None) -> tuple[SSAValue, Instr]:
         result = fresh(dtype=dtype, physical=physical)
+        record_geometry_literal(result, value)
         return result, Instr(Handler.Const.value, [], result, attributes={"constant": value})
 
     def int_vector(values: Iterable[int], *, physical=None) -> tuple[SSAValue, Instr]:
         sequence = tuple(int(value) for value in values)
         result = fresh(shape=(len(sequence),), dtype="int32", physical=physical)
+        record_geometry_literal(result, sequence)
         return result, Instr(
             Handler.Const.value, [], result,
             attributes={"values": sequence, "constant": None},
+        )
+
+    def record_geometry_literal(value: SSAValue, literal: Any) -> None:
+        """Retain explicitly typed geometry even when its Const is pruned."""
+        from .identity_concordance import Derived, Mode
+        from .concordance_declarations import (
+            SSA_CONSTANT_MATERIALIZATION, TENSOR_SSA_LOWERING,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+
+        owner, _source = lowering_at
+        fact = posted_ssa_value_fact(owner, value.id, book=book)
+        if (fact is None or fact.dtype != "int32"
+                or fact.physical_dtype != "int32"
+                or (fact.storage, fact.rank) not in {
+                    ("scalar", 0), ("span", 1),
+                }):
+            return
+        # weighted_cast_source_probe's broadcast count8 is used by its
+        # concordance geometry but not its native Call, so DCE removes the
+        # Const. The literal and explicit int32 domain belong to its minted
+        # identity; preserving them here serves every typed geometry reader.
+        cell = ssa_value_identity_cell(owner, value.id, book=book)
+        if cell is None:
+            raise ValueError("typed geometry literal lacks its SSA identity")
+        book.post(
+            SSA_CONSTANT_MATERIALIZATION,
+            (function_scope_of(owner), owner.name, str(block_name), int(value.id)),
+            ("Const", "int32", repr(literal)), stage=TENSOR_SSA_LOWERING,
+            provenance=Derived((cell,)), mode=Mode.CONCORD,
         )
 
     def call(
@@ -13815,7 +13849,8 @@ def lower_tensor_calls_to_repository_ssa(
                             # source/domain geometry on that same fact; a
                             # direct scalar output needs no heap owner.
                             from .concordance_declarations import (
-                                SSA_VALUE, TENSOR_REDUCTION_DOMAIN,
+                                SSA_CONSTANT_MATERIALIZATION, SSA_VALUE,
+                                TENSOR_REDUCTION_DOMAIN,
                             )
                             from .identity_concordance import Derived, Mode
                             from .ssa_call_input_adapters import (
@@ -13903,6 +13938,47 @@ def lower_tensor_calls_to_repository_ssa(
                                 raise ValueError(
                                     "runtime scalar reduction lacks typed output proof"
                                 )
+                            # The scalar result's output shape (), rank 0, and
+                            # count 1 are explicit int32 helper constants. The
+                            # later pure-instruction prune may remove all three
+                            # Const definitions because the kernel only reads
+                            # the source geometry. Keep their exact typed
+                            # literal identities on the incumbent materialization
+                            # page, caused by this reduction domain and its
+                            # selected int64 pointer formals.
+                            scalar_geometry_receipts = []
+                            for geometry_value, definition, literal in (
+                                (output_shape, output_shape_def, ()),
+                                (output_rank_value, output_rank_def, 0),
+                                (output_count, output_count_def, 1),
+                            ):
+                                geometry_cell = ssa_value_identity_cell(
+                                    function, int(geometry_value.id), book=book,
+                                )
+                                if (
+                                    definition.op != "Const"
+                                    or int(definition.res.id) != int(geometry_value.id)
+                                    or geometry_cell is None
+                                    or definition.attributes.get(
+                                        "values" if isinstance(literal, tuple)
+                                        else "constant"
+                                    ) != literal
+                                ):
+                                    raise ValueError(
+                                        "runtime scalar reduction lacks exact "
+                                        "typed geometry literal"
+                                    )
+                                scalar_geometry_receipts.append(book.post(
+                                    SSA_CONSTANT_MATERIALIZATION,
+                                    (function_scope_of(function), function.name,
+                                     block_name, int(geometry_value.id)),
+                                    ("Const", "int32", repr(literal)),
+                                    stage=_REDUCTION_STAGE,
+                                    provenance=Derived((
+                                        geometry_cell, domain_ref, *formal_cells,
+                                    )),
+                                    mode=Mode.CONCORD,
+                                ))
                             book.post(
                                 SSA_VALUE,
                                 (function_scope_of(function), int(result.id)),
@@ -13911,6 +13987,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 provenance=Derived((
                                     source_cell, *formal_cells,
                                     *geometry_cells, domain_ref,
+                                    *scalar_geometry_receipts,
                                 )),
                                 mode=Mode.CONCORD,
                             )
@@ -15883,6 +15960,84 @@ def lower_tensor_calls_to_repository_ssa(
                                     *edge_cells)),
                 mode=Mode.CONCORD,
             )
+            # weighted_cast_source_probe's checked reshape %16 aliases the
+            # int64 ProgramABI span %0. Its rank-two shape was proved here,
+            # but SSA_VALUE %16 retained physical_dtype=None, so the next
+            # typed span cast refused. The checked view receipt and source's
+            # posted physical span prove the same element storage for %16.
+            from .concordance_declarations import SSA_VALUE
+            from .ssa_record_return_state import (
+                posted_ssa_value_fact, revise_ssa_value,
+            )
+            source_fact = posted_ssa_value_fact(
+                function, int(source.id), book=book,
+            )
+            result_fact = posted_ssa_value_fact(
+                function, int(result.id), book=book,
+            )
+            descriptor = tensor_table.by_id(int(result.id))
+            view_ref = book.latest_ref(
+                TENSOR_RUNTIME_RESHAPE_VALIDITY, reshape_row,
+            )
+            if source_fact is not None and source_fact.physical_dtype is not None:
+                source_cell = ssa_value_identity_cell(
+                    function, int(source.id), book=book,
+                )
+                geometry_cells = tuple(ssa_value_identity_cell(
+                    function, int(value.id), book=book,
+                ) for value in (source_count, shape_value, rank))
+                if (
+                    source_fact.storage != "span"
+                    or source_fact.rank is None or source_fact.rank < 1
+                    or result_fact is None
+                    or result_fact.storage not in (None, "span")
+                    or result_fact.rank not in (None, 2)
+                    or result_fact.physical_dtype not in (
+                        None, source_fact.physical_dtype,
+                    )
+                    or str(result.dtype) != str(source.dtype)
+                    or descriptor is None
+                    or descriptor.storage != "view"
+                    or descriptor.alias_of != int(source.id)
+                    or descriptor.data_value_id != int(source.id)
+                    or descriptor.metadata_state != "dynamic"
+                    or (descriptor.shape_value_id,
+                        descriptor.rank_value_id,
+                        descriptor.element_count_value_id)
+                    != (int(shape_value.id), int(rank.id),
+                        int(source_count.id))
+                    or source_cell is None or view_ref is None
+                    or any(cell is None for cell in geometry_cells)
+                ):
+                    raise ValueError(
+                        "runtime reshape physical view lacks its exact source"
+                    )
+                view_causes = (
+                    source_cell, *geometry_cells, view_ref,
+                )
+                revised = revise_ssa_value(
+                    function, int(result.id), dtype=result.dtype,
+                    shape=tuple(result.shape or ()),
+                    stage=TENSOR_SSA_LOWERING,
+                    sources=view_causes, book=book,
+                    physical={
+                        "physical_dtype": source_fact.physical_dtype,
+                        "storage": "span", "rank": 2,
+                    },
+                )
+                if revised is None:
+                    raise ValueError(
+                        "runtime reshape physical view lacks result identity"
+                    )
+                # If the source had already given the view this same
+                # physical fact, attach the checked receipt without a fake
+                # unchanged revision or an SSA_VALUE self edge.
+                book.post(
+                    SSA_VALUE, (scope, int(result.id)),
+                    posted_ssa_value_fact(function, int(result.id), book=book),
+                    stage=TENSOR_SSA_LOWERING,
+                    provenance=Derived(view_causes), mode=Mode.CONCORD,
+                )
 
         for (
             guarded_block, guard, source_instruction, ordered_operands,

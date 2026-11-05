@@ -125,3 +125,111 @@ def test_runtime_axis_int64_sum_uses_typed_owned_output(tmp_path):
         )
         assert actual.dtype == np.dtype("int64")
         assert actual.item() == int(expected)
+
+
+def test_runtime_axis_int64_sum_rank_one_scalar_native(tmp_path):
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [{
+            "function": "root", "parameter": "values", "storage": "span",
+            "dtype": "int64", "rank": 1,
+            "python_type": "src.common.tensors.abstraction.AbstractTensor",
+        }],
+        "records": {}, "bindings": [],
+    })
+    module, _, exports = lower_ast_source_to_ssa(
+        "def root(values: AbstractTensor) -> int:\n"
+        "    return values.sum(dim=0).item()\n",
+        "root", name="runtime_axis_int64_sum_scalar_native",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        extraction_contract=contract,
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _: None, progress_bars=False,
+    )
+    book = identity_book(module)
+    domain_page = book.page(TENSOR_REDUCTION_DOMAIN)
+    domain_row, = (
+        row for row in domain_page.rows()
+        if (fact := domain_page.latest(row))
+        and fact[0] == "axis-runtime" and fact[2] == "sum"
+    )
+    fact = domain_page.latest(domain_row)
+    function = module.functions[domain_row[0]]
+    result = book.page(SSA_VALUE).latest((function_scope_of(function), domain_row[1]))
+    assert (result.dtype, result.physical_dtype,
+            result.storage, result.rank) == ("int64", "int64", "scalar", 0)
+    assert fact[8:11] != fact[5:8]
+    assert module.tensor_tables[function.name].by_id(
+        domain_row[1]
+    ).metadata_state == "static"
+    artifact = emit_ssa_module_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "runtime_axis_int64_sum_scalar")
+    root = module.functions[exports[0]]
+    parameter = dict(root.metadata["parameter_names"])["values"]
+    output, = (
+        value.id for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for value in instruction.args
+    )
+    for values in (
+        np.empty((0,), dtype=np.int64),
+        np.asarray([2**53, 1, -(2**53)], dtype=np.int64),
+        np.asarray([np.iinfo(np.int64).max, 1], dtype=np.int64),
+        np.asarray([3, 4, 5], dtype=np.int64),
+    ):
+        expected = int(np.sum(values, dtype=np.int64))
+        execution = artifact.prepare_execution({parameter: values})
+        for _ in range(2):
+            actual = np.asarray(execution.run().buffers[output])
+            assert actual.dtype == np.dtype("int64")
+            assert actual.item() == expected
+
+
+def test_runtime_axis_int64_sum_keepdim_native(tmp_path):
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [{
+            "function": "root", "parameter": "values", "storage": "span",
+            "dtype": "int64", "rank": 2,
+            "python_type": "src.common.tensors.abstraction.AbstractTensor",
+        }],
+        "records": {}, "bindings": [],
+    })
+    module, _, exports = lower_ast_source_to_ssa(
+        "def root(values: AbstractTensor) -> int:\n"
+        "    return values.sum(dim=0, keepdim=True).sum().item()\n",
+        "root", name="runtime_axis_int64_sum_keepdim_native",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        extraction_contract=contract,
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _: None, progress_bars=False,
+    )
+    artifact = emit_ssa_module_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "runtime_axis_int64_sum_keepdim")
+    root = module.functions[exports[0]]
+    parameter = dict(root.metadata["parameter_names"])["values"]
+    output, = (
+        value.id for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for value in instruction.args
+    )
+    for values in (
+        np.empty((0, 3), dtype=np.int64),
+        np.asarray([[2**53, 1, -(2**53)]], dtype=np.int64),
+        np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.int64),
+    ):
+        expected = int(np.sum(
+            np.sum(values, axis=0, keepdims=True, dtype=np.int64),
+            dtype=np.int64,
+        ))
+        actual = np.asarray(
+            artifact.prepare_execution({parameter: values}).run().buffers[output]
+        )
+        assert actual.dtype == np.dtype("int64")
+        assert actual.item() == expected
