@@ -55,8 +55,8 @@ class Table:
 
     def new(self, payload: dict) -> dict:
         kind = str(payload.get("game", "meowdoku"))
-        if self.game is not None and hasattr(self.game, "stop") and not isinstance(self.game, LichessGame):
-            self.game.stop()                                   # an arena's thread ends with it
+        # Games are views; the learner and the Lichess client are process-wide
+        # background workers that a mode switch never stops.
         if kind == "meowdoku":
             self.game = MeowdokuGame(self.boards[str(payload["id"])])
         elif kind == "chess":

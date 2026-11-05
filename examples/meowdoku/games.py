@@ -575,46 +575,37 @@ def self_play():
     return _SELF_PLAY
 
 
-class ChessArena(Chess):
-    """Network against network, many games at once.
+class Learner:
+    """The background learning of this process: self-play in batches and
+    the master-game corpus, interleaved in one daemon thread that no game
+    switch stops.  The arena shows its game 0; every other mode can read
+    its numbers.  One per process (``learner()``)."""
 
-    A background thread steps ``parallel`` games together: one batched
-    evaluation values every legal successor of every game, each game takes
-    its move, finished games train the network as one batch and restart.
-    This object is game 0 of that batch, the one the page shows; the page
-    polls as fast as it likes and animates whatever arrived."""
-
-    game = "chess_arena"
-    title = "Chess arena: the network against itself"
-    input = "watch"
-
-    def __init__(self, board_id: str = "arena", parallel: int = 16, lock=None):
-        super().__init__(board_id)
+    def __init__(self, parallel: int = 16):
         import threading
         self.player = self_play()
-        self.lock = lock or threading.RLock()
+        self.lock = threading.RLock()
         self.parallel = max(1, int(parallel))
+        self.display = Chess("arena-0")
+        self.engine = self.player.batch_engine(self.display, self.parallel)
+        self.corpus = None
+        self.note = ""
         self.last_result = ""
         self.steps_per_second = 0.0
-        self.engine = self.player.batch_engine(self, self.parallel)
+        self.started_at = None
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="chess-arena", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
-        import time
-        # The master-game corpus loads once (replayed on the first run,
-        # cached after); then every loop takes one self-play step and one
-        # supervised minibatch on the masters, for as long as the arena runs.
-        import os
-        self.corpus = None
-        self.note = ""
+        import os, time
+        self.started_at = time.time()
         if not os.environ.get("MEOWDOKU_NO_PRETRAIN"):
             try:
                 from meowdoku.pretrain import Corpus
                 self.corpus = Corpus.load_or_build(progress=lambda message: setattr(self, "note", message))
                 self.note = ""
-            except Exception as error:                        # offline, or the source moved: self-play alone
+            except Exception as error:
                 self.note = f"pre-training unavailable: {type(error).__name__}: {str(error)[:60]}"
         tick, count = time.perf_counter(), 0
         while not self._stop.is_set():
@@ -629,12 +620,46 @@ class ChessArena(Chess):
             if now - tick >= 1.0:
                 self.steps_per_second = count / (now - tick)
                 tick, count = now, 0
-            time.sleep(0)                                     # let the server thread in
+            time.sleep(0)
 
-    def stop(self) -> None:
-        self._stop.set()
+    def summary(self) -> str:
+        import time
+        p = self.player
+        rec = p.record
+        lead = (self.corpus.summary() if self.corpus is not None else self.note) or ""
+        hours = (time.time() - self.started_at) / 3600 if self.started_at else 0.0
+        return ((lead + " · ") if lead else "") + (
+            f"self-play {self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · "
+            f"{p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
+            + (f" · loss {p.last_loss:.3f}" if p.games else "")
+            + (f" · last: {self.last_result}" if self.last_result else "")
+            + f" · learning {hours * 60:.0f} min")
 
-    def tick(self) -> None:                                   # the thread moves; a tick just returns state
+
+_LEARNER = None
+
+
+def learner(parallel: int = 16) -> "Learner":
+    global _LEARNER
+    if _LEARNER is None:
+        _LEARNER = Learner(parallel)
+    return _LEARNER
+
+
+class ChessArena(Chess):
+    """Network against network: the learner's game 0, shown live.  The
+    learner itself runs in the background whichever mode is on screen."""
+
+    game = "chess_arena"
+    title = "Chess arena: the network against itself"
+    input = "watch"
+
+    def __init__(self, board_id: str = "arena", parallel: int = 16, lock=None):
+        super().__init__(board_id)
+        self.learner = learner(parallel)
+        self.player = self.learner.player
+
+    def tick(self) -> None:
         return None
 
     def cell(self, r: int, c: int, button: str) -> None:
@@ -647,19 +672,16 @@ class ChessArena(Chess):
         return None
 
     def state(self) -> dict:
-        with self.lock:
-            st = Chess.state(self)
-            p = self.player
-            rec = p.record
-            note = getattr(self, "note", "")
-            corpus = getattr(self, "corpus", None)
-            lead = (corpus.summary() if corpus is not None else note) or ""
-            st["status"] = (lead + " · " if lead else "") + (f"{self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · game {p.games + 1} · "
-                            f"record W{rec['white']} B{rec['black']} D{rec['draw']}"
-                            + (f" · loss {p.last_loss:.3f}" if p.games else "")
-                            + (f" · last: {self.last_result}" if self.last_result else ""))
-            st["moves"] = self.engine.plies(0)
-            return st
+        with self.learner.lock:
+            shown = self.learner.display
+            self.pieces, self.ids, self.turn = dict(shown.pieces), dict(shown.ids), shown.turn
+            self.rights, self.ep = getattr(shown, "rights", set()), getattr(shown, "ep", None)
+            plies = self.learner.engine.plies(0)
+        st = Chess.state(self)
+        st["selected"] = None; st["hints"] = [0] * 64
+        st["status"] = self.learner.summary()
+        st["moves"] = plies
+        return st
 
 
 class ChessVsNet(Chess):
@@ -695,6 +717,7 @@ class LichessGame(Chess):
         super().__init__(board_id)
         from meowdoku import lichess
         self.client = lichess.bot(player=self_play())
+        self.learner = learner()                                  # background learning runs while we watch
         self.note = "" if self.client else "no Lichess token: set MEOWDOKU_LICHESS_TOKEN or build/meowdoku/lichess_token.txt"
 
     def tick(self) -> None:
@@ -732,6 +755,7 @@ class LichessGame(Chess):
                             + (f" · {snap.get('summary', snap['status'])}" if snap.get("result") else "") + record)
             st["won"] = bool(snap.get("result")) and snap.get("result") == snap.get("color")
             st["lost"] = bool(snap.get("result")) and snap.get("result") not in (None, "draw", snap.get("color"))
+        st["status"] += "  ‖  " + self.learner.summary()
         return st
 
 
