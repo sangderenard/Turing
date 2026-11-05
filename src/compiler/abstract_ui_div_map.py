@@ -6504,6 +6504,22 @@ function viewportPointerLook(event) {
     viewportControls.pitch - event.movementY * viewportControls.policy.look_sensitivity));
 }
 
+// One control of the vehicle's control record, sampled by its hookup: a
+// single semantic action, or an axis "+action -action" summed over the live
+// value of each (abstract_ui_viewports.control_terms is the grammar).  The
+// on-screen joystick is one more device for the four movement actions.
+function vehicleControlValue(control, gamepad) {
+  const tokens = String(control).trim().split(/\s+/);
+  const terms = tokens.length === 1 && !/^[+-]/.test(tokens[0])
+    ? [[1, tokens[0]]] : tokens.map(token => [token[0] === "-" ? -1 : 1, token.slice(1)]);
+  const mobile = {"move-forward": Math.max(0, -mobileControlState.move[1]),
+    "move-backward": Math.max(0, mobileControlState.move[1]),
+    "strafe-right": Math.max(0, mobileControlState.move[0]),
+    "strafe-left": Math.max(0, -mobileControlState.move[0])};
+  return terms.reduce((sum, [sign, action]) =>
+    sum + sign * Math.max(viewportInputValue(action, gamepad), mobile[action] || 0), 0);
+}
+
 function viewportInputValue(action, gamepad) {
   let value = 0;
   viewportControls.policy.bindings
@@ -8422,8 +8438,17 @@ function updateViewportControls(dt) {
   const facingX = Math.cos(viewportControls.yaw), facingZ = Math.sin(viewportControls.yaw);
   const running = viewportInputValue("run", gamepad) > 0;
   if(vehicleRuntime.active){
-    const throttle=mobileClamp(forward*(running?1.18:1));
-    updateActiveVehicle(dt,throttle,strafe,jumping?1:0);return;
+    // The vehicle's shell controls come from its declared control record:
+    // each slot that names a hookup is sampled by that hookup, nothing is
+    // composed by name here.  ``run`` still scales throttle on the page
+    // (the record's ``control_mapping`` declares ``run: boost``) until that
+    // composition moves into the law.
+    const controls={};
+    for(const row of vehicleRuntime.active.control_record||[]){
+      if(row.control)controls[row.name]=mobileClamp(vehicleControlValue(row.control,gamepad));
+    }
+    const throttle=mobileClamp(Number(controls.throttle||0)*(running?1.18:1));
+    updateActiveVehicle(dt,throttle,Number(controls.steering||0),Number(controls.brake||0));return;
   }
   const desiredSpeed = viewportControls.policy.move_speed *
     (running ? viewportControls.policy.run_multiplier : 1);

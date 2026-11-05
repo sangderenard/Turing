@@ -55,7 +55,25 @@ export class TuringControlSampler {
     return Array.from(pads || []).find(pad => pad && pad.connected) || null;
   }
 
-  sample(action, parameter) {
+  // A control hookup: one action, or an axis of signed actions
+  // ("+move-forward -move-backward"), the grammar of
+  // abstract_ui_viewports.control_terms.  Each term is sampled and summed.
+  sample(control, parameter) {
+    const tokens = String(control).trim().split(/\s+/);
+    if (tokens.length > 1 || /^[+-]/.test(tokens[0])) {
+      let total = 0;
+      for (const token of tokens) {
+        if (!/^[+-]./.test(token)) return undefined;
+        const value = this.sampleAction(token.slice(1), parameter);
+        if (value === undefined) return undefined;
+        total += (token[0] === '-' ? -1 : 1) * value;
+      }
+      return total;
+    }
+    return this.sampleAction(tokens[0], parameter);
+  }
+
+  sampleAction(action, parameter) {
     if (action in this.resolvers) return this.resolvers[action](parameter, this);
     if (this.pulses.has(action)) return this.pulses.get(action);
     if (action === 'pointer.x') return this.pointer.x;

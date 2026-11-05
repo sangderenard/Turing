@@ -43,8 +43,11 @@ WHEEL_NAMES = ("front_left", "front_right", "rear_left", "rear_right")
 #: array the page and worker agreed on by hand before; it is kept so that no
 #: published program changes meaning, and it is now written once.
 VEHICLE_CONTROL_RECORD: tuple[tuple[str, str | None], ...] = (
-    ("throttle", "move-forward/backward"),
-    ("steering", "strafe-left/right"),
+    # Axis controls are signed sums of semantic actions
+    # (``abstract_ui_viewports.control_terms``): the page samples each
+    # action and sums, it composes nothing by hand.
+    ("throttle", "+move-forward -move-backward"),
+    ("steering", "+strafe-right -strafe-left"),
     ("brake", "jump"),
     ("forward_gear_ratio", None), ("reverse_gear_ratio", None), ("transfer_case_ratio", None),
     ("front_differential_lock", None), ("drive_direction", None),

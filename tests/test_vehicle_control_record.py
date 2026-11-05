@@ -23,8 +23,8 @@ def test_the_record_is_the_control_abi_and_names_its_shell_controls():
     assert vehicles.VEHICLE_CONTROL_INDEX["front_left_knuckle_angle"] == 25
     rows = vehicles.vehicle_control_record_data()
     by_name = {row["name"]: row for row in rows}
-    assert by_name["throttle"]["control"] == "move-forward/backward"
-    assert by_name["steering"]["control"] == "strafe-left/right"
+    assert by_name["throttle"]["control"] == "+move-forward -move-backward"
+    assert by_name["steering"]["control"] == "+strafe-right -strafe-left"
     assert by_name["brake"]["control"] == "jump"
     assert by_name["forward_gear_ratio"]["source"] == "worker-state"
     assert [row["index"] for row in rows] == list(range(36))
@@ -55,3 +55,24 @@ def test_control_mapping_is_a_view_of_the_record():
     source = inspect.getsource(vehicles)
     assert '{**{control: name for name, control in VEHICLE_CONTROL_RECORD' in source
     assert '"control_record": vehicle_control_record_data()' in source
+
+
+def test_axis_controls_follow_the_one_grammar_and_the_page_samples_them():
+    from src.compiler import abstract_ui_div_map
+    from src.compiler.abstract_ui_viewports import control_terms
+    import pytest
+
+    assert control_terms("jump") == ((1, "jump"),)
+    assert control_terms("+move-forward -move-backward") == ((1, "move-forward"), (-1, "move-backward"))
+    assert control_terms("+strafe-right -strafe-left") == ((1, "strafe-right"), (-1, "strafe-left"))
+    with pytest.raises(ValueError):
+        control_terms("+move-forward backward")       # a bare term inside an axis
+    for name, control in vehicles.VEHICLE_CONTROL_RECORD:
+        if control is not None:
+            control_terms(control)                      # every declared hookup parses
+    page = inspect.getsource(abstract_ui_div_map)
+    assert "function vehicleControlValue(control, gamepad)" in page
+    assert "for(const row of vehicleRuntime.active.control_record||[])" in page
+    assert "controls[row.name]=mobileClamp(vehicleControlValue(row.control,gamepad))" in page
+    assert "updateActiveVehicle(dt,throttle,Number(controls.steering||0),Number(controls.brake||0))" in page
+    assert "const throttle=mobileClamp(forward*(running?1.18:1))" not in page

@@ -317,3 +317,29 @@ worker state), and the page still composes `throttle = forward * (running ?
 1.18 : 1)` itself. Binding the three through `TuringControlSampler` and
 moving the boost composition into the law are the next two edits, each with
 its own parity check.
+
+## 8. Step 3 status (2026-11-05, night): the car page binds its controls through the record
+
+- One grammar for a hookup, `abstract_ui_viewports.control_terms`: a
+  single action (`jump`) or an axis of signed actions
+  (`+move-forward -move-backward`), summed by the shell. The vehicle record
+  spells its axes in it: `throttle: +move-forward -move-backward`,
+  `steering: +strafe-right -strafe-left`, `brake: jump`.
+- The Living Data Map samples the active vehicle's `control_record`
+  generically (`vehicleControlValue(control, gamepad)` over
+  `viewportInputValue`, with the on-screen joystick as one more device for
+  the four movement actions) and hands throttle, steering and brake to
+  `updateActiveVehicle`; the hand-composed `forward/strafe/jumping` triple
+  for the vehicle is gone. The page's run-to-boost throttle scaling stays
+  where the record declares it until it moves into the law.
+- `TuringControlSampler.sample` reads the same grammar (`sampleAction` per
+  term, summed), so a core page binds an axis control without any page
+  code; verified in node: `KeyW` gives +1, `KeyS` gives -1 for
+  `+move-forward -move-backward`.
+- Checks: the whole 590 kB page script (the raw-string constant the
+  function was inserted into) passes `node --check`; 5 record tests and 4
+  core-product tests pass. The full page is not rendered here because the
+  vehicle model's build stops in `compile_sympy_equations` on current main.
+
+Left for the car game: the boost composition into the law, with its parity
+check, and the worker-state slots staying worker-owned by design.

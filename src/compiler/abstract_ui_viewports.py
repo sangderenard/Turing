@@ -100,6 +100,33 @@ class ShaderProgramChoice:
         }
 
 
+def control_terms(control: str) -> tuple[tuple[int, str], ...]:
+    """Parse a control hookup into signed semantic actions.
+
+    A control is one action (``"jump"``) or an axis composed of signed
+    actions (``"+move-forward -move-backward"``): whitespace-separated
+    tokens, each ``+action`` or ``-action``, summed by a shell with the
+    live value of each action.  This is the one grammar every shell reads
+    (``TuringControlSampler.sample`` in the page binding, the Living Data
+    Map's ``vehicleControlValue``), so a record field says what fills it
+    without a hand-composed expression on any page.
+    """
+
+    text = str(control).strip()
+    if not text:
+        raise ValueError("a control hookup names at least one action")
+    tokens = text.split()
+    if len(tokens) == 1 and tokens[0][0] not in "+-":
+        return ((1, tokens[0]),)
+    terms = []
+    for token in tokens:
+        if token[0] not in "+-" or len(token) < 2:
+            raise ValueError(
+                f"control {control!r}: an axis term is +action or -action, not {token!r}")
+        terms.append((1 if token[0] == "+" else -1, token[1:]))
+    return tuple(terms)
+
+
 @dataclass(frozen=True, slots=True)
 class ViewportControlBinding:
     """One semantic actor action and the native inputs which may express it."""
