@@ -583,7 +583,7 @@ class Learner:
     switch stops.  The arena shows its game 0; every other mode can read
     its numbers.  One per process (``learner()``)."""
 
-    def __init__(self, parallel: int = 16):
+    def __init__(self, parallel: int = 4):
         import threading
         self.player = self_play()
         self.lock = threading.RLock()
@@ -651,7 +651,7 @@ class Learner:
 _LEARNER = None
 
 
-def learner(parallel: int = 16) -> "Learner":
+def learner(parallel: int = 4) -> "Learner":
     global _LEARNER
     if _LEARNER is None:
         _LEARNER = Learner(parallel)
@@ -666,7 +666,7 @@ class ChessArena(Chess):
     title = "Chess arena: the network against itself"
     input = "watch"
 
-    def __init__(self, board_id: str = "arena", parallel: int = 16, lock=None):
+    def __init__(self, board_id: str = "arena", parallel: int = 4, lock=None):
         super().__init__(board_id)
         self.learner = learner(parallel)
         self.player = self.learner.player
@@ -711,7 +711,7 @@ class ChessVsNet(Chess):
         super().cell(r, c, button)
         if self.moves > before and self.turn == "black" and self.outcome() is None:
             from meowdoku import mcts
-            move = mcts.best_move(self, self.player.net, simulations=1200)   # tree search over the network
+            move = mcts.best_move(self, self.player.net, simulations=3000)   # tree search over the network
             if move is not None:
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
 

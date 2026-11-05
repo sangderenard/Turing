@@ -468,7 +468,7 @@ class BatchEngine:
         self._plies = [0] * len(self.games)
         self.pending: list[tuple] = []
         self.train_every = 1
-        self.playouts = int(playouts or os.environ.get("MEOWDOKU_ARENA_PLAYOUTS", 160))
+        self.playouts = int(playouts or os.environ.get("MEOWDOKU_ARENA_PLAYOUTS", 800))
         self.explore_plies = explore_plies
         self.last_search = ""
 

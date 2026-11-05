@@ -160,13 +160,13 @@ class LichessBot:
     # -- play ------------------------------------------------------------
     def choose_uci(self, game: Chess, my_time_ms=None, increment_ms: int = 3000):
         """The move and the search's visit distribution (a policy target).
-        Budget: a 25th of the clock plus most of the increment, 1 to 12 s."""
+        Budget: a 15th of the clock plus the increment, 1 to 20 s."""
         if self.player is None:
             moves = game.all_legal_moves()
             return (move_to_uci(game, *random.choice(moves)) if moves else None), None
         from meowdoku import mcts
-        seconds = 3.0 if my_time_ms is None else min(12.0, max(1.0, my_time_ms / 1000.0 / 25.0 + increment_ms / 1000.0 * 0.8))
-        result = mcts.search(game, self.player.net, simulations=1500, seconds=seconds)
+        seconds = 6.0 if my_time_ms is None else min(20.0, max(1.0, my_time_ms / 1000.0 / 15.0 + increment_ms / 1000.0 * 0.9))
+        result = mcts.search(game, self.player.net, simulations=5000, seconds=seconds)
         self.last_search = result.describe(game)
         return (move_to_uci(game, *result.move) if result.move else None), result.policy
 
