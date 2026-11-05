@@ -187,6 +187,58 @@ def train(player: SelfPlay, x: np.ndarray, z: np.ndarray, epochs: int = 3, batch
     return loss
 
 
+class Corpus:
+    """The master-game positions as one array, stepped through in shuffled
+    minibatches for as long as the arena runs.  Built once (replay of the
+    PGNs) and cached as ``corpus_<games>.npz`` beside them, so the next
+    start loads in a moment."""
+
+    def __init__(self, x: np.ndarray, z: np.ndarray, batch: int = 256, seed: int = 0):
+        self.x, self.z, self.batch = x, z, batch
+        self.rng = np.random.default_rng(seed)
+        self.order = self.rng.permutation(x.shape[0])
+        self.cursor = 0
+        self.epochs = 0
+        self.steps = 0
+        self.loss = float("nan")
+
+    @classmethod
+    def load_or_build(cls, max_games: int = 2000, progress=print) -> "Corpus":
+        cache = PGN_DIR / f"corpus_{max_games}.npz"
+        if cache.exists():
+            data = np.load(cache)
+            progress(f"[pretrain] corpus: {data['x'].shape[0]} positions from cache")
+            return cls(data["x"], data["z"])
+        paths = fetch(progress)
+        x, z = dataset(paths, max_games, progress)
+        # Written beside and renamed into place, so a second process that
+        # starts meanwhile never reads a half-written file (two servers did).
+        partial = cache.with_suffix(".partial.npz")
+        np.savez(partial, x=x.astype(np.float32), z=z.astype(np.float32))
+        partial.replace(cache)
+        return cls(x, z)
+
+    def step(self, player: SelfPlay) -> float:
+        """One minibatch of supervised training; the running loss is an
+        exponential average over the last fifty or so steps."""
+        if self.cursor + self.batch > self.x.shape[0]:
+            self.order = self.rng.permutation(self.x.shape[0])
+            self.cursor = 0
+            self.epochs += 1
+        idx = self.order[self.cursor:self.cursor + self.batch]
+        self.cursor += self.batch
+        loss = player.net.train_step(self.x[idx], self.z[idx], player.lr)
+        self.loss = loss if np.isnan(self.loss) else self.loss * 0.98 + loss * 0.02
+        self.steps += 1
+        if self.steps % 200 == 0:
+            player.net.save(player.weights)
+        return loss
+
+    def summary(self) -> str:
+        done = self.epochs + self.cursor / max(1, self.x.shape[0])
+        return f"pre-training {self.x.shape[0]} master positions · epoch {done:.2f} · loss {self.loss:.3f}"
+
+
 def ensure(player: SelfPlay, progress=print, max_games: int = 2000, epochs: int = 8) -> bool:
     """Pre-train once: skipped when the marker says it has been done."""
     import os

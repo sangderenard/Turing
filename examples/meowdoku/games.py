@@ -603,20 +603,27 @@ class ChessArena(Chess):
 
     def _run(self) -> None:
         import time
-        # First run ever: pre-train on master games before any self-play.
-        try:
-            from meowdoku.pretrain import ensure
-            self.note = ""
-            ensure(self.player, progress=lambda message: setattr(self, "note", message))
-            self.note = ""
-        except Exception as error:                            # offline, or the source moved: play anyway
-            self.note = f"pre-training skipped: {type(error).__name__}"
+        # The master-game corpus loads once (replayed on the first run,
+        # cached after); then every loop takes one self-play step and one
+        # supervised minibatch on the masters, for as long as the arena runs.
+        import os
+        self.corpus = None
+        self.note = ""
+        if not os.environ.get("MEOWDOKU_NO_PRETRAIN"):
+            try:
+                from meowdoku.pretrain import Corpus
+                self.corpus = Corpus.load_or_build(progress=lambda message: setattr(self, "note", message))
+                self.note = ""
+            except Exception as error:                        # offline, or the source moved: self-play alone
+                self.note = f"pre-training unavailable: {type(error).__name__}: {str(error)[:60]}"
         tick, count = time.perf_counter(), 0
         while not self._stop.is_set():
             with self.lock:
                 finished = self.engine.step()
                 if finished:
                     self.last_result = finished[-1]
+                if self.corpus is not None:
+                    self.corpus.step(self.player)
             count += 1
             now = time.perf_counter()
             if now - tick >= 1.0:
@@ -645,7 +652,9 @@ class ChessArena(Chess):
             p = self.player
             rec = p.record
             note = getattr(self, "note", "")
-            st["status"] = (note + " · " if note else "") + (f"{self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · game {p.games + 1} · "
+            corpus = getattr(self, "corpus", None)
+            lead = (corpus.summary() if corpus is not None else note) or ""
+            st["status"] = (lead + " · " if lead else "") + (f"{self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · game {p.games + 1} · "
                             f"record W{rec['white']} B{rec['black']} D{rec['draw']}"
                             + (f" · loss {p.last_loss:.3f}" if p.games else "")
                             + (f" · last: {self.last_result}" if self.last_result else ""))
