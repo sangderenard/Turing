@@ -784,7 +784,8 @@ function cellPosition(game, cell, rackPiece) {
 // later interval plus the one still open, so the ship answers at once and
 // lands where the server puts it.  What little differs (the two sides'
 // integration step sizes) eases out over ~60 ms.
-const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null };
+const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null,
+               shots: [], shotSeq: 0, lastShot: -10 };
 const PRED_STEP = 1 / 240;            // the predictor's own rate (PREDICT_HZ)
 window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
@@ -833,6 +834,43 @@ function predictFrame(now) {
   if (pred.ship) stepShip(pred.ship, c, frame, game.predict);
   const decay = Math.exp(-frame / 0.06);
   pred.offset = [pred.offset[0] * decay, pred.offset[1] * decay];
+  predictShots(now, game, c);
+}
+// PREDICTED SHOTS.  The page's own shots leave the muzzle of the ship it
+// draws the moment fire is held, under the weapon the game declares (muzzle
+// offsets, velocity, reload, shots in flight), instead of appearing when the
+// server's spawn arrives -- a round trip late and already downrange.  When the
+// server reports a shot of ours, it takes over the oldest provisional one,
+// starting from where that one is drawn; one the server never confirms fades
+// within PROVISIONAL_S.  Provisional shots hit nothing: hits are the server's.
+const PROVISIONAL_S = 0.45;
+function ownShotsInFlight(weapon) {
+  let count = pred.shots.length;
+  for (const piece of state.pieces.values())
+    if (piece.entity && !piece.provisional && piece.owner === pred.lane && piece.mesh === weapon.mesh && piece.removing == null) count++;
+  return count;
+}
+function predictShots(now, game, c) {
+  const drawNow = performance.now() / 1000;
+  for (const shot of pred.shots.filter((s) => drawNow - s.at > PROVISIONAL_S)) {
+    const piece = state.pieces.get(shot.id);
+    if (piece && piece.removing == null) piece.removing = state.time;
+  }
+  pred.shots = pred.shots.filter((s) => drawNow - s.at <= PROVISIONAL_S);
+  const weapon = game.predict && game.predict.weapon;
+  if (!weapon || !pred.ship || !c.fire) return;
+  if (now - pred.lastShot < Math.max(weapon.reload, 0.02)) return;
+  if (ownShotsInFlight(weapon) + weapon.muzzles.length > weapon.max_in_flight) return;
+  const x0 = pred.ship.x + pred.offset[0], z0 = pred.ship.y + pred.offset[1];
+  for (const [mx, mz] of weapon.muzzles) {
+    const id = `prov:${++pred.shotSeq}`;
+    state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane,
+      sx: x0 + mx, sz: z0 + mz, x: x0 + mx, z: z0 + mz, vx: weapon.velocity[0], vz: weapon.velocity[1], tRecv: drawNow,
+      mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
+      t0: state.time, removing: null, seed: 0, birth: null });
+    pred.shots.push({ id, at: drawNow });
+  }
+  pred.lastShot = now;
 }
 // Ticks leave on a steady clock, up to three in flight, outside the action
 // queue -- so the update rate is the clock's, not one round trip's.  Each
@@ -938,8 +976,18 @@ function applySnapshot(view) {
     drop(lane);
     const id = `${lane}:s${++sock.gen}`;
     sock.lanes.set(lane, id);
-    state.pieces.set(id, { id, entity: true, lane, sx: x, sz: y, x, z: y, vx, vz: vy, tRecv: stamp, mesh, color, size, roll, spin, bob, lean,
-                           t0: now, removing: null, seed: 0, birth: birthOffset(ownerLane, age, x, y, vx, vy, you, stamp) });
+    let birth = birthOffset(ownerLane, age, x, y, vx, vy, you, stamp);
+    if (ownerLane === pred.lane && pred.shots.length) {
+      const adopted = pred.shots.shift(), shown = state.pieces.get(adopted.id);
+      if (shown) {
+        const lead = Math.max(0, now - stamp);
+        birth = { dx: shown.x - (x + vx * lead), dz: shown.z - (y + vy * lead) };
+        state.pieces.delete(adopted.id);
+      }
+    }
+    state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean,
+                           t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], x = f32(), y = f32(), vx = f32(), vy = f32();
@@ -1005,7 +1053,10 @@ setInterval(() => {
   const game = state.game;
   if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight + sock.outstanding >= 3) return;
   const now = performance.now() / 1000;
-  const allowed = predicting(game) ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest;
+  // Holding fire is activity: the server must hear of it at once to spawn the
+  // real shots the page is already showing.
+  const firing = predicting(game) && controls().fire > 0;
+  const allowed = predicting(game) && !firing ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest;
   const inputChanged = pred.closed.length > 0;               // a press, release or steer since the last check-in
   if (now < sync.next && !inputChanged) return;
   sync.next = now + allowed;
@@ -1360,7 +1411,7 @@ function applyState(game) {
   document.body.dataset.game = game.game;
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
-    pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1;
+    pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1; pred.shots = [];
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
   arcadeEvents(game, now);

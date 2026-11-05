@@ -354,7 +354,12 @@ class SpaceInvaders(EntityGame):
 
     def motion(self) -> dict[str, Any]:
         return {"speed": PLAYER_SPEED, "tau": SHIP_TAU, "reach": SHIP_REACH,
-                "x": [0.7, self.width - 0.7]}
+                "x": [0.7, self.width - 0.7],
+                # The weapon, as the law fires it: one shot in flight, from
+                # the nose, straight up -- so the page can show its own shot
+                # leaving the muzzle the moment fire is held.
+                "weapon": {"muzzles": [[0.0, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED], "reload": 0.0,
+                           "max_in_flight": 1, "mesh": "bolt", "color": "bolt", "size": 0.26}}
 
     def layout(self, aspect: float) -> None:
         """Fit the field to a new screen shape mid-game: the walls move and

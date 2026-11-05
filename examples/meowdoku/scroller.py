@@ -281,7 +281,11 @@ class BulletScroller(EntityGame):
 
     def motion(self) -> dict[str, Any]:
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
-                "x": [MARGIN, self.width - MARGIN], "y": [MARGIN, HEIGHT - MARGIN]}
+                "x": [MARGIN, self.width - MARGIN], "y": [MARGIN, HEIGHT - MARGIN],
+                # Twin shots from the nose on a reload, as the law fires them.
+                "weapon": {"muzzles": [[-0.2, -MUZZLE], [0.2, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED],
+                           "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",
+                           "size": 0.2}}
 
     def layout(self, aspect: float) -> None:
         width = field_width(aspect)
