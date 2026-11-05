@@ -91,3 +91,23 @@ from scratch: 300 games in under two minutes; against a random mover 6W 8L
 2D before and 5W 3L 8D after.  The page's `chess_arena` plays network
 against network non-stop (a tick per 350 ms while on screen; record, loss
 and the last result in the status); `chess_vs_net` answers your moves.
+
+## Full rules, batched arena, pre-training (2026-11-05, later still)
+
+`games.Chess` now filters every move by the mover's king's safety (no
+moving into check, forced evasion), ends on checkmate or stalemate, and
+has castling, en passant and promotion.  `chess_net.BatchEngine` steps
+sixteen games per forward pass; `ChessArena` runs it in a thread under the
+table lock and shows game 0, and the page polls continuously, pacing its
+slide to the measured move interval.  Measured live: 22 to 29 plies per
+second per game with sixteen in flight, 49 games in the first 20 s.  Under
+the full rules almost every early game is a 160-ply draw; the material
+term is what teaches at this stage.
+
+`pretrain.py` replays master games (pgnmentor.com Kasparov and Carlsen,
+about 2.3 MB zipped, cached in `build/meowdoku/pgn/`) through a SAN reader
+on `games.Chess` and trains the value net on them before self-play; the
+arena calls `ensure` once at its first start and writes
+`chess_net.pretrained.json`.  The download itself was not run from this
+session (the sandbox refused the fetch); the first arena start on the LAN
+server performs it, and `MEOWDOKU_NO_PRETRAIN=1` opts out.
