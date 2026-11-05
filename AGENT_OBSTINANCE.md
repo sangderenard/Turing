@@ -706,3 +706,16 @@ the current mapping case then passed alone in 6.92 seconds with 28 rows,
 zero findings and zero unsourced facts or identities. Reading the script's
 CLI before starting it would have avoided those roughly 52 seconds and the
 unrelated failure output.
+
+## 2026-11-05 — checked a data alias as part of metadata replay
+
+The Run59 metadata replay repair was scoped to the three booked shape, rank
+and count Call pairs. The first draft also required every `feed_ids` entry to
+equal its live Call actual. In the authored ascending-order program, the data
+actual is tensor 19 and its separately proved target alias is formal 20; the
+three metadata feeds already agree with the exact Call binding. That extra
+data check made the native gate fail after 32.01 seconds. A bounded raising
+frame capture took 30.01 seconds and showed the booked RESULT cause, local
+descriptor and all three metadata pairs were valid. The untouched checkout
+passed the same native test in 41.32 seconds. The check now applies only to
+the three metadata pairs; the final native gate passed in 33.11 seconds.

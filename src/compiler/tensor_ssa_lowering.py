@@ -1176,6 +1176,100 @@ def publish_computed_region_result_metadata(
         "tensor_shape_value_id", "tensor_rank_value_id",
         "tensor_element_count_value_id",
     )
+
+    def booked_metadata_replay(
+        binding, result_row, downstream, target, metadata_actuals, local_ids,
+        target_tensor_id,
+    ) -> bool:
+        """Read an earlier exact Call binding when its tensor descriptor is pending.
+
+        Runtime reshape's consumer can already have all three metadata formals
+        while its tensor formal has no descriptor. The booked RESULT predecessor
+        and live Call ports, rather than an empty descriptor triple, prove replay.
+        """
+        if binding is None:
+            return False
+        result_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, result_row)
+        if result_ref is None or result_ref not in {
+            cause for cause, _stage in book.edges_into(binding)
+        }:
+            return False
+        bound_actuals, bound_formals = book.page(
+            TENSOR_METADATA_CALL_BINDING
+        ).cell(binding.row, binding.column)
+        if (len(bound_actuals) != len(bound_formals)
+                or len(downstream.args) != len(target.args)):
+            return False
+        booked_pairs = tuple(zip(
+            map(int, bound_actuals), map(int, bound_formals), strict=True,
+        ))
+        live_pairs = tuple(
+            (int(actual.id), int(formal.id))
+            for actual, formal in zip(
+                downstream.args, target.args, strict=True,
+            )
+        )
+        actual_ids = tuple(int(value.id) for value in metadata_actuals)
+        if len(actual_ids) != len(keys):
+            return False
+        selected = tuple(
+            tuple(dict.fromkeys(
+                pair for pair in booked_pairs if pair[0] == actual_id
+            ))
+            for actual_id in actual_ids
+        )
+        if (any(len(pairs) != 1 for pairs in selected)
+                or any(pairs[0] not in live_pairs for pairs in selected)):
+            return False
+        if not local_ids:
+            tensor_formals = tuple(
+                formal for formal in target.args
+                if int(formal.id) == target_tensor_id
+            )
+            if len(tensor_formals) != 1:
+                return False
+            formal_accounting = tensor_formals[0].accounting or {}
+            local_ids = tuple(formal_accounting.get(key) for key in keys)
+            if any(type(value_id) is not int for value_id in local_ids):
+                return False
+            for kind, value_id in zip(
+                ("shape", "rank", "element_count"), local_ids, strict=True,
+            ):
+                extent_formals = tuple(
+                    formal for formal in target.args
+                    if int(formal.id) == value_id
+                    and (formal.accounting or {}).get("tensor_extent_for")
+                        == target_tensor_id
+                    and (formal.accounting or {}).get("tensor_extent_kind")
+                        == kind
+                )
+                if len(extent_formals) != 1 or ssa_value_identity_cell(
+                    target, value_id, book=book,
+                ) is None:
+                    return False
+        if local_ids:
+            if (len(local_ids) != len(keys)
+                    or any(value_id is None for value_id in local_ids)
+                    or tuple(pairs[0][1] for pairs in selected)
+                    != tuple(map(int, local_ids))):
+                return False
+        feed_ids = downstream.attributes.get("feed_ids")
+        if feed_ids is not None:
+            if len(feed_ids) != len(target.args):
+                return False
+            feed_pairs = tuple(
+                (int(feed_id), int(formal.id))
+                for feed_id, formal in zip(feed_ids, target.args, strict=True)
+            )
+            if any(pairs[0] not in feed_pairs for pairs in selected):
+                return False
+        callee_input_ids = downstream.attributes.get("callee_input_ids")
+        if callee_input_ids is not None and tuple(map(int, callee_input_ids)) != tuple(
+            int(value.id) for value in target.args
+        ):
+            return False
+        return True
+
     # A source function can return a computed region value. Publish region
     # outputs first, then read their projected metadata at the source Ret.
     # The caller's existing geometry fixed point revisits source functions
@@ -1768,14 +1862,6 @@ def publish_computed_region_result_metadata(
                             # that Call's result after forwarding its metadata.
                             # Replay the exact live binding; a void Call has no
                             # new aggregate identity from which to mint another.
-                            live_pairs = tuple(zip(
-                                (int(value.id) for value in downstream.args),
-                                (int(value.id) for value in target.args), strict=True,
-                            ))
-                            requested = tuple(zip(
-                                (int(value.id) for value in metadata_actuals),
-                                map(int, local_ids), strict=True,
-                            )) if all(value is not None for value in local_ids) else ()
                             from .concordance_declarations import DEAD_STRUCTURAL_RETIREMENT
                             from .identity_concordance import Ref
                             retired = downstream.attributes.get("aggregate_retired_result")
@@ -1787,12 +1873,10 @@ def publish_computed_region_result_metadata(
                                 and retired.row[0] == function_scope_of(caller)
                                 and book.latest_ref(retired.page, retired.row) == retired
                                 else None)
-                            booked = (() if binding is None else tuple(zip(
-                                *book.page(binding.page).cell(binding.row, binding.column),
-                                strict=True,
-                            )))
-                            if requested and all(pair in live_pairs and pair in booked
-                                                 for pair in requested):
+                            if booked_metadata_replay(
+                                binding, row, downstream, target, metadata_actuals,
+                                local_ids, target_tensor_id,
+                            ):
                                 continue
                             raise ValueError(
                                 "void region call has no exact live tensor metadata binding"
@@ -1805,46 +1889,14 @@ def publish_computed_region_result_metadata(
                         existing_binding = book.latest_ref(
                             TENSOR_METADATA_CALL_BINDING, existing_row,
                         )
-                        if existing_binding is not None and all(
-                            value_id is not None for value_id in local_ids
+                        if booked_metadata_replay(
+                            existing_binding, row, downstream, target,
+                            metadata_actuals, local_ids, target_tensor_id,
                         ):
-                            bound_actuals, bound_formals = book.page(
-                                TENSOR_METADATA_CALL_BINDING
-                            ).cell(existing_binding.row,
-                                   existing_binding.column)
-                            booked_pairs = tuple(zip(
-                                map(int, bound_actuals),
-                                map(int, bound_formals), strict=True,
-                            ))
-                            live_pairs = tuple(zip(
-                                (int(value.id) for value in downstream.args),
-                                (int(value.id) for value in target.args),
-                                strict=True,
-                            ))
-                            requested_pairs = tuple(zip(
-                                (int(value.id) for value in metadata_actuals),
-                                map(int, local_ids), strict=True,
-                            ))
-                            result_ref = book.latest_ref(
-                                TENSOR_METADATA_RESULT_BINDING, row,
-                            )
-                            if (
-                                result_ref is not None
-                                and result_ref in {
-                                    cause for cause, _stage in book.edges_into(
-                                        existing_binding
-                                    )
-                                }
-                                and all(pair in booked_pairs
-                                        and pair in live_pairs
-                                        for pair in requested_pairs)
-                            ):
-                                # This exact consumer was forwarded in an
-                                # earlier partial-module publication. Its
-                                # local extent queries were already promoted
-                                # to the booked formal IDs; replaying that
-                                # promotion would invent a second binding.
-                                continue
+                            # This exact consumer was forwarded in an earlier
+                            # partial-module publication. Its local metadata
+                            # formals already have a booked Call identity.
+                            continue
                         promoted_extents = ()
                         if (local_descriptor is not None
                                 and local_descriptor.metadata_state == "dynamic"
@@ -1916,6 +1968,10 @@ def publish_computed_region_result_metadata(
                             }
                         )
                         if not fresh_formals:
+                            if local_descriptor is None:
+                                raise ValueError(
+                                    "computed tensor metadata has no exact live Call binding"
+                                )
                             continue
                         from .concordance_declarations import (
                             TENSOR_HEAP_OWNER_CALL_BINDING,
