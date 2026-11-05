@@ -78,8 +78,8 @@ layout(location=0) in vec3 aPos; layout(location=1) in vec3 aColor;
 uniform mat4 uMVP; out vec3 vColor;
 void main(){ vColor = aColor; gl_Position = uMVP * vec4(aPos, 1.0); }`;
 const FLAT_FS = `#version 300 es
-precision highp float; in vec3 vColor; out vec4 FragColor;
-void main(){ FragColor = vec4(pow(vColor, vec3(1.0/2.2)), 1.0); }`;
+precision highp float; in vec3 vColor; out vec4 FragColor; uniform float uAlpha;
+void main(){ FragColor = vec4(pow(vColor, vec3(1.0/2.2)), uAlpha); }`;
 
 // ---------------------------------------------------------------- storage textures (the compiled SSBOs)
 function storageTexture(table, unit) {
@@ -133,13 +133,77 @@ function uploadMesh(mesh) {
   return { vao, count, material: mesh.material, extent: mesh.extent };
 }
 
+const TILE = { height: 0.16, inset: 0.11, gap: 0.03 };
+
 function buildTiles(board) {
-  const n = board.n, pos = [], col = [], gap = 0.04;
+  // One truncated pyramid per cell: a square base at y = 0, a smaller top
+  // at TILE.height, four slanted sides.  Face normals; the region's
+  // material id per vertex (an int attribute) so the Phong program lights
+  // the buttons with the rest of the scene.
+  const n = board.n, pos = [], nrm = [], mat = [];
+  const push = (a, b, c) => {
+    const u = [b[0]-a[0], b[1]-a[1], b[2]-a[2]], v = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    const N = norm(cross(u, v));
+    for (const q of [a, b, c]) { pos.push(...q); nrm.push(...N); }
+  };
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
-    const rgb = hsv(board.hues[board.region[r*n + c]], 0.34, 0.92);
-    const x0 = c + gap, x1 = c + 1 - gap, z0 = r + gap, z1 = r + 1 - gap;
-    const quad = [[x0,0,z0],[x1,0,z0],[x1,0,z1],[x0,0,z0],[x1,0,z1],[x0,0,z1]];
-    for (const p of quad) { pos.push(...p); col.push(...rgb); }
+    const m = state.tileMaterialBase + board.region[r*n + c];
+    const g = TILE.gap, i = TILE.inset, h = TILE.height;
+    const x0 = c + g, x1 = c + 1 - g, z0 = r + g, z1 = r + 1 - g;
+    const b = [[x0,0,z0],[x1,0,z0],[x1,0,z1],[x0,0,z1]];
+    const tp = [[x0+i,h,z0+i],[x1-i,h,z0+i],[x1-i,h,z1-i],[x0+i,h,z1-i]];
+    push(tp[0], tp[2], tp[1]); push(tp[0], tp[3], tp[2]);                 // top (normal +y)
+    for (let k = 0; k < 4; k++) {                                          // sides
+      const k2 = (k + 1) % 4;
+      push(b[k], tp[k], tp[k2]); push(b[k], tp[k2], b[k2]);
+    }
+    for (let k = 0; k < 18; k++) mat.push(m);
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const mb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, mb); gl.bufferData(gl.ARRAY_BUFFER, new Int32Array(mat), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.INT, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: pos.length / 3 };
+}
+
+function uploadBoardMaterials(board) {
+  // The exported tables hold the three piece materials.  Each board adds
+  // one material per region: the X mark's records cloned, with the PBR
+  // albedo replaced by the region's hue (floats 0..2 of a 16-float record,
+  // material_db.PBRBaseRecord's layout) and a matte roughness.
+  const base = state.assets.materials, x = state.assets.meshes.x_mark.material;
+  const k = board.n;
+  const tables = {};
+  for (const [name, table] of Object.entries(base)) {
+    const f = table.floats_per_record, data = Array.from(table.data);
+    const template = data.slice(x * f, (x + 1) * f);
+    for (let region = 0; region < k; region++) {
+      const record = template.slice();
+      if (name === "pbr") {
+        const rgb = hsv(board.hues[region], 0.30, 0.90);              // pastel ring under the lights
+        record[0] = rgb[0]; record[1] = rgb[1]; record[2] = rgb[2];
+        record[3] = 0.78;                                           // roughness
+        record[4] = 0.0;                                            // metallic
+      }
+      if (name === "phong") { record[1] = Math.min(record[1], 0.08); }   // matte buttons
+      data.push(...record);
+    }
+    tables[name] = { floats_per_record: f, records: table.records + k, data };
+  }
+  state.tileMaterialBase = base.pbr.records;
+  storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
+}
+
+function buildShadowQuad() {
+  // A unit disc (triangle list) for contact shadows, drawn flat and dark.
+  const pos = [], col = [], segments = 24;
+  for (let s = 0; s < segments; s++) {
+    const a0 = s / segments * Math.PI * 2, a1 = (s + 1) / segments * Math.PI * 2;
+    for (const q of [[0,0,0],[Math.cos(a0),0,Math.sin(a0)],[Math.cos(a1),0,Math.sin(a1)]]) { pos.push(...q); col.push(0.02, 0.02, 0.03); }
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -181,16 +245,24 @@ function pieceModel(piece, now) {
     spin = now * 0.8 + piece.r * 1.3; y = 0.05 * Math.sin(now * 1.7 + piece.r);
   }
   const mesh = state.meshes[k === "x" ? "x_mark" : k];
-  const scale = (k === "heart" ? 0.42 : 0.4) / mesh.extent * s;
-  let m = M.translate(piece.x, y + 0.02, piece.z);
-  m = M.multiply(m, M.rotateY(spin + (k === "x" ? 0 : 0)));
-  m = M.multiply(m, M.rotateX(-Math.PI / 2 + 0.35 + tilt));     // glyph plane (x, y) lies on the board, leaning back toward the camera
+  const size = (k === "heart" ? 0.42 : 0.38);
+  const scale = size / mesh.extent * s;
+  const lean = 0.35;
+  // Resting height: the glyph is centred on its bounding box and leans
+  // back by `lean`, so its lowest point sits size*sin(lean) (plus half its
+  // thickness) below its origin.  Hearts float in front of the board.
+  const rest = (k === "heart" ? 0.0 : TILE.height) + size * Math.sin(lean + tilt) + 0.04 * s;
+  let m = M.translate(piece.x, rest + y, piece.z);
+  m = M.multiply(m, M.rotateY(spin));
+  m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean + tilt));     // glyph plane (x, y) lies on the board, leaning back toward the camera
   m = M.multiply(m, M.scale(scale, scale, scale));
+  piece.height = y; piece.size = size * s;
   return m;
 }
 
 // ---------------------------------------------------------------- draw
-function draw(now) {
+function draw(ms) {
+  const now = ms / 1000;                                 // every curve below is in seconds
   state.time = now;
   const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
@@ -199,10 +271,6 @@ function draw(now) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.board) { requestAnimationFrame(draw); return; }
   const cam = camera();
-  // tiles
-  gl.useProgram(state.flat); gl.uniformMatrix4fv(gl.getUniformLocation(state.flat, "uMVP"), false, cam.viewProj);
-  gl.bindVertexArray(state.tiles.vao); gl.drawArrays(gl.TRIANGLES, 0, state.tiles.count);
-  // pieces through the Phong program
   const P = state.phong; gl.useProgram(P);
   const lights = state.assets.lights, n = state.board.n;
   const lpos = [], lcol = [], lint = [], lgid = [];
@@ -222,6 +290,12 @@ function draw(now) {
   gl.uniform1i(gl.getUniformLocation(P, "uRenderPass"), 0);
   gl.uniform1f(gl.getUniformLocation(P, "uFieldGain"), 0.0);
   for (const [name, unit] of Object.entries(state.units)) gl.uniform1i(gl.getUniformLocation(P, name), unit);
+  // the board: beveled buttons, model = identity
+  gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, cam.viewProj);
+  gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, cam.view);
+  gl.bindVertexArray(state.tiles.vao);
+  gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, state.tiles.count);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
@@ -235,6 +309,19 @@ function draw(now) {
     gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
   }
   for (const key of removed) state.pieces.delete(key);
+  // contact shadows: a dark disc on the button top under each board piece,
+  // smaller and fainter the higher the piece is
+  gl.useProgram(state.flat); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  gl.bindVertexArray(state.shadow.vao);
+  for (const piece of state.pieces.values()) {
+    if (piece.kind === "heart" || piece.height == null) continue;
+    const h = Math.max(0, piece.height), radius = piece.size * 0.55 / (1 + 1.5 * h), alpha = 0.45 / (1 + 2.0 * h);
+    const model = M.multiply(M.translate(piece.x, TILE.height + 0.004, piece.z + 0.05), M.scale(radius, 1, radius * 0.8));
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.flat, "uMVP"), false, M.multiply(cam.viewProj, model));
+    gl.uniform1f(gl.getUniformLocation(state.flat, "uAlpha"), alpha);
+    gl.drawArrays(gl.TRIANGLES, 0, state.shadow.count);
+  }
+  gl.depthMask(true); gl.disable(gl.BLEND);
   gl.bindVertexArray(null);
   requestAnimationFrame(draw);
 }
@@ -268,7 +355,7 @@ async function api(path, body) {
   return data;
 }
 async function newBoard(board) {
-  state.board = board; state.tiles = buildTiles(board); state.pieces.clear();
+  state.board = board; uploadBoardMaterials(board); state.tiles = buildTiles(board); state.pieces.clear();
   applyState(await api("/api/new", { id: board.id }));
 }
 
@@ -278,7 +365,7 @@ function cellAt(clientX, clientY) {
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
   const inv = M.invert(cam.viewProj);
   const near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
-  const t = -near[1] / (far[1] - near[1]);                          // hit the y = 0 board plane
+  const t = (TILE.height - near[1]) / (far[1] - near[1]);           // hit the plane of the button tops
   if (!(t >= 0)) return null;
   const x = near[0] + t * (far[0] - near[0]), z = near[2] + t * (far[2] - near[2]);
   const n = state.board.n, c = Math.floor(x), r = Math.floor(z);
@@ -340,6 +427,7 @@ function fillPickers() {
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8 };
   for (const role of ["cat", "x_mark", "heart"]) state.meshes[role] = uploadMesh(assets.meshes[role]);
+  state.shadow = buildShadowQuad();
   fillPickers();
   requestAnimationFrame(draw);
   document.getElementById("level").value = Object.keys(boards.levels).find((k) => k.startsWith("small/forced")) || Object.keys(boards.levels)[0];
