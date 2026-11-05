@@ -344,13 +344,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--web-dir", default=str(WEB_DIR))
+    parser.add_argument("--profiles", default=str(PROFILES),
+                        help="profile/score file; a second (dev) server keeps its own so it never clobbers the live one")
     args = parser.parse_args(argv)
     web_dir = Path(args.web_dir)
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
     prepare_predictor(web_dir)
-    sessions = Sessions(web_dir, Profiles(PROFILES))
+    sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
     try:
