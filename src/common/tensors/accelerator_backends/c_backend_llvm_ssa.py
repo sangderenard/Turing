@@ -229,7 +229,7 @@ C_TENSOR_OPCODE_ORDER = (
 C_SSA_EXTERNAL_PRIMITIVES = frozenset({
     "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
     "exp", "llvm.ceil.f64", "llvm.fabs.f64", "llvm.fcmp.ord",
-    "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.sqrt.f64",
+    "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.rint.f64", "llvm.sqrt.f64",
     "llvm.trunc.f64", "llvm.memcpy.p0.p0.i64", "llvm.memset.p0.i64",
     "log", "pow", "sin", "sinh", "tan", "tanh",
     "llvm.maxnum.f64", "llvm.minnum.f64", "llvm.pow.f64",
@@ -321,6 +321,7 @@ source_filename = "ctensor_ops.manual-ssa"
 declare double @llvm.sqrt.f64(double)
 declare double @llvm.fabs.f64(double)
 declare double @llvm.round.f64(double)
+declare double @llvm.rint.f64(double)
 declare double @llvm.trunc.f64(double)
 declare double @llvm.floor.f64(double)
 declare double @llvm.ceil.f64(double)
@@ -790,7 +791,12 @@ abs:
   %abs.value = call double @llvm.fabs.f64(double %value)
   br label %store
 round:
-  %round.value = call double @llvm.round.f64(double %value)
+  ; Tensor round is ties-to-even, as numpy, torch and Python round (and
+  ; the fused elementwise lane's llvm.roundeven spelling).  Spelled
+  ; llvm.rint (default round-to-nearest-even mode): llvm.roundeven lowers
+  ; to a roundeven libcall the Windows CRT lacks, and an unresolved symbol
+  ; left MCJIT's other relocations (fold2d's memset) broken.
+  %round.value = call double @llvm.rint.f64(double %value)
   br label %store
 trunc:
   %trunc.value = call double @llvm.trunc.f64(double %value)

@@ -246,7 +246,7 @@
                 case CT_OP_LOG: out[i] = log(value); break;
                 case CT_OP_NEG: out[i] = -value; break;
                 case CT_OP_ABS: out[i] = fabs(value); break;
-                case CT_OP_ROUND: out[i] = round(value); break;
+                case CT_OP_ROUND: out[i] = nearbyint(value); break;   /* ties to even, as numpy/torch/Python */
                 case CT_OP_TRUNC: out[i] = trunc(value); break;
                 case CT_OP_FLOOR: out[i] = floor(value); break;
                 case CT_OP_CEIL: out[i] = ceil(value); break;
