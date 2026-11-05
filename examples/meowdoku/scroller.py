@@ -13,6 +13,17 @@ Lanes (contiguous blocks, so collisions are block against block):
                    spinners (descend, hold, fire rotating rings, leave)
     49..368        enemy bullets
     369..398       stars: scenery scrolling past, never collide
+    399..406       missiles: ballistic rounds on engine_toy's trajectory law
+    407..412       pickups: weapon power-ups dropped by destroyed enemies
+
+WEAPONS: the ship carries ``weapon`` (basic / laser / missile), ``mult``
+(1..4: 1 + mult shots a volley) and ``fan`` (0..3: the volley's spread).
+Destroyed enemies sometimes drop a pickup -- SPREAD (fan + 1), MULT
+(mult + 1), MISSILE, LASER -- that drifts down and is pulled hard toward the
+ship inside MAGNET_R (harder the closer), collected on contact.  Missiles are
+point masses on ``symbolic_parts.trajectory_batch_step`` (drag on
+air-relative velocity, gravity along height), launched with the firing
+solution that lands them on the nearest enemy; they hit for MISSILE_DAMAGE.
 
 DEPTH: every lane also has a height ``z`` above the board (0..DEPTH) with
 velocity ``vz`` and a depth half-extent ``rz``: the ship climbs and dives on
@@ -35,23 +46,56 @@ from typing import Any
 
 import numpy as np
 
+import sys
+from pathlib import Path
+
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
 from meowdoku.entity_motion import damped_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
 
+# engine_toy's ballistics: the SymPy trajectory law printed as AbstractTensor
+# code over a batch (symbolic_parts.trajectory_batch_step), used as is.
+_ENGINE_TOY = Path(__file__).resolve().parents[3] / "engine_toy"
+if str(_ENGINE_TOY) not in sys.path:
+    sys.path.append(str(_ENGINE_TOY))
+_TRAJECTORY = None
+
+
+def trajectory_step(*args):
+    global _TRAJECTORY
+    if _TRAJECTORY is None:
+        from symbolic_parts import trajectory_batch_step
+        _TRAJECTORY = trajectory_batch_step()
+    return _TRAJECTORY(*args)
+
 HEIGHT = 16.0
 WIDTH = 9.0
 #: The field is portrait (phone-shaped) whatever the screen: its width follows
 #: the screen's shape only up to this width-to-height ratio.
 PORTRAIT = 0.62
-PLAYER, SHOT, ENEMY, BULLET, STAR = 0.0, 1.0, 2.0, 3.0, 4.0
+PLAYER, SHOT, ENEMY, BULLET, STAR, MISSILE_SLOT, PICKUP = 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0
 SHOTS = (1, 25)
 ENEMIES = (25, 49)
 BULLETS = (49, 369)
 STARS = (369, 399)
-LANES = STARS[1]
+MISSILES = (399, 407)
+PICKUPS = (407, 413)
+LANES = PICKUPS[1]
+#: Weapons (the ship's ``weapon`` column) and pickup kinds (a pickup's ``kind``).
+BASIC, LASER, MISSILE = 0.0, 1.0, 2.0
+SPREAD_UP, MULT_UP, MISSILE_UP, LASER_UP = 1.0, 2.0, 3.0, 4.0
+FAN_STEP = 0.13            # radians between neighbouring shots per fan level
+LASER_SPEED = 2.0          # laser shots fly this many times faster
+LASER_RELOAD = 0.05
+MISSILE_RELOAD = 0.5
+MISSILE_DAMAGE = 3.0
+DROP_CHANCE = 0.35
+MAGNET_R = 2.2
+MAGNET_SPEED = 9.0
+#: The missiles' trajectory parameters, in game units (the law is unit-free).
+MISSILE_MASS, MISSILE_DIAMETER, MISSILE_DRAG, AIR_DENSITY, GRAVITY = 1.0, 0.3, 0.3, 1.2, 6.0
 DRIFTER, SPINNER = 1.0, 2.0
 
 LIVES = 3.0
@@ -91,6 +135,7 @@ CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis
 
 def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind, age, timer,
+                  weapon, mult, fan,
                   score, lives, invuln, clock, spawn_clock, field_w,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -99,6 +144,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     playing = lives > 0.0
     is_player, is_shot, is_enemy = slot == PLAYER, slot == SHOT, slot == ENEMY
     is_bullet, is_star = slot == BULLET, slot == STAR
+    is_missile, is_pickup = slot == MISSILE_SLOT, slot == PICKUP
     clock_next = clock + dt
     zero = x * 0.0
 
@@ -113,14 +159,35 @@ def scroller_step(lane, slot, rx, ry, rz,
     px, py, pz = (f(me) * x).sum(), (f(me) * y).sum(), (f(me) * z).sum()
     ship_on = f(me).sum() > 0.0
 
-    # Twin shots on a reload: the first two free shot lanes.
+    # The ship's weapon: 1 + mult shots a volley, fanned by fan; a laser
+    # flies faster on a quicker reload; a missile volley launches mult rounds.
+    pw, pm, pf = (f(is_player) * weapon).sum(), (f(is_player) * mult).sum(), (f(is_player) * fan).sum()
     reload = (f(is_player) * timer).sum()
     volley = (fire > 0.0) & ship_on & playing & (reload <= 0.0)
     free_shot = is_shot & ~live
-    left = first_of(free_shot, lane)
-    right = first_of(free_shot & ~left, lane)
-    shot_spawn = (left | right) & volley
-    shot_x = px + where(left, -0.2, 0.2)
+    shots_n = 1.0 + pm
+    shot_rank = f(free_shot).cumsum(dim=0) - 1.0
+    shot_spawn = free_shot & (shot_rank < shots_n) & volley & (pw != MISSILE)
+    shot_c = shot_rank - 0.5 * (shots_n - 1.0)
+    shot_x = px + shot_c * 0.18
+    shot_angle = shot_c * FAN_STEP * pf
+    shot_speed = where(pw == LASER, SHOT_SPEED * LASER_SPEED, SHOT_SPEED)
+    # Missiles: the firing solution that lands each on the nearest enemy
+    # (time of flight from the horizontal distance, vertical speed to rise
+    # the height difference and fall back over it), then the trajectory law.
+    enemies_live = is_enemy & live
+    gap = ((x - px) * (x - px) + (y - py) * (y - py)).sqrt()
+    nearest = first_of(enemies_live & (where(enemies_live, gap, 1.0e9) == where(enemies_live, gap, 1.0e9).min()), lane)
+    has_target = f(nearest).sum() > 0.0
+    tx = where(has_target, (f(nearest) * x).sum(), px)
+    ty = where(has_target, (f(nearest) * y).sum(), py - 8.0)
+    tz = where(has_target, (f(nearest) * z).sum(), pz)
+    flight = (((tx - px) * (tx - px) + (ty - py) * (ty - py)).sqrt() / 9.0)
+    flight = where(flight < 0.45, 0.45, where(flight > 1.6, 1.6, flight))
+    free_missile = is_missile & ~live
+    missile_rank = f(free_missile).cumsum(dim=0) - 1.0
+    missile_spawn = free_missile & (missile_rank < pm) & volley & (pw == MISSILE)
+    missile_c = missile_rank - 0.5 * (pm - 1.0)
 
     # Enemies: one arrives whenever the spawn clock runs out, faster as the
     # run goes on; drifters three times as often as spinners.
@@ -160,44 +227,72 @@ def scroller_step(lane, slot, rx, ry, rz,
     reach_xy = ((px - sx) * (px - sx) + (py - sy) * (py - sy)).sqrt() + 0.5
     climb = where(skind == SPINNER, 0.0, speed * (pz - sz) / reach_xy)
 
-    spawn = shot_spawn | enemy_spawn | bullet_spawn
-    x1 = where(shot_spawn, shot_x, where(enemy_spawn, enemy_x0, where(bullet_spawn, sx, x)))
-    y1 = where(shot_spawn, py - MUZZLE, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
-    z1 = where(shot_spawn, pz, where(enemy_spawn, routine_z, where(bullet_spawn, sz, z)))
+    spawn = shot_spawn | enemy_spawn | bullet_spawn | missile_spawn
+    x1 = where(shot_spawn, shot_x, where(enemy_spawn, enemy_x0, where(bullet_spawn, sx,
+               where(missile_spawn, px + missile_c * 0.3, x))))
+    y1 = where(shot_spawn | missile_spawn, py - MUZZLE, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
+    z1 = where(shot_spawn | missile_spawn, pz, where(enemy_spawn, routine_z, where(bullet_spawn, sz, z)))
     kind1 = where(enemy_spawn, new_kind, kind)
     age1 = where(spawn, 0.0, age + dt)
     hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0), hp)
-    timer1 = where(is_player, where(volley, RELOAD, (timer - dt).clip(0.0, 10.0)),
+    reload_of = where(pw == LASER, LASER_RELOAD, where(pw == MISSILE, MISSILE_RELOAD, RELOAD))
+    timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
                    where(enemy_spawn, 0.8, where(shooter, where(skind == SPINNER, 0.55, 1.5), timer - dt)))
     # Enemy paths: drifters fall and sway; spinners descend, hold, then leave.
     drifter = is_enemy & (kind1 == DRIFTER)
     spinner = is_enemy & (kind1 == SPINNER)
     sway = 1.8 * (clock_next * 1.9 + lane * 0.7).sin()
     vx1 = where(is_player, ship_vx, where(drifter, sway, where(bullet_spawn, speed * angle.cos(),
-                                     where(spawn | spinner, 0.0, vx))))
+                where(shot_spawn, shot_speed * shot_angle.sin(),
+                      where(missile_spawn, (tx - x1) / flight, where(spawn | spinner, 0.0, vx))))))
     vy1 = where(is_player, ship_vy,
-                where(shot_spawn, -SHOT_SPEED,
+                where(shot_spawn, -shot_speed * shot_angle.cos(), where(missile_spawn, (ty - y1) / flight,
                       where(drifter, 1.7, where(spinner, where(age1 < 3.0, 1.0, where(age1 < 10.0, 0.0, 1.6)),
-                                                where(bullet_spawn, speed * angle.sin(), vy)))))
+                                                where(bullet_spawn, speed * angle.sin(), vy))))))
     vz1 = where(is_player, ship_vz, where(is_enemy, routine_vz, where(bullet_spawn, climb,
-                                                                  where(spawn, 0.0, vz))))
+                where(missile_spawn, (tz - z1) / flight + 0.5 * GRAVITY * flight, where(spawn, 0.0, vz)))))
+    # Pickups drift down; inside MAGNET_R they are pulled hard toward the
+    # ship, harder the closer (velocity set toward it).
+    to_x, to_y, to_z = px - x, py - y, pz - z
+    reach_p = (to_x * to_x + to_y * to_y + to_z * to_z).sqrt() + 1e-6
+    pull = is_pickup & live & ship_on & (reach_p < MAGNET_R)
+    pull_speed = MAGNET_SPEED * (1.0 + 2.0 * (1.0 - reach_p / MAGNET_R))
+    vx1 = where(is_pickup, where(pull, pull_speed * to_x / reach_p, 0.0), vx1)
+    vy1 = where(is_pickup, where(pull, pull_speed * to_y / reach_p, 1.2), vy1)
+    vz1 = where(is_pickup, where(pull, pull_speed * to_z / reach_p, 0.0), vz1)
     live1 = live | spawn
     # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
     # the whole step, so position = birth point + velocity x (clock - born).
     born1 = where(spawn, clock, born)
-    owner1 = where(shot_spawn, 0.0, where(bullet_spawn, shooter_lane, where(enemy_spawn, -1.0, owner)))
+    owner1 = where(shot_spawn | missile_spawn, 0.0, where(bullet_spawn, shooter_lane, where(enemy_spawn, -1.0, owner)))
 
     moving = (live1 & playing) | is_star
     x2 = where(is_player & moving, ship_x, where(moving, x1 + vx1 * dt, x1))
     y2 = where(is_player & moving, ship_y, where(moving, y1 + vy1 * dt, y1))
     z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z, where(moving, z1 + vz1 * dt, z1)))
+    # Missiles fly engine_toy's trajectory law; height is the law's vertical
+    # (y) axis, the field's y its z.
+    mx, mz_, my, mvx, mvz_, mvy = trajectory_step(x1, z1, y1, vx1, vz1, vy1, dt, MISSILE_MASS, MISSILE_DIAMETER,
+                                                  MISSILE_DRAG, AIR_DENSITY, GRAVITY, 0.0, 0.0, 0.0)[:6]
+    flying = is_missile & moving
+    x2, y2, z2 = where(flying, mx, x2), where(flying, my, y2), where(flying, mz_, z2)
+    vx1, vy1, vz1 = where(flying, mvx, vx1), where(flying, mvy, vy1), where(flying, mvz_, vz1)
     # Stars wrap from the bottom back to the top: the scroll.
     y2 = where(is_star & (y2 > HEIGHT + 0.3), y2 - (HEIGHT + 0.6), y2)
     out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
-    live2 = live1 & ~((is_shot | is_enemy | is_bullet) & out)
+    grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the board is spent
+    live2 = live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded
 
     # Collisions, block against block.
-    enemy_hits = block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS, z2, rz)
+    enemy_hits = (block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS, z2, rz)
+                  + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, ENEMIES, MISSILES, z2, rz))
+    missile_hits = block_hits(x2, y2, rx, ry, live2, None, MISSILES, ENEMIES, z2, rz)
+    collected = block_hits(x2, y2, rx, ry, live2, None, PICKUPS, (0, 1), z2, rz)
+    got = is_pickup & live2 & (collected > 0.0)
+    got_kind = lambda k: f(got & (kind == k)).sum() > 0.0  # noqa: E731
+    weapon_next = where(is_player, where(got_kind(MISSILE_UP), MISSILE, where(got_kind(LASER_UP), LASER, weapon)), weapon)
+    mult_next = where(is_player & got_kind(MULT_UP), (mult + 1.0).clip(1.0, 4.0), mult)
+    fan_next = where(is_player & got_kind(SPREAD_UP), (fan + 1.0).clip(0.0, 3.0), fan)
     shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
     exposed = live2 & (invuln <= 0.0)
     player_hits = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
@@ -217,8 +312,23 @@ def scroller_step(lane, slot, rx, ry, rz,
     lives_next = lives - f(hit).sum()
     over = lives_next <= 0.0
     # A hit clears the screen of bullets and grants a moment of grace.
-    gone = killed | (is_shot & (shot_hits > 0.0)) | (is_bullet & ((bullet_hits > 0.0) | was_hit)) | (hit & over)
+    gone = (killed | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
+            | (is_bullet & ((bullet_hits > 0.0) | was_hit)) | (hit & over))
     live3 = live2 & ~gone
+    # A destroyed enemy sometimes drops a pickup (into the first free pickup
+    # lane, where the first of the step's kills died).
+    killer = first_of(killed, lane)
+    dice = noise(clock * 7.3 + score * 0.01 + 3.0)
+    dropping = (f(killer).sum() > 0.0) & (dice < DROP_CHANCE) & playing
+    drop = first_of(is_pickup & ~live3, lane) & dropping
+    drop_kind = (1.0 + (noise(clock * 2.9 + 11.0) * 4.0).floor()).clip(1.0, 4.0)
+    kx, ky, kz = (f(killer) * x2).sum(), (f(killer) * y2).sum(), (f(killer) * z2).sum()
+    x2, y2, z2 = where(drop, kx, x2), where(drop, ky, y2), where(drop, kz, z2)
+    vx1, vy1, vz1 = where(drop, 0.0, vx1), where(drop, 1.2, vy1), where(drop, 0.0, vz1)
+    kind1 = where(drop, drop_kind, kind1)
+    born1 = where(drop, clock, born1)
+    age1 = where(drop, 0.0, age1)
+    live3 = live3 | drop
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
     invuln_next = where(was_hit, INVULN, where(shielded, 0.4, (invuln - dt).clip(0.0, INVULN)))
     score_next = score + (f(killed) * where(kind1 == SPINNER, 300.0, 100.0)).sum()
@@ -237,11 +347,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
     return (f(live3), x2, y2, z2, vx1, vy1, vz1, hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
+            weapon_next, mult_next, fan_next,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
+         "weapon", "mult", "fan",
          "score", "lives", "invuln", "clock", "spawn_clock")
 SETTINGS = ("field_w",)
 
@@ -270,6 +382,9 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     rx, ry, rz = np.full(LANES, HITBOX), np.full(LANES, HITBOX), np.full(LANES, 0.18)
     rx[0], ry[0], rz[0] = SHIP_RX, SHIP_RY, 0.35
     rz[SHOTS[0]:SHOTS[1]], rz[ENEMIES[0]:ENEMIES[1]] = 0.25, 0.45
+    missiles, pickups = slice(*MISSILES), slice(*PICKUPS)
+    slot[missiles], rx[missiles], ry[missiles], rz[missiles] = MISSILE_SLOT, 0.18, 0.3, 0.25
+    slot[pickups], rx[pickups], ry[pickups], rz[pickups] = PICKUP, 0.35, 0.35, 0.4
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
     slot[BULLETS[0]:BULLETS[1]], rx[BULLETS[0]:BULLETS[1]], ry[BULLETS[0]:BULLETS[1]] = BULLET, 0.12, 0.12
@@ -292,7 +407,8 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
         "hp": np.zeros(LANES),
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "energy": (slot == PLAYER).astype(np.float64), "kind": np.zeros(LANES), "age": np.zeros(LANES),
-        "timer": np.zeros(LANES), "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
+        "timer": np.zeros(LANES), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
+        "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
         "field_w": np.full(LANES, float(width)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
@@ -339,10 +455,13 @@ class BulletScroller(EntityGame):
     def palette(self) -> dict[str, list[float]]:
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
                 "invader": [0.75, 0.35, 0.95], "ufo": [0.95, 0.15, 0.55], "bullet": [1.0, 0.25, 0.35],
-                "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1]}
+                "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
+                "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
+                "pickup_S": [0.35, 0.95, 0.45], "pickup_X": [1.0, 0.85, 0.2],
+                "pickup_M": [1.0, 0.5, 0.2], "pickup_L": [0.3, 0.95, 1.0]}
 
     def entities(self) -> list[dict[str, Any]]:
-        names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln")
+        names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln", "weapon")
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
         show = (col["alive"] > 0.0) | (col["boom"] > 0.0)
@@ -355,12 +474,18 @@ class BulletScroller(EntityGame):
                 blink = col["invuln"][k] > 0.0 and int(clock * 12) % 2 == 0
                 mesh, color, size = "rocket", "rocket_blink" if blink else "rocket", SHIP_SIZE
             elif slot == SHOT:
-                mesh, color, size = "bolt", "bolt", 0.2
+                laser = float(col["weapon"][0]) == LASER
+                mesh, color, size = "bolt", "laser" if laser else "bolt", 0.24 if laser else 0.2
             elif slot == ENEMY:
                 spinner = col["kind"][k] == SPINNER
                 mesh, color, size = ("ufo", "ufo", 0.55) if spinner else ("invader", "invader", 0.4)
             elif slot == BULLET:
                 mesh, color, size = "disc", "bullet", 0.13
+            elif slot == MISSILE_SLOT:
+                mesh, color, size = "rocket", "missile", 0.24
+            elif slot == PICKUP:
+                letter = {SPREAD_UP: "S", MULT_UP: "X", MISSILE_UP: "M", LASER_UP: "L"}.get(float(col["kind"][k]), "S")
+                mesh, color, size = letter, f"pickup_{letter}", 0.34
             else:
                 mesh, color, size = "disc", "star", 0.05
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
@@ -389,5 +514,7 @@ class BulletScroller(EntityGame):
         bullets = int(s.column("alive")[BULLETS[0]:BULLETS[1]].sum())
         seconds, calls = s.last_round
         head = "GAME OVER · R to restart" if lives <= 0 else f"lives {lives}"
+        weapon = {BASIC: "blaster", LASER: "laser", MISSILE: "missiles"}.get(float(s.column("weapon")[0]), "blaster")
+        head += f" · {weapon} x{1 + int(s.column('mult')[0])} fan {int(s.column('fan')[0])}"
         return (f"{head} · score {score} · {enemies} enemies · {bullets} bullets · "
                 f"tick {seconds * 1000:.0f} ms = {calls} law steps")

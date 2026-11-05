@@ -64,7 +64,9 @@ GAMES = ("space_invaders", "bullet_hell")
 def make_game(name: str):
     from meowdoku.invaders import SpaceInvaders
     from meowdoku.scroller import BulletScroller
-    return {"space_invaders": SpaceInvaders, "bullet_hell": BulletScroller}[name]("autopilot")
+    game = {"space_invaders": SpaceInvaders, "bullet_hell": BulletScroller}[name]("autopilot")
+    game.learns = False          # training / evaluation episodes are not play to learn from
+    return game
 
 
 # ------------------------------------------------------------------ features
@@ -831,6 +833,17 @@ DEMO_LEARNING: dict[str, bool] = {name: False for name in GAMES}
 LEARN_STATUS: dict[str, dict] = {name: {} for name in GAMES}
 _DEMO_SCORES: dict[str, list[float]] = {name: [] for name in GAMES}
 POST_EPOCHS, REPLAY_ROWS, MIN_ROWS = 4, 4096, 32
+#: The page's learning panel: the last HISTORY runs (score, kept or not) and
+#: training passes (loss), per game.
+HISTORY = 30
+LEARN_HISTORY: dict[str, list[dict]] = {name: [] for name in GAMES}
+TRAINING: dict[str, bool] = {name: False for name in GAMES}
+
+
+def _history(name: str, **entry) -> None:
+    rows = LEARN_HISTORY.setdefault(name, [])
+    rows.append({"at": time.strftime("%H:%M:%S"), **entry})
+    del rows[:-HISTORY]
 
 
 def human_records_path(game: str) -> Path:
@@ -881,6 +894,7 @@ class PlayTrace:
 def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: int = 0) -> None:
     """Fit the live policy on ``x -> y`` (plus replayed human rows), update
     it in place and save it.  Runs on its own thread."""
+    TRAINING[name] = True
     try:
         with LEARN_LOCK:
             live = _PILOT_WEIGHTS.get(name) or fitting_params(name)
@@ -911,10 +925,13 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
                 target[n] = fitted[n]          # the live pilots read this dict
             save_params(target, weights_path(name))
         LEARN_STATUS[name] = {"last": label, "rows": int(len(x)), "loss": round(loss, 4), "at": time.strftime("%H:%M:%S")}
+        _history(name, kind="trained", loss=round(loss, 5), rows=int(len(x)), label=label)
         print(f"[autopilot] {name}: post-trained on {label} ({len(x)} rows, loss {loss:.4f})", flush=True)
     except Exception as error:  # noqa: BLE001 - learning must never take the game down
         LEARN_STATUS[name] = {"last": f"failed: {type(error).__name__}: {str(error)[:80]}"}
         print(f"[autopilot] {name}: post-training failed: {error}", flush=True)
+    finally:
+        TRAINING[name] = False
 
 
 def finish_episode(game, trace: PlayTrace) -> None:
@@ -944,7 +961,10 @@ def finish_episode(game, trace: PlayTrace) -> None:
         scores = _DEMO_SCORES[name]
         baseline = float(np.mean(scores[-10:])) if scores else -1.0
         scores.append(score)
-        if not DEMO_LEARNING.get(name) or score < baseline:
+        kept = bool(DEMO_LEARNING.get(name)) and score >= baseline
+        if DEMO_LEARNING.get(name):
+            _history(name, kind="run", score=score, average=max(baseline, 0.0), kept=kept)
+        if not kept:
             LEARN_STATUS[name] = {**LEARN_STATUS.get(name, {}),
                                   "demo": f"demo run {score:.0f} vs average {max(baseline, 0):.0f}"
                                           + ("" if DEMO_LEARNING.get(name) else " (learning off)")}
@@ -964,4 +984,6 @@ def learning_summary(name: str) -> dict:
             _HUMAN_GAMES[name] = int(len(np.load(records)["episode_score"])) if records.exists() else 0
         except Exception:  # noqa: BLE001
             _HUMAN_GAMES[name] = 0
-    return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name], **LEARN_STATUS.get(name, {})}
+    return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name],
+            "training": bool(TRAINING.get(name)), "history": list(LEARN_HISTORY.get(name, ())),
+            **LEARN_STATUS.get(name, {})}

@@ -616,15 +616,28 @@ function arcadeEnabled() { const box = $("arcade"); return !box || box.checked; 
 // viewer's control for it is on.
 function layerOn(name) {
   const declared = !(state.game && state.game.scene && state.game.scene[name] === false);
-  const control = name === "arcade" ? $("arcade") : $("plate");
-  return declared && (!control || control.checked);
+  return declared && viewerWants(name === "arcade" ? "arcade" : "plate");
 }
-// Both default OFF; a viewer's own choice is remembered (new keys, so the
-// earlier default-on choices do not carry over).
-for (const [id, key] of [["arcade", "meowdoku_arcade2"], ["plate", "meowdoku_plate2"]]) {
+// The viewer's switch for a layer, PER GAME: a choice made in a game is kept
+// for that game; with none, the game's own preference (``scene_prefer``,
+// e.g. bullet hell's glowing plate and arcade lights) and otherwise off.
+function viewerWants(control) {
+  const game = state.game ? state.game.game : "";
+  try { const stored = localStorage.getItem(`meowdoku_${control}_${game}`); if (stored) return stored === "on"; } catch {}
+  const prefer = state.game && state.game.scene_prefer;
+  if (prefer) return control === "arcade" ? !!prefer.arcade : !!(prefer.glass || prefer.floor);
+  return false;
+}
+function syncLayerControls() {
+  for (const id of ["arcade", "plate"]) { const box = $(id); if (box) box.checked = viewerWants(id); }
+}
+// The switches show and set the current game's choice (see viewerWants).
+for (const id of ["arcade", "plate"]) {
   const box = $(id); if (!box) continue;
-  try { box.checked = localStorage.getItem(key) === "on"; } catch {}
-  box.addEventListener("change", () => { try { localStorage.setItem(key, box.checked ? "on" : "off"); } catch {} box.blur(); });
+  box.addEventListener("change", () => {
+    try { localStorage.setItem(`meowdoku_${id}_${state.game ? state.game.game : ""}`, box.checked ? "on" : "off"); } catch {}
+    box.blur();
+  });
 }
 // Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
 // chase.  When the game's declared score rises: a comet walks the ring with a
@@ -1176,7 +1189,7 @@ function entityModel(piece, now) {
   piece.h = far || step >= 1 ? th : ph + (th - ph) * step;
   return placeEntity(piece, now, x, z, mesh);
 }
-const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.55, 1.45];
+const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 function placeEntity(piece, now, x, z, mesh) {
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
@@ -1550,6 +1563,8 @@ function applyState(game) {
   if (game.text_board) $("position").textContent =
     `${game.turn} to move${game.check ? " (check)" : ""}${game.outcome ? ` · game over: ${game.outcome}` : ""}\n${game.text_board}`
     + (game.legal_uci && game.legal_uci.length ? `\nlegal: ${game.legal_uci.join(" ")}` : "");
+  drawLearnPanel(game);
+  syncLayerControls();
   if (game.learning) {
     const L = game.learning;
     $("demo-learn").textContent = L.demo_learning ? "Stop demo learning" : "Start demo learning";
@@ -1952,6 +1967,42 @@ for (const [id, name] of [["rise", "rise"], ["dive", "dive"]]) {
   const on = (e) => { e.preventDefault(); held.add(name); }, off = () => held.delete(name);
   button.addEventListener("pointerdown", on); button.addEventListener("pointerup", off);
   button.addEventListener("pointerleave", off); button.addEventListener("pointercancel", off);
+}
+// THE LEARNING PANEL: while demo learning is on, a pulsing badge (amber while
+// a training pass runs), bars for recent demo runs (green kept for training,
+// grey skipped under the running average), a line of training loss, and a
+// flash each time a pass completes.
+const learnView = { lastTrained: null, flashTimer: null };
+function drawLearnPanel(game) {
+  const L = game && game.learning, panel = $("learn-panel");
+  const on = !!(L && L.demo_learning);
+  panel.classList.toggle("show", on);
+  if (!on) return;
+  panel.classList.toggle("training", !!L.training);
+  const history = L.history || [], runs = history.filter((h) => h.kind === "run"), passes = history.filter((h) => h.kind === "trained");
+  const W = 220, H = 64, svg = [];
+  const top = Math.max(1, ...runs.map((r) => r.score));
+  const bw = W / Math.max(12, runs.length);
+  runs.forEach((r, i) => {
+    const h = Math.max(2, (r.score / top) * (H - 14));
+    svg.push(`<rect x="${(i * bw + 1).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${Math.max(1, bw - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${r.kept ? "#7cf7a6" : "#5a5a66"}"/>`);
+  });
+  if (passes.length > 1) {
+    const losses = passes.map((p) => Math.log10(Math.max(1e-6, p.loss))), lo = Math.min(...losses), hi = Math.max(...losses);
+    const pts = losses.map((v, i) => `${((i / (losses.length - 1)) * (W - 4) + 2).toFixed(1)},${(4 + (hi === lo ? 0.5 : (hi - v) / (hi - lo)) * (H - 22)).toFixed(1)}`);
+    svg.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="#ffd76a" stroke-width="1.5"/>`);
+  }
+  $("learn-chart").innerHTML = svg.join("");
+  const last = passes[passes.length - 1];
+  $("learn-text").textContent = `${runs.filter((r) => r.kept).length} of ${runs.length} demo runs kept`
+    + (last ? ` · last pass loss ${last.loss} on ${last.rows} rows (${last.at})` : " · waiting for a run to finish");
+  if (last && last.at !== learnView.lastTrained) {
+    if (learnView.lastTrained !== null) {
+      panel.classList.add("flash"); clearTimeout(learnView.flashTimer);
+      learnView.flashTimer = setTimeout(() => panel.classList.remove("flash"), 900);
+    }
+    learnView.lastTrained = last.at;
+  }
 }
 $("demo-learn").onclick = () => act({ type: "demo_learning", on: !(state.game && state.game.learning && state.game.learning.demo_learning) });
 $("arena-save").onclick = () => act({ type: "arena_save" });

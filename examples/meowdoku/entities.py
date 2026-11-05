@@ -249,13 +249,33 @@ class LawPiece:
         self._bound = tuple(columns[name] for name in self.argument_names)
         return ()
 
+    def __init_subclass__(cls, **kwargs):
+        """Capture the sources the product is a function of NOW, when the law
+        is defined: then disk and the code in memory agree.  Reading them at
+        compile time instead let a process that imported an older law hash
+        the newer file on disk and file its OLD law's product under the NEW
+        digest (a training run's workers did, one second after an edit)."""
+        super().__init_subclass__(**kwargs)
+        cls._captured_sources = cls._read_sources()
+
+    _captured_sources: str = ""
+
     def _sources(self) -> str:
-        """Everything the product is a function of: the law's module, the
-        engine helpers and motion law it calls, and the printer."""
+        """Everything the product is a function of, as captured when the law
+        was defined (see ``__init_subclass__``)."""
+        return type(self)._captured_sources or type(self)._read_sources()
+
+    @classmethod
+    def _read_sources(cls) -> str:
+        """The law's module, the engine helpers and motion law it calls, and
+        the printer."""
         import inspect
+        if cls.law is None:
+            return ""
         from src.common.tensors.accelerator_backends import tape_to_source
         from meowdoku import entity_motion
-        modules = (inspect.getmodule(type(self).law), sys.modules[__name__], entity_motion, tape_to_source)
+        law_module = sys.modules.get(getattr(cls.law, "__module__", "")) or inspect.getmodule(cls.law)
+        modules = (law_module, sys.modules[__name__], entity_motion, tape_to_source)
         return "\0".join(inspect.getsource(module) for module in modules)
 
     def compile(self, columns: dict[str, np.ndarray]) -> None:
@@ -263,8 +283,21 @@ class LawPiece:
             return
         import hashlib
         import importlib.util
+        import inspect
         digest = hashlib.sha256(self._sources().encode("utf-8")).hexdigest()[:16]
-        path = LAW_PRODUCTS / f"{self.entry}_{digest}.py"
+        # The product is also keyed by the law's argument list, and a product
+        # whose parameters differ from it is never used: a process running an
+        # OLDER law (a long-lived server, a training pool) that hashed the
+        # newer file on disk would otherwise file its old law's product under
+        # the new digest -- the live server did, with three columns missing.
+        signature = hashlib.sha256(",".join(self.argument_names).encode("utf-8")).hexdigest()[:8]
+        path = LAW_PRODUCTS / f"{self.entry}_{digest}_{signature}.py"
+        if path.exists():
+            spec = importlib.util.spec_from_file_location(f"meowdoku_law_check_{self.entry}_{digest}", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if tuple(inspect.signature(getattr(module, self.entry)).parameters) != tuple(self.argument_names):
+                path.unlink()                        # not this law's product: make it again
         if not path.exists():
             from src.common.tensors.autograd import autograd
             from src.common.tensors.numpy_backend import NumPyTensorOperations
@@ -350,7 +383,8 @@ class EntityGame(Game):
     def _trace(self, controls: dict, demo: bool) -> None:
         """Record one decision for learning (games with an autopilot only)."""
         from meowdoku.autopilot import FEATURE_FUNCTIONS, PlayTrace
-        if self.game not in FEATURE_FUNCTIONS or self.session.state is None or getattr(self, "_ended", False):
+        if (self.game not in FEATURE_FUNCTIONS or self.session.state is None or getattr(self, "_ended", False)
+                or not getattr(self, "learns", True)):
             return
         if getattr(self, "trace", None) is None:
             self.trace = PlayTrace()
