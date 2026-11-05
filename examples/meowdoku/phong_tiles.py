@@ -64,13 +64,15 @@ def _spectral():
     return scene_orders, BaseGLRenderer, MaterialDatabase
 
 
-def glyph_mesh(role: str) -> tuple[np.ndarray, np.ndarray]:
+def glyph_mesh(role: str, cap_grid: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """The role's glyph as triangles in the embed plane's own basis
     (x right, y up, z toward the viewer), centred, with per-face normals.
     Returns ``(verts (T, 3, 3), normals (T, 3))``."""
     scene_orders, _, _ = _spectral()
     package = tiles.tile_order_package(roles=(role,))
     job = scene_orders.resolved_jobs(package)[0]
+    if cap_grid is not None:                                            # see token_mesh
+        job["geometry"] = {**job["geometry"], "cap_grid": int(cap_grid)}
     planes = {str(plane["id"]): plane for plane in job["planes"]}
     plane = planes[str(job["geometry"].get("embed_plane", job["planes"][0]["id"]))]
     world = scene_orders._glyph_triangles(job, plane)                   # (T, 3, 3) world
@@ -94,7 +96,8 @@ def _rotation_y(angle: float) -> np.ndarray:
 
 
 def token_mesh(token: str, family: str, weight: str = "normal", *, depth_ratio: float = 0.32,
-               outline_subdivisions: int = 2, profile_segments: int = 1) -> tuple[np.ndarray, np.ndarray]:
+               outline_subdivisions: int = 2, profile_segments: int = 1,
+               cap_grid: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Any font token as a centred extruded mesh in its plane basis, through
     the same ink-on-slate order and glyph builder as the tiles.  Returns
     ``(verts (T, 3, 3), normals (T, 3))``."""
@@ -106,6 +109,11 @@ def token_mesh(token: str, family: str, weight: str = "normal", *, depth_ratio: 
         job["font"] = font.scene_order_mapping()
         geometry = {**job["geometry"], "extrusion_depth_ratio": float(depth_ratio),
                     "outline_subdivisions": int(outline_subdivisions), "profile_segments": int(profile_segments)}
+        if cap_grid is not None:
+            # The glyph builder's interior grid for the flat caps (its default
+            # 28): the simplification knob -- a flat cap needs no interior
+            # points beyond what the outline triangulation asks for.
+            geometry["cap_grid"] = int(cap_grid)
         geometry.pop("depth_m", None)
         if profile_segments <= 1:
             geometry["profile"] = "straight"

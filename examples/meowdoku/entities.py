@@ -428,6 +428,14 @@ class EntityGame(Game):
     #: own state: that is the keyframe the page eases to, so a disagreement
     #: is bounded, never interminable.
     ADOPT_BOUND = 1.0
+    #: Axes the game's own law moves the player along besides the motion law
+    #: (a side scroller shifts the whole world, the player too, in x).  The
+    #: page cannot know that shift, so its report is never adopted there.
+    SCROLL_AXES: tuple[str, ...] = ()
+
+    def adopt_axes(self) -> list[str]:
+        motion = self.motion() or {}
+        return [axis for axis in ("x", "y") if motion.get(axis) and axis not in self.SCROLL_AXES]
 
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
@@ -450,7 +458,9 @@ class EntityGame(Game):
             return
         if int(ship.get("seq", -1)) != self.ack or self.session.column("alive")[k] <= 0.0:
             return
-        axes = [(pos, vel) for axis, pos, vel in (("x", "x", "vx"), ("y", "y", "vy")) if motion.get(axis)]
+        axes = [(axis, "v" + axis) for axis in self.adopt_axes()]
+        if not axes:
+            return
         try:
             values = {name: float(ship[name]) for pos, vel in axes for name in (pos, vel)}
         except (KeyError, TypeError, ValueError):
@@ -515,7 +525,7 @@ class EntityGame(Game):
         st["autopilot"] = self.autopilot
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
-            st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, **(self.motion() or {})}
+            st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, "adopt_axes": self.adopt_axes(), **(self.motion() or {})}
             st["ack"] = self.ack
             st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
                          "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0),

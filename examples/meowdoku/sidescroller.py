@@ -445,6 +445,8 @@ class SideScroller(EntityGame):
     # A side view: the world stands on its own ground tiles, so no slab or
     # glass plate behind it.
     SCENE = {"floor": False, "glass": False, "arcade": True}
+    # The scroll shifts the player in x with the world: never adopt x from the page.
+    SCROLL_AXES = ("x",)
     PLAYER_LANE = 0
     HOSTILE_LANES = (WALKER_LANES,)
 

@@ -35,7 +35,8 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import tiles, tree  # noqa: E402
-from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh, token_mesh  # noqa: E402
+from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh  # noqa: E402
+from meowdoku.phong_tiles import token_mesh as _token_mesh  # noqa: E402
 from meowdoku.puzzle import generate_batch  # noqa: E402
 from meowdoku.tiles import SPECTRAL_ROOT  # noqa: E402
 
@@ -89,6 +90,19 @@ def largest_component(verts: np.ndarray, normals: np.ndarray) -> tuple[np.ndarra
     return np.ascontiguousarray(body, np.float32), np.ascontiguousarray(normals[keep], np.float32)
 
 
+#: SIMPLIFY FILTER for every exported glyph: the glyph builder's interior
+#: grid for the flat front and back caps (its default is 28).  A flat cap
+#: needs no interior points -- the outline carries the shape and the page's
+#: rounding moves only crease vertices -- so this cuts letters ~13x, chess
+#: pieces ~5x and emoji ~2.3x with the same silhouettes.
+CAP_GRID = 8
+
+
+def token_mesh(*args, **kwargs):
+    """``phong_tiles.token_mesh`` under the export's simplify filter."""
+    return _token_mesh(*args, cap_grid=CAP_GRID, **kwargs)
+
+
 def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
@@ -110,7 +124,7 @@ def export_assets(out: Path) -> dict:
         }
 
     for role in PHONG_MATERIALS:
-        verts, normals = glyph_mesh(role)
+        verts, normals = glyph_mesh(role, cap_grid=CAP_GRID)
         pack(role, verts, normals, material_index[role])
     # The other games' pieces: letters A-Z, the six chess pieces (the filled
     # glyphs U+265A..U+265F), a disc for checkers; DejaVu Sans has all of

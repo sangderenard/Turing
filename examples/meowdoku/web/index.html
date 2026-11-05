@@ -91,17 +91,17 @@
   <label class="meowdoku-only">Palette <select id="palette"></select></label>
   <button id="light">Light: sun (L)</button>
   <button id="flat">Flat (V)</button>
-  <label title="Soft bodies: pieces shear, squash and twist as they move"><input id="wobble" type="checkbox" checked> Wobble</label>
+  <label title="Soft bodies: pieces shear, squash and twist as they move"><input id="wobble" type="checkbox"> Wobble</label>
   <label title="Spring stiffness of the soft bodies; lower is also less damped, so soft pieces jiggle longer">Stiff <input id="wobble-k" type="range" min="0.5" max="16" step="0.25" value="8"></label>
   <label id="wobble-gpu-label" style="display:none"><input id="wobble-gpu" type="checkbox"> WebGPU</label>
   <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
-  <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
-  <label>Round <input id="round" type="range" min="0" max="4" value="2"></label>
-  <label>Crease <input id="crease" type="range" min="0" max="90" value="40"></label>
+  <label>Saturation <input id="saturation" type="range" min="0" max="200" value="200"></label>
+  <label>Round <input id="round" type="range" min="0" max="4" value="4"></label>
+  <label>Crease <input id="crease" type="range" min="0" max="90" value="90"></label>
   <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
   <button id="scores-toggle">Scores</button>
-  <label title="The pinball ring of coloured lights around the board: off removes the bulbs and their light from the scene and brings the house light back up">Arcade lights <input id="arcade" type="checkbox" checked></label>
-  <label title="The slab and glass plate under the board; off removes them from the scene (a game may also leave them out)">Plate <input id="plate" type="checkbox" checked></label>
+  <label title="The pinball ring of coloured lights around the board: off removes the bulbs and their light from the scene and brings the house light back up">Arcade lights <input id="arcade" type="checkbox"></label>
+  <label title="The slab and glass plate under the board; off removes them from the scene (a game may also leave them out)">Plate <input id="plate" type="checkbox"></label>
   <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
   <button id="fullscreen">Fullscreen (F)</button>
   <span id="status">loading…</span>

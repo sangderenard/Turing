@@ -238,7 +238,7 @@ function uploadMesh(mesh) {
 
 // Client-side corner rounding of the extruded glyph meshes: weld, crease-angle smooth
 // normals, Taubin smoothing of crease vertices only.  Server meshes stay flat.
-const roundParams = { iters: 2, creaseDeg: 40 };
+const roundParams = { iters: 4, creaseDeg: 90 };      // defaults: fully rounded and creased
 function roundMesh(mesh, iters, creaseDeg) {
   const P0 = mesh.positions, T = P0.length / 9, N0 = mesh.normals;
   if (!T || (P0.length % 9)) return mesh;
@@ -385,7 +385,7 @@ Object.assign(state, {
   pieces: new Map(),                // id -> live piece
   buttons: null, rackButtons: null, glass: null,
   materialIndex: {},                // palette name (and name@hint / name@sel) -> material id
-  saturation: 1.0, tiltDeg: 90, time: 0,
+  saturation: 2.0, tiltDeg: 90, time: 0,              // default: fully saturated
   debug: { shadows: true, exposure: 0.42 },
 });
 const TILE = { height: 0.16, inset: 0.11, gap: 0.03 };
@@ -619,9 +619,11 @@ function layerOn(name) {
   const control = name === "arcade" ? $("arcade") : $("plate");
   return declared && (!control || control.checked);
 }
-for (const [id, key] of [["arcade", "meowdoku_arcade"], ["plate", "meowdoku_plate"]]) {
+// Both default OFF; a viewer's own choice is remembered (new keys, so the
+// earlier default-on choices do not carry over).
+for (const [id, key] of [["arcade", "meowdoku_arcade2"], ["plate", "meowdoku_plate2"]]) {
   const box = $(id); if (!box) continue;
-  try { box.checked = localStorage.getItem(key) !== "off"; } catch {}
+  try { box.checked = localStorage.getItem(key) === "on"; } catch {}
   box.addEventListener("change", () => { try { localStorage.setItem(key, box.checked ? "on" : "off"); } catch {} box.blur(); });
 }
 // Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
@@ -857,13 +859,16 @@ function reconcile(game) {
   // disagreement past the tolerance hands control back -- the server's
   // replay becomes the ship and the difference is eased away, never jumped.
   // Axes the motion law does not declare are the server's alone.
-  const declared = [["x", "vx"], ["y", "vy"]].filter(([pos]) => game.predict[pos]);
+  // Only axes the game will adopt are the page's to keep; a scrolled axis is
+  // still stepped here by the motion law, but from the server's state.
+  const adoptable = game.predict.adopt_axes || ["x", "y"];
+  const declared = [["x", "vx"], ["y", "vy"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos])) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
   if (pred.ship && error <= tolerance) {
     for (const [pos, vel] of declared) { ship[pos] = pred.ship[pos]; ship[vel] = pred.ship[vel]; }
     // The server's own axes still move only on its word -- eased, not jumped.
-    if (before) ["x", "y"].forEach((pos, i) => { if (!game.predict[pos]) pred.offset[i] += before[i] - ship[pos]; });
+    if (before) ["x", "y"].forEach((pos, i) => { if (!declared.some(([p]) => p === pos)) pred.offset[i] += before[i] - ship[pos]; });
     syncFaithfulness(0);
   } else if (before) {
     pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
@@ -1226,7 +1231,7 @@ function pieceModel(piece, now) {
 // per-slot parameter block P (16 floats) and keep D (offsets) and U (rates).
 const WOB_CAP = 512, WOB_TAU = 0.02, WOB_DMAX = 0.45, WOB_GAIN = 0.3, WOB_ZETA = 0.22;
 const wob = {
-  on: true, useGpu: false, freq: 8, frameNo: 0, lastNow: null, hi: -1,
+  on: false, useGpu: false, freq: 8, frameNo: 0, lastNow: null, hi: -1,   // wobble off by default
   D: new Float32Array(WOB_CAP * 24), U: new Float32Array(WOB_CAP * 24), P: new Float32Array(WOB_CAP * 16),
   owner: new Array(WOB_CAP).fill(null), touched: new Int32Array(WOB_CAP), resetFrame: new Int32Array(WOB_CAP),
   free: Array.from({ length: WOB_CAP }, (_, i) => WOB_CAP - 1 - i), gpu: null, gpuState: "off", resetAll: false,
