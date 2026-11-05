@@ -4853,8 +4853,13 @@ def propagate_repository_ssa_call_metadata(
         source_function: Any = None,
         source_owner: Any = None,
         tensor_contract_override: Mapping[str, Any] | None = None,
+        contract_cause: Any = None,
         stage: str = "repository_ssa_enrichment",
     ) -> bool:
+        # ``contract_cause`` is the booked row ``tensor_contract_override``
+        # was read from (a TENSOR_METADATA_RESULT_BINDING for a call result).
+        # The override can turn the target's metadata dynamic; that row is
+        # then the exact cause of the transport edge's revision and is cited.
         # An accepted SSA component is an immutable transaction.  Its caller
         # may read its exact rows through the retained owner book, but cannot
         # revise its values or descriptors in the ambient compilation book.
@@ -5456,6 +5461,10 @@ def propagate_repository_ssa_call_metadata(
                         # transport changed it) is a source of this edge.
                         target_value_cell,
                         elementwise_geometry_cause,
+                        # The result binding whose caller-side metadata ids
+                        # the override carried: when the transported contract
+                        # turns dynamic through it, it is that change's cause.
+                        contract_cause,
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
                         _frame_cite(
@@ -6112,14 +6121,20 @@ def propagate_repository_ssa_call_metadata(
                             from .concordance_declarations import (
                                 TENSOR_METADATA_RESULT_BINDING,
                             )
-                            binding = enrichment_book.page(
-                                TENSOR_METADATA_RESULT_BINDING
-                            ).latest((
+                            binding_row = (
                                 function_scope_of(function),
                                 int(instruction.res.id),
                                 str(callee_name),
                                 int(output_id),
-                            ))
+                            )
+                            binding = enrichment_book.page(
+                                TENSOR_METADATA_RESULT_BINDING
+                            ).latest(binding_row)
+                            binding_cause = (
+                                enrichment_book.latest_ref(
+                                    TENSOR_METADATA_RESULT_BINDING, binding_row,
+                                ) if binding is not None else None
+                            )
                             if binding is not None:
                                 result_override = dict(zip((
                                     "tensor_shape_value_id",
@@ -6135,6 +6150,7 @@ def propagate_repository_ssa_call_metadata(
                                 ),
                                 source_owner=callee,
                                 tensor_contract_override=result_override,
+                                contract_cause=binding_cause,
                             )
                             if not authoritative_returns and binding is None:
                                 changed |= enrich(
