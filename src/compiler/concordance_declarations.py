@@ -4644,6 +4644,23 @@ TENSOR_RUNTIME_VIEW_GEOMETRY = declare_page("tensor_runtime_view_geometry", (
     RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
     RowField("result", K.VALUE_ID),
 ), tuple)                              # DERIVED(SSA values/axis transform); CONCORD
+#: A source tensor's omitted-start/unit-step prefix Slice is projected to its
+#: authored scalar upper bound before numerical region captures are formed.
+#: Fact is (source tensor id, authored Slice id, upper bound id).  The Slice
+#: keeps its own source identity; the scalar becomes the region feed.
+SOURCE_TENSOR_PREFIX_SLICE = declare_page("source_tensor_prefix_slice", (
+    RowField("lexical_scope", K.SCOPE), RowField("result", K.VALUE_ID),
+), tuple)                              # DERIVED(source Slice/operand/ABI); CONCORD
+#: Runtime execution of that authored prefix changes the view's first extent
+#: and element count while retaining its source data pointer. Fact is
+#: (source, source Slice, upper, source shape/rank/count, axis-zero extent,
+#: normalized upper, result shape/rank/count).  All members are live SSA IDs.
+TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY = declare_page(
+    "tensor_runtime_prefix_slice_geometry", (
+        RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+        RowField("result", K.VALUE_ID),
+    ), tuple,
+)                                    # DERIVED(recipe/SSA/descriptor); CONCORD
 #: A binary result's positive-rank runtime broadcast. Fact names the
 #: ordered data operands, their shape/rank/count IDs, the aligned right
 #: shape, output shape/rank/count, helper status, helper callee, and guarded

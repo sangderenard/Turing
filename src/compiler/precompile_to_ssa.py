@@ -32149,6 +32149,170 @@ def lower_control_sections_to_ssa(
                     and int(instr.res.id) not in authored_output_value_ids
                 )
             ]
+            # Program: current_membership[:selected_count].  The authored
+            # Slice is a source recipe, not a third public parameter.  Its
+            # PROCESS_GRAPH_OPERANDS upper edge names the scalar region feed;
+            # keep the Slice's distinct identity in a concordance receipt.
+            if lexical_read_scope is not None:
+                from .concordance_declarations import (
+                    CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
+                    SOURCE_TENSOR_PREFIX_SLICE, VALUE_TYPE_ABI,
+                )
+                from .identity_concordance import (
+                    SHAPE_STATE_PAGE, _canonical_identity_base,
+                )
+
+                _read_scope = tuple(lexical_read_scope)
+                for _indexed in instructions:
+                    if (
+                        str(_indexed.op).casefold() != "indexed"
+                        or _indexed.res is None
+                        or len(_indexed.args) != 2
+                    ):
+                        continue
+                    _source, _selector = _indexed.args
+                    _slice_id = int(_selector.id)
+                    _description = (source_value_descriptions or {}).get(
+                        _slice_id, {}
+                    )
+                    if not (
+                        _description.get("construct") == "Slice"
+                        and _description.get("slice_lower_omitted") is True
+                        and _description.get("slice_step_omitted") is True
+                    ):
+                        continue
+                    _operands_ref = _book().latest_ref(
+                        PROCESS_GRAPH_OPERANDS, (_read_scope, _slice_id),
+                    )
+                    _operands = (
+                        None if _operands_ref is None else
+                        _book().page(PROCESS_GRAPH_OPERANDS).cell(
+                            _operands_ref.row, _operands_ref.column,
+                        )
+                    )
+                    if not (
+                        isinstance(_operands, tuple)
+                        and len(_operands) == 1
+                        and _operands[0][1] == "upper"
+                        and isinstance(_operands[0][0], Ref)
+                        and _operands[0][0].page == CANONICAL_VALUE
+                    ):
+                        continue
+                    _authored_upper = _operands[0][0]
+                    _upper_id = int(_authored_upper.row[1])
+                    _upper_ref = _book().latest_ref(
+                        CANONICAL_VALUE, (_read_scope, _upper_id),
+                    )
+                    _slice_ref = _book().latest_ref(
+                        CANONICAL_VALUE, (_read_scope, _slice_id),
+                    )
+                    _source_ref = _book().latest_ref(
+                        CANONICAL_VALUE, (_read_scope, int(_source.id)),
+                    )
+                    _result_ref = _book().latest_ref(
+                        CANONICAL_VALUE,
+                        (_read_scope, int(_indexed.res.id)),
+                    )
+                    _result_shape_ref = (
+                        _book().latest_ref(
+                            SHAPE_STATE_PAGE,
+                            (shape_scope, int(_indexed.res.id)),
+                        ) if shape_scope is not None else None
+                    )
+                    _result_shape = (
+                        None if _result_shape_ref is None else
+                        _book().page(SHAPE_STATE_PAGE).cell(
+                            _result_shape_ref.row,
+                            _result_shape_ref.column,
+                        )
+                    )
+                    _index_operands_ref = _book().latest_ref(
+                        PROCESS_GRAPH_OPERANDS,
+                        (_read_scope, int(_indexed.res.id)),
+                    )
+                    _index_operands = (
+                        None if _index_operands_ref is None else
+                        _book().page(PROCESS_GRAPH_OPERANDS).cell(
+                            _index_operands_ref.row,
+                            _index_operands_ref.column,
+                        )
+                    )
+                    _abi_ref = _book().latest_ref(
+                        VALUE_TYPE_ABI, (_read_scope, _upper_id),
+                    )
+                    _abi = (
+                        None if _abi_ref is None else
+                        _book().page(VALUE_TYPE_ABI).cell(
+                            _abi_ref.row, _abi_ref.column,
+                        )
+                    )
+                    _arms = tuple(getattr(_abi, "physical_alternatives", ()))
+                    if not (
+                        _source_ref is not None
+                        and _slice_ref is not None
+                        and _result_ref is not None
+                        and isinstance(_result_shape, tuple)
+                        and len(_result_shape) >= 2
+                        and _result_shape[0] == "resolved"
+                        and isinstance(_result_shape[1], tuple)
+                        and len(_result_shape[1]) >= 4
+                        and _result_shape[1][2] is not None
+                        and int(_result_shape[1][2]) >= 1
+                        and str(_result_shape[1][1]) in {
+                            "bool", "int64", "float64", "float32",
+                        }
+                        and isinstance(_index_operands, tuple)
+                        and len(_index_operands) == 2
+                        and tuple(role for _cell, role in _index_operands)
+                        == ("base", "index")
+                        and all(
+                            isinstance(_cell, Ref)
+                            and _cell.page == CANONICAL_VALUE
+                            and _canonical_identity_base(_book(), _cell)
+                            == _canonical_identity_base(_book(), expected)
+                            for (_cell, _role), expected in zip(
+                                _index_operands,
+                                (_source_ref, _slice_ref), strict=True,
+                            )
+                        )
+                        and _upper_ref is not None
+                        and _canonical_identity_base(
+                            _book(), _authored_upper,
+                        ) == _canonical_identity_base(_book(), _upper_ref)
+                        and len(_arms) == 1
+                        and _arms[0].storage == "scalar"
+                        and _arms[0].dtype == "int64"
+                        and _arms[0].rank == 0
+                        and tuple(_arms[0].shape) == ()
+                    ):
+                        continue
+                    _slice_cell = _book().post(
+                        SOURCE_TENSOR_PREFIX_SLICE,
+                        (_read_scope, int(_indexed.res.id)),
+                        (int(_source.id), _slice_id, _upper_id),
+                        stage=CONTROL_SSA_REGION,
+                        provenance=Derived(tuple(dict.fromkeys((
+                            _source_ref, _slice_ref, _result_ref,
+                            _result_shape_ref,
+                            _index_operands_ref, _operands_ref,
+                            _authored_upper, _upper_ref,
+                            _abi_ref, *_arms[0].source_cells,
+                        )))),
+                        mode=Mode.CONCORD,
+                    )
+                    _indexed.args[1] = SSAValue(
+                        _upper_id, dtype="int64", shape=(),
+                        accounting={
+                            "source_tensor_prefix_slice": _slice_id,
+                            "program_abi_storage": "scalar",
+                            "program_abi_rank": 0,
+                            "physical_dtype": "int64",
+                        },
+                    )
+                    _indexed.attributes = {
+                        **dict(_indexed.attributes or {}),
+                        "source_tensor_prefix_slice_cell": _slice_cell,
+                    }
             produced = {
                 int(instr.res.id)
                 for instr in instructions
@@ -32328,6 +32492,9 @@ def lower_control_sections_to_ssa(
                         or (argument.accounting or {}).get(
                             "tensor_metadata_state"
                         ) == "dynamic"
+                        or "source_tensor_prefix_slice" in (
+                            argument.accounting or {}
+                        )
                     )
                 )
                 contracts = {
@@ -32554,6 +32721,9 @@ def lower_control_sections_to_ssa(
                     for cell in (
                         (instruction.attributes or {}).get(
                             "numerical_constructor_dimension_cell"
+                        ),
+                        (instruction.attributes or {}).get(
+                            "source_tensor_prefix_slice_cell"
                         ),
                     )
                     if isinstance(cell, Ref)

@@ -1159,6 +1159,7 @@ def publish_computed_region_result_metadata(
         TENSOR_METADATA_RESULT_BINDING, TENSOR_METADATA_CALL_BINDING,
         TENSOR_RUNTIME_RESHAPE_VALIDITY,
         TENSOR_RUNTIME_VIEW_GEOMETRY,
+        TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
         TENSOR_SSA_LOWERING,
     )
     from .identity_concordance import Derived, Mode
@@ -1212,15 +1213,6 @@ def publish_computed_region_result_metadata(
         actual_ids = tuple(int(value.id) for value in metadata_actuals)
         if len(actual_ids) != len(keys):
             return False
-        selected = tuple(
-            tuple(dict.fromkeys(
-                pair for pair in booked_pairs if pair[0] == actual_id
-            ))
-            for actual_id in actual_ids
-        )
-        if (any(len(pairs) != 1 for pairs in selected)
-                or any(pairs[0] not in live_pairs for pairs in selected)):
-            return False
         if not local_ids:
             tensor_formals = tuple(
                 formal for formal in target.args
@@ -1249,10 +1241,14 @@ def publish_computed_region_result_metadata(
                     return False
         if local_ids:
             if (len(local_ids) != len(keys)
-                    or any(value_id is None for value_id in local_ids)
-                    or tuple(pairs[0][1] for pairs in selected)
-                    != tuple(map(int, local_ids))):
+                    or any(value_id is None for value_id in local_ids)):
                 return False
+        # One shape/rank/count actual can feed several tensor formals. Its
+        # exact target ports, not uniqueness of the caller value across the
+        # whole signature, identify this tensor's geometry binding.
+        selected = tuple(zip(actual_ids, map(int, local_ids), strict=True))
+        if any(pair not in booked_pairs or pair not in live_pairs for pair in selected):
+            return False
         # In compact_codewords region6 -> region8, aggregate passthrough
         # replaces metadata Call actuals 6687/6690/6693 with 6449/6452/6455
         # while feed_ids retains the canonical source identities. The revised
@@ -1363,6 +1359,9 @@ def publish_computed_region_result_metadata(
                 proof = (
                     book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, view_row)
                     or book.latest_ref(TENSOR_RUNTIME_VIEW_GEOMETRY, view_row)
+                    or book.latest_ref(
+                        TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY, view_row,
+                    )
                 )
                 source_id = (
                     int(book.page(TENSOR_RUNTIME_VIEW_GEOMETRY).cell(
@@ -1370,6 +1369,11 @@ def publish_computed_region_result_metadata(
                     )[1])
                     if proof is not None
                     and proof.page == TENSOR_RUNTIME_VIEW_GEOMETRY
+                    else int(book.page(
+                        TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+                    ).cell(proof.row, proof.column)[0])
+                    if proof is not None
+                    and proof.page == TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY
                     else int(output.id)
                 )
                 source_descriptor = table.by_id(source_id)
@@ -4633,6 +4637,35 @@ def _booked_static_view_rebinding(
     ) for cell in (source_cell, target_cell))
 
 
+def _matching_elementwise_metadata_cause(
+    book: Any, function: Any, value_id: int,
+    accounting: Mapping[str, Any],
+) -> Any:
+    """Read this result's booked runtime extent, never another value's."""
+
+    from .concordance_declarations import TENSOR_ELEMENTWISE_EXTENT_BINDING
+    from .ssa_record_return_state import function_scope_of
+
+    if accounting.get("tensor_metadata_state") != "dynamic":
+        return None
+    row = (function_scope_of(function), function.name, int(value_id))
+    cell = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, row)
+    if cell is None:
+        return None
+    fact = book.page(TENSOR_ELEMENTWISE_EXTENT_BINDING).cell(
+        cell.row, cell.column,
+    )
+    metadata = tuple(accounting.get(key) for key in (
+        "tensor_shape_value_id", "tensor_rank_value_id",
+        "tensor_element_count_value_id",
+    ))
+    return (
+        cell if isinstance(fact, tuple) and len(fact) in (5, 6)
+        and all(type(value_id) is int for value_id in metadata)
+        and tuple(fact[-3:]) == metadata else None
+    )
+
+
 def propagate_repository_ssa_call_metadata(
     module: IRModule, *, authoritative_returns: bool = False,
 ) -> bool:
@@ -5364,6 +5397,12 @@ def propagate_repository_ssa_call_metadata(
                 # value to itself; a self-edge would invent a second shape
                 # writer with no distinct source cell.
                 continue
+            # Only this value's exact booked extent triple can cause a
+            # static-to-dynamic metadata edge. A receipt for another result
+            # or another set of metadata IDs cannot revise its shape row.
+            elementwise_geometry_cause = _matching_elementwise_metadata_cause(
+                book, function, int(value.id), target_accounting,
+            )
             shape_transformation_records.append((
                 (
                     shape_scope_of(_shape_source_owner),
@@ -5416,6 +5455,7 @@ def propagate_repository_ssa_call_metadata(
                         # its ``ssa_value`` cell (revised above when the
                         # transport changed it) is a source of this edge.
                         target_value_cell,
+                        elementwise_geometry_cause,
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
                         _frame_cite(
@@ -7423,7 +7463,51 @@ def lower_tensor_calls_to_repository_ssa(
             tensor_id = int(value.id)
             existing = tensor_table.by_id(tensor_id)
             if existing is not None:
-                if alias_proof is not None:
+                from .concordance_declarations import SOURCE_TENSOR_PREFIX_SLICE
+                from .identity_concordance import Ref
+                if (
+                    isinstance(alias_proof, Ref)
+                    and alias_proof.page == SOURCE_TENSOR_PREFIX_SLICE
+                ):
+                    _slice_fact = book.page(SOURCE_TENSOR_PREFIX_SLICE).cell(
+                        alias_proof.row, alias_proof.column,
+                    )
+                    _source_owner = (
+                        tensor_table.by_id(int(alias_of))
+                        if alias_of is not None else None
+                    )
+                    if not (
+                        book.latest_ref(
+                            SOURCE_TENSOR_PREFIX_SLICE,
+                            (alias_proof.row[0], tensor_id),
+                        ) == alias_proof
+                        and isinstance(_slice_fact, tuple)
+                        and len(_slice_fact) == 3
+                        and _slice_fact[0] == alias_of
+                        and _source_owner is not None
+                        and _source_owner.data_value_id == data_value_id
+                        and existing.storage == "output"
+                        and existing.data_value_id == tensor_id
+                        and existing.alias_of is None
+                        and existing.heap_owner_value_id is None
+                        and existing.dtype == _source_owner.dtype
+                        and existing.element_count_value_id is None
+                    ):
+                        raise ValueError(
+                            "runtime prefix slice conflicts with incumbent tensor storage"
+                        )
+                    existing = dataclasses.replace(
+                        existing, storage="view",
+                        alias_of=_source_owner.tensor_id,
+                        data_value_id=_source_owner.data_value_id,
+                        arena_id=_source_owner.arena_id,
+                        allocation_owner=_source_owner.allocation_owner,
+                        owns_allocation=False,
+                        element_offset=_source_owner.element_offset,
+                        byte_offset=_source_owner.byte_offset,
+                    )
+                    tensor_table.tensors[tensor_id] = existing
+                elif alias_proof is not None:
                     # _ascending_order's ensure_tensor requested view20 of
                     # raw19 after a placeholder output20 already existed.
                     # Returning that placeholder left data20 independently
@@ -9192,6 +9276,332 @@ def lower_tensor_calls_to_repository_ssa(
                 emitted: list[Instr] = []
 
                 if operation in {"basic_index", "basic_index_store"}:
+                    _prefix_ref = instruction.attributes.get(
+                        "source_tensor_prefix_slice_cell"
+                    )
+                    if operation == "basic_index" and _prefix_ref is not None:
+                        from .concordance_declarations import (
+                            SOURCE_TENSOR_PREFIX_SLICE,
+                            TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+                            TENSOR_SSA_LOWERING,
+                        )
+                        from .identity_concordance import Derived, Mode, Ref
+                        from .ssa_call_input_adapters import (
+                            _numeric_conversion_attributes,
+                        )
+                        from .ssa_record_return_state import (
+                            function_scope_of, posted_ssa_value_fact,
+                            revise_ssa_value, ssa_value_identity_cell,
+                        )
+
+                        _recipe = (
+                            book.page(SOURCE_TENSOR_PREFIX_SLICE).cell(
+                                _prefix_ref.row, _prefix_ref.column,
+                            ) if isinstance(_prefix_ref, Ref)
+                            and _prefix_ref.page == SOURCE_TENSOR_PREFIX_SLICE
+                            else None
+                        )
+                        if not (
+                            len(args) == 2 and result is not None
+                            and isinstance(_recipe, tuple)
+                            and len(_recipe) == 3
+                            and _recipe[0] == int(args[0].id)
+                            and _recipe[2] == int(args[1].id)
+                            and _prefix_ref.row[1] == int(result.id)
+                            and book.latest_ref(
+                                SOURCE_TENSOR_PREFIX_SLICE,
+                                _prefix_ref.row,
+                            ) == _prefix_ref
+                        ):
+                            raise ValueError(
+                                "runtime prefix slice has no exact authored recipe"
+                            )
+                        _source, _upper = args
+                        _source_cell = ssa_value_identity_cell(
+                            function, int(_source.id), book=book,
+                        )
+                        _upper_cell = ssa_value_identity_cell(
+                            function, int(_upper.id), book=book,
+                        )
+                        _source_fact = posted_ssa_value_fact(
+                            function, int(_source.id), book=book,
+                        )
+                        _upper_fact = posted_ssa_value_fact(
+                            function, int(_upper.id), book=book,
+                        )
+                        _result_fact = posted_ssa_value_fact(
+                            function, int(result.id), book=book,
+                        )
+                        if not (
+                            _source_cell is not None
+                            and _upper_cell is not None
+                            and _source_fact is not None
+                            and _source_fact.storage == "span"
+                            and _source_fact.physical_dtype in {
+                                "int64", "float64",
+                            }
+                            and _source_fact.rank is not None
+                            and _source_fact.rank >= 1
+                            and _upper_fact is not None
+                            and _upper_fact.physical_dtype == "int64"
+                            and _upper_fact.storage == "scalar"
+                            and _upper_fact.rank == 0
+                            and _result_fact is not None
+                            and _result_fact.dtype == _source_fact.dtype
+                            and _result_fact.rank == _source_fact.rank
+                            and _result_fact.physical_dtype is None
+                        ):
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "runtime prefix slice lacks typed source, "
+                                "scalar upper, or rank-preserving result proof",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                        _source_descriptor = register_tensor(
+                            _source,
+                            storage=("input" if int(_source.id)
+                                     in function_argument_ids else "temporary"),
+                        )
+                        _source_metadata = ensure_dynamic(prefix, _source)
+                        _rank = int(_source_fact.rank)
+                        _scalar32 = {
+                            "physical_dtype": "int32", "storage": "scalar",
+                            "rank": 0,
+                        }
+                        _scalar64 = {
+                            "physical_dtype": "int64", "storage": "scalar",
+                            "rank": 0,
+                        }
+                        _axis_extent = dim_extent(prefix, _source, 0)
+                        _extent64 = fresh(dtype="int64", physical=_scalar64)
+                        _zero64, _zero_def = constant(
+                            0, "int64", physical=_scalar64,
+                        )
+                        _negative = fresh(dtype="bool", physical={
+                            "physical_dtype": "bool", "storage": "scalar",
+                            "rank": 0,
+                        })
+                        _negative_offset = fresh(
+                            dtype="int64", physical=_scalar64,
+                        )
+                        _relative = fresh(dtype="int64", physical=_scalar64)
+                        _normalized = fresh(dtype="int64", physical=_scalar64)
+                        _nonnegative = fresh(dtype="int64", physical=_scalar64)
+                        _clipped64 = fresh(dtype="int64", physical=_scalar64)
+                        _clipped = fresh(dtype="int32", physical=_scalar32)
+                        prefix.extend((
+                            _zero_def,
+                            Instr("Cast", [_axis_extent], _extent64,
+                                  attributes={
+                                      **_numeric_conversion_attributes(
+                                          "int32", "int64"),
+                                      "source_dtype": "int32",
+                                      "target_dtype": "int64",
+                                      "binding": "prefix-slice-axis-extent",
+                                  }),
+                            Instr("Lt", [_upper, _zero64], _negative),
+                            # INT64_MAX is a valid positive bound. Select zero
+                            # on that arm before Add, so even its discarded
+                            # relative value has defined int64 arithmetic.
+                            Instr("Select", [_negative, _upper, _zero64],
+                                  _negative_offset),
+                            Instr("Add", [_negative_offset, _extent64],
+                                  _relative),
+                            Instr("Select", [_negative, _relative, _upper],
+                                  _normalized),
+                            Instr("Max", [_normalized, _zero64],
+                                  _nonnegative),
+                            Instr("Min", [_nonnegative, _extent64],
+                                  _clipped64),
+                            Instr("Cast", [_clipped64], _clipped,
+                                  attributes={
+                                      **_numeric_conversion_attributes(
+                                          "int64", "int32"),
+                                      "source_dtype": "int64",
+                                      "target_dtype": "int32",
+                                      "binding": "prefix-slice-clipped-count",
+                                  }),
+                        ))
+                        _shape, _shape_def = int_vector(
+                            (0,) * _rank, physical={
+                                "physical_dtype": "int32", "storage": "span",
+                                "rank": 1,
+                            },
+                        )
+                        prefix.append(_shape_def)
+                        _dimensions = []
+                        _geometry_values = [
+                            _source_metadata["shape"],
+                            _source_metadata["rank"],
+                            _source_metadata["element_count"],
+                            _axis_extent, _negative_offset, _clipped64, _shape,
+                        ]
+                        for _axis in range(_rank):
+                            _extent = (
+                                _clipped if _axis == 0
+                                else dim_extent(prefix, _source, _axis)
+                            )
+                            _index, _index_def = constant(
+                                _axis, "int64", physical=_scalar64,
+                            )
+                            _address = fresh(dtype="ptr")
+                            prefix.extend((
+                                _index_def,
+                                Instr("GetElementPtr", [_shape, _index],
+                                      _address,
+                                      attributes={"binding": "prefix-slice-shape"}),
+                                Instr("Store", [_extent, _address], None,
+                                      attributes={"binding": "prefix-slice-shape"}),
+                            ))
+                            _geometry_values.extend((_extent, _index, _address))
+                            _dimensions.append(_extent)
+                        # A later empty dimension must zero the entire view before
+                        # any earlier wide product is narrowed to an int32 count.
+                        # Use the same checked count program as runtime topk.
+                        _zero32, _zero32_def = constant(
+                            0, "int32", physical=_scalar32,
+                        )
+                        _one32, _one32_def = constant(
+                            1, "int32", physical=_scalar32,
+                        )
+                        prefix.extend((_zero32_def, _one32_def))
+                        _geometry_values.extend((_zero32, _one32))
+                        _empty = None
+                        for _dimension in _dimensions:
+                            _is_zero = fresh(dtype="bool", physical={
+                                "physical_dtype": "bool", "storage": "scalar",
+                                "rank": 0,
+                            })
+                            prefix.append(Instr(
+                                "Eq", [_dimension, _zero32], _is_zero,
+                            ))
+                            _geometry_values.append(_is_zero)
+                            if _empty is None:
+                                _empty = _is_zero
+                            else:
+                                _either = fresh(dtype="bool", physical={
+                                    "physical_dtype": "bool", "storage": "scalar",
+                                    "rank": 0,
+                                })
+                                prefix.append(Instr(
+                                    "LOr", [_empty, _is_zero], _either,
+                                ))
+                                _empty = _either
+                                _geometry_values.append(_either)
+                        _count = fresh(dtype="int32", physical=_scalar32)
+                        prefix.append(Instr(
+                            "Select", [_empty, _zero32, _one32], _count,
+                        ))
+                        _geometry_values.append(_count)
+                        for _dimension in _dimensions:
+                            _widened_count = fresh(
+                                dtype="int64", physical=_scalar64,
+                            )
+                            _widened_dimension = fresh(
+                                dtype="int64", physical=_scalar64,
+                            )
+                            _product = fresh(dtype="int64", physical=_scalar64)
+                            _narrowed = fresh(dtype="int32", physical=_scalar32)
+                            prefix.extend((
+                                Instr("Cast", [_count], _widened_count,
+                                      attributes={"source_dtype": "int32",
+                                                  "target_dtype": "int64"}),
+                                Instr("Cast", [_dimension], _widened_dimension,
+                                      attributes={"source_dtype": "int32",
+                                                  "target_dtype": "int64"}),
+                                Instr("Mul", [_widened_count,
+                                              _widened_dimension], _product),
+                                Instr("Cast", [_product], _narrowed,
+                                      attributes={
+                                          **_numeric_conversion_attributes(
+                                              "int64", "int32"),
+                                          "source_dtype": "int64",
+                                          "target_dtype": "int32",
+                                      }),
+                            ))
+                            _geometry_values.extend((
+                                _widened_count, _widened_dimension,
+                                _product, _narrowed,
+                            ))
+                            _count = _narrowed
+                        _result_rank, _rank_def = constant(
+                            _rank, "int32", physical=_scalar32,
+                        )
+                        prefix.append(_rank_def)
+                        _result_cell = revise_ssa_value(
+                            function, int(result.id),
+                            dtype=_result_fact.dtype,
+                            shape=tuple(_result_fact.shape),
+                            stage=TENSOR_SSA_LOWERING,
+                            sources=(_prefix_ref, _source_cell, _upper_cell),
+                            book=book,
+                            physical={
+                                "physical_dtype": _source_fact.physical_dtype,
+                                "storage": "span", "rank": _rank,
+                            },
+                        )
+                        result.accounting = {
+                            **dict(result.accounting or {}),
+                            "physical_dtype": _source_fact.physical_dtype,
+                            "program_abi_storage": "span",
+                            "program_abi_rank": _rank,
+                            "tensor_metadata_state": "dynamic",
+                            "tensor_shape_value_id": int(_shape.id),
+                            "tensor_rank_value_id": int(_result_rank.id),
+                            "tensor_element_count_value_id": int(_count.id),
+                            "ssa_storage_view": {
+                                "storage_value_id": int(_source.id),
+                                "view_shape": (),
+                                "operation": "prefix_slice",
+                            },
+                        }
+                        register_tensor(
+                            result, storage="view", metadata_state="dynamic",
+                            alias_of=_source_descriptor.tensor_id,
+                            data_value_id=_source_descriptor.data_value_id,
+                            extent_values=(_shape, _result_rank, _count),
+                            alias_proof=_prefix_ref,
+                        )
+                        _geometry_cells = tuple(
+                            ssa_value_identity_cell(
+                                function, int(value.id), book=book,
+                            ) for value in (
+                                *_geometry_values, _result_rank, _count,
+                            )
+                        )
+                        if _result_cell is None or any(
+                            cell is None for cell in _geometry_cells
+                        ):
+                            raise ValueError(
+                                "runtime prefix slice metadata lacks SSA identity"
+                            )
+                        book.post(
+                            TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+                            (function_scope_of(function), function.name,
+                             int(result.id)),
+                            (int(_source.id), int(_recipe[1]), int(_upper.id),
+                             int(_source_metadata["shape"].id),
+                             int(_source_metadata["rank"].id),
+                             int(_source_metadata["element_count"].id),
+                             int(_axis_extent.id), int(_clipped64.id),
+                             int(_shape.id), int(_result_rank.id),
+                             int(_count.id)),
+                            stage=TENSOR_SSA_LOWERING,
+                            provenance=Derived(tuple(dict.fromkeys((
+                                _prefix_ref, _source_cell, _upper_cell,
+                                _result_cell, *_geometry_cells,
+                            )))),
+                            mode=Mode.CONCORD,
+                        )
+                        aliases[int(result.id)] = SSAValue(
+                            _source.id, dtype=result.dtype or _source.dtype,
+                            shape=tuple(result.shape or ()),
+                            device=result.device or _source.device,
+                            accounting=dict(result.accounting),
+                        )
+                        rewritten.extend(prefix)
+                        continue
                     raw_axes = instruction.attributes.get(
                         "basic_index_axes"
                     )
@@ -12178,16 +12588,57 @@ def lower_tensor_calls_to_repository_ssa(
                                     ("scalar_operand", int(1 - span_position)),
                                     (result, scalar),
                                 )
-                                result.accounting = {
-                                    **dict(result.accounting or {}),
-                                    "tensor_metadata_state": "dynamic",
-                                    **dict(zip(("tensor_shape_value_id", "tensor_rank_value_id",
-                                                "tensor_element_count_value_id"),
-                                               (int(value.id) for value in evidence[0]), strict=True)),
-                                }
-                                dynamic_extents[int(result.id)] = dict(zip(
-                                    ("shape", "rank", "element_count"), evidence[0], strict=True,
-                                ))
+                                from .concordance_declarations import (
+                                    SCALAR_KERNEL_OPERAND,
+                                    TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                    TENSOR_SSA_LOWERING,
+                                )
+                                from .identity_concordance import Derived, Mode
+                                from .ssa_record_return_state import ssa_value_identity_cell
+                                metadata, geometry_causes = evidence
+                                causes = tuple(dict.fromkeys((
+                                    *geometry_causes,
+                                    book.latest_ref(SCALAR_KERNEL_OPERAND, (
+                                        str(function.name), int(result.id),
+                                    )),
+                                    *(ssa_value_identity_cell(
+                                        function, int(value.id), book=book,
+                                    ) for value in (span, scalar, result, *metadata)),
+                                )))
+                                if all(cell is not None for cell in causes):
+                                    # Program: derive(x) returns x+1 beside
+                                    # x.to_dtype(int64). The Add5 result gets
+                                    # runtime metadata after its graph shape
+                                    # edge was posted static(4). Publish the
+                                    # existing elementwise extent receipt at
+                                    # this first accounting write; it is the
+                                    # changed source of the later dynamic
+                                    # metadata transport edge.
+                                    book.post(
+                                        TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                        (function_scope_of(function),
+                                         function.name, int(result.id)),
+                                        (str(operation), int(span.id),
+                                         int(scalar.id),
+                                         *(int(value.id) for value in metadata)),
+                                        stage=TENSOR_SSA_LOWERING,
+                                        provenance=Derived(causes),
+                                        mode=Mode.CONCORD,
+                                    )
+                                    result.accounting = {
+                                        **dict(result.accounting or {}),
+                                        "tensor_metadata_state": "dynamic",
+                                        **dict(zip((
+                                            "tensor_shape_value_id",
+                                            "tensor_rank_value_id",
+                                            "tensor_element_count_value_id",
+                                        ), (int(value.id) for value in metadata),
+                                            strict=True)),
+                                    }
+                                    dynamic_extents[int(result.id)] = dict(zip(
+                                        ("shape", "rank", "element_count"),
+                                        metadata, strict=True,
+                                    ))
                     source_descriptor = tensor_table.by_id(int(source.id)) if source is not None else None
                 if (
                     ((opcode_contract is not None
@@ -12286,6 +12737,50 @@ def lower_tensor_calls_to_repository_ssa(
                             and 0 <= int(descriptor.static_element_count) <= 0x7fffffff
                             for _value, descriptor, fact in static_operands
                         )
+                        # Seven mask casts in one root place Add37 after
+                        # Add36's booked broadcast pass arm. The second Add
+                        # has exact geometry, but the old whole-function
+                        # single-block test refused that terminal pass block.
+                        # Its sole incoming booked validation edge and Ret
+                        # make it the same safe continuation for another
+                        # guard; the existing split below posts the next
+                        # SSA_BLOCK and SSA_CONTROL_EDGE receipts.
+                        _booked_terminal_pass = False
+                        if len(function.blocks) > 1:
+                            from .concordance_declarations import (
+                                SSA_BLOCK, SSA_CONTROL_EDGE, SSABlockKind,
+                            )
+                            from .ssa_record_return_state import function_scope_of
+                            _scope = function_scope_of(function)
+                            _block_ref = book.latest_ref(
+                                SSA_BLOCK, (_scope, function.name, block.name),
+                            )
+                            _incoming = tuple(
+                                edge for edge in book.page(SSA_CONTROL_EDGE).rows()
+                                if len(edge) == 5 and edge[0:2] == (
+                                    _scope, function.name,
+                                ) and edge[3] == _block_ref
+                                and edge[4] == "orelse"
+                                and book.page(SSA_CONTROL_EDGE).latest(edge) is True
+                            )
+                            _booked_terminal_pass = (
+                                _block_ref is not None
+                                and book.page(SSA_BLOCK).cell(
+                                    _block_ref.row, _block_ref.column,
+                                ) == SSABlockKind.VALIDATION_PASS
+                                and len(_incoming) == 1
+                                and not block.successors
+                                and bool(block.instrs)
+                                and block.instrs[-1].op == "Ret"
+                                and (parent := function.blocks.get(
+                                    _incoming[0][2].row[2],
+                                )) is not None
+                                and parent.instrs
+                                and parent.instrs[-1].op == "CondBr"
+                                and parent.instrs[-1].attributes.get(
+                                    "false_target",
+                                ) == block.name
+                            )
                         if not (
                             all(descriptor is not None
                                     and descriptor.metadata_state
@@ -12299,7 +12794,8 @@ def lower_tensor_calls_to_repository_ssa(
                             and (len(narrow_metadata) == 3
                                  if narrow_descriptor.metadata_state == "dynamic"
                                  else len(narrow_metadata) == 0)
-                            and len(function.blocks) == 1
+                            and (len(function.blocks) == 1
+                                 or _booked_terminal_pass)
                             and not pending_runtime_view_guards
                             and not pending_runtime_broadcast_guards
                         ):
@@ -12585,25 +13081,14 @@ def lower_tensor_calls_to_repository_ssa(
                         if mixed_count is not None:
                             return mixed_count
                         if scalar_geometry is not None:
-                            from .concordance_declarations import SCALAR_KERNEL_OPERAND, TENSOR_ELEMENTWISE_EXTENT_BINDING, TENSOR_SSA_LOWERING
-                            from .identity_concordance import Derived, Mode
-                            from .ssa_record_return_state import ssa_value_identity_cell
+                            from .concordance_declarations import TENSOR_ELEMENTWISE_EXTENT_BINDING
                             span, scalar, evidence = scalar_geometry
-                            metadata, geometry_causes = evidence
-                            causes = tuple(dict.fromkeys((
-                                *geometry_causes,
-                                book.latest_ref(SCALAR_KERNEL_OPERAND, (
-                                    str(function.name), int(result.id),
-                                )),
-                                *(ssa_value_identity_cell(function, int(value.id), book=book)
-                                  for value in (span, scalar, result, *metadata)),
-                            )))
-                            if all(cell is not None for cell in causes):
-                                book.post(TENSOR_ELEMENTWISE_EXTENT_BINDING,
-                                    (function_scope_of(function), function.name, int(result.id)),
-                                    (str(operation), int(span.id), int(scalar.id),
-                                     *(int(value.id) for value in metadata)),
-                                    stage=TENSOR_SSA_LOWERING, provenance=Derived(causes), mode=Mode.CONCORD)
+                            metadata, _geometry_causes = evidence
+                            if book.latest_ref(
+                                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                (function_scope_of(function), function.name,
+                                 int(result.id)),
+                            ) is not None:
                                 return metadata[2]
                         shortfalls.append(TensorSSALoweringShortfall(
                             function_name, block_name, operation,

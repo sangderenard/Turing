@@ -32737,6 +32737,10 @@ def _class_surface_ssa_program(
                         "node_id": int(node_id),
                         "construct": type(expression).__name__,
                         "source": ast.unparse(expression),
+                        **({
+                            "slice_lower_omitted": expression.lower is None,
+                            "slice_step_omitted": expression.step is None,
+                        } if isinstance(expression, ast.Slice) else {}),
                         "span": (
                             int(getattr(expression, "lineno", 0) or 0),
                             int(getattr(expression, "col_offset", 0) or 0),

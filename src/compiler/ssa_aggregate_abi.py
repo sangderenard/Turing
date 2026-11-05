@@ -850,6 +850,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
         CALL_RECORD, ARGUMENT_BINDING, RESULT_STORAGE_BINDING,
         SEQUENCE_DESCRIPTOR, AGGREGATE_ABI_LEGALIZATION,
         TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_RUNTIME_VIEW_GEOMETRY,
+        TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
         TENSOR_METADATA_RESULT_BINDING, AGGREGATE_PASSTHROUGH_REBINDING,
         TENSOR_METADATA_CALL_BINDING, REGION_SIGNATURE, NATIVE_TENSOR_WRAP,
     )
@@ -1103,8 +1104,8 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 )
                 if not any(int(value_id) in caller_ids for value_id in actual_ids):
                     continue
-                if not all(sum(int(actual_id) == int(old_id)
-                               for actual_id in actual_ids) == 1
+                if not all(any(int(actual_id) == int(old_id)
+                               for actual_id in actual_ids)
                            for old_id in caller_ids):
                     raise ValueError("computed metadata Call fold is incomplete")
                 consumers = tuple(instruction for block in function.blocks.values()
@@ -1114,16 +1115,12 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                                   and instruction.attributes.get("callee") == call_row[4])
                 if len(consumers) != 1:
                     continue
-                data_ids = {int(value.id) for value in consumers[0].args}
-                source_results = tuple(book.latest_ref(TENSOR_METADATA_RESULT_BINDING, candidate)
-                    for candidate in page.rows()
-                    if candidate[0] == row[0] and candidate[3] in data_ids
-                    and page.latest(candidate)[2] == current_ids)
-                if len(source_results) != 1:
-                    # Its data result is a downstream geometry view that the
-                    # same loop has not revised yet. That row owns this Call's
-                    # forwarding, and will revisit it after its own revision.
-                    continue
+                # two_cast_shared_geometry and _varints return several
+                # tensors with one input geometry. The row being folded owns
+                # these exact metadata IDs; searching all results by equal
+                # geometry made the second tensor ambiguous and left its
+                # booked actuals stale after the live operands were rebound.
+                source_result = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
                 revised_actuals = tuple(
                     replacements[int(value_id)][0]
                     if int(value_id) in caller_ids else int(value_id)
@@ -1134,7 +1131,9 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     (revised_actuals, tuple(map(int, formal_input_ids))),
                     stage=AGGREGATE_ABI_LEGALIZATION,
                     provenance=Derived((previous_call, *rebinding_cells,
-                                        source_results[0])),
+                                        source_result,
+                                        *(source for source, _ in book.edges_into(previous_call)
+                                          if source.page == TENSOR_METADATA_RESULT_BINDING))),
                     mode=Mode.REVISE,
                 )
 
@@ -1390,9 +1389,26 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                             unsqueeze_proof.row, unsqueeze_proof.column,
                         )[1]) if unsqueeze_proof is not None else None
                     )
+                    prefix_proof = (
+                        book.latest_ref(
+                            TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY, view_row,
+                        ) if view_row is not None else None
+                    )
+                    prefix_source = (
+                        int(book.page(
+                            TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+                        ).cell(prefix_proof.row, prefix_proof.column)[0])
+                        if prefix_proof is not None else None
+                    )
                     source_descriptor = (
-                        table.by_id(unsqueeze_source)
-                        if table is not None and unsqueeze_source is not None
+                        table.by_id(
+                            unsqueeze_source if unsqueeze_source is not None
+                            else prefix_source
+                        )
+                        if table is not None and (
+                            unsqueeze_source is not None
+                            or prefix_source is not None
+                        )
                         else None
                     )
                     runtime_view = (
@@ -1405,6 +1421,12 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                             or (unsqueeze_proof is not None
                                 and output_descriptor.alias_of
                                 == unsqueeze_source
+                                and source_descriptor is not None
+                                and source_descriptor.data_value_id
+                                == callee_id)
+                            or (prefix_proof is not None
+                                and output_descriptor.alias_of
+                                == prefix_source
                                 and source_descriptor is not None
                                 and source_descriptor.data_value_id
                                 == callee_id)

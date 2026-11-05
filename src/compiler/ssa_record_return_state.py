@@ -42,6 +42,7 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
         CALL_RECORD, TENSOR_METADATA_RESULT_BINDING,
         TENSOR_OWNED_HEAP_BINDING, TENSOR_SOURCE_OWNED_RETURN,
         TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_RUNTIME_VIEW_GEOMETRY,
+        TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
     )
 
     book = identity_book(module) if book is None else book
@@ -98,6 +99,7 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
             if parent.page in {
                 TENSOR_RUNTIME_RESHAPE_VALIDITY,
                 TENSOR_RUNTIME_VIEW_GEOMETRY,
+                TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
             } and parent.row == view_row
         )
         if len(view_refs) == 1 and descriptor is not None:
@@ -139,6 +141,10 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
                         )
                     else:
                         return None
+                elif (view_ref.page == TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY
+                      and len(view_fact) == 11):
+                    source_id = int(view_fact[0])
+                    view_metadata = tuple(map(int, view_fact[8:11]))
                 elif len(view_fact) == 12:
                     source_id = int(view_fact[0])
                     view_metadata = (

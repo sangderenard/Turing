@@ -1533,6 +1533,8 @@ class CorrelationTable:
         found.extend(self._repository_ssa_signature_findings(module))
         found.extend(self._scope_local_accounting_findings(module))
         found.extend(self._tensor_metadata_result_binding_findings(module))
+        found.extend(self._source_tensor_prefix_slice_findings(module))
+        found.extend(self._tensor_runtime_prefix_slice_geometry_findings(module))
         found.extend(self._tensor_runtime_reshape_validity_findings(module))
         found.extend(self._tensor_runtime_view_geometry_findings(module))
         found.extend(self._tensor_runtime_scan_geometry_findings(module))
@@ -5757,21 +5759,10 @@ class CorrelationTable:
                         and isinstance(previous_fact, tuple)
                         and len(previous_fact) == 2
                         and previous_fact[1] == fact[1]
-                        and len(previous_fact[0]) == len(fact[0]) == 3
+                        and len(previous_fact[0]) == len(fact[0])
                         and len(rebindings) == 3
-                        and len(result_refs) == 1
+                        and bool(result_refs)
                     )
-                    if valid:
-                        result_fact = result_page.cell(
-                            result_refs[0].row, result_refs[0].column,
-                        )
-                        valid = (
-                            isinstance(result_fact, tuple)
-                            and len(result_fact) == 3
-                            and result_fact[2] == fact[0]
-                            and result_refs[0].row[0] == row[0]
-                            and result_refs[0].row[3] == result_fact[0]
-                        )
                     if valid:
                         rebind_page = book.page(
                             AGGREGATE_PASSTHROUGH_REBINDING
@@ -5782,17 +5773,41 @@ class CorrelationTable:
                                 rebind_page.cell(parent.row, parent.column),
                             ) for parent in rebindings
                         }
-                        valid = set(previous_fact[0]) == set(mapping)
+                        valid = (len(mapping) == len(rebindings)
+                                 and set(mapping) <= set(previous_fact[0]))
                         for old_id, new_id in zip(
                             previous_fact[0], fact[0], strict=True,
                         ):
                             item = mapping.get(int(old_id))
-                            if (item is None or len(item[1]) != 3
-                                    or item[1][0] != int(new_id)
-                                    or item[1][2] != int(old_id)
-                                    or item[0] not in {
-                                        source for source, _stage in book.edges_into(result_refs[0])
-                                    }):
+                            if item is None:
+                                valid = valid and old_id == new_id
+                                continue
+                            owners = tuple(
+                                result_ref for result_ref in result_refs
+                                if result_ref.row[0] == row[0]
+                                and result_ref.row[2] == item[1][1]
+                                and (result_fact := result_page.cell(
+                                    result_ref.row, result_ref.column))
+                                and len(result_fact) == 3
+                                and result_fact[0] == result_ref.row[3]
+                                and item[1][2] == int(old_id)
+                                and any(
+                                    prior.page == TENSOR_METADATA_RESULT_BINDING
+                                    and prior.row == result_ref.row
+                                    and (prior_fact := result_page.cell(
+                                        prior.row, prior.column))
+                                    and len(prior_fact) == 3
+                                    and prior_fact[:2] == result_fact[:2]
+                                    and (int(old_id), int(new_id)) in tuple(zip(
+                                        prior_fact[2], result_fact[2], strict=True))
+                                    for prior, _ in book.edges_into(result_ref)
+                                )
+                                and item[0] in {
+                                    source for source, _stage in book.edges_into(result_ref)
+                                }
+                            ) if len(item[1]) == 3 else ()
+                            if (len(item[1]) != 3 or item[1][0] != int(new_id)
+                                    or not owners):
                                 valid = False
                                 break
                             cited_rows.update(
@@ -5874,24 +5889,25 @@ class CorrelationTable:
                             if isinstance(result_fact, tuple)
                             and len(result_fact) == 3 else ()
                         )
-                        metadata_matches = tuple(
-                            tuple(formal for actual, formal in pairs
-                                  if actual == value_id)
-                            for value_id in projected
-                        )
-                        formal_ids = tuple(matches[0] for matches in metadata_matches
-                                           if len(matches) == 1)
                         table = module.tensor_tables.get(callee.name)
                         descriptor = (
                             None if table is None or len(data_matches) != 1
                             else table.by_id(int(data_matches[0].id))
                         )
+                        formal_ids = (() if descriptor is None else tuple(
+                            getattr(descriptor, field) for field in (
+                                "shape_value_id", "rank_value_id",
+                                "element_count_value_id",
+                            )))
+                        expected_pairs = tuple(zip(projected, formal_ids))
                         if (predecessor not in causes
                                 or not isinstance(result_fact, tuple)
                                 or len(result_fact) != 3
                                 or result_fact[0] != result_row[3]
                                 or len(projected) != 3
                                 or len(formal_ids) != 3
+                                or any(type(value_id) is not int for value_id in formal_ids)
+                                or any(pair not in pairs for pair in expected_pairs)
                                 or descriptor is None
                                 or tuple(getattr(descriptor, field) for field in (
                                     "shape_value_id", "rank_value_id",
@@ -8281,12 +8297,37 @@ class CorrelationTable:
                 cited_values = {cause.row[1] for cause in causes
                                 if cause.page == SSA_VALUE
                                 and cause.row[0] == row[0]}
+                # Several authored tensor Adds can share one region. Each
+                # accepted broadcast guard's pass arm becomes the block for
+                # the next guard. A nonterminal pass is valid only when the
+                # next runtime broadcast receipt directly cites this exact
+                # SSA_BLOCK and owns its live CondBr targets; that next row
+                # is itself checked by this method.
+                nested_pass = False
+                if (passed.instrs[-1].op == "CondBr" and passing is not None):
+                    terminal = passed.instrs[-1]
+                    nested_pass = any(
+                        other_row != row
+                        and other_row[:2] == row[:2]
+                        and (other_ref := book.latest_ref(
+                            TENSOR_RUNTIME_BROADCAST_VALIDITY, other_row,
+                        )) is not None
+                        and passing in {
+                            source for source, _ in book.edges_into(other_ref)
+                        }
+                        and (other_fact := book.page(
+                            TENSOR_RUNTIME_BROADCAST_VALIDITY,
+                        ).cell(other_ref.row, other_ref.column))[-2:]
+                        == (terminal.attributes.get("true_target"),
+                            terminal.attributes.get("false_target"))
+                        for other_row in page.rows()
+                    )
                 valid = (
                     all((before, failed, passing))
                     and len(edges) == 2 and all(edge is not None for edge in edges)
                     and {before, failed, passing, *edges} <= causes
                     and required_values <= cited_values
-                    and passed.instrs[-1].op == "Ret"
+                    and (passed.instrs[-1].op == "Ret" or nested_pass)
                 )
             if not valid:
                 found.append(Finding(
@@ -8445,6 +8486,284 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_tensor_prefix_slice_findings(module: Any) -> list[Finding]:
+        """The authored Indexed/Slice edges, rather than a displayed name, own a prefix."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
+            SOURCE_TENSOR_PREFIX_SLICE, VALUE_TYPE_ABI,
+        )
+
+        book = identity_book(module)
+        page = book.page(SOURCE_TENSOR_PREFIX_SLICE)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(SOURCE_TENSOR_PREFIX_SLICE, row)
+            fact = page.cell(row, ref.column) if ref is not None else None
+            causes = set() if ref is None else {s for s, _ in book.edges_into(ref)}
+            valid = isinstance(row, tuple) and len(row) == 2 and isinstance(fact, tuple) and len(fact) == 3
+            valid = valid and all(type(value) is int for value in fact)
+            if valid:
+                scope, result = row
+                source, selector, upper = fact
+                required = tuple(book.latest_ref(CANONICAL_VALUE, (scope, value))
+                                 for value in (source, selector, result, upper))
+                indexed = book.latest_ref(PROCESS_GRAPH_OPERANDS, (scope, result))
+                sliced = book.latest_ref(PROCESS_GRAPH_OPERANDS, (scope, selector))
+                abi_ref = book.latest_ref(VALUE_TYPE_ABI, (scope, upper))
+                indexed_fact = None if indexed is None else book.page(PROCESS_GRAPH_OPERANDS).cell(indexed.row, indexed.column)
+                sliced_fact = None if sliced is None else book.page(PROCESS_GRAPH_OPERANDS).cell(sliced.row, sliced.column)
+                abi = None if abi_ref is None else book.page(VALUE_TYPE_ABI).cell(abi_ref.row, abi_ref.column)
+                arms = tuple(getattr(abi, "physical_alternatives", ()))
+                valid = (
+                    all(cell is not None and cell in causes for cell in required)
+                    and indexed is not None and indexed in causes
+                    and sliced is not None and sliced in causes
+                    and abi_ref is not None and abi_ref in causes
+                    and isinstance(indexed_fact, tuple) and len(indexed_fact) == 2
+                    and tuple(role for _, role in indexed_fact) == ("base", "index")
+                    and all(getattr(cell, "page", None) == CANONICAL_VALUE
+                            and _canonical_identity_base(book, cell)
+                                == _canonical_identity_base(book, expected)
+                            for (cell, _), expected in zip(indexed_fact, required[:2], strict=True))
+                    and isinstance(sliced_fact, tuple) and len(sliced_fact) == 1
+                    and sliced_fact[0][1] == "upper"
+                    and getattr(sliced_fact[0][0], "page", None) == CANONICAL_VALUE
+                    and _canonical_identity_base(book, sliced_fact[0][0])
+                        == _canonical_identity_base(book, required[3])
+                    and len(arms) == 1 and arms[0].storage == "scalar"
+                    and arms[0].dtype == "int64" and arms[0].rank == 0
+                    and tuple(arms[0].shape) == ()
+                    and all(cell in causes for cell in arms[0].source_cells)
+                )
+            if not valid:
+                found.append(Finding("source-tensor-prefix-slice", str(row),
+                                     row[1] if isinstance(row, tuple) and len(row) == 2 else None,
+                                     "prefix slice lacks exact Indexed/Slice operands, canonical values or scalar upper ABI"))
+        return found
+
+    @staticmethod
+    def _tensor_runtime_prefix_slice_geometry_findings(module: Any) -> list[Finding]:
+        """A borrowed prefix view has the authored bound and a clipped runtime geometry."""
+
+        from .concordance_declarations import (
+            SOURCE_TENSOR_PREFIX_SLICE, TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+            TENSOR_METADATA_RESULT_BINDING,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY, row)
+            fact = page.cell(row, ref.column) if ref is not None else None
+            function = module.functions.get(row[1]) if isinstance(row, tuple) and len(row) == 3 else None
+            valid = (function is not None and isinstance(fact, tuple)
+                     and len(fact) == 11
+                     and all(type(value) is int for value in fact))
+            if valid:
+                source, selector, upper, src_shape, src_rank, src_count, axis_extent, clipped, shape, rank, count = fact
+                causes = {s for s, _ in book.edges_into(ref)}
+                source_refs = tuple(s for s in causes if s.page == SOURCE_TENSOR_PREFIX_SLICE
+                                    and s.row[1] == row[2])
+                recipe = (book.page(SOURCE_TENSOR_PREFIX_SLICE).cell(source_refs[0].row, source_refs[0].column)
+                          if len(source_refs) == 1 else None)
+                defs = {int(i.res.id): i for block in function.blocks.values()
+                        for i in block.instrs if i.res is not None}
+                stores = tuple(i for block in function.blocks.values() for i in block.instrs if i.op == "Store")
+                table = module.tensor_tables.get(function.name)
+                result = None if table is None else table.by_id(row[2])
+                input_desc = None if table is None else table.by_id(source)
+                source_fact = posted_ssa_value_fact(function, source, book=book)
+                result_fact = posted_ssa_value_fact(function, row[2], book=book)
+                upper_fact = posted_ssa_value_fact(function, upper, book=book)
+                ids = (source, upper, row[2], src_shape, src_rank, src_count,
+                       axis_extent, clipped, shape, rank, count)
+                def op(value, name, *args):
+                    i = defs.get(value)
+                    return i is not None and i.op == name and tuple(int(a.id) for a in i.args) == args
+                def const(value, literal):
+                    i = defs.get(value)
+                    return i is not None and i.op == "Const" and i.attributes.get("constant") == literal
+                def extent(value, kind, axis=None):
+                    i = defs.get(value)
+                    return (op(value, "extent", source)
+                            and i.attributes.get("extent_kind") == kind
+                            and i.attributes.get("axis") == axis)
+                casts64 = tuple(i for i in defs.values() if i.op == "Cast"
+                                and i.res is not None and i.attributes.get("source_dtype") == "int32"
+                                and i.attributes.get("target_dtype") == "int64"
+                                and tuple(int(a.id) for a in i.args) == (axis_extent,))
+                zeroes = tuple(i for i in defs.values() if const(int(i.res.id), 0))
+                normalized = False
+                normalization_offset = None
+                clipped32 = None
+                if len(casts64) == 1:
+                    wide = int(casts64[0].res.id)
+                    for zero in zeroes:
+                        z = int(zero.res.id)
+                        lt = [i for i in defs.values() if i.op == "Lt" and tuple(int(a.id) for a in i.args) == (upper, z)]
+                        offset = [i for i in defs.values() if i.op == "Select"
+                                  and len(lt) == 1
+                                  and tuple(int(a.id) for a in i.args) ==
+                                  (int(lt[0].res.id), upper, z)]
+                        add = [i for i in defs.values() if i.op == "Add"
+                               and len(offset) == 1
+                               and tuple(int(a.id) for a in i.args) ==
+                               (int(offset[0].res.id), wide)]
+                        if len(lt) != 1 or len(offset) != 1 or len(add) != 1:
+                            continue
+                        sel = [i for i in defs.values() if i.op == "Select" and tuple(int(a.id) for a in i.args) == (int(lt[0].res.id), int(add[0].res.id), upper)]
+                        if len(sel) != 1:
+                            continue
+                        mx = [i for i in defs.values() if i.op == "Max" and tuple(int(a.id) for a in i.args) == (int(sel[0].res.id), z)]
+                        if len(mx) == 1 and op(clipped, "Min", int(mx[0].res.id), wide):
+                            narrowed = [i for i in defs.values() if i.op == "Cast"
+                                        and i.attributes.get("source_dtype") == "int64"
+                                        and i.attributes.get("target_dtype") == "int32"
+                                        and tuple(int(a.id) for a in i.args) == (clipped,)]
+                            if len(narrowed) == 1:
+                                normalized = True
+                                normalization_offset = int(offset[0].res.id)
+                                clipped32 = int(narrowed[0].res.id)
+                shape_def = defs.get(shape)
+                rank_def = defs.get(rank)
+                shape_len = (len(shape_def.attributes.get("values", ())) if shape_def is not None
+                             and shape_def.op == "Const" else 0)
+                dims = []
+                for axis in range(shape_len):
+                    dimension = clipped32 if axis == 0 else next(
+                        (int(i.res.id) for i in defs.values() if extent(int(i.res.id), "dim", axis)), None)
+                    index = [int(i.res.id) for i in defs.values() if const(int(i.res.id), axis)]
+                    addresses = [int(i.res.id) for i in defs.values() if i.op == "GetElementPtr"
+                                 and len(i.args) == 2 and int(i.args[0].id) == shape
+                                 and int(i.args[1].id) in index]
+                    if dimension is None or len(addresses) != 1 or not any(
+                        tuple(int(a.id) for a in store.args) == (dimension, addresses[0])
+                        for store in stores):
+                        break
+                    dims.append(dimension)
+                # The first product may exceed int32 even when a later axis
+                # is empty. The selected program seeds zero from every axis,
+                # multiplies in int64, then traps on each int32 narrowing.
+                zero32 = [int(i.res.id) for i in defs.values() if i.op == "Const"
+                          and i.res is not None and i.res.dtype == "int32"
+                          and i.attributes.get("constant") == 0]
+                one32 = [int(i.res.id) for i in defs.values() if i.op == "Const"
+                         and i.res is not None and i.res.dtype == "int32"
+                         and i.attributes.get("constant") == 1]
+                count_chain = bool(zero32 and one32) and len(dims) == shape_len
+                chain_ids = set()
+                if count_chain:
+                    zero_predicates = []
+                    for dimension in dims:
+                        predicates = [int(i.res.id) for i in defs.values() if i.op == "Eq"
+                                      and tuple(int(a.id) for a in i.args) == (dimension, zero32[0])]
+                        if len(predicates) != 1:
+                            count_chain = False
+                            break
+                        zero_predicates.extend(predicates)
+                    if count_chain:
+                        empty = zero_predicates[0]
+                        for predicate in zero_predicates[1:]:
+                            disjunctions = [int(i.res.id) for i in defs.values() if i.op == "LOr"
+                                            and tuple(int(a.id) for a in i.args) == (empty, predicate)]
+                            if len(disjunctions) != 1:
+                                count_chain = False
+                                break
+                            empty = disjunctions[0]
+                    if count_chain:
+                        seeds = [int(i.res.id) for i in defs.values() if i.op == "Select"
+                                 and tuple(int(a.id) for a in i.args) ==
+                                 (empty, zero32[0], one32[0])]
+                        count_chain = len(seeds) == 1
+                        if count_chain:
+                            rolling = seeds[0]
+                            chain_ids.update((zero32[0], one32[0], *zero_predicates, empty, rolling))
+                            for dimension in dims:
+                                def widened(value):
+                                    return [int(i.res.id) for i in defs.values() if i.op == "Cast"
+                                            and tuple(int(a.id) for a in i.args) == (value,)
+                                            and i.attributes.get("source_dtype") == "int32"
+                                            and i.attributes.get("target_dtype") == "int64"]
+                                left, right = widened(rolling), widened(dimension)
+                                if len(left) != 1 or len(right) != 1:
+                                    count_chain = False
+                                    break
+                                products = [int(i.res.id) for i in defs.values() if op(
+                                    int(i.res.id), "Mul", left[0], right[0])]
+                                if len(products) != 1:
+                                    count_chain = False
+                                    break
+                                narrowed = [int(i.res.id) for i in defs.values() if i.op == "Cast"
+                                            and tuple(int(a.id) for a in i.args) == (products[0],)
+                                            and i.attributes.get("source_dtype") == "int64"
+                                            and i.attributes.get("target_dtype") == "int32"
+                                            and i.attributes.get("conversion_kind") == "integer_conversion"
+                                            and i.attributes.get("overflow") == "trap"]
+                                if len(narrowed) != 1:
+                                    count_chain = False
+                                    break
+                                chain_ids.update((*left, *right, *products, *narrowed))
+                                rolling = narrowed[0]
+                            count_chain = count_chain and rolling == count
+                count_chain = count_chain and all(
+                    (cell := ssa_value_identity_cell(function, value, book=book))
+                    is not None and cell in causes for value in chain_ids
+                )
+                result_bindings = tuple(
+                    binding for binding in book.page(TENSOR_METADATA_RESULT_BINDING).rows()
+                    if len(binding) == 4 and binding[2] == function.name
+                    and binding[3] == row[2]
+                    and ref in {s for s, _ in book.edges_into(
+                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding))}
+                )
+                valid = (
+                    row[0] == function_scope_of(function)
+                    and recipe == (source, selector, upper)
+                    and len(source_refs) == 1
+                    and all((cell := ssa_value_identity_cell(function, int(value), book=book)) is not None
+                            and cell in causes for value in ids)
+                    and normalization_offset is not None
+                    and (offset_cell := ssa_value_identity_cell(
+                        function, normalization_offset, book=book,
+                    )) is not None and offset_cell in causes
+                    and input_desc is not None and result is not None
+                    and source_fact is not None and result_fact is not None
+                    and upper_fact is not None
+                    and source_fact.storage == result_fact.storage == "span"
+                    and type(source_fact.rank) is int and source_fact.rank == shape_len
+                    and result_fact.rank == source_fact.rank
+                    and source_fact.physical_dtype is not None
+                    and result_fact.physical_dtype == source_fact.physical_dtype
+                    and upper_fact.physical_dtype == "int64"
+                    and upper_fact.storage == "scalar" and upper_fact.rank == 0
+                    and input_desc.metadata_state == "dynamic"
+                    and (input_desc.shape_value_id, input_desc.rank_value_id,
+                         input_desc.element_count_value_id) == (src_shape, src_rank, src_count)
+                    and result.storage == "view" and result.alias_of == source
+                    and result.data_value_id == input_desc.data_value_id
+                    and result.dtype == input_desc.dtype
+                    and (result.shape_value_id, result.rank_value_id,
+                         result.element_count_value_id) == (shape, rank, count)
+                    and extent(src_shape, "shape") and extent(src_rank, "rank")
+                    and extent(src_count, "element_count") and extent(axis_extent, "dim", 0)
+                    and normalized and shape_len > 0 and len(dims) == shape_len
+                    and rank_def is not None and rank_def.op == "Const"
+                    and rank_def.attributes.get("constant") == shape_len
+                    and count_chain
+                    and bool(result_bindings)
+                )
+            if not valid:
+                found.append(Finding("tensor-runtime-prefix-slice-geometry", str(row[1]) if isinstance(row, tuple) and len(row) > 1 else str(row),
+                                     row[2] if isinstance(row, tuple) and len(row) == 3 else None,
+                                     "prefix view lacks exact source, clipped bound, shape/count chain, alias or metadata result proof"))
+        return found
+
+    @staticmethod
     def _tensor_metadata_result_binding_findings(module: Any) -> list[Finding]:
         """Computed metadata must traverse one exact aggregate call output."""
 
@@ -8453,6 +8772,8 @@ class CorrelationTable:
             TENSOR_METADATA_RESULT_BINDING,
             TENSOR_METADATA_CALL_BINDING,
             TENSOR_OWNED_HEAP_BINDING,
+            SOURCE_TENSOR_PREFIX_SLICE,
+            TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
             CALL_RECORD,
         )
         from .ssa_record_return_state import (
@@ -8661,11 +8982,18 @@ class CorrelationTable:
                                        if source.page == AGGREGATE_PASSTHROUGH_REBINDING)
                     mapping = {source.row[1]: book.page(source.page).cell(
                         source.row, source.column) for source in rebindings}
-                    call = next(instruction for block in caller.blocks.values()
+                    call = next((instruction for block in caller.blocks.values()
                                 for instruction in block.instrs
                                 if instruction.op == "Call" and instruction.res is not None
                                 and int(instruction.res.id) == row[1]
-                                and instruction.attributes.get("callee") == row[2])
+                                and instruction.attributes.get("callee") == row[2]), None)
+                    if call is None:
+                        found.append(Finding(
+                            "tensor-metadata-result-binding-disagreement",
+                            str(row[2]), int(row[3]),
+                            "prefix view metadata lacks its live exact Call",
+                        ))
+                        continue
                     pairs = tuple(zip(call.args, callee.args, strict=True))
                     incoming_fact = book.page(incoming[0].page).cell(
                         incoming[0].row, incoming[0].column)
@@ -8770,6 +9098,145 @@ class CorrelationTable:
                         "rebound actual, or predecessor result proof",
                     ))
                 continue
+            if valid:
+                prefix_refs = tuple(
+                    source for source, _ in book.edges_into(ref)
+                    if source.page == TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY
+                    and source.row == (
+                        function_scope_of(callee), callee.name, int(row[3]),
+                    )
+                )
+                if prefix_refs:
+                    # The prefix's semantic result3 is a borrowed view of
+                    # its source0. The region Ret emits source0 as data and
+                    # result3's distinct metadata at positions 1..3. Its
+                    # caller retains the source data actual through the
+                    # exact aggregate passthrough rebinding, so the Call
+                    # projects only the three metadata ports.
+                    view_ref = prefix_refs[0]
+                    view = book.page(TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY).cell(
+                        view_ref.row, view_ref.column,
+                    )
+                    source_refs = tuple(
+                        source for source, _ in book.edges_into(view_ref)
+                        if source.page == SOURCE_TENSOR_PREFIX_SLICE
+                        and source.row[1] == int(row[3])
+                    )
+                    recipe = (
+                        book.page(SOURCE_TENSOR_PREFIX_SLICE).cell(
+                            source_refs[0].row, source_refs[0].column,
+                        ) if len(source_refs) == 1 else None
+                    )
+                    call = next(instruction for block in caller.blocks.values()
+                                for instruction in block.instrs
+                                if instruction.op == "Call" and instruction.res is not None
+                                and int(instruction.res.id) == row[1]
+                                and instruction.attributes.get("callee") == row[2])
+                    source_id = view[0] if isinstance(view, tuple) and len(view) == 11 else None
+                    input_pairs = tuple(zip(call.args, callee.args))
+                    source_actuals = tuple(int(actual.id) for actual, formal in input_pairs
+                                           if source_id is not None and int(formal.id) == source_id)
+                    actual_id = source_actuals[0] if len(source_actuals) == 1 else None
+                    table = module.tensor_tables.get(callee.name)
+                    descriptor = None if table is None else table.by_id(row[3])
+                    source_descriptor = None if table is None or source_id is None else table.by_id(source_id)
+                    rebind = book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
+                                             (function_scope_of(caller), int(row[3])))
+                    rebind_fact = (None if rebind is None else
+                                   book.page(AGGREGATE_PASSTHROUGH_REBINDING).cell(
+                                       rebind.row, rebind.column))
+                    returns = tuple(instruction for block in callee.blocks.values()
+                                    for instruction in block.instrs if instruction.op == "Ret")
+                    caller_ids = tuple(map(int, call.attributes.get("output_ids", ())))
+                    callee_ids = tuple(map(int, call.attributes.get("callee_output_ids", ())))
+                    positions = tuple(call.attributes.get("output_positions", ()))
+                    passthroughs = tuple(call.attributes.get(
+                        "aggregate_output_passthrough_bindings", ()))
+                    retained = (caller_ids == (int(row[3]), *fact[2])
+                                and callee_ids == (source_id, *fact[1])
+                                and positions == (0, 1, 2, 3))
+                    folded = (caller_ids == fact[2] and callee_ids == fact[1]
+                              and positions == (1, 2, 3))
+                    addresses = {int(instruction.res.id): instruction
+                                 for block in caller.blocks.values()
+                                 for instruction in block.instrs
+                                 if instruction.op == "GetElementPtr"
+                                 and instruction.res is not None and instruction.args
+                                 and int(instruction.args[0].id) == row[1]}
+                    projections = tuple(instruction for block in caller.blocks.values()
+                                        for instruction in block.instrs
+                                        if instruction.op == "Load"
+                                        and instruction.res is not None)
+                    causes = {source for source, _ in book.edges_into(ref)}
+                    required_values = (
+                        *((callee, value_id) for value_id in (row[3], *fact[1])),
+                        *((caller, value_id) for value_id in (row[1], *fact[2])),
+                    )
+                    valid = (
+                        len(prefix_refs) == 1
+                        and len(source_refs) == 1
+                        and isinstance(view, tuple) and len(view) == 11
+                        and isinstance(recipe, tuple) and len(recipe) == 3
+                        and recipe == tuple(view[:3])
+                        and tuple(view[8:11]) == fact[1]
+                        and book.latest_ref(TENSOR_RUNTIME_PREFIX_SLICE_GEOMETRY,
+                                            view_ref.row) == view_ref
+                        and book.latest_ref(SOURCE_TENSOR_PREFIX_SLICE,
+                                            source_refs[0].row) == source_refs[0]
+                        and descriptor is not None and source_descriptor is not None
+                        and descriptor.storage == "view"
+                        and descriptor.metadata_state == "dynamic"
+                        and descriptor.alias_of == source_id
+                        and descriptor.data_value_id == source_descriptor.data_value_id
+                        and descriptor.dtype == source_descriptor.dtype
+                        and (descriptor.shape_value_id, descriptor.rank_value_id,
+                             descriptor.element_count_value_id) == fact[1]
+                        and len(returns) == 1
+                        and tuple(int(value.id) for value in returns[0].args)
+                            == (source_id, *fact[1])
+                        and len(call.args) == len(callee.args)
+                        and (retained or folded)
+                        and actual_id is not None
+                        and ((retained and rebind is None and not passthroughs
+                              and sum(
+                                  int(projection.res.id) == int(row[3])
+                                  and projection.attributes.get("aggregate_index") == 0
+                                  and projection.attributes.get("source_output_id") == int(row[3])
+                                  and len(projection.args) == 1
+                                  and int(projection.args[0].id) in addresses
+                                  and addresses[int(projection.args[0].id)].attributes.get("aggregate_index") == 0
+                                  for projection in projections
+                              ) == 1)
+                             or (folded
+                                 and rebind_fact == (actual_id, callee.name, int(row[3]))
+                                 and any(len(binding) >= 4 and tuple(binding[:4])
+                                         == (0, int(row[3]), source_id, actual_id)
+                                         for binding in passthroughs)))
+                        and all(sum(
+                            int(projection.res.id) == actual_output
+                            and projection.attributes.get("aggregate_index") == position
+                            and projection.attributes.get("source_output_id") == actual_output
+                            and len(projection.args) == 1
+                            and int(projection.args[0].id) in addresses
+                            and addresses[int(projection.args[0].id)].attributes.get(
+                                "aggregate_index") == position
+                            for projection in projections
+                        ) == 1 for position, actual_output in zip(
+                            positions[1:] if retained else positions,
+                            fact[2], strict=True))
+                        and all((cell := ssa_value_identity_cell(
+                            function, int(value_id), book=book,
+                        )) is not None and cell in causes
+                                for function, value_id in required_values)
+                    )
+                    if not valid:
+                        found.append(Finding(
+                            "tensor-metadata-result-binding-disagreement",
+                            str(row[2]), int(row[3]),
+                            "prefix view metadata lacks exact Ret, source alias, "
+                            "Call projection, or cited result proof",
+                        ))
+                    continue
             if valid:
                 call = next(instruction for block in caller.blocks.values()
                             for instruction in block.instrs
