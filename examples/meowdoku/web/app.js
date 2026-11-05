@@ -1804,7 +1804,6 @@ function controls() {
 // A game with a third axis (height above the board): E / PageUp rise,
 // Q / PageDown dive, or the Rise / Dive buttons (held).
 function heightAxis() { return !!(state.game && state.game.predict && state.game.predict.z); }
-}
 function keyControl(key) {
   const k = key.length === 1 ? key.toLowerCase() : key;
   const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
