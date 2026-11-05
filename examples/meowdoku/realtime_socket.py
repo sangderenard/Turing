@@ -8,7 +8,8 @@ frame per tick: ``{"inputs": [...], <held controls>}``.  The server lands
 them (``EntityGame.tick``) and answers with one binary frame: a SNAPSHOT
 DELTA, little-endian:
 
-    u8   kind = 1
+    u8   kind = PROTOCOL (the frame layout's version: a page reading another
+                      layout must not misparse it -- both servers serve one page)
     u8   flags        bit0 keyframe (every lane sent), bit1 clear (forget
                       every entity: a new game, a reset, a rewind)
     i32  ack          last input interval landed (-1: none)
@@ -109,6 +110,13 @@ def frame(opcode: int, payload: bytes) -> bytes:
 
 # ---------------------------------------------------------------- snapshot deltas
 
+
+#: The snapshot frame layout's version, sent as the frame's first byte.  Bump
+#: it whenever the layout changes; the page refuses any other version.
+#:   3 = header + z, vz, health; spawn/update records carry z, vz; spawn
+#:       flags bit1 = face its velocity.
+PROTOCOL = 3
+
 class SnapshotEncoder:
     """What one connection's page knows, and the delta that brings it up to date."""
 
@@ -170,7 +178,7 @@ class SnapshotEncoder:
 
         you = state.get("you") or {}
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBfffff", 1, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBfffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),

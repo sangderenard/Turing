@@ -1164,7 +1164,13 @@ function applySnapshot(view) {
   const u8 = () => view.getUint8(o++), u16 = () => { const v = view.getUint16(o, true); o += 2; return v; };
   const i16 = () => { const v = view.getInt16(o, true); o += 2; return v; }, f32 = () => { const v = view.getFloat32(o, true); o += 4; return v; };
   const i32 = () => { const v = view.getInt32(o, true); o += 4; return v; };
-  if (u8() !== 1) return;
+  // The frame layout's version (realtime_socket.PROTOCOL): a page and a server
+  // of different layouts must not misparse each other -- say so instead.
+  const version = u8();
+  if (version !== SNAPSHOT_PROTOCOL) {
+    if (!sock.versionWarned) { sock.versionWarned = true; status.textContent = `the server speaks snapshot v${version}, this page v${SNAPSHOT_PROTOCOL}: reload the page (the server was updated)`; }
+    return;
+  }
   const flags = u8(), ack = i32();
   const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
   sync.hint = f32();
@@ -1209,6 +1215,7 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
+const SNAPSHOT_PROTOCOL = 3;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
