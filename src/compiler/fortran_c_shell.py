@@ -23774,6 +23774,59 @@ def _refuse_unlowered_stored_callable_calls(deployment: Any) -> None:
         )
 
 
+def _publish_linked_field_physical_rows(module_ir, lowered_control, graph_obj, linked_contracts):
+    """Post a source graph's field contracts on SSA values in that graph's scope."""
+    from .concordance_declarations import (
+        LINKED_VALUE_ABI_SETTLEMENT, SSA_VALUE, SSAValueFact,
+    )
+    from .frame_identity_book import _frame_owner_book
+
+    contract_scope = _frame_book_scope(lowered_control)
+    for function in module_ir.functions.values():
+        owner, _ = _frame_owner_book(function)
+        scope = _frame_book_scope(function)
+        # compact_codewords value 8 is a HuffmanCodewords field, while
+        # compiler_broadcast_extents value 8 is an unrelated helper scalar.
+        # Planned regions retain the source control scope; imported helpers
+        # do not inherit this graph's linked field contracts by numeric ID.
+        if scope != contract_scope:
+            continue
+        for value_id, contract in linked_contracts.items():
+            if (
+                contract.get("program_abi_parameter") is None
+                or contract.get("storage") is None
+                or contract.get("rank") is None
+            ):
+                continue
+            fact = owner.page(SSA_VALUE).latest((scope, int(value_id)))
+            if (
+                not isinstance(fact, SSAValueFact)
+                or fact.storage is not None
+                or fact.rank is not None
+                or str(contract.get("dtype") or "") != str(fact.dtype or "")
+                or (str(contract["storage"]) == "scalar" and tuple(fact.shape or ()))
+            ):
+                continue
+            physical = {
+                "storage": str(contract["storage"]),
+                "rank": int(contract["rank"]),
+            }
+            _revise_ssa_value(
+                function, int(value_id), dtype=fact.dtype, shape=fact.shape,
+                stage=LINKED_VALUE_ABI_SETTLEMENT,
+                sources=_frame_cells(
+                    contract.get("program_abi_field_declaration_cell"),
+                    _frame_graph_cell(graph_obj, int(value_id)),
+                ),
+                book=owner, physical=physical,
+            )
+            for formal in function.args:
+                if int(formal.id) == int(value_id):
+                    formal.accounting = _frame_accounting_from_posted(
+                        formal.accounting, physical,
+                    )
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -33314,71 +33367,20 @@ def _class_surface_ssa_program(
             # (``program_abi_field_declaration_cell``) and the field value's
             # graph cell; accounting is then set FROM the posted fact.  Only a contract that declares both, for a row of the
             # same dtype, posts; a row that records some already keeps them.
+            _publish_linked_field_physical_rows(
+                module_ir, lowered_control, graph_obj, linked_contracts,
+            )
+            # A linked keyed input owns the complete descriptor, not only
+            # column zero. Captures must forward those same caller arenas;
+            # treating the remaining members as private scratch loses the
+            # memo at the native call boundary.
             from .concordance_declarations import (
                 LINKED_VALUE_ABI_SETTLEMENT as _FIELD_PHYSICAL_STAGE,
                 SSA_VALUE as _FIELD_SSA_VALUE,
                 SSAValueFact as _FieldSSAValueFact,
             )
-            from .identity_concordance import (
-                current_identity_book as _field_current_book,
-            )
-            from .frame_identity_book import (
-                _frame_owner_book as _frame_owner_book,
-            )
-            _field_book = _field_current_book()
-            for _field_function in module_ir.functions.values():
-                _field_owner, _ = _frame_owner_book(_field_function)
-                _field_scope = _frame_book_scope(_field_function)
-                for _field_id, _field_contract in linked_contracts.items():
-                    if (
-                        _field_contract.get("program_abi_parameter") is None
-                        or _field_contract.get("storage") is None
-                        or _field_contract.get("rank") is None
-                    ):
-                        continue
-                    _field_fact = _field_owner.page(
-                        _FIELD_SSA_VALUE
-                    ).latest((_field_scope, int(_field_id)))
-                    if (
-                        not isinstance(_field_fact, _FieldSSAValueFact)
-                        or _field_fact.storage is not None
-                        or _field_fact.rank is not None
-                        or str(_field_contract.get("dtype") or "")
-                        != str(_field_fact.dtype or "")
-                        or (
-                            str(_field_contract["storage"]) == "scalar"
-                            and tuple(_field_fact.shape or ())
-                        )
-                    ):
-                        continue
-                    _field_physical = {
-                        "storage": str(_field_contract["storage"]),
-                        "rank": int(_field_contract["rank"]),
-                    }
-                    _revise_ssa_value(
-                        _field_function, int(_field_id),
-                        dtype=_field_fact.dtype, shape=_field_fact.shape,
-                        stage=_FIELD_PHYSICAL_STAGE,
-                        sources=_frame_cells(
-                            _field_contract.get(
-                                "program_abi_field_declaration_cell"
-                            ),
-                            _frame_graph_cell(graph_obj, int(_field_id)),
-                        ),
-                        book=_field_owner, physical=_field_physical,
-                    )
-                    for _field_formal in _field_function.args:
-                        if int(_field_formal.id) == int(_field_id):
-                            _field_formal.accounting = (
-                                _frame_accounting_from_posted(
-                                    _field_formal.accounting,
-                                    _field_physical,
-                                )
-                            )
-            # A linked keyed input owns the complete descriptor, not only
-            # column zero. Captures must forward those same caller arenas;
-            # treating the remaining members as private scratch loses the
-            # memo at the native call boundary.
+            from .frame_identity_book import _frame_owner_book
+
             linked_sequences = lowered_control.metadata.get("sequence_table")
             formals_by_id = {int(value.id): value for value in lowered_control.args}
             for descriptor in getattr(linked_sequences, "sequences", {}).values():
