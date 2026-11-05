@@ -337,9 +337,13 @@ function applyState(game) {
     const r = Math.floor(i / n), c = i % n, key = `cell-${i}`, piece = state.pieces.get(key);
     const want = game.cat[i] ? "cat" : game.x_mark[i] ? "x" : null;
     const have = piece && piece.removing == null ? piece.kind : null;
-    if (want === have) continue;
-    if (piece && piece.removing == null) piece.removing = now;
-    if (want) state.pieces.set(want === have ? key : `${key}-${now}`, { kind: want, x: c + 0.5, z: r + 0.5, r, t0: now, removing: null });
+    if (want === have) continue;                                   // unchanged cell: its piece keeps its own clock
+    if (piece && piece.removing == null) {                         // the old piece shrinks out under a side key
+      piece.removing = now;
+      state.pieces.set(`${key}-gone-${now}`, piece);
+      state.pieces.delete(key);
+    }
+    if (want) state.pieces.set(key, { kind: want, x: c + 0.5, z: r + 0.5, r, t0: now, removing: null });
   }
   for (let h = 0; h < 3; h++) {
     const key = `heart-${h}`, piece = state.pieces.get(key), alive = h < game.hearts;
