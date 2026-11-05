@@ -506,6 +506,10 @@ class BulletScroller(EntityGame):
         return {"score": float(s.column("score")[0]), "detail": f"survived {s.column('clock')[0]:.0f} s"}
 
     HOSTILE_LANES = (ENEMIES, BULLETS)
+    # Lo-fi arcade: the backdrop shows through (no floor slab); the glass
+    # plate and the arcade ring are on by default so the lights glow into it.
+    SCENE = {"floor": False, "glass": True, "arcade": True}
+    SCENE_PREFER = {"glass": True, "arcade": True}
 
     def describe(self) -> str:
         s = self.session

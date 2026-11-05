@@ -450,6 +450,9 @@ class EntityGame(Game):
     #:   glass  -- the glass plate under the board
     #:   arcade -- the ring of arcade lights
     SCENE: dict[str, bool] = {"floor": True, "glass": True, "arcade": True}
+    #: Layers the game would like ON unless the viewer turned them off for it
+    #: (the page's switches default to off otherwise).
+    SCENE_PREFER: dict[str, bool] | None = None
     #: Check-in delay bounds (seconds) the sync hint moves between.
     SYNC_MIN, SYNC_MAX = 0.03, 0.25
 
@@ -573,6 +576,8 @@ class EntityGame(Game):
         st = self.base_state(int(round(self.height)), int(round(self.width)))
         st["board"] = "free"
         st["scene"] = dict(self.SCENE)
+        if self.SCENE_PREFER:
+            st["scene_prefer"] = dict(self.SCENE_PREFER)
         st["width"], st["height"] = self.width, self.height
         st["palette"] = {"floor": [0.10, 0.11, 0.16], **self.palette()}
         st["cells"] = ["floor"]
