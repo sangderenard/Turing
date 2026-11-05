@@ -681,5 +681,59 @@ class ChessVsNet(Chess):
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
 
 
+class LichessGame(Chess):
+    """The network's live game on Lichess, as the page sees it: the board
+    replayed from the game stream's moves, the opponent, clocks and
+    result in the status.  Starting this game starts the Lichess client
+    (once per process) when a token is configured."""
+
+    game = "lichess"
+    title = "Lichess: the network against the world"
+    input = "watch"
+
+    def __init__(self, board_id: str = "lichess"):
+        super().__init__(board_id)
+        from meowdoku import lichess
+        self.client = lichess.bot(player=self_play())
+        self.note = "" if self.client else "no Lichess token: set MEOWDOKU_LICHESS_TOKEN or build/meowdoku/lichess_token.txt"
+
+    def tick(self) -> None:
+        return None
+
+    def cell(self, r: int, c: int, button: str) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+    def undo(self) -> None:
+        return None
+
+    def state(self) -> dict:
+        from meowdoku import lichess
+        snap = self.client.snapshot() if self.client else None
+        if snap:
+            board = lichess.board_from_moves(snap.get("moves", ""))
+            self.pieces, self.ids, self.turn, self.moves = board.pieces, board.ids, board.turn, board.moves
+            self.rights, self.ep = board.rights, board.ep
+        st = Chess.state(self)
+        st["selected"] = None; st["hints"] = [0] * 64
+        if not self.client:
+            st["status"] = self.note
+        elif not snap:
+            me = self.client.me.get("username", "…")
+            st["status"] = f"{me} online · waiting for a game (challenging an idle bot every {int(self.client.idle_challenge_every)} s)"
+        else:
+            clocks = ""
+            if snap.get("wtime") is not None:
+                clocks = f" · ⏱ {int(snap['wtime'] // 1000)}s / {int(snap['btime'] // 1000)}s"
+            record = f" · {len(self.client.results)} games: " + ", ".join(r.split(' vs ')[0] for r in self.client.results[-6:]) if self.client.results else ""
+            st["status"] = (f"{snap['white']} vs {snap['black']} · we are {snap['color']} · {self.turn} to move{clocks}"
+                            + (f" · {snap.get('summary', snap['status'])}" if snap.get("result") else "") + record)
+            st["won"] = bool(snap.get("result")) and snap.get("result") == snap.get("color")
+            st["lost"] = bool(snap.get("result")) and snap.get("result") not in (None, "draw", snap.get("color"))
+        return st
+
+
 GAMES = {"meowdoku": MeowdokuGame, "chess": Chess, "checkers": Checkers, "wordle": Wordle,
-         "chess_arena": ChessArena, "chess_vs_net": ChessVsNet}
+         "chess_arena": ChessArena, "chess_vs_net": ChessVsNet, "lichess": LichessGame}

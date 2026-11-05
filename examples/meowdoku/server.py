@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
-from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, MeowdokuGame, Wordle  # noqa: E402
+from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, LichessGame, MeowdokuGame, Wordle  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 
@@ -48,14 +48,14 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
 
     def new(self, payload: dict) -> dict:
         kind = str(payload.get("game", "meowdoku"))
-        if self.game is not None and hasattr(self.game, "stop"):
+        if self.game is not None and hasattr(self.game, "stop") and not isinstance(self.game, LichessGame):
             self.game.stop()                                   # an arena's thread ends with it
         if kind == "meowdoku":
             self.game = MeowdokuGame(self.boards[str(payload["id"])])
@@ -69,6 +69,8 @@ class Table:
             self.game = ChessArena(parallel=int(payload.get("parallel", 16)), lock=self.lock)
         elif kind == "chess_vs_net":
             self.game = ChessVsNet()
+        elif kind == "lichess":
+            self.game = LichessGame()
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
