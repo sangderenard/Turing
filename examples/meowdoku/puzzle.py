@@ -157,6 +157,11 @@ def _shifted(AT, tensor, dr, dc, fill):
 _FOUR = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _EIGHT = _FOUR + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
+#: Every batched routine runs its AbstractTensor work here unless told
+#: otherwise: the torch backend on the GPU.
+DEFAULT_BACKEND = "torch"
+DEFAULT_DEVICE = "cuda"
+
 
 def singles_solve(region, solution, *, max_rounds: int | None = None):
     """Solve ``(b, n, n)`` boards by singles alone, batched.
@@ -226,12 +231,21 @@ def _simple_points(AT, region):
     return total == 1.0
 
 
-def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = None,
-                   chunk_elements: int = 32_000_000) -> PuzzleBatch:
-    """``batch`` unique, contiguous puzzles of size ``n`` from first
-    principles, batched: AbstractTensor arithmetic over ``(batch, n, n)``
-    spans and ``(batch, n, n, n)`` one-hots, never a loop over cells or
-    boards.
+def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
+                   rounds: int | None = None, jitter: float = 0.35,
+                   chunk_elements: int = 32_000_000, backend: str = DEFAULT_BACKEND,
+                   device=DEFAULT_DEVICE) -> PuzzleBatch:
+    """``batch`` contiguous puzzles of size ``n`` from first principles,
+    batched: AbstractTensor arithmetic over ``(batch, n, n)`` spans and
+    ``(batch, n, n, n)`` one-hots, never a loop over cells or boards.
+
+    Two styles.  ``"relaxed"`` (steps 2 to 4 below) is unique by
+    construction.  ``"free"`` keeps step 1 and grows the regions as plain
+    wavefronts from every cat, nearest jittered centre first, with no
+    solving-order constraint: balanced shapes, any number of valid
+    arrangements.  The solution column is the cat map either way: the
+    arrangement the game scores against, chosen ahead of time; ``tree.py``
+    types a board by its solution tree and can draw another leaf.
 
     1. CAT MAP first.  The arrangement is a random permutation ``sigma``
        (column per row), the rank of random keys; the no-touch rule
@@ -251,8 +265,12 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
        two cells smaller moves to the smallest such neighbour.  Cells of
        one parity class are never 8-adjacent, so simultaneous moves are
        independent and every region stays connected; the donor keeps its
-       cat; the receiver gains an adjacent cell.  Validity therefore holds
-       after every round, and the rounds stop when no cell can move.
+       cat; the receiver gains an adjacent cell.  Then one PIECE HANDOVER
+       per board: a non-simple boundary cell moves together with the piece
+       it cuts off from its donor's cat, when that whole piece is eligible
+       for the receiver (a flood from the cats finds the piece).  Validity
+       therefore holds after every round, and the rounds stop when nothing
+       can move.
 
     What comes out: every region contiguous, every board unique by
     construction (``count_arrangements`` is the oracle in the tests at the
@@ -275,20 +293,31 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
         raise ValueError("Meowdoku needs at least a 4x4 board for a no-touch arrangement")
     if batch < 1:
         raise ValueError("batch must be at least one puzzle")
+    if style not in {"relaxed", "free"}:
+        raise ValueError(f"style={style!r}: relaxed or free")
     per_chunk = max(1, int(chunk_elements) // (n * n * n))
     regions, solutions = [], []
     # One seeded stream of the repository's own PRNG (Xoroshiro128**) feeds
     # every draw in order, so a seed names the whole batch exactly.
     # (``AbstractTensor.randn`` is not reached by any seed; measured.)
+    # ``backend``/``device`` scope every tensor of the build: ``"torch"``
+    # with ``device="cuda"`` puts the whole batch on the GPU; the draws come
+    # from the host stream and are moved once per draw.
+    stream_batch = 1 << 16
     stream = random_generator(kind=RANDOM_KIND.PRNG, algo=PRNG_ALGO.XOROSHIRO128SS,
-                              seed=int(seed), dtype="float", batch_size=1)
+                              seed=int(seed), dtype="float", batch_size=stream_batch)
 
     def uniform(*shape):
         count = int(np.prod(shape))
-        values = np.fromiter((next(stream) for _ in range(count)), dtype=np.float64, count=count)
-        return AT.tensor(values.reshape(shape))
+        pieces, have = [], 0
+        while have < count:
+            block = np.asarray(next(stream), dtype=np.float64).reshape(-1)
+            pieces.append(block)
+            have += block.size
+        values = np.concatenate(pieces)[:count] if len(pieces) > 1 else pieces[0][:count]
+        return AT.tensor(np.ascontiguousarray(values).reshape(shape))
 
-    with AT.use_backend("numpy"):
+    with AT.use_backend(backend, device):
         index_n = AT.arange(n).to_dtype("float")
         rr = index_n.reshape((1, n, 1))
         cc = index_n.reshape((1, 1, n))
@@ -306,19 +335,48 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
                 redraw = _rank_of(uniform(b, n))
                 sigma = AT.where(valid.reshape((b, 1)), sigma, redraw)
                 valid = ((sigma[:, 1:] - sigma[:, :-1]).abs() >= 2.0).all(dim=1)
+            is_cat = (sigma.reshape((b, n, 1)) == columns).to_dtype("float")   # (b, n, n)
+            zero = is_cat * 0.0
+            if style == "free":
+                # Wavefronts from every cat; each round every unassigned
+                # cell joins the 4-neighbour whose region centre (jittered
+                # per cat) is nearest.  Contiguous by construction.
+                centre_r = index_n.reshape((1, n)) + (uniform(b, n) - 0.5) * (float(jitter) * n)
+                centre_c = sigma + (uniform(b, n) - 0.5) * (float(jitter) * n)
+                region = AT.where(is_cat > 0.5, rr + zero, zero - 1.0)
+                own_cr = AT.where(is_cat > 0.5, centre_r.reshape((b, n, 1)) + zero, zero)
+                own_cc = AT.where(is_cat > 0.5, centre_c.reshape((b, n, 1)) + zero, zero)
+                cell_r, cell_c = rr + zero, cc + zero
+                for _round in range(2 * n + 2):
+                    unassigned = region < 0.0
+                    if not bool(unassigned.any()):
+                        break
+                    best_score = zero + float(4 * n * n + 1)
+                    best = [region, own_cr, own_cc]
+                    for dr, dc in _FOUR:
+                        nb = [_shifted(AT, m, dr, dc, zero - 1.0) for m in (region, own_cr, own_cc)]
+                        score = (cell_r - nb[1]) ** 2 + (cell_c - nb[2]) ** 2
+                        take = unassigned & (nb[0] >= 0.0) & (score < best_score)
+                        best_score = AT.where(take, score, best_score)
+                        best = [AT.where(take, new, old) for new, old in zip(nb, best)]
+                    region, own_cr, own_cc = best
+                regions.append(np.asarray(region.numpy(), dtype=np.float64).reshape(b, n * n))
+                solutions.append(np.asarray(is_cat.numpy(), dtype=np.float64).reshape(b, n * n))
+                done += b
+                continue
             # 2. solving order and each cell's elimination moment.
             rank = _rank_of(uniform(b, n))                                     # (b, n)
-            is_cat = (sigma.reshape((b, n, 1)) == columns).to_dtype("float")   # (b, n, n)
             rank_of_column_cat = (is_cat * rank.reshape((b, n, 1))).sum(dim=1)   # (b, n)
             eliminated_at = rank.reshape((b, n, 1)).minimum(rank_of_column_cat.reshape((b, 1, n)))
-            zero = is_cat * 0.0
             # 3. the valid start: everything to the last-solved region.
             last = ((rank == float(n - 1)).to_dtype("float") * index_n.reshape((1, n))).sum(dim=1)   # (b,)
             region = AT.where(is_cat > 0.5, rr + zero, last.reshape((b, 1, 1)) + zero)
             own_rank = AT.where(is_cat > 0.5, rank.reshape((b, n, 1)) + zero, float(n - 1) + zero)
             parity_r, parity_c = (rr % 2.0) + zero, (cc % 2.0) + zero
-            # 4. relaxation rounds.
-            for _round in range(rounds or 4 * n):
+            # 4. relaxation rounds: simple-point moves per parity class, then
+            #    one piece handover per board.
+            cell_index = AT.arange(n * n).to_dtype("float").reshape((1, n * n))
+            for _round in range(rounds or 8 * n):
                 moved = False
                 for pr, pc in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)):
                     one_hot = (region.reshape((b, n, n, 1)) == regions_k).to_dtype("float")
@@ -331,7 +389,6 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
                         nb_region = _shifted(AT, region, dr, dc, zero - 1.0)
                         nb_rank = _shifted(AT, own_rank, dr, dc, zero - 1.0)
                         nb_size = _shifted(AT, own_size, dr, dc, zero + huge)
-                        # Ties between equal-sized neighbours fall to a per-cell draw.
                         take = (may_move & (nb_region >= 0.0) & (nb_region != region)
                                 & (nb_rank > eliminated_at) & (nb_size + 1.0 < own_size) & (nb_size < best_size))
                         best_size = AT.where(take, nb_size, best_size)
@@ -340,6 +397,64 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
                     if bool((best_region != region).any()):
                         moved = True
                         region, own_rank = best_region, best_rank
+                if moved:
+                    # Handovers only when the simple-point moves have
+                    # stalled: each needs a flood, and most rounds do not.
+                    continue
+                # Piece handover.  A cell that is NOT a simple point of its
+                # donor may still move: the piece it cuts off from the
+                # donor's cat goes with it, when every cell of that piece is
+                # eligible for the receiver.  The piece hangs off the moved
+                # cell and the moved cell off the receiver, so both regions
+                # stay connected.  One handover per board per round, the one
+                # with the largest size difference; the flood from the cats
+                # finds the piece.  (Measured: without this, half the
+                # largest region's boundary was eligible but not simple.)
+                one_hot = (region.reshape((b, n, n, 1)) == regions_k).to_dtype("float")
+                size = one_hot.sum(dim=(1, 2))
+                own_size = (one_hot * size.reshape((b, 1, 1, n))).sum(dim=3)
+                not_simple = ~_simple_points(AT, region) & (is_cat < 0.5)
+                best_gain = zero - 1.0
+                best_region, best_rank = region, own_rank
+                for dr, dc in _FOUR:
+                    nb_region = _shifted(AT, region, dr, dc, zero - 1.0)
+                    nb_rank = _shifted(AT, own_rank, dr, dc, zero - 1.0)
+                    nb_size = _shifted(AT, own_size, dr, dc, zero + huge)
+                    gain = own_size - nb_size
+                    take = (not_simple & (nb_region >= 0.0) & (nb_region != region)
+                            & (nb_rank > eliminated_at) & (nb_size + 1.0 < own_size) & (gain > best_gain))
+                    best_gain = AT.where(take, gain, best_gain)
+                    best_region = AT.where(take, nb_region, best_region)
+                    best_rank = AT.where(take, nb_rank, best_rank)
+                flat_gain = best_gain.reshape((b, n * n))
+                has = flat_gain.max(dim=1) > 0.0 if hasattr(flat_gain, "max") else None
+                if has is None or not bool(has.any()):
+                    if not moved:
+                        break
+                    continue
+                pick = (flat_gain * -1.0).argmin(dim=1).to_dtype("float").reshape((b, 1))   # first best per board
+                pick_mask = (cell_index == pick).reshape((b, n, n)) & has.reshape((b, 1, 1))
+                trial = AT.where(pick_mask, best_region, region)
+                trial_rank = AT.where(pick_mask, best_rank, own_rank)
+                receiver = (pick_mask.to_dtype("float") * best_region).sum(dim=(1, 2)).reshape((b, 1, 1))
+                receiver_rank = (pick_mask.to_dtype("float") * best_rank).sum(dim=(1, 2)).reshape((b, 1, 1))
+                reached = is_cat > 0.5
+                for _flood in range(n * n):
+                    grow = reached
+                    for dr, dc in _FOUR:
+                        same = _shifted(AT, trial, dr, dc, zero - 2.0) == trial
+                        grow = grow | (_shifted(AT, reached.to_dtype("float"), dr, dc, zero) > 0.0) & same
+                    if not bool((grow & ~reached).any()):
+                        break
+                    reached = grow
+                stranded = ~reached
+                ok_board = has.reshape((b, 1, 1)) & ~(stranded & ~(receiver_rank > eliminated_at)).any(dim=(1, 2)).reshape((b, 1, 1))
+                handed = AT.where(stranded, receiver + zero, trial)
+                handed_rank = AT.where(stranded, receiver_rank + zero, trial_rank)
+                if bool(ok_board.any()):
+                    moved = True
+                    region = AT.where(ok_board, handed, region)
+                    own_rank = AT.where(ok_board, handed_rank, own_rank)
                 if not moved:
                     break
             regions.append(np.asarray(region.numpy(), dtype=np.float64).reshape(b, n * n))
@@ -351,14 +466,14 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, rounds: int | None = No
     return PuzzleBatch(n, row, col, np.concatenate(regions), np.concatenate(solutions))
 
 
-def contiguous_regions(puzzles: "PuzzleBatch") -> np.ndarray:
+def contiguous_regions(puzzles: "PuzzleBatch", *, backend: str = DEFAULT_BACKEND, device=DEFAULT_DEVICE) -> np.ndarray:
     """Per puzzle: every region is one 4-connected piece.  A batched flood
     from each cat over its own region; a region is contiguous when the
     flood covers it."""
     from src.common.tensors import AbstractTensor as AT
 
     n, b = puzzles.n, puzzles.batch
-    with AT.use_backend("numpy"):
+    with AT.use_backend(backend, device):
         region = AT.tensor(puzzles.region.reshape(b, n, n))
         reached = AT.tensor(puzzles.solution.reshape(b, n, n)) > 0.5
         zero = region * 0.0
@@ -374,14 +489,14 @@ def contiguous_regions(puzzles: "PuzzleBatch") -> np.ndarray:
         return np.asarray(reached.all(dim=(1, 2)).numpy(), dtype=bool).reshape(b)
 
 
-def verify_batch(puzzles: PuzzleBatch) -> np.ndarray:
+def verify_batch(puzzles: PuzzleBatch, *, backend: str = DEFAULT_BACKEND, device=DEFAULT_DEVICE) -> np.ndarray:
     """Per puzzle: the solution obeys all three rules and every region holds
     exactly one cat.  Batched AbstractTensor checks, the same arithmetic the
     game law uses, not a Python walk."""
     from src.common.tensors import AbstractTensor as AT
 
     n, b = puzzles.n, puzzles.batch
-    with AT.use_backend("numpy"):
+    with AT.use_backend(backend, device):
         solution = AT.tensor(puzzles.solution.reshape(b, n, n))
         region = AT.tensor(puzzles.region.reshape(b, n, n))
         index_n = AT.arange(n).to_dtype("float")
