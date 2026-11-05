@@ -31,6 +31,19 @@ three hearts.
   posts clicks (unprojected onto the board plane) and animates the
   difference between states; it never decides anything.
 
+## Light and shadow
+
+The exporter compiles a second fragment with `#define PLUCK_SHADOW_MAP`,
+the shader's own opt-in (`export_shadow_fragment`).  Each frame the page
+renders a depth pre-pass from the key light (orthographic, covering the
+board) into a 2048x2048 depth texture array and sets `uShadowMatrices[0]
+= lightViewProj * model` per draw, since the shader shadows from
+`vPosObj`.  The key light is a world-space point orbiting the board, drawn
+as a bulb; `Light (L)` makes it follow the pointer.  Buttons are truncated
+pyramids lit by the same program with one material per region.  Two
+uniforms the newer source adds without ES defaults, `uExposure` and the
+thermal table, are set explicitly (0.42, off); unset they render black.
+
 ## Animation
 
 Per piece a model matrix from its age: cat `y = 1.6 sin(pi t)` over 1.1 s

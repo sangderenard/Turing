@@ -237,8 +237,12 @@ def contrast_palette(region_grid: np.ndarray, palette: str | np.ndarray = "paste
 #: its allocation on this machine (measured 2026-11-05); the X and heart
 #: render at the default.  A coarser profile keeps the cat under the X's
 #: budget class.
+#: All roles extrude deeper than the ink default (0.03 m on a 0.2 m glyph)
+#: so the 3D pieces read as objects: 0.32 of the glyph height.
 ROLE_GEOMETRY: dict[str, dict[str, Any]] = {
-    "cat": {"outline_subdivisions": 1, "profile_segments": 2},
+    "cat": {"outline_subdivisions": 1, "profile_segments": 2, "extrusion_depth_ratio": 0.32},
+    "x_mark": {"extrusion_depth_ratio": 0.32},
+    "heart": {"extrusion_depth_ratio": 0.32},
 }
 
 #: Scene-order runtime for the tiles: four times the renderer's default ray
@@ -265,12 +269,17 @@ def tile_order_package(roles: tuple[str, ...] = ("cat", "x_mark", "heart")) -> d
             job = dict(job)
             job["id"] = f"meowdoku_{role}"
             job["font"] = font.scene_order_mapping()
-            job["geometry"] = {**job["geometry"], "material": ROLE_MATERIALS[role],
-                               **ROLE_GEOMETRY.get(role, {})}
+            geometry = {**job["geometry"], "material": ROLE_MATERIALS[role], **ROLE_GEOMETRY.get(role, {})}
+            if "extrusion_depth_ratio" in geometry:
+                geometry.pop("depth_m", None)                 # the two depth spellings are exclusive
+            job["geometry"] = geometry
             jobs.append(job)
     assert package is not None
     package["jobs"] = jobs
     package["runtime"] = {**package.get("runtime", {}), **TILE_RUNTIME}
+    # The ink defaults carry depth_m; every tile job states its depth as a
+    # ratio of the glyph height, and the two spellings are exclusive.
+    package["defaults"].get("geometry", {}).pop("depth_m", None)
     scene_orders.validate_order(package)
     return package
 

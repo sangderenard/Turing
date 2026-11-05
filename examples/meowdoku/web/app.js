@@ -81,6 +81,47 @@ const FLAT_FS = `#version 300 es
 precision highp float; in vec3 vColor; out vec4 FragColor; uniform float uAlpha;
 void main(){ FragColor = vec4(pow(vColor, vec3(1.0/2.2)), uAlpha); }`;
 
+const DEPTH_VS = `#version 300 es
+layout(location=0) in vec3 aPos; uniform mat4 uMVP;
+void main(){ gl_Position = uMVP * vec4(aPos, 1.0); }`;
+const DEPTH_FS = `#version 300 es
+precision highp float; void main(){}`;
+const SHADOW_SIZE = 2048;
+
+function buildShadowMap() {
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + 9); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 1);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_COMPARE_MODE, gl.NONE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, tex, 0, 0);
+  gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) throw new Error("shadow framebuffer incomplete: " + status);
+  return { tex, fbo };
+}
+
+function buildSphere(radius = 1, rings = 10, segments = 16) {
+  const pos = [], col = [];
+  const vert = (i, j) => { const th = i / rings * Math.PI, ph = j / segments * Math.PI * 2;
+    return [radius * Math.sin(th) * Math.cos(ph), radius * Math.cos(th), radius * Math.sin(th) * Math.sin(ph)]; };
+  for (let i = 0; i < rings; i++) for (let j = 0; j < segments; j++) {
+    const a = vert(i, j), b = vert(i + 1, j), c = vert(i + 1, j + 1), d = vert(i, j + 1);
+    for (const q of [a, b, c, a, c, d]) { pos.push(...q); col.push(1.0, 0.93, 0.78); }
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const cb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(col), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: pos.length / 3 };
+}
+
 // ---------------------------------------------------------------- storage textures (the compiled SSBOs)
 function storageTexture(table, unit) {
   const data = new Float32Array(table.data);
@@ -113,6 +154,7 @@ const state = window.meow;
 Object.assign(state, {
   assets: null, boards: null, phong: null, flat: null, meshes: {}, tiles: null,
   board: null, game: null, pieces: new Map(), hearts: [3, 3], lastMove: null, level: null, time: 0,
+  debug: { shadows: true, keyGain: 1.0, exposure: 0.42 },
 });
 const hsv = (h, s, v) => {
   const i = Math.floor(((h % 1) + 1) % 1 * 6), f = ((h % 1) + 1) % 1 * 6 - i;
@@ -217,6 +259,33 @@ function buildShadowQuad() {
   return { vao, count: pos.length / 3 };
 }
 
+// ---------------------------------------------------------------- the key light
+// A world-space point light that orbits the board slowly; "Light" (or L)
+// makes it follow the pointer instead.  The Phong program takes it in view
+// space; the shadow pass looks along it.
+const light = { angle: 0.9, radius: 1.2, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
+state.light = light;
+function updateLight(now) {
+  const n = state.board.n;
+  if (light.follow && light.pointer) {
+    light.position = [light.pointer[0], light.height * n * 0.9, light.pointer[1]];
+  } else {
+    light.angle += 0; const a = light.angle + now * 0.18;
+    light.position = [n / 2 + Math.cos(a) * n * light.radius * 0.6, light.height * n * 0.9, n / 2 + Math.sin(a) * n * light.radius * 0.6];
+  }
+  // Orthographic light frustum covering the board; the shadow matrix maps
+  // object space to this clip space (uShadowMatrices wants vPosObj).
+  const target = [n / 2, 0, n / 2 + 0.5];
+  const view = M.lookAt(light.position, target, [0, 1, 0]);
+  const half = n * 0.95, depth = Math.hypot(...sub(light.position, target));
+  const proj = M.identity(); proj[0] = 1 / half; proj[5] = 1 / half; proj[10] = -2 / (depth * 3); proj[14] = -(depth * 3 + depth * -1) / (depth * 3) + 0.0;
+  // simple ortho: z in [near, far] = [depth*0.1, depth*2.5]
+  const near = depth * 0.1, far = depth * 2.5;
+  proj[10] = -2 / (far - near); proj[14] = -(far + near) / (far - near);
+  light.viewProj = M.multiply(proj, view);
+  light.view = view;
+}
+
 // ---------------------------------------------------------------- camera
 function camera() {
   const n = state.board ? state.board.n : 6;
@@ -273,15 +342,36 @@ function draw(ms) {
   gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.board) { requestAnimationFrame(draw); return; }
-  const cam = camera();
-  const P = state.phong; gl.useProgram(P);
-  const lights = state.assets.lights, n = state.board.n;
-  const lpos = [], lcol = [], lint = [], lgid = [];
-  for (const L of lights) {                                       // lights ride with the camera, in view space, scaled to the board
-    lpos.push(L.position[0] * n, L.position[1] * n, L.position[2] * n * 0.5 - 1.0);
-    lcol.push(...L.color); lint.push(L.intensity * n * n * 1.7); lgid.push(-1);
+  const cam = camera(), n = state.board.n;
+  updateLight(now);
+  // Pass 1: depth from the key light into the shadow map.
+  const models = [];                                              // (vao, count, model) of everything that casts or receives
+  models.push([state.tiles.vao, state.tiles.count, M.identity(), null]);
+  const removed = [];
+  for (const [key, piece] of state.pieces) {
+    if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
+    const mesh = state.meshes[piece.kind === "x" ? "x_mark" : piece.kind];
+    models.push([mesh.vao, mesh.count, pieceModel(piece, now), mesh]);
   }
-  gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), lights.length);
+  for (const key of removed) state.pieces.delete(key);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo);
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(state.depthProg); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
+  for (const [vao, count, model] of models) {
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.depthProg, "uMVP"), false, M.multiply(light.viewProj, model));
+    gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
+  }
+  gl.disable(gl.POLYGON_OFFSET_FILL);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
+  // Pass 2: the lit scene.  Key light in view space from its world position;
+  // a cool fill and a warm rim ride with the camera.
+  const P = state.phong; gl.useProgram(P);
+  const keyView = M.apply(cam.view, light.position);
+  const lpos = [...keyView, 0.9 * n, 0.4 * n, 0.4 * n - 1.0, -0.6 * n, -0.1 * n, 0.3 * n - 1.0];
+  const lcol = [1.0, 0.95, 0.86, 0.75, 0.85, 1.0, 1.0, 0.8, 0.7];
+  const lint = [2.6 * n * n * state.debug.keyGain, 0.35 * n * n, 0.25 * n * n];
+  const lgid = [-1, -1, -1];
+  gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), 3);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array(lpos));
   gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array(lcol));
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array(lint));
@@ -293,38 +383,36 @@ function draw(ms) {
   gl.uniform1i(gl.getUniformLocation(P, "uRenderPass"), 0);
   gl.uniform1f(gl.getUniformLocation(P, "uFieldGain"), 0.0);
   for (const [name, unit] of Object.entries(state.units)) gl.uniform1i(gl.getUniformLocation(P, name), unit);
-  // the board: beveled buttons, model = identity
-  gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, cam.viewProj);
-  gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, cam.view);
-  gl.bindVertexArray(state.tiles.vao);
-  gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
-  gl.drawArrays(gl.TRIANGLES, 0, state.tiles.count);
-  const removed = [];
-  for (const [key, piece] of state.pieces) {
-    if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
-    const mesh = state.meshes[piece.kind === "x" ? "x_mark" : piece.kind];
-    const model = pieceModel(piece, now);
+  // The newer source has an exposure uniform and a thermal-emission table;
+  // ES strips the desktop defaults, so they are set here.
+  gl.uniform1f(gl.getUniformLocation(P, "uExposure"), state.debug.exposure);
+  gl.uniform1i(gl.getUniformLocation(P, "uThermalEmission"), 0);
+  gl.uniform1f(gl.getUniformLocation(P, "uThermalGain"), 0.08);
+  gl.uniform1f(gl.getUniformLocation(P, "uThermalRefK"), 1000.0);
+  gl.uniform1f(gl.getUniformLocation(P, "uThermalFloorK"), 720.0);
+  gl.uniform1i(gl.getUniformLocation(P, "turing_ssbo_thermal_k"), 10);
+  gl.uniform1i(gl.getUniformLocation(P, "uShadowMaps"), 9);
+  gl.uniform1i(gl.getUniformLocation(P, "uShadowEnabled"), state.debug.shadows ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(P, "uShadowLightCount"), 1);
+  gl.uniform2f(gl.getUniformLocation(P, "uShadowTexelSize"), 1 / SHADOW_SIZE, 1 / SHADOW_SIZE);
+  gl.uniform1f(gl.getUniformLocation(P, "uShadowBias"), 0.0015);
+  const shadowLoc = gl.getUniformLocation(P, "uShadowMatrices[0]");
+  for (const [vao, count, model, mesh] of models) {
     const mv = M.multiply(cam.view, model), mvp = M.multiply(cam.proj, mv);
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, mvp);
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, mv);
-    gl.bindVertexArray(mesh.vao);
-    gl.vertexAttribI4i(2, mesh.material, 0, 0, 0); gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+    gl.uniformMatrix4fv(shadowLoc, false, M.multiply(light.viewProj, model));
+    gl.bindVertexArray(vao);
+    if (mesh) gl.vertexAttribI4i(2, mesh.material, 0, 0, 0);
+    gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, count);
   }
-  for (const key of removed) state.pieces.delete(key);
-  // contact shadows: a dark disc on the button top under each board piece,
-  // smaller and fainter the higher the piece is
-  gl.useProgram(state.flat); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  gl.bindVertexArray(state.shadow.vao);
-  for (const piece of state.pieces.values()) {
-    if (piece.kind === "heart" || piece.height == null) continue;
-    const h = Math.max(0, piece.height), radius = piece.size * 0.55 / (1 + 1.5 * h), alpha = 0.45 / (1 + 2.0 * h);
-    const model = M.multiply(M.translate(piece.x, TILE.height + 0.004, piece.z + 0.05), M.scale(radius, 1, radius * 0.8));
-    gl.uniformMatrix4fv(gl.getUniformLocation(state.flat, "uMVP"), false, M.multiply(cam.viewProj, model));
-    gl.uniform1f(gl.getUniformLocation(state.flat, "uAlpha"), alpha);
-    gl.drawArrays(gl.TRIANGLES, 0, state.shadow.count);
-  }
-  gl.depthMask(true); gl.disable(gl.BLEND);
+  // the visible light: a small warm sphere where the key light is
+  gl.useProgram(state.flat);
+  gl.uniform1f(gl.getUniformLocation(state.flat, "uAlpha"), 1.0);
+  const bulb = M.multiply(M.translate(...light.position), M.scale(0.12 * Math.sqrt(n), 0.12 * Math.sqrt(n), 0.12 * Math.sqrt(n)));
+  gl.uniformMatrix4fv(gl.getUniformLocation(state.flat, "uMVP"), false, M.multiply(cam.viewProj, bulb));
+  gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
   gl.bindVertexArray(null);
   requestAnimationFrame(draw);
 }
@@ -382,6 +470,7 @@ let press = null;
 canvas.addEventListener("pointerdown", (e) => { press = { x: e.clientX, y: e.clientY, t: performance.now(), button: e.button }; });
 canvas.addEventListener("pointerup", async (e) => {
   if (!press || !state.board) return;
+  if (light.follow) { press = null; return; }
   const long = performance.now() - press.t > 450, button = (press.button === 2 || long) ? "secondary" : "primary";
   press = null;
   const cell = cellAt(e.clientX, e.clientY);
@@ -389,10 +478,23 @@ canvas.addEventListener("pointerup", async (e) => {
   if (cell) applyState(await api("/api/move", { r: cell.r, c: cell.c, button }));
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("pointermove", (e) => {
+  if (!light.follow || !state.board) return;
+  // the pointer's hit on the plane of the light's height
+  const cam = camera(), rect = canvas.getBoundingClientRect();
+  const ndc = [((e.clientX - rect.left) / rect.width) * 2 - 1, 1 - ((e.clientY - rect.top) / rect.height) * 2];
+  const inv = M.invert(cam.viewProj);
+  const near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
+  const yPlane = light.height * state.board.n * 0.9, t = (yPlane - near[1]) / (far[1] - near[1]);
+  if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];
+});
+function toggleLight() { light.follow = !light.follow; document.getElementById("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
+document.getElementById("light").onclick = toggleLight;
 window.addEventListener("keydown", async (e) => {
   if (e.key === "u" || e.key === "U") applyState(await api("/api/undo"));
   if (e.key === "r" || e.key === "R") applyState(await api("/api/reset"));
   if (e.key === "n" || e.key === "N") document.getElementById("new").click();
+  if (e.key === "l" || e.key === "L") toggleLight();
 });
 document.getElementById("undo").onclick = async () => applyState(await api("/api/undo"));
 document.getElementById("reset").onclick = async () => applyState(await api("/api/reset"));
@@ -419,22 +521,26 @@ function fillPickers() {
 (async () => {
   const [vert, frag, assets, boards] = await Promise.all([
     fetch("shaders/base_material.webgl.vert.glsl").then((r) => r.text()),
-    fetch("shaders/base_material.webgl.frag.glsl").then((r) => r.text()),
+    fetch("shaders/base_material.webgl.shadow.frag.glsl").then((r) => r.text()),
     fetch("assets.json").then((r) => r.json()),
     fetch("boards.json").then((r) => r.json()),
   ]);
   state.assets = assets; state.boards = boards;
   state.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
   state.flat = link(compile(gl.VERTEX_SHADER, FLAT_VS), compile(gl.FRAGMENT_SHADER, FLAT_FS));
+  state.depthProg = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
+  state.shadowMap = buildShadowMap();
+  state.bulb = buildSphere();
   // The compiled SSBOs as R32F textures, the identity UV stacks and the empty field volume.
   storageTexture(assets.materials.pbr, 0); storageTexture(assets.materials.phong, 1);
   storageTexture(assets.materials.enamel, 2); storageTexture(assets.materials.texstack, 3);
   arrayTexture(4, [0, 255, 128, 255]); arrayTexture(5, [255, 255, 255, 0]); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8);
+  storageTexture({ data: [0.0] }, 10);                 // thermal kelvins: none
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8 };
   for (const role of ["cat", "x_mark", "heart"]) state.meshes[role] = uploadMesh(assets.meshes[role]);
-  state.shadow = buildShadowQuad();
+
   fillPickers();
   requestAnimationFrame(draw);
   document.getElementById("level").value = Object.keys(boards.levels).find((k) => k.startsWith("small/forced")) || Object.keys(boards.levels)[0];

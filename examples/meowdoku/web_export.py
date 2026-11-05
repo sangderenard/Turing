@@ -43,6 +43,23 @@ WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 SHADERS = ("base_material.webgl.vert.glsl", "base_material.webgl.frag.glsl")
 
 
+def export_shadow_fragment(target: Path) -> None:
+    """The same fragment shader with its own shadow-map path switched on
+    (``#define PLUCK_SHADOW_MAP``, the opt-in it documents for WebGL
+    adapters), compiled through Turing's GLSL project IR like the tracked
+    generated shader.  The page renders a depth pre-pass from the key light
+    into ``uShadowMaps`` and hands ``uShadowMatrices`` per draw."""
+    from src.compiler.glsl_project_ir import compile_glsl_project_to_webgl
+
+    source = (SPECTRAL_ROOT / "csrc" / "shaders" / "base_material.frag.glsl").read_text(encoding="utf-8")
+    source = source.replace("#version 430 core", "#version 430 core\n#define PLUCK_SHADOW_MAP 1", 1)
+    translated = compile_glsl_project_to_webgl(source, source_name="base_material_fragment_shadow", stage_hint="fragment")
+    if not translated.complete:
+        report = "\n".join(item.format() for item in translated.diagnostics)
+        raise RuntimeError(f"shadow fragment translation is incomplete:\n{report}")
+    target.write_text(translated.source, encoding="utf-8", newline="\n")
+
+
 def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
@@ -116,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     (out / "shaders").mkdir(parents=True, exist_ok=True)
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
+    export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
     for name in ("index.html", "app.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
