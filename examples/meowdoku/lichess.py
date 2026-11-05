@@ -219,6 +219,8 @@ class LichessBot:
     # -- events ----------------------------------------------------------
     def accept_or_decline(self, challenge: dict) -> None:
         cid = challenge.get("id")
+        if str(challenge.get("challenger", {}).get("id", "")).lower() == str(self.me.get("id", "")).lower():
+            return                                            # our own outgoing challenge, echoed back
         standard = challenge.get("variant", {}).get("key") == "standard"
         speed_ok = challenge.get("speed") in ("bullet", "blitz", "rapid", "classical", "correspondence")
         if standard and speed_ok:
