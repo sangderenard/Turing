@@ -99,3 +99,39 @@ extern "C" void broadcast_binary_double(const double* a, const double* b, double
         default: break;   // the front end emits only BROADCAST_BINARY_OPCODES
     }
 }
+
+// im2col with the repository layout (batch, channel, kh, kw, oh, ow), the
+// same order as ctensor_ops.c's unfold2d_double: nested loops instead of the
+// authored LLVM form's per-element six-way div/rem decode.  Each output row
+// is decided once (padding row or shifted input row), so the inner loop is a
+// bounded copy.  Values are copied, never computed: results are identical.
+extern "C" void unfold2d_double(const double* input, double* output,
+                                int n, int c, int h, int w, int kernel_h, int kernel_w,
+                                int stride_h, int stride_w, int padding_h, int padding_w,
+                                int dilation_h, int dilation_w) {
+    const int effective_h = (kernel_h - 1) * dilation_h + 1;
+    const int effective_w = (kernel_w - 1) * dilation_w + 1;
+    const int output_h = (h + 2 * padding_h - effective_h) / stride_h + 1;
+    const int output_w = (w + 2 * padding_w - effective_w) / stride_w + 1;
+    double* o = output;
+    for (int batch = 0; batch < n; ++batch)
+        for (int channel = 0; channel < c; ++channel) {
+            const double* plane = input + (long long)(batch * c + channel) * h * w;
+            for (int kh = 0; kh < kernel_h; ++kh)
+                for (int kw = 0; kw < kernel_w; ++kw) {
+                    const int column_offset = kw * dilation_w - padding_w;
+                    for (int oh = 0; oh < output_h; ++oh, o += output_w) {
+                        const int ih = oh * stride_h - padding_h + kh * dilation_h;
+                        if (ih < 0 || ih >= h) {
+                            for (int ow = 0; ow < output_w; ++ow) o[ow] = 0.0;
+                            continue;
+                        }
+                        const double* row = plane + (long long)ih * w;
+                        for (int ow = 0; ow < output_w; ++ow) {
+                            const int iw = ow * stride_w + column_offset;
+                            o[ow] = (iw >= 0 && iw < w) ? row[iw] : 0.0;
+                        }
+                    }
+                }
+        }
+}

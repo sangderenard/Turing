@@ -29,6 +29,9 @@ HONORED_LANES = ("repository", "eigen")
 # Symbol -> the external declaration with the authored signature.
 EIGEN_SYMBOLS: dict[str, str] = {
     "matmul_double": "declare void @matmul_double(ptr, ptr, ptr, i32, i32, i32)",
+    # Same symbol and layout as the authored kernel; nested loops in place of
+    # the per-element div/rem decode.
+    "unfold2d_double": "declare void @unfold2d_double(ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)",
     # Lane-only whole operations (no authored repository definition):
     # softmax over the last axis of a (rows, cols) block, and an elementwise
     # binary over operands addressed by element strides (0 on a broadcast
