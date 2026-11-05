@@ -95,6 +95,7 @@ from .concordance_declarations import (
     PHI_LOOP_EXIT,
     PHI_LOOP_HEADER,
     PHI_RETURN_MERGE,
+    PROCESS_GRAPH_OPERANDS,
     REGION_CALL_RESULT,
     REGION_CAPTURE_BINDING,
     REGION_FEED_CONSUMER,
@@ -117,6 +118,7 @@ from .concordance_declarations import (
     TABLE_REGISTRATION,
     TABLE_LOOKUP,
     TENSOR_SHAPE_CONCORDANCE,
+    SOURCE_TENSOR_PREFIX_SLICE,
     VERSIONED_WRITE,
     VALUE_TYPE_ABI,
     LOOP_UPDATE_MINIMUM_TRIPS,
@@ -32154,10 +32156,6 @@ def lower_control_sections_to_ssa(
             # PROCESS_GRAPH_OPERANDS upper edge names the scalar region feed;
             # keep the Slice's distinct identity in a concordance receipt.
             if lexical_read_scope is not None:
-                from .concordance_declarations import (
-                    CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
-                    SOURCE_TENSOR_PREFIX_SLICE, VALUE_TYPE_ABI,
-                )
                 from .identity_concordance import (
                     SHAPE_STATE_PAGE, _canonical_identity_base,
                 )
