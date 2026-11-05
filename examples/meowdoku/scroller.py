@@ -115,13 +115,23 @@ GROUND_SCROLL = 2.4          # the terrain's scroll (the page's TERRAIN.speed)
 FLAK_SPEED = 6.0
 FLAK_RELOAD = 2.4
 STATION_HP = 4.0
+AA_QUIET = 6.0               # stations hold fire until enemies have not hurt the player this long
 FLASH = 8.0
-RAIN = 1.0
-STRIKE_RATE = 0.35
+RAIN, THUNDER = 1.0, 2.0
+STRIKE_RATE = 0.35           # a rain cloud's strikes a second
 CHAIN_R = 2.6
+#: THUNDERSTORMS form naturally while enemies have not damaged the player for
+#: STORM_QUIET seconds (the player's ``age`` is the time since its last hit):
+#: STORM_RATE a second, at most STORM_MAX at once -- larger and higher clouds
+#: that strike more often and chain farther.
+STORM_QUIET = 10.0
+STORM_RATE = 0.06
+STORM_MAX = 2
+THUNDER_RATE = 0.9
+THUNDER_CHAIN_R = 3.5
 LIGHTNING_DAMAGE = 4.0
 LIGHTNING_HIT = 25.0
-SOAK_TIME = 2.5          # smoke must linger in a cloud this long to make rain (rare)
+SOAK_TIME = 1.5          # smoke must linger in a cloud this long to make rain
 FLASH_LIFE = 0.22
 BOSS_LANE = ENEMIES[1] - 1
 SMOKE = 7.0
@@ -295,7 +305,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     piloted = (is_boss_lane | (is_enemy & (kind == ACE))) & live
     # One volley per step: the ready enemy in the lowest lane fires, into the
     # first free bullet lanes (drifters an aimed spread, spinners a ring).
-    ready = (is_enemy | is_station) & live & (timer <= 0.0) & (y > 0.3) & playing & (~piloted | (pfire > 0.0))
+    # Anti-aircraft wakes only when the enemies have not been hurting the
+    # player (no damage for AA_QUIET: the player's age is the time since).
+    aa_awake = (f(is_player) * age).sum() >= AA_QUIET
+    ready = ((is_enemy & (~piloted | (pfire > 0.0))) | (is_station & aa_awake)) & live & (timer <= 0.0) & (y > 0.3) & playing
     shooter = first_of(ready, lane)
     fired = f(shooter).sum() > 0.0
     sx, sy, sz = (f(shooter) * x).sum(), (f(shooter) * y).sum(), (f(shooter) * z).sum()
@@ -390,9 +403,20 @@ def scroller_step(lane, slot, rx, ry, rz,
     # A cloud soaks while smoke overlaps it in 3-D (its own height too); held
     # for SOAK_TIME it turns to rain.  The cloud's timer counts the soaking.
     in_cloud = block_hits(x2, y2, rx, ry, live1 | is_star, None, STARS, SMOKES, z2, rz) > 0.0
-    soak = where(is_star, where(wrapped, 0.0, where(in_cloud, timer + dt, (timer - 0.5 * dt).clip(0.0, 10.0))), timer1)
+    soak = where(is_star, where(wrapped, 0.0, where(in_cloud, timer + dt, (timer - 0.2 * dt).clip(0.0, 10.0))), timer1)
     timer1 = where(is_star, soak, timer1)
-    kind1 = where(is_star, where(wrapped, 0.0, where(soak >= SOAK_TIME, RAIN, kind1)), kind1)
+    kind1 = where(is_star, where(wrapped, 0.0, where((soak >= SOAK_TIME) & (kind1 == 0.0), RAIN, kind1)), kind1)
+    # A quiet sky (no damage for STORM_QUIET) may grow a thunderstorm: a
+    # plain cloud chosen by the law's dice rises, swells and darkens.
+    quiet = (f(is_player) * age).sum() >= STORM_QUIET
+    storms = f(is_star & (kind1 == THUNDER)).sum()
+    storm_dice = noise(clock * 2.3 + 17.0)
+    grows = playing & quiet & (storms < STORM_MAX) & (storm_dice < STORM_RATE * dt)
+    candidate = is_star & (kind1 == 0.0) & (noise(lane * 1.7 + clock * 0.9) > 0.5) & (y2 < 0.4 * HEIGHT)
+    storm_born = first_of(candidate, lane) & grows
+    kind1 = where(storm_born, THUNDER, kind1)
+    z2 = where(storm_born, 2.6 + 0.8 * noise(clock * 4.7 + 3.0), z2)
+    vy1 = where(storm_born, 0.8 + 0.7 * (2.6 + 0.4), vy1)
     out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
     grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the board is spent
     live2 = (live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded) | rebuilt
@@ -420,13 +444,15 @@ def scroller_step(lane, slot, rx, ry, rz,
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
     # Lightning: one rain cloud may strike this step; it chains to every
     # craft within CHAIN_R of the cloud on the board.
-    raining = is_star & (kind1 == RAIN)
+    raining = is_star & ((kind1 == RAIN) | (kind1 == THUNDER))
     strike_dice = noise(clock * 5.7 + lane * 1.31 + 9.0)
-    striker = first_of(raining & (strike_dice < STRIKE_RATE * dt) & playing, lane)
+    rate = where(kind1 == THUNDER, THUNDER_RATE, STRIKE_RATE)
+    striker = first_of(raining & (strike_dice < rate * dt) & playing, lane)
     striking = f(striker).sum() > 0.0
     lx, ly, lz = (f(striker) * x2).sum(), (f(striker) * y2).sum(), (f(striker) * z2).sum()
     reach_l = ((x2 - lx) * (x2 - lx) + (y2 - ly) * (y2 - ly)).sqrt()
-    struck = striking & live2 & (is_enemy | is_player) & (reach_l < CHAIN_R)
+    chain = where((f(striker) * kind1).sum() == THUNDER, THUNDER_CHAIN_R, CHAIN_R)
+    struck = striking & live2 & (is_enemy | is_player) & (reach_l < chain)
     zapped = f(struck & is_player).sum() > 0.0
     hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy))
     killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
@@ -474,8 +500,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     puff = first_of(is_smoke & ~live3, lane) & (f(killer).sum() > 0.0)
     x2, y2, z2 = where(puff, kx, x2), where(puff, ky, y2), where(puff, (kz * 0.5).clip(0.15, 1.2), z2)
     vx1 = where(puff, 0.3 * (noise(clock * 4.1 + 5.0) - 0.5), vx1)
-    vy1 = where(puff, 2.4, vy1)
-    vz1 = where(puff, -0.08, vz1)
+    vy1 = where(puff, 1.1, vy1)          # drifts back at about the clouds' speed
+    vz1 = where(puff, 0.12, vz1)         # and rises toward the cloud layer
     born1 = where(puff, clock, born1)
     age1 = where(puff, 0.0, age1)
     live3 = (live3 | puff) & ~(is_smoke & (age1 > SMOKE_LIFE))
@@ -661,7 +687,7 @@ class BulletScroller(EntityGame):
                 "invader": [0.75, 0.35, 0.95], "ufo": [0.95, 0.15, 0.55], "bullet": [1.0, 0.25, 0.35],
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
                 "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
-                "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0],
+                "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0], "storm": [0.28, 0.29, 0.33],
                 "station": [1.0, 0.82, 0.1], "flak": [1.0, 0.9, 0.2],
                 "smoke_0": [0.04, 0.04, 0.05], "smoke_1": [0.07, 0.07, 0.08], "smoke_2": [0.1, 0.1, 0.11],
                 "smoke_3": [0.13, 0.13, 0.14],
@@ -717,8 +743,13 @@ class BulletScroller(EntityGame):
             else:
                 # A cloud: frosted glass, larger the higher it floats; grey
                 # when smoke has turned it to rain.
-                rain = float(col["kind"][k]) == RAIN
-                mesh, color, size = "cloud", "rain" if rain else "cloud", (0.34 if rain else 0.26) + 0.08 * float(col["z"][k])
+                kind_k = float(col["kind"][k])
+                if kind_k == THUNDER:
+                    mesh, color, size = "cloud", "storm", 0.9 + 0.12 * float(col["z"][k])
+                elif kind_k == RAIN:
+                    mesh, color, size = "cloud", "rain", 0.34 + 0.08 * float(col["z"][k])
+                else:
+                    mesh, color, size = "cloud", "cloud", 0.26 + 0.08 * float(col["z"][k])
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),

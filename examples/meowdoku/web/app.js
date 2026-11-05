@@ -766,13 +766,15 @@ function uploadMaterials(game) {
   records.push(["cloud@glass", [0.97, 0.98, 1.0], { roughness: 0.65, transmission: 0.7, opacity: 0.34, ior: 1.25, emission: [0.06, 0.07, 0.08] }]);
   // Rain clouds (smoke met a cloud): middle-grey glass, middle opacity.
   records.push(["rain@glass", [0.5, 0.52, 0.56], { roughness: 0.7, transmission: 0.45, opacity: 0.5, ior: 1.25 }]);
+  // Thunderstorms (a quiet sky): big dark-grey towers of frosted glass.
+  records.push(["storm@glass", [0.28, 0.29, 0.33], { roughness: 0.75, transmission: 0.35, opacity: 0.66, ior: 1.2 }]);
   // Smoke where craft were destroyed: black frosted glass as dense as the old
   // clouds, thinning as it ages (smoke_0 .. smoke_3).
   for (let k = 0; k < 4; k++)
     records.push([`smoke_${k}@glass`, [0.03 + 0.03 * k, 0.03 + 0.03 * k, 0.035 + 0.03 * k],
       { roughness: 0.8, transmission: 0.15, opacity: 0.86 - 0.16 * k, ior: 1.15 }]);
   // Lightning: a glowing ribbon of glass, lit from within.
-  records.push(["lightning@glow", [0.85, 0.9, 1.0], { roughness: 0.1, transmission: 0.2, opacity: 0.92, ior: 1.3, emission: [3.2, 3.5, 4.4] }]);
+  records.push(["lightning@glow", [0.9, 0.94, 1.0], { roughness: 0.1, transmission: 0.15, opacity: 0.96, ior: 1.3, emission: [6.0, 6.6, 8.2] }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
@@ -998,6 +1000,25 @@ function jagged(a, b, depth, roughness) {
     points = next;
   }
   return points;
+}
+function strikeGroups() {
+  const groups = new Map();
+  for (const piece of state.ribbonEnds || []) { const key = Math.round(piece.t0 * 20); (groups.get(key) || groups.set(key, []).get(key)).push(piece); }
+  return [...groups.values()];
+}
+function lightningLights(cam, now) {
+  const lights = [];
+  if (state.flat) return lights;
+  for (const group of strikeGroups()) {
+    group.sort((a, b) => (b.h || 0) - (a.h || 0));
+    const top = worldOf(group[0]);
+    const bottom = group[1] ? worldOf(group[1]) : [top[0], 0.02 - planetDrop(top[0], top[2]), top[2]];
+    const fade = Math.max(0, 1 - (now - group[0].t0) / 0.3), flicker = 0.6 + 0.4 * Math.random();
+    const middle = top.map((v, k) => (v + bottom[k]) / 2);
+    for (const [point, weight] of [[top, 0.7], [middle, 1.0], [bottom, 0.9]])
+      lights.push({ view: M.apply(cam.view, point), colour: [0.78, 0.86, 1.0], level: 0, intensity: 38 * weight * fade * flicker });
+  }
+  return lights;
 }
 function drawLightning(cam, now, drawLit) {
   const ends = state.ribbonEnds || [];
@@ -2176,6 +2197,9 @@ function litPass(cam, now, casters, opts = {}) {
   const bulbStates = bulbs.map((_, i) => arcadeBulb(i, bulbs, now));
   const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[bulbStates[i].ci],
                                            level: bulbStates[i].level }));
+  // Lightning lights the scene: each strike is a blue-white point light at
+  // the cloud, the impact and the bolt's middle, fading with the strike.
+  bulbLights.push(...lightningLights(cam, now));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -2184,7 +2208,7 @@ function litPass(cam, now, casters, opts = {}) {
     ...bulbLights.slice(0, count - 3).flatMap((b) => b.colour)]));
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
     (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
-    ...bulbLights.slice(0, count - 3).map((b) => ARCADE.lamp * b.level)]));
+    ...bulbLights.slice(0, count - 3).map((b) => (b.intensity ?? ARCADE.lamp * b.level))]));
   gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
   gl.uniform1f(gl.getUniformLocation(P, "uLightCalibration"), 1.0);
   gl.uniformMatrix3fv(gl.getUniformLocation(P, "uCatCcmMatrix"), false, new Float32Array([1,0,0, 0,1,0, 0,0,1]));
