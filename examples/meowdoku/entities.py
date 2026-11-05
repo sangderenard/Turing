@@ -386,6 +386,7 @@ class EntityGame(Game):
         st["moves"] = self.ticks
         st["over"] = self.session.state is not None and self.result() is not None
         st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
+        st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, **(self.motion() or {})}

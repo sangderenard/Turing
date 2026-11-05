@@ -78,6 +78,7 @@ class Game:
             "cells": ["cell"] * (rows * cols), "marks": [0] * (rows * cols), "hints": [0] * (rows * cols),
             "selected": None, "pieces": [], "palette": {"cell": [0.8, 0.8, 0.8]},
             "hearts": None, "won": False, "lost": False, "status": self.status, "moves": self.moves,
+            "score": None,          # a game's running score, when it has one (the arcade lights follow it)
             "input": self.input, "text": "", "text_max": 0, "rack": None,
         }
 
@@ -99,6 +100,9 @@ class Game:
 #: apart in hue stay far apart in the scheme.  A board with n regions takes
 #: n evenly spaced entries.  The cat and mouse colours are fixed for
 #: contrast against the tiles (dark cat, pale mouse).
+#: Power-ups of each kind per puzzle.
+POWER_STOCK = 3
+
 PALETTES: dict[str, list[tuple[float, float, float]]] = {
     "Candy": [(0.95, 0.35, 0.35), (1.00, 0.60, 0.15), (0.98, 0.85, 0.20), (0.60, 0.85, 0.25), (0.20, 0.72, 0.40),
               (0.15, 0.78, 0.85), (0.25, 0.45, 0.95), (0.58, 0.38, 0.90), (0.88, 0.35, 0.82), (0.98, 0.52, 0.68)],
@@ -129,6 +133,15 @@ class MeowdokuGame(Game):
         self.hints_used = 0
         self.hint_cells: list[int] = []
         self.hint_text = ""
+        # Power-ups, as the official app has them (per its players): the CAT
+        # reveals one cat, the MOUSE drops on three cells that cannot hold a
+        # cat and marks them, the light-bulb HINT shows a deduction.  A few of
+        # each per puzzle.  Cats and mice reach the board through the
+        # dt-system law as ordinary controls (a correct placement, toggled
+        # marks); cells a mouse marked are remembered so they draw as mice.
+        self.stock = {"cat": POWER_STOCK, "mouse": POWER_STOCK, "hint": POWER_STOCK}
+        self.mouse_cells: set[int] = set()
+        self.rng = np.random.default_rng(abs(hash(str(board["id"]))) % (2 ** 32))
 
     def cell(self, r: int, c: int, button: str) -> None:
         self.hint_cells, self.hint_text = [], ""
@@ -144,11 +157,51 @@ class MeowdokuGame(Game):
     def undo(self) -> None:
         self.hint_cells, self.hint_text = [], ""
         self.session.undo()
+        marked = np.asarray(self.session.x_mark).reshape(-1)
+        self.mouse_cells = {i for i in self.mouse_cells if marked[i]}
 
     def reset(self) -> None:
         self.hint_cells, self.hint_text = [], ""
         self.session.reset()
         self.moves = 0
+        self.mouse_cells = set()
+        self.stock = {"cat": POWER_STOCK, "mouse": POWER_STOCK, "hint": POWER_STOCK}
+
+    def power(self, kind: str) -> None:
+        """Spend one power-up: ``cat``, ``mouse`` or ``hint``."""
+        s = self.session
+        if kind not in self.stock:
+            raise ValueError(f"unknown power-up {kind!r}")
+        if s.won or s.lost or self.stock[kind] <= 0:
+            return
+        if kind == "hint":
+            self.hint()
+            self.stock["hint"] -= 1
+            return
+        self.hint_cells, self.hint_text = [], ""
+        solution = np.asarray(self.board["solution"], dtype=float).reshape(-1)
+        cat = np.asarray(s.cat).reshape(-1)
+        marked = np.asarray(s.x_mark).reshape(-1)
+        if kind == "cat":
+            open_cats = np.flatnonzero((solution > 0) & (cat == 0))
+            if not len(open_cats):
+                return
+            i = int(self.rng.choice(open_cats))
+            if marked[i]:
+                s.toggle_x(*divmod(i, self.n))       # a note on a cat's cell gives way
+            s.place(*divmod(i, self.n))
+            self.hint_text = "a cat came out of hiding"
+        else:
+            empty = np.flatnonzero((solution == 0) & (cat == 0) & (marked == 0))
+            if not len(empty):
+                return
+            picks = self.rng.choice(empty, size=min(3, len(empty)), replace=False)
+            for i in picks:
+                s.toggle_x(*divmod(int(i), self.n))
+                self.mouse_cells.add(int(i))
+            self.hint_text = f"{len(picks)} mice found cells with no cat"
+        self.stock[kind] -= 1
+        self.moves += 1
 
     def result(self) -> dict[str, Any] | None:
         s = self.session
@@ -172,7 +225,7 @@ class MeowdokuGame(Game):
                                np.asarray(s.cat).reshape(self.n, self.n), self.board["solution"], s.x_mark)
         self.hint_cells = found["cells"]
         self.hints_used += 1
-        what = "cat here" if found["kind"] == "cat" else ("mouse here" if len(found["cells"]) == 1 else "mice here")
+        what = "cat here" if found["kind"] == "cat" else ("X here" if len(found["cells"]) == 1 else "X marks here")
         self.hint_text = f"hint: {what} - {found['why']}"
 
     def colours(self) -> dict[str, list[float]]:
@@ -187,7 +240,8 @@ class MeowdokuGame(Game):
         st = self.base_state(n, n)
         region = [int(k) for k in self.board["region"]]
         st["palette"] = self.colours()
-        st["palette"].update({"cat": [0.10, 0.05, 0.03], "x": [0.97, 0.95, 0.93], "heart": [0.88, 0.10, 0.16]})
+        st["palette"].update({"cat": [0.78, 0.34, 0.04], "x": [0.38, 0.36, 0.37], "mouse": [0.55, 0.52, 0.55],
+                              "fish": [0.98, 0.62, 0.10]})
         st["palettes"], st["palette_name"] = list(PALETTES), self.palette_name
         st["cells"] = [f"region{k}" for k in region]
         cat = np.asarray(s.cat, dtype=int).reshape(-1)
@@ -199,13 +253,17 @@ class MeowdokuGame(Game):
         st["hints"] = hints
         st["hints_used"], st["hint"] = self.hints_used, self.hint_text
         st["pieces"] = [{"id": f"cat-{i}", "cell": int(i), "mesh": "cat", "color": "cat"} for i in np.flatnonzero(cat)]
-        st["pieces"] += [{"id": f"x-{i}", "cell": int(i), "mesh": "x_mark", "color": "x"} for i in np.flatnonzero(x_mark)]
-        st["pieces"] += [{"id": f"heart-{k}", "cell": f"hud:{k}", "mesh": "heart", "color": "heart"} for k in range(int(s.hearts))]
+        st["pieces"] += [({"id": f"mouse-{i}", "cell": int(i), "mesh": "mouse", "color": "mouse"} if int(i) in self.mouse_cells
+                          else {"id": f"x-{i}", "cell": int(i), "mesh": "x_mark", "color": "x"}) for i in np.flatnonzero(x_mark)]
+        # Lives are goldfish (crackers), not hearts.
+        st["pieces"] += [{"id": f"fish-{k}", "cell": f"hud:{k}", "mesh": "fish", "color": "fish"} for k in range(int(s.hearts))]
+        st["powerups"] = dict(self.stock)
         st["hearts"] = int(s.hearts)
+        st["score"] = int(cat.sum())
         st["won"], st["lost"] = bool(s.won), bool(s.lost)
         hint_note = f" · {self.hints_used} hint{'s' if self.hints_used != 1 else ''}" if self.hints_used else ""
         st["status"] = ("solved! all cats home" if s.won else "out of hearts" if s.lost
-                        else f"{int(s.hearts)} ♥ · {self.moves} moves") + hint_note
+                        else f"{int(s.hearts)} fish · {self.moves} moves") + hint_note
         if self.hint_text and not (s.won or s.lost):
             st["status"] += f" · {self.hint_text}"
         return st

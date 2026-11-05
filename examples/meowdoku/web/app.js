@@ -94,8 +94,8 @@ layout(location=0) in vec3 aPos; layout(location=1) in vec3 aColor;
 uniform mat4 uMVP; out vec3 vColor;
 void main(){ vColor = aColor; gl_Position = uMVP * vec4(aPos, 1.0); }`;
 const FLAT_FS = `#version 300 es
-precision highp float; in vec3 vColor; out vec4 FragColor; uniform float uAlpha;
-void main(){ FragColor = vec4(pow(vColor, vec3(1.0/2.2)), uAlpha); }`;
+precision highp float; in vec3 vColor; out vec4 FragColor; uniform float uAlpha; uniform vec3 uTint;
+void main(){ FragColor = vec4(pow(vColor * uTint, vec3(1.0/2.2)), uAlpha); }`;
 // Flat view: pure cel shading.  The key light sits at the camera and shines
 // straight down, so N.z in view space IS the lighting; it is cut into a few
 // hard bands over the palette colour of each vertex's material.  The palette
@@ -485,11 +485,112 @@ function camera() {
 }
 const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
 state.light = light;
+// ---------------------------------------------------------------- arcade lights
+// Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
+// chase.  When the game's declared score rises: a comet walks the ring with a
+// fading tail.  On a win: the whole ring flashes.  Their colour and activity
+// also tint the fill light, so the pieces catch the show.
+const ARCADE = { colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0]], spacing: 0.55,
+                 burstAt: -10, flashAt: -10, lastScore: null, lastWon: false, key: null };
+function arcadeEvents(game, now) {
+  const key = `${game.game}|${game.id}`;
+  if (ARCADE.key !== key) { ARCADE.key = key; ARCADE.lastScore = game.score; ARCADE.lastWon = !!game.won; return; }
+  if (game.score != null && ARCADE.lastScore != null && game.score > ARCADE.lastScore) ARCADE.burstAt = now;
+  if (game.won && !ARCADE.lastWon) ARCADE.flashAt = now;
+  ARCADE.lastScore = game.score; ARCADE.lastWon = !!game.won;
+}
+function arcadeBulbs() {
+  const ext = state.extent || { width: 6, depth: 6 }, m = GLASS.margin * 0.6;
+  const x0 = -m, z0 = -m, x1 = ext.width + m, z1 = ext.depth + m;
+  const perimeter = 2 * ((x1 - x0) + (z1 - z0)), count = Math.max(16, Math.round(perimeter / ARCADE.spacing));
+  const bulbs = [];
+  for (let i = 0; i < count; i++) {
+    let s = i / count * perimeter, x, z;
+    if (s < x1 - x0) { x = x0 + s; z = z0; } else if ((s -= x1 - x0) < z1 - z0) { x = x1; z = z0 + s; }
+    else if ((s -= z1 - z0) < x1 - x0) { x = x1 - s; z = z1; } else { s -= x1 - x0; x = x0; z = z1 - s; }
+    bulbs.push([x, 0.12, z]);
+  }
+  return bulbs;
+}
+function arcadeBrightness(i, count, now) {
+  const flash = now - ARCADE.flashAt, burst = now - ARCADE.burstAt;
+  if (flash < 2.5) return Math.floor(flash * 8) % 2 === 0 ? 1.0 : 0.15;
+  let level = ((i + Math.floor(now * 6)) % 6 === 0) ? 0.55 : 0.1;            // the idle chase
+  if (burst < 1.4) {
+    const head = (burst * 40) % count, behind = (head - i + count) % count;
+    level = Math.max(level, behind < 10 ? 1.0 - behind / 10 : 0);
+  }
+  return level;
+}
+function arcadeLight(now) {
+  const bulbs = arcadeBulbs(), sum = [0, 0, 0];
+  let total = 0;
+  bulbs.forEach((_, i) => { const b = arcadeBrightness(i, bulbs.length, now), c = ARCADE.colours[i % 4];
+    total += b; sum[0] += c[0] * b; sum[1] += c[1] * b; sum[2] += c[2] * b; });
+  const level = Math.min(1, total / bulbs.length / 0.5);
+  return { level, colour: total > 0 ? [sum[0] / total, sum[1] / total, sum[2] / total] : [1, 1, 1] };
+}
+function drawArcadeRing(now, cam) {
+  const P = state.programs.flat, bulbs = arcadeBulbs();
+  bulbs.forEach((p, i) => {
+    const b = arcadeBrightness(i, bulbs.length, now), c = ARCADE.colours[i % 4];
+    gl.uniform3fv(gl.getUniformLocation(P, "uTint"), c.map((v) => v * (0.25 + 0.75 * b)));
+    for (const [radius, alpha] of [[0.07, 1.0], [0.16, 0.45 * b], [0.3, 0.18 * b]]) {
+      gl.uniform1f(gl.getUniformLocation(P, "uAlpha"), alpha);
+      gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false,
+        M.multiply(cam.viewProj, M.multiply(M.translate(...p), M.scale(radius, radius, radius))));
+      gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
+    }
+  });
+  gl.uniform3fv(gl.getUniformLocation(P, "uTint"), [1, 1, 1]);
+}
+
+// The key light is a lamp in the scene, not a page angle: a small glowing body
+// with inertia, pulled by a critically damped spring toward a target that
+// lives in the board's 3D space -- a slow wander low over the pieces (so it
+// rakes their sides and their shadows swing), or, in pointer mode, the point
+// above the board under the pointer.  Its light falls off with distance, so
+// what it passes close to glows and the far side dims.
+const LAMP = { omega: 1.6 };
+// The sun: a soft light at an angle over the board, placed by the user's local
+// time of day -- its bearing goes once round the board per day, it stands
+// highest at noon, low and warm at dawn and dusk, and at night it is a dim
+// blue moon on the far side.
+function sunState() {
+  const d = new Date(), hours = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+  const day = Math.sin((hours - 6) / 24 * 2 * Math.PI);          // +1 noon, 0 dawn/dusk, -1 midnight
+  const azimuth = hours / 24 * 2 * Math.PI;
+  const elevation = (day >= 0 ? 15 + 55 * day : 35) * Math.PI / 180;
+  const warm = Math.max(0, 1 - Math.abs(day) * 3) * (day > -0.2 ? 1 : 0);
+  const colour = day >= 0 ? mix([1.0, 0.97, 0.9], [1.0, 0.72, 0.45], warm) : mix([0.55, 0.65, 1.0], [1.0, 0.72, 0.45], warm);
+  const strength = day >= 0 ? 0.75 + 0.25 * day : 0.42;
+  return { azimuth, elevation, colour, strength };
+}
+function lampTarget(now, ext) {
+  const span = Math.max(ext.width, ext.depth);
+  if (light.follow && light.pointer) return [light.pointer[0], 0.55 * span, light.pointer[1]];
+  const sun = sunState(), reach = 0.95 * span;
+  return [ext.width / 2 + reach * Math.cos(sun.elevation) * Math.cos(sun.azimuth),
+          reach * Math.sin(sun.elevation) + 0.3,
+          ext.depth / 2 + reach * Math.cos(sun.elevation) * Math.sin(sun.azimuth)];
+}
 function updateLight(now) {
   const ext = state.extent || { width: 6, depth: 6 }, span = Math.max(ext.width, ext.depth);
   if (state.flat) light.position = [ext.width / 2, light.height * span * 0.9, ext.depth / 2];   // co-located with the camera, straight down
-  else if (light.follow && light.pointer) light.position = [light.pointer[0], light.height * span * 0.9, light.pointer[1]];
-  else { const a = light.angle + now * 0.18; light.position = [ext.width / 2 + Math.cos(a) * span * light.radius, light.height * span * 0.9, ext.depth / 2 + Math.sin(a) * span * light.radius]; }
+  else {
+    const target = lampTarget(now, ext);
+    if (!light.body) light.body = { p: target.slice(), v: [0, 0, 0], at: now };
+    const body = light.body, dt = Math.min(0.05, Math.max(0, now - body.at)), w = LAMP.omega;
+    body.at = now;
+    // Critically damped spring, integrated implicitly: stable at any frame time.
+    for (let k = 0; k < 3; k++) {
+      const accel = w * w * (target[k] - body.p[k]) - 2 * w * body.v[k];
+      body.v[k] = (body.v[k] + dt * accel) / (1 + dt * dt * w * w + 2 * dt * w);
+      body.p[k] += body.v[k] * dt;
+    }
+    body.p[1] = Math.max(0.45, body.p[1]);
+    light.position = body.p.slice();
+  }
   const target = [ext.width / 2, 0, ext.depth / 2];
   const depth = Math.hypot(...sub(light.position, target));
   light.view = M.lookAt(light.position, target, [0, 1, 0]);
@@ -501,7 +602,9 @@ function updateLight(now) {
 const FLAT_THICK = 0.04, FLAT_LIFT = 0.02, FLAT_OUTLINE = 1.07;
 const ease = { out: (t) => 1 - (1 - t) ** 3, in: (t) => t ** 3, bounce(t) { return t < 0.85 ? t / 0.85 : 1 + 0.15 * Math.sin((t - 0.85) / 0.15 * Math.PI) * (1 - t); } };
 const LEAN = { cat: 0.35, x_mark: 0.35, heart: 0.35, disc: 0.0, letter: 0.3, chess: 0.55 };
-const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : mesh);
+// The goldfish lives move like the hearts they replaced; a mouse drops in like an X.
+const MESH_FAMILY = { fish: "heart", mouse: "x_mark" };
+const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : MESH_FAMILY[mesh] || mesh);
 function cellPosition(game, cell, rackPiece) {
   if (typeof cell === "string" && cell.startsWith("hud:")) {
     const k = Number(cell.slice(4)); return [game.cols / 2 + (k - 1) * 0.9, game.rows + 0.9, "hud"];
@@ -803,6 +906,7 @@ function applyState(game) {
     pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1;
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
+  arcadeEvents(game, now);
   const seen = new Set();
   const place = (p, rackPiece) => {
     const [x, z, where, cellSize] = cellPosition(game, p.cell, rackPiece);
@@ -892,8 +996,15 @@ function draw(ms) {
   const keyView = M.apply(cam.view, light.position);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), 3);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0, -0.6 * span, -0.1 * span, 0.3 * span - 1.0]));
-  gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([1.0, 0.95, 0.86, 0.75, 0.85, 1.0, 1.0, 0.8, 0.7]));
-  gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([2.6 * span * span, 0.35 * span * span, 0.25 * span * span]));
+  const sun = sunState(), boardCentre = [state.extent.width / 2, 0, state.extent.depth / 2];
+  const sunReach = Math.hypot(...sub(light.position, boardCentre));
+  const arcade = arcadeLight(now);
+  const keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = mix([0.75, 0.85, 1.0], arcade.colour, 0.6 * arcade.level);
+  gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([...keyColour, ...fillColour, 1.0, 0.8, 0.7]));
+  // The sun's intensity is set for its distance to the board's centre (soft,
+  // even light); the fill light carries the arcade ring's colour and activity.
+  gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
+    (state.flat ? 2.6 : 2.4 * sun.strength) * sunReach * sunReach, (0.35 + 0.5 * arcade.level) * span * span, 0.25 * span * span]));
   gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array([-1, -1, -1]));
   gl.uniform1f(gl.getUniformLocation(P, "uLightCalibration"), 1.0);
   gl.uniformMatrix3fv(gl.getUniformLocation(P, "uCatCcmMatrix"), false, new Float32Array([1,0,0, 0,1,0, 0,0,1]));
@@ -925,11 +1036,20 @@ function draw(ms) {
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   drawLit(state.glass.vao, state.glass.count, M.identity(), null);
   gl.depthMask(true); gl.disable(gl.BLEND);
-  // the bulb
-  gl.useProgram(state.programs.flat); gl.uniform1f(gl.getUniformLocation(state.programs.flat, "uAlpha"), 1.0);
-  const bulb = M.multiply(M.translate(...light.position), M.scale(0.12 * Math.sqrt(span), 0.12 * Math.sqrt(span), 0.12 * Math.sqrt(span)));
-  gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.flat, "uMVP"), false, M.multiply(cam.viewProj, bulb));
-  gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
+  // the lamp: a bright core and an additive halo, so it reads as the source
+  gl.useProgram(state.programs.flat);
+  const lampAt = (radius, alpha) => {
+    gl.uniform1f(gl.getUniformLocation(state.programs.flat, "uAlpha"), alpha);
+    const m = M.multiply(M.translate(...light.position), M.scale(radius, radius, radius));
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.flat, "uMVP"), false, M.multiply(cam.viewProj, m));
+    gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
+  };
+  gl.uniform3fv(gl.getUniformLocation(state.programs.flat, "uTint"), sun.colour);
+  lampAt(0.12, 1.0);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false);
+  lampAt(0.3, 0.3); lampAt(0.55, 0.12); lampAt(0.9, 0.05);
+  drawArcadeRing(now, cam);
+  gl.depthMask(true); gl.disable(gl.BLEND);
   gl.bindVertexArray(null);
   requestAnimationFrame(draw);
 }
@@ -1040,7 +1160,7 @@ canvas.addEventListener("pointermove", async (e) => {
     const ndc = [((e.clientX - rect.left) / rect.width) * 2 - 1, 1 - ((e.clientY - rect.top) / rect.height) * 2];
     const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
     const yPlane = light.height * Math.max(state.extent.width, state.extent.depth) * 0.9, t = (yPlane - near[1]) / (far[1] - near[1]);
-    if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];
+    if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];   // the board point the lamp flies above
     return;
   }
   if (game.input === "realtime") { if (steer) steer = boardPlane(e.clientX, e.clientY) || steer; return; }
@@ -1107,7 +1227,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && st
 // in the capture phase, before any other handler sees them.  Fullscreen's own
 // keys (F, Escape) and every game's own keys pass; R still restarts a game
 // that has ended, as its status line offers.
-const BAR_KEYS = new Set(["u", "r", "n", "l", "v", "c", "m", "h"]);
+const BAR_KEYS = new Set(["u", "r", "n", "l", "v"]);
 window.addEventListener("keydown", (e) => {
   if (!document.body.classList.contains("immersive") || e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
@@ -1130,11 +1250,6 @@ window.addEventListener("keydown", async (e) => {
   if (e.key === "u" || e.key === "U") act({ type: "undo" });
   if (e.key === "r" || e.key === "R") act({ type: "reset" });
   if (e.key === "n" || e.key === "N") $("new").click();
-  if (game.input === "meowdoku") {
-    if (e.key === "c" || e.key === "C") setTool("cat");
-    if (e.key === "m" || e.key === "M") setTool("mouse");
-    if (e.key === "h" || e.key === "H") $("hint").click();
-  }
   if (e.key === "l" || e.key === "L") toggleLight();
 });
 $("undo").onclick = () => act({ type: "undo" });
@@ -1149,7 +1264,7 @@ $("round").oninput = (e) => { roundParams.iters = Number(e.target.value); rebuil
 $("crease").oninput = (e) => { roundParams.creaseDeg = Number(e.target.value); rebuildRoundedMeshes(); };
 $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
-function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: orbit (L)"; }
+function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: sun (L)"; }
 $("light").onclick = toggleLight;
 function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
 $("flat").onclick = toggleFlat;
@@ -1221,7 +1336,7 @@ window.addEventListener("keydown", (e) => {
 $("scores-toggle").onclick = () => { const panel = $("scores"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showScores(); };
 
 // ---------------------------------------------------------------- meowdoku tools, hint, palette
-state.tool = "cat";
+state.tool = "mouse";             // a tap marks a mouse, a double tap is a cat (as before the tools)
 function setTool(tool) {
   state.tool = tool;
   $("tool-cat").classList.toggle("active", tool === "cat");
@@ -1229,14 +1344,23 @@ function setTool(tool) {
 }
 $("tool-cat").onclick = () => setTool("cat");
 $("tool-mouse").onclick = () => setTool("mouse");
-$("hint").onclick = () => { if (state.game && state.game.game === "meowdoku") act({ type: "hint" }); };
+// Power-ups are buttons only: Cat reveals a cat, Mouse drops three mice on
+// cells that hold no cat, Hint lights a deduction; each shows what is left.
+for (const kind of ["cat", "mouse", "hint"])
+  $(`power-${kind}`).onclick = () => { if (state.game && state.game.game === "meowdoku") act({ type: "power", kind }); };
 $("palette").onchange = (e) => act({ type: "palette", name: e.target.value });
 function syncMeowdokuBar(game) {
   if (game.game !== "meowdoku") return;
   const select = $("palette");
   if (select.options.length !== game.palettes.length) select.innerHTML = game.palettes.map((n) => `<option value="${n}">${n}</option>`).join("");
   select.value = game.palette_name;
-  $("hint").disabled = game.won || game.lost;
+  const over = game.won || game.lost, stock = game.powerups || {};
+  const label = { cat: "Cat", mouse: "Mouse", hint: "Hint" };
+  for (const kind of ["cat", "mouse", "hint"]) {
+    const button = $(`power-${kind}`), left = stock[kind] ?? 0;
+    button.textContent = `${label[kind]} ×${left}`;
+    button.disabled = over || left <= 0;
+  }
 }
 
 // ---------------------------------------------------------------- game picker
@@ -1283,7 +1407,7 @@ function fillPickers() {
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
   for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
-  if (assets.meshes.mouse) state.meshes.x_mark = state.meshes.mouse;      // mice are drawn as the mouse glyph
+  // (the exported "mouse" mesh is not drawn: X marks are notes, not mice)
   try {
     pred.program = await TuringWasmProgram.load("motion.wasm", "motion.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }

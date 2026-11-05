@@ -120,6 +120,8 @@ class Table:
                 self.game.client.resume()
         elif kind == "hint":
             self.game.hint()
+        elif kind == "power":
+            self.game.power(str(payload.get("kind", "")))
         elif kind == "palette":
             self.game.set_palette(str(payload.get("name", "")))
         elif kind in ("submit", "backspace", "undo", "reset"):

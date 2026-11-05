@@ -103,6 +103,12 @@ def export_assets(out: Path) -> dict:
     pack("disc", *token_mesh("●", "DejaVu Sans", "normal", depth_ratio=0.22, outline_subdivisions=1))
     # The free-board games' entities: emoji outlines (Segoe UI Emoji), named
     # by the game that declares them.
+    # Meowdoku's lives: a goldfish (cracker).
+    try:
+        pack("fish", *token_mesh("\U0001F41F", "Segoe UI Emoji", "normal", depth_ratio=0.32,
+                                 outline_subdivisions=2), material_index["heart"])
+    except Exception as error:  # noqa: BLE001  (the page falls back to the heart)
+        print(f"[export] fish mesh skipped: {error}", flush=True)
     from meowdoku.invaders import EMOJI, EMOJI_SUBDIVISIONS
     for name, glyph in EMOJI.items():
         pack(name, *token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
