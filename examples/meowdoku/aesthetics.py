@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sizes", default="6,9,16,32,64,128")
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--panel-px", type=int, default=640)
+    parser.add_argument("--palette", default=None, help="named palette (pastel, vivid, warm, cool, ink) with hue-contrast assignment; default: the shader's formula")
+    parser.add_argument("--backend", default=None, help="AbstractTensor backend for generation (default: the module default, torch on cuda)")
+    parser.add_argument("--device", default=None)
     parser.add_argument("--out", default=str(ROOT / "build" / "meowdoku" / "aesthetics"))
     args = parser.parse_args(argv)
     sizes = [int(s) for s in args.sizes.split(",")]
@@ -52,12 +55,16 @@ def main(argv: list[str] | None = None) -> int:
     panels = []
     for n in sizes:
         started = time.perf_counter()
-        puzzles = generate_batch(n, 1, seed=args.seed, style=args.style)
+        options = {}
+        if args.backend:
+            options = {"backend": args.backend, "device": args.device}
+        puzzles = generate_batch(n, 1, seed=args.seed, style=args.style, **options)
         elapsed = time.perf_counter() - started
         puzzle = puzzles.puzzle(0)
         cell_px = max(3, args.panel_px // n)
         image = tiles.compose_board(np.zeros(n * n), np.zeros(n * n), puzzle.region, hearts=0,
-                                    sprites={}, cell_px=cell_px, grid_px=1 if n >= 32 else 2, max_hearts=0)
+                                    sprites={}, cell_px=cell_px, grid_px=1 if n >= 32 else 2, max_hearts=0,
+                                    palette=args.palette)
         sizes_of = np.bincount(puzzle.region.astype(int), minlength=n)
         label = f"{n}x{n}  {elapsed:.1f}s  largest {sizes_of.max()}/{n*n}  singletons {(sizes_of == 1).sum()}"
         print(f"[aesthetics] {args.style} {label}", flush=True)
@@ -73,8 +80,8 @@ def main(argv: list[str] | None = None) -> int:
         sheet.paste(Image.fromarray(srgb), (x, pad + strip))
         draw.text((x, pad + 4), label, fill=(230, 230, 230))
     sha = git_short_sha()
-    draw.text((pad, height + strip + pad + 2), f"style={args.style} seed={args.seed} generator@{sha}", fill=(160, 160, 160))
-    path = out / f"{args.style}_{sha}.png"
+    draw.text((pad, height + strip + pad + 2), f"style={args.style} palette={args.palette or 'shader'} seed={args.seed} generator@{sha}", fill=(160, 160, 160))
+    path = out / f"{args.style}_{args.palette or 'shader'}_{sha}.png"
     sheet.save(path)
     print(f"[aesthetics] sheet -> {path} ({sheet.size[0]}x{sheet.size[1]} px)", flush=True)
     return 0

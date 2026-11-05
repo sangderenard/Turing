@@ -115,21 +115,32 @@ def propagate(AT, region, one_hot, placed, excluded, *, max_rounds: int | None =
     return placed, excluded, solved, dead, rounds
 
 
-def _uniform_stream(seed: int):
-    from src.common.tensors.abstraction_methods.random import PRNG_ALGO, RANDOM_KIND, random_generator
-    return random_generator(kind=RANDOM_KIND.PRNG, algo=PRNG_ALGO.XOROSHIRO128SS,
-                            seed=int(seed), dtype="float", batch_size=1 << 16)
+class _Draws:
+    """Uniform draws from one seeded repository PRNG stream (Xoroshiro128**),
+    taken from a buffer refilled in blocks, so a draw of ``count`` values
+    costs ``count`` values of the stream, no more, and the sequence is a
+    function of the seed alone."""
 
+    def __init__(self, seed: int, block: int = 1 << 14):
+        from src.common.tensors.abstraction_methods.random import PRNG_ALGO, RANDOM_KIND, random_generator
+        self._stream = random_generator(kind=RANDOM_KIND.PRNG, algo=PRNG_ALGO.XOROSHIRO128SS,
+                                        seed=int(seed), dtype="float", batch_size=int(block))
+        self._buffer = np.empty(0, dtype=np.float64)
 
-def _uniform(AT, stream, *shape):
-    count = int(np.prod(shape))
-    pieces, have = [], 0
-    while have < count:
-        block = np.asarray(next(stream), dtype=np.float64).reshape(-1)
-        pieces.append(block)
-        have += block.size
-    values = np.concatenate(pieces)[:count] if len(pieces) > 1 else pieces[0][:count]
-    return AT.tensor(np.ascontiguousarray(values).reshape(shape))
+    def take(self, count: int) -> np.ndarray:
+        pieces, have = [], 0
+        if self._buffer.size:
+            pieces.append(self._buffer); have = self._buffer.size
+        while have < count:
+            block = np.asarray(next(self._stream), dtype=np.float64).reshape(-1)
+            pieces.append(block); have += block.size
+        values = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        self._buffer = values[count:]
+        return values[:count]
+
+    def uniform(self, AT, *shape):
+        count = int(np.prod(shape))
+        return AT.tensor(np.ascontiguousarray(self.take(count)).reshape(shape))
 
 
 def sample_solutions(region_batch, seed: int = 0, *, max_steps: int | None = None,
@@ -146,7 +157,7 @@ def sample_solutions(region_batch, seed: int = 0, *, max_steps: int | None = Non
     walk finished within ``max_steps``."""
     from src.common.tensors import AbstractTensor as AT
 
-    stream = _uniform_stream(seed)
+    draws = _Draws(seed)
     region_np = np.asarray(region_batch, dtype=np.float64)
     b = region_np.shape[0]
     n = int(round(region_np.shape[-1] ** 0.5)) if region_np.ndim == 2 else region_np.shape[1]
@@ -181,7 +192,7 @@ def sample_solutions(region_batch, seed: int = 0, *, max_steps: int | None = Non
             tightest = AT.where(region_has | (region_count == 0.0), region_count * 0.0 + huge, region_count).argmin(dim=1)
             tightest = tightest.to_dtype("float").reshape((b, 1, 1))
             in_region = candidate & (region == tightest)
-            draw = _uniform(AT, stream, b, n, n)
+            draw = draws.uniform(AT, b, n, n)
             score = AT.where(in_region, draw + 1.0, zero)
             pick = (score.reshape((b, n * n)) * -1.0).argmin(dim=1).to_dtype("float").reshape((b, 1))
             pick_mask = (cell_index == pick).reshape((b, n, n)) & in_region
@@ -203,6 +214,8 @@ class TreeStats:
     depth: int = 0
     branch_factors: list[int] = field(default_factory=list)
     truncated: bool = False
+    #: the region of each decision node, in enumeration order
+    decision_regions: list[int] = field(default_factory=list)
 
 
 def solution_tree(region_grid, *, limit_leaves: int = 512,
@@ -260,6 +273,7 @@ def solution_tree(region_grid, *, limit_leaves: int = 512,
                 return live[0]
             stats.decisions += 1
             stats.branch_factors.append(len(live))
+            stats.decision_regions.append(k)
             return {"region": k, "branches": branches}
 
         tree = descend(zero, zero > 1.0, 0)
@@ -310,11 +324,13 @@ def catalog(puzzles, *, seed: int = 0, limit_leaves: int = 512, full_tree_max_n:
                                      backend=backend, device=device)
             record.update(type=tree_type(stats), decisions=stats.decisions, leaves=stats.leaves,
                           depth=stats.depth, dead_ends=stats.dead_ends,
-                          branch_factors=stats.branch_factors, truncated=stats.truncated)
+                          branch_factors=stats.branch_factors, truncated=stats.truncated,
+                          decision_regions=stats.decision_regions)
         else:
             record.update(type=("forced" if walk_decisions[index] == 0 else f"~{int(walk_decisions[index])}d"),
                           decisions=int(walk_decisions[index]), leaves=None, depth=None,
-                          dead_ends=int(restarts[index]), branch_factors=[], truncated=True)
+                          dead_ends=int(restarts[index]), branch_factors=[], truncated=True,
+                          decision_regions=[])
         records.append(record)
     return records
 
@@ -341,3 +357,79 @@ def select(records: list[dict[str, Any]], *, decisions: int | None = None,
             continue
         picked.append(record["index"])
     return picked
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy: the axes a level is searched on
+# ---------------------------------------------------------------------------
+
+#: Size classes by board side.
+SIZE_CLASSES = (("tiny", 0, 6), ("small", 7, 9), ("medium", 10, 13), ("large", 14, 24),
+                ("huge", 25, 64), ("preposterous", 65, 10 ** 6))
+
+#: Forcing classes by the tree's decision count: how much guessing the
+#: board demands of a solver who deduces everything deducible.
+FORCING_CLASSES = (("forced", 0, 0), ("light", 1, 2), ("branching", 3, 8), ("open", 9, 10 ** 9))
+
+#: Shape classes by the largest region's share of the board.
+SHAPE_CLASSES = (("balanced", 0.0, 0.2), ("lopsided", 0.2, 0.4), ("dominated", 0.4, 1.01))
+
+
+def _class_of(value, classes):
+    for name, low, high in classes:
+        if low <= value <= high:
+            return name
+    return classes[-1][0]
+
+
+def classify(record: dict[str, Any]) -> dict[str, Any]:
+    """The taxonomy of one catalog record.
+
+    Axes: ``size`` (tiny .. preposterous), ``forcing`` (forced, light,
+    branching, open: by decision count), ``depth`` (the longest chain of
+    guesses), ``branching`` (the widest decision), ``shape`` (balanced,
+    lopsided, dominated: by the largest region's share), ``singletons``,
+    ``decision_regions`` (where the guesses sit, when the full tree is
+    known), ``exact`` (full tree, or sampled walk).  ``level`` joins the
+    searchable axes into one key, so a level is a query over the catalog
+    and the key names the class a board falls in.
+    """
+    n = int(record["n"])
+    decisions = int(record["decisions"])
+    share = record["largest_region"] / float(n * n)
+    forcing = _class_of(decisions, FORCING_CLASSES)
+    widest = max(record.get("branch_factors") or [1])
+    taxonomy = {
+        "size": _class_of(n, SIZE_CLASSES),
+        "forcing": forcing,
+        "decisions": decisions,
+        "depth": record.get("depth"),
+        "branching": widest,
+        "shape": _class_of(share, SHAPE_CLASSES),
+        "largest_share": round(share, 3),
+        "singletons": int(record["singletons"]),
+        "decision_regions": list(record.get("decision_regions") or []),
+        "exact": not bool(record.get("truncated")),
+        "contiguous": bool(record["contiguous"]),
+    }
+    taxonomy["level"] = f"{taxonomy['size']}/{forcing}/{taxonomy['shape']}"
+    return taxonomy
+
+
+def levels(records: list[dict[str, Any]]) -> dict[str, list[int]]:
+    """Board indices per level key, most populated level first."""
+    groups: dict[str, list[int]] = {}
+    for record in records:
+        groups.setdefault(classify(record)["level"], []).append(record["index"])
+    return dict(sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])))
+
+
+def level_table(records: list[dict[str, Any]]) -> list[tuple[str, int, float, float]]:
+    """Per level: count, mean decisions, mean largest-region share."""
+    rows = []
+    for key, indices in levels(records).items():
+        chosen = [records[i] for i in indices]
+        rows.append((key, len(indices),
+                     float(np.mean([r["decisions"] for r in chosen])),
+                     float(np.mean([r["largest_region"] / float(r["n"] * r["n"]) for r in chosen]))))
+    return rows

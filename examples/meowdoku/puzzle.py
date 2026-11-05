@@ -132,6 +132,34 @@ class PuzzleBatch:
                       self.region[index].copy(), self.solution[index].copy())
 
 
+class _Draws:
+    """Uniform draws from one seeded repository PRNG stream (Xoroshiro128**),
+    taken from a buffer refilled in blocks, so a draw of ``count`` values
+    costs ``count`` values of the stream, no more, and the sequence is a
+    function of the seed alone."""
+
+    def __init__(self, seed: int, block: int = 1 << 14):
+        from src.common.tensors.abstraction_methods.random import PRNG_ALGO, RANDOM_KIND, random_generator
+        self._stream = random_generator(kind=RANDOM_KIND.PRNG, algo=PRNG_ALGO.XOROSHIRO128SS,
+                                        seed=int(seed), dtype="float", batch_size=int(block))
+        self._buffer = np.empty(0, dtype=np.float64)
+
+    def take(self, count: int) -> np.ndarray:
+        pieces, have = [], 0
+        if self._buffer.size:
+            pieces.append(self._buffer); have = self._buffer.size
+        while have < count:
+            block = np.asarray(next(self._stream), dtype=np.float64).reshape(-1)
+            pieces.append(block); have += block.size
+        values = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        self._buffer = values[count:]
+        return values[:count]
+
+    def uniform(self, AT, *shape):
+        count = int(np.prod(shape))
+        return AT.tensor(np.ascontiguousarray(self.take(count)).reshape(shape))
+
+
 def _rank_of(keys):
     """Each key's rank among its row: a random permutation when the keys are
     random.  Spelled as a comparison count, not a sort: ``rank_i = #{j :
@@ -285,9 +313,6 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
     loops.
     """
     from src.common.tensors import AbstractTensor as AT
-    from src.common.tensors.abstraction_methods.random import (
-        PRNG_ALGO, RANDOM_KIND, random_generator,
-    )
 
     if n < 4:
         raise ValueError("Meowdoku needs at least a 4x4 board for a no-touch arrangement")
@@ -302,20 +327,11 @@ def generate_batch(n: int, batch: int, seed: int = 0, *, style: str = "relaxed",
     # (``AbstractTensor.randn`` is not reached by any seed; measured.)
     # ``backend``/``device`` scope every tensor of the build: ``"torch"``
     # with ``device="cuda"`` puts the whole batch on the GPU; the draws come
-    # from the host stream and are moved once per draw.
-    stream_batch = 1 << 16
-    stream = random_generator(kind=RANDOM_KIND.PRNG, algo=PRNG_ALGO.XOROSHIRO128SS,
-                              seed=int(seed), dtype="float", batch_size=stream_batch)
+    # from the host stream, buffered, and are moved once per draw.
+    draws = _Draws(seed)
 
     def uniform(*shape):
-        count = int(np.prod(shape))
-        pieces, have = [], 0
-        while have < count:
-            block = np.asarray(next(stream), dtype=np.float64).reshape(-1)
-            pieces.append(block)
-            have += block.size
-        values = np.concatenate(pieces)[:count] if len(pieces) > 1 else pieces[0][:count]
-        return AT.tensor(np.ascontiguousarray(values).reshape(shape))
+        return draws.uniform(AT, *shape)
 
     with AT.use_backend(backend, device):
         index_n = AT.arange(n).to_dtype("float")

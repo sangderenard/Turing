@@ -89,6 +89,89 @@ def region_palette(n: int) -> np.ndarray:
     ], axis=-1)
 
 
+def _hue_ring(count: int, saturation: float, value: float, hue_offset: float = 0.0) -> np.ndarray:
+    """``count`` colours evenly spaced around the hue circle (HSV to RGB)."""
+    hue = (np.arange(count) / float(count) + hue_offset) % 1.0
+    h6 = hue * 6.0
+    k = np.floor(h6)
+    f = h6 - k
+    p, q, s = value * (1 - saturation), value * (1 - saturation * f), value * (1 - saturation * (1 - f))
+    v = np.full(count, value)
+    table = np.stack([
+        np.select([k == 0, k == 1, k == 2, k == 3, k == 4], [v, q, p, p, s], v),
+        np.select([k == 0, k == 1, k == 2, k == 3, k == 4], [s, v, v, q, p], p),
+        np.select([k == 0, k == 1, k == 2, k == 3, k == 4], [p, p, s, v, v], q),
+    ], axis=-1)
+    return table
+
+
+#: Named palettes: a palette is a ring of hue slots; ``contrast_palette``
+#: assigns slots to regions so that touching regions sit far apart on the
+#: ring.  A custom palette is any (slots, 3) array of linear RGB.
+PALETTES: dict[str, np.ndarray] = {
+    "pastel": _hue_ring(12, 0.32, 0.92),
+    "vivid": _hue_ring(12, 0.78, 0.95),
+    "warm": _hue_ring(12, 0.45, 0.95, hue_offset=-0.08)[:7],
+    "cool": _hue_ring(12, 0.40, 0.92, hue_offset=0.42)[:7],
+    "ink": np.array([[0.93, 0.93, 0.90], [0.80, 0.80, 0.78], [0.66, 0.66, 0.64], [0.52, 0.52, 0.50],
+                     [0.40, 0.40, 0.38]]),
+}
+
+
+def region_adjacency(region_grid: np.ndarray) -> np.ndarray:
+    """(k, k) boolean: regions sharing a 4-neighbour edge."""
+    k = int(region_grid.max()) + 1
+    touches = np.zeros((k, k), bool)
+    a, b = region_grid[:, 1:], region_grid[:, :-1]
+    touches[a[a != b], b[a != b]] = True
+    a, b = region_grid[1:, :], region_grid[:-1, :]
+    touches[a[a != b], b[a != b]] = True
+    return touches | touches.T
+
+
+def contrast_palette(region_grid: np.ndarray, palette: str | np.ndarray = "pastel", *,
+                     min_separation: float = 1.0 / 3.0, seed: int = 0) -> np.ndarray:
+    """Colours per region such that touching regions contrast in hue.
+
+    The palette is a ring of slots.  Regions are coloured most-constrained
+    first (DSATUR order: most distinct neighbouring slots, then most
+    neighbours).  A slot is admissible when its ring distance to every
+    already-coloured neighbour's slot is at least ``min_separation`` of the
+    ring (a third by default, so neighbours differ by at least 120 degrees
+    of hue when the ring is a hue circle); among admissible slots the
+    least-used wins, with a seeded draw breaking ties, so the whole ring
+    gets used instead of two opposite slots alternating.  When no slot is
+    admissible the farthest one is taken.  Returns (k, 3) linear RGB
+    indexed by region id."""
+    ring = PALETTES[palette] if isinstance(palette, str) else np.asarray(palette, dtype=np.float64)
+    slots = ring.shape[0]
+    touches = region_adjacency(region_grid)
+    k = touches.shape[0]
+    slot_of = -np.ones(k, int)
+    use = np.zeros(slots, int)
+    half = slots / 2.0
+    draw = np.random.default_rng(seed)
+    for _ in range(k):
+        uncoloured = np.flatnonzero(slot_of < 0)
+        saturation = np.array([len({slot_of[j] for j in np.flatnonzero(touches[i]) if slot_of[j] >= 0}) for i in uncoloured])
+        degree = touches[uncoloured].sum(1)
+        i = int(uncoloured[np.lexsort((-degree, -saturation))[0]])
+        neighbour_slots = np.array([slot_of[j] for j in np.flatnonzero(touches[i]) if slot_of[j] >= 0])
+        if neighbour_slots.size:
+            distance = np.abs(np.arange(slots)[:, None] - neighbour_slots[None, :])
+            distance = np.minimum(distance, slots - distance).min(1) / half
+        else:
+            distance = np.ones(slots)
+        admissible = distance >= min_separation * 2.0          # distance is a fraction of half the ring
+        if admissible.any():
+            score = np.where(admissible, -use + draw.uniform(0.0, 0.5, slots), -np.inf)
+        else:
+            score = distance
+        slot_of[i] = int(np.argmax(score))
+        use[slot_of[i]] += 1
+    return ring[slot_of]
+
+
 #: Per-role extrusion overrides.  The cat outline has 465 font vertices; at
 #: the ink default (outline_subdivisions 2, profile_segments 10) it is 21,356
 #: triangles and the native renderer's emissive-triangle submission fails
@@ -296,7 +379,8 @@ def load_sprites(render_dir: str | Path, package: Mapping[str, Any]) -> dict[str
 
 def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, hearts: int,
                   sprites: Mapping[str, TileSprite], *, cell_px: int = 96, n: int | None = None,
-                  grid_px: int = 2, max_hearts: int = 3) -> np.ndarray:
+                  grid_px: int = 2, max_hearts: int = 3,
+                  palette: str | np.ndarray | None = None) -> np.ndarray:
     """One board image (linear RGB in [0, 1]) from the state columns: flat
     region tiles, the cat and X sprites composed over them, a grid, and a
     hearts row beneath."""
@@ -305,7 +389,10 @@ def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, heart
     x_mark = np.asarray(x_mark, dtype=np.float64).reshape(n, n)
     region = np.asarray(region, dtype=np.float64).reshape(n, n).astype(int)
     cat = cat.reshape(n, n)
-    palette = region_palette(int(region.max()) + 1)
+    if palette is None:
+        palette = region_palette(int(region.max()) + 1)      # the shader's own formula
+    else:
+        palette = contrast_palette(region, palette)          # touching regions contrast in hue
     board = n * cell_px
     image = np.zeros((board + cell_px, board, 3), dtype=np.float64)
     scaled = {role: sprite.resampled(cell_px) for role, sprite in sprites.items()}
@@ -342,5 +429,5 @@ def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, heart
 __all__ = [
     "CAT", "HEART", "ROLE_TOKENS", "SPECTRAL_ROOT", "TileSprite", "X_MARK",
     "compile_tiles", "compose_board", "load_sprites", "native_kernels_available",
-    "region_palette", "render_tiles", "tile_order_package", "write_tile_package",
+    "region_palette", "contrast_palette", "region_adjacency", "PALETTES", "render_tiles", "tile_order_package", "write_tile_package",
 ]
