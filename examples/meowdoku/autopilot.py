@@ -114,7 +114,8 @@ def _observe(game, hostile_kind, remaining, ready, height: float, depth: float |
         else:
             rows = np.stack([dx[order] / DX, dy[order] / DY, dvx[order] / DV, dvy[order] / DV, kinds], axis=1)
         out[head:head + row * n] = rows.reshape(-1)
-    out[head + row * K:] = (field_w / 10.0, remaining(col), float(col("lives")[0]) / 3.0, ready(col))
+    lives_scale = float(getattr(game, "HEALTH_MAX", None) or 3.0)
+    out[head + row * K:] = (field_w / 10.0, remaining(col), float(col("lives")[0]) / lives_scale, ready(col))
     return out
 
 

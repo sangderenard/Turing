@@ -400,9 +400,14 @@ class EntityGame(Game):
             from meowdoku.autopilot import finish_episode
             finish_episode(self, trace)
 
+    def drive_settings(self) -> None:
+        """Settings that follow who is driving (a game overrides; default none)."""
+
     def _land(self, seconds: float, held: dict) -> None:
         """Land ``seconds`` with ``held`` controls, or with the policy's own
         when the autopilot is on (one decision per PILOT_STEP)."""
+        if self.session.state is not None:
+            self.drive_settings()
         if not self.autopilot or self.pilot is None or self.session.state is None:
             self.held = held
             if seconds > 0.0:
@@ -453,6 +458,9 @@ class EntityGame(Game):
     #: Layers the game would like ON unless the viewer turned them off for it
     #: (the page's switches default to off otherwise).
     SCENE_PREFER: dict[str, bool] | None = None
+    #: A game whose ``lives`` column is health points declares their maximum
+    #: (the page draws a health bar); None: lives are lives.
+    HEALTH_MAX: float | None = None
     #: Check-in delay bounds (seconds) the sync hint moves between.
     SYNC_MIN, SYNC_MAX = 0.03, 0.25
 
@@ -604,5 +612,7 @@ class EntityGame(Game):
                          "shield": float(col("energy")[k]) if "energy" in self.session.columns else 0.0,
                          # height above the board (games with a third axis; else 0)
                          "z": float(col("z")[k]) if "z" in self.session.columns else 0.0,
+                         # health as a fraction (a game declaring HEALTH_MAX; else 0)
+                         "health": (float(col("lives")[k]) / self.HEALTH_MAX) if self.HEALTH_MAX else 0.0,
                          "vz": float(col("vz")[k]) if "vz" in self.session.columns else 0.0}
         return st

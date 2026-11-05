@@ -498,6 +498,10 @@ function uploadMaterials(game) {
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
+  // The vital bars: a glass tube each (clear) and its fill (glowing glass).
+  records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
+  records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
+  records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
   // Scrolling ground: albedo from colour layer TERRAIN.layer of the shader's
   // uColorUv texture stack (texstack field 1 = colour layer, 9 = blend).
   records.push(["terrain", [1.0, 1.0, 1.0], { roughness: 0.9, colorLayer: TERRAIN.layer, colorBlend: 1.0 }]);
@@ -674,6 +678,32 @@ function restartAllowed() {
   return true;
 }
 function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; }
+
+// ---------------------------------------------------------------- vital bars
+// Shield (blue glass, left) and health (red glass, right): tubes standing just
+// outside the arcade light strips along the field, each filled from the
+// bottom of the screen in proportion to its value (eased).  Shown for a game
+// whose ship carries health points (``you.health``).
+const vitals = { shield: 0, health: 0, at: null, tube: null };
+function drawVitals(now, drawLit) {
+  const game = state.game, you = game && game.you;
+  if (state.flat || !you || !(you.health > 0 || vitals.health > 0.001) || game.input !== "realtime") return;
+  const frame = vitals.at == null ? 1 : Math.min(0.1, now - vitals.at); vitals.at = now;
+  const ease = 1 - Math.exp(-frame / 0.12);
+  vitals.shield += ((you.shield || 0) - vitals.shield) * ease;
+  vitals.health += ((you.health || 0) - vitals.health) * ease;
+  if (!vitals.tube) vitals.tube = litMesh(box(-0.5, 0, -0.5, 0.5, 1, 0.5, 0));
+  const ext = state.extent, m = GLASS.margin * 0.6 + 0.55, length = ext.depth * 0.86, z1 = ext.depth * 0.93;
+  const bar = (x, value, material) => {
+    const w = 0.34, h = 0.34;
+    drawLit(vitals.tube.vao, vitals.tube.count, M.multiply(M.translate(x, 0.05, z1 - length / 2), M.scale(w, h, length)), state.materialIndex.bar_tube);
+    const fill = Math.max(0, Math.min(1, value)) * length;
+    if (fill > 0.01) drawLit(vitals.tube.vao, vitals.tube.count,
+      M.multiply(M.translate(x, 0.08, z1 - fill / 2), M.scale(w * 0.7, h * 0.7, fill)), state.materialIndex[material]);
+  };
+  bar(-m, vitals.shield, "bar_shield");
+  bar(ext.width + m, vitals.health, "bar_health");
+}
 
 // ---------------------------------------------------------------- the craft's shield
 // A bubble around the player's ship, as charged as the server says (``you``'s
@@ -1130,7 +1160,7 @@ function applySnapshot(view) {
   const flags = u8(), ack = i32();
   const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
   sync.hint = f32();
-  you.z = f32(); you.vz = f32();
+  you.z = f32(); you.vz = f32(); you.health = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -1795,6 +1825,7 @@ function draw(ms) {
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
   drawShield(now, drawLit);
+  drawVitals(now, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);

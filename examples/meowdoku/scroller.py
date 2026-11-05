@@ -85,7 +85,8 @@ PICKUPS = (407, 413)
 LANES = PICKUPS[1]
 #: Weapons (the ship's ``weapon`` column) and pickup kinds (a pickup's ``kind``).
 BASIC, LASER, MISSILE = 0.0, 1.0, 2.0
-SPREAD_UP, MULT_UP, MISSILE_UP, LASER_UP = 1.0, 2.0, 3.0, 4.0
+SPREAD_UP, MULT_UP, MISSILE_UP, LASER_UP, SHIELD_UP, HEALTH_UP = 1.0, 2.0, 3.0, 4.0, 5.0, 6.0
+HEALTH_PICKUP = 40.0
 FAN_STEP = 0.13            # radians between neighbouring shots per fan level
 LASER_SPEED = 2.0          # laser shots fly this many times faster
 LASER_RELOAD = 0.05
@@ -98,7 +99,21 @@ MAGNET_SPEED = 9.0
 MISSILE_MASS, MISSILE_DIAMETER, MISSILE_DRAG, AIR_DENSITY, GRAVITY = 1.0, 0.3, 0.3, 1.2, 6.0
 DRIFTER, SPINNER = 1.0, 2.0
 
-LIVES = 3.0
+#: VITALS.  ``lives`` holds health points (0..HEALTH_MAX, slow regeneration)
+#: and ``energy`` the shield charge as a fraction of SHIELD_POINTS (fast
+#: regeneration).  Damage drains the shield first; what it cannot hold comes
+#: off health; the run ends at zero health.
+HEALTH_MAX = 100.0
+HEALTH_REGEN = 0.5            # health points a second
+SHIELD_POINTS = 200.0
+SHIELD_RATE = 24.0            # shield points a second
+BULLET_DAMAGE = 10.0
+RAM_DAMAGE = 25.0
+LIVES = HEALTH_MAX            # the run starts at full health
+#: PACE scales how often enemies arrive and fire: the user plays at USER_PACE,
+#: training and the demo at 1.  LEVEL steps difficulty up by LEVEL_STEP each.
+USER_PACE = 0.35
+LEVEL_STEP = 0.15
 SPEED = 10.0
 TAU = 0.05
 REACH = 0.18
@@ -115,8 +130,8 @@ HITBOX = 0.11
 #: a hit that finds at least SHIELD_COST of charge is absorbed -- the
 #: projectile still dies, the ship keeps its life -- and drains that much; the
 #: charge regenerates continuously at SHIELD_REGEN per second up to 1.
-SHIELD_COST = 0.5
-SHIELD_REGEN = 0.25
+SHIELD_COST = BULLET_DAMAGE / SHIELD_POINTS      # (historical name: one bullet, as charge)
+SHIELD_REGEN = SHIELD_RATE / SHIELD_POINTS
 #: The ship as drawn: half size, body box (hitbox), muzzle at the nose.
 #: Height above the board: the field's third axis (physically compressed).
 DEPTH = 4.0
@@ -136,7 +151,7 @@ CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis
 def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan,
-                  score, lives, invuln, clock, spawn_clock, field_w,
+                  score, lives, invuln, clock, spawn_clock, field_w, pace, level,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
@@ -195,7 +210,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     enemy_spawn = first_of(is_enemy & ~live, lane) & arrive
     roll = noise(clock * 3.7 + 1.0)
     new_kind = where(roll < 0.75, DRIFTER, SPINNER)
-    spawn_clock_next = where(arrive, (1.1 - clock / 200.0).clip(0.35, 1.1) * (0.6 + 0.8 * noise(clock * 1.3)),
+    tempo = pace * (1.0 + LEVEL_STEP * (level - 1.0))       # arrivals and volleys scale with it
+    spawn_clock_next = where(arrive, (1.1 - clock / 200.0).clip(0.35, 1.1) * (0.6 + 0.8 * noise(clock * 1.3)) / tempo,
                              spawn_clock - dt)
     enemy_x0 = 1.0 + (field_w - 2.0) * noise(clock * 5.1 + 2.0)
     # The enemies' height routine (see DWELL): its value and its slope.
@@ -237,7 +253,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0), hp)
     reload_of = where(pw == LASER, LASER_RELOAD, where(pw == MISSILE, MISSILE_RELOAD, RELOAD))
     timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
-                   where(enemy_spawn, 0.8, where(shooter, where(skind == SPINNER, 0.55, 1.5), timer - dt)))
+                   where(enemy_spawn, 0.8 / tempo,
+                         where(shooter, where(skind == SPINNER, 0.55, 1.5) / tempo, timer - dt)))
     # Enemy paths: drifters fall and sway; spinners descend, hold, then leave.
     drifter = is_enemy & (kind1 == DRIFTER)
     spinner = is_enemy & (kind1 == SPINNER)
@@ -295,25 +312,32 @@ def scroller_step(lane, slot, rx, ry, rz,
     fan_next = where(is_player & got_kind(SPREAD_UP), (fan + 1.0).clip(0.0, 3.0), fan)
     shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
     exposed = live2 & (invuln <= 0.0)
-    player_hits = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
-                   + block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz))
+    bullet_strikes = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
+    rams = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)
+    player_hits = bullet_strikes + rams
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
     hp2 = hp1 - enemy_hits
     killed = is_enemy & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
-    # The craft's shield takes a hit while it holds enough charge (the bullet
-    # still dies); only an unshielded hit costs a life and clears the screen.
-    absorbed = touched & (energy >= SHIELD_COST)
-    hit = touched & ~absorbed
-    shielded = f(absorbed).sum() > 0.0
-    energy_next = where(is_player, where(absorbed, energy - SHIELD_COST,
-                                         (energy + SHIELD_REGEN * dt).clip(0.0, 1.0)), energy)
-    was_hit = f(hit).sum() > 0.0
-    lives_next = lives - f(hit).sum()
+    # Damage drains the shield's points first, the rest comes off health;
+    # shield and health pickups refill them; both regenerate (health slowly).
+    damage = (f(is_player & live2) * (BULLET_DAMAGE * bullet_strikes + RAM_DAMAGE * rams)).sum()
+    shield_pts = (f(is_player) * energy).sum() * SHIELD_POINTS
+    soaked = where(damage < shield_pts, damage, shield_pts)
+    wound = damage - soaked
+    refill = got_kind(SHIELD_UP)
+    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(playing))
+    energy_next = where(is_player, (shield_after / SHIELD_POINTS).clip(0.0, 1.0), energy)
+    healed = where(got_kind(HEALTH_UP), HEALTH_PICKUP, 0.0)
+    health = (lives - wound + healed + HEALTH_REGEN * dt * f(lives > 0.0)).clip(0.0, HEALTH_MAX)
+    lives_next = where(playing, health, lives)
     over = lives_next <= 0.0
+    hit = touched & (wound > 0.0)
+    shielded = (damage > 0.0) & (wound <= 0.0)
+    was_hit = wound > 0.0
     # A hit clears the screen of bullets and grants a moment of grace.
     gone = (killed | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
-            | (is_bullet & ((bullet_hits > 0.0) | was_hit)) | (hit & over))
+            | (is_bullet & (bullet_hits > 0.0)) | (hit & over))
     live3 = live2 & ~gone
     # A destroyed enemy sometimes drops a pickup (into the first free pickup
     # lane, where the first of the step's kills died).
@@ -321,7 +345,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     dice = noise(clock * 7.3 + score * 0.01 + 3.0)
     dropping = (f(killer).sum() > 0.0) & (dice < DROP_CHANCE) & playing
     drop = first_of(is_pickup & ~live3, lane) & dropping
-    drop_kind = (1.0 + (noise(clock * 2.9 + 11.0) * 4.0).floor()).clip(1.0, 4.0)
+    drop_kind = (1.0 + (noise(clock * 2.9 + 11.0) * 6.0).floor()).clip(1.0, 6.0)
     kx, ky, kz = (f(killer) * x2).sum(), (f(killer) * y2).sum(), (f(killer) * z2).sum()
     x2, y2, z2 = where(drop, kx, x2), where(drop, ky, y2), where(drop, kz, z2)
     vx1, vy1, vz1 = where(drop, 0.0, vx1), where(drop, 1.2, vy1), where(drop, 0.0, vz1)
@@ -330,7 +354,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     age1 = where(drop, 0.0, age1)
     live3 = live3 | drop
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
-    invuln_next = where(was_hit, INVULN, where(shielded, 0.4, (invuln - dt).clip(0.0, INVULN)))
+    invuln_next = where(was_hit, 0.6, where(shielded, 0.25, (invuln - dt).clip(0.0, INVULN)))
     score_next = score + (f(killed) * where(kind1 == SPINNER, 300.0, 100.0)).sum()
 
     # The longest step that steps nothing over anything it can hit, pair by
@@ -355,7 +379,7 @@ def scroller_step(lane, slot, rx, ry, rz,
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan",
          "score", "lives", "invuln", "clock", "spawn_clock")
-SETTINGS = ("field_w",)
+SETTINGS = ("field_w", "pace", "level")
 
 
 class ScrollerPiece(LawPiece):
@@ -376,7 +400,7 @@ def field_width(aspect: float | None) -> float:
     return float(np.clip(round(HEIGHT * min(aspect, PORTRAIT) * 2.0) / 2.0, 9.0, HEIGHT * PORTRAIT + 0.5))
 
 
-def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
+def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> dict[str, np.ndarray]:
     lane = np.arange(LANES, dtype=np.float64)
     slot = np.zeros(LANES)
     rx, ry, rz = np.full(LANES, HITBOX), np.full(LANES, HITBOX), np.full(LANES, 0.18)
@@ -410,7 +434,7 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
         "timer": np.zeros(LANES), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
-        "field_w": np.full(LANES, float(width)),
+        "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
     }
@@ -423,15 +447,26 @@ class BulletScroller(EntityGame):
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
 
-    def __init__(self, board_id: str = "", aspect: float | None = None):
+    def __init__(self, board_id: str = "", aspect: float | None = None, level: int = 1):
         self.width = field_width(aspect)
+        self.level = max(1, int(level))
         super().__init__(board_id)
 
     def make_piece(self):
         return ScrollerPiece()
 
     def initial_columns(self) -> dict[str, np.ndarray]:
-        return initial_columns(self.width)
+        return initial_columns(self.width, self.pace(), self.level)
+
+    def pace(self) -> float:
+        """Full speed for training episodes and the demo; USER_PACE for a person."""
+        return 1.0 if (getattr(self, "autopilot", False) or not getattr(self, "learns", True)) else USER_PACE
+
+    def drive_settings(self) -> None:
+        """Before each landing: the pace for whoever drives now."""
+        column = self.session.column("pace")
+        if column[0] != self.pace():
+            column[...] = self.pace()
 
     def motion(self) -> dict[str, Any]:
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
@@ -458,7 +493,8 @@ class BulletScroller(EntityGame):
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
                 "pickup_S": [0.35, 0.95, 0.45], "pickup_X": [1.0, 0.85, 0.2],
-                "pickup_M": [1.0, 0.5, 0.2], "pickup_L": [0.3, 0.95, 1.0]}
+                "pickup_M": [1.0, 0.5, 0.2], "pickup_L": [0.3, 0.95, 1.0],
+                "pickup_O": [0.35, 0.6, 1.0], "pickup_H": [1.0, 0.3, 0.35]}
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln", "weapon")
@@ -484,7 +520,8 @@ class BulletScroller(EntityGame):
             elif slot == MISSILE_SLOT:
                 mesh, color, size = "rocket", "missile", 0.24
             elif slot == PICKUP:
-                letter = {SPREAD_UP: "S", MULT_UP: "X", MISSILE_UP: "M", LASER_UP: "L"}.get(float(col["kind"][k]), "S")
+                letter = {SPREAD_UP: "S", MULT_UP: "X", MISSILE_UP: "M", LASER_UP: "L",
+                          SHIELD_UP: "O", HEALTH_UP: "H"}.get(float(col["kind"][k]), "S")
                 mesh, color, size = letter, f"pickup_{letter}", 0.34
             else:
                 mesh, color, size = "disc", "star", 0.05
@@ -515,6 +552,7 @@ class BulletScroller(EntityGame):
     # plate and the arcade ring are on by default so the lights glow into it.
     SCENE = {"floor": False, "glass": True, "arcade": True, "terrain": True}
     SCENE_PREFER = {"glass": True, "arcade": True}
+    HEALTH_MAX = HEALTH_MAX
 
     def describe(self) -> str:
         s = self.session
@@ -522,7 +560,8 @@ class BulletScroller(EntityGame):
         enemies = int(s.column("alive")[ENEMIES[0]:ENEMIES[1]].sum())
         bullets = int(s.column("alive")[BULLETS[0]:BULLETS[1]].sum())
         seconds, calls = s.last_round
-        head = "GAME OVER · R to restart" if lives <= 0 else f"lives {lives}"
+        head = ("GAME OVER · R to restart" if lives <= 0
+                else f"level {self.level} · health {lives} · shield {s.column('energy')[0] * SHIELD_POINTS:.0f}")
         weapon = {BASIC: "blaster", LASER: "laser", MISSILE: "missiles"}.get(float(s.column("weapon")[0]), "blaster")
         head += f" · {weapon} x{1 + int(s.column('mult')[0])} fan {int(s.column('fan')[0])}"
         return (f"{head} · score {score} · {enemies} enemies · {bullets} bullets · "

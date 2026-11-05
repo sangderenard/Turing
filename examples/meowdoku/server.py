@@ -94,7 +94,9 @@ class Table:
         elif kind == "space_invaders":
             self.game = SpaceInvaders(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "bullet_hell":
-            self.game = BulletScroller(aspect=float(payload.get("aspect") or 0.0))
+            # The player starts at the level after the highest they have defeated.
+            start = 1 + (self.profiles.level(self.player, "bullet_hell") if self.profiles else 0)
+            self.game = BulletScroller(aspect=float(payload.get("aspect") or 0.0), level=start)
         elif kind == "platformer":
             self.game = Platformer(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "side_scroller":

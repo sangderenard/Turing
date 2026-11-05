@@ -68,6 +68,21 @@ class Profiles:
             self._save()
             return json.loads(json.dumps(book))
 
+    def level(self, name: str | None, game: str) -> int:
+        """The highest level ``name`` has defeated in ``game`` (0: none)."""
+        if not name:
+            return 0
+        with self.lock:
+            return int(self.data["profiles"].get(name, {}).get("games", {}).get(game, {}).get("level", 0))
+
+    def defeated(self, name: str, game: str, level: int) -> None:
+        """Record that ``name`` defeated ``level`` (kept as the maximum)."""
+        with self.lock:
+            games = self.data["profiles"].setdefault(name, {"created": time.time(), "games": {}})["games"]
+            book = games.setdefault(game, {"plays": 0, "best": None, "recent": []})
+            book["level"] = max(int(book.get("level", 0)), int(level))
+            self._save()
+
     def profile(self, name: str | None) -> dict[str, Any] | None:
         if not name:
             return None
