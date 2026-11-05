@@ -351,6 +351,7 @@ class SpaceInvaders(EntityGame):
         for name in ("x", "home_x"):
             s.column(name)[...] += shift
         s.column("field_w")[...] = width
+        self.epoch += 1
         self.width = width
 
     def palette(self) -> dict[str, list[float]]:

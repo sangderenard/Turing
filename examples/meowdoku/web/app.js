@@ -477,7 +477,7 @@ function cellPosition(game, cell, rackPiece) {
 // integration step sizes) eases out over ~60 ms.
 const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null };
 const PRED_STEP = 1 / 120;
-window.meowdokuDebug = { pred };   // read-only inspection handle (play tests)
+window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
@@ -523,6 +523,82 @@ function predictFrame(now) {
 // resends every interval not yet acknowledged; the server skips any it has
 // landed, so a reordered or lost request costs nothing.  A reply older than
 // the newest one applied is dropped.
+// The world time a state stands for, on the page's clock: with input-timed
+// rounds, the moment the last landed interval closed.
+function worldStamp(game, now) {
+  let stamp = now;
+  if (predicting(game) && game.ack != null) {
+    const landed = pred.sent.find((interval) => interval.seq === game.ack);
+    stamp = landed ? landed.closedAt : (state.lastStamp ?? now);
+  }
+  return (state.lastStamp = Math.min(stamp, now));
+}
+
+// ---------------------------------------------------------------- real-time socket
+// One WebSocket per page (realtime_socket.py): each tick's input goes up as a
+// small JSON frame; each answer is a binary snapshot delta (spawns with their
+// look, entities whose motion changed, lanes gone, the ship and the ack),
+// with the status as a JSON "meta" frame a few times a second.
+const sock = { ws: null, open: false, outstanding: 0, names: [], gen: 0, lanes: new Map(), bytes: 0, frames: 0 };
+function ensureSocket() {
+  if (sock.ws || typeof WebSocket === "undefined") return;
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  sock.ws = ws;
+  ws.onopen = () => { sock.open = true; sock.outstanding = 0; sock.names = []; sock.lanes.clear(); sock.meta = null; };
+  ws.onclose = () => { sock.ws = null; sock.open = false; sock.outstanding = 0; };
+  ws.onerror = () => {};
+  ws.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      const message = JSON.parse(event.data);
+      if (message.meta) { sock.meta = { ...(sock.meta || {}), ...message.meta }; applyState({ ...sock.meta }); }
+      if (message.error) {
+        sock.outstanding = Math.max(0, sock.outstanding - 1);
+        if (/no game/.test(message.error) && !ticks.restarting && state.game) {
+          ticks.restarting = true;
+          newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) }).finally(() => { ticks.restarting = false; });
+        }
+      }
+      return;
+    }
+    sock.outstanding = Math.max(0, sock.outstanding - 1);
+    sock.bytes += event.data.byteLength; sock.frames += 1;
+    applySnapshot(new DataView(event.data));
+  };
+}
+function applySnapshot(view) {
+  const game = state.game; if (!game || game.input !== "realtime") return;
+  const now = state.time;
+  let o = 0;
+  const u8 = () => view.getUint8(o++), u16 = () => { const v = view.getUint16(o, true); o += 2; return v; };
+  const i16 = () => { const v = view.getInt16(o, true); o += 2; return v; }, f32 = () => { const v = view.getFloat32(o, true); o += 4; return v; };
+  const i32 = () => { const v = view.getInt32(o, true); o += 4; return v; };
+  if (u8() !== 1) return;
+  const flags = u8(), ack = i32();
+  const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1 };
+  for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
+  const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
+  const stamp = worldStamp(frameGame, now);
+  const drop = (lane) => { const key = sock.lanes.get(lane); const piece = key && state.pieces.get(key); if (piece && piece.removing == null) piece.removing = now; sock.lanes.delete(lane); };
+  if (flags & 2) { for (const lane of [...sock.lanes.keys()]) drop(lane);
+                   for (const piece of state.pieces.values()) if (piece.entity && piece.removing == null) piece.removing = now; }
+  for (let n = u16(); n > 0; n--) drop(u16());
+  for (let n = u16(); n > 0; n--) {
+    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000, bob = u8();
+    const x = f32(), y = f32(), vx = f32(), vy = f32();
+    drop(lane);
+    const id = `${lane}:s${++sock.gen}`;
+    sock.lanes.set(lane, id);
+    state.pieces.set(id, { id, entity: true, lane, sx: x, sz: y, x, z: y, vx, vz: vy, tRecv: stamp, mesh, color, size, roll, spin, bob, t0: now, removing: null, seed: 0 });
+  }
+  for (let n = u16(); n > 0; n--) {
+    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], x = f32(), y = f32(), vx = f32(), vy = f32();
+    const piece = state.pieces.get(sock.lanes.get(lane));
+    if (piece) Object.assign(piece, { sx: x, sz: y, vx, vz: vy, tRecv: stamp, mesh, color });
+  }
+  reconcile(frameGame);
+}
+
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -534,6 +610,12 @@ function sendTick(game) {
     if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
     payload.inputs = pred.sent.map((interval) => ({ seq: interval.seq, dur: interval.dur, ...interval.controls }));
   }
+  if (sock.open) {
+    sock.outstanding++;
+    sock.ws.send(JSON.stringify(payload));
+    return Promise.resolve();
+  }
+  ensureSocket();
   const id = ++ticks.sent;
   ticks.inFlight++;
   return fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
@@ -556,7 +638,7 @@ function sendTick(game) {
 }
 setInterval(() => {
   const game = state.game;
-  if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight >= 3) return;
+  if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight + sock.outstanding >= 3) return;
   sendTick(game);
 }, 30);
 
@@ -571,7 +653,9 @@ function entityModel(piece, now) {
   // Carried forward from the moment the server's state stands for, for as
   // long as it takes the next reply to come (constant-velocity motion is
   // exact; anything else is corrected as it arrives) -- never frozen.
-  const mesh = state.meshes[piece.mesh], lead = Math.min(Math.max(0, now - piece.tRecv), 0.3);
+  // (With socket deltas an unchanged entity is carried from its last record,
+  // at most one keyframe -- 0.5 s of world time -- old.)
+  const mesh = state.meshes[piece.mesh], lead = Math.min(Math.max(0, now - piece.tRecv), 1.0);
   if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
     // The player's own ship: the prediction, not the server's last word.
     piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
@@ -630,6 +714,9 @@ function pieceModel(piece, now) {
   return m;
 }
 function applyState(game) {
+  // While the real-time socket is open it owns the entities; a state that
+  // arrives by HTTP (reset, layout, the socket's own meta) leaves them alone.
+  if (game.input === "realtime" && sock.open) delete game.entities;
   const now = state.time, previous = state.game;
   state.game = game;
   document.body.dataset.game = game.game;
@@ -655,12 +742,7 @@ function applyState(game) {
   for (const p of game.pieces) place(p, false);
   // The world time this state stands for, on the page's clock: with
   // input-timed rounds, the moment the last landed interval closed.
-  let stamp = now;
-  if (predicting(game) && game.ack != null) {
-    const landed = pred.sent.find((interval) => interval.seq === game.ack);
-    stamp = landed ? landed.closedAt : (state.lastStamp ?? now);
-  }
-  state.lastStamp = stamp = Math.min(stamp, now);
+  const stamp = worldStamp(game, now);
   for (const e of game.entities || []) {
     seen.add(e.id);
     const live = state.pieces.get(e.id);
@@ -670,7 +752,7 @@ function applyState(game) {
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
-  for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
+  for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
   status.textContent = `${game.status} · ${game.title}${best}`;
   $("hud").textContent = `${game.status}${best}`;

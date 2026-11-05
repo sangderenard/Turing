@@ -217,6 +217,7 @@ class EntityGame(Game):
         self.ticks = 0
         self.held: dict[str, float] = {}
         self.ack = None           # the last input interval landed
+        self.epoch = 0            # bumped when the world jumps (reset, rewind, relayout)
         self.intervals: list[dict] = []
 
     # declared by the game ----------------------------------------------------
@@ -270,10 +271,12 @@ class EntityGame(Game):
     def undo(self) -> None:
         self.session.rewind()
         self.last_tick = None
+        self.epoch += 1
 
     def reset(self) -> None:
         self.session.reset(self.initial_columns())
         self.last_tick = None
+        self.epoch += 1
 
     def state(self) -> dict[str, Any]:
         st = self.base_state(int(round(self.height)), int(round(self.width)))
@@ -288,6 +291,7 @@ class EntityGame(Game):
         st["status"] = self.describe()
         st["moves"] = self.ticks
         st["over"] = self.session.state is not None and self.result() is not None
+        st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, **(self.motion() or {})}

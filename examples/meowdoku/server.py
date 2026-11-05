@@ -42,6 +42,7 @@ from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, LichessGame,
 from meowdoku.invaders import SpaceInvaders  # noqa: E402
 from meowdoku.scroller import BulletScroller  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
+from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PROFILES = ROOT / "build" / "meowdoku" / "profiles.json"
@@ -223,7 +224,53 @@ def make_handler(sessions: Sessions):
                 self.send_header("Cache-Control", "no-cache")          # the page is edited live
             super().end_headers()
 
+        def _socket(self):
+            """``/ws``: this session's real-time channel (realtime_socket.py).
+            Each text frame is one tick's input; each answer is a binary
+            snapshot delta, preceded by a ``meta`` text frame when one is due."""
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+                return self._json({"error": "expected a WebSocket upgrade"}, HTTPStatus.BAD_REQUEST)
+            table = self._table()
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_key(key))
+            self.end_headers()
+            self.wfile.flush()
+            encoder = SnapshotEncoder()
+            try:
+                while True:
+                    message = read_frame(self.rfile)
+                    if message is None or message[0] == 0x8:
+                        break
+                    opcode, payload = message
+                    if opcode == 0x9:
+                        self.wfile.write(frame(0xA, payload)); continue
+                    if opcode != 0x1:
+                        continue
+                    try:
+                        request = json.loads(payload.decode("utf-8"))
+                        with table.lock:
+                            game = table.game
+                            if game is None or not hasattr(game, "session"):
+                                raise ValueError("no game: POST /api/new first")
+                            game.control(request)
+                            game.tick()
+                            binary, meta = encoder.encode(game, table.state())
+                        if meta is not None:
+                            self.wfile.write(frame(0x1, json.dumps({"meta": meta}).encode("utf-8")))
+                        self.wfile.write(frame(0x2, binary))
+                    except Exception as error:  # the page shows the refusal
+                        self.wfile.write(frame(0x1, json.dumps({"error": f"{type(error).__name__}: {error}"}).encode("utf-8")))
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                self.close_connection = True
+
         def do_GET(self):  # noqa: N802
+            if self.path.startswith("/ws"):
+                return self._socket()
             if self.path.startswith("/api/state"):
                 table = self._table()
                 with table.lock:

@@ -275,6 +275,7 @@ class BulletScroller(EntityGame):
         s = self.session
         s.column("x")[...] += (width - self.width) / 2.0
         s.column("field_w")[...] = width
+        self.epoch += 1
         self.width = width
 
     def palette(self) -> dict[str, list[float]]:
