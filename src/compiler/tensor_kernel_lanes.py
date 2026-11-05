@@ -68,20 +68,37 @@ def lane_handles(operation: str, lane: str | None = None) -> bool:
 
 _SOURCE = (Path(__file__).resolve().parents[1] / "common" / "tensors"
            / "accelerator_backends" / "c_backend" / "eigen_kernels.cpp")
-# x86-64-v3 (AVX2 + FMA): the workspace's Eigen headers predate this clang
-# and their AVX-512 packet math does not compile under it (pfirst return
-# type), while -march=native on an AVX-512 host selects it.  The AVX2 + FMA
-# packet paths compile.
-# -fno-threadsafe-statics: Eigen's function-local statics would otherwise
-# call the C++ runtime's __cxa_guard_acquire/release, which the plain C link
-# of an LLVM product does not carry.  The kernels run single-threaded per call.
-_FLAGS = ("-O3", "-mcpu=x86_64_v3", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics",
-          "-DEIGEN_NO_DEBUG", "-DEIGEN_DONT_PARALLELIZE")
+# Built for this host (-march=native: AVX-512 on the development machine).
+# Released Eigen (3.4.0, 3.4.1, 5.0.0) does not compile its packet math under
+# zig's clang 21 (``pfirst`` of a ``_mm_permute_ps`` result is not recognized
+# as Packet4f); Eigen's development head does, so it is preferred below.
+_BASE_FLAGS = ("-O3", "-fno-exceptions", "-fno-rtti",
+               # Eigen's function-local statics would otherwise call the C++
+               # runtime's __cxa_guard_acquire/release, which the plain C link
+               # of an LLVM product does not carry.
+               "-fno-threadsafe-statics",
+               "-DEIGEN_NO_DEBUG", "-DEIGEN_DONT_PARALLELIZE")
+# The numeric contract's ``float_arithmetic`` knob: ``fast`` licenses
+# reassociation and FMA contraction while keeping inf/NaN honored.
+_FLOAT_ARITHMETIC_FLAGS = {
+    "fast": ("-ffast-math", "-fno-finite-math-only"),
+    "strict": ("-ffp-contract=off",),
+}
+
+
+def _flags(include: Path) -> tuple[str, ...]:
+    """Host target for headers whose packet math compiles under this clang
+    (Eigen's development head); a released Eigen (the fftfree fallback) is
+    limited to x86-64-v3 (AVX2 + FMA)."""
+    from .ssa_call_input_adapters import float_arithmetic_policy
+    target = ("-march=native",) if include.name == "eigen-master" else ("-mcpu=x86_64_v3",)
+    return _BASE_FLAGS + target + _FLOAT_ARITHMETIC_FLAGS[float_arithmetic_policy()]
 
 
 def eigen_include() -> Path:
     explicit = os.environ.get("TURING_EIGEN_INCLUDE")
     candidates = [Path(explicit)] if explicit else []
+    candidates.append(Path(__file__).resolve().parents[2] / "build" / "third_party" / "eigen-master")
     candidates.append(Path(__file__).resolve().parents[3] / "fftfree" / "build" / "_deps" / "eigen-src")
     for candidate in candidates:
         if (candidate / "Eigen" / "Core").is_file():
@@ -110,13 +127,14 @@ def eigen_object() -> tuple[str, str]:
     per source+flags+headers and cached under ``build/tensor_kernel_lanes``."""
     include = eigen_include()
     source = _SOURCE.read_text(encoding="utf-8")
-    key = hashlib.sha256("\0".join((source, *_FLAGS, str(include))).encode("utf-8")).hexdigest()[:16]
+    flags = _flags(include)
+    key = hashlib.sha256("\0".join((source, *flags, str(include))).encode("utf-8")).hexdigest()[:16]
     directory = Path(__file__).resolve().parents[2] / "build" / "tensor_kernel_lanes"
     directory.mkdir(parents=True, exist_ok=True)
     obj = directory / f"eigen_kernels_{key}.obj"
     if not obj.is_file():
         partial = obj.with_suffix(".partial.obj")
-        command = [sys.executable, "-m", "ziglang", "c++", "-c", *_FLAGS,
+        command = [sys.executable, "-m", "ziglang", "c++", "-c", *flags,
                    "-I", str(include), str(_SOURCE), "-o", str(partial)]
         done = subprocess.run(command, capture_output=True, text=True)
         if done.returncode or not partial.is_file():

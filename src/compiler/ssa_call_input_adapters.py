@@ -1134,6 +1134,7 @@ _NUMERIC_CONVERSION_MODES = {
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
         "transcendentals": "backend_intrinsic",
+        "float_arithmetic": "fast",
     },
 
     "scientific": {
@@ -1145,6 +1146,7 @@ _NUMERIC_CONVERSION_MODES = {
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
         "transcendentals": "signal_cores",
+        "float_arithmetic": "strict",
     },
 
     "stochastic": {
@@ -1156,11 +1158,12 @@ _NUMERIC_CONVERSION_MODES = {
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
         "transcendentals": "signal_cores",
+        "float_arithmetic": "strict",
     },
 }
 
 
-_DEFAULT_NUMERIC_MODE = "scientific"
+_DEFAULT_NUMERIC_MODE = "compute"
 
 
 def active_numeric_mode() -> str:
@@ -1224,6 +1227,32 @@ def integer_arithmetic_policy(mode=None):
 #: intrinsics (never the 1e-6 sine table).  A rounding contract of
 #: scientific or stricter cannot use a language intrinsic; only compute
 #: may.  Any other value refuses by name.
+#: ``float_arithmetic``: what the native toolchain may assume about float
+#: arithmetic in code it builds for this contract.  ``fast`` (``compute``) --
+#: reassociation, contraction to FMA, reciprocal and signed-zero freedom, so
+#: reductions vectorize and products fuse; infinities and NaN stay honored
+#: (finite-math is NOT assumed: kernels start reductions at -inf and masks
+#: may carry inf).  ``strict`` (``scientific``, ``stochastic``) -- IEEE order
+#: as written.  Any other value refuses by name.
+_FLOAT_ARITHMETIC_POLICIES = ("fast", "strict")
+
+
+def float_arithmetic_policy(mode=None):
+    """The numeric contract's ``float_arithmetic`` for ``mode``."""
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode or _DEFAULT_NUMERIC_MODE]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    policy = contract["float_arithmetic"]
+    if policy not in _FLOAT_ARITHMETIC_POLICIES:
+        raise ValueError(
+            f"float_arithmetic must be one of {_FLOAT_ARITHMETIC_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
+
+
 _TRANSCENDENTAL_POLICIES = ("signal_cores", "backend_intrinsic")
 
 
