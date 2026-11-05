@@ -31,6 +31,14 @@
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
   #player { width: 9em; }
+  /* The result splash: centred over the board, never takes a tap. */
+  #splash { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.9); z-index: 4; display: none;
+            text-align: center; pointer-events: none; padding: 18px 28px; border-radius: 14px;
+            background: rgba(16,16,22,0.78); border: 1px solid #3a3a42; opacity: 0; transition: opacity .25s, transform .25s; }
+  #splash.show { display: block; opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  #splash-title { font-size: 34px; font-weight: 700; letter-spacing: 0.02em; }
+  #splash.win #splash-title { color: #ffd76a; } #splash.loss #splash-title { color: #ff8a7a; }
+  #splash-detail { margin-top: 6px; opacity: 0.8; font-size: 14px; }
   /* Fullscreen: the canvas takes the whole screen; a status line and an exit
      button float over it. */
   #hud, #fs-exit { display: none; position: fixed; z-index: 3; }
@@ -76,11 +84,13 @@
   <label>Crease <input id="crease" type="range" min="0" max="90" value="40"></label>
   <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
   <button id="scores-toggle">Scores</button>
+  <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
   <button id="fullscreen">Fullscreen (F)</button>
   <span id="status">loading…</span>
 </div>
 <div id="scores"></div>
 <div id="hud"></div>
+<div id="splash"><div id="splash-title"></div><div id="splash-detail"></div></div>
 <button id="fs-exit" title="Leave fullscreen (F or Esc)">✕</button>
 <canvas id="gl"></canvas>
 <div id="word">

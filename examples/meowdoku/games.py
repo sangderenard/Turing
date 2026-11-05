@@ -277,7 +277,7 @@ class MeowdokuGame(Game):
         st["score"] = int(cat.sum())
         st["won"], st["lost"] = bool(s.won), bool(s.lost)
         hint_note = f" · {self.hints_used} hint{'s' if self.hints_used != 1 else ''}" if self.hints_used else ""
-        st["status"] = ("solved! all cats home" if s.won else "out of hearts" if s.lost
+        st["status"] = ("solved! all cats home" if s.won else "out of fish" if s.lost
                         else f"{int(s.hearts)} fish · {self.moves} moves") + hint_note
         if self.hint_text and not (s.won or s.lost):
             st["status"] += f" · {self.hint_text}"

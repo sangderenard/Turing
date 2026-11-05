@@ -541,6 +541,35 @@ function camera() {
 }
 const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
 state.light = light;
+// ---------------------------------------------------------------- result splash and auto restart
+// When a game ends (won, lost, or over), show the result over the board, then
+// -- unless Auto restart is off -- start again: a fresh puzzle, word or match
+// for the turn-based games, a reset for the real-time ones.
+const SPLASH_S = 2.6;
+const splash = { key: null, ended: false, timer: null };
+function resultSplash(game) {
+  const key = `${game.game}|${game.id}`, ended = !!(game.won || game.lost || game.over);
+  if (key !== splash.key) { splash.key = key; splash.ended = ended; hideSplash(); return; }
+  if (ended && !splash.ended) {
+    const box = $("splash"), win = !!game.won;
+    box.className = `show ${win ? "win" : "loss"}`;
+    $("splash-title").textContent = win ? (game.game === "meowdoku" ? "Solved!" : "You win!") : "Game over";
+    $("splash-detail").textContent = String(game.status || "").split(" · ").slice(0, 3).join(" · ");
+    clearTimeout(splash.timer);
+    splash.timer = setTimeout(() => {
+      hideSplash();
+      const current = state.game ? `${state.game.game}|${state.game.id}` : null;
+      // Off, or the player already moved on to another game, or a game this
+      // page only watches (the arena, Lichess): leave it.
+      if (!$("autorestart").checked || current !== key || game.input === "watch") return;
+      if (game.input === "realtime") act({ type: "reset" }); else $("new").click();
+    }, SPLASH_S * 1000);
+  }
+  if (!ended && splash.ended) hideSplash();
+  splash.ended = ended;
+}
+function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; }
+
 // ---------------------------------------------------------------- the craft's shield
 // A bubble around the player's ship, as charged as the server says (``you``'s
 // shield); a hit it absorbs (the charge falling) flashes it.  Drawn with the
@@ -1300,6 +1329,7 @@ function applyState(game) {
   rebuildBoards(game);
   arcadeEvents(game, now);
   if (game.you) noteShield(game, now);
+  resultSplash(game);
   const seen = new Set();
   const place = (p, rackPiece) => {
     const [x, z, where, cellSize] = cellPosition(game, p.cell, rackPiece);
