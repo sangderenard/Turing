@@ -48,15 +48,21 @@ class NativeEvaluator:
     """``evaluate(boards, masks)`` with the same answers as the net's own,
     run by the compiled library with the net's current weights."""
 
-    def __init__(self, net: ConvValueNet, batch: int = 32, directory: Path = BUILD):
+    def __init__(self, net: ConvValueNet, batch: int = 32, directory: Path = BUILD,
+                 contract: str | None = None):
+        """``contract`` names the work-contract preset the compile runs
+        under (``develop`` when None): ``fast`` licenses FMA contraction
+        and fast-math, ``eigen`` links Eigen's GEMM for the kernels."""
         from src.compiler.llvm_training_runtime import compile_native_graph_forward
-        self.net, self.batch = net, int(batch)
-        name = f"chess_eval_c{net.channels}_h{net.hidden}_b{self.batch}"
+        from src.compiler.work_contract import PRESETS, scoped_work_contract
+        self.net, self.batch, self.contract = net, int(batch), contract or "develop"
+        name = f"chess_eval_c{net.channels}_h{net.hidden}_b{self.batch}_{self.contract}"
         outputs, bindings, self.shapes = _trace(net.channels, net.hidden, self.batch, name)
         started = time.perf_counter()
-        self.forward = compile_native_graph_forward(
-            outputs, bindings=bindings, source="ConvValueNet.forward_both + masked softmax",
-            name=name, directory=Path(directory) / name)
+        with scoped_work_contract(PRESETS[self.contract]):
+            self.forward = compile_native_graph_forward(
+                outputs, bindings=bindings, source="ConvValueNet.forward_both + masked softmax",
+                name=name, directory=Path(directory) / name)
         self.compile_seconds = time.perf_counter() - started
         self.ids = dict(self.forward.input_value_ids)
         self.value_id, self.policy_id = self.forward.output_value_ids
@@ -66,21 +72,47 @@ class NativeEvaluator:
             return {self.ids[p]: np.ascontiguousarray(np.asarray(getattr(self.net, p).numpy(), dtype=np.float64))
                     for p in PARAMETER_NAMES}
 
+    def _resident(self):
+        """One prepared execution kept for the life of the evaluator: its
+        buffers are bound once, and every call writes into them in place
+        and calls the entry.  Preparation (allocation and extent
+        derivation) is paid on the first call only."""
+        if getattr(self, "_execution", None) is None:
+            from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+            self._execution = prepare_artifact_execution(self.forward.artifact, {
+                **self._weights(),
+                self.ids["x"]: np.zeros((self.batch, PLANES, 8, 8)),
+                self.ids["mask"]: np.ones((self.batch, POLICY))})
+            self._buffers = {key: np.asarray(self._execution.buffers[value]) for key, value in self.ids.items()}
+            self._value_out = np.asarray(self._execution.buffers[self.value_id])
+            self._policy_out = np.asarray(self._execution.buffers[self.policy_id])
+        return self._execution
+
+    def _refresh_weights(self) -> None:
+        """Copy the net's current weights into the resident buffers.  Adam
+        writes the parameters in place, so nothing cheaper than the copy
+        (about half a millisecond) proves they are unchanged."""
+        with self.net.lock:
+            for p in PARAMETER_NAMES:
+                np.copyto(self._buffers[p].reshape(-1),
+                          np.asarray(getattr(self.net, p).numpy(), dtype=np.float64).reshape(-1))
+
     def evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+        execution = self._resident()
+        self._refresh_weights()
         planes = self.net.planes(boards)
         masks = np.asarray(masks, dtype=np.float64)
-        n = planes.shape[0]
-        weights = self._weights()
+        x = self._buffers["x"].reshape(self.batch, PLANES, 8, 8)
+        m = self._buffers["mask"].reshape(self.batch, POLICY)
         values, policies = [], []
-        for start in range(0, n, self.batch):
-            x = np.zeros((self.batch, PLANES, 8, 8)); m = np.ones((self.batch, POLICY))
+        for start in range(0, planes.shape[0], self.batch):
             chunk = planes[start:start + self.batch]
-            x[:len(chunk)] = chunk; m[:len(chunk)] = masks[start:start + self.batch]
-            run = prepare_artifact_execution(self.forward.artifact, {
-                **weights, self.ids["x"]: x, self.ids["mask"]: m}).run()
-            values.append(np.asarray(run.buffers[self.value_id]).reshape(-1)[:len(chunk)])
-            policies.append(np.asarray(run.buffers[self.policy_id]).reshape(self.batch, POLICY)[:len(chunk)])
+            count = len(chunk)
+            x[:count] = chunk; x[count:] = 0.0
+            m[:count] = masks[start:start + self.batch]; m[count:] = 1.0
+            execution.run()
+            values.append(self._value_out.reshape(-1)[:count].copy())
+            policies.append(self._policy_out.reshape(self.batch, POLICY)[:count].copy())
         return np.concatenate(values), np.concatenate(policies)
 
 

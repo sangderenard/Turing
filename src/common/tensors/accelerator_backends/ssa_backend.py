@@ -339,28 +339,34 @@ class SSATensorProgram:
                         (1, left_shape[-2], right_shape[-1]),
                     )
 
-                output = self.full((batch, left_shape[-2], right_shape[-1]), 0.0)
-
-                def matrix_at(value: SSATensorValue, position: int) -> SSATensorValue:
-                    if len(value.shape) == 2:
-                        return value
-                    selected = self.index_select(
-                        value, 0, [position if value.shape[0] > 1 else 0]
-                    )
-                    return self.view(selected, selected.shape[1:])
-
-                for position in range(batch):
-                    product = self.operation(
-                        "matmul",
-                        matrix_at(tensor_operands[0], position),
-                        matrix_at(tensor_operands[1], position),
-                    )
-                    output = self.index_set(
-                        output,
-                        (position, slice(None), slice(None)),
-                        product,
-                    )
-                return output
+                # A batch of matrix products is ONE tensor operation: it
+                # reaches the backend table's batched kernel whole, as the
+                # declared ``supports_native_batched_matmul`` promises,
+                # instead of being unrolled here into per-position
+                # index_select / matmul / index_set.  A rank-2 operand is
+                # broadcast across the batch by a zero offset, the same
+                # routing rule ``tensor_ssa_lowering`` uses for this kernel.
+                m, n, p = left_shape[-2], left_shape[-1], right_shape[-1]
+                left_offsets = [
+                    (position if len(left_shape) == 3 and left_batch > 1 else 0) * m * n
+                    for position in range(batch)
+                ]
+                right_offsets = [
+                    (position if len(right_shape) == 3 and right_batch > 1 else 0) * n * p
+                    for position in range(batch)
+                ]
+                result = self._fresh(shape=(batch, m, p))
+                return self._call(
+                    "batched_matmul_indexed_double",
+                    [
+                        tensor_operands[0].value, tensor_operands[1].value, result,
+                        self._int_vector(left_offsets), self._int_vector(right_offsets),
+                        self._constant(batch, "int32"), self._constant(m, "int32"),
+                        self._constant(n, "int32"), self._constant(p, "int32"),
+                    ],
+                    result,
+                    output_argument=2,
+                )
             if len(left_shape) != 2 or len(right_shape) != 2 or left_shape[1] != right_shape[0]:
                 raise NotImplementedError("the fundamental SSA matmul kernel supports rank two or three")
             shape = (left_shape[0], right_shape[1])
