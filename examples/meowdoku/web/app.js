@@ -208,7 +208,7 @@ function draw(now) {
   const lpos = [], lcol = [], lint = [], lgid = [];
   for (const L of lights) {                                       // lights ride with the camera, in view space, scaled to the board
     lpos.push(L.position[0] * n, L.position[1] * n, L.position[2] * n * 0.5 - 1.0);
-    lcol.push(...L.color); lint.push(L.intensity * n * n * 0.9); lgid.push(-1);
+    lcol.push(...L.color); lint.push(L.intensity * n * n * 1.7); lgid.push(-1);
   }
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), lights.length);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array(lpos));
@@ -291,6 +291,7 @@ canvas.addEventListener("pointerup", async (e) => {
   const long = performance.now() - press.t > 450, button = (press.button === 2 || long) ? "secondary" : "primary";
   press = null;
   const cell = cellAt(e.clientX, e.clientY);
+  console.log("[meowdoku] click", e.clientX, e.clientY, "->", cell, button);
   if (cell) applyState(await api("/api/move", { r: cell.r, c: cell.c, button }));
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
