@@ -153,7 +153,15 @@ class EntitySession:
             # attempt is the controller's last proposal, not the whole window
             # (dt_system's first round has no ceiling of its own).
             dt_initial=None if self.state is None else min(self.dt, float(seconds)))
-        advanced, self.dt, telemetry = results[0]
+        advanced, proposed, telemetry = results[0]
+        # A window shorter than the step only clips that one step: the dt
+        # system's proposal after it is the window's length, not a judgement
+        # of the physics.  Keeping it would shrink every later first attempt
+        # for good (a 3 ms input interval left the controller at 3 ms and a
+        # 250 ms tick at 2000+ law calls).  So the clipped proposal is kept
+        # only when the window was not the limit.
+        if float(seconds) >= self.dt or float(proposed) < float(seconds):
+            self.dt = float(proposed)
         if abs(float(advanced) - seconds) > 1e-9 * max(1.0, seconds):
             raise RuntimeError(f"a tick must land as one window: advanced={advanced} of {seconds}")
         self.telemetry = telemetry

@@ -839,7 +839,9 @@ function stepShip(ship, input, seconds, motion) {
     }
   }
 }
-const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
+// While the demo player (the server's trained policy) flies, the ship is the
+// server's: the page draws it and predicts nothing.
+const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict && !game.autopilot);
 function reconcile(game) {
   if (!predicting(game) || !game.you || !game.you.alive) { pred.ship = null; return; }
   pred.lane = game.predict.lane;
@@ -1695,6 +1697,36 @@ const newGame = (payload) => {
   chain = step;
   return step;
 };
+
+// ---------------------------------------------------------------- demo player
+// The trained autopilot (autopilot.py, run by the server) is the demo player:
+// with a game that has one open and no control from the user for DEMO_START_S
+// (DEMO_IDLE_S after the user last played), the page hands the ship to it;
+// the user's first control takes it back and starts a fresh game.
+const DEMO_GAMES = new Set(["space_invaders", "bullet_hell"]);
+const DEMO_START_S = 3, DEMO_IDLE_S = 15;
+const demo = { key: null, since: 0, lastInput: -Infinity, pending: false };
+const userControlling = () => { const c = controls(); return !!(c.move_axis || c.move_axis_y || c.fire || c.steer_x >= 0); };
+setInterval(() => {
+  const game = state.game, now = performance.now() / 1000;
+  if (!game || !DEMO_GAMES.has(game.game) || game.input !== "realtime" || demo.pending) return;
+  // Opening another game starts its demo clock fresh; a reset of the same
+  // game (the user taking over) keeps the user's last input.
+  if (game.game !== demo.key) { demo.key = game.game; demo.since = now; demo.lastInput = -Infinity; }
+  if (userControlling()) {
+    demo.lastInput = now;
+    if (game.autopilot) {                                  // the user takes over: a fresh game, theirs
+      demo.pending = true;
+      act({ type: "autopilot", on: false }).then(() => act({ type: "reset" })).finally(() => { demo.pending = false; });
+    }
+    return;
+  }
+  const idle = now - Math.max(demo.since + DEMO_START_S - DEMO_IDLE_S, demo.lastInput);
+  if (!game.autopilot && !game.over && idle >= DEMO_IDLE_S) {
+    demo.pending = true;
+    act({ type: "autopilot", on: true }).finally(() => { demo.pending = false; });
+  }
+}, 100);
 
 // ---------------------------------------------------------------- picking and input
 // Real-time controls: held keys, or a held pointer that steers the player
