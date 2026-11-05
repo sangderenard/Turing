@@ -149,6 +149,9 @@ class EntitySession:
         self.state, self.controller, results = dt_system(
             self.pieces, self.columns, rounds=1, round_dt=float(seconds), dx=1.0,
             targets=self.targets, controller=self.controller, state=self.state,
+            # Real-time play keeps no backups: the dt system's no-save,
+            # in-place, no-retry lane, declared rather than inherited.
+            rollback=False,
             # Play is one continuous run cut into ticks: the next tick's first
             # attempt is the controller's last proposal, not the whole window
             # (dt_system's first round has no ceiling of its own).
@@ -167,7 +170,7 @@ class EntitySession:
         self.telemetry = telemetry
         self.last_round = (float(seconds), self.calls() - before)
         self.since_snapshot += seconds
-        if not self.snapshots or self.since_snapshot >= self.rewind_every:
+        if self.rewind_depth and (not self.snapshots or self.since_snapshot >= self.rewind_every):
             self.snapshots.append(self.state.copy_shallow())
             del self.snapshots[:-self.rewind_depth]
             self.since_snapshot = 0.0
@@ -315,7 +318,9 @@ class EntityGame(Game):
         columns = self.initial_columns()
         if hasattr(piece, "compile"):
             piece.compile(columns)
-        self.session = EntitySession(piece, columns, self.CONTROLS)
+        # No rewind snapshots: real-time games are never rolled back (the
+        # page's own history is the record; undo is for the board games).
+        self.session = EntitySession(piece, columns, self.CONTROLS, rewind_depth=0)
         self.last_tick: float | None = None
         self.ticks = 0
         self.held: dict[str, float] = {}
