@@ -20,11 +20,13 @@ Lanes (contiguous blocks, so collisions are block against block):
                    drift back with the scroll, sink toward the land and fade
     425..428       flashes: lightning, at the striking cloud and the craft struck
 
-STORMS: smoke drifting into the same column as a cloud (overlap on the
-board, any height) turns it into a RAIN cloud (``kind`` RAIN) until it
-scrolls away.  A rain cloud strikes at random (STRIKE_RATE a second); the
-strike chains to every craft within CHAIN_R of the cloud: enemies take
-LIGHTNING_DAMAGE, the player's shield gains LIGHTNING_CHARGE points.
+STORMS: smoke soaking into a cloud -- overlapping it in three dimensions,
+at its own height, for SOAK_TIME (the cloud's ``timer`` counts it) -- turns
+it into a RAIN cloud (``kind`` RAIN) until it scrolls away; rare, because
+smoke must really meet a cloud.  A rain cloud strikes at random
+(STRIKE_RATE a second); the strike chains to every craft within CHAIN_R of
+the cloud: enemies take LIGHTNING_DAMAGE, the player LIGHTNING_HIT (shield
+first, then health).
 
 BOSS: lane 48 (the last enemy lane, reserved) is the level's boss, flown by
 the trained policy on a mirrored view of the board (the server writes its
@@ -108,7 +110,8 @@ RAIN = 1.0
 STRIKE_RATE = 0.35
 CHAIN_R = 2.6
 LIGHTNING_DAMAGE = 4.0
-LIGHTNING_CHARGE = 40.0
+LIGHTNING_HIT = 25.0
+SOAK_TIME = 2.5          # smoke must linger in a cloud this long to make rain (rare)
 FLASH_LIFE = 0.22
 BOSS_LANE = ENEMIES[1] - 1
 SMOKE = 7.0
@@ -368,8 +371,12 @@ def scroller_step(lane, slot, rx, ry, rz,
     # Stars wrap from the bottom back to the top: the scroll.
     wrapped = is_star & (y2 > HEIGHT + 0.3)
     y2 = where(wrapped, y2 - (HEIGHT + 0.6), y2)
-    soaked_cloud = block_hits(x2, y2, rx, ry, live1 | is_star, None, STARS, SMOKES) > 0.0      # same column, any height
-    kind1 = where(is_star, where(wrapped, 0.0, where(soaked_cloud, RAIN, kind1)), kind1)
+    # A cloud soaks while smoke overlaps it in 3-D (its own height too); held
+    # for SOAK_TIME it turns to rain.  The cloud's timer counts the soaking.
+    in_cloud = block_hits(x2, y2, rx, ry, live1 | is_star, None, STARS, SMOKES, z2, rz) > 0.0
+    soak = where(is_star, where(wrapped, 0.0, where(in_cloud, timer + dt, (timer - 0.5 * dt).clip(0.0, 10.0))), timer1)
+    timer1 = where(is_star, soak, timer1)
+    kind1 = where(is_star, where(wrapped, 0.0, where(soak >= SOAK_TIME, RAIN, kind1)), kind1)
     out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
     grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the board is spent
     live2 = live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded
@@ -405,15 +412,15 @@ def scroller_step(lane, slot, rx, ry, rz,
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
     # shield and health pickups refill them; both regenerate (health slowly).
-    damage = (f(is_player & live2) * (BULLET_DAMAGE * bullet_strikes + RAM_DAMAGE * rams)).sum()
+    damage = ((f(is_player & live2) * (BULLET_DAMAGE * bullet_strikes + RAM_DAMAGE * rams)).sum()
+              + LIGHTNING_HIT * f(zapped))                       # lightning is a hazard
     shield_pts = (f(is_player) * energy).sum() * SHIELD_POINTS
     soaked = where(damage < shield_pts, damage, shield_pts)
     wound = damage - soaked
     refill = got_kind(SHIELD_UP)
     since_hit = (f(is_player) * age).sum()
     recharging = playing & (damage <= 0.0) & (since_hit >= SHIELD_PAUSE)
-    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(recharging)
-                         + LIGHTNING_CHARGE * f(zapped))          # lightning charges the shield
+    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(recharging))
     energy_next = where(is_player, (shield_after / SHIELD_POINTS).clip(0.0, 1.0), energy)
     healed = where(got_kind(HEALTH_UP), HEALTH_PICKUP, 0.0)
     health = (lives - wound + healed + HEALTH_REGEN * dt * f(lives > 0.0)).clip(0.0, HEALTH_MAX)
@@ -525,7 +532,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     slot[pickups], rx[pickups], ry[pickups], rz[pickups] = PICKUP, 0.35, 0.35, 0.4
     slot[slice(*SMOKES)] = SMOKE
     rx[slice(*SMOKES)], ry[slice(*SMOKES)] = 0.5, 0.5
-    rx[slice(*STARS)], ry[slice(*STARS)] = 0.55, 0.45                  # a cloud's footprint on the board
+    rx[slice(*STARS)], ry[slice(*STARS)], rz[slice(*STARS)] = 0.55, 0.45, 0.3   # a cloud's extent
+    rz[slice(*SMOKES)] = 0.35
     slot[slice(*FLASHES)] = FLASH
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
@@ -656,7 +664,7 @@ class BulletScroller(EntityGame):
             elif slot == SMOKE:
                 # black smoke, thinning as it ages
                 step = min(3, int(4.0 * float(clock - col["born"][k]) / SMOKE_LIFE))
-                mesh, color, size = "cloud", f"smoke_{step}", 0.42 + 0.1 * step
+                mesh, color, size = "cloud", f"smoke_{step}", 0.62 + 0.16 * step
             elif slot == BULLET:
                 mesh, color, size = "disc", "bullet", 0.13
             elif slot == MISSILE_SLOT:
@@ -685,6 +693,7 @@ class BulletScroller(EntityGame):
                         "face": bool(slot == MISSILE_SLOT and not exploding),
                         # drawn with the glass (blended), not in the opaque pass
                         "translucent": bool(slot in (STAR, SMOKE)),
+                        "ribbon": bool(slot == FLASH),       # a lightning end: the page draws the bolt
                         "spin": 9.0 if slot == FLASH else (2.5 if mesh == "ufo" else 0.0),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
@@ -729,7 +738,7 @@ class BulletScroller(EntityGame):
     # Lo-fi arcade: the backdrop shows through (no floor slab); the glass
     # plate and the arcade ring are on by default so the lights glow into it.
     SCENE = {"floor": False, "glass": True, "arcade": True, "terrain": True}
-    SCENE_PREFER = {"glass": True, "arcade": True}
+    SCENE_PREFER = {"glass": True, "arcade": True, "projection": True}
     HEALTH_MAX = HEALTH_MAX
 
     def describe(self) -> str:

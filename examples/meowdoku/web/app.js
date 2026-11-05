@@ -174,6 +174,73 @@ void main() {
   fragColor = (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) ? vec4(0.085, 0.085, 0.1, 1.0) : texture(uFrame, uv);
 }`;
 const lens = { fbo: null, tex: null, depth: null, w: 0, h: 0, program: null, vao: null };
+// THE PROJECTION GLASS: a glass square hovering above the field shows the
+// game as a wide-angle camera straight overhead sees it, through the
+// hyperbolic lens -- from straight above you watch the broadcast; tilt and
+// you see under the glass to the game playing out for real.  The broadcast
+// is rendered every frame into colour layer BROADCAST_LAYER of the Phong
+// shader's uColorUv stack, and the glass's material takes its albedo there.
+const BROADCAST = { size: STACK_SIZE_LATE(), fov: 1.4, fbo: null, tex: null, depth: null, warp: null, quad: null, key: "" };
+function STACK_SIZE_LATE() { return 512; }
+function projectionGlassOn() { return onPlanet() && viewerWants("projection") && !!state.colourStack; }
+function broadcastSpan() { return Math.max(state.extent.width, state.extent.depth) * 1.12; }
+function renderBroadcast(now, casters) {
+  const B = BROADCAST, n = B.size;
+  if (!B.fbo) {
+    B.tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_2D, B.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, n, n, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    B.depth = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, B.depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, n, n);
+    B.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, B.tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, B.depth);
+    B.warp = gl.createFramebuffer();
+    lensTarget(1, 1);                                   // compiles the lens program
+  }
+  // the broadcast camera: straight down over the field's centre, wide angle
+  const S = broadcastSpan(), height = (S / 2) / Math.tan(B.fov / 2);
+  const target = [state.extent.width / 2, 0, state.extent.depth / 2], eye = [target[0], height, target[2]];
+  const view = M.lookAt(eye, target, [0, 0, -1]), proj = M.perspective(B.fov, 1, 0.1, 300);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); gl.viewport(0, 0, n, n);
+  gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+  litPass({ view, proj, viewProj: M.multiply(proj, view), eye }, now, casters, { plate: false });
+  // warp it into the glass's colour layer
+  gl.bindFramebuffer(gl.FRAMEBUFFER, B.warp);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, state.colourStack, 0, BROADCAST_LAYER);
+  gl.viewport(0, 0, n, n); gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  gl.useProgram(lens.program);
+  gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_2D, B.tex);
+  gl.uniform1i(gl.getUniformLocation(lens.program, "uFrame"), 14);
+  gl.uniform1f(gl.getUniformLocation(lens.program, "uK"), Math.max(0.35, Number($("curve").value) / 100 * 1.2));
+  gl.uniform2f(gl.getUniformLocation(lens.program, "uAspect"), 1, 1);
+  gl.bindVertexArray(lens.vao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.colourStack); gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.enable(gl.DEPTH_TEST);
+}
+function drawProjectionGlass(cam, drawLit) {
+  // Sized so that, seen from the main camera straight overhead, it covers
+  // exactly the broadcast's footprint on the board; hovering above everything.
+  const S = broadcastSpan(), y = TILE.height + 4.0 * DEPTH_LIFT + 1.2;
+  const eyeHeight = Math.max(y + 0.5, cam.eye ? cam.eye[1] : y + 10);
+  const side = S * (eyeHeight - y) / eyeHeight, cx = state.extent.width / 2, cz = state.extent.depth / 2;
+  if (!BROADCAST.quad) {
+    const pos = new Float32Array([-0.5, 0, -0.5, 0.5, 0, 0.5, 0.5, 0, -0.5, -0.5, 0, -0.5, -0.5, 0, 0.5, 0.5, 0, 0.5]);
+    const nrm = new Float32Array(18); for (let i = 0; i < 6; i++) nrm[i * 3 + 1] = 1;
+    // image top (v = 1) is the far side (-z), as the broadcast camera looks with -z up
+    const uv = new Float32Array([0, 1, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0]);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    for (const [data, loc, size] of [[pos, 0, 3], [nrm, 1, 3], [uv, 3, 2]]) {
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindVertexArray(null);
+    BROADCAST.quad = { vao, count: 6 };
+  }
+  drawLit(BROADCAST.quad.vao, BROADCAST.quad.count, M.multiply(M.translate(cx, y, cz), M.scale(side, 1, side)),
+          state.materialIndex.broadcast);
+}
 function lensStrength() { const s = $("curve"); return onPlanet() && s ? Number(s.value) / 100 * 1.2 : 0; }
 function lensTarget(w, h) {
   if (!lens.program) { lens.program = link(compile(gl.VERTEX_SHADER, LENS_VS), compile(gl.FRAGMENT_SHADER, LENS_FS)); lens.vao = gl.createVertexArray(); }
@@ -293,7 +360,36 @@ function depthTexture(unit, exported) {
   for (let i = 0; i < raw.length; i++) rgba[i] = raw.charCodeAt(i);
   return uploadTerrainTexture(unit, n, rgba);
 }
+// The colour stack holds two layers of STACK_SIZE: 0 the terrain (upsampled
+// once here), 1 the projection glass's broadcast (rendered every frame).
+const STACK_SIZE = 512, BROADCAST_LAYER = 1;
+function upsample(rgba, n, size) {
+  if (n === size) return rgba;
+  const out = new Uint8Array(size * size * 4), s = n / size;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const fx = x * s, fy = y * s, x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+    const x1 = (x0 + 1) % n, y1 = (y0 + 1) % n;
+    for (let c = 0; c < 4; c++) {
+      const a = rgba[(y0 * n + x0) * 4 + c], b = rgba[(y0 * n + x1) * 4 + c], d = rgba[(y1 * n + x0) * 4 + c], e = rgba[(y1 * n + x1) * 4 + c];
+      out[(y * size + x) * 4 + c] = (a + (b - a) * tx) * (1 - ty) + (d + (e - d) * tx) * ty;
+    }
+  }
+  return out;
+}
 function uploadTerrainTexture(unit, n, rgba) {
+  if (unit === 5) {
+    const layers = new Uint8Array(STACK_SIZE * STACK_SIZE * 4 * 2);
+    layers.set(upsample(rgba, n, STACK_SIZE), 0);
+    const tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, STACK_SIZE, STACK_SIZE, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, layers);
+    gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    state.colourStack = tex;
+    return tex;
+  }
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
   gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
@@ -673,13 +769,17 @@ function uploadMaterials(game) {
   // Smoke where craft were destroyed: black frosted glass as dense as the old
   // clouds, thinning as it ages (smoke_0 .. smoke_3).
   for (let k = 0; k < 4; k++)
-    records.push([`smoke_${k}@glass`, [0.05 + 0.03 * k, 0.05 + 0.03 * k, 0.06 + 0.03 * k],
-      { roughness: 0.75, transmission: 0.3, opacity: 0.66 - 0.14 * k, ior: 1.2 }]);
+    records.push([`smoke_${k}@glass`, [0.03 + 0.03 * k, 0.03 + 0.03 * k, 0.035 + 0.03 * k],
+      { roughness: 0.8, transmission: 0.15, opacity: 0.86 - 0.16 * k, ior: 1.15 }]);
+  // Lightning: a glowing ribbon of glass, lit from within.
+  records.push(["lightning@glow", [0.85, 0.9, 1.0], { roughness: 0.1, transmission: 0.2, opacity: 0.92, ior: 1.3, emission: [3.2, 3.5, 4.4] }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
   // Scrolling ground: albedo from colour layer TERRAIN.layer of the shader's
   // uColorUv texture stack (texstack field 1 = colour layer, 9 = blend).
+  records.push(["broadcast", [1.0, 1.0, 1.0], { roughness: 0.12, transmission: 0.12, opacity: 0.9, ior: 1.5,
+    colorLayer: BROADCAST_LAYER, colorBlend: 1.0 }]);
   records.push(["terrain", [1.0, 1.0, 1.0], { roughness: 0.9, colorLayer: TERRAIN.layer, colorBlend: 1.0,
     depthLayer: TERRAIN.layer, depthScaleMm: (state.assets && state.assets.terrain && state.assets.terrain.depth
       && state.assets.terrain.depth.relief_mm) || 0.0 }]);
@@ -875,6 +975,65 @@ function restartAllowed() {
 }
 function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; }
 
+// ---------------------------------------------------------------- lightning
+// A strike's two ends arrive as ribbon pieces spawned together (the cloud and
+// the craft it hit; a lone end is a strike to the land).  Between them a
+// jagged ribbon: fractal midpoint displacement re-drawn every frame so it
+// flickers, a camera-facing strip of glowing glass, fading as the ends age.
+const bolt = { vao: null, buffers: null };
+function worldOf(piece) {
+  const depth = state.game && state.game.predict && state.game.predict.depth;
+  const lift = depth ? (piece.h || 0) * DEPTH_LIFT : 0;
+  return [piece.x, TILE.height + 0.2 + lift - planetDrop(piece.x, piece.z), piece.z];
+}
+function jagged(a, b, depth, roughness) {
+  let points = [a, b];
+  for (let level = 0, amp = roughness; level < depth; level++, amp *= 0.55) {
+    const next = [points[0]];
+    for (let i = 1; i < points.length; i++) {
+      const p = points[i - 1], q = points[i];
+      next.push([(p[0] + q[0]) / 2 + (Math.random() - 0.5) * amp, (p[1] + q[1]) / 2 + (Math.random() - 0.5) * amp * 0.5,
+                 (p[2] + q[2]) / 2 + (Math.random() - 0.5) * amp], q);
+    }
+    points = next;
+  }
+  return points;
+}
+function drawLightning(cam, now, drawLit) {
+  const ends = state.ribbonEnds || [];
+  if (!ends.length || state.flat) return;
+  const groups = new Map();
+  for (const piece of ends) { const key = Math.round(piece.t0 * 20); (groups.get(key) || groups.set(key, []).get(key)).push(piece); }
+  const pos = [], nrm = [];
+  const eye = cam.eye || [0, 30, 0];
+  for (const group of groups.values()) {
+    group.sort((a, b) => (b.h || 0) - (a.h || 0));
+    const top = worldOf(group[0]);
+    const bottom = group[1] ? worldOf(group[1]) : [top[0], 0.02 - planetDrop(top[0], top[2]), top[2]];
+    const path = jagged(top, bottom, 5, 0.9);
+    const fade = Math.max(0.2, 1 - (now - group[0].t0) / 0.25);
+    const width = 0.07 * fade;
+    for (let i = 1; i < path.length; i++) {
+      const p = path[i - 1], q = path[i], dir = sub(q, p), toEye = sub(eye, p);
+      const side = norm(cross(dir, toEye)).map((v) => v * width);
+      const a = sub(p, side), b = [p[0] + side[0], p[1] + side[1], p[2] + side[2]];
+      const c = sub(q, side), d = [q[0] + side[0], q[1] + side[1], q[2] + side[2]];
+      const n = norm(toEye);
+      for (const v of [a, b, d, a, d, c]) { pos.push(...v); nrm.push(...n); }
+    }
+  }
+  if (!pos.length) return;
+  if (!bolt.vao) {
+    bolt.vao = gl.createVertexArray(); gl.bindVertexArray(bolt.vao);
+    bolt.buffers = [0, 1].map((loc) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0); return b; });
+    gl.bindVertexArray(null);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.DYNAMIC_DRAW);
+  drawLit(bolt.vao, pos.length / 3, M.identity(), state.materialIndex["lightning@glow"]);
+}
+
 // ---------------------------------------------------------------- vital bars
 // Shield (blue glass, left) and health (red glass, right): tubes standing just
 // outside the arcade light strips along the field, each filled from the
@@ -1007,14 +1166,14 @@ function viewerWants(control) {
   const game = state.game ? state.game.game : "";
   try { const stored = localStorage.getItem(`meowdoku_${control}_${game}`); if (stored) return stored === "on"; } catch {}
   const prefer = state.game && state.game.scene_prefer;
-  if (prefer) return control === "arcade" ? !!prefer.arcade : !!(prefer.glass || prefer.floor);
+  if (prefer) return control === "arcade" ? !!prefer.arcade : control === "projection" ? !!prefer.projection : !!(prefer.glass || prefer.floor);
   return false;
 }
 function syncLayerControls() {
-  for (const id of ["arcade", "plate"]) { const box = $(id); if (box) box.checked = viewerWants(id); }
+  for (const id of ["arcade", "plate", "projection"]) { const box = $(id); if (box) box.checked = viewerWants(id); }
 }
 // The switches show and set the current game's choice (see viewerWants).
-for (const id of ["arcade", "plate"]) {
+for (const id of ["arcade", "plate", "projection"]) {
   const box = $(id); if (!box) continue;
   box.addEventListener("change", () => {
     try { localStorage.setItem(`meowdoku_${id}_${state.game ? state.game.game : ""}`, box.checked ? "on" : "off"); } catch {}
@@ -1438,7 +1597,7 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
-    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0;
+    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0;
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
@@ -1455,7 +1614,7 @@ function applySnapshot(view) {
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
                            sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
@@ -1946,7 +2105,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
@@ -1992,36 +2151,10 @@ function applyState(game) {
 }
 
 // ---------------------------------------------------------------- draw
-function draw(ms) {
-  const now = ms / 1000; state.time = now;
-  const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
-  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  gl.viewport(0, 0, w, h); gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-  if (!state.game) { requestAnimationFrame(draw); return; }
-  const cam = camera(); updateLight(now);
-  const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
-    : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
-  if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
-  const removed = [];
-  for (const [key, piece] of state.pieces) {
-    if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
-    if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
-    casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
-  }
-  for (const key of removed) state.pieces.delete(key);
-  if (wob.on) wobFrame(casters, now); else for (const c of casters) if (c[3]) c[3].cage = null;
-  if (state.flat) { drawFlat(cam, casters); requestAnimationFrame(draw); return; }
-  // pass 1: depth from the key light
-  gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
-  gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
-  for (const [vao, count, model] of [...casters, ...terrainShadowCasters()]) {
-    gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.depth, "uMVP"), false, M.multiply(light.viewProj, model));
-    gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
-  }
-  const lensK = lensStrength();
-  gl.disable(gl.POLYGON_OFFSET_FILL); gl.bindFramebuffer(gl.FRAMEBUFFER, lensK > 0 ? lensTarget(w, h).fbo : null); gl.viewport(0, 0, w, h);
-  if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
+// The lit scene from ``cam`` into whatever framebuffer is bound: the main
+// view, or the projection glass's broadcast camera (opts.plate: draw the
+// glass itself -- never into its own broadcast).
+function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
   const P = state.programs.phong; gl.useProgram(P);
   const span = Math.max(state.extent.width, state.extent.depth);
@@ -2094,14 +2227,57 @@ function draw(ms) {
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
     const mesh = state.meshes[piece.mesh] || state.meshes.disc;
     drawLit(mesh.vao, mesh.count, pieceModel(piece, now), state.materialIndex[`${piece.color}@glass`] ?? state.materialIndex[piece.color]);
   }
-  state.glassPieces = [];
   drawShield(now, drawLit);
   drawVitals(now, drawLit);
+  if (opts.plate) drawProjectionGlass(cam, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
+}
+
+function draw(ms) {
+  const now = ms / 1000; state.time = now;
+  const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h); gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  if (!state.game) { requestAnimationFrame(draw); return; }
+  const cam = camera(); updateLight(now);
+  const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
+    : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
+  if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
+  const removed = [];
+  for (const [key, piece] of state.pieces) {
+    if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
+    if (piece.ribbon) { if (piece.removing == null) (state.ribbonEnds ||= []).push(piece); continue; }
+    if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
+    casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
+  }
+  for (const key of removed) state.pieces.delete(key);
+  if (wob.on) wobFrame(casters, now); else for (const c of casters) if (c[3]) c[3].cage = null;
+  if (state.flat) { drawFlat(cam, casters); requestAnimationFrame(draw); return; }
+  // pass 1: depth from the key light
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
+  for (const [vao, count, model] of [...casters, ...terrainShadowCasters()]) {
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.depth, "uMVP"), false, M.multiply(light.viewProj, model));
+    gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
+  }
+  gl.disable(gl.POLYGON_OFFSET_FILL);
+  // The projection glass's broadcast: the scene through its wide-angle camera,
+  // warped into colour layer 1 (the glass shows it); the screen lens steps
+  // aside while the glass carries the warp.
+  const plateOn = projectionGlassOn();
+  if (plateOn) renderBroadcast(now, casters);
+  const lensK = plateOn ? 0 : lensStrength();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lensK > 0 ? lensTarget(w, h).fbo : null); gl.viewport(0, 0, w, h);
+  if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
+  litPass(cam, now, casters, { plate: plateOn });
+  state.glassPieces = [];
+  state.ribbonEnds = [];
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);
   if (lensK > 0) lensPresent(w, h, lensK);
