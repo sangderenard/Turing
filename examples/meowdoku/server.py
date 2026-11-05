@@ -11,6 +11,8 @@ prebaked board database) and a JSON API over the games in ``games.py``:
     POST /api/action  {"type": "cell", "r", "c", "button"} | {"type": "text", "text"}
                       | {"type": "submit"|"backspace"|"undo"|"reset"}
                       | {"type": "tick", "move_axis", "fire"}  (free-board games)
+                      | {"type": "autopilot", "on": true|false}  (entity games: the trained policy
+                        in ``autopilot.py`` supplies each tick's controls; state field ``autopilot``)
     GET  /api/state
     POST /api/profile {"name": "..."}      -> pick this session's player profile
     GET  /api/profile                      -> the profile, and the current game's top scores
@@ -108,6 +110,10 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
+        elif kind == "autopilot":
+            if not hasattr(self.game, "set_autopilot"):
+                raise ValueError("this game has no autopilot")
+            self.game.set_autopilot(bool(payload.get("on")))    # the compiled policy plays; the page keeps drawing
         elif kind == "layout":
             if hasattr(self.game, "layout"):
                 self.game.layout(float(payload.get("aspect") or 0.0))
@@ -344,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
     prepare_predictor(web_dir)
+    from meowdoku import autopilot
+    print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
     sessions = Sessions(web_dir, Profiles(PROFILES))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
