@@ -25353,9 +25353,14 @@ def _propagate_callsite_tensor_specializations(
                             and str(descriptor.get("metadata_state") or "")
                             == "dynamic"
                         )
-                        if publish_to_function_table and (
-                            descriptor_states_a_shape(descriptor) or runtime_span
-                        ):
+                        # lookup's `_require_tensor(symbols)` carries a
+                        # runtime rank-one span after another callsite proved
+                        # `_require_tensor(frequencies)` as (256,). The
+                        # specialized-copy pass must record both exact
+                        # callsites on FORMAL_SHAPE; its
+                        # `publish_to_function_table=False` protects only the
+                        # shared catalogue graph from a local rewrite.
+                        if descriptor_states_a_shape(descriptor) or runtime_span:
                             # DERIVED(the caller argument's identity cell),
                             # as the planner-specialization publication is.
                             argument_cells = _argument_identity_cells(

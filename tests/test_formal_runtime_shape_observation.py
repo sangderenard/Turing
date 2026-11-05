@@ -1,6 +1,7 @@
 """A runtime span callsite withdraws a shared helper's static formal shape."""
 
 from pathlib import Path
+import inspect
 
 import pytest
 
@@ -171,3 +172,82 @@ def test_second_dynamic_caller_revises_unresolved_formal_with_its_source():
         assert book.latest_ref(FORMAL_SHAPE, row) == second_unresolved
     finally:
         end_identity_book(token)
+
+
+@pytest.mark.parametrize("symbols_shape", [None, (128,)])
+def test_specialized_copy_posts_its_formal_shape_observation(
+    monkeypatch, symbols_shape,
+):
+    source = (
+        "def use(symbols: AbstractTensor) -> AbstractTensor:\n"
+        "    return _require_tensor(symbols, 'symbols').to_dtype('int64')\n"
+        "def root(frequencies: AbstractTensor, symbols: AbstractTensor) -> int:\n"
+        "    fixed = _require_tensor(frequencies, 'frequencies')\n"
+        "    selected = use(symbols)\n"
+        "    return fixed.sum().item() + selected.sum().item()\n"
+    )
+    values = [
+        {"function": "root", "parameter": name, "storage": "span",
+         "dtype": "int64", "rank": 1,
+         **({} if shape is None else {"shape": shape}),
+         "python_type": "src.common.tensors.abstraction.AbstractTensor"}
+        for name, shape in (("frequencies", (256,)),
+                            ("symbols", symbols_shape))
+    ]
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({"values": values, "records": {}, "bindings": []})
+    writer_name = (
+        "_publish_formal_runtime_shape" if symbols_shape is None
+        else "_publish_formal_shape"
+    )
+    original = getattr(glsl_deployment_strategy, writer_name)
+    observed = []
+
+    def capture(function, parameter, descriptor, caller, cells):
+        frame = inspect.currentframe().f_back
+        while frame is not None and frame.f_code.co_name != (
+            "_propagate_callsite_tensor_specializations"
+        ):
+            frame = frame.f_back
+        specialized = bool(
+            frame is not None
+            and frame.f_locals.get("publish_to_function_table") is False
+        )
+        changed = original(function, parameter, descriptor, caller, cells)
+        if specialized and function == "_require_tensor" and caller == "use":
+            book = current_identity_book()
+            row = ("_require_tensor", "value")
+            ref = book.latest_ref(FORMAL_SHAPE, row)
+            fact = book.page(FORMAL_SHAPE).cell(row, ref.column)
+            observed.append((changed, descriptor, fact, ref,
+                             tuple(cause for cause, _ in book.edges_into(ref)),
+                             book.page(FORMAL_SHAPE).latest(("unrelated", "value"))))
+            raise _ObservedFormal
+        return changed
+
+    monkeypatch.setattr(glsl_deployment_strategy, writer_name, capture)
+    with pytest.raises(_ObservedFormal):
+        lower_ast_source_to_ssa(
+            source, "root", name="specialized_formal_shape_observation",
+            extraction_contract=contract,
+            python_bindings={"AbstractTensor": AbstractTensor,
+                             "_require_tensor": _require_tensor},
+            tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            progress=lambda _: None, progress_bars=False,
+        )
+    changed, descriptor, fact, ref, causes, unrelated = observed[-1]
+    assert changed
+    assert isinstance(fact, Unresolved)
+    assert ref.column >= 1
+    assert unrelated is None
+    assert any(cause.page.name == "canonical_value"
+               and "'use'" in str(cause.row) for cause in causes)
+    if symbols_shape is None:
+        assert descriptor["metadata_state"] == "dynamic"
+        assert descriptor["rank"] == 1
+        assert any(cause.page.name == "shape_transformation_state"
+                   and "use|shape" in str(cause.row) for cause in causes)
+    else:
+        assert descriptor["shape"] == (128,)
