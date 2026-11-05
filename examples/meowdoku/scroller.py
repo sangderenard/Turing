@@ -19,6 +19,10 @@ Lanes (contiguous blocks, so collisions are block against block):
     413..424       smoke: black clouds left where a craft was destroyed; they
                    drift back with the scroll, sink toward the land and fade
     425..428       flashes: lightning, at the striking cloud and the craft struck
+    429..432       anti-aircraft stations: yellow ground emplacements riding the
+                   terrain's scroll; each fires a yellow shell straight at where
+                   the player IS (no lead); shots, missiles and rams destroy them;
+                   one scrolled past returns at the top, rebuilt elsewhere
 
 STORMS: smoke soaking into a cloud -- overlapping it in three dimensions,
 at its own height, for SOAK_TIME (the cloud's ``timer`` counts it) -- turns
@@ -104,7 +108,13 @@ MISSILES = (399, 407)
 PICKUPS = (407, 413)
 SMOKES = (413, 425)
 FLASHES = (425, 429)
-LANES = FLASHES[1]
+STATIONS = (429, 433)
+LANES = STATIONS[1]
+STATION, STATION_KIND = 9.0, 5.0
+GROUND_SCROLL = 2.4          # the terrain's scroll (the page's TERRAIN.speed)
+FLAK_SPEED = 6.0
+FLAK_RELOAD = 2.4
+STATION_HP = 4.0
 FLASH = 8.0
 RAIN = 1.0
 STRIKE_RATE = 0.35
@@ -155,6 +165,7 @@ LIVES = HEALTH_MAX            # the run starts at full health
 #: PACE scales how often enemies arrive and fire: the user plays at USER_PACE,
 #: training and the demo at 1.  LEVEL steps difficulty up by LEVEL_STEP each.
 USER_PACE = 0.35
+DEMO_EASY_S, DEMO_CHAOS_S = 60.0, 180.0
 LEVEL_STEP = 0.15
 SPEED = 10.0
 TAU = 0.05
@@ -207,6 +218,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_missile, is_pickup = slot == MISSILE_SLOT, slot == PICKUP
     is_smoke = slot == SMOKE
     is_flash = slot == FLASH
+    is_station = slot == STATION
     is_boss_lane = lane == BOSS_LANE
     clock_next = clock + dt
     zero = x * 0.0
@@ -283,20 +295,20 @@ def scroller_step(lane, slot, rx, ry, rz,
     piloted = (is_boss_lane | (is_enemy & (kind == ACE))) & live
     # One volley per step: the ready enemy in the lowest lane fires, into the
     # first free bullet lanes (drifters an aimed spread, spinners a ring).
-    ready = is_enemy & live & (timer <= 0.0) & (y > 0.3) & playing & (~piloted | (pfire > 0.0))
+    ready = (is_enemy | is_station) & live & (timer <= 0.0) & (y > 0.3) & playing & (~piloted | (pfire > 0.0))
     shooter = first_of(ready, lane)
     fired = f(shooter).sum() > 0.0
     sx, sy, sz = (f(shooter) * x).sum(), (f(shooter) * y).sum(), (f(shooter) * z).sum()
     skind = (f(shooter) * kind).sum()
     shooter_lane = (f(shooter) * lane).sum()
-    count = where(skind == SPINNER, RING, where(skind == BOSS_KIND, 5.0, SPREAD))
+    count = where(skind == SPINNER, RING, where(skind == BOSS_KIND, 5.0, where(skind == STATION_KIND, 1.0, SPREAD)))
     free_bullet = is_bullet & ~live
     rank = f(free_bullet).cumsum(dim=0) - 1.0
     bullet_spawn = free_bullet & (rank < count) & fired
     aim = (py - sy).atan2(px - sx)
     angle = where(skind == SPINNER, rank * (6.283185307179586 / RING) + clock * 1.7,
-                  aim + (rank - 1.0) * 0.22)
-    speed = where(skind == SPINNER, BULLET_SPEED * 0.8, BULLET_SPEED)
+                  where(skind == STATION_KIND, aim, aim + (rank - 1.0) * 0.22))   # flak: straight at the ship, no lead
+    speed = where(skind == SPINNER, BULLET_SPEED * 0.8, where(skind == STATION_KIND, FLAK_SPEED, BULLET_SPEED))
     # Aimed spreads climb or dive toward the ship height over the flight
     # their horizontal distance takes; rings stay level.
     reach_xy = ((px - sx) * (px - sx) + (py - sy) * (py - sy)).sqrt() + 0.5
@@ -317,7 +329,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
                    where(arrival, 0.8 / tempo,
                          where(shooter, where(skind == SPINNER, 0.55, where(skind == BOSS_KIND, 0.45,
-                                                                            where(skind == ACE, 1.1, 1.5))) / tempo,
+                                                                            where(skind == ACE, 1.1,
+                                                                                  where(skind == STATION_KIND, FLAK_RELOAD, 1.5)))) / tempo,
                                timer - dt)))
     # Enemy paths: drifters fall and sway; spinners descend, hold, then leave.
     drifter = is_enemy & (kind1 == DRIFTER) & ~is_boss_lane
@@ -354,7 +367,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(spawn, clock, born)
     owner1 = where(shot_spawn | missile_spawn, 0.0, where(bullet_spawn, shooter_lane, where(enemy_spawn, -1.0, owner)))
 
-    moving = (live1 & playing) | is_star
+    moving = (live1 & playing) | is_star | is_station
     x2 = where(is_player & moving, ship_x, where(moving, x1 + vx1 * dt, x1))
     y2 = where(is_player & moving, ship_y, where(moving, y1 + vy1 * dt, y1))
     z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z, where(moving, z1 + vz1 * dt, z1)))
@@ -369,6 +382,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     x2, y2, z2 = where(flying, mx, x2), where(flying, my, y2), where(flying, mz_, z2)
     vx1, vy1, vz1 = where(flying, mvx, vx1), where(flying, mvy, vy1), where(flying, mvz_, vz1)
     # Stars wrap from the bottom back to the top: the scroll.
+    rebuilt = is_station & (y2 > HEIGHT + 0.6)
+    y2 = where(rebuilt, y2 - (HEIGHT + 1.2), y2)
+    x2 = where(rebuilt, 0.8 + (field_w - 1.6) * noise(clock * 3.3 + lane * 0.77), x2)
     wrapped = is_star & (y2 > HEIGHT + 0.3)
     y2 = where(wrapped, y2 - (HEIGHT + 0.6), y2)
     # A cloud soaks while smoke overlaps it in 3-D (its own height too); held
@@ -379,22 +395,27 @@ def scroller_step(lane, slot, rx, ry, rz,
     kind1 = where(is_star, where(wrapped, 0.0, where(soak >= SOAK_TIME, RAIN, kind1)), kind1)
     out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
     grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the board is spent
-    live2 = live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded
+    live2 = (live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded) | rebuilt
 
     # Collisions, block against block.
     enemy_hits = (block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS, z2, rz)
                   + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, ENEMIES, MISSILES, z2, rz))
-    missile_hits = block_hits(x2, y2, rx, ry, live2, None, MISSILES, ENEMIES, z2, rz)
+    missile_hits = (block_hits(x2, y2, rx, ry, live2, None, MISSILES, ENEMIES, z2, rz)
+                    + block_hits(x2, y2, rx, ry, live2, None, MISSILES, STATIONS, z2, rz))
+    station_hits = (block_hits(x2, y2, rx, ry, live2, None, STATIONS, SHOTS, z2, rz)
+                    + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, STATIONS, MISSILES, z2, rz))
     collected = block_hits(x2, y2, rx, ry, live2, None, PICKUPS, (0, 1), z2, rz)
     got = is_pickup & live2 & (collected > 0.0)
     got_kind = lambda k: f(got & (kind == k)).sum() > 0.0  # noqa: E731
     weapon_next = where(is_player, where(got_kind(MISSILE_UP), MISSILE, where(got_kind(LASER_UP), LASER, weapon)), weapon)
     mult_next = where(is_player & got_kind(MULT_UP), (mult + 1.0).clip(1.0, 4.0), mult)
     fan_next = where(is_player & got_kind(SPREAD_UP), (fan + 1.0).clip(0.0, 3.0), fan)
-    shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
+    shot_hits = (block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
+                 + block_hits(x2, y2, rx, ry, live2, None, SHOTS, STATIONS, z2, rz))
     exposed = live2 & (invuln <= 0.0)
     bullet_strikes = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
-    rams = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)        # the boss lane is an enemy lane
+    rams = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)       # the boss lane is an enemy lane
+            + block_hits(x2, y2, rx, ry, exposed, None, (0, 1), STATIONS, z2, rz))
     player_hits = bullet_strikes + rams
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
     # Lightning: one rain cloud may strike this step; it chains to every
@@ -407,8 +428,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     reach_l = ((x2 - lx) * (x2 - lx) + (y2 - ly) * (y2 - ly)).sqrt()
     struck = striking & live2 & (is_enemy | is_player) & (reach_l < CHAIN_R)
     zapped = f(struck & is_player).sum() > 0.0
-    hp2 = hp1 - enemy_hits - LIGHTNING_DAMAGE * f(struck & is_enemy)
-    killed = is_enemy & live2 & (hp2 <= 0.0)
+    hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy))
+    killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
     # shield and health pickups refill them; both regenerate (health slowly).
@@ -535,6 +556,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     rx[slice(*STARS)], ry[slice(*STARS)], rz[slice(*STARS)] = 0.55, 0.45, 0.3   # a cloud's extent
     rz[slice(*SMOKES)] = 0.35
     slot[slice(*FLASHES)] = FLASH
+    stations = slice(*STATIONS)
+    slot[stations], rx[stations], ry[stations], rz[stations] = STATION, 0.35, 0.35, 0.35
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
@@ -551,15 +574,20 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     y[stars] = rng.uniform(-0.3, HEIGHT + 0.3, STARS[1] - STARS[0])
     vy[stars] = rng.uniform(1.5, 5.0, STARS[1] - STARS[0])
     z[stars] = rng.uniform(0.05, 1.2, STARS[1] - STARS[0])      # low clouds, close over the land
+    n_st = STATIONS[1] - STATIONS[0]
+    x[stations] = rng.uniform(0.8, width - 0.8, n_st)
+    y[stations] = np.linspace(-1.0, HEIGHT * 0.7, n_st)
+    vy[stations] = GROUND_SCROLL
     vy[stars] = 0.8 + 0.7 * z[stars]          # clouds: higher drifts faster (parallax)
-    alive = ((slot == PLAYER) | (slot == STAR)).astype(np.float64)
+    alive = ((slot == PLAYER) | (slot == STAR) | (slot == STATION)).astype(np.float64)
     return {
         "lane": lane, "slot": slot, "rx": rx, "ry": ry, "rz": rz,
         "alive": alive, "x": x, "y": y, "z": z, "vx": np.zeros(LANES), "vy": vy, "vz": np.zeros(LANES),
-        "hp": np.zeros(LANES),
+        "hp": np.where(slot == STATION, STATION_HP, 0.0),
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
-        "energy": (slot == PLAYER).astype(np.float64), "kind": np.zeros(LANES), "age": np.zeros(LANES),
-        "timer": np.zeros(LANES), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
+        "energy": (slot == PLAYER).astype(np.float64), "kind": np.where(slot == STATION, STATION_KIND, 0.0),
+        "age": np.zeros(LANES),
+        "timer": np.where(slot == STATION, rng.uniform(0.5, FLAK_RELOAD, LANES), 0.0), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
         **{name: np.zeros(LANES) for name in ("pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock")},
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
@@ -589,7 +617,14 @@ class BulletScroller(EntityGame):
 
     def pace(self) -> float:
         """Full speed for training episodes and the demo; USER_PACE for a person."""
-        return 1.0 if (getattr(self, "autopilot", False) or not getattr(self, "learns", True)) else USER_PACE
+        if getattr(self, "autopilot", False) and self.session.state is not None:
+            # The demo plays the player's early game first (USER_PACE for
+            # DEMO_EASY_S), then ramps to full chaos by DEMO_CHAOS_S -- so what
+            # it learns from its runs starts where the player starts.
+            t = float(self.session.column("clock")[0])
+            ramp = min(1.0, max(0.0, (t - DEMO_EASY_S) / (DEMO_CHAOS_S - DEMO_EASY_S)))
+            return USER_PACE + (1.0 - USER_PACE) * ramp
+        return 1.0 if not getattr(self, "learns", True) else USER_PACE
 
     def drive_settings(self) -> None:
         """Before each landing: the pace for whoever drives now, and the pilots."""
@@ -627,6 +662,7 @@ class BulletScroller(EntityGame):
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
                 "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
                 "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0],
+                "station": [1.0, 0.82, 0.1], "flak": [1.0, 0.9, 0.2],
                 "smoke_0": [0.04, 0.04, 0.05], "smoke_1": [0.07, 0.07, 0.08], "smoke_2": [0.1, 0.1, 0.11],
                 "smoke_3": [0.13, 0.13, 0.14],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
@@ -666,13 +702,16 @@ class BulletScroller(EntityGame):
                 step = min(3, int(4.0 * float(clock - col["born"][k]) / SMOKE_LIFE))
                 mesh, color, size = "cloud", f"smoke_{step}", 0.62 + 0.16 * step
             elif slot == BULLET:
-                mesh, color, size = "disc", "bullet", 0.13
+                flak = STATIONS[0] <= int(col["owner"][k]) < STATIONS[1]
+                mesh, color, size = ("disc", "flak", 0.15) if flak else ("disc", "bullet", 0.13)
             elif slot == MISSILE_SLOT:
                 mesh, color, size = "rocket", "missile", 0.24
             elif slot == PICKUP:
                 letter = {SPREAD_UP: "S", MULT_UP: "X", MISSILE_UP: "M", LASER_UP: "L",
                           SHIELD_UP: "O", HEALTH_UP: "H"}.get(float(col["kind"][k]), "S")
                 mesh, color, size = letter, f"pickup_{letter}", 0.34
+            elif slot == STATION:
+                mesh, color, size = "bomb", "station", 0.42
             elif slot == FLASH:
                 mesh, color, size = "bolt", "lightning", 0.55
             else:
@@ -734,11 +773,11 @@ class BulletScroller(EntityGame):
             for name, value in (("pax", ax), ("pay", ay), ("paz", az), ("pfire", fire)):
                 s.column(name)[k] = value
 
-    HOSTILE_LANES = (ENEMIES, BULLETS)
+    HOSTILE_LANES = (ENEMIES, BULLETS, STATIONS)
     # Lo-fi arcade: the backdrop shows through (no floor slab); the glass
     # plate and the arcade ring are on by default so the lights glow into it.
     SCENE = {"floor": False, "glass": True, "arcade": True, "terrain": True}
-    SCENE_PREFER = {"glass": True, "arcade": True, "projection": True}
+    SCENE_PREFER = {"glass": True, "arcade": True}           # projection glass: off unless the viewer turns it on
     HEALTH_MAX = HEALTH_MAX
 
     def describe(self) -> str:
