@@ -212,6 +212,26 @@ class CompiledVariant:
 
         return prepare_artifact_execution(self.native, feeds)
 
+    def _sequence_slots(self):
+        """``(parameter, length id, capacity id, status id)`` for every
+        entry formal the compiler lowered as a sequence, read from the
+        entry's own sequence table."""
+        entry = f"kb_{self.spec.name}_{self.key}__{self.spec.function_name}"
+        function = getattr(self.module, "functions", {}).get(entry)
+        if function is None:
+            return ()
+        table = function.metadata.get("sequence_table")
+        names = dict(function.metadata.get("sequence_value_names") or ())
+        slots = []
+        for descriptor in (() if table is None else table.sequences.values()):
+            for column in descriptor.column_value_ids:
+                for parameter in names.get(int(column), ()):
+                    slots.append((str(parameter), int(descriptor.length_address_id),
+                                  int(descriptor.capacity_value_id),
+                                  None if descriptor.status_address_id is None
+                                  else int(descriptor.status_address_id)))
+        return tuple(slots)
+
     def _execute(self, arguments: Mapping[str, Any]):
 
         live = {
@@ -247,10 +267,27 @@ class CompiledVariant:
         # same-signature call then writes its inputs THROUGH that view into
         # the caller's memory, silently corrupting whatever lived there.
         # The reuse path below already copies by construction.
-        feeds = {
-            self.id_by_name[p]: np.array(live[p], dtype=float, copy=True)
-            for p in live
-        }
+        # Each feed keeps its call class: integer arguments (sizes) are
+        # posted to the compiler as ``int`` root calls and lowered as int64
+        # formals, so feeding them as float64 would hand the kernel the bit
+        # pattern of a double where it reads an index.
+        def _feed(value):
+            if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+                return np.array(value, dtype=np.int64, copy=True)
+            return np.array(value, dtype=float, copy=True)
+
+        feeds = {self.id_by_name[p]: _feed(live[p]) for p in live}
+        # A formal posted as a Python sequence (``list[float]``) owns a
+        # sequence descriptor whose length, capacity and status cells the
+        # caller fills; left unfed, the length reads as zero and every
+        # index trips the kernel's own bounds check.
+        for parameter, length_id, capacity_id, status_id in self._sequence_slots():
+            if parameter in live:
+                size = int(np.size(live[parameter]))
+                feeds[length_id] = np.array([size], dtype=np.int64)
+                feeds[capacity_id] = np.array([size], dtype=np.int64)
+                if status_id is not None:
+                    feeds[status_id] = np.zeros(1, dtype=np.int64)
         if execution is None:
             execution = self._prepare(feeds)
             self._executions[signature] = execution
@@ -669,6 +706,7 @@ class KernelBank:
                     warnings.simplefilter("ignore", DeprecationWarning)
                     module, outputs, _exports = lower_ast_source_to_ssa(
                         source, spec.function_name, name=tag,
+                        root_calls=_root_calls_of(spec, specialized),
                         extraction_contract=ExtractionContract(
                             Path(__file__).resolve().parents[2]
                             / "extraction_contracts"
@@ -1458,6 +1496,38 @@ class LaunchCoordinator:
 # ---------------------------------------------------------------------------
 # BLAS registration
 # ---------------------------------------------------------------------------
+
+def _root_calls_of(spec: "KernelSpec", specialized: Mapping[str, int]) -> list[dict]:
+    """The host's call of the entry, as classes: the bank is the kernel's
+    caller, and the arguments it passes are the ones its example-input
+    generator produces.  An unannotated formal is typed by what its callers
+    pass (the called inventory), so the bank posts that call instead of
+    leaving the size and scalar formals classless.  Baked size formals are
+    gone from a specialized source and are left out."""
+    from src.compiler.called_inventory import TensorClass
+
+    sizes = {name: 4 for name in spec.size_parameters}
+    sample = spec.example_inputs(sizes, np.random.default_rng(0))
+    call: dict[str, Any] = {}
+    for name in spec.parameter_order:
+        if name in specialized or name not in sample:
+            continue
+        value = sample[name]
+        if isinstance(value, np.ndarray) and value.ndim == 1 and value.size:
+            # The kernels are authored over flat, computed-index buffers
+            # (``A[i * k + p]``): a one-dimensional sequence of the element
+            # class, which the inventory spells ``list[float]``.
+            call[name] = [value.dtype.type(value.flat[0]).item()]
+        elif isinstance(value, np.ndarray):
+            call[name] = TensorClass(str(value.dtype))
+        elif isinstance(value, (bool, np.bool_)):
+            call[name] = bool
+        elif isinstance(value, (int, np.integer)):
+            call[name] = int
+        else:
+            call[name] = float
+    return [call]
+
 
 def _blas_example_inputs(arity: tuple[str, ...]):
     def generate(sizes: Mapping[str, int], rng: np.random.Generator) -> dict:
