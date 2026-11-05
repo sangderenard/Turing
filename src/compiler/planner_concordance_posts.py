@@ -57,7 +57,7 @@ def materialized_sequence_row_dtype(
         BUILTIN_ITERABLE_ELEMENT, INGESTION, INGEST_SOURCE,
         NAME_BINDING, PLANNER_HIERARCHY, PLANNER_SPECIALIZATION_PAGE,
         PROCESS_GRAPH_OPERANDS, SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY,
-        SOURCE_VALUE_CLASS,
+        SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
         SpecializationFact, SpecializationSource,
     )
     from .identity_concordance import (
@@ -234,6 +234,118 @@ def materialized_sequence_row_dtype(
                 )
                 if resolved == (dtypes[0],) and isinstance(receipt, Ref):
                     return resolved[0], (receipt, *causes)
+    if (
+        identity_fact[0] == "builtins.list"
+        and str(source_data.get("type") or "").casefold() == "tuple"
+        and source_attrs.get("producer_kind") == "aggregate"
+        and source_attrs.get("aggregate_kind") == "tuple"
+        and source_attrs.get("sequence_column_count") == 1
+        and tuple(source_attrs.get("sequence_key_columns") or ()) == ()
+        and attrs.get("producer_kind") == "aggregate_materialization"
+        and attrs.get("sequence_column_count") == 1
+        and tuple(attrs.get("materialized_source_value_ids") or ())
+            == (source_id,)
+    ):
+        # Run70 _tensor(list(values)): every specialized tuple member has an
+        # exact scalar ABI and callsite class cell. The ordered 'elts' edges
+        # must account for the whole materialized row, not just one member.
+        leaves = tuple(source_attrs.get("aggregate_leaf_value_ids") or ())
+        class_fact = source_attrs.get("callsite_sequence_element_class_fact")
+        class_cells = tuple(
+            source_attrs.get("callsite_sequence_element_class_cells") or ()
+        )
+        if (
+            leaves and all(type(leaf) is int for leaf in leaves)
+            and isinstance(class_fact, tuple)
+            and len(class_fact) == 3
+            and class_fact == (
+                class_fact[0], 1, "callsite iterable element class",
+            )
+            and class_fact[0] in {
+                "builtins.bool", "builtins.int", "builtins.float",
+            }
+            and class_cells
+            and all(isinstance(cell, Ref) and cell.page == SOURCE_VALUE_CLASS
+                    for cell in class_cells)
+        ):
+            aggregate_edges, aggregate_operands = operands(graph, source_id)
+            leaf_cells = tuple(
+                node_identity_cell(graph, leaf_id, book=book)
+                for leaf_id in leaves
+            )
+            member_proofs = []
+            if (aggregate_operands.page == PROCESS_GRAPH_OPERANDS
+                    and aggregate_edges == tuple(
+                        (leaf_cell, "elts") for leaf_cell in leaf_cells
+                    )):
+                for leaf_id, leaf_cell in zip(leaves, leaf_cells, strict=True):
+                    abi = book.latest_ref(
+                        VALUE_TYPE_ABI, (tuple(lexical_scope), leaf_id),
+                    )
+                    abi_fact = (
+                        None if abi is None else book.page(VALUE_TYPE_ABI).cell(
+                            abi.row, abi.column,
+                        )
+                    )
+                    arms = tuple(
+                        getattr(abi_fact, "physical_alternatives", ()) or ()
+                    )
+                    matching = (
+                        () if len(arms) != 1 else tuple(dict.fromkeys(
+                            class_cell for class_cell in class_cells
+                            if class_cell in arms[0].source_cells
+                            and class_cell in {
+                                source for source, _stage in book.edges_into(abi)
+                            }
+                        ))
+                    )
+                    if (
+                        len(arms) != 1 or len(matching) != 1
+                        or arms[0].identity != class_fact[0]
+                        or arms[0].storage != "scalar"
+                        or arms[0].dtype != {
+                            "builtins.bool": "bool",
+                            "builtins.int": "int64",
+                            "builtins.float": "float64",
+                        }[class_fact[0]]
+                        or arms[0].shape != () or arms[0].rank != 0
+                        or leaf_cell not in {
+                            source for source, _stage in book.edges_into(abi)
+                        }
+                        or book.page(SOURCE_VALUE_CLASS).cell(
+                            matching[0].row, matching[0].column,
+                        )[0] != class_fact[0]
+                    ):
+                        break
+                    member_proofs.append((
+                        leaf_cell, abi, matching[0], arms[0],
+                    ))
+            if (
+                len(member_proofs) == len(leaves)
+                and {proof[3].dtype for proof in member_proofs}
+                    in ({"bool"}, {"int64"}, {"float64"})
+                and {proof[2] for proof in member_proofs}
+                    == set(class_cells)
+            ):
+                row_dtype = member_proofs[0][3].dtype
+                causes = tuple(dict.fromkeys((
+                    materializer, arguments[0], identity, operand,
+                    aggregate_operands,
+                    *(cell for leaf, abi, class_cell, arm in member_proofs
+                      for cell in (
+                          leaf, abi, class_cell, *arm.source_cells,
+                      )),
+                )))
+                resolved = concord_sequence_row_dtypes(
+                    tuple(lexical_scope), {node_id: (row_dtype,)},
+                    source="specialized tuple scalar materialization",
+                    sources=causes, stage=PLANNER_HIERARCHY,
+                )
+                receipt = book.latest_ref(
+                    SEQUENCE_ROW_DTYPE, (tuple(lexical_scope), node_id),
+                )
+                if resolved == (row_dtype,) and isinstance(receipt, Ref):
+                    return row_dtype, (receipt, *causes)
     classes = require_class(numeric_scope, source_id, book=book)
     if (not isinstance(classes, ClassEvidence)
             or not _class_proves_value(book, classes.subject_cell,

@@ -8606,11 +8606,22 @@ def lower_tensor_calls_to_repository_ssa(
                                 causes = {source for source, _stage in book.edges_into(guard_cell)}
                                 if causes & call_ancestors and causes & actual_ancestors:
                                     guards.append(guard_cell)
-                            intervals = {tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
-                                guard.row, guard.column)) for guard in guards}
-                            if len(intervals) == 1:
-                                low, high = next(iter(intervals))
-                                if low >= 0 and high >= low and static_shape[selected_axis] <= (1 << 31) - 1:
+                            intervals = {
+                                tuple(bounds)
+                                for guard in guards
+                                if isinstance((bounds := book.page(
+                                    GUARDED_CALL_ACTUAL_RANGE).cell(
+                                        guard.row, guard.column)), tuple)
+                                and len(bounds) == 2
+                                and all(bound is None or type(bound) is int
+                                        for bound in bounds)
+                            }
+                            lows = [bounds[0] for bounds in intervals if type(bounds[0]) is int]
+                            highs = [bounds[1] for bounds in intervals if type(bounds[1]) is int]
+                            if lows and highs:
+                                low, high = max(lows), min(highs)
+                                if (low >= 0 and high >= low
+                                        and static_shape[selected_axis] <= (1 << 31) - 1):
                                     dynamic_guard = tuple(guards)
                         if not dynamic_guard:
                             shortfalls.append(TensorSSALoweringShortfall(
@@ -8662,6 +8673,48 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                         if len(set(matching_dimensions)) == 1:
                             runtime_dimension_proof = matching_dimensions[0]
+                        if runtime_dimension_proof is None and k_cell is not None:
+                            # LZ `grams` is read under `if grams > 1`. Its
+                            # callsite guard proves a lower bound, while the
+                            # runtime input axis supplies the upper capacity.
+                            # Match the exact call and k forks cited by the
+                            # existing guarded-actual receipt.
+                            def fork_ancestors(cell):
+                                pending, seen = [cell], set()
+                                while pending:
+                                    current = pending.pop()
+                                    if current is None or current in seen:
+                                        continue
+                                    seen.add(current)
+                                    pending.extend(source for source, stage in book.edges_into(current)
+                                                   if source.page == CANONICAL_VALUE
+                                                   and stage.name == "read_scope_fork")
+                                return seen
+                            call_identity = book.latest_ref(CANONICAL_VALUE, layout_proof[0].row)
+                            k_parents = tuple(parent for parent, role in source_operands
+                                              if role == "kw:k" and parent.page == CANONICAL_VALUE)
+                            if call_identity is not None and len(k_parents) == 1:
+                                call_ancestors = fork_ancestors(call_identity)
+                                actual_ancestors = fork_ancestors(k_parents[0])
+                                guards = tuple(
+                                    guard for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows()
+                                    if (guard := book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)) is not None
+                                    and isinstance((bounds := book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+                                        guard.row, guard.column)), tuple)
+                                    and len(bounds) == 2
+                                    and type(bounds[0]) is int
+                                    and bounds[0] >= 0
+                                    and (bounds[1] is None or
+                                         type(bounds[1]) is int and bounds[1] >= bounds[0])
+                                    and (causes := {source for source, _ in book.edges_into(guard)})
+                                        & call_ancestors
+                                    and causes & actual_ancestors
+                                )
+                                if (guards and len({tuple(book.page(
+                                        GUARDED_CALL_ACTUAL_RANGE).cell(
+                                            guard.row, guard.column))
+                                        for guard in guards}) == 1):
+                                    runtime_dimension_proof = guards[0]
                         if runtime_dimension_proof is None:
                             shortfalls.append(TensorSSALoweringShortfall(
                                 function_name, block_name, operation,
@@ -16905,11 +16958,18 @@ def complete_tensor_call_closure(
     while first_pass or pending:
         first_pass = False
         prior_geometry = value_geometry()
-        slice_module = IRModule(
-            {name: function for name, function in module.functions.items()
-             if name in pending},
-            call_table=module.call_table,
+        # make([start])'s int64 column is already in the owner's sequence
+        # table. Constructing a new IRModule here dropped that registry, so
+        # the cast region could not read the existing sequence view and
+        # refused its physical span. This is a view of the same compilation:
+        # narrow functions/tensors while retaining every other registry by
+        # identity, rather than rebuilding an incomplete compilation model.
+        slice_module = dataclasses.replace(
+            module,
+            functions={name: function for name, function in module.functions.items()
+                       if name in pending},
             metadata={
+                **module.metadata,
                 "identity_book": identity_book(module),
                 "tensor_ssa_reference": reference,
             },

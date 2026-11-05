@@ -895,7 +895,8 @@ SOURCE_INT_RANGE = declare_page("source_int_range_concordance", (
 ), tuple)
 #: ``_solve_int_ranges``: the interval a call actual is proven to lie in AT
 #: one callsite, ``(numeric scope, callsite id, value id)`` -> ``(low,
-#: high)``, where a raising guard dominating the call (``if v < 0 or v >
+#: high)``. Either endpoint may be None when the dominating control proves
+#: only one side. A raising guard dominating the call (``if v < 0 or v >
 #: U64_MAX: raise``) narrows a value whose own row is wider or absent.
 #: CONCORD, DERIVED from the guard constants' range cells, the actual's own
 #: range cell when it has one, and the callsite's node identity.  The call

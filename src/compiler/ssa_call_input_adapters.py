@@ -1357,7 +1357,7 @@ def _range_proven_integer_edge(caller, instruction, actual, source_dtype, target
             rows = ((GUARDED_CALL_ACTUAL_RANGE, (scope, int(callsite), int(actual.id))), *rows)
         for page, row in rows:
             interval = book.page(page).latest(row)
-            if interval is not None:
+            if interval is not None and type(interval[0]) is int:
                 return int(interval[0]) >= 0
     return False
 

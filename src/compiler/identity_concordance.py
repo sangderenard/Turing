@@ -1589,6 +1589,7 @@ class CorrelationTable:
         found.extend(self._numerical_constructor_default_findings(module))
         found.extend(self._materialized_byte_row_findings(module))
         found.extend(self._specialized_literal_materialized_row_findings(module))
+        found.extend(self._specialized_scalar_materialized_row_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._numerical_constructor_dimension_findings(module))
@@ -3198,8 +3199,8 @@ class CorrelationTable:
             SOURCE_RESOURCE_CONVERSION, SOURCE_RESOURCE_SCOPE, SOURCE_RESOURCE_ADMISSION_DEMAND, SOURCE_RESOURCE_CONTROL, SOURCE_PROCESS_OPERATION, SOURCE_LOOP_CONTROL_WORK,
             SOURCE_ACTIVITY_CHILD, SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_CUT, SOURCE_CONTROL_OPERATOR,
             SOURCE_CONTROL_IR, CONTROL_PROGRAM, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
-            ControlBlockKind, Placement, SOURCE_LOOP_CONTROL_SITE, SOURCE_LOOP_SITE_EDGE, SOURCE_LOOP_SITE_VIEW, SOURCE_LOOP_EXIT_READ, PROCESS_GRAPH_OPERANDS, INGESTION_VALUE, SSA_CONTROL_EDGE, SSA_ARM_CONTINUATION, SSA_BLOCK,
-            DEPLOYMENT_REGION_MEMBER, MemberRole,
+            ControlBlockKind, Placement, Arm, CANONICAL_VALUE, SOURCE_LOOP_CONTROL_SITE, SOURCE_LOOP_SITE_EDGE, SOURCE_LOOP_SITE_VIEW, SOURCE_LOOP_EXIT_READ, PROCESS_GRAPH_OPERANDS, INGESTION_VALUE, SSA_CONTROL_EDGE, SSA_ARM_CONTINUATION, SSA_BLOCK,
+            DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER, MemberRole,
         )
         import networkx as nx
         book = (getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -3432,6 +3433,69 @@ class CorrelationTable:
                     or block.operand_graph_cell not in value(control).extra):
                 found.append(Finding("ingested-process-control", str(row[0]), int(row[1]),
                                      "process operation lacks its control-IR block, placement or explicit operand graph"))
+        from .control_activity import _binding_from_identity
+        for row in book.page(CONTROL_BLOCK_PLACEMENT).rows():
+            placement_cell = book.latest_ref(CONTROL_BLOCK_PLACEMENT, row)
+            placement = value(placement_cell)
+            block = row[1]
+            if (not isinstance(placement, Placement)
+                    or placement.arm not in {Arm.BODY, Arm.ORELSE}
+                    or block.page != CONTROL_BLOCK
+                    or block.row[1] != ControlBlockKind.STATEMENT
+                    or not isinstance(placement.parent, Ref)
+                    or placement.parent.page != CONTROL_BLOCK
+                    or value(placement.parent).kind != ControlBlockKind.CONDITIONAL
+                    or not isinstance(block.row[2], Ref)
+                    or block.row[2].page != DEPLOYMENT_REGION):
+                continue
+            direct = {source for source, _stage in book.edges_into(placement_cell)}
+            region = block.row[2]
+            members = tuple(source for source in direct
+                            if source.page == DEPLOYMENT_REGION_MEMBER
+                            and source.row[:2] == region.row
+                            and value(source) != MemberRole.INPUT)
+            if not members:
+                continue
+            source_scope = book.page(SOURCE_ACTIVITY_SCOPE).latest((row[0],))
+            parent_causes = {
+                source for source, _stage in book.edges_into(placement.parent)
+            }
+            owners = tuple(source for source in direct & parent_causes
+                           if source.page == CANONICAL_VALUE
+                           and source.row[0] == row[0])
+            accepted = set()
+            if source_scope is not None:
+                for owner in owners:
+                    try:
+                        owner_points, owner_binding = _binding_from_identity(
+                            owner, source_scope, book, node=owner.row[1],
+                        )
+                        if owner_points is None or owner_binding not in direct:
+                            continue
+                        if value(owner_points[0])[0] not in {
+                            'If', 'IfExp', 'BoolOp', 'Try', 'TryStar',
+                        }:
+                            continue
+                        for member in members:
+                            child = book.latest_ref(CANONICAL_VALUE,
+                                                    (row[0], member.row[2]))
+                            if child is None:
+                                continue
+                            child_points, child_binding = _binding_from_identity(
+                                child, source_scope, book, node=member.row[2],
+                            )
+                            if child_points is None or child_binding not in direct:
+                                continue
+                            if (owner_points[0].row[1], placement.arm.value) in value(child_points[0])[1]:
+                                accepted.add(owner)
+                    except ValueError:
+                        continue
+            if len(accepted) != 1:
+                found.append(Finding(
+                    "control-arm-placement", str(row[0]), int(region.row[1]),
+                    "scheduled arm region lacks its exact retained owner, "
+                    "member, and ingested activity proof",
+                ))
         for row in book.page(SOURCE_ACTIVITY_CUT).rows():
             cell = book.latest_ref(SOURCE_ACTIVITY_CUT, row)
             sources = {source for source, _stage in book.edges_into(cell)}
@@ -3803,7 +3867,56 @@ class CorrelationTable:
 
         for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows():
             cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
+            interval = book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+                cell.row, cell.column)
             causes = {source for source, _stage in book.edges_into(cell)}
+            valid_interval = (
+                isinstance(interval, tuple) and len(interval) == 2
+                and all(bound is None or type(bound) is int
+                        for bound in interval)
+                and any(type(bound) is int for bound in interval)
+                and (interval[0] is None or interval[1] is None
+                     or interval[0] <= interval[1])
+            )
+            previous = tuple(source for source in causes
+                             if source.page == GUARDED_CALL_ACTUAL_RANGE
+                             and source.row == row)
+            if any(source.page == GUARDED_CALL_ACTUAL_RANGE
+                   and source.row != row for source in causes):
+                valid_interval = False
+            if valid_interval and previous:
+                valid_interval = len(previous) == 1
+                if valid_interval:
+                    prior_interval = book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+                        previous[0].row, previous[0].column)
+                    valid_interval = (
+                        isinstance(prior_interval, tuple)
+                        and len(prior_interval) == 2
+                        and previous[0].column < cell.column
+                        and all(
+                            old is None or (new is not None and
+                                            (new >= old if index == 0 else new <= old))
+                            for index, (old, new) in enumerate(zip(
+                                prior_interval, interval, strict=True))
+                        )
+                    )
+            if valid_interval:
+                valid_interval = (
+                    any(source.page == CANONICAL_VALUE
+                        and source.row[-1] == row[1] for source in causes)
+                    and any(source.page == CANONICAL_VALUE
+                        and source.row[-1] == row[2] for source in causes)
+                    and any(source.page == SOURCE_SPAN
+                        and getattr(book.page(SOURCE_SPAN).cell(
+                            source.row, source.column), "kind", None) in {"If", "While"}
+                        for source in causes)
+                )
+            if not valid_interval:
+                found.append(Finding(
+                    "guarded-call-actual-range", str(row[0]), row[1],
+                    "callsite range lacks ordered exact bounds or monotone revision",
+                ))
+                continue
             admissions = tuple(source for source in causes
                                if source.page == SOURCE_INTRINSIC_ADMISSION)
             if not admissions:
@@ -5214,14 +5327,21 @@ class CorrelationTable:
                                  for extent in shape)
                          and 0 <= fact.axis < len(shape)
                          and shape[fact.axis] <= (1 << 31) - 1)
+                lows, highs = [], []
                 for guard_cell in fact.guard_cells:
                     interval = book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
                         guard_cell.row, guard_cell.column)
                     valid = valid and (isinstance(interval, tuple)
                                        and len(interval) == 2
-                                       and type(interval[0]) is int
-                                       and type(interval[1]) is int
-                                       and 0 <= interval[0] <= interval[1])
+                                       and all(bound is None or type(bound) is int
+                                               for bound in interval)
+                                       and any(type(bound) is int for bound in interval))
+                    if valid:
+                        if interval[0] is not None:
+                            lows.append(interval[0])
+                        if interval[1] is not None:
+                            highs.append(interval[1])
+                valid = valid and bool(lows and highs) and 0 <= max(lows) <= min(highs)
                 call_cell = book.latest_ref(CANONICAL_VALUE, fact.layout_cell.row)
                 operands_cell = book.latest_ref(
                     PROCESS_GRAPH_OPERANDS, fact.layout_cell.row)
@@ -5348,7 +5468,8 @@ class CorrelationTable:
         """A runtime named leaf uses the checked selection and owned count."""
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_TENSOR_SHAPE_DIMENSION, SSA_VALUE,
+            CANONICAL_VALUE, GUARDED_CALL_ACTUAL_RANGE, SOURCE_SPAN,
+            SOURCE_TENSOR_SHAPE_DIMENSION, SSA_VALUE,
             TENSOR_OWNED_HEAP_BINDING, TENSOR_RUNTIME_TOPK_SELECTION,
             TensorRuntimeTopkSelection,
         )
@@ -5380,7 +5501,9 @@ class CorrelationTable:
                             for cell in required[:11])
                     and fact.output_cell.row[-1] == row[2]
                     and fact.layout_cell.page.name == "source_aggregate_layout"
-                    and fact.nonnegative_cell.page == SOURCE_TENSOR_SHAPE_DIMENSION
+                    and fact.nonnegative_cell.page in {
+                        SOURCE_TENSOR_SHAPE_DIMENSION, GUARDED_CALL_ACTUAL_RANGE,
+                    }
                     and isinstance(fact.axis, int) and fact.axis >= 0
                 )
             if valid:
@@ -5389,9 +5512,39 @@ class CorrelationTable:
                     for source, _ in book.edges_into(fact.selection_input_cell)
                     if source.page == CANONICAL_VALUE
                 }
-                dimension_origin = book.latest_ref(
-                    CANONICAL_VALUE, fact.nonnegative_cell.row,
-                )
+                if fact.nonnegative_cell.page == SOURCE_TENSOR_SHAPE_DIMENSION:
+                    dimension_origin = book.latest_ref(
+                        CANONICAL_VALUE, fact.nonnegative_cell.row,
+                    )
+                    nonnegative_valid = (
+                        dimension_origin is not None
+                        and _canonical_identity_base(book, dimension_origin) in k_causes
+                    )
+                else:
+                    bounds = book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+                        fact.nonnegative_cell.row, fact.nonnegative_cell.column)
+                    guard_causes = {source for source, _ in book.edges_into(
+                        fact.nonnegative_cell)}
+                    call_origin = book.latest_ref(CANONICAL_VALUE, fact.layout_cell.row)
+                    nonnegative_valid = (
+                        isinstance(bounds, tuple) and len(bounds) == 2
+                        and type(bounds[0]) is int
+                        and bounds[0] >= 0
+                        and (bounds[1] is None or
+                             type(bounds[1]) is int and bounds[1] >= bounds[0])
+                        and any(source.page == CANONICAL_VALUE
+                                and _canonical_identity_base(book, source) in k_causes
+                                for source in guard_causes)
+                        and call_origin is not None
+                        and any(source.page == CANONICAL_VALUE
+                                and _canonical_identity_base(book, source)
+                                == _canonical_identity_base(book, call_origin)
+                                for source in guard_causes)
+                        and any(source.page == SOURCE_SPAN
+                                and getattr(book.page(SOURCE_SPAN).cell(
+                                    source.row, source.column), "kind", None) in {"If", "While"}
+                                for source in guard_causes)
+                    )
                 input_fact = book.page(SSA_VALUE).cell(
                     fact.input_cell.row, fact.input_cell.column,
                 )
@@ -5410,8 +5563,7 @@ class CorrelationTable:
                     if owned is not None else None
                 )
                 valid = (
-                    dimension_origin is not None
-                    and _canonical_identity_base(book, dimension_origin) in k_causes
+                    nonnegative_valid
                     and input_fact.storage == "span"
                     and isinstance(input_fact.rank, int)
                     and 0 <= fact.axis < input_fact.rank
@@ -13692,6 +13844,140 @@ class CorrelationTable:
                         else None,
                         "row dtype lacks exact literal, formal, class, "
                         "materializer or operand proof",
+                    ))
+        return found
+
+    @staticmethod
+    def _specialized_scalar_materialized_row_findings(module: Any) -> list[Finding]:
+        """A materialized scalar aggregate retains every exact member's ABI."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS, SEQUENCE_ROW_DTYPE,
+            SOURCE_PYTHON_IDENTITY, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
+        )
+        from .concorded_literals import origin_cell
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SEQUENCE_ROW_DTYPE)
+        scalar_classes = {
+            "bool": "builtins.bool", "int64": "builtins.int",
+            "float64": "builtins.float",
+        }
+        for row in page.rows():
+            for column, fact in page.history(row):
+                if not (isinstance(fact, tuple) and len(fact) == 2
+                        and fact[1] == "specialized tuple scalar materialization"):
+                    continue
+                receipt = Ref(SEQUENCE_ROW_DTYPE, row, column)
+                causes = {source for source, _ in book.edges_into(receipt)}
+                materializers = tuple(source for source in causes
+                                      if source.page == CANONICAL_VALUE
+                                      and source.row == row)
+                inputs = tuple(source for source in causes
+                               if source.page == PROCESS_GRAPH_OPERANDS
+                               and source.row == row)
+                identities = tuple(source for source in causes
+                                   if source.page == SOURCE_PYTHON_IDENTITY)
+                valid = (isinstance(row, tuple) and len(row) == 2
+                         and isinstance(fact[0], tuple) and len(fact[0]) == 1
+                         and fact[0][0] in scalar_classes
+                         and len(materializers) == len(inputs) == len(identities) == 1)
+                members = ()
+                if valid:
+                    call_edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        inputs[0].row, inputs[0].column,
+                    )
+                    actuals = tuple(source for source, role in call_edges
+                                    if role == "arg:0")
+                    layouts = tuple(source for source in causes
+                                    if source.page == PROCESS_GRAPH_OPERANDS
+                                    and len(actuals) == 1
+                                    and source.row == actuals[0].row)
+                    identity_fact = book.page(SOURCE_PYTHON_IDENTITY).cell(
+                        identities[0].row, identities[0].column,
+                    )
+                    try:
+                        same_call = any(
+                            source.page == CANONICAL_VALUE
+                            and origin_cell(book, source)
+                                == origin_cell(book, materializers[0])
+                            for source, _ in book.edges_into(identities[0])
+                        )
+                    except ValueError:
+                        same_call = False
+                    valid = (
+                        len(actuals) == len(layouts) == 1
+                        and actuals[0] in causes
+                        and materializers[0] in {
+                            source for source, _ in book.edges_into(inputs[0])
+                        }
+                        and all(role == "arg:0" or not str(role).startswith("arg:")
+                                for _, role in call_edges)
+                        and isinstance(identity_fact, tuple)
+                        and len(identity_fact) == 4
+                        and identity_fact[:2] == ("builtins.list", "object")
+                        and same_call
+                    )
+                    if valid:
+                        layout = layouts[0]
+                        edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                            layout.row, layout.column,
+                        )
+                        valid = (bool(edges)
+                                 and all(role == "elts" for _, role in edges)
+                                 and actuals[0] in {
+                                     source for source, _ in book.edges_into(layout)
+                                 })
+                        members = tuple(source for source, _ in edges)
+                if valid:
+                    classes = {source for source in causes
+                               if source.page == SOURCE_VALUE_CLASS}
+                    used_classes = set()
+                    used_abis = set()
+                    for member in members:
+                        abis = tuple(source for source in causes
+                                     if source.page == VALUE_TYPE_ABI
+                                     and source.row == member.row)
+                        valid = (member.page == CANONICAL_VALUE
+                                 and member in causes and member.row[0] == row[0]
+                                 and len(abis) == 1)
+                        if not valid:
+                            break
+                        abi = abis[0]
+                        abi_fact = book.page(VALUE_TYPE_ABI).cell(abi.row, abi.column)
+                        arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
+                        expected_class = scalar_classes[fact[0][0]]
+                        valid = (len(arms) == 1 and arms[0].identity == expected_class
+                                 and arms[0].storage == "scalar"
+                                 and arms[0].dtype == fact[0][0]
+                                 and tuple(arms[0].shape) == () and arms[0].rank == 0)
+                        if not valid:
+                            break
+                        direct = {source for source, _ in book.edges_into(abi)}
+                        selected_classes = classes & set(arms[0].source_cells) & direct
+                        valid = (len(selected_classes) == 1
+                                 and set(arms[0].source_cells) <= causes
+                                 and all(book.page(SOURCE_VALUE_CLASS).cell(
+                                     source.row, source.column,
+                                 )[0] == expected_class for source in selected_classes))
+                        if not valid:
+                            break
+                        used_classes.update(selected_classes)
+                        used_abis.add(abi)
+                    local_abis = {source for source in causes
+                                  if source.page == VALUE_TYPE_ABI
+                                  and source.row[0] == row[0]}
+                    valid = (valid and bool(classes) and used_classes == classes
+                             and used_abis == local_abis)
+                if not valid:
+                    found.append(Finding(
+                        "specialized-scalar-materialized-row", str(row),
+                        int(row[1]) if isinstance(row, tuple) and len(row) == 2 else None,
+                        "row dtype lacks exact materializer, complete aggregate "
+                        "operands, or homogeneous scalar member ABI causes",
                     ))
         return found
 

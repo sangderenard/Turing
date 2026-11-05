@@ -7159,33 +7159,59 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         (display_reads, True),
     ):
         for actual, caller, call_id in actuals:
-            interval, used, guard_proofs = guarded(
-                caller, call_id, actual,
-                _INT_RANGE_TOP if unclassed and current(actual) is None
-                else current(actual),
-                with_proof=True,
+            base = (_INT_RANGE_TOP if unclassed and current(actual) is None
+                    else current(actual))
+            finite, finite_used, finite_proofs = guarded(
+                caller, call_id, actual, base, with_proof=True,
             )
-            if not used or interval is None or interval == _INT_RANGE_TOP:
+            lower, upper, used, guard_proofs = guarded(
+                caller, call_id, actual, base, with_bounds=True,
+            )
+            if finite is not None and finite != _INT_RANGE_TOP:
+                lower, upper = finite
+                used = finite_used
+                guard_proofs = finite_proofs
+            if not used:
+                continue
+            if lower is None and upper is None:
+                continue
+            if lower is not None and upper is not None and lower > upper:
                 continue
             row = (actual[0], int(call_id), int(actual[1]))
-            if book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row) is not None:
-                continue
+            prior = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
+            previous = (None if prior is None else book.page(
+                GUARDED_CALL_ACTUAL_RANGE).cell(prior.row, prior.column))
+            if previous is not None:
+                # A later solve may prove the other side of this exact
+                # call actual. Intersect its new evidence with the prior
+                # receipt; no callsite bound may widen on revision.
+                if previous[0] is not None:
+                    lower = previous[0] if lower is None else max(lower, previous[0])
+                if previous[1] is not None:
+                    upper = previous[1] if upper is None else min(upper, previous[1])
+                if previous == (lower, upper):
+                    continue
+                if lower is not None and upper is not None and lower > upper:
+                    continue
             call_cell = node_identity_cell(caller.wrapper, int(call_id))
+            actual_cell = node_identity_cell(caller.wrapper, int(actual[1]))
             book.post(
                 GUARDED_CALL_ACTUAL_RANGE, row,
-                (int(interval[0]), int(interval[1])),
+                (lower, upper),
                 stage=_REDUCTION,
                 provenance=_Derived(tuple(dict.fromkeys(
                     cell for cell in (
                         call_cell,
+                        actual_cell,
                         *intrinsic_causes.get((actual, int(call_id)), ()),
                         *guard_proofs,
+                        prior,
                         *(book.latest_ref(SOURCE_INT_RANGE, read)
                           for read in (actual, *used)),
                     )
                     if cell is not None
                 ))),
-                mode=_Mode.CONCORD,
+                mode=_Mode.REVISE if prior is not None else _Mode.CONCORD,
             )
     return bool(posted or power_posted)
 

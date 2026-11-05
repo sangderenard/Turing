@@ -19,6 +19,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_FUNCTION_REACHABILITY,
     SOURCE_LITERAL_VALUE,
     SOURCE_INT_RANGE,
+    SOURCE_INTRINSIC_ADMISSION,
     SOURCE_OPERATOR_KIND,
     SOURCE_SPAN,
     SOURCE_VALUE_CLASS,
@@ -28,6 +29,16 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import CorrelationTable, current_identity_book
 from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 import src.compiler.glsl_deployment_strategy as deployment
+
+
+def _intrinsic_guard_rows(book):
+    """Rows whose exact receipt cites an admitted intrinsic call."""
+    return tuple(
+        row for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows()
+        if any(source.page == SOURCE_INTRINSIC_ADMISSION
+               for source, _ in book.edges_into(
+                   book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)))
+    )
 
 
 class _Captured(Exception):
@@ -77,7 +88,7 @@ def root(values, k: int):
         raise ValueError("large k")
     return AbstractTensor.topk(values, k=k, dim=0).indices
 ''')
-    rows = tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    rows = tuple(_intrinsic_guard_rows(book))
     assert len(rows) == 1
     cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, rows[0])
     assert book.page(GUARDED_CALL_ACTUAL_RANGE).cell(cell.row, cell.column) == (0, 3)
@@ -103,7 +114,7 @@ def root(values, k: int):
         marker = 2
     return AbstractTensor.topk(values, k=k, dim=0).indices
 ''')
-    assert not tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    assert not tuple(_intrinsic_guard_rows(book))
 
 
 def test_returned_tuple_member_joins_helper_and_caller_raising_guards(monkeypatch):
@@ -119,7 +130,7 @@ def root(values, k: int):
         raise ValueError("large")
     return AbstractTensor.topk(values, k=selected, dim=0).indices
 ''')
-    rows = tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    rows = tuple(_intrinsic_guard_rows(book))
     assert len(rows) == 1
     cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, rows[0])
     assert book.page(GUARDED_CALL_ACTUAL_RANGE).cell(cell.row, cell.column) == (1, 3)
@@ -145,7 +156,7 @@ def root(values, k: int):
         raise ValueError("large")
     return AbstractTensor.topk(values, k=selected, dim=0).indices
 ''')
-    assert not tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    assert not tuple(_intrinsic_guard_rows(book))
 
 
 def test_exact_nonnegative_integer_power_bounds_returned_topk_count(monkeypatch):
@@ -161,7 +172,7 @@ def root(values, k: int):
         raise ValueError("large")
     return AbstractTensor.topk(values, k=selected, dim=0).indices
 ''')
-    rows = tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    rows = tuple(_intrinsic_guard_rows(book))
     assert len(rows) == 1
     guarded = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, rows[0])
     assert book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
@@ -195,7 +206,9 @@ def root(values, k: int, exponent: int):
         raise ValueError("large")
     return AbstractTensor.topk(values, k=selected, dim=0).indices
 ''')
-        assert not tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+        rows = _intrinsic_guard_rows(book)
+        assert len(rows) == 1
+        assert book.page(GUARDED_CALL_ACTUAL_RANGE).latest(rows[0]) == (1, None)
 
 
 def test_power_range_from_other_function_does_not_bound_topk_count(monkeypatch):
@@ -220,11 +233,13 @@ def root(values, k: int, exponent: int):
         and "known" in str(row[0])
         for row in book.page(SOURCE_INT_RANGE).rows()
     )
-    assert not tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
+    rows = _intrinsic_guard_rows(book)
+    assert len(rows) == 1
+    assert book.page(GUARDED_CALL_ACTUAL_RANGE).latest(rows[0]) == (1, None)
 
 
 def test_zero_power_and_unproved_bool_base_keep_exact_range_rule(monkeypatch):
-    for expression, expected in (("0 ** 0", (1, 1)), ("True ** 0", None)):
+    for expression, expected in (("0 ** 0", (1, 1)), ("True ** 0", (1, None))):
         book = _book_at_topk(monkeypatch, f'''
 def bounded(k: int):
     if k < 1:
@@ -237,15 +252,12 @@ def root(values, k: int):
         raise ValueError("large")
     return AbstractTensor.topk(values, k=selected, dim=0).indices
 ''')
-        rows = tuple(book.page(GUARDED_CALL_ACTUAL_RANGE).rows())
-        if expected is None:
-            assert not rows
-        else:
-            assert len(rows) == 1
-            cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, rows[0])
-            assert book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
-                cell.row, cell.column,
-            ) == expected
+        rows = tuple(_intrinsic_guard_rows(book))
+        assert len(rows) == 1
+        cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, rows[0])
+        assert book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+            cell.row, cell.column,
+        ) == expected
 
 
 @pytest.mark.parametrize("upper", ("3", "2 ** 12"))

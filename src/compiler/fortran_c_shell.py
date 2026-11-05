@@ -19580,6 +19580,34 @@ def _sequence_column_dtype_contracts(
                     == declaration_specs[parent_id]
                 ):
                     materialized_copies.append((destination, parent_id))
+    # _tensor(list(values)): the callsite's exact scalar element class must
+    # seed the source aggregate before the existing materialized-copy fixed
+    # point carries its row to the list materializer.
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in declared or declared[value_id] != 1:
+            continue
+        attributes = data.get("attributes") or {}
+        class_fact = attributes.get("callsite_sequence_element_class_fact")
+        class_cells = tuple(
+            attributes.get("callsite_sequence_element_class_cells") or ()
+        )
+        if (
+            not isinstance(class_fact, tuple)
+            or len(class_fact) < 2
+            or int(class_fact[1]) != 1
+            or tuple(class_fact[2:]) != (
+                "callsite iterable element class",
+            )
+            or not class_cells
+        ):
+            continue
+        dtype = {
+            "builtins.int": "int64",
+            "builtins.bool": "bool",
+        }.get(str(class_fact[0]))
+        if dtype is not None:
+            contracts[value_id] = (dtype,)
     changed = True
     while changed:
         changed = False
@@ -19606,33 +19634,6 @@ def _sequence_column_dtype_contracts(
             elif destination_contract is not None and source is None:
                 contracts[source_id] = destination_contract
                 changed = True
-    for node_id, data in graph_obj.nodes(data=True):
-        value_id = int(data.get("value_id", node_id))
-        if value_id not in declared or declared[value_id] != 1:
-            continue
-        attributes = data.get("attributes") or {}
-        class_fact = attributes.get(
-            "callsite_sequence_element_class_fact"
-        )
-        class_cells = tuple(attributes.get(
-            "callsite_sequence_element_class_cells"
-        ) or ())
-        if (
-            not isinstance(class_fact, tuple)
-            or len(class_fact) < 2
-            or int(class_fact[1]) != 1
-            or tuple(class_fact[2:]) != (
-                "callsite iterable element class",
-            )
-            or not class_cells
-        ):
-            continue
-        dtype = {
-            "builtins.int": "int64",
-            "builtins.bool": "bool",
-        }.get(str(class_fact[0]))
-        if dtype is not None:
-            contracts[value_id] = (dtype,)
     return contracts
 
 

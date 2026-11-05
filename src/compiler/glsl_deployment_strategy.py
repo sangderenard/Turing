@@ -2824,7 +2824,8 @@ def _guarded_site_interval(scopes, site_id: int, value_id: int):
         )
         if cell is not None:
             interval = book.page(cell.page).cell(cell.row, cell.column)
-            return int(interval[0]), int(interval[1])
+            if all(type(bound) is int for bound in interval):
+                return int(interval[0]), int(interval[1])
     return None
 
 
@@ -13392,6 +13393,13 @@ def _ordinary_conditional_control_programs(
     """Preserve source conditional arms and their lexical SSA merges."""
 
     from .control_source import ConditionalBlock, LoopControlBlock
+    from .control_activity import (
+        _binding_from_identity, activity_scope, binding as activity_binding,
+    )
+    from .concordance_declarations import (
+        CANONICAL_VALUE, DEPLOYMENT_REGION_MEMBER,
+    )
+    from .identity_concordance import current_identity_book
 
     retained_regions = tuple(map(int, retained_regions))
     retained = frozenset(retained_regions)
@@ -13504,6 +13512,51 @@ def _ordinary_conditional_control_programs(
                 for node_id in subgraph.G.graph.get("deployment_nodes", ())
             )
         )
+        # In lz_encode, If122 is retired from the resident numerical graph
+        # while cat146/148/150 retain its ingested body activity. The arm
+        # placement must cite both that exact retained owner and each carved
+        # region member's activity, not only the resulting region ordinal.
+        book = current_identity_book()
+        read_scope = graph.G.graph.get('lexical_read_scope')
+        planning_scope = graph.G.graph.get('planning_scope')
+        owner_cell = (
+            book.latest_ref(CANONICAL_VALUE, (read_scope, int(control_id)))
+            if read_scope is not None else None
+        )
+        if (body_regions or else_regions) and owner_cell is None:
+            raise ValueError('conditional arm placement lacks exact owner identity')
+        owner_binding = None
+        if body_regions or else_regions:
+            _points, owner_binding = _binding_from_identity(
+                owner_cell, activity_scope(graph, book=book), book,
+                node=int(control_id),
+            )
+            if owner_binding is None:
+                raise ValueError('conditional arm placement lacks owner activity')
+        for arm_name, regions in (('body', body_regions), ('orelse', else_regions)):
+            for region_index in regions:
+                for node_id in subgraphs[region_index].G.graph.get(
+                    'deployment_nodes', ()
+                ):
+                    if (int(control_id), arm_name) not in memberships.get(
+                        int(node_id), ()
+                    ):
+                        continue
+                    member = (
+                        book.latest_ref(DEPLOYMENT_REGION_MEMBER, (
+                            planning_scope, int(region_index), int(node_id),
+                        )) if planning_scope is not None else None
+                    )
+                    _points, activity = activity_binding(
+                        graph, int(node_id), book=book,
+                    )
+                    if member is None or activity is None:
+                        raise ValueError(
+                            'conditional arm placement lacks exact member activity'
+                        )
+                    activity_retention_cells.extend((
+                        owner_cell, owner_binding, member, activity,
+                    ))
         # The comparison node is only the last link in the predicate.  Every
         # retained numerical region containing one of its transitive graph
         # producers must execute before the branch.  Selecting only the region
@@ -26808,8 +26861,29 @@ def _tensor_descriptor(
             or (data.get("attributes") or {}).get("tensor_candidate")
             or data.get("op") or data.get("type") or ""
         ).casefold()
+        materialized_row_dtype = None
+        if descriptor_operation == "tensor":
+            materialized_sources = tuple(dict.fromkeys(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role).casefold() in {
+                    "operand", "value", "base", "input", "self",
+                    "receiver", "arg:0", "arg0",
+                } and int(parent) in graph.G
+            ))
+            if len(materialized_sources) == 1:
+                from .planner_concordance_posts import (
+                    materialized_sequence_row_dtype,
+                )
+
+                materialized_row_dtype, _row_cells = (
+                    materialized_sequence_row_dtype(
+                        graph, materialized_sources[0],
+                    )
+                )
         specialized_operator = bool(
-            primitive_scalar_descriptor is not None or descriptor_operation in {
+            materialized_row_dtype is not None
+            or primitive_scalar_descriptor is not None
+            or descriptor_operation in {
                 "flatten", "reshape", "view", "unsqueeze", "squeeze",
                 "expand", "broadcast_to",
             }
@@ -29680,9 +29754,6 @@ def _tensor_descriptor_rule(
                             "dtype": "float64",
                             "rank": len(aggregate_shape),
                         }
-                inherited = _tensor_descriptor(graph, sources[0], seen)
-                if inherited is not None:
-                    return inherited
                 from .planner_concordance_posts import materialized_sequence_row_dtype
 
                 row_dtype, _row_type_cells = materialized_sequence_row_dtype(graph, sources[0])
@@ -29693,14 +29764,16 @@ def _tensor_descriptor_rule(
                     (data.get("attributes") or {}).get("static_call_arguments") or {}
                 )
                 if row_dtype is not None and not explicit_dtype:
-                    # _octets' tensor(list(data)) precedes its explicit cast.
-                    # The bytes iterator's declared integer rows survive the
-                    # exact list materializer edge; its row ledger supplies
-                    # dtype without sampling bytes or typing a tag column.
+                    # The exact list materializer row, including a flattened
+                    # scalar tuple, is more specific than the list object's
+                    # provisional unknown tensor descriptor.
                     return {
                         "shape": (), "dtype": row_dtype, "rank": 1,
                         "metadata_state": "dynamic",
                     }
+                inherited = _tensor_descriptor(graph, sources[0], seen)
+                if inherited is not None:
+                    return inherited
                 # Repository compressor: ``AbstractTensor.tensor(list(values))``
                 # reaches callsite specialization before native VALUE_TYPE_ABI
                 # publication.  The source resolver has already settled the
@@ -36592,6 +36665,12 @@ def _callsite_actual_int_range(caller: Any, call_id: int, actual_id: int):
     if cell is None:
         return None
     interval = book.page(cell.page).cell(cell.row, cell.column)
+    if not all(type(bound) is int for bound in interval):
+        own = _int_range_cell(caller, value_id)
+        if own is None:
+            return None
+        cell = own
+        interval = book.page(cell.page).cell(cell.row, cell.column)
     return (int(interval[0]), int(interval[1])), cell
 
 

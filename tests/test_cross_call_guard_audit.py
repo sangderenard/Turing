@@ -10,6 +10,7 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import c_backend
 from src.compiler.concordance_declarations import (
     FUNCTION_ADDRESS, GUARDED_CALL_ACTUAL_RANGE, PROCESS_GRAPH_OPERANDS,
     SOURCE_AGGREGATE_LAYOUT, SOURCE_FUNCTION_REACHABILITY, SOURCE_LITERAL_VALUE,
+    SOURCE_INTRINSIC_ADMISSION,
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -43,7 +44,11 @@ def product():
         progress=lambda _: None, progress_bars=False,
     )
     book = identity_book(module)
-    row, = book.page(GUARDED_CALL_ACTUAL_RANGE).rows()
+    row, = (candidate for candidate in book.page(GUARDED_CALL_ACTUAL_RANGE).rows()
+            if any(source.page == SOURCE_INTRINSIC_ADMISSION
+                   for source, _ in book.edges_into(
+                       book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, candidate)))
+            and book.page(GUARDED_CALL_ACTUAL_RANGE).latest(candidate) == (1, 3))
     ref = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
     assert book.page(GUARDED_CALL_ACTUAL_RANGE).latest(row) == (1, 3)
     assert CorrelationTable.build(module).findings(module) == []

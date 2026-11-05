@@ -32,7 +32,15 @@ def binding(graph, node, *, book=None, scope=None):
     from ..common.tensors.topological_reducer import node_identity_cell
     book = current_identity_book() if book is None else book
     scope = activity_scope(graph, book=book) if scope is None else scope
-    pending, seen, found = [node_identity_cell(graph, int(node), book=book)], set(), set()
+    return _binding_from_identity(
+        node_identity_cell(graph, int(node), book=book), scope, book,
+        node=int(node),
+    )
+
+
+def _binding_from_identity(identity, scope, book, *, node):
+    """Follow the incumbent canonical-to-ingestion activity binding."""
+    pending, seen, found = [identity], set(), set()
     while pending:
         identity = pending.pop()
         if identity in seen:
@@ -226,6 +234,39 @@ def memberships(graph, *, book=None):
             fact = book.page(SOURCE_ACTIVITY_NODE).cell(contract[0].row, contract[0].column)
             if _ingested_kind(graph, node, book=book) == fact[0]:
                 owners.setdefault(contract[0].row[1], set()).add(node)
+    # In lz_encode, the retained If122 is absent from the specialized graph
+    # while its three cat results146/148/150 still have ingested body guards.
+    # Resolve that same If through its fork-scoped canonical value and the
+    # incumbent source-activity binding, before projecting the child guards.
+    read_scope = target.graph.get('lexical_read_scope')
+    if read_scope is not None:
+        scope = activity_scope(graph, book=book)
+        for node, record in (target.graph.get('source_control_records') or {}).items():
+            node = int(node)
+            if node in target:
+                continue
+            identity = book.latest_ref(CANONICAL_VALUE, (read_scope, node))
+            if identity is None:
+                raise ValueError(
+                    f'retained source control {node} lacks canonical identity'
+                )
+            contract, _cell = _binding_from_identity(
+                identity, scope, book, node=node,
+            )
+            if contract is None:
+                raise ValueError(
+                    f'retained source control {node} lacks activity binding'
+                )
+            fact = book.page(SOURCE_ACTIVITY_NODE).cell(
+                contract[0].row, contract[0].column,
+            )
+            kinds = _ingested_kinds_from_identity(identity, book)
+            authored_kind = type(record.get('expression')).__name__
+            if kinds != {fact[0]} or fact[0] != authored_kind:
+                raise ValueError(
+                    f'retained source control {node} disagrees with activity kind'
+                )
+            owners.setdefault(contract[0].row[1], set()).add(node)
     result = {}
     for node, contract in bindings.items():
         if contract is None:
@@ -327,7 +368,14 @@ class ActivitySchedule:
 def _ingested_kind(graph, node, *, book=None):
     from ..common.tensors.topological_reducer import node_identity_cell
     book = current_identity_book() if book is None else book
-    pending, seen, kinds = [node_identity_cell(graph, int(node), book=book)], set(), set()
+    kinds = _ingested_kinds_from_identity(
+        node_identity_cell(graph, int(node), book=book), book,
+    )
+    return next(iter(kinds)) if len(kinds) == 1 else None
+
+
+def _ingested_kinds_from_identity(identity, book):
+    pending, seen, kinds = [identity], set(), set()
     while pending:
         cell = pending.pop()
         if cell in seen:
@@ -338,7 +386,7 @@ def _ingested_kind(graph, node, *, book=None):
         elif cell.page == CANONICAL_VALUE:
             pending.extend(source for source, _stage in book.edges_into(cell)
                            if source.page in {CANONICAL_VALUE, INGESTION_VALUE})
-    return next(iter(kinds)) if len(kinds) == 1 else None
+    return kinds
 
 
 def conditional_memberships(graph, *, book=None):
