@@ -4818,7 +4818,34 @@ def extract_llvm_function(symbol: str) -> str:
     match = pattern.search(LLVM_SSA_MODULE)
     if match is None:
         raise KeyError(f"LLVM SSA symbol {symbol!r} has no function definition")
-    return _extract_braced_definition(LLVM_SSA_MODULE, match)
+    return _float_arithmetic_spelling(_extract_braced_definition(LLVM_SSA_MODULE, match))
+
+
+#: The numeric contract's ``float_arithmetic = "fast"`` as LLVM per-instruction
+#: permissions: reassociation, signed-zero and reciprocal freedom, FMA
+#: contraction, approximate functions.  ``nnan``/``ninf`` are deliberately
+#: absent: kernels start reductions at -inf and masks may carry inf.
+_FAST_FLOAT_FLAGS = "reassoc nsz arcp contract afn"
+_FLOAT_ARITHMETIC_INSTRUCTION = re.compile(r"= (fadd|fsub|fmul|fdiv|frem) (double|float)(?=[ ,])")
+
+
+def _float_arithmetic_spelling(definition: str) -> str:
+    """An authored kernel as the active numeric contract permits it.
+
+    Command-line fast-math does not reach IR that is already written:
+    LLVM reads floating-point permissions from each instruction.  Under
+    ``float_arithmetic == "fast"`` (the ``compute`` contract) every authored
+    float arithmetic instruction carries ``_FAST_FLOAT_FLAGS`` so the
+    vectorizer may reassociate reductions and the backend may fuse FMA;
+    under ``strict`` the authored IEEE order is returned unchanged."""
+
+    from ....compiler.ssa_call_input_adapters import float_arithmetic_policy
+
+    if float_arithmetic_policy() != "fast":
+        return definition
+    return _FLOAT_ARITHMETIC_INSTRUCTION.sub(
+        lambda m: f"= {m.group(1)} {_FAST_FLOAT_FLAGS} {m.group(2)}", definition,
+    )
 
 
 def extract_llvm_declaration(symbol: str) -> str:

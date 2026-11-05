@@ -14,6 +14,7 @@ one.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,7 +65,9 @@ class NativeEvaluator:
             outputs, bindings, self.shapes = _trace(net.channels, net.hidden, self.batch, name)
             self.forward = compile_native_graph_forward(
                 outputs, bindings=bindings, source="ConvValueNet.forward_both + masked softmax",
-                name=name, directory=Path(directory) / name)
+                # One directory per process: Windows will not overwrite a DLL
+                # another process (the live server) has loaded.
+                name=name, directory=Path(directory) / name / f"p{os.getpid()}")
         self.compile_seconds = time.perf_counter() - started
         self.ids = dict(self.forward.input_value_ids)
         self.value_id, self.policy_id = self.forward.output_value_ids
