@@ -847,9 +847,27 @@ function reconcile(game) {
   if (game.ack != null) pred.sent = pred.sent.filter((interval) => interval.seq > game.ack);
   const ship = { ...game.you };
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
-  if (before) { pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
-                if (Math.hypot(...pred.offset) > SYNC_SNAP) pred.offset = [0, 0];
-                syncFaithfulness(Math.hypot(before[0] - ship.x, before[1] - ship.y)); }
+  // AUTHORITY WITHIN TOLERANCE.  Page and server are two recordings of the
+  // same signal, ordered by input seq, not one state stepped in lockstep.
+  // While the page's own ship stays within the game's adoption tolerance
+  // (``predict.adopt``, the same bound the server adopts the page's reports
+  // under) the page keeps it: it holds control, the server follows.  Only a
+  // disagreement past the tolerance hands control back -- the server's
+  // replay becomes the ship and the difference is eased away, never jumped.
+  // Axes the motion law does not declare are the server's alone.
+  const declared = [["x", "vx"], ["y", "vy"]].filter(([pos]) => game.predict[pos]);
+  const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos])) : Infinity;
+  const tolerance = Number(game.predict.adopt ?? 0);
+  if (pred.ship && error <= tolerance) {
+    for (const [pos, vel] of declared) { ship[pos] = pred.ship[pos]; ship[vel] = pred.ship[vel]; }
+    // The server's own axes still move only on its word -- eased, not jumped.
+    if (before) ["x", "y"].forEach((pos, i) => { if (!game.predict[pos]) pred.offset[i] += before[i] - ship[pos]; });
+    syncFaithfulness(0);
+  } else if (before) {
+    pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
+    if (Math.hypot(...pred.offset) > SYNC_SNAP) pred.offset = [0, 0];
+    syncFaithfulness(Math.hypot(before[0] - ship.x, before[1] - ship.y));
+  }
   pred.ship = ship;
 }
 // The predictor runs on its own clock, PREDICT_HZ, unbound from the display's

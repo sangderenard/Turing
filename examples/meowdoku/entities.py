@@ -502,7 +502,7 @@ class EntityGame(Game):
         st["autopilot"] = self.autopilot
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
-            st["predict"] = {"lane": k, **(self.motion() or {})}
+            st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, **(self.motion() or {})}
             st["ack"] = self.ack
             st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
                          "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0),
