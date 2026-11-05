@@ -27,9 +27,14 @@ from meowdoku.session import MeowdokuSession  # noqa: E402
 
 
 def find_sprites(tile_root: Path) -> dict[str, tiles.TileSprite]:
-    """The baked sprites when a bake exists, else the single renders."""
+    """The Phong sprites when rendered, else the baked path-traced ones,
+    else the single renders."""
+    from meowdoku.phong_tiles import load_phong_sprites
+
+    sprites: dict[str, tiles.TileSprite] = load_phong_sprites(tile_root / "phong") if (tile_root / "phong").is_dir() else {}
+    if len(sprites) == 3:
+        return sprites
     bake = tile_root / "bake"
-    sprites: dict[str, tiles.TileSprite] = {}
     if bake.is_dir():
         sprites = tiles.load_sprites(bake, tiles.tile_order_package())
     for role, folder in (("x_mark", "rendered_x"), ("heart", "rendered_heart"), ("cat", "rendered_cat")):

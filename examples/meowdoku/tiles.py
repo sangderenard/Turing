@@ -118,6 +118,65 @@ PALETTES: dict[str, np.ndarray] = {
 }
 
 
+#: Ring palettes: a hue circle with a saturation and value; ``ring_palette``
+#: gives every region its own hue on it, relaxed so touching regions repel.
+RINGS: dict[str, tuple[float, float]] = {
+    "pastel": (0.32, 0.92), "vivid": (0.78, 0.95), "soft": (0.22, 0.97), "deep": (0.65, 0.78),
+}
+
+
+def _hsv_to_rgb(hue: np.ndarray, saturation: float, value: float) -> np.ndarray:
+    h6 = (np.asarray(hue, np.float64) % 1.0) * 6.0
+    k = np.floor(h6)
+    f = h6 - k
+    p, q, s = value * (1 - saturation), value * (1 - saturation * f), value * (1 - saturation * (1 - f))
+    v = np.full_like(f, value)
+    choose = [k == 0, k == 1, k == 2, k == 3, k == 4]
+    return np.stack([np.select(choose, [v, q, p, p, s], v),
+                     np.select(choose, [s, v, v, q, p], p),
+                     np.select(choose, [p, p, s, v, v], q)], axis=-1)
+
+
+def ring_hues(region_grid: np.ndarray, *, iterations: int = 400, step: float = 0.02,
+              neighbour_weight: float = 1.0, crowd_weight: float = 0.08, seed: int = 0,
+              backend: str = "numpy", device=None) -> np.ndarray:
+    """One hue per region, relaxed on the colour wheel.
+
+    ``k`` hues start evenly spaced around the ring (in a seeded random order
+    so the layout is not the region index).  Each iteration every hue is
+    pushed away from the hues of the regions it TOUCHES (circular
+    repulsion, ``neighbour_weight``) and, weakly, from every other hue
+    (``crowd_weight``), so touching regions end far apart in hue while all
+    ``k`` hues stay distinct and spread; the whole set is free to drift
+    around the ring.  AbstractTensor arithmetic over the (k, k) pair table,
+    float masks, no boolean operators.  Returns hues in [0, 1)."""
+    from src.common.tensors import AbstractTensor as AT
+
+    grid = np.asarray(region_grid).astype(int)
+    touches = region_adjacency(grid).astype(np.float64)
+    k = touches.shape[0]
+    order = np.random.default_rng(seed).permutation(k)
+    start = np.empty(k); start[order] = np.arange(k) / float(k)
+    with AT.use_backend(backend, device):
+        hue = AT.tensor(start.reshape(k, 1))
+        weight = AT.tensor(touches * neighbour_weight + (1.0 - np.eye(k)) * crowd_weight)
+        for _ in range(int(iterations)):
+            delta = hue - hue.reshape((1, k))                           # (k, k) circular difference
+            delta = delta - (delta + 0.5).floor() if hasattr(delta, "floor") else delta - ((delta + 0.5) // 1.0)
+            # Repulsion falls off with ring distance; sign pushes apart.
+            distance = delta.abs() + 1e-6
+            push = (delta / distance) * (0.5 - distance).maximum(0.0 * distance) * weight
+            hue = hue + push.sum(dim=1).reshape((k, 1)) * (float(step) / float(k))
+            hue = hue - hue.floor() if hasattr(hue, "floor") else hue - (hue // 1.0)
+        return np.asarray(hue.numpy(), np.float64).reshape(k)
+
+
+def ring_palette(region_grid: np.ndarray, ring: str | tuple[float, float] = "pastel", **options) -> np.ndarray:
+    """(k, 3) linear RGB per region: ``ring_hues`` on the named ring."""
+    saturation, value = RINGS[ring] if isinstance(ring, str) else ring
+    return _hsv_to_rgb(ring_hues(region_grid, **options), saturation, value)
+
+
 def region_adjacency(region_grid: np.ndarray) -> np.ndarray:
     """(k, k) boolean: regions sharing a 4-neighbour edge."""
     k = int(region_grid.max()) + 1
@@ -391,6 +450,8 @@ def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, heart
     cat = cat.reshape(n, n)
     if palette is None:
         palette = region_palette(int(region.max()) + 1)      # the shader's own formula
+    elif isinstance(palette, str) and palette.startswith("ring-"):
+        palette = ring_palette(region, palette[5:])          # one relaxed hue per region
     else:
         palette = contrast_palette(region, palette)          # touching regions contrast in hue
     board = n * cell_px
@@ -429,5 +490,5 @@ def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, heart
 __all__ = [
     "CAT", "HEART", "ROLE_TOKENS", "SPECTRAL_ROOT", "TileSprite", "X_MARK",
     "compile_tiles", "compose_board", "load_sprites", "native_kernels_available",
-    "region_palette", "contrast_palette", "region_adjacency", "PALETTES", "render_tiles", "tile_order_package", "write_tile_package",
+    "region_palette", "contrast_palette", "ring_palette", "ring_hues", "region_adjacency", "PALETTES", "RINGS", "render_tiles", "tile_order_package", "write_tile_package",
 ]
