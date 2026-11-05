@@ -1,0 +1,301 @@
+"""Meowdoku tiles as ray-traced sprites from spectral-analyzer's glyph maker.
+
+This module is deliberately outside the compiler: it is Python and GLSL
+through the sibling ``spectral-analyzer`` repository, the way its own
+``compile_base_material_webgl.py`` reaches into Turing.  Nothing here has to
+lower; a web server can run it.
+
+The glyph maker is spectral-analyzer's declarative scene-order pipeline
+(``scene_orders.py``, ``camera_software/render_assets.py``): a token is a
+font outline extruded into a glossy solid half-embedded in a matte slate,
+photographed head-on by the lab's thick-lens camera under its ring light,
+through the native BDPT renderer.  ``sprite_compositor`` then separates the
+capture into a background-independent sprite: a premultiplied body layer, an
+alpha from the authored outline, and a signed additive layer holding the
+light the glossy body spills onto its neighbours.
+
+Meowdoku needs three sprites, not one per region: the cat (``U+1F431`` from
+Segoe UI Symbol, which has real outline geometry for it), the X mark
+(``U+2715``) and the heart (``U+2665``).  Empty tiles are flat region
+colours, the same palette the board shader derives from the region id, and
+the compositor lays sprites over them.  So the board costs three renders.
+
+Three steps, each its own call so a server can cache between them:
+
+1. ``tile_order_package()``: the scene-order package (JSON data).
+2. ``compile_tiles`` / ``render_tiles``: spectral-analyzer's CLI on it.
+   Compile needs only Python; render needs the native kernels
+   (``_spectral_kernels``), which are a C++ build.
+3. ``load_sprites`` + ``compose_board``: sprites from the rendered linear
+   frames, composed over the board state into one image.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+import numpy as np
+
+HERE = Path(__file__).resolve()
+SPECTRAL_ROOT = HERE.parents[3] / "spectral-analyzer"
+
+CAT = "\U0001F431"
+X_MARK = "✕"
+HEART = "♥"
+ROLE_TOKENS = {"cat": CAT, "x_mark": X_MARK, "heart": HEART}
+#: Token -> the font that has real outline geometry for it on this machine
+#: (DejaVu Sans has no cat; Segoe UI Symbol draws it with 465 vertices).
+TOKEN_FONTS = {CAT: ("Segoe UI Symbol", "normal"), X_MARK: ("DejaVu Sans", "bold"),
+               HEART: ("DejaVu Sans", "bold")}
+#: Glyph materials in the scene-order material vocabulary (linear albedo,
+#: reflectivity, diffusion, absorption, roughness, metallic, ior).  The cat
+#: is the board shader's cat colour, glossy; the mark is slate; the heart is
+#: the accepted red ink.
+TILE_MATERIALS = {
+    "cat_orange": {"albedo_rgb": [0.96, 0.55, 0.16], "reflectivity": 0.45, "diffusion": 0.22,
+                   "absorption": 0.30, "roughness": 0.08, "metallic": 0.05, "ior": 1.5},
+    "mark_slate": {"albedo_rgb": [0.30, 0.30, 0.32], "reflectivity": 0.25, "diffusion": 0.55,
+                   "absorption": 0.6, "roughness": 0.35, "metallic": 0.0},
+    "heart_red": {"albedo_rgb": [0.78, 0.006, 0.004], "reflectivity": 0.5, "diffusion": 0.18,
+                  "absorption": 0.31, "roughness": 0.065, "metallic": 0.08, "ior": 1.52},
+}
+ROLE_MATERIALS = {"cat": "cat_orange", "x_mark": "mark_slate", "heart": "heart_red"}
+
+
+def spectral_modules():
+    """Import spectral-analyzer's asset modules from the sibling checkout."""
+    if not SPECTRAL_ROOT.is_dir():
+        raise RuntimeError(f"spectral-analyzer is required beside turing at {SPECTRAL_ROOT}")
+    if str(SPECTRAL_ROOT) not in sys.path:
+        sys.path.insert(0, str(SPECTRAL_ROOT))
+    import scene_orders
+    from camera_software import render_assets, sprite_compositor
+    return scene_orders, render_assets, sprite_compositor
+
+
+def region_palette(n: int) -> np.ndarray:
+    """Flat region colours: the board shader's formula, so a composed board
+    and the shader-drawn board agree on what region k looks like."""
+    share = np.arange(n, dtype=np.float64) / float(n)
+    return np.stack([
+        0.62 + 0.30 * np.sin(share * 6.2831853 + phase)
+        for phase in (0.0, 2.0943951, 4.1887902)
+    ], axis=-1)
+
+
+def tile_order_package(roles: tuple[str, ...] = ("cat", "x_mark", "heart")) -> dict[str, Any]:
+    """The scene-order package for the tile sprites: one ink-on-slate job per
+    role, each in the font that has its glyph and in its own material."""
+    scene_orders, render_assets, _ = spectral_modules()
+    package = None
+    jobs = []
+    for role in roles:
+        token = ROLE_TOKENS[role]
+        family, weight = TOKEN_FONTS[token]
+        font = render_assets.FontAssetSpec(family=family, weight=weight)
+        order = render_assets.build_ink_on_slate_order([token], font=font)
+        if package is None:
+            package = order
+            package["defaults"]["materials"].update(TILE_MATERIALS)
+        for job in order["jobs"]:
+            job = dict(job)
+            job["id"] = f"meowdoku_{role}"
+            job["font"] = font.scene_order_mapping()
+            job["geometry"] = {**job["geometry"], "material": ROLE_MATERIALS[role]}
+            jobs.append(job)
+    assert package is not None
+    package["jobs"] = jobs
+    scene_orders.validate_order(package)
+    return package
+
+
+def write_tile_package(path: str | Path, **options) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tile_order_package(**options), indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
+def _run_scene_orders(package_path: Path, out_dir: Path, mode: str, jobs: tuple[str, ...] = (),
+                      timeout: float = 900.0) -> dict[str, Any]:
+    command = [sys.executable, str(SPECTRAL_ROOT / "render_scene_order.py"), str(package_path),
+               mode, "--out-dir", str(out_dir)]
+    for job in jobs:
+        command += ["--job", job]
+    completed = subprocess.run(command, cwd=str(SPECTRAL_ROOT), capture_output=True,
+                               text=True, encoding="utf-8", timeout=timeout)
+    if completed.returncode != 0:
+        raise RuntimeError(f"render_scene_order {mode} failed:\n{completed.stderr[-2000:]}")
+    manifests = {}
+    for job_dir in sorted(Path(out_dir).iterdir()):
+        for name in ("compile_manifest.json", "composition_manifest.json"):
+            manifest = job_dir / name
+            if manifest.exists():
+                manifests[job_dir.name] = json.loads(manifest.read_text(encoding="utf-8"))
+                break
+    return manifests
+
+
+def glyph_geometry(package: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each job's subject geometry from the scene order alone: the font
+    outline resolved, extruded and triangulated by ``scene_orders``' own
+    glyph builder against the job's embed plane.  This is what a compile
+    proves about the authoring (font found, glyph has an outline, extrusion
+    closed) without the lab scene, which needs the native kernels."""
+    scene_orders, _, _ = spectral_modules()
+    report = {}
+    for job in scene_orders.resolved_jobs(package):
+        planes = {str(plane["id"]): plane for plane in job["planes"]}
+        plane = planes[str(job["geometry"].get("embed_plane", job["planes"][0]["id"]))]
+        triangles = scene_orders._glyph_triangles(job, plane)
+        report[str(job["id"])] = {
+            "token": str(job["token"]), "font": dict(job.get("font", {})),
+            "glyph_triangles": int(triangles.shape[0]),
+            "bounds_min": triangles.reshape(-1, 3).min(axis=0).tolist(),
+            "bounds_max": triangles.reshape(-1, 3).max(axis=0).tolist(),
+            "material": str(job["geometry"].get("material")),
+        }
+    return report
+
+
+def compile_tiles(package_path: str | Path, out_dir: str | Path, jobs: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Compile the tile orders into the lab scene (spectral-analyzer's
+    ``--compile-only``).  That path imports the native kernels for the lab
+    tracer scene, so without them this falls back to ``glyph_geometry``:
+    the same glyph builder, without the retained lab geometry."""
+    if native_kernels_available():
+        return _run_scene_orders(Path(package_path), Path(out_dir), "--compile-only", jobs)
+    package = json.loads(Path(package_path).read_text(encoding="utf-8"))
+    report = glyph_geometry(package)
+    if jobs:
+        report = {name: item for name, item in report.items() if name in jobs}
+    out = Path(out_dir)
+    for name, item in report.items():
+        (out / name).mkdir(parents=True, exist_ok=True)
+        (out / name / "glyph_geometry.json").write_text(json.dumps(item, indent=2), encoding="utf-8")
+    return {name: {"compile": item, "lab_scene": "absent: native kernels not built"}
+            for name, item in report.items()}
+
+
+def native_kernels_available() -> bool:
+    probe = subprocess.run([sys.executable, "-c", "import _spectral_kernels"],
+                           cwd=str(SPECTRAL_ROOT), capture_output=True, text=True)
+    return probe.returncode == 0
+
+
+def render_tiles(package_path: str | Path, out_dir: str | Path, jobs: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Ray-trace the tiles through spectral-analyzer's native thick-lens
+    BDPT.  Refuses by name when the native kernels are not built."""
+    if not native_kernels_available():
+        raise RuntimeError(
+            "spectral-analyzer's native kernels (_spectral_kernels) are not built in "
+            f"{SPECTRAL_ROOT}; the renderer needs its csrc C++ build (pybind11) before "
+            "tiles can be ray-traced")
+    return _run_scene_orders(Path(package_path), Path(out_dir), "--render", jobs)
+
+
+# ---------------------------------------------------------------------------
+# Sprites and the board compositor
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TileSprite:
+    """A background-independent tile sprite: ``out = premultiplied +
+    (1 - alpha) * destination + additive`` (sprite_compositor's contract)."""
+
+    role: str
+    premultiplied_rgb: np.ndarray   # (h, w, 3) linear
+    alpha: np.ndarray               # (h, w)
+    additive_rgb: np.ndarray        # (h, w, 3) linear, signed
+
+    def resampled(self, size: int) -> "TileSprite":
+        """Nearest resample of all three layers to ``size`` x ``size``."""
+        h, w = self.alpha.shape
+        rows = np.minimum((np.arange(size) * h / size).astype(int), h - 1)
+        cols = np.minimum((np.arange(size) * w / size).astype(int), w - 1)
+        return TileSprite(
+            self.role, self.premultiplied_rgb[rows][:, cols], self.alpha[rows][:, cols],
+            self.additive_rgb[rows][:, cols],
+        )
+
+
+def load_sprites(render_dir: str | Path, package: Mapping[str, Any]) -> dict[str, TileSprite]:
+    """Sprites from rendered jobs: each job directory's linear ``.npy`` frame
+    through ``extract_raytraced_sprite`` with the job's own asset recipe."""
+    _, render_assets, sprite_compositor = spectral_modules()
+    capture = render_assets.AtlasCaptureSpec()
+    sprites = {}
+    for job in package["jobs"]:
+        job_dir = Path(render_dir) / str(job["id"])
+        frames = sorted(job_dir.glob("*.npy")) if job_dir.is_dir() else []
+        if not frames:
+            continue
+        linear = np.load(frames[0])
+        if linear.ndim == 3 and linear.shape[-1] > 3:
+            linear = linear[..., :3]
+        token = str(job["token"])
+        font = render_assets.FontAssetSpec.from_mapping(job.get("font", package["defaults"]["font"]))
+        asset = render_assets.ink_token_asset(token, font=font)
+        sprite = sprite_compositor.extract_raytraced_sprite(linear, asset, capture)
+        role = next(role for role, held in ROLE_TOKENS.items() if held == token)
+        sprites[role] = TileSprite(role, sprite.premultiplied_rgb, sprite.alpha, sprite.additive_rgb)
+    return sprites
+
+
+def compose_board(cat: np.ndarray, x_mark: np.ndarray, region: np.ndarray, hearts: int,
+                  sprites: Mapping[str, TileSprite], *, cell_px: int = 96, n: int | None = None,
+                  grid_px: int = 2, max_hearts: int = 3) -> np.ndarray:
+    """One board image (linear RGB in [0, 1]) from the state columns: flat
+    region tiles, the cat and X sprites composed over them, a grid, and a
+    hearts row beneath."""
+    cat = np.asarray(cat, dtype=np.float64).reshape(-1)
+    n = int(n or round(len(cat) ** 0.5))
+    x_mark = np.asarray(x_mark, dtype=np.float64).reshape(n, n)
+    region = np.asarray(region, dtype=np.float64).reshape(n, n).astype(int)
+    cat = cat.reshape(n, n)
+    palette = region_palette(int(region.max()) + 1)
+    board = n * cell_px
+    image = np.zeros((board + cell_px, board, 3), dtype=np.float64)
+    scaled = {role: sprite.resampled(cell_px) for role, sprite in sprites.items()}
+
+    def lay(destination, sprite):
+        alpha = sprite.alpha[..., None]
+        return sprite.premultiplied_rgb + (1.0 - alpha) * destination + sprite.additive_rgb
+
+    for r in range(n):
+        for c in range(n):
+            y0, x0 = r * cell_px, c * cell_px
+            tile = np.broadcast_to(palette[region[r, c]], (cell_px, cell_px, 3)).copy()
+            if cat[r, c] > 0 and "cat" in scaled:
+                tile = lay(tile, scaled["cat"])
+            elif x_mark[r, c] > 0 and "x_mark" in scaled:
+                tile = lay(tile, scaled["x_mark"])
+            image[y0:y0 + cell_px, x0:x0 + cell_px] = tile
+    for k in range(n + 1):                       # grid lines
+        line = np.clip(k * cell_px - grid_px // 2, 0, board - grid_px)
+        image[line:line + grid_px, :board] = 0.12
+        image[:board, line:line + grid_px] = 0.12
+    strip = image[board:, :]
+    strip[...] = 0.09
+    if "heart" in scaled:
+        for k in range(max_hearts):
+            x0 = k * cell_px
+            if x0 + cell_px > board:
+                break
+            dest = strip[:, x0:x0 + cell_px]
+            strip[:, x0:x0 + cell_px] = lay(dest, scaled["heart"]) if k < hearts else dest * 0.5 + 0.045
+    return np.clip(image, 0.0, 1.0)
+
+
+__all__ = [
+    "CAT", "HEART", "ROLE_TOKENS", "SPECTRAL_ROOT", "TileSprite", "X_MARK",
+    "compile_tiles", "compose_board", "load_sprites", "native_kernels_available",
+    "region_palette", "render_tiles", "tile_order_package", "write_tile_package",
+]
