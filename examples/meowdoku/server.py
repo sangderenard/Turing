@@ -123,6 +123,10 @@ class Table:
         elif kind == "layout":
             if hasattr(self.game, "layout"):
                 self.game.layout(float(payload.get("aspect") or 0.0))
+        elif kind == "move":
+            if not hasattr(self.game, "uci_move") or getattr(self.game, "input", "") == "watch":
+                raise ValueError("this game takes no typed moves")
+            self.game.uci_move(payload.get("uci", ""))
         elif kind in ("arena_save", "arena_stop", "arena_resume"):
             if not isinstance(self.game, ChessArena):
                 raise ValueError("not the chess arena")

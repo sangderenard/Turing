@@ -1524,6 +1524,9 @@ function applyState(game) {
   $("lichess-stop").disabled = !lichess || lichess.pause_requested;
   $("lichess-resume").disabled = !lichess || !lichess.pause_requested;
   syncMeowdokuBar(game);
+  if (game.text_board) $("position").textContent =
+    `${game.turn} to move${game.check ? " (check)" : ""}${game.outcome ? ` · game over: ${game.outcome}` : ""}\n${game.text_board}`
+    + (game.legal_uci && game.legal_uci.length ? `\nlegal: ${game.legal_uci.join(" ")}` : "");
   if (game.game === "chess_arena") $("arena-stop").textContent = game.arena_running ? "Stop training" : "Resume training";
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
@@ -1891,6 +1894,24 @@ window.addEventListener("keydown", async (e) => {
 });
 $("undo").onclick = () => act({ type: "undo" });
 $("reset").onclick = () => act({ type: "reset" });
+// Typed chess moves: UCI in the box, Submit (or Enter).  The result line says
+// what happened, including why a move was refused.
+async function submitMove() {
+  const box = $("move-input"), text = box.value.trim();
+  if (!text) return;
+  $("move-result").textContent = "…";
+  try {
+    const response = await fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify({ type: "move", uci: text }) });
+    const data = await response.json();
+    if (data.error) { $("move-result").textContent = `refused: ${data.error}`; return; }
+    box.value = "";
+    $("move-result").textContent = `played ${text}`;
+    applyState(data);
+  } catch (error) { $("move-result").textContent = `failed: ${error}`; }
+}
+$("move-submit").onclick = submitMove;
+$("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
 $("arena-save").onclick = () => act({ type: "arena_save" });
 $("arena-stop").onclick = () => act({ type: state.game && state.game.arena_running ? "arena_stop" : "arena_resume" });
 $("lichess-stop").onclick = () => act({ type: "lichess_pause" });

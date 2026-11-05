@@ -30,6 +30,14 @@
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   .arena-only, #bar .arena-only { display: none; }
+  .chessmove-only, #bar .chessmove-only, #position { display: none; }
+  body[data-game="chess"] #bar .chessmove-only, body[data-game="chess_vs_net"] #bar .chessmove-only { display: inline-flex; }
+  body[data-game="chess"] #position, body[data-game="chess_vs_net"] #position,
+  body[data-game="chess_arena"] #position, body[data-game="lichess"] #position { display: block; }
+  /* The position as text: readable without the 3D board. */
+  #position { position: fixed; left: 12px; bottom: 12px; z-index: 3; margin: 0; padding: 8px 10px; max-width: 46ch;
+              font: 13px/1.35 ui-monospace, Consolas, monospace; white-space: pre-wrap; background: rgba(16,16,22,0.82);
+              border: 1px solid #3a3a42; border-radius: 8px; color: #e8e8ee; }
   body[data-game="chess_arena"] #bar .arena-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
   #player { width: 9em; }
@@ -68,6 +76,10 @@
   <button id="new">New</button>
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
+  <label class="chessmove-only" for="move-input">Move</label>
+  <input id="move-input" class="chessmove-only" type="text" placeholder="e2e4" autocomplete="off" spellcheck="false" size="7" aria-label="Chess move in UCI, like e2e4">
+  <button id="move-submit" class="chessmove-only">Submit move</button>
+  <span id="move-result" class="chessmove-only" role="status" aria-live="polite"></span>
   <button id="arena-save" class="arena-only" title="Write the network's weights to disk now">Save network</button>
   <button id="arena-stop" class="arena-only" title="Stop self-play training (saves first)">Stop training</button>
   <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>
@@ -96,6 +108,7 @@
 </div>
 <div id="scores"></div>
 <div id="hud"></div>
+<pre id="position" aria-label="Chess position as text" aria-live="polite"></pre>
 <div id="splash"><div id="splash-title"></div><div id="splash-detail"></div></div>
 <button id="fs-exit" title="Leave fullscreen (F or Esc)">✕</button>
 <canvas id="gl"></canvas>

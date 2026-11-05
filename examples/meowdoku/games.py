@@ -561,7 +561,36 @@ class Chess(BoardGame):
             st["status"] = f"{self.turn} to move · check · {self.moves} moves"
         st["outcome"] = end
         st["check"] = bool(end is None and self.in_check(self.turn))
+        # The position as text, for players (and agents) who move by typing:
+        # rank 8 at the top, White in capitals, '.' an empty square; and every
+        # legal move for the side to move in UCI (e2e4, e7e8 promotes).
+        from meowdoku.lichess import cell_to_square
+        letters = {"king": "k", "queen": "q", "rook": "r", "bishop": "b", "knight": "n", "pawn": "p"}
+        rows = []
+        for r in range(8):
+            line = ""
+            for c in range(8):
+                piece = self.pieces.get(self.idx(r, c))
+                line += "." if piece is None else (letters[piece[0]].upper() if piece[1] == "white" else letters[piece[0]])
+            rows.append(f"{8 - r} {' '.join(line)}")
+        st["text_board"] = "\n".join(rows + ["  a b c d e f g h"])
+        st["legal_uci"] = sorted(cell_to_square(s) + cell_to_square(d) for s, d in self.all_legal_moves()) if end is None else []
+        st["turn"] = self.turn
         return st
+
+    def uci_move(self, text: str) -> None:
+        """Play one move typed in UCI (``e2e4``) through the same path a click
+        takes, so an answering engine and learning happen as they would."""
+        from meowdoku.lichess import square_to_cell
+        uci = str(text or "").strip().lower().replace("-", "").replace(" ", "")
+        if len(uci) < 4 or uci[0] not in "abcdefgh" or uci[2] not in "abcdefgh" or not uci[1].isdigit() or not uci[3].isdigit():
+            raise ValueError(f"not a UCI move: {text!r} (write it like e2e4)")
+        src, dst = square_to_cell(uci[:2]), square_to_cell(uci[2:4])
+        if (src, dst) not in set(self.all_legal_moves()):
+            raise ValueError(f"illegal move {uci[:4]} for {self.turn}")
+        self.selected = None
+        self.cell(*self.rc(src), "primary")
+        self.cell(*self.rc(dst), "primary")
 
 
 class Checkers(BoardGame):
