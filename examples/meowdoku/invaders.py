@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from meowdoku.entities import EntityGame
+from meowdoku.entities import EntityGame, LawPiece
 from meowdoku.entity_motion import damped_axis
 from src.common.tensors import AbstractTensor
 
@@ -111,7 +111,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
                   move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     n = int(lane.shape[0])
-    f = lambda mask: mask.to_dtype("float")  # noqa: E731
+    f = lambda mask: mask.to_dtype("float64")  # noqa: E731
     live = alive > 0.0
     playing = lives > 0.0
     is_player, is_shot, is_bomb = slot == PLAYER, slot == SHOT, slot == BOMB
@@ -245,29 +245,17 @@ STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner",
 SETTINGS = ("field_w",)
 
 
-class InvadersPiece:
-    """The law as a dt-system piece (``llvm_dt_system.PIECE_API``)."""
+class InvadersPiece(LawPiece):
+    """The law as a dt-system piece; compiled by ``LawPiece.compile``."""
 
     entry = "invaders_step"
+    law = staticmethod(invaders_step)
     argument_names = ("lane", "slot", "home_x", "home_y", "points", "rx", "ry", "home_hp",
                       *STATE, *SETTINGS, *CONTROLS, "dt")
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):
-        self.batch = int(batch)
-        self._bound = None
-
-    def instantiate(self, columns, outputs=None):
-        self._bound = tuple(columns[name] for name in self.argument_names)
-        return ()
-
-    def __call__(self, *columns):
-        if len(columns) != len(self.argument_names):
-            raise TypeError(f"{self.entry}: takes {len(self.argument_names)} columns, got {len(columns)}")
-        tensors = [AbstractTensor.get_tensor(np.asarray(column, dtype=np.float64)) for column in columns]
-        produced = invaders_step(*tensors)
-        return tuple(np.broadcast_to(np.asarray(value.numpy(), dtype=np.float64), (self.batch,)).copy()
-                     for value in produced)
+        super().__init__(batch)
 
 
 def field_width(aspect: float | None) -> float:

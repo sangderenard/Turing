@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from meowdoku.entities import EntityGame, as_float, block_hits, first_of, noise
+from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
 from meowdoku.entity_motion import damped_axis
 from src.common.tensors import AbstractTensor
 
@@ -183,9 +183,9 @@ def scroller_step(lane, slot, rx, ry,
     bullet_pace = where(is_bullet & live3, pace, 0.0).max() + (f(is_player) * pace).sum()
     shot_window = 2.0 * (0.3 + 0.36)
     bullet_window = 2.0 * (SHIP_RX + 0.12)
-    dt_limit = ((0.9 * shot_window / (shot_pace + 1e-6))
-                .clip(0.0, 0.9 * bullet_window / (bullet_pace + 1e-6))
-                .clip(0.0, 0.5 * TAU)) + zero
+    shot_limit = 0.9 * shot_window / (shot_pace + 1e-6)
+    bullet_limit = 0.9 * bullet_window / (bullet_pace + 1e-6)
+    dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
     return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, owner1, kind1, age1, timer1,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
@@ -197,27 +197,16 @@ STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "kind", "
 SETTINGS = ("field_w",)
 
 
-class ScrollerPiece:
-    """The law as a dt-system piece (``llvm_dt_system.PIECE_API``)."""
+class ScrollerPiece(LawPiece):
+    """The law as a dt-system piece; compiled by ``LawPiece.compile``."""
 
     entry = "scroller_step"
+    law = staticmethod(scroller_step)
     argument_names = ("lane", "slot", "rx", "ry", *STATE, *SETTINGS, *CONTROLS, "dt")
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):
-        self.batch = int(batch)
-        self._bound = None
-
-    def instantiate(self, columns, outputs=None):
-        self._bound = tuple(columns[name] for name in self.argument_names)
-        return ()
-
-    def __call__(self, *columns):
-        if len(columns) != len(self.argument_names):
-            raise TypeError(f"{self.entry}: takes {len(self.argument_names)} columns, got {len(columns)}")
-        tensors = [AbstractTensor.get_tensor(np.asarray(column, dtype=np.float64)) for column in columns]
-        return tuple(np.broadcast_to(np.asarray(value.numpy(), dtype=np.float64), (self.batch,)).copy()
-                     for value in scroller_step(*tensors))
+        super().__init__(batch)
 
 
 def field_width(aspect: float | None) -> float:

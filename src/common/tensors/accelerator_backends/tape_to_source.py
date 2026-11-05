@@ -104,7 +104,7 @@ _AXIS_FUNCTIONS = {"sum", "prod", "mean", "max", "min", "cumsum", "cumprod", "al
 
 # PyTorch's two-tensor elementwise functions reject a Python scalar where the
 # NumPy equivalents accept one.
-_TENSOR_ONLY = {"maximum", "minimum", "where"}
+_TENSOR_ONLY = {"maximum", "minimum", "where", "atan2"}
 
 
 def _is_scalar_literal(expression: str) -> bool:
@@ -121,6 +121,28 @@ def _is_scalar_literal(expression: str) -> bool:
     except (TypeError, ValueError):
         return expression in ("True", "False")
     return True
+
+
+def _float_width(result: Any) -> int | None:
+    """32 or 64: the float width of a recorded result, or None if unknown."""
+    try:
+        import numpy as np
+        dtype = np.asarray(result.numpy() if hasattr(result, "numpy") else result).dtype
+    except Exception:
+        return None
+    return {np.dtype("float32"): 32, np.dtype("float64"): 64}.get(dtype)
+
+
+def _index_text(part: Any) -> str:
+    """One basic index as source: an int, ``...``, ``None`` or ``a:b:c``."""
+    if isinstance(part, slice):
+        text = lambda v: "" if v is None else str(int(v))  # noqa: E731
+        return f"{text(part.start)}:{text(part.stop)}" + (f":{int(part.step)}" if part.step is not None else "")
+    if part is Ellipsis:
+        return "..."
+    if part is None:
+        return "None"
+    return str(int(part))
 
 
 def _literal(value: Any) -> str:
@@ -195,6 +217,44 @@ class _Printer:
             if len(data) == 1:
                 return _literal(data[0])
             return dialect.call(dialect.array, repr(data))
+
+        if raw == "slice":
+            # Basic indexing only; a tensor index has no spelling here yet.
+            if params.get("index_tensors"):
+                return None
+            index = params.get("slices")
+            parts = index if isinstance(index, tuple) else (index,)
+            return f"{args[0]}[{', '.join(_index_text(part) for part in parts)}]"
+
+        if raw in {"uitofp", "sitofp"}:
+            # A cast to a float type: the width is the one the trace produced
+            # (``to_dtype("float")`` is float32 on NumPy, ``"float64"`` is not),
+            # read from the recorded result rather than assumed.
+            width = _float_width(node.ctx.get("result"))
+            if width is None:
+                return None
+            if dialect is NUMPY:
+                return f"{args[0]}.astype(np.float{width})"
+            return f"{args[0]}.to(torch.float{width})"
+
+        if raw == "logical_not":
+            return dialect.call("logical_not", args[0])
+
+        if raw == "clamp":
+            low, high = params.get("min"), params.get("max")
+            # A bound recorded as a parameter is a number or nothing; a tensor
+            # bound is dataflow the tape did not trace, and printing it would
+            # freeze its traced value into the program -- refuse instead.
+            if any(bound is not None and not isinstance(bound, (int, float)) for bound in (low, high)):
+                return None
+            if dialect is NUMPY:
+                return dialect.call("clip", args[0], _literal(low) if low is not None else "None",
+                                    _literal(high) if high is not None else "None")
+            return dialect.call("clamp", args[0], f"min={_literal(low) if low is not None else 'None'}",
+                                f"max={_literal(high) if high is not None else 'None'}")
+
+        if raw == "atan2":
+            return dialect.call("arctan2" if dialect is NUMPY else "atan2", *self._tensorize("atan2", args))
 
         if raw in {"reshape", "view"}:
             shape = tuple(params.get("new_shape") or params.get("shape") or ())
