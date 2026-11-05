@@ -10018,6 +10018,144 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _runtime_all_axis_boolean_domain_findings(module, book, row, fact):
+        """Check the counted flat view used by a runtime Boolean fold."""
+        from .concordance_declarations import SSA_VALUE, TENSOR_REDUCTION_DOMAIN
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+        from .tensor_ssa_lowering import (
+            _REDUCTION_CODES, _constant_payload, _dynamic_tensor_geometry_evidence,
+        )
+
+        function = module.functions.get(str(row[0]))
+        valid = (
+            function is not None and isinstance(fact, tuple) and len(fact) == 10
+            and fact[0] == "all-axis-runtime" and fact[2] in {"all", "any"}
+            and all(type(value) is int for value in (fact[1], *fact[3:]))
+        )
+        if valid:
+            (_, source_id, operation, shape_id, rank_id, count_id,
+             flat_id, flat_rank, axis_id, code_id) = fact
+            scope = function_scope_of(function)
+            receipt = book.latest_ref(TENSOR_REDUCTION_DOMAIN, row)
+            causes = {cause for cause, _ in book.edges_into(receipt)}
+            source = posted_ssa_value_fact(function, source_id, book=book)
+            result = posted_ssa_value_fact(function, row[1], book=book)
+            geometry = _dynamic_tensor_geometry_evidence(module, function, source_id)
+            valid = (
+                source is not None and source.physical_dtype == "float64"
+                and source.storage == "span" and type(source.rank) is int
+                and source.rank > 0 and result is not None
+                and result.dtype == "bool" and result.physical_dtype == "float64"
+                and result.storage == "scalar" and result.rank == 0
+                and geometry is not None
+                and tuple(int(value.id) for value in geometry[0])
+                == (shape_id, rank_id, count_id)
+                and set(geometry[1]) <= causes
+            )
+            required = tuple(ssa_value_identity_cell(function, value_id, book=book)
+                             for value_id in (source_id, row[1], *fact[3:]))
+            valid = valid and all(cell is not None and cell in causes
+                                  for cell in required)
+        if valid:
+            locations = [(block.name, index, instruction)
+                         for block in function.blocks.values()
+                         for index, instruction in enumerate(block.instrs)]
+            definitions = {}
+            for block_name, index, instruction in locations:
+                if instruction.res is not None:
+                    definitions.setdefault(int(instruction.res.id), []).append(
+                        (block_name, index, instruction))
+
+            def definition(value_id, operation=None):
+                candidates = definitions.get(int(value_id), ())
+                return (candidates[0] if len(candidates) == 1
+                        and (operation is None or candidates[0][2].op == operation)
+                        else None)
+
+            vector = definition(flat_id, "Const")
+            rank = definition(flat_rank, "Const")
+            axis = definition(axis_id, "Const")
+            code = definition(code_id, "Const")
+            flat_fact = posted_ssa_value_fact(function, flat_id, book=book)
+            valid = (
+                vector is not None
+                and tuple(vector[2].attributes.get("values", ())) == (0,)
+                and flat_fact is not None and flat_fact.physical_dtype == "int32"
+                and flat_fact.storage == "span" and flat_fact.rank == 1
+                and all(item is not None for item in (rank, axis, code))
+                and _constant_payload(rank[2]) == 1
+                and _constant_payload(axis[2]) == 0
+                and _constant_payload(code[2]) == _REDUCTION_CODES[operation]
+            )
+            for value_id in (flat_rank, axis_id, code_id):
+                scalar = posted_ssa_value_fact(function, value_id, book=book)
+                valid = valid and (scalar is not None
+                                   and scalar.physical_dtype == "int32"
+                                   and scalar.storage == "scalar" and scalar.rank == 0)
+        if valid:
+            stores = []
+            for block_name, index, instruction in locations:
+                if instruction.op != "Store" or len(instruction.args) != 2:
+                    continue
+                address = definition(instruction.args[1].id, "GetElementPtr")
+                if (address is None or len(address[2].args) != 2
+                        or int(address[2].args[0].id) != flat_id):
+                    continue
+                offset = definition(address[2].args[1].id, "Const")
+                stores.append((block_name, index, instruction, address, offset))
+            valid = len(stores) == 1
+        if valid:
+            block_name, index, store, address, offset = stores[0]
+            valid = (
+                int(store.args[0].id) == count_id and offset is not None
+                and _constant_payload(offset[2]) == 0
+                and vector[0] == address[0] == block_name
+                and vector[1] < address[1] < index
+            )
+            calls = [(name, position, instruction) for name, position, instruction
+                     in locations if instruction.op == "Call"
+                     and instruction.res is not None
+                     and int(instruction.res.id) == int(row[1])]
+            kernel = module.functions.get("reduce_dim_double")
+            valid = valid and len(calls) == 1 and kernel is not None
+        if valid:
+            call_block, call_index, call = calls[0]
+            valid = (
+                call_block == block_name and index < call_index
+                and call.attributes.get("callee") == "reduce_dim_double"
+                and call.attributes.get("ssa_output_argument") == 1
+                and tuple(int(value.id) for value in call.args)
+                == (source_id, int(row[1]), flat_id, flat_rank, axis_id, code_id)
+                and call.attributes.get("tensor_reduction_domain_concordance") == fact
+                and kernel.metadata.get("ssa_output_argument") == 1
+                and len(kernel.args) == 6
+                and tuple(kernel.metadata.get("named_outputs", ()))
+                == (("out", int(kernel.args[1].id)),)
+            )
+        if valid:
+            origins = (kernel.metadata.get("llvm_repository_kernel") or (None, {}))[1]
+            result_cell = ssa_value_identity_cell(function, row[1], book=book)
+            result_causes = {cause for cause, _ in book.edges_into(result_cell)}
+            for position, formal in enumerate(kernel.args[:2]):
+                cell = ssa_value_identity_cell(kernel, formal.id, book=book)
+                formal_fact = posted_ssa_value_fact(kernel, formal.id, book=book)
+                origin = origins.get(int(formal.id))
+                valid = valid and (
+                    cell is not None and cell in causes and formal_fact is not None
+                    and formal_fact.physical_dtype == "float64"
+                    and isinstance(origin, tuple) and len(origin) >= 3
+                    and origin[1] == "argument" and str(origin[2]).startswith("ptr ")
+                    and (position != 1 or cell in result_causes)
+                )
+        return [] if valid else [Finding(
+            "tensor-reduction-domain-runtime", str(row[0]), int(row[1]),
+            "runtime Boolean fold lacks exact source geometry, counted flat view, "
+            "typed kernel, or scalar output proof",
+        )]
+
+    @staticmethod
     def _tensor_reduction_domain_findings(module: Any) -> list[Finding]:
         """Check all-axis views and control-owned runtime axis geometry."""
 
@@ -10054,6 +10192,12 @@ class CorrelationTable:
                     "tensor-reduction-domain-disagreement",
                     str(function_name), int(result_id),
                     f"all-axis reduction acquired multiple domains: {facts!r}",
+                ))
+                continue
+            if (isinstance(facts[0], tuple) and facts[0]
+                    and facts[0][0] == "all-axis-runtime"):
+                found.extend(CorrelationTable._runtime_all_axis_boolean_domain_findings(
+                    module, book, row, facts[0],
                 ))
                 continue
             if (isinstance(facts[0], tuple) and facts[0]

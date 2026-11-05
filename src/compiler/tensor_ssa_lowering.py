@@ -3641,6 +3641,7 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
 
 def _post_reduction_domain(
     module: IRModule, function: Any, row: tuple, fact: tuple, values: Any,
+    extra_cells: tuple[Any, ...] = (),
 ) -> None:
     """Post the all-axis or tagged runtime-axis reduction domain.
 
@@ -3655,13 +3656,16 @@ def _post_reduction_domain(
     from .ssa_record_return_state import ssa_value_identity_cell
 
     book = identity_book(module)
-    cells = tuple(dict.fromkeys(
+    cells = tuple(dict.fromkeys((
+        *extra_cells,
+        *(
         cell for cell in (
             ssa_value_identity_cell(function, int(value.id), book=book)
             for value in values
         )
         if cell is not None
-    ))
+        ),
+    )))
     if not cells:
         raise ValueError(
             f"{TENSOR_REDUCTION_DOMAIN.name}: no source cell for {row!r} -- "
@@ -4564,6 +4568,46 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
     return changed_any
 
 
+def _booked_static_view_rebinding(
+    book, function, value_id: int, source_owner, source_id: int,
+    view_shape: tuple[int, ...],
+) -> bool:
+    """Whether an aggregate fold binds this exact view to the new storage."""
+    from .concordance_declarations import (
+        AGGREGATE_PASSTHROUGH_REBINDING, SSA_VALUE,
+    )
+    from .ssa_record_return_state import (
+        function_scope_of, ssa_value_identity_cell,
+    )
+
+    ref = book.latest_ref(
+        AGGREGATE_PASSTHROUGH_REBINDING,
+        (function_scope_of(function), int(value_id)),
+    )
+    if ref is None:
+        return False
+    fact = book.page(AGGREGATE_PASSTHROUGH_REBINDING).cell(
+        ref.row, ref.column,
+    )
+    if (len(fact) != 4 or int(fact[0]) != int(source_id)
+            or int(fact[2]) != int(value_id)
+            or tuple(fact[3]) != tuple(view_shape)):
+        return False
+    source_cell = ssa_value_identity_cell(
+        source_owner, int(source_id), book=book,
+    )
+    target_cell = ssa_value_identity_cell(
+        function, int(value_id), book=book,
+    )
+    if source_cell is None or target_cell is None:
+        return False
+    causes = {parent for parent, _stage in book.edges_into(ref)}
+    return all(any(
+        parent.page == SSA_VALUE and parent.row == cell.row
+        for parent in causes
+    ) for cell in (source_cell, target_cell))
+
+
 def propagate_repository_ssa_call_metadata(
     module: IRModule, *, authoritative_returns: bool = False,
 ) -> bool:
@@ -4927,10 +4971,21 @@ def propagate_repository_ssa_call_metadata(
             view_fact = posted_ssa_value_fact(
                 function, int(value.id), book=view_book,
             )
+            # canonical_codes_from_lengths: the aggregate fold rebinds the
+            # rank-2 unsqueeze view 64 from its earlier storage 6 to actual 0.
+            # The old occurrence still names 6, while the booked rebinding
+            # names 0 and preserves the view's full shape.  Only that exact
+            # source/target row and its SSA causes authorize retaining rank 2.
+            _exact_rebound_view = _booked_static_view_rebinding(
+                view_book, function, int(value.id),
+                function if source_owner is None else source_owner,
+                int(source.id), declared_view_shape,
+            )
             static_view_rank_proved = (
                 retained_view and not retained_runtime_view
                 and isinstance(declared_view, Mapping)
-                and declared_view.get("storage_value_id") == int(source.id)
+                and (declared_view.get("storage_value_id") == int(source.id)
+                     or _exact_rebound_view)
                 and view_fact is not None
                 and view_fact.storage == "span"
                 and view_fact.rank == len(declared_view_shape)
@@ -12846,6 +12901,154 @@ def lower_tensor_calls_to_repository_ssa(
                                 "Div", [total, count], result,
                                 attributes={"lowered_from": "mean"},
                                 source_span=instruction.source_span,
+                            ))
+                    elif (
+                        axis is None and operation in {"all", "any"}
+                        and shape_unknown(source)
+                    ):
+                        # A public span formal can define its own runtime
+                        # extents. A computed region formal must wait for the
+                        # producer's metadata Call binding instead.
+                        from .concordance_declarations import (
+                            BindingKind, CONTROL_VALUE_BINDING, ControlBinding,
+                        )
+                        source_binding_ref = book.latest_ref(
+                            CONTROL_VALUE_BINDING,
+                            (function_scope_of(function), int(source.id)),
+                        )
+                        source_binding = (
+                            None if source_binding_ref is None else
+                            book.page(CONTROL_VALUE_BINDING).cell(
+                                source_binding_ref.row,
+                                source_binding_ref.column,
+                            )
+                        )
+                        source_descriptor = tensor_table.by_id(int(source.id))
+                        if (
+                            source_descriptor is not None
+                            and source_descriptor.metadata_state == "unresolved"
+                            and int(source.id) in function_argument_ids
+                            and isinstance(source_binding, ControlBinding)
+                            and source_binding.kind in {
+                                BindingKind.PARAMETER_SEED,
+                                BindingKind.FIELD_INCUMBENT,
+                            }
+                            and source_binding.ssa_value.row == (
+                                function_scope_of(function), int(source.id),
+                            )
+                        ):
+                            ensure_dynamic(prefix, source)
+                        geometry = _dynamic_tensor_geometry_evidence(
+                            module, function, int(source.id), pending=prefix,
+                        )
+                        source_fact = posted_ssa_value_fact(
+                            function, int(source.id), book=book,
+                        )
+                        if (geometry is not None and source_fact is not None
+                                and source_fact.physical_dtype == "float64"
+                                and source_fact.storage == "span"
+                                and type(source_fact.rank) is int
+                                and source_fact.rank > 0):
+                            source_metadata, geometry_cells = geometry
+                            source_count_value = source_metadata[2]
+                            flat_shape, flat_shape_def = int_vector(
+                                (0,), physical={
+                                    "physical_dtype": "int32",
+                                    "storage": "span", "rank": 1,
+                                },
+                            )
+                            zero, zero_def = constant(0, "int64")
+                            shape_slot = fresh(dtype="ptr")
+                            flat_rank, rank_def = constant(
+                                1, "int32", physical={
+                                    "physical_dtype": "int32",
+                                    "storage": "scalar", "rank": 0,
+                                },
+                            )
+                            flat_axis, axis_def = constant(
+                                0, "int32", physical={
+                                    "physical_dtype": "int32",
+                                    "storage": "scalar", "rank": 0,
+                                },
+                            )
+                            code, code_def = constant(
+                                _REDUCTION_CODES[operation], "int32",
+                                physical={
+                                    "physical_dtype": "int32",
+                                    "storage": "scalar", "rank": 0,
+                                },
+                            )
+                            prefix.extend((
+                                flat_shape_def, zero_def,
+                                Instr("GetElementPtr", [flat_shape, zero], shape_slot),
+                                Instr("Store", [source_count_value, shape_slot], None),
+                                rank_def, axis_def, code_def,
+                            ))
+                            selected = reference.module.functions.get("reduce_dim_double")
+                            if (selected is None
+                                    or selected.metadata.get("ssa_output_argument") != 1
+                                    or len(selected.args) < 2):
+                                raise ValueError(
+                                    "runtime Boolean reduction lacks selected output port"
+                                )
+                            from .ssa_call_input_adapters import _infer_pointer_storage
+                            from .ssa_record_return_state import ssa_value_identity_cell
+                            link_repository_function("reduce_dim_double", selected)
+                            _infer_pointer_storage({"reduce_dim_double": selected})
+                            typed_formals = selected.args[:2]
+                            typed_facts = tuple(posted_ssa_value_fact(
+                                selected, int(formal.id), book=book,
+                            ) for formal in typed_formals)
+                            typed_cells = tuple(ssa_value_identity_cell(
+                                selected, int(formal.id), book=book,
+                            ) for formal in typed_formals)
+                            origins = (selected.metadata.get(
+                                "llvm_repository_kernel"
+                            ) or (None, {}))[1]
+                            if (
+                                any(fact is None or fact.physical_dtype != "float64"
+                                    for fact in typed_facts)
+                                or any(cell is None for cell in typed_cells)
+                                or any(
+                                    (origin := origins.get(int(formal.id))) is None
+                                    or origin[1] != "argument"
+                                    or not str(origin[2]).startswith("ptr ")
+                                    for formal in typed_formals
+                                )
+                            ):
+                                raise ValueError(
+                                    "runtime Boolean reduction lacks typed kernel formals"
+                                )
+                            result.shape = ()
+                            _post_double_backed_boolean(
+                                lowering_at[0], result, module, typed_cells,
+                            )
+                            domain_fact = (
+                                "all-axis-runtime", int(source.id), operation,
+                                *(int(value.id) for value in source_metadata),
+                                int(flat_shape.id), int(flat_rank.id),
+                                int(flat_axis.id), int(code.id),
+                            )
+                            _post_reduction_domain(
+                                module, function,
+                                (str(function_name), int(result.id)),
+                                domain_fact,
+                                (source, result, *source_metadata, flat_shape,
+                                 flat_rank, flat_axis, code, zero, shape_slot),
+                                extra_cells=(*geometry_cells, *typed_cells),
+                            )
+                            reduction_instruction = dataclasses.replace(
+                                instruction,
+                                attributes={
+                                    **dict(instruction.attributes or {}),
+                                    "tensor_reduction_domain_concordance": domain_fact,
+                                },
+                            )
+                            emitted.append(call(
+                                "reduce_dim_double",
+                                [source, result, flat_shape, flat_rank,
+                                 flat_axis, code], result, reduction_instruction,
+                                output_argument=1,
                             ))
                     elif (
                         axis is None
