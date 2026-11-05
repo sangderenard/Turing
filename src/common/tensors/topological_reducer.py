@@ -3870,10 +3870,20 @@ def _set_operands(
                         f"{name}: operand position {(scope, node_id, *target)!r} "
                         "receives a fact with no transition into it"
                     )
+                # A forked Name read keeps the exact occurrence cell that
+                # selected its binding.  The transition records the move;
+                # the occurrence carries the normal-continuation proof.
+                source_read = (
+                    book.latest_ref(book.registry.page(name), (scope, *forks[target]))
+                    if target in forks else None
+                )
                 book.post(
                     book.registry.page(name), (scope, node_id, *target), fact,
                     stage=OPERAND_POSITION,
-                    provenance=_Derived((cause_cell,)),
+                    provenance=_Derived(tuple(
+                        cell for cell in (cause_cell, source_read)
+                        if cell is not None
+                    )),
                     mode=_Mode.REVISE,
                 )
     # Positions that all keep their place and operands that keep their id
@@ -4343,7 +4353,7 @@ def _remove_node(graph: Any, node_id: int) -> None:
 
 def _concord_lexical_reads(
     graph: Any, scope: str, occurrence_id: int, binding: str,
-    *, binding_cell: Any = None,
+    *, binding_cell: Any = None, continuation_cell: Any = None,
 ) -> None:
     """Commit, per consumer edge, the binding one ``Name`` occurrence read.
 
@@ -4397,7 +4407,7 @@ def _concord_lexical_reads(
         return
     commit(
         (scope, "occurrence", int(occurrence_id), 0),
-        occurrence_cell, binding_cell,
+        occurrence_cell, binding_cell, continuation_cell,
     )
     if occurrence_id not in graph.G:
         return
@@ -4408,7 +4418,7 @@ def _concord_lexical_reads(
             if parent_id == occurrence_id:
                 commit(
                     (scope, consumer, role, ordinal), occurrence_cell,
-                    binding_cell,
+                    binding_cell, continuation_cell,
                     node_identity_cell(graph, consumer),
                 )
 
@@ -7325,6 +7335,7 @@ def _normalize_lexical_values(
     )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
+    normal_continuation_cells: dict[tuple[str, int], Any] = {}
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     # Exact AST ownership of assignment sites, not a source-line containment
@@ -11433,6 +11444,9 @@ def _normalize_lexical_values(
                     binding_cell=current_name_binding_cell(
                         expression.id, producer_id,
                     ),
+                    continuation_cell=normal_continuation_cells.get((
+                        expression.id, int(producer_id),
+                    )),
                 )
                 _redirect_value(graph, node_id, producer_id)
                 return producer_id
@@ -13309,6 +13323,11 @@ def _normalize_lexical_values(
                     receiver_fork[("operand", 0)] = read_source(
                         expression.func.value, id(expression.func),
                     )
+                for index, argument in enumerate(expression.args):
+                    if isinstance(argument, ast.Name):
+                        receiver_fork[(f"arg:{index}", 0)] = read_source(
+                            argument, id(expression),
+                        )
                 for keyword in expression.keywords:
                     receiver_fork[(
                         f"kw:{keyword.arg}" if keyword.arg else "kwargs", 0,
@@ -18472,6 +18491,145 @@ def _normalize_lexical_values(
                         int(else_result),
                     ),
                 })
+            normal_bindings = tuple(getattr(
+                body_statement, "_turing_exception_normal_bindings", (),
+            ))
+            if normal_bindings:
+                # The exception ingester selected only direct protected-body
+                # assignments whose handlers all end in authored Raise, with
+                # no else/finally.  The generated exception_raise barrier is
+                # the last edge before a normal successor.  Keep its exact
+                # producer/handler/operation cells on one concordance row;
+                # a lexical read may resume that producer only after this
+                # barrier has been reduced and proved terminal on error.
+                from ...compiler.concorded_literals import origin_cell
+                from ...compiler.concordance_declarations import (
+                    SOURCE_ACTIVITY_NODE, SOURCE_EXCEPTION_INGESTION,
+                    SOURCE_EXCEPTION_NORMAL_BINDING,
+                    SOURCE_EXCEPTION_OPERATION, SOURCE_SPAN,
+                )
+                from ...compiler.control_activity import (
+                    binding as activity_binding,
+                )
+
+                book = current_identity_book()
+                barrier_id = int(id(body_statement))
+                barrier_cell = node_identity_cell(graph, barrier_id)
+                ingestion = getattr(
+                    body_statement, "_turing_ingestion_conversion_cell", None,
+                )
+                terminal_operations = []
+                for member in body_statement.body:
+                    for call in ast.walk(member):
+                        if not isinstance(call, ast.Call) or id(call) not in graph.G:
+                            continue
+                        call_cell = node_identity_cell(graph, int(id(call)))
+                        try:
+                            source = origin_cell(book, call_cell)
+                        except ValueError:
+                            continue
+                        operation = book.latest_ref(
+                            SOURCE_EXCEPTION_OPERATION, (source,),
+                        )
+                        if (operation is not None
+                                and book.page(SOURCE_EXCEPTION_OPERATION).cell(
+                                    operation.row, operation.column,
+                                )[0] == "exception_raise"):
+                            terminal_operations.append((operation, int(id(call))))
+                if (len(terminal_operations) == 1
+                        and ingestion is not None
+                        and ingestion.page == SOURCE_EXCEPTION_INGESTION
+                        and barrier_cell is not None):
+                    terminal, terminal_call_id = terminal_operations[0]
+                    wrapper = getattr(
+                        body_statement,
+                        "_turing_exception_normal_wrapper", None,
+                    )
+                    wrapper_id = int(id(wrapper)) if wrapper is not None else -1
+                    activity_scope = graph.G.graph.get(
+                        "authored_function_identity",
+                    )
+                    if (wrapper_id not in graph.G
+                            or activity_scope is None):
+                        return id(body_statement)
+                    wrapper_points, wrapper_activity = activity_binding(
+                        graph, wrapper_id, book=book, scope=activity_scope,
+                    )
+                    barrier_points, barrier_activity = activity_binding(
+                        graph, barrier_id, book=book, scope=activity_scope,
+                    )
+                    terminal_points, terminal_activity = activity_binding(
+                        graph, terminal_call_id, book=book,
+                        scope=activity_scope,
+                    )
+                    if (not wrapper_points or not barrier_points
+                            or not terminal_points or wrapper_activity is None
+                            or barrier_activity is None
+                            or terminal_activity is None):
+                        return id(body_statement)
+                    wrapper_span = wrapper_points[0].row[1]
+                    barrier_span = barrier_points[0].row[1]
+                    terminal_owners = book.page(SOURCE_ACTIVITY_NODE).cell(
+                        terminal_points[0].row, terminal_points[0].column,
+                    )[1]
+                    if (wrapper_span == barrier_span
+                            or (barrier_span, "body") not in terminal_owners):
+                        return id(body_statement)
+                    ingestion_causes = {
+                        source for source, _stage in book.edges_into(ingestion)
+                    }
+                    for name, producer_expression, try_cell, exits in normal_bindings:
+                        producer_id = int(id(producer_expression))
+                        if (producer_id not in graph.G
+                                or try_cell not in ingestion_causes
+                                or not exits
+                                or any(exit_cell not in ingestion_causes
+                                       or exit_cell.page != SOURCE_SPAN
+                                       or book.page(SOURCE_SPAN).cell(
+                                           exit_cell.row, exit_cell.column,
+                                       ).kind != "Raise"
+                                       for exit_cell in exits)):
+                            continue
+                        producer_cell = node_identity_cell(graph, producer_id)
+                        producer_points, producer_activity = activity_binding(
+                            graph, producer_id, book=book,
+                            scope=activity_scope,
+                        )
+                        producer_owners = (
+                            book.page(SOURCE_ACTIVITY_NODE).cell(
+                                producer_points[0].row,
+                                producer_points[0].column,
+                            )[1] if producer_points else ()
+                        )
+                        binding_cell = current_name_binding_cell(
+                            name, producer_id,
+                        )
+                        if (producer_cell is None or binding_cell is None
+                                or producer_activity is None
+                                or (wrapper_span, "body") not in producer_owners
+                                or book.page(_NAME_BINDING).cell(
+                                    binding_cell.row, binding_cell.column,
+                                ).value_id != producer_id):
+                            continue
+                        row = (ingestion_read_scope, barrier_id, producer_id)
+                        receipt = book.post(
+                            SOURCE_EXCEPTION_NORMAL_BINDING, row,
+                            (name, binding_cell, producer_cell, try_cell,
+                             tuple(exits), barrier_cell, terminal, ingestion,
+                             wrapper_activity, producer_activity,
+                             barrier_activity, terminal_activity),
+                            stage=_REDUCTION,
+                            provenance=_Derived(tuple(dict.fromkeys((
+                                binding_cell, producer_cell, try_cell,
+                                *exits, barrier_cell, terminal, ingestion,
+                                wrapper_activity, producer_activity,
+                                barrier_activity, terminal_activity,
+                            )))),
+                            mode=_Mode.CONCORD,
+                        )
+                        environment[name] = producer_id
+                        static_environment.pop(name, None)
+                        normal_continuation_cells[(name, producer_id)] = receipt
             return id(body_statement)
         if isinstance(body_statement, ast.Try):
             # Python parameters exist from function entry.  A parameter first

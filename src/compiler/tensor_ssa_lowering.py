@@ -13014,6 +13014,250 @@ def lower_tensor_calls_to_repository_ssa(
                         result, instruction, output_argument=1,
                     ))
 
+                elif operation == "cumsum" and source is not None:
+                    # A runtime-sized scan preserves the source geometry. The
+                    # source's booked extent triple, rather than the empty
+                    # display shape of result3 in dynamic_cumsum_probe, owns
+                    # the element count and the private output allocation.
+                    from .concordance_declarations import (
+                        BindingKind, CANONICAL_VALUE, CONTROL_VALUE_BINDING,
+                        ControlBinding, TENSOR_OWNED_HEAP_BINDING,
+                        TENSOR_RUNTIME_SCAN_GEOMETRY, TENSOR_SSA_LOWERING,
+                    )
+                    from .concorded_literals import (
+                        MISSING as MISSING_LITERAL, literal_from_identity,
+                    )
+                    from .identity_concordance import Derived, Mode
+                    from .ssa_record_return_state import (
+                        function_scope_of, posted_ssa_value_fact,
+                        ssa_value_identity_cell,
+                    )
+
+                    scope = function_scope_of(function)
+                    source_fact = posted_ssa_value_fact(
+                        function, int(source.id), book=book,
+                    )
+                    result_fact = posted_ssa_value_fact(
+                        function, int(result.id), book=book,
+                    )
+                    axis_value = args[1] if len(args) == 2 else None
+                    axis_cell = (
+                        None if axis_value is None else
+                        ssa_value_identity_cell(
+                            function, int(axis_value.id), book=book,
+                        )
+                    )
+                    axis_origins = (
+                        () if axis_cell is None else tuple(
+                            parent for parent, _stage in book.edges_into(axis_cell)
+                            if parent.page == CANONICAL_VALUE
+                        )
+                    )
+                    axis_literal, literal_cells = (
+                        literal_from_identity(book, axis_origins[0])
+                        if len(axis_origins) == 1 else (MISSING_LITERAL, ())
+                    )
+                    local_axis = (
+                        None if axis_value is None else
+                        constants.get(int(axis_value.id))
+                    )
+                    attributed_axis = _attribute(
+                        instruction.attributes, "axis", "dim",
+                    )
+                    source_rank = None if source_fact is None else source_fact.rank
+                    normalized_axis = (
+                        axis_literal if type(axis_literal) is int
+                        and axis_literal >= 0 else
+                        axis_literal + source_rank
+                        if type(axis_literal) is int and source_rank is not None
+                        else None
+                    )
+                    binding_ref = book.latest_ref(
+                        CONTROL_VALUE_BINDING, (scope, int(source.id)),
+                    )
+                    binding = (
+                        None if binding_ref is None else
+                        book.page(CONTROL_VALUE_BINDING).cell(
+                            binding_ref.row, binding_ref.column,
+                        )
+                    )
+                    booked_ids = (
+                        () if source_descriptor is None else tuple(
+                            getattr(source_descriptor, field) for field in (
+                                "shape_value_id", "rank_value_id",
+                                "element_count_value_id",
+                            )
+                        )
+                    )
+                    can_mint_input = (
+                        int(source.id) in function_argument_ids
+                        and isinstance(binding, ControlBinding)
+                        and binding.kind in {
+                            BindingKind.PARAMETER_SEED,
+                            BindingKind.FIELD_INCUMBENT,
+                        }
+                        and binding.ssa_value.row == (scope, int(source.id))
+                    )
+                    if (
+                        source_fact is None or result_fact is None
+                        or source_fact.physical_dtype != "float64"
+                        or result_fact.physical_dtype != "float64"
+                        or source_fact.storage != "span"
+                        or result_fact.storage != "span"
+                        or type(source_rank) is not int or source_rank < 1
+                        or result_fact.rank != source_rank
+                        or type(axis_literal) is not int
+                        or (local_axis is not None
+                            and local_axis != axis_literal)
+                        or (attributed_axis is not None
+                            and attributed_axis != axis_literal)
+                        or normalized_axis is None
+                        or not 0 <= normalized_axis < source_rank
+                        or not private_dynamic_result(result)
+                        or (not can_mint_input and not (
+                            source_descriptor is not None
+                            and source_descriptor.metadata_state == "dynamic"
+                            and len(booked_ids) == 3
+                            and all(type(identity) is int
+                                    for identity in booked_ids)
+                        ))
+                    ):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "runtime cumsum lacks exact physical span, axis, "
+                            "input geometry or private output proof",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    extents = ensure_dynamic(prefix, source)
+                    evidence = _dynamic_tensor_geometry_evidence(
+                        module, function, int(source.id), pending=prefix,
+                    )
+                    if evidence is None or tuple(
+                        int(value.id) for value in evidence[0]
+                    ) != tuple(int(extents[kind].id) for kind in (
+                        "shape", "rank", "element_count",
+                    )):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "runtime cumsum source has no exact extent binding",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    from .ssa_call_input_adapters import (
+                        _infer_pointer_storage,
+                    )
+                    selected_kernel = reference.module.functions.get(
+                        "cumsum_dim_double"
+                    )
+                    if (
+                        selected_kernel is None
+                        or len(selected_kernel.args) != 5
+                        or selected_kernel.metadata.get(
+                            "ssa_output_argument"
+                        ) != 1
+                        or len(tuple(selected_kernel.metadata.get(
+                            "named_outputs", ()
+                        ))) != 1
+                        or int(tuple(selected_kernel.metadata[
+                            "named_outputs"
+                        ])[0][1]) != int(selected_kernel.args[1].id)
+                    ):
+                        raise ValueError(
+                            "runtime cumsum lacks selected kernel output port"
+                        )
+                    link_repository_function(
+                        "cumsum_dim_double", selected_kernel,
+                    )
+                    _infer_pointer_storage({
+                        "cumsum_dim_double": selected_kernel,
+                    })
+                    selected_formals = (
+                        selected_kernel.args[0], selected_kernel.args[1],
+                    )
+                    typed_facts = tuple(posted_ssa_value_fact(
+                        selected_kernel, int(formal.id), book=book,
+                    ) for formal in selected_formals)
+                    typed_cells = tuple(ssa_value_identity_cell(
+                        selected_kernel, int(formal.id), book=book,
+                    ) for formal in selected_formals)
+                    if (
+                        any(fact is None or cell is None
+                            for fact, cell in zip(
+                                typed_facts, typed_cells, strict=True,
+                            ))
+                        or any(formal.dtype != "ptr" for formal in selected_formals)
+                        or typed_facts[0].physical_dtype !=
+                        typed_facts[1].physical_dtype
+                        or typed_facts[0].physical_dtype !=
+                        source_fact.physical_dtype
+                        or typed_facts[1].physical_dtype !=
+                        result_fact.physical_dtype
+                    ):
+                        raise ValueError(
+                            "runtime cumsum physical span disagrees with selected kernel"
+                        )
+                    result.accounting = {
+                        **dict(result.accounting or {}),
+                        "tensor_metadata_state": "dynamic",
+                        "tensor_shape_value_id": int(extents["shape"].id),
+                        "tensor_rank_value_id": int(extents["rank"].id),
+                        "tensor_element_count_value_id": int(
+                            extents["element_count"].id
+                        ),
+                    }
+                    register_tensor(
+                        result, storage="temporary", metadata_state="dynamic",
+                        extent_values=tuple(extents[kind] for kind in (
+                            "shape", "rank", "element_count",
+                        )),
+                    )
+                    dynamic_extents[int(result.id)] = dict(extents)
+                    carrier = own_dynamic_tensor(
+                        result, extents["element_count"],
+                        str(typed_facts[1].physical_dtype), prefix,
+                    )
+                    dim, dim_def = constant(normalized_axis, "int32")
+                    prefix.append(dim_def)
+                    emitted.append(call(
+                        "cumsum_dim_double", [
+                            source, carrier, extents["shape"],
+                            extents["rank"], dim,
+                        ], result, instruction, output_argument=1,
+                    ))
+                    owner_ref = book.latest_ref(
+                        TENSOR_OWNED_HEAP_BINDING,
+                        (scope, function.name, int(result.id)),
+                    )
+                    scan_values = (
+                        source, result, axis_value, *evidence[0], carrier, dim,
+                    )
+                    scan_cells = tuple(
+                        ssa_value_identity_cell(
+                            function, int(value.id), book=book,
+                        ) for value in scan_values
+                    )
+                    causes = tuple(dict.fromkeys((
+                        *scan_cells, *evidence[1], *literal_cells,
+                        axis_origins[0], owner_ref, *typed_cells,
+                    )))
+                    if any(cell is None for cell in causes):
+                        raise ValueError(
+                            "runtime cumsum lost exact scan evidence"
+                        )
+                    book.post(
+                        TENSOR_RUNTIME_SCAN_GEOMETRY,
+                        (scope, function.name, int(result.id)),
+                        (
+                            "cumsum", int(source.id), int(axis_value.id),
+                            normalized_axis, *(int(value.id)
+                                               for value in evidence[0]),
+                            int(carrier.id), "cumsum_dim_double",
+                        ),
+                        stage=TENSOR_SSA_LOWERING,
+                        provenance=Derived(causes), mode=Mode.CONCORD,
+                    )
+
                 elif operation == "stack" and data_args:
                     operand_shape = tuple(source.shape or ())
                     statically_known = (

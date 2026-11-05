@@ -1535,6 +1535,7 @@ class CorrelationTable:
         found.extend(self._tensor_metadata_result_binding_findings(module))
         found.extend(self._tensor_runtime_reshape_validity_findings(module))
         found.extend(self._tensor_runtime_view_geometry_findings(module))
+        found.extend(self._tensor_runtime_scan_geometry_findings(module))
         found.extend(self._tensor_runtime_broadcast_validity_findings(module))
         found.extend(self._tensor_elementwise_extent_binding_findings(module))
         found.extend(self._tensor_owned_heap_binding_findings(module))
@@ -3600,7 +3601,10 @@ class CorrelationTable:
     def _operator_safety_findings(module: Any) -> list[Finding]:
         from .concordance_declarations import (
             COMPILE_POLICY, C_OPERATOR_SAFETY, SOURCE_EXCEPTION_OPERATION,
-            SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, SOURCE_EXCEPTION_INGESTION, SOURCE_EXCEPTION_NODE, INGESTION_VALUE, SOURCE_SPAN,
+            SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, SOURCE_EXCEPTION_INGESTION,
+            SOURCE_EXCEPTION_NORMAL_BINDING, SOURCE_EXCEPTION_NODE,
+            SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_NODE, NAME_BINDING,
+            LEXICAL_READ_BINDING, INGESTION_VALUE, SOURCE_SPAN,
             GUARDED_CALL_ACTUAL_RANGE, SOURCE_INTRINSIC_ADMISSION, PROCESS_GRAPH_OPERANDS,
             CANONICAL_VALUE,
         )
@@ -3656,6 +3660,91 @@ class CorrelationTable:
             ):
                 found.append(Finding("exception-raise-origin", "<source>", None,
                                      "terminal exception operation lost its authored Raise or conversion"))
+        for row in book.page(SOURCE_EXCEPTION_NORMAL_BINDING).rows():
+            receipt = book.latest_ref(SOURCE_EXCEPTION_NORMAL_BINDING, row)
+            record = fact(receipt)
+            causes = {source for source, _stage in book.edges_into(receipt)}
+            valid = isinstance(record, tuple) and len(record) == 12
+            if valid:
+                (name, binding, producer, authored_try, handler_exits,
+                 barrier, terminal, conversion, wrapper_activity,
+                 producer_activity, barrier_activity,
+                 terminal_activity) = record
+                valid = isinstance(handler_exits, tuple) and bool(handler_exits)
+            if valid:
+                members = (binding, producer, authored_try, *handler_exits,
+                           barrier, terminal, conversion, wrapper_activity,
+                           producer_activity, barrier_activity,
+                           terminal_activity)
+                valid = (
+                    isinstance(name, str)
+                    and all(isinstance(member, Ref) and member in causes
+                            for member in members)
+                    and binding.page == NAME_BINDING
+                    and binding.row[1] == name
+                    and getattr(fact(binding), "value_id", None) == row[2]
+                    and producer.page == INGESTION_VALUE
+                    and producer.row[1] == row[2]
+                    and producer in {source for source, _ in book.edges_into(binding)}
+                    and barrier.page == INGESTION_VALUE
+                    and barrier.row[1] == row[1]
+                    and authored_try.page == SOURCE_SPAN
+                    and getattr(fact(authored_try), "kind", None) == "Try"
+                    and all(exit_cell.page == SOURCE_SPAN
+                            and getattr(fact(exit_cell), "kind", None) == "Raise"
+                            for exit_cell in handler_exits)
+                    and conversion.page == SOURCE_EXCEPTION_INGESTION
+                    and {authored_try, *handler_exits} <= {
+                        source for source, _ in book.edges_into(conversion)
+                    }
+                    and terminal.page == SOURCE_EXCEPTION_OPERATION
+                    and isinstance(fact(terminal), tuple)
+                    and fact(terminal)[:1] == ("exception_raise",)
+                    and wrapper_activity.page == SOURCE_ACTIVITY_BINDING
+                    and producer_activity.page == SOURCE_ACTIVITY_BINDING
+                    and barrier_activity.page == SOURCE_ACTIVITY_BINDING
+                    and terminal_activity.page == SOURCE_ACTIVITY_BINDING
+                    and all(activity.row[0] == wrapper_activity.row[0]
+                            for activity in (producer_activity,
+                                             barrier_activity,
+                                             terminal_activity))
+                    and producer_activity.row[1] == producer
+                    and barrier_activity.row[1] == barrier
+                    and terminal_activity.row[1] == terminal.row[0]
+                )
+                if valid:
+                    wrapper_points = fact(wrapper_activity)
+                    producer_points = fact(producer_activity)
+                    barrier_points = fact(barrier_activity)
+                    terminal_points = fact(terminal_activity)
+                    valid = (
+                        all(isinstance(points, tuple) and len(points) == 2
+                            and all(point.page == SOURCE_ACTIVITY_NODE
+                                    for point in points)
+                            for points in (wrapper_points, producer_points,
+                                           barrier_points, terminal_points))
+                        and wrapper_points[0].row[1] != barrier_points[0].row[1]
+                        and (wrapper_points[0].row[1], "body") in
+                            fact(producer_points[0])[1]
+                        and (barrier_points[0].row[1], "body") in
+                            fact(terminal_points[0])[1]
+                    )
+            if not valid:
+                found.append(Finding(
+                    "exception-normal-binding", str(row), None,
+                    "normal continuation lacks exact producer, terminal handler, or barrier proof",
+                ))
+                continue
+            for read_row in book.page(LEXICAL_READ_BINDING).rows():
+                read = book.latest_ref(LEXICAL_READ_BINDING, read_row)
+                read_causes = {source for source, _ in book.edges_into(read)}
+                if receipt in read_causes and (
+                    fact(read) != name or binding not in read_causes
+                ):
+                    found.append(Finding(
+                        "exception-normal-binding", str(read_row), None,
+                        "normal-continuation lexical read lost its exact binding",
+                    ))
         from .concorded_literals import origin_cell
         for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows():
             cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
@@ -7183,6 +7272,188 @@ class CorrelationTable:
                     "tensor-runtime-view-geometry", str(row[1]) if function is not None else str(row),
                     row[2] if isinstance(row, tuple) and len(row) == 3 else None,
                     "runtime view lacks exact source storage, axis transform or metadata transport",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_runtime_scan_geometry_findings(module: Any) -> list[Finding]:
+        """A runtime scan keeps its source geometry and owns its output."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_LITERAL_VALUE, SSA_VALUE,
+            TENSOR_OWNED_HEAP_BINDING, TENSOR_RUNTIME_SCAN_GEOMETRY,
+        )
+        from .concorded_literals import MISSING, literal_from_identity
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+        from .tensor_ssa_lowering import (
+            _constant_payload, _dynamic_tensor_geometry_evidence,
+        )
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_SCAN_GEOMETRY)
+        found = []
+        for row in page.rows():
+            receipt = book.latest_ref(TENSOR_RUNTIME_SCAN_GEOMETRY, row)
+            record = page.cell(receipt.row, receipt.column)
+            function = (module.functions.get(str(row[1]))
+                        if isinstance(row, tuple) and len(row) == 3 else None)
+            valid = (
+                function is not None and function_scope_of(function) == row[0]
+                and isinstance(record, tuple) and len(record) == 9
+                and record[0] == "cumsum"
+                and all(type(value) is int for value in record[1:8])
+                and record[8] == "cumsum_dim_double"
+            )
+            if valid:
+                (_tag, source_id, axis_id, axis, shape_id, rank_id,
+                 count_id, carrier_id, callee_name) = record
+                table = module.tensor_tables.get(function.name)
+                source = None if table is None else table.by_id(source_id)
+                result = None if table is None else table.by_id(row[2])
+                source_fact = posted_ssa_value_fact(
+                    function, source_id, book=book,
+                )
+                result_fact = posted_ssa_value_fact(
+                    function, row[2], book=book,
+                )
+                owner_ref = book.latest_ref(
+                    TENSOR_OWNED_HEAP_BINDING,
+                    (row[0], function.name, row[2]),
+                )
+                owner = (book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                    owner_ref.row, owner_ref.column,
+                ) if owner_ref is not None else None)
+                causes = {source for source, _ in book.edges_into(receipt)}
+                geometry = _dynamic_tensor_geometry_evidence(
+                    module, function, source_id,
+                )
+                axis_cell = ssa_value_identity_cell(
+                    function, axis_id, book=book,
+                )
+                axis_origins = tuple(
+                    source for source, _ in book.edges_into(axis_cell)
+                    if source.page == CANONICAL_VALUE
+                ) if axis_cell is not None else ()
+                authored_axis, literal_cells = (
+                    literal_from_identity(book, axis_origins[0])
+                    if len(axis_origins) == 1 else (MISSING, ())
+                )
+                cells = tuple(ssa_value_identity_cell(
+                    function, value_id, book=book,
+                ) for value_id in (
+                    source_id, row[2], axis_id, shape_id, rank_id,
+                    count_id, carrier_id,
+                ))
+                definitions = [instruction for block in function.blocks.values()
+                               for instruction in block.instrs]
+                scan_calls = [instruction for instruction in definitions
+                              if instruction.op == "Call"
+                              and instruction.res is not None
+                              and int(instruction.res.id) == row[2]]
+                selected = module.functions.get(callee_name)
+                input_formal = (
+                    selected.args[0] if selected is not None
+                    and len(selected.args) == 5 else None
+                )
+                output_formal = (
+                    selected.args[1] if selected is not None
+                    and len(selected.args) == 5 else None
+                )
+                input_formal_fact = (
+                    posted_ssa_value_fact(
+                        selected, int(input_formal.id), book=book,
+                    ) if input_formal is not None else None
+                )
+                output_formal_fact = (
+                    posted_ssa_value_fact(
+                        selected, int(output_formal.id), book=book,
+                    ) if output_formal is not None else None
+                )
+                selected_formal_cells = (
+                    tuple(ssa_value_identity_cell(
+                        selected, int(value.id), book=book,
+                    ) for value in (input_formal, output_formal))
+                    if input_formal is not None and output_formal is not None
+                    else ()
+                )
+                declared_outputs = (
+                    tuple(selected.metadata.get("named_outputs", ()))
+                    if selected is not None else ()
+                )
+                dim_definitions = [instruction for instruction in definitions
+                                   if instruction.res is not None
+                                   and int(instruction.res.id) ==
+                                   (int(scan_calls[0].args[4].id)
+                                    if len(scan_calls) == 1
+                                    and len(scan_calls[0].args) == 5 else -1)]
+                valid = (
+                    source is not None and result is not None
+                    and source_fact is not None and result_fact is not None
+                    and source_fact.physical_dtype ==
+                    result_fact.physical_dtype == "float64"
+                    and source_fact.storage == result_fact.storage == "span"
+                    and type(source_fact.rank) is int and source_fact.rank > 0
+                    and result_fact.rank == source_fact.rank
+                    and type(axis) is int and 0 <= axis < source_fact.rank
+                    and source.metadata_state == result.metadata_state == "dynamic"
+                    and (source.shape_value_id, source.rank_value_id,
+                         source.element_count_value_id) ==
+                    (shape_id, rank_id, count_id)
+                    and (result.shape_value_id, result.rank_value_id,
+                         result.element_count_value_id) ==
+                    (shape_id, rank_id, count_id)
+                    and result.data_value_id == carrier_id
+                    and isinstance(owner, tuple) and len(owner) == 4
+                    and owner[0] == carrier_id and owner[2] == count_id
+                    and owner[3] == "float64"
+                    and owner_ref in causes
+                    and type(authored_axis) is int
+                    and (authored_axis if authored_axis >= 0 else
+                         authored_axis + source_fact.rank) == axis
+                    and all(cell in causes for cell in literal_cells)
+                    and len(axis_origins) == 1
+                    and axis_origins[0] in causes
+                    and geometry is not None
+                    and tuple(int(value.id) for value in geometry[0]) == (
+                        shape_id, rank_id, count_id,
+                    )
+                    and set(geometry[1]) <= causes
+                    and input_formal_fact is not None
+                    and input_formal_fact.physical_dtype == "float64"
+                    and input_formal.dtype == "ptr"
+                    and output_formal_fact is not None
+                    and output_formal_fact.physical_dtype == "float64"
+                    and output_formal.dtype == "ptr"
+                    and selected.metadata.get("ssa_output_argument") == 1
+                    and len(declared_outputs) == 1
+                    and isinstance(declared_outputs[0], tuple)
+                    and len(declared_outputs[0]) == 2
+                    and isinstance(declared_outputs[0][0], str)
+                    and declared_outputs[0][1] == int(output_formal.id)
+                    and len(selected_formal_cells) == 2
+                    and all(cell is not None and cell in causes
+                            for cell in selected_formal_cells)
+                    and all(cell is not None and cell in causes
+                            for cell in cells)
+                    and any(cause.page == SOURCE_LITERAL_VALUE
+                            for cause in causes)
+                    and len(scan_calls) == 1
+                    and scan_calls[0].attributes.get("callee") == callee_name
+                    and scan_calls[0].attributes.get("ssa_output_argument") == 1
+                    and tuple(int(value.id) for value in scan_calls[0].args[:4])
+                    == (source_id, carrier_id, shape_id, rank_id)
+                    and len(dim_definitions) == 1
+                    and dim_definitions[0].op == "Const"
+                    and _constant_payload(dim_definitions[0]) == axis
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-runtime-scan-geometry", str(row[1]),
+                    row[2] if isinstance(row, tuple) and len(row) == 3 else None,
+                    "runtime scan lacks exact source geometry, selected call, "
+                    "axis or owned output proof",
                 ))
         return found
 

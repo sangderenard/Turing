@@ -222,6 +222,45 @@ class FailureArms:
         error = self.name()
         context = Context(error, parent.caught, True)
         protected_body = self.statements(node.body, context) or [ast.Pass()]
+        # A direct assignment in the protected body is available after this
+        # try only when every handler terminates and no else/finally can
+        # replace it.  Retain the actual copied RHS occurrence for the
+        # reducer's normal-continuation binding, never its source spelling.
+        normal_bindings = ()
+        if (node.handlers and not node.orelse and not node.finalbody
+                and all(handler.body and isinstance(handler.body[-1], ast.Raise)
+                        for handler in node.handlers)
+                and len(protected_body) == len(node.body)
+                and all(isinstance(item, (ast.Assign, ast.AnnAssign))
+                        for item in node.body)):
+            direct = []
+            for authored, copied in zip(node.body, protected_body):
+                authored_targets = (tuple(authored.targets)
+                                    if isinstance(authored, ast.Assign)
+                                    else (authored.target,))
+                copied_targets = (tuple(copied.targets)
+                                  if isinstance(copied, ast.Assign)
+                                  else (copied.target,))
+                if (len(authored_targets) != 1 or len(copied_targets) != 1
+                        or not isinstance(authored_targets[0], ast.Name)
+                        or not isinstance(copied_targets[0], ast.Name)
+                        or authored_targets[0].id != copied_targets[0].id
+                        or copied.value is None):
+                    direct = []
+                    break
+                direct.append((copied_targets[0].id, copied.value))
+            if len({name for name, _value in direct}) == len(direct):
+                from ..transmogrifier.graph.graph_express2 import post_source_span
+                try_cell = post_source_span(None, node)
+                handler_exits = tuple(
+                    post_source_span(None, handler.body[-1])
+                    for handler in node.handlers
+                )
+                if try_cell is not None and all(handler_exits):
+                    normal_bindings = tuple(
+                        (name, value, try_cell, handler_exits)
+                        for name, value in direct
+                    )
         self.checks += 1
         body = [
             self.assign(error, self.intrinsic("exception_none")),
@@ -279,14 +318,21 @@ class FailureArms:
                 body += [ast.If(test=self.load(self.return_flag), body=[self.assign(error, self.intrinsic("exception_none"))],
                     orelse=[self.assign(self.return_flag, self.load(saved_return))])]
         body.append(ast.If(test=self.active(context), body=[self.assign(parent.error, self.load(error))], orelse=[]))
-        return [self.guard(parent, body)]
+        wrapper = self.guard(parent, body)
+        wrapper._turing_exception_normal_bindings = normal_bindings
+        return [wrapper]
 
     def outside(self, statements, context):
         result = []
         for statement in statements:
             if isinstance(statement, ast.Try):
                 lowered = self.try_statement(statement, context)
-                lowered.append(ast.If(test=self.active(context), body=[ast.Expr(value=self.intrinsic("exception_raise", (self.load(context.error),)))], orelse=[]))
+                barrier = ast.If(test=self.active(context), body=[ast.Expr(value=self.intrinsic("exception_raise", (self.load(context.error),)))], orelse=[])
+                barrier._turing_exception_normal_bindings = getattr(
+                    lowered[0], '_turing_exception_normal_bindings', (),
+                )
+                barrier._turing_exception_normal_wrapper = lowered[0]
+                lowered.append(barrier)
                 if self.return_flag is not None:
                     lowered.append(ast.If(test=self.load(self.return_flag), body=[ast.Return(value=self.load(self.return_value))], orelse=[]))
                 for item in lowered: ast.copy_location(item, statement)

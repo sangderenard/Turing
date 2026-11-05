@@ -665,6 +665,14 @@ SOURCE_RESOURCE_CONTROL = declare_page("source_resource_control", (
 SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
     RowField("source", K.PAGE_REF),
 ), tuple)  # exact source body, proposed primitive/control body, check count
+SOURCE_EXCEPTION_NORMAL_BINDING = declare_page(
+    "source_exception_normal_binding", (
+        RowField("read_scope", K.SCOPE),
+        RowField("barrier", K.VALUE_ID),
+        RowField("producer", K.VALUE_ID),
+    ), tuple,
+)  # (name, NAME_BINDING, producer, Try, terminating handlers, barrier,
+   #  exception_raise, ingestion, wrapper/producer/barrier/terminal activity)
 SOURCE_EXCEPTION_NODE = declare_page("source_exception_node", (
     RowField("source", K.PAGE_REF),
 ), object)  # exact generated ingestion node -> exception conversion
@@ -4759,6 +4767,19 @@ CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
 #: the ordered SSA instruction operands remain the execution authority.
 TENSOR_ELEMENTWISE_EXTENT_BINDING = declare_page(
     "tensor_elementwise_extent_binding", (
+        RowField("scope", K.SCOPE), RowField("function", K.NAME),
+        RowField("result", K.VALUE_ID),
+    ), tuple,
+)
+#: A runtime prefix scan preserves its source's exact shape, rank and count,
+#: then writes a distinct owned output carrier.  This is a scan relation,
+#: not an elementwise opcode or a reduction domain.  Fact:
+#: ("cumsum", source, authored_axis, normalized_axis, shape, rank, count,
+#:  output_carrier, selected_kernel).  DERIVED from source/result/axis and
+#: metadata SSA cells, the source geometry proof, the literal axis proof,
+#: and the existing owned heap binding.
+TENSOR_RUNTIME_SCAN_GEOMETRY = declare_page(
+    "tensor_runtime_scan_geometry", (
         RowField("scope", K.SCOPE), RowField("function", K.NAME),
         RowField("result", K.VALUE_ID),
     ), tuple,
