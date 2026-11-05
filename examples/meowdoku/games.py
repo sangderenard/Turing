@@ -640,7 +640,8 @@ class Learner:
         lead = (self.corpus.summary() if self.corpus is not None else self.note) or ""
         hours = (time.time() - self.started_at) / 3600 if self.started_at else 0.0
         return ((lead + " · ") if lead else "") + (
-            f"self-play {self.parallel} games in flight · {self.steps_per_second:.0f} plies/s · "
+            f"self-play {self.parallel} games in flight · {self.engine.playouts} playouts a move · "
+            f"{self.steps_per_second * self.parallel:.1f} plies/s · "
             f"{p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
             + (f" · loss {p.last_loss:.3f}" if p.games else "")
             + (f" · last: {self.last_result}" if self.last_result else "")
@@ -690,7 +691,7 @@ class ChessArena(Chess):
             plies = self.learner.engine.plies(0)
         st = Chess.state(self)
         st["selected"] = None; st["hints"] = [0] * 64
-        st["status"] = self.learner.summary()
+        st["status"] = self.learner.summary() + (f" · search: {self.learner.engine.last_search}" if self.learner.engine.last_search else "")
         st["moves"] = plies
         return st
 

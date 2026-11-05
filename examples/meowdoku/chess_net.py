@@ -272,7 +272,7 @@ class ConvValueNet:
                 total = loss + cross_entropy
                 self.last_policy_loss = float(np.asarray(cross_entropy.numpy()))
             else:
-                total = loss
+                total = loss + logits.sum() * 0.0          # keeps the policy head on the tape (zero gradient)
             grads = AT.autograd.grad(total, params)
             with AT.autograd.no_grad():
                 for p, q in zip(params, self.optimizer.step(params, grads)):
@@ -449,36 +449,45 @@ class SelfPlay:
 
 
 class BatchEngine:
-    """Many games stepped together.  ``step`` advances every game by one
-    ply: all legal successors of all games are encoded into one batch,
-    valued in one forward pass, each game picks its move; games that end
-    are trained on together and restart.  ``games[0]`` is the display
+    """Many self-play games stepped together, every move chosen by the
+    tree search (``mcts.search``): ``playouts`` playouts a move, moves
+    sampled from the visit counts for the first ``explore_plies`` plies
+    (Dirichlet noise at the root) and the most visited move after that.
+    Each finished game trains the value head on its outcome and the policy
+    head on the search's visit distributions.  ``games[0]`` is the display
     game the page shows."""
 
-    def __init__(self, player: SelfPlay, display: Chess, parallel: int):
+    def __init__(self, player: SelfPlay, display: Chess, parallel: int, playouts: int | None = None,
+                 explore_plies: int = 20):
+        import os
         self.player = player
         self.games = [display] + [Chess(f"arena-{k}") for k in range(1, parallel)]
         self.boards = [[] for _ in self.games]
         self.materials = [[] for _ in self.games]
+        self.policies = [[] for _ in self.games]
         self._plies = [0] * len(self.games)
         self.pending: list[tuple] = []
-        self.train_every = max(2, parallel // 4)
+        self.train_every = 1
+        self.playouts = int(playouts or os.environ.get("MEOWDOKU_ARENA_PLAYOUTS", 160))
+        self.explore_plies = explore_plies
+        self.last_search = ""
 
     def plies(self, index: int) -> int:
         return self._plies[index]
 
     def _restart(self, k: int, result: str) -> None:
-        self.pending.append((self.boards[k], self.materials[k], result))
+        self.pending.append((self.boards[k], self.materials[k], result, self.policies[k]))
         game = self.games[k]
         game.pieces, game.ids, game.selected = {}, {}, None
         game.turn = game.sides[0]
         game.history, game.moves = [], 0
         game.setup()
-        self.boards[k], self.materials[k], self._plies[k] = [], [], 0
+        self.boards[k], self.materials[k], self.policies[k], self._plies[k] = [], [], [], 0
 
     def step(self) -> list[str]:
+        """Every game one ply further, each by its own search."""
+        from meowdoku import mcts
         finished: list[str] = []
-        candidates, spans, per_game_moves = [], [], []
         for k, game in enumerate(self.games):
             end = game.outcome()
             if end is None and self._plies[k] >= MAX_PLIES:
@@ -486,28 +495,21 @@ class BatchEngine:
             if end:
                 finished.append(f"{end} in {self._plies[k]} plies")
                 self._restart(k, end)
-                per_game_moves.append(None)
-                spans.append((len(candidates), len(candidates)))
                 continue
             self.boards[k].append(encode(game.pieces, game.turn))
             self.materials[k].append(material(game.pieces))
-            moves = legal_moves(game)
-            per_game_moves.append(moves)
-            start = len(candidates)
-            candidates.extend(encode(*game.peek(src, dst)) for src, dst in moves)
-            spans.append((start, len(candidates)))
-        if candidates:
-            values = self.player.net.values(np.stack(candidates))
-            for k, game in enumerate(self.games):
-                moves = per_game_moves[k]
-                if not moves:
-                    continue
-                a, b = spans[k]
-                move = self.player.pick(moves, values[a:b], game.turn, greedy=False)
-                Chess.cell(game, *game.rc(move[0]), "primary"); Chess.cell(game, *game.rc(move[1]), "primary")
-                self._plies[k] += 1
+            exploring = self._plies[k] < self.explore_plies
+            result = mcts.search(game, self.player.net, simulations=self.playouts, rng=self.player.rng,
+                                 temperature=1.0 if exploring else 0.0, dirichlet=0.3)
+            self.policies[k].append(result.policy)
+            if k == 0:
+                self.last_search = result.describe(game)
+            move = result.move
+            Chess.cell(game, *game.rc(move[0]), "primary"); Chess.cell(game, *game.rc(move[1]), "primary")
+            self._plies[k] += 1
         if len(self.pending) >= self.train_every:
-            self.player.learn_from_games(self.pending)
+            for boards, materials, result, policies in self.pending:
+                self.player.learn_from(boards, materials, result, policies)
             self.pending = []
         return finished
 
