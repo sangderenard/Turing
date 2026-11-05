@@ -1677,9 +1677,14 @@ def _kernel_signature(symbol: str) -> tuple[str, tuple[str, ...]]:
         extract_llvm_function,
     )
 
-    text = extract_llvm_function(symbol)
+    from .tensor_kernel_lanes import lane_declaration
+
+    # A symbol the active tensor-kernel lane defines outside the module has
+    # only its declaration; its signature is read from that.
+    lane = lane_declaration(symbol)
+    text = lane if lane is not None else extract_llvm_function(symbol)
     match = _re.search(
-        r"define\s+([\w<>\s\*]+?)\s*@" + _re.escape(symbol) + r"\((.*?)\)",
+        r"(?:define|declare)\s+([\w<>\s\*]+?)\s*@" + _re.escape(symbol) + r"\((.*?)\)",
         text, _re.DOTALL,
     )
     if match is None:

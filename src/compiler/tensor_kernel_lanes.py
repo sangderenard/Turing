@@ -29,7 +29,39 @@ HONORED_LANES = ("repository", "eigen")
 # Symbol -> the external declaration with the authored signature.
 EIGEN_SYMBOLS: dict[str, str] = {
     "matmul_double": "declare void @matmul_double(ptr, ptr, ptr, i32, i32, i32)",
+    # Lane-only whole operations (no authored repository definition):
+    # softmax over the last axis of a (rows, cols) block, and an elementwise
+    # binary over operands addressed by element strides (0 on a broadcast
+    # axis), so no broadcast copy is materialized.
+    "softmax_lastdim_double": "declare void @softmax_lastdim_double(ptr, ptr, i32, i32)",
+    "broadcast_binary_double": "declare void @broadcast_binary_double(ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32)",
 }
+
+# The capability manifest: the operations each lane performs WHOLE, so the
+# front end and the promotion identities keep them as one node instead of
+# decomposing them.  An operation outside its lane's set is decomposed
+# through the minimal tensor vocabulary as before.
+#   matmul / batched_matmul  -- matmul_double / batched_matmul_indexed_double
+#   softmax_lastdim          -- softmax_lastdim_double
+#   broadcast_binary         -- broadcast_binary_double for BROADCAST_BINARY_OPCODES
+LANE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "repository": frozenset({"matmul", "batched_matmul"}),
+    "eigen": frozenset({"matmul", "batched_matmul", "softmax_lastdim", "broadcast_binary"}),
+}
+# Binary opcodes (CTensorOp numbering) broadcast_binary_double implements, with
+# the repository's exact semantics: add, sub, mul, truediv, maximum
+# (a > b ? a : b), minimum (a < b ? a : b).
+BROADCAST_BINARY_OPCODES = frozenset({0, 1, 2, 3, 26, 27})
+BROADCAST_MAX_RANK = 8
+
+
+def lane_capabilities(lane: str | None = None) -> frozenset[str]:
+    return LANE_CAPABILITIES[lane or active_lane()]
+
+
+def lane_handles(operation: str, lane: str | None = None) -> bool:
+    """Does the active lane perform ``operation`` whole?"""
+    return operation in lane_capabilities(lane)
 
 _SOURCE = (Path(__file__).resolve().parents[1] / "common" / "tensors"
            / "accelerator_backends" / "c_backend" / "eigen_kernels.cpp")

@@ -57,9 +57,11 @@ class NativeEvaluator:
         from src.compiler.work_contract import PRESETS, scoped_work_contract
         self.net, self.batch, self.contract = net, int(batch), contract or "develop"
         name = f"chess_eval_c{net.channels}_h{net.hidden}_b{self.batch}_{self.contract}"
-        outputs, bindings, self.shapes = _trace(net.channels, net.hidden, self.batch, name)
         started = time.perf_counter()
         with scoped_work_contract(PRESETS[self.contract]):
+            # Traced under the contract too: the front end reads the active
+            # kernel lane's capability manifest while it records the program.
+            outputs, bindings, self.shapes = _trace(net.channels, net.hidden, self.batch, name)
             self.forward = compile_native_graph_forward(
                 outputs, bindings=bindings, source="ConvValueNet.forward_both + masked softmax",
                 name=name, directory=Path(directory) / name)

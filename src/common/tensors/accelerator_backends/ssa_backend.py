@@ -387,6 +387,9 @@ class SSATensorProgram:
                         tensor_operands[0], tensor_operands[1], 0
                     )
                 else:
+                    whole = self._broadcast_binary_whole(canonical, left, right, shape)
+                    if whole is not None:
+                        return whole
                     if isinstance(left, SSATensorValue) and left.shape != shape:
                         left = self.broadcast(left, shape)
                     if isinstance(right, SSATensorValue) and right.shape != shape:
@@ -463,6 +466,42 @@ class SSATensorProgram:
                 output_argument=2,
             )
         raise NotImplementedError(f"invalid SSA tensor operand layout for {canonical!r}")
+
+    def _broadcast_binary_whole(self, canonical, left, right, shape):
+        """One ``broadcast_binary_double`` call when the active kernel lane
+        declares ``broadcast_binary`` (``tensor_kernel_lanes``): each operand
+        is addressed by element strides, 0 on its broadcast axes, so no
+        broadcast copy is materialized.  None keeps the decomposed form."""
+        from src.compiler.tensor_kernel_lanes import (
+            BROADCAST_BINARY_OPCODES, BROADCAST_MAX_RANK, lane_handles,
+        )
+        if not shape or len(shape) > BROADCAST_MAX_RANK or not lane_handles("broadcast_binary"):
+            return None
+        if not (isinstance(left, SSATensorValue) and isinstance(right, SSATensorValue)):
+            return None
+        opcode = c_tensor_opcode(canonical)
+        if opcode is None or opcode[0] != "binary" or int(opcode[1]) not in BROADCAST_BINARY_OPCODES:
+            return None
+
+        def strides(operand_shape):
+            aligned = (1,) * (len(shape) - len(operand_shape)) + tuple(operand_shape)
+            result_strides, running = [0] * len(shape), 1
+            for axis in range(len(shape) - 1, -1, -1):
+                result_strides[axis] = 0 if aligned[axis] == 1 and shape[axis] != 1 else running
+                running *= aligned[axis]
+            return result_strides
+
+        result = self._fresh(shape=shape)
+        return self._call(
+            "broadcast_binary_double",
+            [left.value, right.value, result,
+             self._int_vector(shape), self._int_vector(strides(left.shape)),
+             self._int_vector(strides(right.shape)),
+             self._constant(len(shape), "int32"), self._constant(prod(shape), "int32"),
+             self._constant(int(opcode[1]), "int32")],
+            result,
+            output_argument=2,
+        )
 
     def full(self, shape: tuple[int, ...], value: float = 0.0) -> SSATensorValue:
         result = self._fresh(shape=shape)
@@ -1111,6 +1150,21 @@ class SSATensorOperations(AbstractTensor):
 
     def softmax_(self, dim=-1) -> SSATensorValue:
         dim = int(dim) % len(self.data.shape)
+        from src.compiler.tensor_kernel_lanes import lane_handles
+        if lane_handles("softmax_lastdim") and dim == len(self.data.shape) - 1:
+            # The active kernel lane performs softmax whole; otherwise the
+            # five-operation decomposition below.
+            program = self.data.program
+            cols = int(self.data.shape[-1])
+            rows = int(prod(self.data.shape) // cols) if cols else 0
+            result = program._fresh(shape=self.data.shape)
+            return program._call(
+                "softmax_lastdim_double",
+                [self.data.value, result, program._constant(rows, "int32"),
+                 program._constant(cols, "int32")],
+                result,
+                output_argument=1,
+            )
         maximum = self.data.program.reduce_dim(
             self.data, dim, 3, keepdim=True
         )
