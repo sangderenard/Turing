@@ -6599,6 +6599,7 @@ def _emit_repository_call_module(
         r"define\s+[^@]*@([A-Za-z_$.-][\w$.-]*)\s*\(", module_text,
     ))
     pending_kernels.discard(entry_name)
+    lane_objects: list[tuple[str, str]] = []
     while pending_kernels:
         symbol = pending_kernels.pop()
         if symbol in definitions or symbol in declarations:
@@ -6609,6 +6610,15 @@ def _emit_repository_call_module(
             pending_kernels.update(set(_re.findall(
                 r"@([A-Za-z_$.-][\w$.-]*)\s*\(", declarations[symbol],
             )) - set(declarations) - set(definitions))
+            continue
+        from .tensor_kernel_lanes import eigen_object, lane_declaration
+        lane = lane_declaration(symbol)
+        if lane is not None:
+            # The active work contract's tensor-kernel lane defines this
+            # symbol outside the module; its object is linked in.
+            declarations[symbol] = lane
+            symbol_origins[symbol] = ("tensor_kernel_lane",)
+            lane_objects.append(eigen_object())
             continue
         try:
             definition = extract_llvm_function(symbol)
@@ -6745,9 +6755,11 @@ def _emit_repository_call_module(
     )
     return LLVMFunctionArtifact(
         name=entry_name,
-        linked_objects=tuple(dict.fromkeys(
-            tuple(obj) for piece in piece_records.values()
-            for obj in piece.get("linked_objects", ()))),
+        linked_objects=tuple(dict.fromkeys((
+            *(tuple(obj) for piece in piece_records.values()
+              for obj in piece.get("linked_objects", ())),
+            *lane_objects,
+        ))),
         needs_validation_runtime=any(piece.get("needs_validation_runtime", False)
                                      for piece in piece_records.values()),
         external_slots=external_slot_rows(module, slot_functions),
@@ -8874,11 +8886,19 @@ def emit_ssa_function_to_llvm(
     # Authored kernels can call other authored helpers as well as external
     # math/intrinsic symbols.  Carry their definition closure and exact
     # canonical declarations into this otherwise standalone module.
+    from .tensor_kernel_lanes import eigen_object, lane_declaration
     definitions = dict(bounded_definitions)
-    definitions.update({
-        symbol: extract_llvm_function(symbol) for symbol in kernels_used
-    })
     external_declarations: dict[str, str] = {}
+    lane_objects: list[tuple[str, str]] = []
+    for symbol in kernels_used:
+        lane = lane_declaration(symbol)
+        if lane is not None:
+            # The active work contract's tensor-kernel lane defines this
+            # symbol outside the module; its object is linked in.
+            external_declarations[symbol] = lane
+            lane_objects.append(eigen_object())
+        else:
+            definitions[symbol] = extract_llvm_function(symbol)
     unresolved_symbols: set[str] = set()
     while True:
         dependency_text = "\n".join((*definitions.values(), *lines))
@@ -8895,6 +8915,11 @@ def emit_ssa_function_to_llvm(
                 external_declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[
                     symbol
                 ]
+                continue
+            lane = lane_declaration(symbol)
+            if lane is not None:
+                external_declarations[symbol] = lane
+                lane_objects.append(eigen_object())
                 continue
             try:
                 definitions[symbol] = extract_llvm_function(symbol)
@@ -8993,6 +9018,7 @@ def emit_ssa_function_to_llvm(
     return LLVMFunctionArtifact(
         name=name,
         llvm_ir=llvm_ir,
+        linked_objects=tuple(dict.fromkeys(lane_objects)),
         buffer_order=tuple(buffer_ids),
         buffer_shapes=tuple(value_shapes.get(value_id, ()) for value_id in buffer_ids),
         extent_order=tuple(extent_order),

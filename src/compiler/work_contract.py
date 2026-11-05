@@ -242,6 +242,11 @@ class WorkContract:
     # (callee, signature) per round (``signature``) or once per callsite
     # (``callsite``).  See ``_HONORED_CALLSITE_DESCRIPTOR_REUSE``.
     callsite_descriptor_reuse: str = "signature"
+    # Who defines the repository tensor kernels in native products:
+    # ``repository`` (the authored, compensated kernels) or ``eigen``
+    # (Eigen's GEMM linked in; a different numerical contract).  See
+    # ``tensor_kernel_lanes``.
+    tensor_kernel_lane: str = "repository"
     # Resident-set budget for one compile, in bytes; ``None`` = explicitly
     # unregulated. Ordinary compilation starts fully decoded and fast. Only
     # after crossing this default 10 GiB limit does memory regulation escalate
@@ -345,6 +350,12 @@ class WorkContract:
                 "memory_system_reserve_bytes must be a non-negative int, "
                 f"got {self.memory_system_reserve_bytes!r}"
             )
+        from .tensor_kernel_lanes import HONORED_LANES as _HONORED_LANES
+        if self.tensor_kernel_lane not in _HONORED_LANES:
+            raise ValueError(
+                f"tensor_kernel_lane={self.tensor_kernel_lane!r} is not "
+                f"honored; honored: {_HONORED_LANES}"
+            )
         if self.callsite_descriptor_reuse not in _HONORED_CALLSITE_DESCRIPTOR_REUSE:
             raise ValueError(
                 f"callsite_descriptor_reuse={self.callsite_descriptor_reuse!r} "
@@ -446,6 +457,14 @@ PRESETS: dict[str, WorkContract] = {
         # stays off here, so tuning does not change results.
         compiler_flags=("-O3", "-march=native"),
         deployment="auto",
+    ),
+    "eigen": WorkContract(
+        "eigen", register_reuse=True, inexact_identities=False,
+        contract_multiply_add=False,
+        # The deploy preset's toolchain answer with the tensor kernels
+        # defined by Eigen instead of the authored compensated kernels.
+        compiler_flags=("-O3", "-march=native"),
+        tensor_kernel_lane="eigen",
     ),
     "fast": WorkContract(
         "fast", register_reuse=True, inexact_identities=True,
