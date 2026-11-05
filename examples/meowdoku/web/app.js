@@ -818,11 +818,21 @@ const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: nu
 const PRED_STEP = 1 / 240;            // the predictor's own rate (PREDICT_HZ)
 window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
+// ERROR SYNC never jumps the picture.  A correction (the server's word against
+// what is drawn) is eased away over a time that grows with its size -- a
+// hair in ~60 ms, a unit or more over up to ~180 ms -- so a large disagreement
+// glides rather than pops.  Only a jump beyond SYNC_SNAP (a respawn, a tile
+// recycled to the far edge, a rewind) is taken at once.
+const SYNC_SNAP = 6.0;
+const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min(1, error / 2)));
 function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"]]) {
-      if (!motion[axis]) continue;
+      // An axis the game's motion law does not declare (a platformer's
+      // fall) is carried at its last velocity, never frozen until the next
+      // reply; the server's next word is eased in like any correction.
+      if (!motion[axis]) { ship[pos] += (ship[vel] || 0) * dt; continue; }
       const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
         lo: motion[axis][0], hi: motion[axis][1], speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
       ship[pos] = r.x_next; ship[vel] = r.v_next;
@@ -838,7 +848,7 @@ function reconcile(game) {
   const ship = { ...game.you };
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
   if (before) { pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
-                if (Math.hypot(...pred.offset) > 1.5) pred.offset = [0, 0];
+                if (Math.hypot(...pred.offset) > SYNC_SNAP) pred.offset = [0, 0];
                 syncFaithfulness(Math.hypot(before[0] - ship.x, before[1] - ship.y)); }
   pred.ship = ship;
 }
@@ -861,7 +871,7 @@ function predictFrame(now) {
   }
   pred.open.dur += frame;
   if (pred.ship) stepShip(pred.ship, c, frame, game.predict);
-  const decay = Math.exp(-frame / 0.06);
+  const decay = 1 - syncEase(Math.hypot(...pred.offset), frame);
   pred.offset = [pred.offset[0] * decay, pred.offset[1] * decay];
   predictShots(now, game, c);
 }
@@ -1114,11 +1124,13 @@ function entityModel(piece, now) {
   const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
   // Each frame the drawn position first moves by the velocity (so a shot
   // never trails), then only the remaining error is eased away.
-  const frame = piece.drawnAt == null ? 0 : Math.max(0, Math.min(0.1, now - piece.drawnAt));
-  const step = piece.drawnAt == null ? 1 : 1 - Math.exp(-frame / 0.045);
+  const first = piece.drawnAt == null;
+  const frame = first ? 0 : Math.max(0, Math.min(0.1, now - piece.drawnAt));
   piece.drawnAt = now;
   const px = piece.x + piece.vx * frame, pz = piece.z + piece.vz * frame;
-  const far = Math.hypot(tx - px, tz - pz) > 1.5;                    // a respawn or rewind: go there
+  const error = Math.hypot(tx - px, tz - pz);
+  const step = first ? 1 : syncEase(error, frame);
+  const far = error > SYNC_SNAP;                                     // a respawn or rewind: go there
   const x = far || step >= 1 ? tx : px + (tx - px) * step;
   const z = far || step >= 1 ? tz : pz + (tz - pz) * step;
   piece.x = x; piece.z = z;
