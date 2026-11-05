@@ -197,7 +197,14 @@ function terrainHeights(n, seed = 7) {
   for (let i = 0; i < height.length; i++) height[i] /= total;
   return height;
 }
-function terrainTexture(unit) {
+function terrainTexture(unit, exported) {
+  // The exported terrain (web_export: Pluck's DepthMesh relief + its colours)
+  // when present; else the page's own flat procedural map.
+  if (exported && exported.texture) {
+    const n = exported.texture.size, raw = atob(exported.texture.rgba), rgba = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) rgba[i] = raw.charCodeAt(i);
+    return uploadTerrainTexture(unit, n, rgba);
+  }
   const n = TERRAIN.size, h = terrainHeights(n), rgba = new Uint8Array(n * n * 4);
   const ramp = [[0.00, [0.10, 0.22, 0.42]], [0.40, [0.20, 0.42, 0.62]], [0.44, [0.78, 0.72, 0.48]],
                 [0.50, [0.32, 0.58, 0.26]], [0.62, [0.22, 0.44, 0.20]], [0.72, [0.46, 0.40, 0.34]], [0.84, [0.92, 0.93, 0.96]]];
@@ -219,6 +226,14 @@ function terrainTexture(unit) {
     rgba[o] = Math.min(255, c[0] * shade * 255); rgba[o + 1] = Math.min(255, c[1] * shade * 255);
     rgba[o + 2] = Math.min(255, c[2] * shade * 255); rgba[o + 3] = 255;
   }
+  return uploadTerrainTexture(unit, n, rgba);
+}
+function depthTexture(unit, exported) {
+  const n = exported.size, raw = atob(exported.rgba), rgba = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) rgba[i] = raw.charCodeAt(i);
+  return uploadTerrainTexture(unit, n, rgba);
+}
+function uploadTerrainTexture(unit, n, rgba) {
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
   gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
@@ -241,9 +256,51 @@ function terrainMesh(width, depth) {
   gl.bindVertexArray(null);
   return { vao, count: 6, uvBuffer, corners: [[x0, z0], [x1, z1], [x1, z0], [x0, z0], [x0, z1], [x1, z1]], key: `${width}x${depth}` };
 }
+// The relief mesh exported from Pluck's DepthMesh: positions, normals and UVs
+// fixed; the page only slides it along the board by the scroll, wrapping at
+// one tile (the height map is tileable), so mountains pass beneath in true
+// perspective, lit and shaded by the Phong lights through their own normals.
+function reliefMesh(exported) {
+  if (TERRAIN.relief !== undefined) return TERRAIN.relief;
+  if (!exported || !exported.positions) return (TERRAIN.relief = null);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buffer = (data, loc, size) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); };
+  buffer(exported.positions, 0, 3); buffer(exported.normals, 1, 3); buffer(exported.uvs, 3, 2);
+  gl.bindVertexArray(null);
+  let shadow = null;
+  if (exported.shadow_positions) {
+    const svao = gl.createVertexArray(); gl.bindVertexArray(svao);
+    buffer(exported.shadow_positions, 0, 3);
+    gl.bindVertexArray(null);
+    shadow = { vao: svao, count: exported.shadow_positions.length / 3 };
+  }
+  return (TERRAIN.relief = { vao, count: exported.positions.length / 3, tile: exported.tile, span: exported.span, shadow });
+}
+function terrainModel(relief) {
+  // Centred across the field; starting one tile above it and sliding down.
+  return M.translate(state.extent.width / 2 - relief.span[0] / 2, -0.05, -relief.tile - 2.0 + TERRAIN.scroll);
+}
+// The decimated relief into the shadow map: peaks shadow the land and what
+// flies low beneath them, at a fraction of the full mesh's triangles.
+function terrainShadowCaster() {
+  const game = state.game;
+  if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return null;
+  const relief = reliefMesh(state.assets && state.assets.terrain);
+  return relief && relief.shadow ? [relief.shadow.vao, relief.shadow.count, terrainModel(relief)] : null;
+}
 function drawTerrain(now, drawLit) {
   const game = state.game;
   if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return;
+  const relief = reliefMesh(state.assets && state.assets.terrain);
+  if (relief) {
+    const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
+    TERRAIN.at = now;
+    if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
+    drawLit(relief.vao, relief.count, terrainModel(relief), state.materialIndex.terrain);
+    return;
+  }
   const key = `${state.extent.width}x${state.extent.depth}`;
   if (!TERRAIN.mesh || TERRAIN.mesh.key !== key) TERRAIN.mesh = terrainMesh(state.extent.width, state.extent.depth);
   const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
@@ -499,12 +556,16 @@ function uploadMaterials(game) {
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
   // The vital bars: a glass tube each (clear) and its fill (glowing glass).
+  // Clouds: white frosted glass (rough, partly transmissive, softly lit from within).
+  records.push(["cloud@glass", [0.97, 0.98, 1.0], { roughness: 0.65, transmission: 0.55, opacity: 0.62, ior: 1.3, emission: [0.10, 0.11, 0.13] }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
   // Scrolling ground: albedo from colour layer TERRAIN.layer of the shader's
   // uColorUv texture stack (texstack field 1 = colour layer, 9 = blend).
-  records.push(["terrain", [1.0, 1.0, 1.0], { roughness: 0.9, colorLayer: TERRAIN.layer, colorBlend: 1.0 }]);
+  records.push(["terrain", [1.0, 1.0, 1.0], { roughness: 0.9, colorLayer: TERRAIN.layer, colorBlend: 1.0,
+    depthLayer: TERRAIN.layer, depthScaleMm: (state.assets && state.assets.terrain && state.assets.terrain.depth
+      && state.assets.terrain.depth.relief_mm) || 0.0 }]);
   // The craft's energy shield: a glassy bubble that glows blue, in SHIELD_STEPS
   // charge steps (opacity and glow rise with the charge).
   for (let k = 0; k < SHIELD_STEPS; k++) {
@@ -534,6 +595,12 @@ function uploadMaterials(game) {
       }
       if (tname === "texstack" && extra.colorLayer != null) {
         record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
+      }
+      if (tname === "texstack" && extra.depthLayer != null) {
+        // texstack 2 = depth layer, 4 = depth scale (mm), 6 = depth bias (mm);
+        // 5 / 7 = thickness scale / bias (the G channel, same map).
+        record[2] = extra.depthLayer; record[4] = extra.depthScaleMm ?? 0.0; record[6] = 0.0;
+        record[5] = extra.depthScaleMm ?? 0.0; record[7] = 0.0;
       }
       if (tname === "phong") {
         record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
@@ -687,10 +754,21 @@ function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; 
 const vitals = { shield: 0, health: 0, at: null, meshes: {} };
 // litMesh bakes the material into each vertex, so each bar part has its own
 // unit box, rebuilt when the material table is (re)uploaded.
+// A glass cylinder along z (radius 0.5, length 1, capped): the bars' tube and core.
+function cylinderFaces(id, segments = 24) {
+  const faces = [], ring = (z) => Array.from({ length: segments }, (_, i) => {
+    const a = (i / segments) * Math.PI * 2; return [0.5 * Math.cos(a), 0.5 + 0.5 * Math.sin(a), z]; });
+  const lo = ring(-0.5), hi = ring(0.5), cLo = [0, 0.5, -0.5], cHi = [0, 0.5, 0.5];
+  for (let i = 0; i < segments; i++) {
+    const j = (i + 1) % segments;
+    faces.push([lo[i], hi[i], hi[j], id], [lo[i], hi[j], lo[j], id], [cLo, lo[j], lo[i], id], [cHi, hi[i], hi[j], id]);
+  }
+  return faces;
+}
 function vitalBox(material) {
   const id = state.materialIndex[material], key = `${material}:${id}:${state.materialsVersion}`;
   if (!vitals.meshes[material] || vitals.meshes[material].key !== key)
-    vitals.meshes[material] = { key, mesh: litMesh(box(-0.5, 0, -0.5, 0.5, 1, 0.5, id)) };
+    vitals.meshes[material] = { key, mesh: litMesh(cylinderFaces(id)) };
   return vitals.meshes[material].mesh;
 }
 function drawVitals(now, drawLit) {
@@ -721,8 +799,35 @@ const SHIELD_STEPS = 6;
 const shieldView = { charge: 0, last: null, flashAt: -10 };
 function noteShield(game, now) {
   const charge = game && game.you ? Number(game.you.shield || 0) : 0;
-  if (shieldView.last != null && charge < shieldView.last - 0.2) shieldView.flashAt = now;
+  if (shieldView.last != null && charge < shieldView.last - 0.02) shieldView.flashAt = now;
   shieldView.last = charge; shieldView.charge = charge;
+}
+// A geodesic sphere: an icosahedron subdivided ``levels`` times, projected to
+// the unit sphere, FLAT facets (each triangle its own normal) so it reads as
+// cut glass.
+function geodesicMesh(levels = 2) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let verts = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+               [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]].map(norm);
+  let faces = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+               [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  for (let l = 0; l < levels; l++) {
+    const cache = new Map(), next = [];
+    const mid = (a, b) => { const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+      if (!cache.has(key)) { verts.push(norm(verts[a].map((v, k) => (v + verts[b][k]) / 2))); cache.set(key, verts.length - 1); }
+      return cache.get(key); };
+    for (const [a, b, c] of faces) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+      next.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]); }
+    faces = next;
+  }
+  return faces.map(([a, b, c]) => [verts[a], verts[b], verts[c]]);
+}
+const shieldFacets = {};
+function shieldGlobe(material) {
+  const id = state.materialIndex[material], key = `${id}:${state.materialsVersion}`;
+  if (!shieldFacets[material] || shieldFacets[material].key !== key)
+    shieldFacets[material] = { key, mesh: litMesh(geodesicMesh(2).map(([a, b, c]) => [a, b, c, id])) };
+  return shieldFacets[material].mesh;
 }
 function drawShield(now, drawLit) {
   const game = state.game;
@@ -730,11 +835,19 @@ function drawShield(now, drawLit) {
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
   if (!ship) return;
   const flash = Math.max(0, 1 - (now - shieldView.flashAt) / 0.4);
-  const charge = Math.min(1, shieldView.charge + flash);
+  // At rest only a faint rim (the craft must show through a full shield);
+  // each absorbed hit flares it.
+  const charge = Math.min(1, 0.18 * shieldView.charge + flash);
   if (charge <= 0.02) return;
-  const step = Math.round(charge * (SHIELD_STEPS - 1)), r = ship.size * 1.25 * (1 + 0.15 * flash);
-  const model = M.multiply(M.translate(ship.x, TILE.height + ship.size * 0.55, ship.z), M.scale(r, r * 0.7, r));
-  drawLit(state.meshes.__sphere.vao, state.meshes.__sphere.count, model, state.materialIndex[`shield_${step}`]);
+  // A bounding sphere of geodesic glass enclosing the whole craft (its drawn
+  // size grows with height, so the globe follows it), flaring on a hit.
+  const depth = game.predict && game.predict.depth, hRel = depth ? Math.max(0, Math.min(1, (ship.h || 0) / depth)) : null;
+  const grow = hRel == null ? 1 : DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel;
+  const lift = hRel == null ? 0 : (ship.h || 0) * DEPTH_LIFT;
+  const step = Math.round(charge * (SHIELD_STEPS - 1)), r = ship.size * grow * 1.55 * (1 + 0.12 * flash);
+  const globe = shieldGlobe(`shield_${step}`);
+  const model = M.multiply(M.translate(ship.x, TILE.height + 0.04 + lift + ship.size * grow * 0.25, ship.z), M.scale(r, r, r));
+  drawLit(globe.vao, globe.count, model, null);
 }
 
 // ---------------------------------------------------------------- arcade lights
@@ -1186,7 +1299,7 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
-    const look = u8(), bob = look & 1, face = (look & 2) !== 0;
+    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0;
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
@@ -1203,7 +1316,7 @@ function applySnapshot(view) {
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
                            sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
@@ -1694,7 +1807,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
@@ -1754,6 +1867,7 @@ function draw(ms) {
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
+    if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
     casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
   }
   for (const key of removed) state.pieces.delete(key);
@@ -1762,7 +1876,8 @@ function draw(ms) {
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
   gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
-  for (const [vao, count, model] of casters) {
+  const terrainCaster = terrainShadowCaster();
+  for (const [vao, count, model] of terrainCaster ? [...casters, terrainCaster] : casters) {
     gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.depth, "uMVP"), false, M.multiply(light.viewProj, model));
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, count);
   }
@@ -1839,6 +1954,11 @@ function draw(ms) {
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  for (const piece of state.glassPieces || []) {
+    const mesh = state.meshes[piece.mesh] || state.meshes.disc;
+    drawLit(mesh.vao, mesh.count, pieceModel(piece, now), state.materialIndex[`${piece.color}@glass`] ?? state.materialIndex[piece.color]);
+  }
+  state.glassPieces = [];
   drawShield(now, drawLit);
   drawVitals(now, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
@@ -2303,7 +2423,11 @@ function fillPickers() {
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
   state.shadowMap = buildShadowMap(); state.bulb = buildSphere(); state.meshes.__sphere = uploadMesh(sphereMesh());
-  arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
+  arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5, assets.terrain);
+  // The Phong shader's depth stack (uDepthUv, unit 6): layer 0 is the terrain's
+  // height map (exported in the shader's channel layout); no export, the 1x1 default.
+  if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else arrayTexture(6, [0, 0, 0, 255]);
+  arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };

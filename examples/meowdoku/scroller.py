@@ -12,7 +12,8 @@ Lanes (contiguous blocks, so collisions are block against block):
     25..48         enemies: drifters (sway, aimed three-way spreads) and
                    spinners (descend, hold, fire rotating rings, leave)
     49..368        enemy bullets
-    369..398       stars: scenery scrolling past, never collide
+    369..398       clouds: frosted-glass scenery at their own heights, drifting
+                   faster the higher they float (parallax); never collide
     399..406       missiles: ballistic rounds on engine_toy's trajectory law
     407..412       pickups: weapon power-ups dropped by destroyed enemies
 
@@ -106,7 +107,8 @@ DRIFTER, SPINNER = 1.0, 2.0
 HEALTH_MAX = 100.0
 HEALTH_REGEN = 0.5            # health points a second
 SHIELD_POINTS = 200.0
-SHIELD_RATE = 24.0            # shield points a second
+SHIELD_RATE = 5.0             # shield points a second (a full refill takes 40 s)
+SHIELD_PAUSE = 1.5            # no regeneration for this long after any hit (the player's ``age`` counts it)
 BULLET_DAMAGE = 10.0
 RAM_DAMAGE = 25.0
 LIVES = HEALTH_MAX            # the run starts at full health
@@ -143,6 +145,9 @@ ROUTINE_RATE = 0.9
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
 MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
+
+#: Glyphs this game adds to the exported meshes (web_export.py): the cloud.
+EMOJI = {"cloud": "\u2601"}
 
 CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis_z": "move-axis-z",
             "steer_x": "pointer-board-x", "steer_y": "pointer-board-y", "fire": "primary-action"}
@@ -326,7 +331,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     soaked = where(damage < shield_pts, damage, shield_pts)
     wound = damage - soaked
     refill = got_kind(SHIELD_UP)
-    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(playing))
+    since_hit = (f(is_player) * age).sum()
+    recharging = playing & (damage <= 0.0) & (since_hit >= SHIELD_PAUSE)
+    shield_after = where(refill, SHIELD_POINTS, shield_pts - soaked + SHIELD_RATE * dt * f(recharging))
     energy_next = where(is_player, (shield_after / SHIELD_POINTS).clip(0.0, 1.0), energy)
     healed = where(got_kind(HEALTH_UP), HEALTH_PICKUP, 0.0)
     health = (lives - wound + healed + HEALTH_REGEN * dt * f(lives > 0.0)).clip(0.0, HEALTH_MAX)
@@ -352,6 +359,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     kind1 = where(drop, drop_kind, kind1)
     born1 = where(drop, clock, born1)
     age1 = where(drop, 0.0, age1)
+    age1 = where(is_player & (damage > 0.0), 0.0, age1)      # the player's age: time since its last hit
     live3 = live3 | drop
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
     invuln_next = where(was_hit, 0.6, where(shielded, 0.25, (invuln - dt).clip(0.0, INVULN)))
@@ -424,6 +432,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     y[stars] = rng.uniform(-0.3, HEIGHT + 0.3, STARS[1] - STARS[0])
     vy[stars] = rng.uniform(1.5, 5.0, STARS[1] - STARS[0])
     z[stars] = rng.uniform(0.0, DEPTH, STARS[1] - STARS[0])
+    vy[stars] = 0.8 + 0.7 * z[stars]          # clouds: higher drifts faster (parallax)
     alive = ((slot == PLAYER) | (slot == STAR)).astype(np.float64)
     return {
         "lane": lane, "slot": slot, "rx": rx, "ry": ry, "rz": rz,
@@ -491,6 +500,7 @@ class BulletScroller(EntityGame):
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
                 "invader": [0.75, 0.35, 0.95], "ufo": [0.95, 0.15, 0.55], "bullet": [1.0, 0.25, 0.35],
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1],
+                "cloud": [0.96, 0.98, 1.0],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
                 "pickup_S": [0.35, 0.95, 0.45], "pickup_X": [1.0, 0.85, 0.2],
                 "pickup_M": [1.0, 0.5, 0.2], "pickup_L": [0.3, 0.95, 1.0],
@@ -524,7 +534,8 @@ class BulletScroller(EntityGame):
                           SHIELD_UP: "O", HEALTH_UP: "H"}.get(float(col["kind"][k]), "S")
                 mesh, color, size = letter, f"pickup_{letter}", 0.34
             else:
-                mesh, color, size = "disc", "star", 0.05
+                # A cloud: frosted glass, larger the higher it floats.
+                mesh, color, size = "cloud", "cloud", 0.45 + 0.12 * float(col["z"][k])
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
@@ -536,6 +547,8 @@ class BulletScroller(EntityGame):
                         "roll": 0.785 if mesh == "rocket" else 0.0,
                         "lean": 0.0 if slot in (PLAYER, MISSILE_SLOT) else 0.55,
                         "face": bool(slot == MISSILE_SLOT and not exploding),
+                        # drawn with the glass (blended), not in the opaque pass
+                        "translucent": bool(slot == STAR),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})

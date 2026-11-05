@@ -103,6 +103,112 @@ def token_mesh(*args, **kwargs):
     return _token_mesh(*args, cap_grid=CAP_GRID, **kwargs)
 
 
+# ---------------------------------------------------------------- terrain
+#: The scrolling ground: a tileable fractal height map raised into real relief
+#: by Pluck's DepthMesh (spectral-analyzer/depth_mesh.py, the "rect" shape:
+#: every vertex pushed along the base normal by depth_map x depth_scale, smooth
+#: normals recomputed), and coloured from the same map.  The page slides the
+#: mesh by the scroll, wrapping at one tile, so mountains pass in perspective
+#: under the Phong lights.
+TERRAIN_TILE = 12.0          # board units per height-map period
+TERRAIN_SPAN = (16.0, 30.0)  # mesh extent (x, z): the widest field plus margins, the field's depth plus a tile
+TERRAIN_STEP = 0.2           # grid spacing
+TERRAIN_SHADOW_STEP = 0.6    # the decimated triangulation drawn into the shadow map
+TERRAIN_RELIEF = 0.75        # tallest peak above sea level (board units)
+TERRAIN_SEA = 0.42           # height-map value of sea level (below: flat water)
+TERRAIN_TEXTURE = 256
+
+
+def terrain_heights(n: int, seed: int = 7) -> np.ndarray:
+    """A tileable n x n fractal value-noise height map in [0, 1]."""
+    rng = np.random.default_rng(seed)
+    height = np.zeros((n, n))
+    total, amp, period = 0.0, 1.0, 4
+    ys, xs = np.mgrid[0:n, 0:n] / n
+    for _ in range(6):
+        lattice = rng.random((period, period))
+        fx, fy = xs * period, ys * period
+        x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+        tx, ty = fx - x0, fy - y0
+        sx, sy = tx * tx * (3 - 2 * tx), ty * ty * (3 - 2 * ty)
+        at = lambda a, b: lattice[b % period, a % period]  # noqa: E731
+        top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * sx
+        bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * sx
+        height += amp * (top + (bottom - top) * sy)
+        total += amp
+        amp *= 0.5
+        period *= 2
+    return height / total
+
+
+def terrain_colours(height: np.ndarray) -> np.ndarray:
+    """RGBA bytes: albedo by height (water, sand, grass, rock, snow), lightly
+    shaded by slope so the relief also reads from straight above."""
+    ramp = [(0.00, (0.10, 0.22, 0.42)), (0.40, (0.20, 0.42, 0.62)), (0.44, (0.78, 0.72, 0.48)),
+            (0.50, (0.32, 0.58, 0.26)), (0.62, (0.22, 0.44, 0.20)), (0.72, (0.46, 0.40, 0.34)),
+            (0.84, (0.92, 0.93, 0.96)), (1.00, (0.97, 0.98, 1.00))]
+    stops = np.array([s for s, _ in ramp])
+    colours = np.array([c for _, c in ramp])
+    v = height.clip(0.0, 1.0)
+    rgb = np.stack([np.interp(v, stops, colours[:, k]) for k in range(3)], axis=-1)
+    dx = (np.roll(height, -1, axis=1) - np.roll(height, 1, axis=1)) * 18.0
+    dy = (np.roll(height, -1, axis=0) - np.roll(height, 1, axis=0)) * 18.0
+    light = np.array([-0.55, 0.75, -0.35]) / np.linalg.norm([-0.55, 0.75, -0.35])
+    normal = np.stack([-dx, np.ones_like(dx), -dy], axis=-1)
+    normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
+    shade = np.where(v < TERRAIN_SEA, 0.95, (0.55 + 0.45 * (normal @ light)).clip(0.45, 1.1))
+    rgba = np.concatenate([(rgb * shade[..., None]).clip(0, 1) * 255, np.full(v.shape + (1,), 255.0)], axis=-1)
+    return rgba.astype(np.uint8)
+
+
+def export_terrain() -> dict:
+    import base64
+    if str(SPECTRAL_ROOT) not in sys.path:
+        sys.path.insert(0, str(SPECTRAL_ROOT))
+    from depth_mesh import DepthMesh
+    n = TERRAIN_TEXTURE
+    height = terrain_heights(n)
+    width, depth = TERRAIN_SPAN
+    relief = ((height - TERRAIN_SEA) / (1.0 - TERRAIN_SEA)).clip(0.0, 1.0) ** 1.4   # flat water, steeper peaks
+
+    def relief_mesh(step: float) -> tuple[np.ndarray, np.ndarray]:
+        """DepthMesh over the field at ``step`` spacing, the depth map read
+        from the tileable map at every grid vertex; sea level on the board."""
+        grid_u, grid_v = int(round(width / step)), int(round(depth / step))
+        us = (np.arange(grid_u + 1) * step / TERRAIN_TILE * n).astype(int) % n
+        vs = (np.arange(grid_v + 1) * step / TERRAIN_TILE * n).astype(int) % n
+        mesh = DepthMesh("rect", size=(width, depth), grid_u=grid_u, grid_v=grid_v, depth_map=relief[np.ix_(vs, us)],
+                         depth_scale=TERRAIN_RELIEF, origin="bottom_left", axis_u=(1.0, 0.0, 0.0),
+                         axis_v=(0.0, 0.0, 1.0), flip_normals=True, smooth_normals=True)
+        data = np.asarray(mesh.vertex_data, dtype=np.float64)      # (N, 6): x y z nx ny nz
+        pos, nrm = data[:, :3].copy(), data[:, 3:6].copy()
+        if nrm[:, 1].mean() < 0.0:                                 # point the surface up
+            nrm = -nrm
+        pos[:, 1] -= pos[:, 1].min()
+        return pos, nrm
+
+    positions, normals = relief_mesh(TERRAIN_STEP)
+    shadow_positions, _ = relief_mesh(TERRAIN_SHADOW_STEP)
+    uvs = np.stack([positions[:, 0] / TERRAIN_TILE, positions[:, 2] / TERRAIN_TILE], axis=1)
+    return {"positions": np.round(positions.reshape(-1), 4).tolist(),
+            "normals": np.round(normals.reshape(-1), 4).tolist(),
+            "uvs": np.round(uvs.reshape(-1), 5).tolist(),
+            "triangles": int(len(positions) // 3), "tile": TERRAIN_TILE, "span": [width, depth],
+            # the decimated triangulation of the same relief, for the shadow map
+            "shadow_positions": np.round(shadow_positions.reshape(-1), 3).tolist(),
+            "texture": {"size": n, "rgba": base64.b64encode(terrain_colours(height).tobytes()).decode("ascii")},
+            # The same height map as the Phong shader's DEPTH texture (uDepthUv), in its
+            # channel layout: R depth (0..1), G thickness, B translucence mask, A scatter mask.
+            "depth": {"size": n, "relief_mm": TERRAIN_RELIEF * 1000.0,
+                      "rgba": base64.b64encode(terrain_depth_rgba(height).tobytes()).decode("ascii")}}
+
+
+def terrain_depth_rgba(height: np.ndarray) -> np.ndarray:
+    relief = ((height - TERRAIN_SEA) / (1.0 - TERRAIN_SEA)).clip(0.0, 1.0)
+    rgba = np.stack([relief, relief, np.ones_like(relief), np.zeros_like(relief)], axis=-1)
+    return (rgba * 255.0).round().astype(np.uint8)
+
+
 def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
@@ -166,6 +272,15 @@ def export_assets(out: Path) -> dict:
         if name in EMOJI_BODY_ONLY:
             verts, normals = largest_component(verts, normals)
         pack(name, verts, normals)
+    # Bullet hell's own glyphs (its clouds).
+    from meowdoku.scroller import EMOJI as SCROLLER_EMOJI
+    for name, glyph in SCROLLER_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.45, outline_subdivisions=2)
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     # The side scroller's own glyphs (the ones the shared table lacks).
     from meowdoku.sidescroller import EMOJI as SIDE_EMOJI, EMOJI_SUBDIVISIONS as SIDE_SUBDIVISIONS
     for name, glyph in SIDE_EMOJI.items():
@@ -179,6 +294,7 @@ def export_assets(out: Path) -> dict:
                              "data": np.asarray(table, np.float32).reshape(-1).tolist()}
                       for name, table in tables.items()},
         "lights": [{"position": list(p), "color": list(c), "intensity": float(i)} for p, c, i in LIGHTS],
+        "terrain": export_terrain(),
     }
     (out / "assets.json").write_text(json.dumps(assets), encoding="utf-8")
     return assets

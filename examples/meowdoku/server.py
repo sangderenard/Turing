@@ -127,6 +127,7 @@ class Table:
             if getattr(self.game, "game", None) not in autopilot.FEATURE_FUNCTIONS:
                 raise ValueError("this game has no autopilot to teach")
             autopilot.DEMO_LEARNING[self.game.game] = bool(payload.get("on"))
+            autopilot._save_learning()
         elif kind == "layout":
             if hasattr(self.game, "layout"):
                 self.game.layout(float(payload.get("aspect") or 0.0))
@@ -383,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         COOKIE = f"meowdoku_session_{args.port}"
     from meowdoku import autopilot
     print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
+    autopilot.load_learning()
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)

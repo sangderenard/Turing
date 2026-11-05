@@ -847,6 +847,36 @@ def _history(name: str, **entry) -> None:
     del rows[:-HISTORY]
 
 
+# Learning state survives a server restart: the demo-learning switches, the
+# run history, the demo's running scores and the last training status.
+LEARNING_STATE = BUILD / "learning_state.json"
+
+
+def _save_learning() -> None:
+    try:
+        BUILD.mkdir(parents=True, exist_ok=True)
+        partial = LEARNING_STATE.with_suffix(".partial.json")
+        partial.write_text(json.dumps({"demo_learning": DEMO_LEARNING, "history": LEARN_HISTORY,
+                                       "demo_scores": {k: v[-20:] for k, v in _DEMO_SCORES.items()},
+                                       "status": LEARN_STATUS}), encoding="utf-8")
+        partial.replace(LEARNING_STATE)
+    except OSError as error:
+        print(f"[autopilot] learning state not saved: {error}", flush=True)
+
+
+def load_learning() -> None:
+    """Restore the learning state (the server calls this at start)."""
+    try:
+        data = json.loads(LEARNING_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for name in GAMES:
+        DEMO_LEARNING[name] = bool(data.get("demo_learning", {}).get(name, False))
+        LEARN_HISTORY[name] = list(data.get("history", {}).get(name, []))[-HISTORY:]
+        _DEMO_SCORES[name] = [float(s) for s in data.get("demo_scores", {}).get(name, [])]
+        LEARN_STATUS[name] = dict(data.get("status", {}).get(name, {}))
+
+
 def human_records_path(game: str) -> Path:
     """Kept human episodes, versioned by the observation width they were taken
     with (a law that grows an axis starts a new record set)."""
@@ -892,9 +922,36 @@ class PlayTrace:
         self.y.append(target_from(game, controls))
 
 
+def _fit(params: dict, x: np.ndarray, y: np.ndarray, epochs: int) -> tuple[dict, float]:
+    """The fit itself, run in a worker PROCESS (``_TRAINER``): a training pass
+    on a thread held the game server's interpreter lock and stalled every
+    game's ticks for its duration."""
+    trainer = PolicyTrainer(params, lr=1e-3)
+    rng, loss = np.random.default_rng(), float("nan")
+    for _ in range(epochs):
+        order = rng.permutation(len(x))
+        for at in range(0, len(x), 256):
+            rows = order[at:at + 256]
+            loss = trainer.step(x[rows], y[rows])
+    return trainer.params(), loss
+
+
+_TRAINER = None
+
+
+def _trainer_pool():
+    global _TRAINER
+    if _TRAINER is None:
+        import concurrent.futures
+        import multiprocessing
+        _TRAINER = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    return _TRAINER
+
+
 def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: int = 0) -> None:
     """Fit the live policy on ``x -> y`` (plus replayed human rows), update
-    it in place and save it.  Runs on its own thread."""
+    it in place and save it.  Runs on its own thread, which waits on the
+    fit in the trainer process."""
     TRAINING[name] = True
     try:
         with LEARN_LOCK:
@@ -912,14 +969,7 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
                 pick = np.random.default_rng().choice(len(rx), REPLAY_ROWS, replace=False)
                 rx, ry = rx[pick], ry[pick]
             x, y = np.concatenate([x, rx]), np.concatenate([y, ry])
-        trainer = PolicyTrainer(params, lr=1e-3)
-        rng, loss = np.random.default_rng(), float("nan")
-        for _ in range(POST_EPOCHS):
-            order = rng.permutation(len(x))
-            for at in range(0, len(x), 256):
-                rows = order[at:at + 256]
-                loss = trainer.step(x[rows], y[rows])
-        fitted = trainer.params()
+        fitted, loss = _trainer_pool().submit(_fit, params, x, y, POST_EPOCHS).result()
         with LEARN_LOCK:
             target = _PILOT_WEIGHTS.setdefault(name, fitted)
             for n in PARAMS:
@@ -927,6 +977,7 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
             save_params(target, weights_path(name))
         LEARN_STATUS[name] = {"last": label, "rows": int(len(x)), "loss": round(loss, 4), "at": time.strftime("%H:%M:%S")}
         _history(name, kind="trained", loss=round(loss, 5), rows=int(len(x)), label=label)
+        _save_learning()
         print(f"[autopilot] {name}: post-trained on {label} ({len(x)} rows, loss {loss:.4f})", flush=True)
     except Exception as error:  # noqa: BLE001 - learning must never take the game down
         LEARN_STATUS[name] = {"last": f"failed: {type(error).__name__}: {str(error)[:80]}"}
@@ -965,6 +1016,7 @@ def finish_episode(game, trace: PlayTrace) -> None:
         kept = bool(DEMO_LEARNING.get(name)) and score >= baseline
         if DEMO_LEARNING.get(name):
             _history(name, kind="run", score=score, average=max(baseline, 0.0), kept=kept)
+            _save_learning()
         if not kept:
             LEARN_STATUS[name] = {**LEARN_STATUS.get(name, {}),
                                   "demo": f"demo run {score:.0f} vs average {max(baseline, 0):.0f}"
