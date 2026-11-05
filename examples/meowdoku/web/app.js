@@ -539,14 +539,48 @@ state.light = light;
 // also tint the fill light, so the pieces catch the show.
 //: Emission steps of a bulb (linear), the step drawn follows its brightness.
 const ARCADE_LEVELS = [0.15, 0.6, 1.3, 2.4];
-const ARCADE = { lamp: 2.6, colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0]], spacing: 0.55,
-                 burstAt: -10, flashAt: -10, lastScore: null, lastWon: false, key: null };
+// Colours 0-3 are the ring's own idle colours; 4+ are event colours: a side's
+// colour (white gold, black violet, checkers red) and the amber of a check.
+const ARCADE = { lamp: 2.6, spacing: 0.55,
+                 colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0],
+                           [1.0, 0.82, 0.35], [0.62, 0.3, 1.0], [1.0, 0.12, 0.1], [1.0, 0.55, 0.0]],
+                 sideColour: { white: 4, black: 5, red: 6, player: 4 }, checkColour: 7,
+                 events: [], peak: 0, key: null, last: null };
+
+// Score events, read from what each state DECLARES: a board game's material
+// (a capture is the other side's material falling), its check and outcome;
+// any game's running score.  Each event's size is normalised by the largest
+// gain seen so far in this game (the "peak"), floored at a pawn's worth, so
+// the scale follows the game: the first queen taken is huge, a later pawn
+// small.  The size picks the pattern.
 function arcadeEvents(game, now) {
-  const key = `${game.game}|${game.id}`;
-  if (ARCADE.key !== key) { ARCADE.key = key; ARCADE.lastScore = game.score; ARCADE.lastWon = !!game.won; return; }
-  if (game.score != null && ARCADE.lastScore != null && game.score > ARCADE.lastScore) ARCADE.burstAt = now;
-  if (game.won && !ARCADE.lastWon) ARCADE.flashAt = now;
-  ARCADE.lastScore = game.score; ARCADE.lastWon = !!game.won;
+  const key = `${game.game}|${game.id}`, last = ARCADE.last;
+  ARCADE.last = { material: game.material ? { ...game.material } : null, score: game.score,
+                  check: !!game.check, outcome: game.outcome ?? null, won: !!game.won, turn: game.status };
+  if (ARCADE.key !== key || !last) { ARCADE.key = key; ARCADE.peak = 0; ARCADE.events = []; return; }
+  const add = (kind, side, value) => {
+    ARCADE.peak = Math.max(ARCADE.peak, value);
+    const size = value / Math.max(ARCADE.peak, 1);
+    const pattern = kind === "win" ? "flash" : kind === "check" ? "check" : size >= 0.67 ? "twin" : size >= 0.34 ? "comet" : "sparkle";
+    ARCADE.events.push({ pattern, side, size, at: now });
+    if (ARCADE.events.length > 12) ARCADE.events.shift();
+  };
+  if (game.material && last.material) {
+    const sides = game.sides || Object.keys(game.material);
+    for (const side of sides) {
+      const drop = (last.material[side] ?? 0) - (game.material[side] ?? 0);
+      const scorer = sides.find((s) => s !== side);
+      if (drop > 0 && scorer) add("capture", scorer, drop);
+    }
+    if (game.check && !last.check) {
+      const checked = (game.status || "").split(" ")[0], giver = sides.find((s) => s !== checked);
+      if (giver) add("check", checked, 1);
+    }
+    if (game.outcome && game.outcome !== "draw" && last.outcome !== game.outcome) add("win", game.outcome, 1);
+  } else if (game.score != null && last.score != null && game.score > last.score) {
+    add("score", "player", game.score - last.score);
+  }
+  if (game.won && !last.won && !game.material) add("win", "player", 1);
 }
 function arcadeBulbs() {
   const ext = state.extent || { width: 6, depth: 6 }, m = GLASS.margin * 0.6;
@@ -561,37 +595,44 @@ function arcadeBulbs() {
   }
   return bulbs;
 }
-function arcadeBrightness(i, count, now) {
-  const flash = now - ARCADE.flashAt, burst = now - ARCADE.burstAt;
-  if (flash < 2.5) return Math.floor(flash * 8) % 2 === 0 ? 1.0 : 0.15;
-  let level = ((i + Math.floor(now * 6)) % 6 === 0) ? 0.55 : 0.1;            // the idle chase
-  if (burst < 1.4) {
-    const head = (burst * 40) % count, behind = (head - i + count) % count;
-    level = Math.max(level, behind < 10 ? 1.0 - behind / 10 : 0);
-  }
-  return level;
+// Where a side's events start on the ring: white (and a solo player) at the
+// near edge, black at the far edge; the bulb nearest that edge's middle.
+function sideOrigin(side, bulbs) {
+  const ext = state.extent || { width: 6, depth: 6 };
+  const near = side === "black" ? [ext.width / 2, -1] : [ext.width / 2, ext.depth + 1];
+  let best = 0, bestDistance = Infinity;
+  bulbs.forEach((p, i) => { const d = Math.hypot(p[0] - near[0], p[2] - near[1]); if (d < bestDistance) { bestDistance = d; best = i; } });
+  return best;
 }
-function arcadeLight(now) {
-  const bulbs = arcadeBulbs(), sum = [0, 0, 0];
-  let total = 0;
-  bulbs.forEach((_, i) => { const b = arcadeBrightness(i, bulbs.length, now), c = ARCADE.colours[i % 4];
-    total += b; sum[0] += c[0] * b; sum[1] += c[1] * b; sum[2] += c[2] * b; });
-  const level = Math.min(1, total / bulbs.length / 0.5);
-  return { level, colour: total > 0 ? [sum[0] / total, sum[1] / total, sum[2] / total] : [1, 1, 1] };
-}
-function drawArcadeRing(now, cam) {
-  const P = state.programs.flat, bulbs = arcadeBulbs();
-  bulbs.forEach((p, i) => {
-    const b = arcadeBrightness(i, bulbs.length, now), c = ARCADE.colours[i % 4];
-    gl.uniform3fv(gl.getUniformLocation(P, "uTint"), c.map((v) => v * (0.25 + 0.75 * b)));
-    for (const [radius, alpha] of [[0.07, 1.0], [0.16, 0.45 * b], [0.3, 0.18 * b]]) {
-      gl.uniform1f(gl.getUniformLocation(P, "uAlpha"), alpha);
-      gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false,
-        M.multiply(cam.viewProj, M.multiply(M.translate(...p), M.scale(radius, radius, radius))));
-      gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
+// One bulb's light now: {level 0..1, colour index}.  Idle chase underneath;
+// every live event on top, the brightest wins.
+function arcadeBulb(i, bulbs, now) {
+  const count = bulbs.length;
+  let level = ((i + Math.floor(now * 6)) % 6 === 0) ? 0.55 : 0.1, ci = i % 4;
+  for (const event of ARCADE.events) {
+    const age = now - event.at, home = sideOrigin(event.side, bulbs), colour = ARCADE.sideColour[event.side] ?? 4;
+    const ring = (a) => Math.min((a - i + count) % count, (i - a + count) % count);
+    let l = 0, c = colour;
+    if (event.pattern === "flash" && age < 2.6) l = Math.floor(age * 8) % 2 === 0 ? 1.0 : 0.15;
+    else if (event.pattern === "check" && age < 1.4) {
+      l = ring(home) < count / 4 ? 0.9 * (0.5 + 0.5 * Math.sin(age * 18)) : 0; c = ARCADE.checkColour;
+    } else if (event.pattern === "sparkle" && age < 0.8) {
+      const near = ring(home) < count / 4, twinkle = Math.sin(i * 12.9898 + Math.floor(age * 14) * 78.233) > 0.6;
+      l = near && twinkle ? 0.5 + 0.5 * event.size : 0;
+    } else if ((event.pattern === "comet" || event.pattern === "twin") && age < 1.6) {
+      const speed = 30 + 30 * event.size, tail = 6 + 10 * event.size, travelled = age * speed;
+      const heads = event.pattern === "twin" ? [home + travelled, home - travelled] : [home + travelled];
+      for (const h of heads) {
+        const head = ((Math.round(h) % count) + count) % count;
+        const behind = event.pattern === "twin" && h < home ? (i - head + count) % count : (head - i + count) % count;
+        if (behind < tail) l = Math.max(l, 1.0 - behind / tail);
+      }
+      if (event.pattern === "twin") l = Math.max(l, 0.35 * Math.max(0, 1 - age / 1.6));   // the whole ring pulses
     }
-  });
-  gl.uniform3fv(gl.getUniformLocation(P, "uTint"), [1, 1, 1]);
+    if (l > level) { level = l; ci = c; }
+  }
+  ARCADE.events = ARCADE.events.filter((event) => now - event.at < 3);
+  return { level, ci };
 }
 
 // The key light is a lamp in the scene, not a page angle: a small glowing body
@@ -1312,8 +1353,9 @@ function draw(ms) {
   // sun at ~60%, a softer fill; then each bulb is a point light in its own
   // colour at its own place, as bright as the chase makes it.
   const bulbs = state.flat ? [] : arcadeBulbs();
-  const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[i % 4],
-                                           level: arcadeBrightness(i, bulbs.length, now) }));
+  const bulbStates = bulbs.map((_, i) => arcadeBulb(i, bulbs, now));
+  const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[bulbStates[i].ci],
+                                           level: bulbStates[i].level }));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -1356,9 +1398,9 @@ function draw(ms) {
     const orb = state.meshes.__sphere;
     drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
     bulbs.forEach((p, i) => {
-      const level = arcadeBrightness(i, bulbs.length, now);
+      const { level, ci } = bulbStates[i];
       const step = ARCADE_LEVELS.reduce((best, v, k) => (Math.abs(v - 2.4 * level) < Math.abs(ARCADE_LEVELS[best] - 2.4 * level) ? k : best), 0);
-      drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${i % 4}_${step}`]);
+      drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${ci}_${step}`]);
     });
   }
   // the glass plate under everything: blended, no depth write

@@ -58,9 +58,9 @@ PLAYER_SPEED = 9.0
 #: The rocket as drawn: its half size, its body box (the hitbox) and the
 #: muzzle (where a shot leaves, the nose) -- one geometry for the eye and the
 #: law.
-SHIP_SIZE = 0.9
-SHIP_RX, SHIP_RY = 0.36, 0.55
-MUZZLE = 0.71            # the nose: 0.81 drawn half-sizes, foreshortened by the 0.25 lean
+SHIP_SIZE = 0.6            # body only (exhaust puff dropped at export): ~1.6 units long
+SHIP_RX, SHIP_RY = 0.3, 0.7
+MUZZLE = 0.76             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 #: The rocket is integrated, not placed: its velocity relaxes toward the
 #: commanded velocity with time constant SHIP_TAU (the damping), and a held
 #: pointer commands the velocity that would close the gap in SHIP_REACH.
@@ -94,6 +94,9 @@ EMOJI = {
 }
 #: Outline subdivisions per emoji (the rocket's tail collapses at 1).
 EMOJI_SUBDIVISIONS = {"rocket": 2}
+#: Glyphs whose outline carries detached decoration (the rocket's exhaust puff
+#: floats beside its body): only the largest connected part is the piece.
+EMOJI_BODY_ONLY = {"rocket"}
 
 
 def _frac(value):

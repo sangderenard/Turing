@@ -60,6 +60,35 @@ def export_shadow_fragment(target: Path) -> None:
     target.write_text(translated.source, encoding="utf-8", newline="\n")
 
 
+def largest_component(verts: np.ndarray, normals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the largest edge-connected part of a triangle mesh, re-centred in
+    its own bounding box (a glyph's detached decoration is dropped, and the
+    piece is sized and centred by its body, not by body plus decoration)."""
+    keys = np.round(verts.reshape(-1, 3), 4)
+    _, vertex_ids = np.unique(keys, axis=0, return_inverse=True)
+    vertex_ids = vertex_ids.reshape(-1, 3)
+    parent = list(range(int(vertex_ids.max()) + 1))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b, c in vertex_ids:
+        for u, w in ((a, b), (b, c)):
+            ru, rw = find(int(u)), find(int(w))
+            if ru != rw:
+                parent[ru] = rw
+    roots = np.array([find(int(a)) for a in vertex_ids[:, 0]])
+    values, counts = np.unique(roots, return_counts=True)
+    keep = roots == values[np.argmax(counts)]
+    body = verts[keep]
+    lo, hi = body.reshape(-1, 3).min(0), body.reshape(-1, 3).max(0)
+    body = body - (lo + hi)[None, None, :] / 2.0
+    return np.ascontiguousarray(body, np.float32), np.ascontiguousarray(normals[keep], np.float32)
+
+
 def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
@@ -109,10 +138,13 @@ def export_assets(out: Path) -> dict:
                                  outline_subdivisions=2), material_index["heart"])
     except Exception as error:  # noqa: BLE001  (the page falls back to the heart)
         print(f"[export] fish mesh skipped: {error}", flush=True)
-    from meowdoku.invaders import EMOJI, EMOJI_SUBDIVISIONS
+    from meowdoku.invaders import EMOJI, EMOJI_BODY_ONLY, EMOJI_SUBDIVISIONS
     for name, glyph in EMOJI.items():
-        pack(name, *token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
-                               outline_subdivisions=EMOJI_SUBDIVISIONS.get(name, 1)))
+        verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                                    outline_subdivisions=EMOJI_SUBDIVISIONS.get(name, 1))
+        if name in EMOJI_BODY_ONLY:
+            verts, normals = largest_component(verts, normals)
+        pack(name, verts, normals)
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),

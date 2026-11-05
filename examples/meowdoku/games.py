@@ -273,6 +273,10 @@ class MeowdokuGame(Game):
 # Chess and checkers: select a piece, see its destinations, move
 # ---------------------------------------------------------------------------
 
+#: Standard material values (chess); a checkers disc counts 1.
+PIECE_VALUES = {"pawn": 1, "knight": 3, "bishop": 3, "rook": 5, "queen": 9, "king": 0, "disc": 1}
+
+
 class BoardGame(Game):
     """8x8 two-tone board, pieces as {cell: (kind, side)}, select/move."""
 
@@ -358,6 +362,12 @@ class BoardGame(Game):
         st["selected"] = self.selected
         st["pieces"] = [{"id": self.ids[i], "cell": i, "mesh": kind, "color": side} for i, (kind, side) in sorted(self.pieces.items())]
         st["status"] = f"{self.turn} to move · {self.moves} moves"
+        # Each side's material, by the standard piece values: a capture is the
+        # other side's material falling between two states (the page lights
+        # the arcade ring for it, from the side that made it).
+        st["material"] = {side: sum(PIECE_VALUES.get(kind, 1) for kind, owner in self.pieces.values() if owner == side)
+                          for side in self.sides}
+        st["sides"] = list(self.sides)
         return st
 
 
@@ -534,6 +544,8 @@ class Chess(BoardGame):
             st["won"] = end == "white"; st["lost"] = end == "black"
         elif self.in_check(self.turn):
             st["status"] = f"{self.turn} to move · check · {self.moves} moves"
+        st["outcome"] = end
+        st["check"] = bool(end is None and self.in_check(self.turn))
         return st
 
 

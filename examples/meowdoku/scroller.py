@@ -56,9 +56,9 @@ SPREAD = 3.0
 RING = 12.0
 HITBOX = 0.11
 #: The ship as drawn: half size, body box (hitbox), muzzle at the nose.
-SHIP_SIZE = 0.75
-SHIP_RX, SHIP_RY = 0.22, 0.36
-MUZZLE = 0.59           # the nose (0.81 drawn half-sizes, 0.25 lean)
+SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
+SHIP_RX, SHIP_RY = 0.22, 0.4
+MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 
 CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "steer_x": "pointer-board-x",
             "steer_y": "pointer-board-y", "fire": "primary-action"}
