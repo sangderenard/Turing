@@ -33,7 +33,7 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku.games import Chess  # noqa: E402
-from meowdoku.chess_net import FEATURES, SelfPlay, WEIGHTS, encode, material  # noqa: E402
+from meowdoku.chess_net import FEATURES, POLICY, SelfPlay, WEIGHTS, encode, material, move_index  # noqa: E402
 
 PGN_DIR = ROOT / "build" / "meowdoku" / "pgn"
 # The Week in Chess: weekly collections of the world's professional games
@@ -136,42 +136,51 @@ def san_move(game: Chess, san: str):
 def positions_of(result: str, tokens: list[str], max_plies: int = 200):
     """Encoded positions and material along one replayed game, and its outcome."""
     game = Chess("pgn")
-    boards, materials = [], []
+    boards, materials, played = [], [], []
     for san in tokens[:max_plies]:
         move = san_move(game, san)
         if move is None:
             break
         boards.append(encode(game.pieces, game.turn))
         materials.append(material(game.pieces))
+        played.append(move_index(move[0], move[1]))
         src, dst, promotion = move
         game.apply_move(src, dst, promotion)
         game.turn = "black" if game.turn == "white" else "white"
     outcome = {"1-0": "white", "0-1": "black", "1/2-1/2": "draw"}[result]
-    return boards, materials, outcome
+    return boards, materials, outcome, played
 
 
 def dataset(paths: list[Path], max_games: int, progress=print):
-    xs, zs, used, skipped = [], [], 0, 0
+    xs, zs, ms, used, skipped = [], [], [], 0, 0
     player_targets = SelfPlay.targets
     started = time.perf_counter()
     for path in paths:
         for result, tokens in games_in(path.read_text(encoding="latin-1")):
             if used >= max_games:
                 break
-            boards, materials, outcome = positions_of(result, tokens)
+            boards, materials, outcome, played = positions_of(result, tokens)
             if len(boards) < 10:
                 skipped += 1
                 continue
             xs.append(np.stack(boards).astype(np.float32))
             zs.append(player_targets(None, materials, outcome).astype(np.float32))
+            ms.append(np.asarray(played, dtype=np.int32))
             used += 1
             if used % 200 == 0:
                 progress(f"[pretrain] {used} games, {sum(len(x) for x in xs)} positions, {time.perf_counter() - started:.0f}s")
     progress(f"[pretrain] {used} games replayed, {skipped} skipped, {sum(len(x) for x in xs)} positions")
-    return np.concatenate(xs), np.concatenate(zs)
+    return np.concatenate(xs), np.concatenate(zs), np.concatenate(ms)
 
 
-def train(player: SelfPlay, x: np.ndarray, z: np.ndarray, epochs: int = 3, batch: int = 256, progress=print) -> float:
+def one_hot(moves: np.ndarray) -> np.ndarray:
+    rows = np.zeros((len(moves), POLICY), dtype=np.float64)
+    rows[np.arange(len(moves)), moves] = 1.0
+    return rows
+
+
+def train(player: SelfPlay, x: np.ndarray, z: np.ndarray, m: np.ndarray | None = None, epochs: int = 3,
+          batch: int = 256, progress=print) -> float:
     rng = np.random.default_rng(0)
     n = x.shape[0]
     loss = float("nan")
@@ -180,7 +189,7 @@ def train(player: SelfPlay, x: np.ndarray, z: np.ndarray, epochs: int = 3, batch
         losses = []
         for start in range(0, n, batch):
             idx = order[start:start + batch]
-            losses.append(player.net.train_step(x[idx], z[idx], player.lr))
+            losses.append(player.net.train_step(x[idx], z[idx], player.lr, policy=one_hot(m[idx]) if m is not None else None))
         loss = float(np.mean(losses))
         progress(f"[pretrain] epoch {epoch + 1}/{epochs}: loss {loss:.4f}")
         player.net.save(player.weights)
@@ -193,8 +202,9 @@ class Corpus:
     PGNs) and cached as ``corpus_<games>.npz`` beside them, so the next
     start loads in a moment."""
 
-    def __init__(self, x: np.ndarray, z: np.ndarray, batch: int = 256, seed: int = 0):
-        self.x, self.z, self.batch = x, z, batch
+    def __init__(self, x: np.ndarray, z: np.ndarray, m: np.ndarray | None = None, batch: int = 256, seed: int = 0):
+        self.x, self.z, self.m, self.batch = x, z, m, batch
+        self.policy_loss = float("nan")
         self.rng = np.random.default_rng(seed)
         self.order = self.rng.permutation(x.shape[0])
         self.cursor = 0
@@ -204,19 +214,19 @@ class Corpus:
 
     @classmethod
     def load_or_build(cls, max_games: int = 2000, progress=print) -> "Corpus":
-        cache = PGN_DIR / f"corpus_{max_games}.npz"
+        cache = PGN_DIR / f"corpus_{max_games}_policy.npz"      # value targets and the master's move
         if cache.exists():
             data = np.load(cache)
             progress(f"[pretrain] corpus: {data['x'].shape[0]} positions from cache")
-            return cls(data["x"], data["z"])
+            return cls(data["x"], data["z"], data["m"])
         paths = fetch(progress)
-        x, z = dataset(paths, max_games, progress)
+        x, z, m = dataset(paths, max_games, progress)
         # Written beside and renamed into place, so a second process that
         # starts meanwhile never reads a half-written file (two servers did).
         partial = cache.with_suffix(".partial.npz")
-        np.savez(partial, x=x.astype(np.float32), z=z.astype(np.float32))
+        np.savez(partial, x=x.astype(np.float32), z=z.astype(np.float32), m=m.astype(np.int32))
         partial.replace(cache)
-        return cls(x, z)
+        return cls(x, z, m)
 
     def step(self, player: SelfPlay) -> float:
         """One minibatch of supervised training; the running loss is an
@@ -227,8 +237,12 @@ class Corpus:
             self.epochs += 1
         idx = self.order[self.cursor:self.cursor + self.batch]
         self.cursor += self.batch
-        loss = player.net.train_step(self.x[idx], self.z[idx], player.lr)
+        policy = one_hot(self.m[idx]) if self.m is not None else None
+        loss = player.net.train_step(self.x[idx], self.z[idx], player.lr, policy=policy)
         self.loss = loss if np.isnan(self.loss) else self.loss * 0.98 + loss * 0.02
+        if policy is not None:
+            pl = player.net.last_policy_loss
+            self.policy_loss = pl if np.isnan(self.policy_loss) else self.policy_loss * 0.98 + pl * 0.02
         self.steps += 1
         if self.steps % 200 == 0:
             player.net.save(player.weights)
@@ -236,7 +250,8 @@ class Corpus:
 
     def summary(self) -> str:
         done = self.epochs + self.cursor / max(1, self.x.shape[0])
-        return f"pre-training {self.x.shape[0]} master positions · epoch {done:.2f} · loss {self.loss:.3f}"
+        return (f"pre-training {self.x.shape[0]} master positions · epoch {done:.2f} · value loss {self.loss:.3f}"
+                + (f" · move loss {self.policy_loss:.2f}" if not np.isnan(self.policy_loss) else ""))
 
 
 def ensure(player: SelfPlay, progress=print, max_games: int = 2000, epochs: int = 8) -> bool:
@@ -245,8 +260,8 @@ def ensure(player: SelfPlay, progress=print, max_games: int = 2000, epochs: int 
     if MARKER.exists() or os.environ.get("MEOWDOKU_NO_PRETRAIN"):
         return False
     paths = fetch(progress)
-    x, z = dataset(paths, max_games, progress)
-    loss = train(player, x, z, epochs, progress=progress)
+    x, z, m = dataset(paths, max_games, progress)
+    loss = train(player, x, z, m, epochs, progress=progress)
     MARKER.write_text(json.dumps({"games": int(max_games), "positions": int(x.shape[0]), "loss": loss,
                                   "sources": SOURCES, "when": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2), encoding="utf-8")
     return True

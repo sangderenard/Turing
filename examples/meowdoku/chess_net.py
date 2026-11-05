@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,6 +44,29 @@ VALUES = {"king": 0.0, "queen": 9.0, "rook": 5.0, "bishop": 3.0, "knight": 3.0, 
 FEATURES = 12 * 64 + 1
 MAX_PLIES = 160
 WEIGHTS = ROOT / "build" / "meowdoku" / "chess_conv.npz"
+POLICY_PLANES = 64                                     # 56 queen-like (8 directions x 7 steps) + 8 knight
+POLICY = POLICY_PLANES * 64                            # logits: plane * 64 + source square
+_DIRS = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+_KNIGHT = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+
+
+def move_index(src: int, dst: int) -> int:
+    """The policy logit of a move: its source square on the plane of its
+    direction and distance (knight jumps have their own eight planes)."""
+    dr, dc = dst // 8 - src // 8, dst % 8 - src % 8
+    if (dr, dc) in _KNIGHT:
+        plane = 56 + _KNIGHT.index((dr, dc))
+    else:
+        distance = max(abs(dr), abs(dc))
+        plane = _DIRS.index((dr // distance, dc // distance)) * 7 + distance - 1
+    return plane * 64 + src
+
+
+def legal_mask(moves) -> np.ndarray:
+    mask = np.zeros(POLICY, dtype=np.float64)
+    for src, dst in moves:
+        mask[move_index(src, dst)] = 1.0
+    return mask
 PLANES = 13                                            # 12 piece planes + the side to move
 
 
@@ -128,7 +152,9 @@ class ValueNet:
 class ConvValueNet:
     """The board as 13 planes of 8x8 (12 piece planes, one plane of the side
     to move) through two 3x3 convolutions, a hidden layer and a tanh value
-    head: White's outcome in [-1, 1].
+    head: White's outcome in [-1, 1]. A third convolution is a residual
+    refinement initialized to zero, so existing eight-tensor checkpoints
+    produce exactly the same values before that layer learns.
 
     Each convolution is ``unfold2d`` (the library's im2col, on the autograd
     tape) followed by one matmul with the kernel matrix, so the whole
@@ -144,6 +170,9 @@ class ConvValueNet:
         from src.common.tensors import AbstractTensor as AT
         from src.common.tensors.abstract_nn import Adam
         rng = np.random.default_rng(seed)
+        # AbstractTensor.autograd.no_grad is process-wide. Lichess evaluation
+        # must finish its no_grad scope before the learner records a tape.
+        self.lock = threading.RLock()
         self.channels, self.hidden, self.lr = channels, hidden, lr
         c1 = c2 = channels
         with AT.use_backend("numpy"):
@@ -155,10 +184,15 @@ class ConvValueNet:
             self.W2 = param((c2, c1 * 9), math.sqrt(2.0 / (c1 * 9))); self.b2 = param((c2, 1), 0.0)
             self.W3 = param((c2 * 64, hidden), math.sqrt(2.0 / (c2 * 64))); self.b3 = param((1, hidden), 0.0)
             self.W4 = param((hidden, 1), math.sqrt(1.0 / hidden)); self.b4 = param((1, 1), 0.0)
+            self.W5 = param((c2, c2 * 9), 0.0); self.b5 = param((c2, 1), 0.0)
+            # policy head: one logit per (move plane, square) from the square's features
+            self.W6 = param((POLICY_PLANES, c2), math.sqrt(1.0 / c2)); self.b6 = param((POLICY_PLANES, 1), 0.0)
             self.optimizer = Adam(self.parameters(), lr=lr)
+        self.last_policy_loss = float("nan")
 
     def parameters(self):
-        return [self.W1, self.b1, self.W2, self.b2, self.W3, self.b3, self.W4, self.b4]
+        return [self.W1, self.b1, self.W2, self.b2, self.W3, self.b3, self.W4, self.b4,
+                self.W5, self.b5, self.W6, self.b6]
 
     @staticmethod
     def planes(boards: np.ndarray) -> np.ndarray:
@@ -169,7 +203,11 @@ class ConvValueNet:
         return out
 
     def forward(self, x):
-        """x (N, 13, 8, 8) -> (N, 1)."""
+        """x (N, 13, 8, 8) -> value (N, 1)."""
+        return self.forward_both(x)[0]
+
+    def forward_both(self, x):
+        """x (N, 13, 8, 8) -> (value (N, 1), policy logits (N, POLICY))."""
         n, c1, c2 = int(x.shape[0]), self.channels, self.channels
         cols = x.unfold2d((3, 3), padding=1)                       # (N, 13*9, 64)
         h = self.W1 @ cols + self.b1                               # (N, c1, 64)
@@ -177,47 +215,100 @@ class ConvValueNet:
         cols2 = h.reshape((n, c1, 8, 8)).unfold2d((3, 3), padding=1)
         h2 = self.W2 @ cols2 + self.b2                             # (N, c2, 64)
         h2 = h2.maximum(h2 * 0.0)
+        residual = (self.W5 @ h2.reshape((n, c2, 8, 8)).unfold2d((3, 3), padding=1) + self.b5).tanh()
+        h2 = h2 + residual
+        logits = (self.W6 @ h2 + self.b6).reshape((n, POLICY))   # (N, planes, 64) -> plane * 64 + square
         h3 = h2.reshape((n, c2 * 64)) @ self.W3 + self.b3
         h3 = h3.maximum(h3 * 0.0)
-        return (h3 @ self.W4 + self.b4).tanh()
+        return (h3 @ self.W4 + self.b4).tanh(), logits
+
+    def evaluate(self, boards: np.ndarray, masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Values for White and the policy over legal moves (masked softmax)."""
+        from src.common.tensors import AbstractTensor as AT
+        with self.lock, AT.use_backend("numpy"), AT.autograd.no_grad():
+            v, logits = self.forward_both(AT.tensor(self.planes(boards)))
+            masked = logits + (AT.tensor(np.asarray(masks, dtype=np.float64)) - 1.0) * 1e4
+            probs = masked.softmax(dim=1)
+            return (np.asarray(v.numpy(), dtype=np.float64).reshape(-1),
+                    np.asarray(probs.numpy(), dtype=np.float64))
 
     def values(self, boards: np.ndarray) -> np.ndarray:
+        with self.lock:
+            return self._values(boards)
+
+    def _values(self, boards: np.ndarray) -> np.ndarray:
         from src.common.tensors import AbstractTensor as AT
         with AT.use_backend("numpy"), AT.autograd.no_grad():
             v = self.forward(AT.tensor(self.planes(boards)))
             return np.asarray(v.numpy(), dtype=np.float64).reshape(-1)
 
-    def train_step(self, boards: np.ndarray, targets: np.ndarray, lr: float | None = None) -> float:
+    def train_step(self, boards: np.ndarray, targets: np.ndarray, lr: float | None = None,
+                   policy: np.ndarray | None = None) -> float:
+        """One Adam step on the value loss (mean squared error against
+        ``targets``) and, when ``policy`` rows (N, POLICY) are given, the
+        cross-entropy of the policy head against them.  Returns the value
+        loss; the policy loss is kept in ``last_policy_loss``."""
+        with self.lock:
+            return self._train_step(boards, targets, lr, policy)
+
+    def _train_step(self, boards: np.ndarray, targets: np.ndarray, lr: float | None = None,
+                    policy: np.ndarray | None = None) -> float:
         from src.common.tensors import AbstractTensor as AT
         with AT.use_backend("numpy"):
             params = self.parameters()
             x = AT.tensor(self.planes(boards))
             z = AT.tensor(np.asarray(targets, dtype=np.float64).reshape(-1, 1))
-            diff = self.forward(x) - z
+            value, logits = self.forward_both(x)
+            diff = value - z
             loss = (diff * diff).mean()
-            grads = AT.autograd.grad(loss, params)
+            if policy is not None:
+                target = AT.tensor(np.asarray(policy, dtype=np.float64).reshape(-1, POLICY))
+                # log-softmax spelled out on the tape (the library's own is a
+                # data-only op); the shift is a constant, so the gradient is exact.
+                shift = AT.tensor(np.max(np.asarray(logits.numpy()), axis=1, keepdims=True))
+                shifted = logits - shift
+                log_norm = shifted.exp().sum(dim=1).reshape((-1, 1)).log()
+                cross_entropy = (target * (shifted - log_norm)).sum(dim=1).mean() * -1.0
+                total = loss + cross_entropy
+                self.last_policy_loss = float(np.asarray(cross_entropy.numpy()))
+            else:
+                total = loss
+            grads = AT.autograd.grad(total, params)
             with AT.autograd.no_grad():
                 for p, q in zip(params, self.optimizer.step(params, grads)):
                     AT.copyto(p, q)
             return float(np.asarray(loss.numpy()))
 
     def save(self, path: Path = WEIGHTS) -> None:
+        with self.lock:
+            self._save(path)
+
+    def _save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.with_suffix(".partial.npz")
         np.savez(partial, **{f"p{i}": np.asarray(p.numpy()) for i, p in enumerate(self.parameters())})
         partial.replace(path)
 
     def load(self, path: Path = WEIGHTS) -> bool:
+        with self.lock:
+            return self._load(path)
+
+    def _load(self, path: Path) -> bool:
+        """Checkpoints grow with the net: every stored tensor whose shape
+        matches is restored, newer heads keep their fresh initialization.
+        False when the eight core tensors are not all there."""
         from src.common.tensors import AbstractTensor as AT
         if not path.exists():
             return False
         data = np.load(path)
         params = self.parameters()
-        if any(f"p{i}" not in data or data[f"p{i}"].shape != tuple(params[i].shape) for i in range(len(params))):
+        core = 8
+        if any(f"p{i}" not in data or data[f"p{i}"].shape != tuple(params[i].shape) for i in range(core)):
             return False
         with AT.use_backend("numpy"), AT.autograd.no_grad():
             for i, p in enumerate(params):
-                AT.copyto(p, AT.tensor(data[f"p{i}"]))
+                if f"p{i}" in data and data[f"p{i}"].shape == tuple(p.shape):
+                    AT.copyto(p, AT.tensor(data[f"p{i}"]))
         return True
 
 
@@ -286,11 +377,27 @@ class SelfPlay:
         shaping = np.tanh(np.asarray(materials) / 12.0) * 0.25
         return np.clip(discounted + shaping, -1.0, 1.0)
 
-    def learn_from(self, boards, materials, result) -> float:
-        return self.learn_from_games([(boards, materials, result)])
+    def learn_from(self, boards, materials, result, policies=None) -> float:
+        """A finished game: value targets from its outcome and, when the
+        moves were searched, the search's visit distributions as policy
+        targets for the positions that have them."""
+        loss = self.learn_from_games([(boards, materials, result)])
+        if policies:
+            rows = [(b, pi) for b, pi in zip(boards, policies) if pi is not None]
+            if rows:
+                z = self.targets(materials, result)
+                keep = [k for k, pi in enumerate(policies) if pi is not None]
+                with self.net.lock:
+                    self.net.train_step(np.stack([boards[k] for k in keep]), z[keep], self.lr,
+                                        policy=np.stack([policies[k] for k in keep]))
+        return loss
 
     def learn_from_games(self, finished) -> float:
         """One gradient step over every position of several finished games."""
+        with self.net.lock:
+            return self._learn_from_games(finished)
+
+    def _learn_from_games(self, finished) -> float:
         x = np.concatenate([np.stack(boards) for boards, _, _ in finished])
         z = np.concatenate([self.targets(materials, result) for _, materials, result in finished])
         loss = self.net.train_step(x, z, self.lr)

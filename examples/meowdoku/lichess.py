@@ -136,8 +136,10 @@ class LichessBot:
         self.games: dict[str, dict] = {}           # game id -> live view
         self.latest: str | None = None             # the game the page shows
         self.results: list[str] = []
+        self.last_search = ""
         self.lock = threading.RLock()
         self._stop = threading.Event()
+        self.pause_requested = threading.Event()
         self.threads: list[threading.Thread] = []
         self.idle_challenge_every = 90.0            # after a game ends, before seeking again
         self.last_challenge = 0.0
@@ -156,13 +158,17 @@ class LichessBot:
         return self.me
 
     # -- play ------------------------------------------------------------
-    def choose_uci(self, game: Chess) -> str | None:
+    def choose_uci(self, game: Chess, my_time_ms=None, increment_ms: int = 3000):
+        """The move and the search's visit distribution (a policy target).
+        Budget: a 25th of the clock plus most of the increment, 1 to 12 s."""
         if self.player is None:
             moves = game.all_legal_moves()
-            return move_to_uci(game, *random.choice(moves)) if moves else None
-        from meowdoku.search import best_move
-        move = best_move(game, self.player.net)                 # two-ply search over the network
-        return move_to_uci(game, *move) if move else None
+            return (move_to_uci(game, *random.choice(moves)) if moves else None), None
+        from meowdoku import mcts
+        seconds = 3.0 if my_time_ms is None else min(12.0, max(1.0, my_time_ms / 1000.0 / 25.0 + increment_ms / 1000.0 * 0.8))
+        result = mcts.search(game, self.player.net, simulations=1500, seconds=seconds)
+        self.last_search = result.describe(game)
+        return (move_to_uci(game, *result.move) if result.move else None), result.policy
 
     def play_game(self, game_id: str) -> None:
         view = {"id": game_id, "moves": "", "status": "started", "white": "?", "black": "?", "color": "white",
@@ -170,7 +176,7 @@ class LichessBot:
         with self.lock:
             self.games[game_id] = view
             self.latest = game_id
-        boards, materials = [], []
+        boards, materials, policies = [], [], []
         try:
             for event in self.api.lines(f"/api/bot/game/stream/{game_id}"):
                 kind = event.get("type")
@@ -196,7 +202,9 @@ class LichessBot:
                 if game.turn == view["color"]:
                     from meowdoku.chess_net import encode, material
                     boards.append(encode(game.pieces, game.turn)); materials.append(material(game.pieces))
-                    uci = self.choose_uci(game)
+                    my_time = view["wtime"] if view["color"] == "white" else view["btime"]
+                    uci, policy = self.choose_uci(game, my_time)
+                    policies.append(policy)
                     if uci:
                         try:
                             self.api.post(f"/api/bot/game/{game_id}/move/{uci}")
@@ -213,7 +221,7 @@ class LichessBot:
         self.log(f"[lichess] {summary}: {view['status']}")
         if self.learn and self.player is not None and len(boards) >= 4:
             try:
-                self.player.learn_from(boards, materials, outcome)
+                self.player.learn_from(boards, materials, outcome, policies)
             except Exception as error:
                 self.log(f"[lichess] learning from the game failed: {error}")
 
@@ -222,6 +230,9 @@ class LichessBot:
         cid = challenge.get("id")
         if str(challenge.get("challenger", {}).get("id", "")).lower() == str(self.me.get("id", "")).lower():
             return                                            # our own outgoing challenge, echoed back
+        if self.pause_requested.is_set():
+            self.api.post(f"/api/challenge/{cid}/decline", {"reason": "generic"})
+            return
         standard = challenge.get("variant", {}).get("key") == "standard"
         speed_ok = challenge.get("speed") in ("bullet", "blitz", "rapid", "classical", "correspondence")
         if standard and speed_ok:
@@ -245,6 +256,8 @@ class LichessBot:
         daily bot-vs-bot cap, a closed account) moves straight to the
         next; a challenge nobody answers in 30 s is cancelled and the next
         is sent."""
+        if self.pause_requested.is_set():
+            return
         now = time.time()
         if self.pending and now - self.pending["at"] < 30.0:
             return
@@ -256,6 +269,8 @@ class LichessBot:
             self.log(f"[lichess] {self.pending['to']} did not answer; next")
             self.pending = None
         for _attempt in range(12):
+            if self.pause_requested.is_set():
+                return
             if not self.candidates:
                 self._refill_candidates()
                 if not self.candidates:
@@ -267,6 +282,13 @@ class LichessBot:
                 self.log(f"[lichess] {target} refused: {str(error)[-90:]}")
                 continue
             cid = (reply or {}).get("id") or (reply or {}).get("challenge", {}).get("id")
+            if self.pause_requested.is_set():
+                if cid:
+                    try:
+                        self.api.post(f"/api/challenge/{cid}/cancel")
+                    except RuntimeError as error:
+                        self.log(f"[lichess] challenge cancellation: {error}")
+                return
             self.pending = {"id": cid, "to": target, "at": now}
             self.log(f"[lichess] challenged {target}; waiting for an answer")
             return
@@ -303,6 +325,18 @@ class LichessBot:
 
     def _maybe_challenge(self) -> None:
         live = [g for g in self.games.values() if g.get("status") in ("started", "created")]
+        if self.pause_requested.is_set():
+            self.seeking = False
+            if self.pending:
+                pending = self.pending
+                if pending.get("id"):
+                    try:
+                        self.api.post(f"/api/challenge/{pending['id']}/cancel")
+                    except RuntimeError as error:
+                        self.log(f"[lichess] challenge cancellation: {error}")
+                        return
+                self.pending = None
+            return
         if live:
             self.seeking = False
             return
@@ -329,6 +363,21 @@ class LichessBot:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def pause_at_idle(self) -> None:
+        """Finish live games, then stop accepting and seeking challenges."""
+        self.pause_requested.set()
+        self.log("[lichess] stopping at next idle")
+
+    def resume(self) -> None:
+        self.pause_requested.clear()
+        self.last_challenge = 0.0
+        self.log("[lichess] seeking games again")
+
+    def control_state(self) -> dict:
+        live = any(g.get("status") in ("started", "created") for g in self.games.values())
+        return {"pause_requested": self.pause_requested.is_set(), "live": live,
+                "pending": bool(self.pending)}
 
     # -- what the page shows ---------------------------------------------
     def snapshot(self) -> dict | None:

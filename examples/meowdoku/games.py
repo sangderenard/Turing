@@ -365,6 +365,8 @@ class Chess(BoardGame):
         out = []
         saved = (self.pieces, self.ids, getattr(self, "rights", set()), getattr(self, "ep", None))
         for dst in self.pseudo_moves(cell):
+            if self.pieces.get(dst) == ("king", enemy):
+                continue  # checkmate ends the game; a king is never captured
             self.pieces, self.ids = dict(saved[0]), dict(saved[1])
             self.apply_move(cell, dst)
             king = self.king_of(side)
@@ -590,6 +592,7 @@ class Learner:
         self.engine = self.player.batch_engine(self.display, self.parallel)
         self.corpus = None
         self.note = ""
+        self.error = ""
         self.last_result = ""
         self.steps_per_second = 0.0
         self.started_at = None
@@ -609,12 +612,18 @@ class Learner:
                 self.note = f"pre-training unavailable: {type(error).__name__}: {str(error)[:60]}"
         tick, count = time.perf_counter(), 0
         while not self._stop.is_set():
-            with self.lock:
-                finished = self.engine.step()
-                if finished:
-                    self.last_result = finished[-1]
-                if self.corpus is not None:
-                    self.corpus.step(self.player)
+            try:
+                with self.lock:
+                    finished = self.engine.step()
+                    if finished:
+                        self.last_result = finished[-1]
+                    if self.corpus is not None:
+                        self.corpus.step(self.player)
+            except Exception as error:
+                import traceback
+                self.error = f"{type(error).__name__}: {error}"
+                traceback.print_exc()
+                return
             count += 1
             now = time.perf_counter()
             if now - tick >= 1.0:
@@ -626,6 +635,8 @@ class Learner:
         import time
         p = self.player
         rec = p.record
+        if self.error:
+            return f"training stopped: {self.error}"
         lead = (self.corpus.summary() if self.corpus is not None else self.note) or ""
         hours = (time.time() - self.started_at) / 3600 if self.started_at else 0.0
         return ((lead + " · ") if lead else "") + (
@@ -698,8 +709,8 @@ class ChessVsNet(Chess):
         before = self.moves
         super().cell(r, c, button)
         if self.moves > before and self.turn == "black" and self.outcome() is None:
-            from meowdoku.search import best_move
-            move = best_move(self, self.player.net)             # two-ply search over the network
+            from meowdoku import mcts
+            move = mcts.best_move(self, self.player.net, simulations=1200)   # tree search over the network
             if move is not None:
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
 
@@ -742,6 +753,8 @@ class LichessGame(Chess):
             self.rights, self.ep = board.rights, board.ep
         st = Chess.state(self)
         st["selected"] = None; st["hints"] = [0] * 64
+        control = self.client.control_state() if self.client else None
+        st["lichess_control"] = control
         if not self.client:
             st["status"] = self.note
         elif not snap:
@@ -757,6 +770,12 @@ class LichessGame(Chess):
                             + (f" · {snap.get('summary', snap['status'])}" if snap.get("result") else "") + record)
             st["won"] = bool(snap.get("result")) and snap.get("result") == snap.get("color")
             st["lost"] = bool(snap.get("result")) and snap.get("result") not in (None, "draw", snap.get("color"))
+        if self.client and getattr(self.client, "last_search", ""):
+            st["status"] += f" · search: {self.client.last_search}"
+        if control and control["pause_requested"]:
+            mode = ("finishing current game" if control["live"] else
+                    "canceling pending challenge" if control["pending"] else "paused")
+            st["status"] += f" · Lichess {mode}"
         st["status"] += "  ‖  " + self.learner.summary()
         return st
 
