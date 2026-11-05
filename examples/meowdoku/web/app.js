@@ -210,6 +210,16 @@ function buildSphere(radius = 1, rings = 10, segments = 16) {
   }
   return flatVao(pos, col);
 }
+function sphereMesh(rings = 10, segments = 16) {
+  const positions = [], normals = [];
+  const vert = (i, j) => { const th = i / rings * Math.PI, ph = j / segments * Math.PI * 2;
+    return [Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph)]; };
+  for (let i = 0; i < rings; i++) for (let j = 0; j < segments; j++) {
+    const a = vert(i, j), b = vert(i + 1, j), c = vert(i + 1, j + 1), d = vert(i, j + 1);
+    for (const q of [a, c, b, a, d, c]) { positions.push(...q); normals.push(...q); }
+  }
+  return { positions, normals, extent: 1 };
+}
 function uploadMesh(mesh) {
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const count = mesh.positions.length / 3, inter = new Float32Array(count * 8);
@@ -398,6 +408,11 @@ function uploadMaterials(game) {
     records.push([`${name}@sel`, mix(rgb, [1.0, 0.85, 0.3], 0.6), {}]);
   }
   records.push(["glass", [0.80, 0.90, 1.0], { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
+  // Emitters are surfaces the shader lights from within (pbr emission): the
+  // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
+  records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
+  ARCADE.colours.forEach((c, ci) => ARCADE_LEVELS.forEach((level, li) =>
+    records.push([`bulb${ci}_${li}`, c.map((v) => 0.25 * v), { emission: c.map((v) => v * level), roughness: 0.2 }])));
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -413,6 +428,8 @@ function uploadMaterials(game) {
         record[0] = rgb[0]; record[1] = rgb[1]; record[2] = rgb[2];
         record[3] = extra.roughness ?? 0.72; record[4] = 0.0; record[5] = extra.transmission ?? 0.0;
         record[6] = extra.ior ?? 1.5; record[7] = extra.opacity ?? 1.0;
+        const emission = extra.emission || [0, 0, 0];
+        record[8] = emission[0]; record[9] = emission[1]; record[10] = emission[2];
       }
       if (tname === "phong") {
         record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
@@ -520,7 +537,9 @@ state.light = light;
 // chase.  When the game's declared score rises: a comet walks the ring with a
 // fading tail.  On a win: the whole ring flashes.  Their colour and activity
 // also tint the fill light, so the pieces catch the show.
-const ARCADE = { colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0]], spacing: 0.55,
+//: Emission steps of a bulb (linear), the step drawn follows its brightness.
+const ARCADE_LEVELS = [0.15, 0.6, 1.3, 2.4];
+const ARCADE = { lamp: 2.6, colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0]], spacing: 0.55,
                  burstAt: -10, flashAt: -10, lastScore: null, lastWon: false, key: null };
 function arcadeEvents(game, now) {
   const key = `${game.game}|${game.id}`;
@@ -538,7 +557,7 @@ function arcadeBulbs() {
     let s = i / count * perimeter, x, z;
     if (s < x1 - x0) { x = x0 + s; z = z0; } else if ((s -= x1 - x0) < z1 - z0) { x = x1; z = z0 + s; }
     else if ((s -= z1 - z0) < x1 - x0) { x = x1 - s; z = z1; } else { s -= x1 - x0; x = x0; z = z1 - s; }
-    bulbs.push([x, 0.12, z]);
+    bulbs.push([x, 0.45, z]);                      // on posts, so their light falls onto the tiles
   }
   return bulbs;
 }
@@ -1284,18 +1303,27 @@ function draw(ms) {
   const P = state.programs.phong; gl.useProgram(P);
   const span = Math.max(state.extent.width, state.extent.depth);
   const keyView = M.apply(cam.view, light.position);
-  gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), 3);
-  gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0, -0.6 * span, -0.1 * span, 0.3 * span - 1.0]));
   const sun = sunState(), boardCentre = [state.extent.width / 2, 0, state.extent.depth / 2];
   const sunReach = Math.hypot(...sub(light.position, boardCentre));
-  const arcade = arcadeLight(now);
-  const keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = mix([0.75, 0.85, 1.0], arcade.colour, 0.6 * arcade.level);
-  gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([...keyColour, ...fillColour, 1.0, 0.8, 0.7]));
+  const keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = [0.75, 0.85, 1.0];
   // The sun's intensity is set for its distance to the board's centre (soft,
   // even light); the fill light carries the arcade ring's colour and activity.
+  // The house light is turned down so the arcade bulbs carry the scene: the
+  // sun at ~60%, a softer fill; then each bulb is a point light in its own
+  // colour at its own place, as bright as the chase makes it.
+  const bulbs = state.flat ? [] : arcadeBulbs();
+  const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[i % 4],
+                                           level: arcadeBrightness(i, bulbs.length, now) }));
+  const count = Math.min(3 + bulbLights.length, 100);
+  gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
+  gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
+    -0.6 * span, -0.1 * span, 0.3 * span - 1.0, ...bulbLights.slice(0, count - 3).flatMap((b) => b.view)]));
+  gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([...keyColour, ...fillColour, 1.0, 0.8, 0.7,
+    ...bulbLights.slice(0, count - 3).flatMap((b) => b.colour)]));
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
-    (state.flat ? 2.6 : 2.4 * sun.strength) * sunReach * sunReach, (0.35 + 0.5 * arcade.level) * span * span, 0.25 * span * span]));
-  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array([-1, -1, -1]));
+    (state.flat ? 2.6 : 1.45 * sun.strength) * sunReach * sunReach, 0.19 * span * span, 0.14 * span * span,
+    ...bulbLights.slice(0, count - 3).map((b) => ARCADE.lamp * b.level)]));
+  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
   gl.uniform1f(gl.getUniformLocation(P, "uLightCalibration"), 1.0);
   gl.uniformMatrix3fv(gl.getUniformLocation(P, "uCatCcmMatrix"), false, new Float32Array([1,0,0, 0,1,0, 0,0,1]));
   gl.uniform1i(gl.getUniformLocation(P, "uEnableSpecular"), 1); gl.uniform1i(gl.getUniformLocation(P, "uEnableEmissionDirect"), 0);
@@ -1322,24 +1350,22 @@ function draw(ms) {
     gl.drawArrays(gl.TRIANGLES, 0, count);
   };
   for (const [vao, count, model, piece] of casters) drawLit(vao, count, model, piece ? state.materialIndex[piece.color] : null);
+  // Emitters: the sun's orb and the arcade bulbs, Phong-shaded with emissive
+  // materials (a bulb's level picks its brightness step).
+  if (!state.flat) {
+    const orb = state.meshes.__sphere;
+    drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
+    bulbs.forEach((p, i) => {
+      const level = arcadeBrightness(i, bulbs.length, now);
+      const step = ARCADE_LEVELS.reduce((best, v, k) => (Math.abs(v - 2.4 * level) < Math.abs(ARCADE_LEVELS[best] - 2.4 * level) ? k : best), 0);
+      drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${i % 4}_${step}`]);
+    });
+  }
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   drawLit(state.glass.vao, state.glass.count, M.identity(), null);
   gl.depthMask(true); gl.disable(gl.BLEND);
-  // the lamp: a bright core and an additive halo, so it reads as the source
-  gl.useProgram(state.programs.flat);
-  const lampAt = (radius, alpha) => {
-    gl.uniform1f(gl.getUniformLocation(state.programs.flat, "uAlpha"), alpha);
-    const m = M.multiply(M.translate(...light.position), M.scale(radius, radius, radius));
-    gl.uniformMatrix4fv(gl.getUniformLocation(state.programs.flat, "uMVP"), false, M.multiply(cam.viewProj, m));
-    gl.bindVertexArray(state.bulb.vao); gl.drawArrays(gl.TRIANGLES, 0, state.bulb.count);
-  };
-  gl.uniform3fv(gl.getUniformLocation(state.programs.flat, "uTint"), sun.colour);
-  lampAt(0.12, 1.0);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false);
-  lampAt(0.3, 0.3); lampAt(0.55, 0.12); lampAt(0.9, 0.05);
-  drawArcadeRing(now, cam);
-  gl.depthMask(true); gl.disable(gl.BLEND);
+  // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);
   requestAnimationFrame(draw);
 }
@@ -1703,7 +1729,7 @@ function fillPickers() {
   state.programs.flat = link(compile(gl.VERTEX_SHADER, FLAT_VS), compile(gl.FRAGMENT_SHADER, FLAT_FS));
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
-  state.shadowMap = buildShadowMap(); state.bulb = buildSphere();
+  state.shadowMap = buildShadowMap(); state.bulb = buildSphere(); state.meshes.__sphere = uploadMesh(sphereMesh());
   arrayTexture(4, [0, 255, 128, 255]); arrayTexture(5, [255, 255, 255, 0]); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
