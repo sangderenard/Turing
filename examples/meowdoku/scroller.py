@@ -14,7 +14,7 @@ Lanes (contiguous blocks, so collisions are block against block):
     49..368        enemy bullets
     369..398       stars: scenery scrolling past, never collide
 
-Columns: lane, slot (static); alive, x, y, vx, vy, hp, boom, born, owner, kind,
+Columns: lane, slot (static); alive, x, y, vx, vy, hp, boom, born, owner, energy, kind,
 age, timer (entity state: ``timer`` is the player's reload and an enemy's
 time to its next volley); score, lives, invuln, clock, spawn_clock, field_w
 (game-wide); move_axis, move_axis_y, steer_x, steer_y, fire (controls).
@@ -33,7 +33,10 @@ from src.common.tensors import AbstractTensor
 where = AbstractTensor.where
 
 HEIGHT = 16.0
-WIDTH = 13.0
+WIDTH = 9.0
+#: The field is portrait (phone-shaped) whatever the screen: its width follows
+#: the screen's shape only up to this width-to-height ratio.
+PORTRAIT = 0.62
 PLAYER, SHOT, ENEMY, BULLET, STAR = 0.0, 1.0, 2.0, 3.0, 4.0
 SHOTS = (1, 25)
 ENEMIES = (25, 49)
@@ -55,6 +58,12 @@ BULLET_SPEED = 5.0
 SPREAD = 3.0
 RING = 12.0
 HITBOX = 0.11
+#: The craft's regenerative energy shield (the ``energy`` column, player lane):
+#: a hit that finds at least SHIELD_COST of charge is absorbed -- the
+#: projectile still dies, the ship keeps its life -- and drains that much; the
+#: charge regenerates continuously at SHIELD_REGEN per second up to 1.
+SHIELD_COST = 0.5
+SHIELD_REGEN = 0.25
 #: The ship as drawn: half size, body box (hitbox), muzzle at the nose.
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
@@ -65,7 +74,7 @@ CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "steer_x":
 
 
 def scroller_step(lane, slot, rx, ry,
-                  alive, x, y, vx, vy, hp, boom, born, owner, kind, age, timer,
+                  alive, x, y, vx, vy, hp, boom, born, owner, energy, kind, age, timer,
                   score, lives, invuln, clock, spawn_clock, field_w,
                   move_axis, move_axis_y, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -163,7 +172,14 @@ def scroller_step(lane, slot, rx, ry,
     bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1))
     hp2 = hp1 - enemy_hits
     killed = is_enemy & live2 & (hp2 <= 0.0)
-    hit = is_player & live2 & (player_hits > 0.0)
+    touched = is_player & live2 & (player_hits > 0.0)
+    # The craft's shield takes a hit while it holds enough charge (the bullet
+    # still dies); only an unshielded hit costs a life and clears the screen.
+    absorbed = touched & (energy >= SHIELD_COST)
+    hit = touched & ~absorbed
+    shielded = f(absorbed).sum() > 0.0
+    energy_next = where(is_player, where(absorbed, energy - SHIELD_COST,
+                                         (energy + SHIELD_REGEN * dt).clip(0.0, 1.0)), energy)
     was_hit = f(hit).sum() > 0.0
     lives_next = lives - f(hit).sum()
     over = lives_next <= 0.0
@@ -171,7 +187,7 @@ def scroller_step(lane, slot, rx, ry,
     gone = killed | (is_shot & (shot_hits > 0.0)) | (is_bullet & ((bullet_hits > 0.0) | was_hit)) | (hit & over)
     live3 = live2 & ~gone
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
-    invuln_next = where(was_hit, INVULN, (invuln - dt).clip(0.0, INVULN))
+    invuln_next = where(was_hit, INVULN, where(shielded, 0.4, (invuln - dt).clip(0.0, INVULN)))
     score_next = score + (f(killed) * where(kind1 == SPINNER, 300.0, 100.0)).sum()
 
     # The longest step that steps nothing over anything it can hit, pair by
@@ -187,12 +203,12 @@ def scroller_step(lane, slot, rx, ry,
     bullet_limit = 0.9 * bullet_window / (bullet_pace + 1e-6)
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
-    return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, owner1, kind1, age1, timer1,
+    return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "kind", "age", "timer",
+STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "score", "lives", "invuln", "clock", "spawn_clock")
 SETTINGS = ("field_w",)
 
@@ -212,7 +228,7 @@ class ScrollerPiece(LawPiece):
 def field_width(aspect: float | None) -> float:
     if not aspect or aspect <= 0.0:
         return WIDTH
-    return float(np.clip(round(HEIGHT * aspect * 0.92 * 2.0) / 2.0, 10.0, 26.0))
+    return float(np.clip(round(HEIGHT * min(aspect, PORTRAIT) * 2.0) / 2.0, 9.0, HEIGHT * PORTRAIT + 0.5))
 
 
 def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
@@ -236,7 +252,8 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     return {
         "lane": lane, "slot": slot, "rx": rx, "ry": ry,
         "alive": alive, "x": x, "y": y, "vx": np.zeros(LANES), "vy": vy, "hp": np.zeros(LANES),
-        "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0), "kind": np.zeros(LANES), "age": np.zeros(LANES),
+        "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
+        "energy": (slot == PLAYER).astype(np.float64), "kind": np.zeros(LANES), "age": np.zeros(LANES),
         "timer": np.zeros(LANES), "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "spawn_clock": np.full(LANES, 1.5),
         "field_w": np.full(LANES, float(width)),

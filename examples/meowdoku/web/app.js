@@ -403,14 +403,22 @@ function uploadMaterials(game) {
   const records = [];                                   // [name, rgb, extra]
   for (const name of names) {
     const rgb = colour(game.palette[name]);
-    records.push([name, rgb, {}]);
-    records.push([`${name}@hint`, mix(rgb, [0.45, 0.95, 0.45], 0.55), {}]);
+    const glow = game.emissive || {};
+    records.push([name, rgb, glow[name] ? { emission: glow[name] } : {}]);
+    records.push([`${name}@hint`, mix(rgb, [0.45, 0.95, 0.45], 0.55), glow["@hint"] ? { emission: glow["@hint"] } : {}]);
     records.push([`${name}@sel`, mix(rgb, [1.0, 0.85, 0.3], 0.6), {}]);
   }
   records.push(["glass", [0.80, 0.90, 1.0], { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
+  // The craft's energy shield: a glassy bubble that glows blue, in SHIELD_STEPS
+  // charge steps (opacity and glow rise with the charge).
+  for (let k = 0; k < SHIELD_STEPS; k++) {
+    const charge = k / (SHIELD_STEPS - 1);
+    records.push([`shield_${k}`, [0.35, 0.65, 1.0], { roughness: 0.05, transmission: 0.6, ior: 1.2,
+      opacity: 0.06 + 0.22 * charge, emission: [0.1 * charge, 0.35 * charge, 0.9 * charge] }]);
+  }
   ARCADE.colours.forEach((c, ci) => ARCADE_LEVELS.forEach((level, li) =>
     records.push([`bulb${ci}_${li}`, c.map((v) => 0.25 * v), { emission: c.map((v) => v * level), roughness: 0.2 }])));
   const tables = {};
@@ -497,7 +505,8 @@ function rebuildBoards(game) {
     : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
-  const depth = rack ? rack.origin[1] + rack.rows * rack.size : game.rows + (game.hearts != null ? 1.5 : 0);
+  const depth = rack ? rack.origin[1] + rack.rows * rack.size
+    : game.rows + (game.powerups ? TRAY.row + 0.7 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
   state.extent = { width, depth: game.board === "free" ? game.height : depth };
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
@@ -532,6 +541,30 @@ function camera() {
 }
 const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
 state.light = light;
+// ---------------------------------------------------------------- the craft's shield
+// A bubble around the player's ship, as charged as the server says (``you``'s
+// shield); a hit it absorbs (the charge falling) flashes it.  Drawn with the
+// glass: blended, no depth write.
+const SHIELD_STEPS = 6;
+const shieldView = { charge: 0, last: null, flashAt: -10 };
+function noteShield(game, now) {
+  const charge = game && game.you ? Number(game.you.shield || 0) : 0;
+  if (shieldView.last != null && charge < shieldView.last - 0.2) shieldView.flashAt = now;
+  shieldView.last = charge; shieldView.charge = charge;
+}
+function drawShield(now, drawLit) {
+  const game = state.game;
+  if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive) return;
+  const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
+  if (!ship) return;
+  const flash = Math.max(0, 1 - (now - shieldView.flashAt) / 0.4);
+  const charge = Math.min(1, shieldView.charge + flash);
+  if (charge <= 0.02) return;
+  const step = Math.round(charge * (SHIELD_STEPS - 1)), r = ship.size * 1.25 * (1 + 0.15 * flash);
+  const model = M.multiply(M.translate(ship.x, TILE.height + ship.size * 0.55, ship.z), M.scale(r, r * 0.7, r));
+  drawLit(state.meshes.__sphere.vao, state.meshes.__sphere.count, model, state.materialIndex[`shield_${step}`]);
+}
+
 // ---------------------------------------------------------------- arcade lights
 // Pinball-style bulbs ring the board just outside its glass edge.  Idle: a slow
 // chase.  When the game's declared score rises: a comet walks the ring with a
@@ -695,7 +728,15 @@ const LEAN = { cat: 0.35, x_mark: 0.35, heart: 0.35, disc: 0.0, letter: 0.3, che
 // The goldfish lives move like the hearts they replaced; a mouse drops in like an X.
 const MESH_FAMILY = { fish: "heart", mouse: "x_mark" };
 const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : MESH_FAMILY[mesh] || mesh);
+// The power-up tray: a row under the lives; each item with its count beside it.
+const TRAY = { row: 2.05, spacing: 2.0, count: 0.62 };
+function trayPosition(game, cell) {
+  const [, k, part] = cell.split(":");
+  const x = game.cols / 2 + (Number(k) - 1) * TRAY.spacing - 0.3 + (part === "count" ? TRAY.count : 0);
+  return [x, game.rows + TRAY.row, "hud"];
+}
 function cellPosition(game, cell, rackPiece) {
+  if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
   if (typeof cell === "string" && cell.startsWith("hud:")) {
     const k = Number(cell.slice(4)); return [game.cols / 2 + (k - 1) * 0.9, game.rows + 0.9, "hud"];
   }
@@ -835,9 +876,11 @@ function applySnapshot(view) {
   const i32 = () => { const v = view.getInt32(o, true); o += 4; return v; };
   if (u8() !== 1) return;
   const flags = u8(), ack = i32();
-  const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1 };
+  const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
+  state.game.you = you;
+  noteShield(frameGame, now);
   const stamp = worldStamp(frameGame, now);
   const drop = (lane) => { const key = sock.lanes.get(lane); const piece = key && state.pieces.get(key); if (piece && piece.removing == null) piece.removing = now; sock.lanes.delete(lane); };
   if (flags & 2) { for (const lane of [...sock.lanes.keys()]) drop(lane);
@@ -1256,6 +1299,7 @@ function applyState(game) {
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
   arcadeEvents(game, now);
+  if (game.you) noteShield(game, now);
   const seen = new Set();
   const place = (p, rackPiece) => {
     const [x, z, where, cellSize] = cellPosition(game, p.cell, rackPiece);
@@ -1406,6 +1450,7 @@ function draw(ms) {
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  drawShield(now, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);
@@ -1502,6 +1547,11 @@ function hit(clientX, clientY) {
   const near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
   const t = (TILE.height - near[1]) / (far[1] - near[1]); if (!(t >= 0)) return null;
   const x = near[0] + t * (far[0] - near[0]), z = near[2] + t * (far[2] - near[2]);
+  for (const piece of game.pieces || []) {
+    if (!piece.power) continue;
+    const [px, pz] = cellPosition(game, piece.cell);
+    if (Math.hypot(x - px, z - pz) < 0.6) return { kind: "power", power: piece.power, key: `power:${piece.power}` };
+  }
   const c = Math.floor(x), r = Math.floor(z);
   if (c >= 0 && c < game.cols && r >= 0 && r < game.rows) return { kind: "board", r, c, key: `${r},${c}` };
   const rack = rackLayout(game);
@@ -1549,6 +1599,7 @@ canvas.addEventListener("pointerup", async (e) => {
   const h = hit(e.clientX, e.clientY);
   if (game.input === "meowdoku") {
     if (p.moved) return;                                                    // the swipe already painted
+    if (h && h.kind === "power") { await act({ type: "power", kind: h.power }); return; }   // a tray item: use it
     if (!h || h.kind !== "board") return;
     const now = performance.now();
     const long = p.button === 2 || now - p.t > 450;
@@ -1714,23 +1765,15 @@ function setTool(tool) {
 }
 $("tool-cat").onclick = () => setTool("cat");
 $("tool-mouse").onclick = () => setTool("mouse");
-// Power-ups are buttons only: Cat reveals a cat, Mouse drops three mice on
-// cells that hold no cat, Hint lights a deduction; each shows what is left.
-for (const kind of ["cat", "mouse", "hint"])
-  $(`power-${kind}`).onclick = () => { if (state.game && state.game.game === "meowdoku") act({ type: "power", kind }); };
+// Power-ups are objects in the tray beside the board (tap one to use it):
+// Cat reveals a cat, Mouse drops three mice on cells that hold no cat, the
+// Hint bulb lights the next deduction; each shows how many are left.
 $("palette").onchange = (e) => act({ type: "palette", name: e.target.value });
 function syncMeowdokuBar(game) {
   if (game.game !== "meowdoku") return;
   const select = $("palette");
   if (select.options.length !== game.palettes.length) select.innerHTML = game.palettes.map((n) => `<option value="${n}">${n}</option>`).join("");
   select.value = game.palette_name;
-  const over = game.won || game.lost, stock = game.powerups || {};
-  const label = { cat: "Cat", mouse: "Mouse", hint: "Hint" };
-  for (const kind of ["cat", "mouse", "hint"]) {
-    const button = $(`power-${kind}`), left = stock[kind] ?? 0;
-    button.textContent = `${label[kind]} ×${left}`;
-    button.disabled = over || left <= 0;
-  }
 }
 
 // ---------------------------------------------------------------- game picker

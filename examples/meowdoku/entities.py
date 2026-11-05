@@ -392,5 +392,6 @@ class EntityGame(Game):
             st["predict"] = {"lane": k, **(self.motion() or {})}
             st["ack"] = self.ack
             st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
-                         "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0)}
+                         "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0),
+                         "shield": float(col("energy")[k]) if "energy" in self.session.columns else 0.0}
         return st

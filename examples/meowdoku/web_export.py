@@ -115,7 +115,7 @@ def export_assets(out: Path) -> dict:
     # The other games' pieces: letters A-Z, the six chess pieces (the filled
     # glyphs U+265A..U+265F), a disc for checkers; DejaVu Sans has all of
     # them with light outlines.
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
         pack(letter, *token_mesh(letter, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
     for name, code in (("king", 0x265A), ("queen", 0x265B), ("rook", 0x265C), ("bishop", 0x265D),
                        ("knight", 0x265E), ("pawn", 0x265F)):
@@ -138,6 +138,13 @@ def export_assets(out: Path) -> dict:
                                  outline_subdivisions=2), material_index["heart"])
     except Exception as error:  # noqa: BLE001  (the page falls back to the heart)
         print(f"[export] fish mesh skipped: {error}", flush=True)
+    # Meowdoku's hint: a light bulb dropped on the cell it points at, and in
+    # the power-up tray.
+    try:
+        verts, normals = token_mesh("💡", "Segoe UI Emoji", "normal", depth_ratio=0.32, outline_subdivisions=2)
+        pack("bulb", *largest_component(verts, normals))
+    except Exception as error:  # noqa: BLE001
+        print(f"[export] bulb mesh skipped: {error}", flush=True)
     from meowdoku.invaders import EMOJI, EMOJI_BODY_ONLY, EMOJI_SUBDIVISIONS
     for name, glyph in EMOJI.items():
         verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,

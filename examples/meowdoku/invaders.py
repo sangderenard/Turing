@@ -17,7 +17,7 @@ Lanes:
 
 Columns (one value per lane; game-wide values are broadcast to every lane):
     lane, slot, home_x, home_y, points, rx, ry, home_hp      static
-    alive, x, y, vx, vy, hp, boom, born, owner                entity state (owner:
+    alive, x, y, vx, vy, hp, boom, born, owner, energy        entity state (owner:
                                                               the lane that fired it)
     score, lives, wave, fleet_dir, clock, ufo_clock           game state
     field_w                                                   the field's width
@@ -41,7 +41,10 @@ from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
 
-WIDTH, HEIGHT = 15.0, 13.0
+WIDTH, HEIGHT = 12.5, 20.0
+#: The field is portrait (phone-shaped) whatever the screen: its width follows
+#: the screen's shape only up to this width-to-height ratio.
+PORTRAIT = 0.62
 PLAYER, SHOT, BOMB, UFO, INVADER, SHIELD = 0.0, 1.0, 2.0, 3.0, 4.0, 5.0
 BOMB_LANES = range(2, 6)
 UFO_LANE = 6
@@ -55,6 +58,12 @@ INVADERS = float(FLEET_ROWS * FLEET_COLS)
 LIVES = 3.0
 PLAYER_Y = HEIGHT - 0.9
 PLAYER_SPEED = 9.0
+#: The craft's regenerative energy shield (the ``energy`` column, player lane):
+#: a hit that finds at least SHIELD_COST of charge is absorbed -- the
+#: projectile still dies, the ship keeps its life -- and drains that much; the
+#: charge regenerates continuously at SHIELD_REGEN per second up to 1.
+SHIELD_COST = 0.5
+SHIELD_REGEN = 0.25
 #: The rocket as drawn: its half size, its body box (the hitbox) and the
 #: muzzle (where a shot leaves, the nose) -- one geometry for the eye and the
 #: law.
@@ -109,7 +118,7 @@ def _hash(value):
 
 
 def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
-                  alive, x, y, vx, vy, hp, boom, born, owner,
+                  alive, x, y, vx, vy, hp, boom, born, owner, energy,
                   score, lives, wave, fleet_dir, clock, ufo_clock, field_w,
                   move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -208,7 +217,9 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     harmless = (S1 == INVADER) & ((S2 == SHIELD) | (S2 == PLAYER))
     hits = f(touch & may_touch & ~harmless).sum(dim=1)
     hp2 = where(is_shield, hp - hits, hp)
-    dies = live2 & (hits > 0.0) & (~is_shield | (hp2 <= 0.0))
+    # The craft's shield takes a hit while it holds enough charge.
+    absorbed = is_player & live2 & (hits > 0.0) & (energy >= SHIELD_COST)
+    dies = live2 & (hits > 0.0) & (~is_shield | (hp2 <= 0.0)) & ~absorbed
     live3 = live2 & ~dies
     boom3 = where(dies & (is_inv | is_ufo), BOOM,
                   where(dies & is_player, PLAYER_BOOM, (boom - dt).clip(0.0, PLAYER_BOOM)))
@@ -228,6 +239,8 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     vx4 = where(respawn, 0.0, vx_out)
     y4 = where(reform, home_y + FLEET_DROP * (wave + 1.0).clip(0.0, 4.0), y2)
     born4 = where(respawn | reform, clock_next, born1)
+    energy_next = where(is_player, where(respawn, 1.0, where(absorbed, energy - SHIELD_COST,
+                                                              (energy + SHIELD_REGEN * dt).clip(0.0, 1.0))), energy)
     wave_next = where(cleared, wave + 1.0, wave)
     fleet_dir_out = where(cleared, 1.0, fleet_dir_next)
 
@@ -237,12 +250,12 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # ... and no step longer than half the rocket's damping time.
     dt_limit = (0.5 / (pace.max() + 1e-6)).clip(0.0, 0.5 * SHIP_TAU) + x * 0.0
     residual = f(is_inv & live4).sum() + x * 0.0
-    return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4, owner1,
+    return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4, owner1, energy_next,
             score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner",
+STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "energy",
          "score", "lives", "wave", "fleet_dir", "clock", "ufo_clock")
 #: Read by the law, written by the host only (a layout change), never stepped.
 SETTINGS = ("field_w",)
@@ -266,7 +279,7 @@ def field_width(aspect: float | None) -> float:
     height is fixed, the width follows the screen within arcade limits."""
     if not aspect or aspect <= 0.0:
         return WIDTH
-    return float(np.clip(round(HEIGHT * aspect * 0.92 * 2.0) / 2.0, 12.5, 26.0))
+    return float(np.clip(round(HEIGHT * min(aspect, PORTRAIT) * 2.0) / 2.0, 12.5, HEIGHT * PORTRAIT + 0.5))
 
 
 def layout(width: float = WIDTH) -> dict[str, np.ndarray]:
@@ -312,6 +325,7 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
         "alive": starts.astype(np.float64), "x": columns["home_x"].copy(), "y": columns["home_y"].copy(),
         "vx": np.zeros(LANES), "vy": np.zeros(LANES), "hp": columns["home_hp"].copy(),
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
+        "energy": (slot == PLAYER).astype(np.float64),
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES), "wave": np.zeros(LANES),
         "fleet_dir": np.ones(LANES), "clock": np.zeros(LANES), "ufo_clock": np.full(LANES, 12.0),
         "field_w": np.full(LANES, float(width)),

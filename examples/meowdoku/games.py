@@ -241,7 +241,11 @@ class MeowdokuGame(Game):
         region = [int(k) for k in self.board["region"]]
         st["palette"] = self.colours()
         st["palette"].update({"cat": [0.78, 0.34, 0.04], "x": [0.38, 0.36, 0.37], "mouse": [0.55, 0.52, 0.55],
-                              "fish": [0.98, 0.62, 0.10]})
+                              "fish": [0.98, 0.62, 0.10], "bulb": [1.0, 0.86, 0.35], "count": [0.95, 0.93, 0.88],
+                              "spent": [0.28, 0.28, 0.30]})
+        # Colours that light from within (pbr emission): the hint's bulbs, and
+        # the cells a hint points at.
+        st["emissive"] = {"bulb": [1.6, 1.25, 0.45], "@hint": [0.55, 0.85, 0.25]}
         st["palettes"], st["palette_name"] = list(PALETTES), self.palette_name
         st["cells"] = [f"region{k}" for k in region]
         cat = np.asarray(s.cat, dtype=int).reshape(-1)
@@ -258,6 +262,17 @@ class MeowdokuGame(Game):
         # Lives are goldfish (crackers), not hearts.
         st["pieces"] += [{"id": f"fish-{k}", "cell": f"hud:{k}", "mesh": "fish", "color": "fish"} for k in range(int(s.hearts))]
         st["powerups"] = dict(self.stock)
+        # The hint shows itself: a glowing bulb on every cell it points at.
+        st["pieces"] += [{"id": f"hint-{i}-{self.hints_used}", "cell": int(i), "mesh": "bulb", "color": "bulb"}
+                         for i in self.hint_cells]
+        # The power-up tray beside the board: each power-up is an object you
+        # tap, its count standing next to it; a spent one dims.
+        for k, (kind, mesh, colour) in enumerate((("cat", "cat", "cat"), ("mouse", "mouse", "mouse"), ("hint", "bulb", "bulb"))):
+            left = int(self.stock[kind])
+            st["pieces"].append({"id": f"tray-{kind}", "cell": f"tray:{k}", "mesh": mesh,
+                                 "color": colour if left else "spent", "power": kind})
+            st["pieces"].append({"id": f"tray-{kind}-count-{left}", "cell": f"tray:{k}:count", "mesh": str(left),
+                                 "color": "count" if left else "spent"})
         st["hearts"] = int(s.hearts)
         st["score"] = int(cat.sum())
         st["won"], st["lost"] = bool(s.won), bool(s.lost)
