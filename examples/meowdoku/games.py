@@ -819,13 +819,21 @@ class Learner:
         self.started_at = None
         self._stop = threading.Event()
         self.saved = ""                     # when the weights were last written, for the status
+        # Self-play starts PAUSED: the arena shows its board and waits for
+        # Resume training.  Nothing is lost by pausing -- the weights and the
+        # game record stay in memory -- and Lichess bot games and games
+        # against the network learn on their own, whether or not this runs.
         self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
-        self._thread.start()
+        self._stop.set()
 
     # The arena's Save / Stop / Resume buttons ----------------------------
     @property
     def running(self) -> bool:
         return self._thread.is_alive() and not self._stop.is_set()
+
+    @property
+    def started(self) -> bool:
+        return self._thread.ident is not None
 
     def save(self) -> None:
         """Write the network's weights now (the same atomic write the
@@ -838,7 +846,8 @@ class Learner:
     def stop(self) -> None:
         """Stop self-play after the step in flight, then save."""
         self._stop.set()
-        self._thread.join(timeout=30.0)
+        if self.started:
+            self._thread.join(timeout=30.0)
         self.save()
 
     def resume(self) -> None:
@@ -846,7 +855,8 @@ class Learner:
         import threading
         if self.running:
             return
-        self._thread.join(timeout=30.0)
+        if self.started:
+            self._thread.join(timeout=30.0)
         self.error = ""
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
@@ -894,7 +904,8 @@ class Learner:
         if self.error:
             return f"training stopped: {self.error}{saved}"
         if not self.running:
-            return f"training stopped{saved} · {p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
+            word = "paused · press Resume training" if not self.started else "training stopped"
+            return f"{word}{saved} · {p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
         lead = (self.corpus.summary() if self.corpus is not None else self.note) or ""
         hours = (time.time() - self.started_at) / 3600 if self.started_at else 0.0
         return ((lead + " · ") if lead else "") + (
@@ -973,15 +984,40 @@ class ChessVsNet(Chess):
     def __init__(self, board_id: str = "vs_net"):
         super().__init__(board_id)
         self.player = self_play()
+        # Every position of the game, from the mover's side, for learning
+        # when it ends (the same targets Lichess games train with).
+        self.boards, self.materials, self.learned = [], [], False
+        self._record()
+
+    def _record(self) -> None:
+        from meowdoku.chess_net import encode, material
+        del self.boards[self.moves:], self.materials[self.moves:]       # an undo drops what it took back
+        if self.moves == 0:
+            self.learned = False                                        # a new game learns again
+        self.boards.append(encode(self.pieces, self.turn)); self.materials.append(material(self.pieces))
+
+    def _learn_if_over(self) -> None:
+        end = self.outcome()
+        if end is None or self.learned or len(self.boards) < 4:
+            return
+        self.learned = True
+        outcome = end if end in ("white", "black") else "draw"
+        engine().call(self.player.learn_from, list(self.boards), list(self.materials), outcome)
 
     def cell(self, r: int, c: int, button: str) -> None:
         before = self.moves
         super().cell(r, c, button)
+        if self.moves > before:
+            self._record()
         if self.moves > before and self.turn == "black" and self.outcome() is None:
             from meowdoku import mcts
             move = engine().call(mcts.best_move, self, self.player.net, simulations=3000)   # tree search on the engine thread
             if move is not None:
+                answered = self.moves
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
+                if self.moves > answered:
+                    self._record()
+        self._learn_if_over()
 
 
 class LichessGame(Chess):
@@ -997,8 +1033,7 @@ class LichessGame(Chess):
     def __init__(self, board_id: str = "lichess"):
         super().__init__(board_id)
         from meowdoku import lichess
-        self.client = lichess.bot(player=self_play())
-        self.learner = learner()                                  # background learning runs while we watch
+        self.client = lichess.bot(player=self_play())            # learns from its own games (lichess.py)
         self.note = "" if self.client else "no Lichess token: set MEOWDOKU_LICHESS_TOKEN or build/meowdoku/lichess_token.txt"
 
     def tick(self) -> None:
