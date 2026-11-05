@@ -14,10 +14,19 @@ Lanes (contiguous blocks, so collisions are block against block):
     49..368        enemy bullets
     369..398       stars: scenery scrolling past, never collide
 
-Columns: lane, slot (static); alive, x, y, vx, vy, hp, boom, born, owner, energy, kind,
+DEPTH: every lane also has a height ``z`` above the board (0..DEPTH) with
+velocity ``vz`` and a depth half-extent ``rz``: the ship climbs and dives on
+the same damped motion law, shots leave at its height, aimed spreads aim in
+three dimensions, spinner rings stay level, and enemies run a clipped-sine
+height routine that holds them at the floor or the ceiling most of the time
+(crossing between), so they are reachable.  Hits need overlap in depth too.
+The layer is physically compressed (DEPTH units); the page exaggerates the
+drawn scale by height.
+
+Columns: lane, slot, rz (static); alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind,
 age, timer (entity state: ``timer`` is the player's reload and an enemy's
 time to its next volley); score, lives, invuln, clock, spawn_clock, field_w
-(game-wide); move_axis, move_axis_y, steer_x, steer_y, fire (controls).
+(game-wide); move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire (controls).
 """
 
 from __future__ import annotations
@@ -65,18 +74,25 @@ HITBOX = 0.11
 SHIELD_COST = 0.5
 SHIELD_REGEN = 0.25
 #: The ship as drawn: half size, body box (hitbox), muzzle at the nose.
+#: Height above the board: the field's third axis (physically compressed).
+DEPTH = 4.0
+Z_MARGIN = 0.3
+#: The enemies' height routine: a sine clipped DWELL times over, so it sits at
+#: the floor or the ceiling and crosses quickly between them.
+DWELL = 1.8
+ROUTINE_RATE = 0.9
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
 MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 
-CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "steer_x": "pointer-board-x",
-            "steer_y": "pointer-board-y", "fire": "primary-action"}
+CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis_z": "move-axis-z",
+            "steer_x": "pointer-board-x", "steer_y": "pointer-board-y", "fire": "primary-action"}
 
 
-def scroller_step(lane, slot, rx, ry,
-                  alive, x, y, vx, vy, hp, boom, born, owner, energy, kind, age, timer,
+def scroller_step(lane, slot, rx, ry, rz,
+                  alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind, age, timer,
                   score, lives, invuln, clock, spawn_clock, field_w,
-                  move_axis, move_axis_y, steer_x, steer_y, fire, dt):
+                  move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
     live = alive > 0.0
@@ -91,8 +107,10 @@ def scroller_step(lane, slot, rx, ry,
                                   SPEED, TAU, REACH, dt)
     ship_y, ship_vy = damped_axis(y, vy, move_axis_y, steer_y, zero + MARGIN, zero + HEIGHT - MARGIN,
                                   SPEED, TAU, REACH, dt)
+    ship_z, ship_vz = damped_axis(z, vz, move_axis_z, zero - 1.0, zero + Z_MARGIN, zero + DEPTH - Z_MARGIN,
+                                  SPEED, TAU, REACH, dt)
     me = is_player & live
-    px, py = (f(me) * x).sum(), (f(me) * y).sum()
+    px, py, pz = (f(me) * x).sum(), (f(me) * y).sum(), (f(me) * z).sum()
     ship_on = f(me).sum() > 0.0
 
     # Twin shots on a reload: the first two free shot lanes.
@@ -113,13 +131,20 @@ def scroller_step(lane, slot, rx, ry,
     spawn_clock_next = where(arrive, (1.1 - clock / 200.0).clip(0.35, 1.1) * (0.6 + 0.8 * noise(clock * 1.3)),
                              spawn_clock - dt)
     enemy_x0 = 1.0 + (field_w - 2.0) * noise(clock * 5.1 + 2.0)
+    # The enemies' height routine (see DWELL): its value and its slope.
+    phase = clock_next * ROUTINE_RATE + lane * 1.3
+    wave = DWELL * phase.sin()
+    held_wave = where(wave > 1.0, 1.0, where(wave < -1.0, -1.0, wave))
+    span_z = 0.5 * (DEPTH - 2.0 * Z_MARGIN)
+    routine_z = Z_MARGIN + span_z * (1.0 + held_wave)
+    routine_vz = where(wave.abs() < 1.0, span_z * DWELL * ROUTINE_RATE * phase.cos(), 0.0)
 
     # One volley per step: the ready enemy in the lowest lane fires, into the
     # first free bullet lanes (drifters an aimed spread, spinners a ring).
     ready = is_enemy & live & (timer <= 0.0) & (y > 0.3) & playing
     shooter = first_of(ready, lane)
     fired = f(shooter).sum() > 0.0
-    sx, sy = (f(shooter) * x).sum(), (f(shooter) * y).sum()
+    sx, sy, sz = (f(shooter) * x).sum(), (f(shooter) * y).sum(), (f(shooter) * z).sum()
     skind = (f(shooter) * kind).sum()
     shooter_lane = (f(shooter) * lane).sum()
     count = where(skind == SPINNER, RING, SPREAD)
@@ -130,10 +155,15 @@ def scroller_step(lane, slot, rx, ry,
     angle = where(skind == SPINNER, rank * (6.283185307179586 / RING) + clock * 1.7,
                   aim + (rank - 1.0) * 0.22)
     speed = where(skind == SPINNER, BULLET_SPEED * 0.8, BULLET_SPEED)
+    # Aimed spreads climb or dive toward the ship height over the flight
+    # their horizontal distance takes; rings stay level.
+    reach_xy = ((px - sx) * (px - sx) + (py - sy) * (py - sy)).sqrt() + 0.5
+    climb = where(skind == SPINNER, 0.0, speed * (pz - sz) / reach_xy)
 
     spawn = shot_spawn | enemy_spawn | bullet_spawn
     x1 = where(shot_spawn, shot_x, where(enemy_spawn, enemy_x0, where(bullet_spawn, sx, x)))
     y1 = where(shot_spawn, py - MUZZLE, where(enemy_spawn, -0.8, where(bullet_spawn, sy + 0.2, y)))
+    z1 = where(shot_spawn, pz, where(enemy_spawn, routine_z, where(bullet_spawn, sz, z)))
     kind1 = where(enemy_spawn, new_kind, kind)
     age1 = where(spawn, 0.0, age + dt)
     hp1 = where(enemy_spawn, where(new_kind == SPINNER, 9.0, 3.0), hp)
@@ -149,6 +179,8 @@ def scroller_step(lane, slot, rx, ry,
                 where(shot_spawn, -SHOT_SPEED,
                       where(drifter, 1.7, where(spinner, where(age1 < 3.0, 1.0, where(age1 < 10.0, 0.0, 1.6)),
                                                 where(bullet_spawn, speed * angle.sin(), vy)))))
+    vz1 = where(is_player, ship_vz, where(is_enemy, routine_vz, where(bullet_spawn, climb,
+                                                                  where(spawn, 0.0, vz))))
     live1 = live | spawn
     # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
     # the whole step, so position = birth point + velocity x (clock - born).
@@ -158,18 +190,19 @@ def scroller_step(lane, slot, rx, ry,
     moving = (live1 & playing) | is_star
     x2 = where(is_player & moving, ship_x, where(moving, x1 + vx1 * dt, x1))
     y2 = where(is_player & moving, ship_y, where(moving, y1 + vy1 * dt, y1))
+    z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z, where(moving, z1 + vz1 * dt, z1)))
     # Stars wrap from the bottom back to the top: the scroll.
     y2 = where(is_star & (y2 > HEIGHT + 0.3), y2 - (HEIGHT + 0.6), y2)
-    out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5)
+    out = (y2 < -1.5) | (y2 > HEIGHT + 1.5) | (x2 < -1.5) | (x2 > field_w + 1.5) | (z2 < -0.6) | (z2 > DEPTH + 0.6)
     live2 = live1 & ~((is_shot | is_enemy | is_bullet) & out)
 
     # Collisions, block against block.
-    enemy_hits = block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS)
-    shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES)
+    enemy_hits = block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS, z2, rz)
+    shot_hits = block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
     exposed = live2 & (invuln <= 0.0)
-    player_hits = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS)
-                   + block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES))
-    bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1))
+    player_hits = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
+                   + block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz))
+    bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
     hp2 = hp1 - enemy_hits
     killed = is_enemy & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
@@ -194,7 +227,7 @@ def scroller_step(lane, slot, rx, ry,
     # pair: a shot must not cross an enemy's height in one step, a bullet
     # must not cross the ship's hitbox at their closing speed; and the ship
     # moves at most half its damping time per step.
-    pace = vx1.abs() + vy1.abs()
+    pace = vx1.abs() + vy1.abs() + vz1.abs()
     shot_pace = where(is_shot & live3, pace, 0.0).max()
     bullet_pace = where(is_bullet & live3, pace, 0.0).max() + (f(is_player) * pace).sum()
     shot_window = 2.0 * (0.3 + 0.36)
@@ -203,12 +236,12 @@ def scroller_step(lane, slot, rx, ry,
     bullet_limit = 0.9 * bullet_window / (bullet_pace + 1e-6)
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
-    return (f(live3), x2, y2, vx1, vy1, hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
+    return (f(live3), x2, y2, z2, vx1, vy1, vz1, hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             score_next, lives_next, invuln_next, clock_next, spawn_clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
+STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "score", "lives", "invuln", "clock", "spawn_clock")
 SETTINGS = ("field_w",)
 
@@ -218,7 +251,7 @@ class ScrollerPiece(LawPiece):
 
     entry = "scroller_step"
     law = staticmethod(scroller_step)
-    argument_names = ("lane", "slot", "rx", "ry", *STATE, *SETTINGS, *CONTROLS, "dt")
+    argument_names = ("lane", "slot", "rx", "ry", "rz", *STATE, *SETTINGS, *CONTROLS, "dt")
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):
@@ -234,8 +267,9 @@ def field_width(aspect: float | None) -> float:
 def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     lane = np.arange(LANES, dtype=np.float64)
     slot = np.zeros(LANES)
-    rx, ry = np.full(LANES, HITBOX), np.full(LANES, HITBOX)
-    rx[0], ry[0] = SHIP_RX, SHIP_RY
+    rx, ry, rz = np.full(LANES, HITBOX), np.full(LANES, HITBOX), np.full(LANES, 0.18)
+    rx[0], ry[0], rz[0] = SHIP_RX, SHIP_RY, 0.35
+    rz[SHOTS[0]:SHOTS[1]], rz[ENEMIES[0]:ENEMIES[1]] = 0.25, 0.45
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
     slot[BULLETS[0]:BULLETS[1]], rx[BULLETS[0]:BULLETS[1]], ry[BULLETS[0]:BULLETS[1]] = BULLET, 0.12, 0.12
@@ -244,14 +278,18 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
     x, y = np.zeros(LANES), np.zeros(LANES)
     vy = np.zeros(LANES)
     x[0], y[0] = width / 2.0, HEIGHT - 2.0
+    z = np.zeros(LANES)
+    z[0] = DEPTH / 2.0
     stars = slice(*STARS)
     x[stars] = rng.uniform(0.2, width - 0.2, STARS[1] - STARS[0])
     y[stars] = rng.uniform(-0.3, HEIGHT + 0.3, STARS[1] - STARS[0])
     vy[stars] = rng.uniform(1.5, 5.0, STARS[1] - STARS[0])
+    z[stars] = rng.uniform(0.0, DEPTH, STARS[1] - STARS[0])
     alive = ((slot == PLAYER) | (slot == STAR)).astype(np.float64)
     return {
-        "lane": lane, "slot": slot, "rx": rx, "ry": ry,
-        "alive": alive, "x": x, "y": y, "vx": np.zeros(LANES), "vy": vy, "hp": np.zeros(LANES),
+        "lane": lane, "slot": slot, "rx": rx, "ry": ry, "rz": rz,
+        "alive": alive, "x": x, "y": y, "z": z, "vx": np.zeros(LANES), "vy": vy, "vz": np.zeros(LANES),
+        "hp": np.zeros(LANES),
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "energy": (slot == PLAYER).astype(np.float64), "kind": np.zeros(LANES), "age": np.zeros(LANES),
         "timer": np.zeros(LANES), "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
@@ -282,6 +320,7 @@ class BulletScroller(EntityGame):
     def motion(self) -> dict[str, Any]:
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
                 "x": [MARGIN, self.width - MARGIN], "y": [MARGIN, HEIGHT - MARGIN],
+                "z": [Z_MARGIN, DEPTH - Z_MARGIN], "depth": DEPTH,
                 # Twin shots from the nose on a reload, as the law fires them.
                 "weapon": {"muzzles": [[-0.2, -MUZZLE], [0.2, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED],
                            "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",
@@ -303,7 +342,7 @@ class BulletScroller(EntityGame):
                 "bullet_ring": [0.35, 0.8, 1.0], "star": [0.55, 0.6, 0.8], "boom": [1.0, 0.55, 0.1]}
 
     def entities(self) -> list[dict[str, Any]]:
-        names = ("slot", "alive", "x", "y", "vx", "vy", "boom", "born", "owner", "kind", "invuln")
+        names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln")
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
         show = (col["alive"] > 0.0) | (col["boom"] > 0.0)
@@ -327,6 +366,7 @@ class BulletScroller(EntityGame):
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
+                        "z": float(col["z"][k]), "vz": 0.0 if exploding else float(col["vz"][k]),
                         "mesh": mesh, "color": color, "size": size,
                         "roll": 0.785 if mesh == "rocket" else 0.0, "lean": 0.25 if slot == PLAYER else 0.55,
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,

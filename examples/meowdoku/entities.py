@@ -86,7 +86,7 @@ def first_of(mask, lane):
     return mask & (lane == AbstractTensor.where(mask, lane, 1.0e9).min())
 
 
-def block_hits(x, y, rx, ry, live, harms, rows: tuple[int, int], cols: tuple[int, int]):
+def block_hits(x, y, rx, ry, live, harms, rows: tuple[int, int], cols: tuple[int, int], z=None, rz=None):
     """Hit counts of the lanes in ``rows`` by the lanes in ``cols``, as a
     full-length span (zero outside ``rows``).
 
@@ -104,6 +104,11 @@ def block_hits(x, y, rx, ry, live, harms, rows: tuple[int, int], cols: tuple[int
              & ((y[r0:r1].reshape((a, 1)) - y[c0:c1].reshape((1, b))).abs()
                 < (ry[r0:r1].reshape((a, 1)) + ry[c0:c1].reshape((1, b))))
              & live[r0:r1].reshape((a, 1)) & live[c0:c1].reshape((1, b)))
+    if z is not None:
+        # A field with height (``z``, depth half extents ``rz``): boxes must
+        # overlap in depth as well.
+        touch = touch & ((z[r0:r1].reshape((a, 1)) - z[c0:c1].reshape((1, b))).abs()
+                         < (rz[r0:r1].reshape((a, 1)) + rz[c0:c1].reshape((1, b))))
     if harms is not None:
         touch = touch & harms
     counts = as_float(touch).sum(dim=1)
@@ -459,7 +464,7 @@ class EntityGame(Game):
 
     def adopt_axes(self) -> list[str]:
         motion = self.motion() or {}
-        return [axis for axis in ("x", "y") if motion.get(axis) and axis not in self.SCROLL_AXES]
+        return [axis for axis in ("x", "y", "z") if motion.get(axis) and axis not in self.SCROLL_AXES]
 
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
@@ -557,5 +562,8 @@ class EntityGame(Game):
             st["ack"] = self.ack
             st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
                          "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0),
-                         "shield": float(col("energy")[k]) if "energy" in self.session.columns else 0.0}
+                         "shield": float(col("energy")[k]) if "energy" in self.session.columns else 0.0,
+                         # height above the board (games with a third axis; else 0)
+                         "z": float(col("z")[k]) if "z" in self.session.columns else 0.0,
+                         "vz": float(col("vz")[k]) if "vz" in self.session.columns else 0.0}
         return st

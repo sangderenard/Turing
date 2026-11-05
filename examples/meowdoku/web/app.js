@@ -830,7 +830,8 @@ const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min
 function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
-    for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"]]) {
+    for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
+                                                  ["z", "z", "vz", "move_axis_z", "steer_z"]]) {
       // Only the engine's own motion law moves the ship here (the same
       // damped_axis, compiled to wasm).  An axis that law does not declare is
       // the server's alone: the page never guesses it with physics of its own.
@@ -862,7 +863,7 @@ function reconcile(game) {
   // Only axes the game will adopt are the page's to keep; a scrolled axis is
   // still stepped here by the motion law, but from the server's state.
   const adoptable = game.predict.adopt_axes || ["x", "y"];
-  const declared = [["x", "vx"], ["y", "vy"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
+  const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos])) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
   if (pred.ship && error <= tolerance) {
@@ -1024,6 +1025,7 @@ function applySnapshot(view) {
   const flags = u8(), ack = i32();
   const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
   sync.hint = f32();
+  you.z = f32(); you.vz = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -1036,7 +1038,7 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000, bob = u8();
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
-    const x = f32(), y = f32(), vx = f32(), vy = f32();
+    const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
     const id = `${lane}:s${++sock.gen}`;
     sock.lanes.set(lane, id);
@@ -1050,13 +1052,15 @@ function applySnapshot(view) {
       }
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
+                           sh: h, h, vh,
                            tRecv: stamp, mesh, color, size, roll, spin, bob, lean,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], x = f32(), y = f32(), vx = f32(), vy = f32();
+    const h = f32(), vh = f32();
     const piece = state.pieces.get(sock.lanes.get(lane));
-    if (piece) Object.assign(piece, { sx: x, sz: y, vx, vz: vy, tRecv: stamp, mesh, color });
+    if (piece) Object.assign(piece, { sx: x, sz: y, vx, vz: vy, sh: h, vh, tRecv: stamp, mesh, color });
   }
   reconcile(frameGame);
 }
@@ -1076,7 +1080,8 @@ function sendTick(game) {
     // where the engine's motion law (motion.wasm) put it.  The server adopts
     // it for our lane once it has landed that interval, within its bound.
     if (pred.ship && pred.sent.length)
-      payload.ship = { seq: pred.seq, x: pred.ship.x, y: pred.ship.y, vx: pred.ship.vx, vy: pred.ship.vy };
+      payload.ship = { seq: pred.seq, x: pred.ship.x, y: pred.ship.y, vx: pred.ship.vx, vy: pred.ship.vy,
+                       z: pred.ship.z || 0, vz: pred.ship.vz || 0 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -1150,6 +1155,7 @@ function entityModel(piece, now) {
   if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
     // The player's own ship: the prediction, not the server's last word.
     piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
+    piece.h = pred.ship.z || 0;
     return placeEntity(piece, now, piece.x, piece.z, mesh);
   }
   const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
@@ -1165,8 +1171,12 @@ function entityModel(piece, now) {
   const x = far || step >= 1 ? tx : px + (tx - px) * step;
   const z = far || step >= 1 ? tz : pz + (tz - pz) * step;
   piece.x = x; piece.z = z;
+  // Height above the board (a game with a third axis), extrapolated and eased the same way.
+  const th = (piece.sh || 0) + (piece.vh || 0) * lead, ph = (piece.h ?? th) + (piece.vh || 0) * frame;
+  piece.h = far || step >= 1 ? th : ph + (th - ph) * step;
   return placeEntity(piece, now, x, z, mesh);
 }
+const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.55, 1.45];
 function placeEntity(piece, now, x, z, mesh) {
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
@@ -1178,8 +1188,16 @@ function placeEntity(piece, now, x, z, mesh) {
   if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
   if (piece.bob) y = 0.06 * Math.sin(now * 5 + piece.sx * 0.7);
   if (state.flat) y = 0;
-  const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
-  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
+  // THE HEIGHT LAYER: a game with a third axis (``predict.depth``) draws
+  // height compressed (DEPTH_LIFT per unit) and exaggerates scale with it,
+  // DEPTH_SCALE[0] at the floor to DEPTH_SCALE[1] at the ceiling, so the
+  // perspective reads strongly while the layer stays close to the board.
+  const depth = state.game && state.game.predict && state.game.predict.depth;
+  const hRel = depth ? Math.max(0, Math.min(1, (piece.h || 0) / depth)) : null;
+  const grow = hRel == null || state.flat ? 1 : DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel;
+  const lift = hRel == null || state.flat ? 0 : (piece.h || 0) * DEPTH_LIFT;
+  const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size * grow, scale = scale0 / mesh.extent * Math.max(s, 0.001);
+  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift, z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll));
@@ -1514,8 +1532,8 @@ function applyState(game) {
   for (const e of game.entities || []) {
     seen.add(e.id);
     const live = state.pieces.get(e.id);
-    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
-    else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: stamp, mesh: e.mesh, color: e.color,
+    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
+    else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
                                   size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
@@ -1765,12 +1783,18 @@ function controls() {
   const axisY = (held.has("down") ? 1 : 0) - (held.has("up") ? 1 : 0);
   const out = { move_axis: axis, steer_x: steer ? Math.max(0, steer.x) : -1, fire: steer || held.has("fire") ? 1 : 0 };
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
+  if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   return out;
+}
+// A game with a third axis (height above the board): E / PageUp rise,
+// Q / PageDown dive, or the Rise / Dive buttons (held).
+function heightAxis() { return !!(state.game && state.game.predict && state.game.predict.z); }
 }
 function keyControl(key) {
   const k = key.length === 1 ? key.toLowerCase() : key;
   const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
   if (common[k]) return common[k];
+  if (heightAxis()) { const lift = { e: "rise", PageUp: "rise", q: "dive", PageDown: "dive" }[k]; if (lift) return lift; }
   if (twoAxis()) return { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" }[k];
   return { ArrowUp: "fire", w: "fire" }[k];
 }
@@ -1923,6 +1947,12 @@ async function submitMove() {
 }
 $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
+for (const [id, name] of [["rise", "rise"], ["dive", "dive"]]) {
+  const button = $(id);
+  const on = (e) => { e.preventDefault(); held.add(name); }, off = () => held.delete(name);
+  button.addEventListener("pointerdown", on); button.addEventListener("pointerup", off);
+  button.addEventListener("pointerleave", off); button.addEventListener("pointercancel", off);
+}
 $("demo-learn").onclick = () => act({ type: "demo_learning", on: !(state.game && state.game.learning && state.game.learning.demo_learning) });
 $("arena-save").onclick = () => act({ type: "arena_save" });
 $("arena-stop").onclick = () => act({ type: state.game && state.game.arena_running ? "arena_stop" : "arena_resume" });

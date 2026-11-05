@@ -48,6 +48,15 @@ HIDDEN = (64, 64)
 PARAMS = ("W1", "b1", "W2", "b2", "W3", "b3")
 OUTPUTS = 3                        # move_axis, move_axis_y, fire
 FEATURES = 5 + 5 * K + 4
+#: A game with height above the board (bullet hell): the ship row and every
+#: hostile row carry height and its rate too, and the policy steers height.
+FEATURES_DEPTH = 7 + 7 * K + 4
+GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (FEATURES_DEPTH, 4)}
+
+
+def widths_of(params: dict) -> tuple[int, int]:
+    """(features, outputs) of a policy: its first and last layers say."""
+    return int(params["W1"].shape[0]), int(params["W3"].shape[1])
 
 GAMES = ("space_invaders", "bullet_hell")
 
@@ -68,30 +77,42 @@ def make_game(name: str):
 DX, DY, DV = 8.0, 10.0, 10.0
 
 
-def _observe(game, hostile_kind, remaining, ready, height: float) -> np.ndarray:
+def _observe(game, hostile_kind, remaining, ready, height: float, depth: float | None = None) -> np.ndarray:
+    """The observation; with ``depth`` (a field with height) the ship row is
+    x, y, z, vx, vy, vz, shield and each hostile row dx, dy, dz, dvx, dvy, dvz,
+    kind, ordered by three-dimensional time to contact."""
     col = game.session.column
     k = game.PLAYER_LANE
     alive, x, y, vx, vy = col("alive"), col("x"), col("y"), col("vx"), col("vy")
     field_w = float(col("field_w")[0])
-    out = np.zeros(FEATURES)
-    out[0] = 2.0 * x[k] / field_w - 1.0
-    out[1] = 2.0 * y[k] / height - 1.0
-    out[2], out[3] = vx[k] / DV, vy[k] / DV
-    out[4] = col("energy")[k]
+    has_z = depth is not None
+    z = col("z") if has_z else np.zeros_like(x)
+    vz = col("vz") if has_z else np.zeros_like(x)
+    head, row = (7, 7) if has_z else (5, 5)
+    out = np.zeros(head + row * K + 4)
+    if has_z:
+        out[0:7] = (2.0 * x[k] / field_w - 1.0, 2.0 * y[k] / height - 1.0, 2.0 * z[k] / depth - 1.0,
+                    vx[k] / DV, vy[k] / DV, vz[k] / DV, col("energy")[k])
+    else:
+        out[0:5] = (2.0 * x[k] / field_w - 1.0, 2.0 * y[k] / height - 1.0, vx[k] / DV, vy[k] / DV, col("energy")[k])
     lanes = np.concatenate([np.arange(a, b) for a, b in game.HOSTILE_LANES])
     lanes = lanes[alive[lanes] > 0.0]
     if len(lanes):
-        dx, dy = x[lanes] - x[k], y[lanes] - y[k]
-        dvx, dvy = vx[lanes] - vx[k], vy[lanes] - vy[k]
-        dist = np.hypot(dx, dy)
-        closing = -(dx * dvx + dy * dvy) / np.maximum(dist, 1e-6)
-        speed = np.maximum(closing, 0.25 * np.hypot(dvx, dvy) + 1e-3)
+        dx, dy, dz = x[lanes] - x[k], y[lanes] - y[k], z[lanes] - z[k]
+        dvx, dvy, dvz = vx[lanes] - vx[k], vy[lanes] - vy[k], vz[lanes] - vz[k]
+        dist = np.sqrt(dx * dx + dy * dy + dz * dz)
+        closing = -(dx * dvx + dy * dvy + dz * dvz) / np.maximum(dist, 1e-6)
+        speed = np.maximum(closing, 0.25 * np.sqrt(dvx * dvx + dvy * dvy + dvz * dvz) + 1e-3)
         order = np.argsort(np.maximum(dist - 0.5, 0.0) / speed, kind="stable")[:K]
         n = len(order)
-        rows = np.stack([dx[order] / DX, dy[order] / DY, dvx[order] / DV, dvy[order] / DV,
-                         hostile_kind(col, lanes[order])], axis=1)
-        out[5:5 + 5 * n] = rows.reshape(-1)
-    out[5 + 5 * K:] = (field_w / 10.0, remaining(col), float(col("lives")[0]) / 3.0, ready(col))
+        kinds = hostile_kind(col, lanes[order])
+        if has_z:
+            rows = np.stack([dx[order] / DX, dy[order] / DY, dz[order] / DX, dvx[order] / DV, dvy[order] / DV,
+                             dvz[order] / DV, kinds], axis=1)
+        else:
+            rows = np.stack([dx[order] / DX, dy[order] / DY, dvx[order] / DV, dvy[order] / DV, kinds], axis=1)
+        out[head:head + row * n] = rows.reshape(-1)
+    out[head + row * K:] = (field_w / 10.0, remaining(col), float(col("lives")[0]) / 3.0, ready(col))
     return out
 
 
@@ -117,7 +138,7 @@ def scroller_features(game) -> np.ndarray:
         game, kind,
         lambda col: float(col("alive")[sc.ENEMIES[0]:sc.ENEMIES[1]].sum()) / (sc.ENEMIES[1] - sc.ENEMIES[0]),
         lambda col: 1.0 if col("timer")[0] <= 0.0 else 0.0,
-        sc.HEIGHT)
+        sc.HEIGHT, getattr(sc, "DEPTH", None))
 
 
 FEATURE_FUNCTIONS = {"space_invaders": invaders_features, "bullet_hell": scroller_features}
@@ -126,6 +147,8 @@ FEATURE_FUNCTIONS = {"space_invaders": invaders_features, "bullet_hell": scrolle
 def controls_from(game, out: np.ndarray) -> dict[str, float]:
     """The policy's three outputs as the game's control columns."""
     values = {"move_axis": float(out[0]), "move_axis_y": float(out[1]) if "move_axis_y" in game.CONTROLS else 0.0,
+              # A policy with a fourth output steers height; an older one holds it.
+              "move_axis_z": float(out[3]) if len(out) > 3 else 0.0,
               "steer_x": -1.0, "steer_y": -1.0, "fire": 1.0 if out[2] > 0.0 else 0.0}
     return {name: values[name] for name in game.CONTROLS}
 
@@ -140,9 +163,9 @@ def policy_forward(x, W1, b1, W2, b2, W3, b3):
     return (h @ W3 + b3).tanh()
 
 
-def init_params(seed: int = 0, features: int = FEATURES, hidden=HIDDEN) -> dict[str, np.ndarray]:
+def init_params(seed: int = 0, features: int = FEATURES, hidden=HIDDEN, outputs: int = OUTPUTS) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
-    sizes = (features, *hidden, OUTPUTS)
+    sizes = (features, *hidden, outputs)
     params = {}
     for i, (a, b) in enumerate(zip(sizes[:-1], sizes[1:]), start=1):
         params[f"W{i}"] = rng.normal(0.0, math.sqrt(1.0 / a), (a, b))
@@ -185,7 +208,7 @@ def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
     """The AbstractTensor forward itself (numpy backend, no tape)."""
     from src.common.tensors import AbstractTensor as AT
     with AT.use_backend("numpy"), AT.autograd.no_grad():
-        out = policy_forward(AT.tensor(np.asarray(x, dtype=np.float64).reshape(-1, FEATURES)),
+        out = policy_forward(AT.tensor(np.asarray(x, dtype=np.float64).reshape(-1, widths_of(params)[0])),
                              *(AT.tensor(params[n]) for n in PARAMS))
         return np.asarray(out.numpy(), dtype=np.float64)
 
@@ -196,20 +219,21 @@ def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
 _PRODUCTS: dict = {}
 
 
-def numpy_product(batch: int = 1):
-    if batch in _PRODUCTS:
-        return _PRODUCTS[batch]
+def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPUTS):
+    key = (batch, features, outputs)
+    if key in _PRODUCTS:
+        return _PRODUCTS[key]
     from src.common.tensors.autograd import autograd
     from src.common.tensors.numpy_backend import NumPyTensorOperations
     from src.common.tensors.accelerator_backends import tape_to_source
     from src.common.tensors.accelerator_backends.tape_to_source import emit_tape_source
     digest = hashlib.sha256((inspect.getsource(policy_forward) + inspect.getsource(tape_to_source)
-                             + f"{FEATURES}{HIDDEN}{batch}").encode()).hexdigest()[:16]
+                             + f"{features}{HIDDEN}{outputs}{batch}").encode()).hexdigest()[:16]
     entry = "autopilot_policy"
     path = BUILD / f"{entry}_b{batch}_{digest}.py"
     if not path.exists():
-        like = init_params()
-        sample = {"x": NumPyTensorOperations.tensor(np.zeros((batch, FEATURES))),
+        like = init_params(features=features, outputs=outputs)
+        sample = {"x": NumPyTensorOperations.tensor(np.zeros((batch, features))),
                   **{n: NumPyTensorOperations.tensor(like[n]) for n in PARAMS}}
         with autograd.forward_capture() as tape:
             produced = policy_forward(*sample.values())
@@ -227,13 +251,13 @@ def numpy_product(batch: int = 1):
     function = getattr(module, entry)
 
     def run(x, params):
-        out = function(np.asarray(x, dtype=np.float64).reshape(batch, FEATURES), *(params[n] for n in PARAMS))
+        out = function(np.asarray(x, dtype=np.float64).reshape(batch, features), *(params[n] for n in PARAMS))
         if isinstance(out, (tuple, list)):
             out = out[0]
-        return np.asarray(out, dtype=np.float64).reshape(batch, OUTPUTS)
+        return np.asarray(out, dtype=np.float64).reshape(batch, outputs)
 
     run.path = path
-    _PRODUCTS[batch] = run
+    _PRODUCTS[key] = run
     return run
 
 
@@ -252,12 +276,13 @@ class NativePolicy:
         from src.compiler.ssa_llvm_backend import prepare_artifact_execution
         from src.compiler.work_contract import PRESETS, scoped_work_contract
         self.batch, self.contract = int(batch), contract
+        self.features, self.outputs = widths_of(params)
         name = f"autopilot_policy_b{self.batch}_{contract}"
         directory = Path(directory or BUILD / "native")
         started = time.perf_counter()
         with scoped_work_contract(PRESETS[contract]):
             program = SSATensorProgram(name)
-            shapes = {"x": (self.batch, FEATURES), **{n: tuple(params[n].shape) for n in PARAMS}}
+            shapes = {"x": (self.batch, self.features), **{n: tuple(params[n].shape) for n in PARAMS}}
             bindings = {key: SSATensorOperations.input(program, shape) for key, shape in shapes.items()}
             action = policy_forward(bindings["x"], *(bindings[n] for n in PARAMS))
             self.forward = compile_native_graph_forward(
@@ -266,7 +291,7 @@ class NativePolicy:
         self.compile_seconds = time.perf_counter() - started
         ids = dict(self.forward.input_value_ids)
         self._execution = prepare_artifact_execution(self.forward.artifact, {
-            **{ids[n]: np.ascontiguousarray(params[n]) for n in PARAMS}, ids["x"]: np.zeros((self.batch, FEATURES))})
+            **{ids[n]: np.ascontiguousarray(params[n]) for n in PARAMS}, ids["x"]: np.zeros((self.batch, self.features))})
         self._x = np.asarray(self._execution.buffers[ids["x"]])
         self._out = np.asarray(self._execution.buffers[self.forward.output_value_ids[0]])
         self._weights = {n: np.asarray(self._execution.buffers[ids[n]]) for n in PARAMS}
@@ -278,7 +303,7 @@ class NativePolicy:
     def __call__(self, x: np.ndarray) -> np.ndarray:
         self._x.reshape(-1)[:] = np.asarray(x, dtype=np.float64).reshape(-1)
         self._execution.run()
-        return self._out.reshape(self.batch, OUTPUTS).copy()
+        return self._out.reshape(self.batch, self.outputs).copy()
 
 
 class PolicyTrainer:
@@ -315,16 +340,24 @@ class PolicyTrainer:
 _PILOT_WEIGHTS: dict = {}
 
 
+def fitting_params(name: str) -> dict[str, np.ndarray] | None:
+    """The game's saved weights, only if they fit its observation and outputs
+    (a law that grew an axis needs retraining; old weights are not forced in)."""
+    params = load_params(weights_path(name))
+    if params is None or widths_of(params) != GAME_WIDTHS[name]:
+        return None
+    return params
+
+
 def preload() -> list[str]:
-    """Load every trained weight file that exists (the server calls this at start)."""
+    """Load every trained weight file that fits (the server calls this at start)."""
     loaded = []
     for name in GAMES:
-        params = load_params(weights_path(name))
+        params = fitting_params(name)
         if params is not None:
             _PILOT_WEIGHTS[name] = params
+            numpy_product(1, *GAME_WIDTHS[name])
             loaded.append(name)
-    if loaded:
-        numpy_product(1)
     return loaded
 
 
@@ -336,7 +369,8 @@ class Pilot:
         self.name, self.params = name, params
         self.features = FEATURE_FUNCTIONS[name]
         self.lane = "numpy"
-        self.run = lambda x: numpy_product(1)(x, self.params)
+        product = numpy_product(1, *widths_of(params))
+        self.run = lambda x: product(x, self.params)
         if os.environ.get("MEOWDOKU_PILOT", "numpy") == "llvm":
             try:
                 native = NativePolicy(params, batch=1)
@@ -351,21 +385,22 @@ class Pilot:
 def pilot_for(game) -> Pilot:
     name = game.game
     if name not in _PILOT_WEIGHTS:
-        params = load_params(weights_path(name))
+        params = fitting_params(name)
         if params is None:
-            raise ValueError(f"no trained autopilot for {name}: {weights_path(name)} is missing")
+            raise ValueError(f"no trained autopilot for {name} fitting its current observation "
+                             f"{GAME_WIDTHS[name]}: train it ({weights_path(name)})")
         _PILOT_WEIGHTS[name] = params
     return Pilot(name, _PILOT_WEIGHTS[name])
 
 
 def available(name: str) -> bool:
-    return name in _PILOT_WEIGHTS or weights_path(name).exists()
+    return name in _PILOT_WEIGHTS or fitting_params(name) is not None
 
 
 # ---------------------------------------------------------- scripted baselines
 
-def dodger_controls(game) -> tuple[float, float, float]:
-    """The scripted dodger: (move_axis, move_axis_y, fire)."""
+def dodger_controls(game) -> tuple[float, ...]:
+    """The scripted dodger: (move_axis, move_axis_y, fire[, move_axis_z])."""
     return (_invaders_dodger if game.game == "space_invaders" else _scroller_dodger)(game)
 
 
@@ -397,43 +432,56 @@ def _invaders_dodger(game):
 _ACTIONS = np.array([(ax, ay) for ax in (-1.0, 0.0, 1.0) for ay in (-1.0, 0.0, 1.0)])
 
 
+_ACTIONS_3D = np.array([(ax, ay, az) for ax in (-1.0, 0.0, 1.0) for ay in (-1.0, 0.0, 1.0)
+                        for az in (-1.0, 0.0, 1.0)])
+
+
 def _scroller_dodger(game):
+    """Bullet hell teacher: 27 candidate moves (x, y, height) rolled forward
+    0.6 s against straight-line hostiles; a hit needs depth overlap too.
+    Prefers to sit under / level with the nearest enemy so its shots land."""
     from meowdoku import scroller as sc
     col = game.session.column
     alive, x, y, vx, vy, slot = col("alive"), col("x"), col("y"), col("vx"), col("vy"), col("slot")
+    z, vz, rz = col("z"), col("vz"), col("rz")
     field_w = float(col("field_w")[0])
     hostile = np.concatenate([np.arange(a, b) for a, b in game.HOSTILE_LANES])
     hostile = hostile[alive[hostile] > 0.0]
-    steps = 12
+    steps, n = 12, len(_ACTIONS_3D)
     t = np.arange(1, steps + 1) * 0.05
-    # candidate ship paths: velocity relaxes toward axis * SPEED, walls clip
-    pos = np.zeros((9, steps, 2))
-    v = np.tile([vx[0], vy[0]], (9, 1))
-    p = np.tile([x[0], y[0]], (9, 1))
+    pos = np.zeros((n, steps, 3))
+    v = np.tile([vx[0], vy[0], vz[0]], (n, 1))
+    p = np.tile([x[0], y[0], z[0]], (n, 1))
+    lo = [sc.MARGIN, sc.MARGIN, sc.Z_MARGIN]
+    hi = [field_w - sc.MARGIN, sc.HEIGHT - sc.MARGIN, sc.DEPTH - sc.Z_MARGIN]
     for i in range(steps):
-        v = v + (_ACTIONS * sc.SPEED - v) * (0.05 / (sc.TAU + 0.05))
-        p = p + v * 0.05
-        p = np.clip(p, [sc.MARGIN, sc.MARGIN], [field_w - sc.MARGIN, sc.HEIGHT - sc.MARGIN])
+        v = v + (_ACTIONS_3D * sc.SPEED - v) * (0.05 / (sc.TAU + 0.05))
+        p = np.clip(p + v * 0.05, lo, hi)
         pos[:, i] = p
-    cost = np.zeros(9)
+    cost = np.zeros(n)
     if len(hostile):
-        bx = x[hostile][None, :] + vx[hostile][None, :] * t[:, None]                    # (steps, M)
+        bx = x[hostile][None, :] + vx[hostile][None, :] * t[:, None]
         by = y[hostile][None, :] + vy[hostile][None, :] * t[:, None]
-        ddx = np.abs(pos[:, :, 0, None] - bx[None])                                      # (9, steps, M)
+        bz = z[hostile][None, :] + vz[hostile][None, :] * t[:, None]
+        ddx = np.abs(pos[:, :, 0, None] - bx[None])
         ddy = np.abs(pos[:, :, 1, None] - by[None])
+        ddz = np.abs(pos[:, :, 2, None] - bz[None])
         radius = np.where(slot[hostile] == sc.ENEMY, 0.75, 0.42)[None, None, :]
-        hit = (ddx < radius) & (ddy < radius + 0.15)
+        depth_r = (rz[0] + rz[hostile])[None, None, :] + 0.1
+        hit = (ddx < radius) & (ddy < radius + 0.15) & (ddz < depth_r)
         cost += 100.0 * hit.sum(axis=(1, 2))
-        close = np.hypot(ddx, ddy)
+        close = np.sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
         cost += 1.5 * np.maximum(1.4 - close, 0.0).sum(axis=(1, 2)) / steps
     enemies = np.flatnonzero(alive[sc.ENEMIES[0]:sc.ENEMIES[1]] > 0.0) + sc.ENEMIES[0]
     final = pos[:, -1]
     if len(enemies):
-        cost += 0.04 * np.min(np.abs(final[:, 0, None] - x[enemies][None, :]), axis=1)
+        nearest = enemies[np.argmin(np.abs(x[enemies] - x[0]) + 0.3 * np.abs(y[enemies] - y[0]))]
+        cost += 0.04 * np.abs(final[:, 0] - x[nearest])
+        cost += 0.05 * np.abs(final[:, 2] - z[nearest])
     cost += 0.02 * np.abs(final[:, 1] - (sc.HEIGHT - 3.0))
     cost += 0.01 * np.abs(final[:, 0] - field_w / 2.0)
-    best = _ACTIONS[int(np.argmin(cost))]
-    return float(best[0]), float(best[1]), 1.0
+    best = _ACTIONS_3D[int(np.argmin(cost))]
+    return float(best[0]), float(best[1]), 1.0, float(best[2])
 
 
 def make_random(seed: int):
@@ -452,8 +500,8 @@ def make_random(seed: int):
 
 def make_dodger():
     def act(game, features):
-        a, b, f = dodger_controls(game)
-        return np.array([a, b, 1.0])
+        decision = dodger_controls(game)
+        return np.array([decision[0], decision[1], 1.0, *decision[3:]])
     return act
 
 
@@ -474,7 +522,7 @@ def run_episode(name: str, act, seed: int, seconds: float = 40.0, record=None, w
         game.control({"inputs": [{"seq": seq[0], "dur": STEP, **out_controls}]})
         game.tick()
 
-    idle = {"move_axis": 0.0, "move_axis_y": 0.0, "steer_x": -1.0, "steer_y": -1.0, "fire": 0.0}
+    idle = {"move_axis": 0.0, "move_axis_y": 0.0, "move_axis_z": 0.0, "steer_x": -1.0, "steer_y": -1.0, "fire": 0.0}
     advance({k: v for k, v in idle.items() if k in game.CONTROLS})
     if warm:
         drift = {**idle, "move_axis": float(rng.uniform(-1, 1))}
@@ -497,7 +545,7 @@ def run_episode(name: str, act, seed: int, seconds: float = 40.0, record=None, w
 
 
 def policy_act(name: str, params: dict[str, np.ndarray]):
-    run = numpy_product(1)
+    run = numpy_product(1, *widths_of(params))
 
     def act(game, f):
         return run(f, params)[0]
@@ -542,17 +590,23 @@ def collect_imitation(name: str, episodes: int, seconds: float, seed: int = 500)
         rng = np.random.default_rng(seed + e)
         hold = {"left": 0, "out": None}
 
+        outputs = GAME_WIDTHS[name][1]
+
         def act(game, f, rng=rng, hold=hold):
-            a, b, fire = dodger_controls(game)
+            decision = dodger_controls(game)
+            a, b, fire = decision[:3]
+            c = decision[3] if len(decision) > 3 else 0.0
             xs.append(f)
-            ys.append([a * 0.95, b * 0.95, 0.9 if fire > 0 else -0.9])
+            label = [a * 0.95, b * 0.95, 0.9 if fire > 0 else -0.9] + ([c * 0.95] if outputs > 3 else [])
+            ys.append(label)
             if hold["left"] > 0:
                 hold["left"] -= 1
                 return hold["out"]
             if rng.random() < 0.04:                                  # drift off the dodger's path for a moment
                 hold["left"] = int(rng.integers(3, 12))
-                hold["out"] = np.array([rng.uniform(-1, 1), rng.uniform(-1, 1), 1.0])
-            return np.array([a, b, 1.0])
+                hold["out"] = np.array([rng.uniform(-1, 1), rng.uniform(-1, 1), 1.0]
+                                       + ([rng.uniform(-1, 1)] if outputs > 3 else []))
+            return np.array([a, b, 1.0] + ([c] if outputs > 3 else []))
         run_episode(name, act, seed + e, seconds)
     return np.array(xs), np.array(ys)
 
@@ -561,7 +615,8 @@ def imitate(name: str, epochs: int = 60, episodes: int = 10, seconds: float = 30
     started = time.perf_counter()
     x, y = collect_imitation(name, episodes, seconds)
     collected = time.perf_counter() - started
-    trainer = PolicyTrainer(init_params(seed), lr=2e-3)
+    features, outputs = GAME_WIDTHS[name]
+    trainer = PolicyTrainer(init_params(seed, features=features, outputs=outputs), lr=2e-3)
     rng = np.random.default_rng(seed)
     losses = []
     for epoch in range(epochs):
@@ -630,7 +685,7 @@ def train(name: str, workers: int, generations: int, pairs: int, sigma: float, l
             curve.append(row)
             print(f"[{name}] gen {gen:3d} held score {row['held_score_mean']:8.1f} survival {row['held_survival_mean']:5.1f}s "
                   f"fitness {row['held_fitness']:8.1f} pop {row.get('pop_fitness_mean', float('nan')):8.1f} ({row['gen_s']:.0f}s)", flush=True)
-            save_params(unflatten(best[1], params), weights_path(name), game=name, features=FEATURES, k=K)
+            save_params(unflatten(best[1], params), weights_path(name), game=name, features=widths_of(params)[0], k=K)
     wall = time.perf_counter() - t0
     result = {"game": name, "wall_s": wall, "imitation": imit, "curve": curve, "best_held_fitness": best[0],
               "sigma": sigma, "lr": lr, "pairs": pairs, "seconds_per_episode": seconds}
@@ -694,7 +749,7 @@ def cmd_bench(args) -> None:
         feats = np.array(record)
         print(f"[{name}] recorded {len(feats)} feature rows", flush=True)
         for batch in (1, 64):
-            x = feats[:batch] if len(feats) >= batch else np.resize(feats, (batch, FEATURES))
+            x = feats[:batch] if len(feats) >= batch else np.resize(feats, (batch, feats.shape[1]))
             xs = np.array([feats[(i * 7) % len(feats)] for i in range(batch)])
             ref = eager_forward(params, xs)
             line = {"eager_us": _median_us(lambda: eager_forward(params, xs), 30)}
@@ -779,7 +834,9 @@ POST_EPOCHS, REPLAY_ROWS, MIN_ROWS = 4, 4096, 32
 
 
 def human_records_path(game: str) -> Path:
-    return BUILD / f"human_{game}.npz"
+    """Kept human episodes, versioned by the observation width they were taken
+    with (a law that grows an axis starts a new record set)."""
+    return BUILD / f"human_{game}_f{GAME_WIDTHS[game][0]}.npz"
 
 
 def target_from(game, controls: dict) -> np.ndarray:
@@ -787,7 +844,7 @@ def target_from(game, controls: dict) -> np.ndarray:
     pointer is its axis equivalent under the motion law: the law commands
     clamp((target - x) / reach, +-speed), i.e. axis = clamp(gap / speed, +-1)."""
     motion = game.motion() or {}
-    out = np.zeros(OUTPUTS)
+    out = np.zeros(GAME_WIDTHS.get(game.game, (FEATURES, OUTPUTS))[1])
     k = game.PLAYER_LANE
     for i, (axis_name, steer_name, pos) in enumerate((("move_axis", "steer_x", "x"), ("move_axis_y", "steer_y", "y"))):
         steer = float(controls.get(steer_name, -1.0))
@@ -797,6 +854,8 @@ def target_from(game, controls: dict) -> np.ndarray:
         else:
             out[i] = max(-1.0, min(1.0, float(controls.get(axis_name, 0.0))))
     out[2] = 1.0 if float(controls.get("fire", 0.0)) > 0.0 else -1.0
+    if len(out) > 3:
+        out[3] = max(-1.0, min(1.0, float(controls.get("move_axis_z", 0.0))))
     return out
 
 
@@ -824,7 +883,7 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
     it in place and save it.  Runs on its own thread."""
     try:
         with LEARN_LOCK:
-            live = _PILOT_WEIGHTS.get(name) or load_params(weights_path(name))
+            live = _PILOT_WEIGHTS.get(name) or fitting_params(name)
             if live is None:
                 return
             params = {n: v.copy() for n, v in live.items()}

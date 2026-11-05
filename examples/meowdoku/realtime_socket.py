@@ -13,7 +13,8 @@ DELTA, little-endian:
                       every entity: a new game, a reset, a rewind)
     i32  ack          last input interval landed (-1: none)
     f32  x, y, vx, vy the player's ship (``you``), u8 alive, f32 shield charge,
-                      f32 sync hint (the longest a faithful page may wait to check in)
+                      f32 sync hint (the longest a faithful page may wait to check in),
+                      f32 z, vz (the ship height above the board; 0 without a third axis)
     u8   names        new appearance names this connection has not seen,
                       each u8 length + utf-8; indices count up from 0
     u16  gone         lanes whose entity disappeared, u16 each
@@ -21,9 +22,9 @@ DELTA, little-endian:
                       u16 size*1000, i16 roll*1000, i16 spin*1000, u8 bob,
                       i16 lean*1000, u16 owner (65535: none -- the lane that
                       fired a projectile), f32 age (world seconds since it
-                      spawned), f32 x, y, vx, vy
+                      spawned), f32 x, y, vx, vy, z, vz
     u16  updated      changed entities: u16 lane, u8 mesh, u8 color,
-                      f32 x, y, vx, vy
+                      f32 x, y, vx, vy, z, vz
 
 An entity is UPDATED only when the page's extrapolation of what it was last
 sent (position + velocity x world time) would be off by more than
@@ -144,6 +145,7 @@ class SnapshotEncoder:
             lane_text, born = str(entity["id"]).split(":", 1)
             lane = int(lane_text)
             record = {"born": born, "x": entity["x"], "y": entity["y"], "vx": entity["vx"], "vy": entity["vy"],
+                      "z": float(entity.get("z", 0.0)), "vz": float(entity.get("vz", 0.0)),
                       "mesh": self._name(entity["mesh"], fresh), "color": self._name(entity["color"], fresh),
                       "clock": clock}
             current[lane] = record
@@ -152,8 +154,10 @@ class SnapshotEncoder:
                 spawned.append((lane, record, entity))
                 continue
             dt = clock - before["clock"]
-            drift = max(abs(before["x"] + before["vx"] * dt - record["x"]), abs(before["y"] + before["vy"] * dt - record["y"]))
+            drift = max(abs(before["x"] + before["vx"] * dt - record["x"]), abs(before["y"] + before["vy"] * dt - record["y"]),
+                        abs(before["z"] + before["vz"] * dt - record["z"]))
             if (keyframe or drift > DRIFT or before["vx"] != record["vx"] or before["vy"] != record["vy"]
+                    or before["vz"] != record["vz"]
                     or before["mesh"] != record["mesh"] or before["color"] != record["color"]):
                 updated.append((lane, record))
             else:
@@ -165,10 +169,11 @@ class SnapshotEncoder:
 
         you = state.get("you") or {}
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBff", 1, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBffff", 1, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
-                             float(state.get("sync_hint") or 0.03))]
+                             float(state.get("sync_hint") or 0.03),
+                             float(you.get("z", 0.0)), float(you.get("vz", 0.0)))]
         parts.append(struct.pack("<B", len(fresh)))
         for name in fresh:
             raw = name.encode("utf-8")
@@ -177,16 +182,16 @@ class SnapshotEncoder:
         parts.append(struct.pack("<H", len(spawned)))
         for lane, record, entity in spawned:
             owner = int(entity.get("owner", -1))
-            parts.append(struct.pack("<HBBHhhBhHf4f", lane, record["mesh"], record["color"],
+            parts.append(struct.pack("<HBBHhhBhHf6f", lane, record["mesh"], record["color"],
                                      int(round(entity["size"] * 1000)), int(round(entity["roll"] * 1000)),
                                      int(round(entity["spin"] * 1000)), 1 if entity.get("bob") else 0,
                                      int(round(entity.get("lean", 0.55) * 1000)), 65535 if owner < 0 else owner,
                                      float(entity.get("age", 0.0)),
-                                     record["x"], record["y"], record["vx"], record["vy"]))
+                                     record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))
         parts.append(struct.pack("<H", len(updated)))
         for lane, record in updated:
-            parts.append(struct.pack("<HBB4f", lane, record["mesh"], record["color"],
-                                     record["x"], record["y"], record["vx"], record["vy"]))
+            parts.append(struct.pack("<HBB6f", lane, record["mesh"], record["color"],
+                                     record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))
         binary = b"".join(parts)
 
         meta = None
