@@ -108,10 +108,12 @@ function volumeTexture(unit) {
 }
 
 // ---------------------------------------------------------------- scene
-const state = {
+window.meow = {};
+const state = window.meow;
+Object.assign(state, {
   assets: null, boards: null, phong: null, flat: null, meshes: {}, tiles: null,
   board: null, game: null, pieces: new Map(), hearts: [3, 3], lastMove: null, level: null, time: 0,
-};
+});
 const hsv = (h, s, v) => {
   const i = Math.floor(((h % 1) + 1) % 1 * 6), f = ((h % 1) + 1) % 1 * 6 - i;
   const p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
@@ -157,7 +159,7 @@ function buildTiles(board) {
       const k2 = (k + 1) % 4;
       push(b[k], tp[k], tp[k2]); push(b[k], tp[k2], b[k2]);
     }
-    for (let k = 0; k < 18; k++) mat.push(m);
+    for (let k = 0; k < 30; k++) mat.push(m);                              // 6 top + 24 side vertices
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -195,6 +197,7 @@ function uploadBoardMaterials(board) {
     tables[name] = { floats_per_record: f, records: table.records + k, data };
   }
   state.tileMaterialBase = base.pbr.records;
+  state.materialTables = tables;                                   // kept for inspection
   storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
 }
 
