@@ -3745,7 +3745,60 @@ class CorrelationTable:
                         "exception-normal-binding", str(read_row), None,
                         "normal-continuation lexical read lost its exact binding",
                     ))
-        from .concorded_literals import origin_cell
+        from .concorded_literals import MISSING, literal_from_identity, origin_cell
+        from .concordance_declarations import (
+            FUNCTION_ADDRESS, SOURCE_AGGREGATE_LAYOUT,
+            SOURCE_FUNCTION_REACHABILITY,
+        )
+
+        def projected_guard_leaves(operand, causes):
+            """Check one exact call/member step in a guarded read's proof."""
+            edges = fact(operand)
+            by_role = {role: parent for parent, role in edges}
+            members = tuple(source for source in causes
+                            if source.page == CANONICAL_VALUE
+                            and source.row == operand.row)
+            if (len(edges) != 2 or set(by_role) != {"base", "index"}
+                    or len(members) != 1 or by_role["base"] not in causes):
+                return None
+            position, literals = literal_from_identity(book, by_role["index"])
+            if (position is MISSING or type(position) is not int or position < 0
+                    or not literals or not set(literals) <= causes):
+                return None
+            base = by_role["base"]
+            reaches = tuple(source for source in causes
+                            if source.page == SOURCE_FUNCTION_REACHABILITY
+                            and source.row[1] == base.row[1]
+                            and fact(source) is True
+                            and base in {cell for cell, _ in book.edges_into(source)})
+            if len(reaches) != 1:
+                return None
+            reach = reaches[0]
+            addresses = tuple(source for source, _ in book.edges_into(reach)
+                              if source.page == FUNCTION_ADDRESS)
+            if len(addresses) != 1 or addresses[0] not in causes:
+                return None
+            leaves = []
+            for layout in causes:
+                if layout.page != SOURCE_AGGREGATE_LAYOUT:
+                    continue
+                declaration = fact(layout)
+                if (getattr(declaration, "aggregate_kind", None) != "tuple"
+                        or position >= len(declaration.members)):
+                    continue
+                # The canonical layout retains its original source-function
+                # layout. Its scope must be the exact reachable callee, not
+                # another tuple whose slot happens to hold the same integer.
+                if not any(source.page == SOURCE_AGGREGATE_LAYOUT
+                           and source.row[0] == reach.row[2]
+                           for source, _ in book.edges_into(layout)):
+                    continue
+                leaf = declaration.members[position].value_cell
+                if leaf not in causes:
+                    return None
+                leaves.append(leaf)
+            return (members[0], tuple(leaves)) if leaves else None
+
         for row in book.page(GUARDED_CALL_ACTUAL_RANGE).rows():
             cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row)
             causes = {source for source, _stage in book.edges_into(cell)}
@@ -3753,16 +3806,46 @@ class CorrelationTable:
                                if source.page == SOURCE_INTRINSIC_ADMISSION)
             if not admissions:
                 continue  # Existing function-table actuals have a separate binding proof.
-            calls = tuple(source for source in causes
-                          if source.page == CANONICAL_VALUE
-                          and source.row[-1] == row[1])
+            calls = []
+            for source in causes:
+                if source.page != CANONICAL_VALUE or source.row[-1] != row[1]:
+                    continue
+                try:
+                    if len(admissions) == 1 and origin_cell(book, source) == admissions[0].row[0]:
+                        calls.append(source)
+                except ValueError:
+                    pass
+            calls = tuple(calls)
             operands = tuple(source for source in causes
-                             if source.page == PROCESS_GRAPH_OPERANDS)
+                             if source.page == PROCESS_GRAPH_OPERANDS
+                             and len(calls) == 1 and source.row == calls[0].row)
+            projections = tuple(source for source in causes
+                                if source.page == PROCESS_GRAPH_OPERANDS
+                                and source not in operands)
+            projection_valid = True
+            if len(operands) == 1 and projections:
+                steps = tuple(projected_guard_leaves(source, causes)
+                              for source in projections)
+                projection_valid = all(step is not None for step in steps)
+                if projection_valid:
+                    by_member = {step[0]: step[1] for step in steps}
+                    pending = [parent for parent, _role in fact(operands[0])
+                               if parent.row[-1] == row[2] and parent in causes]
+                    visited = set()
+                    while pending:
+                        member = pending.pop()
+                        if member in visited:
+                            continue
+                        visited.add(member)
+                        pending.extend(by_member.get(member, ()))
+                    projection_valid = (len(by_member) == len(steps)
+                                        and set(by_member) <= visited)
             try:
                 call_origin = origin_cell(book, calls[0]) if len(calls) == 1 else None
             except ValueError:
                 call_origin = None
             if (len(admissions) != 1 or len(calls) != 1 or len(operands) != 1
+                    or not projection_valid
                     or call_origin != admissions[0].row[0]
                     or operands[0].row[-1] != row[1]
                     or not any(source.page == SOURCE_SPAN

@@ -1456,6 +1456,78 @@ _STORAGE_VIEW_OPERATIONS = frozenset({
 })
 
 
+def _concordant_span_payload_exclusion(
+    book: Any, lexical_read_scope: Any, shape_scope: Any,
+    hierarchy_name: str, value_id: int,
+) -> bool:
+    """Whether the exact source/ABI rows already prove a material span."""
+
+    from .concordance_declarations import COPY_VALUE_SHAPE, VALUE_SHAPE
+    from .identity_concordance import SHAPE_STATE_PAGE
+
+    if lexical_read_scope is None:
+        return False
+    row = (tuple(lexical_read_scope), int(value_id))
+    copy_cell = book.latest_ref(COPY_VALUE_SHAPE, row)
+    shape_cell = book.latest_ref(
+        VALUE_SHAPE, (str(hierarchy_name), int(value_id)),
+    )
+    if copy_cell is not None and shape_cell is not None:
+        copy_fact = book.page(COPY_VALUE_SHAPE).cell(
+            copy_cell.row, copy_cell.column,
+        )
+        shape_fact = book.page(VALUE_SHAPE).cell(
+            shape_cell.row, shape_cell.column,
+        )
+        shape_causes = {source for source, _ in book.edges_into(shape_cell)}
+        if (
+            copy_cell in shape_causes
+            and str(copy_fact.storage) == str(shape_fact.storage) == "span"
+            and bool(tuple(shape_fact.shape))
+            and tuple(copy_fact.shape) == tuple(shape_fact.shape)
+        ):
+            return True
+    if shape_scope is None:
+        return False
+    canonical = book.latest_ref(CANONICAL_VALUE, row)
+    abi_cell = book.latest_ref(VALUE_TYPE_ABI, row)
+    state_cell = book.latest_ref(
+        SHAPE_STATE_PAGE, (tuple(shape_scope), int(value_id)),
+    )
+    if canonical is None or abi_cell is None or state_cell is None:
+        return False
+    abi_fact = book.page(VALUE_TYPE_ABI).cell(
+        abi_cell.row, abi_cell.column,
+    )
+    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
+    alternatives = tuple(getattr(abi_fact, "alternatives", ()))
+    if len(arms) != 1 or alternatives != (arms[0].identity,):
+        return False
+    arm = arms[0]
+    state_fact = book.page(SHAPE_STATE_PAGE).cell(
+        state_cell.row, state_cell.column,
+    )
+    direct = {source for source, _ in book.edges_into(abi_cell)}
+    return (
+        str(arm.storage) == "span"
+        and isinstance(arm.rank, int)
+        and arm.rank > 0
+        and isinstance(arm.dtype, str)
+        and arm.dtype not in {"", "None", "unknown"}
+        and str(arm.metadata_state) == "dynamic"
+        and tuple(arm.shape) == ()
+        and canonical in arm.source_cells
+        and state_cell in arm.source_cells
+        and {canonical, state_cell}.issubset(direct)
+        and isinstance(state_fact, tuple)
+        and len(state_fact) >= 2
+        and state_fact[0] == "resolved"
+        and tuple(state_fact[1][:4]) == (
+            (), str(arm.dtype), int(arm.rank), "dynamic",
+        )
+    )
+
+
 def _post_storage_roots(
     book: Any, scope: Any, lexical_read_scope: Any, *,
     formals: Mapping[int, Any], instructions: Iterable[Instr],
@@ -30457,36 +30529,23 @@ def lower_control_sections_to_ssa(
         # incumbent physical reader proves its numeric span. Exclude only
         # these concorded spans; unresolved record layouts still reach the
         # storage-root test.
-        from .concordance_declarations import COPY_VALUE_SHAPE, VALUE_SHAPE
         from .identity_concordance import concordant_shape_transformation_sources
 
         candidate_book = current_identity_book()
 
         def proven_span(value_id: int) -> bool:
-            if lexical_read_scope is None:
-                return False
-            copy_cell = candidate_book.latest_ref(
-                COPY_VALUE_SHAPE, (tuple(lexical_read_scope), int(value_id)),
-            )
-            shape_cell = candidate_book.latest_ref(
-                VALUE_SHAPE, (str(hierarchy_plan.name), int(value_id)),
-            )
-            if copy_cell is None or shape_cell is None:
-                return False
-            copy_fact = candidate_book.page(COPY_VALUE_SHAPE).cell(
-                copy_cell.row, copy_cell.column,
-            )
-            shape_fact = candidate_book.page(VALUE_SHAPE).cell(
-                shape_cell.row, shape_cell.column,
-            )
-            shape_causes = {
-                source for source, _ in candidate_book.edges_into(shape_cell)
-            }
-            return (
-                copy_cell in shape_causes
-                and str(copy_fact.storage) == str(shape_fact.storage) == "span"
-                and bool(tuple(shape_fact.shape))
-                and tuple(copy_fact.shape) == tuple(shape_fact.shape)
+            # Program: lz_encode's `_tensor(dictionary + data)` Call93 is
+            # indexed and used in tensor arithmetic. Its selected fork has a
+            # singleton int64/span/rank1 VALUE_TYPE_ABI derived from this
+            # exact canonical value and current dynamic call-result shape
+            # state. It has no COPY_VALUE_SHAPE because it is a Call result,
+            # so classifying it as a record payload asks storage_root for a
+            # nonexistent region-instruction producer. A dynamic span is
+            # already a material value when this exact ABI/state chain says
+            # so; unresolved and heterogeneous arms still reach storage_root.
+            return _concordant_span_payload_exclusion(
+                candidate_book, lexical_read_scope, shape_scope,
+                str(hierarchy_plan.name), value_id,
             )
 
         indexed_results = {

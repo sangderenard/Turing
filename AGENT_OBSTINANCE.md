@@ -21,6 +21,19 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — full lz source pursuit instead of a seconds-scale storage slice
+
+The agent was assigned a small, fast repro of Run67's `lz_encode` storage-root
+candidate before editing the classifier. After a 10-second `_tensor` slice did
+not reach that candidate, it launched public lowering of the entire authored
+`lz_encode` function with a hook at `_post_storage_roots`. Source pursuit ran
+over 150 seconds without reaching the hook; the agent interrupted it and gained
+no candidate-frame evidence. The larger source looked more likely to preserve
+the exact planner context, but it broke the instructed size and time boundary.
+The agent stopped that run, returned to the saved Run67 book and narrowed the
+next probe to the existing storage-root helper. Stopping after the first small
+slice and using the saved graph/record inputs would have avoided the lost time.
+
 ## 2026-11-04 — widening source-return ownership before observing the producer
 
 The agent was assigned exact owned tensor transport across an ordinary source

@@ -6078,7 +6078,13 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
 
         key = unit.key(int(node_id))
         interval = current(key)
-        if interval is None and unit not in units:
+        if interval is None and (
+            unit not in units or isinstance(
+                unit.G.nodes.get(int(node_id), {}).get("expr_obj"), ast.BinOp,
+            ) and isinstance(
+                unit.G.nodes[int(node_id)]["expr_obj"].op, ast.Pow,
+            )
+        ):
             posted = range_page.latest(key)
             if posted is not None:
                 interval = (int(posted[0]), int(posted[1]))
@@ -6178,7 +6184,8 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         finally:
             summary_active.discard((id(callee.G), int(c)))
 
-    def guarded(unit, site_id, value_key, interval, site_ast=None, *, with_proof=False):
+    def guarded(unit, site_id, value_key, interval, site_ast=None, *,
+                with_proof=False, with_bounds=False):
         """``interval`` of ``value_key`` as read at ``site_id``.
 
         ``site_ast``: the authored expression of the read when the site's
@@ -6250,6 +6257,23 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                         high = c - 1 if high is None else min(high, c - 1)
                     read.append(unit.key(constant))
                     proof.extend(guard_cells)
+        projected = projected_control_bounds(unit, value_key)
+        if projected is not None:
+            projected_low, projected_high, projected_reads, projected_cells = projected
+            if projected_low is not None:
+                low = projected_low if low is None else max(low, projected_low)
+            if projected_high is not None:
+                high = projected_high if high is None else min(high, projected_high)
+            read.extend(projected_reads)
+            proof.extend(projected_cells)
+        if with_bounds:
+            # The surviving return of `_validated_frequency_state` proves
+            # active_count >= 1, but has no local finite upper bound. Keep
+            # that control-owned half-bound separate until the caller's
+            # raising guard contributes its upper bound at the actual topk
+            # site; a SOURCE_INT_RANGE row is a finite pair, so posting one
+            # here would invent a bound.
+            return low, high, tuple(read), tuple(dict.fromkeys(proof))
         if low is None and high is None:
             return answer(interval, ())
         if interval is None:
@@ -6271,6 +6295,225 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         if met[0] > met[1]:
             return answer(interval, ())
         return answer(met, tuple(read), proof)
+
+    def projected_return_members(caller, call_id, member_id, position, callee):
+        """Read every callee return leaf behind one exact caller tuple member.
+
+        The member's numeric slot alone is not an interprocedural identity.
+        Its authored operand cell, literal index, and each callee return
+        layout must agree. Later projection/member receipts are checked when
+        present. Any unproved return site refuses the projection.
+        """
+
+        from ...compiler.concordance_declarations import (
+            CALL_RESULT_PROJECTION, CALLSITE_RETURN_MEMBER,
+            FUNCTION_ADDRESS, PROCESS_GRAPH_OPERANDS,
+            SOURCE_AGGREGATE_LAYOUT, SOURCE_FUNCTION_REACHABILITY,
+        )
+        from ...compiler.concorded_literals import (
+            MISSING, literal_from_identity,
+        )
+        from ...compiler.identity_concordance import Ref
+
+        caller_scope = tuple(caller.G.graph.get("lexical_read_scope") or ())
+        callee_scope = tuple(callee.G.graph.get("lexical_read_scope") or ())
+        if not caller_scope or not callee_scope:
+            return None
+        call_id = caller.value_of(call_id)
+        member_id = caller.value_of(member_id)
+        call_cell = node_identity_cell(caller.wrapper, call_id)
+        member_cell = node_identity_cell(caller.wrapper, member_id)
+        # The Call's graph attribute is only a view of its selected target.
+        # The pursuit row binds this exact Call to the callee body and cites
+        # the selected function-address cell; a tuple layout alone cannot.
+        reach_row = (caller.scope, call_id, callee.scope)
+        reach_ref = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, reach_row)
+        if (reach_ref is None or book.page(
+            SOURCE_FUNCTION_REACHABILITY
+        ).cell(reach_ref.row, reach_ref.column) is not True):
+            return None
+        reach_causes = {
+            source for source, _ in book.edges_into(reach_ref)
+        }
+        address_causes = tuple(
+            source for source in reach_causes
+            if source.page == FUNCTION_ADDRESS
+            and book.page(FUNCTION_ADDRESS).cell(
+                source.row, source.column,
+            ) == callee.address
+        )
+        if call_cell not in reach_causes or len(address_causes) != 1:
+            return None
+        operands = book.latest_ref(
+            PROCESS_GRAPH_OPERANDS, (caller_scope, member_id),
+        )
+        operand_fact = (
+            () if operands is None else book.page(
+                PROCESS_GRAPH_OPERANDS
+            ).cell(operands.row, operands.column)
+        )
+        by_role = {
+            str(role): cell for cell, role in operand_fact
+        }
+        if (len(operand_fact) != 2
+                or set(by_role) != {"base", "index"}
+                or by_role["base"] != call_cell):
+            return None
+        indexed_literal, literal_cells = literal_from_identity(
+            book, by_role["index"],
+        )
+        if (indexed_literal is MISSING or type(indexed_literal) is not int
+                or indexed_literal != int(position) or not literal_cells):
+            return None
+        projection_row = (caller_scope, call_id, member_id)
+        projection = book.latest_ref(CALL_RESULT_PROJECTION, projection_row)
+        if (projection is not None and book.page(
+            CALL_RESULT_PROJECTION
+        ).cell(projection.row, projection.column) != (int(position),)):
+            return None
+        if projection is not None:
+            projection_causes = {
+                source for source, _ in book.edges_into(projection)
+            }
+            if (call_cell not in projection_causes
+                    or member_cell not in projection_causes):
+                return None
+        member_row = (caller_scope, call_id, int(position), member_id)
+        member_page = book.page(CALLSITE_RETURN_MEMBER)
+        current_member = book.latest_ref(CALLSITE_RETURN_MEMBER, member_row)
+        current_fact = (
+            None if current_member is None else member_page.cell(
+                current_member.row, current_member.column,
+            )
+        )
+        slot_sets = tuple(
+            tuple(map(int, values))
+            for values in (callee.G.graph.get("return_slot_values") or {}).values()
+            if isinstance(values, (tuple, list))
+        )
+        if not slot_sets or any(
+            not 0 <= int(position) < len(slots) for slots in slot_sets
+        ):
+            return None
+        layout_page = book.page(SOURCE_AGGREGATE_LAYOUT)
+        result = []
+        for slots in slot_sets:
+            leaf_id = slots[int(position)]
+            if leaf_id not in callee.G:
+                return None
+            leaf_cell = node_identity_cell(callee.wrapper, leaf_id)
+            historical = tuple(
+                Ref(CALLSITE_RETURN_MEMBER, member_row, column)
+                for column, fact in member_page.history(member_row)
+                if fact == current_fact
+                and leaf_cell in {
+                    source for source, _ in book.edges_into(
+                        Ref(CALLSITE_RETURN_MEMBER, member_row, column)
+                    )
+                }
+            )
+            layouts = tuple(
+                (ref, fact) for row in layout_page.scope_rows(callee_scope)
+                for ref in (book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row),)
+                if ref is not None
+                for fact in (layout_page.cell(ref.row, ref.column),)
+                if getattr(fact, "aggregate_kind", None) == "tuple"
+                and tuple(member.value_id for member in fact.members) == slots
+                and fact.members[int(position)].value_cell == leaf_cell
+            )
+            if ((current_member is not None and len(historical) != 1)
+                    or len(layouts) != 1):
+                return None
+            layout_ref, _layout = layouts[0]
+            tuple_id = int(layout_ref.row[1])
+            if tuple_id not in callee.G:
+                return None
+            result.append((callee, tuple_id, leaf_id, (
+                call_cell, reach_ref, address_causes[0], member_cell,
+                operands, *literal_cells,
+                *((projection,) if projection is not None else ()),
+                *((historical[0], current_member)
+                  if current_member is not None else ()),
+                layout_ref, leaf_cell,
+            )))
+        return tuple(result)
+
+    active_projected_bounds = set()
+
+    def projected_control_bounds(unit, value_key):
+        """Bounds all exact returned tuple leaves of one projected value.
+
+        A helper's raising guard applies only to values it returns. Its
+        one-sided interval is kept as control evidence until the caller's
+        own guards supply the other side at the actual read site.
+        """
+
+        candidates = tuple(
+            (int(node_id), data)
+            for node_id, data in unit.G.nodes(data=True)
+            if unit.key(int(node_id)) == value_key
+            and str(data.get("type")) == "Indexed"
+        )
+        if len(candidates) != 1:
+            return None
+        member_id, data = candidates[0]
+        parents = dict(
+            (str(role), int(parent))
+            for parent, role in data.get("parents") or ()
+        )
+        if set(parents) != {"base", "index"}:
+            return None
+        call_id, index_id = parents["base"], parents["index"]
+        if (call_id not in unit.G or
+                str(unit.G.nodes[call_id].get("type")) != "Call"):
+            return None
+        index = unit.G.nodes.get(index_id, {})
+        position = index.get("constant", (index.get("attributes") or {}).get(
+            "value",
+        ))
+        if type(position) is not int:
+            return None
+        callee = callee_of(unit, call_id, external=True)
+        if callee is None:
+            return None
+        leaves = projected_return_members(
+            unit, call_id, member_id, position, callee,
+        )
+        if not leaves:
+            return None
+        # A recursive helper may return a projection of its own result.
+        # That cycle proves no new bound; the exact source value remains
+        # unbounded until an acyclic return site supplies control evidence.
+        projection_key = unit.key(member_id)
+        if projection_key in active_projected_bounds:
+            return None
+        active_projected_bounds.add(projection_key)
+        try:
+            bounds = tuple(
+                (guarded(
+                    callee_unit, tuple_id, callee_unit.key(leaf_id),
+                    _INT_RANGE_TOP, with_bounds=True,
+                ), proofs)
+                for callee_unit, tuple_id, leaf_id, proofs in leaves
+            )
+        finally:
+            active_projected_bounds.remove(projection_key)
+        lows = tuple(bound[0] for bound, _ in bounds)
+        highs = tuple(bound[1] for bound, _ in bounds)
+        low = min(lows) if all(bound is not None for bound in lows) else None
+        high = max(highs) if all(bound is not None for bound in highs) else None
+        if low is None and high is None:
+            return None
+        return (
+            low, high,
+            tuple(dict.fromkeys(
+                read for bound, _ in bounds for read in bound[2]
+            )),
+            tuple(dict.fromkeys(
+                cell for bound, projection in bounds
+                for cell in (*projection, *bound[3])
+            )),
+        )
 
     # Every callsite's actual for every formal; a callsite that leaves a
     # formal unbound (its default, a ``*args`` spread we cannot place) makes
@@ -6733,6 +6976,108 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 stage=_REDUCTION, provenance=_Derived(sources),
                 mode=_Mode.CONCORD,
             )
+    # In the actual Huffman guard, max_bits is already proved (12, 12),
+    # but `2 ** max_bits` has no class by operand classes alone: a negative
+    # exponent could produce float. Admit only exact nonnegative integer
+    # powers from the existing operand class/range and operator cells.
+    from ...compiler.concordance_declarations import (
+        PROCESS_GRAPH_OPERANDS, SOURCE_OPERATOR_KIND,
+    )
+    from ...compiler.concorded_literals import origin_cell
+    from ...transmogrifier.ssa_registry import Handler
+    pending_powers = [
+        (unit, int(node_id))
+        for unit in units for node_id, data in unit.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.BinOp)
+        and isinstance(data["expr_obj"].op, ast.Pow)
+    ]
+    power_posted = []
+    while pending_powers:
+        progressed = False
+        for unit, node_id in tuple(pending_powers):
+            parents = {
+                str(role): int(parent)
+                for parent, role in unit.G.nodes[node_id].get("parents") or ()
+            }
+            if set(parents) != {"lhs", "rhs"}:
+                pending_powers.remove((unit, node_id))
+                continue
+            node_cell = node_identity_cell(unit.wrapper, node_id)
+            lhs_cell = node_identity_cell(unit.wrapper, parents["lhs"])
+            rhs_cell = node_identity_cell(unit.wrapper, parents["rhs"])
+            operands = book.latest_ref(PROCESS_GRAPH_OPERANDS, node_cell.row)
+            if operands is None or book.page(PROCESS_GRAPH_OPERANDS).cell(
+                operands.row, operands.column,
+            ) != ((lhs_cell, "lhs"), (rhs_cell, "rhs")):
+                pending_powers.remove((unit, node_id))
+                continue
+            origin = origin_cell(book, node_cell)
+            kind = book.latest_ref(SOURCE_OPERATOR_KIND, (origin,))
+            if kind is None or Handler(book.page(SOURCE_OPERATOR_KIND).cell(
+                kind.row, kind.column,
+            )) != Handler.Pow:
+                pending_powers.remove((unit, node_id))
+                continue
+            operand_keys = (unit.key(parents["lhs"]), unit.key(parents["rhs"]))
+            classes = tuple(book.latest_ref(SOURCE_VALUE_CLASS, key)
+                            for key in operand_keys)
+            ranges = tuple(book.latest_ref(SOURCE_INT_RANGE, key)
+                           for key in operand_keys)
+            if any(cell is None for cell in (*classes, *ranges)):
+                continue
+            class_facts = tuple(class_page.cell(cell.row, cell.column)
+                                for cell in classes)
+            range_facts = tuple(range_page.cell(cell.row, cell.column)
+                                for cell in ranges)
+            if (any(fact[0] not in {"builtins.int", "builtins.bool"}
+                    for fact in class_facts)
+                    or any(low != high for low, high in range_facts)
+                    or range_facts[1][0] < 0):
+                pending_powers.remove((unit, node_id))
+                continue
+            base, exponent = int(range_facts[0][0]), int(range_facts[1][0])
+            # Keep this source proof within the existing 512-bit shift
+            # analysis budget; a giant exact power has no finite row here.
+            if exponent > 512 or abs(base).bit_length() * exponent > 512:
+                pending_powers.remove((unit, node_id))
+                continue
+            value = base ** exponent
+            result_key = unit.key(node_id)
+            incumbent_class = class_page.latest(result_key)
+            incumbent_range = range_page.latest(result_key)
+            if (incumbent_class is not None
+                    and incumbent_class[:2] == ("builtins.int", 1)
+                    and incumbent_range == (value, value)):
+                unit.G.nodes[node_id].setdefault("attributes", {})[
+                    "python_int_range"
+                ] = (value, value)
+                pending_powers.remove((unit, node_id))
+                continue
+            causes = tuple(dict.fromkeys((
+                node_cell, origin, kind, operands, lhs_cell, rhs_cell,
+                *classes, *ranges,
+            )))
+            _concord_source_value_class(
+                unit.scope, unit.value_of(node_id), "builtins.int",
+                source="exact nonnegative integer power",
+                provenance=_Derived(causes),
+            )
+            result_class = book.latest_ref(SOURCE_VALUE_CLASS, result_key)
+            if incumbent_range != (value, value):
+                book.post(
+                    SOURCE_INT_RANGE, result_key, (value, value),
+                    stage=_REDUCTION,
+                    provenance=_Derived((*causes, result_class)),
+                    mode=_Mode.CONCORD,
+                )
+            unit.G.nodes[node_id].setdefault("attributes", {})[
+                "python_int_range"
+            ] = (value, value)
+            power_posted.append(result_key)
+            pending_powers.remove((unit, node_id))
+            progressed = True
+        if not progressed:
+            break
     # A guard narrows an actual only where it dominates the call: the
     # value's own row keeps its whole interval, and the narrowed one is
     # posted for that callsite (corpus c795: ``preflighted`` passes its
@@ -6842,7 +7187,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 ))),
                 mode=_Mode.CONCORD,
             )
-    return bool(posted)
+    return bool(posted or power_posted)
 
 
 def _int_range_scopes(graph: Any) -> tuple:
