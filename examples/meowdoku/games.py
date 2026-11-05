@@ -818,6 +818,37 @@ class Learner:
         self.steps_per_second = 0.0
         self.started_at = None
         self._stop = threading.Event()
+        self.saved = ""                     # when the weights were last written, for the status
+        self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
+        self._thread.start()
+
+    # The arena's Save / Stop / Resume buttons ----------------------------
+    @property
+    def running(self) -> bool:
+        return self._thread.is_alive() and not self._stop.is_set()
+
+    def save(self) -> None:
+        """Write the network's weights now (the same atomic write the
+        learner's own checkpoints use), between steps."""
+        import time
+        with self.lock:
+            self.player.net.save(self.player.weights)
+        self.saved = time.strftime("%H:%M:%S")
+
+    def stop(self) -> None:
+        """Stop self-play after the step in flight, then save."""
+        self._stop.set()
+        self._thread.join(timeout=30.0)
+        self.save()
+
+    def resume(self) -> None:
+        """Start self-play again (also after a crash) from the weights in memory."""
+        import threading
+        if self.running:
+            return
+        self._thread.join(timeout=30.0)
+        self.error = ""
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
         self._thread.start()
 
@@ -859,8 +890,11 @@ class Learner:
         import time
         p = self.player
         rec = p.record
+        saved = f" · saved {self.saved}" if self.saved else ""
         if self.error:
-            return f"training stopped: {self.error}"
+            return f"training stopped: {self.error}{saved}"
+        if not self.running:
+            return f"training stopped{saved} · {p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
         lead = (self.corpus.summary() if self.corpus is not None else self.note) or ""
         hours = (time.time() - self.started_at) / 3600 if self.started_at else 0.0
         return ((lead + " · ") if lead else "") + (
@@ -869,7 +903,7 @@ class Learner:
             f"{p.games} games · W{rec['white']} B{rec['black']} D{rec['draw']}"
             + (f" · loss {p.last_loss:.3f}" if p.games else "")
             + (f" · last: {self.last_result}" if self.last_result else "")
-            + f" · learning {hours * 60:.0f} min"
+            + f" · learning {hours * 60:.0f} min" + saved
             + f" · eval {p.net.native_note}")
 
 
@@ -917,6 +951,7 @@ class ChessArena(Chess):
         st = Chess.state(self)
         st["selected"] = None; st["hints"] = [0] * 64
         st["status"] = self.learner.summary() + (f" · search: {self.learner.engine.last_search}" if self.learner.engine.last_search else "")
+        st["arena_running"] = self.learner.running
         st["moves"] = plies
         return st
 

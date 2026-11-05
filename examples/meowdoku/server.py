@@ -123,6 +123,11 @@ class Table:
         elif kind == "layout":
             if hasattr(self.game, "layout"):
                 self.game.layout(float(payload.get("aspect") or 0.0))
+        elif kind in ("arena_save", "arena_stop", "arena_resume"):
+            if not isinstance(self.game, ChessArena):
+                raise ValueError("not the chess arena")
+            {"arena_save": self.game.learner.save, "arena_stop": self.game.learner.stop,
+             "arena_resume": self.game.learner.resume}[kind]()
         elif kind in ("lichess_pause", "lichess_resume"):
             if not isinstance(self.game, LichessGame) or self.game.client is None:
                 raise ValueError("Lichess mode is not connected")

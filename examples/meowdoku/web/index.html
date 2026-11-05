@@ -29,6 +29,8 @@
   .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
+  .arena-only, #bar .arena-only { display: none; }
+  body[data-game="chess_arena"] #bar .arena-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
   #player { width: 9em; }
   /* The result splash: centred over the board, never takes a tap. */
@@ -66,6 +68,8 @@
   <button id="new">New</button>
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
+  <button id="arena-save" class="arena-only" title="Write the network's weights to disk now">Save network</button>
+  <button id="arena-stop" class="arena-only" title="Stop self-play training (saves first)">Stop training</button>
   <button id="lichess-stop" class="lichess-only">Stop Lichess after game</button>
   <button id="lichess-resume" class="lichess-only">Resume Lichess</button>
   <span class="meowdoku-only" style="gap:4px" role="group" aria-label="Tool">

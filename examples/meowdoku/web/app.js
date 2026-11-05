@@ -1524,6 +1524,7 @@ function applyState(game) {
   $("lichess-stop").disabled = !lichess || lichess.pause_requested;
   $("lichess-resume").disabled = !lichess || !lichess.pause_requested;
   syncMeowdokuBar(game);
+  if (game.game === "chess_arena") $("arena-stop").textContent = game.arena_running ? "Stop training" : "Resume training";
   // The arena plays itself: while it is the game on screen, ask the server
   // for one move every few hundred milliseconds (through the same queue).
   // Watch mode: the server's thread moves; poll again as soon as this reply
@@ -1890,6 +1891,8 @@ window.addEventListener("keydown", async (e) => {
 });
 $("undo").onclick = () => act({ type: "undo" });
 $("reset").onclick = () => act({ type: "reset" });
+$("arena-save").onclick = () => act({ type: "arena_save" });
+$("arena-stop").onclick = () => act({ type: state.game && state.game.arena_running ? "arena_stop" : "arena_resume" });
 $("lichess-stop").onclick = () => act({ type: "lichess_pause" });
 $("lichess-resume").onclick = () => act({ type: "lichess_resume" });
 $("entry").addEventListener("input", (e) => act({ type: "text", text: e.target.value }));
