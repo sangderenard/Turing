@@ -21,6 +21,29 @@ A game declares:
   size, roll, spin}`` in board units (``x`` across, ``y`` down the board),
   for the page to draw and extrapolate between ticks.
 
+PREDICTION AND RECONCILIATION (the classic client-side prediction loop).
+The server is the authority over every lane.  The player's own ship moves by
+``entity_motion.damped_axis``, which the page also runs, compiled to
+WebAssembly from the same text.  The page records its input as INTERVALS --
+what was held and for how long, a new interval whenever the controls change
+-- and each tick sends the intervals it closed, numbered ``seq``.  The
+server lands each interval as its own round with exactly those controls (in
+a world of one player, the player's input timing is the clock: the session
+advances by the page's measured durations, each capped at ``max_frame``).
+The reply carries ``ack`` (the last ``seq`` landed) and ``you`` (the ship's
+lane after it); the page resets its ship to ``you`` and replays every
+interval after ``ack`` plus the one still open, so its ship answers input at
+once and lands where the server puts it -- the only difference left is the
+step size each side integrates with.  A tick without intervals (an
+unpredicting page) lands wall time as before.  Every other lane is drawn
+from the server's state, carried forward by its velocity.  A game declares
+``PLAYER_LANE`` and ``MOTION`` (the motion law's constants and the walls
+per axis); ``state()`` publishes them as ``predict``.
+
+Collisions over many lanes: ``block_hits`` compares a slice of lanes
+against another (bullets against the player, shots against enemies)
+instead of every lane against every lane.
+
 Rewind and reset are not game code: the session snapshots the state with
 ``copy_shallow`` every ``rewind_every`` seconds of play and ``undo`` restores
 one from about two seconds back (the pair ``run_superstep`` uses for in-round
@@ -35,9 +58,56 @@ from typing import Any
 import numpy as np
 
 from meowdoku.games import Game
+from src.common.tensors import AbstractTensor
 from meowdoku.session import ROOT  # noqa: F401  (puts the repo and examples on sys.path)
 from src.common.dt_system.dt_controller import STController, Targets  # noqa: E402
 from llvm_dt_system import dt_system  # noqa: E402
+
+
+# ---------------------------------------------------------------- law helpers
+# Span idioms shared by entity laws; every operand is an AbstractTensor span.
+
+def as_float(mask):
+    return mask.to_dtype("float")
+
+
+def noise(value):
+    """Deterministic per-lane noise in [0, 1): the law's dice."""
+    raw = (value * 12.9898 + 78.233).sin() * 43758.5453
+    return raw - raw.floor()
+
+
+def first_of(mask, lane):
+    """The lowest lane where ``mask`` holds (all false: none)."""
+    return mask & (lane == AbstractTensor.where(mask, lane, 1.0e9).min())
+
+
+def block_hits(x, y, rx, ry, live, harms, rows: tuple[int, int], cols: tuple[int, int]):
+    """Hit counts of the lanes in ``rows`` by the lanes in ``cols``, as a
+    full-length span (zero outside ``rows``).
+
+    ``harms`` is a (len(rows), len(cols)) boolean span of which pairs may
+    hurt (or None: all).  Overlap is box against box with half extents
+    ``rx``, ``ry``.  The block is the only part of the lane-by-lane matrix
+    computed: hundreds of bullets against one ship cost hundreds of tests,
+    not hundreds squared."""
+    r0, r1 = rows
+    c0, c1 = cols
+    n = int(x.shape[0])
+    a, b = r1 - r0, c1 - c0
+    touch = (((x[r0:r1].reshape((a, 1)) - x[c0:c1].reshape((1, b))).abs()
+              < (rx[r0:r1].reshape((a, 1)) + rx[c0:c1].reshape((1, b))))
+             & ((y[r0:r1].reshape((a, 1)) - y[c0:c1].reshape((1, b))).abs()
+                < (ry[r0:r1].reshape((a, 1)) + ry[c0:c1].reshape((1, b))))
+             & live[r0:r1].reshape((a, 1)) & live[c0:c1].reshape((1, b)))
+    if harms is not None:
+        touch = touch & harms
+    counts = as_float(touch).sum(dim=1)
+    parts = [x[:r0] * 0.0] if r0 > 0 else []
+    parts.append(counts)
+    if r1 < n:
+        parts.append(x[r1:] * 0.0)
+    return AbstractTensor.cat(parts, dim=0) if len(parts) > 1 else counts
 
 
 class EntitySession:
@@ -134,6 +204,11 @@ class EntityGame(Game):
     height = 13.0
     max_frame = 0.25          # longer gaps (a hidden tab) are dropped, shorter ones landed whole
     CONTROLS: tuple[str, ...] = ()
+    #: The player's lane and its motion law's constants: ``speed``, ``tau``,
+    #: ``reach`` and, per predicted axis (``x``, and ``y`` for 2D games),
+    #: the walls ``[lo, hi]``.  None: nothing is predicted.
+    PLAYER_LANE: int | None = None
+    MOTION: dict[str, Any] | None = None
 
     def __init__(self, board_id: str = ""):
         super().__init__(board_id)
@@ -141,6 +216,8 @@ class EntityGame(Game):
         self.last_tick: float | None = None
         self.ticks = 0
         self.held: dict[str, float] = {}
+        self.ack = None           # the last input interval landed
+        self.intervals: list[dict] = []
 
     # declared by the game ----------------------------------------------------
     def make_piece(self):
@@ -158,11 +235,27 @@ class EntityGame(Game):
     def describe(self) -> str:
         return ""
 
+    def motion(self) -> dict[str, Any] | None:
+        """``MOTION`` as published; a game whose walls move overrides it."""
+        return self.MOTION
+
     # verbs -------------------------------------------------------------------
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
+        self.intervals = [dict(item) for item in payload.get("inputs") or ()]
 
     def tick(self) -> None:
+        if self.intervals and self.session.state is not None:
+            # Input-timed: each interval is a round with its own controls.
+            for interval in self.intervals:
+                self.held = {name: float(interval[name]) for name in self.CONTROLS if name in interval}
+                self.session.control(self.held)
+                self.session.advance(min(self.max_frame, max(0.0, float(interval.get("dur", 0.0)))))
+                self.ack = int(interval["seq"])
+            self.intervals = []
+            self.last_tick = time.perf_counter()
+            self.ticks += 1
+            return
         now = time.perf_counter()
         seconds = 0.0 if self.last_tick is None else min(self.max_frame, now - self.last_tick)
         self.last_tick = now
@@ -192,4 +285,10 @@ class EntityGame(Game):
         st["clock"] = {"tick_s": seconds, "law_calls": calls, "dt": float(self.session.dt)}
         st["status"] = self.describe()
         st["moves"] = self.ticks
+        if self.PLAYER_LANE is not None and self.session.state is not None:
+            k, col = self.PLAYER_LANE, self.session.column
+            st["predict"] = {"lane": k, **(self.motion() or {})}
+            st["ack"] = self.ack
+            st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
+                         "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0)}
         return st

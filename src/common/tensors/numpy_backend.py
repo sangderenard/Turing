@@ -220,6 +220,31 @@ class NumPyTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return np.logical_xor(self.data, value)
 
+    def bitand_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.bitwise_and(self.data, value)
+
+    def bitor_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.bitwise_or(self.data, value)
+
+    def bitxor_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.bitwise_xor(self.data, value)
+
+    def shl_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.left_shift(self.data, value)
+
+    def shr_(self, value):
+        import numpy as np
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return np.right_shift(self.data, value)
+
     def sqrt_(self):
         import numpy as np
         return np.sqrt(self.data)

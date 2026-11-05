@@ -40,6 +40,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, LichessGame, MeowdokuGame, Wordle  # noqa: E402
 from meowdoku.invaders import SpaceInvaders  # noqa: E402
+from meowdoku.scroller import BulletScroller  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -62,7 +63,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -87,6 +88,8 @@ class Table:
             self.game = LichessGame()
         elif kind == "space_invaders":
             self.game = SpaceInvaders(aspect=float(payload.get("aspect") or 0.0))
+        elif kind == "bullet_hell":
+            self.game = BulletScroller(aspect=float(payload.get("aspect") or 0.0))
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
@@ -246,6 +249,22 @@ def make_handler(sessions: Sessions):
     return Handler
 
 
+def prepare_predictor(web_dir: Path) -> None:
+    """The page's ship predictor: ``entity_motion.damped_axis`` lowered to a
+    WebAssembly core (rebuilt only when its source changes), and the mobile
+    reference app's loader for it."""
+    import shutil
+    from meowdoku.entity_motion import build_predictor
+    shell = ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js"
+    shutil.copyfile(shell, web_dir / "turing-wasm-shell.js")
+    try:
+        build_predictor(web_dir)
+        print("[meowdoku] ship predictor: motion.wasm ready", flush=True)
+    except Exception as error:  # the page plays without prediction
+        print(f"[meowdoku] ship predictor NOT built ({type(error).__name__}: {error}); "
+              "free-board games run unpredicted", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766)
@@ -256,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
+    prepare_predictor(web_dir)
     sessions = Sessions(web_dir, Profiles(PROFILES))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)

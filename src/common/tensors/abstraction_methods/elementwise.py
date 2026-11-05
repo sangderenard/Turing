@@ -69,10 +69,10 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
             if tape and annotate:
                 tape.annotate(out, **({"forced": True} | annotate))
             return out
-    backend_unary = _BACKEND_UNARY.get(op)
-    if backend_unary is not None and getattr(type(self), "_compare_broadcasts", False):
+    kernel = _backend_kernel(self, op)
+    if kernel is not None:
         out = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        out.data = getattr(self, backend_unary)()
+        out.data = kernel(self)
         out = finalize(out)
         tape = getattr(out, "_tape", None)
         if tape and annotate:
@@ -150,33 +150,52 @@ def _broadcast_flat_index(src_shape, dst_shape):
     return map_index
 
 
-# The six comparisons every array backend answers itself.  ``AbstractTensor``'s
-# class body binds ``__eq__`` to ``self.equal`` (the backend's ``equal_``), and
-# the module-level block that installs this shim shadowed that unconditionally,
-# so on NumPy and Torch ``a == b`` walked the broadcast result in Python and
-# rebuilt a tensor from a list.  Measured on one BoundSpring force assembly at
-# 2000 nodes x 8000 edges: 37.0 s through the list, 0.38 s through the backend,
-# forces identical to the bit.  The rule now: a backend that declares its
-# compares broadcast by NumPy rules (``_compare_broadcasts``) answers a
-# comparison here; the branch oracle keeps precedence, and every other backend
-# and every other op keeps the scalar reference path below.
-_BACKEND_COMPARE = {
-    "equal": "equal_",
-    "not_equal": "not_equal_",
-    "less": "less_",
-    "less_equal": "less_equal_",
-    "greater": "greater_",
-    "greater_equal": "greater_equal_",
-    # The boolean connectives on two boolean operands, by the same rule and
-    # for the same reason: a pairwise collision mask (86 x 86 lanes, a few
-    # dozen ``&``/``|`` per step) spent 300k Python calls per step walking
-    # the broadcast here -- 120 ms of a 122 ms step.
-    "logical_and": "logical_and_",
-    "logical_or": "logical_or_",
-    "logical_xor": "logical_xor_",
-}
-#: Unary predicates a ``_compare_broadcasts`` backend answers itself.
-_BACKEND_UNARY = {"logical_not": "logical_not_"}
+# DEFERRING TO THE BACKEND.  The value-wise paths below (v1 unary, v2 binary,
+# v3 ``where``) are the DEFINITION of each op -- the translation proof every
+# backend must agree with -- not how an array backend should run it.  A
+# backend announces it computes an op whole the way backends already announce
+# every capability here: it overrides the op's ``<op>_`` method (the base
+# class leaves it raising NotImplementedError, or absent), and it declares
+# ``_compare_broadcasts`` -- its kernels broadcast by NumPy rules, so a whole
+# kernel and the per-element walk return the same shape.  Given both, the op
+# is deferred; otherwise the reference path runs.  The branch oracle keeps
+# precedence, and the tape records the same op either way.
+#
+# Measured: comparisons through the walk, a BoundSpring force assembly at
+# 2000 nodes x 8000 edges, 37.0 s against 0.38 s deferred, forces identical
+# to the bit; ``&``/``|`` over an 86 x 86 lane collision mask, 120 ms of a
+# 122 ms step.
+
+
+def _backend_kernel(tensor, op: str, *, broadcasts: bool = True):
+    """The backend's whole-tensor kernel for ``op``, or None.
+
+    Announced by overriding ``<op>_``; with ``broadcasts`` (the value-wise
+    unary and binary ops) the backend must also declare
+    ``_compare_broadcasts``.  ``where_`` is its own announcement: every
+    backend that has one (NumPy, Torch, JAX, C, GLSL, the SSA tracer, pure
+    Python) selects with the reference's broadcasting."""
+    from ..abstraction import AbstractTensor
+    cls = type(tensor)
+    if broadcasts and not getattr(cls, "_compare_broadcasts", False):
+        return None
+    kernel = getattr(cls, f"{op}_", None)
+    if kernel is None or kernel is getattr(AbstractTensor, f"{op}_", None):
+        return None
+    return kernel
+
+
+def _backend_class(tensor):
+    """The backend class of ``tensor``.  A reduction's 0-d result is a
+    runtime subclass (``AbstractScalar``: ``NumPyTensorOperationsScalar``) of
+    its backend's class, so "same backend" is membership in the backend
+    class, not equality of exact types -- with exact types a span against a
+    reduced scalar fell to the per-element path."""
+    from ..abstraction import AbstractScalar
+    cls = type(tensor)
+    while issubclass(cls, AbstractScalar):
+        cls = next(base for base in cls.__bases__ if not issubclass(base, AbstractScalar))
+    return cls
 
 
 # --------------- v2: binary (broadcasting, value-wise) ----------------
@@ -207,14 +226,14 @@ def _v2_valuewise(
                 tape.annotate(out, **({"forced": True} | annotate))
             return out
 
-    backend_compare = _BACKEND_COMPARE.get(op)
+    kernel = _backend_kernel(self, op)
     if (
-        backend_compare is not None
-        and getattr(type(self), "_compare_broadcasts", False)
-        and type(other_t) is type(self)
+        kernel is not None
+        and isinstance(other_t, _backend_class(self))
+        and isinstance(self, _backend_class(other_t))
     ):
         out = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        out.data = getattr(self, backend_compare)(other_t)
+        out.data = kernel(self, other_t)
         out = finalize(out)
         tape = getattr(out, "_tape", None)
         if tape and annotate:
@@ -334,11 +353,11 @@ def _v3_valuewise(
     # selection) exactly, while the per-element Python path below stays the
     # definition for backends without the kernel.  Measured on the eager
     # dually tyre: that Python path was 85% of a substep.
-    backend_where = getattr(type(self), "where_", None)
+    backend_where = _backend_kernel(self, "where", broadcasts=False)
     if (
         backend_where is not None
-        and isinstance(a_t, type(self))
-        and isinstance(b_t, type(self))
+        and isinstance(a_t, _backend_class(self))
+        and isinstance(b_t, _backend_class(self))
     ):
         out = self.ensure_tensor(backend_where(self, a_t, b_t))
         out = finalize(out)

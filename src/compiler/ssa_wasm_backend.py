@@ -1429,6 +1429,15 @@ def emit_ssa_module_to_wasm_core(
                 builder.raw(0x9A)  # f64.neg
             builder.local_set(slot_for(env, instruction.res, kind or "f64"))
             return
+        if operation == "Abs" and instruction.args and env.kinds.get(
+                int(instruction.args[0].id)) not in ("i32", "i64"):
+            # Float magnitude is one instruction (the integer Abs has no
+            # spelling here yet and still refuses below, by name).
+            if push(env, instruction.args[0]) is None:
+                return
+            builder.raw(_OP_F64_ABS)
+            builder.local_set(slot_for(env, instruction.res, "f64"))
+            return
         if operation in {"Cast", "CastLike"} and instruction.args:
             result_shape = tuple(getattr(instruction.res, "shape", ()) or ())
             if result_shape:

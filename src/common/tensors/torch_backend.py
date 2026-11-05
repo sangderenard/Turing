@@ -219,6 +219,31 @@ class PyTorchTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return torch.logical_xor(self.data, value)
 
+    def bitand_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.bitwise_and(self.data, value)
+
+    def bitor_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.bitwise_or(self.data, value)
+
+    def bitxor_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.bitwise_xor(self.data, value)
+
+    def shl_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.bitwise_left_shift(self.data, value)
+
+    def shr_(self, value):
+        import torch
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return torch.bitwise_right_shift(self.data, value)
+
     def sqrt_(self):
         import torch
         return torch.sqrt(self.data)

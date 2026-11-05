@@ -4,6 +4,8 @@
 // whatever state the Python server hands it (games.py's protocol) and
 // animates the difference between states; it decides nothing.
 
+import { TuringWasmProgram } from "./turing-wasm-shell.js";
+
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
 if (!gl) throw new Error("WebGL 2 is required");
@@ -447,6 +449,72 @@ function cellPosition(game, cell, rackPiece) {
     return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.size, "rack", rack.size]; }
   return [(cell % game.cols) + 0.5, Math.floor(cell / game.cols) + 0.5, "board"];
 }
+// ---------------------------------------------------------------- ship prediction
+// Client-side prediction with server reconciliation.  The player's ship moves
+// by the server law's own motion function (entity_motion.damped_axis),
+// compiled to WebAssembly.  Input is recorded as INTERVALS -- the controls
+// held and for how long, a new one whenever the controls change -- and each
+// tick sends the closed intervals, numbered.  The server lands each as its
+// own round with those controls; its reply names the last one landed (ack)
+// and the ship after it (you).  The page resets to that and replays every
+// later interval plus the one still open, so the ship answers at once and
+// lands where the server puts it.  What little differs (the two sides'
+// integration step sizes) eases out over ~60 ms.
+const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null };
+const PRED_STEP = 1 / 120;
+window.meowdokuDebug = { pred };   // read-only inspection handle (play tests)
+const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
+function stepShip(ship, input, seconds, motion) {
+  for (let left = seconds; left > 1e-9;) {
+    const dt = Math.min(PRED_STEP, left); left -= dt;
+    for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"]]) {
+      if (!motion[axis]) continue;
+      const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
+        lo: motion[axis][0], hi: motion[axis][1], speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
+      ship[pos] = r.x_next; ship[vel] = r.v_next;
+    }
+  }
+}
+const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
+function reconcile(game) {
+  if (!predicting(game) || !game.you || !game.you.alive) { pred.ship = null; return; }
+  pred.lane = game.predict.lane;
+  const before = pred.ship ? [pred.ship.x, pred.ship.y] : null;
+  if (game.ack != null) pred.sent = pred.sent.filter((interval) => interval.seq > game.ack);
+  const ship = { ...game.you };
+  for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
+  if (before) { pred.offset = [pred.offset[0] + before[0] - ship.x, pred.offset[1] + before[1] - ship.y];
+                if (Math.hypot(...pred.offset) > 1.5) pred.offset = [0, 0]; }
+  pred.ship = ship;
+}
+function predictFrame(now) {
+  const game = state.game;
+  const frame = pred.at == null ? 0 : Math.min(0.1, Math.max(0, now - pred.at));
+  pred.at = now;
+  if (!predicting(game)) return;
+  // The open interval runs while the controls hold; a change closes it.
+  const c = controls();
+  if (!pred.open || !sameControls(pred.open.controls, c)) {
+    if (pred.open && pred.open.dur > 0) pred.closed.push(pred.open);
+    pred.open = { controls: c, dur: 0 };
+  }
+  pred.open.dur += frame;
+  if (pred.ship) stepShip(pred.ship, c, frame, game.predict);
+  const decay = Math.exp(-frame / 0.06);
+  pred.offset = [pred.offset[0] * decay, pred.offset[1] * decay];
+}
+function sendTick(game) {
+  if (!predicting(game)) return act({ type: "tick", ...controls() });
+  // Close the open interval and send everything closed since the last tick.
+  if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
+  const batch = pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq }));
+  pred.closed = [];
+  pred.sent.push(...batch);
+  if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
+  return act({ type: "tick", ...controls(),
+               inputs: batch.map((interval) => ({ seq: interval.seq, dur: interval.dur, ...interval.controls })) });
+}
+
 function entityModel(piece, now) {
   // Free-board entities: drawn where the server last put them, carried on by
   // the velocity it reported (at most a frame's worth, so a late reply never
@@ -456,6 +524,11 @@ function entityModel(piece, now) {
   // constant) instead of jumping, so reply-to-reply latency differences and
   // a released key never show as a snap.
   const mesh = state.meshes[piece.mesh], lead = Math.min(now - piece.tRecv, 0.05);
+  if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
+    // The player's own ship: the prediction, not the server's last word.
+    piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
+    return placeEntity(piece, now, piece.x, piece.z, mesh);
+  }
   const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
   // Each frame the drawn position first moves by the velocity (so a shot
   // never trails), then only the remaining error is eased away.
@@ -466,11 +539,14 @@ function entityModel(piece, now) {
   const far = Math.hypot(tx - px, tz - pz) > 1.5;                    // a respawn or rewind: go there
   const x = far || step >= 1 ? tx : px + (tx - px) * step;
   const z = far || step >= 1 ? tz : pz + (tz - pz) * step;
+  piece.x = x; piece.z = z;
+  return placeEntity(piece, now, x, z, mesh);
+}
+function placeEntity(piece, now, x, z, mesh) {
   let s = Math.min(1, (now - piece.t0) / 0.12), y = 0;
   if (piece.removing != null) s = 1 - ease.in(Math.min(1, (now - piece.removing) / 0.3));
   if (piece.mesh === "boom") s *= 1 + 0.35 * Math.sin(Math.min(1, (now - piece.t0) / 0.35) * Math.PI);
   if (piece.bob) y = 0.06 * Math.sin(now * 5 + piece.sx * 0.7);
-  piece.x = x; piece.z = z;
   const lean = 0.55, scale0 = piece.size, scale = scale0 / mesh.extent * Math.max(s, 0.001);
   let m = M.translate(x, TILE.height + scale0 * Math.sin(lean) + 0.04 + y, z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
@@ -532,10 +608,11 @@ function applyState(game) {
     seen.add(e.id);
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
-    else state.pieces.set(e.id, { id: e.id, entity: true, sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color,
+    else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, tRecv: now, mesh: e.mesh, color: e.color,
                                   size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
+  if (game.input === "realtime") reconcile(game); else pred.ship = null;
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
   status.textContent = `${game.status} · ${game.title}${best}`;
@@ -561,7 +638,7 @@ function applyState(game) {
   // Real time: the next tick leaves as soon as this one is in (a short breath
   // for the UI thread), carrying the held controls; the server lands the
   // wall time between ticks.
-  if (game.input === "realtime" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) act({ type: "tick", ...controls() }); }, 15);
+  if (game.input === "realtime" && !document.hidden) state.arenaTimer = setTimeout(() => { if (state.game === game) sendTick(game); }, 15);
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
@@ -573,6 +650,7 @@ function draw(ms) {
   gl.viewport(0, 0, w, h); gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
+  predictFrame(now);
   const cam = camera(); updateLight(now);
   const casters = [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
@@ -664,22 +742,33 @@ const newGame = (payload) => {
 // toward the finger and fires while down.
 const held = new Set();
 let steer = null;
-function boardPlaneX(clientX, clientY) {
+function boardPlane(clientX, clientY) {
   const cam = camera(), rect = canvas.getBoundingClientRect();
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
   const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
   const t = (TILE.height - near[1]) / (far[1] - near[1]);
-  return t >= 0 ? near[0] + t * (far[0] - near[0]) : null;
+  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]), z: near[2] + t * (far[2] - near[2]) } : null;
 }
+const twoAxis = () => !!(state.game && state.game.predict && state.game.predict.y);
 function controls() {
-  // Keys give an axis; a held pointer gives the board x it asks the rocket to
-  // reach.  The law integrates the rocket toward either with damping, so the
-  // page never closes a loop over a position it learned a round trip ago.
+  // Keys give an axis; a held pointer gives the board point it asks the ship
+  // to reach (on a two-axis board, a little above the finger so the finger
+  // never covers it).  The law integrates the ship toward either with
+  // damping; the page never closes a loop over a stale position.
   const axis = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0);
-  return { move_axis: axis, steer_x: steer != null ? Math.max(0, steer) : -1, fire: steer != null || held.has("fire") ? 1 : 0 };
+  const axisY = (held.has("down") ? 1 : 0) - (held.has("up") ? 1 : 0);
+  const out = { move_axis: axis, steer_x: steer ? Math.max(0, steer.x) : -1, fire: steer || held.has("fire") ? 1 : 0 };
+  if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
+  return out;
 }
-const KEY_CONTROL = { ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right", " ": "fire", ArrowUp: "fire", w: "fire", W: "fire" };
-window.addEventListener("keyup", (e) => { const k = KEY_CONTROL[e.key]; if (k) held.delete(k); });
+function keyControl(key) {
+  const k = key.length === 1 ? key.toLowerCase() : key;
+  const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
+  if (common[k]) return common[k];
+  if (twoAxis()) return { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" }[k];
+  return { ArrowUp: "fire", w: "fire" }[k];
+}
+window.addEventListener("keyup", (e) => { const k = keyControl(e.key); if (k) held.delete(k); });
 window.addEventListener("blur", () => held.clear());
 function hit(clientX, clientY) {
   // the pointer's hit on the plane of the button tops: a board cell, a rack cell, or nothing
@@ -699,7 +788,7 @@ function hit(clientX, clientY) {
 }
 let press = null, clickTimer = null, lastClick = null;
 canvas.addEventListener("pointerdown", (e) => {
-  if (state.game && state.game.input === "realtime") { steer = boardPlaneX(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return; }
+  if (state.game && state.game.input === "realtime") { steer = boardPlane(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return; }
   press = { x: e.clientX, y: e.clientY, t: performance.now(), button: e.button, painted: new Set(), moved: false };
   const h = hit(e.clientX, e.clientY); if (h) press.start = h;
 });
@@ -713,7 +802,7 @@ canvas.addEventListener("pointermove", async (e) => {
     if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];
     return;
   }
-  if (game.input === "realtime") { if (steer != null) steer = boardPlaneX(e.clientX, e.clientY); return; }
+  if (game.input === "realtime") { if (steer) steer = boardPlane(e.clientX, e.clientY) || steer; return; }
   if (!press) return;
   if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) press.moved = true;
   // meowdoku: a swipe paints X marks on every cell it crosses
@@ -769,7 +858,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && st
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
-  if (game.input === "realtime" && KEY_CONTROL[e.key]) { e.preventDefault(); held.add(KEY_CONTROL[e.key]); return; }
+  if (game.input === "realtime" && keyControl(e.key)) { e.preventDefault(); held.add(keyControl(e.key)); return; }
   if (game.input === "text") {
     if (/^[a-zA-Z]$/.test(e.key)) return act({ type: "text", text: game.text + e.key.toUpperCase() });
     if (e.key === "Backspace") return act({ type: "backspace" });
@@ -900,6 +989,9 @@ function fillPickers() {
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
   for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
+  try {
+    pred.program = await TuringWasmProgram.load("motion.wasm", "motion.abi.json");
+  } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());
   requestAnimationFrame(draw);

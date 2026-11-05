@@ -35,6 +35,7 @@ from typing import Any
 import numpy as np
 
 from meowdoku.entities import EntityGame
+from meowdoku.entity_motion import damped_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -56,15 +57,15 @@ PLAYER_SPEED = 9.0
 #: The rocket is integrated, not placed: its velocity relaxes toward the
 #: commanded velocity with time constant SHIP_TAU (the damping), and a held
 #: pointer commands the velocity that would close the gap in SHIP_REACH.
-#: Together a damped second-order approach (damping ratio ~0.85): no
+#: Together a damped second-order approach (damping ratio ~0.95): no
 #: overshoot to speak of, and no network delay inside the loop, since the
 #: pointer's position -- not a speed derived from a stale ship -- is sent.
 SHIP_TAU = 0.05
-SHIP_REACH = 0.15
+SHIP_REACH = 0.18
 SHOT_SPEED = 18.0
 BOMB_SPEED = 7.0
 UFO_SPEED = 4.0
-FLEET_PACE = 0.8
+FLEET_PACE = 0.4
 UFO_Y = 0.75
 FLEET_MARGIN = 0.55
 FLEET_DROP = 0.42
@@ -113,7 +114,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     # The fleet: one heading for every invader; fewer invaders, faster fleet.
     fleet = is_inv & live
     count = f(fleet).sum()
-    speed = (FLEET_PACE + 0.15 * wave) * (1.0 + 4.0 * (1.0 - count / INVADERS))
+    speed = (FLEET_PACE + 0.08 * wave) * (1.0 + 4.0 * (1.0 - count / INVADERS))
     step_x = fleet_dir * speed * dt
     beyond = fleet & ((((x + step_x) > (field_w - FLEET_MARGIN)) & (fleet_dir > 0.0))
                       | (((x + step_x) < FLEET_MARGIN) & (fleet_dir < 0.0)))
@@ -138,7 +139,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     dice = _hash(lane + clock * 7.31)
     ranked = where(front, dice, -1.0)
     shooter = front & (ranked == ranked.max())
-    rate = 0.7 + 0.25 * wave
+    rate = 0.45 + 0.15 * wave
     trigger = (_hash(clock * 3.17 + 0.5) < rate * dt) & (f(front).sum() > 0.0) & playing
     free_bomb = is_bomb & ~live
     first_bomb = free_bomb & (lane == where(free_bomb, lane, 1.0e9).min())
@@ -156,11 +157,10 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     spawn = shot_spawn | bomb_spawn | ufo_spawn
     x1 = where(shot_spawn, player_x, where(bomb_spawn, shooter_x, where(ufo_spawn, ufo_x0, x)))
     y1 = where(shot_spawn, PLAYER_Y - 0.65, where(bomb_spawn, shooter_y + 0.5, where(ufo_spawn, UFO_Y, y)))
-    # The rocket's damped velocity: relax toward the commanded velocity.
-    steering = steer_x >= 0.0
-    command = where(steering, ((steer_x - x) / SHIP_REACH).clip(-PLAYER_SPEED, PLAYER_SPEED),
-                    move_axis.clip(-1.0, 1.0) * PLAYER_SPEED)
-    ship_v = vx + (command - vx) * (dt / SHIP_TAU).clip(0.0, 1.0)
+    # The rocket: the shared damped motion law (entity_motion.damped_axis),
+    # the same text the page runs as WebAssembly to predict its own ship.
+    ship_x, ship_v = damped_axis(x, vx, move_axis, steer_x, x * 0.0 + 0.7, field_w - 0.7,
+                                 PLAYER_SPEED, SHIP_TAU, SHIP_REACH, dt)
     vx1 = where(is_player, ship_v,
                 where(is_inv, fleet_dir_next * speed, where(ufo_spawn, ufo_vx0, where(spawn, 0.0, vx))))
     vy1 = where(shot_spawn, -SHOT_SPEED, where(bomb_spawn, BOMB_SPEED, where(spawn, 0.0, vy)))
@@ -171,10 +171,8 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     moving = live1 & playing
     x2 = where(moving & is_inv, x1 + fleet_dx, where(moving, x1 + vx1 * dt, x1))
     y2 = where(moving & is_inv, y1 + fleet_dy, where(moving, y1 + vy1 * dt, y1))
-    x2 = where(is_player, where(x2 > field_w - 0.7, field_w - 0.7, x2).clip(0.7, 1.0e9), x2)
-    # The rocket reports the velocity it actually moved with: zero when a
-    # wall stops it, so a viewer carrying it forward never overshoots.
-    vx_out = where(is_player & moving, (x2 - x1) / dt, vx1)
+    x2 = where(is_player & moving, ship_x, x2)
+    vx_out = where(is_player & ~moving, 0.0, vx1)
     gone = (((is_shot | is_bomb) & ((y2 < -0.5) | (y2 > HEIGHT + 0.5)))
             | (is_ufo & ((x2 < -1.5) | (x2 > field_w + 1.5))))
     live2 = live1 & ~gone
@@ -334,6 +332,12 @@ class SpaceInvaders(EntityGame):
 
     def initial_columns(self) -> dict[str, np.ndarray]:
         return initial_columns(self.width)
+
+    PLAYER_LANE = 0
+
+    def motion(self) -> dict[str, Any]:
+        return {"speed": PLAYER_SPEED, "tau": SHIP_TAU, "reach": SHIP_REACH,
+                "x": [0.7, self.width - 0.7]}
 
     def layout(self, aspect: float) -> None:
         """Fit the field to a new screen shape mid-game: the walls move and
