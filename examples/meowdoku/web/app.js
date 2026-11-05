@@ -684,7 +684,15 @@ function hideSplash() { clearTimeout(splash.timer); $("splash").className = ""; 
 // outside the arcade light strips along the field, each filled from the
 // bottom of the screen in proportion to its value (eased).  Shown for a game
 // whose ship carries health points (``you.health``).
-const vitals = { shield: 0, health: 0, at: null, tube: null };
+const vitals = { shield: 0, health: 0, at: null, meshes: {} };
+// litMesh bakes the material into each vertex, so each bar part has its own
+// unit box, rebuilt when the material table is (re)uploaded.
+function vitalBox(material) {
+  const id = state.materialIndex[material], key = `${material}:${id}:${state.materialsVersion}`;
+  if (!vitals.meshes[material] || vitals.meshes[material].key !== key)
+    vitals.meshes[material] = { key, mesh: litMesh(box(-0.5, 0, -0.5, 0.5, 1, 0.5, id)) };
+  return vitals.meshes[material].mesh;
+}
 function drawVitals(now, drawLit) {
   const game = state.game, you = game && game.you;
   if (state.flat || !you || !(you.health > 0 || vitals.health > 0.001) || game.input !== "realtime") return;
@@ -692,14 +700,14 @@ function drawVitals(now, drawLit) {
   const ease = 1 - Math.exp(-frame / 0.12);
   vitals.shield += ((you.shield || 0) - vitals.shield) * ease;
   vitals.health += ((you.health || 0) - vitals.health) * ease;
-  if (!vitals.tube) vitals.tube = litMesh(box(-0.5, 0, -0.5, 0.5, 1, 0.5, 0));
   const ext = state.extent, m = GLASS.margin * 0.6 + 0.55, length = ext.depth * 0.86, z1 = ext.depth * 0.93;
   const bar = (x, value, material) => {
     const w = 0.34, h = 0.34;
-    drawLit(vitals.tube.vao, vitals.tube.count, M.multiply(M.translate(x, 0.05, z1 - length / 2), M.scale(w, h, length)), state.materialIndex.bar_tube);
+    const tube = vitalBox("bar_tube"), core = vitalBox(material);
+    drawLit(tube.vao, tube.count, M.multiply(M.translate(x, 0.05, z1 - length / 2), M.scale(w, h, length)), null);
     const fill = Math.max(0, Math.min(1, value)) * length;
-    if (fill > 0.01) drawLit(vitals.tube.vao, vitals.tube.count,
-      M.multiply(M.translate(x, 0.08, z1 - fill / 2), M.scale(w * 0.7, h * 0.7, fill)), state.materialIndex[material]);
+    if (fill > 0.01) drawLit(core.vao, core.count,
+      M.multiply(M.translate(x, 0.08, z1 - fill / 2), M.scale(w * 0.7, h * 0.7, fill)), null);
   };
   bar(-m, vitals.shield, "bar_shield");
   bar(ext.width + m, vitals.health, "bar_health");
