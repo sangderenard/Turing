@@ -3990,13 +3990,32 @@ def _as_sequence(value: Any) -> tuple[Any, ...] | None:
     return None
 
 
-def _known_count(value: SSAValue) -> int | None:
+def _known_count(value: SSAValue, *, physical=None) -> int | None:
     shape = tuple(value.shape)
     if shape:
+        if any(int(extent) < 0 for extent in shape):
+            return None
+        if (physical is not None and physical.rank is not None
+                and physical.rank != len(shape)):
+            return None
         return prod(int(extent) for extent in shape)
+    if physical is not None:
+        # _code_lengths' octet indices are int64/span/rank1 with display
+        # shape (). Their count is runtime geometry, not one scalar.
+        return 1 if physical.storage == "scalar" and physical.rank == 0 else None
     # A typed rank-zero value is a real scalar. An untyped rank-zero value is
     # the whole-object compiler's current spelling for an extent not yet known.
     return 1 if value.dtype is not None else None
+
+
+def _booked_count(function: Function, value: SSAValue, book) -> int | None:
+    """Read a static count only from this function's posted physical view."""
+    from .ssa_record_return_state import posted_ssa_value_fact
+
+    physical = posted_ssa_value_fact(function, int(value.id), book=book)
+    if physical is None and not tuple(value.shape or ()):
+        return None
+    return _known_count(value, physical=physical)
 
 
 def _attribute(attributes: dict[str, Any], *names: str) -> Any:
@@ -4051,7 +4070,9 @@ def settle_static_repository_view_shapes(module: IRModule) -> bool:
                     extent <= 0 and extent != -1 for extent in resolved
                 ):
                     continue
-                source_count = _known_count(instruction.args[0])
+                source_count = _booked_count(
+                    function, instruction.args[0], identity_book(module),
+                )
                 known_count = prod(
                     extent for extent in resolved if extent != -1
                 )
@@ -4213,12 +4234,16 @@ def settle_repository_ssa_static_extent_operands(module: IRModule) -> bool:
                             actual = call_instruction.args[position]
                             if int(actual.id) != int(actual_id):
                                 continue
-                            count = _known_count(actual)
+                            count = _booked_count(
+                                caller, actual, identity_book(module),
+                            )
                             if count is not None:
                                 counts.add(count)
                 if len(counts) == 1:
                     return next(iter(counts))
-            return _known_count(value)
+            return _booked_count(
+                function, value, identity_book(module),
+            )
 
         for block in function.blocks.values():
             for instruction in block.instrs:
@@ -6290,9 +6315,9 @@ def _post_scalar_kernel_input_conversion(
     operand_position: int, source: SSAValue, converted: SSAValue,
     callee: str = "binary_scalar_double",
 ) -> None:
-    """One ``kernel_input_conversion`` row for a scalar promoted at the
-    input of ``callee`` (``binary_scalar_double``, or ``broadcast_double``
-    for a scalar broadcast against an array): (function scope, block,
+    """One ``kernel_input_conversion`` row for a promoted input of
+    ``callee``. Scalar promotions and the counted scatter values span use
+    the same source/converted identity row: (function scope, block,
     consumer result, operand position) -> (source id, converted id, source
     dtype, target dtype, callee), REVISE, DERIVED from the source's
     ``ssa_value`` cell and the converted value's (minted by ``fresh``);
@@ -7251,9 +7276,96 @@ def lower_tensor_calls_to_repository_ssa(
                 return True
             if tuple(value.shape or ()):
                 return False
+            from .ssa_record_return_state import posted_ssa_value_fact
+            physical = posted_ssa_value_fact(
+                function, int(value.id), book=book,
+            )
+            if (physical is not None and physical.storage == "span"
+                    and isinstance(physical.rank, int)
+                    and physical.rank > 0):
+                # _code_lengths' public octet selector has display (), but
+                # its exact SSA row says span/rank1. It has no scalar count.
+                return True
             if value.dtype is None or int(value.id) in unresolved_argument_ids:
                 return True
             return False
+
+        def booked_element_count(value: SSAValue) -> int | None:
+            descriptor = tensor_table.by_id(int(value.id))
+            if descriptor is not None and descriptor.metadata_state != "static":
+                return None
+            return _booked_count(function, value, book)
+
+        def scatter_derived_index_count(
+            indices: SSAValue, values: SSAValue,
+            pending: list[Instr],
+        ) -> SSAValue | None:
+            """Read a values count proved to be the selector's count."""
+            from .concordance_declarations import (
+                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                TENSOR_METADATA_RESULT_BINDING,
+            )
+            from .ssa_record_return_state import (
+                function_scope_of, posted_ssa_value_fact,
+                ssa_value_identity_cell,
+            )
+
+            selector_fact = posted_ssa_value_fact(
+                function, int(indices.id), book=book,
+            )
+            values_fact = posted_ssa_value_fact(
+                function, int(values.id), book=book,
+            )
+            if (selector_fact is None or selector_fact.storage != "span"
+                    or selector_fact.rank != 1
+                    or values_fact is None or values_fact.storage != "span"
+                    or values_fact.rank != 1):
+                return None
+            projected = _dynamic_tensor_geometry_evidence(
+                module, function, int(values.id), pending=pending,
+            )
+            if projected is None:
+                return None
+            result_refs = tuple(ref for ref in projected[1]
+                if ref.page == TENSOR_METADATA_RESULT_BINDING
+                and ref.row[0] == function_scope_of(function)
+                and int(ref.row[3]) == int(values.id))
+            if len(result_refs) != 1:
+                return None
+            result_ref = result_refs[0]
+            producer = module.functions.get(str(result_ref.row[2]))
+            target_source_cell = ssa_value_identity_cell(
+                function, int(indices.id), book=book,
+            )
+            producer_source_cell = None if producer is None else ssa_value_identity_cell(
+                producer, int(indices.id), book=book,
+            )
+            if (producer is None or target_source_cell is None
+                    or target_source_cell != producer_source_cell):
+                return None
+            index_geometry = _dynamic_tensor_geometry_evidence(
+                module, producer, int(indices.id),
+            )
+            values_geometry = _dynamic_tensor_geometry_evidence(
+                module, producer, int(values.id),
+            )
+            result_fact = book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                result_ref.row, result_ref.column,
+            )
+            if (
+                index_geometry is None or values_geometry is None
+                or tuple(value.id for value in index_geometry[0])
+                    != tuple(value.id for value in values_geometry[0])
+                or tuple(value.id for value in values_geometry[0])
+                    != tuple(result_fact[1])
+                or tuple(value.id for value in projected[0])
+                    != tuple(result_fact[2])
+                or not set(index_geometry[1]) <= set(values_geometry[1])
+                or not any(ref.page == TENSOR_ELEMENTWISE_EXTENT_BINDING
+                           for ref in values_geometry[1])
+            ):
+                return None
+            return projected[0][2]
 
         def strides(shape: tuple[int, ...]) -> tuple[int, ...]:
             stride = 1
@@ -9004,8 +9116,8 @@ def lower_tensor_calls_to_repository_ssa(
                     and _attribute(
                         instruction.attributes, "axis", "dim"
                     ) is None
-                    and all(_known_count(argument) == 1 for argument in args)
-                    and _known_count(result) == 1
+                    and all(booked_element_count(argument) == 1 for argument in args)
+                    and booked_element_count(result) == 1
                 ):
                     # The planned graph can retain a count-one tensor shape on
                     # a scalar reduction result. Python's two-argument
@@ -10023,7 +10135,7 @@ def lower_tensor_calls_to_repository_ssa(
                             rank_value, rank_def = constant(
                                 len(source_shape), "int32"
                             )
-                            known_value_count = _known_count(value)
+                            known_value_count = booked_element_count(value)
                             if known_value_count is None:
                                 shortfalls.append(TensorSSALoweringShortfall(
                                     function.name,
@@ -10578,7 +10690,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 extent > 0 or extent == -1
                                 for extent in resolved
                             ):
-                                source_count = _known_count(source)
+                                source_count = booked_element_count(source)
                                 known_count = prod(
                                     extent for extent in resolved
                                     if extent != -1
@@ -11355,11 +11467,19 @@ def lower_tensor_calls_to_repository_ssa(
                             if isinstance(item, (int, float))
                         ), 0)
                     axis = int(raw_dim) % len(source.shape)
+                    known_index_count = booked_element_count(indices)
+                    if known_index_count is None:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "gather index count has no exact static geometry",
+                        ))
+                        rewritten.append(instruction)
+                        continue
                     source_shape, source_shape_def = int_vector(source.shape)
                     rank, rank_def = constant(len(source.shape), "int32")
                     axis_value, axis_def = constant(axis, "int32")
                     index_count, index_count_def = constant(
-                        _known_count(indices) or 1, "int32"
+                        known_index_count, "int32"
                     )
                     prefix.extend((
                         source_shape_def, rank_def, axis_def,
@@ -11396,8 +11516,15 @@ def lower_tensor_calls_to_repository_ssa(
                         rewritten.append(instruction)
                         continue
                     source_shape = tuple(source.shape or ())
-                    index_count = _known_count(indices)
-                    if not source_shape or index_count is None:
+                    index_count = booked_element_count(indices)
+                    runtime_index_count = (
+                        scatter_derived_index_count(indices, values, prefix)
+                        if index_count is None and len(source_shape) == 1
+                        else None
+                    )
+                    if not source_shape or (
+                        index_count is None and runtime_index_count is None
+                    ):
                         shortfalls.append(TensorSSALoweringShortfall(
                             function_name,
                             block_name,
@@ -11422,8 +11549,16 @@ def lower_tensor_calls_to_repository_ssa(
                         ), 0)
                     axis = int(raw_dim) % len(source_shape)
                     expected_values_shape = list(source_shape)
-                    expected_values_shape[axis] = int(index_count)
-                    if tuple(values.shape or ()) != tuple(expected_values_shape):
+                    if index_count is not None:
+                        expected_values_shape[axis] = int(index_count)
+                    if (
+                        runtime_index_count is not None
+                        and (axis != 0 or tuple(values.shape or ()))
+                    ) or (
+                        index_count is not None
+                        and tuple(values.shape or ())
+                            != tuple(expected_values_shape)
+                    ):
                         shortfalls.append(TensorSSALoweringShortfall(
                             function_name,
                             block_name,
@@ -11441,12 +11576,170 @@ def lower_tensor_calls_to_repository_ssa(
                     shape_value, shape_def = int_vector(source_shape)
                     rank, rank_def = constant(len(source_shape), "int32")
                     axis_value, axis_def = constant(axis, "int32")
-                    index_count_value, index_count_def = constant(
-                        int(index_count), "int32"
+                    if runtime_index_count is None:
+                        index_count_value, index_count_def = constant(
+                            int(index_count), "int32"
+                        )
+                        prefix.extend((
+                            shape_def, rank_def, axis_def, index_count_def,
+                        ))
+                    else:
+                        index_count_value = runtime_index_count
+                        prefix.extend((shape_def, rank_def, axis_def))
+                    from .ssa_record_return_state import (
+                        posted_ssa_value_fact, revise_ssa_value,
+                        ssa_value_identity_cell,
                     )
-                    prefix.extend((
-                        shape_def, rank_def, axis_def, index_count_def,
-                    ))
+                    values_fact = posted_ssa_value_fact(
+                        function, int(values.id), book=book,
+                    )
+                    if (values_fact is not None
+                            and values_fact.physical_dtype == "int64"
+                            and values_fact.storage == "span"
+                            and values_fact.rank == 1):
+                        # _code_lengths scatters octets + 1 with a runtime
+                        # selector count. A scalar call-input Cast converted
+                        # only the first limb and let scatter_reduce_double
+                        # read past it. Convert the exact counted values span
+                        # before the selected scatter Call instead.
+                        from .ssa_call_input_adapters import _infer_pointer_storage
+                        from .concordance_declarations import TENSOR_SSA_LOWERING
+                        selected_cast = reference.module.functions.get(
+                            "cast_int64_to_double_values"
+                        )
+                        if (selected_cast is None
+                                or selected_cast.metadata.get(
+                                    "ssa_output_argument") != 1
+                                or len(selected_cast.args) != 3):
+                            raise ValueError(
+                                "scatter values promotion lacks selected counted cast"
+                            )
+                        link_repository_function(
+                            selected_cast.name, selected_cast,
+                        )
+                        _infer_pointer_storage({
+                            selected_cast.name: selected_cast,
+                        })
+                        formal_cells = tuple(ssa_value_identity_cell(
+                            selected_cast, int(formal.id), book=book,
+                        ) for formal in selected_cast.args[:2])
+                        formal_facts = tuple(posted_ssa_value_fact(
+                            selected_cast, int(formal.id), book=book,
+                        ) for formal in selected_cast.args[:2])
+                        origins = (selected_cast.metadata.get(
+                            "llvm_repository_kernel"
+                        ) or (None, {}))[1]
+                        if (any(cell is None for cell in formal_cells)
+                                or any(fact is None for fact in formal_facts)
+                                or tuple(fact.physical_dtype
+                                         for fact in formal_facts)
+                                != ("int64", "float64")
+                                or any(
+                                    (origin := origins.get(int(formal.id))) is None
+                                    or origin[1] != "argument"
+                                    or not str(origin[2]).startswith("ptr ")
+                                    for formal in selected_cast.args[:2]
+                                )):
+                            raise ValueError(
+                                "scatter values promotion lacks typed span formals"
+                            )
+                        values_descriptor = tensor_table.by_id(int(values.id))
+                        dynamic_values = (
+                            values_descriptor is not None
+                            and values_descriptor.metadata_state == "dynamic"
+                        )
+                        if dynamic_values:
+                            values_geometry = _dynamic_tensor_geometry_evidence(
+                                module, function, int(values.id), pending=prefix,
+                            )
+                            valid_count = (
+                                values_geometry is not None
+                                and int(values_geometry[0][2].id)
+                                == int(index_count_value.id)
+                            )
+                        else:
+                            valid_count = (
+                                values_descriptor is not None
+                                and values_descriptor.metadata_state == "static"
+                                and tuple(values_fact.shape)
+                                == tuple(values_descriptor.shape)
+                                and values_descriptor.static_element_count
+                                == int(index_count)
+                            )
+                        if not valid_count:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "scatter values promotion lacks exact span count",
+                            ))
+                            rewritten.extend(prefix)
+                            rewritten.append(instruction)
+                            continue
+                        converted_values = fresh(
+                            shape=tuple(values.shape), dtype="float64",
+                        )
+                        source_cell = ssa_value_identity_cell(
+                            function, int(values.id), book=book,
+                        )
+                        if source_cell is None:
+                            raise ValueError(
+                                "scatter values promotion lost source SSA cell"
+                            )
+                        revise_ssa_value(
+                            function, int(converted_values.id),
+                            dtype="float64", shape=tuple(values.shape),
+                            stage=TENSOR_SSA_LOWERING,
+                            sources=(source_cell, *formal_cells), book=book,
+                            physical={
+                                "physical_dtype": "float64",
+                                "storage": "span", "rank": 1,
+                            },
+                        )
+                        converted_values.accounting = {
+                            **dict(converted_values.accounting or {}),
+                            "physical_dtype": "float64",
+                            "program_abi_storage": "span",
+                            "program_abi_rank": 1,
+                        }
+                        if dynamic_values:
+                            converted_values.accounting.update({
+                                "tensor_metadata_state": "dynamic",
+                                "tensor_shape_value_id": int(values_geometry[0][0].id),
+                                "tensor_rank_value_id": int(values_geometry[0][1].id),
+                                "tensor_element_count_value_id": int(index_count_value.id),
+                            })
+                        register_tensor(
+                            converted_values, storage="temporary",
+                            metadata_state=("dynamic" if dynamic_values else "static"),
+                            extent_ids_from=(values_descriptor
+                                             if dynamic_values else None),
+                        )
+                        carrier = own_dynamic_tensor(
+                            converted_values, index_count_value,
+                            "float64", prefix,
+                        )
+                        prefix.append(call(
+                            selected_cast.name,
+                            [values, carrier, index_count_value],
+                            converted_values, instruction,
+                            output_argument=1,
+                        ))
+                        _post_scalar_kernel_input_conversion(
+                            book, function, str(block_name), int(result.id),
+                            2, values, converted_values,
+                            callee=f"scatter_{reduction}_double",
+                        )
+                        values = converted_values
+                    elif (values_fact is None
+                          or values_fact.physical_dtype != "float64"
+                          or values_fact.storage != "span"
+                          or values_fact.rank != 1):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "scatter values lack selected physical span",
+                        ))
+                        rewritten.extend(prefix)
+                        rewritten.append(instruction)
+                        continue
                     emitted.append(call(
                         f"scatter_{reduction}_double",
                         [
@@ -12234,13 +12527,13 @@ def lower_tensor_calls_to_repository_ssa(
                 # owns the extent decision; only a settled static shape may
                 # supply a compile-time kernel count.
                 source_count = (
-                    _known_count(source)
+                    booked_element_count(source)
                     if source is not None and not shape_unknown(source)
                     else None
                 )
                 result_count = (
                     None if int(result.id) in mixed_runtime_geometry
-                    else _known_count(result) if not shape_unknown(result)
+                    else booked_element_count(result) if not shape_unknown(result)
                     else None
                 )
 
@@ -12323,7 +12616,7 @@ def lower_tensor_calls_to_repository_ssa(
                     count = (
                         constructor_count
                         if constructor_count is not None
-                        else need_count(result, _known_count(result))
+                        else need_count(result, booked_element_count(result))
                     )
                     fill_operand = None
                     if fill_value is not None:
@@ -13171,6 +13464,43 @@ def lower_tensor_calls_to_repository_ssa(
                         source_fact = posted_ssa_value_fact(
                             function, int(source.id), book=book,
                         )
+                        # Run66's loop-carried int64 rank-two source %138 had
+                        # runtime geometry but no physical element type.  A
+                        # dynamic shape does not select a typed reduction
+                        # kernel.  Keep the authored sum for the Call closure
+                        # until its exact source contract is published; no
+                        # output descriptor or private heap may be claimed yet.
+                        if (
+                            source_fact is None
+                            or source_fact.physical_dtype is None
+                            or source_fact.storage != "span"
+                        ):
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "dynamic reduction lacks a typed source span",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                        # A real int64 axis sum needs an int64 input and
+                        # output kernel. Using reduce_dim_double here loses
+                        # cancellation above 2**53 before the next sum.
+                        if (operation == "sum"
+                                and source_fact.physical_dtype == "int64"
+                                and str(result.dtype) == "int64"):
+                            axis_kernel = "sum_dim_int64"
+                            kernel_dtype = "int64"
+                        elif (source_fact.physical_dtype == "float64"
+                              and not (operation == "sum"
+                                       and str(result.dtype) == "int64")):
+                            axis_kernel = "reduce_dim_double"
+                            kernel_dtype = "float64"
+                        else:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "dynamic reduction lacks selected typed kernel",
+                            ))
+                            rewritten.append(instruction)
+                            continue
                         source_rank = None if source_fact is None else source_fact.rank
                         raw_axis = int(axis)
                         normalized_axis = (
@@ -13318,8 +13648,12 @@ def lower_tensor_calls_to_repository_ssa(
                              *geometry_values),
                         )
                         dim, dim_def = constant(normalized_axis, "int32")
-                        code, code_def = constant(_REDUCTION_CODES[operation], "int32")
-                        prefix.extend((dim_def, code_def))
+                        prefix.append(dim_def)
+                        if axis_kernel == "reduce_dim_double":
+                            code, code_def = constant(
+                                _REDUCTION_CODES[operation], "int32",
+                            )
+                            prefix.append(code_def)
                         reduction_output = result
                         if output_rank and has_private_region_result(result):
                             # weighted_native_probe sum27 has a runtime axis-zero
@@ -13328,7 +13662,7 @@ def lower_tensor_calls_to_repository_ssa(
                             # private result uses the established owned tensor
                             # carrier with that exact posted count.
                             reduction_output = own_dynamic_tensor(
-                                result, output_count, "float64", prefix,
+                                result, output_count, kernel_dtype, prefix,
                             )
                             # native_weighted_cast_tail's axis sum produces
                             # logical %27 in this region. Its rank-only SSA
@@ -13348,11 +13682,12 @@ def lower_tensor_calls_to_repository_ssa(
                                 function_scope_of, ssa_value_identity_cell,
                             )
                             selected_reduction = reference.module.functions.get(
-                                "reduce_dim_double"
+                                axis_kernel
                             )
                             if (
                                 selected_reduction is None
-                                or len(selected_reduction.args) != 6
+                                or len(selected_reduction.args)
+                                != (5 if axis_kernel == "sum_dim_int64" else 6)
                                 or selected_reduction.metadata.get(
                                     "ssa_output_argument"
                                 ) != 1
@@ -13366,10 +13701,10 @@ def lower_tensor_calls_to_repository_ssa(
                                     "runtime reduction lacks selected output formal"
                                 )
                             link_repository_function(
-                                "reduce_dim_double", selected_reduction,
+                                axis_kernel, selected_reduction,
                             )
                             _infer_pointer_storage({
-                                "reduce_dim_double": selected_reduction,
+                                axis_kernel: selected_reduction,
                             })
                             input_formal, output_formal = (
                                 selected_reduction.args[:2]
@@ -13409,7 +13744,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     for fact, cell in zip(
                                         formal_facts, formal_cells, strict=True,
                                     ))
-                                or any(fact.physical_dtype != "float64"
+                                or any(fact.physical_dtype != kernel_dtype
                                        for fact in formal_facts)
                                 or any(
                                     (origin := origins.get(int(formal.id)))
@@ -13418,12 +13753,12 @@ def lower_tensor_calls_to_repository_ssa(
                                     for formal in (input_formal, output_formal)
                                 )
                                 or source_fact is None
-                                or source_fact.physical_dtype != "float64"
+                                or source_fact.physical_dtype != kernel_dtype
                                 or source_fact.storage != "span"
                                 or result_fact is None
                                 or result_fact.rank != output_rank
                                 or result_fact.physical_dtype not in (
-                                    None, "float64",
+                                    None, kernel_dtype,
                                 )
                                 or result_fact.storage not in (None, "span")
                                 or descriptor is None
@@ -13433,7 +13768,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 or owned_fact != (
                                     int(reduction_output.id),
                                     descriptor.heap_owner_value_id,
-                                    int(output_count.id), "float64",
+                                    int(output_count.id), kernel_dtype,
                                 )
                                 or domain_ref is None
                             ):
@@ -13464,7 +13799,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     *geometry_cells, domain_ref, owned_ref,
                                 ),
                                 physical={
-                                    "physical_dtype": "float64",
+                                    "physical_dtype": kernel_dtype,
                                     "storage": "span", "rank": output_rank,
                                 },
                             )
@@ -13472,9 +13807,118 @@ def lower_tensor_calls_to_repository_ssa(
                                 raise ValueError(
                                     "runtime reduction output has no SSA identity"
                                 )
+                        elif axis_kernel == "sum_dim_int64" and not output_rank:
+                            # int64_axis_edge_scalar's sum(dim=0) returns a
+                            # scalar. Its posted int64/scalar fact is already
+                            # physical, so revise_ssa_value would be a no-op.
+                            # Cite the selected pointer formals and the exact
+                            # source/domain geometry on that same fact; a
+                            # direct scalar output needs no heap owner.
+                            from .concordance_declarations import (
+                                SSA_VALUE, TENSOR_REDUCTION_DOMAIN,
+                            )
+                            from .identity_concordance import Derived, Mode
+                            from .ssa_call_input_adapters import (
+                                _infer_pointer_storage,
+                            )
+                            from .ssa_record_return_state import (
+                                function_scope_of, ssa_value_identity_cell,
+                            )
+                            selected_reduction = reference.module.functions.get(
+                                axis_kernel
+                            )
+                            if (
+                                selected_reduction is None
+                                or len(selected_reduction.args) != 5
+                                or selected_reduction.metadata.get(
+                                    "ssa_output_argument"
+                                ) != 1
+                                or selected_reduction.metadata.get(
+                                    "named_outputs"
+                                ) != (("out", int(
+                                    selected_reduction.args[1].id
+                                )),)
+                            ):
+                                raise ValueError(
+                                    "runtime scalar reduction lacks selected output formal"
+                                )
+                            link_repository_function(
+                                axis_kernel, selected_reduction,
+                            )
+                            _infer_pointer_storage({
+                                axis_kernel: selected_reduction,
+                            })
+                            formal_cells = tuple(ssa_value_identity_cell(
+                                selected_reduction, int(formal.id), book=book,
+                            ) for formal in selected_reduction.args[:2])
+                            formal_facts = tuple(posted_ssa_value_fact(
+                                selected_reduction, int(formal.id), book=book,
+                            ) for formal in selected_reduction.args[:2])
+                            origins = (
+                                selected_reduction.metadata.get(
+                                    "llvm_repository_kernel"
+                                ) or (None, {})
+                            )[1]
+                            result_fact = posted_ssa_value_fact(
+                                function, int(result.id), book=book,
+                            )
+                            descriptor = tensor_table.by_id(int(result.id))
+                            domain_ref = book.latest_ref(
+                                TENSOR_REDUCTION_DOMAIN,
+                                (function.name, int(result.id)),
+                            )
+                            source_cell = ssa_value_identity_cell(
+                                function, int(source.id), book=book,
+                            )
+                            geometry_cells = tuple(ssa_value_identity_cell(
+                                function, int(value.id), book=book,
+                            ) for value in (
+                                *extents.values(), output_shape,
+                                output_rank_value, output_count,
+                            ))
+                            if (
+                                source_cell is None or domain_ref is None
+                                or any(cell is None for cell in (
+                                    *formal_cells, *geometry_cells,
+                                ))
+                                or any(fact is None or
+                                       fact.physical_dtype != "int64"
+                                       for fact in formal_facts)
+                                or any(
+                                    (origin := origins.get(int(formal.id)))
+                                    is None or origin[1] != "argument"
+                                    or not str(origin[2]).startswith("ptr ")
+                                    for formal in selected_reduction.args[:2]
+                                )
+                                or result_fact is None
+                                or (result_fact.dtype,
+                                    result_fact.physical_dtype,
+                                    result_fact.storage, result_fact.rank)
+                                != ("int64", "int64", "scalar", 0)
+                                or descriptor is None
+                                or descriptor.dtype != "int64"
+                                or descriptor.data_value_id != int(result.id)
+                                or descriptor.metadata_state != "static"
+                            ):
+                                raise ValueError(
+                                    "runtime scalar reduction lacks typed output proof"
+                                )
+                            book.post(
+                                SSA_VALUE,
+                                (function_scope_of(function), int(result.id)),
+                                result_fact,
+                                stage=_REDUCTION_STAGE,
+                                provenance=Derived((
+                                    source_cell, *formal_cells,
+                                    *geometry_cells, domain_ref,
+                                )),
+                                mode=Mode.CONCORD,
+                            )
                         emitted.append(call(
-                            "reduce_dim_double",
-                            [source, reduction_output, extents["shape"], extents["rank"], dim, code],
+                            axis_kernel,
+                            [source, reduction_output, extents["shape"],
+                             extents["rank"], dim]
+                            + ([code] if axis_kernel == "reduce_dim_double" else []),
                             result, instruction, output_argument=1,
                         ))
                     elif axis is not None and source.shape and operation == "mean":
@@ -14166,7 +14610,7 @@ def lower_tensor_calls_to_repository_ssa(
                         # a rank-zero buffer made its caller's scalar a span
                         # of unknown length at the call boundary.
                         result.shape = tuple(map(int, output_shape))
-                        count = need_count(result, _known_count(result))
+                        count = need_count(result, booked_element_count(result))
                         if count is not None:
                             emitted.append(call(
                                 "fill_double", [result, source, count],
@@ -15317,7 +15761,7 @@ def lower_tensor_calls_to_repository_ssa(
                 if recognized and not candidate_only:
                     reason = (
                         "tensor extent/shape or structural operands are not available in SSA"
-                        if source is not None and _known_count(source) is None
+                        if source is not None and booked_element_count(source) is None
                         else "referenced SSA exists but its concrete call operands cannot be derived from this instruction"
                     )
                     reason += (

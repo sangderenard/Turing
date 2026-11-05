@@ -43,6 +43,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "broadcast_double",
     "broadcast_int64",
     "reduce_dim_double",
+    "sum_dim_int64",
     "mean_dim",
     "transpose_double",
     "cumsum_dim_double",
@@ -1003,6 +1004,37 @@ def test_signed_int64_scan_c_kernel_preserves_fixed_width_values():
             np.frombuffer(ffi.buffer(result, 8 * len(values)), dtype=np.int64),
             np.cumsum(values),
         )
+
+
+@pytest.mark.parametrize("values,axis", (
+    (np.empty((0, 3), dtype=np.int64), 0),
+    (np.array([[2**53 + 1, -3, 7]], dtype=np.int64), 0),
+    (np.array([[2**53, 1, -(2**53)],
+               [np.iinfo(np.int64).max, 1, 0]], dtype=np.int64), 1),
+))
+def test_signed_int64_axis_sum_uses_every_limb(llvm_engine, values, axis):
+    shape = values.shape
+    expected = np.sum(values, axis=axis, dtype=np.int64)
+    source = ffi.new("long long[]", values.ravel().tolist())
+    c_result = ffi.new("long long[]", expected.size)
+    c_shape = ffi.new("int[]", list(shape))
+    C.sum_dim_int64(source, c_result, c_shape, 2, axis)
+    c_values = np.frombuffer(
+        ffi.buffer(c_result, 8 * expected.size), dtype=np.int64,
+    ).reshape(expected.shape)
+    llvm_result = (ctypes.c_int64 * expected.size)()
+    _llvm_function(
+        llvm_engine, "sum_dim_int64", ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int32, ctypes.c_int32, result_type=None,
+    )(
+        (ctypes.c_int64 * values.size)(*values.ravel().tolist()),
+        llvm_result, (ctypes.c_int32 * 2)(*shape), 2, axis,
+    )
+    np.testing.assert_array_equal(c_values, expected)
+    np.testing.assert_array_equal(
+        np.ctypeslib.as_array(llvm_result).reshape(expected.shape), expected,
+    )
 
 
 def test_direct_tape_lowering_composes_real_construction_and_reduction_kernels():

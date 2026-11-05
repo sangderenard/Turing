@@ -9858,8 +9858,16 @@ class CorrelationTable:
     @staticmethod
     def _physical_call_input_conversion_findings(module: Any) -> list[Finding]:
         """A converted native argument retains its exact activation and cause."""
-        from .concordance_declarations import CALL_RECORD, CALL_INPUT_CONVERSION, CELL_SET, SSA_VALUE
-        from .ssa_record_return_state import ssa_value_identity_cell
+        from .concordance_declarations import (
+            CALL_RECORD, CALL_INPUT_CONVERSION, CELL_SET,
+            KERNEL_INPUT_CONVERSION, SSA_VALUE, TENSOR_OWNED_HEAP_BINDING,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+        from .tensor_ssa_lowering import (
+            _constant_payload, _dynamic_tensor_geometry_evidence,
+        )
         table = getattr(module, "call_table", None)
         if table is None:
             return []
@@ -9954,6 +9962,248 @@ class CorrelationTable:
                         found.append(Finding("physical-call-conversion-frame", str(caller_name),
                                              None if call.res is None else int(call.res.id),
                                              f"callsite {record.callsite_id}, formal {formal_id}: {detail}"))
+        # _code_lengths scatters a runtime int64 values span. Its selected
+        # double kernel reads one value per selector, so a scalar Cast of the
+        # first element cannot satisfy the counted conversion even when the
+        # numerical total happens to match. The existing kernel conversion
+        # row must name the selected counted Cast, its owned span and the
+        # same count consumed by the scatter Call.
+        kernel_page = book.pages.get(KERNEL_INPUT_CONVERSION.name)
+        scatter_kernels = {
+            "scatter_sum_double", "scatter_mean_double",
+            "scatter_max_double", "scatter_min_double",
+        }
+        scatter_sites = defaultdict(list)
+        for function in functions.values():
+            if (function.metadata.get("llvm_repository_kernel") is not None):
+                continue
+            scope = function_scope_of(function)
+            for block in function.blocks.values():
+                for index, instruction in enumerate(block.instrs):
+                    if (instruction.op == "Call"
+                            and instruction.res is not None
+                            and instruction.attributes.get("callee")
+                            in scatter_kernels):
+                        scatter_sites[(
+                            scope, block.name, int(instruction.res.id),
+                        )].append((function, block, index, instruction))
+        # A removed conversion row must not make the old one-element Cast
+        # disappear from the audit. Every live planned scatter values port is
+        # a float64 span; a selected counted cast additionally needs the row
+        # that joins its original values to this exact consumer.
+        for key, sites in scatter_sites.items():
+            for function, _block, _index, scatter in sites:
+                selected_scatter = functions.get(
+                    scatter.attributes.get("callee"),
+                )
+                selected_formal = (
+                    selected_scatter.args[7]
+                    if selected_scatter is not None
+                    and len(selected_scatter.args) == 8 else None
+                )
+                origin = (
+                    (selected_scatter.metadata.get("llvm_repository_kernel")
+                     or (None, {}))[1].get(int(selected_formal.id))
+                    if selected_formal is not None else None
+                )
+                forwarders = tuple(
+                    instruction for block in selected_scatter.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call"
+                    and instruction.attributes.get("callee")
+                    == "scatter_reduce_double"
+                ) if selected_scatter is not None else ()
+                value = scatter.args[7] if len(scatter.args) == 8 else None
+                physical = (
+                    posted_ssa_value_fact(function, value.id, book=book)
+                    if value is not None else None
+                )
+                definitions = tuple(
+                    instruction for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None and value is not None
+                    and int(instruction.res.id) == int(value.id)
+                )
+                counted_cast = (
+                    len(definitions) == 1 and definitions[0].op == "Call"
+                    and definitions[0].attributes.get("callee")
+                    == "cast_int64_to_double_values"
+                )
+                conversion = (
+                    None if kernel_page is None else kernel_page.latest(
+                        (*key, 2),
+                    )
+                )
+                if (physical is None or physical.physical_dtype != "float64"
+                        or physical.storage != "span"
+                        or type(physical.rank) is not int or physical.rank < 1
+                        or selected_formal is None
+                        or not isinstance(origin, tuple) or len(origin) < 3
+                        or origin[1] != "argument"
+                        or not str(origin[2]).startswith("ptr ")
+                        or len(forwarders) != 1
+                        or len(forwarders[0].args) < 8
+                        or int(forwarders[0].args[7].id)
+                        != int(selected_formal.id)
+                        or counted_cast and (not isinstance(conversion, tuple)
+                            or len(conversion) != 5
+                            or type(conversion[1]) is not int
+                            or int(conversion[1]) != int(value.id))):
+                    found.append(Finding(
+                        "scatter-counted-input-conversion", str(key[0]),
+                        key[2],
+                        "live scatter values port lacks a physical float64 "
+                        "span or its counted conversion receipt",
+                    ))
+        if kernel_page is not None:
+            for row in kernel_page.rows():
+                fact = kernel_page.latest(row)
+                sites = tuple(
+                    scatter_sites.get(tuple(row[:3]), ())
+                    if isinstance(row, tuple) and len(row) == 4 else ()
+                )
+                if not sites:
+                    continue
+                valid = (
+                    isinstance(row, tuple) and len(row) == 4
+                    and row[3] == 2 and type(row[2]) is int
+                    and isinstance(fact, tuple) and len(fact) == 5
+                    and all(type(value) is int for value in fact[:2])
+                    and fact[2:4] == ("int64", "float64")
+                    and fact[4] in scatter_kernels
+                )
+                candidates = tuple(
+                    site for site in sites
+                    if site[3].attributes.get("callee") == fact[4]
+                ) if valid else ()
+                valid = valid and len(sites) == len(candidates) == 1
+                if valid:
+                    function, block, scatter_index, scatter = candidates[0]
+                    source_id, converted_id = fact[:2]
+                    table = module.tensor_tables.get(function.name)
+                    source_desc = None if table is None else table.by_id(source_id)
+                    converted_desc = None if table is None else table.by_id(converted_id)
+                    source_fact = posted_ssa_value_fact(function, source_id, book=book)
+                    converted_fact = posted_ssa_value_fact(function, converted_id, book=book)
+                    source_cell = ssa_value_identity_cell(function, source_id, book=book)
+                    converted_cell = ssa_value_identity_cell(function, converted_id, book=book)
+                    receipt = book.latest_ref(KERNEL_INPUT_CONVERSION, row)
+                    causes = {cell for cell, _ in book.edges_into(receipt)}
+                    selected = functions.get("cast_int64_to_double_values")
+                    typed = tuple(
+                        ssa_value_identity_cell(selected, formal.id, book=book)
+                        for formal in selected.args[:2]
+                    ) if selected is not None and len(selected.args) == 3 else ()
+                    typed_facts = tuple(
+                        posted_ssa_value_fact(selected, formal.id, book=book)
+                        for formal in selected.args[:2]
+                    ) if len(typed) == 2 else ()
+                    converted_causes = (
+                        {cell for cell, _ in book.edges_into(converted_cell)}
+                        if converted_cell is not None else set()
+                    )
+                    origins = (
+                        (selected.metadata.get("llvm_repository_kernel") or (None, {}))[1]
+                        if selected is not None else {}
+                    )
+                    conversions = tuple(
+                        (index, instruction)
+                        for index, instruction in enumerate(block.instrs)
+                        if instruction.op == "Call"
+                        and instruction.res is not None
+                        and int(instruction.res.id) == converted_id
+                    )
+                    owner_ref = book.latest_ref(
+                        TENSOR_OWNED_HEAP_BINDING,
+                        (row[0], function.name, converted_id),
+                    )
+                    owner = (
+                        book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                            owner_ref.row, owner_ref.column,
+                        ) if owner_ref is not None else None
+                    )
+                    valid = (
+                        source_cell is not None and converted_cell is not None
+                        and {source_cell, converted_cell} <= causes
+                        and source_fact is not None
+                        and (source_fact.physical_dtype, source_fact.storage,
+                             source_fact.rank) == ("int64", "span", 1)
+                        and converted_fact is not None
+                        and (converted_fact.physical_dtype, converted_fact.storage,
+                             converted_fact.rank) == ("float64", "span", 1)
+                        and source_desc is not None and converted_desc is not None
+                        and len(typed) == len(typed_facts) == 2
+                        and all(cell is not None and cell in converted_causes
+                                for cell in typed)
+                        and tuple(value.physical_dtype for value in typed_facts)
+                        == ("int64", "float64")
+                        and all(
+                            isinstance(origin := origins.get(int(formal.id)), tuple)
+                            and len(origin) >= 3 and origin[1] == "argument"
+                            and str(origin[2]).startswith("ptr ")
+                            for formal in selected.args[:2]
+                        )
+                        and selected.metadata.get("ssa_output_argument") == 1
+                        and selected.metadata.get("named_outputs")
+                        == (("out", int(selected.args[1].id)),)
+                        and len(conversions) == 1
+                        and len(scatter.args) == 8
+                        and int(scatter.args[7].id) == converted_id
+                        and scatter.attributes.get("ssa_output_argument") == 1
+                    )
+                if valid:
+                    cast_index, cast = conversions[0]
+                    count_id = int(cast.args[2].id) if len(cast.args) == 3 else None
+                    if source_desc.metadata_state == "dynamic":
+                        geometry = _dynamic_tensor_geometry_evidence(
+                            module, function, source_id,
+                        )
+                        count_valid = (
+                            geometry is not None and count_id is not None
+                            and int(geometry[0][2].id) == count_id
+                        )
+                    else:
+                        count_definitions = tuple(
+                            instruction for owner_block in function.blocks.values()
+                            for instruction in owner_block.instrs
+                            if instruction.res is not None
+                            and count_id is not None
+                            and int(instruction.res.id) == count_id
+                        )
+                        count_valid = (
+                            source_desc.metadata_state == "static"
+                            and len(count_definitions) == 1
+                            and count_definitions[0].op == "Const"
+                            and _constant_payload(count_definitions[0])
+                            == source_desc.static_element_count
+                        )
+                    valid = (
+                        cast_index < scatter_index and count_valid
+                        and cast.attributes.get("callee") == selected.name
+                        and cast.attributes.get("ssa_output_argument") == 1
+                        and len(cast.args) == 3
+                        and int(cast.args[0].id) == source_id
+                        and count_id == int(scatter.args[6].id)
+                        and int(cast.args[1].id) == converted_desc.data_value_id
+                        and converted_desc.element_count_value_id == count_id
+                        and (source_desc.metadata_state != "dynamic" or (
+                            converted_desc.metadata_state == "dynamic"
+                            and converted_desc.shape_value_id == source_desc.shape_value_id
+                            and converted_desc.rank_value_id == source_desc.rank_value_id
+                        ))
+                        and owner == (
+                            converted_desc.data_value_id,
+                            converted_desc.heap_owner_value_id,
+                            count_id, "float64",
+                        )
+                    )
+                if not valid:
+                    found.append(Finding(
+                        "scatter-counted-input-conversion", str(row[0]),
+                        row[2] if len(row) == 4 else None,
+                        "scatter values lack exact counted span conversion, "
+                        "selected typed Call or owned output proof",
+                    ))
         return found
 
     @staticmethod
@@ -10233,20 +10483,39 @@ class CorrelationTable:
                     valid = (
                         source_desc is not None and result_desc is not None
                         and source_fact is not None and result_fact is not None
+                        and source_fact.storage == "span"
+                        and (source_fact.physical_dtype == "float64" or (
+                            source_fact.physical_dtype == "int64"
+                            and operation == "sum"
+                            and source_fact.dtype == result_fact.dtype == "int64"
+                            and result_fact.physical_dtype == "int64"
+                            and result_desc.dtype == "int64"
+                        ))
                         and rank is not None and rank >= 1
                         and 0 <= axis < rank
                         and expected_rank is not None
                         and result_fact.rank == expected_rank
                         and source_desc.metadata_state == "dynamic"
-                        and result_desc.metadata_state == "dynamic"
                         and (source_desc.shape_value_id,
                              source_desc.rank_value_id,
                              source_desc.element_count_value_id)
                         == (source_shape, source_rank, source_count)
-                        and (result_desc.shape_value_id,
-                             result_desc.rank_value_id,
-                             result_desc.element_count_value_id)
-                        == (output_shape, output_rank, output_count)
+                        and ((result_desc.metadata_state == "dynamic"
+                              and (result_desc.shape_value_id,
+                                   result_desc.rank_value_id,
+                                   result_desc.element_count_value_id)
+                              == (output_shape, output_rank, output_count))
+                             or (source_fact.physical_dtype == "int64"
+                                 and expected_rank == 0
+                                 and result_fact.storage == "scalar"
+                                 and result_desc.metadata_state == "static"
+                                 and tuple(result_desc.shape) == ()
+                                 and result_desc.data_value_id == int(result_id)
+                                 and result_desc.heap_owner_value_id is None
+                                 and (result_desc.shape_value_id,
+                                      result_desc.rank_value_id,
+                                      result_desc.element_count_value_id)
+                                 == (None, None, None)))
                     )
                 if valid:
                     ref = book.latest_ref(TENSOR_REDUCTION_DOMAIN, row)
@@ -10359,20 +10628,28 @@ class CorrelationTable:
                                 product_id = int(products[0].res.id)
                             valid = valid and product_id == output_count
                 if valid:
-                    kernel = module.functions.get("reduce_dim_double")
+                    # The runtime rank-two int64 sum must retain integer limbs
+                    # above 2**53. Read its selected kernel from the posted
+                    # physical source contract, then check the live typed ABI;
+                    # the logical dtype alone never licenses a double buffer.
+                    integer_sum = source_fact.physical_dtype == "int64"
+                    kernel_name = "sum_dim_int64" if integer_sum else "reduce_dim_double"
+                    kernel_dtype = "int64" if integer_sum else "float64"
+                    arity = 5 if integer_sum else 6
+                    kernel = module.functions.get(kernel_name)
                     calls = tuple(
                         instruction for block in function.blocks.values()
                         for instruction in block.instrs
                         if instruction.op == "Call"
                         and instruction.attributes.get("callee")
-                        == "reduce_dim_double"
-                        and len(instruction.args) == 6
+                        == kernel_name
+                        and len(instruction.args) == arity
                         and int(instruction.args[0].id) == source_id
                         and int(instruction.args[2].id) == source_shape
                         and int(instruction.args[3].id) == source_rank
                     )
                     valid = (kernel is not None
-                             and len(kernel.args) > 1
+                             and len(kernel.args) == arity
                              and (accepted_ssa_component(kernel) or (
                                  isinstance(kernel.metadata.get(
                                      "llvm_repository_kernel"), tuple)
@@ -10387,14 +10664,38 @@ class CorrelationTable:
                 if valid:
                     call = calls[0]
                     dim = definition(int(call.args[4].id), "Const")
-                    code = definition(int(call.args[5].id), "Const")
+                    code = None if integer_sum else definition(int(call.args[5].id), "Const")
                     valid = (
                         dim is not None and dim.attributes.get("constant") == axis
-                        and code is not None
-                        and code.attributes.get("constant")
-                        == _REDUCTION_CODES[operation]
+                        and (integer_sum or (
+                            code is not None
+                            and code.attributes.get("constant")
+                            == _REDUCTION_CODES[operation]
+                        ))
                         and call.res is not None
                     )
+                if valid and integer_sum:
+                    result_ref = book.latest_ref(SSA_VALUE, (scope, int(result_id)))
+                    result_causes = {cause for cause, _ in book.edges_into(result_ref)}
+                    origins = (kernel.metadata.get("llvm_repository_kernel") or (None, {}))[1]
+                    valid = (
+                        int(call.res.id) == int(result_id)
+                        and result_fact.storage == ("span" if expected_rank else "scalar")
+                    )
+                    for formal in kernel.args[:2]:
+                        formal_ref = book.latest_ref(SSA_VALUE, (
+                            function_scope_of(kernel), int(formal.id),
+                        ))
+                        formal_fact = posted_ssa_value_fact(kernel, formal.id, book=book)
+                        origin = origins.get(int(formal.id))
+                        valid = valid and (
+                            formal_ref is not None and formal_ref in result_causes
+                            and formal_fact is not None
+                            and formal_fact.physical_dtype == kernel_dtype
+                            and isinstance(origin, tuple) and len(origin) >= 3
+                            and origin[1] == "argument"
+                            and str(origin[2]).startswith("ptr ")
+                        )
                 if valid and int(call.res.id) == int(result_id):
                     carrier_id = int(call.args[1].id)
                     if carrier_id != int(result_id):

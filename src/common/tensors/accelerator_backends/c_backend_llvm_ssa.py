@@ -70,6 +70,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "broadcast_double": 1,
     "broadcast_int64": 1,
     "reduce_dim_double": 1,
+    "sum_dim_int64": 1,
     "mean_dim": 1,
     "transpose_double": 1,
     "cumsum_dim_double": 1,
@@ -121,6 +122,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "cumsum_dim_double": (2,),
     "cumsum_dim_int64": (2,),
     "reduce_dim_double": (2,),
+    "sum_dim_int64": (2,),
     "scatter_sum_double": (2,),
     "scatter_reduce_double": (2,),
     "scatter_mean_double": (2,),
@@ -137,6 +139,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
 
 C_SSA_I64_POINTER_ARGUMENTS = {
     "cumsum_dim_int64": (0, 1),
+    "sum_dim_int64": (0, 1),
     "sum_int64": (0,),
     "binary_int64": (0, 1, 2),
     "binary_scalar_int64": (0, 2),
@@ -256,6 +259,7 @@ _C_FUNCTION_ROLES = {
     "ctensor_execute_primitive_program_slots": "execution_driver",
     "ctensor_execute_primitive_program": "execution_driver",
     "reduce_dim_double": "tensor_kernel",
+    "sum_dim_int64": "tensor_kernel",
     "transpose_double": "tensor_kernel",
     "where_double": "tensor_kernel",
     "broadcast_double": "tensor_kernel",
@@ -2942,6 +2946,99 @@ exit:
   ret void
 }
 
+; An axis sum of signed-int64 values uses add i64 without nsw. The result
+; has the same fixed-width wrap as NumPy and never passes through double.
+define internal void @sum_dim_int64(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.continue = icmp slt i32 %before.axis, %dim
+  br i1 %before.continue, label %before.body, label %after.entry
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.entry:
+  %after.start = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.start, %after.entry ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.entry ], [ %after.next, %after.body ]
+  %after.continue = icmp slt i32 %after.axis, %ndim
+  br i1 %after.continue, label %after.body, label %dimensions.ready
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+dimensions.ready:
+  %dim64 = sext i32 %dim to i64
+  %count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %count = load i32, ptr %count.ptr, align 4
+  br label %b.header
+
+b.header:
+  %b = phi i32 [ 0, %dimensions.ready ], [ %b.next, %b.latch ]
+  %b.continue = icmp slt i32 %b, %before
+  br i1 %b.continue, label %tail.header, label %exit
+
+tail.header:
+  %tail = phi i32 [ 0, %b.header ], [ %tail.next, %tail.latch ]
+  %tail.continue = icmp slt i32 %tail, %after
+  br i1 %tail.continue, label %d.header, label %b.latch
+
+d.header:
+  %d = phi i32 [ 0, %tail.header ], [ %d.next, %d.body ]
+  %accum = phi i64 [ 0, %tail.header ], [ %accum.next, %d.body ]
+  %d.continue = icmp slt i32 %d, %count
+  br i1 %d.continue, label %d.body, label %store
+
+d.body:
+  %b.count = mul nsw i32 %b, %count
+  %bd = add nsw i32 %b.count, %d
+  %bd.after = mul nsw i32 %bd, %after
+  %index = add nsw i32 %bd.after, %tail
+  %index64 = sext i32 %index to i64
+  %input.ptr = getelementptr inbounds i64, ptr %input, i64 %index64
+  %value = load i64, ptr %input.ptr, align 8
+  %accum.next = add i64 %accum, %value
+  %d.next = add nsw i32 %d, 1
+  br label %d.header
+
+store:
+  %output.base = mul nsw i32 %b, %after
+  %output.index = add nsw i32 %output.base, %tail
+  %output.index64 = sext i32 %output.index to i64
+  %output.ptr = getelementptr inbounds i64, ptr %output, i64 %output.index64
+  store i64 %accum, ptr %output.ptr, align 8
+  br label %tail.latch
+
+tail.latch:
+  %tail.next = add nsw i32 %tail, 1
+  br label %tail.header
+
+b.latch:
+  %b.next = add nsw i32 %b, 1
+  br label %b.header
+
+exit:
+  ret void
+}
+
 define internal void @reduce_dim_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim, i32 %op) {
 entry:
@@ -3670,6 +3767,12 @@ TRANSLATIONS = (
         "reduce_dim_double",
         ("sum", "prod", "min", "max", "any", "all"),
         "arbitrary-rank single-dimension reduction",
+    ),
+    CBackendLLVMSSA(
+        "sum_dim_int64",
+        "sum_dim_int64",
+        ("sum",),
+        "arbitrary-rank signed-int64 single-dimension sum",
     ),
     CBackendLLVMSSA(
         "mean_dim",

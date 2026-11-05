@@ -597,6 +597,27 @@
         }
     }
 
+    // An axis sum keeps the exact signed-int64 bits. NumPy's fixed-width
+    // sum wraps; unsigned accumulation avoids signed C overflow.
+    void sum_dim_int64(
+        const int64_t* input, int64_t* output, const int* shape,
+        int ndim, int dim) {
+        int before = 1;
+        int after = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        int count = shape[dim];
+        for (int b = 0; b < before; ++b) {
+            for (int tail = 0; tail < after; ++tail) {
+                uint64_t bits = 0;
+                for (int d = 0; d < count; ++d) {
+                    bits += (uint64_t)input[(b * count + d) * after + tail];
+                }
+                memcpy(&output[b * after + tail], &bits, sizeof(bits));
+            }
+        }
+    }
+
     void argreduce_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int find_max) {

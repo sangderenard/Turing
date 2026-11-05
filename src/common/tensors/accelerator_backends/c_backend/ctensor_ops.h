@@ -106,6 +106,13 @@ void cumsum_dim_int64(
     int ndim,
     int dim);
 
+void sum_dim_int64(
+    const int64_t* input,
+    int64_t* output,
+    const int* shape,
+    int ndim,
+    int dim);
+
 void gather_values_double(
     const double* input,
     double* output,

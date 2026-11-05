@@ -132,6 +132,9 @@ ffi.cdef("""
     void cumsum_dim_int64(
         const long long* input, long long* output, const int* shape,
         int ndim, int dim);
+    void sum_dim_int64(
+        const long long* input, long long* output, const int* shape,
+        int ndim, int dim);
     void argreduce_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int find_max);
