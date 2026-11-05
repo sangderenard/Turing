@@ -104,7 +104,33 @@ const CEL_PALETTE = 192;
 const CEL_VS = `#version 300 es
 layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNorm; layout(location=2) in int aMat;
 uniform mat4 uMVP; uniform mat4 uMV; flat out int vMat; out vec3 vN;
-void main(){ vMat = aMat; vN = mat3(uMV) * aNorm; gl_Position = uMVP * vec4(aPos, 1.0); }`;
+// Soft-body free-form deformation: a 2x2x2 lattice of control-point offsets (in
+// units of the mesh's half-extent, corner i = x + 2y + 4z) displaces each vertex
+// by their trilinear blend, which is what makes twist (and not only shear) show.
+uniform int uFfd; uniform vec3 uCage[8]; uniform vec3 uCtr; uniform vec3 uHalf;
+void main(){
+  vec3 pos = aPos, n = aNorm;
+  if (uFfd == 1) {
+    vec3 u = clamp((aPos - uCtr) / uHalf * 0.5 + 0.5, 0.0, 1.0);
+    vec3 o = vec3(0.0), dx = vec3(0.0), dy = vec3(0.0), dz = vec3(0.0);
+    for (int i = 0; i < 8; i++) {
+      float ix = float(i & 1), iy = float((i >> 1) & 1), iz = float((i >> 2) & 1);
+      float wx = mix(1.0 - u.x, u.x, ix), wy = mix(1.0 - u.y, u.y, iy), wz = mix(1.0 - u.z, u.z, iz);
+      o += wx * wy * wz * uCage[i];
+      dx += (2.0 * ix - 1.0) * wy * wz * uCage[i];
+      dy += wx * (2.0 * iy - 1.0) * wz * uCage[i];
+      dz += wx * wy * (2.0 * iz - 1.0) * uCage[i];
+    }
+    pos = aPos + o * uHalf;
+    // Jacobian columns in mesh space; the normal follows the cofactor (inverse transpose).
+    vec3 a = (vec3(1.0, 0.0, 0.0) + 0.5 * dx) * uHalf / uHalf.x;
+    vec3 b = (vec3(0.0, 1.0, 0.0) + 0.5 * dy) * uHalf / uHalf.y;
+    vec3 c = (vec3(0.0, 0.0, 1.0) + 0.5 * dz) * uHalf / uHalf.z;
+    vec3 nn = cross(b, c) * aNorm.x + cross(c, a) * aNorm.y + cross(a, b) * aNorm.z;
+    if (dot(nn, nn) > 1e-12) n = normalize(nn);
+  }
+  vMat = aMat; vN = mat3(uMV) * n; gl_Position = uMVP * vec4(pos, 1.0);
+}`;
 const CEL_FS = `#version 300 es
 precision highp float; in vec3 vN; flat in int vMat; out vec4 FragColor;
 uniform vec3 uPal[${CEL_PALETTE}]; uniform int uOutline;
@@ -193,7 +219,11 @@ function uploadMesh(mesh) {
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
   gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 32, 24);
   gl.bindVertexArray(null);
-  return { vao, count, extent: mesh.extent };
+  // bounding box: the soft-body cage's rest lattice sits on its corners
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < count; i++) for (let k = 0; k < 3; k++) { const v = mesh.positions[i*3+k]; if (v < lo[k]) lo[k] = v; if (v > hi[k]) hi[k] = v; }
+  const center = count ? lo.map((v, k) => (v + hi[k]) / 2) : [0, 0, 0], half = count ? lo.map((v, k) => Math.max((hi[k] - v) / 2, 1e-4)) : [1, 1, 1];
+  return { vao, count, extent: mesh.extent, center, half };
 }
 
 // Client-side corner rounding of the extruded glyph meshes: weld, crease-angle smooth
@@ -791,6 +821,265 @@ function pieceModel(piece, now) {
   m = M.multiply(m, M.scale(scale, scale, flat ? scale * FLAT_THICK : scale));
   return m;
 }
+// ---------------------------------------------------------------- soft bodies
+// Every drawn piece carries a 2x2x2 spring cage on its mesh's bounding box
+// (corner i = x + 2y + 4z, offsets in units of the half-extent).  Each cage
+// node is a damped oscillator back to rest.  The piece's own drawn motion drives
+// it as an inertial (non-inertial-frame) impulse: a change of the piece's
+// velocity dv and of its angular velocity dw kicks node n by
+//     du = -weight(n) * (dv + dw x r_n) / halfExtent_world
+// where weight is larger on the side away from the "base" (high above the tile
+// in the lit view, the glyph's head in the flat view), so lag becomes SHEAR, a
+// landing/hop becomes squash/stretch and a turn becomes twist.  Between kicks
+// the oscillator is advanced with its closed-form solution (a fixed 2x2
+// transition matrix per frame), so it is stable at any frame time.  The same
+// kernel exists twice, as CPU JS and as a WebGPU compute shader; both read the
+// per-slot parameter block P (16 floats) and keep D (offsets) and U (rates).
+const WOB_CAP = 512, WOB_TAU = 0.02, WOB_DMAX = 0.45, WOB_GAIN = 0.3, WOB_ZETA = 0.22;
+const wob = {
+  on: true, useGpu: false, freq: 8, frameNo: 0, lastNow: null, hi: -1,
+  D: new Float32Array(WOB_CAP * 24), U: new Float32Array(WOB_CAP * 24), P: new Float32Array(WOB_CAP * 16),
+  owner: new Array(WOB_CAP).fill(null), touched: new Int32Array(WOB_CAP), resetFrame: new Int32Array(WOB_CAP),
+  free: Array.from({ length: WOB_CAP }, (_, i) => WOB_CAP - 1 - i), gpu: null, gpuState: "off", resetAll: false,
+  msStep: 0, msSample: 0, msTotal: 0,
+};
+state.wobble = wob;
+
+function wobTransition(dt, freq) {                       // exact step of d'' + 2 z w d' + w^2 d = 0
+  const w = 2 * Math.PI * freq, z = WOB_ZETA, wd = w * Math.sqrt(1 - z * z), e = Math.exp(-z * w * dt);
+  const C = Math.cos(wd * dt), S = Math.sin(wd * dt), zw = z * w;
+  return [e * (C + zw / wd * S), e * S / wd, -e * w * w / wd * S, e * (C - zw / wd * S)];
+}
+
+// CPU kernel: P/D/U are typed arrays; slots 0..hi; T = [a, b, c, e].
+function wobCpuKernel(P, D, U, hi, T) {
+  const [ta, tb, tc, te] = T, k3 = [0, 0, 0];
+  for (let s = 0; s <= hi; s++) {
+    const p = s * 16, f = P[p + 3]; if (f < 0.5) continue;
+    const base = s * 24;
+    if (f > 1.5) for (let k = 0; k < 24; k++) { D[base + k] = 0; U[base + k] = 0; }
+    const dvx = P[p], dvy = P[p+1], dvz = P[p+2], wx = P[p+4], wy = P[p+5], wz = P[p+6];
+    const hx = P[p+8], hy = P[p+9], hz = P[p+10], gx = P[p+12], gy = P[p+13], gz = P[p+14];
+    for (let n = 0; n < 8; n++) {
+      const rx = n & 1 ? 1 : -1, ry = n & 2 ? 1 : -1, rz = n & 4 ? 1 : -1;
+      const wt = 0.15 + 0.85 * (0.5 + 0.5 * (gx * rx + gy * ry + gz * rz));
+      const px = hx * rx, py = hy * ry, pz = hz * rz;
+      k3[0] = (dvx + (wy * pz - wz * py)) / hx; k3[1] = (dvy + (wz * px - wx * pz)) / hy; k3[2] = (dvz + (wx * py - wy * px)) / hz;
+      const b = base + n * 3;
+      for (let j = 0; j < 3; j++) {
+        const kick = Math.max(-40, Math.min(40, -wt * WOB_GAIN * k3[j]));
+        const u0 = U[b + j] + kick, d0 = D[b + j];
+        const d1 = ta * d0 + tb * u0, u1 = tc * d0 + te * u0;
+        D[b + j] = Math.max(-WOB_DMAX, Math.min(WOB_DMAX, d1)); U[b + j] = u1;
+      }
+    }
+  }
+}
+
+const WOB_WGSL = `
+struct G { a: f32, b: f32, c: f32, e: f32, dmax: f32, n: u32, gain: f32, pad: f32 };
+@group(0) @binding(0) var<uniform> g : G;
+@group(0) @binding(1) var<storage, read> P : array<f32>;
+@group(0) @binding(2) var<storage, read_write> D : array<f32>;
+@group(0) @binding(3) var<storage, read_write> U : array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let t = id.x;
+  if (t >= g.n * 8u) { return; }
+  let s = t / 8u; let n = t % 8u; let p = s * 16u;
+  let f = P[p + 3u];
+  if (f < 0.5) { return; }
+  let b = s * 24u + n * 3u;
+  var d = vec3<f32>(D[b], D[b + 1u], D[b + 2u]);
+  var u = vec3<f32>(U[b], U[b + 1u], U[b + 2u]);
+  if (f > 1.5) { d = vec3<f32>(0.0); u = vec3<f32>(0.0); }
+  let dv = vec3<f32>(P[p], P[p + 1u], P[p + 2u]);
+  let w = vec3<f32>(P[p + 4u], P[p + 5u], P[p + 6u]);
+  let h = vec3<f32>(P[p + 8u], P[p + 9u], P[p + 10u]);
+  let gd = vec3<f32>(P[p + 12u], P[p + 13u], P[p + 14u]);
+  let r = vec3<f32>(select(-1.0, 1.0, (n & 1u) != 0u), select(-1.0, 1.0, (n & 2u) != 0u), select(-1.0, 1.0, (n & 4u) != 0u));
+  let wt = 0.15 + 0.85 * (0.5 + 0.5 * dot(gd, r));
+  let k = (dv + cross(w, h * r)) / h;
+  let kick = clamp(-wt * g.gain * k, vec3<f32>(-40.0), vec3<f32>(40.0));
+  u = u + kick;
+  let d1 = g.a * d + g.b * u;
+  let u1 = g.c * d + g.e * u;
+  let dc = clamp(d1, vec3<f32>(-g.dmax), vec3<f32>(g.dmax));
+  D[b] = dc.x; D[b + 1u] = dc.y; D[b + 2u] = dc.z;
+  U[b] = u1.x; U[b + 1u] = u1.y; U[b + 2u] = u1.z;
+}`;
+
+// One WebGPU cage: persistent D/U on the GPU, per-frame P and transition
+// uploaded, D read back (asynchronously, through a small ring of staging buffers).
+function makeGpuCage(device, cap) {
+  const S = GPUBufferUsage, mk = (size, usage) => device.createBuffer({ size, usage });
+  const pbuf = mk(cap * 64, S.STORAGE | S.COPY_DST), dbuf = mk(cap * 96, S.STORAGE | S.COPY_SRC | S.COPY_DST),
+        ubuf = mk(cap * 96, S.STORAGE | S.COPY_DST), gbuf = mk(32, S.UNIFORM | S.COPY_DST);
+  const module = device.createShaderModule({ code: WOB_WGSL });
+  const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+  const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [gbuf, pbuf, dbuf, ubuf].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+  const staging = Array.from({ length: 3 }, () => mk(cap * 96, S.MAP_READ | S.COPY_DST));
+  const free = staging.slice(), gv = new ArrayBuffer(32), gf = new Float32Array(gv), gu = new Uint32Array(gv);
+  return {
+    device,
+    // One step; resolves with the offsets read back (null if every staging buffer is still in flight).
+    step(P, hi, T) {
+      const n = hi + 1; if (n <= 0) return Promise.resolve(null);
+      device.queue.writeBuffer(pbuf, 0, P, 0, n * 16);
+      gf[0] = T[0]; gf[1] = T[1]; gf[2] = T[2]; gf[3] = T[3]; gf[4] = WOB_DMAX; gu[5] = n; gf[6] = WOB_GAIN;
+      device.queue.writeBuffer(gbuf, 0, gv);
+      const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+      pass.setPipeline(pipeline); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(Math.ceil(n * 8 / 64)); pass.end();
+      const st = free.pop(), bytes = n * 96;
+      if (st) enc.copyBufferToBuffer(dbuf, 0, st, 0, bytes);
+      device.queue.submit([enc.finish()]);
+      if (!st) return Promise.resolve(null);
+      return st.mapAsync(GPUMapMode.READ, 0, bytes).then(() => {
+        const out = new Float32Array(st.getMappedRange(0, bytes).slice(0)); st.unmap(); free.push(st); return out;
+      });
+    },
+    destroy() { for (const b of [pbuf, dbuf, ubuf, gbuf, ...staging]) b.destroy(); },
+  };
+}
+async function wobInitGpu() {
+  if (wob.gpu || wob.gpuState === "pending") return;
+  wob.gpuState = "pending";
+  try {
+    const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error("no adapter");
+    const device = await adapter.requestDevice();
+    device.lost.then(() => { wob.gpu = null; wob.gpuState = "lost"; wob.useGpu = false; syncWobbleUi(); });
+    wob.gpu = makeGpuCage(device, WOB_CAP); wob.gpuState = "ready"; wob.resetAll = true;
+  } catch (e) { console.warn("WebGPU wobble unavailable:", e); wob.gpuState = "failed"; wob.useGpu = false; syncWobbleUi(); }
+}
+// Run the same random inputs through the CPU kernel and a fresh GPU cage; returns the largest difference.
+async function wobbleParity(steps = 120) {
+  if (!navigator.gpu) return null;
+  const device = await (await navigator.gpu.requestAdapter()).requestDevice(), cap = 16, cage = makeGpuCage(device, cap);
+  const P = new Float32Array(cap * 16), D = new Float32Array(cap * 24), U = new Float32Array(cap * 24);
+  let seed = 12345; const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296 - 0.5;
+  let worst = 0;
+  for (let t = 0; t < steps; t++) {
+    for (let s = 0; s < cap; s++) {
+      const p = s * 16; P[p] = rnd() * 6; P[p+1] = rnd() * 6; P[p+2] = rnd() * 6; P[p+3] = t === 0 ? 2 : (s % 5 === 4 ? 0 : 1);
+      P[p+4] = rnd() * 20; P[p+5] = rnd() * 20; P[p+6] = rnd() * 20;
+      P[p+8] = 0.1 + Math.abs(rnd()); P[p+9] = 0.1 + Math.abs(rnd()); P[p+10] = 0.05 + Math.abs(rnd());
+      P[p+12] = rnd() * 2; P[p+13] = rnd() * 2; P[p+14] = rnd() * 2;
+    }
+    const T = wobTransition(0.005 + Math.abs(rnd()) * 0.2, 8);
+    wobCpuKernel(P, D, U, cap - 1, T);
+    const out = await cage.step(P, cap - 1, T);
+    for (let i = 0; i < cap * 24; i++) worst = Math.max(worst, Math.abs(out[i] - D[i]));
+  }
+  cage.destroy(); device.destroy(); return worst;
+}
+wob.parity = wobbleParity;
+
+// ---- sampling a piece's drawn motion -> the cage's parameter block
+function wobSlot(piece) {
+  let w = piece.wob; if (!w) w = piece.wob = { slot: -1, t: null, p: [0, 0, 0], R: null, v: [0, 0, 0], om: [0, 0, 0] };
+  if (w.slot < 0) {
+    if (!wob.free.length) return null;
+    w.slot = wob.free.pop(); wob.owner[w.slot] = piece; wob.resetFrame[w.slot] = wob.frameNo; w.fresh = true; w.t = null;
+    w.v = [0, 0, 0]; w.om = [0, 0, 0];
+    wob.D.fill(0, w.slot * 24, w.slot * 24 + 24); wob.U.fill(0, w.slot * 24, w.slot * 24 + 24);
+  }
+  wob.touched[w.slot] = wob.frameNo; if (w.slot > wob.hi) wob.hi = w.slot;
+  return w;
+}
+function wobSample(piece, m, now) {
+  const w = wobSlot(piece); if (!w) return;
+  const p = w.slot * 16, P = wob.P;
+  const s0 = Math.hypot(m[0], m[1], m[2]), s1 = Math.hypot(m[4], m[5], m[6]), s2 = Math.hypot(m[8], m[9], m[10]);
+  const mesh = state.meshes[piece.mesh];
+  if (s0 < 1e-5 || s1 < 1e-5 || s2 < 1e-5 || !mesh) { P[p+3] = 0; w.t = null; return; }
+  const R = [m[0]/s0, m[1]/s0, m[2]/s0, m[4]/s1, m[5]/s1, m[6]/s1, m[8]/s2, m[9]/s2, m[10]/s2];   // columns = local axes in the world
+  const pos = [m[12], m[13], m[14]], sc = [s0, s1, s2];
+  const dv = [0, 0, 0], dw = [0, 0, 0];
+  const dt = w.t == null ? 0 : now - w.t;
+  if (w.t != null && dt > 1e-4 && dt <= 0.1 && w.R) {
+    const vr = [(pos[0]-w.p[0])/dt, (pos[1]-w.p[1])/dt, (pos[2]-w.p[2])/dt];
+    // relative rotation Q = Rn Ro^T; its antisymmetric part is sin(theta) * axis
+    const A = R, B = w.R, Q = (i, j) => A[i]*B[j] + A[3+i]*B[3+j] + A[6+i]*B[6+j];   // Q[row i][col j] (columns stored as A[3c+row])
+    const vee = [(Q(2, 1) - Q(1, 2)) / 2, (Q(0, 2) - Q(2, 0)) / 2, (Q(1, 0) - Q(0, 1)) / 2];
+    const wr = [vee[0]/dt, vee[1]/dt, vee[2]/dt];
+    if (Math.hypot(...vr) < 30 && Math.hypot(...wr) < 60) {            // a respawn or flip is not motion
+      const a = 1 - Math.exp(-dt / WOB_TAU);
+      for (let k = 0; k < 3; k++) {
+        const vn = w.v[k] + (vr[k] - w.v[k]) * a, on = w.om[k] + (wr[k] - w.om[k]) * a;
+        dv[k] = vn - w.v[k]; dw[k] = on - w.om[k]; w.v[k] = vn; w.om[k] = on;
+      }
+    } else { w.v = [0, 0, 0]; w.om = [0, 0, 0]; }
+  }
+  w.t = now; w.p = pos; w.R = R;
+  // world -> mesh-local (R^T); half-extents measured in the world
+  const loc = (v) => [R[0]*v[0] + R[1]*v[1] + R[2]*v[2], R[3]*v[0] + R[4]*v[1] + R[5]*v[2], R[6]*v[0] + R[7]*v[1] + R[8]*v[2]];
+  const dvl = loc(dv), dwl = loc(dw);
+  const hw = [Math.max(sc[0] * mesh.half[0], 0.03), Math.max(sc[1] * mesh.half[1], 0.03), Math.max(sc[2] * mesh.half[2], 0.03)];
+  let g;
+  if (state.flat) g = [0, 1, 0];                                       // plan view: the glyph's head lags its foot
+  else {                                                                // lit view: high above the tile lags
+    g = [R[1] * hw[0], R[4] * hw[1], R[7] * hw[2]]; const ym = Math.abs(g[0]) + Math.abs(g[1]) + Math.abs(g[2]);
+    g = ym > 1e-6 ? [g[0]/ym, g[1]/ym, g[2]/ym] : [0, 0, 0];
+  }
+  P[p] = dvl[0]; P[p+1] = dvl[1]; P[p+2] = dvl[2]; P[p+3] = (w.fresh || wob.resetAll) ? 2 : 1;
+  P[p+4] = dwl[0]; P[p+5] = dwl[1]; P[p+6] = dwl[2];
+  P[p+8] = hw[0]; P[p+9] = hw[1]; P[p+10] = hw[2]; P[p+12] = g[0]; P[p+13] = g[1]; P[p+14] = g[2];
+  if (wob.resetAll) { wob.resetFrame[w.slot] = wob.frameNo; wob.D.fill(0, w.slot * 24, w.slot * 24 + 24); }
+  w.fresh = false;
+}
+function wobStep(now) {
+  const dt = Math.min(0.1, Math.max(0.001, now - (wob.lastNow ?? now))); wob.lastNow = now;
+  const T = wobTransition(dt, wob.freq), hi = wob.hi;
+  if (hi >= 0 && wob.useGpu && wob.gpu) {
+    const issued = wob.frameNo;
+    wob.gpu.step(wob.P, hi, T).then((out) => {
+      if (!out) return;
+      for (let s = 0; s <= hi; s++) if (wob.owner[s] && wob.resetFrame[s] <= issued) wob.D.set(out.subarray(s * 24, s * 24 + 24), s * 24);
+    }).catch((e) => console.warn("wobble readback", e));
+  } else if (hi >= 0) wobCpuKernel(wob.P, wob.D, wob.U, hi, T);
+  wob.resetAll = false;
+}
+// Per frame: sample every piece, step, free the slots no piece touched, then deform.
+function wobFrame(casters, now) {
+  const t0 = performance.now();
+  wob.frameNo++; wob.hi = -1; wob.P.fill(0);
+  for (const c of casters) if (c[3]) wobSample(c[3], c[2], now);
+  const t1 = performance.now();
+  wobStep(now);
+  for (let s = 0; s < WOB_CAP; s++) {
+    const o = wob.owner[s]; if (!o || wob.touched[s] === wob.frameNo) continue;
+    o.wob.slot = -1; wob.owner[s] = null; wob.free.push(s);
+  }
+  wob.msSample = t1 - t0; wob.msStep = performance.now() - t1;
+  // best-fit affine for the lit model; the flat shader takes the raw cage
+  for (const c of casters) {
+    const piece = c[3]; if (!piece) continue;
+    if (!piece.wob || piece.wob.slot < 0) { piece.cage = null; continue; }
+    const mesh = state.meshes[piece.mesh], b = piece.wob.slot * 24, D = wob.D;
+    piece.cage = { slot: piece.wob.slot, mesh };
+    if (state.flat) continue;
+    // least squares over the +-1 lattice: translation = mean offset, linear part = sum(off_n r_n^T) / 8
+    const t = [0, 0, 0], L = new Float64Array(9);
+    for (let n = 0; n < 8; n++) {
+      const r = [n & 1 ? 1 : -1, n & 2 ? 1 : -1, n & 4 ? 1 : -1];
+      for (let j = 0; j < 3; j++) { const d = D[b + n*3 + j]; t[j] += d / 8; for (let k = 0; k < 3; k++) L[j*3 + k] += d * r[k] / 8; }
+    }
+    const H = mesh.half, C = mesh.center, A = new Float32Array(16); A[15] = 1;
+    for (let j = 0; j < 3; j++) {
+      let off = C[j] + H[j] * t[j];
+      for (let k = 0; k < 3; k++) { const v = H[j] * ((j === k ? 1 : 0) + L[j*3 + k]) / H[k]; A[k*4 + j] = v; off -= v * C[k]; }
+      A[12 + j] = off;
+    }
+    c[2] = M.multiply(c[2], A);
+  }
+  wob.msTotal = performance.now() - t0;
+}
+function syncWobbleUi() {
+  const g = $("wobble-gpu"); if (!g) return;
+  g.checked = wob.useGpu; $("wobble-gpu-label").style.display = navigator.gpu ? "" : "none";
+  $("wobble-gpu-label").title = wob.gpuState === "failed" ? "WebGPU failed; using the CPU" : "Run the cage update as a WebGPU compute shader (results are read back one or two frames late)";
+}
+
 function applyState(game) {
   // While the real-time socket is open it owns the entities; a state that
   // arrives by HTTP (reset, layout, the socket's own meta) leaves them alone.
@@ -877,6 +1166,7 @@ function draw(ms) {
     casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
   }
   for (const key of removed) state.pieces.delete(key);
+  if (wob.on) wobFrame(casters, now); else for (const c of casters) if (c[3]) c[3].cage = null;
   if (state.flat) { drawFlat(cam, casters); requestAnimationFrame(draw); return; }
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -941,7 +1231,11 @@ function drawFlat(cam, casters) {
   const P = state.programs.cel; gl.useProgram(P);
   gl.uniform3fv(gl.getUniformLocation(P, "uPal[0]"), state.celPalette);
   const mvpLoc = gl.getUniformLocation(P, "uMVP"), mvLoc = gl.getUniformLocation(P, "uMV"), outLoc = gl.getUniformLocation(P, "uOutline");
-  const drawOne = (vao, count, model, materialId, outline) => {
+  const ffdLoc = gl.getUniformLocation(P, "uFfd"), cageLoc = gl.getUniformLocation(P, "uCage[0]"), ctrLoc = gl.getUniformLocation(P, "uCtr"), halfLoc = gl.getUniformLocation(P, "uHalf");
+  const drawOne = (vao, count, model, materialId, outline, piece) => {
+    const cg = piece && piece.cage;
+    gl.uniform1i(ffdLoc, cg ? 1 : 0);
+    if (cg) { gl.uniform3fv(cageLoc, wob.D.subarray(cg.slot * 24, cg.slot * 24 + 24)); gl.uniform3fv(ctrLoc, cg.mesh.center); gl.uniform3fv(halfLoc, cg.mesh.half); }
     const mv = M.multiply(cam.view, model);
     gl.uniformMatrix4fv(mvpLoc, false, M.multiply(cam.proj, mv)); gl.uniformMatrix4fv(mvLoc, false, mv);
     gl.uniform1i(outLoc, outline ? 1 : 0);
@@ -951,8 +1245,8 @@ function drawFlat(cam, casters) {
   };
   for (const [vao, count, model, piece] of casters) if (!piece) drawOne(vao, count, model, null, false);
   const grow = M.scale(FLAT_OUTLINE, FLAT_OUTLINE, 1), drop = M.translate(0, -0.006, 0);
-  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, M.multiply(drop, M.multiply(model, grow)), null, true);
-  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, model, state.materialIndex[piece.color], false);
+  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, M.multiply(drop, M.multiply(model, grow)), null, true, piece);
+  for (const [vao, count, model, piece] of casters) if (piece) drawOne(vao, count, model, state.materialIndex[piece.color], false, piece);
   gl.bindVertexArray(null);
 }
 
@@ -1153,6 +1447,14 @@ function toggleLight() { light.follow = !light.follow; $("light").textContent = 
 $("light").onclick = toggleLight;
 function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
 $("flat").onclick = toggleFlat;
+$("wobble").onchange = (e) => { wob.on = e.target.checked; wob.lastNow = null; };
+$("wobble-k").oninput = (e) => { wob.freq = Number(e.target.value); };
+$("wobble-gpu").onchange = async (e) => {
+  wob.useGpu = e.target.checked; wob.resetAll = true;
+  if (wob.useGpu) { await wobInitGpu(); if (!wob.gpu) wob.useGpu = false; }
+  syncWobbleUi();
+};
+syncWobbleUi();
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement && e.target.type === "text") return;
   if ((e.key === "v" || e.key === "V") && !e.ctrlKey && !e.metaKey && !(state.game && state.game.input === "text")) toggleFlat();

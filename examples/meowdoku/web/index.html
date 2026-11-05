@@ -68,6 +68,9 @@
   <label class="meowdoku-only">Palette <select id="palette"></select></label>
   <button id="light">Light: orbit (L)</button>
   <button id="flat">Flat (V)</button>
+  <label title="Soft bodies: pieces shear, squash and twist as they move"><input id="wobble" type="checkbox" checked> Wobble</label>
+  <label>Stiff <input id="wobble-k" type="range" min="2" max="16" value="8"></label>
+  <label id="wobble-gpu-label" style="display:none"><input id="wobble-gpu" type="checkbox"> WebGPU</label>
   <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="100"></label>
   <label>Round <input id="round" type="range" min="0" max="4" value="2"></label>
