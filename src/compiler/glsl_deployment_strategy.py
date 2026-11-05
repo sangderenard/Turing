@@ -31146,6 +31146,12 @@ def _fold_callsite_structural_values(
         if descriptor is None:
             return unresolved
         if attribute == "shape":
+            # Package-Merge reads current_weights.shape[0] inside a loop.
+            # Its dynamic rank-one descriptor spells shape=() as an unknown
+            # extent; folding that display to a literal retired the exact
+            # current_weights lexical read needed by the carried loop state.
+            if not descriptor_states_a_shape(descriptor):
+                return unresolved
             return descriptor["shape"]
         if attribute in {"ndim", "ndims"}:
             if not _descriptor_states_tensor_contract(descriptor):
