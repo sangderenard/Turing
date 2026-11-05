@@ -168,6 +168,92 @@ function arrayTexture(unit, rgba) {
   gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, 1, 1, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([...rgba, ...rgba]));
   return tex;
 }
+// ---------------------------------------------------------------- scrolling terrain
+// A procedural height map (tileable fractal value noise), shown through the
+// Phong shader's colour texture stack: albedo by height (water, sand, grass,
+// rock, snow), hillshaded from the map's own slopes so the relief reads.  The
+// ground quad's UVs advance every frame (TERRAIN.speed board units a second),
+// rolling the land beneath a game that declares a "terrain" layer.
+const TERRAIN = { size: 256, layer: 0, tile: 6.0, speed: 2.4, scroll: 0, mesh: null, at: null };
+function terrainHeights(n, seed = 7) {
+  const lattice = (period, salt) => {
+    const g = new Float32Array(period * period);
+    for (let i = 0; i < g.length; i++) { const s = Math.sin((i + 1) * 12.9898 + salt * 78.233 + seed) * 43758.5453; g[i] = s - Math.floor(s); }
+    return g;
+  };
+  const height = new Float32Array(n * n);
+  let amp = 1.0, total = 0;
+  for (let octave = 0, period = 4; octave < 6; octave++, period *= 2, amp *= 0.5) {
+    const g = lattice(period, octave), cell = n / period;
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      const fx = x / cell, fy = y / cell, x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const tx = fx - x0, ty = fy - y0, sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+      const at = (a, b) => g[((b % period) * period) + (a % period)];
+      const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * sx, bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * sx;
+      height[y * n + x] += amp * (top + (bottom - top) * sy);
+    }
+    total += amp;
+  }
+  for (let i = 0; i < height.length; i++) height[i] /= total;
+  return height;
+}
+function terrainTexture(unit) {
+  const n = TERRAIN.size, h = terrainHeights(n), rgba = new Uint8Array(n * n * 4);
+  const ramp = [[0.00, [0.10, 0.22, 0.42]], [0.40, [0.20, 0.42, 0.62]], [0.44, [0.78, 0.72, 0.48]],
+                [0.50, [0.32, 0.58, 0.26]], [0.62, [0.22, 0.44, 0.20]], [0.72, [0.46, 0.40, 0.34]], [0.84, [0.92, 0.93, 0.96]]];
+  const colourOf = (v) => {
+    for (let i = 1; i < ramp.length; i++) if (v <= ramp[i][0]) {
+      const [a, ca] = ramp[i - 1], [b, cb] = ramp[i], t = (v - a) / (b - a);
+      return ca.map((c, k) => c + (cb[k] - c) * t);
+    }
+    return ramp[ramp.length - 1][1];
+  };
+  const light = norm([-0.55, 0.75, -0.35]);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const v = h[y * n + x], water = v < 0.42;
+    const dx = (h[y * n + (x + 1) % n] - h[y * n + (x + n - 1) % n]) * 18.0;
+    const dy = (h[((y + 1) % n) * n + x] - h[((y + n - 1) % n) * n + x]) * 18.0;
+    const shade = water ? 0.95 : Math.max(0.35, dot(norm([-dx, 1.0, -dy]), light) * 1.15);
+    const c = colourOf(water ? Math.min(v, 0.41) : v);
+    const o = (y * n + x) * 4;
+    rgba[o] = Math.min(255, c[0] * shade * 255); rgba[o + 1] = Math.min(255, c[1] * shade * 255);
+    rgba[o + 2] = Math.min(255, c[2] * shade * 255); rgba[o + 3] = 255;
+  }
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  return tex;
+}
+// The ground quad: positions, an up normal, and a UV buffer rewritten as it scrolls.
+function terrainMesh(width, depth) {
+  const m = 2.0, x0 = -m, x1 = width + m, z0 = -m, z1 = depth + m, y = -0.02;
+  const pos = new Float32Array([x0, y, z0, x1, y, z1, x1, y, z0, x0, y, z0, x0, y, z1, x1, y, z1]);
+  const nrm = new Float32Array(18); for (let i = 0; i < 6; i++) nrm[i * 3 + 1] = 1;
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buffer = (data, loc, size) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); return b; };
+  buffer(pos, 0, 3); buffer(nrm, 1, 3);
+  const uvBuffer = buffer(new Float32Array(12), 3, 2);
+  gl.bindVertexArray(null);
+  return { vao, count: 6, uvBuffer, corners: [[x0, z0], [x1, z1], [x1, z0], [x0, z0], [x0, z1], [x1, z1]], key: `${width}x${depth}` };
+}
+function drawTerrain(now, drawLit) {
+  const game = state.game;
+  if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return;
+  const key = `${state.extent.width}x${state.extent.depth}`;
+  if (!TERRAIN.mesh || TERRAIN.mesh.key !== key) TERRAIN.mesh = terrainMesh(state.extent.width, state.extent.depth);
+  const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
+  TERRAIN.at = now;
+  if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % (TERRAIN.tile * 64);
+  const uv = new Float32Array(12);
+  TERRAIN.mesh.corners.forEach(([x, z], i) => { uv[i * 2] = x / TERRAIN.tile; uv[i * 2 + 1] = (z - TERRAIN.scroll) / TERRAIN.tile; });
+  gl.bindBuffer(gl.ARRAY_BUFFER, TERRAIN.mesh.uvBuffer); gl.bufferSubData(gl.ARRAY_BUFFER, 0, uv);
+  drawLit(TERRAIN.mesh.vao, TERRAIN.mesh.count, M.identity(), state.materialIndex.terrain);
+}
 function volumeTexture(unit) {
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, tex);
@@ -412,6 +498,9 @@ function uploadMaterials(game) {
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
+  // Scrolling ground: albedo from colour layer TERRAIN.layer of the shader's
+  // uColorUv texture stack (texstack field 1 = colour layer, 9 = blend).
+  records.push(["terrain", [1.0, 1.0, 1.0], { roughness: 0.9, colorLayer: TERRAIN.layer, colorBlend: 1.0 }]);
   // The craft's energy shield: a glassy bubble that glows blue, in SHIELD_STEPS
   // charge steps (opacity and glow rise with the charge).
   for (let k = 0; k < SHIELD_STEPS; k++) {
@@ -438,6 +527,9 @@ function uploadMaterials(game) {
         record[6] = extra.ior ?? 1.5; record[7] = extra.opacity ?? 1.0;
         const emission = extra.emission || [0, 0, 0];
         record[8] = emission[0]; record[9] = emission[1]; record[10] = emission[2];
+      }
+      if (tname === "texstack" && extra.colorLayer != null) {
+        record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
       }
       if (tname === "phong") {
         record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
@@ -1049,7 +1141,8 @@ function applySnapshot(view) {
                    for (const piece of state.pieces.values()) if (piece.entity && piece.removing == null) piece.removing = now; }
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
-    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000, bob = u8();
+    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
+    const look = u8(), bob = look & 1, face = (look & 2) !== 0;
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
@@ -1066,7 +1159,7 @@ function applySnapshot(view) {
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
                            sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
@@ -1187,6 +1280,15 @@ function entityModel(piece, now) {
   // Height above the board (a game with a third axis), extrapolated and eased the same way.
   const th = (piece.sh || 0) + (piece.vh || 0) * lead, ph = (piece.h ?? th) + (piece.vh || 0) * frame;
   piece.h = far || step >= 1 ? th : ph + (th - ph) * step;
+  // A body declared to face its flight (a missile): yaw to its heading on the
+  // board, pitch to its climb or fall -- the drawn velocity, every frame.
+  if (piece.face) {
+    const ground = Math.hypot(piece.vx || 0, piece.vz || 0);
+    if (ground > 1e-3 || Math.abs(piece.vh || 0) > 1e-3) {
+      piece.roll = 0.785 - Math.atan2(piece.vx || 0, -(piece.vz || 0));
+      piece.lean = Math.atan2(piece.vh || 0, Math.max(ground, 1e-3));
+    }
+  }
   return placeEntity(piece, now, x, z, mesh);
 }
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
@@ -1547,7 +1649,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
@@ -1676,6 +1778,7 @@ function draw(ms) {
     gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, count);
   };
+  drawTerrain(now, drawLit);
   for (const [vao, count, model, piece] of casters) drawLit(vao, count, model, piece ? state.materialIndex[piece.color] : null);
   // Emitters: the sun's orb and the arcade bulbs, Phong-shaded with emissive
   // materials (a bulb's level picks its brightness step).
@@ -2154,7 +2257,7 @@ function fillPickers() {
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
   state.shadowMap = buildShadowMap(); state.bulb = buildSphere(); state.meshes.__sphere = uploadMesh(sphereMesh());
-  arrayTexture(4, [0, 255, 128, 255]); arrayTexture(5, [255, 255, 255, 0]); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
+  arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5); arrayTexture(6, [0, 0, 0, 255]); arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };

@@ -493,7 +493,12 @@ class BulletScroller(EntityGame):
                         "vy": 0.0 if exploding else float(col["vy"][k]),
                         "z": float(col["z"][k]), "vz": 0.0 if exploding else float(col["vz"][k]),
                         "mesh": mesh, "color": color, "size": size,
-                        "roll": 0.785 if mesh == "rocket" else 0.0, "lean": 0.25 if slot == PLAYER else 0.55,
+                        # Top-down: the ship lies flat, nose up the screen (the
+                        # direction of illusory travel); a missile faces its
+                        # flight (the page aims it along its velocity each frame).
+                        "roll": 0.785 if mesh == "rocket" else 0.0,
+                        "lean": 0.0 if slot in (PLAYER, MISSILE_SLOT) else 0.55,
+                        "face": slot == MISSILE_SLOT and not exploding,
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 2.5 if mesh == "ufo" else 0.0, "bob": 0.0})
@@ -508,7 +513,7 @@ class BulletScroller(EntityGame):
     HOSTILE_LANES = (ENEMIES, BULLETS)
     # Lo-fi arcade: the backdrop shows through (no floor slab); the glass
     # plate and the arcade ring are on by default so the lights glow into it.
-    SCENE = {"floor": False, "glass": True, "arcade": True}
+    SCENE = {"floor": False, "glass": True, "arcade": True, "terrain": True}
     SCENE_PREFER = {"glass": True, "arcade": True}
 
     def describe(self) -> str:

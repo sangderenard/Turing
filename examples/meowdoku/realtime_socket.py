@@ -19,7 +19,7 @@ DELTA, little-endian:
                       each u8 length + utf-8; indices count up from 0
     u16  gone         lanes whose entity disappeared, u16 each
     u16  spawned      new entities: u16 lane, u8 mesh, u8 color,
-                      u16 size*1000, i16 roll*1000, i16 spin*1000, u8 bob,
+                      u16 size*1000, i16 roll*1000, i16 spin*1000, u8 flags (bit0 bob, bit1 face its velocity),
                       i16 lean*1000, u16 owner (65535: none -- the lane that
                       fired a projectile), f32 age (world seconds since it
                       spawned), f32 x, y, vx, vy, z, vz
@@ -184,7 +184,8 @@ class SnapshotEncoder:
             owner = int(entity.get("owner", -1))
             parts.append(struct.pack("<HBBHhhBhHf6f", lane, record["mesh"], record["color"],
                                      int(round(entity["size"] * 1000)), int(round(entity["roll"] * 1000)),
-                                     int(round(entity["spin"] * 1000)), 1 if entity.get("bob") else 0,
+                                     int(round(entity["spin"] * 1000)),
+                                     (1 if entity.get("bob") else 0) | (2 if entity.get("face") else 0),
                                      int(round(entity.get("lean", 0.55) * 1000)), 65535 if owner < 0 else owner,
                                      float(entity.get("age", 0.0)),
                                      record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))
