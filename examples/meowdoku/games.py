@@ -565,6 +565,56 @@ class Wordle(Game):
 # The chess network: an arena that plays itself non-stop, and chess against it
 # ---------------------------------------------------------------------------
 
+class Engine:
+    """The one engine thread.  Every piece of chess-network work (the
+    learner's steps, a user's tree search, Lichess move choice and
+    learning) runs on this single worker, in submission order.
+
+    ``call(fn, ...)`` blocks the caller until the worker has run ``fn`` and
+    returns its result or re-raises its exception.  Called from the worker
+    itself it runs inline, so nested calls cannot deadlock.  Callers must
+    not hold a lock the engine work needs while they wait on ``call``."""
+
+    def __init__(self):
+        import queue, threading
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="engine", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            fn, args, kwargs, box, done = self._queue.get()
+            try:
+                box.append((True, fn(*args, **kwargs)))
+            except BaseException as error:  # delivered to the caller
+                box.append((False, error))
+            done.set()
+
+    def call(self, fn, *args, **kwargs):
+        import threading
+        if threading.current_thread() is self._thread:
+            return fn(*args, **kwargs)
+        box, done = [], threading.Event()
+        self._queue.put((fn, args, kwargs, box, done))
+        done.wait()
+        ok, value = box[0]
+        if not ok:
+            raise value
+        return value
+
+
+_ENGINE = None
+_ENGINE_GUARD = __import__("threading").Lock()
+
+
+def engine() -> Engine:
+    global _ENGINE
+    with _ENGINE_GUARD:
+        if _ENGINE is None:
+            _ENGINE = Engine()
+    return _ENGINE
+
+
 _SELF_PLAY = None
 
 
@@ -605,6 +655,14 @@ class Learner:
         self._thread = threading.Thread(target=self._run, name="learner", daemon=True)
         self._thread.start()
 
+    def _step(self) -> None:
+        with self.lock:
+            finished = self.engine.step()
+            if finished:
+                self.last_result = finished[-1]
+            if self.corpus is not None:
+                self.corpus.step(self.player)
+
     def _run(self) -> None:
         import os, time
         self.started_at = time.time()
@@ -618,12 +676,7 @@ class Learner:
         tick, count = time.perf_counter(), 0
         while not self._stop.is_set():
             try:
-                with self.lock:
-                    finished = self.engine.step()
-                    if finished:
-                        self.last_result = finished[-1]
-                    if self.corpus is not None:
-                        self.corpus.step(self.player)
+                engine().call(self._step)           # network work runs on the engine thread
             except Exception as error:
                 import traceback
                 self.error = f"{type(error).__name__}: {error}"
@@ -717,7 +770,7 @@ class ChessVsNet(Chess):
         super().cell(r, c, button)
         if self.moves > before and self.turn == "black" and self.outcome() is None:
             from meowdoku import mcts
-            move = mcts.best_move(self, self.player.net, simulations=3000)   # tree search over the network
+            move = engine().call(mcts.best_move, self, self.player.net, simulations=3000)   # tree search on the engine thread
             if move is not None:
                 super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
 

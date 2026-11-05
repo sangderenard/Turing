@@ -166,7 +166,8 @@ class LichessBot:
             return (move_to_uci(game, *random.choice(moves)) if moves else None), None
         from meowdoku import mcts
         seconds = 6.0 if my_time_ms is None else min(20.0, max(1.0, my_time_ms / 1000.0 / 15.0 + increment_ms / 1000.0 * 0.9))
-        result = mcts.search(game, self.player.net, simulations=5000, seconds=seconds)
+        from meowdoku.games import engine
+        result = engine().call(mcts.search, game, self.player.net, simulations=5000, seconds=seconds)
         self.last_search = result.describe(game)
         return (move_to_uci(game, *result.move) if result.move else None), result.policy
 
@@ -221,7 +222,8 @@ class LichessBot:
         self.log(f"[lichess] {summary}: {view['status']}")
         if self.learn and self.player is not None and len(boards) >= 4:
             try:
-                self.player.learn_from(boards, materials, outcome, policies)
+                from meowdoku.games import engine
+                engine().call(self.player.learn_from, boards, materials, outcome, policies)
             except Exception as error:
                 self.log(f"[lichess] learning from the game failed: {error}")
 
