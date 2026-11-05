@@ -1176,7 +1176,10 @@ const wob = {
 state.wobble = wob;
 
 function wobTransition(dt, freq) {                       // exact step of d'' + 2 z w d' + w^2 d = 0
-  const w = 2 * Math.PI * freq, z = WOB_ZETA, wd = w * Math.sqrt(1 - z * z), e = Math.exp(-z * w * dt);
+  // Damping follows stiffness: the ratio scales with sqrt(freq / 8), so a softer
+  // spring is also a looser one (decay rate z*w goes as freq^1.5).
+  const z = Math.min(0.6, Math.max(0.03, WOB_ZETA * Math.sqrt(freq / 8)));
+  const w = 2 * Math.PI * freq, wd = w * Math.sqrt(1 - z * z), e = Math.exp(-z * w * dt);
   const C = Math.cos(wd * dt), S = Math.sin(wd * dt), zw = z * w;
   return [e * (C + zw / wd * S), e * S / wd, -e * w * w / wd * S, e * (C - zw / wd * S)];
 }
