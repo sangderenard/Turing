@@ -71,6 +71,31 @@ export function shipStepper(pred, view, aimer = null) {
           lo, hi, speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
         ship[pos] = r.x_next; ship[vel] = r.v_next;
       }
+      // A platformer's vertical motion: the engine's vertical_axis (the SAME law the server's games call, compiled to
+      // wasm), in free flight -- gravity, the buffered press, coyote time, the launch, the cut of a released jump, the
+      // apex hang, terminal velocity, exact over any step.  Contact is the server's word: a body it reports standing
+      // (``coy`` at its full coyote time: it stood on the step before) holds its place until the press launches it.
+      const V = motion.vertical;
+      if (V && pred.vertical && ship.vy != null) {
+        const press = V.press ? (V.press.some((name) => (input[name] || 0) > 0) ? 1 : 0) : 1;
+        const standing = V.coyote > 0 && ship.coy != null && ship.coy >= V.coyote - 1e-9 ? 1 : 0;
+        const r = pred.vertical.invoke({ y: ship.y, vy: ship.vy, held: press, prev: V.press ? (ship.pf || 0) : 1, ground: standing,
+          coy: ship.coy || 0, buf: ship.buf || 0, dt, gravity: V.gravity, jump: V.jump, cut: V.cut, fall_max: V.fall_max,
+          hang_v: V.hang_v, hang_scale: V.hang_scale, coyote: V.coyote, buffer: V.buffer });
+        ship.pf = V.press ? press : 1; ship.coy = r.coy_next; ship.buf = r.buf_next;
+        if (!(standing && r.jumped < 0.5)) {
+          let y1 = r.y_next, v1 = r.vy_next;
+          // CONTACT from the scenery the server sent (pred.contact, app.js; the meshes the game declares): landing on
+          // a top from above, the head on an underside while rising -- the server's contact rule, on the same tiles
+          const hit = pred.contact ? pred.contact(ship.x, ship.y, y1, V) : null;
+          if (hit && v1 > 0 && hit.land != null) {
+            y1 = hit.land - V.ry;                                       // (a bouncing game launches the landed body at once)
+            if (V.bounce) v1 = -V.bounce; else { v1 = 0; ship.coy = V.coyote; }
+          }
+          else if (hit && v1 < 0 && hit.bump != null) { y1 = hit.bump + V.ry; v1 = V.bump || 0; }
+          ship.y = y1; ship.vy = v1;
+        }
+      }
       // A banked craft turns: the engine's bank_turn, after the axes, as the law does.
       if (motion.bank_turn && pred.bankTurn && ship.bank != null) {
         ship.yaw = pred.bankTurn.invoke({ yaw: ship.yaw, bank: ship.bank, level: motion.bank_turn.level,

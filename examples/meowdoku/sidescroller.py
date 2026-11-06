@@ -55,7 +55,7 @@ from typing import Any
 import numpy as np
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, first_of, noise
-from meowdoku.entity_motion import damped_axis, follow_view
+from meowdoku.entity_motion import G_EARTH, damped_axis, follow_view, jump_speed, vertical_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -81,13 +81,22 @@ FIRST_COLUMN = -2                                 # the leftmost column at round
 #: Content of a brick (``holds``) and of an item lane (``holds`` = its kind).
 NOTHING, COIN, MUSHROOM, STAR = 0.0, 1.0, 2.0, 3.0
 
-GRAVITY = 28.0
-JUMP = 15.0                                       # apex JUMP**2 / (2 GRAVITY) = 4.0 above the feet
+# Gravity is the real constant in the game's units: a tile stands for UNIT_M metres (the frog is 0.8 tiles,
+# 28 cm), so GRAVITY = 9.80665 m/s^2 / UNIT_M.  The jump is declared by its height: the launch speed is the one
+# whose held-button rise is exactly JUMP_APEX (entity_motion.jump_speed), integrated exactly by the shared law
+# entity_motion.vertical_axis -- the same apex at any step length.
+UNIT_M = 0.35
+GRAVITY = G_EARTH / UNIT_M                        # 28.02 tiles/s^2
+HANG_V, HANG_SCALE = 2.5, 0.5                     # |vy| under this, fire held: gravity halved (apex hang)
+JUMP_APEX = 4.0                                   # tiles above the feet (held to the top)
+JUMP = jump_speed(JUMP_APEX, GRAVITY, HANG_V, HANG_SCALE)
 JUMP_CUT = 4.0                                    # rising faster than this, fire released: cut to it
-FALL_MAX = 20.0
+FALL_MAX = 20.0                                   # terminal velocity
+STAGE_LEAN = 0.2                                  # the backdrop plane's lean (radians): see ``SCENE``
+COYOTE, BUFFER = 0.09, 0.11                       # seconds: a jump after leaving a ledge, a press before landing
 BUMP = 2.0                                        # downward speed after the head strikes a brick
 STOMP_BOUNCE = 9.0
-SPEED = 8.0                                       # run: a jump covers 2 * JUMP / GRAVITY * SPEED = 8.6 units
+SPEED = 8.0                                       # run: a held jump stays up about 1.2 s
 TAU = 0.06
 REACH = 0.2
 MARGIN = 0.4
@@ -172,7 +181,7 @@ def world_at(col, seed):
 
 
 def sidescroller_step(lane, slot, rx, ry,
-                      alive, x, y, vx, vy, walk, born, holds, spent, col, energy,
+                      alive, x, y, vx, vy, walk, born, holds, spent, col, energy, coy, buf, pf,
                       score, lives, coins, distance, clock, field_w, seed,
                       move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
@@ -194,16 +203,21 @@ def sidescroller_step(lane, slot, rx, ry,
     me = is_player & live & playing
     px, py, pvy = (f(me) * ship_x).sum(), (f(me) * y).sum(), (f(me) * vy).sum()
     has_me = some(me)
-    held = (f(me) * fire).sum() > 0.0
     shield = (f(me) * energy).sum()
 
     # ------------------------------------------------------ the player, vertically
-    # A rise cut short by releasing fire, then gravity.
-    cut = where((pvy < -JUMP_CUT) & ~held, -JUMP_CUT, pvy)
-    fall = (cut + GRAVITY * dt).clip(-FALL_MAX, FALL_MAX)
-    py_new = py + fall * dt
+    # entity_motion.vertical_axis: the shared vertical law (buffered press, coyote time, launch, variable height,
+    # apex hang, terminal velocity, exact integration), for the player AND the bodies (their gravity).  Standing is
+    # sensed here: the feet on a tile's top within a hair, not rising.
     top, bottom = y - ry, y + ry
     near = (x - px).abs()
+    resting = (is_tile & live & has_me & (pvy > -0.05) & ((py + PLAYER_RY - top).abs() < 0.02) & (near < rx + FOOT))
+    fire_p = f(me) * fire
+    y_free, v_free, coy_f, buf_f, jumped = vertical_axis(
+        y, vy, fire_p, f(me) * pf, f(me) * f(some(resting)), coy, buf, zero + dt, GRAVITY, JUMP, JUMP_CUT, FALL_MAX,
+        HANG_V, HANG_SCALE, COYOTE, BUFFER)
+    fall = (f(me) * v_free).sum()
+    py_new = (f(me) * y_free).sum()
     # Standing: the feet cross a tile's top from above over the tile's width.
     support = (is_tile & live & has_me & (fall > 0.0) & (py + PLAYER_RY <= top + 1e-6)
                & (py_new + PLAYER_RY >= top) & (near < rx + FOOT))
@@ -219,7 +233,6 @@ def sidescroller_step(lane, slot, rx, ry,
     under_y = (f(struck) * bottom).sum()
     py1 = where(landed, stand - PLAYER_RY, where(bumped, under_y + PLAYER_RY, py_new))
     pvy1 = where(landed, 0.0, where(bumped, BUMP, fall))
-    pvy1 = where(landed & held, -JUMP, pvy1)
 
     # ------------------------------------------------------ what the strike does
     spent_hit = struck & (spent > 0.0)
@@ -236,9 +249,9 @@ def sidescroller_step(lane, slot, rx, ry,
     # Gravity, then standing on a tile top; a coin is a pop that flies free.
     body = (is_item | is_walker) & live & playing
     solid = body & ~(is_item & (holds == COIN))
-    vb = (vy + GRAVITY * dt).clip(-FALL_MAX, FALL_MAX)
+    vb = v_free
     bx = x + walk * dt
-    by = y + vb * dt
+    by = y_free
     tx = x[t0:t1].reshape((1, t1 - t0))
     ttop = top[t0:t1].reshape((1, t1 - t0))
     trx = rx[t0:t1].reshape((1, t1 - t0))
@@ -362,6 +375,9 @@ def sidescroller_step(lane, slot, rx, ry,
     coins_next = coins + f(coin_out).sum()
     distance_next = view
     energy_next = where(is_player, energy_player, energy)
+    coy_next = where(is_player, coy_f, zero)
+    buf_next = where(is_player, buf_f, zero)
+    pf_next = where(is_player, f(fire > 0.0), zero)
 
     # No step may carry anything through a tile's thickness, nor outrun the
     # sideways law's damping.
@@ -369,12 +385,12 @@ def sidescroller_step(lane, slot, rx, ry,
     fastest = (where(live3, vy2.abs(), 0.0)).max() + 1e-6
     dt_limit = (0.9 * window / fastest).clip(0.0, 0.5 * TAU) + zero
     residual = f(live3 & is_tile).sum() + zero
-    return (f(live3), x2, y2, vx2, vy2, walk2, born2, holds2, spent2, col2, energy_next,
+    return (f(live3), x2, y2, vx2, vy2, walk2, born2, holds2, spent2, col2, energy_next, coy_next, buf_next, pf_next,
             score_next, lives_next, coins_next, distance_next, clock_next,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "vx", "vy", "walk", "born", "holds", "spent", "col", "energy",
+STATE = ("alive", "x", "y", "vx", "vy", "walk", "born", "holds", "spent", "col", "energy", "coy", "buf", "pf",
          "score", "lives", "coins", "distance", "clock")
 SETTINGS = ("field_w", "seed")
 
@@ -435,6 +451,7 @@ def initial_columns(width: float = WIDTH, seed: int = 0) -> dict[str, np.ndarray
         "lane": lane, "slot": slot, "rx": rx, "ry": ry,
         "alive": alive, "x": x, "y": y, "vx": np.zeros(LANES), "vy": np.zeros(LANES), "walk": np.zeros(LANES),
         "born": np.zeros(LANES), "holds": holds, "spent": np.zeros(LANES), "col": col, "energy": energy,
+        "coy": np.zeros(LANES), "buf": np.zeros(LANES), "pf": np.zeros(LANES),
         "score": np.zeros(LANES), "lives": np.ones(LANES), "coins": np.zeros(LANES),
         "distance": np.zeros(LANES), "clock": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "seed": np.full(LANES, seed_value),
@@ -449,7 +466,9 @@ class SideScroller(EntityGame):
     CONTROLS = tuple(CONTROLS)
     # A side view: the world stands on its own ground tiles, so no slab or
     # glass plate behind it.
-    SCENE = {"floor": False, "glass": False, "arcade": True}
+    #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
+    #: tiles are the scenery layer, the actors a layer in front), so a body's feet meet the tile it stands on.
+    SCENE = {"floor": False, "glass": False, "arcade": True, "stage": STAGE_LEAN}
     # World frame: the scroll moves the view, not the player, so the page's
     # x is adopted like any other game's.
     PLAYER_LANE = 0
@@ -471,7 +490,12 @@ class SideScroller(EntityGame):
         on its own predicted player (the same max, so it never waits on us)."""
         view = float(self.session.column("distance")[0]) if self.session.state is not None else 0.0
         return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [view + MARGIN, view + self.width - MARGIN],
-                "camera": {"x": view, "follow": SCROLL_FRACTION, "margin": MARGIN, "width": self.width}}
+                "camera": {"x": view, "follow": SCROLL_FRACTION, "margin": MARGIN, "width": self.width},
+                "vertical": {"gravity": GRAVITY, "jump": JUMP, "cut": JUMP_CUT, "fall_max": FALL_MAX, "hang_v": HANG_V,
+                             "hang_scale": HANG_SCALE, "coyote": COYOTE, "buffer": BUFFER, "press": ["fire"],
+                             # contact, for the page's prediction: the scenery meshes the body lands on (and strikes
+                             # its head on, bump = the speed after), the body's half height and its feet's reach
+                             "ry": PLAYER_RY, "foot": FOOT, "solid": ["ground", "brick"], "oneway": [], "bump": BUMP}}
 
     def reset(self) -> None:
         self.seed = (self.seed + 1) % 1000          # a new level each run
@@ -517,7 +541,7 @@ class SideScroller(EntityGame):
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]),
                         "vy": float(col["vy"][k]) if slot != PLAYER else 0.0,
-                        "mesh": mesh, "color": color, "size": size, "roll": 0.0,
+                        "mesh": mesh, "color": color, "size": size, "roll": 0.0, "scenery": bool(slot in (GROUND, BRICK)),
                         "lean": 0.25 if slot == PLAYER else 0.55, "owner": -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 1.5 if (slot == ITEM and holds in (COIN, STAR)) else 0.0, "bob": 0.0})

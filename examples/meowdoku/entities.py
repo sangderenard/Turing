@@ -875,7 +875,8 @@ class EntityGame(Game):
                                   if self.autopilot else [0.0] * 5)
             # the pilot's decisions, held and pending (law-time intervals: the page integrates them)
             st["you"]["pilot_intervals"] = self.law_pilot_intervals() if self.autopilot else []
-            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz"):
+            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz",
+                         "coy", "buf", "pf"):          # (coy/buf/pf: a platformer's coyote time, buffered press, last press)
                 # the land under it, the laser's reach, its place on a sphere
                 if name in self.session.columns:
                     st["you"][name] = float(col(name)[k])

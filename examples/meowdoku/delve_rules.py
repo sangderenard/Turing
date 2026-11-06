@@ -8,6 +8,8 @@ room is a rectangle of tiles (``y`` down, as everywhere in the engine).
 
 from __future__ import annotations
 
+from meowdoku.entity_motion import G_EARTH, jump_speed
+
 # ---------------------------------------------------------------- tile vocabulary
 EMPTY, SOLID, ONEWAY, LADDER, SPIKE, GEM, ORB = range(7)
 TILE_NAMES = {EMPTY: "empty", SOLID: "solid", ONEWAY: "oneway", LADDER: "ladder", SPIKE: "spike", GEM: "gem", ORB: "orb"}
@@ -20,11 +22,20 @@ DOOR_H = 3                            # rows of a side door's opening
 DOOR_W = 2                            # columns of a floor/ceiling opening (the first holds a ladder)
 
 # ---------------------------------------------------------------- movement (the law's, the planner's)
-GRAVITY = 30.0
-JUMP = 12.0                           # apex JUMP**2 / (2 GRAVITY) = 2.4 above the feet
-JUMP2 = 11.0                          # the double jump (an ability)
+# Gravity is the real constant in the game's units: a tile stands for UNIT_M metres (the frog is 0.8 tiles,
+# 28 cm), so GRAVITY = 9.80665 m/s^2 / UNIT_M tiles/s^2.  The jump is DECLARED by its height: the launch speed is
+# the one whose held-button rise is exactly JUMP_APEX (entity_motion.jump_speed), which the shared law
+# (entity_motion.vertical_axis) integrates exactly -- the same apex at any step length.
+UNIT_M = 0.35
+GRAVITY = G_EARTH / UNIT_M            # 28.02 tiles/s^2
+HANG_V = 2.0                          # |vy| under this with the button held: gravity scaled by HANG_SCALE (apex hang)
+HANG_SCALE = 0.5
+JUMP_APEX = 2.45                      # tiles: clears two rows, never three
+JUMP2_APEX = 2.0                      # the double jump (an ability)
+JUMP = jump_speed(JUMP_APEX, GRAVITY, HANG_V, HANG_SCALE)
+JUMP2 = jump_speed(JUMP2_APEX, GRAVITY, HANG_V, HANG_SCALE)
 JUMP_CUT = 3.5                        # rising faster than this with the button released: cut to it
-FALL_MAX = 18.0
+FALL_MAX = 18.0                       # terminal velocity
 SPEED = 6.0
 TAU = 0.06
 REACH = 0.2

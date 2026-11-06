@@ -1454,7 +1454,8 @@ function camera() {
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
   const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
-  const centre = declared && declared.target ? declared.target : [ext.width / 2, 0, extMidZ(ext)];
+  const lean = stageOf();                                           // a stage game: the plane rises behind the board
+  const centre = declared && declared.target ? declared.target : [ext.width / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
   const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
@@ -2880,7 +2881,7 @@ function applySnapshot(view) {
     const birth = r.body ? null : birthOffset(r.owner, r.age, r.x, r.y, r.vx, r.vy, you, stamp);
     const piece = { id, entity: true, lane: r.lane, owner: r.owner === 65535 ? null : r.owner, sx: r.x, sz: r.y, x: r.x, z: r.y, vx: r.vx, vz: r.vy,
                     sh: r.z, h: r.z, vh: r.vz,
-                    tRecv: stamp, mesh: r.mesh, color: r.color, size: r.size, roll: r.roll, rollBase: r.roll, orient: r.orient, spin: r.spin, bob: r.bob, lean: r.lean,
+                    tRecv: stamp, mesh: r.mesh, color: r.color, size: r.size, roll: r.roll, rollBase: r.roll, orient: r.orient, scenery: r.scenery, spin: r.spin, bob: r.bob, lean: r.lean,
                     face: r.face, translucent: r.translucent, ribbon: r.ribbon, ground: r.ground, glow: r.glow,
                     t0: now, removing: null, seed: 0, birth };
     if (r.body) piece.body = BodyFlight.held(r, stamp);
@@ -3193,6 +3194,24 @@ function authorityText(game) {
 // never falls behind the server's view; a view far behind the page's (a new
 // run) is taken at once.
 const view = { x: 0, at: null };
+// THE PREDICTED BODY'S CONTACT with the scenery the server sent (a platformer's tiles: ``scenery`` pieces, each a
+// square card of half size ``size`` centred at the server's (sx, sz)): over a step of the body at ``x`` from ``y`` to
+// ``y1`` (``V``: the game's declared vertical motion -- the meshes it lands on / strikes, its half height ``ry`` and the
+// reach ``foot`` of its feet), the highest top the feet cross (``land``) and the lowest underside the head crosses
+// (``bump``, solid meshes only).  Only what the game declared is touched: contact itself stays the server's word.
+function sceneryContact(x, y, y1, V) {
+  let land = null, bump = null;
+  const feet0 = y + V.ry, feet1 = y1 + V.ry, head0 = y - V.ry, head1 = y1 - V.ry;
+  for (const p of state.pieces.values()) {
+    if (!p.scenery || p.removing != null || Math.abs(p.sx - x) >= p.size + V.foot) continue;
+    const solid = V.solid.includes(p.mesh), plank = V.oneway.includes(p.mesh);
+    if (!solid && !plank) continue;
+    const top = p.sz - p.size, under = p.sz + p.size;
+    if (top >= feet0 - 1e-6 && top <= feet1 && (land == null || top < land)) land = top;
+    if (solid && under <= head0 + 1e-6 && under >= head1 && (bump == null || under > bump)) bump = under;
+  }
+  return { land, bump };
+}
 // A ROOM-GRAPH GAME (``game.roomview``: the room's size in tiles).  The screen is a window ``game.width`` x
 // ``game.height`` tiles onto the room, centred on the player and clamped to the room (a room smaller than the
 // window is centred in it): the formula of delve_rules.camera_axis, on the ship the page draws.
@@ -3202,7 +3221,9 @@ function roomShip(game) {
   const ship = pred.ship || game.you;
   if (!ship) return null;
   const age = pred.ship && ship.at != null ? Math.min(0.1, Math.max(0, performance.now() / 1000 - ship.at)) : 0;
-  return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + (ship.vy || 0) * age };
+  // (a game that declares ``predict.vertical`` has its vertical motion stepped by the engine law already: no linear carry)
+  const carry = pred.ship && game.predict && game.predict.vertical ? 0 : (ship.vy || 0) * age;
+  return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + carry };
 }
 function roomView(now) {
   const game = state.game, rv = game && game.roomview;
@@ -3230,6 +3251,11 @@ function viewX(now) {
   }
   return view.x;
 }
+// A STAGE GAME's plane (``scene.stage``, see placeEntity): the lean of the plane the declaring game stands its bodies
+// on, and the plane's clearances above the floor slab (``base``: the tiles' half thickness, centred on the plane) and
+// between the tile layer and the layer of bodies in front of it (``front``).
+const stageOf = () => { const v = state.game && state.game.scene && state.game.scene.stage; return typeof v === "number" ? v : null; };
+const STAGE = { base: 0.17, front: 0.16 };
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 // A SERVER BODY IN THE PATCH (a spherical game: predict.patch).  The body is
 // carried on from the state the server sent -- by the engine's flight laws, as
@@ -3274,9 +3300,30 @@ function placeEntity(piece, now, x, z, mesh) {
   const lift = hRel == null || state.flat ? 0 : (piece.h || 0) * DEPTH_LIFT;
   const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size * grow, scale = scale0 / mesh.extent * Math.max(s, 0.001);
   const land = piece.ground && !state.flat ? landHeight(x, z) : null;
+  // WHERE A CARD RESTS.  An entity is a thin extruded card (half-size ``scale0``, half-thickness ``thick * scale0``)
+  // leaned by ``lean``: it spans ``scale0 * sin(lean) + thick * scale0 * cos(lean)`` below its centre, so the centre
+  // stands that high for the lowest point to touch the surface (the card's thickness used to be left out, so the
+  // back of every card sank into the floor or into the tiles it stood among).
+  const thick = mesh.half[2] / mesh.half[1];
+  const stage = !state.flat && land == null ? stageOf() : null;
+  if (stage) {
+    // A STAGE GAME (``scene.stage`` = a lean): bodies stand on ONE backdrop plane leaning back by ``stage`` radians
+    // (height rises (depth - z) tan(stage) away from the camera, each card stretched by 1/cos along its slope so
+    // it covers its true size on the plane).  Tiles (``scenery``) are the plane's own layer, centred on it; every
+    // other body stands in front, its back face on the tiles' front face -- so a body's feet meet the tile it
+    // stands on, a body in front of a ladder never meets the ladder's volume, and no two cards are coplanar.
+    const cL = Math.cos(stage), sL = Math.sin(stage);
+    const out = piece.scenery ? 0 : STAGE.front + thick * scale0;
+    const h = TILE.height + STAGE.base + (state.extent.depth - z) * Math.tan(stage) + y + lift;
+    let m = M.translate(x, h + out * cL, z + out * sL);
+    m = M.multiply(m, M.rotateY(piece.spin * now));
+    m = M.multiply(m, M.rotateX(-Math.PI / 2 + stage));
+    m = M.multiply(m, M.rotateZ(piece.roll));
+    return M.multiply(m, M.scale(scale, scale / cL, scale));
+  }
   let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT
                       : land != null ? land + scale0 * 0.35 - planetDrop(x, z)
-                      : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
+                      : TILE.height + scale0 * (Math.sin(lean) + thick * Math.cos(lean)) + 0.01 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll));
@@ -3621,7 +3668,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, ground: !!e.ground });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, scenery: !!e.scenery, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   syncWalk(game);
@@ -4824,6 +4871,8 @@ function fillPickers() {
     pred.travel = await TuringWasmProgram.load("travel.wasm", "travel.abi.json");
     pred.follow = await TuringWasmProgram.load("follow.wasm", "follow.abi.json");
     pred.bankTurn = await TuringWasmProgram.load("bank.wasm", "bank.abi.json");
+    pred.contact = sceneryContact;                                                  // (the vertical law's contact: below)
+    pred.vertical = await TuringWasmProgram.load("vertical.wasm", "vertical.abi.json");     // a platformer's vertical_axis
     // the sphere: flight (turn, air, advance) and the land's law
     pred.turn = await TuringWasmProgram.load("turn.wasm", "turn.abi.json");
     pred.advance = await TuringWasmProgram.load("advance.wasm", "advance.abi.json");

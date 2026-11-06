@@ -45,14 +45,14 @@ def test_the_mirror_is_the_law(seed):
     assert result["worst"] < 1e-9
 
 
-def test_single_jump_clears_two_tiles_and_two_rows_but_not_three_and_three():
-    flat = room_grid()
-    flat[8, 8:10] = SPIKE                                    # a gap of two
-    wide = room_grid()
-    wide[8, 8:11] = SPIKE                                    # a gap of three
-    for grid, crosses in ((flat, True), (wide, False)):
+def test_single_jump_clears_the_gaps_the_law_allows_and_not_the_next():
+    # the reach is DERIVED from the shared vertical law (exact ballistic, apex hang, JUMP_APEX): a gap of four
+    # tiles is crossed by one jump, five is not (re-derived when gravity moved to G_EARTH / UNIT_M)
+    for gap, crosses in ((2, True), (4, True), (5, False)):
+        grid = room_grid(width=30)
+        grid[8, 8:8 + gap] = SPIKE
         plan = delve_plan.RoomPlan.build(grid)
-        assert (("s", 26, 9) in plan.reach([("s", 3, 9)], False)) is crosses
+        assert (("s", 2 * (8 + gap) + 2, 9) in plan.reach([("s", 3, 9)], False)) is crosses
     step = room_grid()
     step[7, 5:11] = ONEWAY                                   # feet row 7: two above the floor
     high = room_grid()

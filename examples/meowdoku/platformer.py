@@ -37,7 +37,7 @@ from typing import Any
 import numpy as np
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import G_EARTH, damped_axis, jump_speed, vertical_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -51,9 +51,16 @@ PLATFORMS = (1, 25)
 PICKUPS = (25, 29)
 LANES = PICKUPS[1]
 
-GRAVITY = 24.0
-JUMP = 12.0                                  # bounce velocity: apex JUMP**2 / (2 GRAVITY) = 3.0 above the feet
-FALL_MAX = 20.0
+# Gravity is the real constant in the game's units: a tile stands for UNIT_M metres, so
+# GRAVITY = 9.80665 m/s^2 / UNIT_M.  The bounce is declared by its height (the launch speed whose rise is exactly
+# BOUNCE_APEX, entity_motion.jump_speed with no hang) and integrated exactly by the shared law
+# entity_motion.vertical_axis, with terminal velocity FALL_MAX.
+UNIT_M = 0.35
+GRAVITY = G_EARTH / UNIT_M                   # 28.02 tiles/s^2
+STAGE_LEAN = 0.2                             # the backdrop plane's lean (radians): see ``SCENE``
+BOUNCE_APEX = 3.0                            # tiles above the feet; the gap limit stays under it
+JUMP = jump_speed(BOUNCE_APEX, GRAVITY, 1.0, 1.0)      # bounce velocity (no hang band: scale 1)
+FALL_MAX = 20.0                              # terminal velocity
 SPEED = 9.0
 TAU = 0.06
 REACH = 0.2
@@ -92,8 +99,9 @@ def platformer_step(lane, slot, rx, ry,
     pxn = (f(me) * ship_x).sum()
 
     # Vertical: gravity, then the bounce when the feet cross a platform's top.
-    fall = (pvy + GRAVITY * dt).clip(-FALL_MAX, FALL_MAX)
-    py_new = py + fall * dt
+    # (no button: the bounce is the platform's, so no press, no coyote, no hang)
+    py_new, fall, _coy, _buf, _jumped = vertical_axis(
+        py, pvy, 1.0, 1.0, 0.0, 0.0, 0.0, dt, GRAVITY, 0.0, 1.0e9, FALL_MAX, 0.0, 1.0, 0.0, 0.0)
     top = y - ry
     crossed = (is_plat & live & playing & (fall > 0.0)
                & (py + PLAYER_RY <= top) & (py_new + PLAYER_RY >= top)
@@ -205,6 +213,9 @@ class Platformer(EntityGame):
     height = HEIGHT
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
+    #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
+    #: bricks are the scenery layer, the frog and stars a layer in front), so the frog's feet meet the brick.
+    SCENE = {"floor": True, "glass": True, "arcade": True, "stage": STAGE_LEAN}
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None):
         self.width = field_width(aspect)
@@ -218,7 +229,12 @@ class Platformer(EntityGame):
         return initial_columns(self.width, self.seed)
 
     def motion(self) -> dict[str, Any]:
-        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [MARGIN, self.width - MARGIN]}
+        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [MARGIN, self.width - MARGIN],
+                "vertical": {"gravity": GRAVITY, "jump": 0.0, "cut": 1.0e9, "fall_max": FALL_MAX, "hang_v": 0.0,
+                             "hang_scale": 1.0, "coyote": 0.0, "buffer": 0.0, "press": None,
+                             # contact (the page's prediction): a brick is landed on from above and passed from below;
+                             # the bounce itself is the server's (a landed frog is sent back up by it)
+                             "ry": PLAYER_RY, "foot": FOOT, "solid": [], "oneway": ["brick"], "bump": 0.0, "bounce": JUMP}}
 
     def reset(self) -> None:
         self.seed = (self.seed + 1) % 1000          # a new climb each run
@@ -254,7 +270,7 @@ class Platformer(EntityGame):
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]),
                         "vy": float(col["vy"][k]) if slot != PLAYER else 0.0,
-                        "mesh": mesh, "color": mesh, "size": size, "roll": 0.0,
+                        "mesh": mesh, "color": mesh, "size": size, "roll": 0.0, "scenery": bool(slot == PLATFORM),
                         "lean": 0.25 if slot == PLAYER else 0.55, "owner": -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 1.5 if slot == PICKUP else 0.0, "bob": 0.0})

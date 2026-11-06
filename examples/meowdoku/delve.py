@@ -60,11 +60,11 @@ import numpy as np
 from meowdoku import walkers
 from meowdoku.delve_rules import (
     BUFFER, CLIMB, COYOTE, ENT, EMPTY, ENEMY_POINTS, FALL_MAX, FLY_BOB, FLY_RANGE, FLYER, FLYER_LANES, FLYER_RX,
-    FLYER_RY, FOOT, GEM, GEM_POINTS, GRAVITY, HURT_T, JUMP, JUMP2, JUMP_CUT, KNOCK, LADDER, LANES, MAP0, MAP_SLOT,
+    FLYER_RY, FOOT, GEM, GEM_POINTS, GRAVITY, HANG_SCALE, HANG_V, HURT_T, JUMP, JUMP2, JUMP_CUT, KNOCK, LADDER, LANES, MAP0, MAP_SLOT,
     MAXH, MAXW, ONEWAY, ORB, PLAYER_HP, PLAYER_RX, PLAYER_RY, PLAYER_SLOT, REACH, SOLID, SPEED, SPIKE,
     STOMP_BOUNCE, TAU, VIEW_H, WALKER, WALKER_LANES, WALKER_RX, WALKER_RY, WALKER_SPEED, FLYER_SPEED, camera_axis)
 from meowdoku.entities import EntityGame, LawPiece, as_float
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import damped_axis, vertical_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -125,27 +125,28 @@ def delve_step(*columns):
     row_b = below.floor()
     on_solid = (at(solid_t, sl, below) + at(solid_t, sr, below)) > 0.5
     on_plank = ((at(oneway_t, sl, below) + at(oneway_t, sr, below)) > 0.5) & (feet <= row_b + 0.06)
-    grounded = (on_solid | on_plank) & (vy >= -0.5)
+    grounded = (on_solid | on_plank) & (vy >= -0.05)
     in_ladder = at(ladder_t, x, y) > 0.5
 
     # ------------------------------------------------------------ the player's intent
     press = ((fire > 0.0) | ((axy < -0.5) & ~in_ladder)) & is_p
     press_edge = press & (pf <= 0.0)
     want_climb = is_p & in_ladder & ((axy.abs() > 0.2) | (climb > 0.5)) & (fire <= 0.0)
-    ground_jump = grounded | (coy > 0.0) | (climb > 0.5)
-    buf_n = where(press_edge, BUFFER, (buf - dt).clip(0.0, 9.0))
-    do_jump = ready & is_p & (buf_n > 0.0) & ground_jump
-    dbl_jump = ready & is_p & press_edge & ~ground_jump & (air > 0.5) & (ability > 0.5)
-    air_n = where(grounded | (climb > 0.5), 1.0, where(dbl_jump, 0.0, air))
-    coy_n = where(grounded, COYOTE, where(do_jump | dbl_jump, 0.0, (coy - dt).clip(0.0, 9.0)))
-    buf_f = where(do_jump, 0.0, buf_n)
-    climbing = want_climb & ready & ~do_jump
+    stands = grounded | (climb > 0.5)
+    dbl_jump = ready & is_p & press_edge & ~(stands | (coy > 0.0)) & (air > 0.5) & (ability > 0.5)
+    climbing = want_climb & ready
 
     # ------------------------------------------------------------ vertical speed
-    vy_in = where(do_jump, -JUMP, where(dbl_jump, -JUMP2, vy))
-    cut = where((vy_in < -JUMP_CUT) & ~press & ~do_jump & ~dbl_jump, -JUMP_CUT, vy_in)
-    fall_free = (cut + GRAVITY * dt).clip(-FALL_MAX, FALL_MAX)
-    fall = where(is_f, zero, where(climbing, axy.clip(-1.0, 1.0) * CLIMB, fall_free))
+    # entity_motion.vertical_axis: the one vertical law (buffered press, coyote time, launch, variable height,
+    # apex hang, terminal velocity, exact integration); a double jump launches first, the ladder overrides.
+    y_free, v_free, coy_f, buf_f, jumped = vertical_axis(
+        y, where(dbl_jump, -JUMP2, vy), f(press), pf, f(stands), coy, buf, dt, GRAVITY, JUMP, JUMP_CUT, FALL_MAX,
+        HANG_V, HANG_SCALE, COYOTE, BUFFER)
+    do_jump = ready & is_p & (jumped > 0.5)
+    climbing = climbing & ~do_jump
+    air_n = where(stands, 1.0, where(dbl_jump, 0.0, air))
+    coy_n = where(dbl_jump, 0.0, coy_f)
+    fall = where(is_f, zero, where(climbing, axy.clip(-1.0, 1.0) * CLIMB, v_free))
 
     # ------------------------------------------------------------ sideways
     ship_x, ship_vx = damped_axis(x, vx, axis, steer, zero - 3.0, rw + 3.0, SPEED, TAU, REACH, dt)
@@ -164,7 +165,7 @@ def delve_step(*columns):
     vx1 = where(ready, where(is_p, where(stop, 0.0, vxn), where(stop, -walk_v, walk_v)), where(is_p, zero, vx))
 
     # ------------------------------------------------------------ vertical: land or bump
-    ny = y + fall * dt
+    ny = where(is_f, y, where(climbing, y + fall * dt, y_free))
     bottom = ny + ry
     row_land = bottom.floor()
     s_hit = (at(solid_t, x1 - rx * FOOT, bottom) + at(solid_t, x1 + rx * FOOT, bottom)) > 0.5
@@ -329,7 +330,9 @@ class Delve(EntityGame):
     #: Tiles stop the server's player where the page's tile-free prediction
     #: walks on; a gap beyond this keeps the server's word.
     ADOPT_BOUND = 0.25
-    SCENE = {"floor": True, "glass": False, "arcade": False}
+    #: ``stage``: tiles and bodies all stand on one backdrop plane leaning back by this many radians (the page's
+    #: placeEntity: the tiles are the scenery layer, the bodies a layer in front).
+    SCENE = {"floor": True, "glass": False, "arcade": False, "stage": 0.2}
     HOSTILE_LANES = ((1, ENT),)
     #: Tiles beyond the view's edge still sent (the page predicts a little ahead of us).
     TILE_MARGIN = 4
@@ -426,7 +429,13 @@ class Delve(EntityGame):
     # -------------------------------------------------------------- the page's view
     def motion(self) -> dict[str, Any]:
         room = self.world.rooms[self.room]
-        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [-3.0, room.w + 3.0]}
+        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [-3.0, room.w + 3.0],
+                "vertical": {"gravity": GRAVITY, "jump": JUMP, "cut": JUMP_CUT, "fall_max": FALL_MAX, "hang_v": HANG_V,
+                             "hang_scale": HANG_SCALE, "coyote": COYOTE, "buffer": BUFFER, "press": ["fire"],
+                             # contact (the page's prediction): the tile meshes landed on (solid: struck from below too;
+                             # oneway: a plank, landed on from above only), the body's half height and its feet's reach
+                             "ry": PLAYER_RY, "foot": PLAYER_RX * FOOT, "solid": [TILE_LOOK[SOLID][0]],
+                             "oneway": [TILE_LOOK[ONEWAY][0]], "bump": 0.0}}
 
     def layout(self, aspect: float) -> None:
         width = self.window(aspect)
@@ -498,7 +507,7 @@ class Delve(EntityGame):
                 if kind == SOLID and cy > 0 and int(grid[cy - 1, cx]) in (EMPTY, LADDER, SPIKE, GEM, ORB, ONEWAY):
                     color = "top"                                   # a surface you can stand on
                 out.append({"id": f"{10000 + cy * MAXW + cx}:{self.room}", "x": cx + 0.5, "y": cy + 0.5, "vx": 0.0, "vy": 0.0,
-                            "mesh": mesh, "color": color, "size": size, "roll": 0.0, "lean": 0.0, "owner": -1,
+                            "mesh": mesh, "color": color, "size": size, "roll": 0.0, "lean": 0.0, "owner": -1, "scenery": True,
                             "age": 99.0, "spin": 1.2 if kind in (GEM, ORB) else 0.0, "bob": 0.0})
         return out
 
@@ -509,7 +518,7 @@ class Delve(EntityGame):
         out = self.tiles()
         for k in np.flatnonzero(col["alive"] > 0.0):
             slot = col["slot"][k]
-            mesh, size = (("frog", PLAYER_RY + 0.05) if slot == PLAYER_SLOT else ("snail", 0.4) if slot == WALKER else ("bat", 0.36))
+            mesh, size = (("frog", PLAYER_RY) if slot == PLAYER_SLOT else ("snail", WALKER_RY) if slot == WALKER else ("bat", 0.36))
             blink = k == 0 and col["hurt"][0] > 0.0 and int(clock * 12) % 2 == 0
             out.append({"id": f"{k}:{self.room}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]), "vy": float(col["vy"][k]) if k != 0 else 0.0,

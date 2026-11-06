@@ -11,7 +11,7 @@
 // trajectory step of a missile or a bomb; then projected into the patch about
 // the page's own ship by sphere_project.
 
-export const SNAPSHOT_PROTOCOL = 11;          // realtime_socket.PROTOCOL
+export const SNAPSHOT_PROTOCOL = 12;          // realtime_socket.PROTOCOL
 export const FLAG_KEYFRAME = 1, FLAG_CLEAR = 2, FLAG_BODIES = 4;
 
 // One frame: { version } when the layout is another version, else the header,
@@ -36,6 +36,7 @@ export function decodeSnapshot(view, names) {
   you.pilot = [f32(), f32(), f32(), f32(), f32()];
   // the tracking cannon: the locked lane (0 none) and the gun mount's offsets from the nose
   you.lock = f32(); you.mount_yaw = f32(); you.mount_vyaw = f32(); you.mount_pitch = f32(); you.mount_vpitch = f32();
+  you.coy = f32(); you.buf = f32(); you.pf = f32();       // a platformer's vertical_axis state
   // the law time of this state, and the pilot's interval records (seq, law start, length, the five controls):
   // each arrives before its start (scroller.PILOT_PREDELAY)
   you.clock = f64();
@@ -51,7 +52,7 @@ export function decodeSnapshot(view, names) {
     const look = u8(), lean = i16() / 1000, owner = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), z = f32(), vz = f32();
     spawned.push({ lane, mesh, color, size, roll, spin, bob: look & 1, face: (look & 2) !== 0, translucent: (look & 4) !== 0,
-                   ribbon: (look & 8) !== 0, ground: (look & 16) !== 0, glow: (look & 32) !== 0, orient: (look & 64) !== 0,
+                   ribbon: (look & 8) !== 0, ground: (look & 16) !== 0, glow: (look & 32) !== 0, orient: (look & 64) !== 0, scenery: (look & 128) !== 0,
                    lean, owner, age, x, y, vx, vy, z, vz, body: body() });
   }
   const updated = [];

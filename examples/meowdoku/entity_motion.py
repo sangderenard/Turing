@@ -234,6 +234,77 @@ def aim_solution(X: float, Y: float, X2: float, Y2: float, step: float, tspd: fl
     return yaw_t, pitch_t, tau, lx, ly
 
 
+#: Standard gravity, m/s^2.  A game declares the metres its tile stands for
+#: (``UNIT_M``) and its gravity is ``G_EARTH / UNIT_M`` tiles/s^2 -- a real
+#: constant in the game's own units.
+G_EARTH = 9.80665
+
+
+def jump_speed(apex: float, gravity: float, hang_v: float, hang_scale: float):
+    """The launch speed whose held-button rise is exactly ``apex`` (units): the
+    rise at ``gravity`` outside the hang band ``|v| < hang_v`` and at
+    ``gravity * hang_scale`` inside it, so
+    ``apex = (jump^2 - hang_v^2) / (2 g) + hang_v^2 / (2 g hang_scale)``."""
+    return math.sqrt(2.0 * gravity * apex - hang_v * hang_v * (1.0 / hang_scale - 1.0))
+
+
+def vertical_axis(y: float, vy: float, held: float, prev: float, ground: float, coy: float, buf: float, dt: float,
+                  gravity: float, jump: float, cut: float, fall_max: float, hang_v: float, hang_scale: float,
+                  coyote: float, buffer: float):
+    """The vertical motion of a platformer body over ``dt``, one law for the
+    climber, the runner, Delve and the page's prediction of them (``y`` down,
+    so a jump is a NEGATIVE ``vy``).
+
+    The body is a point under constant acceleration, so a step is integrated
+    EXACTLY (``y + v t + g t^2 / 2``), split where the acceleration changes: the
+    HANG BAND (``|v| < hang_v`` with the button ``held``: gravity is scaled by
+    ``hang_scale``, the apex lingers) and TERMINAL VELOCITY (``fall_max``).  The
+    jump height, the time of flight and the fall are therefore the same for any
+    step length.  ``prev`` is the button the step before and ``ground`` is 1
+    when the body stands (the game senses contact; the law does not): a press
+    is BUFFERED for ``buffer`` seconds, a jump is allowed on the ground and for
+    ``coyote`` seconds after leaving it, launches at ``-jump``, and a rise
+    faster than ``cut`` with the button released is cut to it (variable height).
+
+    Returns ``y_next, vy_next, coy_next, buf_next, jumped`` (free flight: the
+    game resolves contact).  Arithmetic and ``abs`` only, so the same text runs
+    on spans in the games and on numbers in the page's WebAssembly core."""
+    down = (held > 0.0) * 1.0
+    pressed = down * ((prev <= 0.0) * 1.0)
+    left_b = buf - dt
+    buf_n = pressed * buffer + (1.0 - pressed) * ((left_b + abs(left_b)) * 0.5)
+    can = ground + (1.0 - ground) * ((coy > 0.0) * 1.0)
+    jumped = ((buf_n > 0.0) * 1.0) * can
+    left_c = coy - dt
+    coy_n = (1.0 - jumped) * (ground * coyote + (1.0 - ground) * ((left_c + abs(left_c)) * 0.5))
+    buf_f = (1.0 - jumped) * buf_n
+    v = jumped * (0.0 - jump) + (1.0 - jumped) * vy
+    v = (v + fall_max - abs(v - fall_max)) * 0.5
+    trim = ((v < 0.0 - cut) * 1.0) * (1.0 - down) * (1.0 - jumped)
+    v = trim * (0.0 - cut) + (1.0 - trim) * v
+    zone_g = gravity * (1.0 - down * (1.0 - hang_scale))
+    # approach the hang band from above (rising fast): ordinary gravity until v = -hang_v
+    rise = ((v < 0.0 - hang_v) * 1.0) * ((((0.0 - hang_v - v) / gravity) + dt - abs(((0.0 - hang_v - v) / gravity) - dt)) * 0.5)
+    v1 = v + gravity * rise
+    d1 = v * rise + 0.5 * gravity * rise * rise
+    left1 = dt - rise
+    # inside the band: scaled gravity until v = +hang_v
+    reach = (hang_v - v1) / zone_g
+    reach = (reach + abs(reach)) * 0.5
+    inside = ((v1 < hang_v) * 1.0) * ((reach + left1 - abs(reach - left1)) * 0.5)
+    v2 = v1 + zone_g * inside
+    d2 = v1 * inside + 0.5 * zone_g * inside * inside
+    left2 = left1 - inside
+    # beyond it: ordinary gravity until terminal velocity, then constant
+    to_fmax = (fall_max - v2) / gravity
+    to_fmax = (to_fmax + abs(to_fmax)) * 0.5
+    ramp = (to_fmax + left2 - abs(to_fmax - left2)) * 0.5
+    v3 = v2 + gravity * ramp
+    d3 = v2 * ramp + 0.5 * gravity * ramp * ramp
+    d4 = v3 * (left2 - ramp)
+    return y + d1 + d2 + d3 + d4, v3, coy_n, buf_f, jumped
+
+
 def climb(z: float, vz: float, dt: float):
     """A body's height after ``dt`` at climb rate ``vz``."""
     return (z + vz * dt,)
@@ -1038,6 +1109,8 @@ PREDICTORS = (
     (aim_solution, ("X", "Y", "X2", "Y2", "step", "tspd", "shot_spd", "dz", "tvz", "slope", "pitch", "yaw_half", "pitch_half"),
      ("yaw_target", "pitch_target", "tau", "lead_x", "lead_y"), "aim"),
     (climb, ("z", "vz", "dt"), ("z_next",), "climb"),
+    (vertical_axis, ("y", "vy", "held", "prev", "ground", "coy", "buf", "dt", "gravity", "jump", "cut", "fall_max", "hang_v",
+                     "hang_scale", "coyote", "buffer"), ("y_next", "vy_next", "coy_next", "buf_next", "jumped"), "vertical"),
     (sphere_project, ("ux", "uy", "uz", "cx", "cy", "cz", "hx", "hy", "hz", "radius"), ("X", "Y"), "project"),
     (sphere_heading, ("hx", "hy", "hz", "cx", "cy", "cz", "gx", "gy", "gz"), ("angle",), "heading"),
     (fire_gate, ("fire_mode", "held", "prev", "timer", "burst_left", "ready", "laser", "missile", "shots_n", "free", "dt",
