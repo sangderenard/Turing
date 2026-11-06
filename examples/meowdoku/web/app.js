@@ -3397,6 +3397,9 @@ function controls() {
   const axisY = (held.has("down") ? 1 : 0) - (held.has("up") ? 1 : 0);
   const out = { move_axis: axis, steer_x: steer ? Math.max(0, steer.x) : -1, fire: steer || held.has("fire") ? 1 : 0 };
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
+  // A game with no ship to predict that still reads the pointer on both axes (a tile board: the cell
+  // under the finger) declares ``steer_y``; it gets the board point itself, not lifted above the finger.
+  else if (state.game && state.game.controls && state.game.controls.includes("steer_y")) out.steer_y = steer ? Math.max(0, steer.z) : -1;
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
   if (banking()) {

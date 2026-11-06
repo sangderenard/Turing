@@ -320,6 +320,15 @@ def export_assets(out: Path) -> dict:
                 pack(name, *largest_component(verts, normals))
             except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
                 print(f"[export] {name} mesh skipped: {error}", flush=True)
+    # Purrline's own glyphs (the tiles, power pieces and cursor).
+    from meowdoku.purrline import EMOJI as PURR_EMOJI
+    for name, glyph in PURR_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3, outline_subdivisions=1)
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
