@@ -5,6 +5,7 @@
 // animates the difference between states; it decides nothing.
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
+import { ComputeRuntime, PointCloud } from "./compute.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -3083,12 +3084,14 @@ function applyState(game) {
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
   renderModes(game);
+  renderGameControls(game);
+  compute.sync(game.compute || null);
   renderHotbars(game);
   showPads(game);
   renderInventory(game);
   renderWordleOptions(game);
   const authority = authorityText(game);
-  status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
+  status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}${game.compute && compute.ready ? " · " + compute.statusText() : ""}`;
   $("hud").textContent = `${game.status}${best}`;
   if (game.record && game.record.plays !== state.recordPlays) { state.recordPlays = game.record.plays; if ($("scores").classList.contains("open")) showScores(); }
   const lichess = game.lichess_control;
@@ -3125,6 +3128,67 @@ function applyState(game) {
   // for the UI thread), carrying the held controls; the server lands the
   // wall time between ticks.
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
+}
+
+// ---------------------------------------------------------------- compute products
+// A game that declares ``game.compute`` (see compute.js) has its law run by the
+// shared compute runtime -- WebGPU compute, or its wasm product -- and its
+// particles drawn here, in the shared scene, as GL points.  A game's own
+// buttons, pickers, ranges and selects come as ``game.controls_ui``.
+let cloud = null;
+const compute = new ComputeRuntime({
+  onStatus: () => { const g = state.game; if (g && g.compute) status.textContent = `${g.status} · ${compute.statusText()}`; },
+  onSamples: (post, base64) => act({ type: post.action, [post.field]: base64 }),
+});
+window.meowdokuDebug.compute = compute;
+function renderGameControls(game) {
+  const box = $("gamectl"), specs = game && game.controls_ui;
+  if (!box) return;
+  if (!specs) { if (box.childElementCount) box.replaceChildren(); delete box.dataset.key; return; }
+  const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;
+  if (box.dataset.key !== key) {
+    box.dataset.key = key;
+    box.replaceChildren(...specs.map((s) => {
+      let el;
+      if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => act({ type: s.action }); }
+      else if (s.kind === "file") {
+        el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
+        const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
+        if (s.capture) input.setAttribute("capture", s.capture);
+        input.onchange = async () => { const f = input.files[0]; input.value = ""; await compute.pickImage(f, s.sample); };
+        el.append(input);
+      } else {
+        el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
+        const input = document.createElement(s.kind === "select" ? "select" : "input");
+        if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
+        else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
+        input.onchange = () => act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value });
+        el.append(input);
+      }
+      el.dataset.ctl = s.id;
+      return el;
+    }));
+  }
+  for (const s of specs) {
+    const el = box.querySelector(`[data-ctl="${s.id}"]`);
+    if (!el) continue;
+    if (s.kind === "button") el.disabled = s.enabled === false;
+    const input = el.querySelector("input:not([type=file]), select");
+    if (input && document.activeElement !== input) input.value = String(s.value);
+  }
+}
+function pointsFrame(cam, now) {
+  const g = state.game;
+  if (!g || !g.compute) return;
+  compute.frame(now);
+  const data = compute.ready && compute.product ? compute.product.points() : null;
+  if (!data) return;
+  if (!cloud) cloud = new PointCloud(gl, link, compile);
+  const ext = state.extent, eye = cam.eye, target = [ext.width / 2, 0, ext.depth / 2];
+  const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
+  const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
+  cloud.draw(data, compute.sizes, { viewProj: cam.viewProj, world: new Float32Array(compute.manifest.view), board: [g.width, g.height],
+                                    y: TILE.height + 0.03, pxPerUnit });
 }
 
 // ---------------------------------------------------------------- draw
@@ -3268,7 +3332,7 @@ function draw(ms) {
   }
   for (const key of removed) state.pieces.delete(key);
   if (wob.on) wobFrame(casters, now); else for (const c of casters) if (c[3]) c[3].cage = null;
-  if (state.flat) { drawFlat(cam, casters); requestAnimationFrame(draw); return; }
+  if (state.flat) { drawFlat(cam, casters); pointsFrame(cam, now); requestAnimationFrame(draw); return; }
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
   gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
@@ -3288,6 +3352,7 @@ function draw(ms) {
   drawSky(cam, now);                                // into whatever target the scene draws in (the lens's, or the screen)
   litPass(cam, now, casters, { plate: plateOn });
   drawCityLights(cam);
+  pointsFrame(cam, now);
   state.glowPoints = [];
   state.glassPieces = [];
   state.ribbonEnds = [];
@@ -3876,12 +3941,9 @@ function fillPickers() {
   levelSelect.onchange = refill;
   levelSelect.value = levels.find((k) => k.startsWith("small/forced")) || levels[0]; refill();
   gameSelect.onchange = () => { document.body.dataset.game = gameSelect.value; $("new").click(); };
-  // the fountain is its own page (fountain.html): a compute-shader particle game, not a board
-  const toFountain = () => { location.href = "fountain.html"; };
   boardSelect.onchange = () => newGame({ game: "meowdoku", id: boardSelect.value });
   $("new").onclick = async () => {
     const g = gameSelect.value;
-    if (g === "fountain") return toFountain();
     if (g === "meowdoku") {
       const chosen = state.catalog.meowdoku.boards.filter((b) => b.level === levelSelect.value);
       const board = chosen[Math.floor(Math.random() * chosen.length)]; boardSelect.value = board.id;

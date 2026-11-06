@@ -466,14 +466,11 @@ def prepare_predictor(web_dir: Path) -> None:
 
 
 def prepare_fountain(web_dir: Path) -> None:
-    """The fountain's page and its compiler products (``fountain_build.build``):
+    """The fountain's compute product (the page's generic compute runtime loads it) (``fountain_build.build``):
     the generated WebGPU compute shader and the wasm product for each size, and
     the manifest holding the compiler's deployment verdicts.  Rebuilt only when
     the law or the emitters change."""
-    import shutil
     from meowdoku import fountain_build
-    for name in ("fountain.html", "fountain.js"):
-        shutil.copyfile(HERE / "web" / name, web_dir / name)
     try:
         started = time.perf_counter()
         manifest = fountain_build.build(web_dir)

@@ -16,6 +16,9 @@
   #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
   #bar .tool, #hint { align-items: center; }
   #status { margin-left: auto; opacity: 0.85; }
+  #gamectl { display: contents; }
+  #gamectl .gctl-file { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  #gamectl button:disabled { opacity: .4; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: 100vw;
@@ -139,6 +142,7 @@
   <label title="A glass screen above the field showing the wide-angle broadcast; tilt to see the real game beneath it">Projection glass <input id="projection" type="checkbox"></label>
   <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
   <span id="modes"></span>
+  <span id="gamectl"></span>
   <span id="hotbars"></span>
   <span id="wordle-opts"></span>
   <label title="Two on-screen thumbsticks: left turns and throttles (double tap: bomb), right climbs and fires while held">Thumbpads <input id="pads" type="checkbox"></label>

@@ -162,17 +162,28 @@ def test_manifest_publishes_the_routes(tmp_path):
     assert json.loads((tmp_path / "fountain.manifest.json").read_text())["sweep"][-1]["pays"] is True
 
 
-def test_server_game_holds_phase_seed_and_image_without_streaming_particles():
+def test_server_game_declares_a_compute_product_and_controls_without_streaming_particles():
     import base64
 
     game = F.FountainGame(cols=8, rows=6)
+    before = game.state()["compute"]["epoch"]
     game.do({"type": "fountain_start", "seed": 11, "mix": 0.25, "mode": 1})
     state = game.state()
     assert (state["phase"], state["seed"], state["mode"], state["n"]) == ("fill", 11, 1, 48)
+    assert state["board"] == "free" and state["entities"] == [] and state["input"] == "compute"
+    assert state["compute"]["epoch"] == before + 1
+    assert state["compute"]["uniforms"] == {"mode": 1.0, "use_image": 0.0}
+    assert "seed=11&mix=0.25" in state["compute"]["layout"]
+    ids = {item["id"]: item for item in state["controls_ui"]}
+    assert ids["replay"]["enabled"] is False and ids["image"]["kind"] == "file"
     with pytest.raises(ValueError):
         game.do({"type": "fountain_replay"})                      # no image yet
     rgb = (np.arange(48 * 3) % 251).astype(np.uint8)
     game.do({"type": "fountain_image", "rgb": base64.b64encode(rgb.tobytes()).decode()})
+    assert {i["id"]: i for i in game.state()["controls_ui"]}["replay"]["enabled"] is True
     game.do({"type": "fountain_replay"})
-    assert game.state()["phase"] == "replay" and game.state()["has_image"]
-    assert "x" not in game.state() and "entities" not in game.state()
+    state = game.state()
+    assert state["phase"] == "replay" and state["compute"]["uniforms"]["use_image"] == 1.0
+    assert state["compute"]["epoch"] == before + 2
+    game.do({"type": "fountain_size", "size": "small"})
+    assert game.state()["n"] == 96 and not game.state()["has_image"]

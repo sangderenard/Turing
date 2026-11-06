@@ -164,6 +164,10 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES)) -> dict:
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
                 "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "dt": F.DT},
         "view": list(F.VIEW), "emit_span": F.EMIT_SPAN, "nozzle": list(F.NOZZLE),
+        # how the page's generic compute runtime presents and starts the product
+        "initial": {"x": F.NOZZLE[0], "y": F.NOZZLE[1]},
+        "points": {"x": "x", "y": "y", "rgb": ["cr", "cg", "cb"], "live": ["age", "t_emit"],
+                   "landed": "landed", "size": "radius"},
         "width": F.WIDTH, "basin_y0": F.BASIN_Y0, "layout_columns": list(F.LAYOUT_COLUMNS),
         "species": [list(item[:4]) + [bool(item[4])] for item in F.SPECIES],
         "settle_seconds": F.EMIT_SPAN + F.FLIGHT[1] + 3.0,

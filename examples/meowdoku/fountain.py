@@ -281,34 +281,53 @@ def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> d
 
 
 # -------------------------------------------------------------------- game
-class FountainGame(Game):
-    """Server side of the fountain: phase, seed, mix, the image hand-off and
-    verification by the law's native product.  It does not stream particles:
-    the page runs the law itself, so a tick costs nothing.
+#: The free board the game occupies in the main scene (board units): the world
+#: window ``VIEW`` mapped onto it.
+BOARD = (10.5, 10.25)
+#: The two particle counts the compiler builds products for (``fountain_build.SIZES``).
+SIZES = {"full": (COLS, ROWS), "small": (12, 8)}
 
-    Actions (``/api/action``): ``fountain_start`` (phase 1, optional ``seed``,
-    ``mix``, ``mode``), ``fountain_image`` (per-id colours as base64 bytes
-    ``rgb``, three per id), ``fountain_replay`` (phase 2), ``fountain_verify``
-    (run the law ``steps`` steps from round zero, natively when the native
-    lane compiles, and report a digest of the state and of the colours)."""
+
+class FountainGame(Game):
+    """Server side of the fountain: phase, seed, mix, size, the image hand-off
+    and verification by the law's native product.  It does not stream
+    particles: the main page's generic compute runtime runs the compiled law
+    (WebGPU compute or the wasm product, as the compiler's verdict and the
+    browser allow) and draws the particles in the shared scene.
+
+    The state declares a ``compute`` product (manifest, size, layout URL,
+    epoch, uniforms) and ``controls_ui`` (buttons, file pickers, ranges and
+    selects for the shared controls bar).
+
+    Actions (``/api/action``): ``fountain_start`` (phase 1; optional ``seed``,
+    ``mix``, ``mode``), ``fountain_mode``, ``fountain_speed``,
+    ``fountain_size``, ``fountain_image`` (per-id colours as base64 bytes
+    ``rgb``, three per id), ``fountain_replay`` (phase 2) and
+    ``fountain_verify`` (run the law ``steps`` steps from round zero,
+    natively when the native lane compiles, and report a digest)."""
 
     game = "fountain"
-    input = "fountain"
+    input = "compute"
     title = "Fountain"
 
     def __init__(self, board_id: str = "", *, cols: int = COLS, rows: int = ROWS):
         super().__init__(board_id)
         self.cols, self.rows = cols, rows
-        self.seed, self.mix, self.mode = 7, 0.5, 0
-        self.phase = "idle"
+        self.seed, self.mix, self.mode, self.speed = 7, 0.5, 0, 2
+        self.phase = "fill"
+        self.epoch = 1                       # bumped whenever the page must restart the fountain
         self.image: np.ndarray | None = None
         self.piece: FountainPiece | None = None
         self.verified: dict[str, Any] | None = None
-        self.status = "fountain: the page runs the law; start a fill"
+        self.status = "fountain"
 
     @property
     def n(self) -> int:
         return self.cols * self.rows
+
+    @property
+    def size_tag(self) -> str:
+        return next((tag for tag, dims in SIZES.items() if dims == (self.cols, self.rows)), "full")
 
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         cols = initial_columns(self.cols, self.rows, seed=self.seed, mix=self.mix, mode=self.mode,
@@ -318,9 +337,8 @@ class FountainGame(Game):
         return cols
 
     def reset(self) -> None:
-        self.phase = "idle"
-        self.image = None
-        self.verified = None
+        self.phase, self.verified = "fill", None
+        self.epoch += 1
 
     def do(self, payload: dict) -> None:
         kind = str(payload.get("type"))
@@ -328,18 +346,29 @@ class FountainGame(Game):
             self.seed = int(payload.get("seed", self.seed))
             self.mix = float(payload.get("mix", self.mix))
             self.mode = int(payload.get("mode", self.mode))
-            self.phase, self.verified = "fill", None
+            self.reset()
+        elif kind == "fountain_mode":
+            self.mode = int(payload["mode"])
+        elif kind == "fountain_speed":
+            self.speed = int(payload["speed"])
+        elif kind == "fountain_size":
+            tag = str(payload["size"])
+            if tag not in SIZES:
+                raise ValueError(f"fountain_size: unknown size {tag!r}")
+            self.cols, self.rows = SIZES[tag]
+            self.image, self.piece = None, None
+            self.reset()
         elif kind == "fountain_image":
             import base64
             raw = np.frombuffer(base64.b64decode(str(payload["rgb"])), dtype=np.uint8)
             if raw.size != self.n * 3:
                 raise ValueError(f"fountain_image: expected {self.n * 3} bytes, got {raw.size}")
             self.image = raw.reshape(self.n, 3).copy()
-            self.phase = "mapped"
         elif kind == "fountain_replay":
             if self.image is None:
                 raise ValueError("fountain_replay: supply an image first")
-            self.phase = "replay"
+            self.phase, self.verified = "replay", None
+            self.epoch += 1
         elif kind == "fountain_verify":
             self.verify(int(payload.get("steps", 600)), image=bool(payload.get("image", False)))
         else:
@@ -357,12 +386,47 @@ class FountainGame(Game):
                          "landed": int(np.sum(final["landed"] > 0.5))}
         return self.verified
 
+    def controls_ui(self) -> list[dict[str, Any]]:
+        sample = {"coords": ["slot_u", "slot_v"], "into": ["ir", "ig", "ib"], "raster_scale": 2,
+                  "post": {"action": "fountain_image", "field": "rgb"}}
+        return [
+            {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start"},
+            {"id": "image", "kind": "file", "label": "Image", "sample": sample},
+            {"id": "camera", "kind": "file", "label": "Camera", "capture": "environment", "sample": sample},
+            {"id": "replay", "kind": "button", "label": "Replay", "action": "fountain_replay",
+             "enabled": self.image is not None},
+            {"id": "mix", "kind": "range", "label": "mix", "min": 0, "max": 1, "step": 0.05,
+             "value": self.mix, "action": "fountain_start", "field": "mix"},
+            {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
+             "field": "mode", "options": [[0, "trig (atan2)"], [1, "rotation"]]},
+            {"id": "size", "kind": "select", "label": "ids", "value": self.size_tag, "action": "fountain_size",
+             "field": "size", "options": [["full", f"{COLS * ROWS}"], ["small", f"{SIZES['small'][0] * SIZES['small'][1]}"]]},
+            {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
+             "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"]]},
+            {"id": "verify", "kind": "button", "label": "Verify", "action": "fountain_verify"},
+        ]
+
     def state(self) -> dict[str, Any]:
-        base = self.base_state(1, 1)
+        width, height = BOARD
+        base = self.base_state(int(round(height)), int(round(width)))
+        verified = self.verified
+        text = {"fill": "phase 1: filling, hue from the slot's angle",
+                "replay": "phase 2: the same fountain, coloured by your image"}[self.phase]
         base.update({
-            "input": self.input, "page": "fountain.html", "n": self.n, "cols": self.cols, "rows": self.rows,
-            "phase": self.phase, "seed": self.seed, "mix": self.mix, "mode": self.mode,
-            "has_image": self.image is not None, "verified": self.verified,
+            "board": "free", "width": width, "height": height, "input": self.input,
+            "palette": {"floor": [0.10, 0.11, 0.16]}, "cells": ["floor"], "marks": [], "hints": [],
+            "pieces": [], "entities": [],
+            "status": f"{text} · {self.n} ids" + (f" · server {verified['lane']}: {verified['landed']} landed, "
+                                                  f"digest {verified['digest']}" if verified else ""),
+            "n": self.n, "phase": self.phase, "seed": self.seed, "mix": self.mix, "mode": self.mode,
+            "has_image": self.image is not None, "verified": verified,
+            "controls_ui": self.controls_ui(),
+            "compute": {
+                "manifest": "fountain.manifest.json", "size": self.size_tag, "epoch": self.epoch,
+                "layout": f"/api/fountain/layout?cols={self.cols}&rows={self.rows}&seed={self.seed}&mix={self.mix}",
+                "uniforms": {"mode": float(self.mode), "use_image": 1.0 if self.phase == "replay" else 0.0},
+                "speed": self.speed, "named": ["ir", "ig", "ib"],
+            },
         })
         return base
 
