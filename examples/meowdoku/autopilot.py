@@ -51,12 +51,37 @@ FEATURES = 5 + 5 * K + 4
 #: A game with height above the board (bullet hell): the ship row and every
 #: hostile row carry height and its rate too, and the policy steers height.
 FEATURES_DEPTH = 7 + 7 * K + 4
+#: THE TOKEN NETWORK (bullet hell): the observation is the ship's own vector
+#: (SHIP_G values), then every body in reach as a token (TOKENS of them, each
+#: TOKEN_F values: relative position and velocity, kind, health), then the
+#: TOKENS-long mask (1 = a real body).  One flat row, so traces, records and
+#: training are unchanged; ``token_policy_forward`` unpacks it, embeds every
+#: token with shared weights, pools them by attention (two learned queries,
+#: softmax over the live tokens only) and joins the ship's embedding to a
+#: two-layer head.  It sees every body in reach, however many, in any order.
+TOKENS, TOKEN_F, SHIP_G = 64, 16, 12
+TOKEN_H, SHIP_H, HEAD_H = 48, 32, 64
+TOKEN_FEATURES = SHIP_G + TOKENS * TOKEN_F + TOKENS
+TOKEN_PARAMS = ("We1", "be1", "We2", "be2", "Q1", "Q2", "Wg", "bg", "Wh1", "bh1", "Wh2", "bh2")
 #: bullet hell's five outputs: roll, throttle, fire, pitch, rudder (two sticks)
-GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (FEATURES_DEPTH, 5)}
+GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (TOKEN_FEATURES, 5)}
+GAME_ARCH = {"space_invaders": "mlp", "bullet_hell": "token"}
+
+
+def arch_of(params: dict) -> str:
+    return "token" if "We1" in params else "mlp"
+
+
+def param_names(params_or_arch) -> tuple[str, ...]:
+    arch = params_or_arch if isinstance(params_or_arch, str) else arch_of(params_or_arch)
+    return TOKEN_PARAMS if arch == "token" else PARAMS
 
 
 def widths_of(params: dict) -> tuple[int, int]:
     """(features, outputs) of a policy: its first and last layers say."""
+    if arch_of(params) == "token":
+        return (int(params["Wg"].shape[0]) + TOKENS * int(params["We1"].shape[0]) + TOKENS,
+                int(params["Wh2"].shape[1]))
     return int(params["W1"].shape[0]), int(params["W3"].shape[1])
 
 GAMES = ("space_invaders", "bullet_hell")
@@ -145,7 +170,65 @@ def scroller_features(game) -> np.ndarray:
         sc.HEIGHT, getattr(sc, "DEPTH", None))
 
 
-FEATURE_FUNCTIONS = {"space_invaders": invaders_features, "bullet_hell": scroller_features}
+def scroller_tokens(game) -> np.ndarray:
+    """The token observation (see TOKENS): the ship's vector, every body in
+    reach (enemies, aces and the boss, bullets and flak, emplacements,
+    pickups, the ship's own shots and missiles, storm and rain clouds) as a
+    token, nearest first, and the mask."""
+    from meowdoku import scroller as sc
+    col = game.session.column
+    k = game.PLAYER_LANE
+    alive, slot, kind = col("alive"), col("slot"), col("kind")
+    x, y, z = col("x"), col("y"), col("z")
+    vx, vy, vz = col("vx"), col("vy"), col("vz")
+    hp = col("hp")
+    span = sc.SPD_MAX - sc.SPD_MIN
+    weapon = int(round(float(col("weapon")[k])))
+    ship = np.zeros(SHIP_G)
+    ship[:9] = (2.0 * z[k] / sc.DEPTH - 1.0, vz[k] / DV, (col("spd")[k] - sc.SPD_MIN) / span,
+                col("bank")[k] - sc.BANK_MAX, col("fuel")[k], col("energy")[k],
+                float(col("lives")[0]) / float(getattr(game, "HEALTH_MAX", None) or 100.0),
+                1.0 if col("timer")[k] <= 0.0 else 0.0, col("beam")[k] / sc.BEAM_RANGE)
+    ship[9 + max(0, min(2, weapon))] = 1.0
+    # the bodies in reach
+    owner = col("owner")
+    is_body = alive > 0.0
+    is_body &= np.isin(slot, (sc.ENEMY, sc.BULLET, sc.STATION, sc.PICKUP, sc.SHOT, sc.MISSILE_SLOT)) | (
+        (slot == sc.STAR) & (kind > 0.0))
+    is_body[k] = False
+    dx, dy, dz = x - x[k], y - y[k], z - z[k]
+    dist = np.sqrt(dx * dx + dy * dy + 0.25 * dz * dz)
+    lanes = np.flatnonzero(is_body & (dist < sc.PATCH_R))
+    lanes = lanes[np.argsort(dist[lanes], kind="stable")][:TOKENS]
+    tokens = np.zeros((TOKENS, TOKEN_F))
+    mask = np.zeros(TOKENS)
+    if len(lanes):
+        s, kd = slot[lanes], kind[lanes]
+        flak = (s == sc.BULLET) & (owner[lanes] >= sc.STATIONS[0]) & (owner[lanes] < sc.STATIONS[1])
+        onehot = np.stack([
+            (s == sc.ENEMY) & (kd != sc.ACE) & (kd != sc.BOSS_KIND),      # enemy craft
+            (s == sc.ENEMY) & ((kd == sc.ACE) | (kd == sc.BOSS_KIND)),     # ace or boss
+            (s == sc.BULLET) & ~flak,                                      # bullet
+            flak,                                                          # flak shell
+            s == sc.STATION,                                               # emplacement
+            s == sc.PICKUP,                                                # pickup
+            (s == sc.SHOT) | (s == sc.MISSILE_SLOT),                       # the ship's own fire
+            s == sc.STAR,                                                  # storm / rain cloud
+        ], axis=1).astype(np.float64)
+        n = len(lanes)
+        tokens[:n, 0], tokens[:n, 1], tokens[:n, 2] = dx[lanes] / DX, -dy[lanes] / DY, dz[lanes] / sc.DEPTH
+        tokens[:n, 3], tokens[:n, 4], tokens[:n, 5] = (vx[lanes] - vx[k]) / DV, -(vy[lanes] - vy[k]) / DV, (vz[lanes] - vz[k]) / DV
+        tokens[:n, 6:14] = onehot
+        tokens[:n, 14] = np.clip(hp[lanes] / 10.0, 0.0, 1.0)
+        tokens[:n, 15] = dist[lanes] / sc.PATCH_R
+        mask[:n] = 1.0
+    return np.concatenate([ship, tokens.reshape(-1), mask])
+
+
+#: The fixed-width observation the bullet hell's MLP used (the nearest K
+#: hostiles); kept for distilling that policy into the token network.
+OLD_FEATURE_FUNCTIONS = {"bullet_hell": scroller_features}
+FEATURE_FUNCTIONS = {"space_invaders": invaders_features, "bullet_hell": scroller_tokens}
 
 
 def controls_from(game, out: np.ndarray) -> dict[str, float]:
@@ -175,6 +258,45 @@ def policy_forward(x, W1, b1, W2, b2, W3, b3):
     return (h @ W3 + b3).tanh()
 
 
+def token_policy_forward(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2):
+    """x (N, TOKEN_FEATURES) -> (N, outputs) in [-1, 1].  AbstractTensor
+    arithmetic only (traced to the NumPy product like ``policy_forward``):
+    unpack the ship, the tokens and the mask; embed every token (shared
+    weights); pool by two attention queries over the live tokens; join the
+    ship's embedding; a two-layer head."""
+    n = int(x.shape[0])
+    ship = x[:, 0:SHIP_G]
+    tokens = x[:, SHIP_G:SHIP_G + TOKENS * TOKEN_F].reshape((n * TOKENS, TOKEN_F))
+    mask = x[:, SHIP_G + TOKENS * TOKEN_F:SHIP_G + TOKENS * TOKEN_F + TOKENS].reshape((n, TOKENS, 1))
+    e = (tokens @ We1 + be1).tanh()
+    e = (e @ We2 + be2).tanh()
+    emb = e.reshape((n, TOKENS, TOKEN_H))
+    pooled = []
+    for q in (Q1, Q2):
+        weight = ((e @ q).tanh() * 4.0).exp().reshape((n, TOKENS, 1)) * mask
+        total = weight.sum(dim=1) + 1e-6
+        pooled.append((weight * emb).sum(dim=1) / total)
+    g = (ship @ Wg + bg).tanh()
+    from src.common.tensors import AbstractTensor as _AT
+    joined = _AT.cat([pooled[0], pooled[1], g], dim=1)
+    h = (joined @ Wh1 + bh1).tanh()
+    return (h @ Wh2 + bh2).tanh()
+
+
+def init_token_params(seed: int = 0, outputs: int = 5) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    w = lambda a, b: rng.normal(0.0, math.sqrt(1.0 / a), (a, b))  # noqa: E731
+    return {"We1": w(TOKEN_F, TOKEN_H), "be1": np.zeros((1, TOKEN_H)), "We2": w(TOKEN_H, TOKEN_H), "be2": np.zeros((1, TOKEN_H)),
+            "Q1": w(TOKEN_H, 1), "Q2": w(TOKEN_H, 1), "Wg": w(SHIP_G, SHIP_H), "bg": np.zeros((1, SHIP_H)),
+            "Wh1": w(2 * TOKEN_H + SHIP_H, HEAD_H), "bh1": np.zeros((1, HEAD_H)), "Wh2": w(HEAD_H, outputs) * 0.1,
+            "bh2": np.zeros((1, outputs))}
+
+
+def forward_of(params_or_arch):
+    arch = params_or_arch if isinstance(params_or_arch, str) else arch_of(params_or_arch)
+    return token_policy_forward if arch == "token" else policy_forward
+
+
 def init_params(seed: int = 0, features: int = FEATURES, hidden=HIDDEN, outputs: int = OUTPUTS) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     sizes = (features, *hidden, outputs)
@@ -186,12 +308,12 @@ def init_params(seed: int = 0, features: int = FEATURES, hidden=HIDDEN, outputs:
 
 
 def flatten(params: dict[str, np.ndarray]) -> np.ndarray:
-    return np.concatenate([params[n].reshape(-1) for n in PARAMS])
+    return np.concatenate([params[n].reshape(-1) for n in param_names(params)])
 
 
 def unflatten(vector: np.ndarray, like: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     out, at = {}, 0
-    for n in PARAMS:
+    for n in param_names(like):
         size = like[n].size
         out[n] = np.asarray(vector[at:at + size], dtype=np.float64).reshape(like[n].shape)
         at += size
@@ -209,7 +331,8 @@ def load_params(path: Path) -> dict[str, np.ndarray] | None:
     if not path.exists():
         return None
     data = np.load(path)
-    return {n: np.asarray(data[n], dtype=np.float64) for n in PARAMS}
+    names = TOKEN_PARAMS if "We1" in data.files else PARAMS
+    return {n: np.asarray(data[n], dtype=np.float64) for n in names}
 
 
 def weights_path(game: str) -> Path:
@@ -220,8 +343,8 @@ def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
     """The AbstractTensor forward itself (numpy backend, no tape)."""
     from src.common.tensors import AbstractTensor as AT
     with AT.use_backend("numpy"), AT.autograd.no_grad():
-        out = policy_forward(AT.tensor(np.asarray(x, dtype=np.float64).reshape(-1, widths_of(params)[0])),
-                             *(AT.tensor(params[n]) for n in PARAMS))
+        out = forward_of(params)(AT.tensor(np.asarray(x, dtype=np.float64).reshape(-1, widths_of(params)[0])),
+                                 *(AT.tensor(params[n]) for n in param_names(params)))
         return np.asarray(out.numpy(), dtype=np.float64)
 
 
@@ -231,26 +354,27 @@ def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
 _PRODUCTS: dict = {}
 
 
-def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPUTS):
-    key = (batch, features, outputs)
+def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPUTS, arch: str = "mlp"):
+    key = (batch, features, outputs, arch)
     if key in _PRODUCTS:
         return _PRODUCTS[key]
     from src.common.tensors.autograd import autograd
     from src.common.tensors.numpy_backend import NumPyTensorOperations
     from src.common.tensors.accelerator_backends import tape_to_source
     from src.common.tensors.accelerator_backends.tape_to_source import emit_tape_source
-    digest = hashlib.sha256((inspect.getsource(policy_forward) + inspect.getsource(tape_to_source)
-                             + f"{features}{HIDDEN}{outputs}{batch}").encode()).hexdigest()[:16]
-    entry = "autopilot_policy"
+    forward, names = forward_of(arch), param_names(arch)
+    digest = hashlib.sha256((inspect.getsource(forward) + inspect.getsource(tape_to_source)
+                             + f"{features}{HIDDEN}{outputs}{batch}{arch}{TOKENS}{TOKEN_F}{SHIP_G}").encode()).hexdigest()[:16]
+    entry = "autopilot_policy" if arch == "mlp" else "autopilot_token_policy"
     path = BUILD / f"{entry}_b{batch}_{digest}.py"
     if not path.exists():
-        like = init_params(features=features, outputs=outputs)
+        like = init_token_params(outputs=outputs) if arch == "token" else init_params(features=features, outputs=outputs)
         sample = {"x": NumPyTensorOperations.tensor(np.zeros((batch, features))),
-                  **{n: NumPyTensorOperations.tensor(like[n]) for n in PARAMS}}
+                  **{n: NumPyTensorOperations.tensor(like[n]) for n in names}}
         with autograd.forward_capture() as tape:
-            produced = policy_forward(*sample.values())
+            produced = forward(*sample.values())
         source = emit_tape_source(tape, sample, {"action": produced}, backend="numpy", function_name=entry)
-        header = (f'"""{entry}: compiled NumPy product of meowdoku.autopilot.policy_forward (batch {batch}).\n\n'
+        header = (f'"""{entry}: compiled NumPy product of meowdoku.autopilot.{forward.__name__} (batch {batch}).\n\n'
                   f"Generated by AbstractTensor tape tracing + tape_to_source (numpy dialect), digest {digest}.\n"
                   f'Do not edit: change policy_forward and it recompiles.\n"""\n')
         BUILD.mkdir(parents=True, exist_ok=True)
@@ -263,7 +387,7 @@ def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPU
     function = getattr(module, entry)
 
     def run(x, params):
-        out = function(np.asarray(x, dtype=np.float64).reshape(batch, features), *(params[n] for n in PARAMS))
+        out = function(np.asarray(x, dtype=np.float64).reshape(batch, features), *(params[n] for n in names))
         if isinstance(out, (tuple, list)):
             out = out[0]
         return np.asarray(out, dtype=np.float64).reshape(batch, outputs)
@@ -324,17 +448,18 @@ class PolicyTrainer:
     def __init__(self, params: dict[str, np.ndarray], lr: float = 2e-3):
         from src.common.tensors import AbstractTensor as AT
         from src.common.tensors.abstract_nn import Adam
+        self.names, self.forward = param_names(params), forward_of(params)
         with AT.use_backend("numpy"):
-            self.tensors = {n: AT.tensor(params[n]) for n in PARAMS}
+            self.tensors = {n: AT.tensor(params[n]) for n in self.names}
             for t in self.tensors.values():
                 t.requires_grad_()
-            self.optimizer = Adam([self.tensors[n] for n in PARAMS], lr=lr)
+            self.optimizer = Adam([self.tensors[n] for n in self.names], lr=lr)
 
     def step(self, x: np.ndarray, target: np.ndarray) -> float:
         from src.common.tensors import AbstractTensor as AT
         with AT.use_backend("numpy"):
-            params = [self.tensors[n] for n in PARAMS]
-            out = policy_forward(AT.tensor(np.asarray(x, dtype=np.float64)), *params)
+            params = [self.tensors[n] for n in self.names]
+            out = self.forward(AT.tensor(np.asarray(x, dtype=np.float64)), *params)
             diff = out - AT.tensor(np.asarray(target, dtype=np.float64))
             loss = (diff * diff).mean()
             grads = AT.autograd.grad(loss, params)
@@ -344,7 +469,7 @@ class PolicyTrainer:
             return float(np.asarray(loss.numpy()))
 
     def params(self) -> dict[str, np.ndarray]:
-        return {n: np.asarray(self.tensors[n].numpy(), dtype=np.float64).copy() for n in PARAMS}
+        return {n: np.asarray(self.tensors[n].numpy(), dtype=np.float64).copy() for n in self.names}
 
 
 # --------------------------------------------------------------- the pilot
@@ -356,7 +481,7 @@ def fitting_params(name: str) -> dict[str, np.ndarray] | None:
     """The game's saved weights, only if they fit its observation and outputs
     (a law that grew an axis needs retraining; old weights are not forced in)."""
     params = load_params(weights_path(name))
-    if params is None:
+    if params is None or arch_of(params) != GAME_ARCH.get(name, "mlp"):
         return None
     features, outputs = widths_of(params)
     want_f, want_o = GAME_WIDTHS[name]
@@ -378,7 +503,7 @@ def preload() -> list[str]:
         params = fitting_params(name)
         if params is not None:
             _PILOT_WEIGHTS[name] = params
-            numpy_product(1, *GAME_WIDTHS[name])
+            numpy_product(1, *GAME_WIDTHS[name], arch=arch_of(params))
             loaded.append(name)
     return loaded
 
@@ -391,7 +516,7 @@ class Pilot:
         self.name, self.params = name, params
         self.features = FEATURE_FUNCTIONS[name]
         self.lane = "numpy"
-        product = numpy_product(1, *widths_of(params))
+        product = numpy_product(1, *widths_of(params), arch=arch_of(params))
         self.run = lambda x: product(x, self.params)
         if os.environ.get("MEOWDOKU_PILOT", "numpy") == "llvm":
             try:
@@ -465,29 +590,89 @@ def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
     game's policy on the craft's own patch, its answers as the player's
     controls mean them (x axis turns, y axis throttles)."""
     name = game.game
-    params = _PILOT_WEIGHTS.get(name) or fitting_params(name)
+    params = live_params(name)
     if params is None:
         return 0.0, 0.0, 0.0, 1.0
     _PILOT_WEIGHTS.setdefault(name, params)
     view = _MirroredView(game, lane)
-    out = numpy_product(1, *widths_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
+    out = numpy_product(1, *widths_of(params), arch=arch_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
     turn = float(out[0]) + (float(out[4]) if len(out) > 4 else 0.0)     # roll and rudder both turn a pilot
     return (max(-1.0, min(1.0, turn)), float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
 
 
+def live_params(name: str) -> dict[str, np.ndarray] | None:
+    """The game's live policy: loaded weights that fit, else -- for a token
+    network, which learns from play -- a fresh one of its kind."""
+    params = _PILOT_WEIGHTS.get(name) or fitting_params(name)
+    if params is None and GAME_ARCH.get(name) == "token":
+        params = init_token_params(outputs=GAME_WIDTHS[name][1])
+    if params is not None:
+        _PILOT_WEIGHTS.setdefault(name, params)
+    return _PILOT_WEIGHTS.get(name)
+
+
 def pilot_for(game) -> Pilot:
     name = game.game
-    if name not in _PILOT_WEIGHTS:
-        params = fitting_params(name)
-        if params is None:
-            raise ValueError(f"no trained autopilot for {name} fitting its current observation "
-                             f"{GAME_WIDTHS[name]}: train it ({weights_path(name)})")
-        _PILOT_WEIGHTS[name] = params
-    return Pilot(name, _PILOT_WEIGHTS[name])
+    params = live_params(name)
+    if params is None:
+        raise ValueError(f"no trained autopilot for {name} fitting its current observation "
+                         f"{GAME_WIDTHS[name]}: train it ({weights_path(name)})")
+    return Pilot(name, params)
 
 
 def available(name: str) -> bool:
-    return name in _PILOT_WEIGHTS or fitting_params(name) is not None
+    return name in _PILOT_WEIGHTS or fitting_params(name) is not None or GAME_ARCH.get(name) == "token"
+
+
+def distill(name: str = "bullet_hell", decisions: int = 6000, epochs: int = 30, seed: int = 0) -> dict:
+    """Carry a learned fixed-width policy into the game's token network: the
+    old policy (``<game>.npz`` as an MLP, kept as ``<game>.mlp.npz``) flies
+    headless games of the real law while the token observation and the old
+    policy's outputs are recorded; the token network fits them (the repo's
+    autograd + Adam) and is saved as the game's weights."""
+    path, kept = weights_path(name), BUILD / f"{name}.mlp.npz"
+    old = load_params(path)
+    if old is None or arch_of(old) != "mlp":
+        old = load_params(kept)
+    if old is None or arch_of(old) != "mlp":
+        raise ValueError(f"no fixed-width {name} policy to distill ({path}, {kept})")
+    if not kept.exists():
+        save_params(old, kept)
+    features, outputs = widths_of(old)
+    want = GAME_WIDTHS[name][1]
+    if outputs < want:                                  # grown controls: zero columns, as fitting_params does
+        old = {**old, "W3": np.concatenate([old["W3"], np.zeros((old["W3"].shape[0], want - outputs))], axis=1),
+               "b3": np.concatenate([old["b3"], np.zeros((1, want - outputs))], axis=1)}
+    teacher = numpy_product(1, features, want, arch="mlp")
+    old_features = OLD_FEATURE_FUNCTIONS[name]
+    xs, ys, game, seq, started = [], [], make_game(name), 0, time.perf_counter()
+    game.control({}); game.tick()
+    while len(xs) < decisions:
+        if game.result() is not None:
+            game.reset(); game.control({}); game.tick()
+        out = teacher(old_features(game), old)[0]
+        xs.append(FEATURE_FUNCTIONS[name](game)); ys.append(out)
+        seq += 1
+        game.control({"inputs": [{"seq": seq, "dur": STEP, **controls_from(game, out)}]}); game.tick()
+    fly_s = time.perf_counter() - started
+    x, y = np.stack(xs), np.stack(ys)
+    trainer, rng = PolicyTrainer(init_token_params(seed=seed, outputs=want), lr=2e-3), np.random.default_rng(seed)
+    losses = []
+    for _ in range(epochs):
+        order, last = rng.permutation(len(x)), float("nan")
+        for at in range(0, len(x), 256):
+            rows = order[at:at + 256]
+            last = trainer.step(x[rows], y[rows])
+        losses.append(last)
+    params = trainer.params()
+    save_params(params, path)
+    _PILOT_WEIGHTS[name] = params
+    return {"decisions": len(x), "fly_s": round(fly_s, 1), "train_s": round(time.perf_counter() - started - fly_s, 1),
+            "loss_first": round(losses[0], 4), "loss_last": round(losses[-1], 4), "saved": str(path), "teacher_kept": str(kept)}
+
+
+def cmd_distill(args) -> None:
+    print(json.dumps(distill(args.game, args.decisions, args.epochs), indent=1), flush=True)
 
 
 # ---------------------------------------------------------- scripted baselines
@@ -638,7 +823,7 @@ def run_episode(name: str, act, seed: int, seconds: float = 40.0, record=None, w
 
 
 def policy_act(name: str, params: dict[str, np.ndarray]):
-    run = numpy_product(1, *widths_of(params))
+    run = numpy_product(1, *widths_of(params), arch=arch_of(params))
 
     def act(game, f):
         return run(f, params)[0]
@@ -892,11 +1077,15 @@ def main(argv=None) -> int:
     c.add_argument("--workers", type=int, default=11)
     c.add_argument("--final-seeds", type=int, default=16)
     c.add_argument("--final-seconds", type=float, default=60.0)
+    d = sub.add_parser("distill")
+    d.add_argument("--game", choices=GAMES, default="bullet_hell")
+    d.add_argument("--decisions", type=int, default=6000)
+    d.add_argument("--epochs", type=int, default=30)
     b = sub.add_parser("bench")
     b.add_argument("--seconds", type=float, default=10.0)
     b.add_argument("--contracts", nargs="*", default=["develop"])
     args = parser.parse_args(argv)
-    {"train": cmd_train, "compare": cmd_compare, "bench": cmd_bench}[args.cmd](args)
+    {"train": cmd_train, "compare": cmd_compare, "bench": cmd_bench, "distill": cmd_distill}[args.cmd](args)
     return 0
 
 
@@ -1081,7 +1270,7 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
     TRAINING[name] = True
     try:
         with LEARN_LOCK:
-            live = _PILOT_WEIGHTS.get(name) or fitting_params(name)
+            live = live_params(name)
             if live is None:
                 return
             params = {n: v.copy() for n, v in live.items()}
@@ -1098,7 +1287,7 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
         fitted, loss = _trainer_pool().submit(_fit, params, x, y, POST_EPOCHS).result()
         with LEARN_LOCK:
             target = _PILOT_WEIGHTS.setdefault(name, fitted)
-            for n in PARAMS:
+            for n in param_names(fitted):
                 target[n] = fitted[n]          # the live pilots read this dict
             save_params(target, weights_path(name))
         LEARN_STATUS[name] = {"last": label, "rows": int(len(x)), "loss": round(loss, 4), "at": time.strftime("%H:%M:%S")}
