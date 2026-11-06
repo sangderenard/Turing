@@ -1415,6 +1415,14 @@ function rebuildBoards(game) {
 }
 
 // ---------------------------------------------------------------- camera and light
+// SCENE-CAMERA GESTURES: a view offset (yaw, pitch, log-zoom, pan on the ground)
+// that composes on top of whatever camera the game is in (board, flat, follow);
+// the gesture layer further down moves the goal, stepCamView eases `cur` toward it.
+const camView = {
+  key: null, lastR: 1, active: 0,
+  cur: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 }, goal: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
+  vel: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
+};
 function camera() {
   const ext = state.extent || { width: 6, depth: 6 };
   const aspect = canvas.width / canvas.height;
@@ -1425,11 +1433,14 @@ function camera() {
   // A free board is sized to the screen already, so it is framed tightly.
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
   const halfFit = Math.max((ext.depth + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
-  const target = [ext.width / 2, 0, ext.depth / 2];
+  const declared = cameraGestures(), V = camView.cur, az = V.yaw;
+  const centre = declared && declared.target ? declared.target : [ext.width / 2, 0, ext.depth / 2];
+  const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
-    const eye = [target[0], 60, target[2]], view = M.lookAt(eye, target, [0, 0, -1]);
-    const hh = halfFit, hw = halfFit * aspect, near = 1, far = 120;
+    const eye = [target[0], 60, target[2]], view = M.lookAt(eye, target, [-Math.sin(az), 0, -Math.cos(az)]);
+    const hh = halfFit * Math.exp(V.lz), hw = hh * aspect, near = 1, far = 120;
+    camView.lastR = hh;
     const proj = new Float32Array([1 / hw,0,0,0, 0,1 / hh,0,0, 0,0,-2 / (far - near),0, 0,0,-(far + near) / (far - near),1]);
     return { view, proj, viewProj: M.multiply(proj, view), eye };
   }
@@ -1448,12 +1459,14 @@ function camera() {
     const proj = M.perspective(COCKPIT.fov, aspect, 0.05, 300);
     return { view, proj, viewProj: M.multiply(proj, view), eye, nose: true, aspect };
   }
-  const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
-  const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
-  const up = el > 1.45 ? [0, 0, -1] : [0, 1, 0];
+  const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el)) * Math.exp(V.lz);
+  camView.lastR = dist;
+  const el2 = Math.max(0.05, Math.min(Math.PI / 2, el + V.pitch));    // the gesture tilt, on top of the game's own
+  const eye = [target[0] + dist * Math.cos(el2) * Math.sin(az), target[1] + dist * Math.sin(el2), target[2] + dist * Math.cos(el2) * Math.cos(az)];
+  const up = el2 > 1.45 ? [-Math.sin(az), 0, -Math.cos(az)] : [0, 1, 0];
   const view = M.lookAt(eye, target, up);
   const proj = M.perspective(0.62, aspect, 0.1, 300);
-  return { view, proj, viewProj: M.multiply(proj, view), eye };
+  return { view, proj, viewProj: M.multiply(proj, view), eye, target };
 }
 const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
 state.light = light;
@@ -3467,7 +3480,7 @@ function pointsFrame(cam, now) {
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
-  const ext = state.extent, eye = cam.eye, target = [ext.width / 2, 0, ext.depth / 2];
+  const ext = state.extent, eye = cam.eye, target = cam.target || [ext.width / 2, 0, ext.depth / 2];
   const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
   const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
   cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height],
@@ -3592,7 +3605,7 @@ function litPass(cam, now, casters, opts = {}) {
 }
 
 function draw(ms) {
-  const now = ms / 1000; state.time = now;
+  const now = ms / 1000; stepCamView(now - (state.time || now)); state.time = now;
   const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   const clear = state.game?.game === "meowdoku" ? MEOW_LOOK.background : [0.085, 0.085, 0.1];
@@ -4056,6 +4069,137 @@ canvas.addEventListener("pointerup", async (e) => {
   }
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ---------------------------------------------------------------- scene-camera gestures
+// One generic layer for every game.  A game declares in its state which input
+// belongs to the camera:
+//   camera_gestures: { orbit: "one" | "two" | null, zoom: true, pan: true, tilt: true,
+//                      target: [x, y, z] | null, limits: { zoom: [lo, hi], elevation: [lo, hi], pan: radius } }
+// absent/null = no camera gestures (the game keeps all its input).  Gestures
+// move a view offset (camView) composed on top of the game's camera mode.
+//   one finger drag (orbit "one", past 8 px)  yaw/pitch around the target
+//   two fingers: pinch = zoom, centre drag = pan (orbit "two": orbit), twist = tilt
+//   double tap (orbit "one") or two-finger tap = reset the view
+//   mouse: wheel = zoom, right/middle drag = orbit, shift+drag = pan, left drag = orbit when orbit "one"
+// A game that declares nothing may be given a default here (below).
+const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: true, tilt: true } };
+function cameraGestures() {
+  const g = state.game; if (!g || (state.camMode === "nose" && !state.flat)) return null;
+  const d = g.camera_gestures === undefined ? CAMERA_GESTURE_DEFAULTS[g.game] : g.camera_gestures;
+  if (!d) return null;
+  const ext = state.extent || { width: 6, depth: 6 }, lim = d.limits || {};
+  return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false, tilt: d.tilt !== false,
+           target: Array.isArray(d.target) ? d.target : null,
+           zoomLim: (lim.zoom || [0.3, 3]).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],
+           panLim: lim.pan != null ? lim.pan : Math.max(ext.width, ext.depth) };
+}
+const CV_KEYS = ["yaw", "pitch", "lz", "px", "pz"];
+function resetCameraView() { for (const k of CV_KEYS) { camView.goal[k] = 0; camView.vel[k] = 0; } }
+function clampCamGoal(gest) {
+  const G = camView.goal, base = state.tiltDeg * Math.PI / 180;
+  G.lz = Math.max(gest.zoomLim[0], Math.min(gest.zoomLim[1], G.lz));
+  G.pitch = Math.max(gest.elLim[0] - base, Math.min(gest.elLim[1] - base, G.pitch));
+  const r = Math.hypot(G.px, G.pz); if (r > gest.panLim) { G.px *= gest.panLim / r; G.pz *= gest.panLim / r; }
+}
+function stepCamView(dt) {
+  const g = state.game, key = g ? g.game : null;
+  if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) camView.cur[k] = camView.goal[k] = camView.vel[k] = 0; }
+  dt = Math.max(0, Math.min(0.1, dt || 0));
+  const gest = cameraGestures(), G = camView.goal, C = camView.cur;
+  if (gest && !camView.active) {                                        // inertia: a released flick coasts and damps
+    const decay = Math.exp(-dt * 4);
+    for (const k of CV_KEYS) { G[k] += camView.vel[k] * dt; camView.vel[k] *= decay; if (Math.abs(camView.vel[k]) < 1e-4) camView.vel[k] = 0; }
+    clampCamGoal(gest);
+  }
+  const ease = 1 - Math.exp(-dt * 16);
+  for (const k of CV_KEYS) C[k] += (G[k] - C[k]) * ease;
+}
+const gpointers = new Map();           // pointerId -> { x, y, sx, sy, t, type }
+let gsession = null;                   // { mode: "pending" | "orbit" | "pan" | "two" | "dead", ... }
+let gLastTap = null;
+function camPush(k, delta, dt) {       // move a goal and keep a smoothed velocity for the flick
+  camView.goal[k] += delta;
+  const v = delta / Math.max(dt, 0.008); camView.vel[k] = camView.vel[k] * 0.5 + v * 0.5;
+}
+function camOrbit(dx, dy, gest, dt) {
+  camPush("yaw", -dx * 0.006, dt);
+  if (gest.tilt) camPush("pitch", dy * 0.006, dt);
+}
+function camPan(dx, dy, dt) {
+  const rect = canvas.getBoundingClientRect(), s = 2 * camView.lastR * Math.tan(0.31) / rect.height, az = camView.cur.yaw;
+  camPush("px", (-Math.cos(az) * dx - Math.sin(az) * dy) * s, dt);
+  camPush("pz", (Math.sin(az) * dx - Math.cos(az) * dy) * s, dt);
+}
+function claimCamera() { steer = null; tap = null; press = null; }   // a camera gesture cancels the game's pending tap/steer
+function twoPoints() { const [a, b] = [...gpointers.values()]; return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1, ang: Math.atan2(b.y - a.y, b.x - a.x) }; }
+canvas.addEventListener("pointerdown", (e) => {
+  const gest = cameraGestures(); if (!gest) return;
+  const now = performance.now();
+  gpointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: now, type: e.pointerType });
+  camView.active = gpointers.size;
+  for (const k of CV_KEYS) camView.vel[k] = 0;
+  if (e.pointerType === "mouse") {
+    const mode = e.button === 1 || e.button === 2 ? "orbit" : (e.shiftKey && e.button === 0 ? "pan" : null);
+    if (mode) { e.preventDefault(); e.stopImmediatePropagation(); claimCamera(); try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* untracked */ } }
+    gsession = { mode: mode || "pending", t: now, last: now };
+    return;
+  }
+  if (gpointers.size === 1) { gsession = { mode: "pending", t: now, last: now }; return; }      // the game sees the first finger
+  e.stopImmediatePropagation(); claimCamera();
+  if (gpointers.size === 2) { const p = twoPoints(); gsession = { mode: "two", t: now, last: now, moved: false, cx: p.cx, cy: p.cy, d: p.d, ang: p.ang }; }
+  else if (gsession) gsession.mode = "dead";
+}, true);
+canvas.addEventListener("pointermove", (e) => {
+  const P = gpointers.get(e.pointerId); if (!P || !gsession) return;
+  const gest = cameraGestures(); if (!gest) return;
+  const now = performance.now(), dt = (now - gsession.last) / 1000, dx = e.clientX - P.x, dy = e.clientY - P.y;
+  P.x = e.clientX; P.y = e.clientY;
+  const S = gsession;
+  if (S.mode === "pending") {
+    if (!(gest.orbit === "one" && Math.hypot(P.x - P.sx, P.y - P.sy) > 8)) return;   // under the threshold: still a tap for the game
+    S.mode = "orbit"; claimCamera(); try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* untracked */ }
+    camOrbit(P.x - P.sx, P.y - P.sy, gest, 0.016);
+  } else if (S.mode === "orbit") camOrbit(dx, dy, gest, dt);
+  else if (S.mode === "pan") { if (gest.pan) camPan(dx, dy, dt); }
+  else if (S.mode === "two" && gpointers.size === 2) {
+    const p = twoPoints();
+    if (Math.hypot(p.cx - S.cx, p.cy - S.cy) > 10 || Math.abs(Math.log(p.d / S.d)) > 0.08) S.moved = true;
+    if (gest.zoom) camPush("lz", Math.log(S.d / p.d), dt);
+    const cdx = p.cx - S.cx, cdy = p.cy - S.cy;
+    if (gest.orbit === "two") camOrbit(cdx, cdy, gest, dt); else if (gest.pan) camPan(cdx, cdy, dt);
+    let dang = p.ang - S.ang; dang = Math.atan2(Math.sin(dang), Math.cos(dang));
+    if (gest.tilt) camPush("pitch", -dang * 0.9, dt);
+    S.cx = p.cx; S.cy = p.cy; S.d = p.d; S.ang = p.ang;
+  } else { e.stopImmediatePropagation(); return; }
+  clampCamGoal(gest); S.last = now; e.preventDefault(); e.stopImmediatePropagation();
+}, true);
+function endGesturePointer(e) {
+  const P = gpointers.get(e.pointerId); if (!P) return;
+  const gest = cameraGestures(), now = performance.now(), S = gsession;
+  gpointers.delete(e.pointerId);
+  camView.active = gpointers.size;
+  if (S && now - S.last > 90) for (const k of CV_KEYS) camView.vel[k] = 0;      // held still before lifting: no flick
+  if (S && gest && e.type === "pointerup") {
+    if (S.mode === "pending" && gest.orbit === "one" && now - P.t < 300 && Math.hypot(P.x - P.sx, P.y - P.sy) < 10) {
+      if (gLastTap && now - gLastTap.t < 320 && Math.hypot(P.x - gLastTap.x, P.y - gLastTap.y) < 30) { resetCameraView(); gLastTap = null; }
+      else gLastTap = { t: now, x: P.x, y: P.y };
+    } else if (S.mode === "two" && !S.moved && now - S.t < 300 && gest.orbit !== "one") resetCameraView();   // two-finger tap
+  }
+  if (S && S.mode !== "pending") e.stopImmediatePropagation();
+  if (S && S.mode === "two" && gpointers.size === 1) S.mode = "dead";           // the lone finger left over does nothing
+  if (!gpointers.size) gsession = null;
+}
+canvas.addEventListener("pointerup", endGesturePointer, true);
+canvas.addEventListener("pointercancel", endGesturePointer, true);
+canvas.addEventListener("dblclick", (e) => { const gest = cameraGestures(); if (gest && gest.orbit === "one" && e.pointerType !== "touch") resetCameraView(); });
+canvas.addEventListener("wheel", (e) => {
+  const gest = cameraGestures(); if (!gest || !gest.zoom) return;
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+  camView.goal.lz += e.deltaY * unit * 0.0012; clampCamGoal(gest);
+}, { passive: false });
+window.meowdokuDebug.camView = camView;
+window.meowdokuDebug.resetCameraView = resetCameraView;
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.game && (state.game.input === "watch" || state.game.input === "realtime")) act({ type: "tick" }); });
 // In fullscreen the bar is hidden, and a hidden control takes no key: its
 // shortcuts (undo, reset, new, light, flat, tools, hint) are swallowed here,

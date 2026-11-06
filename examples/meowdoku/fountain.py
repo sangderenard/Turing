@@ -620,6 +620,7 @@ class FountainGame(Game):
             "n": self.n, "phase": self.phase, "mix": self.mix, "mode": self.mode,
             "has_image": self.has_image, "verified": verified,
             "controls_ui": self.controls_ui(),
+            "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {"mode": float(self.mode), "use_image": 1.0 if self.phase == "replay" else 0.0,
