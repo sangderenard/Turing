@@ -201,12 +201,13 @@ def _edges(seed: int, count: int, tick: float) -> dict:
 
 
 # ------------------------------------------------------------------ the route
-def world_route(world: delve_world.World, goal: int | None = None) -> list[dict] | None:
+def world_route(world: delve_world.World, goal: int | None = None, start: tuple | None = None) -> list[dict] | None:
     """Room by room from the start to ``goal``: for each room the arrival door, whether to take the orb on the
     way, and the door to leave by (a breadth-first search over (room, arrival, ability))."""
     goal = world.goal_room if goal is None else goal
     rooms = world.rooms
-    start = (world.start_room, -1, world.gate_room is None)       # no gate: nothing to find first
+    # ``start``: (room, arrival door or -1, ability) -- from where the player is now, not the world's start
+    start = start or (world.start_room, -1, world.gate_room is None)       # no gate: nothing to find first
     prev, queue = {start: None}, [start]
     for node in queue:
         room_id, d, ability = node
