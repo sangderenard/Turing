@@ -556,11 +556,6 @@ def numpy_compiled_program(program, namespace, pieces, schedule, channel_names):
     source digest.  Control flow is the authored control flow; the pieces stay
     what ``step_i`` names -- linked, called from the loop.
     """
-    import numpy as _np
-    from src.common.tensors.abstraction import AbstractTensor as _AT
-    _probe = type(_AT.get_tensor(_np.zeros(1))).__name__
-    if _probe != "NumPyTensorOperations":
-        raise RuntimeError(f"the active tensor backend is {_probe}, not NumPy")
     from src.compiler.fused_program_python_backend import lower_functions_to_numpy
 
     lowered = lower_functions_to_numpy(
@@ -1194,8 +1189,9 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     program = bind_program(namespace)
     if numpy_compiled:
         # The dt system's own functions run as the NumPy product of their
-        # AbstractTensor source; the pieces stay linked.  Where the lowering
-        # cannot apply (another tensor backend, a refused spelling), the
+        # AbstractTensor source; the pieces stay linked.  Tensors handed in at
+        # the boundary are converted to arrays from any backend
+        # (``adopt_numpy_domain``).  If the lowering refuses a spelling, the
         # system runs its AbstractTensor source and says so.
         try:
             program = numpy_compiled_program(program, namespace, pieces, schedule, channel_names)
