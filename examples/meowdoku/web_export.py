@@ -291,6 +291,16 @@ def export_assets(out: Path) -> dict:
             verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
                                         outline_subdivisions=SIDE_SUBDIVISIONS.get(name, 1))
             pack(name, *largest_component(verts, normals))
+    # Tile Quest's own glyphs (the tiles and kinds the shared tables lack).
+    from meowdoku.tilequest import EMOJI as TILE_EMOJI, EMOJI_SUBDIVISIONS as TILE_SUBDIVISIONS
+    for name, glyph in TILE_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                                            outline_subdivisions=TILE_SUBDIVISIONS.get(name, 1))
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),

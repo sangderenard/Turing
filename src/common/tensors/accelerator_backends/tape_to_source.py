@@ -250,6 +250,18 @@ class _Printer:
         if raw == "logical_not":
             return dialect.call("logical_not", args[0])
 
+        if raw == "long":
+            # The truncating cast to an integer index (a table lookup's
+            # position): the SSA backend's ``trunc`` on doubles.
+            return f"{args[0]}.astype(np.int64)" if dialect is NUMPY else f"{args[0]}.to(torch.int64)"
+
+        if raw == "index_select":
+            # A gather along ``dim`` by an integer index vector.
+            dim = int(params.get("dim", 0))
+            if dialect is NUMPY:
+                return dialect.call("take", args[0], args[1], f"axis={dim}")
+            return dialect.call("index_select", args[0], str(dim), args[1])
+
         if raw == "clamp":
             low, high = params.get("min"), params.get("max")
             # A bound recorded as a parameter is a number or nothing; a tensor

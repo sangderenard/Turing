@@ -52,6 +52,7 @@ rollback); ``reset`` restores round zero.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import time
@@ -243,6 +244,10 @@ class LawPiece:
     law = None
     argument_names: tuple[str, ...] = ()
     output_names: tuple[str, ...] = ()
+    #: Modules besides the law's own whose text the product is a function of
+    #: (a shared substrate the law calls, e.g. ``meowdoku.walkers``): hashed
+    #: into the source digest so editing one recompiles the law.
+    source_modules: tuple[str, ...] = ()
 
     def __init__(self, batch: int):
         self.batch = int(batch)
@@ -281,7 +286,8 @@ class LawPiece:
         from src.common.tensors.accelerator_backends import tape_to_source
         from meowdoku import entity_motion
         law_module = sys.modules.get(getattr(cls.law, "__module__", "")) or inspect.getmodule(cls.law)
-        modules = (law_module, sys.modules[__name__], entity_motion, tape_to_source)
+        modules = (law_module, sys.modules[__name__], entity_motion, tape_to_source,
+                   *(importlib.import_module(name) for name in cls.source_modules))
         return "\0".join(inspect.getsource(module) for module in modules)
 
     def compile(self, columns: dict[str, np.ndarray]) -> None:
