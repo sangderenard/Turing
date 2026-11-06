@@ -3122,6 +3122,7 @@ function applyState(game) {
   const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
   renderModes(game);
   renderGameControls(game);
+  chessClockSync(game);
   compute.sync(game.compute || null);
   renderHotbars(game);
   showPads(game);
@@ -3440,6 +3441,72 @@ const act = (payload) => {
   chain = step;
   return step;
 };
+// ---------------------------------------------------------------- chess against the network
+// The user's move animates at once (the page lit the legal squares, so it
+// knows the move is legal); the server's reply confirms it, or the piece
+// slides back.  The network searches on the server while ``game.thinking``;
+// the page polls for its move.  The clock is the server's: each side's time
+// as of the last state, ticked down locally for the running side.
+const chessClock = { box: null, snap: null, poll: null, asked: false };
+function optimisticMove(game, h) {
+  if (!game || game.game !== "chess_vs_net" || game.thinking || game.outcome || game.selected == null || !h || h.kind !== "board") return;
+  const to = h.r * game.cols + h.c;
+  if (!game.hints || !game.hints[to]) return;                      // not one of the lit squares: the server decides
+  const mover = game.pieces.find((p) => p.cell === game.selected), live = mover && state.pieces.get(mover.id);
+  if (!live || live.removing != null) return;
+  const victim = game.pieces.find((p) => p.cell === to && p.id !== mover.id), taken = victim && state.pieces.get(victim.id);
+  if (taken && taken.removing == null) taken.removing = state.time;
+  const [x, z] = cellPosition(game, to, false);
+  live.from = [live.x, live.z]; live.t0 = state.time; live.x = x; live.z = z;
+}
+const clockText = (s) => { s = Math.max(0, s); return s < 10 ? s.toFixed(1) : `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
+function chessClockBox() {
+  if (chessClock.box) return chessClock.box;
+  const box = document.createElement("div");
+  box.id = "chess-clock";
+  box.style.cssText = "position:fixed;left:12px;top:calc(var(--bar-h, 40px) + 10px);z-index:3;display:none;font:14px/1.3 system-ui,sans-serif;color:#e8e8ea;background:rgba(22,22,26,0.82);border:1px solid #3a3a42;border-radius:10px;padding:8px 10px;min-width:150px";
+  box.innerHTML = `<style>#chess-clock .side{display:flex;justify-content:space-between;gap:14px;padding:3px 6px;border-radius:6px;font-variant-numeric:tabular-nums}
+    #chess-clock .side b{font:600 22px/1.1 ui-monospace,Consolas,monospace}#chess-clock .side.run{background:#3b5a8a}#chess-clock .side.low b{color:#ff8a7a}
+    #chess-clock .think{min-height:18px;opacity:.85;margin-top:4px}#chess-clock .dots::after{content:"";animation:cc-dots 1s steps(4,end) infinite}
+    @keyframes cc-dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+    #chess-clock select{background:#26262c;color:#e8e8ea;border:1px solid #3a3a42;border-radius:6px;padding:3px 6px;font:inherit;margin-top:6px;width:100%}</style>
+    <div class="side" data-side="black"><span>Network</span><b>--</b></div>
+    <div class="side" data-side="white"><span>You</span><b>--</b></div>
+    <div class="think"></div><select title="Time control" aria-label="Time control"></select>`;
+  box.querySelector("select").onchange = (e) => act({ type: "clock", name: e.target.value });
+  document.body.append(box);
+  return (chessClock.box = box);
+}
+function chessClockSync(game) {
+  clearTimeout(chessClock.poll);
+  if (!game || game.game !== "chess_vs_net" || !game.clock) { if (chessClock.box) chessClock.box.style.display = "none"; chessClock.snap = null; return; }
+  const box = chessClockBox(), c = game.clock;
+  box.style.display = "block";
+  chessClock.snap = { clock: c, at: performance.now() }; chessClock.asked = false;
+  const select = box.querySelector("select");
+  if (select.dataset.key !== c.controls.join()) { select.dataset.key = c.controls.join(); select.innerHTML = c.controls.map((n) => `<option>${n}</option>`).join(""); }
+  if (document.activeElement !== select) select.value = c.control;
+  const think = box.querySelector(".think");
+  think.classList.toggle("dots", !!game.thinking);
+  think.textContent = c.flagged ? `${c.flagged} lost on time` : game.thinking ? "network thinking" : "";
+  chessClockTick();
+  // The network's move arrives on the server's thread: ask again soon.
+  if (game.thinking) chessClock.poll = setTimeout(() => { if (state.game === game) act({ type: "tick" }); }, 150);
+}
+function chessClockTick() {
+  const snap = chessClock.snap, box = chessClock.box;
+  if (!snap || !box) return;
+  const c = snap.clock, spent = (performance.now() - snap.at) / 1000;
+  for (const side of ["white", "black"]) {
+    const row = box.querySelector(`[data-side="${side}"]`);
+    const left = c.timed ? c[side] - (c.running === side ? spent : 0) : null;
+    row.querySelector("b").textContent = c.timed ? clockText(left) : "--";
+    row.classList.toggle("run", c.running === side);
+    row.classList.toggle("low", c.timed && left < 20);
+    if (c.running === side && left <= 0 && !chessClock.asked) { chessClock.asked = true; act({ type: "tick" }); }   // the server confirms the flag
+  }
+}
+setInterval(chessClockTick, 100);
 const newGame = (payload) => {
   if (payload.game === "meowdoku" && $("palette").value) payload = { ...payload, palette: $("palette").value };
   const step = chain.then(async () => { console.log("[meow] new", JSON.stringify(payload)); applyState(await api("/api/new", payload)); }).catch((e) => console.warn(e));
@@ -3720,9 +3787,10 @@ canvas.addEventListener("pointerup", async (e) => {
     // tap: select or move; swipe from a piece to a square: select then move
     if (p.moved && p.start && p.start.kind === "board" && h && h.kind === "board" && h.key !== p.start.key) {
       await act({ type: "cell", r: p.start.r, c: p.start.c, button: "primary" });
+      optimisticMove(state.game, h);
       await act({ type: "cell", r: h.r, c: h.c, button: "primary" }); return;
     }
-    if (h && h.kind === "board") await act({ type: "cell", r: h.r, c: h.c, button: "primary" });
+    if (h && h.kind === "board") { optimisticMove(game, h); await act({ type: "cell", r: h.r, c: h.c, button: "primary" }); }
     return;
   }
   if (game.input === "text" && h && h.kind === "rack") {

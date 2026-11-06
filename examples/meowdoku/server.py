@@ -74,6 +74,7 @@ class Table:
         self.boards = {board["id"]: board for board in database["boards"]}
         self.levels = database["levels"]
         self.game = None
+        self.chess_clock = None              # the time control the player last picked (chess against the network)
 
     def catalog(self) -> dict:
         return {
@@ -111,7 +112,8 @@ class Table:
         elif kind == "chess_arena":
             self.game = ChessArena(parallel=int(payload.get("parallel", 4)), lock=self.lock)   # the learner is one per process; 4 searched games
         elif kind == "chess_vs_net":
-            self.game = ChessVsNet()
+            self.game = ChessVsNet(clock=payload.get("clock") or self.chess_clock)
+            self.game.lock = self.lock       # the network's search lands its move under this table's lock
         elif kind == "lichess":
             self.game = LichessGame()
         elif kind == "space_invaders":
@@ -155,6 +157,11 @@ class Table:
             if not hasattr(self.game, "do"):
                 raise ValueError("not the fountain")
             self.game.do(payload)
+        elif kind == "clock":
+            if not isinstance(self.game, ChessVsNet):
+                raise ValueError("only chess against the network has a clock")
+            self.chess_clock = str(payload.get("name", ""))
+            self.game.set_clock(self.chess_clock)           # a new time control restarts the game
         elif kind == "autopilot":
             if not hasattr(self.game, "set_autopilot"):
                 raise ValueError("this game has no autopilot")

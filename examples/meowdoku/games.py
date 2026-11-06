@@ -1008,7 +1008,20 @@ class ChessArena(Chess):
 
 
 class ChessVsNet(Chess):
-    """You play White; the network answers for Black after each move."""
+    """You play White; the network answers for Black after each move.
+
+    Your move lands at once: the network's search runs on a worker thread
+    (``thinking`` in the state) and its answer is applied when it is found,
+    so a request never waits on the search.  The server owns a chess clock:
+    each side's remaining time, charged for the wall time between moves,
+    plus an increment per move; a side whose time runs out loses (flag
+    fall), and the network's search budget is drawn from its own remaining
+    time."""
+
+    TIME_CONTROLS = {"untimed": None, "1+0": (60.0, 0.0), "3+2": (180.0, 2.0), "5+0": (300.0, 0.0), "10+5": (600.0, 5.0)}
+    DEFAULT_CONTROL = "10+5"
+    SIMULATIONS = 3000                 # the untimed search, as before
+    MAX_THINK = 8.0                    # seconds, whatever the clock allows
 
     def result(self) -> dict[str, Any] | None:
         end = self.outcome()
@@ -1016,12 +1029,24 @@ class ChessVsNet(Chess):
             return None
         score = {"white": 1.0, "draw": 0.5}.get(end, 0.0)
         said = {"white": "beat the network", "draw": "drew the network"}.get(end, "lost to the network")
-        return {"score": score, "detail": f"{said} in {self.moves} moves"}
+        how = " on time" if self.flagged else ""
+        return {"score": score, "detail": f"{said}{how} in {self.moves} moves"}
 
     game = "chess_vs_net"
     title = "Chess against the network"
 
-    def __init__(self, board_id: str = "vs_net"):
+    def __init__(self, board_id: str = "vs_net", clock: str | None = None):
+        import threading
+        import time
+        self.lock = threading.RLock()      # Table replaces it with its own, so the worker's move lands under the table's lock
+        self._now = time.monotonic         # tests replace this to drive the clock
+        self.generation = 0                # reset / undo bump it: a stale search is dropped
+        self.thinking = False
+        self.flagged: str | None = None
+        self.last_think: dict = {}
+        self._worker = None
+        self.control_name = clock if clock in self.TIME_CONTROLS else self.DEFAULT_CONTROL
+        self._reset_clock()
         super().__init__(board_id)
         self.player = self_play()
         # Every position of the game, from the mover's side, for learning
@@ -1029,6 +1054,64 @@ class ChessVsNet(Chess):
         self.boards, self.materials, self.learned = [], [], False
         self._record()
 
+    # --- the clock ---------------------------------------------------------
+    def set_clock(self, name: str) -> None:
+        if name not in self.TIME_CONTROLS:
+            raise ValueError(f"unknown time control {name!r}: {', '.join(self.TIME_CONTROLS)}")
+        self.control_name = name
+        self.reset()
+
+    def _reset_clock(self) -> None:
+        spec = self.TIME_CONTROLS[self.control_name]
+        base, inc = spec if spec else (0.0, 0.0)
+        self.increment = inc
+        self.clock = {"white": base, "black": base}
+        self.stamp = None                  # the running side's clock counts from here; it starts with White's first move
+        self.flagged = None
+
+    @property
+    def timed(self) -> bool:
+        return self.TIME_CONTROLS[self.control_name] is not None
+
+    def remaining(self, side: str) -> float:
+        left = self.clock[side]
+        if self.timed and self.stamp is not None and side == self.turn and not self.flagged:
+            left -= self._now() - self.stamp
+        return left
+
+    def _check_flag(self) -> None:
+        if self.timed and not self.flagged and self.stamp is not None and self.remaining(self.turn) <= 0:
+            self.flagged = self.turn
+            self.clock[self.turn] = 0.0
+            self.stamp = None
+            self.selected = None
+            self._learn_async()
+
+    def _charge(self, mover: str) -> None:
+        """The mover has moved: bill the time it took, pay the increment, start the other clock."""
+        if not self.timed:
+            return
+        now = self._now()
+        if self.stamp is not None:
+            self.clock[mover] = max(0.0, self.clock[mover] - (now - self.stamp))
+        self.clock[mover] += self.increment
+        self.stamp = now
+
+    def outcome(self) -> str | None:
+        if self.flagged:
+            return "black" if self.flagged == "white" else "white"
+        return super().outcome()
+
+    def think_budget(self) -> float | None:
+        """Seconds the network may search: a share of its own remaining time
+        plus most of the increment, never more than MAX_THINK or what is left."""
+        if not self.timed:
+            return None
+        left = max(0.0, self.remaining("black"))
+        share = left / 30.0 + 0.75 * self.increment
+        return max(0.05, min(share, self.MAX_THINK, 0.4 * left))
+
+    # --- the game ----------------------------------------------------------
     def _record(self) -> None:
         from meowdoku.chess_net import encode, material
         del self.boards[self.moves:], self.materials[self.moves:]       # an undo drops what it took back
@@ -1044,20 +1127,104 @@ class ChessVsNet(Chess):
         outcome = end if end in ("white", "black") else "draw"
         engine().call(self.player.learn_from, list(self.boards), list(self.materials), outcome)
 
+    def _learn_async(self) -> None:
+        import threading
+        threading.Thread(target=self._learn_if_over, daemon=True, name="chess-vs-net-learn").start()
+
     def cell(self, r: int, c: int, button: str) -> None:
-        before = self.moves
+        self._check_flag()
+        if self.thinking or self.outcome() is not None:
+            return                                                       # the network is on move, or the game is over
+        before, mover = self.moves, self.turn
         super().cell(r, c, button)
-        if self.moves > before:
-            self._record()
-        if self.moves > before and self.turn == "black" and self.outcome() is None:
-            from meowdoku import mcts
-            move = engine().call(mcts.best_move, self, self.player.net, simulations=3000)   # tree search on the engine thread
-            if move is not None:
+        if self.moves == before:
+            return
+        self._charge(mover)
+        self._record()
+        if self.outcome() is not None:
+            self._learn_async()
+            return
+        if self.turn == "black":
+            self._start_search()
+
+    def _start_search(self) -> None:
+        import threading
+        self.thinking = True
+        self._worker = threading.Thread(target=self._think, args=(self.generation,), daemon=True, name="chess-vs-net-search")
+        self._worker.start()
+
+    def _think(self, generation: int) -> None:
+        """Worker: search for Black on the engine thread, then land the move."""
+        import time
+        from meowdoku import mcts
+        try:
+            with self.lock:
+                if generation != self.generation:
+                    return
+                budget = self.think_budget()
+                position = mcts.clone(self)
+            started = time.perf_counter()
+            result = engine().call(mcts.search, position, self.player.net, simulations=self.SIMULATIONS, seconds=budget,
+                                   min_simulations=64 if budget is None or budget >= 1.0 else 16)
+            took = time.perf_counter() - started
+            with self.lock:
+                if generation != self.generation:
+                    return
+                self.last_think = {"budget": budget, "seconds": took, "simulations": result.simulations}
+                self._check_flag()
+                if self.flagged or result.move is None:
+                    return
+                mover = self.turn
                 answered = self.moves
-                super().cell(*self.rc(move[0]), "primary"); super().cell(*self.rc(move[1]), "primary")
+                self.selected = None
+                super().cell(*self.rc(result.move[0]), "primary"); super().cell(*self.rc(result.move[1]), "primary")
                 if self.moves > answered:
+                    self._charge(mover)
                     self._record()
-        self._learn_if_over()
+        except Exception as error:                                       # the state shows it instead of a silent hang
+            self.last_think = {"error": f"{type(error).__name__}: {error}"}
+        finally:
+            with self.lock:
+                if generation == self.generation:
+                    self.thinking = False
+            if generation == self.generation:
+                self._learn_if_over()
+
+    def tick(self) -> None:
+        self._check_flag()
+
+    def reset(self) -> None:
+        self.generation += 1
+        self.thinking = False
+        super().reset()
+        self._reset_clock()
+        self.boards, self.materials = [], []
+        self._record()
+
+    def undo(self) -> None:
+        self.generation += 1
+        self.thinking = False
+        super().undo()
+        if self.timed and self.stamp is not None:
+            self.stamp = self._now()
+        del self.boards[self.moves + 1:], self.materials[self.moves + 1:]
+
+    def state(self) -> dict[str, Any]:
+        self._check_flag()
+        st = super().state()
+        timed = self.timed
+        st["clock"] = {"control": self.control_name, "controls": list(self.TIME_CONTROLS), "timed": timed, "increment": self.increment,
+                       "white": self.remaining("white"), "black": self.remaining("black"),
+                       "running": (self.turn if timed and self.stamp is not None and self.outcome() is None else None),
+                       "flagged": self.flagged}
+        st["thinking"] = self.thinking
+        st["think"] = dict(self.last_think)
+        if self.flagged:
+            st["status"] = f"time · {self.flagged} flagged · {'black' if self.flagged == 'white' else 'white'} wins on time · {self.moves} moves"
+        elif self.thinking:
+            st["status"] = f"network thinking · {self.moves} moves"
+            st["legal_uci"] = []
+        return st
 
 
 class LichessGame(Chess):
