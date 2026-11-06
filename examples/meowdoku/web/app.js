@@ -504,7 +504,22 @@ function reliefMesh(exported) {
 // heights on the mesh's grid nodes, their normals from neighbouring nodes,
 // and the colour/depth UVs are rewritten every frame -- the DepthMesh's own
 // grid and strips, re-read, so relief, colour and depth turn together.
-const TURN_LAND = { travel: [0, 0], at: null };
+const TURN_LAND = { travel: [0, 0], at: null, yaw: 0 };
+// The land's height under board point (x, z): the relief map read at the
+// same turned, travelling coordinate the land is drawn with, on the land's
+// own base (terrainOrigin) -- what a ground piece stands on.
+function landHeight(x, z) {
+  const relief = TERRAIN.relief, game = state.game, patch = game && game.predict && game.predict.patch;
+  if (!relief || !relief.map || !patch) return null;
+  const c = Math.cos(TURN_LAND.yaw), s = Math.sin(TURN_LAND.yaw);
+  const X = x - patch.cx, Y = patch.cy - z;
+  const u = TURN_LAND.travel[0] + X * c + Y * s, v = TURN_LAND.travel[1] + X * s - Y * c;
+  const n = relief.map.n, h = relief.map.h, toMap = n / relief.tile, wrap = (i) => ((i % n) + n) % n;
+  const fu = u * toMap, fv = v * toMap, iu = Math.floor(fu), iv = Math.floor(fv), tu = fu - iu, tv = fv - iv;
+  const a = wrap(iv), b = wrap(iv + 1), l = wrap(iu), r = wrap(iu + 1);
+  const top = h[a * n + l] + (h[a * n + r] - h[a * n + l]) * tu, bottom = h[b * n + l] + (h[b * n + r] - h[b * n + l]) * tu;
+  return terrainOrigin(relief)[1] + top + (bottom - top) * tv;
+}
 function turnRelief(relief, now) {
   const game = state.game, patch = game.predict && game.predict.patch;
   if (!relief.map || !relief.step || !patch) return false;
@@ -513,6 +528,7 @@ function turnRelief(relief, now) {
   const frame = TURN_LAND.at == null ? 0 : Math.min(0.1, now - TURN_LAND.at);
   TURN_LAND.at = now;
   if (!game.over) { TURN_LAND.travel[0] += spd * frame * Math.sin(yaw); TURN_LAND.travel[1] -= spd * frame * Math.cos(yaw); }
+  TURN_LAND.yaw = yaw;
   const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], c = Math.cos(yaw), s = Math.sin(yaw);
   const n = relief.map.n, h = relief.map.h, toMap = n / relief.tile;
   const wrap = (i) => ((i % n) + n) % n;
@@ -1110,6 +1126,21 @@ function headlights(cam) {
     return { view: M.apply(cam.view, at), colour: [1.0, 0.94, 0.82], level: 0, intensity: HEADLIGHT.intensity,
              spotDir: vdir, spotCone: cone };
   });
+}
+// A bomb's blast lights the scene in its own glow colour (the game's
+// emissive palette entry for it), flaring and fading over its life.
+function blastLights(cam, now) {
+  const glow = (state.game && state.game.emissive) || {}, lights = [];
+  if (state.flat) return lights;
+  for (const piece of state.pieces.values()) {
+    if (!piece.entity || piece.removing != null || !glow[piece.color] || piece.ribbon) continue;
+    if (!String(piece.color).startsWith("blast")) continue;
+    const age = now - piece.t0, flare = Math.max(0, 1 - age / 0.5) * (0.75 + 0.25 * Math.random());
+    const g = glow[piece.color], peak = Math.max(...g);
+    const at = worldOf(piece);
+    lights.push({ view: M.apply(cam.view, [at[0], at[1] + 0.3, at[2]]), colour: g.map((v) => v / peak), level: 0, intensity: 55 * flare });
+  }
+  return lights;
 }
 function lightningLights(cam, now) {
   const lights = [];
@@ -1742,7 +1773,7 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
-    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0;
+    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0, ground = (look & 16) !== 0;
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
@@ -1759,11 +1790,11 @@ function applySnapshot(view) {
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
                            sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon, ground,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
-    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], x = f32(), y = f32(), vx = f32(), vy = f32();
+    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], roll = i16() / 1000, x = f32(), y = f32(), vx = f32(), vy = f32();
     const h = f32(), vh = f32();
     const piece = state.pieces.get(sock.lanes.get(lane));
     if (piece) Object.assign(piece, { sx: x, sz: y, vx, vz: vy, sh: h, vh, tRecv: stamp, mesh, color });
@@ -1973,7 +2004,10 @@ function placeEntity(piece, now, x, z, mesh) {
   const grow = hRel == null || state.flat ? 1 : DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel;
   const lift = hRel == null || state.flat ? 0 : (piece.h || 0) * DEPTH_LIFT;
   const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size * grow, scale = scale0 / mesh.extent * Math.max(s, 0.001);
-  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
+  const land = piece.ground && !state.flat ? landHeight(x, z) : null;
+  let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT
+                      : land != null ? land + scale0 * 0.35 - planetDrop(x, z)
+                      : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll + turned));
@@ -2309,9 +2343,9 @@ function applyState(game) {
   for (const e of game.entities || []) {
     seen.add(e.id);
     const live = state.pieces.get(e.id);
-    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob });
+    if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, ground: !!e.ground });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
@@ -2386,6 +2420,7 @@ function litPass(cam, now, casters, opts = {}) {
   // Lightning lights the scene: each strike is a blue-white point light at
   // the cloud, the impact and the bolt's middle, fading with the strike.
   bulbLights.push(...lightningLights(cam, now));
+  bulbLights.push(...blastLights(cam, now));
   bulbLights.push(...headlights(cam));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
@@ -2560,7 +2595,7 @@ const newGame = (payload) => {
 const DEMO_GAMES = new Set(["space_invaders", "bullet_hell"]);
 const DEMO_START_S = 3, DEMO_IDLE_S = 15;
 const demo = { key: null, since: 0, lastInput: -Infinity, pending: false };
-const userControlling = () => { const c = controls(); return !!(c.move_axis || c.move_axis_y || c.fire || c.steer_x >= 0); };
+const userControlling = () => { const c = controls(); return !!(c.move_axis || c.move_axis_y || c.move_axis_z || c.fire || c.alt_fire || c.steer_x >= 0); };
 setInterval(() => {
   const game = state.game, now = performance.now() / 1000;
   if (!game || !DEMO_GAMES.has(game.game) || game.input !== "realtime" || demo.pending) return;
@@ -2605,16 +2640,23 @@ function controls() {
   const out = { move_axis: axis, steer_x: steer ? Math.max(0, steer.x) : -1, fire: steer || held.has("fire") ? 1 : 0 };
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
+  if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
   return out;
 }
 // A game with a third axis (height above the board): E / PageUp rise,
 // Q / PageDown dive, or the Rise / Dive buttons (held).
 function heightAxis() { return !!(state.game && state.game.predict && state.game.predict.z); }
+// ALTERNATE FIRE (a game whose controls take it): B or X drops a bomb (a
+// second press bursts a hanging parachute bomb), C cycles the style.
+const BOMB_STYLES = ["dumb bomb", "parachute bomb", "ground seeker"];
+function bombs() { const g = state.game; return !!(g && g.controls && g.controls.includes && g.controls.includes("alt_fire")); }
+function cycleBomb() { state.bombStyle = ((state.bombStyle || 0) + 1) % BOMB_STYLES.length; $("bomb-style").textContent = `Style: ${BOMB_STYLES[state.bombStyle]}`; }
 function keyControl(key) {
   const k = key.length === 1 ? key.toLowerCase() : key;
   const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
   if (common[k]) return common[k];
   if (heightAxis()) { const lift = { e: "rise", PageUp: "rise", q: "dive", PageDown: "dive" }[k]; if (lift) return lift; }
+  if (bombs() && (k === "b" || k === "x")) return "alt";
   if (twoAxis()) return { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" }[k];
   return { ArrowUp: "fire", w: "fire" }[k];
 }
@@ -2736,6 +2778,7 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
+  if (game.input === "realtime" && bombs() && e.key.toLowerCase() === "c") { e.preventDefault(); cycleBomb(); return; }
   if (game.input === "realtime" && keyControl(e.key)) { e.preventDefault(); held.add(keyControl(e.key)); return; }
   if (game.input === "text") {
     if (/^[a-zA-Z]$/.test(e.key)) return act({ type: "text", text: game.text + e.key.toUpperCase() });
@@ -2767,7 +2810,8 @@ async function submitMove() {
 }
 $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
-for (const [id, name] of [["rise", "rise"], ["dive", "dive"]]) {
+$("bomb-style").onclick = cycleBomb;
+for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) {
   const button = $(id);
   const on = (e) => { e.preventDefault(); held.add(name); }, off = () => held.delete(name);
   button.addEventListener("pointerdown", on); button.addEventListener("pointerup", off);

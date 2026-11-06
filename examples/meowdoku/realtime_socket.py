@@ -24,11 +24,12 @@ DELTA, little-endian:
     u16  gone         lanes whose entity disappeared, u16 each
     u16  spawned      new entities: u16 lane, u8 mesh, u8 color,
                       u16 size*1000, i16 roll*1000, i16 spin*1000, u8 flags (bit0 bob, bit1 face its velocity, bit2 translucent: drawn with the glass,
-                      bit3 ribbon: a lightning end, drawn as the bolt between a strike's two ends),
+                      bit3 ribbon: a lightning end, drawn as the bolt between a strike's two ends,
+                      bit4 ground: sits on the land's relief, wherever it stands),
                       i16 lean*1000, u16 owner (65535: none -- the lane that
                       fired a projectile), f32 age (world seconds since it
                       spawned), f32 x, y, vx, vy, z, vz
-    u16  updated      changed entities: u16 lane, u8 mesh, u8 color,
+    u16  updated      changed entities: u16 lane, u8 mesh, u8 color, i16 roll*1000,
                       f32 x, y, vx, vy, z, vz
 
 An entity is UPDATED only when the page's extrapolation of what it was last
@@ -159,7 +160,7 @@ class SnapshotEncoder:
             record = {"born": born, "x": entity["x"], "y": entity["y"], "vx": entity["vx"], "vy": entity["vy"],
                       "z": float(entity.get("z", 0.0)), "vz": float(entity.get("vz", 0.0)),
                       "mesh": self._name(entity["mesh"], fresh), "color": self._name(entity["color"], fresh),
-                      "clock": clock}
+                      "clock": clock, "roll": round(float(entity.get("roll", 0.0)) * 20.0) / 20.0}
             current[lane] = record
             before = self.known.get(lane)
             if before is None or before["born"] != born:
@@ -170,7 +171,8 @@ class SnapshotEncoder:
                         abs(before["z"] + before["vz"] * dt - record["z"]))
             if (keyframe or drift > DRIFT or before["vx"] != record["vx"] or before["vy"] != record["vy"]
                     or before["vz"] != record["vz"]
-                    or before["mesh"] != record["mesh"] or before["color"] != record["color"]):
+                    or before["mesh"] != record["mesh"] or before["color"] != record["color"]
+                    or before["roll"] != record["roll"]):
                 updated.append((lane, record))
             else:
                 current[lane] = before                 # the page still extrapolates from that
@@ -200,13 +202,14 @@ class SnapshotEncoder:
                                      int(round(entity["size"] * 1000)), int(round(entity["roll"] * 1000)),
                                      int(round(entity["spin"] * 1000)),
                                      (1 if entity.get("bob") else 0) | (2 if entity.get("face") else 0)
-                                     | (4 if entity.get("translucent") else 0) | (8 if entity.get("ribbon") else 0),
+                                     | (4 if entity.get("translucent") else 0) | (8 if entity.get("ribbon") else 0)
+                                     | (16 if entity.get("ground") else 0),
                                      int(round(entity.get("lean", 0.55) * 1000)), 65535 if owner < 0 else owner,
                                      float(entity.get("age", 0.0)),
                                      record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))
         parts.append(struct.pack("<H", len(updated)))
         for lane, record in updated:
-            parts.append(struct.pack("<HBB6f", lane, record["mesh"], record["color"],
+            parts.append(struct.pack("<HBBh6f", lane, record["mesh"], record["color"], int(round(record["roll"] * 1000)),
                                      record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))
         binary = b"".join(parts)
 

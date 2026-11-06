@@ -124,8 +124,24 @@ PICKUPS = (407, 413)
 SMOKES = (413, 425)
 FLASHES = (425, 429)
 STATIONS = (429, 433)
-LANES = STATIONS[1]
+BOMBS = (433, 439)
+BLASTS = (439, 443)
+LANES = BLASTS[1]
 STATION, STATION_KIND = 9.0, 5.0
+#: ALTERNATE FIRE: bombs (``kind`` is the style) and their blasts.  A DUMB
+#: bomb falls on the trajectory law; a PARACHUTE bomb opens its canopy after
+#: CHUTE_DEPLOY and hangs, drifting slowly -- a second press air-bursts it; a
+#: SEEKER flies powered at the nearest ground emplacement.  Each blast hurts
+#: what is inside its own radius and leaves a glowing flash in its colour.
+BOMB_SLOT, BLAST_SLOT = 10.0, 11.0
+DUMB, CHUTE, SEEKER = 0.0, 1.0, 2.0
+BOMB_DIAMETER, BOMB_DRAG = 0.3, 0.3
+CHUTE_DEPLOY, CHUTE_DIAMETER, CHUTE_DRAG = 0.35, 3.2, 1.4
+SEEK_SPD, SEEK_TURN = 6.0, 3.0
+BLAST_R = {DUMB: 1.8, CHUTE: 2.6, SEEKER: 1.3}
+BLAST_DAMAGE = {DUMB: 6.0, CHUTE: 4.0, SEEKER: 10.0}
+BLAST_LIFE = 0.5
+BOMB_LIFE = 14.0
 FLAK_SPEED = 6.0
 FLAK_RELOAD = 2.4
 STATION_HP = 4.0
@@ -249,25 +265,58 @@ SHOT_LIFE, BULLET_LIFE, PICKUP_LIFE = 0.6, 3.5, 14.0
 #: Scenery (clouds, emplacements) left farther than SCENERY_FAR behind is
 #: rebuilt AHEAD in front of the player.
 AHEAD, SCENERY_FAR = 13.0, 16.0
-STATION_Z = 0.15
+STATION_Z = 0.0             # emplacements sit on the land (the page sets them on its relief)
 CLOUD_DRIFT, STORM_DRIFT, SMOKE_DRIFT = 0.25, 0.5, 0.25
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
 MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 
 #: Glyphs this game adds to the exported meshes (web_export.py): the cloud.
-EMOJI = {"cloud": "\u2601"}
+EMOJI = {"cloud": "\u2601", "parachute": "\U0001FA82"}
 
 CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis_z": "move-axis-z",
-            "steer_x": "pointer-board-x", "steer_y": "pointer-board-y", "fire": "primary-action"}
+            "steer_x": "pointer-board-x", "steer_y": "pointer-board-y", "fire": "primary-action",
+            "alt_fire": "secondary-action", "bomb_style": "bomb-style"}
+
+
+def nearest_of_block(u, z, live, rows, cols, radius):
+    """For each lane in ``rows``, the position and height of the nearest live
+    lane in ``cols`` (great-circle distance), as full-length spans (zero
+    outside ``rows``), and whether it has one.  The rows-by-cols block only,
+    as ``block_hits`` computes its pairs."""
+    r0, r1 = rows
+    c0, c1 = cols
+    n = int(u[0].shape[0])
+    a, b = r1 - r0, c1 - c0
+    ru = [u[i][r0:r1].reshape((a, 1)) for i in range(3)]
+    cu = [u[i][c0:c1].reshape((1, b)) for i in range(3)]
+    cross = (ru[1] * cu[2] - ru[2] * cu[1], ru[2] * cu[0] - ru[0] * cu[2], ru[0] * cu[1] - ru[1] * cu[0])
+    gap = radius * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt().atan2(
+        ru[0] * cu[0] + ru[1] * cu[1] + ru[2] * cu[2])
+    gap = where(live[c0:c1].reshape((1, b)) + (gap * 0.0 > 1.0), gap, 1.0e9)
+    best = gap.min(dim=1).reshape((a, 1))
+    pick = as_float(gap == best) * as_float(best < 1.0e8)
+    pick = pick / (pick.sum(dim=1).reshape((a, 1)) + 1e-12)
+
+    def spread(values):
+        parts = [u[0][:r0] * 0.0] if r0 > 0 else []
+        parts.append(values)
+        if r1 < n:
+            parts.append(u[0][r1:] * 0.0)
+        return AbstractTensor.cat(parts, dim=0) if len(parts) > 1 else values
+
+    target = tuple(spread((pick * cu[i]).sum(dim=1)) for i in range(3))
+    height = spread((pick * z[c0:c1].reshape((1, b))).sum(dim=1))
+    has = spread(as_float(best.reshape((a,)) < 1.0e8)) > 0.0
+    return target, height, has
 
 
 def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
                   hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
-                  score, lives, invuln, clock, field_w, pace, level,
-                  move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, dt):
+                  score, lives, invuln, clock, alt_prev, field_w, pace, level,
+                  move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
     live = alive > 0.0
@@ -278,6 +327,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_smoke = slot == SMOKE
     is_flash = slot == FLASH
     is_station = slot == STATION
+    is_bomb, is_blast = slot == BOMB_SLOT, slot == BLAST_SLOT
     is_boss_lane = lane == BOSS_LANE
     clock_next = clock + dt
     zero = x * 0.0
@@ -342,6 +392,26 @@ def scroller_step(lane, slot, rx, ry, rz,
     missile_c = missile_rank - 0.5 * (pm - 1.0)
     missile_u, missile_h0 = sm.offset(u0, h0, zero + MUZZLE, missile_c * 0.3, RADIUS)
     missile_h = sm.vwhere(has_target, sm.toward(missile_u, tu), missile_h0)
+    # Alternate fire, on the press (not the hold): with a parachute bomb of
+    # the player's hanging, the press bursts it; else a bomb of the chosen
+    # style leaves the belly, carrying the ship's speed.  A seeker's target is
+    # the nearest live ground emplacement (else the nearest enemy).
+    alt_now = (P * alt_fire).sum() > 0.0
+    press = alt_now & ((P * alt_prev).sum() <= 0.0) & ship_on & playing
+    hanging = is_bomb & live & (kind == CHUTE) & (age >= CHUTE_DEPLOY)
+    burst_chutes = hanging & press
+    drop_bomb = press & ~(f(hanging).sum() > 0.0)
+    bomb_spawn = first_of(is_bomb & ~live, lane) & drop_bomb
+    style = ((P * bomb_style).sum().clip(0.0, 2.0) + 0.5).floor()
+    ground_live = is_station & live
+    ggap = where(ground_live, dist, 1.0e9)
+    ground_t = first_of(ground_live & (ggap == ggap.min()), lane)
+    has_ground = f(ground_t).sum() > 0.0
+    G_ = where(has_ground, f(ground_t), f(nearest))
+    gu = ((G_ * ux).sum(), (G_ * uy).sum(), (G_ * uz).sum())
+    gz = (G_ * z).sum()
+    bomb_u, bomb_h = sm.offset(u0, h0, zero - 0.2, zero, RADIUS)
+    bomb_h = sm.vwhere((style == SEEKER) & (G_.sum() > 0.0), sm.toward(bomb_u, gu), bomb_h)
 
     # ------------------------------------------------ the population
     # A FIXED population lives on the sphere: POP enemy lanes (more each
@@ -443,7 +513,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     agility = where(kind == SPINNER, SPINNER_TURN, DRIFTER_TURN)
     hunt_turn = where(passed, zero, (HUNT_GAIN * want).clip(-1.0, 1.0) * agility)
     pilot_turn = pax.clip(-1.0, 1.0) * PILOT_TURN
-    turn_angle = where(is_player, zero + dyaw, where(hunt, hunt_turn * dt, where(piloted, pilot_turn * dt, zero)))
+    seeking = is_bomb & live & (kind == SEEKER)
+    own_u, own_z, own_has = nearest_of_block(u, z, ground_live, BOMBS, STATIONS, RADIUS)
+    seek_u = sm.vwhere(own_has, own_u, (gu[0] + zero, gu[1] + zero, gu[2] + zero))
+    seek_z = where(own_has, own_z, gz + zero)
+    seek_turn = (2.0 * sm.bearing(u, h, sm.toward(u, seek_u))).clip(-1.0, 1.0) * SEEK_TURN
+    turn_angle = where(is_player, zero + dyaw, where(hunt, hunt_turn * dt, where(piloted, pilot_turn * dt,
+                       where(seeking, seek_turn * dt, zero))))
     h_turned = sm.turn(u, h, turn_angle)
     # Pickups wait where they fell; inside MAGNET_R they fly hard at the ship.
     pull = is_pickup & live & ship_on & (dist < MAGNET_R)
@@ -456,16 +532,21 @@ def scroller_step(lane, slot, rx, ry, rz,
                  where(is_pickup, where(pull, pull_speed, 0.0), spd))))
 
     # ------------------------------------------------ spawns
-    spawn = shot_spawn | arrival | bullet_spawn | missile_spawn
+    spawn = shot_spawn | arrival | bullet_spawn | missile_spawn | bomb_spawn
+    u1 = sm.vwhere(bomb_spawn, bomb_u, u)
     u1 = sm.vwhere(shot_spawn, shot_u, sm.vwhere(missile_spawn, missile_u, sm.vwhere(bullet_spawn, su,
-                   sm.vwhere(arrival, arrival_u, u))))
+                   sm.vwhere(arrival, arrival_u, u1))))
+    h_turned = sm.vwhere(bomb_spawn, bomb_h, h_turned)
     h1 = sm.vwhere(shot_spawn, shot_h, sm.vwhere(missile_spawn, missile_h, sm.vwhere(bullet_spawn, bullet_h,
                    sm.vwhere(arrival, sm.toward(arrival_u, u0), h_turned))))
+    spd1 = where(bomb_spawn, where(style == SEEKER, zero + SEEK_SPD, pspd), spd1)
     spd1 = where(shot_spawn, shot_speed, where(missile_spawn, t_dist / flight, where(bullet_spawn, bullet_speed,
                  where(arrival, where(is_boss_lane | ace_spawn, zero + PILOT_SPD,
                        where(new_kind == SPINNER, SPINNER_SPD, DRIFTER_SPD) * (0.8 + 0.4 * tempo.clip(0.0, 1.0))), spd1))))
     z1 = where(shot_spawn | missile_spawn, pz, where(arrival, routine_z, where(bullet_spawn, sz, z)))
+    z1 = where(bomb_spawn, (pz - 0.15).clip(0.05, DEPTH), z1)
     kind1 = where(respawn, new_kind, where(boss_spawn, BOSS_KIND, where(ace_spawn, ACE, kind)))
+    kind1 = where(bomb_spawn, style, kind1)
     age1 = where(spawn, 0.0, age + dt)
     level_hp = 1.0 + 0.5 * (level - 1.0)
     hp1 = where(respawn, where(new_kind == SPINNER, 9.0, 3.0),
@@ -482,7 +563,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     vz1 = where(is_pickup, 0.0, vz1)
     live1 = live | spawn
     born1 = where(spawn, clock, born)
-    owner1 = where(shot_spawn | missile_spawn, 0.0, where(bullet_spawn, shooter_lane, where(respawn, -1.0, owner)))
+    owner1 = where(shot_spawn | missile_spawn | bomb_spawn, 0.0, where(bullet_spawn, shooter_lane, where(respawn, -1.0, owner)))
 
     # ------------------------------------------------ flight
     # Everything flies its great circle at its speed; the player's height and
@@ -495,11 +576,25 @@ def scroller_step(lane, slot, rx, ry, rz,
                                                   MISSILE_DRAG, AIR_DENSITY, GRAVITY, 0.0, 0.0, 0.0)[:6]
     flying = is_missile & moving
     step = where(flying, mx, step)
+    # Bombs: the same trajectory law, a canopy's drag once a parachute opens
+    # (it slows, hangs and drifts down); a seeker flies powered, diving at
+    # its target over the time the arc takes.
+    canopy = (kind1 == CHUTE) & (age1 >= CHUTE_DEPLOY)
+    diameter = where(canopy, zero + CHUTE_DIAMETER, zero + BOMB_DIAMETER)
+    drag_k = where(canopy, zero + CHUTE_DRAG, zero + BOMB_DRAG)
+    bx_, bz_, by_, bvx_, bvz_, bvy_ = trajectory_step(zero, z1, zero, spd1, vz1, zero, dt, MISSILE_MASS, diameter,
+                                                      drag_k, AIR_DENSITY, GRAVITY, 0.0, 0.0, 0.0)[:6]
+    falling = is_bomb & moving & (kind1 != SEEKER)
+    seeker_live = is_bomb & moving & (kind1 == SEEKER)
+    seek_time = (sm.arc(u1, seek_u, RADIUS) / SEEK_SPD).clip(0.15, 10.0)
+    seek_vz = (seek_z - z1) / seek_time
+    step = where(falling, bx_, step)
     u2, h2 = sm.advance(u1, h1, step, RADIUS)
-    spd2 = where(flying, mvx, spd1)
+    spd2 = where(flying, mvx, where(falling, bvx_, spd1))
     z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z,
-               where(flying, mz_, where(moving, z1 + vz1 * dt, z1))))
-    vz1 = where(flying, mvz_, vz1)
+               where(flying, mz_, where(falling, bz_, where(seeker_live, z1 + seek_vz * dt,
+                                                            where(moving, z1 + vz1 * dt, z1))))))
+    vz1 = where(flying, mvz_, where(falling, bvz_, where(seeker_live, seek_vz, vz1)))
     paz_z, paz_vz = damped_axis(z1, vz, paz, zero - 1.0, zero + Z_MARGIN, zero + DEPTH - Z_MARGIN,
                                 SPEED, TAU, REACH, dt)
     flown = piloted & ~arrival
@@ -543,6 +638,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     expired = ((is_shot & (age1 > where(pw == LASER, SHOT_LIFE / LASER_SPEED, SHOT_LIFE)))
                | (is_bullet & (age1 > BULLET_LIFE)) | (is_pickup & (age1 > PICKUP_LIFE)))
     grounded = is_missile & (z2 < 0.0)                  # a missile that reaches the land is spent
+    expired = expired | (is_bomb & (age1 > BOMB_LIFE)) | (is_blast & (age1 > BLAST_LIFE))
     live2 = (live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded & ~expired) | rebuilt
 
     # ------------------------------------------------ collisions, block against block (in the patch)
@@ -586,7 +682,23 @@ def scroller_step(lane, slot, rx, ry, rz,
     closest = first_of(in_reach & (where(in_reach, reach_l, 1.0e9) == where(in_reach, reach_l, 1.0e9).min()), lane)
     struck = where(storm_strike, closest, in_reach)
     zapped = f(struck & is_player).sum() > 0.0
-    hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy))
+    # Bombs go off on the land, on a seeker's target, or (a parachute) at the
+    # second press; each blast hurts every craft and emplacement inside its
+    # style's radius (in 3-D: the patch and height).
+    seek_arrived = is_bomb & live2 & (kind1 == SEEKER) & (sm.arc(u2, seek_u, RADIUS) < 0.6) & (z2 < seek_z + 0.6)
+    blows = is_bomb & live2 & ((z2 <= 0.0) | seek_arrived | burst_chutes)
+    blast_hurt = zero
+    for style_k in (DUMB, CHUTE, SEEKER):
+        radius_k = BLAST_R[style_k]
+        mine = blows & (kind1 == style_k)
+        reach_x = where(is_bomb, zero + radius_k, rx)
+        reach_z = where(is_bomb, zero + 0.8 * radius_k, rz)
+        live_k = (mine | ((is_enemy | is_station) & live2))
+        blast_hurt = blast_hurt + BLAST_DAMAGE[style_k] * (
+            block_hits(x2, y2, reach_x, reach_x, live_k, None, ENEMIES, BOMBS, z2.clip(0.0, DEPTH), reach_z)
+            + block_hits(x2, y2, reach_x, reach_x, live_k, None, STATIONS, BOMBS, z2.clip(0.0, DEPTH), reach_z))
+    hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy)
+                - blast_hurt)
     killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
@@ -608,7 +720,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     hit = touched & (wound > 0.0)
     shielded = (damage > 0.0) & (wound <= 0.0)
     was_hit = wound > 0.0
-    gone = (killed | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
+    gone = (killed | blows | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
             | (is_bullet & (bullet_hits > 0.0)) | (hit & over))
     live3 = live2 & ~gone
     # A destroyed craft sometimes drops a pickup (into the first free pickup
@@ -654,6 +766,22 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(flashing, clock, born1)
     age1 = where(flashing, 0.0, age1)
     live3 = (live3 | flashing) & ~(is_flash & (age1 > FLASH_LIFE))
+    # A blast's flash: the first two free blast lanes take the step's first
+    # two bursts, glowing in their style's colour (kind) for BLAST_LIFE.
+    first_blow = first_of(blows, lane)
+    second_blow = first_of(blows & ~first_blow, lane)
+    blast_rank = f(is_blast & ~live3).cumsum(dim=0) - 1.0
+    for rank_k, which in ((0.0, first_blow), (1.0, second_blow)):
+        W = f(which)
+        takes = is_blast & ~live3 & (blast_rank == rank_k) & (W.sum() > 0.0)
+        wu = ((W * u2[0]).sum(), (W * u2[1]).sum(), (W * u2[2]).sum())
+        u2 = sm.vwhere(takes, wu, u2)
+        x2, y2 = where(takes, (W * x2).sum(), x2), where(takes, (W * y2).sum(), y2)
+        z2 = where(takes, (W * z2).sum().clip(0.0, DEPTH), z2)
+        kind1 = where(takes, (W * kind1).sum(), kind1)
+        spd2, vz1 = where(takes, 0.0, spd2), where(takes, 0.0, vz1)
+        born1, age1 = where(takes, clock, born1), where(takes, 0.0, age1)
+        live3 = live3 | takes
     boss_killed = (f(killed & is_boss_lane).sum() > 0.0)
     boss_phase_next = where(boss_killed, 2.0, where(boss_due, 1.0, boss_phase))
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
@@ -684,20 +812,21 @@ def scroller_step(lane, slot, rx, ry, rz,
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
+    alt_prev_next = where(is_player, f(alt_now) + zero, alt_prev)
     vyaw_next = where(is_player, ship_vyaw, vyaw)
     vspd_next = where(is_player, ship_vspd, vspd)
     return (f(live3), x2, y2, z2, vx2, vy2, vz1, u2[0], u2[1], u2[2], h2[0], h2[1], h2[2], spd2,
             yaw_next, vyaw_next, vspd_next,
             hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
-            score_next, lives_next, invuln_next, clock_next,
+            score_next, lives_next, invuln_next, clock_next, alt_prev_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
          "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
-         "score", "lives", "invuln", "clock")
+         "score", "lives", "invuln", "clock", "alt_prev")
 SETTINGS = ("field_w", "pace", "level")
 
 
@@ -735,6 +864,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     slot[slice(*FLASHES)] = FLASH
     stations = slice(*STATIONS)
     slot[stations], rx[stations], ry[stations], rz[stations] = STATION, 0.35, 0.35, 0.35
+    slot[slice(*BOMBS)], rx[slice(*BOMBS)], ry[slice(*BOMBS)], rz[slice(*BOMBS)] = BOMB_SLOT, 0.2, 0.2, 0.2
+    slot[slice(*BLASTS)] = BLAST_SLOT
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
@@ -793,7 +924,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "timer": np.where(slot == STATION, rng.uniform(0.5, FLAK_RELOAD, LANES), 0.0), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
         **{name: np.zeros(LANES) for name in ("pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock")},
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
-        "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES),
+        "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "alt_prev": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
@@ -864,7 +995,10 @@ class BulletScroller(EntityGame):
 
     @property
     def emissive(self) -> dict[str, list[float]]:
-        return {"lightning": [2.6, 2.8, 3.4]}
+        # Lightning and the three bomb styles' blasts glow (emissive materials;
+        # the page also lights the scene from each).
+        return {"lightning": [2.6, 2.8, 3.4], "blast_dumb": [3.2, 1.7, 0.5], "blast_chute": [2.4, 2.6, 3.2],
+                "blast_seeker": [3.0, 0.8, 2.6]}
 
     def palette(self) -> dict[str, list[float]]:
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
@@ -873,6 +1007,9 @@ class BulletScroller(EntityGame):
                 "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
                 "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0], "storm": [0.28, 0.29, 0.33],
                 "station": [1.0, 0.82, 0.1], "flak": [1.0, 0.9, 0.2],
+                "bomb_dumb": [0.3, 0.32, 0.36], "bomb_chute": [0.85, 0.85, 0.8], "chute": [0.95, 0.95, 0.9],
+                "seeker": [1.0, 0.45, 0.2],
+                "blast_dumb": [1.0, 0.6, 0.2], "blast_chute": [0.9, 0.95, 1.0], "blast_seeker": [1.0, 0.3, 0.9],
                 "smoke_0": [0.04, 0.04, 0.05], "smoke_1": [0.07, 0.07, 0.08], "smoke_2": [0.1, 0.1, 0.11],
                 "smoke_3": [0.13, 0.13, 0.14],
                 "laser": [0.3, 1.0, 0.9], "missile": [1.0, 0.75, 0.3],
@@ -937,6 +1074,19 @@ class BulletScroller(EntityGame):
                 mesh, color, size = "bomb", "station", 0.42
             elif slot == FLASH:
                 mesh, color, size = "bolt", "lightning", 0.55
+            elif slot == BOMB_SLOT:
+                style_k = float(col["kind"][k])
+                if style_k == SEEKER:
+                    mesh, color, size = "rocket", "seeker", 0.26
+                elif style_k == CHUTE and clock - float(col["born"][k]) >= CHUTE_DEPLOY:
+                    mesh, color, size = "parachute", "chute", 0.42
+                else:
+                    mesh, color, size = "bomb", "bomb_" + ("chute" if style_k == CHUTE else "dumb"), 0.24
+            elif slot == BLAST_SLOT:
+                style_k = float(col["kind"][k])
+                grow = 0.6 + 1.6 * min(1.0, float(clock - col["born"][k]) / BLAST_LIFE)
+                mesh, color = "boom", {DUMB: "blast_dumb", CHUTE: "blast_chute", SEEKER: "blast_seeker"}.get(style_k, "blast_dumb")
+                size = BLAST_R.get(style_k, 1.5) * 0.5 * grow
             else:
                 # A cloud: frosted glass, larger the higher it floats; grey
                 # when smoke has turned it to rain.
@@ -967,6 +1117,7 @@ class BulletScroller(EntityGame):
                         # drawn with the glass (blended), not in the opaque pass
                         "translucent": bool(slot in (STAR, SMOKE)),
                         "ribbon": bool(slot == FLASH),       # a lightning end: the page draws the bolt
+                        "ground": bool(slot == STATION),     # emplacements stand on the land's relief
                         "spin": 9.0 if slot == FLASH else (2.5 if mesh == "ufo" else 0.0),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
