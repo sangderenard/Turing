@@ -1006,6 +1006,26 @@ function strikeGroups() {
   for (const piece of state.ribbonEnds || []) { const key = Math.round(piece.t0 * 20); (groups.get(key) || groups.set(key, []).get(key)).push(piece); }
   return [...groups.values()];
 }
+// The rocket's headlights: two warm-white SPOT lights at the nose, aimed
+// along the direction of travel (up the screen) and down onto the land.
+// The craft flies ~0.2 above the board, so a shallow dip throws the beam
+// ahead (a long ellipse on the land) instead of pooling under the nose.
+const HEADLIGHT = { inner: 9 * Math.PI / 180, outer: 18 * Math.PI / 180, intensity: 70, dip: 0.16, spread: 0.16 };
+function headlights(cam) {
+  const game = state.game;
+  if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive || !onPlanet()) return [];
+  const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
+  if (!ship) return [];
+  const base = worldOf(ship), dir = norm([0, -HEADLIGHT.dip, -1]);
+  const viewDir = (d) => { const a = M.apply(cam.view, base), b = M.apply(cam.view, [base[0] + d[0], base[1] + d[1], base[2] + d[2]]);
+    return norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]); };
+  const vdir = viewDir(dir), cone = [Math.cos(HEADLIGHT.inner), Math.cos(HEADLIGHT.outer)];
+  return [-1, 1].map((side) => {
+    const at = [base[0] + side * HEADLIGHT.spread, base[1] + 0.05, base[2] - ship.size * 0.9];
+    return { view: M.apply(cam.view, at), colour: [1.0, 0.94, 0.82], level: 0, intensity: HEADLIGHT.intensity,
+             spotDir: vdir, spotCone: cone };
+  });
+}
 function lightningLights(cam, now) {
   const lights = [];
   if (state.flat) return lights;
@@ -2200,6 +2220,7 @@ function litPass(cam, now, casters, opts = {}) {
   // Lightning lights the scene: each strike is a blue-white point light at
   // the cloud, the impact and the bolt's middle, fading with the strike.
   bulbLights.push(...lightningLights(cam, now));
+  bulbLights.push(...headlights(cam));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -2210,6 +2231,15 @@ function litPass(cam, now, casters, opts = {}) {
     (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
     ...bulbLights.slice(0, count - 3).map((b) => (b.intensity ?? ARCADE.lamp * b.level))]));
   gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
+  // Spot cones (Pluck's light loop): a direction and (cos inner, cos outer)
+  // per light; zero direction = a point light (the key, fills, bulbs, lightning).
+  const spotDir = new Float32Array(count * 3), spotCone = new Float32Array(count * 2);
+  bulbLights.slice(0, count - 3).forEach((b, i) => {
+    if (!b.spotDir) return;
+    spotDir.set(b.spotDir, (i + 3) * 3); spotCone.set(b.spotCone, (i + 3) * 2);
+  });
+  gl.uniform3fv(gl.getUniformLocation(P, "uLightSpotDir[0]"), spotDir);
+  gl.uniform2fv(gl.getUniformLocation(P, "uLightSpotCone[0]"), spotCone);
   gl.uniform1f(gl.getUniformLocation(P, "uLightCalibration"), 1.0);
   gl.uniformMatrix3fv(gl.getUniformLocation(P, "uCatCcmMatrix"), false, new Float32Array([1,0,0, 0,1,0, 0,0,1]));
   gl.uniform1i(gl.getUniformLocation(P, "uEnableSpecular"), 1); gl.uniform1i(gl.getUniformLocation(P, "uEnableEmissionDirect"), 0);
