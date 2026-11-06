@@ -70,12 +70,21 @@ def follow_view(view: float, x: float, follow: float, width: float):
     return (view_next,)
 
 
+def bank_turn(yaw: float, bank: float, level: float, gain: float, dt: float):
+    """A banked craft turns: its yaw moves by ``gain`` times its bank (the
+    bank axis is held offset by ``level``, so ``bank - level`` is the angle)
+    over ``dt`` -- the coordinated turn of a rolled wing, linear in the bank."""
+    yaw_next = yaw + gain * (bank - level) * dt
+    return (yaw_next,)
+
+
 #: The engine laws the page runs, each lowered to its own WebAssembly core:
 #: (function, input names, output names, file stem).
 PREDICTORS = (
     (damped_axis, NAMES, OUTPUTS, "motion"),
     (ground_travel, ("u", "v", "gx", "gy", "turn", "speed", "dt"), ("u_next", "v_next", "gx_next", "gy_next"), "travel"),
     (follow_view, ("view", "x", "follow", "width"), ("view_next",), "follow"),
+    (bank_turn, ("yaw", "bank", "level", "gain", "dt"), ("yaw_next",), "bank"),
 )
 
 

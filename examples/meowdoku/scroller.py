@@ -88,7 +88,7 @@ import sys
 from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import damped_axis, ground_travel
+from meowdoku.entity_motion import bank_turn, damped_axis, ground_travel
 from meowdoku import sphere_motion as sm
 from src.common.tensors import AbstractTensor
 
@@ -246,6 +246,28 @@ YAW0, YAW_LO, YAW_HI = 1000.0, 0.0, 2000.0
 TURN_RATE, TURN_TAU, TURN_REACH = 2.0, 0.12, 0.35
 SPD_MIN, SPD_MAX, SPD0 = 2.5, 7.0, 4.0
 THROTTLE, THROTTLE_TAU = 4.0, 0.2
+#: TWO STICKS: ROLL (``move_axis``) banks the craft on the damped law, the
+#: bank axis held offset by BANK_MAX so ``bank - BANK_MAX`` is the angle and a
+#: released stick levels the wings (the law steers it back to BANK_MAX); a
+#: bank turns the craft (entity_motion.bank_turn, BANK_GAIN rad/s per rad).
+#: RUDDER (``move_axis_r``) yaws directly, slower (the yaw axis); PITCH
+#: (``move_axis_z``) climbs and dives; THROTTLE (``move_axis_y``).
+BANK_MAX, ROLL_RATE, ROLL_TAU, ROLL_REACH = 0.9, 2.6, 0.12, 0.3
+BANK_GAIN = 2.2
+RUDDER_RATE = 0.9
+#: FIRE MODES (``fire_mode``): CONTINUOUS (a fast stream: reload x 0.55),
+#: AUTO (repeats while held), BURST (BURST_N volleys per press, reload x
+#: 0.5), SINGLE (one volley per press).  The PRIMARY hotbar (``primary_slot``:
+#: blaster, laser, missile -- laser and missile once picked up) and the
+#: SECONDARY (``bomb_style``: dumb, parachute, seeker) each keep their own
+#: upgrades; a multiplier or spread pickup upgrades the active weapon of
+#: whichever fire was used last (``last_fire``).
+CONTINUOUS, AUTO, BURST, SINGLE = 0.0, 1.0, 2.0, 3.0
+BURST_N = 3.0
+#: THE LASER is a beam: a straight ray from the nose up to BEAM_RANGE that
+#: burns the first craft or emplacement in its path for BEAM_DPS a second
+#: (more per multiplier); ``beam`` is its length (0 when off).
+BEAM_RANGE, BEAM_HALF, BEAM_DPS = 13.0, 0.18, 14.0
 #: FUEL (the player's ``fuel``, 0..1): burnt in proportion to the throttle
 #: above CRUISE (a full burn empties the tank in 1 / FUEL_BURN seconds),
 #: refilled only at or below CRUISE; with the tank dry the throttle tops out
@@ -285,7 +307,8 @@ EMOJI = {"cloud": "\u2601", "parachute": "\U0001FA82"}
 
 CONTROLS = {"move_axis": "move-axis-x", "move_axis_y": "move-axis-y", "move_axis_z": "move-axis-z",
             "steer_x": "pointer-board-x", "steer_y": "pointer-board-y", "fire": "primary-action",
-            "alt_fire": "secondary-action", "bomb_style": "bomb-style"}
+            "alt_fire": "secondary-action", "bomb_style": "bomb-style",
+            "move_axis_r": "move-axis-rudder", "fire_mode": "fire-mode", "primary_slot": "primary-slot"}
 
 
 def nearest_of_block(u, z, live, rows, cols, radius):
@@ -324,8 +347,12 @@ def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
                   hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
-                  score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy, field_w, pace, level,
-                  move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style, dt):
+                  score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy,
+                  bank, vbank, fire_prev, burst_left, last_fire, owned_l, owned_m, mult_l, mult_m, fan_l, fan_m,
+                  bombs_d, bombs_c, bombs_s, beam,
+                  field_w, pace, level,
+                  move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style,
+                  move_axis_r, fire_mode, primary_slot, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
     live = alive > 0.0
@@ -351,8 +378,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     # (up/down throttle; released, the speed holds) and HEIGHT.
     finger = (steer_x - cx).atan2(cy - steer_y)
     yaw_target = where(steer_x >= 0.0, yaw + finger, zero - 1.0)
-    ship_yaw, ship_vyaw = damped_axis(yaw, vyaw, move_axis, yaw_target, zero + YAW_LO, zero + YAW_HI,
-                                      TURN_RATE, TURN_TAU, TURN_REACH, dt)
+    rudder_yaw, ship_vyaw = damped_axis(yaw, vyaw, move_axis_r, yaw_target, zero + YAW_LO, zero + YAW_HI,
+                                        RUDDER_RATE, TURN_TAU, TURN_REACH, dt)
+    # roll: the stick banks; released, the law steers the wings level
+    level_target = where(move_axis.abs() < 0.05, zero + BANK_MAX, zero - 1.0)
+    ship_bank, ship_vbank = damped_axis(bank, vbank, move_axis, level_target, zero, zero + 2.0 * BANK_MAX,
+                                        ROLL_RATE, ROLL_TAU, ROLL_REACH, dt)
+    ship_yaw = bank_turn(rudder_yaw, ship_bank, zero + BANK_MAX, zero + BANK_GAIN, dt)[0]
     tank = (P * fuel).sum()
     top_speed = where(tank > 1e-3, zero + SPD_MAX, zero + CRUISE)
     ship_spd, ship_vspd = damped_axis(spd, vspd, zero - move_axis_y, zero - 1.0, zero + SPD_MIN, top_speed,
@@ -375,9 +407,23 @@ def scroller_step(lane, slot, rx, ry, rz,
     bearing_p = sm.bearing(u, h, to_player)
 
     # ------------------------------------------------ the player's guns
-    pw, pm, pf = (P * weapon).sum(), (P * mult).sum(), (P * fan).sum()
+    # the primary hotbar: the chosen slot if owned, else the blaster
+    slot_p = ((P * primary_slot).sum().clip(0.0, 2.0) + 0.5).floor()
+    owns = (slot_p == BASIC) | ((slot_p == LASER) & ((P * owned_l).sum() > 0.0)) | ((slot_p == MISSILE) & ((P * owned_m).sum() > 0.0))
+    pw = where(owns, slot_p, zero + BASIC)
+    pm = where(pw == LASER, (P * mult_l).sum(), where(pw == MISSILE, (P * mult_m).sum(), (P * mult).sum()))
+    pf = where(pw == LASER, (P * fan_l).sum(), where(pw == MISSILE, (P * fan_m).sum(), (P * fan).sum()))
     reload = (P * timer).sum()
-    volley = (fire > 0.0) & ship_on & playing & (reload <= 0.0)
+    # the trigger, by fire mode: held, pressed (edge), a burst under way
+    fm = ((P * fire_mode).sum().clip(0.0, 3.0) + 0.5).floor()
+    held = (P * fire).sum() > 0.0
+    pressed = held & ((P * fire_prev).sum() <= 0.0)
+    burst_now = where(pressed & (fm == BURST), zero + BURST_N, (P * burst_left).sum())
+    ready_gun = ship_on & playing & (reload <= 0.0) & (pw != LASER)
+    volley = ready_gun & ((((fm == CONTINUOUS) | (fm == AUTO)) & held) | ((fm == BURST) & (burst_now > 0.0))
+                          | ((fm == SINGLE) & pressed))
+    burst_next = where(volley & (fm == BURST), burst_now - 1.0, burst_now)
+    beaming = (pw == LASER) & ship_on & playing & where(fm == SINGLE, pressed, held)
     free_shot = is_shot & ~live
     shots_n = 1.0 + pm
     shot_rank = f(free_shot).cumsum(dim=0) - 1.0
@@ -412,8 +458,11 @@ def scroller_step(lane, slot, rx, ry, rz,
     hanging = is_bomb & live & (kind == CHUTE) & (age >= CHUTE_DEPLOY)
     burst_chutes = hanging & press
     drop_bomb = press & ~(f(hanging).sum() > 0.0)
-    bomb_spawn = first_of(is_bomb & ~live, lane) & drop_bomb
     style = ((P * bomb_style).sum().clip(0.0, 2.0) + 0.5).floor()
+    bombs_n = 1.0 + where(style == SEEKER, (P * bombs_s).sum(), where(style == CHUTE, (P * bombs_c).sum(), (P * bombs_d).sum()))
+    free_bomb = is_bomb & ~live
+    bomb_rank = f(free_bomb).cumsum(dim=0) - 1.0
+    bomb_spawn = free_bomb & (bomb_rank < bombs_n) & drop_bomb
     ground_live = is_station & live
     ggap = where(ground_live, dist, 1.0e9)
     ground_t = first_of(ground_live & (ggap == ggap.min()), lane)
@@ -421,7 +470,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     G_ = where(has_ground, f(ground_t), f(nearest))
     gu = ((G_ * ux).sum(), (G_ * uy).sum(), (G_ * uz).sum())
     gz = (G_ * z).sum()
-    bomb_u, bomb_h = sm.offset(u0, h0, zero - 0.2, zero, RADIUS)
+    bomb_u, bomb_h = sm.offset(u0, h0, zero - 0.2, (bomb_rank - 0.5 * (bombs_n - 1.0)) * 0.35, RADIUS)
     bomb_h = sm.vwhere((style == SEEKER) & (G_.sum() > 0.0), sm.toward(bomb_u, gu), bomb_h)
 
     # ------------------------------------------------ the population
@@ -562,7 +611,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     level_hp = 1.0 + 0.5 * (level - 1.0)
     hp1 = where(respawn, where(new_kind == SPINNER, 9.0, 3.0),
                 where(boss_spawn, BOSS_HP * level_hp, where(ace_spawn, ACE_HP * level_hp, hp)))
-    reload_of = where(pw == LASER, LASER_RELOAD, where(pw == MISSILE, MISSILE_RELOAD, RELOAD))
+    reload_of = (where(pw == MISSILE, MISSILE_RELOAD, RELOAD)
+                 * where(fm == CONTINUOUS, 0.55, where(fm == BURST, 0.5, 1.0)))
     timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
                    where(arrival, 0.8 / tempo,
                          where(shooter, where(skind == SPINNER, 0.9, where(skind == BOSS_KIND, 0.45,
@@ -666,9 +716,22 @@ def scroller_step(lane, slot, rx, ry, rz,
     collected = block_hits(x2, y2, rx, ry, live2, None, PICKUPS, (0, 1), z2, rz)
     got = is_pickup & live2 & (collected > 0.0)
     got_kind = lambda k: f(got & (kind == k)).sum() > 0.0  # noqa: E731
-    weapon_next = where(is_player, where(got_kind(MISSILE_UP), MISSILE, where(got_kind(LASER_UP), LASER, weapon)), weapon)
-    mult_next = where(is_player & got_kind(MULT_UP), (mult + 1.0).clip(1.0, 4.0), mult)
-    fan_next = where(is_player & got_kind(SPREAD_UP), (fan + 1.0).clip(0.0, 3.0), fan)
+    weapon_next = where(is_player, pw, weapon)              # the active primary, as drawn and described
+    owned_l_next = where(is_player & got_kind(LASER_UP), 1.0 + zero, owned_l)
+    owned_m_next = where(is_player & got_kind(MISSILE_UP), 1.0 + zero, owned_m)
+    on_primary = (P * last_fire).sum() <= 0.0
+    up_mult, up_fan = got_kind(MULT_UP), got_kind(SPREAD_UP)
+    bump = lambda col, cond, top: where(is_player & cond, (col + 1.0).clip(0.0, top), col)  # noqa: E731
+    mult_next = bump(mult, up_mult & on_primary & (pw == BASIC), 4.0)
+    mult_l_next = bump(mult_l, up_mult & on_primary & (pw == LASER), 4.0)
+    mult_m_next = bump(mult_m, up_mult & on_primary & (pw == MISSILE), 4.0)
+    fan_next = bump(fan, up_fan & on_primary & (pw == BASIC), 3.0)
+    fan_l_next = bump(fan_l, up_fan & on_primary & (pw == LASER), 3.0)
+    fan_m_next = bump(fan_m, up_fan & on_primary & (pw == MISSILE), 3.0)
+    up_bombs = (up_mult | up_fan) & ~on_primary
+    bombs_d_next = bump(bombs_d, up_bombs & (style == DUMB), 3.0)
+    bombs_c_next = bump(bombs_c, up_bombs & (style == CHUTE), 3.0)
+    bombs_s_next = bump(bombs_s, up_bombs & (style == SEEKER), 3.0)
     shot_hits = (block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
                  + block_hits(x2, y2, rx, ry, live2, None, SHOTS, STATIONS, z2, rz))
     exposed = live2 & (invuln <= 0.0)
@@ -712,8 +775,18 @@ def scroller_step(lane, slot, rx, ry, rz,
         blast_hurt = blast_hurt + BLAST_DAMAGE[style_k] * (
             block_hits(x2, y2, reach_x, reach_x, live_k, None, ENEMIES, BOMBS, z2.clip(0.0, DEPTH), reach_z)
             + block_hits(x2, y2, reach_x, reach_x, live_k, None, STATIONS, BOMBS, z2.clip(0.0, DEPTH), reach_z))
+    # The laser's beam: straight up the patch from the ship, at its height;
+    # the first craft or emplacement in it burns, and the beam ends there.
+    pz2 = (P * z2).sum()
+    ahead_gap = cy - y2
+    in_beam = (beaming & (is_enemy | is_station) & live2 & (ahead_gap > 0.0) & (ahead_gap < BEAM_RANGE)
+               & ((x2 - cx).abs() < rx + BEAM_HALF) & ((z2 - pz2).abs() < rz + 2.0 * BEAM_HALF))
+    beam_gap = where(in_beam, ahead_gap, 1.0e9)
+    burnt = in_beam & (beam_gap == beam_gap.min())
+    beam_len = where(beaming, where(f(burnt).sum() > 0.0, (f(burnt) * ahead_gap).sum(), zero + BEAM_RANGE), zero)
+    beam_hurt = f(burnt) * BEAM_DPS * (1.0 + 0.5 * pm) * dt
     hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy)
-                - blast_hurt)
+                - blast_hurt - beam_hurt)
     killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
@@ -807,7 +880,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     # Apparent velocity in the patch (relative flight plus the frame's turn);
     # the player sits still at the patch's centre.
     X2, Y2 = x2 - cx, cy - y2
-    pvx, pvy = sm.patch_velocity(h2, spd2, X2, Y2, h0n, pspd, u0n, (P * ship_vyaw).sum())
+    pvx, pvy = sm.patch_velocity(h2, spd2, X2, Y2, h0n, pspd, u0n, dyaw / dt)   # the frame's whole turn (rudder + bank)
     vx2 = where(is_player, zero, pvx)
     vy2 = where(is_player, zero, -pvy)
     x2 = where(is_player, cx, x2)
@@ -827,6 +900,12 @@ def scroller_step(lane, slot, rx, ry, rz,
     dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
+    bank_next = where(is_player, ship_bank, bank)
+    vbank_next = where(is_player, ship_vbank, vbank)
+    fire_prev_next = where(is_player, f(held) + zero, fire_prev)
+    burst_left_next = where(is_player, burst_next + zero, burst_left)
+    last_fire_next = where(is_player, where(press, 1.0, where(volley | beaming, 0.0, last_fire)), last_fire)
+    beam_next = where(is_player, beam_len + zero, beam)
     alt_prev_next = where(is_player, f(alt_now) + zero, alt_prev)
     burn = ((pspd - CRUISE) / (SPD_MAX - CRUISE)).clip(0.0, 1.0) * FUEL_BURN
     refill = where(pspd <= CRUISE + 1e-6, zero + FUEL_REFILL, zero)
@@ -846,13 +925,17 @@ def scroller_step(lane, slot, rx, ry, rz,
             weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
             score_next, lives_next, invuln_next, clock_next, alt_prev_next, fuel_next,
             map_u_next, map_v_next, map_gx_next, map_gy_next,
+            bank_next, vbank_next, fire_prev_next, burst_left_next, last_fire_next, owned_l_next, owned_m_next,
+            mult_l_next, mult_m_next, fan_l_next, fan_m_next, bombs_d_next, bombs_c_next, bombs_s_next, beam_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
          "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
-         "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy")
+         "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy",
+         "bank", "vbank", "fire_prev", "burst_left", "last_fire", "owned_l", "owned_m", "mult_l", "mult_m",
+         "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam")
 SETTINGS = ("field_w", "pace", "level")
 
 
@@ -953,6 +1036,11 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "alt_prev": np.zeros(LANES), "fuel": np.ones(LANES),
         # the land's map point and the ground frame's heading (unit; "up" the map)
         "map_u": np.zeros(LANES), "map_v": np.zeros(LANES), "map_gx": np.zeros(LANES), "map_gy": np.full(LANES, -1.0),
+        "bank": np.full(LANES, BANK_MAX), "vbank": np.zeros(LANES),          # wings level
+        **{name: np.zeros(LANES) for name in ("fire_prev", "burst_left", "last_fire", "owned_l", "owned_m",
+                                              "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam")},
+        "mult_l": np.ones(LANES), "mult_m": np.ones(LANES),
+        "fire_mode": np.full(LANES, AUTO), "primary_slot": np.zeros(LANES), "move_axis_r": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
@@ -1002,9 +1090,12 @@ class BulletScroller(EntityGame):
         draws in (the player fixed at its centre)."""
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
                 "z": [Z_MARGIN, DEPTH - Z_MARGIN], "depth": DEPTH,
-                "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, self._top_speed()],
-                "bind": {"yaw": {"move": "move_axis", "finger": True, "speed": TURN_RATE, "tau": TURN_TAU,
+                "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, self._top_speed()], "bank": [0.0, 2.0 * BANK_MAX],
+                "bank_turn": {"level": BANK_MAX, "gain": BANK_GAIN},
+                "bind": {"yaw": {"move": "move_axis_r", "finger": True, "speed": RUDDER_RATE, "tau": TURN_TAU,
                                  "reach": TURN_REACH},
+                         "bank": {"move": "move_axis", "level": BANK_MAX, "speed": ROLL_RATE, "tau": ROLL_TAU,
+                                  "reach": ROLL_REACH},
                          "spd": {"move": "move_axis_y", "sign": -1.0, "speed": THROTTLE, "tau": THROTTLE_TAU}},
                 "patch": {"cx": self.width / 2.0, "cy": PLAYER_Y, "radius": RADIUS},
                 # the land's travel law (entity_motion.ground_travel): stepped
@@ -1216,6 +1307,18 @@ class BulletScroller(EntityGame):
             span = SPD_MAX - SPD_MIN
             st["flight"] = {"throttle": (float(c("spd")[0]) - SPD_MIN) / span, "fuel": float(c("fuel")[0]),
                             "cruise": (CRUISE - SPD_MIN) / span, "min": SPD_MIN, "max": SPD_MAX}
+            # The hotbars: the primary weapons (owned, upgrades), the secondary
+            # bombs (per-drop count), which fire was used last (it takes the
+            # next multiplier), and the active primary.
+            st["arsenal"] = {
+                "primary": [{"name": "Blaster", "owned": True, "mult": int(c("mult")[0]), "fan": int(c("fan")[0])},
+                            {"name": "Laser", "owned": bool(c("owned_l")[0] > 0), "mult": int(c("mult_l")[0]), "fan": int(c("fan_l")[0])},
+                            {"name": "Missile", "owned": bool(c("owned_m")[0] > 0), "mult": int(c("mult_m")[0]), "fan": int(c("fan_m")[0])}],
+                "secondary": [{"name": "Dumb bomb", "count": 1 + int(c("bombs_d")[0])},
+                              {"name": "Parachute", "count": 1 + int(c("bombs_c")[0])},
+                              {"name": "Seeker", "count": 1 + int(c("bombs_s")[0])}],
+                "active": int(c("weapon")[0]), "last": "secondary" if c("last_fire")[0] > 0 else "primary",
+                "beam_range": BEAM_RANGE}
             boss_live = float(c("alive")[BOSS_LANE]) > 0.0 and float(c("boss_phase")[0]) == 1.0
             st["boss"] = ({"hp": max(0.0, float(c("hp")[BOSS_LANE])),
                            "max": BOSS_HP * (1.0 + 0.5 * (self.level - 1.0))} if boss_live else None)

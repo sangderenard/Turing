@@ -51,7 +51,8 @@ FEATURES = 5 + 5 * K + 4
 #: A game with height above the board (bullet hell): the ship row and every
 #: hostile row carry height and its rate too, and the policy steers height.
 FEATURES_DEPTH = 7 + 7 * K + 4
-GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (FEATURES_DEPTH, 4)}
+#: bullet hell's five outputs: roll, throttle, fire, pitch, rudder (two sticks)
+GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (FEATURES_DEPTH, 5)}
 
 
 def widths_of(params: dict) -> tuple[int, int]:
@@ -153,6 +154,8 @@ def controls_from(game, out: np.ndarray) -> dict[str, float]:
               # A policy with a fourth output steers height; an older one holds it.
               "move_axis_z": float(out[3]) if len(out) > 3 else 0.0,
               "steer_x": -1.0, "steer_y": -1.0, "fire": 1.0 if out[2] > 0.0 else 0.0}
+    if len(out) > 4:
+        values["move_axis_r"] = float(out[4])          # a fifth output: the rudder
     # Controls the policy does not drive (a game's alternate fire, its bomb
     # style, ...) rest at the game's own initial value for them.
     rest = getattr(game, "_control_rest", None)
@@ -353,7 +356,17 @@ def fitting_params(name: str) -> dict[str, np.ndarray] | None:
     """The game's saved weights, only if they fit its observation and outputs
     (a law that grew an axis needs retraining; old weights are not forced in)."""
     params = load_params(weights_path(name))
-    if params is None or widths_of(params) != GAME_WIDTHS[name]:
+    if params is None:
+        return None
+    features, outputs = widths_of(params)
+    want_f, want_o = GAME_WIDTHS[name]
+    if features == want_f and outputs < want_o:
+        # The game grew controls (new outputs): the learned layers carry over
+        # and each new output starts at zero, to be learned from play.
+        grow = want_o - outputs
+        params = {**params, "W3": np.concatenate([params["W3"], np.zeros((params["W3"].shape[0], grow))], axis=1),
+                  "b3": np.concatenate([params["b3"], np.zeros((1, grow))], axis=1)}
+    if widths_of(params) != GAME_WIDTHS[name]:
         return None
     return params
 
@@ -458,7 +471,8 @@ def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
     _PILOT_WEIGHTS.setdefault(name, params)
     view = _MirroredView(game, lane)
     out = numpy_product(1, *widths_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
-    return (float(out[0]), float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
+    turn = float(out[0]) + (float(out[4]) if len(out) > 4 else 0.0)     # roll and rudder both turn a pilot
+    return (max(-1.0, min(1.0, turn)), float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
 
 
 def pilot_for(game) -> Pilot:
@@ -961,7 +975,8 @@ def load_learning() -> None:
 def human_records_path(game: str) -> Path:
     """Kept human episodes, versioned by the observation width they were taken
     with (a law that grows an axis starts a new record set)."""
-    return BUILD / f"human_{game}_f{GAME_WIDTHS[game][0]}.npz"
+    features, outputs = GAME_WIDTHS[game]
+    return BUILD / (f"human_{game}_f{features}.npz" if outputs == 3 else f"human_{game}_f{features}_o{outputs}.npz")
 
 
 def target_from(game, controls: dict) -> np.ndarray:
@@ -981,6 +996,8 @@ def target_from(game, controls: dict) -> np.ndarray:
     out[2] = 1.0 if float(controls.get("fire", 0.0)) > 0.0 else -1.0
     if len(out) > 3:
         out[3] = max(-1.0, min(1.0, float(controls.get("move_axis_z", 0.0))))
+    if len(out) > 4:
+        out[4] = max(-1.0, min(1.0, float(controls.get("move_axis_r", 0.0))))
     return out
 
 

@@ -1009,6 +1009,7 @@ function uploadMaterials(game) {
   // The rocket's aeronautic marker lights: red port, green starboard, white
   // tail, and the white anti-collision strobe (dark between flashes).
   records.push(["nav_red", [0.3, 0.02, 0.02], { emission: [2.6, 0.12, 0.1], roughness: 0.2 }]);
+  records.push(["beam", [0.2, 0.9, 0.8], { roughness: 0.1, transmission: 0.3, opacity: 0.85, ior: 1.2, emission: [0.5, 2.8, 2.4] }]);
   records.push(["nav_green", [0.02, 0.3, 0.06], { emission: [0.1, 2.4, 0.5], roughness: 0.2 }]);
   records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
   records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [2.4, 2.4, 2.5], roughness: 0.2 }]);
@@ -1517,6 +1518,22 @@ function drawCockpit(cam, drawLit) {
   drawLit(mesh.vao, mesh.count, model, mesh.material);
   COCKPIT.model = model;                            // the vitals mount on this plate (drawVitals)
 }
+// THE LASER'S BEAM: the engine's beam (``you.beam``: its length, the first
+// thing it burns) drawn as a straight emissive ray from the nose up the
+// screen -- shown at once while the page's own trigger holds a laser.
+function drawBeam(now, drawLit) {
+  const game = state.game, you = game && game.you, a = game && game.arsenal;
+  if (state.flat || !you || !you.alive || !a) return;
+  const holding = held.has("fire") || (pads.right && pads.right.active);
+  const length = you.beam > 0 ? you.beam : holding && (state.primarySlot || 0) === 1 && a.primary[1].owned ? a.beam_range : 0;
+  if (length <= 0) return;
+  const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
+  if (!ship) return;
+  const at = worldOf(ship), nose = (ship.size || 0.5) * 1.1, flicker = 0.85 + 0.15 * Math.sin(now * 90);
+  const tube = vitalBox("beam");
+  drawLit(tube.vao, tube.count, M.multiply(M.translate(at[0], at[1] - 0.04, at[2] - nose - length / 2),
+    M.scale(0.07 * flicker, 0.07 * flicker, length)), null);
+}
 function drawShield(now, drawLit) {
   const game = state.game;
   if (state.camMode === "nose") return;             // first person: the eye is inside the shield
@@ -1818,7 +1835,8 @@ function stepShip(ship, input, seconds, motion) {
     const yawBefore = ship.yaw;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
                                                   ["z", "z", "vz", "move_axis_z", "steer_z"],
-                                                  ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null]]) {
+                                                  ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null],
+                                                  ["bank", "bank", "vbank", "move_axis", null]]) {
       // Only the engine's own motion law moves the ship here (the same
       // damped_axis, compiled to wasm).  An axis that law does not declare is
       // the server's alone: the page never guesses it with physics of its own.
@@ -1830,7 +1848,9 @@ function stepShip(ship, input, seconds, motion) {
         // the ship, as the law computes it.
         const patch = motion.patch || {};
         const steering = bind.finger && input.steer_x >= 0;
-        const aim = steering ? ship[pos] + Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y) : -1;
+        const idle = Math.abs(input[bind.move] || 0) < 0.05;
+        const aim = steering ? ship[pos] + Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y)
+          : bind.level != null && idle ? bind.level : -1;          // a released stick returns the axis to its level
         const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: (bind.sign ?? 1) * (input[bind.move] || 0), target: aim,
           lo: motion[axis][0], hi: motion[axis][1], speed: bind.speed ?? motion.speed, tau: bind.tau ?? motion.tau,
           reach: bind.reach ?? motion.reach, dt });
@@ -1843,6 +1863,11 @@ function stepShip(ship, input, seconds, motion) {
       const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
         lo, hi, speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
       ship[pos] = r.x_next; ship[vel] = r.v_next;
+    }
+    // A banked craft turns: the engine's bank_turn, after the axes, as the law does.
+    if (motion.bank_turn && pred.bankTurn && ship.bank != null) {
+      ship.yaw = pred.bankTurn.invoke({ yaw: ship.yaw, bank: ship.bank, level: motion.bank_turn.level,
+                                        gain: motion.bank_turn.gain, dt }).yaw_next;
     }
     // The land under the ship: the engine's ground_travel, as the law steps it.
     if (motion.travel && pred.travel && ship.map_gy != null) {
@@ -1873,7 +1898,7 @@ function reconcile(game) {
   // Only axes the game will adopt are the page's to keep; a scrolled axis is
   // still stepped here by the motion law, but from the server's state.
   const adoptable = game.predict.adopt_axes || ["x", "y"];
-  const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"], ["yaw", "vyaw"], ["spd", "vspd"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
+  const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"], ["yaw", "vyaw"], ["spd", "vspd"], ["bank", "vbank"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
   const land = game.predict.travel && pred.ship && pred.ship.map_u != null
     ? Math.hypot(pred.ship.map_u - ship.map_u, pred.ship.map_v - ship.map_v) : 0;
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos]), land) : Infinity;
@@ -2047,6 +2072,7 @@ function applySnapshot(view) {
   you.z = f32(); you.vz = f32(); you.health = f32();
   you.yaw = f32(); you.vyaw = f32(); you.spd = f32(); you.vspd = f32(); you.at = performance.now() / 1000;
   you.map_u = f32(); you.map_v = f32(); you.map_gx = f32(); you.map_gy = f32();
+  you.bank = f32(); you.vbank = f32(); you.beam = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -2087,7 +2113,7 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 5;           // realtime_socket.PROTOCOL
+const SNAPSHOT_PROTOCOL = 6;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -2107,7 +2133,7 @@ function sendTick(game) {
                        z: pred.ship.z || 0, vz: pred.ship.vz || 0,
                        yaw: pred.ship.yaw || 0, vyaw: pred.ship.vyaw || 0, spd: pred.ship.spd || 0, vspd: pred.ship.vspd || 0,
                        map_u: pred.ship.map_u || 0, map_v: pred.ship.map_v || 0, map_gx: pred.ship.map_gx || 0,
-                       map_gy: pred.ship.map_gy ?? -1 };
+                       map_gy: pred.ship.map_gy ?? -1, bank: pred.ship.bank ?? 0, vbank: pred.ship.vbank ?? 0 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -2749,6 +2775,7 @@ function applyState(game) {
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
   renderModes(game);
+  renderHotbars(game);
   showPads(game);
   renderInventory(game);
   renderWordleOptions(game);
@@ -2903,6 +2930,7 @@ function litPass(cam, now, casters, opts = {}) {
     drawLit(mesh.vao, mesh.count, pieceModel(piece, now), state.materialIndex[`${piece.color}@glass`] ?? state.materialIndex[piece.color]);
   }
   drawShield(now, drawLit);
+  drawBeam(now, drawLit);
   drawVitals(now, drawLit);
   if (opts.plate) drawProjectionGlass(cam, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
@@ -3060,6 +3088,10 @@ function controls() {
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
+  if (banking()) {
+    out.move_axis_r = (held.has("rud_right") ? 1 : 0) - (held.has("rud_left") ? 1 : 0);
+    out.fire_mode = state.fireMode ?? 1; out.primary_slot = state.primarySlot || 0;
+  }
   // First person: the mouse's height on the screen pitches the nose; pitch
   // climbs or dives (the height axis), stopping at the floor and ceiling.
   if (state.camMode === "nose" && heightAxis() && Math.abs(NOSE_PITCH.value) > NOSE_PITCH.dead) {
@@ -3071,7 +3103,8 @@ function controls() {
   // drops a bomb.  They add to the keys and replace a steering finger.
   if (pads.left.active || pads.right.active || pads.altUntil > performance.now()) {
     const clamp = (v) => Math.max(-1, Math.min(1, v));
-    out.move_axis = clamp(out.move_axis + pads.left.x + pads.right.x);
+    out.move_axis = clamp(out.move_axis + (banking() ? 0 : pads.left.x) + pads.right.x);
+    if (banking()) out.move_axis_r = clamp((out.move_axis_r || 0) + pads.left.x);
     out.steer_x = -1;
     if ("move_axis_y" in out) { out.move_axis_y = clamp(out.move_axis_y + pads.left.y); out.steer_y = -1; }
     if ("move_axis_z" in out) out.move_axis_z = clamp(out.move_axis_z - pads.right.y);
@@ -3134,10 +3167,45 @@ function showPads(game) {
 // ALTERNATE FIRE (a game whose controls take it): B or X drops a bomb (a
 // second press bursts a hanging parachute bomb), C cycles the style.
 const BOMB_STYLES = ["dumb bomb", "parachute bomb", "ground seeker"];
+const FIRE_MODES = ["continuous", "auto", "burst", "single"];
+function cycleFireMode() { state.fireMode = ((state.fireMode ?? 1) + 1) % FIRE_MODES.length; renderHotbars(state.game); }
+// THE HOTBARS: primary weapons (1 2 3) and secondary bombs (4 5 6), each with
+// its own upgrades; the active ones lit; the fire mode beside them (T).
+function renderHotbars(game) {
+  const box = $("hotbars"), a = game && game.arsenal;
+  if (!box) return;
+  if (!a) { if (box.childElementCount) box.replaceChildren(); return; }
+  const key = JSON.stringify([a, state.primarySlot, state.bombStyle, state.fireMode]);
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  const slot = (label, title, active, enabled, pick) => {
+    const b = document.createElement("button");
+    b.textContent = label; b.title = title; b.disabled = !enabled;
+    if (active) b.style.outline = "2px solid #ffd76a";
+    b.onclick = pick;
+    return b;
+  };
+  const prim = a.primary.map((w, i) => slot(`${i + 1} ${w.name}${w.owned ? ` x${w.mult}${w.fan ? ` f${w.fan}` : ""}` : ""}`,
+    w.owned ? `${w.name}: x${w.mult} fan ${w.fan}` : `${w.name}: pick one up`, (state.primarySlot || 0) === i, w.owned,
+    () => { state.primarySlot = i; renderHotbars(state.game); }));
+  const sec = a.secondary.map((w, i) => slot(`${i + 4} ${w.name} x${w.count}`, `${w.name}: ${w.count} a drop`, (state.bombStyle || 0) === i, true,
+    () => { state.bombStyle = i; $("bomb-style").textContent = `Style: ${BOMB_STYLES[i]}`; renderHotbars(state.game); }));
+  const mode = slot(`Fire: ${FIRE_MODES[state.fireMode ?? 1]} (T)`, "continuous / auto / burst / single", false, true, cycleFireMode);
+  const last = document.createElement("span");
+  last.textContent = ` upgrades go to: ${a.last}`;
+  box.replaceChildren(...prim, " ", ...sec, " ", mode, last);
+}
 function bombs() { const g = state.game; return !!(g && g.controls && g.controls.includes && g.controls.includes("alt_fire")); }
 function cycleBomb() { state.bombStyle = ((state.bombStyle || 0) + 1) % BOMB_STYLES.length; $("bomb-style").textContent = `Style: ${BOMB_STYLES[state.bombStyle]}`; if (inventoryView.applied) saveSettings(); }
+const banking = () => !!(state.game && state.game.predict && state.game.predict.bank);
 function keyControl(key) {
   const k = key.length === 1 ? key.toLowerCase() : key;
+  // Two-stick flying: arrows roll and pitch, A/D rudder, W/S throttle.
+  if (banking()) {
+    const fly = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "rise", ArrowDown: "dive", a: "rud_left", d: "rud_right",
+                  w: "up", s: "down", e: "rise", q: "dive", PageUp: "rise", PageDown: "dive", " ": "fire" }[k];
+    if (fly) return fly;
+  }
   const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
   if (common[k]) return common[k];
   if (heightAxis()) { const lift = { e: "rise", PageUp: "rise", q: "dive", PageDown: "dive" }[k]; if (lift) return lift; }
@@ -3264,6 +3332,12 @@ window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
   if (game.input === "realtime" && bombs() && e.key.toLowerCase() === "c") { e.preventDefault(); cycleBomb(); return; }
+  if (game.input === "realtime" && banking()) {
+    const n = Number(e.key);
+    if (n >= 1 && n <= 3) { e.preventDefault(); state.primarySlot = n - 1; renderHotbars(game); return; }
+    if (n >= 4 && n <= 6) { e.preventDefault(); state.bombStyle = n - 4; $("bomb-style").textContent = `Style: ${BOMB_STYLES[n - 4]}`; renderHotbars(game); return; }
+    if (e.key.toLowerCase() === "t") { e.preventDefault(); cycleFireMode(); return; }
+  }
   if (game.input === "realtime" && game.predict && e.key.toLowerCase() === "n") { e.preventDefault(); toggleCamera(); return; }
   if (game.input === "realtime" && keyControl(e.key)) { e.preventDefault(); held.add(keyControl(e.key)); return; }
   if (game.input === "text") {
@@ -3517,6 +3591,7 @@ function fillPickers() {
     // the engine's other laws the page runs (entity_motion.PREDICTORS)
     pred.travel = await TuringWasmProgram.load("travel.wasm", "travel.abi.json");
     pred.follow = await TuringWasmProgram.load("follow.wasm", "follow.abi.json");
+    pred.bankTurn = await TuringWasmProgram.load("bank.wasm", "bank.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());

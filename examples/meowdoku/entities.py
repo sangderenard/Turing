@@ -514,7 +514,7 @@ class EntityGame(Game):
         motion = self.motion() or {}
         # ("yaw", "spd": a spherical game's turn and throttle, columns of the
         # same names with velocities "vyaw", "vspd")
-        return [axis for axis in ("x", "y", "z", "yaw", "spd") if motion.get(axis) and axis not in self.SCROLL_AXES]
+        return [axis for axis in ("x", "y", "z", "yaw", "spd", "bank") if motion.get(axis) and axis not in self.SCROLL_AXES]
 
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
@@ -651,10 +651,10 @@ class EntityGame(Game):
                          # health as a fraction (a game declaring HEALTH_MAX; else 0)
                          "health": (float(col("lives")[k]) / self.HEALTH_MAX) if self.HEALTH_MAX else 0.0,
                          "vz": float(col("vz")[k]) if "vz" in self.session.columns else 0.0}
-            for axis in ("yaw", "spd"):                 # a spherical game's turn and throttle
+            for axis in ("yaw", "spd", "bank"):         # a spherical game's turn, throttle and bank
                 if axis in self.session.columns:
                     st["you"][axis], st["you"]["v" + axis] = float(col(axis)[k]), float(col("v" + axis)[k])
-            for name in ("map_u", "map_v", "map_gx", "map_gy"):  # and the land under it
+            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam"):  # the land under it, the laser's reach
                 if name in self.session.columns:
                     st["you"][name] = float(col(name)[k])
         return st
