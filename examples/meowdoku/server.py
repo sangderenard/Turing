@@ -84,7 +84,8 @@ class Table:
         elif kind == "checkers":
             self.game = Checkers("checkers")
         elif kind == "wordle":
-            self.game = Wordle(int(payload.get("seed", 0)))
+            self.game = Wordle(int(payload.get("seed", 0)), str(payload.get("dictionary") or "builtin"),
+                               int(payload.get("length") or 5))
         elif kind == "chess_arena":
             self.game = ChessArena(parallel=int(payload.get("parallel", 4)), lock=self.lock)   # the learner is one per process; 4 searched games
         elif kind == "chess_vs_net":

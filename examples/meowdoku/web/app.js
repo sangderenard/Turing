@@ -1981,6 +1981,32 @@ function entityModel(piece, now) {
 const drawnShip = { page: 0, server: 0, at: null };
 // A game's selectable MODES (game.modes: labels and which are on): one
 // toggle each, sent as {"type": "mode", name, on}; the law reads it.
+// WORDLE'S DICTIONARY: which word list is active (the answer is any of its
+// words) and, for the complete list, how many letters; a change starts a
+// new word.  Remembered by this page between games.
+const wordleChoice = (() => { try { return JSON.parse(localStorage.getItem("wordleChoice")) || {}; } catch (_) { return {}; } })();
+function renderWordleOptions(game) {
+  const box = $("wordle-opts"), d = game && game.dictionary;
+  if (!box) return;
+  if (!d) { if (box.childElementCount) box.replaceChildren(); return; }
+  const key = `${d.name}:${d.length}`;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  const restart = () => {
+    try { localStorage.setItem("wordleChoice", JSON.stringify(wordleChoice)); } catch (_) { /* private window */ }
+    newGame({ game: "wordle", seed: Math.floor(Math.random() * 100000), ...wordleChoice });
+  };
+  const pick = document.createElement("select");
+  for (const [name, label] of Object.entries(d.choices)) pick.append(new Option(label, name, false, name === d.name));
+  pick.onchange = () => { wordleChoice.dictionary = pick.value; restart(); };
+  const len = document.createElement("select");
+  for (const n of d.lengths[d.name] || [5]) len.append(new Option(`${n} letters`, String(n), false, n === d.length));
+  len.disabled = (d.lengths[d.name] || [5]).length < 2;
+  len.onchange = () => { wordleChoice.length = Number(len.value); restart(); };
+  const size = document.createElement("span");
+  size.textContent = ` ${d.size.toLocaleString()} words`;
+  box.replaceChildren("Dictionary ", pick, " ", len, size);
+}
 function renderModes(game) {
   const box = $("modes"), modes = game && game.modes;
   if (!box) return;
@@ -2419,6 +2445,7 @@ function applyState(game) {
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
   renderModes(game);
   showPads(game);
+  renderWordleOptions(game);
   const authority = authorityText(game);
   status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
   $("hud").textContent = `${game.status}${best}`;
@@ -3123,7 +3150,7 @@ function fillPickers() {
       const chosen = state.catalog.meowdoku.boards.filter((b) => b.level === levelSelect.value);
       const board = chosen[Math.floor(Math.random() * chosen.length)]; boardSelect.value = board.id;
       newGame({ game: "meowdoku", id: board.id });
-    } else if (g === "wordle") newGame({ game: "wordle", seed: Math.floor(Math.random() * 100000) });
+    } else if (g === "wordle") newGame({ game: "wordle", seed: Math.floor(Math.random() * 100000), ...wordleChoice });
     else newGame({ game: g, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) });
   };
 }

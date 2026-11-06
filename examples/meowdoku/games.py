@@ -663,16 +663,21 @@ class Wordle(Game):
     title = "Wordle"
     RACK = ("QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM")
 
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, dictionary: str = "builtin", length: int = 5):
+        from meowdoku import words as word_lists
         super().__init__(f"wordle-{seed}")
         self.rng = random.Random(seed)
-        self.answer = self.rng.choice(ANSWERS)
+        # The ACTIVE dictionary: the answer is any of its words of the chosen
+        # length, and only its words are accepted as guesses.
+        self.dictionary, self.length, found, self.note = word_lists.dictionary(dictionary, int(length))
+        self.words = frozenset(found)
+        self.answer = self.rng.choice(found)
         self.guesses: list[str] = []
         self.entry = ""
         self.won = False
 
     def text(self, value: str) -> None:
-        self.entry = "".join(ch for ch in value.lower() if ch.isalpha())[:5]
+        self.entry = "".join(ch for ch in value.lower() if ch.isalpha())[:self.length]
 
     def backspace(self) -> None:
         self.entry = self.entry[:-1]
@@ -680,10 +685,10 @@ class Wordle(Game):
     def submit(self) -> None:
         if self.won or len(self.guesses) >= 6:
             return
-        if len(self.entry) != 5:
-            self.status = "five letters"
+        if len(self.entry) != self.length:
+            self.status = f"{self.length} letters"
             return
-        if self.entry not in ALL:
+        if self.entry not in self.words:
             self.status = f"{self.entry.upper()} is not in the list"
             return
         self.guesses.append(self.entry)
@@ -707,7 +712,7 @@ class Wordle(Game):
     @staticmethod
     def score(guess: str, answer: str) -> list[str]:
         """green / yellow / absent per letter, with multiplicity."""
-        result = ["absent"] * 5
+        result = ["absent"] * len(answer)
         pool = list(answer)
         for i, ch in enumerate(guess):
             if answer[i] == ch:
@@ -720,25 +725,26 @@ class Wordle(Game):
         return result
 
     def state(self) -> dict[str, Any]:
-        st = self.base_state(6, 5)
+        n = self.length
+        st = self.base_state(6, n)
         st["palette"] = {"cell": [0.22, 0.22, 0.25], "entry": [0.32, 0.32, 0.36], "green": [0.33, 0.65, 0.30],
                          "yellow": [0.78, 0.66, 0.2], "absent": [0.30, 0.30, 0.33], "unknown": [0.62, 0.62, 0.66],
                          "letter": [0.93, 0.93, 0.95], "ink": [0.08, 0.08, 0.1]}
-        cells, pieces = ["cell"] * 30, []
+        cells, pieces = ["cell"] * (6 * n), []
         best: dict[str, str] = {}
         rank = {"absent": 0, "yellow": 1, "green": 2}
         for g, guess in enumerate(self.guesses):
             colours = self.score(guess, self.answer)
             for i, ch in enumerate(guess):
-                cells[g * 5 + i] = colours[i]
-                pieces.append({"id": f"g{g}-{i}", "cell": g * 5 + i, "mesh": ch.upper(), "color": "letter"})
+                cells[g * n + i] = colours[i]
+                pieces.append({"id": f"g{g}-{i}", "cell": g * n + i, "mesh": ch.upper(), "color": "letter"})
                 if rank[colours[i]] >= rank.get(best.get(ch, "absent"), -1):
                     best[ch] = colours[i]
         row = len(self.guesses)
         if row < 6:
             for i, ch in enumerate(self.entry):
-                cells[row * 5 + i] = "entry"
-                pieces.append({"id": f"entry-{i}-{ch}", "cell": row * 5 + i, "mesh": ch.upper(), "color": "ink"})
+                cells[row * n + i] = "entry"
+                pieces.append({"id": f"entry-{i}-{ch}", "cell": row * n + i, "mesh": ch.upper(), "color": "ink"})
         st["cells"], st["pieces"] = cells, pieces
         rack_cells, rack_pieces = [], []
         for r, line in enumerate(self.RACK):
@@ -748,11 +754,15 @@ class Wordle(Game):
             rack_cells += [""] * (10 - len(line))
         st["rack"] = {"rows": 3, "cols": 10, "cells": rack_cells, "pieces": rack_pieces,
                       "letters": ["".join(line) for line in self.RACK]}
-        st["text"], st["text_max"] = self.entry.upper(), 5
+        st["text"], st["text_max"] = self.entry.upper(), n
+        from meowdoku import words as word_lists
+        st["dictionary"] = {"name": self.dictionary, "length": n, "size": len(self.words),
+                            "choices": dict(word_lists.LABELS),
+                            "lengths": {k: list(v) for k, v in word_lists.LENGTHS.items()}}
         st["won"] = self.won
         st["lost"] = (not self.won) and len(self.guesses) >= 6
-        st["status"] = self.status or ("got it!" if self.won else f"the word was {self.answer.upper()}" if st["lost"]
-                                       else f"guess {len(self.guesses) + 1} of 6")
+        st["status"] = self.status or self.note or ("got it!" if self.won else f"the word was {self.answer.upper()}" if st["lost"]
+                                                    else f"guess {len(self.guesses) + 1} of 6")
         return st
 
 
