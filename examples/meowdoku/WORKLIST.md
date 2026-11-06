@@ -6,7 +6,11 @@ deploy to 8766 as soon as work lands.
 
 ## In flight (workers)
 
-- **Fountain stage A:** nozzle energy (the ymax 3.7 vs 2.6 ballistic ceiling), symmetry, particle conservation, energy-aware settle, basin fills the screen aspect. The "graph forward WASM compile failed (5)" build error must be fixed.
+- **Fountain stage A follow-ups** (stage A landed in ee0883d7):
+  - dropped contacts (`n_drop`) are not 0 while grains emit and in dense piles at 4k, and reach 1.2e6 per step at 64k; the row-run walk drops the right-hand cells first (a bias); needs a complete or order-free neighbour selection (stage B) and contact stiffness scaled with pile depth;
+  - the 64k pile never settles (E stays near 5e-2 at the 40 s cap), probably the same cause;
+  - single grains still exceed their own ballistic ceiling through exchange between species of different mass (total energy holds to 1.7%);
+  - emission is now 21% slower (60% at mix 1.0) because the jet falls back through its own nozzle: tune `EMIT_MARGIN`, the bar width and `EMIT_SPAN`.
 
 ## Autopilot follow-ups (the base landed in 727be7c2)
 
