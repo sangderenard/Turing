@@ -164,7 +164,7 @@ def _observe(game, hostile_kind, remaining, ready, height: float, depth: float |
 
 def invaders_features(game) -> np.ndarray:
     from meowdoku import invaders as inv
-    flag = {inv.BOMB: 1.0, inv.UFO: 0.75, inv.INVADER: 0.5}
+    flag = {inv.BOMB: 1.0, inv.UFO: 0.75, inv.INVADER: 0.5, inv.WBULLET: 1.0, inv.WAVER: 0.75}
     return _observe(
         game,
         lambda col, lanes: np.array([flag.get(s, 0.5) for s in col("slot")[lanes]]),
@@ -723,7 +723,7 @@ def _invaders_dodger(game):
     col = game.session.column
     alive, x, y, vy = col("alive"), col("x"), col("y"), col("vy")
     px, py = float(x[0]), float(y[0])
-    bombs = np.array([k for k in (*inv.BOMB_LANES, inv.UFO_LANE) if alive[k] > 0.0 and k != inv.UFO_LANE], dtype=int)
+    bombs = np.array([k for k in (*inv.BOMB_LANES, *range(*inv.WBULLET_LANES)) if alive[k] > 0.0], dtype=int)
     fleet = np.flatnonzero(alive[inv.FLEET0:inv.SHIELD0] > 0.0) + inv.FLEET0
     field_w = float(col("field_w")[0])
     cands = np.arange(0.7, field_w - 0.69, 0.35)
@@ -731,13 +731,15 @@ def _invaders_dodger(game):
     if len(fleet):
         cost += 0.12 * np.min(np.abs(cands[:, None] - x[fleet][None, :]), axis=1)
     if len(bombs):
-        t_hit = np.maximum((py - y[bombs]) / inv.BOMB_SPEED, 0.0)                       # when each bomb reaches the ship's row
+        fall = np.where(vy[bombs] > 0.5, vy[bombs], inv.BOMB_SPEED)                     # a bomb falls at BOMB_SPEED, a wave bullet at its own
+        t_hit = np.maximum((py - y[bombs]) / fall, 0.0)                                   # when each reaches the ship's row
         ahead = (y[bombs] < py + 0.3) & (t_hit < 2.0)
         reach = np.minimum(np.abs(cands[:, None] - px), inv.PLAYER_SPEED * t_hit[None, :] + 0.0)
         where = px + np.sign(cands[:, None] - px) * reach                                 # ship x when the bomb arrives
-        near = np.abs(where - x[bombs][None, :]) < 0.75
+        lands = (x[bombs] + col("vx")[bombs] * t_hit)[None, :]                            # where it crosses that row (wave bullets are aimed)
+        near = np.abs(where - lands) < 0.75
         cost += 50.0 * (near & ahead[None, :]).sum(axis=1)
-        cost += 1.0 * ((np.abs(cands[:, None] - x[bombs][None, :]) < 1.0) & ahead[None, :]).sum(axis=1)
+        cost += 1.0 * ((np.abs(cands[:, None] - lands) < 1.0) & ahead[None, :]).sum(axis=1)
     target = float(cands[int(np.argmin(cost))])
     gap = target - px
     return float(np.clip(gap * 3.0, -1.0, 1.0)), 0.0, 1.0
