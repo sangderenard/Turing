@@ -1027,6 +1027,20 @@ function camera() {
     return { view, proj, viewProj: M.multiply(proj, view), eye };
   }
   const RAISE = 1.12;                                              // the eye a little higher off the board
+  // FIRST PERSON (the Camera control, N): the eye just ahead of the ship's
+  // nose, looking along its heading -- up the board -- and a little down at
+  // the land; a spherical game turns the world under it, so this is the
+  // view out of the cockpit.
+  const own = state.camMode === "nose" && state.game && state.game.predict && state.game.input === "realtime"
+    ? [...state.pieces.values()].find((p) => p.entity && p.lane === state.game.predict.lane && p.removing == null) : null;
+  if (own) {
+    const at = worldOf(own), nose = (own.size || 0.5) * 1.1;
+    const eye = [at[0], at[1] + 0.22, at[2] - nose];
+    const look = [at[0], at[1] - 0.9, at[2] - nose - 7.0];
+    const view = M.lookAt(eye, look, [0, 1, 0]);
+    const proj = M.perspective(1.05, aspect, 0.05, 300);
+    return { view, proj, viewProj: M.multiply(proj, view), eye };
+  }
   const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
   const up = el > 1.45 ? [0, 0, -1] : [0, 1, 0];
@@ -1286,6 +1300,7 @@ function shieldGlobe(material) {
 }
 function drawShield(now, drawLit) {
   const game = state.game;
+  if (state.camMode === "nose") return;             // first person: the eye is inside the shield
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive) return;
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
   if (!ship) return;
@@ -2509,6 +2524,9 @@ function draw(ms) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
     if (piece.ribbon) { if (piece.removing == null) (state.ribbonEnds ||= []).push(piece); continue; }
     if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
+    // First person: the eye is in the ship's nose -- its body is not drawn
+    // (its model is still advanced: the camera rides it).
+    if (state.camMode === "nose" && piece.entity && state.game.predict && piece.lane === state.game.predict.lane) { pieceModel(piece, now); continue; }
     casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
   }
   for (const key of removed) state.pieces.delete(key);
@@ -2779,6 +2797,7 @@ window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
   if (e.target === $("entry")) return;
   if (game.input === "realtime" && bombs() && e.key.toLowerCase() === "c") { e.preventDefault(); cycleBomb(); return; }
+  if (game.input === "realtime" && game.predict && e.key.toLowerCase() === "n") { e.preventDefault(); toggleCamera(); return; }
   if (game.input === "realtime" && keyControl(e.key)) { e.preventDefault(); held.add(keyControl(e.key)); return; }
   if (game.input === "text") {
     if (/^[a-zA-Z]$/.test(e.key)) return act({ type: "text", text: game.text + e.key.toUpperCase() });
@@ -2811,6 +2830,8 @@ async function submitMove() {
 $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
 $("bomb-style").onclick = cycleBomb;
+function toggleCamera() { state.camMode = state.camMode === "nose" ? "board" : "nose"; $("camera-mode").textContent = state.camMode === "nose" ? "Camera: nose (N)" : "Camera: board (N)"; }
+$("camera-mode").onclick = toggleCamera;
 for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) {
   const button = $(id);
   const on = (e) => { e.preventDefault(); held.add(name); }, off = () => held.delete(name);
