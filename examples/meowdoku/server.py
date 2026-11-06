@@ -45,6 +45,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 from meowdoku.games import Checkers, Chess, ChessArena, ChessVsNet, LichessGame, MeowdokuGame, Wordle  # noqa: E402
 from meowdoku.invaders import SpaceInvaders  # noqa: E402
 from meowdoku.scroller import BulletScroller  # noqa: E402
+from meowdoku.delve import Delve  # noqa: E402
 from meowdoku.platformer import Platformer  # noqa: E402
 from meowdoku.sidescroller import SideScroller  # noqa: E402
 from meowdoku.tilequest import TileQuest  # noqa: E402
@@ -80,7 +81,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "purrline"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "purrline"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -126,6 +127,8 @@ class Table:
             self.game = BulletScroller(aspect=float(payload.get("aspect") or 0.0), level=start)
         elif kind == "platformer":
             self.game = Platformer(aspect=float(payload.get("aspect") or 0.0))
+        elif kind == "delve":
+            self.game = Delve(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "side_scroller":
             self.game = SideScroller(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "tilequest":
@@ -155,7 +158,7 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
-        elif kind.startswith("fountain_") or kind.startswith("worldwalk_"):
+        elif kind.startswith("fountain_") or kind.startswith("worldwalk_") or kind.startswith("delve_"):
             if not hasattr(self.game, "do"):
                 raise ValueError("this game takes no such action")
             self.game.do(payload)

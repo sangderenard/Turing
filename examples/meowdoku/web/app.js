@@ -2654,6 +2654,7 @@ function entityModel(piece, now) {
   if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
     // The player's own ship: the prediction, not the server's last word.
     piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
+    if (state.game.roomview) piece.z = roomShip(state.game).y;
     piece.h = pred.ship.z || 0;
     return placeEntity(piece, now, piece.x, piece.z, mesh);
   }
@@ -2836,7 +2837,32 @@ function authorityText(game) {
 // never falls behind the server's view; a view far behind the page's (a new
 // run) is taken at once.
 const view = { x: 0, at: null };
+// A ROOM-GRAPH GAME (``game.roomview``: the room's size in tiles).  The screen is a window ``game.width`` x
+// ``game.height`` tiles onto the room, centred on the player and clamped to the room (a room smaller than the
+// window is centred in it): the formula of delve_rules.camera_axis, on the ship the page draws.
+const roomCam = { at: null, x: 0, y: 0 };
+function roomShip(game) {
+  // the ship as drawn: the prediction sideways, the server's word vertically carried on by its velocity (a frame's worth)
+  const ship = pred.ship || game.you;
+  if (!ship) return null;
+  const age = pred.ship && ship.at != null ? Math.min(0.1, Math.max(0, performance.now() / 1000 - ship.at)) : 0;
+  return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + (ship.vy || 0) * age };
+}
+function roomView(now) {
+  const game = state.game, rv = game && game.roomview;
+  if (!rv) return null;
+  if (roomCam.at !== now) {
+    roomCam.at = now;
+    const at = roomShip(game) || { x: rv.w / 2, y: rv.h / 2 };
+    const axis = (pos, win, room) => room <= win ? (room - win) / 2 : Math.min(Math.max(pos - win / 2, 0), room - win);
+    roomCam.x = axis(at.x, game.width, rv.w); roomCam.y = axis(at.y, game.height, rv.h);
+  }
+  return roomCam;
+}
+const viewY = (now) => { const rv = roomView(now); return rv ? rv.y : 0; };
 function viewX(now) {
+  const rcam = roomView(now);
+  if (rcam) return rcam.x;
   // The engine's follow_view (the law's own), from the server's view with the
   // ship the page draws -- the same rule, the same compiled code.
   const game = state.game, cam = game && game.predict && game.predict.camera;
@@ -2871,6 +2897,7 @@ function carriedPatch(piece, now) {
 }
 function placeEntity(piece, now, x, z, mesh) {
   x -= viewX(now);                                // world frame -> the screen (0 unless the game scrolls a view)
+  z -= viewY(now);                                // (a room-graph game scrolls vertically too)
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
     if (t >= 1) piece.birth = null;
@@ -3204,6 +3231,7 @@ function applyState(game) {
     drawnShip.page = drawnShip.server = 0;
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
+  delveOverlay(game);
   arcadeEvents(game, now);
   if (game.you) noteShield(game, now);
   if (game.sync_hint != null) sync.hint = game.sync_hint;
@@ -3286,6 +3314,67 @@ function applyState(game) {
   if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
+// ---------------------------------------------------------------- room-graph overlays
+// A room-graph game (``game.roomview``, ``game.world``): a fade with the room's name whenever the room changes
+// (``roomview.serial``), and the MAP (M or the Map button): the rooms visited on the coarse grid, their joins
+// (a one-way drop is dashed), the room you are in and where you stand.  Self-contained: DOM made here.
+const delveUi = { serial: null, id: null, fade: null, name: null, map: null };
+function delveOverlay(game) {
+  const rv = game && game.roomview;
+  if (!rv) {
+    if (delveUi.fade) delveUi.fade.style.opacity = 0;
+    if (delveUi.map) delveUi.map.hidden = true;
+    delveUi.serial = null;
+    return;
+  }
+  if (!delveUi.fade) {
+    const style = document.createElement("style");
+    style.textContent = "#delve-fade{position:fixed;inset:0;background:#05060c;opacity:0;pointer-events:none;z-index:40;display:flex;"
+      + "align-items:flex-end;justify-content:center;padding-bottom:12vh;color:#e8e6f0;font:600 1.1rem system-ui,sans-serif}"
+      + "#delve-map{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:41;background:rgba(8,9,16,.92);"
+      + "border:1px solid #4a4a66;border-radius:10px;padding:10px;max-width:92vw;max-height:80vh;box-shadow:0 8px 40px #000a}"
+      + "#delve-map svg{display:block;max-width:86vw;max-height:70vh}#delve-map small{display:block;color:#9a98b0;margin-top:6px;font:12px system-ui,sans-serif}";
+    document.head.append(style);
+    delveUi.fade = Object.assign(document.createElement("div"), { id: "delve-fade" });
+    delveUi.name = document.createElement("span");
+    delveUi.fade.append(delveUi.name);
+    delveUi.map = Object.assign(document.createElement("div"), { id: "delve-map", hidden: true });
+    document.body.append(delveUi.fade, delveUi.map);
+  }
+  if (delveUi.serial != null && rv.serial !== delveUi.serial) {
+    // a quick fade from black into the next room, its name on the dark
+    delveUi.name.textContent = game.room ? game.room.name : "";
+    delveUi.fade.style.transition = "none"; delveUi.fade.style.opacity = 0.92; void delveUi.fade.offsetWidth;
+    delveUi.fade.style.transition = "opacity .55s ease-out .12s"; delveUi.fade.style.opacity = 0;
+  }
+  delveUi.serial = rv.serial;
+  const world = game.world;
+  delveUi.map.hidden = !(world && world.show);
+  if (!delveUi.map.hidden) {
+    const key = JSON.stringify([world.rooms.map((r) => r.seen), world.current, world.joins.length]);
+    const you = game.you && game.room ? [game.room.gx * world.unit[0] + game.you.x, game.room.gy * world.unit[1] + game.you.y] : null;
+    if (delveUi.key !== key || you) {
+      delveUi.key = key;
+      const [gw, gh] = world.grid, [uw, uh] = world.unit, cw = 30, ch = cw * uh / uw;
+      const sx = (tx) => (tx / uw) * cw, sy = (ty) => (ty / uh) * ch;
+      let svg = `<svg viewBox="-4 -4 ${gw * cw + 8} ${gh * ch + 8}" xmlns="http://www.w3.org/2000/svg">`;
+      for (const r of world.rooms) {
+        if (!r.seen) continue;
+        const cur = r.id === world.current;
+        svg += `<rect x="${r.gx * cw + 1}" y="${r.gy * ch + 1}" width="${r.cw * cw - 2}" height="${r.ch * ch - 2}" rx="3" `
+          + `fill="${cur ? "#3b3f7a" : "#232640"}" stroke="${cur ? "#ffd75e" : "#7a7aa8"}" stroke-width="${cur ? 2 : 1}"/>`;
+      }
+      for (const j of world.joins) {
+        const x = sx(j.x), y = sy(j.y), vertical = j.side === "L" || j.side === "R";
+        svg += `<rect x="${x - (vertical ? 2 : 6)}" y="${y - (vertical ? 6 : 2)}" width="${vertical ? 4 : 12}" height="${vertical ? 12 : 4}" `
+          + `fill="${j.oneway ? "#ff9f6e" : "#9ee6a8"}"${j.oneway ? ' stroke="#05060c" stroke-dasharray="2 2"' : ""}/>`;
+      }
+      if (you) svg += `<circle cx="${sx(you[0])}" cy="${sy(you[1])}" r="3.2" fill="#7dff8a" stroke="#05060c"/>`;
+      delveUi.map.innerHTML = svg + `</svg><small>${world.rooms.filter((r) => r.seen).length}/${world.rooms.length} rooms · `
+        + `green: door · orange: one-way drop · M closes</small>`;
+    }
+  }
+}
 // ---------------------------------------------------------------- compute products
 // A game that declares ``game.compute`` (see compute.js) has its law run by the
 // shared compute runtime -- WebGPU compute, or its wasm product -- and its
@@ -3685,9 +3774,10 @@ function boardPlane(clientX, clientY) {
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
   const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
   const t = (TILE.height - near[1]) / (far[1] - near[1]);
-  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]) + viewX(performance.now() / 1000), z: near[2] + t * (far[2] - near[2]) } : null;
+  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]) + viewX(performance.now() / 1000), z: near[2] + t * (far[2] - near[2]) + viewY(performance.now() / 1000) } : null;
 }
 const twoAxis = () => !!(state.game && state.game.predict && (state.game.predict.y || state.game.predict.yaw));
+const climbAxis = () => !!(state.game && state.game.controls && state.game.controls.includes("move_axis_y") && !twoAxis());
 function controls() {
   // Keys give an axis; a held pointer gives the board point it asks the ship
   // to reach (on a two-axis board, a little above the finger so the finger
@@ -3700,6 +3790,8 @@ function controls() {
   // A game with no ship to predict that still reads the pointer on both axes (a tile board: the cell
   // under the finger) declares ``steer_y``; it gets the board point itself, not lifted above the finger.
   else if (state.game && state.game.controls && state.game.controls.includes("steer_y")) out.steer_y = steer ? Math.max(0, steer.z) : -1;
+  // A climbing game (a ladder) takes the vertical stick without predicting that axis: the server's alone.
+  if (climbAxis()) out.move_axis_y = axisY;
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
   if (banking()) {
@@ -3828,7 +3920,7 @@ function keyControl(key) {
   if (common[k]) return common[k];
   if (heightAxis()) { const lift = { e: "rise", PageUp: "rise", q: "dive", PageDown: "dive" }[k]; if (lift) return lift; }
   if (bombs() && (k === "b" || k === "x")) return "alt";
-  if (twoAxis()) return { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" }[k];
+  if (twoAxis() || climbAxis()) return { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" }[k];
   return { ArrowUp: "fire", w: "fire" }[k];
 }
 window.addEventListener("keyup", (e) => { const k = keyControl(e.key); if (k) held.delete(k); });
@@ -3965,6 +4057,7 @@ window.addEventListener("keydown", async (e) => {
     if (n >= 4 && n <= 6) { e.preventDefault(); state.bombStyle = n - 4; $("bomb-style").textContent = `Style: ${BOMB_STYLES[n - 4]}`; renderHotbars(game); return; }
     if (e.key.toLowerCase() === "t") { e.preventDefault(); cycleFireMode(); return; }
   }
+  if (game.input === "realtime" && game.roomview && e.key.toLowerCase() === "m") { e.preventDefault(); act({ type: "delve_map" }); return; }
   if (game.input === "realtime" && game.predict && e.key.toLowerCase() === "n") { e.preventDefault(); toggleCamera(); return; }
   if (game.input === "realtime" && keyControl(e.key)) { e.preventDefault(); held.add(keyControl(e.key)); return; }
   if (game.input === "text") {

@@ -301,6 +301,16 @@ def export_assets(out: Path) -> dict:
                 pack(name, *largest_component(verts, normals))
             except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
                 print(f"[export] {name} mesh skipped: {error}", flush=True)
+    # Delve's own glyphs (its ladder, spikes, gem, ability orb and bat).
+    from meowdoku.delve import EMOJI as DELVE_EMOJI, EMOJI_SUBDIVISIONS as DELVE_SUBDIVISIONS
+    for name, glyph in DELVE_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                                            outline_subdivisions=DELVE_SUBDIVISIONS.get(name, 1))
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     # Boardwalk's own glyphs (the track's tiles and its racers).
     from meowdoku.boardwalk import EMOJI as BOARDWALK_EMOJI
     for name, glyph in BOARDWALK_EMOJI.items():
