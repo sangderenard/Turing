@@ -22,7 +22,9 @@ DELTA, little-endian:
                       f32 map_u, map_v, map_gx, map_gy (the land under its
                       ship: entity_motion.ground_travel's state),
                       f32 bank, vbank (its roll axis), beam (its laser's length; 0 off),
-                      f32 ux, uy, uz, hx, hy, hz (its place and heading on the sphere)
+                      f32 ux, uy, uz, hx, hy, hz (its place and heading on the sphere),
+                      f32 x5 the demo pilot's controls (roll, throttle, pitch, rudder,
+                      fire; 0 unless the autopilot flies)
     u8   names        new appearance names this connection has not seen,
                       each u8 length + utf-8; indices count up from 0
     u16  gone         lanes whose entity disappeared, u16 each
@@ -124,7 +126,7 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #: it whenever the layout changes; the page refuses any other version.
 #:   3 = header + z, vz, health; spawn/update records carry z, vz; spawn
 #:       flags bit1 = face its velocity.
-PROTOCOL = 7
+PROTOCOL = 8
 
 class SnapshotEncoder:
     """What one connection's page knows, and the delta that brings it up to date."""
@@ -188,7 +190,7 @@ class SnapshotEncoder:
 
         you = state.get("you") or {}
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBfffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),
@@ -198,7 +200,8 @@ class SnapshotEncoder:
                              float(you.get("map_u", 0.0)), float(you.get("map_v", 0.0)),
                              float(you.get("map_gx", 0.0)), float(you.get("map_gy", -1.0)),
                              float(you.get("bank", 0.0)), float(you.get("vbank", 0.0)), float(you.get("beam", 0.0)),
-                             *(float(you.get(n, 0.0)) for n in ("ux", "uy", "uz", "hx", "hy", "hz")))]
+                             *(float(you.get(n, 0.0)) for n in ("ux", "uy", "uz", "hx", "hy", "hz")),
+                             *(float(v) for v in (you.get("pilot") or [0.0] * 5)))]
         parts.append(struct.pack("<B", len(fresh)))
         for name in fresh:
             raw = name.encode("utf-8")

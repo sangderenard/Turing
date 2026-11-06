@@ -2088,13 +2088,27 @@ function stepShip(ship, input, seconds, motion) {
 }
 // While the demo player (the server's trained policy) flies, the ship is the
 // server's: the page draws it and predicts nothing.
-const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict && !game.autopilot);
+// The page predicts its ship always: from its own controls, or -- while the
+// demo pilot flies -- from the pilot's, which every snapshot carries
+// (you.pilot), on the same compiled laws.  Only its own flying is sent.
+const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
+const piloting = (game) => !!(game && game.autopilot && game.you && game.you.pilot);
+function pilotControls(game) {
+  const p = game.you.pilot;
+  return { move_axis: p[0], move_axis_y: p[1], move_axis_z: p[2], move_axis_r: p[3], fire: p[4], steer_x: -1, steer_y: -1 };
+}
 function reconcile(game) {
   if (!predicting(game) || !game.you || !game.you.alive) { pred.ship = null; return; }
   pred.lane = game.predict.lane;
   const before = pred.ship ? [pred.ship.x, pred.ship.y] : null;
   if (game.ack != null) pred.sent = pred.sent.filter((interval) => interval.seq > game.ack);
   const ship = { ...game.you };
+  if (piloting(game)) {
+    // the pilot's ship: the server's, carried on by the snapshot's age with
+    // the pilot's controls
+    pred.sent = []; pred.closed = []; pred.open = null;
+    stepShip(ship, pilotControls(game), Math.min(0.25, Math.max(0, performance.now() / 1000 - (game.you.at ?? 0))), game.predict);
+  }
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
   // AUTHORITY WITHIN TOLERANCE.  Page and server are two recordings of the
   // same signal, ordered by input seq, not one state stepped in lockstep.
@@ -2115,7 +2129,9 @@ function reconcile(game) {
     : 0;
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos]), land) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
-  if (pred.ship && error <= tolerance) {
+  // (the demo pilot's ship is the server's: rebased on it every snapshot,
+  // carried forward by the snapshot's age -- the page never keeps its own)
+  if (pred.ship && error <= tolerance && !piloting(game)) {
     for (const [pos, vel] of declared) { ship[pos] = pred.ship[pos]; ship[vel] = pred.ship[vel]; }
     for (const name of game.predict.travel || []) if (pred.ship[name] != null) ship[name] = pred.ship[name];
     // The server's own axes still move only on its word -- eased, not jumped.
@@ -2139,6 +2155,12 @@ function predictFrame(now) {
   const frame = pred.at == null ? 0 : Math.min(0.1, Math.max(0, now - pred.at));
   pred.at = now;
   if (!predicting(game)) return;
+  if (piloting(game)) {                          // the demo pilot flies: predict with its controls, send nothing
+    if (pred.ship) stepShip(pred.ship, pilotControls(game), frame, game.predict);
+    const decayP = 1 - syncEase(Math.hypot(...pred.offset), frame);
+    pred.offset = [pred.offset[0] * decayP, pred.offset[1] * decayP];
+    return;
+  }
   // The open interval runs while the controls hold; a change closes it.
   const c = controls();
   if (!pred.open || !sameControls(pred.open.controls, c)) {
@@ -2286,6 +2308,7 @@ function applySnapshot(view) {
   you.map_u = f32(); you.map_v = f32(); you.map_gx = f32(); you.map_gy = f32();
   you.bank = f32(); you.vbank = f32(); you.beam = f32();
   you.ux = f32(); you.uy = f32(); you.uz = f32(); you.hx = f32(); you.hy = f32(); you.hz = f32();
+  you.pilot = [f32(), f32(), f32(), f32(), f32()];
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -2327,11 +2350,11 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 7;           // realtime_socket.PROTOCOL
+const SNAPSHOT_PROTOCOL = 8;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
-  if (predicting(game)) {
+  if (predicting(game) && !piloting(game)) {
     if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
     const at = performance.now() / 1000;
     pred.sent.push(...pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq, closedAt: at })));

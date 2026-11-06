@@ -654,6 +654,11 @@ class EntityGame(Game):
             for axis in ("yaw", "spd", "bank"):         # a spherical game's turn, throttle and bank
                 if axis in self.session.columns:
                     st["you"][axis], st["you"]["v" + axis] = float(col(axis)[k]), float(col("v" + axis)[k])
+            # the demo pilot's controls (the page predicts the ship with them,
+            # on the same laws, while the autopilot flies)
+            held = getattr(self, "held", {}) or {}
+            st["you"]["pilot"] = ([float(held.get(n, 0.0)) for n in ("move_axis", "move_axis_y", "move_axis_z", "move_axis_r", "fire")]
+                                  if self.autopilot else [0.0] * 5)
             for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz"):
                 # the land under it, the laser's reach, its place on a sphere
                 if name in self.session.columns:
