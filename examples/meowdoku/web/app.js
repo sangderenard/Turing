@@ -935,6 +935,8 @@ function uploadMaterials(game) {
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
+  records.push(["bar_throttle", [1.0, 0.85, 0.2], { roughness: 0.06, transmission: 0.45, opacity: 0.8, ior: 1.4, emission: [1.2, 0.95, 0.15] }]);
+  records.push(["bar_boss", [0.3, 1.0, 0.4], { roughness: 0.06, transmission: 0.45, opacity: 0.8, ior: 1.4, emission: [0.2, 1.1, 0.3] }]);
   // Scrolling ground: albedo from colour layer TERRAIN.layer of the shader's
   // uColorUv texture stack (texstack field 1 = colour layer, 9 = blend).
   records.push(["broadcast", [1.0, 1.0, 1.0], { roughness: 0.12, transmission: 0.12, opacity: 0.9, ior: 1.5,
@@ -1313,6 +1315,24 @@ function drawVitals(now, drawLit) {
       for (let i = 0; i < n; i++) segment(core, x, 0.08, start + (i * fill) / n, start + ((i + 1) * fill) / n, w * 0.7);
     }
   };
+  // THE THROTTLE (yellow, from the centre out: the throttle's fraction, the
+  // page's own predicted speed so it answers at once) inside a glass tube as
+  // long as the FUEL left; and the BOSS's health (green) while it flies.
+  const flight = game.flight, boss = game.boss;
+  if (flight) {
+    const spd = pred.ship && pred.ship.spd != null ? pred.ship.spd : flight.min + flight.throttle * (flight.max - flight.min);
+    const target = Math.max(0, Math.min(1, (spd - flight.min) / (flight.max - flight.min)));
+    vitals.throttle = (vitals.throttle ?? target) + (target - (vitals.throttle ?? target)) * ease;
+    vitals.fuel = (vitals.fuel ?? flight.fuel) + (flight.fuel - (vitals.fuel ?? flight.fuel)) * ease;
+  }
+  vitals.boss = boss ? (vitals.boss ?? 1) + (boss.hp / boss.max - (vitals.boss ?? 1)) * ease : 0;
+  // A horizontal bar from the centre out: in the cockpit on the plate (plate
+  // units), on the map across the field (board units).
+  const across = (place, centre, half, value, material, fuelLeft) => {
+    const tube = vitalBox("bar_tube"), core = vitalBox(material);
+    place(tube, centre, half * 2 * Math.max(0.04, fuelLeft ?? 1), 1.0);
+    if (value > 0.005) place(core, centre, half * 2 * value, 0.7);
+  };
   if (state.camMode === "nose") {
     // In the cockpit the bars leave the map: they stand on the hull's inner
     // wall either side of the window (plate units; the window spans +-0.8),
@@ -1328,10 +1348,20 @@ function drawVitals(now, drawLit) {
     };
     wall(-0.93, vitals.shield, "bar_shield");
     wall(0.93, vitals.health, "bar_health");
+    // throttle under the window, boss health over it (lying along x)
+    const plate = (y) => (mesh, cx, length, k) => drawLit(mesh.vao, mesh.count,
+      M.multiply(COCKPIT.model, M.multiply(M.translate(cx, y, 0.02), M.multiply(M.rotateY(Math.PI / 2), M.scale(0.06 * k, 0.06 * k, length)))), null);
+    if (flight) across(plate(COCKPIT.window.cy - COCKPIT.window.b - 0.12), 0, 0.6, vitals.throttle, "bar_throttle", vitals.fuel);
+    if (boss) across(plate(COCKPIT.window.cy + COCKPIT.window.b + 0.1), 0, 0.6, vitals.boss, "bar_boss");
     return;
   }
   bar(-m, vitals.shield, "bar_shield");
   bar(ext.width + m, vitals.health, "bar_health");
+  // on the map: throttle along the bottom edge, boss health along the top
+  const lying = (z) => (mesh, cx, length, k) => drawLit(mesh.vao, mesh.count,
+    M.multiply(M.translate(cx, 0.06 + (k < 1 ? 0.03 : 0) - planetDrop(cx, z), z), M.multiply(M.rotateY(Math.PI / 2), M.scale(0.3 * k, 0.3 * k, length))), null);
+  if (flight) across(lying(ext.depth - 0.55), ext.width / 2, ext.width * 0.36, vitals.throttle, "bar_throttle", vitals.fuel);
+  if (boss) across(lying(0.45), ext.width / 2, ext.width * 0.36, vitals.boss, "bar_boss");
 }
 
 // ---------------------------------------------------------------- the craft's shield

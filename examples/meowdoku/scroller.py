@@ -246,6 +246,15 @@ YAW0, YAW_LO, YAW_HI = 1000.0, 0.0, 2000.0
 TURN_RATE, TURN_TAU, TURN_REACH = 2.0, 0.12, 0.35
 SPD_MIN, SPD_MAX, SPD0 = 2.5, 7.0, 4.0
 THROTTLE, THROTTLE_TAU = 4.0, 0.2
+#: FUEL (the player's ``fuel``, 0..1): burnt in proportion to the throttle
+#: above CRUISE (a full burn empties the tank in 1 / FUEL_BURN seconds),
+#: refilled only at or below CRUISE; with the tank dry the throttle tops out
+#: at CRUISE.
+CRUISE = 3.2
+FUEL_BURN, FUEL_REFILL = 1.0 / 12.0, 1.0 / 10.0
+#: The guns' climb per unit of horizontal flight at full pitch (the page
+#: draws height at half scale: this matches the cockpit's sight line).
+AIM_SLOPE = 1.2
 #: The fixed population: POP_BASE + POP_STEP * level enemies (at most
 #: POP_MAX); one destroyed returns RESPAWN / tempo seconds later, FAR_MIN..
 #: FAR_MAX radians of arc away.  They hunt head on: steering for a point LEAD
@@ -315,7 +324,7 @@ def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
                   hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
-                  score, lives, invuln, clock, alt_prev, field_w, pace, level,
+                  score, lives, invuln, clock, alt_prev, fuel, field_w, pace, level,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
@@ -344,7 +353,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     yaw_target = where(steer_x >= 0.0, yaw + finger, zero - 1.0)
     ship_yaw, ship_vyaw = damped_axis(yaw, vyaw, move_axis, yaw_target, zero + YAW_LO, zero + YAW_HI,
                                       TURN_RATE, TURN_TAU, TURN_REACH, dt)
-    ship_spd, ship_vspd = damped_axis(spd, vspd, zero - move_axis_y, zero - 1.0, zero + SPD_MIN, zero + SPD_MAX,
+    tank = (P * fuel).sum()
+    top_speed = where(tank > 1e-3, zero + SPD_MAX, zero + CRUISE)
+    ship_spd, ship_vspd = damped_axis(spd, vspd, zero - move_axis_y, zero - 1.0, zero + SPD_MIN, top_speed,
                                       THROTTLE, THROTTLE_TAU, REACH, dt)
     ship_z, ship_vz = damped_axis(z, vz, move_axis_z, zero - 1.0, zero + Z_MARGIN, zero + DEPTH - Z_MARGIN,
                                   SPEED, TAU, REACH, dt)
@@ -561,6 +572,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     vz1 = where(is_player, ship_vz, where(is_enemy, routine_vz, where(bullet_spawn, climb,
                 where(missile_spawn, (tz - z1) / flight + 0.5 * GRAVITY * flight, where(spawn, 0.0, vz)))))
     vz1 = where(is_pickup, 0.0, vz1)
+    # The guns follow the nose's pitch: a shot climbs or dives at the slope
+    # the pitch command (the height axis) asks for -- point and shoot.
+    pitch = (P * move_axis_z).sum().clip(-1.0, 1.0)
+    vz1 = where(shot_spawn, shot_speed * AIM_SLOPE * pitch, vz1)
     live1 = live | spawn
     born1 = where(spawn, clock, born)
     owner1 = where(shot_spawn | missile_spawn | bomb_spawn, 0.0, where(bullet_spawn, shooter_lane, where(respawn, -1.0, owner)))
@@ -813,20 +828,23 @@ def scroller_step(lane, slot, rx, ry, rz,
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
     alt_prev_next = where(is_player, f(alt_now) + zero, alt_prev)
+    burn = ((pspd - CRUISE) / (SPD_MAX - CRUISE)).clip(0.0, 1.0) * FUEL_BURN
+    refill = where(pspd <= CRUISE + 1e-6, zero + FUEL_REFILL, zero)
+    fuel_next = where(is_player & playing, (fuel - burn * dt + refill * dt).clip(0.0, 1.0), fuel)
     vyaw_next = where(is_player, ship_vyaw, vyaw)
     vspd_next = where(is_player, ship_vspd, vspd)
     return (f(live3), x2, y2, z2, vx2, vy2, vz1, u2[0], u2[1], u2[2], h2[0], h2[1], h2[2], spd2,
             yaw_next, vyaw_next, vspd_next,
             hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
-            score_next, lives_next, invuln_next, clock_next, alt_prev_next,
+            score_next, lives_next, invuln_next, clock_next, alt_prev_next, fuel_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
          "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
-         "score", "lives", "invuln", "clock", "alt_prev")
+         "score", "lives", "invuln", "clock", "alt_prev", "fuel")
 SETTINGS = ("field_w", "pace", "level")
 
 
@@ -924,7 +942,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "timer": np.where(slot == STATION, rng.uniform(0.5, FLAK_RELOAD, LANES), 0.0), "weapon": np.full(LANES, BASIC), "mult": np.ones(LANES), "fan": np.zeros(LANES),
         **{name: np.zeros(LANES) for name in ("pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock")},
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
-        "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "alt_prev": np.zeros(LANES),
+        "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "alt_prev": np.zeros(LANES), "fuel": np.ones(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
@@ -974,7 +992,7 @@ class BulletScroller(EntityGame):
         draws in (the player fixed at its centre)."""
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
                 "z": [Z_MARGIN, DEPTH - Z_MARGIN], "depth": DEPTH,
-                "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, SPD_MAX],
+                "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, self._top_speed()],
                 "bind": {"yaw": {"move": "move_axis", "finger": True, "speed": TURN_RATE, "tau": TURN_TAU,
                                  "reach": TURN_REACH},
                          "spd": {"move": "move_axis_y", "sign": -1.0, "speed": THROTTLE, "tau": THROTTLE_TAU}},
@@ -1170,10 +1188,24 @@ class BulletScroller(EntityGame):
     #: and night.
     SUN = (0.82, 0.18, 0.55)
 
+    def _top_speed(self) -> float:
+        """The throttle's top as the law applies it: SPD_MAX, CRUISE with the tank dry."""
+        if self.session.state is None:
+            return SPD_MAX
+        return SPD_MAX if float(self.session.column("fuel")[0]) > 1e-3 else CRUISE
+
     def state(self) -> dict[str, Any]:
         st = super().state()
         if self.session.state is not None:
             c = self.session.column
+            # The flight gauges: throttle (0 at SPD_MIN .. 1 at SPD_MAX), the
+            # fuel tank, cruise as a throttle fraction; and the boss's health.
+            span = SPD_MAX - SPD_MIN
+            st["flight"] = {"throttle": (float(c("spd")[0]) - SPD_MIN) / span, "fuel": float(c("fuel")[0]),
+                            "cruise": (CRUISE - SPD_MIN) / span, "min": SPD_MIN, "max": SPD_MAX}
+            boss_live = float(c("alive")[BOSS_LANE]) > 0.0 and float(c("boss_phase")[0]) == 1.0
+            st["boss"] = ({"hp": max(0.0, float(c("hp")[BOSS_LANE])),
+                           "max": BOSS_HP * (1.0 + 0.5 * (self.level - 1.0))} if boss_live else None)
             # The player's place and heading on the globe (and the yaw they
             # were read at), for the page's sun and sky.
             st["globe"] = {"u": [float(c("ux")[0]), float(c("uy")[0]), float(c("uz")[0])],
