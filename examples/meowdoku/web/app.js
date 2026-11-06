@@ -1756,6 +1756,11 @@ function entityModel(piece, now) {
   // (With socket deltas an unchanged entity is carried from its last record,
   // at most one keyframe -- 0.5 s of world time -- old.)
   const mesh = state.meshes[piece.mesh], lead = Math.min(Math.max(0, now - piece.tRecv), 1.0);
+  const own = state.game && state.game.predict && piece.lane === state.game.predict.lane && piece.mesh !== "boom" && piece.removing == null;
+  if (own && drawnShip.at !== now) {             // once per frame (the shadow and lit passes both draw it)
+    drawnShip.at = now;
+    drawnShip[pred.ship && piece.lane === pred.lane ? "page" : "server"] += 1;
+  }
   if (pred.ship && piece.lane === pred.lane && piece.mesh !== "boom" && piece.removing == null) {
     // The player's own ship: the prediction, not the server's last word.
     piece.x = pred.ship.x + pred.offset[0]; piece.z = pred.ship.y + pred.offset[1]; piece.drawnAt = now;
@@ -1788,6 +1793,23 @@ function entityModel(piece, now) {
     }
   }
   return placeEntity(piece, now, x, z, mesh);
+}
+// AUTHORITY STATS: which ship the page drew each frame (its own prediction
+// or the server's), beside the server's count of who authored the ship on
+// each landed step (game.authority).  The rest of the world is always the
+// server's, extrapolated between snapshots.
+const drawnShip = { page: 0, server: 0, at: null };
+function authorityText(game) {
+  const a = game && game.authority;
+  if (!a) return "";
+  const pct = (n, d) => d ? `${Math.round(100 * n / d)}%` : "-";
+  const landed = (a.client || 0) + (a.kept || 0) + (a.unreported || 0) + (a.server || 0);
+  const drawn = drawnShip.page + drawnShip.server;
+  const axes = (a.axes || []).join("") || "none";
+  const scroll = (a.scroll_axes || []).length ? ` (${a.scroll_axes.join("")} always server: the world scrolls it)` : "";
+  return `ship steps: client ${pct(a.client || 0, landed)} · server kept ${pct(a.kept || 0, landed)} · `
+       + `server alone ${pct((a.unreported || 0) + (a.server || 0), landed)} of ${landed}, client axes ${axes}${scroll}`
+       + ` · frames drawn from page ${pct(drawnShip.page, drawn)} · world 100% server`;
 }
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 function placeEntity(piece, now, x, z, mesh) {
@@ -2118,6 +2140,7 @@ function applyState(game) {
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
     pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1; pred.shots = [];
+    drawnShip.page = drawnShip.server = 0;
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
   arcadeEvents(game, now);
@@ -2153,7 +2176,8 @@ function applyState(game) {
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
-  status.textContent = `${game.status} · ${game.title}${best}`;
+  const authority = authorityText(game);
+  status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
   $("hud").textContent = `${game.status}${best}`;
   if (game.record && game.record.plays !== state.recordPlays) { state.recordPlays = game.record.plays; if ($("scores").classList.contains("open")) showScores(); }
   const lichess = game.lichess_control;

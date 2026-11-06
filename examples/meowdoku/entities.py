@@ -526,26 +526,42 @@ class EntityGame(Game):
         ADOPT_BOUND apart (then the server's own state stands as the keyframe).
         Written in place into the dt system's state columns, as ``control``
         writes the control columns."""
+        outcome = self._adopt_outcome()
+        self.count_authority(outcome)
+
+    def count_authority(self, outcome: str) -> None:
+        """Who authored the player's ship on this landed step: ``client``
+        (the page's report adopted), ``kept`` (reported but too far apart:
+        the server's state stood), ``unreported`` (no usable report), or
+        ``server`` (no input intervals: the server stepped on its own)."""
+        counts = getattr(self, "authority", None)
+        if counts is None:
+            counts = self.authority = {"client": 0, "kept": 0, "unreported": 0, "server": 0}
+        counts[outcome] += 1
+
+    def _adopt_outcome(self) -> str:
         ship, self.reported = getattr(self, "reported", None), None
         motion, k = self.motion(), self.PLAYER_LANE
         if not ship or not motion or k is None or self.session.state is None or self.ack is None:
-            return
+            return "unreported"
         if int(ship.get("seq", -1)) != self.ack or self.session.column("alive")[k] <= 0.0:
-            return
+            return "unreported"
         axes = [(axis, "v" + axis) for axis in self.adopt_axes()]
         if not axes:
-            return
+            return "unreported"
         try:
             values = {name: float(ship[name]) for pos, vel in axes for name in (pos, vel)}
         except (KeyError, TypeError, ValueError):
-            return
+            return "unreported"
         if not all(np.isfinite(list(values.values()))):
-            return
+            return "unreported"
         error = math.hypot(*(values[pos] - float(self.session.column(pos)[k]) for pos, _ in axes))
         self.adopted = error <= self.ADOPT_BOUND
         if self.adopted:
             for name, value in values.items():
                 getattr(self.session.state, name)[k] = value
+            return "client"
+        return "kept"
 
     def tick(self) -> None:
         if self.intervals and self.session.state is not None:
@@ -567,6 +583,7 @@ class EntityGame(Game):
         if self.session.state is None:
             seconds = max(seconds, 1.0 / 60.0)      # round zero instantiates the state
         self._land(seconds, self.held)
+        self.count_authority("server")
         self.ticks += 1
 
     def undo(self) -> None:
@@ -579,6 +596,7 @@ class EntityGame(Game):
         self.last_tick = None
         self.epoch += 1
         self.trace, self._ended = None, False          # a new episode to learn from
+        self.authority = None                           # authorship counts start over
 
     def state(self) -> dict[str, Any]:
         st = self.base_state(int(round(self.height)), int(round(self.width)))
@@ -610,6 +628,8 @@ class EntityGame(Game):
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, "adopt_axes": self.adopt_axes(), **(self.motion() or {})}
             st["ack"] = self.ack
+            st["authority"] = {**(getattr(self, "authority", None) or {}), "axes": self.adopt_axes(),
+                               "scroll_axes": list(self.SCROLL_AXES)}
             st["you"] = {"x": float(col("x")[k]), "y": float(col("y")[k]), "vx": float(col("vx")[k]),
                          "vy": float(col("vy")[k]), "alive": bool(col("alive")[k] > 0.0),
                          "shield": float(col("energy")[k]) if "energy" in self.session.columns else 0.0,
