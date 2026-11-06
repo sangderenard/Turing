@@ -298,6 +298,10 @@ BANK_GAIN = 2.2
 #: faster on the same throttle (entity_motion.air_gain).
 AIR_FALL, AIR_GAIN = 0.35, 0.5
 RUDDER_RATE = 0.9
+#: A held finger within this bearing (rad) of straight ahead steers nothing;
+#: past it the bearing counts from the edge (no step).  The page reads it from
+#: motion()['bind']['yaw']['finger_dead'].
+FINGER_DEAD = 0.12
 #: FIRE MODES (``fire_mode``): CONTINUOUS (a fast stream: reload x 0.55),
 #: AUTO (repeats while held), BURST (BURST_N volleys per press, reload x
 #: 0.5), SINGLE (one volley per press).  The PRIMARY hotbar (``primary_slot``:
@@ -552,7 +556,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     # The shared damped motion law on three axes: YAW (left/right turn the
     # ship; a held finger steers toward its bearing from the ship), SPEED
     # (up/down throttle; released, the speed holds) and HEIGHT.
-    finger = (steer_x - cx).atan2(cy - steer_y)
+    bearing = (steer_x - cx).atan2(cy - steer_y)
+    finger = where(bearing.abs() < FINGER_DEAD, zero,
+                   bearing - where(bearing > 0.0, zero + FINGER_DEAD, zero - FINGER_DEAD))
     yaw_target = where(steer_x >= 0.0, yaw + finger, zero - 1.0)
     rudder_yaw, ship_vyaw = damped_axis(yaw, vyaw, move_axis_r, yaw_target, zero + YAW_LO, zero + YAW_HI,
                                         RUDDER_RATE, TURN_TAU, TURN_REACH, dt)
@@ -1412,7 +1418,7 @@ class BulletScroller(EntityGame):
                 "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, self._top_speed()], "bank": [0.0, 2.0 * BANK_MAX],
                 "bank_turn": {"level": BANK_MAX, "gain": BANK_GAIN},
                 "bind": {"yaw": {"move": "move_axis_r", "finger": True, "speed": RUDDER_RATE, "tau": TURN_TAU,
-                                 "reach": TURN_REACH},
+                                 "reach": TURN_REACH, "finger_dead": FINGER_DEAD},
                          "bank": {"move": "move_axis", "level": BANK_MAX, "speed": ROLL_RATE, "tau": ROLL_TAU,
                                   "reach": ROLL_REACH},
                          "spd": {"move": "move_axis_y", "sign": -1.0, "speed": THROTTLE, "tau": THROTTLE_TAU}},

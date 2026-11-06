@@ -2104,7 +2104,12 @@ function stepShip(ship, input, seconds, motion) {
         const patch = motion.patch || {};
         const steering = bind.finger && input.steer_x >= 0;
         const idle = Math.abs(input[bind.move] || 0) < 0.05;
-        const aim = steering ? ship[pos] + Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y)
+        // the bearing's dead zone is the law's (bind.finger_dead): straight
+        // ahead steers nothing, past the edge it counts from the edge
+        const bearing = steering ? Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y) : 0;
+        const dead = bind.finger_dead || 0;
+        const finger = Math.abs(bearing) < dead ? 0 : bearing - Math.sign(bearing) * dead;
+        const aim = steering ? ship[pos] + finger
           : bind.level != null && idle ? bind.level : -1;          // a released stick returns the axis to its level
         const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: (bind.sign ?? 1) * (input[bind.move] || 0), target: aim,
           lo: motion[axis][0], hi: motion[axis][1], speed: bind.speed ?? motion.speed, tau: bind.tau ?? motion.tau,
@@ -3425,6 +3430,7 @@ function heightAxis() { return !!(state.game && state.game.predict && state.game
 // THE THUMBPADS: two on-screen sticks for a real-time game (shown on touch
 // screens, or with the Thumbpads control).  Each tracks one pointer: its
 // offset from the pad's centre over the pad's radius is the stick (-1..1).
+const PAD_DEAD = { turn: 0.22, forward: 0.1 };
 const pads = { left: { x: 0, y: 0, active: false, id: null, taps: [] }, right: { x: 0, y: 0, active: false, id: null, taps: [] },
                altUntil: 0, built: false };
 function buildPads() {
@@ -3439,7 +3445,10 @@ function buildPads() {
       const r = pad.getBoundingClientRect(), radius = r.width / 2;
       let dx = (e.clientX - (r.left + radius)) / radius, dy = (e.clientY - (r.top + radius)) / radius;
       const len = Math.hypot(dx, dy); if (len > 1) { dx /= len; dy /= len; }
-      s.x = dx; s.y = dy;
+      // A dead zone per axis, rescaled so the stick still reaches 1 at the rim:
+      // a thumb resting near the centre turns (sideways) or throttles nothing.
+      const deadband = (v, d) => Math.abs(v) <= d ? 0 : Math.sign(v) * (Math.abs(v) - d) / (1 - d);
+      s.x = deadband(dx, PAD_DEAD.turn); s.y = deadband(dy, PAD_DEAD.forward);
       knob.style.transform = `translate(${dx * radius * 0.6}px, ${dy * radius * 0.6}px)`;
     };
     pad.addEventListener("pointerdown", (e) => {
