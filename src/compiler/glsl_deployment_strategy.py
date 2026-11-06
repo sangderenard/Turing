@@ -7644,7 +7644,7 @@ def _build_shell_hierarchy_plan(
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
                     "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
-                    "acos", "atan", "sinh", "cosh", "asinh", "acosh",
+                    "acos", "atan", "atan2", "sinh", "cosh", "asinh", "acosh",
                     "atanh", "sign", "add", "sub", "mul", "truediv",
                     "floordiv", "mod", "pow", "less", "less_equal",
                     "greater", "greater_equal", "equal", "not_equal",

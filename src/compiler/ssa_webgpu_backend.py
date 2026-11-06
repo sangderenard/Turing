@@ -32,6 +32,7 @@ _BINARY: dict[str, str] = {
     "mod": "({0} % {1})", "pow": "pow({0}, {1})",
     "floordiv": "floor({0} / {1})",
     "maximum": "max({0}, {1})", "minimum": "min({0}, {1})",
+    "atan2": "atan2({0}, {1})",
     "equal": "f32({0} == {1})", "not_equal": "f32({0} != {1})",
     "less": "f32({0} < {1})", "less_equal": "f32({0} <= {1})",
     "greater": "f32({0} > {1})", "greater_equal": "f32({0} >= {1})",
@@ -1473,3 +1474,108 @@ __all__ = [
     "supported_tensor_operations",
     "webgpublas_gemm",
 ]
+
+
+def emit_pairwise_reduce_module(
+    pair: Function,
+    pair_result: SSAValue,
+    *,
+    rows: int,
+    cols: int,
+    roles: Mapping[int, tuple[str, int]],
+    reductions: Sequence[tuple[str, str, str]],
+    row_count: int,
+    col_count: int,
+    uniform_count: int,
+    name: str = "pairwise",
+    preferred_local_size: int = 64,
+) -> WGSLModule:
+    """A rows x cols pairwise block reduced along its column axis.
+
+    The per-pair arithmetic is emitted from repository SSA (``pair``, a
+    scalar-in scalar-out function) as a WGSL helper through the same
+    ``_FunctionEmitter`` the numerical-region helpers use.  One invocation
+    owns one row and walks the columns, so the rows x cols intermediate is
+    never stored, and the host sees only the row and column feeds going in
+    and one value per row per reduction coming out.
+
+    ``roles`` maps each formal of ``pair`` (by value id) to
+    ``("row"|"col"|"uniform", index)`` -- the feed it reads.  Feeds are three
+    packed spans (row feeds ``[k * rows + i]``, column feeds
+    ``[k * cols + j]``, uniforms ``[k]``) and one packed output span
+    (``[r * rows + i]``), four bindings in all, under the guaranteed
+    eight.  ``reductions`` is ``(output_name, "sum"|"min"|"max",
+    expression)``; the expression is WGSL over ``{gap}`` (the helper's
+    result), ``{row<k>}``, ``{col<k>}`` and ``{u<k>}``.
+    """
+
+    shortfalls: list[WGSLShortfall] = []
+    emitter = _FunctionEmitter(
+        pair, outputs=(pair_result,), loop_records=(), store_outputs=False,
+    )
+    body, helper_shortfalls = emitter.emit()
+    shortfalls.extend(helper_shortfalls)
+    unmapped = [value.id for value in pair.args if value.id not in roles]
+    if unmapped:
+        shortfalls.append(WGSLShortfall(
+            pair.name, "roles", f"formals {unmapped} have no declared feed role",
+        ))
+    helper_parameters = ", ".join(f"{_name(value)}: f32" for value in pair.args)
+    spelled = {
+        "row": lambda k: f"row{k}", "col": lambda k: f"col{k}",
+        "uniform": lambda k: f"u{k}",
+    }
+    call_arguments = ", ".join(
+        spelled[roles[value.id][0]](roles[value.id][1])
+        for value in pair.args if value.id in roles
+    )
+    initial = {"sum": "0.0f", "min": "3.0e38f", "max": "-3.0e38f"}
+    combine = {
+        "sum": "{acc} = {acc} + {term};",
+        "min": "{acc} = min({acc}, {term});",
+        "max": "{acc} = max({acc}, {term});",
+    }
+    local = launch_plan = plan_wgsl_launch(rows, preferred_local_size=preferred_local_size)
+    local_x = local.workgroup_size[0]
+    lines = [
+        "@group(0) @binding(0) var<storage, read> rows_in: array<f32>;",
+        "@group(0) @binding(1) var<storage, read> cols_in: array<f32>;",
+        "@group(0) @binding(2) var<storage, read> params: array<f32>;",
+        "@group(0) @binding(3) var<storage, read_write> outputs: array<f32>;",
+        "",
+        f"fn pair_gap({helper_parameters}) -> f32 {{",
+        body,
+        "}",
+        "",
+        f"@compute @workgroup_size({local_x}, 1, 1)",
+        "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {",
+        f"  let i: u32 = gid.x;",
+        f"  if (i >= {int(rows)}u) {{ return; }}",
+    ]
+    for k in range(row_count):
+        lines.append(f"  let row{k}: f32 = rows_in[{k * int(rows)}u + i];")
+    for k in range(uniform_count):
+        lines.append(f"  let u{k}: f32 = params[{k}u];")
+    for index, (_label, operation, _term) in enumerate(reductions):
+        lines.append(f"  var acc{index}: f32 = {initial[operation]};")
+    lines.append(f"  for (var j: u32 = 0u; j < {int(cols)}u; j = j + 1u) {{")
+    for k in range(col_count):
+        lines.append(f"    let col{k}: f32 = cols_in[{k * int(cols)}u + j];")
+    lines.append(f"    let gap: f32 = pair_gap({call_arguments});")
+    substitutions = {
+        **{f"row{k}": f"row{k}" for k in range(row_count)},
+        **{f"col{k}": f"col{k}" for k in range(col_count)},
+        **{f"u{k}": f"u{k}" for k in range(uniform_count)},
+        "gap": "gap",
+    }
+    for index, (_label, operation, term) in enumerate(reductions):
+        lines.append("    " + combine[operation].format(
+            acc=f"acc{index}", term=term.format(**substitutions),
+        ))
+    lines.append("  }")
+    for index in range(len(reductions)):
+        lines.append(f"  outputs[{index * int(rows)}u + i] = acc{index};")
+    lines += ["}", ""]
+    return WGSLModule(
+        name, "\n".join(lines), not shortfalls, tuple(shortfalls), None, launch_plan,
+    )
