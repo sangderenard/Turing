@@ -459,7 +459,7 @@ def prepare_predictor(web_dir: Path) -> None:
     shutil.copyfile(shell, web_dir / "turing-wasm-shell.js")
     try:
         build_predictor(web_dir)
-        print("[meowdoku] engine laws for the page: motion.wasm, travel.wasm, follow.wasm, bank.wasm ready", flush=True)
+        print("[meowdoku] engine laws for the page: every entity_motion.PREDICTORS core (motion, travel, ..., shot, climb, project) ready", flush=True)
     except Exception as error:  # the page plays without prediction
         print(f"[meowdoku] ship predictor NOT built ({type(error).__name__}: {error}); "
               "free-board games run unpredicted", flush=True)

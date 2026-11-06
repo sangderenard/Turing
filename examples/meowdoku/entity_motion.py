@@ -129,6 +129,92 @@ def sphere_advance(ux: float, uy: float, uz: float, hx: float, hy: float, hz: fl
     return px, py, pz, qx * inv2, qy * inv2, qz * inv2
 
 
+def shot_spawn(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
+               c: float, fan: float, laser: float, ship_spd: float, pitch: float,
+               ahead: float, spacing: float, fan_step: float, speed: float, laser_mult: float,
+               slope: float, radius: float):
+    """The player's shot at birth, as one law for server and page.  The ship is
+    at unit position ``u`` heading ``h``; the shot is ``c`` gun-spacings to the
+    side of the nose (``c`` is its rank in the volley, centred on zero), ``ahead``
+    along the heading and ``spacing * c`` to the right, the heading carried there
+    (the muzzle offset), then turned by ``c * fan_step * fan`` (the volley's
+    spread, the exact rotation of ``sphere_turn``).  It leaves at ``speed`` (a
+    laser's ``laser_mult`` times that), on top of the ship's own speed, and climbs
+    at ``slope`` times that speed per unit of the ship's pitch command.  Returns
+    the shot's position, heading, speed and climb rate.  Arithmetic only (the
+    unit lengths are kept by Newton steps, as the flight laws do); fly it with
+    ``sphere_advance`` and ``climb``."""
+    rx = hy * uz - hz * uy
+    ry = hz * ux - hx * uz
+    rz = hx * uy - hy * ux
+    ka = ahead / radius
+    kr = spacing * c / radius
+    px = ux + hx * ka + rx * kr
+    py = uy + hy * ka + ry * kr
+    pz = uz + hz * ka + rz * kr
+    n2 = px * px + py * py + pz * pz
+    y = 1.5 - 0.5 * n2
+    y = y * (1.5 - 0.5 * n2 * y * y)
+    y = y * (1.5 - 0.5 * n2 * y * y)
+    y = 1.0 / (1.0 / y + 1e-12)                    # (sphere_motion.normalized's epsilon)
+    px = px * y
+    py = py * y
+    pz = pz * y
+    k = hx * px + hy * py + hz * pz
+    qx = hx - px * k
+    qy = hy - py * k
+    qz = hz - pz * k
+    m2 = qx * qx + qy * qy + qz * qz
+    w = 1.5 - 0.5 * m2
+    w = w * (1.5 - 0.5 * m2 * w * w)
+    w = w * (1.5 - 0.5 * m2 * w * w)
+    w = 1.0 / (1.0 / w + 1e-12)
+    qx = qx * w
+    qy = qy * w
+    qz = qz * w
+    t = c * fan_step * fan * 0.5
+    d = 1.0 + t * t
+    cs = (1.0 - t * t) / d
+    sn = (2.0 * t) / d
+    tx = qy * pz - qz * py
+    ty = qz * px - qx * pz
+    tz = qx * py - qy * px
+    nx = qx * cs + tx * sn
+    ny = qy * cs + ty * sn
+    nz = qz * cs + tz * sn
+    k2 = nx * px + ny * py + nz * pz
+    nx = nx - k2 * px
+    ny = ny - k2 * py
+    nz = nz - k2 * pz
+    inv = 1.5 - 0.5 * (nx * nx + ny * ny + nz * nz)
+    shot_speed = speed * (laser * laser_mult + (1.0 - laser)) + ship_spd
+    return px, py, pz, nx * inv, ny * inv, nz * inv, shot_speed, shot_speed * slope * pitch
+
+
+def climb(z: float, vz: float, dt: float):
+    """A body's height after ``dt`` at climb rate ``vz``."""
+    return (z + vz * dt,)
+
+
+def sphere_project(ux: float, uy: float, uz: float, cx: float, cy: float, cz: float,
+                   hx: float, hy: float, hz: float, radius: float):
+    """The patch (azimuthal-equidistant view about the unit position ``c``
+    facing ``h``) coordinates, (right, ahead), of the unit position ``u``:
+    ``sphere_motion.project``'s text for plain numbers -- the page projects its
+    own shots into the patch it draws."""
+    rx = hy * cz - hz * cy
+    ry = hz * cx - hx * cz
+    rz = hx * cy - hy * cx
+    e = ux * rx + uy * ry + uz * rz
+    n = ux * hx + uy * hy + uz * hz
+    c = ux * cx + uy * cy + uz * cz
+    rho = math.sqrt(e * e + n * n) * 1.0
+    arc = math.atan2(rho, c) * 1.0
+    inv = 1.0 / (rho + 1e-12)                       # (a Div of the atan2 result has no settled dtype yet: multiply)
+    k = radius * arc * inv
+    return e * k, n * k
+
+
 def air_gain(z: float, fall: float, gain: float):
     """Air thins with height (density 1 / (1 + fall * z)); a craft meets
     less resistance there and its throttle carries it faster, by up to
@@ -748,6 +834,11 @@ PREDICTORS = (
     (sphere_turn, ("ux", "uy", "uz", "hx", "hy", "hz", "angle"), ("hx_next", "hy_next", "hz_next"), "turn"),
     (sphere_advance, ("ux", "uy", "uz", "hx", "hy", "hz", "distance", "radius"),
      ("ux_next", "uy_next", "uz_next", "hx_next", "hy_next", "hz_next"), "advance"),
+    (shot_spawn, ("ux", "uy", "uz", "hx", "hy", "hz", "c", "fan", "laser", "ship_spd", "pitch", "ahead", "spacing",
+                  "fan_step", "speed", "laser_mult", "slope", "radius"),
+     ("ux_next", "uy_next", "uz_next", "hx_next", "hy_next", "hz_next", "speed_next", "vz_next"), "shot"),
+    (climb, ("z", "vz", "dt"), ("z_next",), "climb"),
+    (sphere_project, ("ux", "uy", "uz", "cx", "cy", "cz", "hx", "hy", "hz", "radius"), ("X", "Y"), "project"),
     (air_gain, ("z", "fall", "gain"), ("factor",), "air"),
     (terrain_height, ("x", "y", "z"), ("height", "raw"), "terrain"),
 )

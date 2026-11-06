@@ -89,6 +89,7 @@ from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
 from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, ground_travel
+from meowdoku.entity_motion import climb as climb_law, shot_spawn as shot_birth
 from meowdoku import sphere_motion as sm
 from src.common.tensors import AbstractTensor
 
@@ -347,6 +348,7 @@ STATION_Z = 0.0             # emplacements sit on the land (the page sets them o
 CLOUD_DRIFT, STORM_DRIFT, SMOKE_DRIFT = 0.25, 0.5, 0.25
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
+MUZZLE_SPACING = 0.18      # the gun spacing: a volley's shots sit this far apart across the nose
 MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 
 #: Glyphs this game adds to the exported meshes (web_export.py): the cloud.
@@ -611,9 +613,15 @@ def scroller_step(lane, slot, rx, ry, rz,
     shot_rank = f(free_shot).cumsum(dim=0) - 1.0
     shot_spawn = free_shot & (shot_rank < shots_n) & volley & (pw != MISSILE)
     shot_c = shot_rank - 0.5 * (shots_n - 1.0)
-    shot_u, shot_h = sm.offset(u0, h0, zero + MUZZLE, shot_c * 0.18, RADIUS)
-    shot_h = sm.turn(shot_u, shot_h, shot_c * FAN_STEP * pf)
-    shot_speed = where(pw == LASER, SHOT_SPEED * LASER_SPEED, zero + SHOT_SPEED) + pspd
+    # the guns follow the nose's pitch: a shot climbs or dives at the slope
+    # the pitch command (the height axis) asks for -- point and shoot
+    pitch = (P * move_axis_z).sum().clip(-1.0, 1.0)
+    # one law for the shot's birth, the page's provisional shots included
+    # (entity_motion.shot_spawn, imported as shot_birth): muzzle, spread, speed, climb
+    sux, suy, suz, shx, shy, shz, shot_speed, shot_vz = shot_birth(
+        u0[0], u0[1], u0[2], h0[0], h0[1], h0[2], shot_c, pf, f(pw == LASER), pspd, pitch,
+        MUZZLE, MUZZLE_SPACING, FAN_STEP, SHOT_SPEED, LASER_SPEED, AIM_SLOPE, RADIUS)
+    shot_u, shot_h = (sux, suy, suz), (shx, shy, shz)
     # Missiles: the firing solution that lands each on the nearest enemy
     # (time of flight from the arc to it, vertical speed to rise the height
     # difference and fall back over it), then engine_toy's trajectory law.
@@ -821,10 +829,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     vz1 = where(is_player, ship_vz, where(is_enemy, routine_vz, where(bullet_spawn, climb,
                 where(missile_spawn, (tz - z1) / flight + 0.5 * GRAVITY * flight, where(spawn, 0.0, vz)))))
     vz1 = where(pull, (pz - z) / PULL_TAU, where(is_pickup, 0.0, vz1))     # ... in height too
-    # The guns follow the nose's pitch: a shot climbs or dives at the slope
-    # the pitch command (the height axis) asks for -- point and shoot.
-    pitch = (P * move_axis_z).sum().clip(-1.0, 1.0)
-    vz1 = where(shot_spawn, shot_speed * AIM_SLOPE * pitch, vz1)
+    vz1 = where(shot_spawn, shot_vz, vz1)
     live1 = live | spawn
     born1 = where(spawn, clock, born)
     owner1 = where(shot_spawn | missile_spawn | bomb_spawn, 0.0, where(bullet_spawn, shooter_lane, where(respawn, -1.0, owner)))
@@ -859,7 +864,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     spd2 = where(flying, mvx, where(falling, bvx_, spd1))
     z2 = where(is_player & moving, ship_z, where(is_enemy & moving, routine_z,
                where(flying, mz_, where(falling, bz_, where(seeker_live, z1 + seek_vz * dt,
-                                                            where(moving, z1 + vz1 * dt, z1))))))
+                                                            where(moving, climb_law(z1, vz1, dt)[0], z1))))))
     vz1 = where(flying, mvz_, where(falling, bvz_, where(seeker_live, seek_vz, vz1)))
     paz_z, paz_vz = damped_axis(z1, vz, paz, zero - 1.0, zero + Z_MARGIN, zero + DEPTH - Z_MARGIN,
                                 SPEED, TAU, REACH, dt)
@@ -1430,7 +1435,9 @@ class BulletScroller(EntityGame):
                 # air_gain / sphere_advance) and the land's law (terrain_height)
                 "sphere": {"radius": RADIUS, "air": [AIR_FALL, AIR_GAIN], "relief": 0.75, "sea": 0.48},
                 # Twin shots from the nose on a reload, as the law fires them.
-                "weapon": {"muzzles": [[-0.2, -MUZZLE], [0.2, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED],
+                "weapon": {"muzzles": {"ahead": MUZZLE, "spacing": MUZZLE_SPACING}, "fan_step": FAN_STEP,
+                           "speed": SHOT_SPEED, "laser_mult": LASER_SPEED, "slope": AIM_SLOPE,
+                           "life": SHOT_LIFE, "laser_life": SHOT_LIFE / LASER_SPEED,
                            "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",
                            "size": 0.2}}
 

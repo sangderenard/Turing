@@ -2236,7 +2236,30 @@ function predictFrame(now) {
   if (pred.ship) stepShip(pred.ship, c, frame, game.predict);
   const decay = 1 - syncEase(Math.hypot(...pred.offset), frame);
   pred.offset = [pred.offset[0] * decay, pred.offset[1] * decay];
+  flyShots(frame, game);
   predictShots(now, game, c);
+}
+// A sphere game's provisional shot flies the server's law: sphere_advance by
+// its speed (the shot's lane in scroller_step moves only by that and by
+// climb), and is drawn where sphere_project puts it in the patch about the
+// ship AS PREDICTED -- the frame the page draws everything else in.
+function flyShots(seconds, game) {
+  const R = game.predict.sphere && game.predict.sphere.radius;
+  if (!R || !pred.advance || !pred.climb) return;
+  for (const shot of pred.shots) {
+    const s = shot.flown;
+    if (!s) continue;
+    const a = pred.advance.invoke({ ux: s.ux, uy: s.uy, uz: s.uz, hx: s.hx, hy: s.hy, hz: s.hz, distance: s.spd * seconds, radius: R });
+    s.ux = a.ux_next; s.uy = a.uy_next; s.uz = a.uz_next; s.hx = a.hx_next; s.hy = a.hy_next; s.hz = a.hz_next;
+    s.z = pred.climb.invoke({ z: s.z, vz: s.vz, dt: seconds }).z_next;
+  }
+}
+// The primary weapon the server fires: the blaster's volley is bolts (the
+// laser is a beam and the missiles their own bodies, not shots).
+function blasterVolley(game) {
+  const a = game.arsenal && game.arsenal.primary, slot = state.primarySlot || 0;
+  const owned = a && a[slot] && a[slot].owned;
+  return a && (owned ? slot : 0) === 0 ? a[0] : null;
 }
 // PREDICTED SHOTS.  The page's own shots leave the muzzle of the ship it
 // draws the moment fire is held, under the weapon the game declares (muzzle
@@ -2263,6 +2286,31 @@ function predictShots(now, game, c) {
   if (!weapon || !pred.ship || !c.fire) return;
   if (now - pred.lastShot < Math.max(weapon.reload, 0.02)) return;
   if (ownShotsInFlight(weapon) + weapon.muzzles.length > weapon.max_in_flight) return;
+  if (weapon.slope != null) {
+    // A sphere game: the volley is born by the engine's shot_spawn from the
+    // ship's predicted frame (position, heading, speed, pitch command) --
+    // the very law scroller_step calls -- and flown by sphere_advance.
+    const ship = pred.ship, volley = blasterVolley(game), R = game.predict.sphere && game.predict.sphere.radius;
+    if (!volley || !pred.shot || ship.ux == null || !R) return;
+    const n = 1 + volley.mult, pitch = Math.max(-1, Math.min(1, c.move_axis_z || 0));
+    if (ownShotsInFlight(weapon) + n > weapon.max_in_flight) return;
+    for (let rank = 0; rank < n; rank++) {
+      const r = pred.shot.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
+        c: rank - 0.5 * volley.mult, fan: volley.fan, laser: 0, ship_spd: ship.spd || 0, pitch,
+        ahead: weapon.muzzles.ahead, spacing: weapon.muzzles.spacing, fan_step: weapon.fan_step, speed: weapon.speed,
+        laser_mult: weapon.laser_mult, slope: weapon.slope, radius: R });
+      const id = `prov:${++pred.shotSeq}`;
+      const flown = { ux: r.ux_next, uy: r.uy_next, uz: r.uz_next, hx: r.hx_next, hy: r.hy_next, hz: r.hz_next,
+                      spd: r.speed_next, vz: r.vz_next, z: ship.z || 0 };
+      state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane, flown,
+        sx: 0, sz: 0, x: 0, z: 0, vx: 0, vz: 0, tRecv: drawNow,
+        mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
+        t0: state.time, removing: null, seed: 0, birth: null });
+      pred.shots.push({ id, at: drawNow, flown });
+    }
+    pred.lastShot = now;
+    return;
+  }
   const x0 = pred.ship.x + pred.offset[0], z0 = pred.ship.y + pred.offset[1];
   for (const [mx, mz] of weapon.muzzles) {
     const id = `prov:${++pred.shotSeq}`;
@@ -2524,6 +2572,15 @@ function entityModel(piece, now) {
     piece.h = pred.ship.z || 0;
     return placeEntity(piece, now, piece.x, piece.z, mesh);
   }
+  if (piece.flown && pred.ship && pred.project && pred.ship.ux != null) {
+    // The player's own provisional shot (engine law, flyShots): its patch
+    // position about the ship as predicted -- sphere_project, no linear guess.
+    const patch = state.game.predict.patch, f = piece.flown, ship = pred.ship;
+    const p = pred.project.invoke({ ux: f.ux, uy: f.uy, uz: f.uz, cx: ship.ux, cy: ship.uy, cz: ship.uz,
+                                    hx: ship.hx, hy: ship.hy, hz: ship.hz, radius: state.game.predict.sphere.radius });
+    piece.x = patch.cx + p.X + pred.offset[0]; piece.z = patch.cy - p.Y + pred.offset[1]; piece.h = f.z; piece.drawnAt = now;
+    return placeEntity(piece, now, piece.x, piece.z, mesh);
+  }
   const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
   // Each frame the drawn position first moves by the velocity (so a shot
   // never trails), then only the remaining error is eased away.
@@ -2710,7 +2767,7 @@ function placeEntity(piece, now, x, z, mesh) {
   x -= viewX(now);                                // world frame -> the screen (0 unless the game scrolls a view)
   const game = state.game, patch = game && game.predict && game.predict.patch;
   let turned = 0;
-  if (patch && piece.lane !== game.predict.lane) {
+  if (patch && piece.lane !== game.predict.lane && !piece.flown) {
     turned = patchTurn(now);
     if (turned) {
       const X = x - patch.cx, Y = patch.cy - z, c = Math.cos(turned), s = Math.sin(turned);
@@ -3987,6 +4044,10 @@ function fillPickers() {
     pred.turn = await TuringWasmProgram.load("turn.wasm", "turn.abi.json");
     pred.advance = await TuringWasmProgram.load("advance.wasm", "advance.abi.json");
     pred.air = await TuringWasmProgram.load("air.wasm", "air.abi.json");
+    // the player's shots: birth, climb and the patch projection (entity_motion.shot_spawn / climb / sphere_project)
+    pred.shot = await TuringWasmProgram.load("shot.wasm", "shot.abi.json");
+    pred.climb = await TuringWasmProgram.load("climb.wasm", "climb.abi.json");
+    pred.project = await TuringWasmProgram.load("project.wasm", "project.abi.json");
     pred.terrain = await TuringWasmProgram.load("terrain.wasm", "terrain.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   // The autopilot policy network (policy_wasm.py): the MLP forward as a wasm

@@ -672,6 +672,9 @@ _MATH_IMPORTS = {
     "asin": 1, "acos": 1, "atan": 1, "atan2": 2, "sinh": 1, "cosh": 1, "tanh": 1,
     "asinh": 1, "acosh": 1, "atanh": 1,
 }
+#: SSA binary ops with no Wasm instruction that the LLVM lane spells as a libm
+#: call (``ssa_llvm_backend``: ``Atan2`` -> ``@atan2``): here the host import.
+_SSA_MATH_IMPORT_OPS = {"Atan2": "atan2", "atan2": "atan2"}
 _PTR_DTYPES = frozenset({"ptr", "pointer"})
 _OP_DROP = 0x1A
 _OP_LOCAL_TEE = 0x22
@@ -736,6 +739,9 @@ def emit_ssa_module_to_wasm_core(
             continue
         for block in owner.blocks.values():
             for instruction in block.instrs:
+                if str(instruction.op) in _SSA_MATH_IMPORT_OPS and len(instruction.args) == 2:
+                    # an SSA ``atan2`` op: spelled as the host's import
+                    externs.add(_SSA_MATH_IMPORT_OPS[str(instruction.op)])
                 if instruction.op in ("Call", "call"):
                     callee_name = str(instruction.attributes.get("callee") or "")
                     if callee_name in module.functions:
@@ -1727,6 +1733,16 @@ def emit_ssa_module_to_wasm_core(
             elif target_kind == "i32":
                 builder.raw(0xAA)                 # i32.trunc_f64_s
             builder.local_set(slot_for(env, instruction.res, target_kind))
+            return
+        if operation in _SSA_MATH_IMPORT_OPS and len(instruction.args) == 2 and instruction.res is not None:
+            symbol = _SSA_MATH_IMPORT_OPS[operation]
+            if (value_kind(instruction.res) or "f64") != "f64" or symbol not in import_index:
+                shortfalls.append(WasmEmissionShortfall(
+                    operation, f"{env.function.name}: {operation} lacks its f64 x2 -> f64 import"))
+                return
+            if all(push_as(env, argument, "f64", operation) for argument in instruction.args):
+                builder.call(import_index[symbol])
+                builder.local_set(slot_for(env, instruction.res, "f64"))
             return
         if operation in TENSOR_OPERATION_SCALAR_SPELLING or operation == "equal":
             shapes = tuple(
