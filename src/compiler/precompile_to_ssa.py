@@ -3554,6 +3554,7 @@ class _ControlSSABuilder(TiledObject):
             if int(sequence_id) in self.sequence_child_table_layouts
             and int(self.sequence_child_table_layouts[int(sequence_id)][0]) > 0
         }
+        heterogeneous_columns: set[tuple[int, int]] = set()
         for sequence_id, policy, column_count, writable in sequence_declarations:
             # A row of a list of lists is selected by its row load, which
             # builds its descriptor where it runs (``len(g[i])``, corpus
@@ -3630,6 +3631,27 @@ class _ControlSSABuilder(TiledObject):
                         continue
                     proposed_shape, proposed_dtype = row_contract
                     incumbent_shape = column_shapes[column]
+                    if (
+                        (int(sequence_id), column) in heterogeneous_columns
+                    ):
+                        continue
+                    if (
+                        incumbent_shape and incumbent_shape != proposed_shape
+                        and self._authored_aggregate_sequence(
+                            int(sequence_id)
+                        )
+                    ):
+                        # Program: ``AbstractTensor.cat([a, b], dim=1)`` with
+                        # a (2, 3) and b (2, 2).  Wrong record: the authored
+                        # list's single column took a's row shape and then
+                        # refused b's.  Rule: a list/tuple the source
+                        # declared (SOURCE_AGGREGATE_LAYOUT) is a structural
+                        # sequence of tensor handles; each member owns its
+                        # own shape on proven_shape, so when the members
+                        # differ the column carries no row shape of its own.
+                        column_shapes[column] = ()
+                        heterogeneous_columns.add((int(sequence_id), column))
+                        continue
                     if incumbent_shape and incumbent_shape != proposed_shape:
                         self.shortfalls.append(SSALoweringShortfall(
                             "ssa-sequence", "conflicting-row-shape",
@@ -8554,6 +8576,21 @@ class _ControlSSABuilder(TiledObject):
         if structure.kind != "product" or structure.storage != "tuple":
             return None
         return tuple(leaf.value_id for _path, leaf in structure.leaves())
+
+    def _authored_aggregate_sequence(self, value_id: int) -> bool:
+        """True when the source declared this value as a list/tuple aggregate."""
+        from .concordance_declarations import SOURCE_AGGREGATE_LAYOUT
+
+        if self.lexical_read_scope is None:
+            return False
+        book = self._book()
+        ref = book.latest_ref(
+            SOURCE_AGGREGATE_LAYOUT, (self.lexical_read_scope, int(value_id)),
+        )
+        if ref is None:
+            return False
+        declaration = book.page(ref.page).cell(ref.row, ref.column)
+        return getattr(declaration, "aggregate_kind", None) in {"list", "tuple"}
 
     def _declared_cell(self, page_name: str, row: tuple) -> Ref | None:
         """Read-side lookup of a cell on a page another lane declares

@@ -3965,8 +3965,17 @@ def _record_ssa_shape(function: Any, value: Any) -> None:
             f"{int(value.id)} in {function.name!r}; the shape is not posted "
             "from a fact the book holds"
         )
+    row = (shape_scope_of(function), int(value.id))
+    # Program: an unrolled loop reads one value (``e``) as the operand of
+    # several matmuls, so the lowering observes the same shape of the same
+    # ssa_value once per reader.  Wrong record: each observation was posted
+    # as a REVISE, and the second, which changes nothing, was refused.  Rule:
+    # a shape the row already states is not a revision; only a different
+    # extent is.
+    if book.page(SHAPE_SSA_STORE).latest(row) == extents:
+        return
     book.post(
-        SHAPE_SSA_STORE, (shape_scope_of(function), int(value.id)), extents,
+        SHAPE_SSA_STORE, row, extents,
         stage=TENSOR_SSA_LOWERING, provenance=Derived((cell,)),
         mode=Mode.REVISE,
     )
@@ -15097,6 +15106,21 @@ def lower_tensor_calls_to_repository_ssa(
                         ))
 
                 elif operation in {"cat", "concat", "concatenate"} and data_args:
+                    # Program: ``AbstractTensor.cat([a, b], dim=1)``.  The
+                    # region carve passes ``dim`` as a trailing integer
+                    # scalar formal (not a folded Const, so ``constants``
+                    # does not drop it), exactly as ``sum(dim=1)`` receives
+                    # its.  Wrong value: that formal sat in ``data_args`` and
+                    # failed the rank test, leaving ``cat`` unlowered.  Rule:
+                    # a 0-d integer operand is never a concatenation
+                    # operand (cat refuses 0-d tensors); the axis is read
+                    # from the ``dim`` attribute below.
+                    data_args = [
+                        value for value in data_args
+                        if tuple(value.shape or ()) != ()
+                        or not str(value.dtype or "").startswith(("int", "uint"))
+                    ] or data_args
+                    source = data_args[0]
                     rank = len(tuple(source.shape or ()))
                     raw_dim = _attribute(instruction.attributes, "axis", "dim")
                     if raw_dim is None:
@@ -15120,30 +15144,85 @@ def lower_tensor_calls_to_repository_ssa(
                             int(shape[dim_index]) for shape in shapes
                         )
                         result.shape = tuple(result_shape)
-                        pointers = fresh(
-                            shape=(len(data_args),), dtype="ptrptr_float64"
+                        # cat is composed structurally, as the SSA tensor
+                        # backend's ``cat_`` does: a zero fill of the output
+                        # and one ``index_set_double`` per operand writing its
+                        # span of the joined axis.  ``cat_double`` takes a
+                        # pointer table (``PointerArray``, double**) that the
+                        # one-level SSA address cannot carry, so the module
+                        # lanes could not spell it.
+                        output_extents = tuple(map(int, result.shape))
+                        element_total = 1
+                        for extent in output_extents:
+                            element_total *= int(extent)
+                        zero_scalar, zero_def = constant(0.0, "float64")
+                        total_count, total_def = constant(
+                            element_total, "int32"
                         )
-                        sizes, sizes_def = int_vector(
-                            shape[dim_index] for shape in shapes
+                        prefix.extend((zero_def, total_def))
+                        joined = fresh(
+                            dtype=recorded_dtype(result, "cat result"),
+                            shape=output_extents,
                         )
-                        shape_value, shape_def = int_vector(source.shape)
-                        count_value, count_def = constant(
-                            len(data_args), "int32"
+                        register_tensor(joined, storage="temporary")
+                        emitted.append(call(
+                            "fill_double", [joined, zero_scalar, total_count],
+                            joined, instruction, output_argument=0,
+                        ))
+                        output_shape_value, output_shape_def = int_vector(
+                            output_extents
                         )
                         rank_value, rank_def = constant(rank, "int32")
-                        dim_value, dim_def = constant(dim_index, "int32")
-                        prefix.extend((
-                            Instr("PointerArray", data_args, pointers),
-                            sizes_def, shape_def, count_def, rank_def, dim_def,
-                        ))
-                        emitted.append(call(
-                            "cat_double",
-                            [
-                                pointers, sizes, count_value, shape_value,
-                                rank_value, dim_value, result,
-                            ],
-                            result, instruction, output_argument=6,
-                        ))
+                        prefix.extend((output_shape_def, rank_def))
+                        position = 0
+                        for part_index, part in enumerate(data_args):
+                            register_tensor(
+                                part,
+                                storage=(
+                                    "input"
+                                    if int(part.id) in function_argument_ids
+                                    else "temporary"
+                                ),
+                            )
+                            part_extent = int(shapes[part_index][dim_index])
+                            offsets = [0]
+                            flattened = []
+                            for axis in range(rank):
+                                flattened.extend(
+                                    range(position, position + part_extent)
+                                    if axis == dim_index
+                                    else range(output_extents[axis])
+                                )
+                                offsets.append(len(flattened))
+                            offsets_value, offsets_def = int_vector(offsets)
+                            indices_value, indices_def = int_vector(flattened)
+                            part_count_value = 1
+                            for extent in shapes[part_index]:
+                                part_count_value *= int(extent)
+                            part_count, part_count_def = constant(
+                                part_count_value, "int32"
+                            )
+                            prefix.extend((
+                                offsets_def, indices_def, part_count_def,
+                            ))
+                            last = part_index == len(data_args) - 1
+                            target = result if last else fresh(
+                                dtype=recorded_dtype(result, "cat result"),
+                                shape=output_extents,
+                            )
+                            if not last:
+                                register_tensor(target, storage="temporary")
+                            emitted.append(call(
+                                "index_set_double",
+                                [
+                                    joined, target, output_shape_value,
+                                    rank_value, offsets_value, indices_value,
+                                    part, part_count,
+                                ],
+                                target, instruction, output_argument=1,
+                            ))
+                            joined = target
+                            position += part_extent
 
                 elif operation == "where" and len(data_args) == 3:
                     count = need_count(result, result_count)

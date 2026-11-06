@@ -3865,7 +3865,24 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 int(child) for child, _role in
                 graph_obj.nodes[candidate].get("children") or ()
             )
-            if readers <= unread_collections:
+            # Program: ``AbstractTensor.cat([a, b], dim=1)``.  Wrong record:
+            # the list literal was born as resident sequence storage (a
+            # clear and one append per member) although its only reader is
+            # cat, which consumes the members as its numerical operands
+            # through the aggregate leaf ledger -- the tuple spelling
+            # ``cat((a, b))`` has no storage and lowers.  The appends stored
+            # tensor handles the module lane cannot spell.  Rule: a list
+            # read only by stack/cat-family calls is a structural operand
+            # list; like an unread collection it has no birth.
+            structural_consumers = {
+                reader for reader in readers - unread_collections
+                if str(
+                    (graph_obj.nodes[reader].get("attributes") or {}).get(
+                        "tensor_candidate"
+                    ) or graph_obj.nodes[reader].get("op") or ""
+                ).casefold() in {"stack", "cat", "concat", "concatenate"}
+            }
+            if readers <= unread_collections | structural_consumers:
                 unread_collections.add(candidate)
                 grew = True
     for node_id, data in graph_obj.nodes(data=True):

@@ -23939,6 +23939,66 @@ def _publish_exact_zip_loop_target_descriptors(graph: Any) -> int:
             graph, int(loop_id), iterable_nodes[0], target_bindings,
             f"iteration_{int(loop_id)}",
         )
+        iterable_attributes = G.nodes[iterable_nodes[0]].get("attributes") or {}
+        loop_target = loop_data["expr_obj"].target
+        if (
+            not bindings
+            and isinstance(loop_target, ast.Name)
+            and iterable_attributes.get("aggregate_kind") == "tuple"
+            and iterable_attributes.get("aggregate_leaf_value_ids")
+            and dict(target_bindings).get(loop_target.id) is not None
+        ):
+            # Program: ``for q in (Q1, Q2): out.append((e @ q).tanh())`` with
+            # Q1 and Q2 declared (3, 1) float64 inputs.  Wrong record: the
+            # loop target ``q`` had no shape state, so the matmul it feeds
+            # had no dtype and the region refused ("has no settled dtype").
+            # Rule: a tuple literal's iteration yields its members; when
+            # every member's descriptor is the same state, that state is the
+            # target's, one edge per member (each member's own identity cell
+            # is the source).  Members that differ have no single target
+            # state and post nothing.
+            from ..common.tensors.topological_reducer import (
+                node_identity_cell,
+            )
+
+            leaves = tuple(
+                int(leaf) for leaf in iterable_attributes[
+                    "aggregate_leaf_value_ids"
+                ]
+            )
+            member_states = tuple(
+                _tensor_descriptor(graph, leaf) if leaf in G else None
+                for leaf in leaves
+            )
+            first_state = member_states[0] if member_states else None
+            if (
+                isinstance(first_state, Mapping)
+                and str(first_state.get("dtype") or "") not in {
+                    "", "None", "unknown",
+                }
+                and all(
+                    isinstance(state, Mapping)
+                    and tuple(state.get("shape") or ())
+                    == tuple(first_state.get("shape") or ())
+                    and str(state.get("dtype")) == str(first_state.get("dtype"))
+                    for state in member_states
+                )
+            ):
+                target_value = int(dict(target_bindings)[loop_target.id])
+                for leaf, state in zip(leaves, member_states, strict=True):
+                    record_shape_transformation(
+                        scope, ("iterable_member", leaf),
+                        scope, target_value,
+                        stage="projected_iterable_type",
+                        operation="projected_iterable_member",
+                        source_state=state, target_state=dict(first_state),
+                        role="element",
+                        source_cells=tuple(filter(None, (
+                            node_identity_cell(graph, leaf),
+                        ))),
+                    )
+                    posted += 1
+            continue
         for source_id, target_id, _induction, projection in bindings:
             if projection is None:
                 source_descriptor = _tensor_descriptor(graph, int(source_id))
@@ -30432,6 +30492,35 @@ def _tensor_descriptor_rule(
                     return _tensor_descriptor(
                         graph, leaves[index % len(leaves)], seen
                     )
+                # Program: ``pooled = []`` then, in ``for q in (Q1, Q2)``,
+                # ``pooled.append(<tensor>)``, then ``pooled[0]``.  Wrong
+                # record: an empty display has no leaves, so the literal-index
+                # read had no descriptor and the region refused it ("has no
+                # settled dtype").  Rule: a list that starts empty holds only
+                # what its retained append effects put in it; when every
+                # appended value states the same descriptor, any element read
+                # of the list is that descriptor.  Differing members state no
+                # single element and answer nothing (as the cat rule above).
+                if (
+                    not leaves
+                    and base_attributes.get("aggregate_kind") == "list"
+                    and isinstance(index, int)
+                    and not isinstance(index, bool)
+                ):
+                    appended = tuple(dict.fromkeys(
+                        int(value) for _effect, value
+                        in _sequence_append_descriptor_sources(graph, base)
+                    ))
+                    element_states = tuple(
+                        _tensor_descriptor(graph, value, seen)
+                        for value in appended
+                    )
+                    if element_states and all(
+                        isinstance(state, Mapping)
+                        and dict(state) == dict(element_states[0])
+                        for state in element_states
+                    ):
+                        return copy.deepcopy(dict(element_states[0]))
         if provisional_tensor is not None:
             tensor = provisional_tensor
         elif declared_rank > 0:

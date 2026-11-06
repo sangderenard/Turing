@@ -304,6 +304,102 @@ class LoopShaderReduction(TiledObject):
     domain_region_indices: tuple[int, ...] = ()
 
 
+def aggregate_member_iterable(
+    graph: Any, iterable_node: int | None, target: ast.AST | None,
+) -> tuple[int, ...] | None:
+    """The member value ids a ``for NAME in (a, b, ...)`` loop iterates.
+
+    Program: ``for q in (Q1, Q2)`` with Q1, Q2 declared inputs.  The tuple
+    display is an aggregate whose ``aggregate_leaf_value_ids`` are the exact
+    members the source wrote; iteration k's target IS member k (no constant
+    exists for a runtime tensor).  A list display may be mutated in the
+    body, so only a tuple qualifies.
+    """
+
+    if iterable_node is None or int(iterable_node) not in graph.G:
+        return None
+    if not isinstance(target, ast.Name):
+        return None
+    attributes = graph.G.nodes[int(iterable_node)].get("attributes") or {}
+    leaves = tuple(int(v) for v in attributes.get("aggregate_leaf_value_ids") or ())
+    if (
+        attributes.get("aggregate_kind") != "tuple"
+        or attributes.get("producer_kind") != "aggregate"
+        or not leaves
+        or any(leaf not in graph.G for leaf in leaves)
+    ):
+        return None
+    return leaves
+
+
+def local_append_publication(
+    graph: Any, loop: LoopDescriptor, effect: LoopStateEffect,
+) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+    """``(list node, ((Indexed node, literal k), ...))`` for an unrollable append.
+
+    Program: ``pooled = []`` then, in ``for q in (Q1, Q2)``,
+    ``pooled.append(f(q))``, then ``pooled[0]`` / ``pooled[1]``.  Wrong
+    record: the append is a SEQUENCE_MUTATION, so the planner retained the
+    loop and every ``pooled[k]`` read went through sequence storage of
+    tensor handles.  Rule: when the trip count is static, the list is an
+    empty display, its only mutation is this one unconditional append, and
+    every other use is a read at a literal in-range index, iteration ``k``
+    defines member ``k`` and the read IS that iteration's value (the
+    evaporator redirects it, as it redirects a body value read after the
+    loop).  Anything else (len(), escape, another writer, a dynamic index)
+    answers None and the loop stays retained.
+    """
+
+    if (
+        graph is None
+        or effect.mode is not LoopStateEffectMode.SEQUENCE_MUTATION
+        or effect.operator != "append"
+        or effect.argument_kind != "value"
+        or len(effect.argument_value_ids) != 1
+        or loop.trip_count is None
+        or int(effect.state_input_id) not in graph.G
+    ):
+        return None
+    if sum(
+        1 for other in loop.state_effects
+        if int(other.state_input_id) == int(effect.state_input_id)
+    ) != 1:
+        return None
+    list_id = int(effect.state_input_id)
+    attributes = graph.G.nodes[list_id].get("attributes") or {}
+    if (
+        attributes.get("aggregate_kind") != "list"
+        or attributes.get("producer_kind") != "aggregate"
+        or tuple(attributes.get("aggregate_leaf_value_ids") or ())
+    ):
+        return None
+    reads = []
+    for child, _role in graph.G.nodes[list_id].get("children") or ():
+        child = int(child)
+        if child == int(effect.effect_node_id):
+            continue
+        data = graph.G.nodes.get(child, {})
+        if str(data.get("type") or "") != "Indexed":
+            return None
+        roles = {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+        }
+        if roles.get("base") != list_id or "index" not in roles:
+            return None
+        index_data = graph.G.nodes.get(roles["index"], {})
+        literal = (index_data.get("attributes") or {}).get(
+            "value", index_data.get("constant")
+        )
+        if (
+            isinstance(literal, bool) or not isinstance(literal, int)
+            or not -int(loop.trip_count) <= literal < int(loop.trip_count)
+        ):
+            return None
+        reads.append((child, int(literal)))
+    return list_id, tuple(reads)
+
+
 def planned_collection_bindings(
     graph: Any,
     loop: LoopDescriptor,
@@ -1398,11 +1494,13 @@ def evaporate_unrolled_loops(
                 LoopStateEffectMode.SEQUENCE_MUTATION,
                 LoopStateEffectMode.MAPPING_MUTATION,
             }
+            and local_append_publication(graph, member.loop, effect) is None
             for member in selected_plans
             for effect in member.loop.state_effects
         ):
             continue
         iteration_assignments: tuple[dict[int, object], ...] | None = None
+        member_leaves: tuple[int, ...] | None = None
         if group is not None:
             generator_expression = next(
                 data.get("expr_obj")
@@ -1494,7 +1592,16 @@ def evaporate_unrolled_loops(
         elif loop.iterable_constant is not None:
             iteration_values = tuple(loop.iterable_constant)
         else:
-            continue
+            member_leaves = aggregate_member_iterable(
+                graph, loop.iterable_node,
+                getattr(
+                    graph.G.nodes[int(loop.node_id)].get("expr_obj"),
+                    "target", None,
+                ),
+            )
+            if member_leaves is None:
+                continue
+            iteration_values = tuple(range(len(member_leaves)))
 
         empty_generator_materializers = set()
         if not iteration_values:
@@ -1652,6 +1759,13 @@ def evaporate_unrolled_loops(
             for effect in state_effects
             if effect.mode is LoopStateEffectMode.INDEXED_PUBLICATION
         }
+        local_appends: dict[int, tuple[Any, list[int]]] = {}
+        for effect in state_effects:
+            published = local_append_publication(graph, loop, effect)
+            if published is not None:
+                local_appends[int(effect.effect_node_id)] = (
+                    published, [],
+                )
         materializations: dict[int, list[int]] = {
             int(output.materializer_node_id): []
             for output in iteration_outputs
@@ -1682,16 +1796,27 @@ def evaporate_unrolled_loops(
                         "iterable loop has no destructurable source target: "
                         f"loop={loop.node_id}"
                     )
-                values_by_name = dict(_destructure_loop_target(
-                    source_expression.target, iteration
-                ))
-                mapping.update(
-                    (
-                        int(target_id),
-                        add_constant(values_by_name[str(name)], loop.node_id),
+                if member_leaves is not None:
+                    # Iteration k binds the target to member k itself.
+                    mapping.update(
+                        (int(target_id), int(member_leaves[iteration]))
+                        for name, target_id in loop.target_bindings
                     )
-                    for name, target_id in loop.target_bindings
-                )
+                    values_by_name = None
+                else:
+                    values_by_name = dict(_destructure_loop_target(
+                        source_expression.target, iteration
+                    ))
+                if values_by_name is not None:
+                    mapping.update(
+                        (
+                            int(target_id),
+                            add_constant(
+                                values_by_name[str(name)], loop.node_id,
+                            ),
+                        )
+                        for name, target_id in loop.target_bindings
+                    )
             for source_id in body_order:
                 parents = tuple(
                     (
@@ -1738,6 +1863,14 @@ def evaporate_unrolled_loops(
                         f"initial={initial}, updated={updated}"
                     )
             for effect in state_effects:
+                if int(effect.effect_node_id) in local_appends:
+                    local_appends[int(effect.effect_node_id)][1].append(
+                        int(mapping.get(
+                            int(effect.argument_value_ids[0]),
+                            int(effect.argument_value_ids[0]),
+                        ))
+                    )
+                    continue
                 if (
                     effect.mode
                     is not LoopStateEffectMode.INDEXED_PUBLICATION
@@ -1832,6 +1965,38 @@ def evaporate_unrolled_loops(
                     for child in graph.G.successors(int(body_id))
                 ):
                     _replace_parent_value(graph, int(body_id), (int(final_id),))
+        retired_local_lists: set[int] = set()
+        for (list_id, reads), values in local_appends.values():
+            # Member k of the display is iteration k's value: each literal
+            # read of it is redirected to that value through the incumbent
+            # operand writer, then the read and the display are retired.
+            for read_id, literal in reads:
+                _replace_parent_value(
+                    graph, int(read_id), (int(values[literal]),),
+                )
+                retired_local_lists.add(int(read_id))
+            retired_local_lists.add(int(list_id))
+        if local_appends:
+            # The pre-fold mutation snapshot still names the evaporated
+            # append effects; control lowering would install them on a
+            # display that no longer exists.  An effect the unroll retires
+            # leaves the snapshot with its node (as the structural fold's
+            # rejected effects do).
+            from .glsl_deployment_strategy import (
+                _retain_source_sequence_mutation_records,
+            )
+
+            _retain_source_sequence_mutation_records(
+                graph.G, getattr(graph, "function_table", None),
+            )
+            graph.G.graph["source_sequence_mutation_records"] = {
+                int(effect_id): record
+                for effect_id, record in (
+                    graph.G.graph.get("source_sequence_mutation_records")
+                    or {}
+                ).items()
+                if int(effect_id) not in local_appends
+            }
         for collection_id, values in publications.items():
             if values:
                 _replace_parent_value(
@@ -1872,6 +2037,7 @@ def evaporate_unrolled_loops(
             materializer["attributes"] = attributes
 
         removable = {
+            *retired_local_lists,
             *(
                 int(member.loop.node_id)
                 for member in selected_plans
@@ -4262,6 +4428,14 @@ class LoopComposer:
             if isinstance(literal_iterable, (tuple, list)):
                 iterable_constant = tuple(literal_iterable)
                 count = len(iterable_constant)
+        if count is None and iterator_kind == "iterable" and isinstance(
+            expression, ast.For
+        ):
+            member_leaves = aggregate_member_iterable(
+                graph, iterable_node, expression.target,
+            )
+            if member_leaves is not None:
+                count = len(member_leaves)
         if count is None and iterable_node is not None:
             known, iterable = _constant(graph, iterable_node)
             if known and isinstance(iterable, (tuple, list, range)):
@@ -4505,7 +4679,10 @@ class LoopComposer:
             backpressured_output=bool(publication_nodes),
         )
 
-    def plan(self, loop: LoopDescriptor, *, nesting_depth: int = 0) -> LoopPlan:
+    def plan(
+        self, loop: LoopDescriptor, *, nesting_depth: int = 0,
+        graph: Any = None,
+    ) -> LoopPlan:
         from .work_contract import active_contract
         depth_limit = active_contract().loops.unroll_depth
         if loop.trip_count == 0:
@@ -4521,6 +4698,7 @@ class LoopComposer:
             and all(
                 effect.mode
                 is LoopStateEffectMode.INDEXED_PUBLICATION
+                or local_append_publication(graph, loop, effect) is not None
                 for effect in loop.state_effects
             )
         ):
@@ -4573,14 +4751,15 @@ class LoopComposer:
                 (ast.For, ast.While, ast.comprehension),
             ):
                 descriptor = self.describe(graph, node_id)
-                plans.append(self.plan(descriptor))
+                plans.append(self.plan(descriptor, graph=graph))
 
         from .work_contract import active_contract
         depth_limit = active_contract().loops.unroll_depth
         if depth_limit is not None:
             plans = [self.plan(plan.loop, nesting_depth=sum(
                 int(plan.loop.node_id) in owner.loop.body_nodes
-                for owner in plans if owner is not plan)) for plan in plans]
+                for owner in plans if owner is not plan), graph=graph)
+                for plan in plans]
 
         # Realization decisions form a hierarchy.  A multi-carried loop is a
         # coordinated recurrence: its whole (initial, updated) vector must

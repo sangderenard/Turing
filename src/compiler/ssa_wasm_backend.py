@@ -1093,6 +1093,22 @@ def emit_ssa_module_to_wasm_core(
                 builder.raw(opcode)
                 builder.local_set(slot_for(env, result, "f64"))
             return True
+        if symbol.startswith("llvm.memcpy.") or symbol.startswith("llvm.memmove."):
+            # Program: any repository kernel that copies a span (``index_set``,
+            # ``slice_copy``: ``memcpy(out, in, n * sizeof(double))``).  The
+            # intrinsic's (dst, src, byte length, volatile) is exactly the
+            # bulk-memory ``memory.copy`` (dst, src, n) on the one linear
+            # memory; non-overlapping memcpy and memmove coincide there.
+            if len(args) != 4 or result is not None:
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"{symbol} lacks its (dst, src, length, volatile) signature",
+                ))
+                return True
+            if (push_as(env, args[0], "i32", "Call")
+                    and push_as(env, args[1], "i32", "Call")
+                    and push_as(env, args[2], "i32", "Call", _INDEX_CONVERSIONS)):
+                builder.raw(0xFC, 0x0A, 0x00, 0x00)  # memory.copy 0 0
+            return True
         if symbol == "llvm.round.f64":
             # Round half away from zero, which f64.nearest (half to even)
             # is not: r = trunc(x); |x - r| >= 0.5 ? r + copysign(1, x) : r.
