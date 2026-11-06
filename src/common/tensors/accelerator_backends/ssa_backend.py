@@ -654,6 +654,29 @@ class SSATensorProgram:
             result, output_argument=1,
         )
 
+    def gather_values(
+        self, source: SSATensorValue, dim: int, indices: SSATensorValue,
+    ) -> SSATensorValue:
+        """Select along ``dim`` by index VALUES known only at run time (a
+        table lookup): the repository's ``gather_values_double`` reads the
+        indices as doubles and truncates them."""
+        if indices.program is not self or source.program is not self:
+            raise ValueError("SSA gather operands must share one program")
+        dim %= len(source.shape)
+        shape = list(source.shape)
+        shape[dim] = indices.size
+        result = self._fresh(shape=tuple(shape))
+        return self._call(
+            "gather_values_double",
+            [
+                source.value, result, self._int_vector(source.shape),
+                self._constant(len(source.shape), "int32"),
+                self._constant(dim, "int32"), indices.value,
+                self._constant(indices.size, "int32"),
+            ],
+            result, output_argument=1,
+        )
+
     def index_set(
         self, source: SSATensorValue, index, values: SSATensorValue,
     ) -> SSATensorValue:
@@ -1048,6 +1071,13 @@ class SSATensorOperations(AbstractTensor):
         source = tensor or self.data
         return source.program.operation("add", source, 0.0)
 
+    def long_(self) -> SSATensorValue:
+        # Integral values live in double storage (see to_dtype_); the cast is
+        # its value change, truncation toward zero.
+        return self.data.program.operation("trunc", self.data, None)
+
+    int_ = long_
+
     def to_dtype_(self, dtype) -> SSATensorValue:
         # Repository tensor storage is presently double even for integral and
         # logical values; casting therefore changes values, not the ABI.  The
@@ -1253,8 +1283,19 @@ class SSATensorOperations(AbstractTensor):
         return self.transpose_(axis1, axis2)
 
     def index_select_(self, dim, indices) -> SSATensorValue:
-        if isinstance(indices, AbstractTensor):
-            raise NotImplementedError("dynamic SSA index vectors require an SSA input vector")
+        index_value = self._data(indices)
+        if isinstance(index_value, SSATensorValue) and not isinstance(self.data, SSATensorValue):
+            # A host table (a baked LUT) enters the program as a constant.
+            import numpy as _np
+            table = _np.asarray(self.data, dtype=_np.float64)
+            self.data = index_value.program.constant(table.reshape(-1).tolist(), tuple(table.shape))
+        if isinstance(index_value, SSATensorValue):
+            # Indices computed by the program (a LUT's base node): a runtime
+            # gather, the result shaped like the index vector along ``dim``.
+            gathered = self.data.program.gather_values(self.data, int(dim), self.data.program.view(index_value, (index_value.size,)))
+            if len(self.data.shape) == 1 and index_value.shape != (index_value.size,):
+                gathered = self.data.program.view(gathered, index_value.shape)
+            return gathered
         return self.data.program.index_select(self.data, int(dim), indices)
 
     def get_item_(self, data, index) -> SSATensorValue:

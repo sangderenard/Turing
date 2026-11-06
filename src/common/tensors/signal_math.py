@@ -1071,8 +1071,11 @@ def fit_lut(core: str, epsilon: float | None = None,
     epsilon = validate_epsilon(epsilon)
     spec = CORE_RANGES[core]
     if generator is None:
-        generator = fit_series(core, epsilon)
-    if generator.admitted:
+        from .signal_symbolic import TRANSCENDENTALS
+        # A core with no series (sqrt) has no prerun to cache: its nodes come
+        # from the reference, exactly as when a series falls short.
+        generator = fit_series(core, epsilon) if core in TRANSCENDENTALS else None
+    if generator is not None and generator.admitted:
         source = "series prerun"
 
         def evaluate(positions: np.ndarray) -> np.ndarray:
@@ -1083,8 +1086,9 @@ def fit_lut(core: str, epsilon: float | None = None,
             ).ravel()
 
     else:
-        source = (f"reference prerun (series fell short at "
-                  f"{generator.measured_error:.2e})")
+        source = ("reference prerun (no series for this core)" if generator is None
+                  else f"reference prerun (series fell short at "
+                       f"{generator.measured_error:.2e})")
         reference = _reference(core)
 
         def evaluate(positions: np.ndarray) -> np.ndarray:
