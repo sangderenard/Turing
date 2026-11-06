@@ -113,3 +113,21 @@ def test_the_floors_the_law_recycles_stay_reachable_as_the_world_scrolls():
             seen += 1
     assert seen == 16
     assert float(game.session.column("climbed")[0]) > 3.0 * p.HEIGHT                    # many floors went round
+
+
+def test_the_player_is_the_chosen_character_and_the_choice_is_a_profile_setting():
+    from meowdoku import characters, profiles
+    assert "avatar" in profiles.SETTING_KEYS                           # persisted with the player (the profile), not the page
+    for module_name, make in (("platformer", lambda: p.Platformer(seed=1, aspect=0.6)),):
+        game = make()
+        game.session.control({})
+        game.session.advance(1 / 60)
+        assert game.hero_mesh == "hero_frog" and game.state()["characters"]["chosen"] == "frog"
+        game.set_hero("fox")
+        state = game.state()
+        player = next(e for e in state["entities"] if e["id"].startswith("0:"))
+        assert player["mesh"] == "hero_fox" and state["characters"]["chosen"] == "fox"
+        assert [t["character"] for t in state["pieces"]] == list(characters.CHARACTERS)
+        assert [t["lit"] for t in state["pieces"]].count(True) == 1
+        game.set_hero("no such character")                              # refused: the choice stays
+        assert game.hero == "fox"

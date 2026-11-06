@@ -54,6 +54,7 @@ from typing import Any
 
 import numpy as np
 
+from meowdoku import characters
 from meowdoku.entities import EntityGame, LawPiece, as_float, first_of, noise
 from meowdoku.entity_motion import G_EARTH, damped_axis, follow_view, jump_speed, vertical_axis
 from src.common.tensors import AbstractTensor
@@ -473,6 +474,7 @@ class SideScroller(EntityGame):
     # World frame: the scroll moves the view, not the player, so the page's
     # x is adopted like any other game's.
     PLAYER_LANE = 0
+    CHARACTERS_ON = True
     HOSTILE_LANES = (WALKER_LANES,)
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None):
@@ -516,7 +518,7 @@ class SideScroller(EntityGame):
         return {"ground": [0.35, 0.62, 0.25], "frog": [0.45, 0.9, 0.35], "brick": [0.75, 0.42, 0.25],
                 "brick_full": [0.95, 0.72, 0.2], "brick_spent": [0.42, 0.36, 0.33],
                 "coin": [1.0, 0.85, 0.2], "mushroom": [0.9, 0.25, 0.2], "star": [1.0, 0.92, 0.3],
-                "walker": [0.55, 0.45, 0.7], "boom": [1.0, 0.55, 0.1]}
+                "walker": [0.55, 0.45, 0.7], "boom": [1.0, 0.55, 0.1], **characters.PALETTE}
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "vx", "vy", "born", "rx", "holds", "spent")
@@ -526,7 +528,7 @@ class SideScroller(EntityGame):
         for k in np.flatnonzero(col["alive"] > 0.0):
             slot, holds, spent = col["slot"][k], col["holds"][k], col["spent"][k]
             if slot == PLAYER:
-                mesh, color, size = "frog", "frog", PLAYER_RY
+                mesh, color, size = self.hero_mesh, self.hero_mesh, PLAYER_RY
             elif slot == GROUND:
                 mesh, color, size = "ground", "ground", 0.5
             elif slot == BRICK:

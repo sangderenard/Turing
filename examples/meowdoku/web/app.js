@@ -1412,12 +1412,13 @@ function rebuildBoards(game) {
     : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
-  const trayFaces = game.powerups ? trayButtonFaces(game) : null;
+  const trayFaces = game.powerups ? trayButtonFaces(game) : game.characters ? characterFaces(game) : null;
   state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.size
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
-  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0 };
+  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
+                   x0: game.characters ? CHAR.left : 0 };         // (the tile set stands left of the board)
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
   if (game.scene && game.scene.terrain === true && !state.flat) {
     // The plate lies on the planet's curve: a fine grid of glass (it never
@@ -1452,10 +1453,11 @@ function camera() {
   // the board foreshortened and backs off a little more.
   // A free board is sized to the screen already, so it is framed tightly.
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
-  const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
+  const x0 = ext.x0 || 0;
+  const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width - x0 + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
   const lean = stageOf();                                           // a stage game: the plane rises behind the board
-  const centre = declared && declared.target ? declared.target : [ext.width / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
+  const centre = declared && declared.target ? declared.target : [(ext.width + x0) / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
   const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
@@ -2454,7 +2456,19 @@ function trayButtonFaces(game) {
   }
   return faces;
 }
+// THE CHARACTER TILE SET (``game.characters``, characters.py): a column of glass cubes left of the board -- the power-up
+// tray's cubes and glyph pieces -- one per character; a tap on one chooses it (a profile setting, ``avatar``).
+const CHAR = { x: -0.95, top: 0.6, step: 1.0, cube: 0.9, cubeHeight: 0.8, left: -1.7 };
+function characterCentre(k) { return [CHAR.x, CHAR.top + Number(k) * CHAR.step]; }
+function characterFaces(game) {
+  const n = game.characters ? game.characters.keys.length : 0, material = state.materialIndex.traycube;
+  if (!n || material == null) return [];
+  const faces = [], h = CHAR.cube / 2;
+  for (let k = 0; k < n; k++) { const [x, z] = characterCentre(k); faces.push(...box(x - h, 0, z - h, x + h, CHAR.cubeHeight, z + h, material)); }
+  return faces;
+}
 function cellPosition(game, cell, rackPiece) {
+  if (typeof cell === "string" && cell.startsWith("char:")) { const [x, z] = characterCentre(cell.slice(5)); return [x, z, "tray"]; }
   if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
   if (typeof cell === "string" && cell.startsWith("hud:")) {
     const k = Number(cell.slice(4));
@@ -3704,11 +3718,11 @@ function applyState(game) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "roster" ? TOP.catSize : where === "tray" ? 0.4 : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "roster" ? TOP.catSize : where === "tray" ? (p.lit ? 0.5 : 0.4) : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
       if (where === "roster" && live.color !== p.color && p.lit) live.litAt = now;   // lit now: pop
-      live.mesh = p.mesh; live.color = p.color;
+      live.mesh = p.mesh; live.color = p.color; if (where === "tray") live.size = size;
     } else {
       state.pieces.set(key, { id: key, mesh: p.mesh, color: p.color, x, z, place: where, cellSize: cellSize || 1, size, t0: now, removing: null, seed: Math.random() * 6.28, from: null });
     }
@@ -4401,6 +4415,11 @@ function hit(clientX, clientY) {
   const t = (TILE.height - near[1]) / (far[1] - near[1]); if (!(t >= 0)) return null;
   const x = near[0] + t * (far[0] - near[0]), z = near[2] + t * (far[2] - near[2]);
   for (const piece of game.pieces || []) {
+    if (piece.character) {
+      const [px, pz] = cellPosition(game, piece.cell);
+      if (Math.abs(x - px) < CHAR.cube / 2 && Math.abs(z - pz) < CHAR.cube / 2) return { kind: "character", character: piece.character, key: `char:${piece.character}` };
+      continue;
+    }
     if (!piece.power) continue;
     const [px, pz] = cellPosition(game, piece.cell);
     if (Math.hypot(x - px, z - pz) < 0.6) return { kind: "power", power: piece.power, key: `power:${piece.power}` };
@@ -4415,6 +4434,11 @@ function hit(clientX, clientY) {
 let press = null, clickTimer = null, lastClick = null, tap = null;
 canvas.addEventListener("pointerdown", (e) => {
   if (state.game && state.game.input === "realtime") {
+    const tile = state.game.characters ? hit(e.clientX, e.clientY) : null;
+    if (tile && tile.kind === "character") {                  // a character tile: choose it (kept in the profile)
+      if (state.game.characters.chosen !== tile.character) act({ type: "settings", values: { avatar: tile.character } }).catch(() => {});
+      return;
+    }
     if (isWalker()) { tap = { x: e.clientX, y: e.clientY, t: performance.now() }; return; }       // a walker is not steered by a held finger
     steer = boardPlane(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return;
   }

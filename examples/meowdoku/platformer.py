@@ -43,6 +43,7 @@ from typing import Any
 
 import numpy as np
 
+from meowdoku import characters
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
 from meowdoku.entity_motion import G_EARTH, damped_axis, jump_speed, vertical_axis
 from src.common.tensors import AbstractTensor
@@ -252,6 +253,7 @@ class Platformer(EntityGame):
     height = HEIGHT
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
+    CHARACTERS_ON = True
     #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
     #: bricks are the scenery layer, the frog and stars a layer in front), so the frog's feet meet the brick.
     #: ``rocket: False``: no shield bubble, marker lights or headlights (a rocket's gear); ``spot``: the one cone
@@ -294,7 +296,7 @@ class Platformer(EntityGame):
 
     def palette(self) -> dict[str, list[float]]:
         return {"floor": [0.55, 0.78, 0.95], "frog": [0.45, 0.9, 0.35], "brick": [0.75, 0.42, 0.25],
-                "star": [1.0, 0.85, 0.2]}
+                "star": [1.0, 0.85, 0.2], **characters.PALETTE}
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "vx", "vy", "born", "rx")
@@ -304,7 +306,7 @@ class Platformer(EntityGame):
         for k in np.flatnonzero(col["alive"] > 0.0):
             slot = col["slot"][k]
             if slot == PLAYER:
-                mesh, size = "frog", PLAYER_RY
+                mesh, size = self.hero_mesh, PLAYER_RY
             elif slot == PLATFORM:
                 mesh, size = "brick", float(col["rx"][k])
             else:

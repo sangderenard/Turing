@@ -57,7 +57,7 @@ from typing import Any
 
 import numpy as np
 
-from meowdoku import walkers
+from meowdoku import characters, walkers
 from meowdoku.delve_rules import (
     BUFFER, CLIMB, COYOTE, ENT, EMPTY, ENEMY_POINTS, FALL_MAX, FLY_BOB, FLY_RANGE, FLYER, FLYER_LANES, FLYER_RX,
     FLYER_RY, FOOT, GEM, GEM_POINTS, GRAVITY, HANG_SCALE, HANG_V, HURT_T, JUMP, JUMP2, JUMP_CUT, KNOCK, LADDER, LANES, MAP0, MAP_SLOT,
@@ -326,6 +326,7 @@ class Delve(EntityGame):
     height = VIEW_H
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
+    CHARACTERS_ON = True
     HEALTH_MAX = PLAYER_HP
     #: Tiles stop the server's player where the page's tile-free prediction
     #: walks on; a gap beyond this keeps the server's word.
@@ -456,7 +457,7 @@ class Delve(EntityGame):
         return {"floor": [0.07, 0.08, 0.13], "wall": [0.46, 0.44, 0.56], "plank": [0.70, 0.50, 0.28],
                 "ladder": [0.86, 0.72, 0.40], "spike": [0.30, 0.78, 0.38], "gem": [0.35, 0.85, 0.95],
                 "orb": [0.78, 0.45, 0.98], "frog": [0.45, 0.9, 0.35], "snail": [0.92, 0.62, 0.35],
-                "bat": [0.62, 0.40, 0.78], "top": [0.40, 0.58, 0.36]}
+                "bat": [0.62, 0.40, 0.78], "top": [0.40, 0.58, 0.36], **characters.PALETTE}
 
     def controls_ui(self) -> list[dict[str, Any]]:
         return [
@@ -521,7 +522,7 @@ class Delve(EntityGame):
         out = self.tiles()
         for k in np.flatnonzero(col["alive"] > 0.0):
             slot = col["slot"][k]
-            mesh, size = (("frog", PLAYER_RY) if slot == PLAYER_SLOT else ("snail", WALKER_RY) if slot == WALKER else ("bat", 0.36))
+            mesh, size = ((self.hero_mesh, PLAYER_RY) if slot == PLAYER_SLOT else ("snail", WALKER_RY) if slot == WALKER else ("bat", 0.36))
             blink = k == 0 and col["hurt"][0] > 0.0 and int(clock * 12) % 2 == 0
             out.append({"id": f"{k}:{self.room}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]), "vy": float(col["vy"][k]) if k != 0 else 0.0,

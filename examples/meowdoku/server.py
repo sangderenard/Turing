@@ -143,7 +143,15 @@ class Table:
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:
             raise ValueError(f"unknown game {kind!r}")
+        self.apply_hero()
         return self.state()
+
+    def apply_hero(self) -> None:
+        """A platformer-style game draws the player's chosen character (the profile's ``avatar`` setting)."""
+        if hasattr(self.game, "set_hero") and self.profiles is not None and self.player:
+            avatar = ((self.profiles.inventory(self.player) or {}).get("settings") or {}).get("avatar")
+            if avatar:
+                self.game.set_hero(avatar)
 
     def action(self, payload: dict) -> dict:
         if self.game is None:
@@ -223,6 +231,8 @@ class Table:
         elif kind == "settings":
             if self.profiles is not None and self.player and isinstance(payload.get("values"), dict):
                 self.profiles.save_settings(self.player, payload["values"])
+            if hasattr(self.game, "set_hero") and isinstance(payload.get("values"), dict) and "avatar" in payload["values"]:
+                self.game.set_hero(payload["values"]["avatar"])
         elif kind == "palette":
             self.game.set_palette(str(payload.get("name", "")))
         elif kind == "mode":
