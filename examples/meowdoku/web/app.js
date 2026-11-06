@@ -1432,8 +1432,11 @@ function stepShip(ship, input, seconds, motion) {
       // damped_axis, compiled to wasm).  An axis that law does not declare is
       // the server's alone: the page never guesses it with physics of its own.
       if (!motion[axis]) continue;
+      // The walls ride the view in a world-frame game (the law's own bounds).
+      const cam = axis === "x" && motion.camera, base = cam ? Math.max(view.x, cam.x) : 0;
+      const lo = cam ? base + cam.margin : motion[axis][0], hi = cam ? base + cam.width - cam.margin : motion[axis][1];
       const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
-        lo: motion[axis][0], hi: motion[axis][1], speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
+        lo, hi, speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
       ship[pos] = r.x_next; ship[vel] = r.v_next;
     }
   }
@@ -1811,8 +1814,26 @@ function authorityText(game) {
        + `server alone ${pct((a.unreported || 0) + (a.server || 0), landed)} of ${landed}, client axes ${axes}${scroll}`
        + ` · frames drawn from page ${pct(drawnShip.page, drawn)} · world 100% server`;
 }
+// THE VIEW (a world-frame game: predict.camera).  Lanes arrive at their world
+// x; the screen's left edge is the view.  The page runs the law's own view
+// rule on the ship it draws -- view = max(view, x - follow * width) -- and
+// never falls behind the server's view; a view far behind the page's (a new
+// run) is taken at once.
+const view = { x: 0, at: null };
+function viewX(now) {
+  const game = state.game, cam = game && game.predict && game.predict.camera;
+  if (!cam) return 0;
+  if (view.at !== now) {
+    view.at = now;
+    if (cam.x + SYNC_SNAP < view.x) view.x = cam.x;
+    const shipX = pred.ship ? pred.ship.x + pred.offset[0] : (game.you ? game.you.x : 0);
+    view.x = Math.max(view.x, cam.x, shipX - cam.follow * cam.width);
+  }
+  return view.x;
+}
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 function placeEntity(piece, now, x, z, mesh) {
+  x -= viewX(now);                                // world frame -> the screen (0 unless the game scrolls a view)
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
     if (t >= 1) piece.birth = null;
@@ -2451,7 +2472,7 @@ function boardPlane(clientX, clientY) {
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
   const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
   const t = (TILE.height - near[1]) / (far[1] - near[1]);
-  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]), z: near[2] + t * (far[2] - near[2]) } : null;
+  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]) + viewX(performance.now() / 1000), z: near[2] + t * (far[2] - near[2]) } : null;
 }
 const twoAxis = () => !!(state.game && state.game.predict && state.game.predict.y);
 function controls() {

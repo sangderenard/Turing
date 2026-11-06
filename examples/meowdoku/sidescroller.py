@@ -28,10 +28,14 @@ block (``spent = 1``); a spent block only bumps.  ``fire`` is the jump
 button: held on the ground it sets the upward velocity, released early it cuts
 the rise (variable jump height).
 
-The world scrolls: when the player runs past ``SCROLL_FRACTION`` of the field
-width every lane's x shifts left by the overshoot (``distance`` and the score
-grow by it).  Tiles that fall off the left edge are recycled ahead of the
-right-most one; WHAT a world column holds (a pit, a brick, a brick's content)
+WORLD FRAME: every lane lives at its world x; nothing is shifted.  The view
+is ``distance`` (the world x of the screen's left edge): when the player runs
+past ``SCROLL_FRACTION`` of the field width the view follows,
+``distance = max(distance, x - SCROLL_FRACTION * field_w)``, and the score
+grows by the advance.  The player's walls ride the view.  So the player's x is
+the motion law's alone -- the page predicts it and the server adopts it, as in
+every other realtime game -- and tiles stand still.  Tiles that fall off the
+view's left edge are recycled ahead of the right-most one; WHAT a world column holds (a pit, a brick, a brick's content)
 is a pure function of its column number and the run's ``seed`` (``world_at``),
 so the level is the same however the steps were cut.  Pits are 2-3 columns,
 never twice in a row (at least six ground tiles between pits).  Falling below
@@ -39,7 +43,7 @@ the field ends the run.
 
 Columns: lane, slot, rx, ry (static); alive, x, y, vx, vy, walk, born, holds,
 spent, col, energy, score, lives, coins, distance, clock (state; ``vx`` of a
-non-player lane is its DRAWN velocity, scroll plus ``walk``, its own);
+non-player lane is its own ``walk``; ``distance`` is the view's world x);
 field_w, seed (settings); move_axis, steer_x, fire (controls).
 """
 
@@ -185,7 +189,7 @@ def sidescroller_step(lane, slot, rx, ry,
     clock_next = clock + dt
 
     # ------------------------------------------------------ the player, sideways
-    ship_x, ship_vx = damped_axis(x, vx, move_axis, steer_x, zero + MARGIN, field_w - MARGIN,
+    ship_x, ship_vx = damped_axis(x, vx, move_axis, steer_x, distance + MARGIN, distance + field_w - MARGIN,
                                   SPEED, TAU, REACH, dt)
     me = is_player & live & playing
     px, py, pvy = (f(me) * ship_x).sum(), (f(me) * y).sum(), (f(me) * vy).sum()
@@ -277,17 +281,17 @@ def sidescroller_step(lane, slot, rx, ry,
     got_star = some(reach & (holds == STAR))
     energy_player = where(absorbed, shield - SHIELD_COST, where(got_mushroom, 1.0, shield))
 
-    # ------------------------------------------------------ scroll
-    overshoot = (px - SCROLL_FRACTION * field_w).clip(0.0, 100.0) * f(playing & has_me)
-    scroll_v = overshoot / dt
+    # ------------------------------------------------------ the view follows
+    overshoot = (px - distance - SCROLL_FRACTION * field_w).clip(0.0, 100.0) * f(playing & has_me)
+    view = distance + overshoot
 
-    # ------------------------------------------------------ positions after the step
-    x1 = where(is_player, where(me, px, x), where(body, bx, x)) - overshoot
+    # ------------------------------------------------------ positions after the step (world frame)
+    x1 = where(is_player, where(me, px, x), where(body, bx, x))
     y1 = where(is_player, where(me, py1, y), where(body, by1, y))
     vy1 = where(is_player, where(me, pvy1, vy), where(body, vb1, 0.0))
 
     # ------------------------------------------------------ tiles: recycle ahead
-    gone = is_tile & (x1 < GONE_X) & playing
+    gone = is_tile & (x1 - view < GONE_X) & playing
     gone_ground, gone_brick = gone & is_ground, gone & is_brick
 
     def recycled(kind_mask, gone_kind):
@@ -330,7 +334,7 @@ def sidescroller_step(lane, slot, rx, ry,
     live1 = live & ~walker_gone & ~breaks & ~reach
     live1 = live1 & ~(is_item & ((holds == COIN) & ((clock_next - born) > COIN_LIFE)))
     live1 = live1 & ~(is_boom & ((clock_next - born) > BOOM))
-    live1 = live1 & ~((is_item | is_walker) & ((y1 > HEIGHT + 1.0) | (x1 < GONE_X)))
+    live1 = live1 & ~((is_item | is_walker) & ((y1 > HEIGHT + 1.0) | (x1 - view < GONE_X)))
     live2 = where(gone, new_alive > 0.0, live1)
     live2 = live2 | spawn_any
     x2 = where(gone, new_x, where(spawn_item, sx, where(spawn_walker, wx,
@@ -343,7 +347,7 @@ def sidescroller_step(lane, slot, rx, ry,
     vy2 = where(spawn_item, -ITEM_POP, where(spawn_any, 0.0, vy1))
     walk2 = where(spawn_item, where(sh > COIN, ITEM_SPEED, 0.0),
                   where(spawn_walker, -WALKER_SPEED, where(spawn_any, 0.0, walk1)))
-    vx2 = where(is_player, ship_vx, walk2 - scroll_v)
+    vx2 = where(is_player, ship_vx, walk2)
     born2 = where(gone | spawn_any, clock, born)
 
     # ------------------------------------------------------ the run
@@ -355,7 +359,7 @@ def sidescroller_step(lane, slot, rx, ry,
               + STOMP_POINTS * f(stomped).sum() + MUSHROOM_POINTS * f(got_mushroom) + STAR_POINTS * f(got_star))
     score_next = score + earned
     coins_next = coins + f(coin_out).sum()
-    distance_next = distance + overshoot
+    distance_next = view
     energy_next = where(is_player, energy_player, energy)
 
     # No step may carry anything through a tile's thickness, nor outrun the
@@ -445,8 +449,8 @@ class SideScroller(EntityGame):
     # A side view: the world stands on its own ground tiles, so no slab or
     # glass plate behind it.
     SCENE = {"floor": False, "glass": False, "arcade": True}
-    # The scroll shifts the player in x with the world: never adopt x from the page.
-    SCROLL_AXES = ("x",)
+    # World frame: the scroll moves the view, not the player, so the page's
+    # x is adopted like any other game's.
     PLAYER_LANE = 0
     HOSTILE_LANES = (WALKER_LANES,)
 
@@ -462,7 +466,11 @@ class SideScroller(EntityGame):
         return initial_columns(self.width, self.seed)
 
     def motion(self) -> dict[str, Any]:
-        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [MARGIN, self.width - MARGIN]}
+        """The walls ride the view; ``camera`` is the view law the page runs
+        on its own predicted player (the same max, so it never waits on us)."""
+        view = float(self.session.column("distance")[0]) if self.session.state is not None else 0.0
+        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [view + MARGIN, view + self.width - MARGIN],
+                "camera": {"x": view, "follow": SCROLL_FRACTION, "margin": MARGIN, "width": self.width}}
 
     def reset(self) -> None:
         self.seed = (self.seed + 1) % 1000          # a new level each run
