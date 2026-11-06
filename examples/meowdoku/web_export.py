@@ -310,6 +310,16 @@ def export_assets(out: Path) -> dict:
                 pack(name, *largest_component(verts, normals))
             except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
                 print(f"[export] {name} mesh skipped: {error}", flush=True)
+    # World Walk's own glyphs (the builder).
+    from meowdoku.worldwalk import EMOJI as WALK_EMOJI, EMOJI_SUBDIVISIONS as WALK_SUBDIVISIONS
+    for name, glyph in WALK_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3,
+                                            outline_subdivisions=WALK_SUBDIVISIONS.get(name, 1))
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),

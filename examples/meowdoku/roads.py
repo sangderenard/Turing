@@ -43,16 +43,34 @@ def _slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     return p / np.linalg.norm(p)
 
 
-@lru_cache(maxsize=4)
-def plan(seed: int, radius: float, sites: int = SITES, road_points: int = 160):
-    """(site positions (S, 3), road polylines [list of (k, 3)], road points (road_points, 3))."""
+@lru_cache(maxsize=2)
+def world():
+    """(nodes (NODES, 3), height, dry, nearest (NODES, NEIGHBOURS)): the Fibonacci
+    nodes, the land's law at each, which are dry, and each node's nearest
+    nodes by angle.  The graph the roads and the walkers' flow fields share."""
     nodes = fibonacci_sphere(NODES)
     land = np.array([terrain_height(*p) for p in nodes])
     height, raw = land[:, 0], land[:, 1]
     dry = raw >= SEA
-    # neighbours by angle
     dots = nodes @ nodes.T
     nearest = np.argsort(-dots, axis=1)[:, 1:NEIGHBOURS + 1]
+    return nodes, height, dry, nearest
+
+
+def edge_cost(nodes, height, dry, radius: float, a: int, b: int) -> float:
+    """What an edge costs: its arc length raised by its slope; infinite across
+    water or up a slope steeper than MAX_SLOPE."""
+    if not (dry[a] and dry[b]):
+        return math.inf
+    arc = radius * math.acos(max(-1.0, min(1.0, float(nodes[a] @ nodes[b]))))
+    slope = abs(height[a] - height[b]) / max(arc, 1e-9)
+    return math.inf if slope > MAX_SLOPE else arc * (1.0 + SLOPE_COST * slope)
+
+
+@lru_cache(maxsize=4)
+def plan(seed: int, radius: float, sites: int = SITES, road_points: int = 160):
+    """(site positions (S, 3), road polylines [list of (k, 3)], road points (road_points, 3))."""
+    nodes, height, dry, nearest = world()
     # AA sites: farthest-point sampling over dry land (the dice pick the first)
     rng = np.random.default_rng(seed)
     dry_ids = np.flatnonzero(dry)
@@ -63,12 +81,8 @@ def plan(seed: int, radius: float, sites: int = SITES, road_points: int = 160):
         gap_dry = np.where(dry, gap, -1.0)
         chosen.append(int(np.argmax(gap_dry)))
 
-    def edge_cost(a: int, b: int) -> float:
-        if not (dry[a] and dry[b]):
-            return math.inf
-        arc = radius * math.acos(max(-1.0, min(1.0, float(nodes[a] @ nodes[b]))))
-        slope = abs(height[a] - height[b]) / max(arc, 1e-9)
-        return math.inf if slope > MAX_SLOPE else arc * (1.0 + SLOPE_COST * slope)
+    def edge(a: int, b: int) -> float:
+        return edge_cost(nodes, height, dry, radius, a, b)
 
     def dijkstra(src: int):
         dist = np.full(NODES, np.inf)
@@ -80,7 +94,7 @@ def plan(seed: int, radius: float, sites: int = SITES, road_points: int = 160):
             if d > dist[a]:
                 continue
             for b in nearest[a]:
-                c = edge_cost(a, int(b))
+                c = edge(a, int(b))
                 if c == math.inf:
                     continue
                 nd = d + c

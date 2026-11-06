@@ -375,3 +375,254 @@ def shift_block(values, source: int, count: int, target: int):
 def widen(head, tail):
     """The entity lanes' span followed by the map lanes' (unchanged) tail."""
     return AbstractTensor.cat([head, tail], dim=0)
+
+
+# ======================================================================
+# THE SPHERE.  The same walkers on a small planet: the cells are nodes
+# (a near-even Fibonacci scatter, as roads.py uses) instead of square tiles.
+# A node's neighbours are its nearest nodes by angle; an edge costs its arc
+# length raised by its slope; water and cliffs bar it.  The flow fields keep
+# the square ones' roles (a distance to a goal set, a descent to follow, an
+# avoidance field) but a node's descent is its NEXT NODE (stored as that
+# node's position): a walker steers along the great circle from where it
+# stands to that node.  Fields live in dt-system columns, one lane per node
+# (the node's position is the ``ux, uy, uz`` of its lane), exactly as the
+# square map's.  The helpers below the builds are the sphere's cell_lane /
+# blocked_at / line_clear / pairwise / nearest / separation_of, batched.
+# ======================================================================
+
+@dataclass
+class SphereGraph:
+    """The walkable graph over a sphere's nodes.
+
+    ``adjacent``: each node's neighbours (the nearest-node lists made
+    symmetric).  ``cost(a, b)``: the edge's cost, infinite where it cannot
+    be walked (supplied by the caller: ``roads.edge_cost`` for the globe).
+    ``passable``: whether a node can be stood on."""
+
+    nodes: np.ndarray
+    nearest: np.ndarray
+    passable: np.ndarray
+    cost: object
+    adjacent: list
+    cut: set = field(default_factory=set)
+
+    @classmethod
+    def build(cls, nodes, nearest, passable, cost) -> "SphereGraph":
+        adjacent = [set() for _ in range(len(nodes))]
+        for a, row in enumerate(nearest):
+            for b in row:
+                adjacent[a].add(int(b))
+                adjacent[int(b)].add(a)
+        graph = cls(nodes, nearest, passable, cost, [sorted(s) for s in adjacent])
+        graph.cut = graph._corner_cuts()
+        return graph
+
+    def _corner_cuts(self, samples: int = 4) -> set:
+        """The edges whose straight walk leaves its two nodes' cells for an unwalkable
+        node's (the square map's 'no corner cutting'): a walker following such an edge
+        would be stopped at the shore, so the graph does not offer it."""
+        edges = [(a, b) for a, row in enumerate(self.adjacent) for b in row
+                 if a < b and self.passable[a] and self.passable[b]]
+        if not edges:
+            return set()
+        ab = np.asarray(edges)
+        cut = np.zeros(len(edges), dtype=bool)
+        for k in range(1, samples):
+            t = k / samples
+            p = self.nodes[ab[:, 0]] * (1.0 - t) + self.nodes[ab[:, 1]] * t
+            p /= np.linalg.norm(p, axis=1, keepdims=True)
+            for lo in range(0, len(p), 2048):
+                nearest = np.argmax(p[lo:lo + 2048] @ self.nodes.T, axis=1)
+                cut[lo:lo + 2048] |= ~self.passable[nearest]
+        return {edges[i] for i in np.flatnonzero(cut)}
+
+    def edge(self, a: int, b: int) -> float:
+        """The cost of walking the edge (infinite when it cannot be walked)."""
+        return np.inf if ((a, b) if a < b else (b, a)) in self.cut else self.cost(a, b)
+
+    def arc(self, a: int, b: int, radius: float) -> float:
+        return radius * float(np.arccos(np.clip(self.nodes[a] @ self.nodes[b], -1.0, 1.0)))
+
+
+@dataclass
+class SphereField:
+    """A goal set's distance over a sphere graph and each node's next node.
+
+    ``dist``: path length (``UNREACHABLE`` where there is none).  ``nxt``: the
+    neighbour on the cheapest way to the goal (the node itself at a goal and
+    where nothing is reachable).  Built once, in NumPy."""
+
+    dist: np.ndarray
+    nxt: np.ndarray
+
+    UNREACHABLE = 999.0
+
+    @classmethod
+    def build(cls, graph: SphereGraph, goals: list[int], discount=None, factor: float = 1.0) -> "SphereField":
+        """``discount``: a set of node pairs (either order) whose edges cost ``factor``
+        times as much (roads are cheap to walk)."""
+        n = len(graph.nodes)
+
+        def cost(a, b):
+            c = graph.edge(a, b)
+            if discount is not None and ((a, b) in discount or (b, a) in discount):
+                c *= factor
+            return c
+
+        dist = np.full(n, cls.UNREACHABLE)
+        heap = []
+        for g in goals:
+            dist[g] = 0.0
+            heap.append((0.0, int(g)))
+        heapq.heapify(heap)
+        while heap:
+            d, a = heapq.heappop(heap)
+            if d > dist[a]:
+                continue
+            for b in graph.adjacent[a]:
+                c = cost(a, b)
+                if d + c < dist[b]:
+                    dist[b] = d + c
+                    heapq.heappush(heap, (d + c, b))
+        nxt = np.arange(n)
+        for a in range(n):
+            if dist[a] >= cls.UNREACHABLE or dist[a] == 0.0:
+                continue
+            best = np.inf
+            for b in graph.adjacent[a]:
+                c = cost(a, b)
+                if c < np.inf and c + dist[b] < best - 1e-12:      # (ties: the lowest node number)
+                    best, nxt[a] = c + dist[b], b
+        return cls(dist, nxt)
+
+    @classmethod
+    def clearance(cls, graph: SphereGraph, radius: float, cap: float = 4.0) -> "SphereField":
+        """The avoidance field: ``dist`` is the arc to the nearest blocked node (capped),
+        ``nxt`` the neighbour with the most clearance (the node itself on a local peak)."""
+        n = len(graph.nodes)
+        clear = np.full(n, cap)
+        heap = [(0.0, a) for a in range(n) if not graph.passable[a]]
+        for _, a in heap:
+            clear[a] = 0.0
+        heapq.heapify(heap)
+        while heap:
+            d, a = heapq.heappop(heap)
+            if d > clear[a]:
+                continue
+            for b in graph.adjacent[a]:
+                nd = d + graph.arc(a, b, radius)
+                if nd < clear[b]:
+                    clear[b] = nd
+                    heapq.heappush(heap, (nd, b))
+        nxt = np.arange(n)
+        for a in range(n):
+            if not graph.passable[a]:
+                continue
+            best = clear[a]
+            for b in graph.adjacent[a]:
+                if clear[b] > best + 1e-9:
+                    best, nxt[a] = clear[b], b
+        return cls(clear, nxt)
+
+
+def sphere_components(graph: SphereGraph) -> np.ndarray:
+    """The walkable component each node belongs to (-1 where it cannot be stood on):
+    walkers on different components can neither see nor reach one another."""
+    n = len(graph.nodes)
+    comp = np.full(n, -1)
+    label = 0
+    for s in range(n):
+        if comp[s] >= 0 or not graph.passable[s]:
+            continue
+        comp[s] = label
+        stack = [s]
+        while stack:
+            a = stack.pop()
+            for b in graph.adjacent[a]:
+                if comp[b] < 0 and graph.edge(a, b) < np.inf:
+                    comp[b] = label
+                    stack.append(b)
+        label += 1
+    return comp
+
+
+def sphere_field_columns(fields: list[SphereField], nodes: np.ndarray, map_lane0: int, lanes: int) -> dict[str, np.ndarray]:
+    """The fields as dt-system columns, one value per node on the node's lane
+    (``map_lane0 + node``): ``fnx{i}, fny{i}, fnz{i}`` the position of the node's
+    NEXT node, ``fdd{i}`` the distance; zero on the entity lanes."""
+    out = {}
+    for i, fld in enumerate(fields):
+        for k, name in enumerate(("fnx", "fny", "fnz")):
+            col = np.zeros(lanes)
+            col[map_lane0:map_lane0 + len(nodes)] = nodes[fld.nxt, k]
+            out[f"{name}{i}"] = col
+        col = np.zeros(lanes)
+        col[map_lane0:map_lane0 + len(nodes)] = fld.dist
+        out[f"fdd{i}"] = col
+    return out
+
+
+def sphere_node_columns(graph: SphereGraph, comp: np.ndarray, map_lane0: int, lanes: int) -> dict[str, np.ndarray]:
+    """``nb0..``: each node's nearest nodes as LANE numbers; ``comp``: its walkable component."""
+    out = {}
+    for k in range(graph.nearest.shape[1]):
+        col = np.zeros(lanes)
+        col[map_lane0:map_lane0 + len(graph.nodes)] = graph.nearest[:, k] + map_lane0
+        out[f"nb{k}"] = col
+    col = np.full(lanes, -1.0)
+    col[map_lane0:map_lane0 + len(graph.nodes)] = comp
+    out["comp"] = col
+    return out
+
+
+def climb(node, ux, uy, uz, node_ux, node_uy, node_uz, neighbours: list, rounds: int = 2):
+    """The node nearest to each (ux, uy, uz), found by walking from the node a lane was
+    last known to stand on: each round moves to the nearest of the node and its
+    neighbours (``neighbours``: the ``nb{k}`` columns).  A walker moves a fraction of a
+    cell a step, so a round or two suffices and no lane scans the globe.  ``node`` and
+    the result are lane numbers (the sphere's ``cell_lane``)."""
+    best = node
+    best_dot = gather(node_ux, node) * ux + gather(node_uy, node) * uy + gather(node_uz, node) * uz
+    for _ in range(rounds):
+        base = best
+        for column in neighbours:
+            cand = gather(column, base)
+            d = gather(node_ux, cand) * ux + gather(node_uy, cand) * uy + gather(node_uz, cand) * uz
+            better = d > best_dot + 1e-12
+            best = where(better, cand, best)
+            best_dot = where(better, d, best_dot)
+    return best
+
+
+def sphere_pairwise(ux, uy, uz, radius: float):
+    """(ex, ey, ez, d): matrices of the unit tangent at lane i (row) pointing to lane j
+    (column) along the great circle, and the arc length between them."""
+    n = int(ux.shape[0])
+    rx, ry, rz = ux.reshape((n, 1)), uy.reshape((n, 1)), uz.reshape((n, 1))
+    cx, cy, cz = ux.reshape((1, n)), uy.reshape((1, n)), uz.reshape((1, n))
+    dot = rx * cx + ry * cy + rz * cz
+    tx, ty, tz = cx - rx * dot, cy - ry * dot, cz - rz * dot
+    s = (tx * tx + ty * ty + tz * tz + 1e-18).sqrt()
+    return tx / s, ty / s, tz / s, s.atan2(dot) * radius
+
+
+def nearest3(ex, ey, ez, d, valid):
+    """For each row lane: the arc to the nearest valid column lane (1e9: none) and the
+    unit tangent bearing to it (the sphere's ``nearest``)."""
+    n = int(d.shape[0])
+    masked = where(valid, d, 1.0e9)
+    best = masked.min(dim=1)
+    pick = as_float(masked == best.reshape((n, 1))) * as_float(valid)
+    pick = pick / (pick.sum(dim=1).reshape((n, 1)) + 1e-12)
+    has = best < 1.0e8
+    zero = best * 0.0
+    return (best, where(has, (pick * ex).sum(dim=1), zero), where(has, (pick * ey).sum(dim=1), zero),
+            where(has, (pick * ez).sum(dim=1), zero))
+
+
+def separation3(ex, ey, ez, d, valid, radius: float):
+    """The tangent push each row lane feels from valid neighbours closer than ``radius``
+    (the sphere's ``separation_of``)."""
+    push = as_float(valid & (d < radius)) * ((radius - d) * (1.0 / radius))
+    return -(push * ex).sum(dim=1), -(push * ey).sum(dim=1), -(push * ez).sum(dim=1)
