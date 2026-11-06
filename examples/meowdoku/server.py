@@ -149,6 +149,8 @@ class Table:
         if self.game is None:
             raise ValueError("no game: POST /api/new first")
         kind = str(payload.get("type"))
+        from meowdoku import idle_trainer
+        idle_trainer.touch()                            # play is on: the background trainer waits
         if kind == "cell":
             self.game.cell(int(payload["r"]), int(payload["c"]), str(payload.get("button", "primary")))
         elif kind == "text":
@@ -171,6 +173,15 @@ class Table:
             if not hasattr(self.game, "set_autopilot"):
                 raise ValueError("this game has no autopilot")
             self.game.set_autopilot(bool(payload.get("on")))    # the compiled policy plays; the page keeps drawing
+        elif kind == "pilot_arch":
+            from meowdoku import autopilot, pilot_decl
+            name = getattr(self.game, "game", None)
+            if name not in pilot_decl.DECLS:
+                raise ValueError("this game has no declared autopilot networks")
+            pilot_decl.set_arch(name, str(payload.get("arch")))          # token net or simple graph net, per game
+            autopilot._PILOT_WEIGHTS.pop(name, None)
+            if self.game.autopilot:
+                self.game.set_autopilot(True)                             # re-attach the chosen network's weights
         elif kind == "demo_learning":
             from meowdoku import autopilot
             if getattr(self.game, "game", None) not in autopilot.FEATURE_FUNCTIONS:
@@ -390,6 +401,8 @@ def make_handler(sessions: Sessions):
                             game = table.game
                             if game is None or not hasattr(game, "session"):
                                 raise ValueError("no game: POST /api/new first")
+                            from meowdoku import idle_trainer
+                            idle_trainer.touch()          # a realtime tick: play is on
                             game.control(request)
                             game.tick()
                             binary, meta = encoder.encode(game, table.state())
@@ -517,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default=None,
                         help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
     parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
+    parser.add_argument("--no-idle-train", action="store_true",
+                        help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
     web_dir = Path(args.web_dir)
     if not (web_dir / "boards.json").exists():
@@ -533,6 +548,9 @@ def main(argv: list[str] | None = None) -> int:
     from meowdoku import autopilot
     print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
     autopilot.load_learning()
+    from meowdoku import idle_trainer
+    if not args.no_idle_train:
+        idle_trainer.start_default()                    # studies recorded play whenever the server is idle
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     scheme = "http"

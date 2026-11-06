@@ -4156,7 +4156,7 @@ const demo = { key: null, since: 0, lastInput: -Infinity, pending: false };
 const userControlling = () => { const c = controls(); return !!(c.move_axis || c.move_axis_y || c.move_axis_z || c.fire || c.alt_fire || c.steer_x >= 0); };
 setInterval(() => {
   const game = state.game, now = performance.now() / 1000;
-  if (!game || !DEMO_GAMES.has(game.game) || game.input !== "realtime" || demo.pending) return;
+  if (!game || !(DEMO_GAMES.has(game.game) || game.autopilot_ready) || game.input !== "realtime" || demo.pending) return;
   // Opening another game starts its demo clock fresh; a reset of the same
   // game (the user taking over) keeps the user's last input.
   if (game.game !== demo.key) { demo.key = game.game; demo.since = now; demo.lastInput = -Infinity; }

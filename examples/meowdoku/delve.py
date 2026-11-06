@@ -363,6 +363,7 @@ class Delve(EntityGame):
         self.saved: dict[int, np.ndarray] = {}          # a room's tiles as the player left them (picked-up gems stay gone)
         self.serial = 0                                  # room changes so far (the page fades on it)
         self.hist = []                                   # the rooms walked through, in order
+        self.arrival_door = -1                           # the door the player came in by (-1: the spawn)
 
     def start_columns(self) -> dict[str, np.ndarray]:
         columns = blank_columns()
@@ -421,6 +422,7 @@ class Delve(EntityGame):
         self.visited.add(other_id)
         self.serial += 1
         self.hist.append(other_id)
+        self.arrival_door = other_door
         arrival = self.world.rooms[other_id].arrival_at(other_door)
         self.load_room(self.writable(), other_id, arrival)
         s.state.hurt[0] = keep["hurt"]

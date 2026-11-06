@@ -62,14 +62,20 @@ FEATURES_DEPTH = 7 + 7 * K + 4
 # (the network's layout and forward live in pilot_law.py, the one text the law traces too)
 from meowdoku.pilot_law import (  # noqa: E402,F401
     TOKENS, TOKEN_F, SHIP_G, TOKEN_H, SHIP_H, HEAD_H, TOKEN_FEATURES, TOKEN_PARAMS, DX, DY, DV, token_policy_forward,
+    GRAPH_PARAMS, GRAPH_TRAINED, graph_policy_forward,
     ACTIVE_VARIANT, DEFAULT_VARIANT, spec_of, spec_of_shapes, token_param_shapes, features_of, slice_tokens)
 #: bullet hell's five outputs: roll, throttle, fire, pitch, rudder (two sticks)
 GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (TOKEN_FEATURES, 5)}
 GAME_ARCH = {"space_invaders": "mlp", "bullet_hell": "token"}
+# The games that opt in by DECLARATION (pilot_decl.py): any EntityGame can.  Their recorded rows are
+# ``joint`` (both networks' observations); the network flown is ``pilot_decl.arch_for(game)``.
+from meowdoku import pilot_decl as _decl  # noqa: E402
+for _name, _d in _decl.DECLS.items():
+    GAME_WIDTHS[_name], GAME_ARCH[_name] = _d.widths("joint"), "decl"
 
 
 def arch_of(params: dict) -> str:
-    return "token" if "We1" in params else "mlp"
+    return "token" if "We1" in params else "graph" if "GW1" in params else "mlp"
 
 
 def variant_of(params: dict) -> str:
@@ -82,14 +88,14 @@ def arch_key(params: dict) -> str:
     """``arch_of`` plus the variant, for the places that build a product from
     the architecture alone: ``mlp``, ``token`` or ``token:<variant>``."""
     if arch_of(params) != "token":
-        return "mlp"
+        return arch_of(params)
     variant = variant_of(params)
     return "token" if variant == DEFAULT_VARIANT else f"token:{variant}"
 
 
 def param_names(params_or_arch) -> tuple[str, ...]:
     arch = params_or_arch if isinstance(params_or_arch, str) else arch_of(params_or_arch)
-    return TOKEN_PARAMS if arch.startswith("token") else PARAMS
+    return TOKEN_PARAMS if arch.startswith("token") else GRAPH_PARAMS if arch == "graph" else PARAMS
 
 
 def widths_of(params: dict) -> tuple[int, int]:
@@ -97,15 +103,22 @@ def widths_of(params: dict) -> tuple[int, int]:
     for a token network, its variant's token count)."""
     if arch_of(params) == "token":
         tokens = spec_of(variant_of(params))["tokens"]
-        return (features_of(tokens) if int(params["We1"].shape[0]) == TOKEN_F else
-                int(params["Wg"].shape[0]) + tokens * int(params["We1"].shape[0]) + tokens,
-                int(params["Wh2"].shape[1]))
+        return (features_of(tokens, int(params["Wg"].shape[0])), int(params["Wh2"].shape[1]))
+    if arch_of(params) == "graph":
+        return int(params["GW1"].shape[0]), int(params["GW2"].shape[1])
     return int(params["W1"].shape[0]), int(params["W3"].shape[1])
 
-GAMES = ("space_invaders", "bullet_hell")
+GAMES = ("space_invaders", "bullet_hell", *_decl.DECLS)
 
 
-def make_game(name: str):
+def declared(name: str):
+    """The game's ``PilotDecl`` (None: a game with its own hand-written observation)."""
+    return _decl.DECLS.get(name)
+
+
+def make_game(name: str, seed: int | None = None):
+    if declared(name) is not None:
+        return declared(name).make(int(seed if seed is not None else 0))
     from meowdoku.invaders import SpaceInvaders
     from meowdoku.scroller import BulletScroller
     game = {"space_invaders": SpaceInvaders, "bullet_hell": BulletScroller}[name]("autopilot")
@@ -246,10 +259,14 @@ def scroller_tokens(game) -> np.ndarray:
 #: hostiles); kept for distilling that policy into the token network.
 OLD_FEATURE_FUNCTIONS = {"bullet_hell": scroller_features}
 FEATURE_FUNCTIONS = {"space_invaders": invaders_features, "bullet_hell": scroller_tokens}
+for _name, _d in _decl.DECLS.items():
+    FEATURE_FUNCTIONS[_name] = (lambda d: lambda game: d.observe(game, "joint"))(_d)
 
 
 def controls_from(game, out: np.ndarray) -> dict[str, float]:
     """The policy's three outputs as the game's control columns."""
+    if declared(game.game) is not None:
+        return declared(game.game).controls_from(game, out)
     values = {"move_axis": float(out[0]), "move_axis_y": float(out[1]) if "move_axis_y" in game.CONTROLS else 0.0,
               # A policy with a fourth output steers height; an older one holds it.
               "move_axis_z": float(out[3]) if len(out) > 3 else 0.0,
@@ -275,11 +292,11 @@ def policy_forward(x, W1, b1, W2, b2, W3, b3):
     return (h @ W3 + b3).tanh()
 
 
-def init_token_params(seed: int = 0, outputs: int = 5, variant: str | None = None) -> dict[str, np.ndarray]:
-    """Fresh weights of ``variant`` (default the process's active one)."""
+def init_token_params(seed: int = 0, outputs: int = 5, variant: str | None = None, ship: int = SHIP_G) -> dict[str, np.ndarray]:
+    """Fresh weights of ``variant`` (default the process's active one); ``ship``: the own-state block's width."""
     variant = ACTIVE_VARIANT if variant is None else variant
     rng = np.random.default_rng(seed)
-    shapes = token_param_shapes(outputs, variant)
+    shapes = token_param_shapes(outputs, variant, ship)
     params = {}
     for n in TOKEN_PARAMS:
         shape = shapes[n]
@@ -296,6 +313,8 @@ def forward_of(params_or_arch):
     arch = params_or_arch if isinstance(params_or_arch, str) else arch_key(params_or_arch)
     if arch == "mlp":
         return policy_forward
+    if arch == "graph":
+        return graph_policy_forward
     variant = arch.partition(":")[2] or DEFAULT_VARIANT
     act = spec_of(variant)["act"]
     if variant == ACTIVE_VARIANT or act == spec_of(ACTIVE_VARIANT)["act"]:
@@ -341,7 +360,7 @@ def load_params(path: Path) -> dict[str, np.ndarray] | None:
     if not path.exists():
         return None
     data = np.load(path)
-    names = TOKEN_PARAMS if "We1" in data.files else PARAMS
+    names = TOKEN_PARAMS if "We1" in data.files else GRAPH_PARAMS if "GW1" in data.files else PARAMS
     params = {n: np.asarray(data[n], dtype=np.float64) for n in names}
     if "variant" in data.files:
         params["variant"] = np.array(str(data["variant"]))
@@ -351,8 +370,15 @@ def load_params(path: Path) -> dict[str, np.ndarray] | None:
 def weights_path(game: str, variant: str | None = None) -> Path:
     """The game's weights; a trimmed token variant (MEOWDOKU_PILOT_ARCH or
     ``variant``) keeps its own file beside the default's."""
+    if declared(game) is not None:
+        return decl_weights_path(game, _decl.arch_for(game))
     variant = ACTIVE_VARIANT if variant is None else variant
     return BUILD / (f"{game}.npz" if variant == DEFAULT_VARIANT or GAME_ARCH.get(game) != "token" else f"{game}.{variant}.npz")
+
+
+def decl_weights_path(game: str, arch: str) -> Path:
+    """A declared game's weights: ``<game>.<arch>.npz`` (``token`` or ``graph``)."""
+    return BUILD / f"{game}.{arch}.npz"
 
 
 def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
@@ -370,8 +396,10 @@ def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
 _PRODUCTS: dict = {}
 
 
-def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPUTS, arch: str = "mlp"):
-    key = (batch, features, outputs, arch)
+def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPUTS, arch: str = "mlp", like: dict | None = None):
+    """``like``: a params dict whose shapes the traced forward takes (a declared game's networks have
+    their own widths); without it the architecture's own default shapes."""
+    key = (batch, features, outputs, arch, tuple(tuple(like[n].shape) for n in param_names(arch)) if like else None)
     if key in _PRODUCTS:
         return _PRODUCTS[key]
     from src.common.tensors.autograd import autograd
@@ -382,11 +410,14 @@ def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPU
     import meowdoku.pilot_law as _law
     digest = hashlib.sha256((inspect.getsource(forward) + inspect.getsource(_law) + inspect.getsource(tape_to_source)
                              + f"{features}{HIDDEN}{outputs}{batch}{arch}{TOKEN_F}{SHIP_G}").encode()).hexdigest()[:16]
-    entry = "autopilot_policy" if arch == "mlp" else "autopilot_token_policy"
+    entry = {"mlp": "autopilot_policy", "graph": "autopilot_graph_policy"}.get(arch, "autopilot_token_policy")
+    if like is not None:
+        digest = hashlib.sha256((digest + repr(sorted((n, like[n].shape) for n in names))).encode()).hexdigest()[:16]
     path = BUILD / f"{entry}_b{batch}_{digest}.py"
     if not path.exists():
-        like = (init_token_params(outputs=outputs, variant=arch.partition(":")[2] or DEFAULT_VARIANT) if arch.startswith("token")
-                else init_params(features=features, outputs=outputs))
+        if like is None:
+            like = (init_token_params(outputs=outputs, variant=arch.partition(":")[2] or DEFAULT_VARIANT) if arch.startswith("token")
+                    else init_params(features=features, outputs=outputs))
         sample = {"x": NumPyTensorOperations.tensor(np.zeros((batch, features))),
                   **{n: NumPyTensorOperations.tensor(like[n]) for n in names}}
         with autograd.forward_capture() as tape:
@@ -470,7 +501,8 @@ class PolicyTrainer:
         self.names, self.forward = param_names(params), forward_of(params)
         self.variant = params.get("variant")
         # a one-query variant carries Q2 as an unused placeholder: it is kept, not trained
-        self.trained = tuple(n for n in self.names if not (n == "Q2" and params["Q2"].shape[0] != params["We1"].shape[1]))
+        self.trained = tuple(n for n in self.names if not (n == "Q2" and params["Q2"].shape[0] != params["We1"].shape[1])
+                             and n not in ("GM1", "GM2"))        # a graph's masks are its edges, not trained
         with AT.use_backend("numpy"):
             self.tensors = {n: AT.tensor(params[n]) for n in self.names}
             for n in self.trained:
@@ -501,11 +533,17 @@ class PolicyTrainer:
 # --------------------------------------------------------------- the pilot
 
 _PILOT_WEIGHTS: dict = {}
+#: Bumped whenever a game's live weights are replaced in place (a native forward holds a copy).
+WEIGHT_VERSION: dict[str, int] = {}
 
 
 def fitting_params(name: str) -> dict[str, np.ndarray] | None:
     """The game's saved weights, only if they fit its observation and outputs
     (a law that grew an axis needs retraining; old weights are not forced in)."""
+    if declared(name) is not None:
+        arch = _decl.arch_for(name)
+        params = load_params(decl_weights_path(name, arch))
+        return params if params is not None and arch_of(params) == arch and widths_of(params) == declared(name).widths(arch) else None
     params = load_params(weights_path(name))
     if params is None or arch_of(params) != GAME_ARCH.get(name, "mlp"):
         return None
@@ -529,7 +567,7 @@ def preload() -> list[str]:
         params = fitting_params(name)
         if params is not None:
             _PILOT_WEIGHTS[name] = params
-            numpy_product(1, *GAME_WIDTHS[name], arch=arch_key(params))
+            numpy_product(1, *widths_of(params), arch=arch_key(params), like=params)
             loaded.append(name)
     return loaded
 
@@ -540,13 +578,15 @@ class Pilot:
 
     def __init__(self, name: str, params: dict[str, np.ndarray]):
         self.name, self.params = name, params
-        self.features = FEATURE_FUNCTIONS[name]
+        self.decl = declared(name)
+        self.features = FEATURE_FUNCTIONS[name] if self.decl is None else (lambda g, d=self.decl, a=arch_of(params): d.observe(g, a))
         self.lane = "numpy"
-        product = numpy_product(1, *widths_of(params), arch=arch_key(params))
+        product = numpy_product(1, *widths_of(params), arch=arch_key(params), like=params if self.decl else None)
         self.run = lambda x: product(x, self.params)
+        self.version = WEIGHT_VERSION.get(name, 0)
         # The token network runs native by default (MEOWDOKU_PILOT=numpy opts out);
         # the fixed MLP stays on NumPy unless MEOWDOKU_PILOT=llvm.
-        if os.environ.get("MEOWDOKU_PILOT", "llvm" if arch_of(params) == "token" else "numpy") == "llvm":
+        if os.environ.get("MEOWDOKU_PILOT", "llvm" if arch_of(params) == "token" and self.decl is None else "numpy") == "llvm":
             try:
                 # The eigen contract's matmul is Eigen's GEMM; the default
                 # ``develop`` contract's is a compensated scalar loop (about
@@ -562,6 +602,9 @@ class Pilot:
                       f"({type(error).__name__}: {str(error)[:400]}); FALLING BACK to the Python forward", flush=True)
 
     def controls(self, game) -> dict[str, float]:
+        if self.lane == "llvm" and WEIGHT_VERSION.get(self.name, 0) != self.version:
+            self.version = WEIGHT_VERSION.get(self.name, 0)      # new weights adopted: hand them to the native forward
+            self.run.set_weights(self.params)
         return controls_from(game, self.run(self.features(game))[0])
 
 
@@ -640,7 +683,7 @@ def live_params(name: str) -> dict[str, np.ndarray] | None:
     """The game's live policy: loaded weights that fit, else -- for a token
     network, which learns from play -- a fresh one of its kind."""
     params = _PILOT_WEIGHTS.get(name) or fitting_params(name)
-    if params is None and GAME_ARCH.get(name) == "token":
+    if params is None and GAME_ARCH.get(name) == "token" and declared(name) is None:
         params = init_token_params(outputs=GAME_WIDTHS[name][1])
     if params is not None:
         _PILOT_WEIGHTS.setdefault(name, params)
@@ -657,7 +700,25 @@ def pilot_for(game) -> Pilot:
 
 
 def available(name: str) -> bool:
-    return name in _PILOT_WEIGHTS or fitting_params(name) is not None or GAME_ARCH.get(name) == "token"
+    if name in _PILOT_WEIGHTS or GAME_ARCH.get(name) == "token":
+        return True
+    params = fitting_params(name)
+    if params is not None:
+        _PILOT_WEIGHTS[name] = params          # read the file once, not on every state the page asks for
+    return params is not None
+
+
+def adopt(name: str, params: dict[str, np.ndarray]) -> None:
+    """Replace a game's live weights IN PLACE (the live pilots, and an in-law pilot's next parameter
+    hand-over, read this dict) and bump the version a native forward watches."""
+    with LEARN_LOCK:
+        target = _PILOT_WEIGHTS.setdefault(name, params)
+        if target is not params:
+            for n in param_names(params):
+                target[n] = params[n]
+            if "variant" in params:
+                target["variant"] = params["variant"]
+        WEIGHT_VERSION[name] = WEIGHT_VERSION.get(name, 0) + 1
 
 
 def distill(name: str = "bullet_hell", decisions: int = 6000, epochs: int = 30, seed: int = 0) -> dict:
@@ -1199,17 +1260,112 @@ def load_learning() -> None:
         LEARN_STATUS[name] = dict(data.get("status", {}).get(name, {}))
 
 
-def human_records_path(game: str) -> Path:
-    """Kept human episodes, versioned by the observation width they were taken
-    with (a law that grows an axis starts a new record set)."""
+# ------------------------------------------------ spans: harvested as play happens, not when it ends
+# Every decision is traced as (observation, controls used).  The trace cuts the stream into SPANS --
+# windows of up to SPAN_ROWS consecutive decisions -- AS IT GOES, whether or not the game ever ends:
+#   * an OUTCOME cuts the window at once and tags it: the lead-up to a rise in score, a pickup, a room
+#     transition or a kill (TAG_SCORE / TAG_PICKUP / TAG_ROOM / TAG_KILL), or to damage (TAG_DAMAGE);
+#   * a full window with nothing happening is cut plain, or tagged TAG_AVOID when a hostile body came
+#     close and nothing hurt (a span of avoiding);
+# and hands the cut spans over every FLUSH_ROWS rows or FLUSH_SECONDS of play.  A span's WORTH is its
+# effect on the loss landscape: the idle trainer (idle_trainer.py) scores every stored span by the
+# current policy's loss on it and replays high-loss spans most (prioritised replay).
+
+TAG_SCORE, TAG_DAMAGE, TAG_PICKUP, TAG_ROOM, TAG_KILL, TAG_AVOID = 1, 2, 4, 8, 16, 32
+TAG_NAMES = {TAG_SCORE: "score", TAG_DAMAGE: "damage", TAG_PICKUP: "pickup", TAG_ROOM: "room", TAG_KILL: "kill",
+             TAG_AVOID: "avoid"}
+#: How much a tagged span is worth beyond its loss (damage: what the human did there is not to be copied).
+TAG_WEIGHT = {TAG_SCORE: 2.0, TAG_PICKUP: 2.0, TAG_ROOM: 2.5, TAG_KILL: 2.0, TAG_AVOID: 1.5, TAG_DAMAGE: 0.25}
+SUCCESS_TAGS = TAG_SCORE | TAG_PICKUP | TAG_ROOM | TAG_KILL
+FLUSH_SECONDS, MIN_SPAN, NEAR_MISS = 15.0, 8, 0.35
+
+
+def tag_names(tag: int) -> list[str]:
+    return [name for bit, name in TAG_NAMES.items() if int(tag) & bit] or ["plain"]
+
+
+def tag_weight(tag: int) -> float:
+    return max([w for bit, w in TAG_WEIGHT.items() if int(tag) & bit] or [1.0])
+
+
+def human_records_path(game: str, source: str = "human") -> Path:
+    """Kept spans, versioned by the observation width they were taken with (a law that grows an axis
+    starts a new record set).  ``source``: ``human`` play, or the autopilot's own ``selfplay`` (the
+    demo's and the inference's play, harvested exactly like a human's)."""
     features, outputs = GAME_WIDTHS[game]
-    return BUILD / (f"human_{game}_f{features}.npz" if outputs == 3 else f"human_{game}_f{features}_o{outputs}.npz")
+    return BUILD / (f"{source}_{game}_f{features}.npz" if outputs == 3 and declared(game) is None else f"{source}_{game}_f{features}_o{outputs}.npz")
+
+
+def load_records(name: str, source: str = "human") -> dict | None:
+    """The kept rows: ``x y`` and, per row, ``tags`` (outcome bits), ``span`` (the span's id), ``loss``
+    (the span's last scored loss, NaN = never scored) and ``ret`` (what followed the span: its reward
+    plus a share of the next span's; NaN for a human's); ``episode_score`` per finished game."""
+    path = human_records_path(name, source)
+    if not path.exists():
+        return None
+    data = np.load(path)
+    n = len(data["x"])
+    return {"x": data["x"], "y": data["y"],
+            "tags": data["tags"] if "tags" in data.files else np.zeros(n, dtype=np.int64),
+            "span": data["span"] if "span" in data.files else np.arange(n) // SPAN_ROWS,
+            "loss": data["loss"] if "loss" in data.files else np.full(n, np.nan),
+            "ret": data["ret"] if "ret" in data.files else np.full(n, np.nan),
+            "episode_score": data["episode_score"] if "episode_score" in data.files else np.zeros(0)}
+
+
+def save_records(name: str, rec: dict, source: str = "human") -> None:
+    path = human_records_path(name, source)
+    BUILD.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(f".{os.getpid()}.partial.npz")
+    np.savez(partial, **rec)
+    partial.replace(path)
+
+
+def prune_records(rec: dict, cap: int = RECORD_ROWS if "RECORD_ROWS" in globals() else 20000) -> dict:
+    """Over the cap, whole spans go -- the least worth keeping first (scored loss x tag weight; unscored
+    spans are kept, oldest of equals go first), not simply the oldest."""
+    n = len(rec["x"])
+    if n <= cap:
+        return rec
+    ids, first = np.unique(rec["span"], return_index=True)
+    worth = []
+    for sid, at in zip(ids, first):
+        rows = rec["span"] == sid
+        loss = float(np.nanmean(rec["loss"][rows])) if not np.all(np.isnan(rec["loss"][rows])) else np.inf
+        worth.append((loss * tag_weight(int(rec["tags"][at])), at))
+    keep = np.ones(n, dtype=bool)
+    for (_, at), sid in sorted(zip(worth, ids)):
+        if keep.sum() <= cap:
+            break
+        keep[rec["span"] == sid] = False
+    return {**rec, **{k: rec[k][keep] for k in ("x", "y", "tags", "span", "loss", "ret")}}
+
+
+def append_records(name: str, x: np.ndarray, y: np.ndarray, tags: np.ndarray, span: np.ndarray, score: float | None,
+                   source: str = "human", ret: np.ndarray | None = None) -> int:
+    """Append rows (span ids are relative; they are made unique here) -- a finished game also adds its score."""
+    with LEARN_LOCK:
+        rec = load_records(name, source)
+        if rec is None:
+            rec = {"x": x[:0], "y": y[:0], "tags": np.zeros(0, dtype=np.int64), "span": np.zeros(0, dtype=np.int64),
+                   "loss": np.zeros(0), "ret": np.zeros(0), "episode_score": np.zeros(0)}
+        base = int(rec["span"].max()) + 1 if len(rec["span"]) else 0
+        rec = {"x": np.concatenate([rec["x"], x]), "y": np.concatenate([rec["y"], y]),
+               "tags": np.concatenate([rec["tags"], tags]).astype(np.int64),
+               "span": np.concatenate([rec["span"], span + base]).astype(np.int64),
+               "loss": np.concatenate([rec["loss"], np.full(len(x), np.nan)]),
+               "ret": np.concatenate([rec["ret"], np.full(len(x), np.nan) if ret is None else ret]),
+               "episode_score": np.concatenate([rec["episode_score"], [score]]) if score is not None else rec["episode_score"]}
+        save_records(name, prune_records(rec, RECORD_ROWS), source)
+        return len(rec["episode_score"])
 
 
 def target_from(game, controls: dict) -> np.ndarray:
-    """The controls a decision used, as the policy's three outputs.  A held
+    """The controls a decision used, as the policy's outputs.  A held
     pointer is its axis equivalent under the motion law: the law commands
     clamp((target - x) / reach, +-speed), i.e. axis = clamp(gap / speed, +-1)."""
+    if declared(game.game) is not None:
+        return declared(game.game).target_from(game, controls)
     motion = game.motion() or {}
     out = np.zeros(GAME_WIDTHS.get(game.game, (FEATURES, OUTPUTS))[1])
     k = game.PLAYER_LANE
@@ -1228,55 +1384,113 @@ def target_from(game, controls: dict) -> np.ndarray:
     return out
 
 
+def outcome_counters(game) -> dict:
+    """The game's running counts an outcome is read from: score, lives (damage), and where it has them
+    pickups, rooms, kills (a declared game's ``View.counters``); the shield counts as lives otherwise."""
+    d = declared(game.game)
+    if d is not None:
+        return d.read(game).counters
+    col = game.session.column
+    return {"score": float(col("score")[0]), "lives": float(col("lives")[0]) + (
+        float(col("energy")[game.PLAYER_LANE or 0]) if "energy" in game.session.columns else 0.0) * 1e-3}
+
+
+#: What a span earned, from the counters at its start and end: score, rooms entered (a room is worth a
+#: gem), minus the damage taken as a share of a full health bar.
+ROOM_REWARD, DAMAGE_REWARD, RETURN_SHARE = 100.0, 100.0, 0.5
+
+
+def span_reward(game, a: dict, b: dict) -> float:
+    health = float(getattr(game, "HEALTH_MAX", None) or 1.0)
+    damage = max(0.0, a.get("lives", 0.0) - b.get("lives", 0.0)) / health
+    return (b.get("score", 0.0) - a.get("score", 0.0)) + ROOM_REWARD * (b.get("rooms", 0.0) - a.get("rooms", 0.0)) \
+        - DAMAGE_REWARD * min(1.0, damage)
+
+
 class PlayTrace:
-    """The spans of an episode worth learning from (see SPAN_ROWS): a ring of
-    recent decisions, and the kept rows -- lead-ups to a rise in score."""
+    """The spans of play being cut as it happens (see above): a ring of the latest decisions, the spans
+    cut so far waiting for the learner."""
 
     def __init__(self):
         import collections
-        self.ring = collections.deque(maxlen=SPAN_ROWS)
-        self.x: list[np.ndarray] = []       # kept rows
-        self.y: list[np.ndarray] = []
+        self.ring = collections.deque(maxlen=SPAN_ROWS)          # (observation, target, danger)
+        self.pending: list[tuple[np.ndarray, np.ndarray, int, float]] = []       # cut spans: (x rows, y rows, tag, reward)
+        self.start = None                   # the counters when the open window began
+        self.game = None
+        self.rows = 0
         self.demo = None                    # True / False once the first decision lands
-        self.last = None                    # (score, lives, shield) at the last decision
+        self.last = None                    # the counters at the last decision
         self.spans = 0
+        self.flushed_at = time.monotonic()
+
+    def cut(self, tag: int) -> None:
+        if len(self.ring) >= (MIN_SPAN if not tag else 4):
+            x = np.stack([r[0] for r in self.ring])
+            y = np.stack([r[1] for r in self.ring])
+            reward = span_reward(self.game, self.start, self.last) if self.start is not None and self.last is not None else 0.0
+            self.pending.append((x, y, int(tag), float(reward)))
+            self.rows += len(x)
+            self.spans += 1
+        self.ring.clear()
+        self.start = self.last
 
     def record(self, game, controls: dict, demo: bool, features=None) -> bool:
-        """One decision; True when enough kept rows wait for the learner.
-        ``features``: the observation it was made on, when the caller read it
-        before the state moved (the in-law pilot's decision lands a step
-        later)."""
+        """One decision; True when it is time to hand the cut spans over (enough rows, or enough seconds
+        of play).  ``features``: the observation it was made on, when the caller read it before the
+        state moved (the in-law pilot's decision lands a step later)."""
         if game.game not in FEATURE_FUNCTIONS or game.session.state is None:
             return False
         if self.demo is None:
             self.demo = demo
         elif self.demo != demo:            # who drives changed mid-game: keep one kind per episode
             return False
-        col = game.session.column
-        k = game.PLAYER_LANE or 0
-        now = (float(col("score")[0]), float(col("lives")[0]),
-               float(col("energy")[k]) if "energy" in game.session.columns else 0.0)
-        if self.last is not None:
-            if now[1] < self.last[1] or now[2] < self.last[2] - 1e-9:
-                self.ring.clear()           # hurt: the lead-up is not one to imitate
-            elif now[0] > self.last[0] and self.ring:
-                for x, y in self.ring:      # scored: keep the lead-up
-                    self.x.append(x); self.y.append(y)
-                self.ring.clear()
-                self.spans += 1
-        self.last = now
+        now = outcome_counters(game)
+        self.game = game
+        if not self.ring:
+            self.start = self.last if self.last is not None else now
         if features is None:
             features = FEATURE_FUNCTIONS[game.game](game)
-        self.ring.append((np.asarray(features, dtype=np.float64).reshape(-1), target_from(game, controls)))
-        return len(self.x) >= FLUSH_ROWS
+        features = np.asarray(features, dtype=np.float64).reshape(-1)
+        danger = float(features[-1]) if declared(game.game) is not None else 0.0
+        self.ring.append((features, target_from(game, controls), danger))
+        if self.last is not None:
+            tag = 0
+            if now.get("lives", 0.0) < self.last.get("lives", 0.0) - 1e-9:
+                tag |= TAG_DAMAGE
+            if now.get("score", 0.0) > self.last.get("score", 0.0):
+                tag |= TAG_SCORE
+            if now.get("pickups", 0.0) > self.last.get("pickups", 0.0):
+                tag |= TAG_PICKUP
+            if now.get("rooms", 0.0) > self.last.get("rooms", 0.0):
+                tag |= TAG_ROOM
+            if now.get("kills", 0.0) > self.last.get("kills", 0.0):
+                tag |= TAG_KILL
+            self.last = now
+            if tag:
+                self.cut(tag)
+            elif len(self.ring) == SPAN_ROWS:
+                self.cut(TAG_AVOID if max(r[2] for r in self.ring) > NEAR_MISS else 0)
+        self.last = now
+        return self.rows >= FLUSH_ROWS or (self.rows >= MIN_ROWS and time.monotonic() - self.flushed_at > FLUSH_SECONDS)
+
+    def cut_remaining(self) -> None:
+        """The game is over (or the session ends): the window still open is a span too."""
+        self.cut(0)
+
+    def take_spans(self) -> list[tuple[np.ndarray, np.ndarray, int, float]]:
+        """The cut spans as (x, y, tag, return): a span's return is its reward plus RETURN_SHARE of the
+        next span's (what followed it)."""
+        out, self.pending, self.rows = self.pending, [], 0
+        self.flushed_at = time.monotonic()
+        return [(x, y, tag, r + (RETURN_SHARE * out[i + 1][3] if i + 1 < len(out) else 0.0))
+                for i, (x, y, tag, r) in enumerate(out)]
 
     def take(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """The kept rows (and forget them)."""
-        if not self.x:
+        """The cut rows (and forget them)."""
+        spans = self.take_spans()
+        if not spans:
             return None
-        x, y = np.stack(self.x), np.stack(self.y)
-        self.x, self.y = [], []
-        return x, y
+        return np.concatenate([s[0] for s in spans]), np.concatenate([s[1] for s in spans])
 
 
 def _fit(params: dict, x: np.ndarray, y: np.ndarray, epochs: int) -> tuple[dict, float]:
@@ -1301,7 +1515,8 @@ def _trainer_pool():
     if _TRAINER is None:
         import concurrent.futures
         import multiprocessing
-        _TRAINER = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        from meowdoku.idle_trainer import low_priority
+        _TRAINER = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"), initializer=low_priority)
     return _TRAINER
 
 
@@ -1316,22 +1531,21 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
             if live is None:
                 return
             params = {n: v.copy() for n, v in live.items()}
-        records = human_records_path(name)
-        if records.exists():
-            data = np.load(records)
-            rx, ry = data["x"], data["y"]
-            if kept_tail:                       # this episode is already the records' tail
+        rec = load_records(name)
+        if rec is not None:
+            rx, ry = rec["x"], rec["y"]
+            if kept_tail:                       # this flush is already the records' tail
                 rx, ry = rx[:-kept_tail], ry[:-kept_tail]
             if len(rx) > REPLAY_ROWS:
                 pick = np.random.default_rng().choice(len(rx), REPLAY_ROWS, replace=False)
                 rx, ry = rx[pick], ry[pick]
             x, y = np.concatenate([x, rx]), np.concatenate([y, ry])
+        if declared(name) is not None:
+            x = declared(name).slice(arch_of(params), x)
         fitted, loss = _trainer_pool().submit(_fit, params, x, y, POST_EPOCHS).result()
         with LEARN_LOCK:
-            target = _PILOT_WEIGHTS.setdefault(name, fitted)
-            for n in param_names(fitted):
-                target[n] = fitted[n]          # the live pilots read this dict
-            save_params(target, weights_path(name))
+            adopt(name, fitted)                # the live pilots read this dict
+            save_params(_PILOT_WEIGHTS[name], weights_path(name))
         LEARN_STATUS[name] = {"last": label, "rows": int(len(x)), "loss": round(loss, 4), "at": time.strftime("%H:%M:%S")}
         _history(name, kind="trained", loss=round(loss, 5), rows=int(len(x)), label=label)
         _save_learning()
@@ -1343,32 +1557,47 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
         TRAINING[name] = False
 
 
+IDLE_TRAINER = None        # the server's IdleTrainer when it runs: human spans are then recorded and left to it
+
+
 def finish_episode(game, trace: PlayTrace, final: bool = True) -> None:
-    """Hand a trace's kept spans to the learner: at the game's end, or
-    mid-game once FLUSH_ROWS have gathered (``final`` False)."""
+    """Hand a trace's cut spans over: mid-game every FLUSH_ROWS / FLUSH_SECONDS (``final`` False -- the game
+    need not end) and at the game's end.  Human spans are recorded (all of them, tagged) and, unless the
+    idle trainer is running, post-trained on at once; a demo's go to the learner only when demo learning is
+    on and the lead-up succeeded."""
     name = game.game
-    if name not in FEATURE_FUNCTIONS or trace.demo is None or len(trace.x) < MIN_ROWS:
+    if name not in FEATURE_FUNCTIONS or trace.demo is None:
         return
-    x, y = trace.take()
+    if final:
+        trace.cut_remaining()
+    spans = trace.take_spans()
+    if not spans:
+        return
     score = float(game.session.column("score")[0]) if game.session.state is not None else 0.0
+    x = np.concatenate([s[0] for s in spans])
+    y = np.concatenate([s[1] for s in spans])
+    tags = np.concatenate([np.full(len(s[0]), s[2]) for s in spans])
+    ids = np.concatenate([np.full(len(s[0]), i) for i, s in enumerate(spans)])
+    if trace.demo:        # the autopilot's own play: every span recorded with what followed it
+        append_records(name, x, y, tags, ids, score if final else None, "selfplay",
+                       np.concatenate([np.full(len(s[0]), s[3]) for s in spans]))
     if not trace.demo:
-        path = human_records_path(name)
-        with LEARN_LOCK:
-            if path.exists():
-                old = np.load(path)
-                kx, ky = np.concatenate([old["x"], x]), np.concatenate([old["y"], y])
-                episodes = np.concatenate([old["episode_score"], [score]])
-            else:
-                kx, ky, episodes = x, y, np.asarray([score])
-            kx, ky = kx[-RECORD_ROWS:], ky[-RECORD_ROWS:]          # the newest rows only
-            BUILD.mkdir(parents=True, exist_ok=True)
-            partial = path.with_suffix(".partial.npz")
-            np.savez(partial, x=kx, y=ky, episode_score=episodes)
-            partial.replace(path)
-        _HUMAN_GAMES[name] = int(len(episodes))
-        label = f"human {'game' if final else 'spans'} {len(episodes)} (score {score:.0f}, {len(x)} span rows)"
-        kept_tail = len(x)
+        _HUMAN_GAMES[name] = append_records(name, x, y, tags, ids, score if final else None)
+        label = f"human {'game' if final else 'spans'} (score {score:.0f}, {len(spans)} spans, {len(x)} rows)"
+        if IDLE_TRAINER is not None:
+            LEARN_STATUS[name] = {**LEARN_STATUS.get(name, {}), "queued": label}
+            return
+        keep = tags != TAG_DAMAGE
+        x, y, kept_tail = x[keep], y[keep], len(x)
+        if len(x) < MIN_ROWS:
+            return
     else:
+        if IDLE_TRAINER is not None:
+            return                           # the idle trainer learns from the self-play store, weighted by outcome
+        spans = [s for s in spans if s[2] & SUCCESS_TAGS and not s[2] & TAG_DAMAGE]
+        if not spans:
+            return
+        x, y = np.concatenate([s[0] for s in spans]), np.concatenate([s[1] for s in spans])
         scores = _DEMO_SCORES[name]
         baseline = float(np.mean(scores[-10:])) if scores else -1.0
         if final:
@@ -1385,7 +1614,7 @@ def finish_episode(game, trace: PlayTrace, final: bool = True) -> None:
                                           + ("" if DEMO_LEARNING.get(name) else " (learning off)")}
             return
         label = (f"demo run (score {score:.0f} >= average {max(baseline, 0):.0f})" if final
-                 else f"demo spans ({len(x)} rows of lead-ups to scoring)")
+                 else f"demo spans ({len(x)} rows of lead-ups to success)")
         kept_tail = 0
     _threading.Thread(target=_post_train, args=(name, x, y, label, kept_tail), name=f"post-train-{name}", daemon=True).start()
 
@@ -1397,7 +1626,7 @@ def learning_summary(name: str) -> dict:
     if name not in _HUMAN_GAMES:                  # read the record file once, then count in memory
         records = human_records_path(name)
         try:
-            _HUMAN_GAMES[name] = int(len(np.load(records)["episode_score"])) if records.exists() else 0
+            _HUMAN_GAMES[name] = int(len(load_records(name)["episode_score"])) if records.exists() else 0
         except Exception:  # noqa: BLE001
             _HUMAN_GAMES[name] = 0
     params = _PILOT_WEIGHTS.get(name)
@@ -1405,7 +1634,7 @@ def learning_summary(name: str) -> dict:
     if params is not None:
         arch = arch_of(params)
         network = {"arch": arch, "params": int(sum(params[n].size for n in param_names(params))),
-                   "outputs": widths_of(params)[1], "tokens": TOKENS if arch == "token" else None,
+                   "outputs": widths_of(params)[1], "tokens": (declared(name).tokens if declared(name) else TOKENS) if arch == "token" else None,
                    "span_rows": SPAN_ROWS, "flush_rows": FLUSH_ROWS}
     return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name],
             "training": bool(TRAINING.get(name)), "history": list(LEARN_HISTORY.get(name, ())),

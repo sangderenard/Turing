@@ -465,6 +465,11 @@ class LawPiece:
                      for value in type(self).law(*tensors))
 
 
+def _declared(name):
+    from meowdoku.autopilot import declared
+    return declared(name)
+
+
 class EntityGame(Game):
     """A free-board game: entity lanes on a plain floor, advanced by ticks.
 
@@ -515,6 +520,9 @@ class EntityGame(Game):
         if on:
             from meowdoku.autopilot import pilot_for
             self.pilot = pilot_for(self)         # refuses when there are no trained weights
+            decl = _declared(self.game)
+            if decl is not None:
+                self.PILOT_STEP = decl.step      # a declared game holds each decision for its own step
         self.autopilot = bool(on)
         self._pilot_hold = 0.0
 
@@ -851,6 +859,11 @@ class EntityGame(Game):
         from meowdoku.autopilot import FEATURE_FUNCTIONS, learning_summary
         if self.game in FEATURE_FUNCTIONS:
             st["learning"] = learning_summary(self.game)
+            from meowdoku.autopilot import available, declared
+            st["autopilot_ready"] = bool(available(self.game))         # trained weights fit: the page may hand it the controls
+            if declared(self.game) is not None:
+                from meowdoku.pilot_decl import arch_for
+                st["autopilot_net"] = arch_for(self.game)              # token or graph
         if self.PLAYER_LANE is not None and self.session.state is not None:
             k, col = self.PLAYER_LANE, self.session.column
             st["predict"] = {"lane": k, "adopt": self.ADOPT_BOUND, "adopt_axes": self.adopt_axes(), **(self.motion() or {})}
