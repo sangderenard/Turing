@@ -297,7 +297,11 @@ const lens = { fbo: null, tex: null, depth: null, w: 0, h: 0, program: null, vao
 const BROADCAST = { size: STACK_SIZE_LATE(), fov: 1.4, fbo: null, tex: null, depth: null, warp: null, quad: null, key: "" };
 function STACK_SIZE_LATE() { return 512; }
 function projectionGlassOn() { return onPlanet() && viewerWants("projection") && !!state.colourStack; }
-function broadcastSpan() { return Math.max(state.extent.width, state.extent.depth) * 1.12; }
+// The extent runs from z0 (<= 0: content above row 0, e.g. Meowdoku's fish and cat roster) to depth.
+function extZ0(ext = state.extent) { return (ext && ext.z0) || 0; }
+function extLength(ext = state.extent) { return ext.depth - extZ0(ext); }
+function extMidZ(ext = state.extent) { return (ext.depth + extZ0(ext)) / 2; }
+function broadcastSpan() { return Math.max(state.extent.width, extLength()) * 1.12; }
 function renderBroadcast(now, casters) {
   const B = BROADCAST, n = B.size;
   if (!B.fbo) {
@@ -315,7 +319,7 @@ function renderBroadcast(now, casters) {
   }
   // the broadcast camera: straight down over the field's centre, wide angle
   const S = broadcastSpan(), height = (S / 2) / Math.tan(B.fov / 2);
-  const target = [state.extent.width / 2, 0, state.extent.depth / 2], eye = [target[0], height, target[2]];
+  const target = [state.extent.width / 2, 0, extMidZ()], eye = [target[0], height, target[2]];
   const view = M.lookAt(eye, target, [0, 0, -1]), proj = M.perspective(B.fov, 1, 0.1, 300);
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); gl.viewport(0, 0, n, n);
   gl.clearColor(...sceneBackground(), 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
@@ -338,7 +342,7 @@ function drawProjectionGlass(cam, drawLit) {
   // exactly the broadcast's footprint on the board; hovering above everything.
   const S = broadcastSpan(), y = TILE.height + 4.0 * DEPTH_LIFT + 1.2;
   const eyeHeight = Math.max(y + 0.5, cam.eye ? cam.eye[1] : y + 10);
-  const side = S * (eyeHeight - y) / eyeHeight, cx = state.extent.width / 2, cz = state.extent.depth / 2;
+  const side = S * (eyeHeight - y) / eyeHeight, cx = state.extent.width / 2, cz = extMidZ();
   if (!BROADCAST.quad) {
     const pos = new Float32Array([-0.5, 0, -0.5, 0.5, 0, 0.5, 0.5, 0, -0.5, -0.5, 0, -0.5, -0.5, 0, 0.5, 0.5, 0, 0.5]);
     const nrm = new Float32Array(18); for (let i = 0; i < 6; i++) nrm[i * 3 + 1] = 1;
@@ -552,7 +556,7 @@ const PLANET = { radius: 36.0, strip: 0.4, shadowStrip: 0.6 };
 function onPlanet() { const g = state.game; return !state.flat && !!(g && g.scene && g.scene.terrain === true); }
 function planetDrop(x, z) {
   if (!onPlanet()) return 0;
-  const dx = x - state.extent.width / 2, dz = z - state.extent.depth / 2;
+  const dx = x - state.extent.width / 2, dz = z - extMidZ();
   return (dx * dx + dz * dz) / (2 * PLANET.radius);
 }
 function stripsOf(positions, extras, span, length = PLANET.strip) {
@@ -1225,6 +1229,8 @@ function meowMaterial(name, rgb) {
   if (name.endsWith("@sel")) return [mix(rgb, [1.0, 0.72, 0.27], 0.32), { roughness: 0.53 }];
   if (name.startsWith("region")) return [mix(rgb, [1, 1, 1], 0.24), { roughness: 0.82 }];
   if (name === "cat") return [MEOW_LOOK.cat, { roughness: 0.48 }];
+  if (name === "catlit") return [MEOW_LOOK.cat, { roughness: 0.4 }];
+  if (name === "catdim") return [[0.66, 0.72, 0.74], { roughness: 0.95 }];
   if (name === "x") return [MEOW_LOOK.x, { roughness: 0.88 }];
   if (name === "mouse") return [MEOW_LOOK.mouse, { roughness: 0.72 }];
   if (name === "count") return [MEOW_LOOK.ink, { roughness: 0.84 }];
@@ -1404,20 +1410,20 @@ function rebuildBoards(game) {
   const depth = rack ? rack.origin[1] + rack.rows * rack.size
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
-  state.extent = { width, depth: game.board === "free" ? game.height : depth };
+  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0 };
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
   if (game.scene && game.scene.terrain === true && !state.flat) {
     // The plate lies on the planet's curve: a fine grid of glass (it never
     // scrolls, so the curve is baked once).
-    const faces = [], step = 0.5, x0 = -m, x1 = width + m, z0 = -m, z1 = state.extent.depth + m;
+    const faces = [], step = 0.5, x0 = -m, x1 = width + m, zA = state.extent.z0 - m, z1 = state.extent.depth + m;
     const at = (x, z) => [x, -planetDrop(x, z), z];
-    for (let x = x0; x < x1 - 1e-6; x += step) for (let z = z0; z < z1 - 1e-6; z += step) {
+    for (let x = x0; x < x1 - 1e-6; x += step) for (let z = zA; z < z1 - 1e-6; z += step) {
       const xa = Math.min(x + step, x1), za = Math.min(z + step, z1);
       faces.push([at(x, z), at(x, za), at(xa, za), gm], [at(x, z), at(xa, za), at(xa, z), gm]);
     }
     state.glass = litMesh(faces);
   } else {
-    state.glass = litMesh(box(-m, -t, -m, width + m, 0.0, state.extent.depth + m, gm));
+    state.glass = litMesh(box(-m, -t, state.extent.z0 - m, width + m, 0.0, state.extent.depth + m, gm));
   }
 }
 
@@ -1439,9 +1445,9 @@ function camera() {
   // the board foreshortened and backs off a little more.
   // A free board is sized to the screen already, so it is framed tightly.
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
-  const halfFit = Math.max((ext.depth + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
+  const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
-  const centre = declared && declared.target ? declared.target : [ext.width / 2, 0, ext.depth / 2];
+  const centre = declared && declared.target ? declared.target : [ext.width / 2, 0, extMidZ(ext)];
   const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
@@ -1994,7 +2000,7 @@ function arcadeEvents(game, now) {
 }
 function arcadeBulbs() {
   const ext = state.extent || { width: 6, depth: 6 }, m = GLASS.margin * 0.6;
-  const x0 = -m, z0 = -m, x1 = ext.width + m, z1 = ext.depth + m;
+  const x0 = -m, z0 = extZ0(ext) - m, x1 = ext.width + m, z1 = ext.depth + m;
   const perimeter = 2 * ((x1 - x0) + (z1 - z0)), count = Math.max(16, Math.round(perimeter / ARCADE.spacing));
   const bulbs = [];
   for (let i = 0; i < count; i++) {
@@ -2009,7 +2015,7 @@ function arcadeBulbs() {
 // near edge, black at the far edge; the bulb nearest that edge's middle.
 function sideOrigin(side, bulbs) {
   const ext = state.extent || { width: 6, depth: 6 };
-  const near = side === "black" ? [ext.width / 2, -1] : [ext.width / 2, ext.depth + 1];
+  const near = side === "black" ? [ext.width / 2, extZ0(ext) - 1] : [ext.width / 2, ext.depth + 1];
   let best = 0, bestDistance = Infinity;
   bulbs.forEach((p, i) => { const d = Math.hypot(p[0] - near[0], p[2] - near[1]); if (d < bestDistance) { bestDistance = d; best = i; } });
   return best;
@@ -2220,21 +2226,21 @@ function setSkyMode(mode, save = true) {
   if (save && inventoryView.applied) saveSettings();
 }
 function lampTarget(now, ext) {
-  const span = Math.max(ext.width, ext.depth);
+  const span = Math.max(ext.width, extLength(ext));
   if (light.follow && light.pointer) return [light.pointer[0], 0.55 * span, light.pointer[1]];
   const globe = globeSun(now);
   if (globe) {
     const reach = 0.95 * span;
-    return [ext.width / 2 + reach * globe[0], reach * Math.max(0.05, globe[1]) + 0.3, ext.depth / 2 + reach * globe[2]];
+    return [ext.width / 2 + reach * globe[0], reach * Math.max(0.05, globe[1]) + 0.3, extMidZ(ext) + reach * globe[2]];
   }
   const sun = sunState(), reach = 0.95 * span;
   return [ext.width / 2 + reach * Math.cos(sun.elevation) * Math.cos(sun.azimuth),
           reach * Math.sin(sun.elevation) + 0.3,
-          ext.depth / 2 + reach * Math.cos(sun.elevation) * Math.sin(sun.azimuth)];
+          extMidZ(ext) + reach * Math.cos(sun.elevation) * Math.sin(sun.azimuth)];
 }
 function updateLight(now) {
-  const ext = state.extent || { width: 6, depth: 6 }, span = Math.max(ext.width, ext.depth);
-  if (state.flat) light.position = [ext.width / 2, light.height * span * 0.9, ext.depth / 2];   // co-located with the camera, straight down
+  const ext = state.extent || { width: 6, depth: 6 }, span = Math.max(ext.width, extLength(ext));
+  if (state.flat) light.position = [ext.width / 2, light.height * span * 0.9, extMidZ(ext)];   // co-located with the camera, straight down
   else {
     const target = lampTarget(now, ext);
     if (!light.body) light.body = { p: target.slice(), v: [0, 0, 0], at: now };
@@ -2249,7 +2255,7 @@ function updateLight(now) {
     body.p[1] = Math.max(0.45, body.p[1]);
     light.position = body.p.slice();
   }
-  const target = [ext.width / 2, 0, ext.depth / 2];
+  const target = [ext.width / 2, 0, extMidZ(ext)];
   const depth = Math.hypot(...sub(light.position, target));
   light.view = M.lookAt(light.position, target, [0, 1, 0]);
   light.viewProj = M.multiply(M.ortho(span * 0.95, depth * 0.1, depth * 2.5), light.view);
@@ -2266,6 +2272,9 @@ const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook
 // The power-up tray: a row under the lives.  Each item sits on its own
 // button tile (it reads as a button from above); its count is set small
 // UNDER the tile, outside the button, so it stays understated.
+// The rows above the board (a game that sends ``roster``): the fish across the top, the cat
+// roster just under them, then row 0.  ``height`` is how far above row 0 the extent reaches.
+const TOP = { fish: -1.9, roster: -0.85, height: 2.55, fishSize: 0.36, catSize: 0.27, catSpacing: 0.66 };
 const TRAY = { row: 2.0, spacing: 1.5, tile: 1.0, countDrop: 0.8 };
 function trayCentre(game, k) { return [game.cols / 2 + (Number(k) - 1) * TRAY.spacing, game.rows + TRAY.row]; }
 function trayPosition(game, cell) {
@@ -2287,7 +2296,13 @@ function trayButtonFaces(game) {
 function cellPosition(game, cell, rackPiece) {
   if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
   if (typeof cell === "string" && cell.startsWith("hud:")) {
-    const k = Number(cell.slice(4)); return [game.cols / 2 + (k - 1) * 0.9, game.rows + 0.9, "hud"];
+    const k = Number(cell.slice(4));
+    if (game.roster) return [game.cols / 2 + (k - (Math.max(1, game.hearts || 3) - 1) / 2) * 0.9, TOP.fish, "hud"];
+    return [game.cols / 2 + (k - 1) * 0.9, game.rows + 0.9, "hud"];
+  }
+  if (typeof cell === "string" && cell.startsWith("roster:")) {
+    const k = Number(cell.slice(7)), n = Math.max(1, (game.roster || []).length), step = Math.min(TOP.catSpacing, (game.cols - 0.4) / n);
+    return [game.cols / 2 + (k - (n - 1) / 2) * step, TOP.roster, "roster"];
   }
   if (rackPiece) { const rack = rackLayout(game), r = Math.floor(cell / rack.cols), c = cell % rack.cols;
     return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.size, "rack", rack.size]; }
@@ -3168,6 +3183,11 @@ function pieceModel(piece, now) {
     x = piece.from[0] + (piece.x - piece.from[0]) * k; z = piece.from[1] + (piece.z - piece.from[1]) * k; y = 0.5 * Math.sin(Math.PI * t);
     if (t >= 1) piece.from = null;
   }
+  else if (piece.place === "roster") {                              // understated until lit; then a small pop
+    const t = piece.litAt == null ? 1 : Math.min(1, (now - piece.litAt) / 0.5);
+    s = 1 + 0.5 * Math.sin(Math.PI * t) * (1 - t) ** 0.5; y = 0.25 * Math.sin(Math.PI * t);
+    if (piece.color === "catlit" && t >= 1) s = 1 + 0.04 * Math.sin(now * 2.1 + piece.seed);
+  }
   else if (fam === "cat") { const T = 1.1, t = Math.min(1, age / T);
     y = t < 0.9 ? 1.6 * Math.sin(Math.PI * t / 0.9) : 0; spin = t < 0.25 ? 0 : 2 * Math.PI * ease.out(Math.min(1, (t - 0.25) / 0.65));
     s = t > 0.9 ? 1 - 0.18 * Math.sin((t - 0.9) / 0.1 * Math.PI) : 1; if (t >= 1) s = 1 + 0.03 * Math.sin(now * 2.1 + piece.seed); }
@@ -3179,7 +3199,7 @@ function pieceModel(piece, now) {
   const flat = state.flat;
   if (flat) { y = 0; tilt = 0; }                                   // no hop, no lean
   const lean = flat ? 0 : LEAN[fam] ?? 0.35;
-  const base = piece.place === "hud" || piece.place === "traycount" ? 0.0 : TILE.height * (piece.cellSize || 1);
+  const base = piece.place === "hud" || piece.place === "traycount" || piece.place === "roster" ? 0.0 : TILE.height * (piece.cellSize || 1);
   const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s;
   let m = M.translate(x, rest + y, z);
   m = M.multiply(m, M.rotateY(spin));
@@ -3473,9 +3493,10 @@ function applyState(game) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "tray" ? 0.3 : where === "traycount" ? 0.19 : where === "hud" ? 0.42 : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "roster" ? TOP.catSize : where === "tray" ? 0.3 : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
+      if (where === "roster" && live.color !== p.color && p.lit) live.litAt = now;   // lit now: pop
       live.mesh = p.mesh; live.color = p.color;
     } else {
       state.pieces.set(key, { id: key, mesh: p.mesh, color: p.color, x, z, place: where, cellSize: cellSize || 1, size, t0: now, removing: null, seed: Math.random() * 6.28, from: null });
@@ -3673,7 +3694,7 @@ function pointsFrame(cam, now) {
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
-  const ext = state.extent, eye = cam.eye, target = cam.target || [ext.width / 2, 0, ext.depth / 2];
+  const ext = state.extent, eye = cam.eye, target = cam.target || [ext.width / 2, 0, extMidZ(ext)];
   const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
   const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
   cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height],
@@ -3687,9 +3708,9 @@ function pointsFrame(cam, now) {
 function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
   const P = state.programs.phong; gl.useProgram(P);
-  const span = Math.max(state.extent.width, state.extent.depth);
+  const span = Math.max(state.extent.width, extLength());
   const keyView = M.apply(cam.view, light.position);
-  const sun = sunState(), boardCentre = [state.extent.width / 2, 0, state.extent.depth / 2];
+  const sun = sunState(), boardCentre = [state.extent.width / 2, 0, extMidZ()];
   const sunReach = Math.hypot(...sub(light.position, boardCentre));
   let keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = [0.75, 0.85, 1.0];
   const globe = !state.flat && SKY.dir && state.game && state.game.globe ? SKY.dir : null;
@@ -4196,7 +4217,7 @@ canvas.addEventListener("pointermove", async (e) => {
     const cam = camera(), rect = canvas.getBoundingClientRect();
     const ndc = [((e.clientX - rect.left) / rect.width) * 2 - 1, 1 - ((e.clientY - rect.top) / rect.height) * 2];
     const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
-    const yPlane = light.height * Math.max(state.extent.width, state.extent.depth) * 0.9, t = (yPlane - near[1]) / (far[1] - near[1]);
+    const yPlane = light.height * Math.max(state.extent.width, extLength()) * 0.9, t = (yPlane - near[1]) / (far[1] - near[1]);
     if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];   // the board point the lamp flies above
     return;
   }
@@ -4287,7 +4308,7 @@ function cameraGestures() {
   return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false, tilt: d.tilt !== false,
            target: Array.isArray(d.target) ? d.target : null,
            zoomLim: (lim.zoom || [0.3, 3]).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],
-           panLim: lim.pan != null ? lim.pan : Math.max(ext.width, ext.depth) };
+           panLim: lim.pan != null ? lim.pan : Math.max(ext.width, extLength(ext)) };
 }
 const CV_KEYS = ["yaw", "pitch", "lz", "px", "pz"];
 function resetCameraView() { for (const k of CV_KEYS) { camView.goal[k] = 0; camView.vel[k] = 0; } }
