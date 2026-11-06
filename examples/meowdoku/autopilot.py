@@ -414,6 +414,11 @@ class _MirroredView:
             col[...] = max(0.0, min(1.0, hp / top))
         elif name == "timer":
             col[0] = self._real.column("timer")[k]
+        elif name == "slot":
+            # The player registers as a bad guy (an enemy craft to line up
+            # on); its shots and missiles as incoming bullets to dodge.
+            col[(col == sc.SHOT) | (col == sc.MISSILE_SLOT)] = sc.BULLET
+            col[0] = sc.ENEMY
         return col
 
 

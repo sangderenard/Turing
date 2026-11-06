@@ -926,7 +926,8 @@ function camera() {
     const proj = new Float32Array([1 / hw,0,0,0, 0,1 / hh,0,0, 0,0,-2 / (far - near),0, 0,0,-(far + near) / (far - near),1]);
     return { view, proj, viewProj: M.multiply(proj, view), eye };
   }
-  const dist = halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
+  const RAISE = 1.12;                                              // the eye a little higher off the board
+  const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
   const up = el > 1.45 ? [0, 0, -1] : [0, 1, 0];
   const view = M.lookAt(eye, target, up);

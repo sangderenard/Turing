@@ -326,6 +326,12 @@ def scroller_step(lane, slot, rx, ry, rz,
     # their horizontal distance takes; rings stay level.
     reach_xy = ((px - sx) * (px - sx) + (py - sy) * (py - sy)).sqrt() + 0.5
     climb = where(skind == SPINNER, 0.0, speed * (pz - sz) / reach_xy)
+    # Piloted craft (the boss, aces) fire FORWARD as the player's guns do --
+    # straight down the screen, level, a fan centred on the nose -- so the
+    # network that flies them lines up its shots as it learned to.
+    s_piloted = f(shooter & piloted).sum() > 0.0
+    angle = where(s_piloted, 1.5707963267948966 + (rank - 0.5 * (count - 1.0)) * 0.22, angle)
+    climb = where(s_piloted, 0.0, climb)
 
     arrival = enemy_spawn | boss_spawn | ace_spawn
     spawn = shot_spawn | arrival | bullet_spawn | missile_spawn
