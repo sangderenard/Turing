@@ -8,6 +8,7 @@ deploy to 8766 as soon as work lands.
 
 - **Fountain stage A:** nozzle energy (the ymax 3.7 vs 2.6 ballistic ceiling), symmetry, particle conservation, energy-aware settle, basin fills the screen aspect. The "graph forward WASM compile failed (5)" build error must be fixed.
 - **Platformers** (platformer, side scroller, delve): better gravity law and z clipping.
+- **Platformer lights:** drop the rocket shield and marker lights; one intent-aimed cone spotlight (control input or acceleration, smoothed; velocity as the fallback).
 - **Platformer level generator:** an ice-climber style climb of wide floors, each reachable under the jump law (proved in a test). No impossible single-brick maps.
 
 ## Autopilot follow-ups (the base landed in 727be7c2)
