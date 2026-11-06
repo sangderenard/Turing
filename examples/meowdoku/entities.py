@@ -590,35 +590,49 @@ class EntityGame(Game):
         self._end_check()
 
     def _land_in_law(self, seconds: float) -> None:
-        """Land ``seconds`` with the network flying INSIDE the law: it decides
-        on every physics step, so there is no held decision and nothing for
-        Python to do per step.  The demo trace still records at the pilot's
-        decision cadence (PILOT_STEP): the observation is read first, the
-        first law call of the cadence lands on its own, and the decision that
-        call made (read back from the law's own columns) is the row's
-        target -- the in-law decision, on the observation it was made on."""
+        """Land ``seconds`` with the network flying INSIDE the law.  The law
+        owns the pilot's decision clock (a decision every PILOT_INTERVAL of law
+        time, in effect PILOT_PREDELAY later; nothing for Python to do).  The
+        demo trace records each decision as the law takes it: the observation
+        is read first, the one law step that takes the decision lands on its
+        own, and the decision (read back from the law's own columns) is the
+        row's target -- the in-law decision, on the observation it was made on."""
         from meowdoku.autopilot import FEATURE_FUNCTIONS
         self.session.control(self.law_pilot_rest())      # what the network does not drive
         left = seconds
         while left > 1e-9:
-            if self._pilot_hold <= 1e-9:
-                features = FEATURE_FUNCTIONS[self.game](self) if self._tracing() else None
+            if not self._tracing():
+                self.session.advance(left)
+                left = 0.0
+            elif self.law_pilot_due():
+                features = FEATURE_FUNCTIONS[self.game](self)
                 step = min(left, self.session.dt)
                 self.session.advance(step)
-                self.held = self.law_pilot_controls()
-                self._trace(self.held, demo=True, features=features)
-                self._pilot_hold = self.PILOT_STEP - step
+                left -= step
+                self._trace(self.law_pilot_decision(), demo=True, features=features)
             else:
-                step = min(left, self._pilot_hold)
+                step = min(left, max(self.law_pilot_hold(), 1e-6))
                 self.session.advance(step)
-                self.held = self.law_pilot_controls()
-                self._pilot_hold -= step
-            left -= step
+                left -= step
+        self.held = self.law_pilot_controls()
         self._end_check()
 
     def law_pilot_rest(self) -> dict[str, float]:
         """Every control at rest (the network's own overwrite the law's)."""
         raise NotImplementedError
+
+    def law_pilot_due(self) -> bool:
+        return False
+
+    def law_pilot_hold(self) -> float:
+        return 0.0
+
+    def law_pilot_decision(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    def law_pilot_intervals(self) -> list[dict]:
+        """The law's pilot decisions the page integrates (held + pending); none by default."""
+        return []
 
     # declared by the game ----------------------------------------------------
     def make_piece(self):
@@ -847,6 +861,8 @@ class EntityGame(Game):
             held = getattr(self, "held", {}) or {}
             st["you"]["pilot"] = ([float(held.get(n, 0.0)) for n in ("move_axis", "move_axis_y", "move_axis_z", "move_axis_r", "fire")]
                                   if self.autopilot else [0.0] * 5)
+            # the pilot's decisions, held and pending (law-time intervals: the page integrates them)
+            st["you"]["pilot_intervals"] = self.law_pilot_intervals() if self.autopilot else []
             for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz"):
                 # the land under it, the laser's reach, its place on a sphere
                 if name in self.session.columns:

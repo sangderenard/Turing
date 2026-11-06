@@ -85,6 +85,7 @@ from typing import Any
 
 import numpy as np
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -252,6 +253,17 @@ LEVEL_STEP = 0.15
 SPEED = 10.0
 TAU = 0.05
 STEP_CAP = 1.0 / 30.0      # the longest law step: one frame
+#: The pilot's decision clock (see the pilot block of scroller_step): a decision
+#: is taken every PILOT_INTERVAL of law time and takes effect PILOT_PREDELAY
+#: later -- longer than the trip to the page (one way plus a snapshot), so the
+#: page holds every interval before it starts.  PILOT_QUEUE decisions are kept
+#: (decided, not yet in effect, plus the one in effect, plus one spare).
+PILOT_INTERVAL = 0.1
+PILOT_PREDELAY = 0.2
+PILOT_EPS = 1e-9
+PILOT_QUEUE = int(math.ceil(PILOT_PREDELAY / PILOT_INTERVAL)) + 2
+PILOT_COLUMNS = ("pilot_hold", "pilot_seq", "pilot_hseq", "pilot_hstart",
+                 "pilot_q0", "pilot_q1", "pilot_q2", "pilot_q3", "pilot_q4", "pilot_qstart")
 REACH = 0.18
 MARGIN = 0.5
 SHOT_SPEED = 22.0
@@ -537,6 +549,8 @@ def scroller_step(lane, slot, rx, ry, rz,
                   score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy,
                   bank, vbank, fire_prev, burst_left, last_fire, owned_l, owned_m, mult_l, mult_m, fan_l, fan_m,
                   bombs_d, bombs_c, bombs_s, beam, net_o0, net_o1, net_o2, net_o3, net_o4,
+                  pilot_hold, pilot_seq, pilot_hseq, pilot_hstart,
+                  pilot_q0, pilot_q1, pilot_q2, pilot_q3, pilot_q4, pilot_qstart,
                   field_w, pace, level, net_pilot,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style,
                   move_axis_r, fire_mode, primary_slot, dt,
@@ -580,15 +594,57 @@ def scroller_step(lane, slot, rx, ry, rz,
         "lives": lives, "timer": timer, "beam": beam, "weapon": weapon},
         (We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2))
     net_span = [pilot_law.spread(net_out[:, j], PILOT_ROWS, x) for j in range(pilot_law.OUTPUTS)]
-    net_lane = net_pilot > 0.0
-    net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next = (
-        where(net_lane, net_span[j], old) for j, old in enumerate((net_o0, net_o1, net_o2, net_o3, net_o4)))
     net_on = (P * net_pilot).sum() > 0.0
-    move_axis = where(net_on, (P * net_span[0]).sum() + zero, move_axis)
-    move_axis_y = where(net_on, (P * net_span[1]).sum() + zero, move_axis_y)
-    fire = where(net_on, f((P * net_span[2]).sum() > 0.0) + zero, fire)
-    move_axis_z = where(net_on, (P * net_span[3]).sum() + zero, move_axis_z)
-    move_axis_r = where(net_on, (P * net_span[4]).sum() + zero, move_axis_r)
+    # THE PILOT'S DECISION CLOCK.  The network's outputs are control decisions,
+    # not a per-step command: one is TAKEN every PILOT_INTERVAL of law time
+    # (``pilot_hold`` counts the time left), and IN EFFECT only PILOT_PREDELAY
+    # later -- long enough that the page has the interval before it starts.
+    # A decision is a numbered record in a small ring of lanes (``pilot_q0..4``
+    # its five outputs, ``pilot_qstart`` the law time it takes effect; lane
+    # ``seq mod PILOT_QUEUE`` holds decision ``seq``).  ``pilot_seq`` is the
+    # last decision taken, ``pilot_hseq`` the one in effect (its start in
+    # ``pilot_hstart``), and ``net_o0..4`` the outputs in effect: held,
+    # unchanged, between starts.  (The network is traced as straight-line text:
+    # it is evaluated every step and a decision keeps its result only when due.)
+    t_now = (P * clock).sum()
+    hold = (P * pilot_hold).sum()
+    last = (P * pilot_seq).sum()
+    seq_held = (P * pilot_hseq).sum()
+    start_held = (P * pilot_hstart).sum()
+    due = net_on & (hold <= PILOT_EPS)
+    ahead = seq_held + 1.0                                  # the next decision to take effect
+    ahead_at = f(lane == ahead - PILOT_QUEUE * (ahead / PILOT_QUEUE).floor())
+    ahead_start = (ahead_at * pilot_qstart).sum()
+    take = net_on & (seq_held < last) & (t_now >= ahead_start - PILOT_EPS)
+    held_o = [where(take, (ahead_at * q).sum(), (P * old).sum())
+              for q, old in zip((pilot_q0, pilot_q1, pilot_q2, pilot_q3, pilot_q4), (net_o0, net_o1, net_o2, net_o3, net_o4))]
+    held_o = [where(net_on, o, o * 0.0) for o in held_o]
+    pilot_hseq_next = zero + where(net_on, where(take, ahead, seq_held), last)
+    pilot_hstart_next = zero + where(net_on, where(take, ahead_start, start_held), t_now)
+    fresh = last + 1.0
+    write = f(lane == fresh - PILOT_QUEUE * (fresh / PILOT_QUEUE).floor()) * f(due)
+    pilot_q_next = [where(write > 0.0, (P * net_span[j]).sum(), q)
+                    for j, q in enumerate((pilot_q0, pilot_q1, pilot_q2, pilot_q3, pilot_q4))]
+    pilot_qstart_next = where(write > 0.0, t_now + PILOT_PREDELAY, pilot_qstart)
+    pilot_seq_next = zero + where(due, fresh, last)
+    pilot_hold_next = zero + where(net_on, where(due, hold - dt + PILOT_INTERVAL, hold - dt), 0.0)
+    # The step ends where the next pending decision takes effect (below, dt_limit),
+    # so a decision is in effect from exactly its start: the page switches
+    # controls at that law time and the server's steps do too.  (The step may run
+    # PILOT_EPS past the start: a step cut an ulp short would leave a window's
+    # remainder of ~1e-15 s, a law call whose velocity update is not continuous.)
+    seq_next = where(net_on, where(take, ahead, seq_held), last)
+    upcoming = seq_next + 1.0
+    upcoming_at = f(lane == upcoming - PILOT_QUEUE * (upcoming / PILOT_QUEUE).floor())
+    gap = (upcoming_at * pilot_qstart_next).sum() - (t_now + dt)
+    until_start = where(net_on & (seq_next < where(due, fresh, last)) & (gap > PILOT_EPS), (gap + PILOT_EPS).clip(0.0, STEP_CAP), STEP_CAP)
+    net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next = (
+        where(is_player, o + zero, old) for o, old in zip(held_o, (net_o0, net_o1, net_o2, net_o3, net_o4)))
+    move_axis = where(net_on, held_o[0] + zero, move_axis)
+    move_axis_y = where(net_on, held_o[1] + zero, move_axis_y)
+    fire = where(net_on, f(held_o[2] > 0.0) + zero, fire)
+    move_axis_z = where(net_on, held_o[3] + zero, move_axis_z)
+    move_axis_r = where(net_on, held_o[4] + zero, move_axis_r)
     steer_x = where(net_on, zero - 1.0, steer_x)
     steer_y = where(net_on, zero - 1.0, steer_y)
 
@@ -1251,7 +1307,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     # bullet the ship's hitbox in one step at any speed.  (The damped motion
     # laws are implicit -- stable at any step -- so the cap is the frame, not a
     # fraction of their damping time.)
-    dt_limit = zero + STEP_CAP
+    dt_limit = zero + until_start
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
     bank_next = where(is_player, ship_bank, bank)
@@ -1285,6 +1341,7 @@ def scroller_step(lane, slot, rx, ry, rz,
             bank_next, vbank_next, fire_prev_next, burst_left_next, last_fire_next, owned_l_next, owned_m_next,
             mult_l_next, mult_m_next, fan_l_next, fan_m_next, bombs_d_next, bombs_c_next, bombs_s_next, beam_next,
             net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next,
+            pilot_hold_next, pilot_seq_next, pilot_hseq_next, pilot_hstart_next, *pilot_q_next, pilot_qstart_next,
             residual, dt_limit)
 
 
@@ -1294,7 +1351,9 @@ STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy",
          "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy",
          "bank", "vbank", "fire_prev", "burst_left", "last_fire", "owned_l", "owned_m", "mult_l", "mult_m",
          "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam",
-         "net_o0", "net_o1", "net_o2", "net_o3", "net_o4")
+         "net_o0", "net_o1", "net_o2", "net_o3", "net_o4",
+         "pilot_hold", "pilot_seq", "pilot_hseq", "pilot_hstart",
+         "pilot_q0", "pilot_q1", "pilot_q2", "pilot_q3", "pilot_q4", "pilot_qstart")
 SETTINGS = ("field_w", "pace", "level", "net_pilot")
 #: The lanes the pilot network is evaluated for (a contiguous block; the
 #: player's, so far).  ``net_pilot`` marks which of them it flies.
@@ -1445,7 +1504,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "mult_l": np.ones(LANES), "mult_m": np.ones(LANES),
         "fire_mode": np.full(LANES, AUTO), "primary_slot": np.zeros(LANES), "move_axis_r": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
-        **{name: np.zeros(LANES) for name in ("net_pilot", "net_o0", "net_o1", "net_o2", "net_o3", "net_o4")},
+        **{name: np.zeros(LANES) for name in ("net_pilot", "net_o0", "net_o1", "net_o2", "net_o3", "net_o4", *PILOT_COLUMNS)},
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
     }
@@ -1504,6 +1563,45 @@ class BulletScroller(EntityGame):
         col = self.session.column
         return controls_from(self, np.array([float(col(f"net_o{j}")[PILOT_ROWS[0]]) for j in range(pilot_law.OUTPUTS)]))
 
+    def law_pilot_due(self) -> bool:
+        """Whether the pilot's next law step takes a decision (its clock has run out)."""
+        col = self.session.column
+        return bool(col("net_pilot")[PILOT_ROWS[0]] > 0.0 and col("pilot_hold")[PILOT_ROWS[0]] <= PILOT_EPS)
+
+    def law_pilot_hold(self) -> float:
+        """Law time until the pilot's next decision."""
+        return float(self.session.column("pilot_hold")[PILOT_ROWS[0]])
+
+    def law_pilot_decision(self) -> dict[str, float]:
+        """The decision the law took last (not yet in effect), as controls."""
+        from meowdoku.autopilot import controls_from
+        col = self.session.column
+        seq = int(col("pilot_seq")[PILOT_ROWS[0]])
+        return controls_from(self, np.array([float(col(f"pilot_q{j}")[seq % PILOT_QUEUE]) for j in range(pilot_law.OUTPUTS)]))
+
+    def law_pilot_intervals(self) -> list[dict[str, Any]]:
+        """The decisions the page needs, held and pending, as interval records:
+        sequence number, law start time, length, the five controls.  Streamed
+        ahead of their start (the pre-delay), each applied by the page over
+        exactly its span of law time."""
+        from meowdoku.autopilot import controls_from
+        col = self.session.column
+        k = PILOT_ROWS[0]
+        if not col("net_pilot")[k] > 0.0:
+            return []
+        held, last = int(col("pilot_hseq")[k]), int(col("pilot_seq")[k])
+        out = []
+        for seq in range(max(held, 1), last + 1):
+            if seq == held:
+                outputs, start = [float(col(f"net_o{j}")[k]) for j in range(pilot_law.OUTPUTS)], float(col("pilot_hstart")[k])
+            else:
+                slot = seq % PILOT_QUEUE
+                outputs, start = [float(col(f"pilot_q{j}")[slot]) for j in range(pilot_law.OUTPUTS)], float(col("pilot_qstart")[slot])
+            c = controls_from(self, np.array(outputs))
+            out.append({"seq": seq, "start": start, "length": PILOT_INTERVAL,
+                        "controls": [float(c.get(n, 0.0)) for n in ("move_axis", "move_axis_y", "move_axis_z", "move_axis_r", "fire")]})
+        return out
+
     def drive_settings(self) -> None:
         """Before each landing: the pace for whoever drives now, who flies
         the player (the law's network or a person), and the pilots."""
@@ -1524,6 +1622,9 @@ class BulletScroller(EntityGame):
         the up/down axis, inverted) and Z (height); and the patch the page
         draws in (the player fixed at its centre)."""
         return {"speed": SPEED, "tau": TAU, "reach": REACH,
+                # the pilot's decision clock: one decision per interval, in effect
+                # `predelay` after it is taken (law seconds)
+                "pilot": {"interval": PILOT_INTERVAL, "predelay": PILOT_PREDELAY},
                 "z": [Z_MARGIN, DEPTH - Z_MARGIN], "depth": DEPTH,
                 "yaw": [YAW_LO, YAW_HI], "spd": [SPD_MIN, self._top_speed()], "bank": [0.0, 2.0 * BANK_MAX],
                 "bank_turn": {"level": BANK_MAX, "gain": BANK_GAIN},

@@ -11,7 +11,7 @@
 // trajectory step of a missile or a bomb; then projected into the patch about
 // the page's own ship by sphere_project.
 
-export const SNAPSHOT_PROTOCOL = 9;           // realtime_socket.PROTOCOL
+export const SNAPSHOT_PROTOCOL = 10;          // realtime_socket.PROTOCOL
 export const FLAG_KEYFRAME = 1, FLAG_CLEAR = 2, FLAG_BODIES = 4;
 
 // One frame: { version } when the layout is another version, else the header,
@@ -22,6 +22,7 @@ export function decodeSnapshot(view, names) {
   const u8 = () => view.getUint8(o++), u16 = () => { const v = view.getUint16(o, true); o += 2; return v; };
   const i16 = () => { const v = view.getInt16(o, true); o += 2; return v; }, f32 = () => { const v = view.getFloat32(o, true); o += 4; return v; };
   const i32 = () => { const v = view.getInt32(o, true); o += 4; return v; };
+  const u32 = () => { const v = view.getUint32(o, true); o += 4; return v; }, f64 = () => { const v = view.getFloat64(o, true); o += 8; return v; };
   const version = u8();
   if (version !== SNAPSHOT_PROTOCOL) return { version };
   const flags = u8(), ack = i32();
@@ -33,6 +34,11 @@ export function decodeSnapshot(view, names) {
   you.bank = f32(); you.vbank = f32(); you.beam = f32();
   you.ux = f32(); you.uy = f32(); you.uz = f32(); you.hx = f32(); you.hy = f32(); you.hz = f32();
   you.pilot = [f32(), f32(), f32(), f32(), f32()];
+  // the law time of this state, and the pilot's interval records (seq, law start, length, the five controls):
+  // each arrives before its start (scroller.PILOT_PREDELAY)
+  you.clock = f64();
+  you.intervals = [];
+  for (let n = u8(); n > 0; n--) { const seq = u32(), start = f64(), length = f32(); you.intervals.push({ seq, start, length, controls: [f32(), f32(), f32(), f32(), f32()] }); }
   for (let n = u8(); n > 0; n--) { const len = u8(); names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   // (a body's flight state: u8 flight, f32 u (3), h (3), spd, turn)
   const body = () => (flags & FLAG_BODIES) ? { flight: u8(), ux: f32(), uy: f32(), uz: f32(), hx: f32(), hy: f32(), hz: f32(), spd: f32(), turn: f32() } : null;

@@ -7,6 +7,7 @@
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
+import { shipStepper, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -2076,7 +2077,6 @@ function cellPosition(game, cell, rackPiece) {
 // integration step sizes) eases out over ~60 ms.
 const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null,
                shots: [], shotSeq: 0, lastShot: -10 };
-const PRED_STEP = 1 / 240;            // the predictor's own rate (PREDICT_HZ)
 window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // ERROR SYNC never jumps the picture.  A correction (the server's word against
@@ -2086,80 +2086,23 @@ const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // recycled to the far edge, a rewind) is taken at once.
 const SYNC_SNAP = 6.0;
 const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min(1, error / 2)));
-function stepShip(ship, input, seconds, motion) {
-  for (let left = seconds; left > 1e-9;) {
-    const dt = Math.min(PRED_STEP, left); left -= dt;
-    const yawBefore = ship.yaw, zBefore = ship.z || 0;
-    for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
-                                                  ["z", "z", "vz", "move_axis_z", "steer_z"],
-                                                  ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null],
-                                                  ["bank", "bank", "vbank", "move_axis", null]]) {
-      // Only the engine's own motion law moves the ship here (the same
-      // damped_axis, compiled to wasm).  An axis that law does not declare is
-      // the server's alone: the page never guesses it with physics of its own.
-      if (!motion[axis]) continue;
-      const bind = motion.bind && motion.bind[axis];
-      if (bind) {
-        // A bound axis (a spherical game's turn, throttle): its own input,
-        // sign and rates; a turn's held finger steers for its bearing from
-        // the ship, as the law computes it.
-        const patch = motion.patch || {};
-        const steering = bind.finger && input.steer_x >= 0;
-        const idle = Math.abs(input[bind.move] || 0) < 0.05;
-        // the bearing's dead zone is the law's (bind.finger_dead): straight
-        // ahead steers nothing, past the edge it counts from the edge
-        const bearing = steering ? Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y) : 0;
-        const dead = bind.finger_dead || 0;
-        const finger = Math.abs(bearing) < dead ? 0 : bearing - Math.sign(bearing) * dead;
-        const aim = steering ? ship[pos] + finger
-          : bind.level != null && idle ? bind.level : -1;          // a released stick returns the axis to its level
-        const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: (bind.sign ?? 1) * (input[bind.move] || 0), target: aim,
-          lo: motion[axis][0], hi: motion[axis][1], speed: bind.speed ?? motion.speed, tau: bind.tau ?? motion.tau,
-          reach: bind.reach ?? motion.reach, dt });
-        ship[pos] = r.x_next; ship[vel] = r.v_next;
-        continue;
-      }
-      // The walls ride the view in a world-frame game (the law's own bounds).
-      const cam = axis === "x" && motion.camera, base = cam ? Math.max(view.x, cam.x) : 0;
-      const lo = cam ? base + cam.margin : motion[axis][0], hi = cam ? base + cam.width - cam.margin : motion[axis][1];
-      const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: input[move] || 0, target: input[target] ?? -1,
-        lo, hi, speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
-      ship[pos] = r.x_next; ship[vel] = r.v_next;
-    }
-    // A banked craft turns: the engine's bank_turn, after the axes, as the law does.
-    if (motion.bank_turn && pred.bankTurn && ship.bank != null) {
-      ship.yaw = pred.bankTurn.invoke({ yaw: ship.yaw, bank: ship.bank, level: motion.bank_turn.level,
-                                        gain: motion.bank_turn.gain, dt }).yaw_next;
-    }
-    // The ship's flight on the sphere: the engine's sphere_turn by this
-    // step's yaw, then sphere_advance by its speed in the air at its height.
-    if (motion.sphere && pred.advance && pred.turn && pred.air && ship.ux != null) {
-      const t = pred.turn.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
-                                   angle: (ship.yaw ?? 0) - (yawBefore ?? 0) });
-      const air = pred.air.invoke({ z: zBefore, fall: motion.sphere.air[0], gain: motion.sphere.air[1] }).factor;
-      const a = pred.advance.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: t.hx_next, hy: t.hy_next, hz: t.hz_next,
-                                      distance: (ship.spd || 0) * dt * air, radius: motion.sphere.radius });
-      ship.ux = a.ux_next; ship.uy = a.uy_next; ship.uz = a.uz_next; ship.hx = a.hx_next; ship.hy = a.hy_next; ship.hz = a.hz_next;
-    }
-    // The land under the ship: the engine's ground_travel, as the law steps it.
-    if (motion.travel && pred.travel && ship.map_gy != null) {
-      const g = pred.travel.invoke({ u: ship.map_u, v: ship.map_v, gx: ship.map_gx, gy: ship.map_gy,
-                                     turn: (ship.yaw ?? 0) - (yawBefore ?? 0), speed: ship.spd || 0, dt });
-      ship.map_u = g.u_next; ship.map_v = g.v_next; ship.map_gx = g.gx_next; ship.map_gy = g.gy_next;
-    }
-  }
-}
-// While the demo player (the server's trained policy) flies, the ship is the
-// server's: the page draws it and predicts nothing.
+const stepShip = shipStepper(pred, () => view);
 // The page predicts its ship always: from its own controls, or -- while the
-// demo pilot flies -- from the pilot's, which every snapshot carries
-// (you.pilot), on the same compiled laws.  Only its own flying is sent.
+// demo pilot flies -- from the pilot's INTERVAL TIMELINE (pilot_timeline.js):
+// the pilot decides on its own slow clock, each decision takes effect
+// motion.pilot.predelay of law time after it is taken and is streamed ahead of
+// its start (you.intervals), and the page applies it over exactly its span of
+// law time, on the same compiled laws.  Only its own flying is sent.
 const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
 const piloting = (game) => !!(game && game.autopilot && game.you && game.you.pilot);
-function pilotControls(game) {
-  const p = game.you.pilot;
-  return { move_axis: p[0], move_axis_y: p[1], move_axis_z: p[2], move_axis_r: p[3], fire: p[4], steer_x: -1, steer_y: -1 };
-}
+const pilotLine = new PilotTimeline();           // the pilot's intervals, keyed to law time
+const pilotRest = intervalControls([0, 0, 0, 0, 0]);
+// The predicted pilot ship is always the server's state at the last snapshot (pilotBase, at law time pilotBaseT)
+// carried to the law time now (pilotAt) through the timeline, in steps that end where the server's do: its tick
+// windows (the spacing of the snapshots' law clocks, pilotWindow).  The laws are discretised, so the same steps
+// give the same ship; a finer step of the page's own would be a (small, growing) disagreement.
+let pilotBase = null, pilotBaseT = 0, pilotAt = null, pilotSeen = -Infinity, pilotWindow = 1 / 40;
+window.meowdokuDebug.pilotLine = pilotLine;
 function reconcile(game) {
   if (!predicting(game) || !game.you || !game.you.alive) { pred.ship = null; return; }
   pred.lane = game.predict.lane;
@@ -2167,13 +2110,19 @@ function reconcile(game) {
   if (game.ack != null) pred.sent = pred.sent.filter((interval) => interval.seq > game.ack);
   const ship = { ...game.you };
   if (piloting(game)) {
-    // the pilot's ship: the server's, carried on by the snapshot's age with
-    // the pilot's controls
+    // the pilot's ship: the server's state at the snapshot's LAW time, carried
+    // on to now by the intervals in effect over each span of law time
     pred.sent = []; pred.closed = []; pred.open = null;
+    if (game.you.clock < pilotSeen - 1) { pilotLine.clear(); pilotSeen = -Infinity; }   // the law clock went back: a new game
+    if (game.you.clock > pilotSeen && pilotSeen > -Infinity) pilotWindow = Math.min(STEP_CAP_S, Math.max(1e-3, game.you.clock - pilotSeen));
+    pilotSeen = game.you.clock;
+    pilotLine.accept(game.you.intervals, game.you.clock);
     // unwinding the latency: the snapshot's age since it arrived plus the
     // half round trip it took to come (the server stepped it that long ago)
-    const age = performance.now() / 1000 - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0);
-    stepShip(ship, pilotControls(game), Math.min(0.3, Math.max(0, age)), game.predict);
+    const age = Math.min(0.3, Math.max(0, performance.now() / 1000 - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0)));
+    pilotBase = { ...game.you }; pilotBaseT = game.you.clock;
+    pilotAt = pilotBaseT + age;
+    pilotLine.integrate(stepShip, ship, pilotBaseT, pilotAt, game.predict, pilotRest, pilotWindow);
   }
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
   // AUTHORITY WITHIN TOLERANCE.  Page and server are two recordings of the
@@ -2222,7 +2171,12 @@ function predictFrame(now) {
   pred.at = now;
   if (!predicting(game)) return;
   if (piloting(game)) {                          // the demo pilot flies: predict with its controls, send nothing
-    if (pred.ship) stepShip(pred.ship, pilotControls(game), frame, game.predict);
+    if (pred.ship && pilotBase) {
+      pilotAt = Math.min(pilotAt + frame, pilotBaseT + 0.5);
+      const ahead = { ...pilotBase };
+      pilotLine.integrate(stepShip, ahead, pilotBaseT, pilotAt, game.predict, pilotRest, pilotWindow);
+      Object.assign(pred.ship, ahead);
+    }
     const decayP = 1 - syncEase(Math.hypot(...pred.offset), frame);
     pred.offset = [pred.offset[0] * decayP, pred.offset[1] * decayP];
     return;

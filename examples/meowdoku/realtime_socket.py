@@ -25,8 +25,17 @@ DELTA, little-endian:
                       ship: entity_motion.ground_travel's state),
                       f32 bank, vbank (its roll axis), beam (its laser's length; 0 off),
                       f32 ux, uy, uz, hx, hy, hz (its place and heading on the sphere),
-                      f32 x5 the demo pilot's controls (roll, throttle, pitch, rudder,
-                      fire; 0 unless the autopilot flies)
+                      f32 x5 the controls in effect of the demo pilot (move_axis,
+                      move_axis_y, move_axis_z, move_axis_r, fire; 0 unless the
+                      autopilot flies),
+                      f64 law clock (the law time of this state),
+                      u8 n, then n pilot INTERVAL records: u32 seq, f64 law start
+                      time, f32 length, f32 x5 controls (same order).  The pilot
+                      decides on its own clock (scroller.PILOT_INTERVAL) and a
+                      decision takes effect PILOT_PREDELAY after it is taken, so
+                      every interval arrives BEFORE its start; the page applies
+                      each over exactly its law-time span.  Only intervals this
+                      connection has not been sent (all of them on a keyframe).
     u8   names        new appearance names this connection has not seen,
                       each u8 length + utf-8; indices count up from 0
     u16  gone         lanes whose entity disappeared, u16 each
@@ -145,7 +154,9 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #:       flags bit1 = face its velocity.
 #:   9 = frame flags bit2 (bodies): spawn and update records end with the
 #:       body's flight state (u8 flight, f32 u, h, spd, turn).
-PROTOCOL = 9
+#:  10 = the header ends with the law clock (f64) and the pilot's interval
+#:       records (u8 n; u32 seq, f64 start, f32 length, f32 x5 controls).
+PROTOCOL = 10
 
 def _pack_body(body: dict[str, Any]) -> bytes:
     """A body's flight state: u8 flight, f32 u (3), h (3), spd, turn."""
@@ -168,6 +179,7 @@ class SnapshotEncoder:
         self.meta_sent: dict[str, Any] = {}
         self.bytes_sent = 0
         self.frames_sent = 0
+        self.pilot_sent = 0           # the last pilot interval (seq) this connection was sent
 
     def _name(self, name: str, fresh: list[str]) -> int:
         if name not in self.names:
@@ -230,6 +242,7 @@ class SnapshotEncoder:
         if clear:
             self.game, self.epoch, self.known, self.keyframe_at = game, epoch, {}, None
             self.sim, self.sim_clock = {}, None
+            self.pilot_sent = 0
         keyframe = clear or self.keyframe_at is None or clock - self.keyframe_at >= KEYFRAME_S or clock < self.keyframe_at
         if keyframe:
             self.keyframe_at = clock
@@ -306,6 +319,14 @@ class SnapshotEncoder:
                              float(you.get("bank", 0.0)), float(you.get("vbank", 0.0)), float(you.get("beam", 0.0)),
                              *(float(you.get(n, 0.0)) for n in ("ux", "uy", "uz", "hx", "hy", "hz")),
                              *(float(v) for v in (you.get("pilot") or [0.0] * 5)))]
+        intervals = sorted(you.get("pilot_intervals") or (), key=lambda r: r["seq"])
+        if intervals and intervals[-1]["seq"] < self.pilot_sent:
+            self.pilot_sent = 0                        # the law's counter began again
+        intervals = [r for r in intervals if keyframe or r["seq"] > self.pilot_sent]
+        parts.append(struct.pack("<dB", clock, len(intervals)))
+        for r in intervals:
+            parts.append(struct.pack("<Idf5f", int(r["seq"]), float(r["start"]), float(r["length"]), *(float(v) for v in r["controls"])))
+            self.pilot_sent = max(self.pilot_sent, int(r["seq"]))
         parts.append(struct.pack("<B", len(fresh)))
         for name in fresh:
             raw = name.encode("utf-8")
