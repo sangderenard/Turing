@@ -252,3 +252,13 @@ def test_stall_penalty_compares_against_recent_average():
     assert ap.stall_penalty(hist[:2], (0.5, 0.0), 3) == 0.0           # too little history
     assert ap.stall_penalty(hist, (0.6, 0.2), 3) == ap.STALL_PENALTY  # pacing around the same spot
     assert ap.stall_penalty(hist, (5.0, 0.0), 3) == 0.0               # moved on
+
+
+def test_time_trickle_charges_at_the_usual_score_rate(monkeypatch):
+    monkeypatch.setattr(ap, "SCORE_RATE", {})
+    assert ap.time_trickle("g", 20.0, 2.0) == 20.0                  # first span: the usual rate is its own
+    for _ in range(200):
+        ap.time_trickle("g", 20.0, 2.0)                             # settles at 10 points / s
+    fast = 40.0 - ap.time_trickle("g", 40.0, 2.0)                   # twice the usual rate
+    slow = 0.0 - ap.time_trickle("g", 0.0, 2.0)                     # nothing scored: pays for the time
+    assert fast > 15.0 and slow < -15.0

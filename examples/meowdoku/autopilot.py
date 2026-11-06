@@ -1404,6 +1404,22 @@ ROOM_REWARD, DAMAGE_REWARD, RETURN_SHARE = 100.0, 100.0, 0.5
 #: room) is charged STALL_PENALTY -- pacing or hovering in place is not progress even when nothing hurts.
 STALL_TILES, STALL_SECONDS, STALL_PENALTY = 1.5, 4.0, 50.0
 
+#: Time trickle: every span pays for its seconds at the game's running average score rate (an
+#: exponential average over spans, SCORE_RATE_ALPHA per span), so a span earns credit only by scoring
+#: FASTER than usual -- time spent costs like slow damage, and score has to outpace it.
+SCORE_RATE_ALPHA = 0.05
+SCORE_RATE: dict[str, float] = {}
+
+
+def time_trickle(game_name: str, gained: float, seconds: float) -> float:
+    """The charge for ``seconds`` of play that scored ``gained``; updates the game's running rate."""
+    if seconds <= 0.0:
+        return 0.0
+    rate = gained / seconds
+    usual = SCORE_RATE.get(game_name, rate)
+    SCORE_RATE[game_name] = (1.0 - SCORE_RATE_ALPHA) * usual + SCORE_RATE_ALPHA * rate
+    return usual * seconds
+
 
 def stall_penalty(history: list, mean: tuple, needed: int) -> float:
     """The loitering charge for a span with average position ``mean`` after the per-decision
@@ -1453,13 +1469,17 @@ class PlayTrace:
             x = np.stack([r[0] for r in self.ring])
             y = np.stack([r[1] for r in self.ring])
             reward = span_reward(self.game, self.start, self.last) if self.start is not None and self.last is not None else 0.0
+            d = declared(self.game.game) if self.game is not None else None
+            step = float(getattr(d, "step", None) or 0.05)
+            if self.start is not None and self.last is not None:
+                reward -= time_trickle(self.game.game, self.last.get("score", 0.0) - self.start.get("score", 0.0),
+                                       len(self.ring) * step)
             if self.positions:
                 if self.start is not None and self.last is not None and self.last.get("rooms", 0.0) != self.start.get("rooms", 0.0):
                     self.span_means.clear()          # a new room: positions are not comparable
                 mean = (sum(q[0] for q in self.positions) / len(self.positions),
                         sum(q[1] for q in self.positions) / len(self.positions))
-                d = declared(self.game.game) if self.game is not None else None
-                needed = max(1, int(round(STALL_SECONDS / float(getattr(d, "step", None) or 0.05))))
+                needed = max(1, int(round(STALL_SECONDS / step)))
                 reward -= stall_penalty(self.span_means, mean, needed)
                 self.span_means = (self.span_means + self.positions)[-needed:]
             self.pending.append((x, y, int(tag), float(reward)))
