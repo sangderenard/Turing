@@ -251,7 +251,9 @@ class _FunctionEmitter:
         gather_slots: Mapping[int, int] | None = None,
         gather_base: int = 0,
         gather_iota: Sequence[int] = (),
+        gather_refs: Mapping[int, tuple[str, int]] | None = None,
     ):
+        self.gather_refs = None if gather_refs is None else dict(gather_refs)
         self.gather_iota = frozenset(int(i) for i in gather_iota)
         self.gather_slots = None if gather_slots is None else dict(gather_slots)
         self.gather_base = int(gather_base)
@@ -365,6 +367,9 @@ class _FunctionEmitter:
             elif slot is None:
                 self.fail(operation, f"gather source %{instr.args[0].id} has no arena slot")
                 return
+            elif self.gather_refs is not None:
+                var, base = self.gather_refs[int(instr.args[0].id)]
+                expression = f"{var}[{base}u + min(u32(max({args[1]}, 0.0f)), {count - 1}u)]"
             else:
                 expression = (
                     f"arena[{self.gather_base + slot * count}u + min(u32(max({args[1]}, 0.0f)), {count - 1}u)]"
@@ -1854,16 +1859,23 @@ class WGSLPassProgram:
     backend_identity_decisions: tuple[Any, ...] = ()
     launch_plan: Any = None
     uniform_index: dict[int, int] = None     # uniform formal id -> element index in the arena's head
-    lane_base: int = 0                       # elements before the first lane slot
+    lane_base: int = 0                       # unused: the uniform head is its own binding
     iota_ids: tuple[int, ...] = ()           # formals the shader derives from its invocation index
+    bindings: int = 1                        # lane bindings ``lane0``..; the uniform ``head`` is binding ``bindings``
+    slots_per_binding: int = 1               # slot s is in lane binding s // slots_per_binding at element (s % slots_per_binding) * count
+    slot_report: tuple = ()                  # (slot, value id, producing op, dispatch defined, dispatch last read): the arena's occupancy
 
     @property
     def arena_elements(self) -> int:
-        return self.lane_base + self.slots * self.count
+        return self.slots * self.count + len(self.uniform_index or ())
 
     @property
     def dispatches(self) -> int:
         return len(self.entries)
+
+
+#: the most operations a rematerialised lane value may cost per use (counted as a tree)
+REMAT_CONE_LIMIT = 96
 
 
 def emit_tensor_program_passes(
@@ -1875,6 +1887,7 @@ def emit_tensor_program_passes(
     name: str | None = None,
     preferred_local_size: int = 64,
     iota_args: Sequence[int] = (),
+    binding_bytes: int = 256 * 1024 * 1024,
 ) -> WGSLPassProgram:
     """Compute dispatches for a tensor law in the elementwise + gather kernel-call
     form.  Rank-zero formals are uniforms (element 0 of their slot).  Anything
@@ -1905,7 +1918,7 @@ def emit_tensor_program_passes(
     formal_set = set(formal_ids)
     iota_set = {int(i) for i in iota_args}
     uniform_index = {i: k for k, i in enumerate(uniform_ids)}
-    lane_base = -(-max(len(uniform_ids), 1) // 4) * 4
+    lane_base = 0
     # ---- cut into dispatches
     seg_of: dict[int, int] = {}              # instr index -> dispatch
     def_seg: dict[int, int] = {i: -1 for i in lane_ids if i in formal_set}
@@ -1930,6 +1943,31 @@ def emit_tensor_program_passes(
         if str(item.op) == "gather":
             gather_sources.add(int(item.args[0].id))
     output_ids = [int(v.id) for v in lowered_outputs]
+    # REMATERIALISATION.  A lane value computed only from feeds, the iota, uniforms and other such
+    # values (no gather in its cone) is a pure function of data that does not change during the program,
+    # so a dispatch that needs it recomputes it instead of reading a stored copy: it holds no arena slot
+    # (4 bytes per id) across the dispatches between its definition and its uses.  A sort stage's
+    # ``partner``/``lower``/``upper`` are exactly this.  Values that are published, or that a gather
+    # reads from memory, are stored as before.
+    remat: dict[int, Instr] = {}
+    cone: dict[int, int] = {}
+    for item in instrs:
+        if item.res is None:
+            continue
+        r = int(item.res.id)
+        if r not in lane_ids or str(item.op) == "gather" or r in output_ids or r in gather_sources or r in formal_set:
+            continue
+        size, free = 1, True
+        for argument in item.args:
+            a = int(argument.id)
+            if a in remat:
+                size += cone[a]
+            elif a in lane_ids and a not in formal_set:
+                free = False
+                break
+        if free and size <= REMAT_CONE_LIMIT:
+            remat[r] = item
+            cone[r] = size
     slot_of: dict[int, int] = {}
     for i in formal_ids:
         if i in iota_set or i in uniform_index:
@@ -1944,7 +1982,7 @@ def emit_tensor_program_passes(
         if item.res is None:
             continue
         r = int(item.res.id)
-        if r not in lane_ids or r in slot_of:
+        if r not in lane_ids or r in slot_of or r in remat:
             continue
         if last_use.get(r, -1) > seg_of[index] or r in gather_sources:
             for entry in pool:
@@ -1957,6 +1995,18 @@ def emit_tensor_program_passes(
                 pool.append([next_slot, last_use.get(r, seg_of[index])])
                 next_slot += 1
     slots = next_slot
+    # The arena is split across storage bindings of at most ``binding_bytes`` each, so no single
+    # buffer limit caps the total, and the lane extent need not be a power of two or padded:
+    # slot s is in ``lane{s // spb}`` at element (s % spb) * count.
+    spb = max(1, int(binding_bytes) // (4 * int(count)))
+    bindings = -(-slots // spb)
+
+    ops_of = {int(item.res.id): str(item.op) for item in instrs if item.res is not None}
+    report = tuple(sorted(
+        (slot_of[v], v, ops_of.get(v, "formal"), def_seg.get(v, -1), last_use.get(v, -1)) for v in slot_of))
+
+    def ref(slot: int) -> tuple[str, int]:
+        return f"lane{slot // spb}", (slot % spb) * int(count)
     # ---- emit the dispatches
     scalar_defs: dict[int, Instr] = {}
     for item in instrs:
@@ -1970,14 +2020,22 @@ def emit_tensor_program_passes(
         emitter = _FunctionEmitter(
             function, outputs=(), loop_records=(), store_outputs=False,
             invocation_count=n, gather_slots=slot_of, gather_base=lane_base, gather_iota=iota_set,
+            gather_refs={v: ref(sl) for v, sl in slot_of.items()},
         )
-        local = [(index, item) for index, item in enumerate(instrs) if seg_of[index] == s]
+        local = [(index, item) for index, item in enumerate(instrs)
+                 if seg_of[index] == s and not (item.res is not None and int(item.res.id) in remat)]
         defined_here = {int(item.res.id) for _i, item in local if item.res is not None}
         emitted_scalars: set[int] = set()
 
         def need(value: SSAValue, emitter=emitter, defined_here=defined_here, emitted_scalars=emitted_scalars) -> None:
             v = int(value.id)
             if v in emitter.declared:
+                return
+            if v in remat:
+                for argument in remat[v].args:
+                    need(argument)
+                emitter.emit_assignment(remat[v], "  ")
+                emitter.declared.add(v)
                 return
             if v in lane_ids:
                 if v in defined_here:
@@ -1986,12 +2044,13 @@ def emit_tensor_program_passes(
                 if v in iota_set:
                     emitter.lines.append(f"  let v_{v}: {dtype} = f32(i);")
                 else:
-                    emitter.lines.append(f"  let v_{v}: {dtype} = arena[{lane_base + slot_of[v] * n}u + i];")
+                    var, base = ref(slot_of[v])
+                    emitter.lines.append(f"  let v_{v}: {dtype} = {var}[{base}u + i];")
                 emitter.declared.add(v)
                 return
             if v in formal_set:
                 dtype = emitter.dtype(value) or "f32"
-                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{uniform_index[v]}u];")
+                emitter.lines.append(f"  let v_{v}: {dtype} = head[{uniform_index[v]}u];")
                 emitter.declared.add(v)
                 return
             definition = scalar_defs.get(v)
@@ -2014,7 +2073,8 @@ def emit_tensor_program_passes(
                 continue
             r = int(item.res.id)
             if r in lane_ids and r in slot_of and (r in output_ids or last_use.get(r, -1) > s or r in gather_sources):
-                emitter.lines.append(f"  arena[{lane_base + slot_of[r] * n}u + i] = v_{r};")
+                var, base = ref(slot_of[r])
+                emitter.lines.append(f"  {var}[{base}u + i] = v_{r};")
         all_shortfalls.extend(emitter.shortfalls)
         entry = f"p{s}"
         entries.append(entry)
@@ -2027,7 +2087,9 @@ def emit_tensor_program_passes(
             "}",
             "",
         ]))
-    source = "\n".join(["@group(0) @binding(0) var<storage, read_write> arena: array<f32>;", "", *bodies])
+    declarations = [f"@group(0) @binding({b}) var<storage, read_write> lane{b}: array<f32>;" for b in range(bindings)]
+    declarations.append(f"@group(0) @binding({bindings}) var<storage, read_write> head: array<f32>;")
+    source = "\n".join([*declarations, "", *bodies])
     # a 2D grid keeps each dimension under the device's workgroup limit (65535 by default)
     total_groups = -(-n // local_x)
     group_x = min(total_groups, 16384)
@@ -2037,4 +2099,6 @@ def emit_tensor_program_passes(
         tuple(entries), (local_x, 1, 1), groups, slots,
         {i: slot_of[i] for i in formal_ids if i in slot_of}, {i: slot_of[i] for i in output_ids}, uniform_ids,
         identity.decisions, plan, uniform_index, lane_base, tuple(sorted(iota_set & formal_set)),
+        bindings, spb,
+        slot_report=report,
     )

@@ -20,11 +20,10 @@ from meowdoku import fountain as F  # noqa: E402
 from meowdoku import fountain_build as B  # noqa: E402
 
 
-def test_the_size_ladder_reaches_ten_million_with_power_of_two_sort_lengths():
+def test_the_size_ladder_reaches_ten_million_without_padding():
     counts = [count for _tag, (count, _pad) in F.SIZES.items()]
     assert counts == [256, 4096, 16384, 65536, 262144, 1048576, 4194304, 10_000_000]
-    assert F.SIZES["10M"][1] == 1 << 24 and F.SIZES["4M"][1] == 4194304
-    assert all(pad & (pad - 1) == 0 and pad >= count for count, pad in F.SIZES.values())
+    assert all(pad == count for count, pad in F.SIZES.values())           # no power-of-two pad: the sort is a merge exchange
 
 
 def test_every_per_id_constant_is_derived_from_the_id_so_mix_picks_the_species():
@@ -97,28 +96,33 @@ def test_hue_modes_trig_and_rotation_differ_and_stay_in_range(native_piece):
 
 
 def test_the_compiler_chooses_per_size_and_the_program_carries_no_per_id_data():
+    # 256 ids sits at the break-even (K_RUN = 16 candidates per row put it just over the model's bar):
+    # the verdict is the classifier's, so the test holds only that it is the weakest of the ladder
     small = B.verdict_for("small")
-    assert not small.pays
+    assert small.speedup < B.verdict_for("4k").speedup / 2
     for tag in ("4k", "64k", "1M", "10M"):
         assert B.verdict_for(tag).pays, tag
     compiled, _program, _outputs, ids = B.passes_for("10M")
     assert compiled.complete, compiled.shortfalls
     pad = F.SIZES["10M"][1]
-    # N is baked into the dispatch structure: 24 bits -> 24*25/2 sort stages + search/contact + the iota
-    assert compiled.dispatches == 24 * 25 // 2 + 2
+    # N is baked into the dispatch structure: Knuth's merge-exchange stages + search/contact + the iota
+    assert compiled.dispatches == len(F.merge_exchange_stages(F.SIZES["10M"][0])) + 2
     assert compiled.groups[1] > 1 and compiled.groups[0] * compiled.groups[1] * 64 >= pad     # a 2D grid
     assert ids["pid"] not in compiled.feed_slots                       # the iota is the invocation index
     assert sorted(compiled.feed_slots) == sorted(ids[n] for n in F.STATE + ("ir", "ig", "ib"))
-    assert "arena[" in compiled.source and "f32(i)" in compiled.source
-    assert compiled.arena_elements * 4 / pad < 200                     # bytes per id
+    assert "lane0[" in compiled.source and "f32(i)" in compiled.source
+    assert compiled.arena_elements * 4 / pad < 100                     # bytes per id (rematerialised sort temporaries hold no slot)
+    # the arena is split across bindings of at most 256 MiB, none of the single-buffer limit's business
+    assert compiled.bindings > 1 and compiled.slots_per_binding * pad * 4 <= 256 * 1024 * 1024
+    assert compiled.bindings == -(-compiled.slots // compiled.slots_per_binding)
 
 
 def test_the_wgsl_program_is_generated_from_the_authored_law():
     compiled, _program, _outputs, ids = B.passes_for("small")
     assert compiled.complete, compiled.shortfalls
-    assert compiled.dispatches == 8 * 9 // 2 + 2
+    assert compiled.dispatches == len(F.merge_exchange_stages(256)) + 2
     assert "atan2(" in compiled.source and "tanh(" in compiled.source
-    assert compiled.source.count("@binding(") == 1
+    assert compiled.source.count("@binding(") == compiled.bindings + 1       # the lane bindings and the uniform head
     assert compiled.backend_identity_decisions[0].identity == "shader_float64_storage_to_float32"
     assert set(compiled.uniform_index) == {ids[n] for n in F.UNIFORMS}
 
@@ -216,3 +220,23 @@ def test_server_game_declares_a_compute_product_sizes_and_count_only_images():
     assert game.state()["has_image"]
     with pytest.raises(ValueError):
         game.do({"type": "fountain_image", "count": 5})
+
+
+def test_the_merge_exchange_network_sorts_every_length():
+    rng = np.random.default_rng(7)
+    for n in (2, 3, 5, 17, 100, 1000, 4097):
+        cell = rng.integers(0, 40, n).astype(np.float64)
+        pid = np.arange(n, dtype=np.float64)
+        kc, ki = cell.copy(), pid.copy()
+        for (p, d, r) in F.merge_exchange_stages(n):
+            bs = np.floor(pid / p) - 2 * np.floor(pid / (2 * p))
+            pj = np.clip(pid - d, 0, n - 1)
+            bo = np.floor(pj / p) - 2 * np.floor(pj / (2 * p))
+            lower = (np.abs(bs - r) < .5) * (pid + d < n)
+            upper = (np.abs(bo - r) < .5) * (pid >= d) * (1 - lower)
+            partner = (pid + d * (lower - upper)).astype(int)
+            oc, oi = kc[partner], ki[partner]
+            less = (kc < oc) * 1.0 + (np.abs(kc - oc) < .5) * (ki < oi)
+            keep = (1 - lower - upper) + lower * less + upper * (1 - less)
+            kc, ki = np.where(keep > .5, kc, oc), np.where(keep > .5, ki, oi)
+        assert np.array_equal(ki, np.lexsort((pid, cell))), n

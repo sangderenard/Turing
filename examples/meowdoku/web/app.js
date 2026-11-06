@@ -3108,7 +3108,7 @@ async function wobInitGpu() {
   if (wob.gpu || wob.gpuState === "pending") return;
   wob.gpuState = "pending";
   try {
-    const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error("no adapter");
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }); if (!adapter) throw new Error("no adapter");
     const device = await adapter.requestDevice();
     device.lost.then(() => { wob.gpu = null; wob.gpuState = "lost"; wob.useGpu = false; syncWobbleUi(); });
     wob.gpu = makeGpuCage(device, WOB_CAP); wob.gpuState = "ready"; wob.resetAll = true;
@@ -3117,7 +3117,7 @@ async function wobInitGpu() {
 // Run the same random inputs through the CPU kernel and a fresh GPU cage; returns the largest difference.
 async function wobbleParity(steps = 120) {
   if (!navigator.gpu) return null;
-  const device = await (await navigator.gpu.requestAdapter()).requestDevice(), cap = 16, cage = makeGpuCage(device, cap);
+  const device = await (await navigator.gpu.requestAdapter({ powerPreference: "high-performance" })).requestDevice(), cap = 16, cage = makeGpuCage(device, cap);
   const P = new Float32Array(cap * 16), D = new Float32Array(cap * 24), U = new Float32Array(cap * 24);
   let seed = 12345; const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296 - 0.5;
   let worst = 0;
@@ -3446,12 +3446,12 @@ function renderGameControls(game) {
     if (s.kind === "button") el.disabled = s.enabled === false;
     const input = el.querySelector("input:not([type=file]), select");
     if (input && s.id === "size" && compute.support) {
-      // a size this device (or browser) cannot hold is offered but disabled, with the reason
+      // a size whose bindings this device cannot structurally run is offered but disabled, with the reason (memory is never a gate: it is allocated and a failure reported)
       for (const option of input.options) {
         const verdict = compute.support[option.value];
         option.disabled = !!verdict && !verdict.ok;
         const base = option.dataset.label || (option.dataset.label = option.textContent);
-        option.textContent = verdict && !verdict.ok ? `${base} (too large for this device)` : base;
+        option.textContent = verdict && !verdict.ok ? `${base} (unsupported here)` : base;
         option.title = verdict && !verdict.ok ? verdict.reason : verdict && verdict.note ? verdict.note : "";
         if (verdict && !verdict.ok) input.title = verdict.reason;
       }
@@ -4244,7 +4244,7 @@ let layoutTimer = null;
 new ResizeObserver(() => {
   clearTimeout(layoutTimer);
   layoutTimer = setTimeout(() => {
-    if (state.game && state.game.board === "free") act({ type: "layout", aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) });
+    if (state.game && state.game.board === "free") act({ type: "layout", aspect: Math.min(3.0, Math.max(0.4, canvas.clientWidth / Math.max(1, canvas.clientHeight))) });   // a game declares its world; a strip or a column of screen never reshapes it
   }, 250);
 }).observe(canvas);
 

@@ -126,6 +126,7 @@ def build_size(tag: str, web_dir: Path) -> dict:
             "count": pad, "workgroup_size": list(compiled.workgroup_size), "groups": list(compiled.groups),
             "entries": list(compiled.entries), "slots": compiled.slots, "dispatches": compiled.dispatches,
             "lane_base": compiled.lane_base, "arena_elements": compiled.arena_elements,
+            "bindings": compiled.bindings, "slots_per_binding": compiled.slots_per_binding,
             "arguments": list(F.ARGUMENTS), "uniforms": list(F.UNIFORMS), "iota": list(F.IOTA),
             "outputs": list(F.OUTPUTS),
             "feed_slots": {name: compiled.feed_slots[ids[name]] for name in F.ARGUMENTS if ids[name] in compiled.feed_slots},

@@ -64,98 +64,114 @@ export function sampleRasterAt(raster, X, Y, count, into) {
 }
 
 // ---------------------------------------------------------------- GPU route
+// The arena is SPLIT across storage bindings (the compiler's `bindings`, `slots_per_binding`): slot s
+// lives in lane buffer floor(s / spb) at element (s % spb) * pad, so no single-buffer limit caps the
+// size.  The uniforms are their own small `head` buffer.  `ref(slot)` spells "lane<k>[base + i]".
 const PACK_WGSL = `
-@group(0) @binding(0) var<storage, read> arena: array<f32>;
-@group(0) @binding(1) var<storage, read_write> pts: array<f32>;
+__LANES__
+@group(0) @binding(__PTSB__) var<storage, read_write> pts: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {
   let j = g.x + g.y * grid.x * 64u;
   if (j >= __NDISP__u) { return; }
   let i = j * __STRIDE__u;
-  let live = arena[__AGE__u + i] >= f32(i) * __RATE__f;
-  let vx = arena[__VX__u + i];
-  let vy = arena[__VY__u + i];
+  let live = __AGE__ >= f32(i) * __RATE__f;
+  let vx = __VX__;
+  let vy = __VY__;
   let rest = (vx * vx + vy * vy) < __REST2__;
-  let c = pack4x8unorm(vec4<f32>(arena[__R__u + i], arena[__G__u + i], arena[__B__u + i], 1.0));
-  pts[4u * j] = arena[__X__u + i];
-  pts[4u * j + 1u] = arena[__Y__u + i];
+  let c = pack4x8unorm(vec4<f32>(__R__, __G__, __B__, 1.0));
+  pts[4u * j] = __X__;
+  pts[4u * j + 1u] = __Y__;
   pts[4u * j + 2u] = bitcast<f32>(c);
-  pts[4u * j + 3u] = select(0.0, select(100.0, 200.0, rest) + arena[__RAD__u + i] * 1000.0, live);
+  pts[4u * j + 3u] = select(0.0, select(100.0, 200.0, rest) + __RAD__ * 1000.0, live);
 }`;
 
 class GpuProduct {
   kind = "webgpu-compute";
 
-  // Limits first, allocation after: a size the device cannot hold is refused here, never attempted.
+  // Structural limits only (a binding's size, the bindings a stage may use, the workgroup grid).  The
+  // total is NOT gated here: it is allocated under an out-of-memory error scope and a real failure is
+  // reported.  There is no size gate.
   static async limits(rec) {
-    const adapter = await navigator.gpu.requestAdapter();
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return { ok: false, reason: "no WebGPU adapter" };
-    const L = adapter.limits, abi = rec.wgsl_abi, bytes = rec.memory.arena_bytes;
-    const need = bytes + rec.memory.display_bytes;
-    if (bytes > L.maxStorageBufferBindingSize) return { ok: false, reason: `the arena is ${mb(bytes)} and this device binds at most ${mb(L.maxStorageBufferBindingSize)} (maxStorageBufferBindingSize)` };
-    if (bytes > L.maxBufferSize) return { ok: false, reason: `the arena is ${mb(bytes)} and this device allows buffers of at most ${mb(L.maxBufferSize)} (maxBufferSize)` };
+    const L = adapter.limits, abi = rec.wgsl_abi;
+    const bindingBytes = abi.slots_per_binding * rec.pad * 4;
+    if (bindingBytes > L.maxStorageBufferBindingSize) return { ok: false, reason: `a ${mb(bindingBytes)} binding exceeds this device's maxStorageBufferBindingSize (${mb(L.maxStorageBufferBindingSize)})` };
+    if (bindingBytes > L.maxBufferSize) return { ok: false, reason: `a ${mb(bindingBytes)} buffer exceeds this device's maxBufferSize (${mb(L.maxBufferSize)})` };
+    if (abi.bindings + 1 > L.maxStorageBuffersPerShaderStage) return { ok: false, reason: `needs ${abi.bindings + 1} storage bindings per stage; the device allows ${L.maxStorageBuffersPerShaderStage}` };
     if (Math.max(abi.groups[0], abi.groups[1]) > L.maxComputeWorkgroupsPerDimension) return { ok: false, reason: `needs ${abi.groups[0]}x${abi.groups[1]} workgroups; the device allows ${L.maxComputeWorkgroupsPerDimension} per dimension` };
-    return { ok: true, need, adapter, limits: L };
+    return { ok: true, adapter, limits: L, bindingBytes };
   }
 
   async init(rec, manifest) {
     const check = await GpuProduct.limits(rec);
     if (!check.ok) throw new Error("refused: " + check.reason);
-    const adapter = check.adapter, L = check.limits;
+    const adapter = check.adapter, A = rec.wgsl_abi, B = A.bindings;
     this.device = await adapter.requestDevice({ requiredLimits: {
-      maxStorageBufferBindingSize: Math.min(L.maxStorageBufferBindingSize, Math.max(rec.memory.arena_bytes, 134217728)),
-      maxBufferSize: Math.min(L.maxBufferSize, Math.max(rec.memory.arena_bytes, 268435456)) } });
+      maxStorageBufferBindingSize: Math.max(check.bindingBytes, 134217728),
+      maxBufferSize: Math.max(check.bindingBytes, 268435456),
+      maxStorageBuffersPerShaderStage: Math.max(B + 1, 8) } });
     this.device.addEventListener?.("uncapturederror", (e) => { this.failure = String((e.error && e.error.message) || e.error); });
     this.adapterInfo = adapter.info ? [adapter.info.vendor, adapter.info.architecture, adapter.info.device].filter(Boolean).join("/") : "";
-    this.rec = rec; this.n = rec.n; this.pad = rec.pad; this.abi = rec.wgsl_abi; this.manifest = manifest;
+    this.rec = rec; this.n = rec.n; this.pad = rec.pad; this.abi = A; this.manifest = manifest;
     this.state = manifest.law.state;
-    const A = this.abi;
-    this.at = (slot) => A.lane_base + slot * this.pad;           // element offset of a lane slot
+    const pad = this.pad, spb = A.slots_per_binding;
+    this.laneOf = (slot) => Math.floor(slot / spb);
+    this.byteAt = (slot) => (slot % spb) * pad * 4;                     // byte offset of a lane slot in its buffer
+    this.ref = (slot) => `lane${Math.floor(slot / spb)}[${(slot % spb) * pad}u + i]`;
+    const lanes = (access) => Array.from({ length: B }, (_, b) => `@group(0) @binding(${b}) var<storage, ${access}> lane${b}: array<f32>;`).join("\n");
     const code = await fetch(rec.wgsl).then((r) => r.text());
     const module = this.device.createShaderModule({ code });
     this.#check(await module.getCompilationInfo(), "generated WGSL");
-    const layout = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }] });
+    const entries = Array.from({ length: B + 1 }, (_, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }));
+    const layout = this.device.createBindGroupLayout({ entries });
     const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [layout] });
     this.pipelines = [];
     for (let k = 0; k < A.entries.length; k += 64) {                 // in batches: hundreds of entry points at the largest sizes
       this.pipelines.push(...await Promise.all(A.entries.slice(k, k + 64).map((entryPoint) =>
         this.device.createComputePipelineAsync({ layout: pipelineLayout, compute: { module, entryPoint } }))));
     }
-    const slot = (name) => this.at(A.feed_slots[name]), oslot = (name) => this.at(A.output_slots[name]), p = manifest.points;
+    const slot = (name) => A.feed_slots[name], oslot = (name) => A.output_slots[name], p = manifest.points;
     const stride = rec.display_stride, ndisp = rec.memory.display_ids;
     // the state commit: each state output over its feed slot, one more dispatch (WebGPU forbids a copy within one buffer)
-    const commit = this.state.map((name) => `  arena[${slot(name)}u + i] = arena[${oslot(name + "_next")}u + i];`).join("\n");
-    const total = Math.ceil(this.pad / 64);
-    const commitModule = this.device.createShaderModule({ code: `@group(0) @binding(0) var<storage, read_write> arena: array<f32>;
+    const commit = this.state.map((name) => `  ${this.ref(slot(name))} = ${this.ref(oslot(name + "_next"))};`).join("\n");
+    const commitModule = this.device.createShaderModule({ code: `${lanes("read_write")}
+@group(0) @binding(${B}) var<storage, read_write> head: array<f32>;
 @compute @workgroup_size(64) fn commit(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {
   let i = g.x + g.y * grid.x * 64u;
-  if (i >= ${this.pad}u) { return; }
+  if (i >= ${pad}u) { return; }
 ${commit}
 }` });
     this.#check(await commitModule.getCompilationInfo(), "commit WGSL");
     this.pipelines.push(await this.device.createComputePipelineAsync({ layout: pipelineLayout, compute: { module: commitModule, entryPoint: "commit" } }));
-    const packCode = PACK_WGSL.replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride))
-      .replaceAll("__AGE__", slot(p.live[0])).replaceAll("__RATE__", rec.emit_rate.toPrecision(9))
-      .replaceAll("__X__", slot(p.x)).replaceAll("__Y__", slot(p.y)).replaceAll("__VX__", slot(p.vx)).replaceAll("__VY__", slot(p.vy))
-      .replaceAll("__R__", oslot(p.rgb[0])).replaceAll("__G__", oslot(p.rgb[1])).replaceAll("__B__", oslot(p.rgb[2]))
-      .replaceAll("__RAD__", oslot(p.radius)).replaceAll("__REST2__", (p.rest_speed * p.rest_speed).toFixed(8));
+    // the pack pass reads element j * stride of a slot, not i
+    const at = (s) => `lane${Math.floor(s / spb)}[${(s % spb) * pad}u + i]`;
+    const packCode = PACK_WGSL.replace("__LANES__", lanes("read_write")).replace("__PTSB__", String(B))
+      .replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride)).replaceAll("__RATE__", rec.emit_rate.toPrecision(9))
+      .replaceAll("__AGE__", at(slot(p.live[0]))).replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y)))
+      .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy)))
+      .replaceAll("__R__", at(oslot(p.rgb[0]))).replaceAll("__G__", at(oslot(p.rgb[1]))).replaceAll("__RAD__", at(oslot(p.radius)))
+      .replaceAll("__B__", at(oslot(p.rgb[2]))).replaceAll("__REST2__", (p.rest_speed * p.rest_speed).toFixed(8));
     const pack = this.device.createShaderModule({ code: packCode });
     this.#check(await pack.getCompilationInfo(), "pack WGSL");
-    this.pack = await this.device.createComputePipelineAsync({ layout: "auto", compute: { module: pack, entryPoint: "main" } });
+    const packEntries = Array.from({ length: B + 1 }, (_, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }));
+    const packLayout = this.device.createBindGroupLayout({ entries: packEntries });
+    this.pack = await this.device.createComputePipelineAsync({ layout: this.device.createPipelineLayout({ bindGroupLayouts: [packLayout] }), compute: { module: pack, entryPoint: "main" } });
     this.ndisp = ndisp;
-    // allocation, with out-of-memory caught: a refusal, not a crash
+    // allocation, with out-of-memory caught: a real failure reported, never a size gate
     this.device.pushErrorScope("out-of-memory");
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    this.arena = this.device.createBuffer({ size: rec.memory.arena_bytes, usage: S });
+    const lastSlots = A.slots - spb * (B - 1);
+    this.lanes = Array.from({ length: B }, (_, b) => this.device.createBuffer({ size: (b === B - 1 ? lastSlots : spb) * pad * 4, usage: S }));
+    this.head = this.device.createBuffer({ size: Math.max(16, Math.ceil(Object.keys(A.uniform_index).length / 4) * 16), usage: S });
     this.pts = this.device.createBuffer({ size: ndisp * 16, usage: S });
     this.staging = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: ndisp * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
     const oom = await this.device.popErrorScope();
-    if (oom) throw new Error(`refused: the device could not allocate ${mb(rec.memory.arena_bytes + 4 * ndisp * 16)} (${oom.message})`);
-    this.group = this.device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: this.arena } }] });
-    this.packGroup = this.device.createBindGroup({ layout: this.pack.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: this.arena } }, { binding: 1, resource: { buffer: this.pts } }] });
+    if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + 4 * ndisp * 16)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
+    this.group = this.device.createBindGroup({ layout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.head } }] });
+    this.packGroup = this.device.createBindGroup({ layout: packLayout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.pts } }] });
     this.latest = null; this.stepMs = 0; this.pending = 0;
-    void total;
   }
 
   #check(info, what) {
@@ -166,19 +182,20 @@ ${commit}
   // zero on the GPU (no host array), then the uniforms and the per-id image colours
   reset({ named, uniforms }) {
     const encoder = this.device.createCommandEncoder();
-    encoder.clearBuffer(this.arena);
+    for (const buffer of [...this.lanes, this.head]) encoder.clearBuffer(buffer);
     this.device.queue.submit([encoder.finish()]);
     for (const [name, value] of Object.entries(uniforms)) this.setUniform(name, value);
-    for (const [name, values] of Object.entries(named)) {
-      if (this.abi.feed_slots[name] !== undefined) this.device.queue.writeBuffer(this.arena, this.at(this.abi.feed_slots[name]) * 4, values);
-    }
+    this.setColours(named);
     this.latest = null;
   }
 
-  setUniform(name, value) { this.device.queue.writeBuffer(this.arena, this.abi.uniform_index[name] * 4, new Float32Array([value])); }
+  setUniform(name, value) { this.device.queue.writeBuffer(this.head, this.abi.uniform_index[name] * 4, new Float32Array([value])); }
 
   setColours(named) {
-    for (const [name, values] of Object.entries(named)) this.device.queue.writeBuffer(this.arena, this.at(this.abi.feed_slots[name]) * 4, values);
+    for (const [name, values] of Object.entries(named)) {
+      const slot = this.abi.feed_slots[name];
+      if (slot !== undefined) this.device.queue.writeBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), values);
+    }
   }
 
   step(count) {
@@ -225,7 +242,7 @@ ${commit}
       const slot = this.abi.output_slots[name] !== undefined && this.abi.feed_slots[name] === undefined ? this.abi.output_slots[name] : this.abi.feed_slots[name];
       const read = this.device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
       const encoder = this.device.createCommandEncoder();
-      encoder.copyBufferToBuffer(this.arena, this.at(slot) * 4, read, 0, n * 4);
+      encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), read, 0, n * 4);
       this.device.queue.submit([encoder.finish()]);
       await read.mapAsync(GPUMapMode.READ);
       out[name] = new Float32Array(read.getMappedRange().slice(0)); read.unmap(); read.destroy();
@@ -234,14 +251,12 @@ ${commit}
   }
 
   nudge(ids, dx) {              // test hook: perturb a few ids' x, to exercise the replay-not-identical path
-    for (const id of ids) {
-      const at = (this.at(this.abi.feed_slots.x) + id) * 4;
-      this.device.queue.writeBuffer(this.arena, at, new Float32Array([dx]));
-    }
+    const slot = this.abi.feed_slots.x;
+    for (const id of ids) this.device.queue.writeBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot) + id * 4, new Float32Array([dx]));
   }
 
   async idle() { await this.device.queue.onSubmittedWorkDone(); }
-  destroy() { for (const b of [this.arena, this.pts]) b?.destroy(); for (const s of this.staging || []) s.buffer.destroy(); this.device.destroy(); }
+  destroy() { for (const b of [...(this.lanes || []), this.head, this.pts]) b?.destroy(); for (const s of this.staging || []) s.buffer.destroy(); this.device.destroy(); }
 }
 
 // ---------------------------------------------------------------- wasm route

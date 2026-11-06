@@ -8,7 +8,10 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #16161a; color: #e8e8ea; font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
   #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
-         background: rgba(22,22,26,0.85); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap; }
+         background: rgba(22,22,26,0.85); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
+         /* a wrapping bar must not eat the viewport: past a third of the screen it scrolls, so the
+            canvas below it (100vh - --bar-h) always keeps at least two thirds */
+         max-height: 34vh; overflow-y: auto; box-sizing: border-box; }
   #bar select, #bar button, #bar input[type=text] { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 5px 9px; font: inherit; }
   #bar button:hover { background: #30303a; }
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
@@ -27,6 +30,7 @@
   #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
                 background: #1e1e24; color: #f0f0f3; border: 1px solid #3a3a42; border-radius: 8px; padding: 6px 4px 6px 12px; }
   #word button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 8px 12px; font: inherit; }
+  @media (max-width: 700px), (max-height: 500px) { #help { display: none; } }   /* the long help line would cover the board on a phone */
   #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; pointer-events: none; }   /* never takes a tap meant for the board or the tray */
   /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
   .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
@@ -190,7 +194,9 @@
   // Keep the canvas below the control bar as the bar wraps or unwraps.
   (() => { const bar = document.getElementById("bar");
     const fit = () => document.documentElement.style.setProperty("--bar-h", bar.offsetHeight + "px");
-    new ResizeObserver(fit).observe(bar); fit(); })();
+    // border-box, so the clamp (max-height) is seen; and again after a window resize has settled
+    new ResizeObserver(fit).observe(bar, { box: "border-box" }); fit();
+    addEventListener("resize", () => { fit(); requestAnimationFrame(fit); }); })();
 </script>
 <script type="module" src="app.js"></script>
 </body>

@@ -82,7 +82,8 @@ OMEGA = 150.0                          # contact stiffness: kn = m * OMEGA^2 (OM
 ZETA = 0.7                             # normal damping ratio
 VREF = 0.02                            # tangential slip speed over which friction saturates
 SPIN_DRAG = 3.0                        # 1/s
-K_RUN = 10                             # candidates walked per row run
+STRATA = 4.0                           # hue cycles over the emission in mode 2 (time strata)
+K_RUN = 16                             # candidates walked per row run
 BAR_HEIGHT = 0.12
 
 #: species: name, radius, density, friction, linear drag (1/s)
@@ -104,6 +105,24 @@ OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "cr",
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
 
 TAU = 2.0 * math.pi
+
+
+def merge_exchange_stages(n: int) -> list[tuple[int, int, int]]:
+    """Knuth 5.2.2 Algorithm M (merge exchange) for any ``n``: the sorting network as stages
+    ``(p, d, r)`` -- compare-exchange ``(i, i + d)`` for every ``i`` with ``bit_p(i) == r`` (r in {0, 1})
+    and ``i + d < n``.  The pairs of a stage are disjoint, so a stage is one dispatch."""
+    stages: list[tuple[int, int, int]] = []
+    if n < 2:
+        return stages
+    t = (n - 1).bit_length()
+    p = 1 << (t - 1)
+    while p > 0:
+        q, r, d = 1 << (t - 1), 0, p
+        while d > 0:
+            stages.append((p, d, 1 if r else 0))
+            d, q, r = q - p, q >> 1, p
+        p >>= 1
+    return stages
 
 
 def pad_count(n: int) -> int:
@@ -177,42 +196,44 @@ def make_law(n: int, active: int | None = None):
     geo = basin(active)
     s, half, cols, rows, cells = geo["scale"], geo["half"], geo["cols"], geo["rows"], geo["cells"]
     nozzle_y, bar_half = geo["nozzle_y"], 0.8 * geo["scale"]
-    stages = []
-    k = 2
-    while k <= n:
-        j = k // 2
-        while j >= 1:
-            stages.append((k, j))
-            j //= 2
-        k *= 2
+    stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
     emit_rate = EMIT_SPAN / float(active)
 
     def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix):
         """One fixed step of every particle (see the module docstring)."""
-        # ---- the id's emit time: derived from the id, nothing shipped
-        t_emit = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
-        act = as_float(age >= t_emit)
-        # ---- grid cell; only particles inside the grid take part (parked ones, and the dilute
-        # spray above the grid's top, get the cell past the end: sorted last, in nobody's block)
-        cx = ((x + half) * (1.0 / CELL)).floor().clamp(0.0, cols - 1.0)
-        cy = ((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, rows - 1.0)
-        gridded = act * as_float(y < rows * CELL + FLOOR_Y)
+        def frame():
+            """emit time, activity and grid cell of each id, from the id and its state.  Evaluated
+            again after the sort rather than carried across its ~300 dispatches (a value that crosses
+            them holds an arena slot, 4 bytes per id each, for all of them)."""
+            t = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
+            a = as_float(age >= t)
+            # only particles inside the grid take part (parked ones, and the dilute spray above the
+            # grid's top, get the cell past the end: sorted last, in nobody's block)
+            ix = ((x + half) * (1.0 / CELL)).floor().clamp(0.0, cols - 1.0)
+            iy = ((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, rows - 1.0)
+            return t, a, ix, iy, a * as_float(y < rows * CELL + FLOOR_Y)
+        t_emit, act, cx, cy, gridded = frame()
         kc = AbstractTensor.where(gridded > 0.5, cy * float(cols) + cx, cy * 0.0 + float(cells))
         ki = pid
-        # ---- stable bitonic sort of (cell, id) pairs: gathers and compare-exchanges
-        for (kk, jj) in stages:
-            bit = (pid * (1.0 / jj)).floor() - 2.0 * (pid * (1.0 / (2 * jj))).floor()
-            up = 1.0 - ((pid * (1.0 / kk)).floor() - 2.0 * (pid * (1.0 / (2 * kk))).floor())
-            partner = pid + jj * (1.0 - 2.0 * bit)
+        # ---- sort of (cell, id) pairs by Knuth's merge exchange (any length, no padding): each stage
+        # is a gather of the partner and a compare-exchange; the pairs of one stage are disjoint
+        top_i = float(n - 1)
+        for (pp, dd, rr) in stages:
+            b_self = (pid * (1.0 / pp)).floor() - 2.0 * (pid * (1.0 / (2 * pp))).floor()
+            pj = (pid - float(dd)).clamp(0.0, top_i)
+            b_other = (pj * (1.0 / pp)).floor() - 2.0 * (pj * (1.0 / (2 * pp))).floor()
+            lower = as_float((b_self - float(rr)).abs() < 0.5) * as_float(pid + float(dd) < float(n))
+            upper = as_float((b_other - float(rr)).abs() < 0.5) * as_float(pid >= float(dd)) * (1.0 - lower)
+            partner = pid + float(dd) * (lower - upper)
             oc = kc.index_select(0, partner)
             oi = ki.index_select(0, partner)
             less = as_float(kc < oc) + as_float((kc - oc).abs() < 0.5) * as_float(ki < oi)
-            keep_min = AbstractTensor.where(bit < 0.5, up, 1.0 - up)
-            keep_self = AbstractTensor.where(keep_min > 0.5, less, 1.0 - less)
+            keep_self = (1.0 - lower - upper) + lower * less + upper * (1.0 - less)
             kc = AbstractTensor.where(keep_self > 0.5, kc, oc)
             ki = AbstractTensor.where(keep_self > 0.5, ki, oi)
         # ---- the run of sorted cells covering each of the three rows of the 3x3 block
+        t_emit, act, cx, cy, gridded = frame()
         fx = x * 0.0
         fy = fx
         tq = fx
@@ -347,7 +368,11 @@ def make_law(n: int, active: int | None = None):
         rot_r = (c * (2.0 / 3.0)) * 0.85 + 0.5
         rot_g = (c * (-1.0 / 3.0) + sn * root3) * 0.85 + 0.5
         rot_b = (c * (-1.0 / 3.0) - sn * root3) * 0.85 + 0.5
-        m = as_float(mode > 0.5)
+        # mode 2: TIME STRATA -- hue turns STRATA times over the emission, so the settled pile is layered
+        # by the order its grains arrived (ids are emitted in order)
+        m2 = as_float(mode > 1.5)
+        hue = hue + m2 * (pid * (STRATA / float(active)) - hue)
+        m = as_float(mode > 0.5) * (1.0 - m2)
         hue_r = _ramp(hue, 0.0)
         hue_g = _ramp(hue, 2.0 / 3.0)
         hue_b = _ramp(hue, 1.0 / 3.0)
@@ -446,7 +471,7 @@ def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> d
 SIZES = {
     "small": (256, 256), "4k": (4096, 4096), "16k": (16384, 16384), "64k": (65536, 65536),
     "256k": (262144, 262144), "1M": (1048576, 1048576), "4M": (4194304, 4194304),
-    "10M": (10_000_000, pad_count(10_000_000)),
+    "10M": (10_000_000, 10_000_000),
 }
 DEFAULT_SIZE = "4k"
 N_FULL = SIZES[DEFAULT_SIZE][0]
@@ -477,7 +502,7 @@ class FountainGame(Game):
     def __init__(self, board_id: str = "", *, size: str = DEFAULT_SIZE):
         super().__init__(board_id)
         self.size = size
-        self.mix, self.mode, self.speed = 0.5, 0, 1
+        self.mix, self.mode, self.speed = 0.5, 2, 1
         self.phase = "fill"
         self.epoch = 1                       # bumped whenever the page must restart the fountain
         self.image: np.ndarray | None = None
@@ -572,7 +597,7 @@ class FountainGame(Game):
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix"},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
-             "field": "mode", "options": [[0, "trig (atan2)"], [1, "rotation"]]},
+             "field": "mode", "options": [[2, "time strata"], [0, "trig (atan2)"], [1, "rotation"]]},
             {"id": "size", "kind": "select", "label": "ids", "value": self.size, "action": "fountain_size",
              "field": "size", "options": sizes},
             {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
