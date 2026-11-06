@@ -1038,8 +1038,8 @@ function camera() {
     const eye = [at[0], at[1] + 0.22, at[2] - nose];
     const look = [at[0], at[1] - 0.9, at[2] - nose - 7.0];
     const view = M.lookAt(eye, look, [0, 1, 0]);
-    const proj = M.perspective(1.05, aspect, 0.05, 300);
-    return { view, proj, viewProj: M.multiply(proj, view), eye };
+    const proj = M.perspective(COCKPIT.fov, aspect, 0.05, 300);
+    return { view, proj, viewProj: M.multiply(proj, view), eye, nose: true, aspect };
   }
   const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el));
   const eye = [target[0], target[1] + dist * Math.sin(el), target[2] + dist * Math.cos(el)];
@@ -1297,6 +1297,36 @@ function shieldGlobe(material) {
   if (!shieldFacets[material] || shieldFacets[material].key !== key)
     shieldFacets[material] = { key, mesh: litMesh(geodesicMesh(2).map(([a, b, c]) => [a, b, c, id])) };
   return shieldFacets[material].mesh;
+}
+// THE COCKPIT (first person): the rocket's hull around the eye with a
+// window cut through it -- the hull plate minus a rounded window (a
+// superellipse), triangulated as the ring between the window's edge and the
+// plate's, plus the window's sill (its cut edge, receding), in the rocket's
+// own material and lit with the scene.  It rides the camera.
+const COCKPIT = { fov: 1.05, distance: 0.1, window: { a: 0.8, b: 0.58, p: 4.5, cy: 0.14 }, sill: 0.09, mesh: null };
+function cockpitMesh() {
+  const material = state.materialIndex.rocket;
+  if (COCKPIT.mesh && COCKPIT.mesh.material === material) return COCKPIT.mesh;
+  const { a, b, p, cy } = COCKPIT.window, N = 128, faces = [];
+  const rim = (k) => {
+    const th = (k / N) * 2 * Math.PI, c = Math.cos(th), s = Math.sin(th);
+    const r = Math.pow(Math.pow(Math.abs(c) / a, p) + Math.pow(Math.abs(s) / b, p), -1 / p);   // the window's edge
+    const out = 2.2 / Math.max(Math.abs(c), Math.abs(s));                                        // well past the screen (the lens bends edges)
+    return { inner: [r * c, cy + r * s, 0], outer: [out * c, cy + out * s, 0], sill: [r * c, cy + r * s, -COCKPIT.sill] };
+  };
+  for (let k = 0; k < N; k++) {
+    const q = rim(k), r = rim(k + 1);
+    faces.push([q.inner, q.outer, r.outer, material], [q.inner, r.outer, r.inner, material]);   // the plate, facing the eye
+    faces.push([q.sill, q.inner, r.inner, material], [q.sill, r.inner, r.sill, material]);      // the cut edge, receding
+  }
+  COCKPIT.mesh = { ...litMesh(faces), material };
+  return COCKPIT.mesh;
+}
+function drawCockpit(cam, drawLit) {
+  if (!cam.nose) return;
+  const mesh = cockpitMesh(), d = COCKPIT.distance, h = d * Math.tan(COCKPIT.fov / 2), w = h * (cam.aspect || 1);
+  const model = M.multiply(M.invert(cam.view), M.multiply(M.translate(0, 0, -d), M.scale(w, h, h)));
+  drawLit(mesh.vao, mesh.count, model, mesh.material);
 }
 function drawShield(now, drawLit) {
   const game = state.game;
@@ -2494,6 +2524,7 @@ function litPass(cam, now, casters, opts = {}) {
       drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${ci}_${step}`]);
     });
   }
+  drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
