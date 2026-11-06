@@ -1399,12 +1399,27 @@ def outcome_counters(game) -> dict:
 #: gem), minus the damage taken as a share of a full health bar.
 ROOM_REWARD, DAMAGE_REWARD, RETURN_SHARE = 100.0, 100.0, 0.5
 
+#: Loitering: a span whose average position (world tiles, from the declared counters ``px``/``py``)
+#: lies within STALL_TILES of the average position over the STALL_SECONDS of play before it (same
+#: room) is charged STALL_PENALTY -- pacing or hovering in place is not progress even when nothing hurts.
+STALL_TILES, STALL_SECONDS, STALL_PENALTY = 1.5, 4.0, 50.0
+
+
+def stall_penalty(history: list, mean: tuple, needed: int) -> float:
+    """The loitering charge for a span with average position ``mean`` after the per-decision
+    positions ``history`` (oldest first, same room); ``needed`` = decisions in STALL_SECONDS."""
+    if len(history) < needed:
+        return 0.0
+    old = history[-needed:]
+    hx = sum(h[0] for h in old) / len(old)
+    hy = sum(h[1] for h in old) / len(old)
+    return STALL_PENALTY if math.hypot(mean[0] - hx, mean[1] - hy) < STALL_TILES else 0.0
+
 
 def span_reward(game, a: dict, b: dict) -> float:
     health = float(getattr(game, "HEALTH_MAX", None) or 1.0)
     damage = max(0.0, a.get("lives", 0.0) - b.get("lives", 0.0)) / health
-    return (b.get("score", 0.0) - a.get("score", 0.0)) + ROOM_REWARD * (b.get("rooms", 0.0) - a.get("rooms", 0.0)) \
-        - DAMAGE_REWARD * min(1.0, damage)
+    return (b.get("score", 0.0) - a.get("score", 0.0)) + ROOM_REWARD * (b.get("rooms", 0.0) - a.get("rooms", 0.0))         - DAMAGE_REWARD * min(1.0, damage)
 
 
 class PlayTrace:
@@ -1422,16 +1437,36 @@ class PlayTrace:
         self.last = None                    # the counters at the last decision
         self.spans = 0
         self.flushed_at = time.monotonic()
+        self.positions: list = []           # the open window's (px, py) per decision
+        self.carry = 0                      # outcome tags waiting for the window to grow long enough
+        self.span_means: list = []          # earlier per-decision positions (one room, STALL_SECONDS)
 
-    def cut(self, tag: int) -> None:
+    def cut(self, tag: int, force: bool = False) -> None:
+        # An outcome on a window still too short to keep (a score that rises every step, as distance
+        # does) is carried into the window instead of discarding its rows.
+        tag |= self.carry
+        if not force and len(self.ring) < (MIN_SPAN if not tag else 4):
+            self.carry = tag
+            return
+        self.carry = 0
         if len(self.ring) >= (MIN_SPAN if not tag else 4):
             x = np.stack([r[0] for r in self.ring])
             y = np.stack([r[1] for r in self.ring])
             reward = span_reward(self.game, self.start, self.last) if self.start is not None and self.last is not None else 0.0
+            if self.positions:
+                if self.start is not None and self.last is not None and self.last.get("rooms", 0.0) != self.start.get("rooms", 0.0):
+                    self.span_means.clear()          # a new room: positions are not comparable
+                mean = (sum(q[0] for q in self.positions) / len(self.positions),
+                        sum(q[1] for q in self.positions) / len(self.positions))
+                d = declared(self.game.game) if self.game is not None else None
+                needed = max(1, int(round(STALL_SECONDS / float(getattr(d, "step", None) or 0.05))))
+                reward -= stall_penalty(self.span_means, mean, needed)
+                self.span_means = (self.span_means + self.positions)[-needed:]
             self.pending.append((x, y, int(tag), float(reward)))
             self.rows += len(x)
             self.spans += 1
         self.ring.clear()
+        self.positions = []
         self.start = self.last
 
     def record(self, game, controls: dict, demo: bool, features=None) -> bool:
@@ -1453,6 +1488,8 @@ class PlayTrace:
         features = np.asarray(features, dtype=np.float64).reshape(-1)
         danger = float(features[-1]) if declared(game.game) is not None else 0.0
         self.ring.append((features, target_from(game, controls), danger))
+        if "px" in now:
+            self.positions.append((float(now["px"]), float(now.get("py", 0.0))))
         if self.last is not None:
             tag = 0
             if now.get("lives", 0.0) < self.last.get("lives", 0.0) - 1e-9:
@@ -1475,7 +1512,7 @@ class PlayTrace:
 
     def cut_remaining(self) -> None:
         """The game is over (or the session ends): the window still open is a span too."""
-        self.cut(0)
+        self.cut(0, force=True)
 
     def take_spans(self) -> list[tuple[np.ndarray, np.ndarray, int, float]]:
         """The cut spans as (x, y, tag, return): a span's return is its reward plus RETURN_SHARE of the

@@ -353,7 +353,7 @@ def read_delve(game) -> View:
                          (evx[k] - vx) / 6.0, evy[k] / 6.0, 1.0))
     goal = _delve_goal(game)
     g = ((goal[2] - px) / 8.0, (goal[3] - py) / 6.0) if goal is not None else None
-    counters = {"score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("gems")[0]),
+    counters = {"px": px, "py": py, "score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("gems")[0]),
                 "rooms": float(len(game.visited)), "kills": float(col("kills")[0])}
     return View(own, ents, _patch(grid_of, cx, cy, DELVE_PATCH, DELVE_ANCHOR), g, _near(ents), counters)
 
@@ -389,7 +389,7 @@ def read_platformer(game) -> View:
             for cxx in range(int(math.floor(x[k] - col("rx")[k])), int(math.floor(x[k] + col("rx")[k])) + 1):
                 cells[(cxx, top)] = CH_PLATFORM
     cx, cy = int(math.floor(px)), int(math.floor(py))
-    counters = {"score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("score")[0] // 100.0)}
+    counters = {"px": px, "py": py, "score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("score")[0] // 100.0)}
     return View(own, ents, _patch(lambda a, b: cells.get((a, b)), cx, cy, PLATFORMER_PATCH, PLATFORMER_ANCHOR), None, 0.0, counters)
 
 
@@ -428,7 +428,7 @@ def read_side_scroller(game) -> View:
         if alive[k] > 0.0:
             ents.append((HOSTILE, 0, (x[k] - px) / 6.0, (y[k] - py) / 5.0, (vx[k] - vx[0]) / 8.0, 0.0, 1.0))
     cx, cy = int(math.floor(px)), int(math.floor(py))
-    counters = {"score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("coins")[0])}
+    counters = {"px": px, "py": py, "score": float(col("score")[0]), "lives": float(col("lives")[0]), "pickups": float(col("coins")[0])}
     return View(own, ents, _patch(lambda a, b: cells.get((a, b)), cx, cy, SIDE_PATCH, SIDE_ANCHOR), None, _near(ents), counters)
 
 
@@ -467,7 +467,7 @@ def read_tilequest(game) -> View:
         return chans.get(int(grid[b, a])) if 0 <= a < t.WIDTH and 0 <= b < t.HEIGHT else CH_SOLID
 
     cx, cy = int(math.floor(px)), int(math.floor(py))
-    counters = {"score": float(col("score")[0]), "lives": float(col("lives")[0]), "kills": float(col("kills")[0]),
+    counters = {"px": px, "py": py, "score": float(col("score")[0]), "lives": float(col("lives")[0]), "kills": float(col("kills")[0]),
                 "pickups": float(col("trips")[0])}
     return View(own, ents, _patch(grid_of, cx, cy, TILEQUEST_PATCH, TILEQUEST_ANCHOR), None, _near(ents), counters)
 
