@@ -84,6 +84,60 @@ function compile(type, src) {
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
   return s;
 }
+// THE SKY (a spherical game): single-scattering Rayleigh + Mie along each
+// view ray, the sun's disc, and stars where the sky is dark -- sunrise and
+// sunset from the same atmosphere that colours the Phong scene's sunlight.
+// Drawn first, behind everything, without depth.
+const SKY_VS = `#version 300 es
+const vec2 P[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+out vec2 vNdc;
+void main() { vNdc = P[gl_VertexID]; gl_Position = vec4(P[gl_VertexID], 0.999, 1.0); }`;
+const SKY_FS = `#version 300 es
+precision highp float;
+in vec2 vNdc; out vec4 FragColor;
+uniform mat4 uInvViewProj; uniform vec3 uSun; uniform vec3 uTauR; uniform float uTauM; uniform float uExposure;
+float airMass(float e) { float d = max(-2.5, degrees(e)); return 1.0 / (sin(radians(max(d, 0.0))) + 0.50572 * pow(d + 6.07995, -1.6364)); }
+float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+void main() {
+  vec4 a = uInvViewProj * vec4(vNdc, -1.0, 1.0), b = uInvViewProj * vec4(vNdc, 1.0, 1.0);
+  vec3 dir = normalize(b.xyz / b.w - a.xyz / a.w);
+  float view_e = asin(clamp(dir.y, -1.0, 1.0)), sun_e = asin(clamp(uSun.y, -1.0, 1.0));
+  float mu = dot(dir, uSun);
+  vec3 tau = uTauR + vec3(uTauM);
+  vec3 sunlight = exp(-tau * airMass(sun_e)) * clamp((degrees(sun_e) + 3.0) / 6.0, 0.0, 1.0);
+  float phaseR = 0.0596831 * (1.0 + mu * mu);
+  float g = 0.76, phaseM = 0.0795775 * (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5);
+  float mv = airMass(max(view_e, 0.0));
+  vec3 inscatter = (uTauR * phaseR + vec3(uTauM) * phaseM) / tau * (1.0 - exp(-tau * mv));
+  vec3 sky = 18.0 * sunlight * inscatter;
+  // twilight: the sky glows on after the sun is down
+  sky += vec3(0.02, 0.025, 0.05) * clamp((degrees(sun_e) + 12.0) / 12.0, 0.0, 1.0) * (1.0 - clamp(view_e * 3.0, 0.0, 1.0));
+  // the sun's disc and its glare
+  sky += sunlight * (smoothstep(0.99985, 0.99995, mu) * 60.0 + pow(max(mu, 0.0), 400.0) * 3.0);
+  // below the horizon: the haze over the far land, darkening downward
+  if (dir.y < 0.0) sky = mix(sky, vec3(0.03, 0.035, 0.05) * (0.3 + sunlight), clamp(-dir.y * 4.0, 0.0, 1.0));
+  // stars where the sky is dark
+  float dark = 1.0 - clamp(dot(sky, vec3(0.3, 0.5, 0.2)) * 6.0, 0.0, 1.0);
+  vec3 cell = floor(dir * 220.0);
+  float star = step(0.9965, hash(cell)) * dark * step(0.0, dir.y);
+  sky += vec3(star * (0.6 + 0.4 * hash(cell + 7.0)));
+  vec3 mapped = vec3(1.0) - exp(-sky * uExposure * 2.4);
+  FragColor = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
+}`;
+function drawSky(cam, now) {
+  if (state.flat || !state.game || !state.game.globe || !SKY.dir) return;
+  if (!SKY.prog) { SKY.prog = link(compile(gl.VERTEX_SHADER, SKY_VS), compile(gl.FRAGMENT_SHADER, SKY_FS)); SKY.vao = gl.createVertexArray(); }
+  gl.useProgram(SKY.prog); gl.bindVertexArray(SKY.vao);
+  gl.uniformMatrix4fv(gl.getUniformLocation(SKY.prog, "uInvViewProj"), false, M.invert(cam.viewProj));
+  gl.uniform3fv(gl.getUniformLocation(SKY.prog, "uSun"), new Float32Array(SKY.dir));
+  gl.uniform3fv(gl.getUniformLocation(SKY.prog, "uTauR"), new Float32Array(SKY.tauR));
+  gl.uniform1f(gl.getUniformLocation(SKY.prog, "uTauM"), SKY.tauM);
+  gl.uniform1f(gl.getUniformLocation(SKY.prog, "uExposure"), state.debug.exposure);
+  gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.bindVertexArray(null);
+}
 function link(vs, fs) {
   const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
@@ -505,6 +559,7 @@ function reliefMesh(exported) {
 // and the colour/depth UVs are rewritten every frame -- the DepthMesh's own
 // grid and strips, re-read, so relief, colour and depth turn together.
 const TURN_LAND = { travel: [0, 0], at: null, yaw: 0 };
+const SHADOW_SINK = 0.07;
 // The land's height under board point (x, z): the relief map read at the
 // same turned, travelling coordinate the land is drawn with, on the land's
 // own base (terrainOrigin) -- what a ground piece stands on.
@@ -569,7 +624,9 @@ function turnRelief(relief, now) {
       if (!strip.node) continue;
       for (let v = 0; v < strip.count; v++) {
         const dx = strip.pos[v * 3] - cx;
-        strip.pos[v * 3 + 1] = coarse.hgt[strip.node[v]] - (dx * dx) / (2 * PLANET.radius);
+        // a hair under the fine land, so the coarse caster never cuts through
+        // the surface it shades (that crossing was the rippling shadow)
+        strip.pos[v * 3 + 1] = coarse.hgt[strip.node[v]] - SHADOW_SINK - (dx * dx) / (2 * PLANET.radius);
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, strip.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, strip.pos);
     }
@@ -1036,7 +1093,7 @@ function camera() {
   if (own) {
     const at = worldOf(own), nose = (own.size || 0.5) * 1.1;
     const eye = [at[0], at[1] + 0.22, at[2] - nose];
-    const look = [at[0], at[1] - 0.9, at[2] - nose - 7.0];
+    const look = [at[0], at[1] - 0.9 + NOSE_PITCH.value * 4.2, at[2] - nose - 7.0];
     const view = M.lookAt(eye, look, [0, 1, 0]);
     const proj = M.perspective(COCKPIT.fov, aspect, 0.05, 300);
     return { view, proj, viewProj: M.multiply(proj, view), eye, nose: true, aspect };
@@ -1256,6 +1313,23 @@ function drawVitals(now, drawLit) {
       for (let i = 0; i < n; i++) segment(core, x, 0.08, start + (i * fill) / n, start + ((i + 1) * fill) / n, w * 0.7);
     }
   };
+  if (state.camMode === "nose") {
+    // In the cockpit the bars leave the map: they stand on the hull's inner
+    // wall either side of the window (plate units; the window spans +-0.8),
+    // their glowing glass filling from the bottom.
+    if (!COCKPIT.model) return;
+    const wall = (x, value, material) => {
+      const L = 0.95, y0 = COCKPIT.window.cy - 0.05, r = 0.075;
+      const upright = (mesh, centre, length, radius) => drawLit(mesh.vao, mesh.count,
+        M.multiply(COCKPIT.model, M.multiply(M.translate(x, centre, 0.02), M.multiply(M.rotateX(-Math.PI / 2), M.scale(radius, radius, length)))), null);
+      upright(vitalBox("bar_tube"), y0, L, r);
+      const fill = Math.max(0, Math.min(1, value)) * L;
+      if (fill > 0.005) upright(vitalBox(material), y0 - L / 2 + fill / 2, fill, r * 0.7);
+    };
+    wall(-0.93, vitals.shield, "bar_shield");
+    wall(0.93, vitals.health, "bar_health");
+    return;
+  }
   bar(-m, vitals.shield, "bar_shield");
   bar(ext.width + m, vitals.health, "bar_health");
 }
@@ -1327,6 +1401,7 @@ function drawCockpit(cam, drawLit) {
   const mesh = cockpitMesh(), d = COCKPIT.distance, h = d * Math.tan(COCKPIT.fov / 2), w = h * (cam.aspect || 1);
   const model = M.multiply(M.invert(cam.view), M.multiply(M.translate(0, 0, -d), M.scale(w, h, h)));
   drawLit(mesh.vao, mesh.count, model, mesh.material);
+  COCKPIT.model = model;                            // the vitals mount on this plate (drawVitals)
 }
 function drawShield(now, drawLit) {
   const game = state.game;
@@ -1505,9 +1580,49 @@ function sunState() {
   const strength = day >= 0 ? 0.75 + 0.25 * day : 0.42;
   return { azimuth, elevation, colour, strength };
 }
+// THE SUN ON THE GLOBE (a spherical game publishes ``globe``): the sun's
+// direction is fixed in the planet's frame, so its place in the local sky is
+// the player's place and heading -- elevation from the local vertical, bearing
+// from the heading (turned on by the page's predicted yaw, as the world is).
+// Board frame: x right, y up, -z ahead.
+function globeSun(now) {
+  const game = state.game, g = game && game.globe;
+  if (!g || state.flat) return null;
+  const u = g.u, s = norm(g.sun);
+  let h = g.h;
+  const turn = pred.ship && pred.ship.yaw != null ? pred.ship.yaw - g.yaw : 0;
+  if (turn) { const r = cross(h, u); h = norm(h.map((v, k) => v * Math.cos(turn) + r[k] * Math.sin(turn))); }
+  const r = cross(h, u), dir = [dot3(s, r), dot3(s, u), -dot3(s, h)];
+  const target = norm(dir);
+  // Eased: the published place arrives a few times a second.
+  if (!SKY.dir) SKY.dir = target;
+  const k = 1 - Math.exp(-Math.min(0.1, Math.max(0, now - (SKY.at ?? now))) / 0.35);
+  SKY.at = now;
+  SKY.dir = norm(SKY.dir.map((v, i) => v + (target[i] - v) * k));
+  return SKY.dir;
+}
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+// The atmosphere: optical depths at the zenith (Rayleigh per colour, Mie),
+// the air mass along a ray at elevation e (Kasten & Young), and the sun's
+// colour after crossing it -- what lights the Phong scene and the sky.
+const SKY = { tauR: [0.07, 0.16, 0.36], tauM: 0.03, dir: null, at: null, prog: null, vao: null };
+function airMass(elevation) {
+  const deg = Math.max(-2.5, elevation * 180 / Math.PI);
+  return 1 / (Math.sin(Math.max(deg, 0) * Math.PI / 180) + 0.50572 * Math.pow(deg + 6.07995, -1.6364));
+}
+function sunThroughAir(dir) {
+  const e = Math.asin(Math.max(-1, Math.min(1, dir[1]))), m = airMass(e);
+  const above = Math.max(0, Math.min(1, (e * 180 / Math.PI + 3) / 6));        // the disc sinking through the horizon
+  return SKY.tauR.map((t) => Math.exp(-(t + SKY.tauM) * m) * above);
+}
 function lampTarget(now, ext) {
   const span = Math.max(ext.width, ext.depth);
   if (light.follow && light.pointer) return [light.pointer[0], 0.55 * span, light.pointer[1]];
+  const globe = globeSun(now);
+  if (globe) {
+    const reach = 0.95 * span;
+    return [ext.width / 2 + reach * globe[0], reach * Math.max(0.05, globe[1]) + 0.3, ext.depth / 2 + reach * globe[2]];
+  }
   const sun = sunState(), reach = 0.95 * span;
   return [ext.width / 2 + reach * Math.cos(sun.elevation) * Math.cos(sun.azimuth),
           reach * Math.sin(sun.elevation) + 0.3,
@@ -2497,7 +2612,18 @@ function litPass(cam, now, casters, opts = {}) {
   const keyView = M.apply(cam.view, light.position);
   const sun = sunState(), boardCentre = [state.extent.width / 2, 0, state.extent.depth / 2];
   const sunReach = Math.hypot(...sub(light.position, boardCentre));
-  const keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = [0.75, 0.85, 1.0];
+  let keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = [0.75, 0.85, 1.0];
+  const globe = !state.flat && SKY.dir && state.game && state.game.globe ? SKY.dir : null;
+  if (globe) {
+    // The sun's light as the atmosphere leaves it (reddening at sunrise and
+    // sunset, gone at night), and the sky's blue (deepening to night) as the
+    // fill; a little starlight keeps the night readable.
+    const through = sunThroughAir(globe), peak = Math.max(...through, 1e-4);
+    keyColour = through.map((v) => v / peak);
+    sun.strength = Math.min(1, peak * 1.25);
+    const day = Math.max(0, Math.min(1, (globe[1] + 0.12) / 0.4));
+    fillColour = [0.35 + 0.4 * day, 0.42 + 0.43 * day, 0.62 + 0.38 * day].map((v) => v * (0.35 + 0.65 * day));
+  }
   // The sun's intensity is set for its distance to the board's centre (soft,
   // even light); the fill light carries the arcade ring's colour and activity.
   // The house light is turned down so the arcade bulbs carry the scene: the
@@ -2629,6 +2755,7 @@ function draw(ms) {
   const lensK = plateOn ? 0 : lensStrength();
   gl.bindFramebuffer(gl.FRAMEBUFFER, lensK > 0 ? lensTarget(w, h).fbo : null); gl.viewport(0, 0, w, h);
   if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
+  drawSky(cam, now);                                // into whatever target the scene draws in (the lens's, or the screen)
   litPass(cam, now, casters, { plate: plateOn });
   state.glassPieces = [];
   state.ribbonEnds = [];
@@ -2740,6 +2867,11 @@ function controls() {
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
+  // First person: the mouse's height on the screen pitches the nose; pitch
+  // climbs or dives (the height axis), stopping at the floor and ceiling.
+  if (state.camMode === "nose" && heightAxis() && Math.abs(NOSE_PITCH.value) > NOSE_PITCH.dead) {
+    out.move_axis_z = Math.max(-1, Math.min(1, out.move_axis_z + NOSE_PITCH.value));
+  }
   // THE THUMBPADS (analog, mode-2 style): left = turn (sideways) and
   // throttle (forward = faster); right = climb (forward = up), its sideways
   // adding to the turn, and holding it fires; a double tap on the left
@@ -2974,6 +3106,13 @@ $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.
 $("bomb-style").onclick = cycleBomb;
 $("pads").checked = matchMedia("(pointer: coarse)").matches;
 $("pads").onchange = () => showPads(state.game);
+const NOSE_PITCH = { value: 0, dead: 0.08 };
+canvas.addEventListener("mousemove", (e) => {
+  if (state.camMode !== "nose") return;
+  const r = canvas.getBoundingClientRect();
+  NOSE_PITCH.value = Math.max(-1, Math.min(1, -((e.clientY - r.top) / r.height - 0.5) * 2.2));
+});
+canvas.addEventListener("mouseleave", () => { NOSE_PITCH.value = 0; });
 function toggleCamera() { state.camMode = state.camMode === "nose" ? "board" : "nose"; $("camera-mode").textContent = state.camMode === "nose" ? "Camera: nose (N)" : "Camera: board (N)"; }
 $("camera-mode").onclick = toggleCamera;
 for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) {

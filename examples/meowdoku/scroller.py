@@ -1165,6 +1165,22 @@ class BulletScroller(EntityGame):
     SCENE_PREFER = {"glass": True, "arcade": True}           # projection glass: off unless the viewer turns it on
     HEALTH_MAX = HEALTH_MAX
 
+    #: The sun's direction in the planet's frame: fixed, so the local sky is
+    #: where the player is -- fly round the globe through dawn, day, dusk
+    #: and night.
+    SUN = (0.82, 0.18, 0.55)
+
+    def state(self) -> dict[str, Any]:
+        st = super().state()
+        if self.session.state is not None:
+            c = self.session.column
+            # The player's place and heading on the globe (and the yaw they
+            # were read at), for the page's sun and sky.
+            st["globe"] = {"u": [float(c("ux")[0]), float(c("uy")[0]), float(c("uz")[0])],
+                           "h": [float(c("hx")[0]), float(c("hy")[0]), float(c("hz")[0])],
+                           "yaw": float(c("yaw")[0]), "sun": list(self.SUN), "radius": RADIUS}
+        return st
+
     def describe(self) -> str:
         s = self.session
         lives, score = int(s.column("lives")[0]), int(s.column("score")[0])
