@@ -328,7 +328,9 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
-            if not self.path.startswith("/api/"):
+            # A malformed request (e.g. TLS bytes on this http port) is answered
+            # before the request line is parsed, so there may be no path yet.
+            if not getattr(self, "path", "").startswith("/api/"):
                 self.send_header("Cache-Control", "no-cache")          # the page is edited live
             super().end_headers()
 
