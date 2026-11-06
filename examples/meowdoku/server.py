@@ -412,30 +412,7 @@ def make_handler(sessions: Sessions):
                 table = self._table()
                 with table.lock:
                     return self._json(table.profile())
-            if self.path.startswith("/api/fountain/layout"):
-                return self._fountain_layout()
             return super().do_GET()
-
-        def _fountain_layout(self):
-            """The fountain's round-zero layout (``fountain.layout``) as raw float32
-            columns, one block per ``LAYOUT_COLUMNS`` name: bulk array work, no session."""
-            from urllib.parse import parse_qs, urlparse
-            from meowdoku import fountain
-            query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
-            try:
-                n = int(query.get("n", fountain.N_FULL))
-                if n not in fountain.SIZES.values():
-                    raise ValueError(f"n must be one of {sorted(fountain.SIZES.values())}")
-                layout = fountain.layout(n, seed=int(query.get("seed", 7)), mix=float(query.get("mix", 0.5)))
-            except (ValueError, TypeError) as error:
-                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            body = b"".join(layout[name].astype("<f4").tobytes() for name in fountain.LAYOUT_COLUMNS)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
 
         def do_POST(self):  # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)

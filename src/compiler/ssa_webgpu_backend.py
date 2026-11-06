@@ -249,8 +249,12 @@ class _FunctionEmitter:
         packed_outputs: bool = False,
         invocation_count: int = 1,
         gather_slots: Mapping[int, int] | None = None,
+        gather_base: int = 0,
+        gather_iota: Sequence[int] = (),
     ):
+        self.gather_iota = frozenset(int(i) for i in gather_iota)
         self.gather_slots = None if gather_slots is None else dict(gather_slots)
+        self.gather_base = int(gather_base)
         self.function = function
         self.outputs = tuple(outputs)
         self.loops = tuple(loop_records)
@@ -354,13 +358,17 @@ class _FunctionEmitter:
             # A gather reads another invocation's element of a value an
             # EARLIER dispatch materialized into its arena slot.
             slot = self.gather_slots.get(int(instr.args[0].id))
-            if slot is None:
+            count = self.invocation_count
+            if int(instr.args[0].id) in self.gather_iota:
+                # an iota's element k is k: there is no memory to read
+                expression = f"f32(min(u32(max({args[1]}, 0.0f)), {count - 1}u))"
+            elif slot is None:
                 self.fail(operation, f"gather source %{instr.args[0].id} has no arena slot")
                 return
-            count = self.invocation_count
-            expression = (
-                f"arena[{slot * count}u + min(u32(max({args[1]}, 0.0f)), {count - 1}u)]"
-            )
+            else:
+                expression = (
+                    f"arena[{self.gather_base + slot * count}u + min(u32(max({args[1]}, 0.0f)), {count - 1}u)]"
+                )
         elif operation in {"Call", "call"}:
             callee = str(instr.attributes.get("callee", ""))
             returns = self.callees.get(callee)
@@ -1840,11 +1848,18 @@ class WGSLPassProgram:
     workgroup_size: tuple[int, int, int]
     groups: tuple[int, int, int]
     slots: int                          # arena slots (each ``count`` floats)
-    feed_slots: dict[int, int]          # formal value id -> slot
+    feed_slots: dict[int, int]          # lane formal value id -> slot (element offset lane_base + slot * count)
     output_slots: dict[int, int]        # output value id -> slot
     uniform_feeds: tuple[int, ...]      # formal ids whose value is element 0 of its slot
     backend_identity_decisions: tuple[Any, ...] = ()
     launch_plan: Any = None
+    uniform_index: dict[int, int] = None     # uniform formal id -> element index in the arena's head
+    lane_base: int = 0                       # elements before the first lane slot
+    iota_ids: tuple[int, ...] = ()           # formals the shader derives from its invocation index
+
+    @property
+    def arena_elements(self) -> int:
+        return self.lane_base + self.slots * self.count
 
     @property
     def dispatches(self) -> int:
@@ -1859,6 +1874,7 @@ def emit_tensor_program_passes(
     count: int,
     name: str | None = None,
     preferred_local_size: int = 64,
+    iota_args: Sequence[int] = (),
 ) -> WGSLPassProgram:
     """Compute dispatches for a tensor law in the elementwise + gather kernel-call
     form.  Rank-zero formals are uniforms (element 0 of their slot).  Anything
@@ -1878,8 +1894,6 @@ def emit_tensor_program_passes(
     lowered_outputs = tuple(identity.outputs[function_name])
     plan = plan_wgsl_launch(count, preferred_local_size=preferred_local_size)
     local_x = plan.workgroup_size[0]
-    is_lane = lambda value: extents.get(int(value.id), 1) > 1 or int(value.id) in lane_defined  # noqa: E731
-    lane_defined: set[int] = set()
     # lane-extent values: formals with extent > 1, and results with extent > 1
     instrs = [item for block in function.blocks.values() for item in block.instrs]
     formal_ids = [int(v.id) for v in function.args]
@@ -1888,10 +1902,13 @@ def emit_tensor_program_passes(
     for item in instrs:
         if item.res is not None and extents.get(int(item.res.id), 1) > 1:
             lane_ids.add(int(item.res.id))
-    del is_lane, lane_defined
+    formal_set = set(formal_ids)
+    iota_set = {int(i) for i in iota_args}
+    uniform_index = {i: k for k, i in enumerate(uniform_ids)}
+    lane_base = -(-max(len(uniform_ids), 1) // 4) * 4
     # ---- cut into dispatches
     seg_of: dict[int, int] = {}              # instr index -> dispatch
-    def_seg: dict[int, int] = {i: -1 for i in lane_ids if i in set(formal_ids)}
+    def_seg: dict[int, int] = {i: -1 for i in lane_ids if i in formal_set}
     seg = 0
     for index, item in enumerate(instrs):
         if str(item.op) == "gather":
@@ -1915,6 +1932,8 @@ def emit_tensor_program_passes(
     output_ids = [int(v.id) for v in lowered_outputs]
     slot_of: dict[int, int] = {}
     for i in formal_ids:
+        if i in iota_set or i in uniform_index:
+            continue                          # the iota is the invocation index; a uniform lives in the head
         slot_of[i] = len(slot_of)
     for i in output_ids:
         if i not in slot_of:
@@ -1950,7 +1969,7 @@ def emit_tensor_program_passes(
     for s in range(dispatches):
         emitter = _FunctionEmitter(
             function, outputs=(), loop_records=(), store_outputs=False,
-            invocation_count=n, gather_slots=slot_of,
+            invocation_count=n, gather_slots=slot_of, gather_base=lane_base, gather_iota=iota_set,
         )
         local = [(index, item) for index, item in enumerate(instrs) if seg_of[index] == s]
         defined_here = {int(item.res.id) for _i, item in local if item.res is not None}
@@ -1964,12 +1983,15 @@ def emit_tensor_program_passes(
                 if v in defined_here:
                     return
                 dtype = emitter.dtype(value) or "f32"
-                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{slot_of[v] * n}u + i];")
+                if v in iota_set:
+                    emitter.lines.append(f"  let v_{v}: {dtype} = f32(i);")
+                else:
+                    emitter.lines.append(f"  let v_{v}: {dtype} = arena[{lane_base + slot_of[v] * n}u + i];")
                 emitter.declared.add(v)
                 return
-            if v in set(formal_ids):
+            if v in formal_set:
                 dtype = emitter.dtype(value) or "f32"
-                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{slot_of[v] * n}u];")
+                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{uniform_index[v]}u];")
                 emitter.declared.add(v)
                 return
             definition = scalar_defs.get(v)
@@ -1992,26 +2014,27 @@ def emit_tensor_program_passes(
                 continue
             r = int(item.res.id)
             if r in lane_ids and r in slot_of and (r in output_ids or last_use.get(r, -1) > s or r in gather_sources):
-                emitter.lines.append(f"  arena[{slot_of[r] * n}u + i] = v_{r};")
-        for r in output_ids:
-            if r in lane_ids and r not in defined_here and r in set(formal_ids):
-                continue
+                emitter.lines.append(f"  arena[{lane_base + slot_of[r] * n}u + i] = v_{r};")
         all_shortfalls.extend(emitter.shortfalls)
         entry = f"p{s}"
         entries.append(entry)
         bodies.append("\n".join([
             f"@compute @workgroup_size({local_x}, 1, 1)",
-            f"fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
-            "  let i: u32 = gid.x;",
+            f"fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {{",
+            f"  let i: u32 = gid.x + gid.y * grid.x * {local_x}u;",
             f"  if (i >= {n}u) {{ return; }}",
             *emitter.lines,
             "}",
             "",
         ]))
     source = "\n".join(["@group(0) @binding(0) var<storage, read_write> arena: array<f32>;", "", *bodies])
+    # a 2D grid keeps each dimension under the device's workgroup limit (65535 by default)
+    total_groups = -(-n // local_x)
+    group_x = min(total_groups, 16384)
+    groups = (group_x, -(-total_groups // group_x), 1)
     return WGSLPassProgram(
         name or function_name, source, not all_shortfalls, tuple(dict.fromkeys(all_shortfalls)), n,
-        tuple(entries), (local_x, 1, 1), (-(-n // local_x), 1, 1), slots,
-        {i: slot_of[i] for i in formal_ids}, {i: slot_of[i] for i in output_ids}, uniform_ids,
-        identity.decisions, plan,
+        tuple(entries), (local_x, 1, 1), groups, slots,
+        {i: slot_of[i] for i in formal_ids if i in slot_of}, {i: slot_of[i] for i in output_ids}, uniform_ids,
+        identity.decisions, plan, uniform_index, lane_base, tuple(sorted(iota_set & formal_set)),
     )

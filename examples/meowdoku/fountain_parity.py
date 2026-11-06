@@ -93,7 +93,7 @@ def pile_statistics(final: dict, columns: dict, n: int) -> dict:
     """The settled pile as numbers that survive chaos: height profile (mean top of each of 8
     column bands), 99th-percentile height, and packing fraction."""
     geo = F.basin(n)
-    x, y, r = np.asarray(final["x"]), np.asarray(final["y"]), np.asarray(columns["radius"])
+    x, y, r = np.asarray(final["x"]), np.asarray(final["y"]), np.asarray(final["rad"])
     edges = np.linspace(-geo["half"], geo["half"], 9)
     profile = [float(np.mean(np.sort(y[(x >= lo) & (x < hi)])[-max(1, int((x >= lo).sum() // 8)):]))
                if ((x >= lo) & (x < hi)).any() else 0.0 for lo, hi in zip(edges[:-1], edges[1:])]
@@ -123,8 +123,8 @@ def numpy_reference(n: int, columns: dict, steps: int) -> dict:
 
 
 def headless(tag: str, steps: int, web_dir: Path) -> dict:
-    n = B.SIZES[tag]
-    B.build(web_dir, (tag,), sweep=False)
+    active, n = B.SIZES[tag]
+    B.build(web_dir, (tag,))
     columns = F.initial_columns(n)
     report = {"tag": tag, "n": n, "steps": steps}
     started = time.perf_counter()
@@ -142,8 +142,8 @@ def headless(tag: str, steps: int, web_dir: Path) -> dict:
 def page(tag: str, web_dir: Path, out: Path) -> Path:
     """Emit ``fountain_parity.html`` for ``tag``: the generated dispatch program, the round-zero
     columns, and the native (f64) reference at ``FRAMES``."""
-    B.build(web_dir, (tag,), sweep=False)
-    n = B.SIZES[tag]
+    B.build(web_dir, (tag,))
+    active, n = B.SIZES[tag]
     columns = F.initial_columns(n)
     _final, saved = native_reference(n, columns, max(FRAMES), record=FRAMES)
     record = json.loads((web_dir / "fountain.manifest.json").read_text(encoding="utf-8"))["sizes"][tag]
@@ -156,7 +156,6 @@ def page(tag: str, web_dir: Path, out: Path) -> Path:
     payload = {
         "n": n, "abi": record["wgsl_abi"], "wgsl": wgsl, "verdict": record["verdict"], "frames": list(FRAMES),
         "state": list(F.STATE), "names": list(names),
-        "initial": pack([np.broadcast_to(np.asarray(columns[k]), (n,)) for k in F.ARGUMENTS]),
         "reference": {str(f): pack([saved[f][k] for k in names]) for f in FRAMES},
     }
     out.mkdir(parents=True, exist_ok=True)
@@ -181,7 +180,7 @@ async function main() {
   if (!navigator.gpu) { log('NO WEBGPU'); window.__result = {error: 'no webgpu'}; return; }
   const adapter = await navigator.gpu.requestAdapter(); const device = await adapter.requestDevice();
   const info = adapter.info || {}; log('adapter: ' + [info.vendor, info.architecture, info.device].filter(Boolean).join(' / '));
-  const n = P.n, A = P.abi, S = A.feed_slots, O = A.output_slots;
+  const n = P.n, A = P.abi, S = A.feed_slots, O = A.output_slots, at = (slot) => A.lane_base + slot * n;
   log(`n=${n}  ${A.dispatches} dispatches  verdict pays=${P.verdict.pays} predicted ${P.verdict.speedup.toFixed(2)}x`);
   const module = device.createShaderModule({code: P.wgsl});
   const ci = await module.getCompilationInfo();
@@ -191,37 +190,36 @@ async function main() {
   const pl = device.createPipelineLayout({bindGroupLayouts: [layout]});
   const pipes = await Promise.all(A.entries.map(entryPoint => device.createComputePipelineAsync({layout: pl, compute: {module, entryPoint}})));
   const commitSrc = `@group(0) @binding(0) var<storage, read_write> arena: array<f32>;
-@compute @workgroup_size(64) fn commit(@builtin(global_invocation_id) g: vec3<u32>) { let i = g.x; if (i >= ${n}u) { return; }
-${P.state.map(s => `  arena[${S[s] * n}u + i] = arena[${O[s + '_next'] * n}u + i];`).join('\n')}
+@compute @workgroup_size(64) fn commit(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) { let i = g.x + g.y * grid.x * 64u; if (i >= ${n}u) { return; }
+${P.state.map(s => `  arena[${at(S[s])}u + i] = arena[${at(O[s + '_next'])}u + i];`).join('\n')}
 }`;
   pipes.push(await device.createComputePipelineAsync({layout: pl, compute: {module: device.createShaderModule({code: commitSrc}), entryPoint: 'commit'}}));
   const U = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-  const arena = device.createBuffer({size: A.slots * n * 4, usage: U});
-  const read = device.createBuffer({size: A.slots * n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  const bytes = A.arena_elements * 4;
+  const arena = device.createBuffer({size: bytes, usage: U});
+  const read = device.createBuffer({size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
   const group = device.createBindGroup({layout, entries: [{binding: 0, resource: {buffer: arena}}]});
-  const initial = f32(P.initial);
-  const host = new Float32Array(A.slots * n);
-  P.state.concat(A.arguments.filter(a => !P.state.includes(a))).forEach(() => {});
-  A.arguments.forEach((name, k) => { host.set(initial.subarray(k * n, (k + 1) * n), S[name] * n); });
+  const host = new Float32Array(A.arena_elements);      // zero state and colours; uniforms in the head; no per-id data
+  host[A.uniform_index.mode] = 0; host[A.uniform_index.use_image] = 0; host[A.uniform_index.mix] = 0.5;
   const run = (steps) => { const enc = device.createCommandEncoder();
-    for (let k = 0; k < steps; k++) { const pass = enc.beginComputePass(); pass.setBindGroup(0, group); for (const p of pipes) { pass.setPipeline(p); pass.dispatchWorkgroups(A.groups[0]); } pass.end(); }
+    for (let k = 0; k < steps; k++) { const pass = enc.beginComputePass(); pass.setBindGroup(0, group); for (const p of pipes) { pass.setPipeline(p); pass.dispatchWorkgroups(A.groups[0], A.groups[1]); } pass.end(); }
     device.queue.submit([enc.finish()]); };
   const results = []; let frame = 0;
   device.queue.writeBuffer(arena, 0, host);
   for (const target of P.frames) {
     run(target - frame); frame = target;
-    const enc = device.createCommandEncoder(); enc.copyBufferToBuffer(arena, 0, read, 0, A.slots * n * 4); device.queue.submit([enc.finish()]);
+    const enc = device.createCommandEncoder(); enc.copyBufferToBuffer(arena, 0, read, 0, bytes); device.queue.submit([enc.finish()]);
     await read.mapAsync(GPUMapMode.READ); const all = new Float32Array(read.getMappedRange().slice(0)); read.unmap();
     const ref = f32(P.reference[target]); const row = {frame: target, worst: {}, over1e3: {}};
     P.names.forEach((name, k) => {
-      const slot = (name in O) ? O[name] : S[name]; let worst = 0, bad = 0;
-      for (let i = 0; i < n; i++) { const d = Math.abs(all[slot * n + i] - ref[k * n + i]); worst = Math.max(worst, d); if (d > 1e-3) bad++; }
+      const base = at((name in O) ? O[name] : S[name]); let worst = 0, bad = 0;
+      for (let i = 0; i < n; i++) { const d = Math.abs(all[base + i] - ref[k * n + i]); worst = Math.max(worst, d); if (d > 1e-3) bad++; }
       row.worst[name] = worst; row.over1e3[name] = bad; });
     results.push(row);
     log(`frame ${target}: max abs diff ` + ['x', 'y', 'vx', 'vy'].map(k => `${k} ${row.worst[k].toExponential(2)} (${row.over1e3[k]} over 1e-3)`).join('  '));
   }
   // determinism: the same program twice from the same initial bytes
-  const again = async () => { device.queue.writeBuffer(arena, 0, host); run(200); const enc = device.createCommandEncoder(); enc.copyBufferToBuffer(arena, 0, read, 0, A.slots * n * 4); device.queue.submit([enc.finish()]); await read.mapAsync(GPUMapMode.READ); const a = new Float32Array(read.getMappedRange().slice(0)); read.unmap(); return a; };
+  const again = async () => { device.queue.writeBuffer(arena, 0, host); run(200); const enc = device.createCommandEncoder(); enc.copyBufferToBuffer(arena, 0, read, 0, bytes); device.queue.submit([enc.finish()]); await read.mapAsync(GPUMapMode.READ); const a = new Float32Array(read.getMappedRange().slice(0)); read.unmap(); return a; };
   const r1 = await again(), r2 = await again(); let diff = 0; for (let i = 0; i < r1.length; i++) if (r1[i] !== r2[i]) diff++;
   log(`determinism: two runs of 200 steps differ in ${diff} of ${r1.length} arena values`);
   device.queue.writeBuffer(arena, 0, host); await device.queue.onSubmittedWorkDone();

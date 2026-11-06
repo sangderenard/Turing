@@ -3176,7 +3176,8 @@ function applyState(game) {
 let cloud = null;
 const compute = new ComputeRuntime({
   onStatus: () => { const g = state.game; if (g && g.compute) status.textContent = `${g.status} · ${compute.statusText()}`; },
-  onSamples: (post, base64) => act({ type: post.action, [post.field]: base64 }),
+  onSamples: (post, fields) => act({ type: post.action, ...fields }),
+  onSupport: () => { if (state.game) renderGameControls(state.game); },
 });
 window.meowdokuDebug.compute = compute;
 function renderGameControls(game) {
@@ -3212,6 +3213,17 @@ function renderGameControls(game) {
     if (!el) continue;
     if (s.kind === "button") el.disabled = s.enabled === false;
     const input = el.querySelector("input:not([type=file]), select");
+    if (input && s.id === "size" && compute.support) {
+      // a size this device (or browser) cannot hold is offered but disabled, with the reason
+      for (const option of input.options) {
+        const verdict = compute.support[option.value];
+        option.disabled = !!verdict && !verdict.ok;
+        const base = option.dataset.label || (option.dataset.label = option.textContent);
+        option.textContent = verdict && !verdict.ok ? `${base} (too large for this device)` : base;
+        option.title = verdict && !verdict.ok ? verdict.reason : verdict && verdict.note ? verdict.note : "";
+        if (verdict && !verdict.ok) input.title = verdict.reason;
+      }
+    }
     if (input && document.activeElement !== input) input.value = String(s.value);
   }
 }
@@ -3220,13 +3232,14 @@ function pointsFrame(cam, now) {
   if (!g || !g.compute) return;
   compute.frame(now);
   const data = compute.ready && compute.product ? compute.product.points() : null;
-  if (!data) return;
+  const rec = compute.rec;
+  if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   const ext = state.extent, eye = cam.eye, target = [ext.width / 2, 0, ext.depth / 2];
   const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
   const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
-  cloud.draw(data, compute.sizes, { viewProj: cam.viewProj, world: new Float32Array(compute.manifest.view), board: [g.width, g.height],
-                                    y: TILE.height + 0.03, pxPerUnit });
+  cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height],
+                     y: TILE.height + 0.03, pxPerUnit, stride: rec.display_stride });
 }
 
 // ---------------------------------------------------------------- draw
