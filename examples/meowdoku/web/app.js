@@ -548,8 +548,28 @@ function reliefMesh(exported) {
     map = { n, h: new Float32Array(n * n) };
     for (let i = 0; i < n * n; i++) map.h[i] = Math.pow(raw.charCodeAt(i * 4) / 255, exported.relief_power || 1.4) * (exported.relief || 0.75);
   }
+  // THE SURFACE: the whole relief as ONE mesh (no strips, so no seams):
+  // every vertex is placed in board coordinates each frame -- its height read
+  // at the turned map point, less the planet's drop -- and drawn untransformed.
+  const surfaceOf = (positions, step, withShading) => {
+    if (!positions || !step) return null;
+    const n = positions.length / 3, cols = Math.round(exported.span[0] / step) + 1;
+    const pos = new Float32Array(positions), node = new Int32Array(n);
+    for (let v = 0; v < n; v++) node[v] = Math.round(pos[v * 3 + 2] / step) * cols + Math.round(pos[v * 3] / step);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const buffers = [buffer(pos, 0, 3)];
+    let nrm = null, uv = null;
+    if (withShading) {
+      nrm = new Float32Array(exported.normals); uv = new Float32Array(exported.uvs);
+      buffers.push(buffer(nrm, 1, 3), buffer(uv, 3, 2));
+    }
+    gl.bindVertexArray(null);
+    return { vao, count: n, base: new Float32Array(positions), pos, nrm, uv, node, buffers };
+  };
+  const surface = surfaceOf(exported.positions, exported.step, true);
+  const shadowSurface = surfaceOf(exported.shadow_positions, exported.shadow_step, false);
   return (TERRAIN.relief = { strips, shadows, tile: exported.tile, span: exported.span, step: exported.step,
-                             shadowStep: exported.shadow_step, map });
+                             shadowStep: exported.shadow_step, map, surface, shadowSurface });
 }
 // TURNING THE LAND (a spherical game, predict.patch).  The ship never moves
 // on screen; the land is read from the same tileable relief map at a turned,
@@ -604,6 +624,34 @@ function turnRelief(relief, now) {
     return { cols, rows, hgt, mu, mv };
   };
   const fine = grid(relief.step), cx = relief.span[0] / 2;
+  const ext = state.extent, R = PLANET.radius;
+  if (relief.surface) {
+    // one surface: board position = origin + mesh (x, z); height = the map's,
+    // less the planet's drop there (the same drop every body is drawn with)
+    const S = relief.surface, y0 = origin[1];
+    for (let v = 0; v < S.count; v++) {
+      const k = S.node[v], i = k % fine.cols, j = (k - i) / fine.cols;
+      const bx = x0 + S.base[v * 3], bz = z0 + S.base[v * 3 + 2];
+      const dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
+      S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + fine.hgt[k] - (dx * dx + dz * dz) / (2 * R); S.pos[v * 3 + 2] = bz;
+      const hl = fine.hgt[j * fine.cols + Math.max(0, i - 1)], hr = fine.hgt[j * fine.cols + Math.min(fine.cols - 1, i + 1)];
+      const hu = fine.hgt[Math.max(0, j - 1) * fine.cols + i], hd = fine.hgt[Math.min(fine.rows - 1, j + 1) * fine.cols + i];
+      // slope of the land plus the slope of the planet's curve
+      const nx = -(hr - hl) / (2 * relief.step) + dx / R, nz = -(hd - hu) / (2 * relief.step) + dz / R, len = Math.hypot(nx, 1, nz);
+      S.nrm[v * 3] = nx / len; S.nrm[v * 3 + 1] = 1 / len; S.nrm[v * 3 + 2] = nz / len;
+      S.uv[v * 2] = fine.mu[k] / relief.tile; S.uv[v * 2 + 1] = fine.mv[k] / relief.tile;
+    }
+    [S.pos, S.nrm, S.uv].forEach((data, b) => { gl.bindBuffer(gl.ARRAY_BUFFER, S.buffers[b]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, data); });
+    if (relief.shadowSurface) {
+      const coarse = grid(relief.shadowStep), C = relief.shadowSurface;
+      for (let v = 0; v < C.count; v++) {
+        const bx = x0 + C.base[v * 3], bz = z0 + C.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
+        C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + coarse.hgt[C.node[v]] - SHADOW_SINK - (dx * dx + dz * dz) / (2 * R); C.pos[v * 3 + 2] = bz;
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, C.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, C.pos);
+    }
+    return true;
+  }
   for (const strip of relief.strips) {
     if (!strip.node) continue;
     for (let v = 0; v < strip.count; v++) {
@@ -649,6 +697,7 @@ function terrainShadowCasters() {
   const game = state.game;
   if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return [];
   const relief = reliefMesh(state.assets && state.assets.terrain);
+  if (relief && relief.shadowSurface && game.predict && game.predict.patch) return [[relief.shadowSurface.vao, relief.shadowSurface.count, M.identity()]];
   return relief ? relief.shadows.map((s) => [s.vao, s.count, stripModel(relief, s)]) : [];
 }
 function drawTerrain(now, drawLit) {
@@ -658,8 +707,12 @@ function drawTerrain(now, drawLit) {
   if (relief) {
     const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
     TERRAIN.at = now;
-    if (game.predict && game.predict.patch) { TERRAIN.scroll = 0; turnRelief(relief, now); }   // the land turns and travels under the ship
-    else if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
+    if (game.predict && game.predict.patch && relief.surface) {
+      // the land turns and travels under the ship: one continuous surface
+      TERRAIN.scroll = 0;
+      if (turnRelief(relief, now)) { drawLit(relief.surface.vao, relief.surface.count, M.identity(), state.materialIndex.terrain); return; }
+    }
+    if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
     return;
   }
@@ -958,7 +1011,7 @@ function uploadMaterials(game) {
   records.push(["nav_red", [0.3, 0.02, 0.02], { emission: [2.6, 0.12, 0.1], roughness: 0.2 }]);
   records.push(["nav_green", [0.02, 0.3, 0.06], { emission: [0.1, 2.4, 0.5], roughness: 0.2 }]);
   records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
-  records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [6.0, 6.0, 6.2], roughness: 0.2 }]);
+  records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [2.4, 2.4, 2.5], roughness: 0.2 }]);
   records.push(["nav_off", [0.12, 0.12, 0.13], { roughness: 0.3 }]);
   const tables = {};
   state.materialIndex = {};
@@ -1230,7 +1283,7 @@ function markerLights(now) {
     { at: put(-0.8, 0.3), material: "nav_red", size: bulb, light: [1.0, 0.08, 0.06], intensity: 0.8 },
     { at: put(0.8, 0.3), material: "nav_green", size: bulb, light: [0.08, 1.0, 0.3], intensity: 0.8 },
     { at: put(0, 1.2, 0.28), material: "nav_white", size: bulb * 0.9, light: [1, 1, 0.95], intensity: 0.5 },
-    { at: put(0, 0.1, 0.42), material: strobe ? "nav_strobe" : "nav_off", size: bulb, light: [1, 1, 1], intensity: strobe ? 6.0 : 0.0 },
+    { at: put(0, 0.1, 0.42), material: strobe ? "nav_strobe" : "nav_off", size: bulb, light: [1, 1, 1], intensity: strobe ? 1.2 : 0.0 },
   ];
 }
 function blastLights(cam, now) {
