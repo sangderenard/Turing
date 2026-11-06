@@ -52,6 +52,7 @@ rollback); ``reset`` restores round zero.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import sys
@@ -244,6 +245,14 @@ class LawPiece:
     law = None
     argument_names: tuple[str, ...] = ()
     output_names: tuple[str, ...] = ()
+    #: PARAMETER inputs: arrays that are not shaped like lanes (a network's
+    #: weights), name -> shape.  They follow ``argument_names`` in the law's
+    #: arguments, are SSA inputs of those shapes in the native compile,
+    #: arrays of the NumPy product, and named inputs of the page's wasm
+    #: (``graph_wasm``).  The game sets their values with ``set_parameters``
+    #: -- per landing, never a recompile; the digest carries their names and
+    #: shapes only.
+    parameter_shapes: dict[str, tuple[int, ...]] = {}
     #: Modules besides the law's own whose text the product is a function of
     #: (a shared substrate the law calls, e.g. ``meowdoku.walkers``): hashed
     #: into the source digest so editing one recompiles the law.
@@ -252,9 +261,32 @@ class LawPiece:
     def __init__(self, batch: int):
         self.batch = int(batch)
         self._bound = None
+        self._parameters = {n: np.zeros(shape) for n, shape in self.parameter_shapes.items()}
+        self._parameter_buffers: dict[str, np.ndarray] = {}
         self.product = None
         self.lane = "eager"
         self.product_path: Path | None = None
+
+    @property
+    def parameter_names(self) -> tuple[str, ...]:
+        return tuple(self.parameter_shapes)
+
+    def set_parameters(self, values: dict[str, Any]) -> None:
+        """Set the parameter inputs (a name -> array dict; names the law does
+        not declare are ignored, declared ones must be present and of their
+        shape).  The values are copied into the native execution's input
+        buffers in place -- or into the arrays the NumPy product is called
+        with -- so new values never recompile anything."""
+        for name, shape in self.parameter_shapes.items():
+            if name not in values:
+                raise KeyError(f"{self.entry}: parameter {name!r} not given")
+            array = np.asarray(values[name], dtype=np.float64)
+            if tuple(array.shape) != tuple(shape):
+                raise ValueError(f"{self.entry}: parameter {name!r} has shape {array.shape}, declared {tuple(shape)}")
+            np.copyto(self._parameters[name], array)
+            buffer = self._parameter_buffers.get(name)
+            if buffer is not None:
+                np.copyto(buffer.reshape(-1), array.reshape(-1))
 
     def instantiate(self, columns, outputs=None):
         self._bound = tuple(columns[name] for name in self.argument_names)
@@ -290,6 +322,14 @@ class LawPiece:
                    *(importlib.import_module(name) for name in cls.source_modules))
         return "\0".join(inspect.getsource(module) for module in modules)
 
+    def _signature(self) -> str:
+        """Argument names, and the parameters' names and SHAPES (never their
+        values), as the short key a product is filed under."""
+        text = ",".join(self.argument_names)
+        if self.parameter_shapes:
+            text += "|" + ",".join(f"{n}{tuple(shape)}" for n, shape in self.parameter_shapes.items())
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
     def compile(self, columns: dict[str, np.ndarray]) -> None:
         if LAW_LANE in {"llvm", "develop", "eigen", "fast"}:
             try:
@@ -310,8 +350,10 @@ class LawPiece:
         import hashlib
         import pickle
         digest = hashlib.sha256(self._sources().encode("utf-8")).hexdigest()[:16]
-        signature = hashlib.sha256(",".join(self.argument_names).encode("utf-8")).hexdigest()[:8]
+        signature = self._signature()
         shapes = {name: (tuple(np.shape(columns[name])) if name in columns else ()) for name in self.argument_names}
+        shapes.update({n: tuple(shape) for n, shape in self.parameter_shapes.items()})
+        names = (*self.argument_names, *self.parameter_names)
         name = f"{self.entry}_{contract}"
         home = LAW_NATIVE / f"{self.entry}_{digest}_{signature}_{contract}"
         cached = home / "forward.pkl"
@@ -323,9 +365,9 @@ class LawPiece:
             started = time.perf_counter()
             with scoped_work_contract(PRESETS[contract]):
                 program = SSATensorProgram(name)
-                bindings = {n: SSATensorOperations.input(program, shapes[n]) for n in self.argument_names}
+                bindings = {n: SSATensorOperations.input(program, shapes[n]) for n in names}
                 with program.activate():
-                    produced = type(self).law(*(bindings[n] for n in self.argument_names))
+                    produced = type(self).law(*(bindings[n] for n in names))
                 forward = compile_native_graph_forward(
                     produced, bindings=bindings, source=self._sources(), name=name, directory=home)
             home.mkdir(parents=True, exist_ok=True)
@@ -334,8 +376,10 @@ class LawPiece:
         from src.compiler.ssa_llvm_backend import prepare_artifact_execution
         ids = forward.input_value_ids
         execution = prepare_artifact_execution(forward.artifact, {
-            ids[n]: np.zeros(shapes[n]) if shapes[n] else np.asarray(0.0) for n in self.argument_names})
+            ids[n]: (self._parameters[n] if n in self._parameters else np.zeros(shapes[n]) if shapes[n] else np.asarray(0.0))
+            for n in names})
         inputs = [np.asarray(execution.buffers[ids[n]]).reshape(-1) for n in self.argument_names]
+        self._parameter_buffers = {n: np.asarray(execution.buffers[ids[n]]) for n in self.parameter_names}
         outputs = [np.asarray(execution.buffers[i]).reshape(-1) for i in forward.output_value_ids]
         batch = self.batch
 
@@ -358,21 +402,23 @@ class LawPiece:
         # OLDER law (a long-lived server, a training pool) that hashed the
         # newer file on disk would otherwise file its old law's product under
         # the new digest -- the live server did, with three columns missing.
-        signature = hashlib.sha256(",".join(self.argument_names).encode("utf-8")).hexdigest()[:8]
+        signature = self._signature()
+        names = (*self.argument_names, *self.parameter_names)
         path = LAW_PRODUCTS / f"{self.entry}_{digest}_{signature}.py"
         if path.exists():
             spec = importlib.util.spec_from_file_location(f"meowdoku_law_check_{self.entry}_{digest}", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            if tuple(inspect.signature(getattr(module, self.entry)).parameters) != tuple(self.argument_names):
+            if tuple(inspect.signature(getattr(module, self.entry)).parameters) != names:
                 path.unlink()                        # not this law's product: make it again
         if not path.exists():
             from src.common.tensors.autograd import autograd
             from src.common.tensors.numpy_backend import NumPyTensorOperations
             from src.common.tensors.accelerator_backends.tape_to_source import emit_tape_source
             sample = {name: NumPyTensorOperations.tensor(np.asarray(
-                columns[name] if name in columns else np.full(self.batch, 1.0 / 60.0), dtype=np.float64))
-                for name in self.argument_names}
+                columns[name] if name in columns else self._parameters[name] if name in self._parameters
+                else np.full(self.batch, 1.0 / 60.0), dtype=np.float64))
+                for name in names}
             with autograd.forward_capture() as tape:
                 produced = type(self).law(*sample.values())
             source = emit_tape_source(tape, sample, dict(zip(self.output_names, produced)),
@@ -385,7 +431,11 @@ class LawPiece:
         spec = importlib.util.spec_from_file_location(f"meowdoku_law_{self.entry}_{digest}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.product, self.lane, self.product_path = getattr(module, self.entry), "numpy", path
+        function = getattr(module, self.entry)
+        # the parameters ride behind the columns, as the law's last arguments
+        self.product = (lambda *cols: function(*cols, *(self._parameters[n] for n in self.parameter_names))
+                        ) if self.parameter_shapes else function
+        self.lane, self.product_path = "numpy", path
 
     def __call__(self, *columns):
         if len(columns) != len(self.argument_names):
@@ -394,7 +444,8 @@ class LawPiece:
             produced = self.product(*(np.asarray(column, dtype=np.float64) for column in columns))
             return tuple(np.broadcast_to(np.asarray(value, dtype=np.float64), (self.batch,)).copy()
                          for value in produced)
-        tensors = [AbstractTensor.get_tensor(np.asarray(column, dtype=np.float64)) for column in columns]
+        tensors = [AbstractTensor.get_tensor(np.asarray(column, dtype=np.float64))
+                   for column in (*columns, *(self._parameters[n] for n in self.parameter_names))]
         return tuple(np.broadcast_to(np.asarray(value.numpy(), dtype=np.float64), (self.batch,)).copy()
                      for value in type(self).law(*tensors))
 
@@ -427,6 +478,7 @@ class EntityGame(Game):
         # No rewind snapshots: real-time games are never rolled back (the
         # page's own history is the record; undo is for the board games).
         self.session = EntitySession(piece, columns, self.CONTROLS, rewind_depth=0)
+        self.sync_parameters()
         self.last_tick: float | None = None
         self.ticks = 0
         self.held: dict[str, float] = {}
@@ -451,15 +503,21 @@ class EntityGame(Game):
         self.autopilot = bool(on)
         self._pilot_hold = 0.0
 
-    def _trace(self, controls: dict, demo: bool) -> None:
-        """Record one decision for learning (games with an autopilot only)."""
-        from meowdoku.autopilot import FEATURE_FUNCTIONS, PlayTrace
-        if (self.game not in FEATURE_FUNCTIONS or self.session.state is None or getattr(self, "_ended", False)
-                or not getattr(self, "learns", True)):
+    def _tracing(self) -> bool:
+        """Whether a decision made now would be recorded for learning."""
+        from meowdoku.autopilot import FEATURE_FUNCTIONS
+        return not (self.game not in FEATURE_FUNCTIONS or self.session.state is None or getattr(self, "_ended", False)
+                    or not getattr(self, "learns", True))
+
+    def _trace(self, controls: dict, demo: bool, features=None) -> None:
+        """Record one decision for learning (games with an autopilot only);
+        ``features`` the observation it was made on, when the caller has it."""
+        from meowdoku.autopilot import PlayTrace
+        if not self._tracing():
             return
         if getattr(self, "trace", None) is None:
             self.trace = PlayTrace()
-        if self.trace.record(self, controls, demo):
+        if self.trace.record(self, controls, demo, features):
             # enough spans of action gathered: learn from them now, mid-game
             from meowdoku.autopilot import finish_episode
             finish_episode(self, self.trace, final=False)
@@ -477,11 +535,36 @@ class EntityGame(Game):
     def drive_settings(self) -> None:
         """Settings that follow who is driving (a game overrides; default none)."""
 
+    def law_pilot_on(self) -> bool:
+        """Whether the autopilot's network runs INSIDE the law (a game whose
+        law carries the pilot overrides; default: the Python pilot flies)."""
+        return False
+
+    def law_pilot_controls(self) -> dict[str, float]:
+        """The controls the law's own pilot decided on its last step."""
+        raise NotImplementedError
+
+    def parameters(self) -> dict[str, np.ndarray] | None:
+        """The law's PARAMETER inputs now (``LawPiece.parameter_shapes``): a
+        game with a network in its law returns its current weights; None: none."""
+        return None
+
+    def sync_parameters(self) -> None:
+        """Hand the law its parameter inputs (copied in place; no recompile)."""
+        piece = self.session.piece
+        if getattr(piece, "parameter_shapes", None):
+            values = self.parameters()
+            if values is not None:
+                piece.set_parameters(values)
+
     def _land(self, seconds: float, held: dict) -> None:
         """Land ``seconds`` with ``held`` controls, or with the policy's own
         when the autopilot is on (one decision per PILOT_STEP)."""
         if self.session.state is not None:
             self.drive_settings()
+        if self.autopilot and self.pilot is not None and self.session.state is not None and self.law_pilot_on():
+            self._land_in_law(seconds)
+            return
         if not self.autopilot or self.pilot is None or self.session.state is None:
             self.held = held
             if seconds > 0.0:
@@ -502,6 +585,37 @@ class EntityGame(Game):
             left -= step
             self._pilot_hold -= step
         self._end_check()
+
+    def _land_in_law(self, seconds: float) -> None:
+        """Land ``seconds`` with the network flying INSIDE the law: it decides
+        on every physics step, so there is no held decision and nothing for
+        Python to do per step.  The demo trace still records at the pilot's
+        decision cadence (PILOT_STEP): the observation is read first, the
+        first law call of the cadence lands on its own, and the decision that
+        call made (read back from the law's own columns) is the row's
+        target -- the in-law decision, on the observation it was made on."""
+        from meowdoku.autopilot import FEATURE_FUNCTIONS
+        self.session.control(self.law_pilot_rest())      # what the network does not drive
+        left = seconds
+        while left > 1e-9:
+            if self._pilot_hold <= 1e-9:
+                features = FEATURE_FUNCTIONS[self.game](self) if self._tracing() else None
+                step = min(left, self.session.dt)
+                self.session.advance(step)
+                self.held = self.law_pilot_controls()
+                self._trace(self.held, demo=True, features=features)
+                self._pilot_hold = self.PILOT_STEP - step
+            else:
+                step = min(left, self._pilot_hold)
+                self.session.advance(step)
+                self.held = self.law_pilot_controls()
+                self._pilot_hold -= step
+            left -= step
+        self._end_check()
+
+    def law_pilot_rest(self) -> dict[str, float]:
+        """Every control at rest (the network's own overwrite the law's)."""
+        raise NotImplementedError
 
     # declared by the game ----------------------------------------------------
     def make_piece(self):

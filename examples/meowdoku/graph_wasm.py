@@ -114,7 +114,11 @@ def _compile(stem: str, shapes: dict, run, output_names, contract: str, web_dir:
 def law_shapes() -> dict:
     from meowdoku import scroller as sc
     columns = sc.initial_columns()
-    return {n: (tuple(np.shape(columns[n])) if n in columns else ()) for n in sc.ScrollerPiece.argument_names}
+    piece = sc.ScrollerPiece
+    shapes = {n: (tuple(np.shape(columns[n])) if n in columns else ()) for n in piece.argument_names}
+    # the law's PARAMETER inputs (the pilot network's weights) are named inputs too
+    shapes.update({n: tuple(shape) for n, shape in piece.parameter_shapes.items()})
+    return shapes
 
 
 def build_law(web_dir: Path, contract: str = CONTRACT) -> dict:
@@ -124,14 +128,16 @@ def build_law(web_dir: Path, contract: str = CONTRACT) -> dict:
     piece = sc.ScrollerPiece
     shapes = law_shapes()
     digest = _digest(piece._captured_sources or piece._read_sources(),
-                     ",".join(piece.argument_names), json.dumps(shapes, sort_keys=True), contract, _emitter_sources())
+                     ",".join((*piece.argument_names, *piece.parameter_shapes)), json.dumps(shapes, sort_keys=True),
+                     contract, _emitter_sources())
     abi = _cached(web_dir, "law", digest)
     if abi is not None:
         return abi
     started = time.perf_counter()
-    names = piece.argument_names
+    names = (*piece.argument_names, *piece.parameter_shapes)
     abi = _compile("law", shapes, lambda b: piece.law(*(b[n] for n in names)), piece.output_names,
-                   contract, web_dir, {"source_digest": digest, "argument_names": list(names)})
+                   contract, web_dir, {"source_digest": digest, "argument_names": list(piece.argument_names),
+                                       "parameter_names": list(piece.parameter_shapes)})
     abi["build_seconds"] = round(time.perf_counter() - started, 1)
     (web_dir / "law.abi.json").write_text(json.dumps(abi), encoding="utf-8")
     return abi
@@ -230,11 +236,16 @@ def parity_law(work: Path) -> dict:
         game._land(0.1, {"move_axis": 0.4, "move_axis_y": 0.2, "fire": 1.0})
     piece = game.session.piece
     names = piece.argument_names
+    # the network flies the player in this step: marked, with the live weights as parameter inputs
+    game.session.column("net_pilot")[sc.PILOT_ROWS[0]] = 1.0
+    weights = game.parameters()
     columns = {n: np.array(game.session.column(n), dtype=np.float64) for n in names if n != "dt"}
     columns["dt"] = np.asarray(float(game.session.dt))
     piece._compile_native({n: columns[n] for n in columns}, CONTRACT)
+    piece.set_parameters(weights)
     native = piece.product(*(columns[n] for n in names))
-    got = _node_run(work, "law", "law", [(n, columns[n]) for n in names])
+    got = _node_run(work, "law", "law", [*((n, columns[n]) for n in names),
+                                          *((n, weights[n]) for n in piece.parameter_names)])
     report = {"lanes": sc.LANES, "alive": int(columns["alive"].sum()), "outputs": {}}
     worst = 0.0
     for name, ref in zip(piece.output_names, native):

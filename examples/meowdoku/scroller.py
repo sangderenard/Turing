@@ -84,6 +84,7 @@ from typing import Any
 
 import numpy as np
 
+import os
 import sys
 from pathlib import Path
 
@@ -91,6 +92,7 @@ from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_
 from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, ground_travel
 from meowdoku.entity_motion import climb as climb_law, shot_spawn as shot_birth
 from meowdoku import sphere_motion as sm
+from meowdoku import pilot_law
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -525,10 +527,11 @@ def scroller_step(lane, slot, rx, ry, rz,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
                   score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy,
                   bank, vbank, fire_prev, burst_left, last_fire, owned_l, owned_m, mult_l, mult_m, fan_l, fan_m,
-                  bombs_d, bombs_c, bombs_s, beam,
-                  field_w, pace, level,
+                  bombs_d, bombs_c, bombs_s, beam, net_o0, net_o1, net_o2, net_o3, net_o4,
+                  field_w, pace, level, net_pilot,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style,
-                  move_axis_r, fire_mode, primary_slot, dt):
+                  move_axis_r, fire_mode, primary_slot, dt,
+                  We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
     live = alive > 0.0
@@ -553,6 +556,32 @@ def scroller_step(lane, slot, rx, ry, rz,
     cx, cy = field_w * 0.5, zero + PLAYER_Y
     u = (ux, uy, uz)
     h = (hx, hy, hz)
+
+    # ------------------------------------------------ the pilot network
+    # The token network (pilot_law) decides, from the columns as this step
+    # finds them, for every lane in PILOT_ROWS; its weights are the law's
+    # parameter inputs.  The lanes ``net_pilot`` marks take its outputs as
+    # their controls: the player's five (roll, throttle, fire, pitch, rudder)
+    # replace the control columns this step (no pointer: steer is released);
+    # every marked lane's outputs are kept in ``net_o0..net_o4`` (the demo
+    # trace reads them back).
+    net_out = pilot_law.decide(PILOT_ROWS, {
+        "lane": lane, "slot": slot, "kind": kind, "owner": owner, "alive": alive, "x": x, "y": y, "z": z,
+        "vx": vx, "vy": vy, "vz": vz, "hp": hp, "spd": spd, "bank": bank, "fuel": fuel, "energy": energy,
+        "lives": lives, "timer": timer, "beam": beam, "weapon": weapon},
+        (We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2))
+    net_span = [pilot_law.spread(net_out[:, j], PILOT_ROWS, x) for j in range(pilot_law.OUTPUTS)]
+    net_lane = net_pilot > 0.0
+    net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next = (
+        where(net_lane, net_span[j], old) for j, old in enumerate((net_o0, net_o1, net_o2, net_o3, net_o4)))
+    net_on = (P * net_pilot).sum() > 0.0
+    move_axis = where(net_on, (P * net_span[0]).sum() + zero, move_axis)
+    move_axis_y = where(net_on, (P * net_span[1]).sum() + zero, move_axis_y)
+    fire = where(net_on, f((P * net_span[2]).sum() > 0.0) + zero, fire)
+    move_axis_z = where(net_on, (P * net_span[3]).sum() + zero, move_axis_z)
+    move_axis_r = where(net_on, (P * net_span[4]).sum() + zero, move_axis_r)
+    steer_x = where(net_on, zero - 1.0, steer_x)
+    steer_y = where(net_on, zero - 1.0, steer_y)
 
     # ------------------------------------------------ the player: turn, throttle, height
     # The shared damped motion law on three axes: YAW (left/right turn the
@@ -1219,6 +1248,7 @@ def scroller_step(lane, slot, rx, ry, rz,
             map_u_next, map_v_next, map_gx_next, map_gy_next,
             bank_next, vbank_next, fire_prev_next, burst_left_next, last_fire_next, owned_l_next, owned_m_next,
             mult_l_next, mult_m_next, fan_l_next, fan_m_next, bombs_d_next, bombs_c_next, bombs_s_next, beam_next,
+            net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next,
             residual, dt_limit)
 
 
@@ -1227,8 +1257,12 @@ STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
          "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy",
          "bank", "vbank", "fire_prev", "burst_left", "last_fire", "owned_l", "owned_m", "mult_l", "mult_m",
-         "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam")
-SETTINGS = ("field_w", "pace", "level")
+         "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam",
+         "net_o0", "net_o1", "net_o2", "net_o3", "net_o4")
+SETTINGS = ("field_w", "pace", "level", "net_pilot")
+#: The lanes the pilot network is evaluated for (a contiguous block; the
+#: player's, so far).  ``net_pilot`` marks which of them it flies.
+PILOT_ROWS = (0, 1)
 
 
 class ScrollerPiece(LawPiece):
@@ -1237,6 +1271,9 @@ class ScrollerPiece(LawPiece):
     entry = "scroller_step"
     law = staticmethod(scroller_step)
     argument_names = ("lane", "slot", "rx", "ry", "rz", *STATE, *SETTINGS, *CONTROLS, "dt")
+    #: the token network's weights: parameter inputs, never baked constants
+    parameter_shapes = pilot_law.token_param_shapes()
+    source_modules = ("meowdoku.pilot_law",)
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):
@@ -1372,6 +1409,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "mult_l": np.ones(LANES), "mult_m": np.ones(LANES),
         "fire_mode": np.full(LANES, AUTO), "primary_slot": np.zeros(LANES), "move_axis_r": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
+        **{name: np.zeros(LANES) for name in ("net_pilot", "net_o0", "net_o1", "net_o2", "net_o3", "net_o4")},
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
     }
@@ -1406,11 +1444,42 @@ class BulletScroller(EntityGame):
             return USER_PACE + (1.0 - USER_PACE) * ramp
         return 1.0 if not getattr(self, "learns", True) else USER_PACE
 
+    #: The autopilot's network runs inside the law (``pilot_law``) unless
+    #: MEOWDOKU_PILOT_LAW=0 keeps the Python pilot (``autopilot.Pilot``).
+    LAW_PILOT = os.environ.get("MEOWDOKU_PILOT_LAW", "1") != "0"
+
+    def parameters(self) -> dict[str, np.ndarray] | None:
+        """The pilot network's weights, the law's parameter inputs (the live
+        policy: training updates the dict, the next landing hands them over)."""
+        from meowdoku.autopilot import arch_of, live_params
+        params = live_params(self.game)
+        return params if params is not None and arch_of(params) == "token" else None
+
+    def law_pilot_on(self) -> bool:
+        return self.LAW_PILOT and self.parameters() is not None and "net_pilot" in self.session.columns
+
+    def law_pilot_rest(self) -> dict[str, float]:
+        from meowdoku.autopilot import controls_from
+        return controls_from(self, np.zeros(pilot_law.OUTPUTS))
+
+    def law_pilot_controls(self) -> dict[str, float]:
+        """The five outputs the law's pilot kept for the player's lane, as controls."""
+        from meowdoku.autopilot import controls_from
+        col = self.session.column
+        return controls_from(self, np.array([float(col(f"net_o{j}")[PILOT_ROWS[0]]) for j in range(pilot_law.OUTPUTS)]))
+
     def drive_settings(self) -> None:
-        """Before each landing: the pace for whoever drives now, and the pilots."""
+        """Before each landing: the pace for whoever drives now, who flies
+        the player (the law's network or a person), and the pilots."""
         column = self.session.column("pace")
         if column[0] != self.pace():
             column[...] = self.pace()
+        flying = 1.0 if (self.autopilot and self.law_pilot_on()) else 0.0
+        mark = self.session.column("net_pilot")
+        if mark[PILOT_ROWS[0]] != flying:
+            mark[PILOT_ROWS[0]] = flying
+        if flying:
+            self.sync_parameters()
         self.fly_pilots()
 
     def motion(self) -> dict[str, Any]:

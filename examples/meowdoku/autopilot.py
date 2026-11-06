@@ -59,10 +59,9 @@ FEATURES_DEPTH = 7 + 7 * K + 4
 #: token with shared weights, pools them by attention (two learned queries,
 #: softmax over the live tokens only) and joins the ship's embedding to a
 #: two-layer head.  It sees every body in reach, however many, in any order.
-TOKENS, TOKEN_F, SHIP_G = 64, 16, 12
-TOKEN_H, SHIP_H, HEAD_H = 48, 32, 64
-TOKEN_FEATURES = SHIP_G + TOKENS * TOKEN_F + TOKENS
-TOKEN_PARAMS = ("We1", "be1", "We2", "be2", "Q1", "Q2", "Wg", "bg", "Wh1", "bh1", "Wh2", "bh2")
+# (the network's layout and forward live in pilot_law.py, the one text the law traces too)
+from meowdoku.pilot_law import (  # noqa: E402,F401
+    TOKENS, TOKEN_F, SHIP_G, TOKEN_H, SHIP_H, HEAD_H, TOKEN_FEATURES, TOKEN_PARAMS, DX, DY, DV, token_policy_forward)
 #: bullet hell's five outputs: roll, throttle, fire, pitch, rudder (two sticks)
 GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (TOKEN_FEATURES, 5)}
 GAME_ARCH = {"space_invaders": "mlp", "bullet_hell": "token"}
@@ -102,7 +101,6 @@ def make_game(name: str):
 #            ship, scaled) and a kind flag (0 = padding)
 #   75..78   field width, remaining fleet/enemies, lives, weapon ready
 
-DX, DY, DV = 8.0, 10.0, 10.0
 
 
 def _observe(game, hostile_kind, remaining, ready, height: float, depth: float | None = None) -> np.ndarray:
@@ -256,31 +254,6 @@ def policy_forward(x, W1, b1, W2, b2, W3, b3):
     h = (x @ W1 + b1).tanh()
     h = (h @ W2 + b2).tanh()
     return (h @ W3 + b3).tanh()
-
-
-def token_policy_forward(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2):
-    """x (N, TOKEN_FEATURES) -> (N, outputs) in [-1, 1].  AbstractTensor
-    arithmetic only (traced to the NumPy product like ``policy_forward``):
-    unpack the ship, the tokens and the mask; embed every token (shared
-    weights); pool by two attention queries over the live tokens; join the
-    ship's embedding; a two-layer head."""
-    n = int(x.shape[0])
-    ship = x[:, 0:SHIP_G]
-    tokens = x[:, SHIP_G:SHIP_G + TOKENS * TOKEN_F].reshape((n * TOKENS, TOKEN_F))
-    mask = x[:, SHIP_G + TOKENS * TOKEN_F:SHIP_G + TOKENS * TOKEN_F + TOKENS].reshape((n, TOKENS, 1))
-    e = (tokens @ We1 + be1).tanh()
-    e = (e @ We2 + be2).tanh()
-    emb = e.reshape((n, TOKENS, TOKEN_H))
-    pooled = []
-    for q in (Q1, Q2):
-        weight = ((e @ q).tanh() * 4.0).exp().reshape((n, TOKENS, 1)) * mask
-        total = weight.sum(dim=1) + 1e-6
-        pooled.append((weight * emb).sum(dim=1) / total)
-    g = (ship @ Wg + bg).tanh()
-    from src.common.tensors import AbstractTensor as _AT
-    joined = _AT.cat([pooled[0], pooled[1], g], dim=1)
-    h = (joined @ Wh1 + bh1).tanh()
-    return (h @ Wh2 + bh2).tanh()
 
 
 def init_token_params(seed: int = 0, outputs: int = 5) -> dict[str, np.ndarray]:
@@ -523,7 +496,14 @@ class Pilot:
         # the fixed MLP stays on NumPy unless MEOWDOKU_PILOT=llvm.
         if os.environ.get("MEOWDOKU_PILOT", "llvm" if arch_of(params) == "token" else "numpy") == "llvm":
             try:
-                native = NativePolicy(params, batch=1)
+                # The eigen contract's matmul is Eigen's GEMM; the default
+                # ``develop`` contract's is a compensated scalar loop (about
+                # 1.5-2x slower at every batch: 96 -> 66 us a row at batch 1,
+                # 150 -> 64-80 us at 16-64).  Eigen needs TURING_EIGEN_INCLUDE.
+                try:
+                    native = NativePolicy(params, batch=1, contract="eigen")
+                except Exception:
+                    native = NativePolicy(params, batch=1)
                 self.run, self.lane = native, "llvm"
             except Exception as error:      # keep NumPy; say why
                 print(f"autopilot: WARNING llvm lane refused for the {arch_of(params)} network "
@@ -1207,8 +1187,11 @@ class PlayTrace:
         self.last = None                    # (score, lives, shield) at the last decision
         self.spans = 0
 
-    def record(self, game, controls: dict, demo: bool) -> bool:
-        """One decision; True when enough kept rows wait for the learner."""
+    def record(self, game, controls: dict, demo: bool, features=None) -> bool:
+        """One decision; True when enough kept rows wait for the learner.
+        ``features``: the observation it was made on, when the caller read it
+        before the state moved (the in-law pilot's decision lands a step
+        later)."""
         if game.game not in FEATURE_FUNCTIONS or game.session.state is None:
             return False
         if self.demo is None:
@@ -1228,8 +1211,9 @@ class PlayTrace:
                 self.ring.clear()
                 self.spans += 1
         self.last = now
-        self.ring.append((np.asarray(FEATURE_FUNCTIONS[game.game](game), dtype=np.float64).reshape(-1),
-                          target_from(game, controls)))
+        if features is None:
+            features = FEATURE_FUNCTIONS[game.game](game)
+        self.ring.append((np.asarray(features, dtype=np.float64).reshape(-1), target_from(game, controls)))
         return len(self.x) >= FLUSH_ROWS
 
     def take(self) -> tuple[np.ndarray, np.ndarray] | None:
