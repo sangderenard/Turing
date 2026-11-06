@@ -636,11 +636,14 @@ export class PointCloud {
     const gl = this.gl;
     if (this.target && this.target.w === w && this.target.h === h) return this.target;
     if (this.target) { gl.deleteTexture(this.target.tex); gl.deleteFramebuffer(this.target.fbo); this.target = null; }
+    // Texture bindings are shared with the scene's passes: bind on a unit of our own, then give back what was there.
+    const unit = gl.getParameter(gl.ACTIVE_TEXTURE), held = gl.getParameter(gl.TEXTURE_BINDING_2D);
     const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindTexture(gl.TEXTURE_2D, held); gl.activeTexture(unit);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { this.floatOk = false; gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); return null; }
     return (this.target = { w, h, tex, fbo });
   }
@@ -681,9 +684,15 @@ export class PointCloud {
       gl.bindVertexArray(this.emptyVao);
       gl.useProgram(this.resolve);
       gl.uniformMatrix4fv(this.rloc.uViewProj, false, viewProj); gl.uniform3f(this.rloc.uBoard, board[0], board[1], y); gl.uniform1f(this.rloc.uMargin, 2.0);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, target.tex); gl.uniform1i(this.rloc.uAccum, 0);
+      // The resolve reads the accumulation target on unit 0 -- the unit of the scene's pbr material table -- so
+      // put that binding back afterwards: left bound, the next frame's lit pass read every material (albedo,
+      // opacity, emission) out of this float texture and the plate, the sun and the bulbs rendered black.
+      const activeUnit = gl.getParameter(gl.ACTIVE_TEXTURE);
+      gl.activeTexture(gl.TEXTURE0); const held = gl.getParameter(gl.TEXTURE_BINDING_2D);
+      gl.bindTexture(gl.TEXTURE_2D, target.tex); gl.uniform1i(this.rloc.uAccum, 0);
       gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.bindTexture(gl.TEXTURE_2D, held); gl.activeTexture(activeUnit);
       gl.bindVertexArray(this.vao); gl.useProgram(this.program);
     } else {
       gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);

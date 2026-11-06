@@ -1254,13 +1254,19 @@ function uploadMaterials(game) {
     for (const [role, tint, emission] of [[name, rgb, glow[name]],
       [`${name}@hint`, mix(rgb, [0.45, 0.95, 0.45], 0.55), glow["@hint"]],
       [`${name}@sel`, mix(rgb, [1.0, 0.85, 0.3], 0.6), null]]) {
-      const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint) : [tint, {}];
+      // The fountain's plate is a near-black glossy backdrop: the sand reads
+      // against it and the sun leaves a soft highlight.  (It was always drawn
+      // this dark, but by accident -- see pointsFrame.)  Declared here as a finish.
+      const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint)
+        : game.game === "fountain" ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
   }
   records.push(["traycube", [0.86, 0.95, 1.0], { roughness: 0.04, transmission: 0.88, opacity: 0.2, ior: 1.5 }]);
-  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : [0.80, 0.90, 1.0],
+  // (the fountain's glass slab matches its dark floor)
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
+      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
@@ -1962,7 +1968,22 @@ const ARCADE = { lamp: 2.6, spacing: 0.55,
                  colours: [[1.0, 0.18, 0.12], [1.0, 0.62, 0.08], [1.0, 0.95, 0.85], [0.2, 0.55, 1.0],
                            [1.0, 0.82, 0.35], [0.62, 0.3, 1.0], [1.0, 0.12, 0.1], [1.0, 0.55, 0.0]],
                  sideColour: { white: 4, black: 5, red: 6, player: 4 }, checkColour: 7,
-                 events: [], peak: 0, key: null, last: null };
+                 events: [], peak: 0, key: null, last: null,
+                 activity: null };    // a compute game's live activity (see arcadeActivity), else null
+// Colours 8.. are the hues of a compute game's particles (ARCADE_HUES steps
+// round the wheel, full saturation): the ring takes the colour of what it is
+// showing.  Their bulb materials come with the rest in uploadMaterials.
+const ARCADE_HUES = 12, ARCADE_HUE0 = ARCADE.colours.length, ARCADE_WHITE = 2;
+for (let k = 0; k < ARCADE_HUES; k++) {
+  const h = k / ARCADE_HUES * 6, x = 1 - Math.abs(h % 2 - 1), sector = Math.floor(h);
+  ARCADE.colours.push([[1, x, 0], [x, 1, 0], [0, 1, x], [0, x, 1], [x, 0, 1], [1, 0, x]][sector]);
+}
+function arcadeHueIndex(r, g, b) {       // a particle's colour -> the ring colour nearest its hue (washed-out: white)
+  const hi = Math.max(r, g, b), lo = Math.min(r, g, b), c = hi - lo;
+  if (hi < 1e-3 || c / hi < 0.25) return ARCADE_WHITE;
+  const h = (hi === r ? ((g - b) / c + 6) % 6 : hi === g ? (b - r) / c + 2 : (r - g) / c + 4) / 6;
+  return ARCADE_HUE0 + Math.round(h * ARCADE_HUES) % ARCADE_HUES;
+}
 
 // Score events, read from what each state DECLARES: a board game's material
 // (a capture is the other side's material falling), its check and outcome;
@@ -1999,10 +2020,14 @@ function arcadeEvents(game, now) {
   }
   if (game.won && !last.won && !game.material) add("win", "player", 1);
 }
-function arcadeBulbs() {
+function arcadeRing() {
   const ext = state.extent || { width: 6, depth: 6 }, m = GLASS.margin * 0.6;
   const x0 = -m, z0 = extZ0(ext) - m, x1 = ext.width + m, z1 = ext.depth + m;
-  const perimeter = 2 * ((x1 - x0) + (z1 - z0)), count = Math.max(16, Math.round(perimeter / ARCADE.spacing));
+  const perimeter = 2 * ((x1 - x0) + (z1 - z0));
+  return { x0, z0, x1, z1, perimeter, count: Math.max(16, Math.round(perimeter / ARCADE.spacing)) };
+}
+function arcadeBulbs() {
+  const { x0, z0, x1, z1, perimeter, count } = arcadeRing();
   const bulbs = [];
   for (let i = 0; i < count; i++) {
     let s = i / count * perimeter, x, z;
@@ -2011,6 +2036,83 @@ function arcadeBulbs() {
     bulbs.push([x, 0.45 - planetDrop(x, z), z]);   // on posts, so their light falls onto the tiles
   }
   return bulbs;
+}
+// The ring driven from a compute game's packed points ([x, y, rgba8, meta] per
+// displayed id; meta/100: 0 not launched, 1 in flight, 2 at rest), once per
+// frame, from what the simulation already gives the page -- no readback of its
+// own.  Three signals, all through the one arcadeBulb mechanism:
+//  * EMISSION: the share of ids in flight pulses the idle chase (speed and
+//    brightness), and the chase takes the colour of the particles nearest the
+//    nozzle -- the ones just launched, so the hue follows the time strata.
+//  * IMPACT: each in-flight id's motion this frame (displacement) is credited
+//    to the ring bulb nearest it on the edge it is closest to, weighted by how
+//    near that edge is; a bulb flashes with the motion beside it, in the
+//    average colour of the ids that moved there, and fades over a few frames.
+//  * PROGRESS: a comet runs the ring each time another tenth of the ids has
+//    settled, and the whole ring flashes when the last one stops.
+function arcadeActivity(data, rec, g, now) {
+  const ring = arcadeRing(), count = ring.count;
+  let A = ARCADE.activity;
+  const key = `${g.game}|${g.compute && g.compute.epoch}|${data.length}`;
+  if (!A || A.key !== key || A.level.length !== count) {
+    A = ARCADE.activity = { key, level: new Float32Array(count), ci: new Int32Array(count).fill(ARCADE_WHITE), prev: null, peak: 1e-4,
+                            pulse: 0, pulsePeak: 1, phase: 0, emitCi: ARCADE_WHITE, at: now, step: 0, hadMotion: false, done: false };
+  }
+  const dt = Math.min(0.25, Math.max(0.001, now - A.at)); A.at = now;
+  const n = data.length / 4, stride = Math.max(1, Math.floor(n / 6000)), ns = Math.ceil(n / stride);
+  const u = new Uint32Array(data.buffer, data.byteOffset, data.length);
+  if (!A.prev || A.prev.length !== 2 * ns) A.prev = new Float32Array(2 * ns).fill(NaN);
+  const [vx0, vx1, vy0, vy1] = rec.geometry.view, bw = g.width, bh = g.height;
+  const k = Math.min(bw / (vx1 - vx0), bh / (vy1 - vy0)), cx = (vx0 + vx1) / 2, cy = (vy0 + vy1) / 2;
+  const nozzle = (rec.geometry.nozzle_y ?? vy1), tol = 0.04 * (vy1 - vy0), reach = 0.15 * Math.min(bw, bh);
+  const E = new Float32Array(count), R = new Float32Array(count), G = new Float32Array(count), B = new Float32Array(count);
+  const em = { d: Infinity, r: 0, g: 0, b: 0, n: 0 };
+  let moving = 0, rest = 0;
+  for (let i = 0, j = 0; i < n; i += stride, j++) {
+    const px = data[4 * i], py = data[4 * i + 1], flag = Math.floor(data[4 * i + 3] / 100 + 0.001);
+    const qx = A.prev[2 * j], qy = A.prev[2 * j + 1]; A.prev[2 * j] = px; A.prev[2 * j + 1] = py;
+    if (flag < 1) continue;
+    if (flag >= 2) { rest++; continue; }
+    moving++;
+    const rgba = u[4 * i + 2], r = (rgba & 255) / 255, gg = ((rgba >> 8) & 255) / 255, b = ((rgba >> 16) & 255) / 255;
+    const nd = Math.hypot(px - cx, py - nozzle);
+    if (nd < em.d - tol) { em.d = nd; em.r = em.g = em.b = 0; em.n = 0; }
+    if (nd <= em.d + tol) { em.r += r; em.g += gg; em.b += b; em.n++; }
+    if (Number.isNaN(qx)) continue;
+    const bx = bw / 2 + (px - cx) * k, bz = bh / 2 - (py - cy) * k, move = Math.hypot(px - qx, py - qy) * k;
+    // nearest edge of the ring, and the arc length along the ring to the point on it
+    const dl = bx - ring.x0, dr = ring.x1 - bx, dtp = bz - ring.z0, db = ring.z1 - bz, d = Math.max(0, Math.min(dl, dr, dtp, db));
+    const wx = ring.x1 - ring.x0, wz = ring.z1 - ring.z0;
+    const s = d === dtp ? dl : d === dr ? wx + dtp : d === db ? wx + wz + dr : 2 * wx + wz + db;
+    const w = move / (1 + (d / reach) * (d / reach)), at = Math.round(Math.max(0, s) / ring.perimeter * count) % count;
+    E[at] += w; R[at] += w * r; G[at] += w * gg; B[at] += w * b;
+  }
+  // a little spread along the ring, then the fade: a bulb keeps most of its last brightness
+  const kernel = [0.25, 0.5, 1, 0.5, 0.25];
+  const blur = (X) => { const out = new Float32Array(count); for (let i = 0; i < count; i++) kernel.forEach((c, o) => { out[(i + o - 2 + count) % count] += c * X[i]; }); return out; };
+  const Eb = blur(E), Rb = blur(R), Gb = blur(G), Bb = blur(B);
+  let top = 0; for (let i = 0; i < count; i++) top = Math.max(top, Eb[i]);
+  A.peak = Math.max(A.peak * 0.995, top, 1e-4);
+  A.emitCi = em.n ? arcadeHueIndex(em.r / em.n, em.g / em.n, em.b / em.n) : A.emitCi;
+  for (let i = 0; i < count; i++) {
+    A.level[i] = Math.max(Math.pow(Eb[i] / A.peak, 0.7), A.level[i] * 0.86);
+    A.ci[i] = Eb[i] > 0.15 * A.peak ? arcadeHueIndex(Rb[i], Gb[i], Bb[i]) : A.emitCi;
+  }
+  A.pulsePeak = Math.max(A.pulsePeak * 0.999, moving);
+  A.pulse += (moving / A.pulsePeak - A.pulse) * Math.min(1, 6 * dt);
+  A.phase += (3 + 12 * A.pulse) * dt;
+  // progress
+  const settled = Math.floor(10 * rest / ns);
+  if (settled < A.step) { A.step = settled; A.done = false; A.hadMotion = false; }
+  if (settled > A.step) {
+    A.step = settled;
+    ARCADE.events.push({ pattern: "comet", side: "player", ci: A.emitCi, size: 0.4 + 0.06 * settled, at: now });
+  }
+  if (moving > 0) A.hadMotion = true;
+  if (A.hadMotion && !A.done && moving === 0 && rest > 0) {
+    A.done = true; ARCADE.events.push({ pattern: "flash", side: "player", ci: A.emitCi, size: 1, at: now });
+  }
+  if (ARCADE.events.length > 12) ARCADE.events.splice(0, ARCADE.events.length - 12);
 }
 // Where a side's events start on the ring: white (and a solo player) at the
 // near edge, black at the far edge; the bulb nearest that edge's middle.
@@ -2026,8 +2128,14 @@ function sideOrigin(side, bulbs) {
 function arcadeBulb(i, bulbs, now) {
   const count = bulbs.length;
   let level = ((i + Math.floor(now * 6)) % 6 === 0) ? 0.55 : 0.1, ci = i % 4;
+  const act = ARCADE.activity && ARCADE.activity.level.length === count ? ARCADE.activity : null;
+  if (act) {
+    // a compute game: the idle chase is driven by its emission (faster and
+    // brighter the more is in flight) and takes the colour being launched
+    level = ((i + Math.floor(act.phase)) % 6 === 0) ? 0.3 + 0.35 * act.pulse : 0.05 + 0.15 * act.pulse; ci = act.emitCi;
+  }
   for (const event of ARCADE.events) {
-    const age = now - event.at, home = sideOrigin(event.side, bulbs), colour = ARCADE.sideColour[event.side] ?? 4;
+    const age = now - event.at, home = sideOrigin(event.side, bulbs), colour = event.ci ?? ARCADE.sideColour[event.side] ?? 4;
     const ring = (a) => Math.min((a - i + count) % count, (i - a + count) % count);
     let l = 0, c = colour;
     if (event.pattern === "flash" && age < 2.6) l = Math.floor(age * 8) % 2 === 0 ? 1.0 : 0.15;
@@ -2048,6 +2156,7 @@ function arcadeBulb(i, bulbs, now) {
     }
     if (l > level) { level = l; ci = c; }
   }
+  if (act && act.level[i] > level) { level = act.level[i]; ci = act.ci[i]; }   // impacts, in the colour that struck
   ARCADE.events = ARCADE.events.filter((event) => now - event.at < 3);
   return { level, ci };
 }
@@ -3689,12 +3798,13 @@ function renderGameControls(game) {
 }
 function pointsFrame(cam, now) {
   const g = state.game;
-  if (!g || !g.compute) return;
+  if (!g || !g.compute) { ARCADE.activity = null; return; }
   compute.frame(now);
   const data = compute.ready && compute.product ? compute.product.points() : null;
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
+  if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
                      y: TILE.height + 0.03, stride: rec.display_stride, background: sceneBackground() });
 }
