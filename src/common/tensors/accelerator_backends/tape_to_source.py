@@ -184,7 +184,17 @@ class _Printer:
             expression = _literal(flat[0])
             self._literal_expressions.add(expression)
             return expression
-        return self.dialect.call(self.dialect.array, repr(list(flat)))
+        expression = self.dialect.call(self.dialect.array, repr(list(flat)))
+        # A folded constant keeps its shape.  Flattened alone, a (256, 6)
+        # constant -- the sum of two static radius blocks in meowdoku's
+        # scroller_step (``block_hits``: rx[rows].reshape((a, 1)) +
+        # rx[cols].reshape((1, b))) -- was printed as a 1536-long vector and
+        # the product raised "operands could not be broadcast together with
+        # shapes (256,6) (1536,)" where the traced eager law broadcast fine.
+        shape = tuple(int(n) for n in (getattr(value, "shape", ()) or ()))
+        if len(shape) > 1:
+            expression = f"{expression}.reshape({repr(shape)})"
+        return expression
 
     def emit(self, node: Any) -> None:
         dialect = self.dialect
