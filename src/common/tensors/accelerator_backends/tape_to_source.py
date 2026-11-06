@@ -256,11 +256,13 @@ class _Printer:
             return f"{args[0]}.astype(np.int64)" if dialect is NUMPY else f"{args[0]}.to(torch.int64)"
 
         if raw == "index_select":
-            # A gather along ``dim`` by an integer index vector.
+            # A gather along ``dim`` by an index vector.  The traced lanes carry
+            # an index as a whole-number float (as the eager NumPy backend now
+            # reads it too), so the printed gather casts it to int64 itself.
             dim = int(params.get("dim", 0))
             if dialect is NUMPY:
-                return dialect.call("take", args[0], args[1], f"axis={dim}")
-            return dialect.call("index_select", args[0], str(dim), args[1])
+                return dialect.call("take", args[0], f"np.asarray({args[1]}).astype(np.int64)", f"axis={dim}")
+            return dialect.call("index_select", args[0], str(dim), f"{args[1]}.to(torch.int64)")
 
         if raw == "clamp":
             low, high = params.get("min"), params.get("max")

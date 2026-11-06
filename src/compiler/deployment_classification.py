@@ -460,6 +460,7 @@ def webgpu_compute_payoff(
     *,
     model: WebGPUComputeCostModel = WebGPUComputeCostModel(),
     outputs: Sequence[Any] | None = None,
+    dispatches: int = 1,
 ) -> ComputePayoff:
     """Whether dispatching a function's tensor regions as ONE compute chain
     beats leaving them on the host.
@@ -516,7 +517,7 @@ def webgpu_compute_payoff(
     host_seconds = element_ops / model.host_ops_per_s
     waves = -(-invocations // int(model.gpu_resident_threads))
     gpu_seconds = (
-        model.dispatch_overhead_s
+        model.dispatch_overhead_s * max(1, int(dispatches))
         + (bytes_in + bytes_out) / model.transfer_bytes_per_s
         + waves * (element_ops / invocations) / model.gpu_thread_ops_per_s
     )

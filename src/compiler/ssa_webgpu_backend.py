@@ -248,7 +248,9 @@ class _FunctionEmitter:
         store_outputs: bool = True,
         packed_outputs: bool = False,
         invocation_count: int = 1,
+        gather_slots: Mapping[int, int] | None = None,
     ):
+        self.gather_slots = None if gather_slots is None else dict(gather_slots)
         self.function = function
         self.outputs = tuple(outputs)
         self.loops = tuple(loop_records)
@@ -348,6 +350,17 @@ class _FunctionEmitter:
                     constant = values[0]
             if constant is not None:
                 expression = _literal(constant, dtype or "f32")
+        elif operation == "gather" and len(args) == 2 and self.gather_slots is not None:
+            # A gather reads another invocation's element of a value an
+            # EARLIER dispatch materialized into its arena slot.
+            slot = self.gather_slots.get(int(instr.args[0].id))
+            if slot is None:
+                self.fail(operation, f"gather source %{instr.args[0].id} has no arena slot")
+                return
+            count = self.invocation_count
+            expression = (
+                f"arena[{slot * count}u + min(u32(max({args[1]}, 0.0f)), {count - 1}u)]"
+            )
         elif operation in {"Call", "call"}:
             callee = str(instr.attributes.get("callee", ""))
             returns = self.callees.get(callee)
@@ -1644,6 +1657,7 @@ def lower_elementwise_kernel_calls(
     outputs: Sequence[SSAValue],
     *,
     count: int,
+    allow_gather: bool = False,
 ) -> tuple[Function, tuple[SSAValue, ...], tuple[WGSLShortfall, ...]]:
     """Rewrite a function in the elementwise kernel-call form to the
     per-invocation scalar form ``emit_module`` consumes.
@@ -1716,6 +1730,12 @@ def lower_elementwise_kernel_calls(
                         name, operands = "where", args[:3]
                     elif callee == "fill_double":
                         name, operands = "copy", [args[1]]
+                    elif callee == "gather_values_double" and allow_gather:
+                        if (int(constants[int(args[3].id)]), int(constants[int(args[4].id)])) != (1, 0):
+                            fail(callee, "only a gather along dim 0 of a rank-one value is spelled")
+                            continue
+                        # gather_values_double(input, OUTPUT, shape, ndim, dim, indices, count)
+                        name, operands = "gather", [args[0], args[5]]
                     else:
                         fail(callee or operation,
                              "is not an elementwise repository kernel: a "
@@ -1732,9 +1752,17 @@ def lower_elementwise_kernel_calls(
                 emit(name, operands, result)
             else:
                 fail(operation, "instruction is not in the elementwise kernel-call form")
+    # the extent of every value in the SOURCE (a scalar broadcast by ``fill`` is
+    # still a lane value), which the per-invocation form no longer carries
+    extents: dict[int, int] = {}
+    for value in [*source.args, *(i.res for b in source.blocks.values() for i in b.instrs if i.res is not None)]:
+        elements = 1
+        for extent in tuple(value.shape or ()):
+            elements *= int(extent)
+        extents[int(value.id)] = elements
     function = Function(
         function_name, [lane(item) for item in source.args],
-        {"entry": BasicBlock("entry", instrs)},
+        {"entry": BasicBlock("entry", instrs)}, metadata={"extents": extents},
     )
     return function, tuple(lane(item) for item in outputs), tuple(shortfalls)
 
@@ -1779,3 +1807,211 @@ def emit_tensor_program_module(
         artifact.shortfalls = tuple(shortfalls) + tuple(artifact.shortfalls)
         artifact.complete = False
     return artifact
+
+
+# ---------------------------------------------------------------------------
+# Multi-dispatch programs: elementwise kernels AND gathers.
+#
+# A gather reads ANOTHER invocation's element, so it can only read a value an
+# earlier dispatch has finished writing.  The program is therefore cut into
+# DISPATCHES: instructions are walked in order and a new dispatch starts at
+# each gather whose source was produced in the current one.  A bitonic sort
+# is exactly such a chain (one dispatch per compare-exchange stage); a binary
+# search or a neighbour-contact loop gathers from values that already exist,
+# so all of its steps fuse into one dispatch.  Every value that crosses a
+# dispatch boundary (or is published) lives in one ARENA, a single storage
+# buffer of ``slots * count`` floats, in a slot reused once its last reader's
+# dispatch is past; scalars (rank-zero values) are recomputed where used.
+# Within one compute pass WebGPU orders the dispatches' storage writes and
+# reads, so nothing else synchronises them.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WGSLPassProgram:
+    """A sequence of compute dispatches over one arena buffer."""
+
+    name: str
+    source: str
+    complete: bool
+    shortfalls: tuple[WGSLShortfall, ...]
+    count: int
+    entries: tuple[str, ...]            # one entry point per dispatch, in order
+    workgroup_size: tuple[int, int, int]
+    groups: tuple[int, int, int]
+    slots: int                          # arena slots (each ``count`` floats)
+    feed_slots: dict[int, int]          # formal value id -> slot
+    output_slots: dict[int, int]        # output value id -> slot
+    uniform_feeds: tuple[int, ...]      # formal ids whose value is element 0 of its slot
+    backend_identity_decisions: tuple[Any, ...] = ()
+    launch_plan: Any = None
+
+    @property
+    def dispatches(self) -> int:
+        return len(self.entries)
+
+
+def emit_tensor_program_passes(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue],
+    *,
+    count: int,
+    name: str | None = None,
+    preferred_local_size: int = 64,
+) -> WGSLPassProgram:
+    """Compute dispatches for a tensor law in the elementwise + gather kernel-call
+    form.  Rank-zero formals are uniforms (element 0 of their slot).  Anything
+    the form cannot spell (a reduction, a scatter, a sort kernel) is named as a
+    shortfall.  The caller sets the work contract (``fast``: f64 -> f32)."""
+
+    from .backend_identities import apply_backend_identities
+
+    function, lowered_outputs, shortfalls = lower_elementwise_kernel_calls(
+        module, function_name, outputs, count=count, allow_gather=True,
+    )
+    extents = dict(function.metadata["extents"])
+    identity = apply_backend_identities(
+        IRModule({function_name: function}), {function_name: lowered_outputs}, backend="webgpu",
+    )
+    function = identity.module.functions[function_name]
+    lowered_outputs = tuple(identity.outputs[function_name])
+    plan = plan_wgsl_launch(count, preferred_local_size=preferred_local_size)
+    local_x = plan.workgroup_size[0]
+    is_lane = lambda value: extents.get(int(value.id), 1) > 1 or int(value.id) in lane_defined  # noqa: E731
+    lane_defined: set[int] = set()
+    # lane-extent values: formals with extent > 1, and results with extent > 1
+    instrs = [item for block in function.blocks.values() for item in block.instrs]
+    formal_ids = [int(v.id) for v in function.args]
+    uniform_ids = tuple(i for i in formal_ids if extents.get(i, 1) <= 1)
+    lane_ids = {i for i in formal_ids if extents.get(i, 1) > 1}
+    for item in instrs:
+        if item.res is not None and extents.get(int(item.res.id), 1) > 1:
+            lane_ids.add(int(item.res.id))
+    del is_lane, lane_defined
+    # ---- cut into dispatches
+    seg_of: dict[int, int] = {}              # instr index -> dispatch
+    def_seg: dict[int, int] = {i: -1 for i in lane_ids if i in set(formal_ids)}
+    seg = 0
+    for index, item in enumerate(instrs):
+        if str(item.op) == "gather":
+            source_id = int(item.args[0].id)
+            if def_seg.get(source_id, -1) == seg:
+                seg += 1
+        seg_of[index] = seg
+        if item.res is not None and int(item.res.id) in lane_ids:
+            def_seg[int(item.res.id)] = seg
+    dispatches = seg + 1
+    # ---- which lane values cross a dispatch boundary
+    last_use: dict[int, int] = {}
+    gather_sources: set[int] = set()
+    for index, item in enumerate(instrs):
+        for argument in item.args:
+            a = int(argument.id)
+            if a in lane_ids:
+                last_use[a] = max(last_use.get(a, -1), seg_of[index])
+        if str(item.op) == "gather":
+            gather_sources.add(int(item.args[0].id))
+    output_ids = [int(v.id) for v in lowered_outputs]
+    slot_of: dict[int, int] = {}
+    for i in formal_ids:
+        slot_of[i] = len(slot_of)
+    for i in output_ids:
+        if i not in slot_of:
+            slot_of[i] = len(slot_of)
+    pool: list[list[int]] = []                # [slot, free_after_dispatch]
+    next_slot = len(slot_of)
+    for index, item in enumerate(instrs):
+        if item.res is None:
+            continue
+        r = int(item.res.id)
+        if r not in lane_ids or r in slot_of:
+            continue
+        if last_use.get(r, -1) > seg_of[index] or r in gather_sources:
+            for entry in pool:
+                if entry[1] < seg_of[index]:
+                    entry[1] = last_use.get(r, seg_of[index])
+                    slot_of[r] = entry[0]
+                    break
+            else:
+                slot_of[r] = next_slot
+                pool.append([next_slot, last_use.get(r, seg_of[index])])
+                next_slot += 1
+    slots = next_slot
+    # ---- emit the dispatches
+    scalar_defs: dict[int, Instr] = {}
+    for item in instrs:
+        if item.res is not None and int(item.res.id) not in lane_ids:
+            scalar_defs[int(item.res.id)] = item
+    entries: list[str] = []
+    bodies: list[str] = []
+    all_shortfalls: list[WGSLShortfall] = list(shortfalls)
+    n = int(count)
+    for s in range(dispatches):
+        emitter = _FunctionEmitter(
+            function, outputs=(), loop_records=(), store_outputs=False,
+            invocation_count=n, gather_slots=slot_of,
+        )
+        local = [(index, item) for index, item in enumerate(instrs) if seg_of[index] == s]
+        defined_here = {int(item.res.id) for _i, item in local if item.res is not None}
+        emitted_scalars: set[int] = set()
+
+        def need(value: SSAValue, emitter=emitter, defined_here=defined_here, emitted_scalars=emitted_scalars) -> None:
+            v = int(value.id)
+            if v in emitter.declared:
+                return
+            if v in lane_ids:
+                if v in defined_here:
+                    return
+                dtype = emitter.dtype(value) or "f32"
+                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{slot_of[v] * n}u + i];")
+                emitter.declared.add(v)
+                return
+            if v in set(formal_ids):
+                dtype = emitter.dtype(value) or "f32"
+                emitter.lines.append(f"  let v_{v}: {dtype} = arena[{slot_of[v] * n}u];")
+                emitter.declared.add(v)
+                return
+            definition = scalar_defs.get(v)
+            if definition is None:
+                emitter.fail("operand", f"value %{v} has no definition")
+                return
+            for argument in definition.args:
+                need(argument)
+            emitter.emit_assignment(definition, "  ")
+            emitter.declared.add(v)
+
+        for _index, item in local:
+            for argument in item.args:
+                need(argument)
+            emitter.emit_assignment(item, "  ")
+            if item.res is not None:
+                emitter.declared.add(int(item.res.id))
+        for _index, item in local:
+            if item.res is None:
+                continue
+            r = int(item.res.id)
+            if r in lane_ids and r in slot_of and (r in output_ids or last_use.get(r, -1) > s or r in gather_sources):
+                emitter.lines.append(f"  arena[{slot_of[r] * n}u + i] = v_{r};")
+        for r in output_ids:
+            if r in lane_ids and r not in defined_here and r in set(formal_ids):
+                continue
+        all_shortfalls.extend(emitter.shortfalls)
+        entry = f"p{s}"
+        entries.append(entry)
+        bodies.append("\n".join([
+            f"@compute @workgroup_size({local_x}, 1, 1)",
+            f"fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
+            "  let i: u32 = gid.x;",
+            f"  if (i >= {n}u) {{ return; }}",
+            *emitter.lines,
+            "}",
+            "",
+        ]))
+    source = "\n".join(["@group(0) @binding(0) var<storage, read_write> arena: array<f32>;", "", *bodies])
+    return WGSLPassProgram(
+        name or function_name, source, not all_shortfalls, tuple(dict.fromkeys(all_shortfalls)), n,
+        tuple(entries), (local_x, 1, 1), (-(-n // local_x), 1, 1), slots,
+        {i: slot_of[i] for i in formal_ids}, {i: slot_of[i] for i in output_ids}, uniform_ids,
+        identity.decisions, plan,
+    )

@@ -877,7 +877,11 @@ class NumPyTensorOperations(AbstractTensor):
 
     def index_select_(self, dim, indices):
         tensor = self.data
-        idx = self._AbstractTensor__unwrap(indices)
+        idx = np.asarray(self._AbstractTensor__unwrap(indices))
+        if idx.dtype.kind == "f":
+            # The traced lanes (repository SSA, native, wasm, WGSL) carry an index as a
+            # float value that holds a whole number; the eager lane reads it the same way.
+            idx = idx.astype(np.int64)
         return np.take(tensor, idx, axis=dim)
 
     def argmin_(self, dim=None, keepdim=False):

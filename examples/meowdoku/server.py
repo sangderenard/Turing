@@ -416,10 +416,10 @@ def make_handler(sessions: Sessions):
             from meowdoku import fountain
             query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             try:
-                cols, rows = int(query.get("cols", fountain.COLS)), int(query.get("rows", fountain.ROWS))
-                if not (2 <= cols <= 512 and 2 <= rows <= 512):
-                    raise ValueError("cols and rows must be 2..512")
-                layout = fountain.layout(cols, rows, seed=int(query.get("seed", 7)), mix=float(query.get("mix", 0.5)))
+                n = int(query.get("n", fountain.N_FULL))
+                if n not in fountain.SIZES.values():
+                    raise ValueError(f"n must be one of {sorted(fountain.SIZES.values())}")
+                layout = fountain.layout(n, seed=int(query.get("seed", 7)), mix=float(query.get("mix", 0.5)))
             except (ValueError, TypeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             body = b"".join(layout[name].astype("<f4").tobytes() for name in fountain.LAYOUT_COLUMNS)

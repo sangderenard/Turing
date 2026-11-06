@@ -5,26 +5,30 @@
 //   game.compute = { manifest, size, epoch, layout, uniforms, speed, named }
 //
 // `manifest` is a compiler-built products manifest (fountain_build.py writes
-// one): per size, the generated WGSL + its ABI (`wgsl`, `wgsl_abi`), the wasm
-// product (`wasm`, `wasm_abi`), the compiler's deployment verdict (`route`,
-// `verdict`), and how to start and present it (`initial`, `points`,
-// `layout_columns`).  This runtime creates the device, keeps the buffers
-// resident, dispatches the law each frame, and falls back to the wasm product
-// when the classifier said the dispatch does not pay or `navigator.gpu` is
-// missing.  Nothing here knows what the law is.
+// one): per size, the generated WGSL program + its ABI (`wgsl`, `wgsl_abi`:
+// dispatch entry points over ONE arena buffer, the arena slot of every formal
+// and output), the wasm product (`wasm`, `wasm_abi`), the compiler's
+// deployment verdict (`route`, `verdict`), and how to present it (`points`,
+// `layout_columns`).  This runtime creates the device, keeps the arena
+// resident, runs the program's dispatches each step, and falls back to the
+// wasm product when the classifier said the dispatches do not pay or
+// `navigator.gpu` is missing.  Nothing here knows what the law is.
 //
-// Presentation: the main renderer is WebGL2, which cannot read WebGPU buffers.
-// The product's `points` description (position, colour, liveness, landed
-// flags, per-id size) is packed on the device by one small generic compute
-// pass into 16 bytes per id -- [x, y, rgba8 (as bits), meta] -- and that
-// packed buffer alone is copied back (double buffered, one or two frames
-// late) for WebGL to draw as instanced GL points in the shared scene.  No
-// WGSL is read by a vertex stage, so devices with no vertex-stage storage
-// buffers (Apple's) are not a case.  The wasm route packs the same layout on
-// the CPU.
+// Presentation: the main renderer is WebGL2, which cannot read WebGPU
+// buffers.  The product's `points` description (position, velocity for the
+// at-rest flag, colour, liveness) is packed on the device by one small
+// generic compute pass into 16 bytes per id -- [x, y, rgba8 (as bits), meta]
+// -- and that packed buffer alone is copied back (triple buffered, one or two
+// frames late) for WebGL to draw as GL points in the shared scene.  No WGSL
+// is read by a vertex stage, so devices with no vertex-stage storage buffers
+// (Apple's) are not a case.  The wasm route packs the same layout on the CPU.
+//
+// Determinism: a product's reset writes the same bytes every time, and the
+// law has no atomics and no scatter, so a replay from the same initial
+// columns on the same device repeats exactly.  The runtime records the rest
+// positions when phase 1 settles (one readback, an event) and compares them
+// with phase 2's.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
-
-const DT = 1 / 120;
 
 async function json(url) {
   const response = await fetch(url);
@@ -34,20 +38,21 @@ async function json(url) {
 
 // ---------------------------------------------------------------- GPU route
 const PACK_WGSL = `
-@group(0) @binding(0) var<storage, read> feeds: array<f32>;
-@group(0) @binding(1) var<storage, read> outs: array<f32>;
-@group(0) @binding(2) var<storage, read_write> pts: array<f32>;
+@group(0) @binding(0) var<storage, read> arena: array<f32>;
+@group(0) @binding(1) var<storage, read_write> pts: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let i = g.x;
   if (i >= __N__u) { return; }
-  let live = feeds[__AGE__u * __N__u + i] >= feeds[__START__u * __N__u + i];
-  let landed = feeds[__LANDED__u * __N__u + i] > 0.5;
-  let c = pack4x8unorm(vec4<f32>(outs[__R__u * __N__u + i], outs[__G__u * __N__u + i], outs[__B__u * __N__u + i], 1.0));
-  pts[4u * i] = feeds[__X__u * __N__u + i];
-  pts[4u * i + 1u] = feeds[__Y__u * __N__u + i];
+  let live = arena[__AGE__u * __N__u + i] >= arena[__START__u * __N__u + i];
+  let vx = arena[__VX__u * __N__u + i];
+  let vy = arena[__VY__u * __N__u + i];
+  let rest = (vx * vx + vy * vy) < __REST2__;
+  let c = pack4x8unorm(vec4<f32>(arena[__R__u * __N__u + i], arena[__G__u * __N__u + i], arena[__B__u * __N__u + i], 1.0));
+  pts[4u * i] = arena[__X__u * __N__u + i];
+  pts[4u * i + 1u] = arena[__Y__u * __N__u + i];
   pts[4u * i + 2u] = bitcast<f32>(c);
-  pts[4u * i + 3u] = select(0.0, select(1.0, 2.0, landed), live);
+  pts[4u * i + 3u] = select(0.0, select(1.0, 2.0, rest), live);
 }`;
 
 class GpuProduct {
@@ -59,31 +64,43 @@ class GpuProduct {
     this.device = await adapter.requestDevice();
     this.device.addEventListener?.("uncapturederror", (e) => { this.failure = String((e.error && e.error.message) || e.error); });
     this.adapterInfo = adapter.info ? [adapter.info.vendor, adapter.info.architecture, adapter.info.device].filter(Boolean).join("/") : "";
-    this.rec = rec; this.n = rec.n; this.abi = rec.wgsl_abi; this.A = this.abi.arguments; this.O = this.abi.outputs;
+    this.rec = rec; this.n = rec.n; this.abi = rec.wgsl_abi; this.manifest = manifest;
     this.state = manifest.law.state;
     const module = this.device.createShaderModule({ code: await fetch(rec.wgsl).then((r) => r.text()) });
     this.#check(await module.getCompilationInfo(), "generated WGSL");
-    this.compute = await this.device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } });
-    const slot = (name) => this.A.indexOf(name), oslot = (name) => this.O.indexOf(name), p = manifest.points;
+    const storage = (type) => ({ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type } });
+    const layout = this.device.createBindGroupLayout({ entries: [storage("storage")] });
+    const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    this.pipelines = await Promise.all(this.abi.entries.map((entryPoint) =>
+      this.device.createComputePipelineAsync({ layout: pipelineLayout, compute: { module, entryPoint } })));
+    const slot = (name) => this.abi.feed_slots[name], oslot = (name) => this.abi.output_slots[name], p = manifest.points;
     const code = PACK_WGSL.replaceAll("__N__", String(this.n))
-      .replaceAll("__AGE__", slot(p.live[0])).replaceAll("__START__", slot(p.live[1])).replaceAll("__LANDED__", slot(p.landed))
-      .replaceAll("__X__", slot(p.x)).replaceAll("__Y__", slot(p.y))
-      .replaceAll("__R__", oslot(p.rgb[0])).replaceAll("__G__", oslot(p.rgb[1])).replaceAll("__B__", oslot(p.rgb[2]));
+      .replaceAll("__AGE__", slot(p.live[0])).replaceAll("__START__", slot(p.live[1]))
+      .replaceAll("__X__", slot(p.x)).replaceAll("__Y__", slot(p.y)).replaceAll("__VX__", slot(p.vx)).replaceAll("__VY__", slot(p.vy))
+      .replaceAll("__R__", oslot(p.rgb[0])).replaceAll("__G__", oslot(p.rgb[1])).replaceAll("__B__", oslot(p.rgb[2]))
+      .replaceAll("__REST2__", (p.rest_speed * p.rest_speed).toFixed(8));
     const pack = this.device.createShaderModule({ code });
     this.#check(await pack.getCompilationInfo(), "pack WGSL");
     this.pack = await this.device.createComputePipelineAsync({ layout: "auto", compute: { module: pack, entryPoint: "main" } });
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    this.feeds = this.device.createBuffer({ size: this.A.length * this.n * 4, usage: S });
-    this.outs = this.device.createBuffer({ size: this.O.length * this.n * 4, usage: S });
+    this.arena = this.device.createBuffer({ size: this.abi.slots * this.n * 4, usage: S });
     this.pts = this.device.createBuffer({ size: this.n * 16, usage: S });
-    this.group = this.device.createBindGroup({ layout: this.compute.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: this.feeds } }, { binding: 1, resource: { buffer: this.outs } }] });
+    this.group = this.device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: this.arena } }] });
     this.packGroup = this.device.createBindGroup({ layout: this.pack.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: this.feeds } }, { binding: 1, resource: { buffer: this.outs } },
-      { binding: 2, resource: { buffer: this.pts } }] });
+      { binding: 0, resource: { buffer: this.arena } }, { binding: 1, resource: { buffer: this.pts } }] });
     this.staging = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.n * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
-    this.copies = this.abi.outputs.filter((o) => o.endsWith("_next")).map((o) => [oslot(o), slot(o.slice(0, -5))]);
-    this.host = new Float32Array(this.A.length * this.n);
+    // each state output is committed over its feed slot after the step: one more dispatch, the
+    // arena's disjoint slots (WebGPU forbids a buffer-to-buffer copy within one buffer)
+    const commit = this.state.map((name) => `  arena[${slot(name) * this.n}u + i] = arena[${oslot(name + "_next") * this.n}u + i];`).join("\n");
+    const commitModule = this.device.createShaderModule({ code: `@group(0) @binding(0) var<storage, read_write> arena: array<f32>;
+@compute @workgroup_size(64) fn commit(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x;
+  if (i >= ${this.n}u) { return; }
+${commit}
+}` });
+    this.#check(await commitModule.getCompilationInfo(), "commit WGSL");
+    this.pipelines.push(await this.device.createComputePipelineAsync({ layout: pipelineLayout, compute: { module: commitModule, entryPoint: "commit" } }));
+    this.host = new Float32Array(this.abi.slots * this.n);
     this.latest = null;
   }
 
@@ -92,37 +109,41 @@ class GpuProduct {
     if (errors.length) throw new Error(`${what} rejected: ` + errors.map((m) => `${m.lineNum}: ${m.message}`).join(" | "));
   }
 
-  slot(name) { return this.A.indexOf(name); }
-
   reset({ columns, init, named, uniforms }) {
-    const n = this.n, host = this.host;
+    const n = this.n, host = this.host, S = this.abi.feed_slots;
     host.fill(0);
-    for (const [name, value] of Object.entries(init)) host.fill(value, this.slot(name) * n, this.slot(name) * n + n);
-    for (const name of this.A) {
+    for (const [name, value] of Object.entries(init)) host.fill(value, S[name] * n, S[name] * n + n);
+    for (const name of this.abi.arguments) {
       const source = columns[name] || named[name];
-      if (source && this.slot(name) >= 0) host.set(source, this.slot(name) * n);
+      if (source && !this.abi.uniforms.includes(name)) host.set(source, S[name] * n);
     }
-    for (const [name, value] of Object.entries(uniforms)) host[this.slot(name) * n] = value;
-    this.device.queue.writeBuffer(this.feeds, 0, host);
-    this.device.queue.writeBuffer(this.outs, 0, new Float32Array(this.O.length * n));
+    for (const [name, value] of Object.entries(uniforms)) host[S[name] * n] = value;
+    this.device.queue.writeBuffer(this.arena, 0, host);
     this.latest = null;
   }
 
-  setUniform(name, value) { this.device.queue.writeBuffer(this.feeds, this.slot(name) * this.n * 4, new Float32Array([value])); }
+  setUniform(name, value) { this.device.queue.writeBuffer(this.arena, this.abi.feed_slots[name] * this.n * 4, new Float32Array([value])); }
 
   step(count) {
-    const encoder = this.device.createCommandEncoder();
+    const encoder = this.device.createCommandEncoder(), groups = this.abi.groups[0];
     for (let k = 0; k < count; k++) {
       const pass = encoder.beginComputePass();
-      pass.setPipeline(this.compute); pass.setBindGroup(0, this.group);
-      pass.dispatchWorkgroups(this.abi.groups[0], this.abi.groups[1], this.abi.groups[2]);
+      pass.setBindGroup(0, this.group);
+      for (const pipeline of this.pipelines) { pass.setPipeline(pipeline); pass.dispatchWorkgroups(groups); }
       pass.end();
-      for (const [from, to] of this.copies) encoder.copyBufferToBuffer(this.outs, from * this.n * 4, this.feeds, to * this.n * 4, this.n * 4);
     }
     const pack = encoder.beginComputePass();
     pack.setPipeline(this.pack); pack.setBindGroup(0, this.packGroup);
     pack.dispatchWorkgroups(Math.ceil(this.n / 64));
     pack.end();
+    // back-pressure and a measured cost: the frame loop does not submit more while the last
+    // submission is unfinished, and the time to finish it, per step, is the step cost
+    const submitted = performance.now();
+    this.pending = (this.pending || 0) + 1;
+    const settle = () => {
+      this.pending--;
+      if (count > 0) { const per = (performance.now() - submitted) / count; this.stepMs = this.stepMs ? this.stepMs * 0.8 + per * 0.2 : per; }
+    };
     const free = this.staging.find((s) => !s.busy);
     if (free) {
       free.busy = true;
@@ -133,22 +154,28 @@ class GpuProduct {
         free.buffer.unmap(); free.busy = false;
       }).catch(() => { free.busy = false; });
     } else this.device.queue.submit([encoder.finish()]);
+    this.device.queue.onSubmittedWorkDone().then(settle);
   }
+
+  get busy() { return (this.pending || 0) > 0; }
 
   points() { return this.latest; }
 
-  async feedsNow() {          // diagnostics only: the running page never reads state back
-    const bytes = this.A.length * this.n * 4;
+  async feedsNow() {          // an event, never per frame: the whole arena, by name
+    const bytes = this.abi.slots * this.n * 4;
     const read = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const encoder = this.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.feeds, 0, read, 0, bytes);
+    encoder.copyBufferToBuffer(this.arena, 0, read, 0, bytes);
     this.device.queue.submit([encoder.finish()]);
     await read.mapAsync(GPUMapMode.READ);
     const all = new Float32Array(read.getMappedRange().slice(0)); read.unmap(); read.destroy();
-    return Object.fromEntries(this.A.map((name, k) => [name, all.subarray(k * this.n, (k + 1) * this.n)]));
+    const at = (slot) => all.slice(slot * this.n, (slot + 1) * this.n);
+    return { ...Object.fromEntries(this.abi.arguments.map((name) => [name, at(this.abi.feed_slots[name])])),
+             ...Object.fromEntries(this.abi.outputs.map((name) => [name, at(this.abi.output_slots[name])])) };
   }
 
-  destroy() { for (const b of [this.feeds, this.outs, this.pts]) b.destroy(); for (const s of this.staging) s.buffer.destroy(); this.device.destroy(); }
+  async idle() { await this.device.queue.onSubmittedWorkDone(); }
+  destroy() { for (const b of [this.arena, this.pts]) b.destroy(); for (const s of this.staging) s.buffer.destroy(); this.device.destroy(); }
 }
 
 // ---------------------------------------------------------------- wasm route
@@ -168,7 +195,7 @@ class WasmProduct {
   }
 
   reset({ columns, init, named, uniforms }) {
-    for (const [name, view] of Object.entries(this.inputs)) if (view.length > 1) view.fill(0);
+    for (const view of Object.values(this.inputs)) if (view.length > 1) view.fill(0);
     for (const [name, value] of Object.entries(init)) this.inputs[name].fill(value);
     for (const name of Object.keys(this.inputs)) {
       const source = columns[name] || named[name];
@@ -188,18 +215,22 @@ class WasmProduct {
 
   points() {
     const p = this.manifest.points, I = this.inputs, O = this.nexts, f = this.f32, u = this.u32;
-    const x = I[p.x], y = I[p.y], age = I[p.live[0]], start = I[p.live[1]], landed = I[p.landed];
-    const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]];
+    const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], age = I[p.live[0]], start = I[p.live[1]];
+    const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]], rest2 = p.rest_speed * p.rest_speed;
     const byte = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
     for (let i = 0; i < this.n; i++) {
       f[4 * i] = x[i]; f[4 * i + 1] = y[i];
       u[4 * i + 2] = (255 << 24) | (byte(b[i]) << 16) | (byte(g[i]) << 8) | byte(r[i]);
-      f[4 * i + 3] = age[i] >= start[i] ? (landed[i] > 0.5 ? 2 : 1) : 0;
+      f[4 * i + 3] = age[i] >= start[i] ? ((vx[i] * vx[i] + vy[i] * vy[i]) < rest2 ? 2 : 1) : 0;
     }
     return f;
   }
 
-  async feedsNow() { return Object.fromEntries(Object.entries(this.inputs).map(([k, v]) => [k, Float32Array.from(v)])); }
+  async feedsNow() {
+    return { ...Object.fromEntries(Object.entries(this.inputs).map(([k, v]) => [k, Float32Array.from(v)])),
+             ...Object.fromEntries(Object.entries(this.nexts).map(([k, v]) => [k, Float32Array.from(v)])) };
+  }
+  async idle() {}
   destroy() {}
 }
 
@@ -209,10 +240,11 @@ export class ComputeRuntime {
     this.onStatus = onStatus; this.onSamples = onSamples;
     this.spec = null; this.manifest = null; this.product = null; this.productKey = null;
     this.layout = null; this.layoutUrl = null; this.epoch = null; this.uniforms = {};
-    this.named = {}; this.raster = null; this.sampleSpec = null;
+    this.named = {}; this.raster = null; this.sampleSpec = null; this.rest = null; this.determinism = null;
+    this.restPending = false; this.stepMs = 0; this.stepsPerFrame = 0;
     this.steps = 0; this.running = false; this.last = 0; this.fps = 0; this.frames = 0; this.fpsAt = 0;
     this.route = ""; this.why = ""; this.warn = false; this.queue = Promise.resolve(); this.error = null;
-    this.sizes = null; this.ready = false;
+    this.sizes = null; this.ready = false; this.note = "";
   }
 
   get active() { return !!this.spec; }
@@ -232,7 +264,7 @@ export class ComputeRuntime {
       this.layout = await this.#fetchLayout(spec.layout);
       this.layoutUrl = spec.layout; relayout = true;
       this.sizes = this.layout.radius;
-      if (this.raster) this.#sample();            // the slots moved: the same image, sampled afresh
+      this.rest = null;                          // a new pile: its rest positions are not known yet
     }
     if (relayout || spec.epoch !== this.epoch) {
       this.epoch = spec.epoch; this.uniforms = { ...spec.uniforms };
@@ -251,14 +283,14 @@ export class ComputeRuntime {
     const rec = this.manifest.sizes[spec.size];
     // The compiler decides (rec.route, from its verdict); the browser can only veto.
     const v = rec.verdict, model = this.manifest.cost_model;
-    const detail = `n=${rec.n}: predicted ${v.speedup.toFixed(2)}x, needs ${model.min_speedup.toFixed(1)}x`;
+    const detail = `n=${rec.n}, ${rec.wgsl_abi.dispatches} dispatches: predicted ${v.speedup.toFixed(2)}x, needs ${model.min_speedup.toFixed(1)}x`;
     let product = null; this.warn = false;
     if (rec.route === "webgpu-compute") {
       if (navigator.gpu) {
-        try { product = new GpuProduct(); await product.init(rec, this.manifest); this.why = `compiler verdict: a dispatch pays (${detail})`; }
-        catch (error) { product = null; this.warn = true; this.why = `FALLBACK to wasm: WebGPU could not run the generated shader (${error.message || error})`; }
+        try { product = new GpuProduct(); await product.init(rec, this.manifest); this.why = `compiler verdict: the dispatches pay (${detail})`; }
+        catch (error) { product = null; this.warn = true; this.why = `FALLBACK to wasm: WebGPU could not run the generated program (${error.message || error})`; }
       } else { this.warn = true; this.why = `FALLBACK to wasm: the compiler chose WebGPU compute (${detail}) but navigator.gpu is absent here (needs https and a WebGPU browser)`; }
-    } else this.why = `compiler verdict: a dispatch does not pay (${detail})`;
+    } else this.why = `compiler verdict: the dispatches do not pay (${detail})`;
     if (!product) { product = new WasmProduct(); await product.init(rec, this.manifest); }
     this.product = product; this.rec = rec; this.productKey = key;
     this.layoutUrl = null; this.epoch = null;
@@ -278,12 +310,13 @@ export class ComputeRuntime {
   #reset() {
     this.product.reset({ columns: this.layout, init: this.manifest.initial, named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms } });
     this.steps = 0; this.running = true; this.last = performance.now() / 1000;
+    this.restPending = true; this.note = "";
   }
 
   // --- image -> per-id feeds (a game's `file` control with a `sample` spec) ---
   async pickImage(file, spec) {
-    if (!file || !this.layout) return;
-    const [rw, rh] = [spec.raster_scale * this.manifest.sizes[this.spec.size].cols, spec.raster_scale * this.manifest.sizes[this.spec.size].rows];
+    if (!file) return;
+    const [rw, rh] = spec.raster;
     const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
     const canvas = document.createElement("canvas");
     canvas.width = rw; canvas.height = rh;
@@ -292,28 +325,53 @@ export class ComputeRuntime {
     const scale = Math.max(rw / bitmap.width, rh / bitmap.height);
     ctx.drawImage(bitmap, (rw - bitmap.width * scale) / 2, (rh - bitmap.height * scale) / 2, bitmap.width * scale, bitmap.height * scale);
     if (bitmap.close) bitmap.close();
-    this.raster = { w: rw, h: rh, data: ctx.getImageData(0, 0, rw, rh).data };
-    this.sampleSpec = spec;
-    this.#sample();
+    this.setRaster({ w: rw, h: rh, data: ctx.getImageData(0, 0, rw, rh).data }, spec);
   }
 
-  setRaster(raster, spec) { this.raster = raster; this.sampleSpec = spec; this.#sample(); }
+  setRaster(raster, spec) {
+    this.raster = raster; this.sampleSpec = spec;
+    if (this.rest) this.#sample(); else { this.note = "image loaded: it is mapped when the pile has settled"; this.onStatus(); }
+  }
 
-  // The image is ONLY sampled into the per-id feeds, at each id's recorded slot;
-  // nothing of it is drawn.  (fountain.sample_raster is the same formula.)
+  // The image is ONLY sampled into the per-id feeds, at each id's ACTUAL rest position
+  // in phase 1's pile (normalised by the pile's own extent); nothing of it is drawn.
+  // (fountain.fit_extent + fountain.sample_raster are the same formulas.)
   #sample() {
-    const { w, h, data } = this.raster, spec = this.sampleSpec;
-    const u = this.layout[spec.coords[0]], v = this.layout[spec.coords[1]], n = u.length;
+    const { w, h, data } = this.raster, spec = this.sampleSpec, X = this.rest.x, Y = this.rest.y, n = X.length;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < n; i++) { x0 = Math.min(x0, X[i]); x1 = Math.max(x1, X[i]); y0 = Math.min(y0, Y[i]); y1 = Math.max(y1, Y[i]); }
     const bytes = new Uint8Array(3 * n);
     this.named = Object.fromEntries(spec.into.map((name) => [name, new Float32Array(n)]));
     for (let i = 0; i < n; i++) {
-      const px = Math.min(Math.max(Math.floor(u[i] * w), 0), w - 1), py = Math.min(Math.max(Math.floor(v[i] * h), 0), h - 1);
+      const u = Math.fround((X[i] - x0) / Math.max(x1 - x0, 1e-12)), v = Math.fround(1 - (Y[i] - y0) / Math.max(y1 - y0, 1e-12));
+      const px = Math.min(Math.max(Math.floor(u * w), 0), w - 1), py = Math.min(Math.max(Math.floor(v * h), 0), h - 1);
       const at = 4 * (py * w + px);
       spec.into.forEach((name, c) => { bytes[3 * i + c] = data[at + c]; this.named[name][i] = Math.fround(data[at + c] / 255); });
     }
     let text = "";
     for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    this.note = "image mapped at the rest positions";
     this.onSamples(spec.post, btoa(text));
+  }
+
+  // When the pile has settled (an event): record phase 1's rest positions; in phase 2
+  // compare them with phase 1's.
+  async #recordRest() {
+    const feeds = await this.product.feedsNow();
+    const x = Float32Array.from(feeds.x), y = Float32Array.from(feeds.y);
+    if (!this.uniforms.use_image) {
+      this.rest = { x, y };
+      this.determinism = null;
+      if (this.raster) this.#sample();
+    } else if (this.rest) {
+      let equal = 0, worst = 0;
+      for (let i = 0; i < x.length; i++) {
+        if (x[i] === this.rest.x[i] && y[i] === this.rest.y[i]) equal++;
+        worst = Math.max(worst, Math.abs(x[i] - this.rest.x[i]), Math.abs(y[i] - this.rest.y[i]));
+      }
+      this.determinism = { equal, n: x.length, worst };
+    }
+    this.onStatus();
   }
 
   // --- per frame ---
@@ -323,24 +381,41 @@ export class ComputeRuntime {
     this.last = now;
     this.frames++;
     if (now - this.fpsAt > 0.5) { this.fps = this.frames / (now - this.fpsAt); this.frames = 0; this.fpsAt = now; this.onStatus(); }
-    const settled = this.steps * DT >= this.manifest.settle_seconds;
-    const want = settled ? 0 : Math.max(1, Math.min(16, Math.round(elapsed / DT * (this.spec.speed || 1))));
-    if (want) { this.product.step(want); this.steps += want; }
-    else if (!this.settledPacked) { this.product.step(0); this.settledPacked = true; }
-    if (want) this.settledPacked = false;
+    const dt = this.manifest.law.dt;
+    // Both phases stop at EXACTLY the same step, so their rest positions are comparable
+    const total = Math.ceil(this.manifest.settle_seconds / dt - 1e-9);
+    const settled = this.steps >= total;
+    if (settled && this.restPending) { this.restPending = false; this.#recordRest(); }
+    // the sim runs in real time at speed 1; a slow route (wasm) takes what its frame budget allows
+    const wanted = settled || this.product.busy ? 0
+      : Math.min(total - this.steps, Math.max(1, Math.min(48, Math.round(elapsed / dt * (this.spec.speed || 1)))));
+    const budget = this.product.kind === "wasm" ? 22 : 1e9;
+    const t0 = performance.now();
+    let done = 0;
+    while (done < wanted && (performance.now() - t0) < budget) { const chunk = Math.min(wanted - done, this.product.kind === "wasm" ? 1 : wanted); this.product.step(chunk); done += chunk; }
+    if (done) { this.steps += done; this.stepsPerFrame = done; if (this.product.kind === "wasm") this.stepMs = (performance.now() - t0) / done; }
+    else if (!this.packedAtRest) { this.product.step(0); this.packedAtRest = true; }
+    if (done) this.packedAtRest = false;
   }
 
   statusText() {
     if (!this.ready) return this.error ? "compute: " + this.error : "compute: loading";
     const adapter = this.product.adapterInfo ? ` [${this.product.adapterInfo}]` : "";
-    const t = this.steps * DT, span = this.manifest.settle_seconds;
+    const dt = this.manifest.law.dt, t = this.steps * dt, span = this.manifest.settle_seconds;
     const done = t >= span ? "settled" : `${Math.round(100 * t / span)}%`;
     const fail = this.product.failure ? ` | GPU error: ${this.product.failure}` : "";
-    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${done} | ${this.fps.toFixed(0)} fps${fail}`;
+    const det = this.determinism ? ` | replay rest positions identical: ${this.determinism.equal}/${this.determinism.n}${this.determinism.equal === this.determinism.n ? "" : " (max diff " + this.determinism.worst.toExponential(2) + ")"}` : "";
+    const ms = this.product.kind === "wasm" ? this.stepMs : this.product.stepMs;
+    const rate = ms ? ` | ${ms.toFixed(2)} ms/step` : "";
+    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${done} | ${this.fps.toFixed(0)} fps${rate}${this.note ? " | " + this.note : ""}${det}${fail}`;
   }
 
   // test/diagnostics only
-  advance(count) { this.product.step(count); this.steps += count; return this.steps; }
+  advance(count) {
+    const total = Math.ceil(this.manifest.settle_seconds / this.manifest.law.dt - 1e-9);
+    count = Math.min(count, total - this.steps);
+    this.product.step(count); this.steps += count; this.packedAtRest = false; return this.steps;
+  }
   feedsNow() { return this.product.feedsNow(); }
 }
 
@@ -357,7 +432,7 @@ void main() {
   float u = (aPos.x - uWorld.x) / (uWorld.y - uWorld.x);
   float v = 1.0 - (aPos.y - uWorld.z) / (uWorld.w - uWorld.z);
   gl_Position = uViewProj * vec4(u * uBoard.x, uBoard.z, v * uBoard.y, 1.0);
-  float diameter = 2.7 * aRadius * (uBoard.x / (uWorld.y - uWorld.x)) * uPx;
+  float diameter = 2.0 * aRadius * (uBoard.x / (uWorld.y - uWorld.x)) * uPx;
   float least = aMeta > 1.5 ? 1.5 * uDpr : 3.5 * uDpr;      // a flying particle is never a speck
   gl_PointSize = min(max(diameter, least), uMax);
   vBig = step(5.0, gl_PointSize);
