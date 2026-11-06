@@ -1258,6 +1258,7 @@ function uploadMaterials(game) {
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
   }
+  records.push(["traycube", [0.86, 0.95, 1.0], { roughness: 0.04, transmission: 0.88, opacity: 0.2, ior: 1.5 }]);
   records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
@@ -2269,13 +2270,13 @@ const LEAN = { cat: 0.35, x_mark: 0.35, heart: 0.35, disc: 0.0, letter: 0.3, che
 // The goldfish lives move like the hearts they replaced; a mouse drops in like an X.
 const MESH_FAMILY = { fish: "heart", mouse: "x_mark" };
 const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : MESH_FAMILY[mesh] || mesh);
-// The power-up tray: a row under the lives.  Each item sits on its own
-// button tile (it reads as a button from above); its count is set small
-// UNDER the tile, outside the button, so it stays understated.
+// The power-up tray: a row under the board.  Each item stands inside a
+// thick clear glass cube -- an ordinary scene box with a glass material --
+// and its count is set small UNDER the cube, outside the glass.
 // The rows above the board (a game that sends ``roster``): the fish across the top, the cat
 // roster just under them, then row 0.  ``height`` is how far above row 0 the extent reaches.
 const TOP = { fish: -1.9, roster: -0.85, height: 2.55, fishSize: 0.36, catSize: 0.27, catSpacing: 0.66 };
-const TRAY = { row: 2.0, spacing: 1.5, tile: 1.0, countDrop: 0.8 };
+const TRAY = { row: 2.0, spacing: 1.6, cube: 1.15, cubeHeight: 0.95, countDrop: 0.9 };
 function trayCentre(game, k) { return [game.cols / 2 + (Number(k) - 1) * TRAY.spacing, game.rows + TRAY.row]; }
 function trayPosition(game, cell) {
   const [, k, part] = cell.split(":");
@@ -2283,13 +2284,13 @@ function trayPosition(game, cell) {
   return part === "count" ? [x, z + TRAY.countDrop, "traycount"] : [x, z, "tray"];
 }
 function trayButtonFaces(game) {
-  // One raised tile per power-up, in the board's own tile finish.
-  const kinds = Object.keys(game.powerups || {}).length, material = (game.cells || [])[0];
-  if (!kinds || !material) return null;
-  const faces = [];
+  // One glass cube per power-up, encasing its glyph.
+  const kinds = Object.keys(game.powerups || {}).length, material = state.materialIndex.traycube;
+  if (!kinds || material == null) return null;
+  const faces = [], h = TRAY.cube / 2;
   for (let k = 0; k < kinds; k++) {
     const [x, z] = trayCentre(game, k);
-    faces.push(...buttonFaces(1, 1, () => material, [x - TRAY.tile / 2, z - TRAY.tile / 2], TRAY.tile));
+    faces.push(...box(x - h, 0, z - h, x + h, TRAY.cubeHeight, z + h, material));
   }
   return faces;
 }
@@ -3199,7 +3200,7 @@ function pieceModel(piece, now) {
   const flat = state.flat;
   if (flat) { y = 0; tilt = 0; }                                   // no hop, no lean
   const lean = flat ? 0 : LEAN[fam] ?? 0.35;
-  const base = piece.place === "hud" || piece.place === "traycount" || piece.place === "roster" ? 0.0 : TILE.height * (piece.cellSize || 1);
+  const base = piece.place === "hud" || piece.place === "traycount" || piece.place === "roster" ? 0.0 : piece.place === "tray" ? 0.08 : TILE.height * (piece.cellSize || 1);
   const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s;
   let m = M.translate(x, rest + y, z);
   m = M.multiply(m, M.rotateY(spin));
@@ -3493,7 +3494,7 @@ function applyState(game) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "roster" ? TOP.catSize : where === "tray" ? 0.3 : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "roster" ? TOP.catSize : where === "tray" ? 0.4 : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
       if (where === "roster" && live.color !== p.color && p.lit) live.litAt = now;   // lit now: pop
@@ -3806,6 +3807,7 @@ function litPass(cam, now, casters, opts = {}) {
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
     const mesh = state.meshes[piece.mesh] || state.meshes.disc;
@@ -3832,7 +3834,6 @@ function draw(ms) {
   const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
     : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
-  if (state.trayButtons) casters.push([state.trayButtons.vao, state.trayButtons.count, M.identity(), null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
