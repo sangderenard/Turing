@@ -174,7 +174,7 @@ NODE_COLUMNS = ("tile", "comp", *(f"nb{k}" for k in range(NEIGHBOURS)))
 FIELD_COLUMNS = tuple(f"{n}{i}" for n in ("fnx", "fny", "fnz", "fdd") for i in range(NF))
 STATIC = ("lane", "kind", *KIND_COLUMNS, "owner", "home_node", *NODE_COLUMNS, *FIELD_COLUMNS)
 STATE = ("alive", "x", "y", "vx", "vy", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
-         "bank", "vbank", "hp", "hurt", "cool", "timer", "need", "phase", "mot", "think", "born", "node",
+         "mdx", "mdy", "mdz", "gspd", "bank", "vbank", "hp", "hurt", "cool", "timer", "need", "phase", "mot", "think", "born", "node",
          "map_u", "map_v", "map_gx", "map_gy",
          "score", "kills", "trips", "losses", "built", "lives", "clock")
 SETTINGS = ("field_w",)
@@ -472,7 +472,10 @@ def worldwalk_step(*columns):
         wide("alive", f(live_n)), wide("x", x_n), wide("y", y_n), wide("vx", vx_n), wide("vy", vy_n),
         wide("ux", u_n[0]), wide("uy", u_n[1]), wide("uz", u_n[2]), wide("hx", h_n[0]), wide("hy", h_n[1]), wide("hz", h_n[2]),
         wide("spd", spd_n), wide("yaw", where(is_player, ship_yaw, yaw)), wide("vyaw", where(is_player, ship_vyaw, vyaw)),
-        wide("vspd", where(is_player, ship_vspd, vspd)), wide("bank", where(is_player, ship_bank, bank)),
+        wide("vspd", where(is_player, ship_vspd, vspd)),
+        # the direction each walker is walking and its ground speed: the state the page carries it on from
+        wide("mdx", mdir[0]), wide("mdy", mdir[1]), wide("mdz", mdir[2]), wide("gspd", ground_speed),
+        wide("bank", where(is_player, ship_bank, bank)),
         wide("vbank", where(is_player, ship_vbank, vbank)),
         wide("hp", hp_n), wide("hurt", hurt_f), wide("cool", cool_f), wide("timer", timer_n),
         wide("need", need_f), wide("phase", phase_f), wide("mot", mot_f), wide("think", think_f),
@@ -637,6 +640,7 @@ def initial_columns(width: float = sc.WIDTH, seed: int = 0) -> dict[str, np.ndar
         "alive": alive, "x": np.full(LANES, width / 2.0), "y": np.full(LANES, PLAYER_Y), "vx": np.zeros(LANES),
         "vy": np.zeros(LANES), "ux": ux, "uy": uy, "uz": uz, "hx": hx, "hy": hy, "hz": hz, "spd": spd,
         "yaw": yaw, "vyaw": np.zeros(LANES), "vspd": np.zeros(LANES), "bank": np.full(LANES, sc.BANK_MAX),
+        "mdx": hx.copy(), "mdy": hy.copy(), "mdz": hz.copy(), "gspd": np.zeros(LANES),
         "vbank": np.zeros(LANES), "hp": columns["hpmax"].copy(), "hurt": np.zeros(LANES), "cool": cool,
         "timer": timer, "need": np.zeros(LANES), "phase": np.zeros(LANES), "mot": np.zeros(LANES),
         "think": rng.uniform(0.0, 0.25, LANES), "born": np.zeros(LANES), "node": node,
@@ -697,7 +701,14 @@ class WorldWalk(EntityGame):
                          "spd": {"move": "move_axis_y", "sign": -1.0, "speed": sc.THROTTLE, "tau": sc.THROTTLE_TAU}},
                 "patch": {"cx": self.width / 2.0, "cy": PLAYER_Y, "radius": RADIUS},
                 "travel": ["map_u", "map_v", "map_gx", "map_gy", "ux", "uy", "uz", "hx", "hy", "hz"],
-                "sphere": {"radius": RADIUS, "air": [0.0, 0.0], "relief": 0.75, "sea": 0.48}}
+                "sphere": {"radius": RADIUS, "air": [0.0, 0.0], "relief": 0.75, "sea": 0.48},
+                # a walker, an arrow, a light is carried on between snapshots along its walking direction at its
+                # ground speed (entity_motion.sphere_advance), as the step moved it; the page runs the same core
+                "bodies": {"step": sc.STEP_CAP, "flight": {"body": sc.FLY_BODY, "craft": sc.FLY_CRAFT, "missile": sc.FLY_MISSILE,
+                                                           "bomb": sc.FLY_BOMB, "canopy": sc.FLY_CANOPY},
+                           "ballistic": {"mass": sc.MISSILE_MASS, "air_density": sc.AIR_DENSITY, "gravity": sc.GRAVITY,
+                                         "missile": [sc.MISSILE_DIAMETER, sc.MISSILE_DRAG],
+                                         "bomb": [sc.BOMB_DIAMETER, sc.BOMB_DRAG], "canopy": [sc.CHUTE_DIAMETER, sc.CHUTE_DRAG]}}}
 
     def layout(self, aspect: float) -> None:
         width = sc.field_width(aspect)
@@ -717,7 +728,8 @@ class WorldWalk(EntityGame):
                 "bolt": [1.0, 0.92, 0.25], "city": [1.0, 0.86, 0.55]}
 
     def entities(self) -> list[dict[str, Any]]:
-        names = ("kind", "alive", "x", "y", "vx", "vy", "born", "hurt", "hp", "hpmax", "ux", "uy", "uz", "hx", "hy", "hz")
+        names = ("kind", "alive", "x", "y", "vx", "vy", "born", "hurt", "hp", "hpmax", "ux", "uy", "uz", "hx", "hy", "hz",
+                 "mdx", "mdy", "mdz", "gspd")
         col = {name: self.session.column(name)[:ENT] for name in names}
         clock = float(self.session.column("clock")[0])
         u = np.stack([col["ux"], col["uy"], col["uz"]], axis=1)
@@ -733,7 +745,10 @@ class WorldWalk(EntityGame):
             else:
                 mesh, color, size = KIND_LOOK[kid]
             moving = abs(col["vx"][k]) + abs(col["vy"][k]) > 0.1
-            out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
+            body = {"u": [float(col["ux"][k]), float(col["uy"][k]), float(col["uz"][k])],
+                    "h": [float(col["mdx"][k]), float(col["mdy"][k]), float(col["mdz"][k])],
+                    "spd": float(col["gspd"][k]), "turn": 0.0, "flight": sc.FLY_BODY}
+            out.append({"id": f"{k}:{col['born'][k]:.4f}", "body": body, "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]), "vy": float(col["vy"][k]), "z": 0.0, "vz": 0.0,
                         "mesh": mesh, "color": color, "size": size, "roll": 0.0,
                         "lean": 0.0 if kid in (ARROW, LIGHT) else 0.45, "face": False, "translucent": False,

@@ -199,20 +199,71 @@ def climb(z: float, vz: float, dt: float):
 def sphere_project(ux: float, uy: float, uz: float, cx: float, cy: float, cz: float,
                    hx: float, hy: float, hz: float, radius: float):
     """The patch (azimuthal-equidistant view about the unit position ``c``
-    facing ``h``) coordinates, (right, ahead), of the unit position ``u``:
-    ``sphere_motion.project``'s text for plain numbers -- the page projects its
-    own shots into the patch it draws."""
+    facing ``h``) coordinates, (right, ahead), of the unit position ``u``: true
+    arc length from the centre, the player's view of every body of a spherical
+    game.  ONE text for every lane: the server's batched law
+    (``sphere_motion.project``) runs it on spans, the source compiler lowers it
+    to the page's WebAssembly core.  ``sqrt`` and ``atan2`` are written as the
+    methods AbstractTensor spells them (the compiler resolves them as tensor
+    operations on a scalar too: the same ``Sqrt`` and ``Atan2`` ops)."""
     rx = hy * cz - hz * cy
     ry = hz * cx - hx * cz
     rz = hx * cy - hy * cx
     e = ux * rx + uy * ry + uz * rz
     n = ux * hx + uy * hy + uz * hz
     c = ux * cx + uy * cy + uz * cz
-    rho = math.sqrt(e * e + n * n) * 1.0
-    arc = math.atan2(rho, c) * 1.0
-    inv = 1.0 / (rho + 1e-12)                       # (a Div of the atan2 result has no settled dtype yet: multiply)
-    k = radius * arc * inv
+    rho = (e * e + n * n).sqrt()
+    k = radius * rho.atan2(c) / (rho + 1e-12)
     return e * k, n * k
+
+
+def sphere_heading(hx: float, hy: float, hz: float, cx: float, cy: float, cz: float,
+                   gx: float, gy: float, gz: float):
+    """The heading ``h`` of a body as the patch about the ship (at the unit
+    position ``c``, heading ``g``) draws it: the angle from up the screen,
+    right positive -- how a craft is turned on the screen.  One text for the
+    server's spans and the page's core, like ``sphere_project``."""
+    rx = gy * cz - gz * cy
+    ry = gz * cx - gx * cz
+    rz = gx * cy - gy * cx
+    right = hx * rx + hy * ry + hz * rz
+    ahead = hx * gx + hy * gy + hz * gz
+    return (right.atan2(ahead),)
+
+
+def fire_gate(fire_mode: float, held: float, prev: float, timer: float, burst_left: float,
+              ready: float, laser: float, missile: float, shots_n: float, free: float, dt: float,
+              reload: float, missile_reload: float, burst_count: float, cont_factor: float, burst_factor: float):
+    """When the player's guns may fire, as one law for server and page: the
+    fire mode (0 continuous, 1 auto, 2 burst, 3 single -- by the half-integers
+    around each), whether fire is ``held`` and was ``prev`` the step before
+    (a press is held now and not before), the gun's reload ``timer`` and the
+    ``burst_left`` of a burst under way, whether the ship is ``ready`` to fire
+    at all (alive, the game running), the weapon (a ``laser`` is a beam, not
+    volleys; a ``missile`` reloads on its own clock), the volley's size
+    ``shots_n`` against the ``free`` shot lanes (the in-flight limit).
+    Returns ``volley`` (1 when a volley leaves this step), the burst count
+    left, the reload timer after this step (a volley sets it to ``reload``
+    -- the missile's own -- times the mode's factor: a continuous stream
+    ``cont_factor``, a burst ``burst_factor``) and how many shots of the volley
+    the free lanes admit.  Arithmetic only: the same text runs on spans in
+    ``scroller_step`` and on plain numbers in the page's WebAssembly core."""
+    cont = (fire_mode < 0.5) * 1.0
+    auto = ((fire_mode >= 0.5) * 1.0) * ((fire_mode < 1.5) * 1.0)
+    burst = ((fire_mode >= 1.5) * 1.0) * ((fire_mode < 2.5) * 1.0)
+    single = (fire_mode >= 2.5) * 1.0
+    down = (held > 0.0) * 1.0
+    pressed = down * ((prev <= 0.0) * 1.0)
+    starts = pressed * burst
+    burst_now = starts * burst_count + (1.0 - starts) * burst_left
+    gun = ready * ((timer <= 0.0) * 1.0) * (1.0 - laser)
+    volley = gun * ((cont + auto) * down + burst * ((burst_now > 0.0) * 1.0) + single * pressed)
+    burst_next = burst_now - volley * burst
+    reload_of = (missile * missile_reload + (1.0 - missile) * reload) * (cont * cont_factor + burst * burst_factor + auto + single)
+    left = timer - dt
+    timer_next = volley * reload_of + (1.0 - volley) * ((left + abs(left)) * 0.5)
+    spawn_n = (shots_n + free - abs(shots_n - free)) * 0.5
+    return volley, burst_next, timer_next, spawn_n
 
 
 def air_gain(z: float, fall: float, gain: float):
@@ -824,6 +875,45 @@ def terrain_height(x: float, y: float, z: float):
     return height, raw
 
 
+class PrintedLaw:
+    """A law whose text is printed rather than authored (engine_toy's
+    trajectory step, printed from SymPy as AbstractTensor code): the server
+    execs ``source()`` for its spans, the page's core is lowered from the very
+    same text."""
+
+    def __init__(self, name: str, source):
+        self.__name__ = name
+        self._source = source
+
+    def source(self) -> str:
+        return self._source()
+
+
+def _trajectory_source() -> str:
+    import sys
+    try:
+        from symbolic_parts import trajectory_batch_source
+    except ImportError:                       # engine_toy sits beside the repository (scroller.py's rule)
+        sys.path.append(str(Path(__file__).resolve().parents[3] / "engine_toy"))
+        from symbolic_parts import trajectory_batch_source
+    text = trajectory_batch_source()
+    # The float annotations the other laws carry for the lowering (the server
+    # execs the unannotated text, the body is the same).
+    import re
+    head, body = text.split("\n", 1)
+    return re.sub(r"(\w+)(?=[,)])", r"\1: float", head) + "\n" + body
+
+
+#: engine_toy's ballistic step (drag on air-relative velocity, gravity), the
+#: law missiles and bombs fly on the server (``scroller.trajectory_step``).
+TRAJECTORY = PrintedLaw("trajectory_step_batch", _trajectory_source)
+TRAJECTORY_NAMES = ("position_x_m", "position_y_m", "position_z_m", "velocity_x_m_s", "velocity_y_m_s", "velocity_z_m_s",
+                    "dt", "mass_kg", "diameter_m", "drag_coefficient", "air_density_kg_m3", "gravity_m_s2",
+                    "wind_x_m_s", "wind_y_m_s", "wind_z_m_s")
+TRAJECTORY_OUTPUTS = ("position_next_x_m", "position_next_y_m", "position_next_z_m", "velocity_next_x_m_s",
+                      "velocity_next_y_m_s", "velocity_next_z_m_s", "speed_m_s", "kinetic_energy_j")
+
+
 #: The engine laws the page runs, each lowered to its own WebAssembly core:
 #: (function, input names, output names, file stem).
 PREDICTORS = (
@@ -839,6 +929,11 @@ PREDICTORS = (
      ("ux_next", "uy_next", "uz_next", "hx_next", "hy_next", "hz_next", "speed_next", "vz_next"), "shot"),
     (climb, ("z", "vz", "dt"), ("z_next",), "climb"),
     (sphere_project, ("ux", "uy", "uz", "cx", "cy", "cz", "hx", "hy", "hz", "radius"), ("X", "Y"), "project"),
+    (sphere_heading, ("hx", "hy", "hz", "cx", "cy", "cz", "gx", "gy", "gz"), ("angle",), "heading"),
+    (fire_gate, ("fire_mode", "held", "prev", "timer", "burst_left", "ready", "laser", "missile", "shots_n", "free", "dt",
+                 "reload", "missile_reload", "burst_count", "cont_factor", "burst_factor"),
+     ("volley", "burst_next", "timer_next", "spawn_n"), "gate"),
+    (TRAJECTORY, TRAJECTORY_NAMES, TRAJECTORY_OUTPUTS, "ballistic"),
     (air_gain, ("z", "fall", "gain"), ("factor",), "air"),
     (terrain_height, ("x", "y", "z"), ("height", "raw"), "terrain"),
 )
@@ -857,7 +952,8 @@ def _build_one(out_dir: Path, fn, names, outputs_names, stem: str) -> dict:
     from src.compiler.ssa_wasm_backend import emit_ssa_module_to_wasm_core
 
     out_dir = Path(out_dir)
-    source = "import math\n" + inspect.getsource(fn)       # the module's import, which the laws read
+    # the module's import, which the laws read; a printed law brings its own text
+    source = "import math\n" + (fn.source() if isinstance(fn, PrintedLaw) else inspect.getsource(fn))
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
     abi_path, wasm_path = out_dir / f"{stem}.abi.json", out_dir / f"{stem}.wasm"
     if abi_path.exists() and wasm_path.exists():

@@ -3106,7 +3106,8 @@ def _planned_scalar_dtypes_from_graph(
 
     from .hierarchical_plan import (
         REGION_DTYPE_PRESERVING_OPS, REGION_INTEGER_RESULT_OPS,
-        REGION_PREDICATE_OPS, REGION_SCALAR_CAST_DTYPES,
+        REGION_MATH_FLOAT_FUNCTIONS, REGION_PREDICATE_OPS,
+        REGION_SCALAR_CAST_DTYPES,
     )
 
     G = graph.G
@@ -4765,6 +4766,22 @@ def _planned_scalar_dtypes_from_graph(
                 }:
                     settle(scalar, node_id, "int64")
                 continue
+            # Program: ``rho = math.sqrt(e * e + n * n); arc = math.atan2(rho,
+            # c); k = radius * arc / (rho + 1e-12)``.  Wrong record: nothing
+            # proved the class of a ``math`` float function's result, so the
+            # ``/`` that read it was never settled ("region value N (Div) has
+            # no settled dtype"; ``*`` beside it settled only through the
+            # tensor-operation path).  Rule: a ``math`` function that returns
+            # ``float`` (``REGION_MATH_FLOAT_FUNCTIONS``, named by its
+            # extraction identity) over proven scalar operands is float64.
+            if callee_identity in REGION_MATH_FLOAT_FUNCTIONS:
+                arguments = parents(data, "arg:")
+                if arguments and all(
+                    scalar.get(a) in {"int64", "float64", "bool"}
+                    for a in arguments
+                ):
+                    settle(scalar, node_id, "float64")
+                    continue
             if op in {"truediv", "div"}:
                 operands = parents(data, "lhs", "rhs")
                 if operands and all(scalar.get(o) is not None for o in operands):
@@ -7645,7 +7662,11 @@ def _build_shell_hierarchy_plan(
                     "floor", "ceil", "isfinite", "isnan", "isinf",
                     "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
                     "acos", "atan", "atan2", "sinh", "cosh", "asinh", "acosh",
-                    "atanh", "sign", "add", "sub", "mul", "truediv",
+                    # ("div" is the AST spelling of the same operator;
+                    # without it a quotient whose operands are tensor-method
+                    # results -- ``rho.atan2(c) / (rho + 1e-12)`` -- carried
+                    # no dtype and refused "has no settled dtype".)
+                    "atanh", "sign", "add", "sub", "mul", "truediv", "div",
                     "floordiv", "mod", "pow", "less", "less_equal",
                     "greater", "greater_equal", "equal", "not_equal",
                     "maximum", "minimum", "where", "float", "double",
@@ -7713,6 +7734,11 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                        if operation in {"div", "truediv"} and dtype in {
+                            "int", "int64", "bool",
+                        }:
+                            # True division is floating over integral operands.
+                            dtype = "float64"
                 if operation in {"to_dtype", "astype", "to"} and not tensor.get(
                     "dtype"
                 ):

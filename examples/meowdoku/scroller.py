@@ -73,7 +73,8 @@ drawn scale by height.
 
 Columns: lane, slot, rz (static); alive, x, y, z, vx, vy, vz, hp, boom, born, owner, energy, kind,
 age, timer (entity state: ``timer`` is the player's reload and an enemy's
-time to its next volley); ux, uy, uz, hx, hy, hz, spd (the sphere), yaw,
+time to its next volley); ux, uy, uz, hx, hy, hz, spd (the sphere), turn (the rate each body's
+heading was last turned at, rad/s: what the page carries on), yaw,
 vyaw, vspd (the player's turn and throttle); score, lives, invuln, clock, field_w
 (game-wide); move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire (controls).
 """
@@ -89,7 +90,7 @@ import sys
 from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, ground_travel
+from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, fire_gate, ground_travel, sphere_heading
 from meowdoku.entity_motion import climb as climb_law, shot_spawn as shot_birth
 from meowdoku import sphere_motion as sm
 from meowdoku import pilot_law
@@ -314,6 +315,13 @@ FINGER_DEAD = 0.12
 #: whichever fire was used last (``last_fire``).
 CONTINUOUS, AUTO, BURST, SINGLE = 0.0, 1.0, 2.0, 3.0
 BURST_N = 3.0
+#: A volley's reload is the weapon's, times the mode's factor (entity_motion.fire_gate):
+#: a continuous stream reloads in CONT_FACTOR of it, a burst in BURST_FACTOR.
+CONT_FACTOR, BURST_FACTOR = 0.55, 0.5
+#: How a body flies between the snapshots the page is sent (the page runs the
+#: same laws): 1 on its heading and speed (turning at the rate it was last sent), 2 a craft (thin air
+#: speeds it), 3 a missile and 4 a bomb (engine_toy's trajectory law), 5 a bomb under its canopy.
+FLY_BODY, FLY_CRAFT, FLY_MISSILE, FLY_BOMB, FLY_CANOPY = 1, 2, 3, 4, 5
 #: THE LASER is a beam: a straight ray from the nose up to BEAM_RANGE that
 #: burns the first craft or emplacement in its path for BEAM_DPS a second
 #: (more per multiplier); ``beam`` is its length (0 when off).
@@ -522,7 +530,7 @@ def enemy_brain(kind, bp, bm, bg, bt, seen_abs, dist, face_dot, glow_gap, glow_h
 
 
 def scroller_step(lane, slot, rx, ry, rz,
-                  alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
+                  alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd, turn,
                   hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
                   score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy,
@@ -627,20 +635,24 @@ def scroller_step(lane, slot, rx, ry, rz,
     pm = where(pw == LASER, (P * mult_l).sum(), where(pw == MISSILE, (P * mult_m).sum(), (P * mult).sum()))
     pf = where(pw == LASER, (P * fan_l).sum(), where(pw == MISSILE, (P * fan_m).sum(), (P * fan).sum()))
     reload = (P * timer).sum()
-    # the trigger, by fire mode: held, pressed (edge), a burst under way
+    # the trigger, by fire mode: held, pressed (edge), a burst under way.  WHEN a
+    # volley may leave is one law for server and page (entity_motion.fire_gate:
+    # fire mode, held fire, the last step's fire, the reload clock, the burst
+    # count, the volley against the free shot lanes); the beam reads the same
+    # trigger.
     fm = ((P * fire_mode).sum().clip(0.0, 3.0) + 0.5).floor()
     held = (P * fire).sum() > 0.0
     pressed = held & ((P * fire_prev).sum() <= 0.0)
-    burst_now = where(pressed & (fm == BURST), zero + BURST_N, (P * burst_left).sum())
-    ready_gun = ship_on & playing & (reload <= 0.0) & (pw != LASER)
-    volley = ready_gun & ((((fm == CONTINUOUS) | (fm == AUTO)) & held) | ((fm == BURST) & (burst_now > 0.0))
-                          | ((fm == SINGLE) & pressed))
-    burst_next = where(volley & (fm == BURST), burst_now - 1.0, burst_now)
-    beaming = (pw == LASER) & ship_on & playing & where(fm == SINGLE, pressed, held)
     free_shot = is_shot & ~live
     shots_n = 1.0 + pm
+    gate_go, burst_next, gate_timer, gate_n = fire_gate(
+        (P * fire_mode).sum(), f(held), (P * fire_prev).sum(), reload, (P * burst_left).sum(),
+        f(ship_on & playing), f(pw == LASER), f(pw == MISSILE), shots_n, f(free_shot).sum(), dt,
+        RELOAD, MISSILE_RELOAD, BURST_N, CONT_FACTOR, BURST_FACTOR)
+    volley = gate_go > 0.5
+    beaming = (pw == LASER) & ship_on & playing & where(fm == SINGLE, pressed, held)
     shot_rank = f(free_shot).cumsum(dim=0) - 1.0
-    shot_spawn = free_shot & (shot_rank < shots_n) & volley & (pw != MISSILE)
+    shot_spawn = free_shot & (shot_rank < gate_n) & volley & (pw != MISSILE)
     shot_c = shot_rank - 0.5 * (shots_n - 1.0)
     # the guns follow the nose's pitch: a shot climbs or dives at the slope
     # the pitch command (the height axis) asks for -- point and shoot
@@ -847,9 +859,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     level_hp = 1.0 + 0.5 * (level - 1.0)
     hp1 = where(respawn, where(new_kind == SPINNER, 9.0, where(new_kind == PLANTER, 4.0, 3.0)),
                 where(boss_spawn, BOSS_HP * level_hp, where(ace_spawn, ACE_HP * level_hp, hp)))
-    reload_of = (where(pw == MISSILE, MISSILE_RELOAD, RELOAD)
-                 * where(fm == CONTINUOUS, 0.55, where(fm == BURST, 0.5, 1.0)))
-    timer1 = where(is_player, where(volley, reload_of, (timer - dt).clip(0.0, 10.0)),
+    timer1 = where(is_player, gate_timer + zero,
                    where(arrival, 0.8 / tempo,
                          where(shooter, where(skind == SPINNER, 0.9, where(skind == BOSS_KIND, 0.45,
                                                                            where(skind == ACE, 1.1,
@@ -1240,8 +1250,11 @@ def scroller_step(lane, slot, rx, ry, rz,
     map_gx_next, map_gy_next = where(flying_on, ggx, map_gx), where(flying_on, ggy, map_gy)
     vyaw_next = where(is_player, ship_vyaw, vyaw)
     vspd_next = where(is_player, ship_vspd, vspd)
+    # the rate every body's heading was turned at this step: sent to the page,
+    # which turns the body on (entity_motion.sphere_turn) until the next word
+    turn_next = turn_angle / dt
     return (f(live3), x2, y2, z2, vx2, vy2, vz1, u2[0], u2[1], u2[2], h2[0], h2[1], h2[2], spd2,
-            yaw_next, vyaw_next, vspd_next,
+            yaw_next, vyaw_next, vspd_next, turn_next,
             hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
             score_next, lives_next, invuln_next, clock_next, alt_prev_next, fuel_next,
@@ -1252,7 +1265,7 @@ def scroller_step(lane, slot, rx, ry, rz,
             residual, dt_limit)
 
 
-STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
+STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd", "turn",
          "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
          "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy",
@@ -1392,7 +1405,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "alive": alive, "x": np.full(LANES, width / 2.0), "y": np.full(LANES, PLAYER_Y), "z": z,
         "vx": np.zeros(LANES), "vy": np.zeros(LANES), "vz": np.zeros(LANES),
         "ux": ux, "uy": uy, "uz": uz, "hx": hx, "hy": hy, "hz": hz, "spd": spd,
-        "yaw": yaw, "vyaw": np.zeros(LANES), "vspd": np.zeros(LANES),
+        "yaw": yaw, "vyaw": np.zeros(LANES), "vspd": np.zeros(LANES), "turn": np.zeros(LANES),
         "hp": hp0,
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "energy": (slot == PLAYER).astype(np.float64), "kind": np.where(slot == STATION, STATION_KIND, 0.0),
@@ -1507,8 +1520,21 @@ class BulletScroller(EntityGame):
                 "weapon": {"muzzles": {"ahead": MUZZLE, "spacing": MUZZLE_SPACING}, "fan_step": FAN_STEP,
                            "speed": SHOT_SPEED, "laser_mult": LASER_SPEED, "slope": AIM_SLOPE,
                            "life": SHOT_LIFE, "laser_life": SHOT_LIFE / LASER_SPEED,
-                           "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",
-                           "size": 0.2}}
+                           "reload": RELOAD, "missile_reload": MISSILE_RELOAD, "burst_count": BURST_N,
+                           "cont_factor": CONT_FACTOR, "burst_factor": BURST_FACTOR,
+                           "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",
+                           "size": 0.2},
+                # How every body the server sends flies between snapshots (the
+                # page runs the same laws: sphere_turn at the rate it was last
+                # sent, sphere_advance at its speed -- a craft's by the air --,
+                # climb at its climb rate; a missile or a bomb on the trajectory
+                # law, with these coefficients): the longest sub-step is the
+                # server's step cap.
+                "bodies": {"step": STEP_CAP, "flight": {"body": FLY_BODY, "craft": FLY_CRAFT, "missile": FLY_MISSILE,
+                                                        "bomb": FLY_BOMB, "canopy": FLY_CANOPY},
+                           "ballistic": {"mass": MISSILE_MASS, "air_density": AIR_DENSITY, "gravity": GRAVITY,
+                                         "missile": [MISSILE_DIAMETER, MISSILE_DRAG],
+                                         "bomb": [BOMB_DIAMETER, BOMB_DRAG], "canopy": [CHUTE_DIAMETER, CHUTE_DRAG]}}}
 
     def layout(self, aspect: float) -> None:
         width = field_width(aspect)
@@ -1546,7 +1572,7 @@ class BulletScroller(EntityGame):
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln", "weapon",
-                 "ux", "uy", "uz", "hx", "hy", "hz", "hp")
+                 "ux", "uy", "uz", "hx", "hy", "hz", "hp", "spd", "turn", "age")
         # (clouds and flashes are always shown; flashes glow -- see emissive)
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
@@ -1556,9 +1582,11 @@ class BulletScroller(EntityGame):
         u = np.stack([col["ux"], col["uy"], col["uz"]], axis=1)
         hd = np.stack([col["hx"], col["hy"], col["hz"]], axis=1)
         u0, h0 = u[0], hd[0]
-        r0 = np.cross(h0, u0)
         reach = RADIUS * np.arctan2(np.linalg.norm(np.cross(u, u0), axis=1), u @ u0)
-        heading = np.arctan2(hd @ r0, hd @ h0)
+        # each body's heading in the patch: the engine's sphere_heading (the page's core too)
+        T = lambda a: AbstractTensor.get_tensor(np.asarray(a, dtype=np.float64))  # noqa: E731
+        heading = np.asarray(sphere_heading(T(col["hx"]), T(col["hy"]), T(col["hz"]), T(u0[0]), T(u0[1]), T(u0[2]),
+                                            T(h0[0]), T(h0[1]), T(h0[2]))[0].numpy(), dtype=np.float64)
         # ... and within the land's width either side of the ship (no body
         # floats off the edge of the drawn board).
         names_hp = self.session.column("hp")
@@ -1634,7 +1662,17 @@ class BulletScroller(EntityGame):
                     mesh, color, size = "cloud", "rain", 0.34 + 0.08 * float(col["z"][k])
                 else:
                     mesh, color, size = "cloud", "cloud", 0.26 + 0.08 * float(col["z"][k])
-            out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
+            # How the page carries this body on between snapshots (the laws
+            # the step flew it with): its place, heading and speed on the
+            # sphere, the rate its heading was turned at, and its flight.
+            kind_b = float(col["kind"][k])
+            flight = (FLY_CRAFT if slot in (PLAYER, ENEMY) else FLY_MISSILE if slot == MISSILE_SLOT
+                      else FLY_BODY if slot != BOMB_SLOT or kind_b == SEEKER
+                      else FLY_CANOPY if kind_b == CHUTE and float(col["age"][k]) >= CHUTE_DEPLOY else FLY_BOMB)
+            body = {"u": [float(col["ux"][k]), float(col["uy"][k]), float(col["uz"][k])],
+                    "h": [float(col["hx"][k]), float(col["hy"][k]), float(col["hz"][k])],
+                    "spd": float(col["spd"][k]), "turn": float(col["turn"][k]), "flight": flight}
+            out.append({"id": f"{k}:{col['born'][k]:.4f}", "body": body, "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": 0.0 if exploding else float(col["vx"][k]),
                         "vy": 0.0 if exploding else float(col["vy"][k]),
                         "z": float(col["z"][k]), "vz": 0.0 if exploding else float(col["vz"][k]),
@@ -1646,9 +1684,11 @@ class BulletScroller(EntityGame):
                         # its own flight plane, as it would really fly.
                         # Craft point along their own heading on the sphere
                         # (the rocket glyph's nose sits at 45 degrees).
-                        "roll": (0.785 if slot == PLAYER else
-                                 0.785 - float(heading[k]) if mesh == "rocket" else
-                                 -float(heading[k]) if slot == ENEMY and not exploding else 0.0),
+                        # (its base; a craft that points along its heading adds
+                        # minus the heading in the patch, which the page reads
+                        # from the engine's sphere_heading every frame: ``orient``)
+                        "roll": 0.785 if slot == PLAYER or (mesh == "rocket" and not exploding) else 0.0,
+                        "orient": bool(slot != PLAYER and not exploding and (mesh == "rocket" or slot == ENEMY)),
                         "lean": 0.0,
                         "face": False,
                         # drawn with the glass (blended), not in the opaque pass

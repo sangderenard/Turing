@@ -105,12 +105,11 @@ def place(u, h, arc_angle, azimuth):
 
 def project(u, centre, heading, radius):
     """Patch coordinates of ``u`` about ``centre`` facing ``heading``: (right,
-    ahead) in units, true arc length from the centre."""
-    r = right_of(centre, heading)
-    e, n, c = dot(u, r), dot(u, heading), dot(u, centre)
-    rho = (e * e + n * n).sqrt()
-    k = radius * rho.atan2(c) / (rho + EPS)
-    return e * k, n * k
+    ahead) in units, true arc length from the centre (entity_motion.sphere_project:
+    the one text the page's core is lowered from too)."""
+    from meowdoku.entity_motion import sphere_project
+    return sphere_project(u[0], u[1], u[2], centre[0], centre[1], centre[2],
+                          heading[0], heading[1], heading[2], radius)
 
 
 def patch_velocity(h, speed, X, Y, centre_h, centre_speed, centre, yaw_rate):
@@ -121,3 +120,38 @@ def patch_velocity(h, speed, X, Y, centre_h, centre_speed, centre, yaw_rate):
     r = right_of(centre, centre_h)
     rel = add(scale(h, speed), scale(centre_h, -centre_speed))
     return dot(rel, r) - yaw_rate * Y, dot(rel, centre_h) + yaw_rate * X
+
+
+def carry(u, h, spd, turn, z, vz, flight, dt, radius, air, ballistic, flights):
+    """Carry bodies on for ``dt`` the way ``scroller_step`` flies them, from
+    the state the page was last sent: the heading turned by ``turn * dt``
+    (``entity_motion.sphere_turn``), the body flown ``spd * dt`` along its
+    great circle (``sphere_advance``; a craft's by the thin air at its height,
+    ``air_gain``) and climbed ``vz * dt`` (``climb``).  A missile or a bomb
+    (``flight`` by ``flights``) flies engine_toy's trajectory law instead --
+    drag and gravity -- whose horizontal advance is flown along the heading,
+    its speed, height and climb taken from the law.  The page runs these same
+    laws (as WebAssembly cores) on each body it was sent; the server's
+    snapshot encoder runs this text on spans to know what the page will have
+    drawn, and sends a body again only when that has drifted.
+
+    ``air`` is (fall, gain); ``ballistic`` the trajectory coefficients (mass,
+    air density, gravity and the (diameter, drag) of a missile, a bomb, a
+    canopy); ``flights`` the flight codes.  Returns u, h, spd, z, vz."""
+    from meowdoku.entity_motion import air_gain, climb, sphere_advance, sphere_turn
+    from src.common.tensors import AbstractTensor
+    where = AbstractTensor.where
+    zero = spd * 0.0
+    h1 = sphere_turn(u[0], u[1], u[2], h[0], h[1], h[2], turn * dt)
+    thin = air_gain(z, zero + air[0], zero + air[1])[0]
+    distance = spd * dt * where(flight == flights["craft"], thin, 1.0)
+    missile, bomb = flight == flights["missile"], flight == flights["bomb"]
+    shot = missile | bomb | (flight == flights["canopy"])
+    from meowdoku.scroller import trajectory_step
+    diameter = where(missile, zero + ballistic["missile"][0], where(bomb, zero + ballistic["bomb"][0], zero + ballistic["canopy"][0]))
+    drag = where(missile, zero + ballistic["missile"][1], where(bomb, zero + ballistic["bomb"][1], zero + ballistic["canopy"][1]))
+    mx, mz, _my, mvx, mvz, _mvy = trajectory_step(zero, z, zero, spd, vz, zero, dt, ballistic["mass"], diameter, drag,
+                                                  ballistic["air_density"], ballistic["gravity"], 0.0, 0.0, 0.0)[:6]
+    distance = where(shot, mx, distance)
+    px, py, pz, qx, qy, qz = sphere_advance(u[0], u[1], u[2], h1[0], h1[1], h1[2], distance, radius)
+    return ((px, py, pz), (qx, qy, qz), where(shot, mvx, spd), where(shot, mz, climb(z, vz, dt)[0]), where(shot, mvz, vz))

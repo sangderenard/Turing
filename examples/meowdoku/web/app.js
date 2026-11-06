@@ -6,6 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
+import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -2283,34 +2284,10 @@ function predictShots(now, game, c) {
   }
   pred.shots = pred.shots.filter((s) => drawNow - s.at <= PROVISIONAL_S);
   const weapon = game.predict && game.predict.weapon;
+  if (weapon && weapon.slope != null) return predictVolleys(now, game, c, weapon, drawNow);
   if (!weapon || !pred.ship || !c.fire) return;
   if (now - pred.lastShot < Math.max(weapon.reload, 0.02)) return;
   if (ownShotsInFlight(weapon) + weapon.muzzles.length > weapon.max_in_flight) return;
-  if (weapon.slope != null) {
-    // A sphere game: the volley is born by the engine's shot_spawn from the
-    // ship's predicted frame (position, heading, speed, pitch command) --
-    // the very law scroller_step calls -- and flown by sphere_advance.
-    const ship = pred.ship, volley = blasterVolley(game), R = game.predict.sphere && game.predict.sphere.radius;
-    if (!volley || !pred.shot || ship.ux == null || !R) return;
-    const n = 1 + volley.mult, pitch = Math.max(-1, Math.min(1, c.move_axis_z || 0));
-    if (ownShotsInFlight(weapon) + n > weapon.max_in_flight) return;
-    for (let rank = 0; rank < n; rank++) {
-      const r = pred.shot.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
-        c: rank - 0.5 * volley.mult, fan: volley.fan, laser: 0, ship_spd: ship.spd || 0, pitch,
-        ahead: weapon.muzzles.ahead, spacing: weapon.muzzles.spacing, fan_step: weapon.fan_step, speed: weapon.speed,
-        laser_mult: weapon.laser_mult, slope: weapon.slope, radius: R });
-      const id = `prov:${++pred.shotSeq}`;
-      const flown = { ux: r.ux_next, uy: r.uy_next, uz: r.uz_next, hx: r.hx_next, hy: r.hy_next, hz: r.hz_next,
-                      spd: r.speed_next, vz: r.vz_next, z: ship.z || 0 };
-      state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane, flown,
-        sx: 0, sz: 0, x: 0, z: 0, vx: 0, vz: 0, tRecv: drawNow,
-        mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
-        t0: state.time, removing: null, seed: 0, birth: null });
-      pred.shots.push({ id, at: drawNow, flown });
-    }
-    pred.lastShot = now;
-    return;
-  }
   const x0 = pred.ship.x + pred.offset[0], z0 = pred.ship.y + pred.offset[1];
   for (const [mx, mz] of weapon.muzzles) {
     const id = `prov:${++pred.shotSeq}`;
@@ -2322,6 +2299,51 @@ function predictShots(now, game, c) {
   }
   pred.lastShot = now;
 }
+// A SPHERICAL GAME'S FIRE.  WHEN a volley may leave is the engine's fire_gate
+// -- the very law scroller_step calls: the fire mode, held fire and the last
+// step's, the reload clock, a burst's count, the volley against the free shot
+// lanes -- run on the server's own step grid (``clock.dt``, the dt system's
+// step the server reports), the law's state (the reload clock and the burst
+// count) the page's own between the server's words.  WHAT leaves is the
+// engine's shot_spawn, flown by sphere_advance and climb.  A laser is a beam
+// and a missile its own body: the server's, so the gate only keeps their clocks.
+function predictVolleys(now, game, c, weapon, drawNow) {
+  const ship = pred.ship, R = game.predict.sphere && game.predict.sphere.radius;
+  if (!pred.gate || !pred.shot || !R || !ship) return;
+  const fire = pred.fire || (pred.fire = { at: null, owed: 0, timer: 0, burst: 0, prev: 0 });
+  fire.owed += fire.at == null ? 0 : Math.min(0.1, Math.max(0, now - fire.at));
+  fire.at = now;
+  const step = Math.min(STEP_CAP_S, Math.max(1 / 240, (game.clock && game.clock.dt) || 1 / 60));
+  const primary = game.arsenal && game.arsenal.primary, slot = state.primarySlot || 0;
+  const gun = primary && primary[slot] && primary[slot].owned ? slot : 0;      // the primary the server fires: the chosen slot if owned, else the blaster
+  const volley = primary && primary[gun], mult = volley ? volley.mult : 0, fan = volley ? volley.fan : 0;
+  const held = c.fire ? 1 : 0;
+  while (fire.owed >= step - 1e-12) {
+    fire.owed -= step;
+    const gate = pred.gate.invoke({ fire_mode: state.fireMode ?? 1, held, prev: fire.prev, timer: fire.timer, burst_left: fire.burst,
+      ready: game.you && game.you.alive ? 1 : 0, laser: gun === 1 ? 1 : 0, missile: gun === 2 ? 1 : 0, shots_n: 1 + mult,
+      free: weapon.max_in_flight - ownShotsInFlight(weapon), dt: step, reload: weapon.reload, missile_reload: weapon.missile_reload,
+      burst_count: weapon.burst_count, cont_factor: weapon.cont_factor, burst_factor: weapon.burst_factor });
+    fire.timer = gate.timer_next; fire.burst = gate.burst_next; fire.prev = held;
+    if (!(gate.volley > 0.5) || gun !== 0 || ship.ux == null) continue;
+    const pitch = Math.max(-1, Math.min(1, c.move_axis_z || 0));
+    for (let rank = 0; rank < gate.spawn_n; rank++) {
+      const r = pred.shot.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
+        c: rank - 0.5 * mult, fan, laser: 0, ship_spd: ship.spd || 0, pitch,
+        ahead: weapon.muzzles.ahead, spacing: weapon.muzzles.spacing, fan_step: weapon.fan_step, speed: weapon.speed,
+        laser_mult: weapon.laser_mult, slope: weapon.slope, radius: R });
+      const id = `prov:${++pred.shotSeq}`;
+      const flown = { ux: r.ux_next, uy: r.uy_next, uz: r.uz_next, hx: r.hx_next, hy: r.hy_next, hz: r.hz_next,
+                      spd: r.speed_next, vz: r.vz_next, z: ship.z || 0 };
+      state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane, flown,
+        sx: 0, sz: 0, x: 0, z: 0, vx: 0, vz: 0, tRecv: drawNow,
+        mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
+        t0: state.time, removing: null, seed: 0, birth: null });
+      pred.shots.push({ id, at: drawNow, flown });
+    }
+  }
+}
+const STEP_CAP_S = 1 / 30;            // the longest law step the server takes (scroller.STEP_CAP)
 // Ticks leave on a steady clock, up to three in flight, outside the action
 // queue -- so the update rate is the clock's, not one round trip's.  Each
 // resends every interval not yet acknowledged; the server skips any it has
@@ -2406,68 +2428,58 @@ function birthOffset(ownerLane, age, x, y, vx, vy, you, stamp) {
 function applySnapshot(view) {
   const game = state.game; if (!game || game.input !== "realtime") return;
   const now = state.time;
-  let o = 0;
-  const u8 = () => view.getUint8(o++), u16 = () => { const v = view.getUint16(o, true); o += 2; return v; };
-  const i16 = () => { const v = view.getInt16(o, true); o += 2; return v; }, f32 = () => { const v = view.getFloat32(o, true); o += 4; return v; };
-  const i32 = () => { const v = view.getInt32(o, true); o += 4; return v; };
-  // The frame layout's version (realtime_socket.PROTOCOL): a page and a server
-  // of different layouts must not misparse each other -- say so instead.
-  const version = u8();
-  if (version !== SNAPSHOT_PROTOCOL) {
-    if (!sock.versionWarned) { sock.versionWarned = true; status.textContent = `the server speaks snapshot v${version}, this page v${SNAPSHOT_PROTOCOL}: reload the page (the server was updated)`; }
+  // The frame layout is bodies.js's (realtime_socket.PROTOCOL): a page and a
+  // server of different layouts must not misparse each other -- say so instead.
+  const frame = decodeSnapshot(view, sock.names);
+  if (frame.version !== SNAPSHOT_PROTOCOL) {
+    if (!sock.versionWarned) { sock.versionWarned = true; status.textContent = `the server speaks snapshot v${frame.version}, this page v${SNAPSHOT_PROTOCOL}: reload the page (the server was updated)`; }
     return;
   }
-  const flags = u8(), ack = i32();
-  const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
-  sync.hint = f32();
-  you.z = f32(); you.vz = f32(); you.health = f32();
-  you.yaw = f32(); you.vyaw = f32(); you.spd = f32(); you.vspd = f32(); you.at = performance.now() / 1000;
-  you.map_u = f32(); you.map_v = f32(); you.map_gx = f32(); you.map_gy = f32();
-  you.bank = f32(); you.vbank = f32(); you.beam = f32();
-  you.ux = f32(); you.uy = f32(); you.uz = f32(); you.hx = f32(); you.hy = f32(); you.hz = f32();
-  you.pilot = [f32(), f32(), f32(), f32(), f32()];
-  for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
+  const { flags, ack, you } = frame;
+  sync.hint = frame.hint;
+  you.at = performance.now() / 1000;
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
   noteShield(frameGame, now);
   const stamp = worldStamp(frameGame, now);
   const drop = (lane) => { const key = sock.lanes.get(lane); const piece = key && state.pieces.get(key); if (piece && piece.removing == null) piece.removing = now; sock.lanes.delete(lane); };
-  if (flags & 2) { for (const lane of [...sock.lanes.keys()]) drop(lane);
+  if (flags & FLAG_CLEAR) { for (const lane of [...sock.lanes.keys()]) drop(lane);
                    for (const piece of state.pieces.values()) if (piece.entity && piece.removing == null) piece.removing = now; }
-  for (let n = u16(); n > 0; n--) drop(u16());
-  for (let n = u16(); n > 0; n--) {
-    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
-    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0, ground = (look & 16) !== 0,
-      glow = (look & 32) !== 0;
-    const lean = i16() / 1000, ownerLane = u16(), age = f32();
-    const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
-    drop(lane);
-    const id = `${lane}:s${++sock.gen}`;
-    sock.lanes.set(lane, id);
-    let birth = birthOffset(ownerLane, age, x, y, vx, vy, you, stamp);
-    if (ownerLane === pred.lane && pred.shots.length) {
+  for (const lane of frame.gone) drop(lane);
+  for (const r of frame.spawned) {
+    drop(r.lane);
+    const id = `${r.lane}:s${++sock.gen}`;
+    sock.lanes.set(r.lane, id);
+    // (a body of a spherical game is born where the laws carry it, below; a flat
+    // game's projectile is eased onto its path from its owner as drawn)
+    const birth = r.body ? null : birthOffset(r.owner, r.age, r.x, r.y, r.vx, r.vy, you, stamp);
+    const piece = { id, entity: true, lane: r.lane, owner: r.owner === 65535 ? null : r.owner, sx: r.x, sz: r.y, x: r.x, z: r.y, vx: r.vx, vz: r.vy,
+                    sh: r.z, h: r.z, vh: r.vz,
+                    tRecv: stamp, mesh: r.mesh, color: r.color, size: r.size, roll: r.roll, rollBase: r.roll, orient: r.orient, spin: r.spin, bob: r.bob, lean: r.lean,
+                    face: r.face, translucent: r.translucent, ribbon: r.ribbon, ground: r.ground, glow: r.glow,
+                    t0: now, removing: null, seed: 0, birth };
+    if (r.body) piece.body = BodyFlight.held(r, stamp);
+    if (r.owner === pred.lane && pred.shots.length) {
       const adopted = pred.shots.shift(), shown = state.pieces.get(adopted.id);
       if (shown) {
-        const lead = Math.max(0, now - stamp);
-        birth = { dx: shown.x - (x + vx * lead), dz: shown.z - (y + vy * lead) };
+        // our own shot, confirmed: it leaves from where the provisional one is drawn and glides onto the server's path
+        const at = piece.body ? carriedPatch(piece, now) : null;
+        if (at) piece.birth = { dx: shown.x - at.x, dz: shown.z - at.z };
+        else { const lead = Math.max(0, now - stamp); piece.birth = { dx: shown.x - (r.x + r.vx * lead), dz: shown.z - (r.y + r.vy * lead) }; }
         state.pieces.delete(adopted.id);
       }
     }
-    state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
-                           sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon, ground, glow,
-                           t0: now, removing: null, seed: 0, birth });
+    state.pieces.set(id, piece);
   }
-  for (let n = u16(); n > 0; n--) {
-    const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], roll = i16() / 1000, x = f32(), y = f32(), vx = f32(), vy = f32();
-    const h = f32(), vh = f32();
-    const piece = state.pieces.get(sock.lanes.get(lane));
-    if (piece) Object.assign(piece, { sx: x, sz: y, vx, vz: vy, sh: h, vh, tRecv: stamp, mesh, color });
+  for (const r of frame.updated) {
+    const piece = state.pieces.get(sock.lanes.get(r.lane));
+    if (!piece) continue;
+    Object.assign(piece, { sx: r.x, sz: r.y, vx: r.vx, vz: r.vy, sh: r.z, vh: r.vz, tRecv: stamp, mesh: r.mesh, color: r.color });
+    if (r.body) { piece.body = BodyFlight.held(r, stamp); piece.rollBase = piece.roll = r.roll; }
   }
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 8;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -2560,7 +2572,9 @@ function entityModel(piece, now) {
   // exact; anything else is corrected as it arrives) -- never frozen.
   // (With socket deltas an unchanged entity is carried from its last record,
   // at most one keyframe -- 0.5 s of world time -- old.)
-  const mesh = state.meshes[piece.mesh], lead = Math.min(Math.max(0, now - piece.tRecv), 1.0);
+  // (a spherical game's body is never extrapolated linearly: with its cores not
+  // loaded it stands where the server last put it)
+  const mesh = state.meshes[piece.mesh], lead = piece.body ? 0 : Math.min(Math.max(0, now - piece.tRecv), 1.0);
   const own = state.game && state.game.predict && piece.lane === state.game.predict.lane && piece.mesh !== "boom" && piece.removing == null;
   if (own && drawnShip.at !== now) {             // once per frame (the shadow and lit passes both draw it)
     drawnShip.at = now;
@@ -2580,6 +2594,17 @@ function entityModel(piece, now) {
                                     hx: ship.hx, hy: ship.hy, hz: ship.hz, radius: state.game.predict.sphere.radius });
     piece.x = patch.cx + p.X + pred.offset[0]; piece.z = patch.cy - p.Y + pred.offset[1]; piece.h = f.z; piece.drawnAt = now;
     return placeEntity(piece, now, piece.x, piece.z, mesh);
+  }
+  if (piece.body && !own) {
+    // A body of a spherical game: carried on from the state the server sent
+    // by the engine's laws and projected into the patch about the ship (see
+    // carriedPatch) -- never extrapolated with a velocity of the page's own.
+    const at = carriedPatch(piece, now);
+    if (at) {
+      piece.x = at.x + pred.offset[0]; piece.z = at.y + pred.offset[1]; piece.h = at.z; piece.drawnAt = now;
+      if (piece.orient) piece.roll = piece.rollBase - at.heading;
+      return placeEntity(piece, now, piece.x, piece.z, mesh);
+    }
   }
   const tx = piece.sx + piece.vx * lead, tz = piece.sz + piece.vz * lead;
   // Each frame the drawn position first moves by the velocity (so a shot
@@ -2753,27 +2778,28 @@ function viewX(now) {
   return view.x;
 }
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
-// THE TURN (a spherical game: predict.patch).  The server drew the patch at
-// its yaw; the page's own ship is ahead by the inputs not yet landed, so the
-// world is turned under it by the difference at once -- the player's turn is
-// felt with no round trip -- about the ship's fixed point.
-function patchTurn(now) {
-  const game = state.game, patch = game && game.predict && game.predict.patch;
-  if (!patch || !pred.ship || !game.you || game.you.yaw == null) return 0;
-  const lead = Math.min(0.25, Math.max(0, now - (game.you.at ?? now)));
-  return pred.ship.yaw - (game.you.yaw + (game.you.vyaw || 0) * lead);
+// A SERVER BODY IN THE PATCH (a spherical game: predict.patch).  The body is
+// carried on from the state the server sent -- by the engine's flight laws, as
+// the server's step flies it (bodies.js: sphere_turn, sphere_advance, climb or
+// the trajectory step) -- up to ``now`` (at most a second past the record), and
+// projected into the patch about the ship the page draws, where sphere_project
+// puts it: the turn the player's yaw makes under the world is in the
+// projection, not a rotation of the page's own.  Once per frame.
+function carriedPatch(piece, now) {
+  const game = state.game, cfg = game && game.predict;
+  const ship = pred.ship && pred.ship.ux != null ? pred.ship : game && game.you;
+  if (!pred.bodies || !cfg || !cfg.bodies || !cfg.patch || !cfg.sphere || !ship || ship.ux == null) return null;
+  if (piece.carried && piece.carried.at === now) return piece.carried;
+  const b = piece.body, until = Math.min(now, piece.tRecv + 1.0);
+  pred.bodies.carry(b, until - b.at, cfg.bodies, cfg.sphere);
+  b.at = Math.max(b.at, until);
+  const at = pred.bodies.patch(b, ship, cfg.patch, cfg.sphere.radius);
+  at.heading = piece.orient ? pred.bodies.heading(b, ship) : 0;
+  at.at = now;
+  return (piece.carried = at);
 }
 function placeEntity(piece, now, x, z, mesh) {
   x -= viewX(now);                                // world frame -> the screen (0 unless the game scrolls a view)
-  const game = state.game, patch = game && game.predict && game.predict.patch;
-  let turned = 0;
-  if (patch && piece.lane !== game.predict.lane && !piece.flown) {
-    turned = patchTurn(now);
-    if (turned) {
-      const X = x - patch.cx, Y = patch.cy - z, c = Math.cos(turned), s = Math.sin(turned);
-      x = patch.cx + X * c - Y * s; z = patch.cy - (X * s + Y * c);
-    }
-  }
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
     if (t >= 1) piece.birth = null;
@@ -2799,7 +2825,7 @@ function placeEntity(piece, now, x, z, mesh) {
                       : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
-  m = M.multiply(m, M.rotateZ(piece.roll + turned));
+  m = M.multiply(m, M.rotateZ(piece.roll));
   return M.multiply(m, M.scale(scale, scale, state.flat ? scale * FLAT_THICK : scale));
 }
 function pieceModel(piece, now) {
@@ -4048,6 +4074,13 @@ function fillPickers() {
     pred.shot = await TuringWasmProgram.load("shot.wasm", "shot.abi.json");
     pred.climb = await TuringWasmProgram.load("climb.wasm", "climb.abi.json");
     pred.project = await TuringWasmProgram.load("project.wasm", "project.abi.json");
+    // the trigger's gate (when a volley may leave), a body's heading in the patch, and the
+    // trajectory step missiles and bombs fly on: the server's laws, the same text
+    pred.gate = await TuringWasmProgram.load("gate.wasm", "gate.abi.json");
+    pred.heading = await TuringWasmProgram.load("heading.wasm", "heading.abi.json");
+    pred.ballistic = await TuringWasmProgram.load("ballistic.wasm", "ballistic.abi.json");
+    // the server's bodies, carried on between snapshots by those laws (bodies.js)
+    if (BODY_CORES.every((stem) => pred[stem])) pred.bodies = new BodyFlight(Object.fromEntries(BODY_CORES.map((stem) => [stem, pred[stem]])));
     pred.terrain = await TuringWasmProgram.load("terrain.wasm", "terrain.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   // The autopilot policy network (policy_wasm.py): the MLP forward as a wasm

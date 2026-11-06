@@ -150,6 +150,18 @@ REGION_SCALAR_CAST_DTYPES = {
     "int": "int64",
     "bool": "bool",
 }
+#: The ``math`` module's functions whose Python result is a ``float`` for any
+#: numeric operands (the extraction identity names the callee, whatever the
+#: authored spelling).  A scalar call of one is a float64 value by its source;
+#: the planner's scalar inference reads this table (``math.floor``/``ceil``
+#: are ``int``, ``isnan`` a ``bool``: they are not here).
+REGION_MATH_FLOAT_FUNCTIONS = frozenset(f"math.{name}" for name in (
+    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt",
+    "copysign", "cos", "cosh", "degrees", "dist", "erf", "erfc", "exp",
+    "exp2", "expm1", "fabs", "fmod", "gamma", "hypot", "lgamma", "log",
+    "log10", "log1p", "log2", "pow", "radians", "remainder", "sin", "sinh",
+    "sqrt", "tan", "tanh",
+))
 REGION_DTYPE_PRESERVING_OPS = frozenset({
     "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
     "min", "max", "minimum", "maximum", "emax", "emin", "bitand", "bitor",
