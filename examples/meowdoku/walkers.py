@@ -459,16 +459,19 @@ class SphereField:
     UNREACHABLE = 999.0
 
     @classmethod
-    def build(cls, graph: SphereGraph, goals: list[int], discount=None, factor: float = 1.0) -> "SphereField":
+    def build(cls, graph: SphereGraph, goals: list[int], discount=None, factor: float = 1.0, cost=None) -> "SphereField":
         """``discount``: a set of node pairs (either order) whose edges cost ``factor``
-        times as much (roads are cheap to walk)."""
+        times as much (roads are cheap to walk).  ``cost``: the edge cost itself, ``cost(a, b)``
+        (infinite where it cannot be walked), instead of the graph's: World Walk costs an edge by the time
+        it takes to cross at the walk-speed law's speeds (``entity_motion.walk_speed``)."""
         n = len(graph.nodes)
 
-        def cost(a, b):
-            c = graph.edge(a, b)
-            if discount is not None and ((a, b) in discount or (b, a) in discount):
-                c *= factor
-            return c
+        if cost is None:
+            def cost(a, b):
+                c = graph.edge(a, b)
+                if discount is not None and ((a, b) in discount or (b, a) in discount):
+                    c *= factor
+                return c
 
         dist = np.full(n, cls.UNREACHABLE)
         heap = []
@@ -499,7 +502,8 @@ class SphereField:
     @classmethod
     def clearance(cls, graph: SphereGraph, radius: float, cap: float = 4.0) -> "SphereField":
         """The avoidance field: ``dist`` is the arc to the nearest blocked node (capped),
-        ``nxt`` the neighbour with the most clearance (the node itself on a local peak)."""
+        ``nxt`` the neighbour with the most clearance (the node itself on a local peak; on a blocked node,
+        the neighbour nearest the shore)."""
         n = len(graph.nodes)
         clear = np.full(n, cap)
         heap = [(0.0, a) for a in range(n) if not graph.passable[a]]
@@ -523,7 +527,59 @@ class SphereField:
             for b in graph.adjacent[a]:
                 if clear[b] > best + 1e-9:
                     best, nxt[a] = clear[b], b
+        # A walker in the water (it may swim: World Walk) is pointed to the shore: an unwalkable node's
+        # ``nxt`` is its neighbour nearest the land (its ``dist`` stays zero: no clearance there).
+        shore = np.full(n, np.inf)
+        heap = [(0.0, a) for a in range(n) if graph.passable[a]]
+        for _, a in heap:
+            shore[a] = 0.0
+        heapq.heapify(heap)
+        while heap:
+            d, a = heapq.heappop(heap)
+            if d > shore[a]:
+                continue
+            for b in graph.adjacent[a]:
+                nd = d + graph.arc(a, b, radius)
+                if nd < shore[b]:
+                    shore[b] = nd
+                    heapq.heappush(heap, (nd, b))
+        for a in range(n):
+            if graph.passable[a]:
+                continue
+            best = shore[a]
+            for b in graph.adjacent[a]:
+                if shore[b] < best - 1e-9:
+                    best, nxt[a] = shore[b], b
         return cls(clear, nxt)
+
+
+def sphere_path(adjacent, cost, start: int, goal: int) -> list[int] | None:
+    """The cheapest node path ``start`` .. ``goal`` (Dijkstra with an early exit, over the same edge costs the
+    flow fields use), or None when the goal cannot be reached.  ``adjacent``: each node's neighbours;
+    ``cost(a, b)``: the edge cost (infinite where it cannot be walked)."""
+    dist = {start: 0.0}
+    prev: dict[int, int] = {}
+    heap = [(0.0, start)]
+    done = set()
+    while heap:
+        d, a = heapq.heappop(heap)
+        if a in done:
+            continue
+        done.add(a)
+        if a == goal:
+            path = [a]
+            while path[-1] != start:
+                path.append(prev[path[-1]])
+            return path[::-1]
+        for b in adjacent[a]:
+            c = cost(a, b)
+            if c == np.inf:
+                continue
+            nd = d + c
+            if nd < dist.get(b, np.inf):
+                dist[b], prev[b] = nd, a
+                heapq.heappush(heap, (nd, b))
+    return None
 
 
 def sphere_components(graph: SphereGraph) -> np.ndarray:

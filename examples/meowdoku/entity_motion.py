@@ -231,6 +231,71 @@ def sphere_heading(hx: float, hy: float, hz: float, cx: float, cy: float, cz: fl
     return (right.atan2(ahead),)
 
 
+#: The surface materials of a walker's world and how fast each is walked (the factor on a walker's base speed).
+#: ``walk_speed`` writes these numbers as literals (a law carries no table); a test holds the two together.
+WALK_MATERIALS = {"grass": (0, 1.0), "road": (1, 1.6), "sand": (2, 0.8), "rock": (3, 0.55), "water": (4, 0.05),
+                  "wall": (5, 0.0)}
+#: The walk speed's slope term: speed / (1 + WALK_SLOPE_COST * slope) -- the roads' own cost of a slope (roads.SLOPE_COST).
+WALK_SLOPE_COST = 6.0
+
+
+def walk_speed(base: float, mat: float, slope: float):
+    """How fast a walker of base speed ``base`` walks on surface material ``mat`` at gradient ``slope``
+    (rise over run between nodes): base * material factor / (1 + 6 * slope).  Grass 1, road 1.6, sand 0.8,
+    rock 0.55, water 0.05 (a swim: very slow, never blocked), a wall 0 (it bars).  ONE text: the server's spans
+    run it (the player's top speed, every walker's pace), the NumPy pathing costs run it on arrays (the flow
+    fields and the click path cost a node by the time it takes to cross, from these very speeds), and the page's
+    WebAssembly core is lowered from it.  Arithmetic only."""
+    grass = ((mat > -0.5) * 1.0) * ((mat < 0.5) * 1.0)
+    road = ((mat > 0.5) * 1.0) * ((mat < 1.5) * 1.0)
+    sand = ((mat > 1.5) * 1.0) * ((mat < 2.5) * 1.0)
+    rock = ((mat > 2.5) * 1.0) * ((mat < 3.5) * 1.0)
+    water = ((mat > 3.5) * 1.0) * ((mat < 4.5) * 1.0)
+    # (each material's mask multiplies a float64 speed -- never a bare constant -- so the masks' narrower
+    # type cannot round the factors: the spans, the arrays and the page's core agree to the bit)
+    pace = base / (1.0 + 6.0 * slope)
+    return (pace * grass + pace * 1.6 * road + pace * 0.8 * sand + pace * 0.55 * rock + pace * 0.05 * water,)
+
+
+def walk_drive(spd: float, top: float, fwd: float, route: float, align: float, dt: float, tau: float):
+    """A walker's pace over ``dt``: it eases (time constant ``tau``) to the pace it is asked for -- on a click
+    path (``route`` 1) the surface's ``top`` speed scaled by how squarely it faces the next waypoint (``align``,
+    0..1); under free control (``route`` 0) ``top`` times the stick ``fwd`` (-1..1; backing up is half as fast).
+    With nothing asked the target is zero: a released walker STOPS (no held throttle).  Returns the new
+    signed speed.  Arithmetic only."""
+    ahead = (fwd + abs(fwd)) * 0.5
+    back = (abs(fwd) - fwd) * 0.5
+    drive = route * align + (1.0 - route) * (ahead - 0.5 * back)
+    spd_next = spd + (top * drive - spd) * (dt / (tau + dt))
+    return (spd_next,)
+
+
+def walk_route(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
+               wx: float, wy: float, wz: float, route: float, turn_in: float,
+               rate: float, route_rate: float, reach: float, dt: float, radius: float):
+    """How a walker turns over ``dt`` and how it stands to its next waypoint.  Under free control (``route`` 0)
+    it turns by ``turn_in`` (-1..1, right positive) times ``rate`` radians a second.  On a click path
+    (``route`` 1) it turns toward the waypoint ``w`` (a unit position on the sphere) by the bearing, no faster
+    than ``route_rate``.  Returns the turn (radians), ``align`` (the cosine of the bearing left, clipped at 0:
+    how squarely it faces the waypoint) and ``arrived`` (1 within ``reach`` units of arc of the waypoint, on
+    its side of the sphere).  One text for the server's spans and the page's core."""
+    rx = hy * uz - hz * uy
+    ry = hz * ux - hx * uz
+    rz = hx * uy - hy * ux
+    right = wx * rx + wy * ry + wz * rz
+    ahead = wx * hx + wy * hy + wz * hz
+    near = wx * ux + wy * uy + wz * uz
+    mag = (right * right + ahead * ahead).sqrt()
+    bearing = right.atan2(ahead)
+    limit = route_rate * dt
+    held = (abs(bearing + limit) - abs(bearing - limit)) * 0.5
+    angle = route * held + (1.0 - route) * turn_in * rate * dt
+    cos_left = ahead / (mag + 1e-12)
+    align = (cos_left + abs(cos_left)) * 0.5
+    arrived = ((mag * radius < reach) * 1.0) * ((near > 0.0) * 1.0)
+    return angle, align, arrived
+
+
 def fire_gate(fire_mode: float, held: float, prev: float, timer: float, burst_left: float,
               ready: float, laser: float, missile: float, shots_n: float, free: float, dt: float,
               reload: float, missile_reload: float, burst_count: float, cont_factor: float, burst_factor: float):
@@ -936,6 +1001,10 @@ PREDICTORS = (
     (TRAJECTORY, TRAJECTORY_NAMES, TRAJECTORY_OUTPUTS, "ballistic"),
     (air_gain, ("z", "fall", "gain"), ("factor",), "air"),
     (terrain_height, ("x", "y", "z"), ("height", "raw"), "terrain"),
+    (walk_speed, ("base", "mat", "slope"), ("speed",), "walkspeed"),
+    (walk_drive, ("spd", "top", "fwd", "route", "align", "dt", "tau"), ("spd_next",), "walkdrive"),
+    (walk_route, ("ux", "uy", "uz", "hx", "hy", "hz", "wx", "wy", "wz", "route", "turn_in", "rate", "route_rate", "reach",
+                  "dt", "radius"), ("angle", "align", "arrived"), "walkroute"),
 )
 
 

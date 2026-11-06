@@ -13,6 +13,8 @@ prebaked board database) and a JSON API over the games in ``games.py``:
                       | {"type": "tick", "move_axis", "fire"}  (free-board games)
                       | {"type": "autopilot", "on": true|false}  (entity games: the trained policy
                         in ``autopilot.py`` supplies each tick's controls; state field ``autopilot``)
+                      | {"type": "worldwalk_goto"|"worldwalk_stop"|"worldwalk_tool"|"worldwalk_place"
+                        |"worldwalk_here", ...}  (World Walk: click to walk, build tiles; see ``WorldWalk``)
     GET  /api/state
     POST /api/profile {"name": "..."}      -> pick this session's player profile
     GET  /api/profile                      -> the profile, and the current game's top scores
@@ -153,9 +155,9 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
-        elif kind.startswith("fountain_"):
+        elif kind.startswith("fountain_") or kind.startswith("worldwalk_"):
             if not hasattr(self.game, "do"):
-                raise ValueError("not the fountain")
+                raise ValueError("this game takes no such action")
             self.game.do(payload)
         elif kind == "clock":
             if not isinstance(self.game, ChessVsNet):

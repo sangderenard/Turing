@@ -726,8 +726,17 @@ function landColour(height, raw, sea, relief, out, o) {
 // circles, projected into the patch about the ship's predicted place, set on
 // the land's height from the same baked table.
 const ROADS_VIEW = { vao: null, buffers: null, width: 0.07, sub: 6 };
+// The click path (World Walk) is drawn the same way: a glowing ribbon from the walker to the goal.
+const ROUTE_VIEW = { vao: null, buffers: null, width: 0.05, sub: 4 };
 function drawRoads(drawLit) {
-  const game = state.game, lines = game && game.roads, f = LAND.frame, patch = game && game.predict && game.predict.patch;
+  const game = state.game;
+  if (!game) return;
+  drawRibbons(ROADS_VIEW, game.roads, state.materialIndex.road, drawLit, 0.025);
+  const route = isWalker(game) ? walkRouteLine() : null;
+  if (route) drawRibbons(ROUTE_VIEW, [route], state.materialIndex.city ?? state.materialIndex.road, drawLit, 0.06);
+}
+function drawRibbons(view, lines, material, drawLit, lift) {
+  const game = state.game, f = LAND.frame, patch = game && game.predict && game.predict.patch;
   if (!lines || !f || !LAND.height || !patch || state.flat) return;
   const relief = TERRAIN.relief, y0 = relief ? terrainOrigin(relief)[1] : 0, R = f.radius;
   const toPatch = (u) => {
@@ -742,17 +751,17 @@ function drawRoads(drawLit) {
     let prev = null;
     for (let s = 0; s + 1 < line.length; s++) {
       const a = line[s], b = line[s + 1];
-      for (let q = 0; q <= ROADS_VIEW.sub; q++) {
+      for (let q = 0; q <= view.sub; q++) {
         if (q === 0 && s > 0) continue;
-        const w = q / ROADS_VIEW.sub, m = [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w, a[2] + (b[2] - a[2]) * w];
+        const w = q / view.sub, m = [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w, a[2] + (b[2] - a[2]) * w];
         const len = Math.hypot(m[0], m[1], m[2]), u = [m[0] / len, m[1] / len, m[2] / len];
         const [bx, bz, c] = toPatch(u);
         const inView = c > near && Math.abs(bx - patch.cx) < 9 && bz > -6 && bz < patch.cy + 6;
-        const y = y0 + sampleLand(u[0], u[1], u[2])[0] + 0.025 - planetDrop(bx, bz);
+        const y = y0 + sampleLand(u[0], u[1], u[2])[0] + lift - planetDrop(bx, bz);
         const here = inView ? [bx, y, bz] : null;
         if (prev && here) {
           const dx = here[0] - prev[0], dz = here[2] - prev[2], l = Math.hypot(dx, dz) || 1;
-          const sx = (-dz / l) * ROADS_VIEW.width, sz = (dx / l) * ROADS_VIEW.width;
+          const sx = (-dz / l) * view.width, sz = (dx / l) * view.width;
           const p1 = [prev[0] - sx, prev[1], prev[2] - sz], p2 = [prev[0] + sx, prev[1], prev[2] + sz];
           const p3 = [here[0] - sx, here[1], here[2] - sz], p4 = [here[0] + sx, here[1], here[2] + sz];
           for (const v of [p1, p2, p4, p1, p4, p3]) { pos.push(...v); nrm.push(0, 1, 0); }
@@ -762,15 +771,15 @@ function drawRoads(drawLit) {
     }
   }
   if (!pos.length) return;
-  if (!ROADS_VIEW.vao) {
-    ROADS_VIEW.vao = gl.createVertexArray(); gl.bindVertexArray(ROADS_VIEW.vao);
-    ROADS_VIEW.buffers = [0, 1].map((loc) => { const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  if (!view.vao) {
+    view.vao = gl.createVertexArray(); gl.bindVertexArray(view.vao);
+    view.buffers = [0, 1].map((loc) => { const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
       gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0); return buf; });
     gl.bindVertexArray(null);
   }
-  gl.bindBuffer(gl.ARRAY_BUFFER, ROADS_VIEW.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, ROADS_VIEW.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.DYNAMIC_DRAW);
-  drawLit(ROADS_VIEW.vao, pos.length / 3, M.identity(), state.materialIndex.road);
+  gl.bindBuffer(gl.ARRAY_BUFFER, view.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, view.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.DYNAMIC_DRAW);
+  drawLit(view.vao, pos.length / 3, M.identity(), material);
 }
 function sphereLand(relief, now) {
   const game = state.game, patch = game.predict && game.predict.patch, sphere = game.predict && game.predict.sphere;
@@ -1404,7 +1413,7 @@ function camera() {
   // nose, looking along its heading -- up the board -- and a little down at
   // the land; a spherical game turns the world under it, so this is the
   // view out of the cockpit.
-  const own = state.camMode === "nose" && state.game && state.game.predict && state.game.input === "realtime"
+  const own = noseCam() && state.game && state.game.predict && state.game.input === "realtime"
     ? [...state.pieces.values()].find((p) => p.entity && p.lane === state.game.predict.lane && p.removing == null) : null;
   if (own) {
     const at = worldOf(own), nose = (own.size || 0.5) * 1.1;
@@ -1501,6 +1510,7 @@ function strikeGroups() {
 const HEADLIGHT = { inner: 9 * Math.PI / 180, outer: 18 * Math.PI / 180, intensity: 70, dip: 0.16, spread: 0.16 };
 function headlights(cam) {
   const game = state.game;
+  if (isWalker(game)) return [];               // a walker carries no headlights
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive || !onPlanet()) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
   if (!ship) return [];
@@ -1522,6 +1532,7 @@ function headlights(cam) {
 // Not drawn from inside the cockpit.
 function markerLights(now) {
   const game = state.game;
+  if (isWalker(game)) return [];               // a walker has no wingtip lights or strobe: that is the rocket's
   if (state.flat || state.camMode === "nose" || !game || game.input !== "realtime" || !game.predict || !game.you || !game.you.alive) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
   if (!ship) return [];
@@ -1676,7 +1687,7 @@ function drawVitals(now, drawLit) {
     place(tube, centre, half * 2 * Math.max(0.04, fuelLeft ?? 1), 1.0);
     if (value > 0.005) place(core, centre, half * 2 * value, 0.7);
   };
-  if (state.camMode === "nose") {
+  if (noseCam()) {
     // In the cockpit the bars leave the map: they stand on the hull's inner
     // wall either side of the window (plate units; the window spans +-0.8),
     // their glowing glass filling from the bottom.
@@ -1781,6 +1792,7 @@ function drawCockpit(cam, drawLit) {
 // screen -- shown at once while the page's own trigger holds a laser.
 function drawBeam(now, drawLit) {
   const game = state.game, you = game && game.you, a = game && game.arsenal;
+  if (isWalker(game)) return;
   if (state.flat || !you || !you.alive || !a) return;
   const holding = held.has("fire") || (pads.right && pads.right.active);
   const length = you.beam > 0 ? you.beam : holding && (state.primarySlot || 0) === 1 && a.primary[1].owned ? a.beam_range : 0;
@@ -1794,6 +1806,7 @@ function drawBeam(now, drawLit) {
 }
 function drawShield(now, drawLit) {
   const game = state.game;
+  if (isWalker(game)) return;                  // (no rocket's shield bubble on a walker)
   if (state.camMode === "nose") return;             // first person: the eye is inside the shield
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive) return;
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
@@ -2064,6 +2077,98 @@ function cellPosition(game, cell, rackPiece) {
     return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.size, "rack", rack.size]; }
   return [(cell % game.cols) + 0.5, Math.floor(cell / game.cols) + 0.5, "board"];
 }
+// ---------------------------------------------------------------- the walker (World Walk)
+// A game whose player is a walker (``game.avatar === "walker"``) has no ship: no throttle to hold, no marker
+// lights, strobe, headlights or shield.  The page predicts its walk with the server's own laws, as
+// WebAssembly cores of the very text the law calls: ``walk_speed`` (base speed x the node's surface material
+// factor over 1 + 6 slope: the table below is the server's, node by node), ``walk_route`` (the turn, and how
+// squarely it faces the next waypoint), ``walk_drive`` (the pace it eases to: nothing asked, it stops), then
+// ``sphere_turn`` and ``sphere_advance`` as for any body on the globe.  The click path is the server's
+// (``game.walk.route``: node ids); free walking cancels it, as in the law.
+const walk = { version: null, nodes: null, mat: null, slope: null, routeId: 0, path: null };
+const isWalker = (game = state.game) => !!(game && game.avatar === "walker");
+// (a walker has no rocket to sit in: the first-person cockpit is the ship's)
+const noseCam = () => state.camMode === "nose" && !isWalker();
+function fibonacciNodes(n) {          // roads.fibonacci_sphere: the nodes' places (the world's data, not physics)
+  const out = new Float64Array(n * 3), golden = Math.PI * (3 - Math.sqrt(5));
+  for (let k = 0; k < n; k++) {
+    const kk = k + 0.5, z = 1 - 2 * kk / n, r = Math.sqrt(1 - z * z), phi = kk * golden;
+    out[k * 3] = r * Math.cos(phi); out[k * 3 + 1] = r * Math.sin(phi); out[k * 3 + 2] = z;
+  }
+  return out;
+}
+function syncWalk(game) {
+  const w = game && game.walk;
+  if (!isWalker(game) || !w) return;
+  if (!walk.nodes || walk.nodes.length !== w.nodes * 3) walk.nodes = fibonacciNodes(w.nodes);
+  if (walk.version !== w.version || !walk.mat) {
+    walk.version = w.version;
+    walk.mat = Float64Array.from(w.mat, (ch) => Number(ch));
+    walk.slope = Float64Array.from(atob(w.slope), (ch) => ch.charCodeAt(0) / 100);
+  }
+  const route = w.route;
+  if (route && route.id !== walk.routeId) {         // a new click path: the page starts down it at once
+    walk.routeId = route.id; walk.path = route.path.slice(1);
+    if (pred.ship) { pred.ship.wp = 0; pred.ship.route = 1; }
+  } else if (!route && walk.path && game.walking && !game.walking.active) walk.path = null;
+}
+function nearestNode(u, v, w) {
+  const n = walk.nodes; let best = 0, bestDot = -2;
+  for (let k = 0; k < n.length; k += 3) {
+    const d = n[k] * u + n[k + 1] * v + n[k + 2] * w;
+    if (d > bestDot) { bestDot = d; best = k / 3; }
+  }
+  return best;
+}
+function stepWalker(ship, input, seconds, motion) {
+  const W = motion.walk, R = W.radius;
+  if (!pred.walkSpeed || !pred.walkDrive || !pred.walkRoute || !pred.turn || !pred.advance || !pred.travel || !walk.nodes || !walk.mat || ship.ux == null) return;
+  for (let left = seconds; left > 1e-9;) {
+    const dt = Math.min(PRED_STEP, left); left -= dt;
+    const node = nearestNode(ship.ux, ship.uy, ship.uz);
+    const top = pred.walkSpeed.invoke({ base: W.base, mat: walk.mat[node], slope: walk.slope[node] }).speed;
+    const turnIn = input.move_axis || 0, walkIn = input.move_axis_y || 0;
+    const held = Math.abs(turnIn) > W.dead || Math.abs(walkIn) > W.dead ? 1 : 0;
+    const path = walk.path, len = path ? path.length : 0;
+    const route = (ship.route || 0) * (1 - held) * (len ? 1 : 0);
+    const k = len ? path[Math.min(Math.max(ship.wp || 0, 0), len - 1)] : 0;
+    const r = pred.walkRoute.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
+      wx: walk.nodes[k * 3], wy: walk.nodes[k * 3 + 1], wz: walk.nodes[k * 3 + 2], route, turn_in: turnIn,
+      rate: W.turn, route_rate: W.route_turn, reach: W.reach, dt, radius: R });
+    const spd = pred.walkDrive.invoke({ spd: ship.spd || 0, top, fwd: -walkIn, route, align: r.align, dt, tau: W.tau }).spd_next;
+    const t = pred.turn.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz, angle: r.angle });
+    const a = pred.advance.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: t.hx_next, hy: t.hy_next, hz: t.hz_next,
+      distance: spd * dt, radius: R });
+    const g = pred.travel.invoke({ u: ship.map_u, v: ship.map_v, gx: ship.map_gx, gy: ship.map_gy, turn: r.angle, speed: spd, dt });
+    ship.map_u = g.u_next; ship.map_v = g.v_next; ship.map_gx = g.gx_next; ship.map_gy = g.gy_next;
+    ship.yaw = (ship.yaw ?? 0) + r.angle; ship.vyaw = r.angle / dt; ship.vspd = 0;
+    const walled = walk.mat[nearestNode(a.ux_next, a.uy_next, a.uz_next)] > W.wall - 0.5;
+    if (walled) {                                     // a wall bars its node: it turns in place
+      ship.hx = t.hx_next; ship.hy = t.hy_next; ship.hz = t.hz_next; ship.spd = 0;
+    } else {
+      ship.ux = a.ux_next; ship.uy = a.uy_next; ship.uz = a.uz_next; ship.hx = a.hx_next; ship.hy = a.hy_next; ship.hz = a.hz_next; ship.spd = spd;
+    }
+    if (route) { ship.wp = (ship.wp || 0) + r.arrived; ship.route = ship.wp < len ? 1 : 0; }
+    else ship.route = 0;
+  }
+}
+// The click path as the page draws it: from the walker to the goal, along the nodes it has yet to reach.
+function walkRouteLine() {
+  const ship = pred.ship, path = walk.path;
+  if (!ship || !path || !ship.route || ship.ux == null || !walk.nodes) return null;
+  const line = [[ship.ux, ship.uy, ship.uz]];
+  for (let i = Math.max(0, ship.wp || 0); i < path.length; i++) line.push([walk.nodes[path[i] * 3], walk.nodes[path[i] * 3 + 1], walk.nodes[path[i] * 3 + 2]]);
+  return line.length > 1 ? line : null;
+}
+// A tap on a walker's globe: the board point under the finger -> the patch about the walker -> the globe.
+// "walk there" sends the point as a click path; a build tool sends it to be placed on the road beside it.
+function walkTap(e) {
+  const game = state.game, f = LAND.frame, patch = game && game.predict && game.predict.patch, p = boardPlane(e.clientX, e.clientY);
+  if (!p || !f || !patch) return;
+  const u = patchToSphere(p.x - patch.cx, patch.cy - p.z, f);
+  const tool = game.tool || "walk";
+  act(tool === "walk" ? { type: "worldwalk_goto", u } : { type: "worldwalk_place", tool, u });
+}
 // ---------------------------------------------------------------- ship prediction
 // Client-side prediction with server reconciliation.  The player's ship moves
 // by the server law's own motion function (entity_motion.damped_axis),
@@ -2086,7 +2191,13 @@ const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // recycled to the far edge, a rewind) is taken at once.
 const SYNC_SNAP = 6.0;
 const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min(1, error / 2)));
-const stepShip = shipStepper(pred, () => view);
+const shipStep = shipStepper(pred, () => view);
+// A walker (World Walk) steps by the walking laws; everything else by the
+// shared ship stepper (pilot_timeline.js).
+function stepShip(ship, input, seconds, motion) {
+  if (motion.walk) return stepWalker(ship, input, seconds, motion);
+  return shipStep(ship, input, seconds, motion);
+}
 // The page predicts its ship always: from its own controls, or -- while the
 // demo pilot flies -- from the pilot's INTERVAL TIMELINE (pilot_timeline.js):
 // the pilot decides on its own slow clock, each decision takes effect
@@ -2109,6 +2220,11 @@ function reconcile(game) {
   const before = pred.ship ? [pred.ship.x, pred.ship.y] : null;
   if (game.ack != null) pred.sent = pred.sent.filter((interval) => interval.seq > game.ack);
   const ship = { ...game.you };
+  if (isWalker(game)) {          // the click path's progress: the server's word (the page's own is kept below while it agrees)
+    const w = game.walking;
+    ship.route = w && w.id === walk.routeId && w.active ? 1 : 0; ship.wp = w ? w.wp : 0;
+    if (pred.ship && w && w.id === walk.routeId && !w.active) pred.ship.route = 0;      // the server's path is done or cancelled
+  }
   if (piloting(game)) {
     // the pilot's ship: the server's state at the snapshot's LAW time, carried
     // on to now by the intervals in effect over each span of law time
@@ -2455,7 +2571,8 @@ function sendTick(game) {
                        map_u: pred.ship.map_u || 0, map_v: pred.ship.map_v || 0, map_gx: pred.ship.map_gx || 0,
                        map_gy: pred.ship.map_gy ?? -1, bank: pred.ship.bank ?? 0, vbank: pred.ship.vbank ?? 0,
                        ux: pred.ship.ux ?? 0, uy: pred.ship.uy ?? 0, uz: pred.ship.uz ?? 1,
-                       hx: pred.ship.hx ?? 0, hy: pred.ship.hy ?? 1, hz: pred.ship.hz ?? 0 };
+                       hx: pred.ship.hx ?? 0, hy: pred.ship.hy ?? 1, hz: pred.ship.hz ?? 0,
+                       wp: pred.ship.wp ?? 0, route: pred.ship.route ?? 0 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -3117,6 +3234,7 @@ function applyState(game) {
                                   size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
+  syncWalk(game);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
@@ -3378,7 +3496,7 @@ function draw(ms) {
     if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
     // First person: the eye is in the ship's nose -- its body is not drawn
     // (its model is still advanced: the camera rides it).
-    if (state.camMode === "nose" && piece.entity && state.game.predict && piece.lane === state.game.predict.lane) { pieceModel(piece, now); continue; }
+    if (noseCam() && piece.entity && state.game.predict && piece.lane === state.game.predict.lane) { pieceModel(piece, now); continue; }
     casters.push([state.meshes[piece.mesh].vao, state.meshes[piece.mesh].count, pieceModel(piece, now), piece]);
   }
   for (const key of removed) state.pieces.delete(key);
@@ -3590,7 +3708,7 @@ function controls() {
   }
   // First person: the mouse's height on the screen pitches the nose; pitch
   // climbs or dives (the height axis), stopping at the floor and ceiling.
-  if (state.camMode === "nose" && heightAxis() && Math.abs(NOSE_PITCH.value) > NOSE_PITCH.dead) {
+  if (noseCam() && heightAxis() && Math.abs(NOSE_PITCH.value) > NOSE_PITCH.dead) {
     out.move_axis_z = Math.max(-1, Math.min(1, out.move_axis_z + NOSE_PITCH.value));
   }
   // THE THUMBPADS (analog, mode-2 style): left = turn (sideways) and
@@ -3736,9 +3854,12 @@ function hit(clientX, clientY) {
     if (rc >= 0 && rc < rack.cols && rr >= 0 && rr < rack.rows) return { kind: "rack", r: rr, c: rc, key: `rack:${rr},${rc}` }; }
   return null;
 }
-let press = null, clickTimer = null, lastClick = null;
+let press = null, clickTimer = null, lastClick = null, tap = null;
 canvas.addEventListener("pointerdown", (e) => {
-  if (state.game && state.game.input === "realtime") { steer = boardPlane(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return; }
+  if (state.game && state.game.input === "realtime") {
+    if (isWalker()) { tap = { x: e.clientX, y: e.clientY, t: performance.now() }; return; }       // a walker is not steered by a held finger
+    steer = boardPlane(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return;
+  }
   press = { x: e.clientX, y: e.clientY, t: performance.now(), button: e.button, painted: new Set(), moved: false };
   const h = hit(e.clientX, e.clientY); if (h) press.start = h;
 });
@@ -3768,9 +3889,14 @@ canvas.addEventListener("pointermove", async (e) => {
     press.last = to;
   }
 });
-canvas.addEventListener("pointercancel", () => { steer = null; });
+canvas.addEventListener("pointercancel", () => { steer = null; tap = null; });
 canvas.addEventListener("pointerup", async (e) => {
   steer = null;
+  if (tap) {                                  // a walker: a short tap in place walks there (or builds)
+    const t = tap; tap = null;
+    if (isWalker() && Math.hypot(e.clientX - t.x, e.clientY - t.y) < 14 && performance.now() - t.t < 700) walkTap(e);
+    return;
+  }
   const game = state.game; const p = press; press = null;
   if (!p || !game || light.follow) return;
   const h = hit(e.clientX, e.clientY);
@@ -4117,6 +4243,10 @@ function fillPickers() {
     // the server's bodies, carried on between snapshots by those laws (bodies.js)
     if (BODY_CORES.every((stem) => pred[stem])) pred.bodies = new BodyFlight(Object.fromEntries(BODY_CORES.map((stem) => [stem, pred[stem]])));
     pred.terrain = await TuringWasmProgram.load("terrain.wasm", "terrain.abi.json");
+    // the walker's laws (World Walk): the surface speed, the pace, the turn toward a waypoint
+    pred.walkSpeed = await TuringWasmProgram.load("walkspeed.wasm", "walkspeed.abi.json");
+    pred.walkDrive = await TuringWasmProgram.load("walkdrive.wasm", "walkdrive.abi.json");
+    pred.walkRoute = await TuringWasmProgram.load("walkroute.wasm", "walkroute.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   // The autopilot policy network (policy_wasm.py): the MLP forward as a wasm
   // core with the live weights fed as its inputs.  Inspection only -- nothing

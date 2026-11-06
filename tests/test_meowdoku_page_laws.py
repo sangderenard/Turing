@@ -239,3 +239,106 @@ def test_the_page_carries_every_server_body_to_where_the_server_has_it(trace, tm
     assert report["compared"] > 1000 and report["records"] > 100, report
     # every body, every frame, through the real frames and the compiled cores: where the server has it
     assert report["worst"] < 1e-4 and report["worstZ"] < 1e-4, report
+
+
+def test_the_walk_cores_are_the_span_laws_the_server_walks_by(tmp_path):
+    """World Walk's walk-speed, pace and route-turn laws: the page's WebAssembly cores give what the server's spans
+    (and, for the speed, the NumPy pathing costs) give."""
+    _core("walkspeed", "walkdrive", "walkroute")
+    rng = np.random.default_rng(11)
+    n = 400
+    u = rng.normal(size=(n, 3)); u /= np.linalg.norm(u, axis=1, keepdims=True)
+    h = rng.normal(size=(n, 3)); h -= (h * u).sum(axis=1, keepdims=True) * u; h /= np.linalg.norm(h, axis=1, keepdims=True)
+    w = u + 0.05 * rng.normal(size=(n, 3)) * rng.uniform(0, 3.0, (n, 1)); w /= np.linalg.norm(w, axis=1, keepdims=True)
+    cases = {
+        "walkspeed": _cases("walkspeed", {"base": rng.uniform(0.5, 3.5, n), "mat": rng.integers(0, 6, n).astype(float),
+                                          "slope": np.round(rng.uniform(0.0, 0.5, n) * 100) / 100}),
+        "walkdrive": _cases("walkdrive", {"spd": rng.uniform(-2, 4, n), "top": rng.uniform(0, 4, n), "fwd": rng.uniform(-1, 1, n),
+                                          "route": rng.integers(0, 2, n).astype(float), "align": rng.uniform(0, 1, n),
+                                          "dt": np.full(n, 1 / 240), "tau": np.full(n, 0.15)}),
+        "walkroute": _cases("walkroute", {"ux": u[:, 0], "uy": u[:, 1], "uz": u[:, 2], "hx": h[:, 0], "hy": h[:, 1], "hz": h[:, 2],
+                                          "wx": w[:, 0], "wy": w[:, 1], "wz": w[:, 2], "route": rng.integers(0, 2, n).astype(float),
+                                          "turn_in": rng.uniform(-1, 1, n), "rate": np.full(n, 2.4), "route_rate": np.full(n, 5.0),
+                                          "reach": np.full(n, 0.6), "dt": np.full(n, 1 / 240), "radius": np.full(n, 30.0)}),
+    }
+    (tmp_path / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+    report = _node(PARITY_JS, tmp_path, CORES, SHELL, tmp_path / "cases.json")
+    # (the arithmetic laws agree to the bit; the route law's atan2 is the browser's libm against NumPy's)
+    assert report["walkspeed"]["worst"] == 0.0 and report["walkdrive"]["worst"] == 0.0, report
+    assert report["walkroute"]["worst"] < 1e-12, report
+    # the speeds are the declared table, and the NumPy pathing costs run the same text on arrays
+    for name, (index, factor) in em.WALK_MATERIALS.items():
+        assert em.walk_speed(2.0, np.asarray([float(index)]), np.asarray([0.0]))[0][0] == pytest.approx(2.0 * factor), name
+    arr = em.walk_speed(1.0, np.asarray([0.0, 1.0, 4.0]), np.asarray([0.0, 0.0, 0.0]))[0]
+    spans = em.walk_speed(_T([1.0] * 3), _T([0.0, 1.0, 4.0]), _T([0.0] * 3))[0]
+    assert np.array_equal(arr, np.asarray(spans.numpy()))
+
+
+WALKER_JS = """
+import fs from 'node:fs';
+import vm from 'node:vm';
+import { pathToFileURL } from 'node:url';
+const [dir, shell, appPath, casePath] = process.argv.slice(2);
+const { TuringWasmProgram } = await import(pathToFileURL(shell).href);
+const load = async (s) => TuringWasmProgram.fromBytes(fs.readFileSync(`${dir}/${s}.wasm`), JSON.parse(fs.readFileSync(`${dir}/${s}.abi.json`, 'utf8')));
+const pred = { walkSpeed: await load('walkspeed'), walkDrive: await load('walkdrive'), walkRoute: await load('walkroute'),
+               turn: await load('turn'), advance: await load('advance'), travel: await load('travel'), ship: null };
+// the page's own walker code, cut out of app.js between its two markers and run with the page's globals stubbed
+const text = fs.readFileSync(appPath, 'utf8');
+const a = text.indexOf('// ---------------------------------------------------------------- the walker (World Walk)');
+const b = text.indexOf('// The click path as the page draws it');
+if (a < 0 || b < 0) throw new Error('the walker section of app.js was not found');
+const job = JSON.parse(fs.readFileSync(casePath, 'utf8'));
+const state = { game: { avatar: 'walker', walk: job.walk, walking: job.walking } };
+const context = { pred, state, PRED_STEP: 1 / 240, Math, Float64Array, atob, Number, Infinity };
+vm.createContext(context);
+vm.runInContext(text.slice(a, b) + '\\n;globalThis.__walk = walk; globalThis.__sync = syncWalk; globalThis.__step = stepWalker;', context);
+context.__sync(state.game);
+const ship = job.ship;
+for (const interval of job.intervals) context.__step(ship, interval.controls, interval.dur, job.motion);
+console.log(JSON.stringify(ship));
+"""
+
+
+def test_the_page_walks_the_servers_walk(tmp_path):
+    """The page's walker prediction (the stepWalker in app.js, run in node on the compiled cores) against the server's
+    law over the same script: a click path across the roads, then free walking, a turn and a release."""
+    _core("walkspeed", "walkdrive", "walkroute", "turn", "advance", "travel")
+    from meowdoku import worldwalk as ww
+    w = ww.world()
+    game = ww.WorldWalk(seed=0)
+    s = game.session
+    s.control({})
+    s.advance(1.0 / 60.0)
+    towns = [w.site_nodes[i] for i in w.towns]
+    path = min((p for a in towns for b in towns if a < b for p in [game.ground.path(a, b)] if p), key=len)
+    p, g = w.nodes[path[0]], w.nodes[path[1]]
+    h = g - (g @ p) * p
+    h /= np.linalg.norm(h)
+    for name, v in zip(("ux", "uy", "uz"), p):
+        getattr(s.state, name)[0] = v
+    for name, v in zip(("hx", "hy", "hz"), h):
+        getattr(s.state, name)[0] = v
+    s.state.node[0] = ww.MAP0 + path[0]
+    game.goto(node=path[-1])
+    st = game.state()
+    names = ("ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "map_u", "map_v", "map_gx", "map_gy", "wp", "route")
+    ship = {n: float(s.column(n)[0]) for n in names}
+    script = [(5.0, {}), (1.0, {"move_axis_y": -1.0}), (0.7, {"move_axis": 1.0, "move_axis_y": -0.6}), (1.0, {})]
+    intervals = []
+    for seconds, controls in script:
+        s.control({"move_axis": 0.0, "move_axis_y": 0.0, **controls})
+        for _ in range(int(round(seconds * 30))):
+            s.advance(1.0 / 30.0)
+        intervals.append({"dur": seconds, "controls": {"move_axis": 0.0, "move_axis_y": 0.0, **controls}})
+    case = {"walk": st["walk"], "walking": st["walking"] | {"active": True, "id": st["walk"]["route"]["id"]},
+            "motion": st["predict"], "ship": ship, "intervals": intervals}
+    (tmp_path / "walker.json").write_text(json.dumps(case), encoding="utf-8")
+    page = _node(WALKER_JS, tmp_path, CORES, SHELL, ROOT / "examples/meowdoku/web/app.js", tmp_path / "walker.json")
+    server = {n: float(s.column(n)[0]) for n in names}
+    place = ww.RADIUS * float(np.arccos(np.clip(np.array([page[n] for n in ("ux", "uy", "uz")]) @ np.array([server[n] for n in ("ux", "uy", "uz")]), -1, 1)))
+    # (two integrators -- the page's fixed 1/240 step, the dt system's own -- of one law: they agree to a fraction of a unit)
+    print(f"[walker parity] page vs server after 7.7 s: place {place:.4f} units, spd {abs(page['spd'] - server['spd']):.4f}, yaw {abs(page['yaw'] - server['yaw']):.4f}")
+    assert place < 0.15, (place, page, server)
+    assert abs(page["spd"] - server["spd"]) < 0.05 and abs(page["yaw"] - server["yaw"]) < 0.05
+    assert page["route"] == server["route"] == 0.0                     # the stick cancelled the path on both
