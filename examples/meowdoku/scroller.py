@@ -90,6 +90,7 @@ import sys
 from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
+from meowdoku.sweep import swept_block_hits
 from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, fire_gate, ground_travel, sphere_heading
 from meowdoku.entity_motion import climb as climb_law, shot_spawn as shot_birth
 from meowdoku import sphere_motion as sm
@@ -953,20 +954,37 @@ def scroller_step(lane, slot, rx, ry, rz,
     live2 = (live1 & ~((is_shot | is_enemy | is_bullet | is_missile | is_pickup) & out) & ~grounded & ~expired) | rebuilt
 
     # ------------------------------------------------ collisions, block against block (in the patch)
-    enemy_hits = (block_hits(x2, y2, rx, ry, live2, None, ENEMIES, SHOTS, z2, rz)
-                  + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, ENEMIES, MISSILES, z2, rz))
-    missile_hits = (block_hits(x2, y2, rx, ry, live2, None, MISSILES, ENEMIES, z2, rz)
-                    + block_hits(x2, y2, rx, ry, live2, None, MISSILES, STATIONS, z2, rz))
-    station_hits = (block_hits(x2, y2, rx, ry, live2, None, STATIONS, SHOTS, z2, rz)
-                    + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, STATIONS, MISSILES, z2, rz))
-    base_hits = (block_hits(x2, y2, rx, ry, live2, None, BASES, SHOTS, z2, rz)
-                 + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, BASES, MISSILES, z2, rz))
+    # SWEPT: every contact below is tested over the step, not at its end.  Each
+    # lane's start (after any spawn: ``u1``, ``z1``) is projected into the same
+    # end-of-step patch its end ``x2, y2, z2`` is in, and the pair's boxes are
+    # tested for overlap at ANY instant between (entities.swept_block_hits).
+    # So no step length can carry a shot through an enemy or a bullet through
+    # the ship, and the law's step is the frame, not a tunnelling window.
+    Xs, Ys = sm.project(u1, u0n, h0n, RADIUS)
+    xs, ys = cx + Xs, cy - Ys
+    start_pos, end_pos = (xs, ys, z1), (x2, y2, z2)
+    swept = lambda live, rows, cols: swept_block_hits(start_pos, end_pos, rx, ry, live, rows, cols, rz)  # noqa: E731
+    enemy_hits = (swept(live2, ENEMIES, SHOTS)
+                  + MISSILE_DAMAGE * swept(live2, ENEMIES, MISSILES))
+    missile_hits = (swept(live2, MISSILES, ENEMIES)
+                    + swept(live2, MISSILES, STATIONS))
+    station_hits = (swept(live2, STATIONS, SHOTS)
+                    + MISSILE_DAMAGE * swept(live2, STATIONS, MISSILES))
+    base_hits = (swept(live2, BASES, SHOTS)
+                 + MISSILE_DAMAGE * swept(live2, BASES, MISSILES))
     # anti-alien flak hits the aliens it meets (and, as any bullet, the ship)
     flak_lane = is_bullet & (owner >= STATIONS[0]) & (owner < STATIONS[1])
-    flak_hits = block_hits(x2, y2, rx, ry, live2 & (is_enemy | flak_lane), None, ENEMIES, BULLETS, z2, rz)
-    collected = block_hits(x2, y2, rx, ry, live2, None, PICKUPS, (0, 1), z2, rz)
+    flak_hits = swept(live2 & (is_enemy | flak_lane), ENEMIES, BULLETS)
+    collected = swept(live2, PICKUPS, (0, 1))
     # ... and taken the moment it is close in 3-D (it zips in)
-    grab = (((x2 - cx) * (x2 - cx) + (y2 - cy) * (y2 - cy) + (z2 - (P * z2).sum()) * (z2 - (P * z2).sum())).sqrt()
+    # (swept: the segment of the pickup's position relative to the ship, over
+    # the step, comes within MAGNET_GRAB of the ship at its closest point)
+    g0 = (xs - (P * xs).sum(), ys - (P * ys).sum(), z1 - (P * z1).sum())
+    g1 = (x2 - cx, y2 - cy, z2 - (P * z2).sum())
+    gv = (g1[0] - g0[0], g1[1] - g0[1], g1[2] - g0[2])
+    g_t = (-(g0[0] * gv[0] + g0[1] * gv[1] + g0[2] * gv[2]) / (gv[0] * gv[0] + gv[1] * gv[1] + gv[2] * gv[2] + 1e-12)).clip(0.0, 1.0)
+    gc = (g0[0] + g_t * gv[0], g0[1] + g_t * gv[1], g0[2] + g_t * gv[2])
+    grab = ((gc[0] * gc[0] + gc[1] * gc[1] + gc[2] * gc[2]).sqrt()
             < MAGNET_GRAB)
     got = is_pickup & live2 & ship_on & ((collected > 0.0) | grab)
     got_kind = lambda k: f(got & (kind == k)).sum() > 0.0  # noqa: E731
@@ -986,14 +1004,14 @@ def scroller_step(lane, slot, rx, ry, rz,
     bombs_d_next = bump(bombs_d, up_bombs & (style == DUMB), 3.0)
     bombs_c_next = bump(bombs_c, up_bombs & (style == CHUTE), 3.0)
     bombs_s_next = bump(bombs_s, up_bombs & (style == SEEKER), 3.0)
-    shot_hits = (block_hits(x2, y2, rx, ry, live2, None, SHOTS, ENEMIES, z2, rz)
-                 + block_hits(x2, y2, rx, ry, live2, None, SHOTS, STATIONS, z2, rz))
+    shot_hits = (swept(live2, SHOTS, ENEMIES)
+                 + swept(live2, SHOTS, STATIONS))
     exposed = live2 & (invuln <= 0.0)
-    bullet_strikes = block_hits(x2, y2, rx, ry, exposed, None, (0, 1), BULLETS, z2, rz)
-    rams = (block_hits(x2, y2, rx, ry, exposed, None, (0, 1), ENEMIES, z2, rz)       # the boss lane is an enemy lane
-            + block_hits(x2, y2, rx, ry, exposed, None, (0, 1), STATIONS, z2, rz))
+    bullet_strikes = swept(exposed, (0, 1), BULLETS)
+    rams = (swept(exposed, (0, 1), ENEMIES)       # the boss lane is an enemy lane
+            + swept(exposed, (0, 1), STATIONS))
     player_hits = bullet_strikes + rams
-    bullet_hits = block_hits(x2, y2, rx, ry, live2 & ((invuln <= 0.0) | ~is_player), None, BULLETS, (0, 1), z2, rz)
+    bullet_hits = swept(live2 & ((invuln <= 0.0) | ~is_player), BULLETS, (0, 1))
     # Lightning: one rain cloud may strike this step; it chains to every
     # craft within CHAIN_R of the cloud on the board.
     raining = is_star & ((kind1 == RAIN) | (kind1 == THUNDER))
@@ -1017,7 +1035,16 @@ def scroller_step(lane, slot, rx, ry, rz,
     # Bombs go off on the land, on a seeker's target, or (a parachute) at the
     # second press; each blast hurts every craft and emplacement inside its
     # style's radius (in 3-D: the patch and height).
-    seek_arrived = is_bomb & live2 & (kind1 == SEEKER) & (sm.arc(u2, seek_u, RADIUS) < 0.6) & (z2 < seek_z + 0.6)
+    # (a seeker arrives if it is within reach of its target at the step's end
+    # OR at its closest approach to it during the step, in the patch and height)
+    tgX, tgY = sm.project(seek_u, u0n, h0n, RADIUS)
+    tg0 = (xs - (cx + tgX), ys - (cy - tgY))
+    tgv = (x2 - xs, y2 - ys)
+    tg_t = (-(tg0[0] * tgv[0] + tg0[1] * tgv[1]) / (tgv[0] * tgv[0] + tgv[1] * tgv[1] + 1e-12)).clip(0.0, 1.0)
+    tg_c = (tg0[0] + tg_t * tgv[0], tg0[1] + tg_t * tgv[1])
+    swept_arrival = ((tg_c[0] * tg_c[0] + tg_c[1] * tg_c[1]).sqrt() < 0.6) & (z1 + tg_t * (z2 - z1) < seek_z + 0.6)
+    seek_arrived = (is_bomb & live2 & (kind1 == SEEKER)
+                    & (((sm.arc(u2, seek_u, RADIUS) < 0.6) & (z2 < seek_z + 0.6)) | swept_arrival))
     blows = is_bomb & live2 & ((z2 <= 0.0) | seek_arrived | burst_chutes)
     blast_hurt = zero
     blackout = zero
@@ -1028,8 +1055,12 @@ def scroller_step(lane, slot, rx, ry, rz,
         reach_z = where(is_bomb, zero + 0.8 * radius_k, rz)
         live_k = (mine | ((is_enemy | is_station) & live2))
         live_k = live_k | is_base & live2
+        # (a blast is where its bomb ended the step; the aliens it meets are
+        # swept through it -- stations, bases and pins stand still)
+        z_end = z2.clip(0.0, DEPTH)
+        at_blast = (where(is_bomb, x2, xs), where(is_bomb, y2, ys), where(is_bomb, z_end, z1.clip(0.0, DEPTH)))
         blast_hurt = blast_hurt + BLAST_DAMAGE[style_k] * (
-            block_hits(x2, y2, reach_x, reach_x, live_k, None, ENEMIES, BOMBS, z2.clip(0.0, DEPTH), reach_z)
+            swept_block_hits(at_blast, (x2, y2, z_end), reach_x, reach_x, live_k, ENEMIES, BOMBS, reach_z)
             + block_hits(x2, y2, reach_x, reach_x, live_k, None, STATIONS, BOMBS, z2.clip(0.0, DEPTH), reach_z)
             + block_hits(x2, y2, reach_x, reach_x, live_k, None, BASES, BOMBS, z2.clip(0.0, DEPTH), reach_z))
         # ... and blacks out the city lights inside it
@@ -1214,21 +1245,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     x2 = where(is_player, cx, x2)
     y2 = where(is_player, cy, y2)
 
-    # The longest step that steps nothing over anything it can hit, pair by
-    # pair: a shot must not cross an enemy's body in one step, a bullet must
-    # not cross the ship's hitbox at their closing speed; the ship moves at
-    # most half its damping time per step.
-    pace_k = spd2.abs() + vz1.abs()
-    shot_pace = where(is_shot & live3, pace_k, 0.0).max() + pspd
-    bullet_pace = where(is_bullet & live3, pace_k, 0.0).max() + pspd + (P * vz1.abs()).sum()
-    shot_window = 2.0 * (0.3 + 0.36)
-    bullet_window = 2.0 * (SHIP_RX + 0.12)
-    shot_limit = 0.9 * shot_window / (shot_pace + 1e-6)
-    bullet_limit = 0.9 * bullet_window / (bullet_pace + 1e-6)
-    # (the damped motion laws are implicit -- stable at any step -- so the cap
-    # is one frame, not a fraction of their damping time; the collision
-    # windows above keep anything from stepping through what it can hit)
-    dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, STEP_CAP) + zero
+    # The longest step is one frame.  Nothing needs a shorter one to avoid
+    # stepping over what it can hit: every contact above is swept over the step
+    # (entities.swept_block_hits), so a shot cannot cross an enemy's body nor a
+    # bullet the ship's hitbox in one step at any speed.  (The damped motion
+    # laws are implicit -- stable at any step -- so the cap is the frame, not a
+    # fraction of their damping time.)
+    dt_limit = zero + STEP_CAP
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
     bank_next = where(is_player, ship_bank, bank)
@@ -1286,7 +1309,7 @@ class ScrollerPiece(LawPiece):
     argument_names = ("lane", "slot", "rx", "ry", "rz", *STATE, *SETTINGS, *CONTROLS, "dt")
     #: the token network's weights: parameter inputs, never baked constants
     parameter_shapes = pilot_law.token_param_shapes()
-    source_modules = ("meowdoku.pilot_law",)
+    source_modules = ("meowdoku.pilot_law", "meowdoku.sweep")
     output_names = (*(f"{name}_next" for name in STATE), "residual", "dt_limit")
 
     def __init__(self, batch: int = LANES):

@@ -131,7 +131,10 @@ class EntitySession:
         self.columns = columns
         self.controls = tuple(controls)
         # cfl 1: the laws' dt_limit already carries its own 0.9 safety factor
-        self.targets = Targets(cfl=1.0, div_max=1e9, mass_max=1e9, energy_exchange_fraction=0.2)
+        # Entity games publish no energy exchange: no exchange-time scheduling
+        # (configured, it made every participant HOLD, so a step that shrank
+        # once could never regrow).
+        self.targets = Targets(cfl=1.0, div_max=1e9, mass_max=1e9, energy_exchange_fraction=None)
         self.controller = STController(dt_min=1e-6)
         self.state = None
         self.dt = 1.0 / 60.0
