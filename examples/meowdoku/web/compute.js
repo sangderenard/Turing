@@ -550,9 +550,10 @@ void main() {
 const POINT_FS = `#version 300 es
 precision highp float;
 in vec4 vColor; in float vBig; out vec4 FragColor;
+uniform vec3 u_background;   // the page's shared background: what an unfilled (alpha < 1) point fades to
 void main() {
   if (vBig > 0.5 && length(gl_PointCoord - 0.5) > 0.5) discard;
-  FragColor = vec4(vColor.rgb, 1.0);
+  FragColor = vec4(mix(u_background, vColor.rgb, vColor.a), 1.0);
 }`;
 
 export class PointCloud {
@@ -566,11 +567,11 @@ export class PointCloud {
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 16, 12);
     gl.bindVertexArray(null);
     this.max = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
-    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uPx", "uDpr", "uMax", "uStride"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
+    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uPx", "uDpr", "uMax", "uStride", "u_background"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
   }
 
   // data: packed points ([x, y, rgba8, meta] per displayed id); view: the size's world window
-  draw(data, { viewProj, view, board, y, pxPerUnit, stride }) {
+  draw(data, { viewProj, view, board, y, pxPerUnit, stride, background }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
@@ -583,6 +584,7 @@ export class PointCloud {
     gl.uniform3f(this.loc.uBoard, board[0], board[1], y);
     gl.uniform1f(this.loc.uPx, pxPerUnit); gl.uniform1f(this.loc.uDpr, window.devicePixelRatio || 1); gl.uniform1f(this.loc.uMax, this.max);
     gl.uniform1f(this.loc.uStride, stride || 1);
+    gl.uniform3fv(this.loc.u_background, new Float32Array(background || [0.085, 0.085, 0.1]));
     gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(false);
     gl.drawArrays(gl.POINTS, 0, data.length / 4);
     gl.depthMask(true); gl.bindVertexArray(null);

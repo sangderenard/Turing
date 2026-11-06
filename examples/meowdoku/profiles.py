@@ -49,7 +49,7 @@ SHOP = {
     "lucky": ("Lucky run: +1 of every power-up for the next 5 puzzles", 10, "ongoing"),
 }
 LUCKY_PUZZLES = 5
-SETTING_KEYS = ("camMode", "pads", "bombStyle", "wordle", "palette")
+SETTING_KEYS = ("camMode", "pads", "bombStyle", "wordle", "palette", "skyMode")
 RECENT = 20
 TOP = 10
 

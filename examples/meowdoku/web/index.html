@@ -5,22 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meowdoku</title>
 <style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #16161a; color: #e8e8ea; font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  /* The shared background: --scene-bg is set by app.js from the Rayleigh sky model for the viewer's local
+     time (the same colour the WebGL clear and the shaders' empty colour use); html[data-night="1"] is its
+     night mode.  The dark palette below is tinted by it; the fallbacks are the old fixed colours. */
+  :root { color-scheme: dark; --scene-bg: #16161a;
+          --panel: color-mix(in srgb, var(--scene-bg) 14%, #14141a); --ctl: #26262c; --ctl-hover: #30303a;
+          --line: #3a3a42; --fg: #e8e8ea; --fg-strong: #f0f0f3; }
+  :root[data-night="1"] { --panel: color-mix(in srgb, var(--scene-bg) 55%, #04060c); --ctl: #151b2e; --ctl-hover: #212b48;
+          --line: #55648c; --fg: #f4f6ff; --fg-strong: #ffffff; }
+  html, body { margin: 0; height: 100%; background: var(--scene-bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
   #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
-         background: rgba(22,22,26,0.85); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
+         background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
          /* a wrapping bar must not eat the viewport: past a third of the screen it scrolls, so the
             canvas below it (100vh - --bar-h) always keeps at least two thirds */
          max-height: 34vh; overflow-y: auto; box-sizing: border-box; }
-  #bar select, #bar button, #bar input[type=text] { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 5px 9px; font: inherit; }
-  #bar button:hover { background: #30303a; }
+  #bar select, #bar button, #bar input[type=text] { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: inherit; }
+  #bar button:hover { background: var(--ctl-hover); }
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
   #bar input[type=range] { width: 90px; }
   #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
   #bar .tool, #hint { align-items: center; }
   #status { margin-left: auto; opacity: 0.85; }
   #gamectl { display: contents; }
-  #gamectl .gctl-file { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  #gamectl .gctl-file { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
   #gamectl button:disabled { opacity: .4; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
@@ -28,8 +35,8 @@
            height: calc(100vh - var(--bar-h, 0px)); touch-action: none; }
   #word { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
   #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
-                background: #1e1e24; color: #f0f0f3; border: 1px solid #3a3a42; border-radius: 8px; padding: 6px 4px 6px 12px; }
-  #word button { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 8px 12px; font: inherit; }
+                background: var(--ctl); color: var(--fg-strong); border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px 6px 12px; }
+  #word button { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; font: inherit; }
   @media (max-width: 700px), (max-height: 500px) { #help { display: none; } }   /* the long help line would cover the board on a phone */
   #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; pointer-events: none; }   /* never takes a tap meant for the board or the tray */
   /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
@@ -59,8 +66,8 @@
   .pilot-only, #bar .pilot-only { display: none; }
   /* The learning panel: shown while demo learning is on. */
   #learn-panel { position: fixed; right: 12px; top: 64px; z-index: 3; display: none; pointer-events: none;
-                 padding: 8px 10px; border-radius: 10px; background: rgba(16,16,22,0.82); border: 1px solid #3a3a42;
-                 font: 12px/1.35 ui-monospace, Consolas, monospace; color: #e8e8ee; transition: box-shadow .3s; }
+                 padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--line);
+                 font: 12px/1.35 ui-monospace, Consolas, monospace; color: var(--fg); transition: box-shadow .3s; }
   #learn-panel.show { display: block; }
   #learn-panel.flash { box-shadow: 0 0 0 2px #7cf7a6, 0 0 22px #7cf7a6; }
   #learn-badge { font-weight: 700; letter-spacing: .08em; color: #7cf7a6; margin-bottom: 4px; }
@@ -80,15 +87,15 @@
   body[data-game="chess_arena"] #position, body[data-game="lichess"] #position { display: block; }
   /* The position as text: readable without the 3D board. */
   #position { position: fixed; left: 12px; bottom: 12px; z-index: 3; margin: 0; padding: 8px 10px; max-width: 46ch;
-              font: 13px/1.35 ui-monospace, Consolas, monospace; white-space: pre-wrap; background: rgba(16,16,22,0.82);
-              border: 1px solid #3a3a42; border-radius: 8px; color: #e8e8ee; }
+              font: 13px/1.35 ui-monospace, Consolas, monospace; white-space: pre-wrap; background: color-mix(in srgb, var(--panel) 82%, transparent);
+              border: 1px solid var(--line); border-radius: 8px; color: var(--fg); }
   body[data-game="chess_arena"] #bar .arena-only { display: inline-flex; }
   body[data-game="wordle"] #word { display: flex; }
   #player { width: 9em; }
   /* The result splash: centred over the board, never takes a tap. */
   #splash { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.9); z-index: 4; display: none;
             text-align: center; pointer-events: none; padding: 18px 28px; border-radius: 14px;
-            background: rgba(16,16,22,0.78); border: 1px solid #3a3a42; opacity: 0; transition: opacity .25s, transform .25s; }
+            background: color-mix(in srgb, var(--panel) 78%, transparent); border: 1px solid var(--line); opacity: 0; transition: opacity .25s, transform .25s; }
   #splash.show { display: block; opacity: 1; transform: translate(-50%, -50%) scale(1); }
   #splash-title { font-size: 34px; font-weight: 700; letter-spacing: 0.02em; }
   #splash.win #splash-title { color: #ffd76a; } #splash.loss #splash-title { color: #ff8a7a; }
@@ -100,13 +107,13 @@
   body.immersive canvas { top: 0; height: 100vh; }
   body.immersive #hud { display: block; left: 10px; top: 8px; right: 64px; font-size: 13px; opacity: 0.8; pointer-events: none;
                         text-shadow: 0 1px 2px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: rgba(38,38,44,0.75); color: #e8e8ea;
-                            border: 1px solid #3a3a42; border-radius: 6px; padding: 4px 10px; font: inherit; }
+  body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: color-mix(in srgb, var(--ctl) 75%, transparent); color: #e8e8ea;
+                            border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; }
   #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
-            max-height: 70vh; overflow: auto; background: rgba(22,22,26,0.94); border: 1px solid #3a3a42; border-radius: 8px; padding: 10px 12px; }
+            max-height: 70vh; overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   #scores.open { display: block; }
   #shop { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
-          max-height: 70vh; overflow: auto; background: rgba(22,22,26,0.94); border: 1px solid #3a3a42; border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+          max-height: 70vh; overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
   #shop.open { display: block; }
   #shop h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
   #shop .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
@@ -117,6 +124,25 @@
   #scores td { padding: 2px 4px; } #scores td.n { text-align: right; font-variant-numeric: tabular-nums; }
   #scores tr.me { color: #ffd76a; }
   #scores .muted { opacity: 0.6; font-size: 12px; }
+  /* NIGHT MODE for the light Meowdoku frame: the same rules as its day look, on the dark palette. */
+  :root[data-night="1"] body[data-game="meowdoku"] { color-scheme: dark; background: var(--scene-bg); color: var(--fg); }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar { background: color-mix(in srgb, var(--panel) 94%, transparent);
+                                    border-bottom: 2px solid var(--line); box-shadow: 0 3px 14px rgba(0,0,0,.4); }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar select, :root[data-night="1"] body[data-game="meowdoku"] #bar button,
+  :root[data-night="1"] body[data-game="meowdoku"] #bar input[type=text], :root[data-night="1"] body[data-game="meowdoku"] #gamectl .gctl-file {
+    background: var(--ctl); color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar button:hover { background: var(--ctl-hover); }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar .tool.active { background: #2f7f86; color: #fff; border-color: #7fd0d6; }
+  :root[data-night="1"] body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #ffd76a; outline-offset: 2px; }
+  :root[data-night="1"] body[data-game="meowdoku"] #help { color: var(--fg); background: color-mix(in srgb, var(--panel) 91%, transparent); opacity: 1; }
+  :root[data-night="1"] body[data-game="meowdoku"] #splash { color: var(--fg); background: color-mix(in srgb, var(--panel) 92%, transparent); border-color: var(--line); }
+  :root[data-night="1"] body[data-game="meowdoku"] #splash.win #splash-title { color: #ffd76a; }
+  :root[data-night="1"] body[data-game="meowdoku"] #splash.loss #splash-title { color: #ff8a7a; }
+  :root[data-night="1"] body[data-game="meowdoku"].immersive #hud { color: var(--fg); text-shadow: 0 1px 2px #000; }
+  :root[data-night="1"] body[data-game="meowdoku"].immersive #fs-exit { background: color-mix(in srgb, var(--ctl) 85%, transparent); color: var(--fg); border-color: var(--line); }
+  /* night: dim helper text is raised for contrast */
+  :root[data-night="1"] #help, :root[data-night="1"] #status { opacity: 1; }
+  :root[data-night="1"] #scores .muted, :root[data-night="1"] #shop .muted { opacity: .85; }
 </style>
 </head>
 <body data-game="meowdoku">
@@ -148,6 +174,8 @@
   </span>
   <label class="meowdoku-only">Palette <select id="palette"></select></label>
   <button id="light">Light: sun (L)</button>
+  <label title="The page's background and night mode follow the sun at your local time; auto, or force day or night">Sky <select id="sky-mode"><option value="auto">auto</option><option value="day">day</option><option value="night">night</option></select></label>
+  <button id="sky-locate" title="Optional: use your location for the sun's place (otherwise a rough latitude from your timezone). Nothing asks until you press this.">Locate</button>
   <button id="flat">Flat (V)</button>
   <label title="Soft bodies: pieces shear, squash and twist as they move"><input id="wobble" type="checkbox"> Wobble</label>
   <label title="Spring stiffness of the soft bodies; lower is also less damped, so soft pieces jiggle longer">Stiff <input id="wobble-k" type="range" min="0.5" max="16" step="0.25" value="8"></label>

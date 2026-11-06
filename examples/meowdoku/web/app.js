@@ -99,11 +99,14 @@ const SKY_FS = `#version 300 es
 precision highp float;
 in vec2 vNdc; out vec4 FragColor;
 uniform mat4 uInvViewProj; uniform vec3 uSun; uniform vec3 uTauR; uniform float uTauM; uniform float uExposure;
+uniform vec3 uProbe;   // non-zero: sample this one direction (the page's shared background), no stars
 float airMass(float e) { float d = max(-2.5, degrees(e)); return 1.0 / (sin(radians(max(d, 0.0))) + 0.50572 * pow(d + 6.07995, -1.6364)); }
 float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
 void main() {
   vec4 a = uInvViewProj * vec4(vNdc, -1.0, 1.0), b = uInvViewProj * vec4(vNdc, 1.0, 1.0);
   vec3 dir = normalize(b.xyz / b.w - a.xyz / a.w);
+  float probing = step(0.5, dot(uProbe, uProbe));
+  if (probing > 0.5) dir = normalize(uProbe);
   float view_e = asin(clamp(dir.y, -1.0, 1.0)), sun_e = asin(clamp(uSun.y, -1.0, 1.0));
   float mu = dot(dir, uSun);
   vec3 tau = uTauR + vec3(uTauM);
@@ -122,7 +125,7 @@ void main() {
   // stars where the sky is dark
   float dark = 1.0 - clamp(dot(sky, vec3(0.3, 0.5, 0.2)) * 6.0, 0.0, 1.0);
   vec3 cell = floor(dir * 220.0);
-  float star = step(0.9965, hash(cell)) * dark * step(0.0, dir.y);
+  float star = step(0.9965, hash(cell)) * dark * step(0.0, dir.y) * (1.0 - probing);
   sky += vec3(star * (0.6 + 0.4 * hash(cell + 7.0)));
   vec3 mapped = vec3(1.0) - exp(-sky * uExposure * 2.4);
   FragColor = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
@@ -315,7 +318,7 @@ function renderBroadcast(now, casters) {
   const target = [state.extent.width / 2, 0, state.extent.depth / 2], eye = [target[0], height, target[2]];
   const view = M.lookAt(eye, target, [0, 0, -1]), proj = M.perspective(B.fov, 1, 0.1, 300);
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); gl.viewport(0, 0, n, n);
-  gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(...sceneBackground(), 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
   litPass({ view, proj, viewProj: M.multiply(proj, view), eye }, now, casters, { plate: false });
   // warp it into the glass's colour layer
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.warp);
@@ -2098,6 +2101,124 @@ function sunThroughAir(dir) {
   const above = Math.max(0, Math.min(1, (e * 180 / Math.PI + 3) / 6));        // the disc sinking through the horizon
   return SKY.tauR.map((t) => Math.exp(-(t + SKY.tauM) * m) * above);
 }
+// ---------------------------------------------------------------- THE BACKGROUND
+// ONE shared background colour for the page, its CSS and every shader that
+// needs an "empty" colour: the SKY pass above, evaluated for the sun's place
+// at the viewer's local time (a solar position from the clock and date; the
+// longitude from the timezone offset, the latitude a rough default that the
+// player may replace by opting in to geolocation).  The sample is taken by
+// that same SKY_FS (uProbe: one direction, no stars) into a 2x1 target --
+// the zenith and the horizon -- and read back once a minute; nothing here
+// re-derives the atmosphere, so a game that draws the sky itself (bullet
+// hell) and this default agree.  Night is a deep blue-black, and the page's
+// CSS switches to its night palette with it (html[data-night]).
+//   auto: the real sun; day / night: the player's override (saved in the
+//   profile's settings).  Debug: ?clock=HH:MM (or an ISO time), or
+//   window.setSceneClock("18:30") / setSceneClock(null).
+const SCENE_MODES = ["auto", "day", "night"];
+const SCENE = { mode: "auto", rgb: [0.085, 0.085, 0.1], night: 0, elevation: 0, azimuth: 0, at: -1e9, prog: null, vao: null, fbo: null, rb: null,
+                lat: null, lon: null, clock: null, css: "" };
+const NIGHT_SKY = [0.030, 0.040, 0.095];                        // deep blue-black, never pure black
+// Rough latitude when nothing better is known: the timezone name says which hemisphere and about how far.
+function defaultLatitude() {
+  let tz = ""; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { /* no Intl */ }
+  if (/^(Australia|Pacific\/(Auckland|Fiji)|Antarctica)/.test(tz)) return -33;
+  if (/^(America\/(Sao_Paulo|Argentina|Santiago|Lima|Montevideo|Asuncion|La_Paz)|Africa\/(Johannesburg|Maputo|Harare|Lusaka)|Indian\/(Mauritius|Reunion))/.test(tz)) return -25;
+  if (/^(Africa\/(Lagos|Nairobi|Kinshasa|Accra|Abidjan|Addis_Ababa)|Asia\/(Singapore|Jakarta|Colombo|Kuala_Lumpur))/.test(tz)) return 5;
+  return 42;
+}
+try { const g = JSON.parse(localStorage.getItem("meowdoku_geo") || "null"); if (g && Number.isFinite(g.lat) && Number.isFinite(g.lon)) { SCENE.lat = g.lat; SCENE.lon = g.lon; } } catch { /* private window */ }
+try { const q = new URLSearchParams(location.search).get("clock"); if (q) SCENE.clock = q; } catch { /* no location */ }
+window.setSceneClock = (value) => { SCENE.clock = value || null; SCENE.at = -1e9; };
+function sceneDate() {
+  const c = SCENE.clock, now = new Date();
+  if (!c) return now;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(c);
+  if (m) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(m[1]), Number(m[2]));
+  const d = new Date(c); return Number.isNaN(d.getTime()) ? now : d;
+}
+// NOAA's solar position (equation of time and declination); azimuth from north, clockwise.
+function solarPosition(date, latDeg, lonDeg) {
+  const R = Math.PI / 180, yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+  const doy = Math.floor((date.getTime() - yearStart) / 864e5) + 1, hour = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  const g = 2 * Math.PI / 365 * (doy - 1 + (hour - 12) / 24);
+  const eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(g) - 0.032077 * Math.sin(g) - 0.014615 * Math.cos(2 * g) - 0.040849 * Math.sin(2 * g));
+  const decl = 0.006918 - 0.399912 * Math.cos(g) + 0.070257 * Math.sin(g) - 0.006758 * Math.cos(2 * g) + 0.000907 * Math.sin(2 * g)
+             - 0.002697 * Math.cos(3 * g) + 0.00148 * Math.sin(3 * g);
+  const solarMin = hour * 60 + eqTime + 4 * lonDeg, ha = (solarMin / 4 - 180) * R, lat = latDeg * R;
+  const elevation = Math.asin(Math.max(-1, Math.min(1, Math.sin(lat) * Math.sin(decl) + Math.cos(lat) * Math.cos(decl) * Math.cos(ha))));
+  const azimuth = Math.atan2(Math.sin(ha), Math.cos(ha) * Math.sin(lat) - Math.tan(decl) * Math.cos(lat)) + Math.PI;
+  return { elevation, azimuth };
+}
+const sunBoardDir = (el, az) => [Math.sin(az) * Math.cos(el), Math.sin(el), -Math.cos(az) * Math.cos(el)];
+// The sky's colour at the viewer's sun, through SKY_FS itself.
+function probeSky(sunEl, sunAz) {
+  if (!SCENE.prog) {
+    SCENE.prog = link(compile(gl.VERTEX_SHADER, SKY_VS), compile(gl.FRAGMENT_SHADER, SKY_FS));
+    SCENE.vao = gl.createVertexArray();
+    SCENE.rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, SCENE.rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, 2, 1);
+    SCENE.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, SCENE.fbo);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, SCENE.rb);
+  }
+  const P = SCENE.prog, at = (n) => gl.getUniformLocation(P, n), R = Math.PI / 180;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, SCENE.fbo); gl.useProgram(P); gl.bindVertexArray(SCENE.vao);
+  gl.uniformMatrix4fv(at("uInvViewProj"), false, M.identity());
+  gl.uniform3fv(at("uSun"), new Float32Array(sunBoardDir(sunEl, sunAz)));
+  gl.uniform3fv(at("uTauR"), new Float32Array(SKY.tauR)); gl.uniform1f(at("uTauM"), SKY.tauM); gl.uniform1f(at("uExposure"), state.debug.exposure);
+  gl.depthMask(false); gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+  const horizon = sunBoardDir(10 * R, sunAz + 50 * R);          // low sky, well off the sun's own glare
+  [[0, 1, 0], horizon].forEach((dir, i) => { gl.viewport(i, 0, 1, 1); gl.uniform3fv(at("uProbe"), new Float32Array(dir)); gl.drawArrays(gl.TRIANGLES, 0, 3); });
+  const px = new Uint8Array(8); gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.bindVertexArray(null); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  return [0, 1, 2].map((k) => (0.6 * px[k] + 0.4 * px[4 + k]) / 255);       // zenith / horizon blend
+}
+function updateBackground() {
+  const R = Math.PI / 180, d = sceneDate();
+  const lon = SCENE.lon ?? -d.getTimezoneOffset() / 4, lat = SCENE.lat ?? defaultLatitude();
+  let { elevation, azimuth } = solarPosition(d, lat, lon);
+  if (SCENE.mode === "day" && elevation < 55 * R) { elevation = 55 * R; azimuth = Math.PI; }
+  else if (SCENE.mode === "night") elevation = Math.min(elevation, -30 * R);
+  SCENE.elevation = elevation; SCENE.azimuth = azimuth;
+  const sky = probeSky(elevation, azimuth);
+  // night: the sun well below the horizon (past the twilight glow) fades the sky to the night colour
+  const t = Math.max(0, Math.min(1, (-elevation / R - 3) / 11));
+  SCENE.night = t * t * (3 - 2 * t);
+  SCENE.rgb = sky.map((v, k) => v + (NIGHT_SKY[k] - v) * SCENE.night);
+  SCENE.at = performance.now();
+  SCENE.css = "";                                              // force the CSS to be rewritten
+}
+// What this game draws where it has no sky.  A game with an authored look (MEOW_LOOK.background, Meowdoku's
+// bright frame) keeps it as its daytime colour: the model only TINTS it, by the sunlight the atmosphere leaves
+// (sunThroughAir, relative to high noon: warm at golden hour, exactly the authored colour at noon), and carries
+// it to the shared night colour as dark comes.  Every other game takes the shared colour as it is.
+const NOON_LIGHT = (() => { const l = sunThroughAir(sunBoardDir(25 * Math.PI / 180, Math.PI)), p = Math.max(...l); return l.map((v) => v / p); })();
+function sceneBackground() {
+  if (state.game?.game !== "meowdoku") return SCENE.rgb;
+  const l = sunThroughAir(sunBoardDir(Math.max(SCENE.elevation, 0.02), SCENE.azimuth)), p = Math.max(...l, 1e-4);
+  const tint = l.map((v, k) => Math.max(0.5, Math.min(1.05, v / p / NOON_LIGHT[k])));       // reddening only: the frame never washes out
+  const warm = MEOW_LOOK.background.map((v, k) => Math.min(1, v * (1 + 0.4 * (tint[k] - 1))));
+  return mix(warm, SCENE.rgb, SCENE.night);
+}
+function backgroundFrame() {
+  if (performance.now() - SCENE.at > 60000) updateBackground();           // every minute
+  const bg = sceneBackground().map((v) => Math.round(v * 255)), key = bg.join(",") + "|" + (SCENE.night > 0.5 ? 1 : 0);
+  if (key === SCENE.css) return;
+  SCENE.css = key;
+  const root = document.documentElement;
+  root.style.setProperty("--scene-bg", `rgb(${bg.join(",")})`);
+  root.dataset.night = SCENE.night > 0.5 ? "1" : "0";
+}
+// The fill light for a game with no sky: the shared background's tint, dimmed by night.
+function ambientFill(fill) {
+  const bg = SCENE.rgb, peak = Math.max(...bg, 1e-3), day = 1 - SCENE.night;
+  return fill.map((v, k) => (0.55 * v + 0.45 * bg[k] / peak) * (0.5 + 0.5 * day));
+}
+function setSkyMode(mode, save = true) {
+  if (!SCENE_MODES.includes(mode)) return;
+  SCENE.mode = mode; SCENE.at = -1e9;
+  if ($("sky-mode")) $("sky-mode").value = mode;
+  if (save && inventoryView.applied) saveSettings();
+}
 function lampTarget(now, ext) {
   const span = Math.max(ext.width, ext.depth);
   if (light.follow && light.pointer) return [light.pointer[0], 0.55 * span, light.pointer[1]];
@@ -2900,7 +3021,7 @@ function showShop(inv) {
 // Settings ride on the profile: saved when changed, applied once on arrival.
 function currentSettings() {
   return { camMode: state.camMode || "board", pads: $("pads") ? $("pads").checked : false,
-           bombStyle: state.bombStyle || 0, wordle: { ...wordleChoice } };
+           bombStyle: state.bombStyle || 0, wordle: { ...wordleChoice }, skyMode: SCENE.mode };
 }
 function saveSettings() { if (state.game) act({ type: "settings", values: currentSettings() }).catch(() => {}); }
 function applySettings(values) {
@@ -2908,6 +3029,7 @@ function applySettings(values) {
   if (typeof values.pads === "boolean" && $("pads")) { $("pads").checked = values.pads; showPads(state.game); }
   if (Number.isInteger(values.bombStyle)) { state.bombStyle = (values.bombStyle + BOMB_STYLES.length - 1) % BOMB_STYLES.length; cycleBomb(); }
   if (values.wordle && typeof values.wordle === "object") Object.assign(wordleChoice, values.wordle);
+  if (SCENE_MODES.includes(values.skyMode)) setSkyMode(values.skyMode, false);
 }
 function renderModes(game) {
   const box = $("modes"), modes = game && game.modes;
@@ -3555,7 +3677,7 @@ function pointsFrame(cam, now) {
   const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
   const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
   cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height],
-                     y: TILE.height + 0.03, pxPerUnit, stride: rec.display_stride });
+                     y: TILE.height + 0.03, pxPerUnit, stride: rec.display_stride, background: sceneBackground() });
 }
 
 // ---------------------------------------------------------------- draw
@@ -3580,7 +3702,7 @@ function litPass(cam, now, casters, opts = {}) {
     sun.strength = Math.min(1, peak * 1.25);
     const day = Math.max(0, Math.min(1, (globe[1] + 0.12) / 0.4));
     fillColour = [0.35 + 0.4 * day, 0.42 + 0.43 * day, 0.62 + 0.38 * day].map((v) => v * (0.35 + 0.65 * day));
-  }
+  } else fillColour = ambientFill(fillColour);   // no sky of its own: the shared background tints the fill
   // The sun's intensity is set for its distance to the board's centre (soft,
   // even light); the fill light carries the arcade ring's colour and activity.
   // The house light is turned down so the arcade bulbs carry the scene: the
@@ -3680,7 +3802,8 @@ function draw(ms) {
   const now = ms / 1000; stepCamView(now - (state.time || now)); state.time = now;
   const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  const clear = state.game?.game === "meowdoku" ? MEOW_LOOK.background : [0.085, 0.085, 0.1];
+  backgroundFrame();
+  const clear = sceneBackground();
   gl.viewport(0, 0, w, h); gl.clearColor(...clear, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
@@ -4410,6 +4533,15 @@ $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };
 $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 100; if (state.game) { uploadMaterials(state.game); rebuildBoards(state.game); } };
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: sun (L)"; }
 $("light").onclick = toggleLight;
+$("sky-mode").onchange = () => setSkyMode($("sky-mode").value);
+$("sky-locate").onclick = () => {      // opt-in only: nothing asks for the location unless this is pressed
+  if (!navigator.geolocation) { $("sky-locate").textContent = "No geolocation"; return; }
+  navigator.geolocation.getCurrentPosition((p) => {
+    SCENE.lat = p.coords.latitude; SCENE.lon = p.coords.longitude; SCENE.at = -1e9;
+    try { localStorage.setItem("meowdoku_geo", JSON.stringify({ lat: SCENE.lat, lon: SCENE.lon })); } catch { /* private window */ }
+    $("sky-locate").textContent = "Located";
+  }, () => { $("sky-locate").textContent = "Location denied"; });
+};
 function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
 $("flat").onclick = toggleFlat;
 $("wobble").onchange = (e) => { wob.on = e.target.checked; wob.lastNow = null; };
