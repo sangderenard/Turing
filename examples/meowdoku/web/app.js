@@ -142,17 +142,20 @@ function drawSky(cam, now) {
 // not meshes, not lamps that light the land: points that read through cloud
 // (drawn after the glass, depth-tested only against the land), brighter the
 // darker the local sky.
+// Like the night side seen from orbit: tiny hard points, each with its own
+// colour (sodium amber to cool white, by a hash of where it stands), no blur.
 const GLOW_VS = `#version 300 es
 layout(location=0) in vec4 aPoint;      // x y z, light
-uniform mat4 uViewProj; uniform float uScale;
-out float vLight;
+uniform mat4 uViewProj;
+out float vLight; out vec3 vTint;
 void main() { vLight = aPoint.w; gl_Position = uViewProj * vec4(aPoint.xyz, 1.0);
-  gl_PointSize = clamp(uScale * (0.6 + 2.4 * aPoint.w) / gl_Position.w, 3.0, 22.0); }`;
+  float h = fract(sin(dot(aPoint.xz, vec2(12.9898, 78.233))) * 43758.5453);
+  vTint = mix(vec3(1.0, 0.62, 0.22), vec3(0.92, 0.95, 1.0), h * h);
+  gl_PointSize = vLight > 0.6 ? 2.0 : 1.0; }`;
 const GLOW_FS = `#version 300 es
 precision highp float;
-in float vLight; out vec4 FragColor; uniform float uNight;
-void main() { vec2 d = gl_PointCoord * 2.0 - 1.0; float r = dot(d, d); if (r > 1.0) discard;
-  float core = exp(-r * 3.0); FragColor = vec4(vec3(1.0, 0.82, 0.5) * core * (0.6 + 1.8 * vLight) * uNight, 1.0); }`;
+in float vLight; in vec3 vTint; out vec4 FragColor; uniform float uNight;
+void main() { FragColor = vec4(vTint * (0.55 + 0.75 * vLight) * uNight, 1.0); }`;
 const GLOW = { prog: null, vao: null, buf: null };
 function drawCityLights(cam) {
   const pts = state.glowPoints || [];
@@ -164,17 +167,29 @@ function drawCityLights(cam) {
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
   }
-  const data = new Float32Array(pts.length * 4);
-  pts.forEach((p, i) => data.set([p[0], p[1] + 0.03, p[2], Math.min(1, Math.max(0, (p[3] - 0.06) / 0.06))], i * 4));
+  // each pin is a district: up to CLUSTER tiny lights scattered round it (a
+  // fixed hash pattern, so they hold still), more the brighter it is
+  const CLUSTER = 9, data = new Float32Array(pts.length * CLUSTER * 4);
+  let n = 0;
+  for (const p of pts) {
+    const light = Math.min(1, Math.max(0, (p[3] - 0.06) / 0.06));
+    const count = 2 + Math.round(light * (CLUSTER - 2));
+    for (let j = 0; j < count; j++) {
+      const s = Math.sin((p[0] * 12.99 + p[2] * 78.23 + j * 37.7)) * 43758.5453, r1 = s - Math.floor(s);
+      const s2 = Math.sin((p[0] * 39.35 + p[2] * 11.13 + j * 91.3)) * 24634.6345, r2 = s2 - Math.floor(s2);
+      const ang = r1 * 6.2832, rad = 0.05 + 0.22 * Math.sqrt(r2);
+      data.set([p[0] + Math.cos(ang) * rad, p[1] + 0.03, p[2] + Math.sin(ang) * rad, light * (0.5 + 0.5 * r2)], n * 4);
+      n++;
+    }
+  }
   const sunUp = SKY.dir ? SKY.dir[1] : -1;
   const night = Math.max(0.12, Math.min(1, (0.12 - sunUp) / 0.3));
   gl.useProgram(GLOW.prog); gl.bindVertexArray(GLOW.vao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, GLOW.buf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, GLOW.buf); gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, n * 4), gl.DYNAMIC_DRAW);
   gl.uniformMatrix4fv(gl.getUniformLocation(GLOW.prog, "uViewProj"), false, cam.viewProj);
-  gl.uniform1f(gl.getUniformLocation(GLOW.prog, "uScale"), canvas.height * 0.4);
   gl.uniform1f(gl.getUniformLocation(GLOW.prog, "uNight"), night);
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
-  gl.drawArrays(gl.POINTS, 0, pts.length);
+  gl.drawArrays(gl.POINTS, 0, n);
   gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
 }
 function link(vs, fs) {
