@@ -194,6 +194,9 @@ def export_terrain() -> dict:
             "normals": np.round(normals.reshape(-1), 4).tolist(),
             "uvs": np.round(uvs.reshape(-1), 5).tolist(),
             "triangles": int(len(positions) // 3), "tile": TERRAIN_TILE, "span": [width, depth],
+            # the grids and the height law the mesh was read with, so a page can
+            # re-read the same map at a turned coordinate (a spherical game)
+            "step": TERRAIN_STEP, "shadow_step": TERRAIN_SHADOW_STEP, "relief": TERRAIN_RELIEF, "relief_power": 1.4,
             # the decimated triangulation of the same relief, for the shadow map
             "shadow_positions": np.round(shadow_positions.reshape(-1), 3).tolist(),
             "texture": {"size": n, "rgba": base64.b64encode(terrain_colours(height).tobytes()).decode("ascii")},

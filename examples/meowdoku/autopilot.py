@@ -386,10 +386,12 @@ class Pilot:
 
 
 class _MirroredView:
-    """The board as a piloted enemy sees it: itself as "the ship" at the
-    bottom (the field flipped top to bottom), the player's ship, shots and
-    missiles as its hostiles, its health as its vitals -- so the policy
-    trained to survive and score as the player flies it unchanged."""
+    """The board as a piloted enemy sees it: the patch of the sphere about
+    ITSELF, its heading up the screen (sphere_motion.project, the projection
+    the law draws the player's patch with), itself as "the ship", the player
+    as an enemy craft and the player's shots and missiles as bullets, its
+    health as its vitals -- so the policy trained to survive and score as the
+    player flies it unchanged."""
 
     def __init__(self, game, lane: int):
         from meowdoku import scroller as sc
@@ -399,15 +401,32 @@ class _MirroredView:
         self.HEALTH_MAX = 1.0
         self._sc, self._real, self._lane = sc, game.session, lane
         self.session = self
+        self._patch = self._project()
+
+    def _project(self) -> dict[str, np.ndarray]:
+        from meowdoku import sphere_motion as sm
+        from src.common.tensors import AbstractTensor
+        sc, real, k = self._sc, self._real, self._lane
+        T = lambda a: AbstractTensor.get_tensor(np.asarray(a, dtype=np.float64))  # noqa: E731
+        col = {name: real.column(name) for name in ("ux", "uy", "uz", "hx", "hy", "hz", "spd", "field_w")}
+        u = (T(col["ux"]), T(col["uy"]), T(col["uz"]))
+        h = (T(col["hx"]), T(col["hy"]), T(col["hz"]))
+        uk = tuple(T(col[n][k]) for n in ("ux", "uy", "uz"))
+        hk = tuple(T(col[n][k]) for n in ("hx", "hy", "hz"))
+        X, Y = sm.project(u, uk, hk, sc.RADIUS)
+        VX, VY = sm.patch_velocity(h, T(col["spd"]), X, Y, hk, T(col["spd"][k]), uk, T(0.0))
+        cx, cy = 0.5 * float(col["field_w"][0]), sc.PLAYER_Y
+        out = {"x": cx + np.asarray(X.numpy()), "y": cy - np.asarray(Y.numpy()),
+               "vx": np.asarray(VX.numpy()), "vy": -np.asarray(VY.numpy())}
+        out["x"][k], out["y"][k], out["vx"][k], out["vy"][k] = cx, cy, 0.0, 0.0
+        return out
 
     def column(self, name: str) -> np.ndarray:
-        col = np.array(self._real.column(name), dtype=np.float64, copy=True)
         sc, k = self._sc, self._lane
-        if name == "y":
-            col = sc.HEIGHT - col
-        elif name == "vy":
-            col = -col
-        elif name == "energy":
+        if name in self._patch:
+            return np.array(self._patch[name], dtype=np.float64, copy=True)
+        col = np.array(self._real.column(name), dtype=np.float64, copy=True)
+        if name == "energy":
             col[k] = 1.0
         elif name == "lives":
             hp, top = float(self._real.column("hp")[k]), sc.BOSS_HP if k == sc.BOSS_LANE else sc.ACE_HP
@@ -423,8 +442,9 @@ class _MirroredView:
 
 
 def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
-    """(x axis, y axis, height axis, fire) for a piloted enemy: the game's
-    policy on the mirrored view, its y answer flipped back to the board."""
+    """(turn, throttle axis, height axis, fire) for a piloted enemy: the
+    game's policy on the craft's own patch, its answers as the player's
+    controls mean them (x axis turns, y axis throttles)."""
     name = game.game
     params = _PILOT_WEIGHTS.get(name) or fitting_params(name)
     if params is None:
@@ -432,7 +452,7 @@ def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
     _PILOT_WEIGHTS.setdefault(name, params)
     view = _MirroredView(game, lane)
     out = numpy_product(1, *widths_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
-    return (float(out[0]), -float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
+    return (float(out[0]), float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
 
 
 def pilot_for(game) -> Pilot:

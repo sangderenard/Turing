@@ -16,7 +16,9 @@ DELTA, little-endian:
     f32  x, y, vx, vy the player's ship (``you``), u8 alive, f32 shield charge,
                       f32 sync hint (the longest a faithful page may wait to check in),
                       f32 z, vz (the ship height above the board; 0 without a third axis),
-                      f32 health (fraction; 0 for a game without health points)
+                      f32 health (fraction; 0 for a game without health points),
+                      f32 yaw, vyaw, spd, vspd (a spherical game's turn and
+                      throttle axes; 0 elsewhere)
     u8   names        new appearance names this connection has not seen,
                       each u8 length + utf-8; indices count up from 0
     u16  gone         lanes whose entity disappeared, u16 each
@@ -116,7 +118,7 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #: it whenever the layout changes; the page refuses any other version.
 #:   3 = header + z, vz, health; spawn/update records carry z, vz; spawn
 #:       flags bit1 = face its velocity.
-PROTOCOL = 3
+PROTOCOL = 4
 
 class SnapshotEncoder:
     """What one connection's page knows, and the delta that brings it up to date."""
@@ -179,11 +181,13 @@ class SnapshotEncoder:
 
         you = state.get("you") or {}
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBfffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBfffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),
-                             float(you.get("z", 0.0)), float(you.get("vz", 0.0)), float(you.get("health", 0.0)))]
+                             float(you.get("z", 0.0)), float(you.get("vz", 0.0)), float(you.get("health", 0.0)),
+                             float(you.get("yaw", 0.0)), float(you.get("vyaw", 0.0)), float(you.get("spd", 0.0)),
+                             float(you.get("vspd", 0.0)))]
         parts.append(struct.pack("<B", len(fresh)))
         for name in fresh:
             raw = name.encode("utf-8")

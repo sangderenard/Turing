@@ -460,22 +460,105 @@ function stripsOf(positions, extras, span, length = PLANET.strip) {
 function reliefMesh(exported) {
   if (TERRAIN.relief !== undefined) return TERRAIN.relief;
   if (!exported || !exported.positions) return (TERRAIN.relief = null);
+  // Buffers stay writable: a spherical game re-reads the relief under a
+  // turned, travelling coordinate every frame (turnRelief).
   const buffer = (data, loc, size) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); };
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); return b; };
+  // Each vertex's node on the mesh's grid (the DepthMesh grid it was read on).
+  const nodesOf = (s, step) => {
+    const n = s.pos.length / 3, node = new Int32Array(n), cols = Math.round(exported.span[0] / step) + 1;
+    for (let v = 0; v < n; v++) node[v] = Math.round((s.pos[v * 3 + 2] + s.centre) / step) * cols + Math.round(s.pos[v * 3] / step);
+    return node;
+  };
   const strips = stripsOf(exported.positions, [[exported.normals, 3], [exported.uvs, 2]], exported.span).map((s) => {
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
-    buffer(s.pos, 0, 3); buffer(s.extra[0], 1, 3); buffer(s.extra[1], 3, 2);
+    const pos = new Float32Array(s.pos), nrm = new Float32Array(s.extra[0]), uv = new Float32Array(s.extra[1]);
+    const buffers = [buffer(pos, 0, 3), buffer(nrm, 1, 3), buffer(uv, 3, 2)];
     gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre };
+    return { vao, count: s.pos.length / 3, centre: s.centre, pos, nrm, uv, buffers,
+             node: exported.step ? nodesOf(s, exported.step) : null };
   });
   const shadows = exported.shadow_positions ? stripsOf(exported.shadow_positions, [], exported.span, PLANET.shadowStrip).map((s) => {
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
-    buffer(s.pos, 0, 3);
+    const pos = new Float32Array(s.pos), buffers = [buffer(pos, 0, 3)];
     gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre };
+    return { vao, count: s.pos.length / 3, centre: s.centre, pos, buffers,
+             node: exported.shadow_step ? nodesOf(s, exported.shadow_step) : null };
   }) : [];
-  return (TERRAIN.relief = { strips, shadows, tile: exported.tile, span: exported.span });
+  // The relief map itself (the depth texture's R channel), through the
+  // export's height law, for re-reading.
+  let map = null;
+  if (exported.depth && exported.depth.rgba) {
+    const raw = atob(exported.depth.rgba), n = exported.depth.size;
+    map = { n, h: new Float32Array(n * n) };
+    for (let i = 0; i < n * n; i++) map.h[i] = Math.pow(raw.charCodeAt(i * 4) / 255, exported.relief_power || 1.4) * (exported.relief || 0.75);
+  }
+  return (TERRAIN.relief = { strips, shadows, tile: exported.tile, span: exported.span, step: exported.step,
+                             shadowStep: exported.shadow_step, map });
+}
+// TURNING THE LAND (a spherical game, predict.patch).  The ship never moves
+// on screen; the land is read from the same tileable relief map at a turned,
+// travelling coordinate: board offset (X right, Y ahead of the ship) maps to
+// map (u, v) = travel + (X cos yaw + Y sin yaw, X sin yaw - Y cos yaw).  The
+// heights on the mesh's grid nodes, their normals from neighbouring nodes,
+// and the colour/depth UVs are rewritten every frame -- the DepthMesh's own
+// grid and strips, re-read, so relief, colour and depth turn together.
+const TURN_LAND = { travel: [0, 0], at: null };
+function turnRelief(relief, now) {
+  const game = state.game, patch = game.predict && game.predict.patch;
+  if (!relief.map || !relief.step || !patch) return false;
+  const ship = pred.ship || game.you || {};
+  const yaw = ship.yaw || 0, spd = ship.spd || 0;
+  const frame = TURN_LAND.at == null ? 0 : Math.min(0.1, now - TURN_LAND.at);
+  TURN_LAND.at = now;
+  if (!game.over) { TURN_LAND.travel[0] += spd * frame * Math.sin(yaw); TURN_LAND.travel[1] -= spd * frame * Math.cos(yaw); }
+  const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], c = Math.cos(yaw), s = Math.sin(yaw);
+  const n = relief.map.n, h = relief.map.h, toMap = n / relief.tile;
+  const wrap = (i) => ((i % n) + n) % n;
+  const sample = (u, v) => {
+    const fu = u * toMap, fv = v * toMap, iu = Math.floor(fu), iv = Math.floor(fv), tu = fu - iu, tv = fv - iv;
+    const a = wrap(iv), b = wrap(iv + 1), l = wrap(iu), r = wrap(iu + 1);
+    const top = h[a * n + l] + (h[a * n + r] - h[a * n + l]) * tu, bottom = h[b * n + l] + (h[b * n + r] - h[b * n + l]) * tu;
+    return top + (bottom - top) * tv;
+  };
+  const grid = (step) => {
+    const cols = Math.round(relief.span[0] / step) + 1, rows = Math.round(relief.span[1] / step) + 1;
+    const hgt = new Float32Array(cols * rows), mu = new Float32Array(cols * rows), mv = new Float32Array(cols * rows);
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const X = x0 + i * step - patch.cx, Y = patch.cy - (z0 + j * step);
+      const u = TURN_LAND.travel[0] + X * c + Y * s, v = TURN_LAND.travel[1] + X * s - Y * c, k = j * cols + i;
+      hgt[k] = sample(u, v); mu[k] = u; mv[k] = v;
+    }
+    return { cols, rows, hgt, mu, mv };
+  };
+  const fine = grid(relief.step), cx = relief.span[0] / 2;
+  for (const strip of relief.strips) {
+    if (!strip.node) continue;
+    for (let v = 0; v < strip.count; v++) {
+      const k = strip.node[v], i = k % fine.cols, j = (k - i) / fine.cols;
+      const dx = strip.pos[v * 3] - cx;
+      strip.pos[v * 3 + 1] = fine.hgt[k] - (dx * dx) / (2 * PLANET.radius);
+      const hl = fine.hgt[j * fine.cols + Math.max(0, i - 1)], hr = fine.hgt[j * fine.cols + Math.min(fine.cols - 1, i + 1)];
+      const hu = fine.hgt[Math.max(0, j - 1) * fine.cols + i], hd = fine.hgt[Math.min(fine.rows - 1, j + 1) * fine.cols + i];
+      const nx = -(hr - hl) / (2 * relief.step), nz = -(hd - hu) / (2 * relief.step), len = Math.hypot(nx, 1, nz);
+      strip.nrm[v * 3] = nx / len; strip.nrm[v * 3 + 1] = 1 / len; strip.nrm[v * 3 + 2] = nz / len;
+      strip.uv[v * 2] = fine.mu[k] / relief.tile; strip.uv[v * 2 + 1] = fine.mv[k] / relief.tile;
+    }
+    [strip.pos, strip.nrm, strip.uv].forEach((data, b) => { gl.bindBuffer(gl.ARRAY_BUFFER, strip.buffers[b]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, data); });
+  }
+  if (relief.shadowStep) {
+    const coarse = grid(relief.shadowStep);
+    for (const strip of relief.shadows) {
+      if (!strip.node) continue;
+      for (let v = 0; v < strip.count; v++) {
+        const dx = strip.pos[v * 3] - cx;
+        strip.pos[v * 3 + 1] = coarse.hgt[strip.node[v]] - (dx * dx) / (2 * PLANET.radius);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, strip.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, strip.pos);
+    }
+  }
+  return true;
 }
 function terrainOrigin(relief) {
   // Centred across the field; starting one tile above it and sliding down.
@@ -502,7 +585,8 @@ function drawTerrain(now, drawLit) {
   if (relief) {
     const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
     TERRAIN.at = now;
-    if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
+    if (game.predict && game.predict.patch) { TERRAIN.scroll = 0; turnRelief(relief, now); }   // the land turns and travels under the ship
+    else if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
     return;
   }
@@ -1427,11 +1511,26 @@ function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
-                                                  ["z", "z", "vz", "move_axis_z", "steer_z"]]) {
+                                                  ["z", "z", "vz", "move_axis_z", "steer_z"],
+                                                  ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null]]) {
       // Only the engine's own motion law moves the ship here (the same
       // damped_axis, compiled to wasm).  An axis that law does not declare is
       // the server's alone: the page never guesses it with physics of its own.
       if (!motion[axis]) continue;
+      const bind = motion.bind && motion.bind[axis];
+      if (bind) {
+        // A bound axis (a spherical game's turn, throttle): its own input,
+        // sign and rates; a turn's held finger steers for its bearing from
+        // the ship, as the law computes it.
+        const patch = motion.patch || {};
+        const steering = bind.finger && input.steer_x >= 0;
+        const aim = steering ? ship[pos] + Math.atan2(input.steer_x - patch.cx, patch.cy - input.steer_y) : -1;
+        const r = pred.program.invoke({ x: ship[pos], v: ship[vel], axis: (bind.sign ?? 1) * (input[bind.move] || 0), target: aim,
+          lo: motion[axis][0], hi: motion[axis][1], speed: bind.speed ?? motion.speed, tau: bind.tau ?? motion.tau,
+          reach: bind.reach ?? motion.reach, dt });
+        ship[pos] = r.x_next; ship[vel] = r.v_next;
+        continue;
+      }
       // The walls ride the view in a world-frame game (the law's own bounds).
       const cam = axis === "x" && motion.camera, base = cam ? Math.max(view.x, cam.x) : 0;
       const lo = cam ? base + cam.margin : motion[axis][0], hi = cam ? base + cam.width - cam.margin : motion[axis][1];
@@ -1462,7 +1561,7 @@ function reconcile(game) {
   // Only axes the game will adopt are the page's to keep; a scrolled axis is
   // still stepped here by the motion law, but from the server's state.
   const adoptable = game.predict.adopt_axes || ["x", "y"];
-  const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
+  const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"], ["yaw", "vyaw"], ["spd", "vspd"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos])) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
   if (pred.ship && error <= tolerance) {
@@ -1631,6 +1730,7 @@ function applySnapshot(view) {
   const you = { x: f32(), y: f32(), vx: f32(), vy: f32(), alive: u8() === 1, shield: f32() };
   sync.hint = f32();
   you.z = f32(); you.vz = f32(); you.health = f32();
+  you.yaw = f32(); you.vyaw = f32(); you.spd = f32(); you.vspd = f32(); you.at = performance.now() / 1000;
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -1671,7 +1771,7 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 3;           // realtime_socket.PROTOCOL
+const SNAPSHOT_PROTOCOL = 4;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -1688,7 +1788,8 @@ function sendTick(game) {
     // it for our lane once it has landed that interval, within its bound.
     if (pred.ship && pred.sent.length)
       payload.ship = { seq: pred.seq, x: pred.ship.x, y: pred.ship.y, vx: pred.ship.vx, vy: pred.ship.vy,
-                       z: pred.ship.z || 0, vz: pred.ship.vz || 0 };
+                       z: pred.ship.z || 0, vz: pred.ship.vz || 0,
+                       yaw: pred.ship.yaw || 0, vyaw: pred.ship.vyaw || 0, spd: pred.ship.spd || 0, vspd: pred.ship.vspd || 0 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -1832,8 +1933,27 @@ function viewX(now) {
   return view.x;
 }
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
+// THE TURN (a spherical game: predict.patch).  The server drew the patch at
+// its yaw; the page's own ship is ahead by the inputs not yet landed, so the
+// world is turned under it by the difference at once -- the player's turn is
+// felt with no round trip -- about the ship's fixed point.
+function patchTurn(now) {
+  const game = state.game, patch = game && game.predict && game.predict.patch;
+  if (!patch || !pred.ship || !game.you || game.you.yaw == null) return 0;
+  const lead = Math.min(0.25, Math.max(0, now - (game.you.at ?? now)));
+  return pred.ship.yaw - (game.you.yaw + (game.you.vyaw || 0) * lead);
+}
 function placeEntity(piece, now, x, z, mesh) {
   x -= viewX(now);                                // world frame -> the screen (0 unless the game scrolls a view)
+  const game = state.game, patch = game && game.predict && game.predict.patch;
+  let turned = 0;
+  if (patch && piece.lane !== game.predict.lane) {
+    turned = patchTurn(now);
+    if (turned) {
+      const X = x - patch.cx, Y = patch.cy - z, c = Math.cos(turned), s = Math.sin(turned);
+      x = patch.cx + X * c - Y * s; z = patch.cy - (X * s + Y * c);
+    }
+  }
   if (piece.birth) {
     const t = (now - piece.t0) / BIRTH_S;
     if (t >= 1) piece.birth = null;
@@ -1856,7 +1976,7 @@ function placeEntity(piece, now, x, z, mesh) {
   let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
-  m = M.multiply(m, M.rotateZ(piece.roll));
+  m = M.multiply(m, M.rotateZ(piece.roll + turned));
   return M.multiply(m, M.scale(scale, scale, state.flat ? scale * FLAT_THICK : scale));
 }
 function pieceModel(piece, now) {
@@ -2474,7 +2594,7 @@ function boardPlane(clientX, clientY) {
   const t = (TILE.height - near[1]) / (far[1] - near[1]);
   return t >= 0 ? { x: near[0] + t * (far[0] - near[0]) + viewX(performance.now() / 1000), z: near[2] + t * (far[2] - near[2]) } : null;
 }
-const twoAxis = () => !!(state.game && state.game.predict && state.game.predict.y);
+const twoAxis = () => !!(state.game && state.game.predict && (state.game.predict.y || state.game.predict.yaw));
 function controls() {
   // Keys give an axis; a held pointer gives the board point it asks the ship
   // to reach (on a two-axis board, a little above the finger so the finger
