@@ -3948,13 +3948,28 @@ def _record_ssa_shape(function: Any, value: Any) -> None:
     ``function`` was lowered from -- the key every other shape store uses, so
     a value whose stores disagree is one row."""
 
-    from .identity_concordance import current_identity_book, shape_scope_of
+    from .concordance_declarations import SHAPE_SSA_STORE, TENSOR_SSA_LOWERING
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book, shape_scope_of,
+    )
+    from .ssa_record_return_state import ssa_value_identity_cell
 
     extents = tuple(int(e) for e in (value.shape or ()))
     if not extents:
         return
-    page = current_identity_book().page("shape.ssa")
-    page.set((shape_scope_of(function), int(value.id)), 0, extents)
+    book = current_identity_book()
+    cell = ssa_value_identity_cell(function, int(value.id), book=book)
+    if cell is None:
+        raise ValueError(
+            f"{SHAPE_SSA_STORE.name}: no ssa_value cell for value "
+            f"{int(value.id)} in {function.name!r}; the shape is not posted "
+            "from a fact the book holds"
+        )
+    book.post(
+        SHAPE_SSA_STORE, (shape_scope_of(function), int(value.id)), extents,
+        stage=TENSOR_SSA_LOWERING, provenance=Derived((cell,)),
+        mode=Mode.REVISE,
+    )
 
 
 def _used_value_ids(module: IRModule) -> set[int]:

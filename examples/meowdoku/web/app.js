@@ -3912,6 +3912,21 @@ function fillPickers() {
     pred.air = await TuringWasmProgram.load("air.wasm", "air.abi.json");
     pred.terrain = await TuringWasmProgram.load("terrain.wasm", "terrain.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
+  // The autopilot policy network (policy_wasm.py): the MLP forward as a wasm
+  // core with the live weights fed as its inputs.  Inspection only -- nothing
+  // pilots with it.  window.meowdokuDebug.policy.evaluate(features) -> action[].
+  try {
+    const program = await TuringWasmProgram.load("policy.wasm", "policy.abi.json");
+    const weights = await fetch("policy.weights.json").then((response) => response.json());
+    const feeds = Object.fromEntries(Object.entries(weights).map(([name, w]) => [name, w.data]));
+    window.meowdokuDebug.policy = {
+      program, weights, features: program.contract.features, outputs: program.contract.outputs_width,
+      evaluate(features) {
+        if (features.length !== this.features) throw new Error(`policy takes ${this.features} features, got ${features.length}`);
+        return Array.from(program.invoke({ ...feeds, x: features }).action);
+      },
+    };
+  } catch (error) { console.warn("[meow] autopilot policy unavailable", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());
   requestAnimationFrame(draw);

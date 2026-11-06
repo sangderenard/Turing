@@ -4820,6 +4820,12 @@ SHAPE_NODE_STORE = declare_page("shape.node", (
 SHAPE_LINKED_STORE = declare_page("shape.linked", (
     RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
 ), tuple)
+#: ``shape.ssa``: what the repository tensor lowering reads of a matmul
+#: operand's extents, keyed by the shape scope of the copy.  REVISE,
+#: DERIVED(the operand's ``ssa_value`` cell), stage TENSOR_SSA_LOWERING.
+SHAPE_SSA_STORE = declare_page("shape.ssa", (
+    RowField("function", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)
 #: Every exact call edge the linked-value phase settles over:
 #: ``(callee, formal id, caller, actual id)`` -> ``"argument"``, DERIVED(the
 #: actual's and the formal's ``canonical_value`` cells).

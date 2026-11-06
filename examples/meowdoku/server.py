@@ -421,6 +421,26 @@ def prepare_predictor(web_dir: Path) -> None:
               "free-board games run unpredicted", flush=True)
 
 
+def prepare_policy(web_dir: Path) -> None:
+    """The autopilot policy network as a WebAssembly core beside the engine
+    laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
+    with the live weights as ``policy.weights.json`` for the page to feed.
+    The MLP architecture only: the token network does not lower yet."""
+    from meowdoku import autopilot
+    from meowdoku.policy_wasm import build_policy
+    for name in autopilot.GAMES:
+        if autopilot.GAME_ARCH.get(name) != "mlp":
+            continue
+        try:
+            params = autopilot.live_params(name)
+            if params is None:
+                continue
+            build_policy(web_dir, params)
+            print(f"[meowdoku] autopilot policy for the page ({name}): policy.wasm + policy.weights.json ready", flush=True)
+        except Exception as error:  # the page plays without it
+            print(f"[meowdoku] autopilot policy NOT built for {name} ({type(error).__name__}: {error})", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766)
@@ -434,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
     prepare_predictor(web_dir)
+    prepare_policy(web_dir)
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
