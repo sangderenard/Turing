@@ -332,7 +332,8 @@ class Delve(EntityGame):
     ADOPT_BOUND = 0.25
     #: ``stage``: tiles and bodies all stand on one backdrop plane leaning back by this many radians (the page's
     #: placeEntity: the tiles are the scenery layer, the bodies a layer in front).
-    SCENE = {"floor": True, "glass": False, "arcade": False, "stage": 0.2}
+    SCENE = {"floor": True, "glass": False, "arcade": False, "stage": 0.2, "rocket": False,
+             "spot": {"inner": 14, "outer": 30, "intensity": 70, "vy_weight": 0.5, "bias": [0.0, 0.0]}}
     HOSTILE_LANES = ((1, ENT),)
     #: Tiles beyond the view's edge still sent (the page predicts a little ahead of us).
     TILE_MARGIN = 4

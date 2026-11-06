@@ -1569,7 +1569,7 @@ function strikeGroups() {
 const HEADLIGHT = { inner: 9 * Math.PI / 180, outer: 18 * Math.PI / 180, intensity: 70, dip: 0.16, spread: 0.16 };
 function headlights(cam) {
   const game = state.game;
-  if (isWalker(game)) return [];               // a walker carries no headlights
+  if (isWalker(game) || !rocketGear(game)) return [];               // a walker carries no headlights
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive || !onPlanet()) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
   if (!ship) return [];
@@ -1583,6 +1583,56 @@ function headlights(cam) {
              spotDir: vdir, spotCone: cone };
   });
 }
+// THE SPOTLIGHT OF INTENT (``scene.spot``: a platformer's frog).  One cone, the SAME spot light the rocket's headlights
+// are (a ``spotDir`` / ``spotCone`` record in the light list), held in front of the character and aimed where the player
+// means to go: the control input (the stick; a held finger's side of the character; a press of the jump aims up),
+// else the velocity it has, smoothed over INTENT_TAU so it never snaps or flickers; with nothing to go on it keeps the
+// way it last pointed.  The game declares the cone (``inner``/``outer`` degrees, ``intensity``), how much of the
+// vertical velocity counts (``vy_weight``: a bouncing climber would swing the beam with every bounce) and a standing
+// ``bias`` (a climber means up).
+const INTENT_TAU = 0.18;
+const intent = { x: 1, y: 0, dirX: 1, dirY: 0, at: null };
+function intentSpot(cam, now) {
+  const game = state.game, cfg = game && game.scene && game.scene.spot;
+  if (!cfg || state.flat || game.input !== "realtime" || !game.you || !game.you.alive) return [];
+  const piece = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
+  const ship = pred.ship || game.you, m = game.predict || {}, c = controls();
+  if (!piece || !ship) return [];
+  // the intent this frame: input first, else the velocity it has
+  const steering = c.steer_x >= 0;
+  let ix = Math.abs(c.move_axis) > 0.05 ? c.move_axis
+    : steering ? Math.max(-1, Math.min(1, (c.steer_x - ship.x) / 1.5)) : (ship.vx || 0) / (m.speed || 8);
+  let iy = Math.abs(c.move_axis_y || 0) > 0.05 ? c.move_axis_y
+    : c.fire > 0 && m.vertical ? -1 : ((ship.vy || 0) / ((m.vertical && m.vertical.jump) || m.speed || 8)) * (cfg.vy_weight ?? 0.5);
+  iy += (cfg.bias || [0, 0])[1]; ix += (cfg.bias || [0, 0])[0];
+  const dt = intent.at == null ? 1 : Math.min(0.1, Math.max(0, now - intent.at)); intent.at = now;
+  const k = 1 - Math.exp(-dt / INTENT_TAU);
+  intent.x += (ix - intent.x) * k; intent.y += (iy - intent.y) * k;
+  const mag = Math.hypot(intent.x, intent.y);
+  if (mag > 0.12) { intent.dirX = intent.x / mag; intent.dirY = intent.y / mag; }          // (idle: keeps its last way)
+  // the character's drawn centre, and the aim in the world: along the intent in the stage plane (or the board), tilted in
+  // toward what it lights
+  const stage = stageOf(), zr = piece.z - viewY(now), xr = piece.x - viewX(now);
+  const tilt = (cfg.tilt ?? 32) * Math.PI / 180;
+  let at, flow, normal;
+  if (stage != null) {
+    const cL = Math.cos(stage), sL = Math.sin(stage);
+    flow = [intent.dirX, intent.dirY * -sL, intent.dirY * cL];                  // game +y runs down the plane: (0, -sinL, +cosL)
+    normal = [0, cL, sL];
+    const out = STAGE.front + (piece.size || 0.4) * 0.3;
+    at = [xr, stageHeight(stage, zr) + out * cL, zr + out * sL];
+  } else {
+    flow = [intent.dirX, 0, intent.dirY]; normal = [0, 1, 0];
+    at = [xr, TILE.height + 0.3, zr];
+  }
+  const lift = cfg.height ?? 1.1;
+  const pos = [at[0] + normal[0] * lift - flow[0] * 0.25, at[1] + normal[1] * lift - flow[1] * 0.25, at[2] + normal[2] * lift - flow[2] * 0.25];
+  const dir = norm(flow.map((v, i) => v * Math.cos(tilt) - normal[i] * Math.sin(tilt)));
+  const a = M.apply(cam.view, pos), b = M.apply(cam.view, [pos[0] + dir[0], pos[1] + dir[1], pos[2] + dir[2]]);
+  const vdir = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+  const cone = [Math.cos((cfg.inner ?? 14) * Math.PI / 180), Math.cos((cfg.outer ?? 30) * Math.PI / 180)];
+  return [{ view: a, colour: cfg.colour || [1.0, 0.94, 0.82], level: 0, intensity: cfg.intensity ?? 70, spotDir: vdir, spotCone: cone }];
+}
 // A bomb's blast lights the scene in its own glow colour (the game's
 // emissive palette entry for it), flaring and fading over its life.
 // MARKER LIGHTS on the player's rocket (aeronautic: red port wingtip, green
@@ -1591,7 +1641,7 @@ function headlights(cam) {
 // Not drawn from inside the cockpit.
 function markerLights(now) {
   const game = state.game;
-  if (isWalker(game)) return [];               // a walker has no wingtip lights or strobe: that is the rocket's
+  if (isWalker(game) || !rocketGear(game)) return [];               // a walker has no wingtip lights or strobe: that is the rocket's
   if (state.flat || state.camMode === "nose" || !game || game.input !== "realtime" || !game.predict || !game.you || !game.you.alive) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
   if (!ship) return [];
@@ -1904,7 +1954,7 @@ function drawReticle(now, drawLit) {
 }
 function drawShield(now, drawLit) {
   const game = state.game;
-  if (isWalker(game)) return;                  // (no rocket's shield bubble on a walker)
+  if (isWalker(game) || !rocketGear(game)) return;                  // (no rocket's shield bubble on a walker)
   if (state.camMode === "nose") return;             // first person: the eye is inside the shield
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive) return;
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
@@ -2429,6 +2479,9 @@ function cellPosition(game, cell, rackPiece) {
 // (``game.walk.route``: node ids); free walking cancels it, as in the law.
 const walk = { version: null, nodes: null, mat: null, slope: null, routeId: 0, path: null };
 const isWalker = (game = state.game) => !!(game && game.avatar === "walker");
+// The rocket's gear (shield bubble, marker lights, headlights) belongs to a rocket: a game whose character is a frog
+// declares ``scene.rocket = false`` and carries a SPOTLIGHT of intent instead (``scene.spot``, intentSpot below).
+const rocketGear = (game = state.game) => !(game && game.scene && game.scene.rocket === false);
 // (a walker has no rocket to sit in: the first-person cockpit is the ship's)
 const noseCam = () => state.camMode === "nose" && !isWalker();
 function fibonacciNodes(n) {          // roads.fibonacci_sphere: the nodes' places (the world's data, not physics)
@@ -2524,7 +2577,7 @@ function walkTap(e) {
 // integration step sizes) eases out over ~60 ms.
 const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null,
                shots: [], shotSeq: 0, lastShot: -10 };
-window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
+window.meowdokuDebug = { pred, get sock() { return sock; }, get intent() { return intent; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // ERROR SYNC never jumps the picture.  A correction (the server's word against
 // what is drawn) is eased away over a time that grows with its size -- a
@@ -3256,6 +3309,7 @@ function viewX(now) {
 // between the tile layer and the layer of bodies in front of it (``front``).
 const stageOf = () => { const v = state.game && state.game.scene && state.game.scene.stage; return typeof v === "number" ? v : null; };
 const STAGE = { base: 0.17, front: 0.16 };
+const stageHeight = (lean, z) => TILE.height + STAGE.base + (state.extent.depth - z) * Math.tan(lean);
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 // A SERVER BODY IN THE PATCH (a spherical game: predict.patch).  The body is
 // carried on from the state the server sent -- by the engine's flight laws, as
@@ -3314,7 +3368,7 @@ function placeEntity(piece, now, x, z, mesh) {
     // stands on, a body in front of a ladder never meets the ladder's volume, and no two cards are coplanar.
     const cL = Math.cos(stage), sL = Math.sin(stage);
     const out = piece.scenery ? 0 : STAGE.front + thick * scale0;
-    const h = TILE.height + STAGE.base + (state.extent.depth - z) * Math.tan(stage) + y + lift;
+    const h = stageHeight(stage, z) + y + lift;
     let m = M.translate(x, h + out * cL, z + out * sL);
     m = M.multiply(m, M.rotateY(piece.spin * now));
     m = M.multiply(m, M.rotateX(-Math.PI / 2 + stage));
@@ -3899,6 +3953,7 @@ function litPass(cam, now, casters, opts = {}) {
   bulbLights.push(...blastLights(cam, now));
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
+  bulbLights.push(...intentSpot(cam, now));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,

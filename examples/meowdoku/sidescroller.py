@@ -468,7 +468,8 @@ class SideScroller(EntityGame):
     # glass plate behind it.
     #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
     #: tiles are the scenery layer, the actors a layer in front), so a body's feet meet the tile it stands on.
-    SCENE = {"floor": False, "glass": False, "arcade": True, "stage": STAGE_LEAN}
+    SCENE = {"floor": False, "glass": False, "arcade": True, "stage": STAGE_LEAN, "rocket": False,
+             "spot": {"inner": 14, "outer": 30, "intensity": 70, "vy_weight": 0.5, "bias": [0.0, 0.0]}}
     # World frame: the scroll moves the view, not the player, so the page's
     # x is adopted like any other game's.
     PLAYER_LANE = 0
