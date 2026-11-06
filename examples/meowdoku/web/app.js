@@ -3932,6 +3932,10 @@ function fillPickers() {
   // neither predicts nor pilots with them yet.
   //   meowdokuDebug.lawWasm.run({alive, x, ..., dt}) -> {x_next, ..., dt_limit}
   //   meowdokuDebug.pilotWasm.evaluate(tokenFeatures) -> action[]
+  // Loaded in the BACKGROUND: the law module is 875 KB with 61 MB of buffers,
+  // and a phone can take long (or fail) to compile and grow it -- awaiting it
+  // here held the game pickers empty until it finished.
+  (async () => {
   try {
     const law = await TuringGraphProgram.load("law.wasm", "law.abi.json");
     window.meowdokuDebug.lawWasm = {
@@ -3957,6 +3961,7 @@ function fillPickers() {
       },
     };
   } catch (error) { console.warn("[meow] pilot wasm unavailable", error); }
+  })();
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());
   requestAnimationFrame(draw);
