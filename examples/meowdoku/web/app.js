@@ -1223,13 +1223,14 @@ function markerLights(now) {
   const grow = depth ? DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel : 1;
   const at = worldOf(ship), s = (ship.size || 0.5) * grow;
   const phase = now % 1.2, strobe = phase < 0.06 || (phase > 0.16 && phase < 0.22);
-  const put = (dx, dz, up = 0.55) => [at[0] + dx * s, at[1] + up * s, at[2] + dz * s];
-  const bulb = 0.22 * s;                      // big enough to read at a glance
+  // tiny balls set into the hull's surface (wingtips, tail, the strobe on the spine)
+  const put = (dx, dz, up = 0.32) => [at[0] + dx * s, at[1] + up * s, at[2] + dz * s];
+  const bulb = 0.045 * s;
   return [
-    { at: put(-0.85, 0.3), material: "nav_red", size: bulb, light: [1.0, 0.08, 0.06], intensity: 1.6 },
-    { at: put(0.85, 0.3), material: "nav_green", size: bulb, light: [0.08, 1.0, 0.3], intensity: 1.6 },
-    { at: put(0, 1.25, 0.45), material: "nav_white", size: bulb * 0.9, light: [1, 1, 0.95], intensity: 1.0 },
-    { at: put(0, 0.1, 0.75), material: strobe ? "nav_strobe" : "nav_off", size: bulb * 1.1, light: [1, 1, 1], intensity: strobe ? 9.0 : 0.0 },
+    { at: put(-0.8, 0.3), material: "nav_red", size: bulb, light: [1.0, 0.08, 0.06], intensity: 0.8 },
+    { at: put(0.8, 0.3), material: "nav_green", size: bulb, light: [0.08, 1.0, 0.3], intensity: 0.8 },
+    { at: put(0, 1.2, 0.28), material: "nav_white", size: bulb * 0.9, light: [1, 1, 0.95], intensity: 0.5 },
+    { at: put(0, 0.1, 0.42), material: strobe ? "nav_strobe" : "nav_off", size: bulb, light: [1, 1, 1], intensity: strobe ? 6.0 : 0.0 },
   ];
 }
 function blastLights(cam, now) {

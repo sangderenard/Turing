@@ -153,7 +153,13 @@ def controls_from(game, out: np.ndarray) -> dict[str, float]:
               # A policy with a fourth output steers height; an older one holds it.
               "move_axis_z": float(out[3]) if len(out) > 3 else 0.0,
               "steer_x": -1.0, "steer_y": -1.0, "fire": 1.0 if out[2] > 0.0 else 0.0}
-    return {name: values[name] for name in game.CONTROLS}
+    # Controls the policy does not drive (a game's alternate fire, its bomb
+    # style, ...) rest at the game's own initial value for them.
+    rest = getattr(game, "_control_rest", None)
+    if rest is None:
+        columns = game.initial_columns()
+        rest = game._control_rest = {name: float(columns[name][0]) for name in game.CONTROLS if name in columns}
+    return {name: values[name] if name in values else rest.get(name, 0.0) for name in game.CONTROLS}
 
 
 # ------------------------------------------------------------------- the net
