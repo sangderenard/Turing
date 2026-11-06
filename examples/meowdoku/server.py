@@ -441,6 +441,24 @@ def prepare_policy(web_dir: Path) -> None:
             print(f"[meowdoku] autopilot policy NOT built for {name} ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_graph_products(web_dir: Path) -> None:
+    """The bullet-hell law and the token pilot as buffer-table WebAssembly
+    products (``graph_wasm.py``): ``law.wasm`` + ``law.abi.json`` and
+    ``pilot.wasm`` + ``pilot.abi.json`` + ``pilot.weights.json``, rebuilt only
+    when their source digest changes.  The page loads them
+    (``window.meowdokuDebug.lawWasm`` / ``.pilotWasm``); nothing pilots or
+    predicts with them yet."""
+    from meowdoku import graph_wasm
+    for label, build in (("law", graph_wasm.build_law), ("pilot", graph_wasm.build_pilot)):
+        try:
+            started = time.perf_counter()
+            abi = build(web_dir)
+            print(f"[meowdoku] page {label} graph product ready ({len(abi['order'])} buffers, "
+                  f"{time.perf_counter() - started:.1f}s)", flush=True)
+        except Exception as error:  # the page plays without it
+            print(f"[meowdoku] page {label} graph product NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766)
@@ -455,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
+    prepare_graph_products(web_dir)
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

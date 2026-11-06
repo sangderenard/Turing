@@ -192,3 +192,91 @@ export class TuringWasmProgram {
       .map(parameter => [parameter.name, this.read(parameter)]));
   }
 }
+
+// A buffer-table product (compile_graph_forward_to_wasm: a traced forward
+// re-emitted for wasm32-freestanding).  The ABI JSON (schema
+// turing.graph-buffer-abi.v1, written by examples/meowdoku/graph_wasm.py from
+// the BrowserGraphForward fields) names the buffer order, shapes, dtypes and
+// extents, the named inputs' value ids and the outputs.  The layout is
+// CompiledObjectReverse's (src/compiler/standard_object_product.py): every
+// buffer after __heap_base, an i32 pointer table, the extent table, memory
+// grown once; then f(ptrTable, extentTable).
+const GRAPH_TYPES = {double: [Float64Array, 8], i32: [Int32Array, 4], i64: [BigInt64Array, 8],
+                     i1: [Uint8Array, 1], ptr: [Uint32Array, 4]};
+const graphAlign = (value, boundary) => (value + boundary - 1) & ~(boundary - 1);
+const graphCount = (shape) => (shape.length ? shape.reduce((a, b) => a * Number(b), 1) : 1);
+
+export class TuringGraphProgram {
+  static async load(moduleUrl, abiUrl) {
+    const [abi, instantiated] = await Promise.all([
+      fetch(abiUrl).then((response) => response.json()),
+      WebAssembly.instantiateStreaming(fetch(moduleUrl), {math: TURING_MATH_IMPORTS}),
+    ]);
+    return new TuringGraphProgram(instantiated.instance, abi);
+  }
+
+  static async fromBytes(bytes, abi) {
+    const {instance} = await WebAssembly.instantiate(bytes, {math: TURING_MATH_IMPORTS});
+    return new TuringGraphProgram(instance, abi);
+  }
+
+  constructor(instance, abi) {
+    this.instance = instance;
+    this.abi = abi;
+    this.memory = instance.exports.memory;
+    const order = abi.order.map(Number);
+    this.layouts = new Map();
+    let cursor = graphAlign(Number(instance.exports.__heap_base.value), 8);
+    this.pointerOffset = cursor; cursor += order.length * 4;
+    this.extentOffset = graphAlign(cursor, 4); cursor = this.extentOffset + abi.extents.length * 4;
+    order.forEach((id, i) => {
+      const [Ctor, width] = GRAPH_TYPES[abi.dtypes[i]] || [];
+      if (!Ctor) throw new Error(`unsupported graph ABI dtype ${abi.dtypes[i]}`);
+      cursor = graphAlign(cursor, width);
+      this.layouts.set(id, {offset: cursor, Ctor, shape: abi.shapes[i], size: graphCount(abi.shapes[i])});
+      cursor += graphCount(abi.shapes[i]) * width;
+    });
+    this.used = cursor;
+    const missing = cursor - this.memory.buffer.byteLength;
+    if (missing > 0) this.memory.grow(Math.ceil(missing / 65536));
+    const pointers = new Uint32Array(this.memory.buffer, this.pointerOffset, order.length);
+    order.forEach((id, i) => { pointers[i] = this.layouts.get(id).offset; });
+    const extents = new Int32Array(this.memory.buffer, this.extentOffset, abi.extents.length);
+    abi.extents.forEach(([id, kind, axis], i) => {
+      const {shape, size} = this.layouts.get(Number(id));
+      extents[i] = kind === 'rank' ? shape.length
+        : (kind === 'numel' || kind === 'element_count') ? size
+        : (axis !== null && axis !== undefined) ? Number(shape[Number(axis)]) : 0;
+    });
+    this.outputIds = new Map(abi.outputs.map((o) => [o.name, Number(o.id)]));
+  }
+
+  // A fresh view every call: memory.grow detaches old ArrayBuffers.
+  view(id) {
+    const layout = this.layouts.get(Number(id));
+    return new layout.Ctor(this.memory.buffer, layout.offset, layout.size);
+  }
+
+  inputNames() { return Object.keys(this.abi.inputs); }
+  outputNames() { return Array.from(this.outputIds.keys()); }
+
+  setInput(name, values) {
+    if (!(name in this.abi.inputs)) throw new Error(`unknown graph input ${name}`);
+    const view = this.view(this.abi.inputs[name]);
+    const data = values != null && values.length !== undefined ? values : [values];
+    if (data.length !== view.length && data.length !== 1) {
+      throw new Error(`graph input ${name} takes ${view.length} values, got ${data.length}`);
+    }
+    if (view instanceof BigInt64Array) view.set(Array.from(data, BigInt));
+    else if (data.length === 1 && view.length !== 1) view.fill(Number(data[0]));
+    else view.set(data);
+  }
+
+  run() { this.instance.exports[this.abi.entry](this.pointerOffset, this.extentOffset); }
+
+  // A copy of the named output (the buffer is rewritten by the next run).
+  output(name) {
+    if (!this.outputIds.has(name)) throw new Error(`unknown graph output ${name}`);
+    return this.view(this.outputIds.get(name)).slice();
+  }
+}

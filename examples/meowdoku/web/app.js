@@ -4,7 +4,7 @@
 // whatever state the Python server hands it (games.py's protocol) and
 // animates the difference between states; it decides nothing.
 
-import { TuringWasmProgram } from "./turing-wasm-shell.js";
+import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -3927,6 +3927,36 @@ function fillPickers() {
       },
     };
   } catch (error) { console.warn("[meow] autopilot policy unavailable", error); }
+  // The traced graph products (graph_wasm.py): the bullet-hell law and the token
+  // pilot as buffer-table wasm (TuringGraphProgram).  Inspection only -- the page
+  // neither predicts nor pilots with them yet.
+  //   meowdokuDebug.lawWasm.run({alive, x, ..., dt}) -> {x_next, ..., dt_limit}
+  //   meowdokuDebug.pilotWasm.evaluate(tokenFeatures) -> action[]
+  try {
+    const law = await TuringGraphProgram.load("law.wasm", "law.abi.json");
+    window.meowdokuDebug.lawWasm = {
+      program: law,
+      run(columns) {
+        for (const name of law.inputNames()) { if (name in columns) law.setInput(name, columns[name]); }
+        law.run();
+        return Object.fromEntries(law.outputNames().map((name) => [name, law.output(name)]));
+      },
+    };
+  } catch (error) { console.warn("[meow] law wasm unavailable", error); }
+  try {
+    const pilot = await TuringGraphProgram.load("pilot.wasm", "pilot.abi.json");
+    const weights = await fetch("pilot.weights.json").then((response) => response.json());
+    for (const [name, w] of Object.entries(weights)) pilot.setInput(name, w.data);
+    window.meowdokuDebug.pilotWasm = {
+      program: pilot, weights, features: pilot.abi.features, outputs: pilot.abi.outputs_width,
+      run(inputs) { for (const name in inputs) pilot.setInput(name, inputs[name]); pilot.run(); return pilot.output("action"); },
+      evaluate(features) {
+        if (features.length !== this.features) throw new Error(`pilot takes ${this.features} features, got ${features.length}`);
+        pilot.setInput("x", features); pilot.run();
+        return Array.from(pilot.output("action"));
+      },
+    };
+  } catch (error) { console.warn("[meow] pilot wasm unavailable", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());
   requestAnimationFrame(draw);
