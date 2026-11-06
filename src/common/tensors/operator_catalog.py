@@ -132,6 +132,7 @@ COMPOSITE_MATH_OPERATORS = frozenset(
         "bitxor",
         "shl",
         "shr",
+        "atan2",
         "cbrt",
         "clamp",
         "clamp_max",

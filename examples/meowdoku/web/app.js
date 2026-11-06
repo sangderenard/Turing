@@ -718,6 +718,57 @@ function landColour(height, raw, sea, relief, out, o) {
   const c = mixc(water, land, ss(sea - 0.004, sea + 0.004, raw));               // the shore
   out[o] = c[0] * 255; out[o + 1] = c[1] * 255; out[o + 2] = c[2] * 255; out[o + 3] = 255;
 }
+// THE ROADS (game.roads: the server's plan, polylines on the sphere): draped
+// on the land as thin ribbons -- each polyline subdivided along its great
+// circles, projected into the patch about the ship's predicted place, set on
+// the land's height from the same baked table.
+const ROADS_VIEW = { vao: null, buffers: null, width: 0.07, sub: 6 };
+function drawRoads(drawLit) {
+  const game = state.game, lines = game && game.roads, f = LAND.frame, patch = game && game.predict && game.predict.patch;
+  if (!lines || !f || !LAND.height || !patch || state.flat) return;
+  const relief = TERRAIN.relief, y0 = relief ? terrainOrigin(relief)[1] : 0, R = f.radius;
+  const toPatch = (u) => {
+    const e = u[0] * f.r0[0] + u[1] * f.r0[1] + u[2] * f.r0[2], n = u[0] * f.h0[0] + u[1] * f.h0[1] + u[2] * f.h0[2];
+    const c = u[0] * f.u0[0] + u[1] * f.u0[1] + u[2] * f.u0[2], rho = Math.hypot(e, n);
+    const k = R * Math.atan2(rho, c) / Math.max(rho, 1e-9);
+    return [patch.cx + e * k, patch.cy - n * k, c];
+  };
+  const pos = [], nrm = [];
+  const near = Math.cos(22 / R);
+  for (const line of lines) {
+    let prev = null;
+    for (let s = 0; s + 1 < line.length; s++) {
+      const a = line[s], b = line[s + 1];
+      for (let q = 0; q <= ROADS_VIEW.sub; q++) {
+        if (q === 0 && s > 0) continue;
+        const w = q / ROADS_VIEW.sub, m = [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w, a[2] + (b[2] - a[2]) * w];
+        const len = Math.hypot(m[0], m[1], m[2]), u = [m[0] / len, m[1] / len, m[2] / len];
+        const [bx, bz, c] = toPatch(u);
+        const inView = c > near && Math.abs(bx - patch.cx) < 9 && bz > -6 && bz < patch.cy + 6;
+        const y = y0 + sampleLand(u[0], u[1], u[2])[0] + 0.025 - planetDrop(bx, bz);
+        const here = inView ? [bx, y, bz] : null;
+        if (prev && here) {
+          const dx = here[0] - prev[0], dz = here[2] - prev[2], l = Math.hypot(dx, dz) || 1;
+          const sx = (-dz / l) * ROADS_VIEW.width, sz = (dx / l) * ROADS_VIEW.width;
+          const p1 = [prev[0] - sx, prev[1], prev[2] - sz], p2 = [prev[0] + sx, prev[1], prev[2] + sz];
+          const p3 = [here[0] - sx, here[1], here[2] - sz], p4 = [here[0] + sx, here[1], here[2] + sz];
+          for (const v of [p1, p2, p4, p1, p4, p3]) { pos.push(...v); nrm.push(0, 1, 0); }
+        }
+        prev = here;
+      }
+    }
+  }
+  if (!pos.length) return;
+  if (!ROADS_VIEW.vao) {
+    ROADS_VIEW.vao = gl.createVertexArray(); gl.bindVertexArray(ROADS_VIEW.vao);
+    ROADS_VIEW.buffers = [0, 1].map((loc) => { const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0); return buf; });
+    gl.bindVertexArray(null);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, ROADS_VIEW.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, ROADS_VIEW.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.DYNAMIC_DRAW);
+  drawLit(ROADS_VIEW.vao, pos.length / 3, M.identity(), state.materialIndex.road);
+}
 function sphereLand(relief, now) {
   const game = state.game, patch = game.predict && game.predict.patch, sphere = game.predict && game.predict.sphere;
   if (!patch || !sphere || !relief.surface || !bakeLand()) return false;
@@ -903,7 +954,11 @@ function drawTerrain(now, drawLit) {
     if (game.predict && game.predict.patch && relief.surface) {
       // the land turns and travels under the ship: one continuous surface
       TERRAIN.scroll = 0;
-      if (sphereLand(relief, now) || turnRelief(relief, now)) { drawLit(relief.surface.vao, relief.surface.count, M.identity(), state.materialIndex.terrain); return; }
+      if (sphereLand(relief, now) || turnRelief(relief, now)) {
+        drawLit(relief.surface.vao, relief.surface.count, M.identity(), state.materialIndex.terrain);
+        drawRoads(drawLit);
+        return;
+      }
     }
     if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
@@ -1179,6 +1234,7 @@ function uploadMaterials(game) {
   // Lightning: a glowing ribbon of glass, lit from within.
   records.push(["lightning@glow", [0.9, 0.94, 1.0], { roughness: 0.1, transmission: 0.15, opacity: 0.96, ior: 1.3, emission: [6.0, 6.6, 8.2] }]);
   records.push(["zap@glow", [0.5, 1.0, 0.4], { roughness: 0.1, transmission: 0.15, opacity: 0.96, ior: 1.3, emission: [1.6, 5.0, 1.2] }]);
+  records.push(["road", [0.16, 0.15, 0.14], { roughness: 0.95 }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
@@ -2107,7 +2163,10 @@ function reconcile(game) {
     // the pilot's ship: the server's, carried on by the snapshot's age with
     // the pilot's controls
     pred.sent = []; pred.closed = []; pred.open = null;
-    stepShip(ship, pilotControls(game), Math.min(0.25, Math.max(0, performance.now() / 1000 - (game.you.at ?? 0))), game.predict);
+    // unwinding the latency: the snapshot's age since it arrived plus the
+    // half round trip it took to come (the server stepped it that long ago)
+    const age = performance.now() / 1000 - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0);
+    stepShip(ship, pilotControls(game), Math.min(0.3, Math.max(0, age)), game.predict);
   }
   for (const interval of [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])]) stepShip(ship, interval.controls, interval.dur, game.predict);
   // AUTHORITY WITHIN TOLERANCE.  Page and server are two recordings of the
@@ -2252,6 +2311,7 @@ function ensureSocket() {
       }
       if (message.error) {
         sock.outstanding = Math.max(0, sock.outstanding - 1);
+        if (sock.sentAt) sock.sentAt.shift();                 // an answered tick, all the same
         if (live && /no game/.test(message.error) && restartAllowed()) {
           ticks.restarting = true;
           newGame({ game: state.game.game, aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) }).finally(() => { ticks.restarting = false; });
@@ -2260,6 +2320,9 @@ function ensureSocket() {
       return;
     }
     sock.outstanding = Math.max(0, sock.outstanding - 1);
+    // the round trip of the tick this snapshot answers (smoothed)
+    const sentAt = sock.sentAt && sock.sentAt.shift();
+    if (sentAt != null) { const rtt = performance.now() / 1000 - sentAt; sock.rtt = sock.rtt == null ? rtt : sock.rtt * 0.85 + rtt * 0.15; }
     if (!live) return;
     sock.bytes += event.data.byteLength; sock.frames += 1;
     applySnapshot(new DataView(event.data));
@@ -2376,6 +2439,7 @@ function sendTick(game) {
   }
   if (sock.open) {
     sock.outstanding++;
+    (sock.sentAt ||= []).push(performance.now() / 1000);      // for the round trip (latency unwinding)
     sock.ws.send(JSON.stringify(payload));
     return Promise.resolve();
   }

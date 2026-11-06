@@ -474,6 +474,13 @@ def emin(self, other):
 def atan2(self, other):
     """Elementwise ``atan2(self, other)`` -- the angle of (other, self)."""
     from ..abstraction import AbstractTensor
+    # The trigonometry switch governs atan2 like the rest of the surface:
+    # under ``use_signal_math`` the baked cores (SignalMath.atan2, built on
+    # the atan core) are the definition, so a compiled law carries them
+    # instead of the platform's libm.
+    from . import trigonometry as _trig
+    if _trig._IMPLEMENTATION in {"signal_math", "signal_kernels"}:
+        return _trig._surface().atan2(self, other)
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
     if not isinstance(other, AbstractTensor):

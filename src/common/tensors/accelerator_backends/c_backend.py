@@ -62,7 +62,7 @@ ffi.cdef("""
         CT_OP_ATANH, CT_OP_SIGN, CT_OP_INVERT, CT_OP_SIGMOID,
         CT_OP_BITAND, CT_OP_BITOR,
         CT_OP_BITXOR, CT_OP_SHL, CT_OP_SHR, CT_OP_LOGICAL_AND,
-        CT_OP_LOGICAL_OR, ...
+        CT_OP_LOGICAL_OR, CT_OP_ATAN2, ...
     } CTensorOp;
     typedef enum CTensorOperandKind {
         CT_OPERAND_NONE, CT_OPERAND_SLOT, CT_OPERAND_SCALAR
@@ -479,6 +479,7 @@ class CTensorOperations(AbstractTensor):
             "shr": C.CT_OP_SHR,
             "logical_and": C.CT_OP_LOGICAL_AND,
             "logical_or": C.CT_OP_LOGICAL_OR,
+            "atan2": C.CT_OP_ATAN2,
         }
         unary_codes = {
             "sqrt": C.CT_OP_SQRT,

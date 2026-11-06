@@ -156,6 +156,7 @@
                 return (double)((long long)a >> ((unsigned long long)b & 63));
             case CT_OP_LOGICAL_AND: return (a != 0.0) && (b != 0.0);
             case CT_OP_LOGICAL_OR: return (a != 0.0) || (b != 0.0);
+            case CT_OP_ATAN2: return atan2(a, b);
             default: return NAN;
         }
     }

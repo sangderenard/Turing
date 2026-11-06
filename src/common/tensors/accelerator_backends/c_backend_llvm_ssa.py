@@ -224,10 +224,11 @@ C_TENSOR_OPCODE_ORDER = (
     # appended the same way: ctensor_ops.c's is_unary_op classifies by enum
     # range, so a mid-list insertion would renumber every opcode after it.
     "SIGMOID",
+    "ATAN2",
 )
 
 C_SSA_EXTERNAL_PRIMITIVES = frozenset({
-    "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
+    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cos", "cosh",
     "exp", "llvm.ceil.f64", "llvm.fabs.f64", "llvm.fcmp.ord",
     "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.rint.f64", "llvm.sqrt.f64",
     "llvm.trunc.f64", "llvm.memcpy.p0.p0.i64", "llvm.memset.p0.i64",
@@ -340,6 +341,7 @@ declare double @tan(double)
 declare double @asin(double)
 declare double @acos(double)
 declare double @atan(double)
+declare double @atan2(double, double)
 declare double @sinh(double)
 declare double @cosh(double)
 declare double @asinh(double)
@@ -486,6 +488,7 @@ entry:
     i32 46, label %shr
     i32 47, label %logical_and
     i32 48, label %logical_or
+    i32 50, label %atan2
   ]
 
 add:
@@ -589,6 +592,9 @@ logical_or:
   %logical.or.bit = or i1 %logical.or.a, %logical.or.b
   %logical.or.value = uitofp i1 %logical.or.bit to double
   ret double %logical.or.value
+atan2:
+  %atan2.value = call double @atan2(double %a, double %b)
+  ret double %atan2.value
 invalid:
   ret double 0x7FF8000000000000
 }
@@ -3723,6 +3729,7 @@ TRANSLATIONS = (
             "shr",
             "logical_and",
             "logical_or",
+            "atan2",
         ),
         "elementwise binary loop",
     ),
@@ -3752,6 +3759,7 @@ TRANSLATIONS = (
             "shr",
             "logical_and",
             "logical_or",
+            "atan2",
         ),
         "elementwise tensor-scalar loop",
     ),

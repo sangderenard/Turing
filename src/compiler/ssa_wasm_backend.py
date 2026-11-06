@@ -669,7 +669,7 @@ _WASM_UNARY_INTRINSICS = {
 #: ``unary_double`` / ``binary_value``), so its parity stays exact.
 _MATH_IMPORTS = {
     "pow": 2, "exp": 1, "log": 1, "sin": 1, "cos": 1, "tan": 1,
-    "asin": 1, "acos": 1, "atan": 1, "sinh": 1, "cosh": 1, "tanh": 1,
+    "asin": 1, "acos": 1, "atan": 1, "atan2": 2, "sinh": 1, "cosh": 1, "tanh": 1,
     "asinh": 1, "acosh": 1, "atanh": 1,
 }
 _PTR_DTYPES = frozenset({"ptr", "pointer"})
@@ -2187,7 +2187,7 @@ rl.on('line', async (line) => {
     if (msg.cmd === 'init') {
       const bytes = Buffer.from(msg.module, 'base64');
       const math = {};
-      for (const name of ['pow','exp','log','sin','cos','tan','asin','acos','atan',
+      for (const name of ['pow','exp','log','sin','cos','tan','asin','acos','atan','atan2',
                           'sinh','cosh','tanh','asinh','acosh','atanh']) math[name] = Math[name];
       const { instance } = await WebAssembly.instantiate(bytes, {math});
       exports = instance.exports;

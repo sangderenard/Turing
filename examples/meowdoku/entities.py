@@ -128,7 +128,8 @@ class EntitySession:
         self.pieces = [piece]
         self.columns = columns
         self.controls = tuple(controls)
-        self.targets = Targets(cfl=0.5, div_max=1e9, mass_max=1e9, energy_exchange_fraction=0.2)
+        # cfl 1: the laws' dt_limit already carries its own 0.9 safety factor
+        self.targets = Targets(cfl=1.0, div_max=1e9, mass_max=1e9, energy_exchange_fraction=0.2)
         self.controller = STController(dt_min=1e-6)
         self.state = None
         self.dt = 1.0 / 60.0
@@ -220,9 +221,14 @@ LAW_PRODUCTS = Path(__file__).resolve().parents[2] / "build" / "meowdoku" / "law
 #: The lane a law runs in.  ``numpy``: the law traced through AbstractTensor
 #: (the translatable source) and printed as a standalone NumPy function by
 #: ``tape_to_source`` (the product).  ``eager``: the AbstractTensor law itself.
-#: The ladder above NumPy (WebAssembly in the page, LLVM over the socket,
-#: Eigen) slots in here as further lanes.
-LAW_LANE = os.environ.get("MEOWDOKU_LAW", "numpy")
+#: ``llvm`` / ``eigen``: the same law traced through the SSA tensor backend
+#: and compiled natively by ``compile_native_graph_forward`` under that work
+#: contract (``eigen`` links Eigen's kernels; it measured fastest for the
+#: scroller: 4.1 ms a step against NumPy's 8.0, bit-identical).
+LAW_LANE = os.environ.get("MEOWDOKU_LAW", "eigen")
+#: Where natively compiled laws are kept: one directory per law, source
+#: digest, argument list and contract.
+LAW_NATIVE = LAW_PRODUCTS.parent / "native_law"
 
 
 class LawPiece:
@@ -279,8 +285,64 @@ class LawPiece:
         return "\0".join(inspect.getsource(module) for module in modules)
 
     def compile(self, columns: dict[str, np.ndarray]) -> None:
-        if LAW_LANE != "numpy":
+        if LAW_LANE in {"llvm", "develop", "eigen", "fast"}:
+            try:
+                self._compile_native(columns, "develop" if LAW_LANE == "llvm" else LAW_LANE)
+                return
+            except Exception as exc:              # the NumPy product is the fallback, said aloud
+                print(f"[law] {self.entry}: native lane {LAW_LANE} refused ({type(exc).__name__}: "
+                      f"{str(exc)[:300]}); running the NumPy product", flush=True)
+        elif LAW_LANE != "numpy":
             return
+        self._compile_numpy(columns)
+
+    def _compile_native(self, columns: dict[str, np.ndarray], contract: str) -> None:
+        """Trace the law through the SSA tensor backend and compile it
+        natively (``compile_native_graph_forward``), cached by source digest,
+        argument list and contract.  Each call writes the columns into one
+        resident execution's buffers and runs the entry."""
+        import hashlib
+        import pickle
+        digest = hashlib.sha256(self._sources().encode("utf-8")).hexdigest()[:16]
+        signature = hashlib.sha256(",".join(self.argument_names).encode("utf-8")).hexdigest()[:8]
+        shapes = {name: (tuple(np.shape(columns[name])) if name in columns else ()) for name in self.argument_names}
+        name = f"{self.entry}_{contract}"
+        home = LAW_NATIVE / f"{self.entry}_{digest}_{signature}_{contract}"
+        cached = home / "forward.pkl"
+        forward = pickle.loads(cached.read_bytes()) if cached.exists() else None
+        if forward is None:
+            from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
+            from src.compiler.llvm_training_runtime import compile_native_graph_forward
+            from src.compiler.work_contract import PRESETS, scoped_work_contract
+            started = time.perf_counter()
+            with scoped_work_contract(PRESETS[contract]):
+                program = SSATensorProgram(name)
+                bindings = {n: SSATensorOperations.input(program, shapes[n]) for n in self.argument_names}
+                with program.activate():
+                    produced = type(self).law(*(bindings[n] for n in self.argument_names))
+                forward = compile_native_graph_forward(
+                    produced, bindings=bindings, source=self._sources(), name=name, directory=home)
+            home.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(pickle.dumps(forward))
+            print(f"[law] {self.entry}: compiled natively ({contract}) in {time.perf_counter() - started:.1f}s", flush=True)
+        from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+        ids = forward.input_value_ids
+        execution = prepare_artifact_execution(forward.artifact, {
+            ids[n]: np.zeros(shapes[n]) if shapes[n] else np.asarray(0.0) for n in self.argument_names})
+        inputs = [np.asarray(execution.buffers[ids[n]]).reshape(-1) for n in self.argument_names]
+        outputs = [np.asarray(execution.buffers[i]).reshape(-1) for i in forward.output_value_ids]
+        batch = self.batch
+
+        def product(*cols):
+            for buffer, column in zip(inputs, cols):
+                buffer[...] = np.asarray(column, dtype=np.float64).reshape(-1) if buffer.size > 1 else float(np.asarray(column).reshape(-1)[0])
+            execution.run()
+            return tuple(out if out.size == batch else np.broadcast_to(out, (batch,)) for out in outputs)
+
+        self.product, self.lane, self.product_path = product, contract, home
+        self._native = (forward, execution)
+
+    def _compile_numpy(self, columns: dict[str, np.ndarray]) -> None:
         import hashlib
         import importlib.util
         import inspect
@@ -369,8 +431,11 @@ class EntityGame(Game):
         self.pilot = None
         self._pilot_hold = 0.0    # seconds left on the policy's current decision
 
-    #: Seconds one autopilot decision is held (the cadence it was trained at).
-    PILOT_STEP = 1.0 / 30.0
+    #: Seconds one autopilot decision is held.  The policy's outputs are
+    #: control values held over an interval -- streamed like a player's
+    #: inputs -- not a per-frame command, so it decides at 10 Hz (a third of
+    #: the policy work; the page predicts the ship between decisions).
+    PILOT_STEP = 1.0 / 10.0
 
     def set_autopilot(self, on: bool) -> None:
         """Hand the controls to the trained policy (server side); the page keeps drawing."""

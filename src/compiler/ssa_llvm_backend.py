@@ -178,6 +178,7 @@ _FUSED_BINARY: dict[str, str] = {
         "{out}.c = and i1 {out}.a, {out}.b\n"
         "{out} = uitofp i1 {out}.c to double"
     ),
+    "ATAN2": "{out} = call double @atan2(double {0}, double {1})",
     "LOGICAL_OR": (
         "{out}.a = fcmp une double {0}, 0.0\n"
         "{out}.b = fcmp une double {1}, 0.0\n"
@@ -366,6 +367,9 @@ _TENSOR: dict[str, str] = {
     "ge": "binary_double",
     "maximum": "binary_double",
     "minimum": "binary_double",
+    "logical_and": "binary_double",
+    "logical_or": "binary_double",
+    "atan2": "binary_double",
     "add_scalar": "binary_scalar_double",
     "abs": "unary_double",
     "neg": "unary_double",
@@ -8276,9 +8280,20 @@ def emit_ssa_function_to_llvm(
                     payload = instruction.attributes.get("value")
                 if isinstance(payload, (tuple, list)):
                     symbol = f"@const.vec.{result_id}"
-                    elements = ", ".join(f"i32 {int(item)}" for item in payload)
+                    # The element type is the value's declared dtype: a
+                    # float64 tensor literal (a broadcast scalar, a table)
+                    # is doubles; shape/axis vectors declare int32.
+                    element_dtype = str(getattr(instruction.res, "dtype", "") or "")
+                    if element_dtype in {"float64", "double", "f64"}:
+                        element_type = "double"
+                        elements = ", ".join(
+                            f"double {_double_literal(float(item))}" for item in payload
+                        )
+                    else:
+                        element_type = "i32"
+                        elements = ", ".join(f"i32 {int(item)}" for item in payload)
                     globals_out.append(
-                        f"{symbol} = private constant [{len(payload)} x i32] [{elements}]"
+                        f"{symbol} = private constant [{len(payload)} x {element_type}] [{elements}]"
                     )
                     recorder.unit(
                         UnitKind.DECLARATION, globals_out[-1],

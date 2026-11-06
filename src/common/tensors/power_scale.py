@@ -122,7 +122,7 @@ _declare("settle",
          "scatter_row")
 _declare("materialize",
          # transcendental and nonlinear elementwise
-         "exp", "log", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+         "exp", "log", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh",
          "asinh", "acosh", "atanh", "sigmoid", "erf", "sinc", "softmax", "log_softmax",
          "coth", "cot", "csch", "csc", "sec", "sech",
          # rounding, integer arithmetic, bit patterns, integer and boolean casts

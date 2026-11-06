@@ -123,13 +123,15 @@ MISSILES = (399, 407)
 PICKUPS = (407, 413)
 SMOKES = (413, 425)
 FLASHES = (425, 429)
-STATIONS = (429, 433)
+RETIRED = (429, 433)         # the old scenery emplacements' lanes (never live)
 BOMBS = (433, 439)
 BLASTS = (439, 443)
 PINS = (443, 699)            # city lights: a fixed population of pins on the sphere
 BASES = (699, 705)           # alien ground bases: they zap city lights; bomb them
 ZAPS = (705, 709)            # a base's laser blast: two ends, drawn as a straight ribbon
-LANES = ZAPS[1]
+ROADS = (709, 869)           # road points (roads.plan): what cities grow along; never drawn as bodies
+STATIONS = (869, 881)        # AA emplacements, one at each AA site the roads join
+LANES = STATIONS[1]
 STATION, STATION_KIND = 9.0, 5.0
 #: ALTERNATE FIRE: bombs (``kind`` is the style) and their blasts.  A DUMB
 #: bomb falls on the trajectory law; a PARACHUTE bomb opens its canopy after
@@ -138,6 +140,14 @@ STATION, STATION_KIND = 9.0, 5.0
 #: what is inside its own radius and leaves a glowing flash in its colour.
 BOMB_SLOT, BLAST_SLOT = 10.0, 11.0
 PIN_SLOT, BASE_SLOT, ZAP_SLOT = 12.0, 13.0, 14.0
+ROAD_SLOT, RETIRED_SLOT = 15.0, 99.0
+#: ROADS (roads.py: gradient-limited paths between the AA sites over the
+#: land's law).  Cities grow along them: a new light sprouts ROAD_SPROUT from
+#: a road point that already has a lit pin within CITY_LINK.  A destroyed
+#: AA emplacement is rebuilt (after SITE_REGROW) once its site is connected:
+#: SITE_NEED lit pins within SITE_REACH.
+CITY_LINK, ROAD_SPROUT = 2.0, (0.25, 0.9)
+SITE_REACH, SITE_NEED, SITE_REGROW = 5.0, 6.0, 6.0
 #: CITIES: each pin's ``hp`` is its light (0 dark .. 1).  They GROW like a mold:
 #: at GROW_RATE a second the first dark pin is re-lit GROW_NEAR from a lit
 #: pin the dice pick, so lit regions spread from their edges; a lit pin
@@ -236,6 +246,7 @@ DEMO_EASY_S, DEMO_CHAOS_S = 60.0, 180.0
 LEVEL_STEP = 0.15
 SPEED = 10.0
 TAU = 0.05
+STEP_CAP = 1.0 / 30.0      # the longest law step: one frame
 REACH = 0.18
 MARGIN = 0.5
 SHOT_SPEED = 22.0
@@ -417,6 +428,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_station = slot == STATION
     is_bomb, is_blast = slot == BOMB_SLOT, slot == BLAST_SLOT
     is_pin, is_base, is_zap = slot == PIN_SLOT, slot == BASE_SLOT, slot == ZAP_SLOT
+    is_road = slot == ROAD_SLOT
     # night: facing away from the sun (fixed in the planet's frame)
     sun_dot = ux * SUN_DIR[0] + uy * SUN_DIR[1] + uz * SUN_DIR[2]
     night = sun_dot < NIGHT_EDGE
@@ -753,9 +765,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     # fixed population of scenery).
     rebuild_az = 2.0 * (noise(lane * 0.77 + clock * 3.3) - 0.5)
     ahead_u = sm.place(u0n, h0n, zero + AHEAD / RADIUS, rebuild_az)
-    rebuilt = is_station & (dist2 > SCENERY_FAR) & playing
     wrapped = is_star & (dist2 > SCENERY_FAR)
-    renewed = rebuilt | wrapped
+    renewed = wrapped                                         # (emplacements stay at their sites)
+    site_linked = near_count_of_block(u2, lit, STATIONS, PINS, SITE_REACH, RADIUS) >= SITE_NEED
+    rebuilt = is_station & ~live & site_linked & (age >= SITE_REGROW) & playing
     u2 = sm.vwhere(renewed, ahead_u, u2)
     h2 = sm.vwhere(renewed, sm.turn(ahead_u, sm.toward(ahead_u, u0n), zero + 6.283185307179586 * noise(lane * 1.3 + clock)), h2)
     X, Y = sm.project(u2, u0n, h0n, RADIUS)
@@ -904,6 +917,17 @@ def scroller_step(lane, slot, rx, ry, rz,
     pa_h = ((Pa * h2[0]).sum(), (Pa * h2[1]).sum(), (Pa * h2[2]).sum())
     sprout_gap = GROW_NEAR[0] + (GROW_NEAR[1] - GROW_NEAR[0]) * noise(clock * 3.3 + 2.0)
     sprout_u = sm.place(pa_u, pa_h, zero + sprout_gap / RADIUS, zero + 6.283185307179586 * noise(clock * 2.7 + 5.0))
+    # ... along the roads: beside a road point already linked to a lit pin
+    road_linked = is_road & (near_count_of_block(u2, lit_now, ROADS, PINS, CITY_LINK, RADIUS) > 0.0)
+    n_road = f(road_linked).sum()
+    road_rank = f(road_linked).cumsum(dim=0) - 1.0
+    road_pick = road_linked & (road_rank == (noise(clock * 5.3 + 13.0) * n_road).floor())
+    Rp = f(road_pick)
+    rp_u = ((Rp * u2[0]).sum(), (Rp * u2[1]).sum(), (Rp * u2[2]).sum())
+    rp_h = ((Rp * h2[0]).sum(), (Rp * h2[1]).sum(), (Rp * h2[2]).sum())
+    road_gap = ROAD_SPROUT[0] + (ROAD_SPROUT[1] - ROAD_SPROUT[0]) * noise(clock * 2.1 + 9.0)
+    along_u = sm.place(rp_u, rp_h, zero + road_gap / RADIUS, zero + 6.283185307179586 * noise(clock * 1.9 + 3.0))
+    sprout_u = sm.vwhere(n_road > 0.0, along_u, sprout_u)
     u2 = sm.vwhere(sprout, sprout_u, u2)
     hp2 = where(is_pin, where(sprout, 0.25, pin_light), hp2)
     killed = (is_enemy | is_station | is_base) & live2 & (hp2 <= 0.0)
@@ -964,7 +988,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(left_at, clock, born1)
     age1 = where(left_at, 0.0, age1)
     age1 = where(is_player & (damage > 0.0), 0.0, age1)      # the player's age: time since its last hit
-    age1 = where(killed & (is_enemy | is_base), 0.0, age1)    # an enemy's or base's age, dead: time to its return
+    age1 = where(killed & (is_enemy | is_base | is_station), 0.0, age1)   # dead: time to its return / rebuild
     timer1 = where(zap_ready, BASE_RELOAD + zero, timer1)
     z2 = where(is_base, zero + STATION_Z, z2)
     live3 = (live3 | drop | puff) & ~(is_smoke & (age1 > SMOKE_LIFE))
@@ -1048,7 +1072,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     bullet_window = 2.0 * (SHIP_RX + 0.12)
     shot_limit = 0.9 * shot_window / (shot_pace + 1e-6)
     bullet_limit = 0.9 * bullet_window / (bullet_pace + 1e-6)
-    dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, 0.5 * TAU) + zero
+    # (the damped motion laws are implicit -- stable at any step -- so the cap
+    # is one frame, not a fraction of their damping time; the collision
+    # windows above keep anything from stepping through what it can hit)
+    dt_limit = where(shot_limit < bullet_limit, shot_limit, bullet_limit).clip(0.0, STEP_CAP) + zero
     residual = f(is_enemy & live3).sum() + zero
     yaw_next = where(is_player, ship_yaw, yaw)
     bank_next = where(is_player, ship_bank, bank)
@@ -1129,6 +1156,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     slot[slice(*PINS)], rx[slice(*PINS)], ry[slice(*PINS)], rz[slice(*PINS)] = PIN_SLOT, 0.1, 0.1, 0.1
     slot[slice(*BASES)], rx[slice(*BASES)], ry[slice(*BASES)], rz[slice(*BASES)] = BASE_SLOT, 0.35, 0.35, 0.3
     slot[slice(*ZAPS)] = ZAP_SLOT
+    slot[slice(*ROADS)] = ROAD_SLOT
+    slot[slice(*RETIRED)] = RETIRED_SLOT
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
@@ -1164,9 +1193,12 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     # alien BASES beside the cities
     pins, bases = slice(*PINS), slice(*BASES)
     n_pin, n_base = PINS[1] - PINS[0], BASES[1] - BASES[0]
-    centres = rng.normal(size=(CITY_SEEDS, 3))
-    centres[0] = (0.25, 0.35, 1.0)
-    centres /= np.linalg.norm(centres, axis=1, keepdims=True)
+    # the roads and their AA sites, from the land's law (cached per world)
+    from meowdoku import roads as road_plan
+    site_pts, _lines, road_pts = road_plan.plan(7, RADIUS, sites=STATIONS[1] - STATIONS[0], road_points=ROADS[1] - ROADS[0])
+    # cities start at the AA sites (nearest the start first)
+    order = np.argsort(-site_pts[:, 2])
+    centres = np.array(site_pts[order[:CITY_SEEDS]], dtype=np.float64)
     owner_city = np.arange(n_pin) % CITY_SEEDS
     lit0 = rng.uniform(size=n_pin) < 0.55
     pts = centres[owner_city] + rng.normal(scale=CITY_SPREAD / RADIUS, size=(n_pin, 3))
@@ -1182,8 +1214,13 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         tg /= np.linalg.norm(tg, axis=1, keepdims=True) + 1e-12
         hx[lanes_], hy[lanes_], hz[lanes_] = tg[:, 0], tg[:, 1], tg[:, 2]
     stations = slice(*STATIONS)
-    n_st = STATIONS[1] - STATIONS[0]
-    put(stations, rng.uniform(-3.5, 3.5, n_st), np.linspace(3.0, AHEAD, n_st), np.zeros(n_st))
+    roads_ = slice(*ROADS)
+    for lanes_, pts_ in ((stations, site_pts), (roads_, road_pts)):
+        ux[lanes_], uy[lanes_], uz[lanes_] = pts_[:, 0], pts_[:, 1], pts_[:, 2]
+        g = np.tile([[0.0, 1.0, 0.0]], (len(pts_), 1))
+        tg = g - (g * pts_).sum(axis=1, keepdims=True) * pts_
+        tg /= np.linalg.norm(tg, axis=1, keepdims=True) + 1e-12
+        hx[lanes_], hy[lanes_], hz[lanes_] = tg[:, 0], tg[:, 1], tg[:, 2]
     z[stations] = STATION_Z
     z[0] = DEPTH / 2.0
     spd[0] = SPD0
@@ -1513,6 +1550,11 @@ class BulletScroller(EntityGame):
                               {"name": "Seeker", "count": 1 + int(c("bombs_s")[0])}],
                 "active": int(c("weapon")[0]), "last": "secondary" if c("last_fire")[0] > 0 else "primary",
                 "beam_range": BEAM_RANGE}
+            if not hasattr(self, "_roads_published"):
+                from meowdoku import roads as road_plan
+                _s, lines, _p = road_plan.plan(7, RADIUS, sites=STATIONS[1] - STATIONS[0], road_points=ROADS[1] - ROADS[0])
+                self._roads_published = [[[round(float(v), 5) for v in pt] for pt in line] for line in lines]
+            st["roads"] = self._roads_published
             light = c("hp")[PINS[0]:PINS[1]]
             st["city"] = {"lit": int((light > 0.05).sum()), "light": round(float(light.sum()), 1), "pins": PINS[1] - PINS[0]}
             boss_live = float(c("alive")[BOSS_LANE]) > 0.0 and float(c("boss_phase")[0]) == 1.0

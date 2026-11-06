@@ -63,6 +63,7 @@ typedef enum CTensorOp {
        renumber every op after it and silently reclassify anything holding a
        raw opcode. New entries go here and are named explicitly below. */
     CT_OP_SIGMOID,
+    CT_OP_ATAN2,
     CT_OP_COUNT
 } CTensorOp;
 

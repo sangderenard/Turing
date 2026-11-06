@@ -7,7 +7,7 @@
 // trig family) under module "math"; the page binds them from Math, which is
 // the same table the node harness supplies.
 export const TURING_MATH_IMPORTS = Object.fromEntries(
-  ['pow', 'exp', 'log', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+  ['pow', 'exp', 'log', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
    'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh'].map(name => [name, Math[name]]));
 
 // A browser sampler over the viewport control-binding vocabulary

@@ -767,9 +767,13 @@ class SSATensorProgram:
         operands = (condition, when_true, when_false)
         if any(operand.program is not self for operand in operands):
             raise ValueError("SSA where operands must belong to the same source program")
-        shape = self._broadcast_shape(when_true.shape, when_false.shape)
-        if any(operand.shape != shape for operand in operands):
-            raise NotImplementedError("SSA where broadcasting requires the broadcast primitive")
+        shape = self._broadcast_shape(
+            condition.shape, self._broadcast_shape(when_true.shape, when_false.shape)
+        )
+        # Operands of another shape meet through the broadcast primitive.
+        condition, when_true, when_false = (
+            self.broadcast(operand, shape) for operand in operands
+        )
         result = self._fresh(shape=shape)
         count = self._constant(prod(shape) if shape else 1, "int32")
         return self._call(
@@ -988,6 +992,23 @@ class SSATensorOperations(AbstractTensor):
     def __ge__(self, other):
         return self._comparison("greater_equal", other)
 
+    # The boolean operators stay boolean in the program: logical_and,
+    # logical_or and logical_not are their own SSA operations, so a backend
+    # keeps the mask abstraction (i1 and/or in LLVM's lane, a boolean array
+    # in Eigen) instead of reading float arithmetic back into masks.
+    def __and__(self, other):
+        return self._apply_operator("logical_and", self, other)
+
+    __rand__ = __and__
+
+    def __or__(self, other):
+        return self._apply_operator("logical_or", self, other)
+
+    __ror__ = __or__
+
+    def __invert__(self):
+        return self._apply_operator("logical_not", self, None)
+
     @staticmethod
     def _data(value: Any) -> Any:
         return value.data if isinstance(value, AbstractTensor) else value
@@ -1003,7 +1024,11 @@ class SSATensorOperations(AbstractTensor):
                 raise ValueError("SSA tensor literals must be rectangular")
             return (len(value),) + child
 
-        program = getattr(self, "_program", None) or SSATensorProgram("ssa_tensor_literal")
+        program = (
+            getattr(self, "_program", None)
+            or _ACTIVE_SSA_PROGRAM.get()
+            or SSATensorProgram("ssa_tensor_literal")
+        )
         self._program = program
         return program.constant(data, shape_of(data))
 
@@ -1048,6 +1073,32 @@ class SSATensorOperations(AbstractTensor):
             index = [slice(None)] * len(output_shape)
             index[dim] = position
             output = program.index_set(output, tuple(index), value)
+        return output
+
+    def cat_(self, tensors, dim=0) -> SSATensorValue:
+        # Composed structurally like stack_: each part is written into its
+        # span of the output with index_set (cat_double takes a pointer
+        # table the one-level SSA address cannot carry).
+        values = tuple(self._data(tensor) for tensor in tensors)
+        if not values:
+            raise ValueError("SSA cat requires at least one tensor")
+        program = values[0].program
+        if any(value.program is not program for value in values):
+            raise ValueError("SSA cat inputs must share one source program")
+        rank = len(values[0].shape)
+        dim = int(dim) % rank
+        rest = values[0].shape[:dim] + values[0].shape[dim + 1:]
+        if any(value.shape[:dim] + value.shape[dim + 1:] != rest for value in values):
+            raise ValueError("SSA cat inputs differ off the joined axis")
+        total = sum(value.shape[dim] for value in values)
+        output_shape = values[0].shape[:dim] + (total,) + values[0].shape[dim + 1:]
+        output = program.full(output_shape, 0.0)
+        start = 0
+        for value in values:
+            index = [slice(None)] * rank
+            index[dim] = slice(start, start + value.shape[dim])
+            output = program.index_set(output, tuple(index), value)
+            start += value.shape[dim]
         return output
 
     def _view_value(self, shape: tuple[int, ...]) -> SSATensorValue:
@@ -1300,7 +1351,7 @@ for _operation in (
     "isfinite", "isnan", "isinf", "logical_not", "tanh", "sin", "cos", "tan",
     "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh", "sign",
     "less", "less_equal", "greater", "greater_equal", "equal", "not_equal",
-    "maximum", "minimum",
+    "maximum", "minimum", "logical_and", "logical_or", "atan2",
 ):
     setattr(SSATensorOperations, f"{_operation}_", _operator_hook(_operation))
 
