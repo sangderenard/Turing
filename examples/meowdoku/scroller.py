@@ -763,8 +763,10 @@ class BulletScroller(EntityGame):
                         # Top-down: the ship lies flat, nose up the screen (the
                         # direction of illusory travel); a missile faces its
                         # flight (the page aims it along its velocity each frame).
+                        # Nothing leans toward the camera: every body lies in
+                        # its own flight plane, as it would really fly.
                         "roll": 0.785 if mesh == "rocket" else 0.0,
-                        "lean": 0.0 if slot in (PLAYER, MISSILE_SLOT) else 0.55,
+                        "lean": 0.0,
                         "face": bool(slot == MISSILE_SLOT and not exploding),
                         # drawn with the glass (blended), not in the opaque pass
                         "translucent": bool(slot in (STAR, SMOKE)),
