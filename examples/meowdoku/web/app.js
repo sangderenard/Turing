@@ -3873,9 +3873,12 @@ function fillPickers() {
   levelSelect.onchange = refill;
   levelSelect.value = levels.find((k) => k.startsWith("small/forced")) || levels[0]; refill();
   gameSelect.onchange = () => { document.body.dataset.game = gameSelect.value; $("new").click(); };
+  // the fountain is its own page (fountain.html): a compute-shader particle game, not a board
+  const toFountain = () => { location.href = "fountain.html"; };
   boardSelect.onchange = () => newGame({ game: "meowdoku", id: boardSelect.value });
   $("new").onclick = async () => {
     const g = gameSelect.value;
+    if (g === "fountain") return toFountain();
     if (g === "meowdoku") {
       const chosen = state.catalog.meowdoku.boards.filter((b) => b.level === levelSelect.value);
       const board = chosen[Math.floor(Math.random() * chosen.length)]; boardSelect.value = board.id;

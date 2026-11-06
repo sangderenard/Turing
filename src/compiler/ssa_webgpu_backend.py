@@ -643,7 +643,14 @@ def emit_module(
     count: int = 1,
     preferred_local_size: int = 256,
     packed_outputs: bool = False,
+    uniform_args: Sequence[int] = (),
 ) -> WGSLModule:
+    """Emit one compute shader, one invocation per element of ``count``.
+
+    ``uniform_args`` names formals (by value id) that are ONE value shared by
+    every invocation rather than one element per invocation: they are read at
+    index 0 of their span instead of ``linear_index``."""
+    uniform_ids = frozenset(int(item) for item in uniform_args)
     ir_module = module if isinstance(module, IRModule) else IRModule(dict(module))
     # Precision sections are refused BEFORE anything is spelled, mirroring
     # the wasm/llvm lanes: WGSL's fma() is explicitly permitted to round
@@ -952,11 +959,12 @@ def emit_module(
     )
     for position, value in enumerate(function.args):
         dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+        index = "0u" if value.id in uniform_ids else "linear_index"
         emitter.lines.append(
             f"  let {_name(value)}: {dtype} = "
-            f"feeds[{position * int(count)}u + linear_index];"
+            f"feeds[{position * int(count)}u + {index}];"
             if packed_feeds else
-            f"  let {_name(value)}: {dtype} = feed_{value.id}[linear_index];"
+            f"  let {_name(value)}: {dtype} = feed_{value.id}[{index}];"
         )
     body, function_shortfalls = emitter.emit()
     shortfalls.extend(function_shortfalls)
@@ -1007,6 +1015,10 @@ def emit_module(
             "feed_span": (
                 [int(value.id) for value in function.args]
                 if packed_feeds else None
+            ),
+            "uniform_feeds": sorted(
+                int(value.id) for value in function.args
+                if value.id in uniform_ids
             ),
             "outputs": [item.to_mapping() for item in output_bindings],
             "packed_outputs": bool(packed_outputs),
@@ -1473,6 +1485,8 @@ __all__ = [
     "emit_operator_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
     "supported_tensor_operations",
     "webgpublas_gemm",
+    "emit_pairwise_reduce_module", "emit_tensor_program_module",
+    "lower_elementwise_kernel_calls",
 ]
 
 
@@ -1579,3 +1593,189 @@ def emit_pairwise_reduce_module(
     return WGSLModule(
         name, "\n".join(lines), not shortfalls, tuple(shortfalls), None, launch_plan,
     )
+
+
+# ---------------------------------------------------------------------------
+# The elementwise kernel-call form.
+#
+# A tensor law traced through ``SSATensorProgram`` (or lowered by the public
+# entry) does not name scalar operations.  It names the repository's tensor
+# KERNELS -- ``binary_double(a, b, out, count, opcode)``,
+# ``binary_scalar_double(a, s, out, count, opcode, reverse)``,
+# ``unary_double(a, out, count, opcode)``, ``where_double(c, a, b, out,
+# count)`` -- with the operation as an integer opcode (the C backend's
+# ``CTensorOp`` numbering, ``C_TENSOR_OPCODE_ORDER``) and an output buffer
+# argument.  That is the form the wasm and native lanes consume, and the one
+# ``_FunctionEmitter`` could not: it reads one scalar operation per
+# instruction.  The function below closes that seam by REWRITING the
+# elementwise kernels to the per-invocation scalar form (one invocation owns
+# one element, so a ``(count,)`` tensor becomes the invocation's scalar and a
+# rank-zero value stays the shared scalar), with every value keeping its id.
+# Anything that is not elementwise over the lane extent (a reduction, a
+# gather, a broadcast kernel, a matmul) is NOT rewritten: it is named as a
+# shortfall, loudly.
+# ---------------------------------------------------------------------------
+
+#: Operations the repository defines on doubles that WGSL does not spell the
+#: same way: ``mod`` is floored where WGSL ``%`` truncates, and the bit and
+#: shift operations convert through ``long long`` where the f32 table
+#: reinterprets bits.  They are refused rather than approximated.
+_NOT_FAITHFUL_IN_WGSL = frozenset({
+    "mod", "bitand", "bitor", "bitxor", "shl", "shr", "invert", "isfinite",
+    "isnan", "isinf", "sigmoid",
+})
+
+
+def _opcode_operation_names() -> dict[tuple[str, int], str]:
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_dispatch_operations, c_tensor_opcode,
+    )
+
+    names: dict[tuple[str, int], str] = {}
+    for operation in sorted(c_dispatch_operations()):
+        kind, opcode = c_tensor_opcode(operation)
+        names.setdefault((kind, int(opcode)), operation)
+    return names
+
+
+def lower_elementwise_kernel_calls(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue],
+    *,
+    count: int,
+) -> tuple[Function, tuple[SSAValue, ...], tuple[WGSLShortfall, ...]]:
+    """Rewrite a function in the elementwise kernel-call form to the
+    per-invocation scalar form ``emit_module`` consumes.
+
+    ``count`` is the lane extent: every tensor value must be ``(count,)`` and
+    every other value a single shared scalar.  Returns the rewritten function
+    (same formals, same value ids), the output values, and the shortfalls
+    (kernels that are not elementwise, operations WGSL cannot spell
+    faithfully, shapes that are not the lane extent)."""
+
+    source = module.functions[function_name]
+    names = _opcode_operation_names()
+    shortfalls: list[WGSLShortfall] = []
+    lanes: dict[int, SSAValue] = {}
+    constants: dict[int, Any] = {}
+    instrs: list[Instr] = []
+
+    def fail(operation: str, reason: str) -> None:
+        item = WGSLShortfall(function_name, operation, reason)
+        if item not in shortfalls:
+            shortfalls.append(item)
+
+    def lane(value: SSAValue) -> SSAValue:
+        found = lanes.get(int(value.id))
+        if found is None:
+            elements = 1
+            for extent in tuple(value.shape or ()):
+                elements *= int(extent)
+            if elements not in (1, int(count)):
+                fail(f"value %{value.id}",
+                     f"shape {tuple(value.shape)} is neither the lane extent "
+                     f"({int(count)},) nor a shared scalar")
+            found = SSAValue(int(value.id), value.dtype, ())
+            lanes[int(value.id)] = found
+        return found
+
+    def emit(operation: str, args: Sequence[SSAValue], result: SSAValue) -> None:
+        instrs.append(Instr(operation, [lane(item) for item in args], lane(result)))
+
+    for block in source.blocks.values():
+        for instr in block.instrs:
+            operation = str(instr.op)
+            result = instr.res
+            if operation in {"Const", "const"}:
+                value = instr.attributes.get("constant", instr.attributes.get("value"))
+                constants[int(result.id)] = value
+                # integer constants are kernel parameters (count, opcode,
+                # reverse), consumed below; only data constants are emitted
+                if str(result.dtype or "").startswith(("int", "uint")):
+                    continue
+                instrs.append(Instr("Const", [], lane(result), attributes=dict(instr.attributes)))
+            elif operation in {"reshape", "view"}:
+                emit("reshape", instr.args[:1], result)
+            elif operation in {"Call", "call"}:
+                callee = str(instr.attributes.get("callee", ""))
+                args = list(instr.args)
+                try:
+                    if callee == "binary_double":
+                        name = names[("binary", int(constants[int(args[4].id)]))]
+                        operands = args[:2]
+                    elif callee == "binary_scalar_double":
+                        name = names[("binary", int(constants[int(args[4].id)]))]
+                        operands = args[:2]
+                        if int(constants[int(args[5].id)]):
+                            operands = operands[::-1]
+                    elif callee == "unary_double":
+                        name = names[("unary", int(constants[int(args[3].id)]))]
+                        operands = args[:1]
+                    elif callee == "where_double":
+                        name, operands = "where", args[:3]
+                    elif callee == "fill_double":
+                        name, operands = "copy", [args[1]]
+                    else:
+                        fail(callee or operation,
+                             "is not an elementwise repository kernel: a "
+                             "per-invocation shader cannot express it "
+                             "(reductions, gathers, broadcasts and matmuls "
+                             "need their own region emitter)")
+                        continue
+                except (KeyError, IndexError, ValueError):
+                    fail(callee, "opcode is not a compile-time constant of the repository table")
+                    continue
+                if name in _NOT_FAITHFUL_IN_WGSL:
+                    fail(name, "the repository's definition differs from WGSL's spelling; refused rather than approximated")
+                    continue
+                emit(name, operands, result)
+            else:
+                fail(operation, "instruction is not in the elementwise kernel-call form")
+    function = Function(
+        function_name, [lane(item) for item in source.args],
+        {"entry": BasicBlock("entry", instrs)},
+    )
+    return function, tuple(lane(item) for item in outputs), tuple(shortfalls)
+
+
+def emit_tensor_program_module(
+    module: IRModule,
+    function_name: str,
+    outputs: Sequence[SSAValue],
+    *,
+    count: int,
+    name: str | None = None,
+    preferred_local_size: int = 64,
+) -> WGSLModule:
+    """A compute shader from a tensor law in the elementwise kernel-call form.
+
+    ``module`` is a traced or lowered module whose ``function_name`` holds the
+    law as repository kernel calls over lanes of extent ``count``; ``outputs``
+    are the values it publishes.  Rank-zero formals are shared scalars
+    (uniforms); every other formal is one element per invocation.  Feeds and
+    outputs are packed spans (formal ``k`` at ``[k * count, (k + 1) * count)``;
+    a uniform's value is the first element of its slot), so the binding count
+    stays at two.  The caller sets the work contract (float64 storage is
+    legalized to f32 by the ``fast`` contract's backend identity)."""
+
+    function, lowered_outputs, shortfalls = lower_elementwise_kernel_calls(
+        module, function_name, outputs, count=count,
+    )
+    uniforms = [
+        int(item.id) for item in module.functions[function_name].args
+        if not tuple(item.shape or ())
+    ]
+    artifact = emit_module(
+        IRModule({function_name: function}),
+        name=name or function_name,
+        outputs={function_name: lowered_outputs},
+        count=count,
+        preferred_local_size=preferred_local_size,
+        packed_outputs=True,
+        uniform_args=uniforms,
+    )
+    if shortfalls:
+        artifact.shortfalls = tuple(shortfalls) + tuple(artifact.shortfalls)
+        artifact.complete = False
+    return artifact

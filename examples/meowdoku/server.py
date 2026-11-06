@@ -48,6 +48,7 @@ from meowdoku.sidescroller import SideScroller  # noqa: E402
 from meowdoku.tilequest import TileQuest  # noqa: E402
 from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.worldwalk import WorldWalk  # noqa: E402
+from meowdoku.fountain import FountainGame  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 
@@ -75,7 +76,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "side_scroller", "tilequest", "boardwalk", "worldwalk"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -128,6 +129,8 @@ class Table:
             self.game = Boardwalk(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "worldwalk":
             self.game = WorldWalk(aspect=float(payload.get("aspect") or 0.0))
+        elif kind == "fountain":
+            self.game = FountainGame()       # the page runs the law; the server holds phase, seed, image
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
@@ -145,6 +148,10 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
+        elif kind.startswith("fountain_"):
+            if not hasattr(self.game, "do"):
+                raise ValueError("not the fountain")
+            self.game.do(payload)
         elif kind == "autopilot":
             if not hasattr(self.game, "set_autopilot"):
                 raise ValueError("this game has no autopilot")
@@ -395,7 +402,30 @@ def make_handler(sessions: Sessions):
                 table = self._table()
                 with table.lock:
                     return self._json(table.profile())
+            if self.path.startswith("/api/fountain/layout"):
+                return self._fountain_layout()
             return super().do_GET()
+
+        def _fountain_layout(self):
+            """The fountain's round-zero layout (``fountain.layout``) as raw float32
+            columns, one block per ``LAYOUT_COLUMNS`` name: bulk array work, no session."""
+            from urllib.parse import parse_qs, urlparse
+            from meowdoku import fountain
+            query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            try:
+                cols, rows = int(query.get("cols", fountain.COLS)), int(query.get("rows", fountain.ROWS))
+                if not (2 <= cols <= 512 and 2 <= rows <= 512):
+                    raise ValueError("cols and rows must be 2..512")
+                layout = fountain.layout(cols, rows, seed=int(query.get("seed", 7)), mix=float(query.get("mix", 0.5)))
+            except (ValueError, TypeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            body = b"".join(layout[name].astype("<f4").tobytes() for name in fountain.LAYOUT_COLUMNS)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):  # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
@@ -430,6 +460,24 @@ def prepare_predictor(web_dir: Path) -> None:
     except Exception as error:  # the page plays without prediction
         print(f"[meowdoku] ship predictor NOT built ({type(error).__name__}: {error}); "
               "free-board games run unpredicted", flush=True)
+
+
+def prepare_fountain(web_dir: Path) -> None:
+    """The fountain's page and its compiler products (``fountain_build.build``):
+    the generated WebGPU compute shader and the wasm product for each size, and
+    the manifest holding the compiler's deployment verdicts.  Rebuilt only when
+    the law or the emitters change."""
+    import shutil
+    from meowdoku import fountain_build
+    for name in ("fountain.html", "fountain.js"):
+        shutil.copyfile(HERE / "web" / name, web_dir / name)
+    try:
+        started = time.perf_counter()
+        manifest = fountain_build.build(web_dir)
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
 def prepare_policy(web_dir: Path) -> None:
@@ -488,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
+    prepare_fountain(web_dir)
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

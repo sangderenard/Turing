@@ -394,42 +394,64 @@ def region_compute_facts(module: Any, function_name: str) -> tuple[RegionCompute
             body = module.functions.get(str(attributes.get("callee", "")))
             if body is None:
                 continue
-            constants = {
-                int(item.res.id)
-                for body_block in body.blocks.values()
-                for item in body_block.instrs
-                if str(item.op) in {"Const", "const"} and item.res is not None
-            }
-            arithmetic = broadcast = reduction = lanes = reduced_in = 0
-            for body_block in body.blocks.values():
-                for item in body_block.instrs:
-                    if str(item.op) not in {"Call", "call"} or item.res is None:
-                        continue
-                    result_shape = tuple(getattr(item.res, "shape", ()) or ())
-                    result_elements = _elements(result_shape)
-                    tensor_shapes = [
-                        tuple(getattr(arg, "shape", ()) or ())
-                        for arg in item.args
-                        if int(arg.id) not in constants
-                        and _elements(getattr(arg, "shape", ())) > 1
-                    ]
-                    if "dim" in item.attributes or "axis" in item.attributes:
-                        reduction += 1
-                        reduced_in += max(
-                            (_elements(shape) for shape in tensor_shapes), default=0,
-                        )
-                        lanes = max(lanes, result_elements)
-                    elif result_elements > 1:
-                        if any(shape != result_shape for shape in tensor_shapes):
-                            broadcast += 1
-                        else:
-                            arithmetic += 1
-                        lanes = max(lanes, result_elements)
+            counts = _body_compute_counts(body)
             facts.append(RegionComputeFacts(
-                int(attributes["region_index"]), str(attributes["callee"]),
-                arithmetic, broadcast, reduction, lanes, reduced_in,
+                int(attributes["region_index"]), str(attributes["callee"]), *counts,
             ))
+    if not facts:
+        # No planned regions: a tensor law traced or lowered straight to
+        # tensor kernel calls (the elementwise kernel-call form) is ONE
+        # region, the function itself.  Reductions in it declare no axis
+        # attribute, so they are read from their shapes: a tensor in, fewer
+        # elements out.
+        counts = _body_compute_counts(entry, shape_reductions=True)
+        if counts[3]:
+            facts.append(RegionComputeFacts(0, function_name, *counts))
     return tuple(facts)
+
+
+def _body_compute_counts(
+    body: Any, *, shape_reductions: bool = False,
+) -> tuple[int, int, int, int, int]:
+    """(arithmetic passes, broadcast moves, reduction passes, lanes,
+    reduction input elements) of one body, by the shapes its calls move."""
+
+    constants = {
+        int(item.res.id)
+        for body_block in body.blocks.values()
+        for item in body_block.instrs
+        if str(item.op) in {"Const", "const"} and item.res is not None
+    }
+    arithmetic = broadcast = reduction = lanes = reduced_in = 0
+    for body_block in body.blocks.values():
+        for item in body_block.instrs:
+            if str(item.op) not in {"Call", "call"} or item.res is None:
+                continue
+            result_shape = tuple(getattr(item.res, "shape", ()) or ())
+            result_elements = _elements(result_shape)
+            tensor_shapes = [
+                tuple(getattr(arg, "shape", ()) or ())
+                for arg in item.args
+                if int(arg.id) not in constants
+                and _elements(getattr(arg, "shape", ())) > 1
+            ]
+            if "dim" in item.attributes or "axis" in item.attributes:
+                reduction += 1
+                reduced_in += max(
+                    (_elements(shape) for shape in tensor_shapes), default=0,
+                )
+                lanes = max(lanes, result_elements)
+            elif shape_reductions and result_elements <= 1 and tensor_shapes:
+                reduction += 1
+                reduced_in += max(_elements(shape) for shape in tensor_shapes)
+                lanes = max(lanes, max(_elements(shape) for shape in tensor_shapes))
+            elif result_elements > 1:
+                if any(shape != result_shape for shape in tensor_shapes):
+                    broadcast += 1
+                else:
+                    arithmetic += 1
+                lanes = max(lanes, result_elements)
+    return arithmetic, broadcast, reduction, lanes, reduced_in
 
 
 def webgpu_compute_payoff(
@@ -437,6 +459,7 @@ def webgpu_compute_payoff(
     function_name: str,
     *,
     model: WebGPUComputeCostModel = WebGPUComputeCostModel(),
+    outputs: Sequence[Any] | None = None,
 ) -> ComputePayoff:
     """Whether dispatching a function's tensor regions as ONE compute chain
     beats leaving them on the host.
@@ -460,7 +483,9 @@ def webgpu_compute_payoff(
     entry = module.functions[function_name]
     facts = region_compute_facts(module, function_name)
     tensor_regions = tuple(fact for fact in facts if fact.lanes > 1)
-    returned = [
+    # A traced tensor program publishes its results without a ``Ret``:
+    # ``outputs`` names them.
+    returned = list(outputs) if outputs is not None else [
         arg
         for block in entry.blocks.values()
         for instruction in block.instrs

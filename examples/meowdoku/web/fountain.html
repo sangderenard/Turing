@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fountain: fill, map an image, fill again</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0d12; --panel: #151922; --line: #2a3140; --ink: #e7ebf3; --dim: #8f9bb0; --accent: #5ad1c4; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.35 system-ui, sans-serif; overscroll-behavior: none; }
+  body { display: flex; flex-direction: column; height: 100dvh; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #stage { position: relative; flex: 1 1 auto; min-height: 0; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #route { position: absolute; left: 8px; top: 8px; max-width: calc(100% - 16px); padding: 6px 8px; border-radius: 6px; background: rgba(11, 13, 18, .72); color: var(--dim); font-size: 12px; pointer-events: none; }
+  #route b { color: var(--accent); font-weight: 600; }
+  #route.warn b { color: #ffb454; }
+  #thumb { position: absolute; right: 8px; top: 8px; width: 84px; border: 1px solid var(--line); border-radius: 4px; display: none; background: #000; }
+  #bar { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); }
+  button, select, label.btn { font: inherit; color: var(--ink); background: #1e2531; border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; min-height: 40px; }
+  button.primary { background: var(--accent); color: #05201d; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .4; }
+  label.btn { cursor: pointer; display: inline-flex; align-items: center; }
+  label.btn input[type=file] { display: none; }
+  .grp { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+  input[type=range] { width: 110px; }
+  #status { flex: 1 1 100%; color: var(--dim); font-size: 12px; min-height: 16px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="route">starting...</div>
+  <canvas id="thumb" width="84" height="64"></canvas>
+</div>
+<div id="bar">
+  <button id="start" class="primary">Start</button>
+  <label class="btn">Image<input id="image" type="file" accept="image/*"></label>
+  <label class="btn">Camera<input id="camera" type="file" accept="image/*" capture="environment"></label>
+  <button id="replay" disabled>Replay</button>
+  <span class="grp">mix <input id="mix" type="range" min="0" max="1" step="0.05" value="0.5"><span id="mixv">0.50</span></span>
+  <span class="grp">colour <select id="mode"><option value="0">trig (atan2)</option><option value="1">rotation</option></select></span>
+  <span class="grp">size <select id="size"></select></span>
+  <span class="grp">speed <select id="speed"><option value="1">1x</option><option value="2" selected>2x</option><option value="4">4x</option></select></span>
+  <button id="verify" title="Run the law natively on the server and report a digest">Verify</button>
+  <div id="status"></div>
+</div>
+<script type="module" src="fountain.js"></script>
+</body>
+</html>
