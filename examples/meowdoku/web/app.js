@@ -6,6 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
+import { GravitySensor } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 
@@ -3859,11 +3860,48 @@ function delveOverlay(game) {
 // buttons, pickers, ranges and selects come as ``game.controls_ui``.
 let cloud = null;
 const compute = new ComputeRuntime({
-  onStatus: () => { const g = state.game; if (g && g.compute) status.textContent = `${g.status} · ${compute.statusText()}`; },
+  onStatus: () => { const g = state.game; if (g && g.compute) { status.textContent = `${g.status} · ${compute.statusText()}`; refreshLocalControls(); } },
   onSamples: (post, fields) => act({ type: post.action, ...fields }),
   onSupport: () => { if (state.game) renderGameControls(state.game); },
 });
 window.meowdokuDebug.compute = compute;
+// The phone's orientation is the fountain's gravity (a runtime input of the law), on by default, with an off switch.  iOS only
+// delivers the events after a permission asked for on a tap: the first tap anywhere asks.
+const gravitySensor = new GravitySensor({
+  onGravity: (gx, gy) => compute.setGravity(gx, gy),
+  onState: () => refreshLocalControls(),
+});
+try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
+gravitySensor.start();
+const firstTap = () => { for (const type of ["click", "touchend"]) removeEventListener(type, firstTap, true); gravitySensor.grant(); };
+for (const type of ["click", "touchend"]) addEventListener(type, firstTap, true);
+window.meowdokuDebug.gravitySensor = gravitySensor;
+// A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
+function localControl(s, value) {
+  if (s.local === "tilt") {
+    gravitySensor.enabled = !!value;
+    try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
+    if (value) gravitySensor.grant();
+  } else compute.control(s.local);
+  refreshLocalControls();
+}
+function refreshLocalControls() {
+  const box = $("gamectl"), g = state.game;
+  if (!box || !g || !g.controls_ui) return;
+  const st = compute.localState();
+  for (const s of g.controls_ui) {
+    if (!s.local) continue;
+    const el = box.querySelector(`[data-ctl="${s.id}"]`);
+    if (!el) continue;
+    if (s.local === "tilt") {
+      el.querySelector("input").checked = gravitySensor.enabled;
+      el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
+    } else {
+      el.disabled = !st.ready || (s.local === "continue" ? st.mode === "live" : s.local === "rebirth" ? false : st.frames === 0);
+      el.classList.toggle("on", s.local === st.mode);
+    }
+  }
+}
 function renderGameControls(game) {
   const box = $("gamectl"), specs = game && game.controls_ui;
   if (!box) return;
@@ -3873,7 +3911,12 @@ function renderGameControls(game) {
     box.dataset.key = key;
     box.replaceChildren(...specs.map((s) => {
       let el;
-      if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }); }
+      if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => (s.local ? localControl(s) : act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) })); }
+      else if (s.kind === "toggle") {
+        el = document.createElement("label"); const input = document.createElement("input"); input.type = "checkbox";
+        input.onchange = () => (s.local ? localControl(s, input.checked) : act({ type: s.action, [s.field]: input.checked }));
+        el.append(input, " " + s.label);
+      }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
@@ -3908,14 +3951,16 @@ function renderGameControls(game) {
         if (verdict && !verdict.ok) input.title = verdict.reason;
       }
     }
-    if (input && document.activeElement !== input) input.value = String(s.value);
+    if (input && s.kind === "toggle") input.checked = s.local ? gravitySensor.enabled : !!s.value;
+    else if (input && document.activeElement !== input) input.value = String(s.value);
   }
+  refreshLocalControls();
 }
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
   compute.frame(now);
-  const data = compute.ready && compute.product ? compute.product.points() : null;
+  const data = compute.points();
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);

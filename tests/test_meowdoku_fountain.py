@@ -176,6 +176,7 @@ def test_the_pages_image_sampling_equals_pythons_sample_raster(tmp_path):
     rgba.tofile(tmp_path / "raster.bin"); x.tofile(tmp_path / "x.bin"); y.tofile(tmp_path / "y.bin")
     (tmp_path / "job.json").write_text(json.dumps({"n": n, "w": w, "h": h}))
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SAMPLE)
     done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
@@ -510,6 +511,7 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
     quiet = {k: np.concatenate([v, np.full(4000, v[-1] if k != "ke" else 1e-9)]) for k, v in diag.items()}
     quiet["vmax2"][len(diag["ke"]):] = 1e-6
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SETTLE)
     for series in (diag, quiet):
@@ -520,3 +522,222 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
         assert done.returncode == 0, done.stderr[-1500:]
         assert json.loads((tmp_path / "settle.json").read_text())["step"] == F.settle_step(series, F.N_SMALL, F.N_SMALL)
     assert F.settle_step(quiet, F.N_SMALL, F.N_SMALL) is not None
+
+
+# ---------------------------------------------------------- run modes: gravity, recording, playback
+#: sha256 of the float64 bytes of STATE + (cr, cg, cb) after 700 steps of the 256-id law at mix 0.5, as the law ran BEFORE gravity
+#: became a runtime vector (``G`` baked into ``vy``).  The default inputs must reproduce it bit for bit.
+PRE_GRAVITY_DIGEST_700 = "576e50eb1463aa61fa3727fae820dadd018e01f587c0e54a46a70de49692643f"
+
+
+def _digest(final) -> str:
+    import hashlib
+    return hashlib.sha256(b"".join(np.ascontiguousarray(final[k], dtype=np.float64).tobytes() for k in F.STATE + ("cr", "cg", "cb"))).hexdigest()
+
+
+def test_gravity_is_a_runtime_input_the_default_is_the_old_law_and_a_tilt_changes_it_without_a_rebuild(native_piece):
+    piece, columns = native_piece
+    assert F.RUNTIME_INPUTS == ("grav_x", "grav_y", "lid", "rows") and set(F.RUNTIME_INPUTS) <= set(F.UNIFORMS)
+    assert float(columns["grav_x"]) == 0.0 and float(columns["grav_y"]) == -F.G and float(columns["lid"]) == F.LID_OFF
+    default = F.run_frames(piece, columns, 700)
+    assert _digest(default) == PRE_GRAVITY_DIGEST_700                     # the default is bit for bit the law before the change
+    tilted = dict(columns, grav_x=np.float64(0.5), grav_y=np.float64(-0.8660254))
+    other = F.run_frames(piece, tilted, 700)                              # the same compiled piece: only the uniform changed
+    assert _digest(other) != _digest(default)
+    live = (np.abs(default["x"]) + np.abs(default["y"])) > 0
+    assert float(other["x"][live].mean()) > float(default["x"][live].mean()) + 0.05          # the pile slid toward +x
+    assert np.isfinite(other["x"]).all() and float(other["n_nan"][0]) == 0 and float(other["n_out"][0]) == 0
+
+
+def test_the_lid_keeps_grains_in_the_basin_when_gravity_points_up(native_piece):
+    piece, columns = native_piece
+    geo = F.basin(F.N_SMALL)
+    top = geo["rows"] * F.CELL
+    up = dict(columns, grav_x=np.float64(0.0), grav_y=np.float64(F.G))
+    free = F.run_frames(piece, dict(up), 700)
+    closed = F.run_frames(piece, dict(up, lid=np.float64(top)), 700)
+    placed = lambda f: (np.abs(f["x"]) + np.abs(f["y"])) > 0
+    assert float(free["y"][placed(free)].max()) > top + 0.5               # open top: the spray leaves
+    assert float(closed["y"][placed(closed)].max()) <= top + 1e-3         # closed: nothing passes the lid
+    assert float(closed["n_nan"][0]) == 0
+
+
+def test_the_server_declares_the_run_modes_and_the_tilt_inputs():
+    game = F.FountainGame(size="small")
+    state = game.state()
+    assert state["compute"]["run"] == "continuous"                         # the default run never stops
+    ids = {item["id"]: item for item in state["controls_ui"]}
+    for name in ("rebirth", "rec_replay", "bounce", "continue"):
+        assert ids[name]["kind"] == "button" and ids[name]["local"] == name.replace("rec_", "")
+    assert ids["tilt"]["kind"] == "toggle" and ids["tilt"]["local"] == "tilt" and ids["tilt"]["value"] is True
+    assert ids["run"]["value"] == "continuous" and [o[0] for o in ids["run"]["options"]] == ["continuous", "settle"]
+    assert [o[0] for o in ids["speed"]["options"]] == [1, 2, 4, 0]          # 0: follow the newest frame
+    tilt = state["compute"]["tilt"]                                          # what the page writes while the sensor drives gravity
+    geo = F.basin(256)
+    assert tilt["lid"] > geo["nozzle_y"] + 1.35 and tilt["rows"] * F.CELL >= tilt["lid"]
+    before = state["compute"]["epoch"]
+    game.do({"type": "fountain_run", "run": "settle"})
+    assert game.state()["compute"]["run"] == "settle" and game.state()["compute"]["epoch"] == before + 1
+    with pytest.raises(ValueError):
+        game.do({"type": "fountain_run", "run": "sideways"})
+
+
+JS_RECORDING = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {Recording, Playback} = await import(pathToFileURL(`${dir}/recording.js`).href);
+
+// ---- the window: a memory cap in bytes, oldest frame out first
+const rec = new Recording({snapEvery: 6, frameBytes: 100, capBytes: 1000, keyBytes: 1e9, keyEvery: 60});
+assert.equal(rec.capFrames, 10);
+const evicted = [];
+for (let k = 1; k <= 25; k++) evicted.push(...rec.push(k, {k}).frames.map((f) => f.k));
+assert.deepEqual([rec.lo, rec.hi, rec.length], [16, 25, 10]);
+assert.deepEqual(evicted, Array.from({length: 15}, (_, i) => i + 1));
+assert.equal(rec.get(15), null); assert.equal(rec.get(16).k, 16); assert.equal(rec.get(25).k, 25); assert.equal(rec.get(26), null);
+assert.throws(() => rec.push(27, {}));                 // frames come in order
+
+// ---- playback: live follows at the pace given and never passes the newest; turbo is the newest
+const play = new Playback();
+play.set('live', rec); play.jump(16);
+assert.equal(play.advance(3.5, rec), 19);
+assert.equal(play.advance(100, rec), 25);
+assert.equal(play.advance(0, rec, {turbo: true}), 25);
+play.jump(16); assert.equal(play.advance(1, rec, {maxLead: 2}), 23);   // too far behind: skips ahead to within maxLead
+// replay: the window's first frame to its last, then holds
+play.set('replay', rec);
+assert.equal(play.advance(0, rec), 16);
+assert.equal(play.advance(4, rec), 20);
+assert.equal(play.advance(100, rec), 25); assert.equal(play.ended, true); assert.equal(play.advance(5, rec), 25);
+// bounce: forward then backward, for ever, inside the window
+play.set('bounce', rec);
+const seen = [];
+for (let i = 0; i < 40; i++) seen.push(play.advance(1, rec));
+assert.deepEqual(seen.slice(0, 11), [17, 18, 19, 20, 21, 22, 23, 24, 25, 24, 23]);
+assert.ok(seen.every((k) => k >= 16 && k <= 25));
+assert.ok(seen.includes(16) && seen.slice(18).includes(25));              // it turns at both ends
+assert.equal(play.advance(37.5, rec) >= 16, true);                        // a long step still reflects into the window
+
+// ---- continue is EXACT: a toy law with a runtime input, keyframes, and the input log
+const SNAP = 6, KEY = 60;
+const law = (s, g) => s * 1.0001 + g;                    // deterministic, input-dependent
+const run = new Recording({snapEvery: SNAP, frameBytes: 8, capBytes: 8 * 200, keyBytes: 1e9, keyEvery: KEY});
+let s = 1.5, g = -1, step = 0;
+run.setInputs(0, {g});
+const truth = new Map(), keys = new Map();
+const inputAt = (st) => (st === 70 ? 0.3 : st === 133 ? -0.2 : st === 500 ? 0.9 : null);
+for (let k = 1; k <= 160; k++) {
+  const target = k * SNAP;
+  for (; step < target; step++) {
+    const change = inputAt(step);
+    if (change !== null) { g = change; run.setInputs(step, {g}); }
+    s = law(s, g);
+  }
+  truth.set(k, s);
+  run.push(k, s);
+  if (target % KEY === 0) { keys.set(target, s); run.addKey(target, s, 8); }
+}
+assert.equal(run.length, 160);
+const replay = (f) => {
+  const plan = run.plan(f);
+  let state = plan.key ? plan.key.snap : 1.5, gg = plan.initial ? plan.initial.g : -1;
+  for (const op of plan.ops) { if (op.set) gg = op.set.g; else for (let i = 0; i < op.steps; i++) state = law(state, gg); }
+  return {state, plan};
+};
+for (const f of [1, 2, 11, 12, 23, 24, 60, 99, 100, 158, 160]) {
+  const {state, plan} = replay(f);
+  assert.equal(state, truth.get(f), `frame ${f}`);                         // bit for bit
+  assert.ok(plan.start <= plan.target);
+  if (f >= 10) assert.ok(plan.key !== null && plan.start % KEY === 0);      // from a keyframe, not from the start
+}
+// branching drops the future (frames, keys, inputs) and leaves the rest replayable
+const dropped = run.truncateAfter(100);
+assert.equal(run.hi, 100); assert.equal(dropped.frames.length, 60);
+assert.ok(run.keys.every((k) => k.step <= 600));
+assert.equal(replay(100).state, truth.get(100));
+
+// ---- a long run under the cap: the window slides, keyframes older than the window's start are dropped, replay still exact
+const slide = new Recording({snapEvery: SNAP, frameBytes: 8, capBytes: 8 * 30, keyBytes: 1e9, keyEvery: KEY});
+let t = 1.5, gg = -1, st = 0; slide.setInputs(0, {g: gg});
+const truth2 = new Map();
+for (let k = 1; k <= 400; k++) {
+  for (; st < k * SNAP; st++) { if (st % 97 === 0) { gg = ((st / 97) % 5) - 2; slide.setInputs(st, {g: gg}); } t = law(t, gg); }
+  truth2.set(k, t); slide.push(k, t);
+  if ((k * SNAP) % KEY === 0) slide.addKey(k * SNAP, t, 8);
+}
+assert.deepEqual([slide.lo, slide.hi], [371, 400]);
+assert.ok(slide.keys.length <= 5 && slide.keys[0].step <= slide.lo * SNAP);
+assert.ok(slide.inputs.length < 400 / 97 * 2);
+for (const f of [371, 380, 400]) {
+  const plan = slide.plan(f);
+  let state = plan.key ? plan.key.snap : 1.5, g2 = plan.initial ? plan.initial.g : -1;
+  for (const op of plan.ops) { if (op.set) g2 = op.set.g; else for (let i = 0; i < op.steps; i++) state = law(state, g2); }
+  assert.equal(state, truth2.get(f), `slid frame ${f}`);
+}
+// thinning: keyframes over their byte budget keep the oldest and the newest
+const thin = new Recording({snapEvery: SNAP, frameBytes: 8, capBytes: 8 * 1000, keyBytes: 50, keyEvery: KEY});
+for (let k = 1; k <= 100; k++) { thin.push(k, k); if ((k * SNAP) % KEY === 0) thin.addKey(k * SNAP, k, 8); }
+assert.ok(thin.keyBytesUsed <= 50 + 8 && thin.keys[0].step === 60 && thin.keys.at(-1).step === 600);
+console.log('ok');
+"""
+
+JS_GRAVITY = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {gravityInScreen, gravityFromAcceleration, GravitySensor} = await import(pathToFileURL(`${dir}/gravity.js`).href);
+const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} vs ${b}`);
+let g = gravityInScreen(90, 0, 0); near(g[0], 0); near(g[1], -1);              // held upright: straight down the screen
+g = gravityInScreen(0, 0, 0); near(g[0], 0); near(g[1], 0);                     // lying flat: no pull in the screen's plane
+g = gravityInScreen(60, 0, 0); near(g[0], 0); near(g[1], -Math.sin(Math.PI / 3));      // tipped back 30 degrees
+g = gravityInScreen(0, 30, 0); near(g[0], 0.5); near(g[1], 0);                  // flat, right edge down
+g = gravityInScreen(0, -90, 90); near(g[0], 0); near(g[1], -1);                 // landscape (screen angle 90): still down the screen
+g = gravityFromAcceleration(0, 9.81, 0, 0, true); near(g[0], 0); near(g[1], -1);    // Android upright reads +y; gravity is the other way
+g = gravityFromAcceleration(0, -9.81, 0, 0, false); near(g[0], 0); near(g[1], -1); // iOS reads the opposite
+
+// the sensor: nothing listens until the first tap on iOS; the tap asks permission; the off switch releases the gravity
+const listeners = {}, calls = [];
+const win = {DeviceOrientationEvent: {requestPermission: async () => 'granted'}, screen: {orientation: {angle: 0}},
+             addEventListener: (type, fn) => { listeners[type] = fn; }};
+const states = [];
+const sensor = new GravitySensor({win, onGravity: (x, y) => calls.push([x, y]), onState: (s) => states.push(s)});
+sensor.start();
+assert.deepEqual(Object.keys(listeners), []);                                   // iOS: no events before a gesture
+await sensor.grant();
+assert.ok(listeners.deviceorientation); assert.equal(sensor.enabled, true);
+listeners.deviceorientation({beta: 90, gamma: 0});
+assert.equal(calls.length, 1); near(calls[0][1], -1); assert.equal(sensor.state, 'on');
+listeners.deviceorientation({beta: null, gamma: null});                          // a desktop's empty event is ignored
+assert.equal(calls.length, 1);
+sensor.enabled = false;
+assert.deepEqual(calls.at(-1), [null, null]); assert.equal(sensor.state, 'off');
+const denied = new GravitySensor({win: {...win, DeviceOrientationEvent: {requestPermission: async () => 'denied'}, addEventListener: () => { throw new Error('must not listen'); }}, onGravity: () => {}});
+assert.equal(await denied.grant(), 'denied');
+// elsewhere (no permission API) it listens at once and is on by default
+const plain = {addEventListener: (type, fn) => { listeners['plain' + type] = fn; }, screen: {orientation: {angle: 0}}};
+const other = new GravitySensor({win: plain, onGravity: (x, y) => calls.push([x, y])});
+assert.equal(other.enabled, true); other.start(); assert.ok(listeners.plaindeviceorientation);
+console.log('ok');
+"""
+
+
+def _run_node(tmp_path, script: str, *modules: str) -> str:
+    for name in modules:
+        shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / name, tmp_path / name)
+    (tmp_path / "run.mjs").write_text(script, encoding="utf-8")
+    done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
+    assert done.returncode == 0, (done.stdout + done.stderr)[-2500:]
+    return done.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's recording logic")
+def test_the_recording_window_playback_and_continue_are_exact(tmp_path):
+    """The page's recording (a memory-capped sliding window with keyframes and an input log), its Replay / Bounce /
+    live cursor, and the Continue plan: a frame's state rebuilt from a keyframe plus the logged inputs equals the run."""
+    assert _run_node(tmp_path, JS_RECORDING, "recording.js").strip() == "ok"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's gravity code")
+def test_the_phone_orientation_gives_the_screen_plane_gravity_and_the_sensor_asks_on_a_tap(tmp_path):
+    assert _run_node(tmp_path, JS_GRAVITY, "gravity.js").strip() == "ok"
