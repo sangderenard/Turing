@@ -259,9 +259,9 @@ AIM_SLOPE = 1.2
 #: POP_MAX); one destroyed returns RESPAWN / tempo seconds later, FAR_MIN..
 #: FAR_MAX radians of arc away.  They hunt head on: steering for a point LEAD
 #: ahead on the player's path, holding course for a pass inside PASS_R.
-POP_BASE, POP_STEP, POP_MAX = 5.0, 3.0, 18.0
-RESPAWN = 6.0
-FAR_MIN, FAR_MAX = 0.7, 1.6
+POP_BASE, POP_STEP, POP_MAX = 7.0, 3.0, 18.0
+RESPAWN = 2.5
+FAR_MIN, FAR_MAX = 0.4, 0.8
 ARRIVE = 14.0                # the boss and aces arrive this far ahead
 LEAD, PASS_R, HUNT_GAIN = 18.0, 3.5, 1.5
 TURN_IN = 15.0

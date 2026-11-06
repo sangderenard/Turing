@@ -953,6 +953,13 @@ function uploadMaterials(game) {
   }
   ARCADE.colours.forEach((c, ci) => ARCADE_LEVELS.forEach((level, li) =>
     records.push([`bulb${ci}_${li}`, c.map((v) => 0.25 * v), { emission: c.map((v) => v * level), roughness: 0.2 }])));
+  // The rocket's aeronautic marker lights: red port, green starboard, white
+  // tail, and the white anti-collision strobe (dark between flashes).
+  records.push(["nav_red", [0.3, 0.02, 0.02], { emission: [2.6, 0.12, 0.1], roughness: 0.2 }]);
+  records.push(["nav_green", [0.02, 0.3, 0.06], { emission: [0.1, 2.4, 0.5], roughness: 0.2 }]);
+  records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
+  records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [6.0, 6.0, 6.2], roughness: 0.2 }]);
+  records.push(["nav_off", [0.12, 0.12, 0.13], { roughness: 0.3 }]);
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -1202,6 +1209,29 @@ function headlights(cam) {
 }
 // A bomb's blast lights the scene in its own glow colour (the game's
 // emissive palette entry for it), flaring and fading over its life.
+// MARKER LIGHTS on the player's rocket (aeronautic: red port wingtip, green
+// starboard, white tail, a white strobe double-flashing every 1.2 s), riding
+// the drawn ship (nose up the screen: port is -x), scaled with its height.
+// Not drawn from inside the cockpit.
+function markerLights(now) {
+  const game = state.game;
+  if (state.flat || state.camMode === "nose" || !game || game.input !== "realtime" || !game.predict || !game.you || !game.you.alive) return [];
+  const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
+  if (!ship) return [];
+  // the drawn size grows with height (DEPTH_SCALE), as placeEntity draws it
+  const depth = game.predict.depth, hRel = depth ? Math.max(0, Math.min(1, (ship.h || 0) / depth)) : 0;
+  const grow = depth ? DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel : 1;
+  const at = worldOf(ship), s = (ship.size || 0.5) * grow;
+  const phase = now % 1.2, strobe = phase < 0.06 || (phase > 0.16 && phase < 0.22);
+  const put = (dx, dz, up = 0.55) => [at[0] + dx * s, at[1] + up * s, at[2] + dz * s];
+  const bulb = 0.22 * s;                      // big enough to read at a glance
+  return [
+    { at: put(-0.85, 0.3), material: "nav_red", size: bulb, light: [1.0, 0.08, 0.06], intensity: 1.6 },
+    { at: put(0.85, 0.3), material: "nav_green", size: bulb, light: [0.08, 1.0, 0.3], intensity: 1.6 },
+    { at: put(0, 1.25, 0.45), material: "nav_white", size: bulb * 0.9, light: [1, 1, 0.95], intensity: 1.0 },
+    { at: put(0, 0.1, 0.75), material: strobe ? "nav_strobe" : "nav_off", size: bulb * 1.1, light: [1, 1, 1], intensity: strobe ? 9.0 : 0.0 },
+  ];
+}
 function blastLights(cam, now) {
   const glow = (state.game && state.game.emissive) || {}, lights = [];
   if (state.flat) return lights;
@@ -2749,6 +2779,7 @@ function litPass(cam, now, casters, opts = {}) {
   // the cloud, the impact and the bolt's middle, fading with the strike.
   bulbLights.push(...lightningLights(cam, now));
   bulbLights.push(...blastLights(cam, now));
+  for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
@@ -2806,6 +2837,7 @@ function litPass(cam, now, casters, opts = {}) {
       const step = ARCADE_LEVELS.reduce((best, v, k) => (Math.abs(v - 2.4 * level) < Math.abs(ARCADE_LEVELS[best] - 2.4 * level) ? k : best), 0);
       drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${ci}_${step}`]);
     });
+    for (const nav of markerLights(now)) drawLit(orb.vao, orb.count, M.multiply(M.translate(...nav.at), M.scale(nav.size, nav.size, nav.size)), state.materialIndex[nav.material]);
   }
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
