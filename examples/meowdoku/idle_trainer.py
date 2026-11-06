@@ -296,9 +296,11 @@ class IdleTrainer:
         ps = self.passes[name]
         data = ps["data"]
         key = f"{os.getpid()}:{name}"
+        ap.TRAINING[name] = True                                    # the page's learn panel shows a pass running
         while ps["done"] < self.steps_per_pass:
             if not self.idle():                                     # play resumed: stop NOW, keep the pass
                 self.paused_count += 1
+                ap.TRAINING[name] = False
                 return {"game": name, "status": "paused", "steps": ps["done"]}
             first = ps["done"] == 0
             args = (key, {n: v.copy() for n, v in ps["params"].items()} if first else None,
@@ -337,10 +339,26 @@ class IdleTrainer:
         self.seen[name] = ps["counts"]
         self._save_state()
         self.results.append(record)
+        ap.TRAINING[name] = False
+        self._announce(name, record)
         self.log(f"[idle-trainer] {name} {record['arch']}: {record['rows']} rows "
                  f"(human spans {data['report']['human_spans']}, self {data['report']['self_spans']}, teacher {data['report']['teacher_rows']}) "
                  f"val loss {before:.4f} -> {after:.4f} {record['status']}")
         return record
+
+    def _announce(self, name: str, record: dict) -> None:
+        """The pass on the page: the same learn status and history the post-game trainer writes, so the
+        learn panel flashes, charts the loss and names the pass (adopted or kept)."""
+        rep = record
+        label = (f"idle pass ({record['status']}): {rep.get('human_spans', 0)} of your spans, "
+                 f"{rep.get('self_spans', 0)} self-play, val {record['val_before']:.4f} -> {record['val_after']:.4f}")
+        ap.LEARN_STATUS[name] = {"last": label, "rows": record["rows"], "loss": round(float(record["val_after"]), 4),
+                                 "at": time.strftime("%H:%M:%S"), "idle_t": time.time()}
+        ap._history(name, kind="trained", loss=round(float(record["val_after"]), 5), rows=record["rows"], label=label)
+        try:
+            ap._save_learning()
+        except Exception:  # noqa: BLE001 - the record is a convenience
+            pass
 
     def _submit(self, key, params, x, y, p, steps):
         if self.remote:
@@ -360,6 +378,7 @@ class IdleTrainer:
                 except Exception as error:  # noqa: BLE001 - learning must never take the server down
                     self.log(f"[idle-trainer] {name}: pass failed: {type(error).__name__}: {str(error)[:120]}")
                     self.passes.pop(name, None)
+                    ap.TRAINING[name] = False
                     self.seen[name] = self._counts(name)
                 worked += 1
         return worked

@@ -1695,4 +1695,6 @@ def learning_summary(name: str) -> dict:
                    "span_rows": SPAN_ROWS, "flush_rows": FLUSH_ROWS}
     return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name],
             "training": bool(TRAINING.get(name)), "history": list(LEARN_HISTORY.get(name, ())),
-            "network": network, **LEARN_STATUS.get(name, {})}
+            "network": network, **LEARN_STATUS.get(name, {}),
+            # seconds since the background (idle) trainer last finished a pass on this game, None if never
+            "idle_age": (time.time() - LEARN_STATUS[name]["idle_t"]) if "idle_t" in LEARN_STATUS.get(name, {}) else None}

@@ -1544,7 +1544,20 @@ const bolt = { vao: null, buffers: null };
 function worldOf(piece) {
   const depth = state.game && state.game.predict && state.game.predict.depth;
   const lift = depth ? (piece.h || 0) * DEPTH_LIFT : 0;
-  return [piece.x, TILE.height + 0.2 + lift - planetDrop(piece.x, piece.z), piece.z];
+  return [piece.x, TILE.height + 0.2 + lift + cardRise(piece) - planetDrop(piece.x, piece.z), piece.z];
+}
+// How far placeEntity raised a card above the old anchor when it began counting the card's thickness
+// (centre at scale0 (sin lean + thick cos lean) + 0.01, where it was scale0 sin lean + 0.04): the gear
+// set on a body (marker lights, headlights, flame, reticles) is placed against worldOf, so it rises
+// by the same amount and stays on the hull.  A point with no size (a bare position) is not a card.
+function cardRise(piece) {
+  if (!piece.size || state.flat) return 0;
+  const mesh = state.meshes && state.meshes[piece.mesh];
+  const thick = mesh && mesh.half ? mesh.half[2] / mesh.half[1] : 0;
+  const depth = state.game && state.game.predict && state.game.predict.depth;
+  const hRel = depth ? Math.max(0, Math.min(1, (piece.h || 0) / depth)) : null;
+  const grow = hRel == null ? 1 : DEPTH_SCALE[0] + (DEPTH_SCALE[1] - DEPTH_SCALE[0]) * hRel;
+  return piece.size * grow * thick * Math.cos(piece.lean ?? 0.55) - 0.03;
 }
 function jagged(a, b, depth, roughness) {
   let points = [a, b];
@@ -1937,20 +1950,23 @@ function drawReticle(now, drawLit) {
     drawLit(mesh.vao, mesh.count, M.multiply(M.translate((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2),
       M.multiply(M.rotateY(Math.atan2(dx, dz)), M.scale(w, w, len))), null);
   };
-  const world = (x, z, h) => worldOf({ x: x + pred.offset[0], z: z + pred.offset[1], h });
+  const own = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
+  const card = (piece) => piece ? { size: piece.size, mesh: piece.mesh, lean: piece.lean } : {};
+  const world = (x, z, h, like) => worldOf({ x: x + pred.offset[0], z: z + pred.offset[1], h, ...card(like) });
   // the sight: where a shot is a few units out along the mount (yaw right of the nose, climbing at the pitch it carries)
   const D = 4.0, my = 2 * Math.atan((ship.mount_yaw || 0) / 2);        // (the mount turns by the Cayley half-angle: 2 atan(m / 2))
   const sh = Math.max(0, Math.min(depth, (ship.z || 0) + D * cfg.slope * (ship.mount_pitch || 0)));
-  ring(world(patch.cx + D * Math.sin(my), patch.cy - D * Math.cos(my), sh), 0.16, "sight", 0.035, 8);
+  ring(world(patch.cx + D * Math.sin(my), patch.cy - D * Math.cos(my), sh, own), 0.16, "sight", 0.035, 8);
   if (!(ship.lock > 0.5) || !pred.aim || !game.predict.weapon) return;
   const tg = aimTarget({ ...ship });
   if (!tg) return;
-  ring(world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz), 0.6 + 0.04 * Math.sin(now * 6), "reticle", 0.05, 14);
+  const foe = aimLock.piece;                                         // the locked body (lockedBody keeps it)
+  ring(world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz, foe), 0.6 + 0.04 * Math.sin(now * 6), "reticle", 0.05, 14);
   const a = pred.aim.invoke({ X: tg.X, Y: tg.Y, X2: tg.X2, Y2: tg.Y2, step: cfg.step, tspd: tg.tspd,
     shot_spd: game.predict.weapon.speed + (ship.spd || 0), dz: tg.dz, tvz: tg.tvz, slope: cfg.slope, pitch: 0,
     yaw_half: cfg.travel[0], pitch_half: cfg.travel[1] });
-  const target = world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz);
-  const lead = world(patch.cx + a.lead_x, patch.cy - a.lead_y, Math.max(0, Math.min(depth, (ship.z || 0) + tg.dz + tg.tvz * a.tau)));
+  const target = world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz, foe);
+  const lead = world(patch.cx + a.lead_x, patch.cy - a.lead_y, Math.max(0, Math.min(depth, (ship.z || 0) + tg.dz + tg.tvz * a.tau)), foe);
   line(target, lead, "reticle");
   ring(lead, 0.22, "reticle", 0.04, 8);
 }
@@ -4734,9 +4750,11 @@ for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) 
 // grey skipped under the running average), a line of training loss, and a
 // flash each time a pass completes.
 const learnView = { lastTrained: null, flashTimer: null };
+const IDLE_PANEL_S = 300;                                           // the panel stays up 5 min after an idle pass
 function drawLearnPanel(game) {
   const L = game && game.learning, panel = $("learn-panel");
-  const on = !!(L && L.demo_learning);
+  // shown while demo learning is on, while a pass runs, and for a while after the idle trainer finished one
+  const on = !!(L && (L.demo_learning || L.training || (L.idle_age != null && L.idle_age < IDLE_PANEL_S)));
   panel.classList.toggle("show", on);
   if (!on) return;
   panel.classList.toggle("training", !!L.training);
@@ -4764,7 +4782,8 @@ function drawLearnPanel(game) {
   const netText = net ? (net.arch === "token" ? `token net · ${net.tokens} bodies · ${net.params.toLocaleString()} weights · ${net.outputs} controls`
                                               : `MLP · ${net.params.toLocaleString()} weights · ${net.outputs} controls`) : "no network yet";
   $("learn-text").textContent = `${netText} · ${spans.length} span flushes · ${runs.filter((r) => r.kept).length} of ${runs.length} runs kept`
-    + (last ? ` · last pass loss ${last.loss} on ${last.rows} rows (${last.at})` : " · waiting for a span of action");
+    + (last ? ` · last pass loss ${last.loss} on ${last.rows} rows (${last.at})${last.label && last.label.startsWith("idle") ? " · " + last.label : ""}`
+            : " · waiting for a span of action");
   if (last && last.at !== learnView.lastTrained) {
     if (learnView.lastTrained !== null) {
       panel.classList.add("flash"); clearTimeout(learnView.flashTimer);
