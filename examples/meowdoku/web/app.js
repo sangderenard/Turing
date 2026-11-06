@@ -1979,6 +1979,27 @@ function entityModel(piece, now) {
 // each landed step (game.authority).  The rest of the world is always the
 // server's, extrapolated between snapshots.
 const drawnShip = { page: 0, server: 0, at: null };
+// A game's selectable MODES (game.modes: labels and which are on): one
+// toggle each, sent as {"type": "mode", name, on}; the law reads it.
+function renderModes(game) {
+  const box = $("modes"), modes = game && game.modes;
+  if (!box) return;
+  if (!modes) { if (box.childElementCount) box.replaceChildren(); return; }
+  const key = `${game.game}:${Object.keys(modes.labels).join(",")}`;
+  if (box.dataset.key !== key) {
+    box.dataset.key = key;
+    box.replaceChildren(...Object.entries(modes.labels).map(([name, label]) => {
+      const tag = document.createElement("label"), input = document.createElement("input");
+      input.type = "checkbox"; input.dataset.mode = name;
+      input.onchange = () => act({ type: "mode", name, on: input.checked });
+      tag.append(label + " ", input);
+      return tag;
+    }));
+  }
+  for (const input of box.querySelectorAll("input[data-mode]")) {
+    if (document.activeElement !== input) input.checked = !!modes.on[input.dataset.mode];
+  }
+}
 function authorityText(game) {
   const a = game && game.authority;
   if (!a) return "";
@@ -2396,6 +2417,7 @@ function applyState(game) {
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
+  renderModes(game);
   const authority = authorityText(game);
   status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
   $("hud").textContent = `${game.status}${best}`;

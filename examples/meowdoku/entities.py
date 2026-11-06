@@ -624,6 +624,8 @@ class EntityGame(Game):
         st["sync_hint"] = self.sync_hint()
         st["autopilot"] = self.autopilot
         st["controls"] = list(self.CONTROLS)           # the control names this game's law takes
+        if getattr(self, "MODES", None):
+            st["modes"] = {"labels": dict(self.MODES), "on": self.modes()}
         from meowdoku.autopilot import FEATURE_FUNCTIONS, learning_summary
         if self.game in FEATURE_FUNCTIONS:
             st["learning"] = learning_summary(self.game)

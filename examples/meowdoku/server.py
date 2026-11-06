@@ -153,6 +153,10 @@ class Table:
             self.game.power(str(payload.get("kind", "")))
         elif kind == "palette":
             self.game.set_palette(str(payload.get("name", "")))
+        elif kind == "mode":
+            if not hasattr(self.game, "set_mode"):
+                raise ValueError("this game has no modes")
+            self.game.set_mode(str(payload.get("name", "")), bool(payload.get("on")))
         elif kind in ("submit", "backspace", "undo", "reset"):
             getattr(self.game, kind)()
             if kind in ("undo", "reset"):

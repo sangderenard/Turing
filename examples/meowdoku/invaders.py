@@ -14,6 +14,10 @@ Lanes:
     6            the saucer
     7..61        the fleet: 5 rows x 11 columns
     62..85       four shields of 3 x 2 blocks, 3 hp each
+    86..109      FREE FIRE shots: with the ``freefire`` setting on, every
+                 volley sprays SPRAY_N shots into these lanes on a short
+                 reload, fanned and jittered by the law's dice (lane 1, the
+                 arcade's one shot, rests); off, these rest and lane 1 fires
 
 Columns (one value per lane; game-wide values are broadcast to every lane):
     lane, slot, home_x, home_y, points, rx, ry, home_hp      static
@@ -52,7 +56,10 @@ FLEET_ROWS, FLEET_COLS = 5, 11
 FLEET0 = 7
 SHIELD0 = FLEET0 + FLEET_ROWS * FLEET_COLS
 SHIELDS, SHIELD_COLS, SHIELD_ROWS = 4, 3, 2
-LANES = SHIELD0 + SHIELDS * SHIELD_COLS * SHIELD_ROWS
+SPRAY_LANES = (SHIELD0 + SHIELDS * SHIELD_COLS * SHIELD_ROWS, SHIELD0 + SHIELDS * SHIELD_COLS * SHIELD_ROWS + 24)
+LANES = SPRAY_LANES[1]
+#: Free fire: shots a volley, the fan between them, the dice's spread, the reload.
+SPRAY_N, SPRAY_FAN, SPRAY_JITTER, FREE_RELOAD = 3.0, 0.16, 0.22, 0.09
 INVADERS = float(FLEET_ROWS * FLEET_COLS)
 
 LIVES = 3.0
@@ -120,7 +127,7 @@ def _hash(value):
 
 def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
                   alive, x, y, vx, vy, hp, boom, born, owner, energy,
-                  score, lives, wave, fleet_dir, clock, ufo_clock, field_w,
+                  score, lives, wave, fleet_dir, clock, ufo_clock, reload, field_w, freefire,
                   move_axis, steer_x, fire, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     n = int(lane.shape[0])
@@ -148,8 +155,17 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     player_x = (f(player_live) * x).sum()
     player_on = f(player_live).sum() > 0.0
 
-    # Spawns.  Shot: whenever fire is held and the one shot lane is free.
-    shot_spawn = is_shot & ~live & (fire > 0.0) & player_on & playing
+    # Spawns.  Shot: whenever fire is held and the one shot lane is free --
+    # or, in free fire, a sprayed volley whenever the reload has run out.
+    spraying = freefire > 0.0
+    classic_shot = is_shot & (lane == 1.0) & ~live & (fire > 0.0) & player_on & playing & ~spraying
+    reload_now = (f(is_player) * reload).sum()
+    volley = (fire > 0.0) & player_on & playing & spraying & (reload_now <= 0.0)
+    free_spray = is_shot & ~live & (lane >= SPRAY_LANES[0])
+    spray_rank = f(free_spray).cumsum(dim=0) - 1.0
+    spray_shot = free_spray & (spray_rank < SPRAY_N) & volley
+    spray_angle = (spray_rank - 0.5 * (SPRAY_N - 1.0)) * SPRAY_FAN + (_hash(lane * 1.7 + clock * 13.1) - 0.5) * SPRAY_JITTER
+    shot_spawn = classic_shot | spray_shot
     # Bombs: the dice pick a front invader (nothing alive below it in its
     # column) and the first free bomb lane carries its bomb.
     hx1, hx2 = home_x.reshape((n, 1)), home_x.reshape((1, n))
@@ -176,15 +192,19 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     ufo_clock_next = where(ufo_launched, 14.0 + 10.0 * _hash(clock * 5.3), ufo_clock - dt)
 
     spawn = shot_spawn | bomb_spawn | ufo_spawn
-    x1 = where(shot_spawn, player_x, where(bomb_spawn, shooter_x, where(ufo_spawn, ufo_x0, x)))
+    x1 = where(shot_spawn, player_x + where(spray_shot, (spray_rank - 0.5 * (SPRAY_N - 1.0)) * 0.15, 0.0),
+               where(bomb_spawn, shooter_x, where(ufo_spawn, ufo_x0, x)))
     y1 = where(shot_spawn, PLAYER_Y - MUZZLE, where(bomb_spawn, shooter_y + 0.5, where(ufo_spawn, UFO_Y, y)))
     # The rocket: the shared damped motion law (entity_motion.damped_axis),
     # the same text the page runs as WebAssembly to predict its own ship.
     ship_x, ship_v = damped_axis(x, vx, move_axis, steer_x, x * 0.0 + 0.7, field_w - 0.7,
                                  PLAYER_SPEED, SHIP_TAU, SHIP_REACH, dt)
     vx1 = where(is_player, ship_v,
-                where(is_inv, fleet_dir_next * speed, where(ufo_spawn, ufo_vx0, where(spawn, 0.0, vx))))
-    vy1 = where(shot_spawn, -SHOT_SPEED, where(bomb_spawn, BOMB_SPEED, where(spawn, 0.0, vy)))
+                where(is_inv, fleet_dir_next * speed, where(ufo_spawn, ufo_vx0,
+                      where(spray_shot, SHOT_SPEED * spray_angle.sin(), where(spawn, 0.0, vx)))))
+    vy1 = where(spray_shot, -SHOT_SPEED * spray_angle.cos(),
+                where(shot_spawn, -SHOT_SPEED, where(bomb_spawn, BOMB_SPEED, where(spawn, 0.0, vy))))
+    reload_next = where(is_player, where(volley, FREE_RELOAD, (reload - dt).clip(0.0, 1.0)), reload)
     live1 = live | spawn
     # Born at the start of the step: a spawn leaves the muzzle at x1/y1 and flies
     # the whole step, so position = birth point + velocity x (clock - born).
@@ -197,7 +217,7 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     y2 = where(moving & is_inv, y1 + fleet_dy, where(moving, y1 + vy1 * dt, y1))
     x2 = where(is_player & moving, ship_x, x2)
     vx_out = where(is_player & ~moving, 0.0, vx1)
-    gone = (((is_shot | is_bomb) & ((y2 < -0.5) | (y2 > HEIGHT + 0.5)))
+    gone = (((is_shot | is_bomb) & ((y2 < -0.5) | (y2 > HEIGHT + 0.5) | (x2 < -0.5) | (x2 > field_w + 0.5)))
             | (is_ufo & ((x2 < -1.5) | (x2 > field_w + 1.5))))
     live2 = live1 & ~gone
 
@@ -252,14 +272,14 @@ def invaders_step(lane, slot, home_x, home_y, points, rx, ry, home_hp,
     dt_limit = (0.5 / (pace.max() + 1e-6)).clip(0.0, 0.5 * SHIP_TAU) + x * 0.0
     residual = f(is_inv & live4).sum() + x * 0.0
     return (f(live4), x4, y4, vx4, vy1, hp2, boom3, born4, owner1, energy_next,
-            score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next,
+            score_next, lives_next, wave_next, fleet_dir_out, clock_next, ufo_clock_next, reload_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "vx", "vy", "hp", "boom", "born", "owner", "energy",
-         "score", "lives", "wave", "fleet_dir", "clock", "ufo_clock")
+         "score", "lives", "wave", "fleet_dir", "clock", "ufo_clock", "reload")
 #: Read by the law, written by the host only (a layout change), never stepped.
-SETTINGS = ("field_w",)
+SETTINGS = ("field_w", "freefire")
 
 
 class InvadersPiece(LawPiece):
@@ -295,6 +315,8 @@ def layout(width: float = WIDTH) -> dict[str, np.ndarray]:
     home_hp = np.ones(LANES)
     rx[0], ry[0] = SHIP_RX, SHIP_RY                 # the rocket's drawn body
     slot[1], rx[1], ry[1] = SHOT, 0.08, 0.28
+    for k in range(*SPRAY_LANES):
+        slot[k], rx[k], ry[k] = SHOT, 0.08, 0.28
     for k in BOMB_LANES:
         slot[k], rx[k], ry[k] = BOMB, 0.16, 0.24
     slot[UFO_LANE], rx[UFO_LANE], ry[UFO_LANE], points[UFO_LANE], home_y[UFO_LANE] = UFO, 0.6, 0.35, 100.0, UFO_Y
@@ -318,7 +340,7 @@ def layout(width: float = WIDTH) -> dict[str, np.ndarray]:
             "points": points, "rx": rx, "ry": ry, "home_hp": home_hp}
 
 
-def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
+def initial_columns(width: float = WIDTH, freefire: bool = False) -> dict[str, np.ndarray]:
     columns = layout(width)
     slot = columns["slot"]
     starts = (slot == PLAYER) | (slot == INVADER) | (slot == SHIELD)
@@ -329,7 +351,8 @@ def initial_columns(width: float = WIDTH) -> dict[str, np.ndarray]:
         "energy": (slot == PLAYER).astype(np.float64),
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES), "wave": np.zeros(LANES),
         "fleet_dir": np.ones(LANES), "clock": np.zeros(LANES), "ufo_clock": np.full(LANES, 12.0),
-        "field_w": np.full(LANES, float(width)),
+        "reload": np.zeros(LANES),
+        "field_w": np.full(LANES, float(width)), "freefire": np.full(LANES, 1.0 if freefire else 0.0),
         "move_axis": np.zeros(LANES), "steer_x": np.full(LANES, -1.0), "fire": np.zeros(LANES),
     })
     return columns
@@ -341,15 +364,32 @@ class SpaceInvaders(EntityGame):
     width, height = WIDTH, HEIGHT
     CONTROLS = tuple(CONTROLS)
 
-    def __init__(self, board_id: str = "", aspect: float | None = None):
+    def __init__(self, board_id: str = "", aspect: float | None = None, freefire: bool = False):
         self.width = field_width(aspect)
+        self.freefire = bool(freefire)
         super().__init__(board_id)
 
     def make_piece(self):
         return InvadersPiece()
 
     def initial_columns(self) -> dict[str, np.ndarray]:
-        return initial_columns(self.width)
+        return initial_columns(self.width, self.freefire)
+
+    #: Selectable modes (the page shows a toggle for each): FREE FIRE sprays
+    #: volleys instead of the arcade's one shot on the screen at a time.
+    MODES = {"freefire": "Free fire"}
+
+    def modes(self) -> dict[str, bool]:
+        return {"freefire": self.freefire}
+
+    def set_mode(self, name: str, on: bool) -> None:
+        """A host write, like the layout: the law reads it as a setting."""
+        if name != "freefire":
+            raise ValueError(f"no mode {name!r}")
+        self.freefire = bool(on)
+        if self.session.state is not None:
+            self.session.column("freefire")[...] = 1.0 if self.freefire else 0.0
+        self.epoch += 1
 
     PLAYER_LANE = 0
 
@@ -359,8 +399,11 @@ class SpaceInvaders(EntityGame):
                 # The weapon, as the law fires it: one shot in flight, from
                 # the nose, straight up -- so the page can show its own shot
                 # leaving the muzzle the moment fire is held.
-                "weapon": {"muzzles": [[0.0, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED], "reload": 0.0,
-                           "max_in_flight": 1, "mesh": "bolt", "color": "bolt", "size": 0.26}}
+                # (In free fire the spray's angles are the law's dice: the page
+                # waits for the server's shots instead of guessing them.)
+                **({} if self.freefire else {
+                    "weapon": {"muzzles": [[0.0, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED], "reload": 0.0,
+                               "max_in_flight": 1, "mesh": "bolt", "color": "bolt", "size": 0.26}})}
 
     def layout(self, aspect: float) -> None:
         """Fit the field to a new screen shape mid-game: the walls move and
