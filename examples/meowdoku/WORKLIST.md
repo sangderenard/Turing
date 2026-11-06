@@ -7,10 +7,6 @@ deploy to 8766 as soon as work lands.
 ## In flight (workers)
 
 - **Fountain stage A:** nozzle energy (the ymax 3.7 vs 2.6 ballistic ceiling), symmetry, particle conservation, energy-aware settle, basin fills the screen aspect. The "graph forward WASM compile failed (5)" build error must be fixed.
-- **Platformers** (platformer, side scroller, delve): better gravity law and z clipping.
-- **Platformer lights:** drop the rocket shield and marker lights; one intent-aimed cone spotlight (control input or acceleration, smoothed; velocity as the fallback).
-- **Character picker:** a persistent emoji character chosen from a tile set on the left (stored in the profile), replacing the hardcoded frog and similar sprites in platformer-style games.
-- **Platformer level generator:** an ice-climber style climb of wide floors, each reachable under the jump law (proved in a test). No impossible single-brick maps.
 
 ## Autopilot follow-ups (the base landed in 727be7c2)
 
@@ -20,6 +16,8 @@ deploy to 8766 as soon as work lands.
   - tilequest: rushing the nearest monster scores below standing still;
   - delve: it dies in rooms and reaches the goal in about 1 of 6 seeds.
 - The platformer and side scroller students are far below their teachers (overfit): more data and DAgger rounds.
+- The platformer weights were trained on the old level (the climber was rebuilt in 492dc368): retrain, or let the idle trainer adapt.
+- The board `pieceModel` path still leaves out card thickness (the entity games were fixed).
 - Verify the live, end-to-end demo handoff for the new games on 8766.
 
 ## Fountain queue (next, in order)
