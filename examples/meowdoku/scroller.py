@@ -127,7 +127,7 @@ CHAIN_R = 2.6
 STORM_QUIET = 10.0
 STORM_RATE = 0.06
 STORM_MAX = 2
-THUNDER_RATE = 0.9
+THUNDER_RATE = 2.4          # storms strike often: the nearest craft in reach, else the ground (harmless)
 THUNDER_CHAIN_R = 3.5
 LIGHTNING_DAMAGE = 4.0
 LIGHTNING_HIT = 25.0
@@ -451,8 +451,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     striking = f(striker).sum() > 0.0
     lx, ly, lz = (f(striker) * x2).sum(), (f(striker) * y2).sum(), (f(striker) * z2).sum()
     reach_l = ((x2 - lx) * (x2 - lx) + (y2 - ly) * (y2 - ly)).sqrt()
-    chain = where((f(striker) * kind1).sum() == THUNDER, THUNDER_CHAIN_R, CHAIN_R)
-    struck = striking & live2 & (is_enemy | is_player) & (reach_l < chain)
+    storm_strike = (f(striker) * kind1).sum() == THUNDER
+    chain = where(storm_strike, THUNDER_CHAIN_R, CHAIN_R)
+    in_reach = striking & live2 & (is_enemy | is_player) & (reach_l < chain)
+    # A rain cloud's strike chains to everything in reach; a thunderstorm's
+    # takes the closest craft only (nothing in reach: a harmless ground strike).
+    closest = first_of(in_reach & (where(in_reach, reach_l, 1.0e9) == where(in_reach, reach_l, 1.0e9).min()), lane)
+    struck = where(storm_strike, closest, in_reach)
     zapped = f(struck & is_player).sum() > 0.0
     hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy))
     killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
