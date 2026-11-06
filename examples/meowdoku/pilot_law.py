@@ -90,8 +90,8 @@ TOKENS, TOKEN_H, HEAD_H, QUERIES, ACT = _ACTIVE["tokens"], _ACTIVE["h"], _ACTIVE
 TOKEN_FEATURES = SHIP_G + TOKENS * (TOKEN_F + 1)
 
 
-def features_of(tokens: int) -> int:
-    return SHIP_G + tokens * (TOKEN_F + 1)
+def features_of(tokens: int, ship: int = SHIP_G) -> int:
+    return ship + tokens * (TOKEN_F + 1)
 
 
 def slice_tokens(x, tokens_from: int, tokens_to: int):
@@ -105,13 +105,14 @@ def slice_tokens(x, tokens_from: int, tokens_to: int):
                            x[..., SHIP_G + n:SHIP_G + n + tokens_to]], axis=-1)
 
 
-def token_param_shapes(outputs: int = OUTPUTS, variant: str | None = None) -> dict[str, tuple[int, ...]]:
+def token_param_shapes(outputs: int = OUTPUTS, variant: str | None = None, ship: int = SHIP_G) -> dict[str, tuple[int, ...]]:
     """The network's parameter arrays by name: the law's declared parameter
-    inputs (of ``variant``, default the process's active one)."""
+    inputs (of ``variant``, default the process's active one).  ``ship``: the
+    width of the own-state block (a declared game's carries its map patch)."""
     spec = _ACTIVE if variant is None else spec_of(variant)
     H, G, q = spec["h"], spec["g"], spec["q"]
     return {"We1": (TOKEN_F, H), "be1": (1, H), "We2": (H, H), "be2": (1, H),
-            "Q1": (H, 1), "Q2": (H, 1) if q == 2 else (1, 1), "Wg": (SHIP_G, SHIP_H), "bg": (1, SHIP_H),
+            "Q1": (H, 1), "Q2": (H, 1) if q == 2 else (1, 1), "Wg": (ship, SHIP_H), "bg": (1, SHIP_H),
             "Wh1": (q * H + SHIP_H, G), "bh1": (1, G), "Wh2": (G, outputs), "bh2": (1, outputs)}
 
 
@@ -279,3 +280,26 @@ def decide(rows: tuple[int, int], c: dict, params: tuple):
     observation of ``observation`` through ``token_policy_forward`` with the
     law's parameter inputs ``params`` (in ``TOKEN_PARAMS`` order)."""
     return token_policy_forward(observation(rows, c), *params)
+
+
+# ----------------------------------------------------------------- the graph network
+#: THE SIMPLE GRAPH NETWORK, in the style of the scroller's ``enemy_brain`` and
+#: the walkers' ``Kind`` nets: a few gated hidden units over a compact feature
+#: set, each unit seeing only the features its mask row lets through, and an
+#: output layer of logits over the gates.  Gates are (tanh + 1) / 2 in [0, 1].
+#: The masks (``GM1``, ``GM2``) are PARAMETERS that are stored with the
+#: weights but never trained: they are the graph's edges.
+GRAPH_PARAMS = ("GW1", "Gb1", "GM1", "GW2", "Gb2", "GM2")
+GRAPH_TRAINED = ("GW1", "Gb1", "GW2", "Gb2")
+
+
+def graph_param_shapes(features: int, outputs: int, hidden: int = 12) -> dict[str, tuple[int, ...]]:
+    return {"GW1": (features, hidden), "Gb1": (1, hidden), "GM1": (features, hidden),
+            "GW2": (hidden, outputs), "Gb2": (1, outputs), "GM2": (hidden, outputs)}
+
+
+def graph_policy_forward(x, GW1, Gb1, GM1, GW2, Gb2, GM2):
+    """x (N, features) -> (N, outputs) in [-1, 1]: gates = (tanh(x (W1 * M1) + b1) + 1) / 2,
+    outputs = tanh(gates (W2 * M2) + b2).  AbstractTensor arithmetic only."""
+    gates = ((x @ (GW1 * GM1) + Gb1).tanh() + 1.0) * 0.5
+    return (gates @ (GW2 * GM2) + Gb2).tanh()
