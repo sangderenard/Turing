@@ -207,7 +207,7 @@ class MeowdokuGame(Game):
         s = self.session
         if not s.won:
             return None
-        return {"score": 100 * int(s.hearts) + 10 * self.n,
+        return {"score": 100 * int(s.hearts) + 10 * self.n, "lives": int(s.hearts), "board": str(self.board["id"]),
                 "detail": f"{self.n}x{self.n} solved with {int(s.hearts)} hearts in {self.moves} moves"}
 
     def set_palette(self, name: str) -> None:

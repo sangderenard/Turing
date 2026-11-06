@@ -59,6 +59,10 @@ class Table:
         self.web_dir = web_dir
         self.profiles = profiles
         self.player: str | None = None       # this session's profile name
+        self.player_token: str | None = None # the browser's long-lived player token (cookie)
+        self.last_award: dict | None = None  # points from the last finished game
+        self.bank_start: dict = {}           # a puzzle's banked power-ups at its start
+        self.free_start: dict = {}           # ... and its free ones (stock + ongoing extras)
         self.recorded = None                 # the game object whose result is on the profile
         self.lock = threading.RLock()
         database = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
@@ -75,10 +79,23 @@ class Table:
 
     def new(self, payload: dict) -> dict:
         kind = str(payload.get("game", "meowdoku"))
+        # A streak game left unsolved breaks its success streak.
+        previous = self.game
+        if (self.profiles is not None and self.player and previous is not None
+                and getattr(previous, "game", None) in ("meowdoku", "wordle")
+                and self.recorded is not previous and getattr(previous, "moves", 0) > 0):
+            self.profiles.break_streak(self.player, previous.game)
         # Games are views; the learner and the Lichess client are process-wide
         # background workers that a mode switch never stops.
         if kind == "meowdoku":
             self.game = MeowdokuGame(self.boards[str(payload["id"])], **({"palette": str(payload["palette"])} if payload.get("palette") else {}))
+            # The player's banked power-ups and any ongoing extras join the tray.
+            if self.profiles is not None and self.player:
+                bank, bonus = self.profiles.start_puzzle(self.player)
+                self.bank_start = {k: int(bank.get(k, 0)) for k in self.game.stock}
+                self.free_start = {k: self.game.stock[k] + int(bonus.get(k, 0)) for k in self.game.stock}
+                for k in self.game.stock:
+                    self.game.stock[k] = self.free_start[k] + self.bank_start[k]
         elif kind == "chess":
             self.game = Chess("chess")
         elif kind == "checkers":
@@ -151,7 +168,19 @@ class Table:
         elif kind == "hint":
             self.game.hint()
         elif kind == "power":
-            self.game.power(str(payload.get("kind", "")))
+            power = str(payload.get("kind", ""))
+            self.game.power(power)
+            # Free power-ups go first; past them, each one used spends the bank.
+            if self.profiles is not None and self.player and power in self.bank_start:
+                used = self.free_start[power] + self.bank_start[power] - self.game.stock[power]
+                self.profiles.set_bank(self.player, power, self.bank_start[power] - max(0, used - self.free_start[power]))
+        elif kind == "buy":
+            if self.profiles is None or not self.player:
+                raise ValueError("no player")
+            self.profiles.buy(self.player, str(payload.get("item", "")))
+        elif kind == "settings":
+            if self.profiles is not None and self.player and isinstance(payload.get("values"), dict):
+                self.profiles.save_settings(self.player, payload["values"])
         elif kind == "palette":
             self.game.set_palette(str(payload.get("name", "")))
         elif kind == "mode":
@@ -172,6 +201,8 @@ class Table:
         if self.profiles is not None and self.game is not None:
             st["player"] = self.player
             st["record"] = self.profiles.best(self.player, self.game.game)
+            st["inventory"] = self.profiles.inventory(self.player)
+            st["award"] = self.last_award
         return st
 
     def _record(self) -> None:
@@ -181,12 +212,15 @@ class Table:
         result = self.game.result()
         if result is not None:
             self.profiles.record(self.player, self.game.game, result)
+            self.last_award = self.profiles.award(self.player, self.game.game, result)
             if result.get("won") and result.get("level"):
                 self.profiles.defeated(self.player, self.game.game, int(result["level"]))
             self.recorded = self.game
 
     def set_player(self, payload: dict) -> dict:
         self.player = self.profiles.ensure(str(payload.get("name", "")))
+        if self.player_token:
+            self.profiles.bind(self.player_token, self.player)     # this browser is now that player
         return self.profile()
 
     def profile(self) -> dict:
@@ -200,6 +234,8 @@ class Table:
 # every request, so each sees "no game" and the page restarts in a loop.  The
 # default port keeps the historical name; any other port gets its own.
 COOKIE = "meowdoku_session"
+PLAYER_COOKIE = "meowdoku_player"      # the long-lived player identity (per port, like COOKIE)
+PLAYER_COOKIE_SECONDS = 2 * 365 * 24 * 3600
 SESSION_IDLE_SECONDS = 2 * 3600
 
 
@@ -259,7 +295,19 @@ def make_handler(sessions: Sessions):
             from http.cookies import SimpleCookie
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token, table, fresh = sessions.get(jar[COOKIE].value if COOKIE in jar else None)
-            self._set_cookie = f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax" if fresh else None
+            self._set_cookie = [f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"] if fresh else []
+            # The player: the browser's long-lived token names its profile; a
+            # browser without one gets a token and a generated name.
+            profiles = sessions.profiles
+            if profiles is not None and table.player_token is None:
+                held = jar[PLAYER_COOKIE].value if PLAYER_COOKIE in jar else None
+                name = profiles.by_token(held)
+                if name is None:
+                    held = secrets.token_urlsafe(24)
+                    name = profiles.generated_name()
+                    profiles.bind(held, name)
+                    self._set_cookie.append(f"{PLAYER_COOKIE}={held}; Path=/; Max-Age={PLAYER_COOKIE_SECONDS}; HttpOnly; SameSite=Lax")
+                table.player_token, table.player = held, name
             return table
 
         def _json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
@@ -268,8 +316,8 @@ def make_handler(sessions: Sessions):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            if getattr(self, "_set_cookie", None):
-                self.send_header("Set-Cookie", self._set_cookie)
+            for cookie in getattr(self, "_set_cookie", None) or ():
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(body)
 
@@ -386,9 +434,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
     prepare_predictor(web_dir)
-    global COOKIE
+    global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
+        PLAYER_COOKIE = f"meowdoku_player_{args.port}"
     from meowdoku import autopilot
     print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
     autopilot.load_learning()

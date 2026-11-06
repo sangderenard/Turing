@@ -79,6 +79,13 @@
   #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
             max-height: 70vh; overflow: auto; background: rgba(22,22,26,0.94); border: 1px solid #3a3a42; border-radius: 8px; padding: 10px 12px; }
   #scores.open { display: block; }
+  #shop { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
+          max-height: 70vh; overflow: auto; background: rgba(22,22,26,0.94); border: 1px solid #3a3a42; border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+  #shop.open { display: block; }
+  #shop h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
+  #shop .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
+  #shop .muted { opacity: 0.6; font-size: 12px; }
+  body.immersive #shop { display: none; }
   #scores h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
   #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
   #scores td { padding: 2px 4px; } #scores td.n { text-align: right; font-variant-numeric: tabular-nums; }
@@ -126,6 +133,7 @@
   <label>Crease <input id="crease" type="range" min="0" max="90" value="90"></label>
   <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
   <button id="scores-toggle">Scores</button>
+  <button id="shop-toggle" title="Points you have earned, and what they buy">Shop</button>
   <label title="The pinball ring of coloured lights around the board: off removes the bulbs and their light from the scene and brings the house light back up">Arcade lights <input id="arcade" type="checkbox"></label>
   <label title="The slab and glass plate under the board; off removes them from the scene (a game may also leave them out)">Plate <input id="plate" type="checkbox"></label>
   <label title="A glass screen above the field showing the wide-angle broadcast; tilt to see the real game beneath it">Projection glass <input id="projection" type="checkbox"></label>
@@ -137,6 +145,7 @@
   <span id="status">loading…</span>
 </div>
 <div id="scores"></div>
+<div id="shop"></div>
 <div id="hud"></div>
 <div id="learn-panel" aria-live="polite">
   <div id="learn-badge"><span class="dot"></span> LEARNING</div>

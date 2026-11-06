@@ -2152,6 +2152,7 @@ function renderWordleOptions(game) {
   box.dataset.key = key;
   const restart = () => {
     try { localStorage.setItem("wordleChoice", JSON.stringify(wordleChoice)); } catch (_) { /* private window */ }
+    saveSettings();
     newGame({ game: "wordle", seed: Math.floor(Math.random() * 100000), ...wordleChoice });
   };
   const pick = document.createElement("select");
@@ -2164,6 +2165,67 @@ function renderWordleOptions(game) {
   const size = document.createElement("span");
   size.textContent = ` ${d.size.toLocaleString()} words`;
   box.replaceChildren("Dictionary ", pick, " ", len, size);
+}
+// THE PLAYER'S INVENTORY (the server's profile, by this browser's player
+// cookie): the name it knows us by, points, the success streak, banked and
+// ongoing power-ups, the shop; page settings saved to the profile; completed
+// boards ticked in the picker.
+const inventoryView = { applied: false, awardKey: null, awardAt: 0, completedKey: "" };
+function renderInventory(game) {
+  const inv = game && game.inventory;
+  if (game && game.player && document.activeElement !== $("player") && $("player").value !== game.player) {
+    $("player").value = game.player;
+    try { localStorage.setItem("meowdoku_player", game.player); } catch { /* private window */ }
+  }
+  if (!inv) return;
+  $("shop-toggle").textContent = `Shop · ${inv.points} pts`;
+  if (!inventoryView.applied) { inventoryView.applied = true; applySettings(inv.settings || {}); }
+  const done = (inv.completed && inv.completed.meowdoku) || [], key = done.join(",");
+  if (key !== inventoryView.completedKey) {
+    inventoryView.completedKey = key;
+    for (const option of $("board").options) {
+      const plain = option.textContent.replace(/^✓ /, "");
+      option.textContent = done.includes(option.value) ? `✓ ${plain}` : plain;
+    }
+  }
+  if ($("shop").classList.contains("open")) showShop(inv);
+}
+function awardText(game) {
+  const a = game && game.award;
+  if (!a) return "";
+  const key = JSON.stringify(a);
+  if (key !== inventoryView.awardKey) { inventoryView.awardKey = key; inventoryView.awardAt = performance.now(); }
+  if (performance.now() - inventoryView.awardAt > 8000) return "";
+  return ` · +${a.points} points${a.multiplier > 1 ? ` (x${a.multiplier} streak)` : ""}`;
+}
+function showShop(inv) {
+  inv = inv || (state.game && state.game.inventory);
+  const panel = $("shop");
+  if (!inv) { panel.innerHTML = `<div class="muted">no player yet</div>`; return; }
+  const streaks = Object.entries(inv.streak || {}).filter(([, n]) => n > 0).map(([g, n]) => `${escapeHtml(g)} ${n} in a row (x${Math.min(n, inv.multiplier_max)})`).join(", ");
+  const bank = Object.entries(inv.bank || {}).map(([k, n]) => `${escapeHtml(k)} ${n}`).join(" · ");
+  const ongoing = inv.ongoing ? `${escapeHtml(inv.ongoing.item)}: ${inv.ongoing.puzzles} puzzles left` : "none";
+  panel.innerHTML = `<h3>${escapeHtml((state.game && state.game.player) || "You")} · ${inv.points} points</h3>`
+    + `<div class="muted">a solved puzzle pays lives x your streak; Wordle unused guesses x streak; arcade games score / 500</div>`
+    + `<div class="row"><span>streak</span><span>${streaks || "none yet"}</span></div>`
+    + `<div class="row"><span>banked power-ups</span><span>${bank}</span></div>`
+    + `<div class="row"><span>ongoing</span><span>${ongoing}</span></div>`
+    + `<h3>Buy</h3>` + inv.shop.map((it) => `<div class="row"><span>${escapeHtml(it.label)}</span>`
+      + `<button data-buy="${escapeHtml(it.item)}" ${inv.points < it.cost ? "disabled" : ""}>${it.cost} pts</button></div>`).join("");
+  for (const button of panel.querySelectorAll("button[data-buy]"))
+    button.onclick = () => act({ type: "buy", item: button.dataset.buy }).catch((e) => console.warn(e));
+}
+// Settings ride on the profile: saved when changed, applied once on arrival.
+function currentSettings() {
+  return { camMode: state.camMode || "board", pads: $("pads") ? $("pads").checked : false,
+           bombStyle: state.bombStyle || 0, wordle: { ...wordleChoice } };
+}
+function saveSettings() { if (state.game) act({ type: "settings", values: currentSettings() }).catch(() => {}); }
+function applySettings(values) {
+  if (values.camMode && values.camMode !== (state.camMode || "board")) toggleCamera();
+  if (typeof values.pads === "boolean" && $("pads")) { $("pads").checked = values.pads; showPads(state.game); }
+  if (Number.isInteger(values.bombStyle)) { state.bombStyle = (values.bombStyle + BOMB_STYLES.length - 1) % BOMB_STYLES.length; cycleBomb(); }
+  if (values.wordle && typeof values.wordle === "object") Object.assign(wordleChoice, values.wordle);
 }
 function renderModes(game) {
   const box = $("modes"), modes = game && game.modes;
@@ -2601,9 +2663,10 @@ function applyState(game) {
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
-  const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
+  const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
   renderModes(game);
   showPads(game);
+  renderInventory(game);
   renderWordleOptions(game);
   const authority = authorityText(game);
   status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
@@ -2986,7 +3049,7 @@ function showPads(game) {
 // second press bursts a hanging parachute bomb), C cycles the style.
 const BOMB_STYLES = ["dumb bomb", "parachute bomb", "ground seeker"];
 function bombs() { const g = state.game; return !!(g && g.controls && g.controls.includes && g.controls.includes("alt_fire")); }
-function cycleBomb() { state.bombStyle = ((state.bombStyle || 0) + 1) % BOMB_STYLES.length; $("bomb-style").textContent = `Style: ${BOMB_STYLES[state.bombStyle]}`; }
+function cycleBomb() { state.bombStyle = ((state.bombStyle || 0) + 1) % BOMB_STYLES.length; $("bomb-style").textContent = `Style: ${BOMB_STYLES[state.bombStyle]}`; if (inventoryView.applied) saveSettings(); }
 function keyControl(key) {
   const k = key.length === 1 ? key.toLowerCase() : key;
   const common = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", " ": "fire" };
@@ -3149,7 +3212,7 @@ $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
 $("bomb-style").onclick = cycleBomb;
 $("pads").checked = matchMedia("(pointer: coarse)").matches;
-$("pads").onchange = () => showPads(state.game);
+$("pads").onchange = () => { showPads(state.game); saveSettings(); };
 const NOSE_PITCH = { value: 0, dead: 0.08 };
 canvas.addEventListener("mousemove", (e) => {
   if (state.camMode !== "nose") return;
@@ -3157,7 +3220,7 @@ canvas.addEventListener("mousemove", (e) => {
   NOSE_PITCH.value = Math.max(-1, Math.min(1, -((e.clientY - r.top) / r.height - 0.5) * 2.2));
 });
 canvas.addEventListener("mouseleave", () => { NOSE_PITCH.value = 0; });
-function toggleCamera() { state.camMode = state.camMode === "nose" ? "board" : "nose"; $("camera-mode").textContent = state.camMode === "nose" ? "Camera: nose (N)" : "Camera: board (N)"; }
+function toggleCamera() { state.camMode = state.camMode === "nose" ? "board" : "nose"; $("camera-mode").textContent = state.camMode === "nose" ? "Camera: nose (N)" : "Camera: board (N)"; if (inventoryView.applied) saveSettings(); }
 $("camera-mode").onclick = toggleCamera;
 for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) {
   const button = $(id);
@@ -3292,6 +3355,7 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "Escape" && document.body.classList.contains("immersive")) setImmersive(false);
 });
 $("scores-toggle").onclick = () => { const panel = $("scores"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showScores(); };
+$("shop-toggle").onclick = () => { const panel = $("shop"); panel.classList.toggle("open"); if (panel.classList.contains("open")) showShop(); };
 
 // ---------------------------------------------------------------- meowdoku tools, hint, palette
 state.tool = "mouse";             // a tap marks a mouse, a double tap is a cat (as before the tools)
