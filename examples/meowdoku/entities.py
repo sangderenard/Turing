@@ -125,8 +125,14 @@ class EntitySession:
     """One persistent dt-system state over entity lanes, advanced on demand."""
 
     def __init__(self, piece, columns: dict[str, np.ndarray], controls: tuple[str, ...], *,
-                 rewind_every: float = 0.5, rewind_depth: int = 40):
+                 rewind_every: float = 0.5, rewind_depth: int = 40,
+                 numpy_compiled: bool | None = None):
         self.piece = piece
+        # The dt system's own functions as the NumPy product of their
+        # AbstractTensor source (llvm_dt_system.numpy_compiled_program): the
+        # controller's per-step numerical work leaves AbstractTensor dispatch;
+        # the law piece stays linked and called from the controller loop.
+        self.numpy_compiled = (DT_LANE == "numpy") if numpy_compiled is None else bool(numpy_compiled)
         self.pieces = [piece]
         self.columns = columns
         self.controls = tuple(controls)
@@ -163,6 +169,7 @@ class EntitySession:
             # Real-time play keeps no backups: the dt system's no-save,
             # in-place, no-retry lane, declared rather than inherited.
             rollback=False,
+            numpy_compiled=self.numpy_compiled,
             # Play is one continuous run cut into ticks: the next tick's first
             # attempt is the controller's last proposal, not the whole window
             # (dt_system's first round has no ceiling of its own).
@@ -218,6 +225,11 @@ class EntitySession:
 
 
 # ---------------------------------------------------------------- law pieces
+
+#: How the dt system's own functions run: ``numpy`` (the product of their
+#: AbstractTensor source, ``llvm_dt_system.numpy_compiled_program``) or
+#: ``eager`` (as written, AbstractTensor dispatch).
+DT_LANE = os.environ.get("MEOWDOKU_DT", "numpy")
 
 #: Where compiled law products are kept (ignored by git): one file per law and
 #: source digest, so an unchanged law loads its product and a changed one

@@ -59,9 +59,11 @@ information only.  It is never read by anything that chooses dt.
 """
 
 import math
+import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -523,6 +525,89 @@ def bind_program(namespace):
         dt_system_over.__code__, program, dt_system_over.__name__,
         dt_system_over.__defaults__, dt_system_over.__closure__)
     return program
+
+
+#: Where the dt system's own functions, lowered to the NumPy dialect, are kept:
+#: one file per source digest (the digest includes the lowering backend's source).
+DT_NUMPY_PRODUCTS = Path(__file__).resolve().parents[1] / "build" / "dt_numpy"
+
+_NUMPY_POOL_FIELDS = (*PUBLICATION_FIELDS, *COURANT_FIELDS,
+                      "pub_values", "pub_present", "pub_limits", "pub_limits_present")
+
+
+def _dt_owned(value):
+    """A function the dt system owns: lowered with the functions that call it."""
+    module = getattr(value, "__module__", "") or ""
+    # A module-level definition only: the pieces a program calls by name
+    # (``step_i``, wrapped by the wall-cost ledger's closure) are bound, not lowered.
+    if getattr(value, "__qualname__", None) != getattr(value, "__name__", None):
+        return False
+    return module.startswith("src.common.dt_system") or module == __name__
+
+
+def numpy_compiled_program(program, namespace, pieces, schedule, channel_names):
+    """The state's program with the dt system's own functions lowered to NumPy.
+
+    ``dt_system_over`` and everything it reaches in the dt system
+    (``run_superstep``, ``step_with_dt_control_used``, the controller's PI
+    update, the participant bounds, the generated ``advance_pieces``) are
+    lowered from their AbstractTensor source by
+    ``fused_program_python_backend.lower_functions_to_numpy`` and cached by
+    source digest.  Control flow is the authored control flow; the pieces stay
+    what ``step_i`` names -- linked, called from the loop.
+    """
+    import numpy as _np
+    from src.common.tensors.abstraction import AbstractTensor as _AT
+    _probe = type(_AT.get_tensor(_np.zeros(1))).__name__
+    if _probe != "NumPyTensorOperations":
+        raise RuntimeError(f"the active tensor backend is {_probe}, not NumPy")
+    from src.compiler.fused_program_python_backend import lower_functions_to_numpy
+
+    lowered = lower_functions_to_numpy(
+        [dt_system_over, generated_source(pieces, schedule, channel_names=channel_names)],
+        namespace=namespace, owned=_dt_owned,
+        subclass_methods={STController: ("pi_update", "update_dt_max")},
+    )
+    DT_NUMPY_PRODUCTS.mkdir(parents=True, exist_ok=True)
+    path = DT_NUMPY_PRODUCTS / f"dt_system_{lowered.digest}.py"
+    if not path.exists() or path.read_text(encoding="utf-8") != lowered.source:
+        path.write_text(lowered.source, encoding="utf-8")
+    product = {"__name__": f"dt_numpy_{lowered.digest}", "__file__": str(path)}
+    product.update({name: namespace[name] for name in lowered.injected})
+    exec(compile(lowered.source, str(path), "exec"), product)
+    compiled = dict(program)
+    compiled["dt_system_over"] = product["dt_system_over"]
+    compiled["advance_pieces"] = product["advance_pieces"]
+    compiled["numpy_product"] = product
+    return compiled
+
+
+def _as_array(value):
+    """An AbstractTensor held by the dt system, as the array it is."""
+    if isinstance(value, np.ndarray) or value is None:
+        return value
+    if hasattr(value, "numpy") and not isinstance(value, (int, float)):
+        return np.array(value.numpy())
+    return value
+
+
+def adopt_numpy_domain(state, targets, controller=None):
+    """Hand the state's, targets' and controller's tensors to the NumPy product.
+
+    An AbstractTensor on the NumPy backend is its array; the product computes
+    on arrays.  Idempotent: arrays pass through unchanged."""
+    for name in _NUMPY_POOL_FIELDS:
+        value = getattr(state, name, None)
+        if value is not None and not isinstance(value, np.ndarray):
+            setattr(state, name, _as_array(value))
+    for name in ("error_limits", "error_limits_present"):
+        setattr(targets, name, _as_array(getattr(targets, name)))
+    if controller is not None:
+        compiled_class = state.program["numpy_product"]["STController"]
+        if not isinstance(controller, compiled_class):
+            controller.__class__ = compiled_class
+        for name in ("acc", "max_vel_ever", "dt_min", "dt_max"):
+            setattr(controller, name, _as_array(getattr(controller, name)))
 
 
 def bind_pieces(pieces, *, wrap=None, schedule="sequential", channel_names=DT_CHANNEL_NAMES):
@@ -1086,7 +1171,8 @@ def interpret_round(node, *, wrap=None, channel_names=DT_CHANNEL_NAMES):
 
 
 def instantiate_state(pieces, columns, *, targets, schedule="sequential",
-                      scope="lockstep", subcycles=(), channel_names=DT_CHANNEL_NAMES):
+                      scope="lockstep", subcycles=(), channel_names=DT_CHANNEL_NAMES,
+                      numpy_compiled=False):
     """The instantiation hook: make the dt system's state, once.
 
     Everything scoped to the state's lifetime happens here and nowhere else:
@@ -1103,8 +1189,20 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     names = column_names_of(pieces)
     batch = pieces[0].batch
     ledger = WallCostLedger(str(piece.entry) for piece in pieces)
-    program = bind_program(bind_namespace(pieces, wrap=ledger.wrap, schedule=schedule,
-                                         channel_names=channel_names))
+    namespace = bind_namespace(pieces, wrap=ledger.wrap, schedule=schedule,
+                               channel_names=channel_names)
+    program = bind_program(namespace)
+    if numpy_compiled:
+        # The dt system's own functions run as the NumPy product of their
+        # AbstractTensor source; the pieces stay linked.  Where the lowering
+        # cannot apply (another tensor backend, a refused spelling), the
+        # system runs its AbstractTensor source and says so.
+        try:
+            program = numpy_compiled_program(program, namespace, pieces, schedule, channel_names)
+        except Exception as error:  # noqa: BLE001 (stated, then the authored source runs)
+            print(f"[dt_system] NumPy-compiled controller not used ({type(error).__name__}: "
+                  f"{str(error)[:300]}); running the AbstractTensor source", flush=True)
+            numpy_compiled = False
     # One contiguous span; every column, ``dt`` and the telemetry are views
     # into it (``state_spans``).  The state owns it for its whole lifetime.
     span, views, dt, telemetry = state_spans(names, columns, batch)
@@ -1135,6 +1233,8 @@ def instantiate_state(pieces, columns, *, targets, schedule="sequential",
     # ``dt_system(rollback=...)`` from an explicit request.
     state.rollback = False
     state.rollback_threshold_multiplier = 1.0
+    if numpy_compiled:
+        adopt_numpy_domain(state, targets)
     configure_publication_limits(state, targets)
     # Instantiation cascades: the containing system asks each piece to
     # instantiate against the spans it will be handed every round, so a piece
@@ -1236,7 +1336,8 @@ def advance_round(state, window=None, *, subcycles=()):
 
 def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, controller=None,
               subcycles=(), scope="lockstep", schedule="sequential", dt_initial=None,
-              state=None, rollback=None, channel_names=None, allow_increase_mid_round=None):
+              state=None, rollback=None, channel_names=None, allow_increase_mid_round=None,
+              numpy_compiled=None):
     """Load the pieces from their files and run ``rounds`` rounds of the dt
     system over them in Python, the way the native unit will be driven.
 
@@ -1248,6 +1349,14 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
 
     ``allow_increase_mid_round=None`` uses the state's declared choice (adaptive
     by default, or the graph's choice). An explicit bool updates that same field.
+
+    ``numpy_compiled`` is the declared opt-in that runs the dt system's own
+    functions as the NumPy product of their AbstractTensor source
+    (``numpy_compiled_program``).  ``None`` (default) reads
+    ``TURING_DT_NUMPY`` (on unless set to ``0``): every dt system uses the
+    compiled controller by default, falling back to the source as written
+    (with a printed reason) where the lowering cannot apply.  It is
+    fixed when the state is instantiated.
 
     ``subcycles`` are independent participants (``Subcycle``).  Each round
     the lockstep system consults them without waiting, reads their owned
@@ -1293,7 +1402,8 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
         # discarding it.
         state = instantiate_state(
             pieces, columns, targets=targets, schedule=schedule, scope=scope,
-            subcycles=subcycles, channel_names=channel_names)
+            subcycles=subcycles, channel_names=channel_names,
+            numpy_compiled=(os.environ.get("TURING_DT_NUMPY", "1") != "0" if numpy_compiled is None else numpy_compiled))
     else:
         if tuple(state.channel_names) != channel_names:
             raise ValueError("persistent dt state has a different declared channel layout")
@@ -1321,6 +1431,8 @@ def dt_system(piece_files, columns, *, rounds, round_dt, dx, targets=None, contr
         state.rollback = bool(rollback)
     if allow_increase_mid_round is not None:
         state.allow_increase_mid_round = bool(allow_increase_mid_round)
+    if "numpy_product" in state.program:
+        adopt_numpy_domain(state, targets, controller)
     ledger = state.wall_cost_ledger
     time_record = state.time_velocity
     for sub in subcycles:

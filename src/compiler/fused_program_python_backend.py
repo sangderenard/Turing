@@ -28,6 +28,14 @@ diffable -- not a string-templated whole-program print like
 here: it walks a tape, and dialect tables that shape belong to a JIT
 consumer, not this one).
 
+Whole functions (``lower_functions_to_numpy``, at the end of this file) take the
+same route one level up: a function written against AbstractTensor is parsed
+with ``ast``, every AbstractTensor spelling in it is rewritten to the NumPy
+dialect's spelling from the tables here, and every ``if``/``while``/``for``/
+``return``/``try`` stays exactly as authored -- control flow is not
+rediscovered, it is never taken apart.  The product is Python source, cached
+by the digest of the source it was lowered from plus this file.
+
 The composed region source is finalized through the existing control-shell
 runtime (``control_source.compile_python_shell``), the same "instantiate a
 real callable from finalized region bodies" contract
@@ -417,16 +425,392 @@ def compile_single_region_python(
     return CompiledPythonProgram(callable=function, source=source, dialect=dialect)
 
 
+# ----------------------------------------------------------------------------
+# Whole-function lowering: AbstractTensor source -> NumPy dialect source.
+#
+# The value domain.  An AbstractTensor on the NumPy backend IS a NumPy array
+# (``.data``); every operation in the tables below is that backend's own call
+# (``numpy_backend.maximum_`` is ``np.maximum``, ``clamp_`` is ``np.clip`` ...),
+# so the lowered function computes the same IEEE results, in the same kernels,
+# on the same shapes and dtypes.  The one spelling that is not a single NumPy
+# call, ``AbstractTensor.tensor``, is a named helper in ``_NUMPY_PRELUDE`` that
+# reproduces the library's shape/dtype rule exactly; ``isinstance(x,
+# AbstractTensor)`` is ``isinstance(x, np.ndarray)``.
+# ----------------------------------------------------------------------------
+
+#: ``AbstractTensor.<name>(...)`` -> NumPy dialect call.  Each row is the
+#: backend call the AbstractTensor function makes (``numpy_backend``).
+NUMPY_ABSTRACT_TENSOR_FUNCTIONS: dict[str, str] = {
+    "tensor": "_at_tensor",          # shape/dtype rule: see _NUMPY_PRELUDE
+    "maximum": "np.maximum",         # numpy_backend.maximum_ (NaN-propagating)
+    "minimum": "np.minimum",         # numpy_backend.minimum_ (NaN-propagating)
+    "where": "np.where",             # numpy_backend.where_
+    "zeros_like": "np.zeros_like",
+    "ones_like": "np.ones_like",
+    "zeros": "np.zeros",
+}
+
+#: ``x.<name>(...)`` tensor methods that NumPy arrays do not carry under that
+#: name -> the backend's module-function call.
+NUMPY_TENSOR_METHODS: dict[str, str] = {
+    "log": "np.log", "exp": "np.exp", "sqrt": "np.sqrt", "floor": "np.floor",
+    "isfinite": "np.isfinite",
+}
+
+#: Reductions AbstractTensor spells ``dim=``/``keepdim=`` and NumPy ``axis=``/``keepdims=``.
+NUMPY_AXIS_METHODS = frozenset({"sum", "max", "min", "any", "all", "mean", "prod"})
+
+_NUMPY_PRELUDE = '''
+def _at_tensor(data):
+    """``AbstractTensor.tensor(data)`` on the NumPy backend, rule for rule: an
+    array of any rank is copied as it is; a list or tuple is ``np.array``; a
+    Python or NumPy scalar becomes a one-element array whose dtype is its kind
+    (bool, int64, or float64 for every float width)."""
+    if isinstance(data, np.ndarray):
+        return np.array(data)
+    if isinstance(data, (list, tuple)):
+        return np.array(data)
+    if isinstance(data, (bool, np.bool_)):
+        return np.array([data], dtype=np.bool_)
+    if isinstance(data, (int, np.integer)):
+        return np.array([data], dtype=np.int64)
+    return np.array([data], dtype=np.float64)
+
+
+def _at_truediv(a, b):
+    """``a / b`` where either side is an AbstractTensor: the backend's
+    ``_safe_divide`` in its ``zero`` mode (a zero divisor gives 0, not inf or
+    nan; the result is at least float32).  Neither side a tensor is Python's
+    own division, ZeroDivisionError included."""
+    if not (isinstance(a, np.ndarray) or isinstance(b, np.ndarray)):
+        return a / b
+    dtype = np.result_type(a, b, np.float32)
+    a = np.asarray(a, dtype=dtype)
+    b = np.asarray(b, dtype=dtype)
+    out = np.empty(np.broadcast(a, b).shape, dtype=dtype)
+    mask = np.broadcast_to(b != 0, out.shape)
+    np.divide(a, b, out=out, where=mask)
+    out[~mask] = 0
+    return out
+'''
+
+#: The division mode ``_at_truediv`` spells.  Lowering refuses a backend whose
+#: ``DIVIDE_MODE`` is anything else rather than approximate it.
+NUMPY_DIVIDE_MODE = "zero"
+
+_BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
+
+
+class _NumpyDialectRewriter(ast.NodeTransformer):
+    """Rewrite one function's AbstractTensor spellings; touch nothing else."""
+
+    #: Names bound to modules in the function's globals: ``math.sqrt(x)`` is a
+    #: module function, not the tensor method ``x.sqrt()``.
+    modules: frozenset = frozenset({"np", "numpy", "math"})
+
+    def visit_BinOp(self, node):
+        node = self.generic_visit(node)
+        if isinstance(node.op, ast.Div):
+            return ast.copy_location(
+                ast.Call(ast.Name("_at_truediv", ast.Load()), [node.left, node.right], []), node
+            )
+        return node
+
+    def visit_AugAssign(self, node):
+        if isinstance(node.op, ast.Div):
+            raise PythonLoweringShortfall(
+                "an in-place true division has no NumPy dialect spelling here "
+                f"(line {getattr(node, 'lineno', '?')})"
+            )
+        return self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if node.id == "AbstractTensor":
+            return ast.copy_location(
+                ast.Attribute(ast.Name("np", ast.Load()), "ndarray", node.ctx), node
+            )
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        function = node.func
+        if not isinstance(function, ast.Attribute):
+            return node
+        owner = function.value
+        if isinstance(owner, ast.Name) and owner.id in self.modules:
+            return node
+        # ``AbstractTensor.<fn>`` arrives here as ``np.ndarray.<fn>``.
+        if (
+            isinstance(owner, ast.Attribute) and owner.attr == "ndarray"
+            and isinstance(owner.value, ast.Name) and owner.value.id == "np"
+            and function.attr in NUMPY_ABSTRACT_TENSOR_FUNCTIONS
+        ):
+            head = ast.parse(NUMPY_ABSTRACT_TENSOR_FUNCTIONS[function.attr], mode="eval").body
+            node.func = ast.copy_location(head, function)
+            return node
+        if function.attr in NUMPY_TENSOR_METHODS and not node.keywords:
+            head = ast.parse(NUMPY_TENSOR_METHODS[function.attr], mode="eval").body
+            return ast.copy_location(
+                ast.Call(head, [function.value, *node.args], []), node
+            )
+        if function.attr == "clamp":
+            keywords = {k.arg: k.value for k in node.keywords}
+            positional = list(node.args)
+            low = keywords.get("min", positional[0] if positional else ast.Constant(None))
+            high = keywords.get("max", positional[1] if len(positional) > 1 else ast.Constant(None))
+            head = ast.parse("np.clip", mode="eval").body
+            return ast.copy_location(ast.Call(head, [function.value, low, high], []), node)
+        if function.attr in NUMPY_AXIS_METHODS:
+            for keyword in node.keywords:
+                if keyword.arg == "dim":
+                    keyword.arg = "axis"
+                elif keyword.arg == "keepdim":
+                    keyword.arg = "keepdims"
+        return node
+
+
+def _bound_names(tree) -> set[str]:
+    """Every name a lowered function binds itself (parameters, assignments,
+    loop and comprehension targets, nested defs, imports)."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arguments):
+            for argument in (*node.posonlyargs, *node.args, *node.kwonlyargs, node.vararg, node.kwarg):
+                if argument is not None:
+                    bound.add(argument.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node is not tree:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    return bound
+
+
+def _importable(value):
+    module = getattr(value, "__module__", None)
+    name = getattr(value, "__name__", None)
+    if module is None or name is None or getattr(value, "__qualname__", name) != name:
+        return None
+    import importlib
+
+    try:
+        if getattr(importlib.import_module(module), name) is value:
+            return module, name
+    except Exception:
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class LoweredPythonModule:
+    """Whole functions lowered to the NumPy dialect: the source, the functions
+    it defines, the names the runtime must still bind (the pieces a generated
+    program calls by name), and the digest it is cached under."""
+
+    source: str
+    functions: tuple[str, ...]
+    injected: tuple[str, ...]
+    digest: str
+
+
+def lower_functions_to_numpy(
+    roots,
+    *,
+    namespace: Mapping[str, Any],
+    owned,
+    subclass_methods: Mapping[Any, tuple[str, ...]] | None = None,
+) -> LoweredPythonModule:
+    """Lower ``roots`` and everything they reach that ``owned`` admits.
+
+    ``roots`` are function objects or source texts (generated source, whose
+    free names resolve in ``namespace``).  A function ``owned(value)`` admits
+    is lowered with its callers.  Any other name a lowered function reads is
+    bound by an ``import`` or literal at the top of the product, or listed in
+    ``injected`` when only the runtime has it.  ``subclass_methods`` maps an
+    owned class to the methods to lower; the product defines a subclass of the
+    original carrying them, so ``isinstance`` and the fields stay the original's.
+    """
+    import hashlib
+    import inspect
+    import sys
+    import textwrap
+
+    subclass_methods = dict(subclass_methods or {})
+    queue: list[tuple[str, ast.AST, Mapping[str, Any]]] = []
+    seen: set[int] = set()
+    lowered: dict[str, ast.AST] = {}
+    bases: dict[str, Any] = {}
+    imports: dict[str, str] = {}
+    literals: dict[str, str] = {}
+    injected: set[str] = set()
+    sources: list[str] = []
+    defined: set[str] = {"_at_tensor", "_at_truediv"}  # the prelude's helpers
+    from ..common.tensors.numpy_backend import NumPyTensorOperations
+
+    if NumPyTensorOperations.DIVIDE_MODE != NUMPY_DIVIDE_MODE:
+        raise PythonLoweringShortfall(
+            f"the NumPy backend divides in mode {NumPyTensorOperations.DIVIDE_MODE!r}; "
+            f"the dialect spells {NUMPY_DIVIDE_MODE!r}"
+        )
+
+    def enqueue_function(function):
+        if id(function) in seen:
+            return
+        seen.add(id(function))
+        text = textwrap.dedent(inspect.getsource(function))
+        sources.append(text)
+        queue.append((function.__name__, ast.parse(text).body[0], function.__globals__))
+        defined.add(function.__name__)
+
+    def enqueue_class(cls, methods):
+        if id(cls) in seen:
+            return
+        seen.add(id(cls))
+        text = textwrap.dedent(inspect.getsource(cls))
+        sources.append(text)
+        tree = ast.parse(text).body[0]
+        tree.body = [
+            member for member in tree.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name in methods
+        ]
+        tree.decorator_list = []
+        tree.bases = [ast.Name(f"_{cls.__name__}_base", ast.Load())]
+        bases[cls.__name__] = cls
+        defined.add(f"_{cls.__name__}_base")
+        queue.append((cls.__name__, tree, sys.modules[cls.__module__].__dict__))
+        defined.add(cls.__name__)
+
+    for root in roots:
+        if isinstance(root, str):
+            sources.append(root)
+            for node in ast.parse(root).body:
+                if isinstance(node, ast.FunctionDef):
+                    queue.append((node.name, node, namespace))
+                    defined.add(node.name)
+        else:
+            enqueue_function(root)
+    for cls, methods in subclass_methods.items():
+        enqueue_class(cls, methods)
+
+    def strip_imports(tree, globals_):
+        """Drop local imports of AbstractTensor and of lowered functions;
+        make every other relative import absolute."""
+        import importlib
+
+        class Strip(ast.NodeTransformer):
+            def visit_ImportFrom(self, node):
+                module = node.module or ""
+                if node.level:
+                    parts = (globals_.get("__package__") or "").split(".")
+                    base = ".".join(parts[: len(parts) - node.level + 1])
+                    module = f"{base}.{module}" if module else base
+                kept = []
+                for alias in node.names:
+                    if alias.name == "AbstractTensor":
+                        continue
+                    target = getattr(importlib.import_module(module), alias.name, None)
+                    if inspect.isfunction(target) and owned(target):
+                        enqueue_function(target)
+                        continue
+                    kept.append(alias)
+                if not kept:
+                    return None
+                return ast.copy_location(ast.ImportFrom(module=module, names=kept, level=0), node)
+
+        return Strip().visit(tree)
+
+    rewriter = _NumpyDialectRewriter()
+    processed = 0
+    while processed < len(queue):
+        name, tree, globals_ = queue[processed]
+        processed += 1
+        rewriter.modules = frozenset({"np", "numpy"}) | frozenset(
+            key for key, value in globals_.items() if inspect.ismodule(value)
+        ) | frozenset(
+            (alias.asname or alias.name).split(".")[0]
+            for node in ast.walk(tree) if isinstance(node, ast.Import)
+            for alias in node.names
+        )
+        tree = strip_imports(rewriter.visit(tree), globals_)
+        ast.fix_missing_locations(tree)
+        lowered[name] = tree
+        local = _bound_names(tree)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)):
+                continue
+            ident = node.id
+            if ident in local or ident in defined or ident == "np" or ident in _BUILTIN_NAMES:
+                continue
+            if ident not in globals_:
+                injected.add(ident)
+                continue
+            value = globals_[ident]
+            if inspect.isfunction(value) and owned(value):
+                enqueue_function(value)
+            elif inspect.isclass(value) and value in subclass_methods:
+                enqueue_class(value, subclass_methods[value])
+            elif inspect.ismodule(value):
+                imports[ident] = f"import {value.__name__}" + (
+                    "" if value.__name__ == ident else f" as {ident}"
+                )
+            elif isinstance(value, (bool, int, float, str, type(None))):
+                literals[ident] = repr(value)
+            else:
+                found = _importable(value)
+                if found is None:
+                    injected.add(ident)
+                else:
+                    module, attribute = found
+                    imports[ident] = f"from {module} import {attribute}" + (
+                        "" if attribute == ident else f" as {ident}"
+                    )
+
+    for cls in bases.values():
+        imports[f"_{cls.__name__}_base"] = (
+            f"from {cls.__module__} import {cls.__name__} as _{cls.__name__}_base"
+        )
+    digest = hashlib.sha256(
+        ("\0".join(sources) + "\0" + inspect.getsource(sys.modules[__name__])).encode("utf-8")
+    ).hexdigest()[:16]
+    banner = (
+        '"""Whole functions lowered from AbstractTensor source to the NumPy dialect '
+        f"(source digest {digest}).\n\nGenerated by "
+        "src.compiler.fused_program_python_backend.lower_functions_to_numpy; "
+        'change the source and it is lowered again.  Do not edit."""\n'
+    )
+    header = "\n".join((
+        "from __future__ import annotations",
+        "import numpy as np",
+        *sorted(set(imports.values())),
+        *(f"{key} = {value}" for key, value in sorted(literals.items())),
+    ))
+    body = "\n\n\n".join(ast.unparse(tree) for tree in lowered.values())
+    return LoweredPythonModule(
+        source=banner + header + "\n" + _NUMPY_PRELUDE + "\n\n" + body + "\n",
+        functions=tuple(lowered),
+        injected=tuple(sorted(injected)),
+        digest=digest,
+    )
+
+
 __all__ = [
     "ABSTRACT_TENSOR",
     "CompiledPythonProgram",
     "DIALECTS",
     "Dialect",
+    "LoweredPythonModule",
     "LoweredRegion",
     "NUMPY",
+    "NUMPY_ABSTRACT_TENSOR_FUNCTIONS",
+    "NUMPY_TENSOR_METHODS",
     "PythonLoweringShortfall",
     "TORCH",
     "compile_single_region_python",
+    "lower_functions_to_numpy",
     "lower_fused_program_region",
     "region_source_lines",
     "supported_elementwise_operations",
