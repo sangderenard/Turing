@@ -3589,6 +3589,13 @@ try:   # Ensure random also supports requires_grad + tape and force global tape 
 except Exception:
     pass
 def _wrap_with_autograd(name: str, func: Callable) -> Callable:
+    # The signature of ``func`` is fixed: read it once here, not on every
+    # call (it was 22k inspect.signature calls per 150 game ticks).
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        signature = None
+
     @wraps(func)
     def wrapped(self, *args, **kwargs):
         from . import autograd as _autograd
@@ -3624,7 +3631,9 @@ def _wrap_with_autograd(name: str, func: Callable) -> Callable:
 
         params = {}
         try:
-            bound = inspect.signature(func).bind(self, *args, **kwargs)
+            if signature is None:
+                raise TypeError("no signature")
+            bound = signature.bind(self, *args, **kwargs)
             bound.apply_defaults()
             params = {
                 key: value

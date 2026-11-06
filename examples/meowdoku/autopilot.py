@@ -413,27 +413,28 @@ class NativePolicy:
         from src.compiler.work_contract import PRESETS, scoped_work_contract
         self.batch, self.contract = int(batch), contract
         self.features, self.outputs = widths_of(params)
-        name = f"autopilot_policy_b{self.batch}_{contract}"
+        self.names, forward = param_names(params), forward_of(params)
+        name = f"autopilot_{arch_of(params)}_policy_b{self.batch}_{contract}"
         directory = Path(directory or BUILD / "native")
         started = time.perf_counter()
         with scoped_work_contract(PRESETS[contract]):
             program = SSATensorProgram(name)
-            shapes = {"x": (self.batch, self.features), **{n: tuple(params[n].shape) for n in PARAMS}}
+            shapes = {"x": (self.batch, self.features), **{n: tuple(params[n].shape) for n in self.names}}
             bindings = {key: SSATensorOperations.input(program, shape) for key, shape in shapes.items()}
-            action = policy_forward(bindings["x"], *(bindings[n] for n in PARAMS))
+            action = forward(bindings["x"], *(bindings[n] for n in self.names))
             self.forward = compile_native_graph_forward(
-                action, bindings=bindings, source="meowdoku.autopilot.policy_forward",
+                action, bindings=bindings, source=f"meowdoku.autopilot.{forward.__name__}",
                 name=name, directory=directory / name / f"p{os.getpid()}_{next(_BUILDS)}")
         self.compile_seconds = time.perf_counter() - started
         ids = dict(self.forward.input_value_ids)
         self._execution = prepare_artifact_execution(self.forward.artifact, {
-            **{ids[n]: np.ascontiguousarray(params[n]) for n in PARAMS}, ids["x"]: np.zeros((self.batch, self.features))})
+            **{ids[n]: np.ascontiguousarray(params[n]) for n in self.names}, ids["x"]: np.zeros((self.batch, self.features))})
         self._x = np.asarray(self._execution.buffers[ids["x"]])
         self._out = np.asarray(self._execution.buffers[self.forward.output_value_ids[0]])
-        self._weights = {n: np.asarray(self._execution.buffers[ids[n]]) for n in PARAMS}
+        self._weights = {n: np.asarray(self._execution.buffers[ids[n]]) for n in self.names}
 
     def set_weights(self, params: dict[str, np.ndarray]) -> None:
-        for n in PARAMS:
+        for n in self.names:
             np.copyto(self._weights[n].reshape(-1), np.asarray(params[n], dtype=np.float64).reshape(-1))
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
@@ -518,12 +519,15 @@ class Pilot:
         self.lane = "numpy"
         product = numpy_product(1, *widths_of(params), arch=arch_of(params))
         self.run = lambda x: product(x, self.params)
-        if os.environ.get("MEOWDOKU_PILOT", "numpy") == "llvm":
+        # The token network runs native by default (MEOWDOKU_PILOT=numpy opts out);
+        # the fixed MLP stays on NumPy unless MEOWDOKU_PILOT=llvm.
+        if os.environ.get("MEOWDOKU_PILOT", "llvm" if arch_of(params) == "token" else "numpy") == "llvm":
             try:
                 native = NativePolicy(params, batch=1)
                 self.run, self.lane = native, "llvm"
             except Exception as error:      # keep NumPy; say why
-                print(f"autopilot: llvm lane refused ({type(error).__name__}: {str(error)[:200]}); numpy", flush=True)
+                print(f"autopilot: WARNING llvm lane refused for the {arch_of(params)} network "
+                      f"({type(error).__name__}: {str(error)[:400]}); FALLING BACK to the Python forward", flush=True)
 
     def controls(self, game) -> dict[str, float]:
         return controls_from(game, self.run(self.features(game))[0])
