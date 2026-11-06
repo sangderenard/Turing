@@ -55,7 +55,7 @@ from typing import Any
 import numpy as np
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, first_of, noise
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import damped_axis, follow_view
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -282,8 +282,9 @@ def sidescroller_step(lane, slot, rx, ry,
     energy_player = where(absorbed, shield - SHIELD_COST, where(got_mushroom, 1.0, shield))
 
     # ------------------------------------------------------ the view follows
-    overshoot = (px - distance - SCROLL_FRACTION * field_w).clip(0.0, 100.0) * f(playing & has_me)
-    view = distance + overshoot
+    # entity_motion.follow_view: the one view law, which the page runs too
+    view = where(playing & has_me, follow_view(distance, px + 0.0 * distance, zero + SCROLL_FRACTION, field_w)[0], distance)
+    overshoot = view - distance
 
     # ------------------------------------------------------ positions after the step (world frame)
     x1 = where(is_player, where(me, px, x), where(body, bx, x))

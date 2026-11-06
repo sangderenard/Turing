@@ -88,7 +88,7 @@ import sys
 from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import damped_axis, ground_travel
 from meowdoku import sphere_motion as sm
 from src.common.tensors import AbstractTensor
 
@@ -324,7 +324,7 @@ def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
                   hp, boom, born, owner, energy, kind, age, timer,
                   weapon, mult, fan, pax, pay, paz, pfire, calm, boss_phase, ace_clock,
-                  score, lives, invuln, clock, alt_prev, fuel, field_w, pace, level,
+                  score, lives, invuln, clock, alt_prev, fuel, map_u, map_v, map_gx, map_gy, field_w, pace, level,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style, dt):
     """Advance every lane by ``dt``.  Every operand is a (LANES,) span."""
     f = as_float
@@ -831,6 +831,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     burn = ((pspd - CRUISE) / (SPD_MAX - CRUISE)).clip(0.0, 1.0) * FUEL_BURN
     refill = where(pspd <= CRUISE + 1e-6, zero + FUEL_REFILL, zero)
     fuel_next = where(is_player & playing, (fuel - burn * dt + refill * dt).clip(0.0, 1.0), fuel)
+    # The land under the ship: one law (entity_motion.ground_travel) the page
+    # runs too -- the ground frame turns with the ship's yaw step and the map
+    # point travels at its speed.
+    gu, gv, ggx, ggy = ground_travel(map_u, map_v, map_gx, map_gy, zero + dyaw, zero + pspd, dt)
+    flying_on = is_player & playing
+    map_u_next, map_v_next = where(flying_on, gu, map_u), where(flying_on, gv, map_v)
+    map_gx_next, map_gy_next = where(flying_on, ggx, map_gx), where(flying_on, ggy, map_gy)
     vyaw_next = where(is_player, ship_vyaw, vyaw)
     vspd_next = where(is_player, ship_vspd, vspd)
     return (f(live3), x2, y2, z2, vx2, vy2, vz1, u2[0], u2[1], u2[2], h2[0], h2[1], h2[2], spd2,
@@ -838,13 +845,14 @@ def scroller_step(lane, slot, rx, ry, rz,
             hp2, boom3, born1, owner1, energy_next, kind1, age1, timer1,
             weapon_next, mult_next, fan_next, pax, pay, paz, pfire, calm_next, boss_phase_next, ace_clock_next,
             score_next, lives_next, invuln_next, clock_next, alt_prev_next, fuel_next,
+            map_u_next, map_v_next, map_gx_next, map_gy_next,
             residual, dt_limit)
 
 
 STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy", "hz", "spd", "yaw", "vyaw", "vspd",
          "hp", "boom", "born", "owner", "energy", "kind", "age", "timer",
          "weapon", "mult", "fan", "pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock",
-         "score", "lives", "invuln", "clock", "alt_prev", "fuel")
+         "score", "lives", "invuln", "clock", "alt_prev", "fuel", "map_u", "map_v", "map_gx", "map_gy")
 SETTINGS = ("field_w", "pace", "level")
 
 
@@ -943,6 +951,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         **{name: np.zeros(LANES) for name in ("pax", "pay", "paz", "pfire", "calm", "boss_phase", "ace_clock")},
         "score": np.zeros(LANES), "lives": np.full(LANES, LIVES),
         "invuln": np.full(LANES, 1.0), "clock": np.zeros(LANES), "alt_prev": np.zeros(LANES), "fuel": np.ones(LANES),
+        # the land's map point and the ground frame's heading (unit; "up" the map)
+        "map_u": np.zeros(LANES), "map_v": np.zeros(LANES), "map_gx": np.zeros(LANES), "map_gy": np.full(LANES, -1.0),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
@@ -997,6 +1007,9 @@ class BulletScroller(EntityGame):
                                  "reach": TURN_REACH},
                          "spd": {"move": "move_axis_y", "sign": -1.0, "speed": THROTTLE, "tau": THROTTLE_TAU}},
                 "patch": {"cx": self.width / 2.0, "cy": PLAYER_Y, "radius": RADIUS},
+                # the land's travel law (entity_motion.ground_travel): stepped
+                # here, predicted by the page, adopted with the ship
+                "travel": ["map_u", "map_v", "map_gx", "map_gy"],
                 # Twin shots from the nose on a reload, as the law fires them.
                 "weapon": {"muzzles": [[-0.2, -MUZZLE], [0.2, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED],
                            "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",

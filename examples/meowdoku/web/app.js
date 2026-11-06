@@ -558,7 +558,7 @@ function reliefMesh(exported) {
 // heights on the mesh's grid nodes, their normals from neighbouring nodes,
 // and the colour/depth UVs are rewritten every frame -- the DepthMesh's own
 // grid and strips, re-read, so relief, colour and depth turn together.
-const TURN_LAND = { travel: [0, 0], at: null, yaw: 0 };
+const TURN_LAND = { travel: [0, 0], c: 1, s: 0 };
 const SHADOW_SINK = 0.07;
 // The land's height under board point (x, z): the relief map read at the
 // same turned, travelling coordinate the land is drawn with, on the land's
@@ -566,7 +566,7 @@ const SHADOW_SINK = 0.07;
 function landHeight(x, z) {
   const relief = TERRAIN.relief, game = state.game, patch = game && game.predict && game.predict.patch;
   if (!relief || !relief.map || !patch) return null;
-  const c = Math.cos(TURN_LAND.yaw), s = Math.sin(TURN_LAND.yaw);
+  const c = TURN_LAND.c, s = TURN_LAND.s;
   const X = x - patch.cx, Y = patch.cy - z;
   const u = TURN_LAND.travel[0] + X * c + Y * s, v = TURN_LAND.travel[1] + X * s - Y * c;
   const n = relief.map.n, h = relief.map.h, toMap = n / relief.tile, wrap = (i) => ((i % n) + n) % n;
@@ -578,13 +578,13 @@ function landHeight(x, z) {
 function turnRelief(relief, now) {
   const game = state.game, patch = game.predict && game.predict.patch;
   if (!relief.map || !relief.step || !patch) return false;
-  const ship = pred.ship || game.you || {};
-  const yaw = ship.yaw || 0, spd = ship.spd || 0;
-  const frame = TURN_LAND.at == null ? 0 : Math.min(0.1, now - TURN_LAND.at);
-  TURN_LAND.at = now;
-  if (!game.over) { TURN_LAND.travel[0] += spd * frame * Math.sin(yaw); TURN_LAND.travel[1] -= spd * frame * Math.cos(yaw); }
-  TURN_LAND.yaw = yaw;
-  const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], c = Math.cos(yaw), s = Math.sin(yaw);
+  // The land's state is the engine's (ground_travel: the server's, carried
+  // on by the page's prediction of the same law) -- read, never integrated here.
+  const ship = (pred.ship && pred.ship.map_gy != null ? pred.ship : game.you) || {};
+  if (ship.map_gy == null) return false;
+  TURN_LAND.travel = [ship.map_u, ship.map_v];
+  TURN_LAND.c = -ship.map_gy; TURN_LAND.s = ship.map_gx;          // the frame's (cos, sin) of its heading
+  const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], c = TURN_LAND.c, s = TURN_LAND.s;
   const n = relief.map.n, h = relief.map.h, toMap = n / relief.tile;
   const wrap = (i) => ((i % n) + n) % n;
   const sample = (u, v) => {
@@ -1731,6 +1731,7 @@ const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min
 function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
+    const yawBefore = ship.yaw;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
                                                   ["z", "z", "vz", "move_axis_z", "steer_z"],
                                                   ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null]]) {
@@ -1759,6 +1760,12 @@ function stepShip(ship, input, seconds, motion) {
         lo, hi, speed: motion.speed, tau: motion.tau, reach: motion.reach, dt });
       ship[pos] = r.x_next; ship[vel] = r.v_next;
     }
+    // The land under the ship: the engine's ground_travel, as the law steps it.
+    if (motion.travel && pred.travel && ship.map_gy != null) {
+      const g = pred.travel.invoke({ u: ship.map_u, v: ship.map_v, gx: ship.map_gx, gy: ship.map_gy,
+                                     turn: (ship.yaw ?? 0) - (yawBefore ?? 0), speed: ship.spd || 0, dt });
+      ship.map_u = g.u_next; ship.map_v = g.v_next; ship.map_gx = g.gx_next; ship.map_gy = g.gy_next;
+    }
   }
 }
 // While the demo player (the server's trained policy) flies, the ship is the
@@ -1783,10 +1790,13 @@ function reconcile(game) {
   // still stepped here by the motion law, but from the server's state.
   const adoptable = game.predict.adopt_axes || ["x", "y"];
   const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"], ["yaw", "vyaw"], ["spd", "vspd"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
-  const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos])) : Infinity;
+  const land = game.predict.travel && pred.ship && pred.ship.map_u != null
+    ? Math.hypot(pred.ship.map_u - ship.map_u, pred.ship.map_v - ship.map_v) : 0;
+  const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos]), land) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
   if (pred.ship && error <= tolerance) {
     for (const [pos, vel] of declared) { ship[pos] = pred.ship[pos]; ship[vel] = pred.ship[vel]; }
+    for (const name of game.predict.travel || []) if (pred.ship[name] != null) ship[name] = pred.ship[name];
     // The server's own axes still move only on its word -- eased, not jumped.
     if (before) ["x", "y"].forEach((pos, i) => { if (!declared.some(([p]) => p === pos)) pred.offset[i] += before[i] - ship[pos]; });
     syncFaithfulness(0);
@@ -1952,6 +1962,7 @@ function applySnapshot(view) {
   sync.hint = f32();
   you.z = f32(); you.vz = f32(); you.health = f32();
   you.yaw = f32(); you.vyaw = f32(); you.spd = f32(); you.vspd = f32(); you.at = performance.now() / 1000;
+  you.map_u = f32(); you.map_v = f32(); you.map_gx = f32(); you.map_gy = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -1992,7 +2003,7 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 4;           // realtime_socket.PROTOCOL
+const SNAPSHOT_PROTOCOL = 5;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -2010,7 +2021,9 @@ function sendTick(game) {
     if (pred.ship && pred.sent.length)
       payload.ship = { seq: pred.seq, x: pred.ship.x, y: pred.ship.y, vx: pred.ship.vx, vy: pred.ship.vy,
                        z: pred.ship.z || 0, vz: pred.ship.vz || 0,
-                       yaw: pred.ship.yaw || 0, vyaw: pred.ship.vyaw || 0, spd: pred.ship.spd || 0, vspd: pred.ship.vspd || 0 };
+                       yaw: pred.ship.yaw || 0, vyaw: pred.ship.vyaw || 0, spd: pred.ship.spd || 0, vspd: pred.ship.vspd || 0,
+                       map_u: pred.ship.map_u || 0, map_v: pred.ship.map_v || 0, map_gx: pred.ship.map_gx || 0,
+                       map_gy: pred.ship.map_gy ?? -1 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -2190,13 +2203,14 @@ function authorityText(game) {
 // run) is taken at once.
 const view = { x: 0, at: null };
 function viewX(now) {
+  // The engine's follow_view (the law's own), from the server's view with the
+  // ship the page draws -- the same rule, the same compiled code.
   const game = state.game, cam = game && game.predict && game.predict.camera;
   if (!cam) return 0;
   if (view.at !== now) {
     view.at = now;
-    if (cam.x + SYNC_SNAP < view.x) view.x = cam.x;
     const shipX = pred.ship ? pred.ship.x + pred.offset[0] : (game.you ? game.you.x : 0);
-    view.x = Math.max(view.x, cam.x, shipX - cam.follow * cam.width);
+    view.x = pred.follow ? pred.follow.invoke({ view: cam.x, x: shipX, follow: cam.follow, width: cam.width }).view_next : cam.x;
   }
   return view.x;
 }
@@ -3350,6 +3364,9 @@ function fillPickers() {
   // (the exported "mouse" mesh is not drawn: X marks are notes, not mice)
   try {
     pred.program = await TuringWasmProgram.load("motion.wasm", "motion.abi.json");
+    // the engine's other laws the page runs (entity_motion.PREDICTORS)
+    pred.travel = await TuringWasmProgram.load("travel.wasm", "travel.abi.json");
+    pred.follow = await TuringWasmProgram.load("follow.wasm", "follow.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());

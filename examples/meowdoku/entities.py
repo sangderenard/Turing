@@ -562,6 +562,11 @@ class EntityGame(Game):
         if self.adopted:
             for name, value in values.items():
                 getattr(self.session.state, name)[k] = value
+            # State the motion declares stepped with the ship (a spherical
+            # game's land: ``travel``) is adopted with it, when reported.
+            for name in motion.get("travel") or ():
+                if name in ship and np.isfinite(float(ship[name])):
+                    getattr(self.session.state, name)[k] = float(ship[name])
             return "client"
         return "kept"
 
@@ -646,4 +651,7 @@ class EntityGame(Game):
             for axis in ("yaw", "spd"):                 # a spherical game's turn and throttle
                 if axis in self.session.columns:
                     st["you"][axis], st["you"]["v" + axis] = float(col(axis)[k]), float(col("v" + axis)[k])
+            for name in ("map_u", "map_v", "map_gx", "map_gy"):  # and the land under it
+                if name in self.session.columns:
+                    st["you"][name] = float(col(name)[k])
         return st
