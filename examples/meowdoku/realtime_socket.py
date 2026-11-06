@@ -28,6 +28,8 @@ DELTA, little-endian:
                       f32 x5 the controls in effect of the demo pilot (move_axis,
                       move_axis_y, move_axis_z, move_axis_r, fire; 0 unless the
                       autopilot flies),
+                      f32 x5 the tracking cannon: lock (the locked lane; 0 none),
+                      mount_yaw, mount_vyaw, mount_pitch, mount_vpitch,
                       f64 law clock (the law time of this state),
                       u8 n, then n pilot INTERVAL records: u32 seq, f64 law start
                       time, f32 length, f32 x5 controls (same order).  The pilot
@@ -156,7 +158,10 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #:       body's flight state (u8 flight, f32 u, h, spd, turn).
 #:  10 = the header ends with the law clock (f64) and the pilot's interval
 #:       records (u8 n; u32 seq, f64 start, f32 length, f32 x5 controls).
-PROTOCOL = 10
+#:  11 = the header's pilot controls are followed by the tracking cannon:
+#:       f32 lock (the locked lane; 0 none), mount_yaw, mount_vyaw,
+#:       mount_pitch, mount_vpitch (the gun mount's offsets from the nose).
+PROTOCOL = 11
 
 def _pack_body(body: dict[str, Any]) -> bytes:
     """A body's flight state: u8 flight, f32 u (3), h (3), spd, turn."""
@@ -307,7 +312,7 @@ class SnapshotEncoder:
         self.sim, self.sim_clock = sim, clock
 
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBfffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBffffffffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),
@@ -318,7 +323,8 @@ class SnapshotEncoder:
                              float(you.get("map_gx", 0.0)), float(you.get("map_gy", -1.0)),
                              float(you.get("bank", 0.0)), float(you.get("vbank", 0.0)), float(you.get("beam", 0.0)),
                              *(float(you.get(n, 0.0)) for n in ("ux", "uy", "uz", "hx", "hy", "hz")),
-                             *(float(v) for v in (you.get("pilot") or [0.0] * 5)))]
+                             *(float(v) for v in (you.get("pilot") or [0.0] * 5)),
+                             *(float(you.get(n, 0.0)) for n in ("lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch")))]
         intervals = sorted(you.get("pilot_intervals") or (), key=lambda r: r["seq"])
         if intervals and intervals[-1]["seq"] < self.pilot_sent:
             self.pilot_sent = 0                        # the law's counter began again

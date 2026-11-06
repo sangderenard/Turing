@@ -11,7 +11,7 @@
 // trajectory step of a missile or a bomb; then projected into the patch about
 // the page's own ship by sphere_project.
 
-export const SNAPSHOT_PROTOCOL = 10;          // realtime_socket.PROTOCOL
+export const SNAPSHOT_PROTOCOL = 11;          // realtime_socket.PROTOCOL
 export const FLAG_KEYFRAME = 1, FLAG_CLEAR = 2, FLAG_BODIES = 4;
 
 // One frame: { version } when the layout is another version, else the header,
@@ -34,6 +34,8 @@ export function decodeSnapshot(view, names) {
   you.bank = f32(); you.vbank = f32(); you.beam = f32();
   you.ux = f32(); you.uy = f32(); you.uz = f32(); you.hx = f32(); you.hy = f32(); you.hz = f32();
   you.pilot = [f32(), f32(), f32(), f32(), f32()];
+  // the tracking cannon: the locked lane (0 none) and the gun mount's offsets from the nose
+  you.lock = f32(); you.mount_yaw = f32(); you.mount_vyaw = f32(); you.mount_pitch = f32(); you.mount_vpitch = f32();
   // the law time of this state, and the pilot's interval records (seq, law start, length, the five controls):
   // each arrives before its start (scroller.PILOT_PREDELAY)
   you.clock = f64();

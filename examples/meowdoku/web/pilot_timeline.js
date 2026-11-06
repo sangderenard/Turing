@@ -3,8 +3,34 @@
 // autopilot prediction against the server's.
 export const PRED_STEP = 1 / 240;            // the predictor's own rate (PREDICT_HZ)
 
+// THE TRACKING CANNON'S TARGET as the page knows it.  ``locate(lane)`` returns the locked lane's body as the page holds
+// it ({ body: BodyFlight.held, until: the world time to carry it to }) or null; the aimer carries it on, then gives,
+// seen from ``ship`` (its heading as turned this step): the body's patch point, the patch point of the same body flown
+// cannon.step further along its heading (the aim law reads its velocity from the pair), its speed in the air at its
+// height, and its height and climb over the ship -- the inputs of entity_motion.aim_solution.  Null with no body.
+export function cannonAimer(pred, motionOf, locate) {
+  return function aimTarget(ship) {
+    const motion = motionOf(), cfg = motion && motion.cannon;
+    if (!cfg || !motion.sphere || !pred.bodies || !pred.project || !pred.advance || !pred.air || !(ship.lock > 0.5)) return null;
+    const hit = locate(ship.lock);
+    if (!hit) return null;
+    const b = hit.body, R = motion.sphere.radius;
+    pred.bodies.carry(b, hit.until - b.at, motion.bodies, motion.sphere);
+    b.at = Math.max(b.at, hit.until);
+    const at = (q) => pred.project.invoke({ ux: q.ux, uy: q.uy, uz: q.uz, cx: ship.ux, cy: ship.uy, cz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz, radius: R });
+    const p = at(b);
+    const f = pred.advance.invoke({ ux: b.ux, uy: b.uy, uz: b.uz, hx: b.hx, hy: b.hy, hz: b.hz, distance: cfg.step, radius: R });
+    const p2 = at({ ux: f.ux_next, uy: f.uy_next, uz: f.uz_next });
+    const air = pred.air.invoke({ z: b.z, fall: motion.sphere.air[0], gain: motion.sphere.air[1] }).factor;
+    return { X: p.X, Y: p.Y, X2: p2.X, Y2: p2.Y, tspd: (b.spd || 0) * air, dz: b.z - (ship.z || 0), tvz: b.vz || 0 };
+  };
+}
+
 // ``pred``: { program, bankTurn, turn, advance, air, travel } wasm cores; ``view``: () => the camera { x }.
-export function shipStepper(pred, view) {
+//
+// ``aimer(ship, input)``: the tracking cannon's target as the page knows it -- { X, Y, X2, Y2, tspd, dz, tvz } for
+// entity_motion.aim_solution about ``ship`` (its heading already turned by this step), or null: no lock to aim at.
+export function shipStepper(pred, view, aimer = null) {
   return function stepShip(ship, input, seconds, motion, stepSize = PRED_STEP) {
     for (let left = seconds; left > 1e-9;) {
       const dt = Math.min(stepSize, left); left -= dt;
@@ -55,6 +81,25 @@ export function shipStepper(pred, view) {
       if (motion.sphere && pred.advance && pred.turn && pred.air && ship.ux != null) {
         const t = pred.turn.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
                                      angle: (ship.yaw ?? 0) - (yawBefore ?? 0) });
+        // THE GUN MOUNT (the tracking cannon): the law's order -- aimed from the frame as turned this step, before the
+        // ship advances -- and on the same damped_axis, each offset a non-negative position (offset + half its travel).
+        if (motion.cannon && pred.aim && ship.mount_yaw != null) {
+          const C = motion.cannon, turned = { ...ship, hx: t.hx_next, hy: t.hy_next, hz: t.hz_next, z: zBefore };
+          const tg = ship.lock > 0.5 && aimer ? aimer(turned, input) : null;
+          let yawTo = C.travel[0], pitchTo = C.travel[1];
+          if (tg) {
+            const a = pred.aim.invoke({ X: tg.X, Y: tg.Y, X2: tg.X2, Y2: tg.Y2, step: C.step, tspd: tg.tspd,
+              shot_spd: motion.weapon.speed + (ship.spd || 0), dz: tg.dz, tvz: tg.tvz, slope: C.slope,
+              pitch: Math.max(-1, Math.min(1, input.move_axis_z || 0)), yaw_half: C.travel[0], pitch_half: C.travel[1] });
+            yawTo = a.yaw_target; pitchTo = a.pitch_target;
+          }
+          const my = pred.program.invoke({ x: ship.mount_yaw + C.travel[0], v: ship.mount_vyaw, axis: 0, target: yawTo,
+            lo: 0, hi: 2 * C.travel[0], speed: C.rate[0], tau: C.tau, reach: C.reach, dt });
+          const mp = pred.program.invoke({ x: ship.mount_pitch + C.travel[1], v: ship.mount_vpitch, axis: 0, target: pitchTo,
+            lo: 0, hi: 2 * C.travel[1], speed: C.rate[1], tau: C.tau, reach: C.reach, dt });
+          ship.mount_yaw = my.x_next - C.travel[0]; ship.mount_vyaw = my.v_next;
+          ship.mount_pitch = mp.x_next - C.travel[1]; ship.mount_vpitch = mp.v_next;
+        }
         const air = pred.air.invoke({ z: zBefore, fall: motion.sphere.air[0], gain: motion.sphere.air[1] }).factor;
         const a = pred.advance.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: t.hx_next, hy: t.hy_next, hz: t.hz_next,
                                         distance: (ship.spd || 0) * dt * air, radius: motion.sphere.radius });

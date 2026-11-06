@@ -7,7 +7,7 @@
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
-import { shipStepper, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
+import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -1297,6 +1297,8 @@ function uploadMaterials(game) {
   // tail, and the white anti-collision strobe (dark between flashes).
   records.push(["nav_red", [0.3, 0.02, 0.02], { emission: [2.6, 0.12, 0.1], roughness: 0.2 }]);
   records.push(["beam", [0.2, 0.9, 0.8], { roughness: 0.1, transmission: 0.3, opacity: 0.85, ior: 1.2, emission: [0.5, 2.8, 2.4] }]);
+  records.push(["reticle", [0.9, 0.5, 0.1], { roughness: 0.1, opacity: 0.9, emission: [3.0, 1.2, 0.2] }]);
+  records.push(["sight", [0.3, 0.9, 0.4], { roughness: 0.1, opacity: 0.9, emission: [0.4, 2.6, 0.9] }]);
   records.push(["nav_green", [0.02, 0.3, 0.06], { emission: [0.1, 2.4, 0.5], roughness: 0.2 }]);
   records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
   records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [2.4, 2.4, 2.5], roughness: 0.2 }]);
@@ -1844,6 +1846,45 @@ function drawBeam(now, drawLit) {
   drawLit(tube.vao, tube.count, M.multiply(M.translate(at[0], at[1] - 0.04, at[2] - nose - length / 2),
     M.scale(0.07 * flicker, 0.07 * flicker, length)), null);
 }
+// THE TRACKING CANNON'S RETICLE: a ring on the locked enemy, a lead marker at the intercept the gun mount is
+// slewing to (joined to the ring by a line), and a small sight where the gun points now -- the mount's yaw and
+// pitch from the nose.  All from the law's state: the lock the server sends, the mount as the page steps it, and
+// aim_solution for the lead.
+function drawReticle(now, drawLit) {
+  const game = state.game, you = game && game.you, cfg = game && game.predict && game.predict.cannon;
+  if (!cfg || state.flat || !you || !you.alive || isWalker(game) || !pred.ship || pred.ship.mount_yaw == null) return;
+  const ship = pred.ship, patch = game.predict.patch, depth = game.predict.depth || 4;
+  const ring = (at, r, material, w = 0.05, n = 14) => {
+    const mesh = vitalBox(material), len = (2 * Math.PI * r / n) * 1.08;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * 2 * Math.PI;
+      drawLit(mesh.vao, mesh.count, M.multiply(M.translate(at[0] + r * Math.sin(a), at[1], at[2] + r * Math.cos(a)),
+        M.multiply(M.rotateY(a + Math.PI / 2), M.scale(w, w, len))), null);
+    }
+  };
+  const line = (a, b, material, w = 0.03) => {
+    const dx = b[0] - a[0], dz = b[2] - a[2], len = Math.hypot(dx, dz), mesh = vitalBox(material);
+    if (len < 0.05) return;
+    drawLit(mesh.vao, mesh.count, M.multiply(M.translate((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2),
+      M.multiply(M.rotateY(Math.atan2(dx, dz)), M.scale(w, w, len))), null);
+  };
+  const world = (x, z, h) => worldOf({ x: x + pred.offset[0], z: z + pred.offset[1], h });
+  // the sight: where a shot is a few units out along the mount (yaw right of the nose, climbing at the pitch it carries)
+  const D = 4.0, my = 2 * Math.atan((ship.mount_yaw || 0) / 2);        // (the mount turns by the Cayley half-angle: 2 atan(m / 2))
+  const sh = Math.max(0, Math.min(depth, (ship.z || 0) + D * cfg.slope * (ship.mount_pitch || 0)));
+  ring(world(patch.cx + D * Math.sin(my), patch.cy - D * Math.cos(my), sh), 0.16, "sight", 0.035, 8);
+  if (!(ship.lock > 0.5) || !pred.aim || !game.predict.weapon) return;
+  const tg = aimTarget({ ...ship });
+  if (!tg) return;
+  ring(world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz), 0.6 + 0.04 * Math.sin(now * 6), "reticle", 0.05, 14);
+  const a = pred.aim.invoke({ X: tg.X, Y: tg.Y, X2: tg.X2, Y2: tg.Y2, step: cfg.step, tspd: tg.tspd,
+    shot_spd: game.predict.weapon.speed + (ship.spd || 0), dz: tg.dz, tvz: tg.tvz, slope: cfg.slope, pitch: 0,
+    yaw_half: cfg.travel[0], pitch_half: cfg.travel[1] });
+  const target = world(patch.cx + tg.X, patch.cy - tg.Y, (ship.z || 0) + tg.dz);
+  const lead = world(patch.cx + a.lead_x, patch.cy - a.lead_y, Math.max(0, Math.min(depth, (ship.z || 0) + tg.dz + tg.tvz * a.tau)));
+  line(target, lead, "reticle");
+  ring(lead, 0.22, "reticle", 0.04, 8);
+}
 function drawShield(now, drawLit) {
   const game = state.game;
   if (isWalker(game)) return;                  // (no rocket's shield bubble on a walker)
@@ -2245,7 +2286,20 @@ const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // recycled to the far edge, a rewind) is taken at once.
 const SYNC_SNAP = 6.0;
 const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min(1, error / 2)));
-const shipStep = shipStepper(pred, () => view);
+// THE TRACKING CANNON'S TARGET (pilot_timeline.js: cannonAimer): the server's locked lane (you.lock, riding the
+// snapshot) as the body the page carries on between snapshots, to the moment now.
+const aimLock = { piece: null };
+function lockedBody(lane) {
+  let piece = aimLock.piece;
+  if (!piece || piece.lane !== lane || piece.removing != null || state.pieces.get(piece.id) !== piece) {
+    piece = null;
+    for (const p of state.pieces.values()) if (p.entity && !p.provisional && p.lane === lane && p.body && p.removing == null) { piece = p; break; }
+    aimLock.piece = piece;
+  }
+  return piece && { body: piece.body, until: Math.min(performance.now() / 1000, piece.tRecv + 1.0) };
+}
+const aimTarget = cannonAimer(pred, () => state.game && state.game.predict, lockedBody);
+const shipStep = shipStepper(pred, () => view, aimTarget);
 // A walker (World Walk) steps by the walking laws; everything else by the
 // shared ship stepper (pilot_timeline.js).
 function stepShip(ship, input, seconds, motion) {
@@ -2455,7 +2509,8 @@ function predictVolleys(now, game, c, weapon, drawNow) {
       const r = pred.shot.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
         c: rank - 0.5 * mult, fan, laser: 0, ship_spd: ship.spd || 0, pitch,
         ahead: weapon.muzzles.ahead, spacing: weapon.muzzles.spacing, fan_step: weapon.fan_step, speed: weapon.speed,
-        laser_mult: weapon.laser_mult, slope: weapon.slope, radius: R });
+        laser_mult: weapon.laser_mult, slope: weapon.slope, radius: R,
+        mount_yaw: ship.mount_yaw || 0, mount_pitch: ship.mount_pitch || 0 });       // along the gun mount, as the law fires
       const id = `prov:${++pred.shotSeq}`;
       const flown = { ux: r.ux_next, uy: r.uy_next, uz: r.uz_next, hx: r.hx_next, hy: r.hy_next, hz: r.hz_next,
                       spd: r.speed_next, vz: r.vz_next, z: ship.z || 0 };
@@ -3615,6 +3670,7 @@ function litPass(cam, now, casters, opts = {}) {
   }
   drawShield(now, drawLit);
   drawBeam(now, drawLit);
+  drawReticle(now, drawLit);
   drawVitals(now, drawLit);
   if (opts.plate) drawProjectionGlass(cam, drawLit);
   gl.depthMask(true); gl.disable(gl.BLEND);
@@ -4513,6 +4569,8 @@ function fillPickers() {
     pred.air = await TuringWasmProgram.load("air.wasm", "air.abi.json");
     // the player's shots: birth, climb and the patch projection (entity_motion.shot_spawn / climb / sphere_project)
     pred.shot = await TuringWasmProgram.load("shot.wasm", "shot.abi.json");
+    // the tracking cannon's aim (entity_motion.aim_solution): the intercept the gun mount slews to
+    pred.aim = await TuringWasmProgram.load("aim.wasm", "aim.abi.json");
     pred.climb = await TuringWasmProgram.load("climb.wasm", "climb.abi.json");
     pred.project = await TuringWasmProgram.load("project.wasm", "project.abi.json");
     // the trigger's gate (when a volley may leave), a body's heading in the patch, and the

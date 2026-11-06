@@ -132,7 +132,7 @@ def sphere_advance(ux: float, uy: float, uz: float, hx: float, hy: float, hz: fl
 def shot_spawn(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
                c: float, fan: float, laser: float, ship_spd: float, pitch: float,
                ahead: float, spacing: float, fan_step: float, speed: float, laser_mult: float,
-               slope: float, radius: float):
+               slope: float, radius: float, mount_yaw: float, mount_pitch: float):
     """The player's shot at birth, as one law for server and page.  The ship is
     at unit position ``u`` heading ``h``; the shot is ``c`` gun-spacings to the
     side of the nose (``c`` is its rank in the volley, centred on zero), ``ahead``
@@ -140,7 +140,11 @@ def shot_spawn(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
     (the muzzle offset), then turned by ``c * fan_step * fan`` (the volley's
     spread, the exact rotation of ``sphere_turn``).  It leaves at ``speed`` (a
     laser's ``laser_mult`` times that), on top of the ship's own speed, and climbs
-    at ``slope`` times that speed per unit of the ship's pitch command.  Returns
+    at ``slope`` times that speed per unit of the ship's pitch command.  The GUN
+    MOUNT (the tracking cannon) adds to both: the whole volley is turned by
+    ``mount_yaw`` radians (right positive, the same rotation as the spread) and
+    climbs for ``mount_pitch`` more units of pitch command; both zero is the
+    fixed gun.  Returns
     the shot's position, heading, speed and climb rate.  Arithmetic only (the
     unit lengths are kept by Newton steps, as the flight laws do); fly it with
     ``sphere_advance`` and ``climb``."""
@@ -172,7 +176,7 @@ def shot_spawn(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
     qx = qx * w
     qy = qy * w
     qz = qz * w
-    t = c * fan_step * fan * 0.5
+    t = (c * fan_step * fan + mount_yaw) * 0.5
     d = 1.0 + t * t
     cs = (1.0 - t * t) / d
     sn = (2.0 * t) / d
@@ -188,7 +192,46 @@ def shot_spawn(ux: float, uy: float, uz: float, hx: float, hy: float, hz: float,
     nz = nz - k2 * pz
     inv = 1.5 - 0.5 * (nx * nx + ny * ny + nz * nz)
     shot_speed = speed * (laser * laser_mult + (1.0 - laser)) + ship_spd
-    return px, py, pz, nx * inv, ny * inv, nz * inv, shot_speed, shot_speed * slope * pitch
+    return px, py, pz, nx * inv, ny * inv, nz * inv, shot_speed, shot_speed * slope * (pitch + mount_pitch)
+
+
+def aim_solution(X: float, Y: float, X2: float, Y2: float, step: float, tspd: float, shot_spd: float,
+                 dz: float, tvz: float, slope: float, pitch: float, yaw_half: float, pitch_half: float):
+    """The tracking cannon's aim, as one law for server and page: where the gun
+    mount must point to meet a target, led by the shot's travel time.  The
+    target is at patch point (``X``, ``Y``) (right, ahead; ``sphere_project``
+    about the ship) and, flown ``step`` along its heading, at (``X2``, ``Y2``),
+    so its ground velocity in the ship's tangent plane is that direction at
+    ``tspd``; the shot leaves at ``shot_spd`` over the ground.  The intercept
+    time ``tau`` is the positive root of |P + V tau| = shot_spd tau (a target
+    outrunning the shot is led by at most 3 s), the lead point P + V tau gives
+    the yaw offset from the nose -- in the units ``shot_spawn``'s mount turns by
+    (the Cayley half-angle form: ``2 tan(angle / 2)``, here ``2 lx / (|L| + ly)``,
+    so the shot flies exactly at the lead point) --, and the height ``dz`` (target above the
+    ship) plus its climb ``tvz`` over ``tau`` gives the pitch the shot must
+    carry (``slope`` per unit, as ``shot_spawn``), less the pitch command
+    ``pitch`` the shot already has.  Returns the mount's TARGET POSITIONS in
+    ``damped_axis``'s non-negative frame -- offset + ``yaw_half`` / ``pitch_half``,
+    clamped to the travel [0, 2 half] --, ``tau`` and the lead point."""
+    vx = (X2 - X) / step * tspd
+    vy = (Y2 - Y) / step * tspd
+    a = vx * vx + vy * vy - shot_spd * shot_spd
+    b = X * vx + Y * vy
+    c = X * X + Y * Y
+    disc = b * b - a * c
+    s = ((abs(disc) + disc) * 0.5).sqrt()
+    q = ((-a - 1e-3) + abs(-a - 1e-3)) * 0.5 + 1e-3
+    t0 = (b + s) / q
+    tau = (abs(t0) - abs(t0 - 3.0) + 3.0) * 0.5
+    lx = X + vx * tau
+    ly = Y + vy * tau
+    yaw = 2.0 * lx / ((lx * lx + ly * ly).sqrt() + ly + 1e-12)
+    need = (dz + tvz * tau) / (shot_spd * tau * slope + 1e-3) - pitch
+    yaw_pos = yaw + yaw_half
+    pitch_pos = need + pitch_half
+    yaw_t = (abs(yaw_pos) - abs(yaw_pos - 2.0 * yaw_half)) * 0.5 + yaw_half
+    pitch_t = (abs(pitch_pos) - abs(pitch_pos - 2.0 * pitch_half)) * 0.5 + pitch_half
+    return yaw_t, pitch_t, tau, lx, ly
 
 
 def climb(z: float, vz: float, dt: float):
@@ -990,8 +1033,10 @@ PREDICTORS = (
     (sphere_advance, ("ux", "uy", "uz", "hx", "hy", "hz", "distance", "radius"),
      ("ux_next", "uy_next", "uz_next", "hx_next", "hy_next", "hz_next"), "advance"),
     (shot_spawn, ("ux", "uy", "uz", "hx", "hy", "hz", "c", "fan", "laser", "ship_spd", "pitch", "ahead", "spacing",
-                  "fan_step", "speed", "laser_mult", "slope", "radius"),
+                  "fan_step", "speed", "laser_mult", "slope", "radius", "mount_yaw", "mount_pitch"),
      ("ux_next", "uy_next", "uz_next", "hx_next", "hy_next", "hz_next", "speed_next", "vz_next"), "shot"),
+    (aim_solution, ("X", "Y", "X2", "Y2", "step", "tspd", "shot_spd", "dz", "tvz", "slope", "pitch", "yaw_half", "pitch_half"),
+     ("yaw_target", "pitch_target", "tau", "lead_x", "lead_y"), "aim"),
     (climb, ("z", "vz", "dt"), ("z_next",), "climb"),
     (sphere_project, ("ux", "uy", "uz", "cx", "cy", "cz", "hx", "hy", "hz", "radius"), ("X", "Y"), "project"),
     (sphere_heading, ("hx", "hy", "hz", "cx", "cy", "cz", "gx", "gy", "gz"), ("angle",), "heading"),

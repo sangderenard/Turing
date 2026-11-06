@@ -62,6 +62,10 @@ point masses on ``symbolic_parts.trajectory_batch_step`` (drag on
 air-relative velocity, gravity along height), launched with the firing
 solution that lands them on the nearest enemy; they hit for MISSILE_DAMAGE.
 
+TRACKING CANNON: each step the law locks the best live enemy in a cone about the nose (``lock``: its lane, 0 none;
+see LOCK_*) and slews the gun MOUNT (``mount_yaw``/``mount_pitch``, offsets from the nose) on the shared
+``damped_axis`` toward ``entity_motion.aim_solution``'s intercept; ``shot_spawn`` fires along the mount.
+
 DEPTH: every lane also has a height ``z`` above the board (0..DEPTH) with
 velocity ``vz`` and a depth half-extent ``rz``: the ship climbs and dives on
 the same damped motion law, shots leave at its height, aimed spreads aim in
@@ -92,7 +96,7 @@ from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
 from meowdoku.sweep import swept_block_hits
-from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, fire_gate, ground_travel, sphere_heading
+from meowdoku.entity_motion import aim_solution, air_gain, bank_turn, damped_axis, fire_gate, ground_travel, sphere_heading
 from meowdoku.entity_motion import climb as climb_law, shot_spawn as shot_birth
 from meowdoku import sphere_motion as sm
 from meowdoku import pilot_law
@@ -371,6 +375,25 @@ STATION_Z = 0.0             # emplacements sit on the land (the page sets them o
 CLOUD_DRIFT, STORM_DRIFT, SMOKE_DRIFT = 0.25, 0.5, 0.25
 SHIP_SIZE = 0.5            # body only (exhaust puff dropped at export): ~1.3 units long
 SHIP_RX, SHIP_RY = 0.22, 0.4
+#: THE TRACKING CANNON.  Each step the law scores the live enemies ahead by a
+#: CONE about the nose -- ``q = (yaw off the nose / LOCK_CONE[0])^2 + (pitch it
+#: needs / LOCK_CONE[1])^2``, inside the cone while q < 1, within LOCK_RANGE --
+#: as ``distance * (1 + LOCK_WEIGHT * q)`` (lowest wins: near and central).  The
+#: held lock stays while it is alive and inside the cone grown to LOCK_KEEP times
+#: its angles, unless another scores under LOCK_SWITCH times its score.  The gun
+#: MOUNT (a yaw and a pitch offset from the nose, travel +-MOUNT_TRAVEL) slews on
+#: the shared damped_axis law (MOUNT_RATE/MOUNT_TAU/MOUNT_REACH) toward
+#: entity_motion.aim_solution: the locked target's intercept, led by the shot's
+#: flight time (AIM_STEP is the span the target's heading is sampled over).
+LOCK_CONE = (0.55, 0.9)
+LOCK_RANGE = 14.0
+LOCK_WEIGHT = 3.0
+LOCK_KEEP = 1.3
+LOCK_SWITCH = 0.7
+MOUNT_TRAVEL = (0.6, 1.0)
+MOUNT_RATE = (3.0, 4.0)
+MOUNT_TAU, MOUNT_REACH = 0.04, 0.25
+AIM_STEP = 0.1
 MUZZLE_SPACING = 0.18      # the gun spacing: a volley's shots sit this far apart across the nose
 MUZZLE = 0.63             # the nose: 1.31 drawn half-sizes ahead, foreshortened by the 0.25 lean
 
@@ -551,6 +574,7 @@ def scroller_step(lane, slot, rx, ry, rz,
                   bombs_d, bombs_c, bombs_s, beam, net_o0, net_o1, net_o2, net_o3, net_o4,
                   pilot_hold, pilot_seq, pilot_hseq, pilot_hstart,
                   pilot_q0, pilot_q1, pilot_q2, pilot_q3, pilot_q4, pilot_qstart,
+                  lock, mount_yaw, mount_vyaw, mount_pitch, mount_vpitch,
                   field_w, pace, level, net_pilot,
                   move_axis, move_axis_y, move_axis_z, steer_x, steer_y, fire, alt_fire, bomb_style,
                   move_axis_r, fire_mode, primary_slot, dt,
@@ -718,12 +742,51 @@ def scroller_step(lane, slot, rx, ry, rz,
     # (entity_motion.shot_spawn, imported as shot_birth): muzzle, spread, speed, climb
     sux, suy, suz, shx, shy, shz, shot_speed, shot_vz = shot_birth(
         u0[0], u0[1], u0[2], h0[0], h0[1], h0[2], shot_c, pf, f(pw == LASER), pspd, pitch,
-        MUZZLE, MUZZLE_SPACING, FAN_STEP, SHOT_SPEED, LASER_SPEED, AIM_SLOPE, RADIUS)
+        MUZZLE, MUZZLE_SPACING, FAN_STEP, SHOT_SPEED, LASER_SPEED, AIM_SLOPE, RADIUS,
+        (P * mount_yaw).sum(), (P * mount_pitch).sum())
     shot_u, shot_h = (sux, suy, suz), (shx, shy, shz)
     # Missiles: the firing solution that lands each on the nearest enemy
     # (time of flight from the arc to it, vertical speed to rise the height
     # difference and fall back over it), then engine_toy's trajectory law.
     enemies_live = is_enemy & live
+    # ---- the tracking cannon: lock the best enemy in the cone, slew the mount to lead it
+    lock_x, lock_y = sm.project(u, u0, h0, RADIUS)               # every body in the patch about the ship (right, ahead)
+    lock_d = (lock_x * lock_x + lock_y * lock_y).sqrt()
+    lock_yaw_off = lock_x.atan2(lock_y)
+    lock_pitch_off = (z - pz) / (lock_d * AIM_SLOPE + 1e-3)      # the pitch command that would lift a shot to its height
+    lock_q = (lock_yaw_off / LOCK_CONE[0]) * (lock_yaw_off / LOCK_CONE[0]) + (lock_pitch_off / LOCK_CONE[1]) * (lock_pitch_off / LOCK_CONE[1])
+    lock_ahead = enemies_live & (lock_y > 0.0) & (lock_d < LOCK_RANGE) & ship_on & playing
+    lock_raw = lock_d * (1.0 + LOCK_WEIGHT * lock_q)
+    lock_score = where(lock_ahead & (lock_q < 1.0), lock_raw, zero + 1.0e9)
+    lock_best = lock_score.min()
+    best_pick = first_of((lock_score == lock_best) & (lock_best < 1.0e8), lane)
+    has_best = f(best_pick).sum() > 0.0
+    best_lane = (f(best_pick) * lane).sum()
+    lock_was = (P * lock).sum()                                  # the held lock's lane (0: none; the player's own lane)
+    held_pick = (lane == lock_was) & (lock_was > 0.5) & lock_ahead & (lock_q < LOCK_KEEP * LOCK_KEEP)
+    holds = f(held_pick).sum() > 0.0
+    held_score = (f(held_pick) * lock_raw).sum()
+    lock_switch = has_best & (lock_best < held_score * LOCK_SWITCH)
+    lock_now = where(holds & ~lock_switch, zero + lock_was, where(has_best, zero + best_lane, zero))
+    # the aim: the mount follows the lock held at the start of the step
+    aim_pick = f((lane == lock_was) & (lock_was > 0.5) & enemies_live & ship_on & playing)
+    has_aim = aim_pick.sum() > 0.0
+    t_u = sm.vwhere(has_aim, ((aim_pick * ux).sum(), (aim_pick * uy).sum(), (aim_pick * uz).sum()), u0)
+    t_h = sm.vwhere(has_aim, ((aim_pick * hx).sum(), (aim_pick * hy).sum(), (aim_pick * hz).sum()), h0)
+    t_z = (aim_pick * z).sum()
+    t_speed = (aim_pick * spd * air_gain(z, zero + AIR_FALL, zero + AIR_GAIN)[0]).sum()
+    t_X, t_Y = (aim_pick * lock_x).sum(), (aim_pick * lock_y).sum()
+    t_u2 = sm.advance(t_u, t_h, AIM_STEP, RADIUS)[0]
+    t_X2, t_Y2 = sm.project(t_u2, u0, h0, RADIUS)
+    aim_yaw, aim_pitch, aim_tau, aim_lead_x, aim_lead_y = aim_solution(
+        t_X, t_Y, t_X2, t_Y2, AIM_STEP, t_speed, SHOT_SPEED + pspd, t_z - pz, (aim_pick * vz).sum(), AIM_SLOPE, pitch,
+        MOUNT_TRAVEL[0], MOUNT_TRAVEL[1])
+    mount_yaw_pos, mount_yaw_v = damped_axis(
+        mount_yaw + MOUNT_TRAVEL[0], mount_vyaw, zero, zero + where(has_aim, aim_yaw, MOUNT_TRAVEL[0]),
+        zero, zero + 2.0 * MOUNT_TRAVEL[0], MOUNT_RATE[0], MOUNT_TAU, MOUNT_REACH, dt)
+    mount_pitch_pos, mount_pitch_v = damped_axis(
+        mount_pitch + MOUNT_TRAVEL[1], mount_vpitch, zero, zero + where(has_aim, aim_pitch, MOUNT_TRAVEL[1]),
+        zero, zero + 2.0 * MOUNT_TRAVEL[1], MOUNT_RATE[1], MOUNT_TAU, MOUNT_REACH, dt)
     gap = where(enemies_live, dist, 1.0e9)
     nearest = first_of(enemies_live & (gap == gap.min()), lane)
     has_target = f(nearest).sum() > 0.0
@@ -1328,6 +1391,11 @@ def scroller_step(lane, slot, rx, ry, rz,
     map_u_next, map_v_next = where(flying_on, gu, map_u), where(flying_on, gv, map_v)
     map_gx_next, map_gy_next = where(flying_on, ggx, map_gx), where(flying_on, ggy, map_gy)
     vyaw_next = where(is_player, ship_vyaw, vyaw)
+    lock_next = where(is_player, lock_now, lock)
+    mount_yaw_next = where(is_player, mount_yaw_pos - MOUNT_TRAVEL[0], mount_yaw)
+    mount_vyaw_next = where(is_player, mount_yaw_v, mount_vyaw)
+    mount_pitch_next = where(is_player, mount_pitch_pos - MOUNT_TRAVEL[1], mount_pitch)
+    mount_vpitch_next = where(is_player, mount_pitch_v, mount_vpitch)
     vspd_next = where(is_player, ship_vspd, vspd)
     # the rate every body's heading was turned at this step: sent to the page,
     # which turns the body on (entity_motion.sphere_turn) until the next word
@@ -1342,6 +1410,7 @@ def scroller_step(lane, slot, rx, ry, rz,
             mult_l_next, mult_m_next, fan_l_next, fan_m_next, bombs_d_next, bombs_c_next, bombs_s_next, beam_next,
             net_o0_next, net_o1_next, net_o2_next, net_o3_next, net_o4_next,
             pilot_hold_next, pilot_seq_next, pilot_hseq_next, pilot_hstart_next, *pilot_q_next, pilot_qstart_next,
+            lock_next, mount_yaw_next, mount_vyaw_next, mount_pitch_next, mount_vpitch_next,
             residual, dt_limit)
 
 
@@ -1353,7 +1422,8 @@ STATE = ("alive", "x", "y", "z", "vx", "vy", "vz", "ux", "uy", "uz", "hx", "hy",
          "fan_l", "fan_m", "bombs_d", "bombs_c", "bombs_s", "beam",
          "net_o0", "net_o1", "net_o2", "net_o3", "net_o4",
          "pilot_hold", "pilot_seq", "pilot_hseq", "pilot_hstart",
-         "pilot_q0", "pilot_q1", "pilot_q2", "pilot_q3", "pilot_q4", "pilot_qstart")
+         "pilot_q0", "pilot_q1", "pilot_q2", "pilot_q3", "pilot_q4", "pilot_qstart",
+         "lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch")
 SETTINGS = ("field_w", "pace", "level", "net_pilot")
 #: The lanes the pilot network is evaluated for (a contiguous block; the
 #: player's, so far).  ``net_pilot`` marks which of them it flies.
@@ -1504,7 +1574,8 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "mult_l": np.ones(LANES), "mult_m": np.ones(LANES),
         "fire_mode": np.full(LANES, AUTO), "primary_slot": np.zeros(LANES), "move_axis_r": np.zeros(LANES),
         "field_w": np.full(LANES, float(width)), "pace": np.full(LANES, float(pace)), "level": np.full(LANES, float(level)),
-        **{name: np.zeros(LANES) for name in ("net_pilot", "net_o0", "net_o1", "net_o2", "net_o3", "net_o4", *PILOT_COLUMNS)},
+        **{name: np.zeros(LANES) for name in ("net_pilot", "net_o0", "net_o1", "net_o2", "net_o3", "net_o4", *PILOT_COLUMNS,
+                                              "lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch")},
         **{name: np.zeros(LANES) for name in CONTROLS}, "steer_x": np.full(LANES, -1.0),
         "steer_y": np.full(LANES, -1.0),
     }
@@ -1640,6 +1711,12 @@ class BulletScroller(EntityGame):
                 # the ship's flight on the sphere (entity_motion.sphere_turn /
                 # air_gain / sphere_advance) and the land's law (terrain_height)
                 "sphere": {"radius": RADIUS, "air": [AIR_FALL, AIR_GAIN], "relief": 0.75, "sea": 0.48},
+                # The tracking cannon: the lock's cone and weights, the mount's
+                # travel and slew (damped_axis), the aim's span (aim_solution)
+                "cannon": {"cone": list(LOCK_CONE), "range": LOCK_RANGE, "weight": LOCK_WEIGHT, "keep": LOCK_KEEP,
+                           "switch": LOCK_SWITCH, "travel": list(MOUNT_TRAVEL), "rate": list(MOUNT_RATE),
+                           "tau": MOUNT_TAU, "reach": MOUNT_REACH, "step": AIM_STEP, "slope": AIM_SLOPE,
+                           "air": [AIR_FALL, AIR_GAIN]},
                 # Twin shots from the nose on a reload, as the law fires them.
                 "weapon": {"muzzles": {"ahead": MUZZLE, "spacing": MUZZLE_SPACING}, "fan_step": FAN_STEP,
                            "speed": SHOT_SPEED, "laser_mult": LASER_SPEED, "slope": AIM_SLOPE,
@@ -1909,6 +1986,12 @@ class BulletScroller(EntityGame):
             boss_live = float(c("alive")[BOSS_LANE]) > 0.0 and float(c("boss_phase")[0]) == 1.0
             st["boss"] = ({"hp": max(0.0, float(c("hp")[BOSS_LANE])),
                            "max": BOSS_HP * (1.0 + 0.5 * (self.level - 1.0))} if boss_live else None)
+            # The tracking cannon: the locked lane (0: none) and the gun mount's
+            # offsets from the nose and their rates (the page carries them on with
+            # the same damped_axis, and draws the reticle on the lock).
+            if "you" in st:
+                for name in ("lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch"):
+                    st["you"][name] = float(c(name)[0])
             # The player's place and heading on the globe (and the yaw they
             # were read at), for the page's sun and sky.
             st["globe"] = {"u": [float(c("ux")[0]), float(c("uy")[0]), float(c("uz")[0])],
