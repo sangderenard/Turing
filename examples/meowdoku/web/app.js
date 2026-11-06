@@ -1381,7 +1381,7 @@ function rebuildBoards(game) {
                               game.cells, game.hints, game.selected, game.hearts != null, game.rack && game.rack.cells]);
   if (key === state.boardKey) return;
   state.boardKey = key;
-  disposeMesh(state.buttons); disposeMesh(state.rackButtons); disposeMesh(state.glass);
+  disposeMesh(state.buttons); disposeMesh(state.rackButtons); disposeMesh(state.trayButtons); state.trayButtons = null; disposeMesh(state.glass);
   const hintOf = (r, c, name) => {
     const i = r * game.cols + c;
     if (game.selected === i) return `${name}@sel`;
@@ -1394,8 +1394,10 @@ function rebuildBoards(game) {
     : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
+  const trayFaces = game.powerups ? trayButtonFaces(game) : null;
+  state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.size
-    : game.rows + (game.powerups ? TRAY.row + 0.7 : game.hearts != null ? 1.5 : 0);
+    : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
   state.extent = { width, depth: game.board === "free" ? game.height : depth };
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
@@ -2099,12 +2101,26 @@ const LEAN = { cat: 0.35, x_mark: 0.35, heart: 0.35, disc: 0.0, letter: 0.3, che
 // The goldfish lives move like the hearts they replaced; a mouse drops in like an X.
 const MESH_FAMILY = { fish: "heart", mouse: "x_mark" };
 const family = (mesh) => (mesh.length === 1 ? "letter" : ["king", "queen", "rook", "bishop", "knight", "pawn"].includes(mesh) ? "chess" : MESH_FAMILY[mesh] || mesh);
-// The power-up tray: a row under the lives; each item with its count beside it.
-const TRAY = { row: 2.05, spacing: 2.0, count: 0.62 };
+// The power-up tray: a row under the lives.  Each item sits on its own
+// button tile (it reads as a button from above); its count is set small
+// UNDER the tile, outside the button, so it stays understated.
+const TRAY = { row: 2.0, spacing: 1.5, tile: 1.0, countDrop: 0.8 };
+function trayCentre(game, k) { return [game.cols / 2 + (Number(k) - 1) * TRAY.spacing, game.rows + TRAY.row]; }
 function trayPosition(game, cell) {
   const [, k, part] = cell.split(":");
-  const x = game.cols / 2 + (Number(k) - 1) * TRAY.spacing - 0.3 + (part === "count" ? TRAY.count : 0);
-  return [x, game.rows + TRAY.row, "hud"];
+  const [x, z] = trayCentre(game, k);
+  return part === "count" ? [x, z + TRAY.countDrop, "traycount"] : [x, z, "tray"];
+}
+function trayButtonFaces(game) {
+  // One raised tile per power-up, in the board's own tile finish.
+  const kinds = Object.keys(game.powerups || {}).length, material = (game.cells || [])[0];
+  if (!kinds || !material) return null;
+  const faces = [];
+  for (let k = 0; k < kinds; k++) {
+    const [x, z] = trayCentre(game, k);
+    faces.push(...buttonFaces(1, 1, () => material, [x - TRAY.tile / 2, z - TRAY.tile / 2], TRAY.tile));
+  }
+  return faces;
 }
 function cellPosition(game, cell, rackPiece) {
   if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
@@ -2986,7 +3002,7 @@ function pieceModel(piece, now) {
   const flat = state.flat;
   if (flat) { y = 0; tilt = 0; }                                   // no hop, no lean
   const lean = flat ? 0 : LEAN[fam] ?? 0.35;
-  const base = piece.place === "hud" ? 0.0 : TILE.height * (piece.cellSize || 1);
+  const base = piece.place === "hud" || piece.place === "traycount" ? 0.0 : TILE.height * (piece.cellSize || 1);
   const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s;
   let m = M.translate(x, rest + y, z);
   m = M.multiply(m, M.rotateY(spin));
@@ -3280,7 +3296,7 @@ function applyState(game) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "hud" ? 0.42 : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "tray" ? 0.3 : where === "traycount" ? 0.19 : where === "hud" ? 0.42 : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
       live.mesh = p.mesh; live.color = p.color;
@@ -3616,6 +3632,7 @@ function draw(ms) {
   const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
     : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
+  if (state.trayButtons) casters.push([state.trayButtons.vao, state.trayButtons.count, M.identity(), null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
