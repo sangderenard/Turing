@@ -3695,11 +3695,8 @@ function pointsFrame(cam, now) {
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
-  const ext = state.extent, eye = cam.eye, target = cam.target || [ext.width / 2, 0, extMidZ(ext)];
-  const dist = state.flat ? 1 : Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
-  const pxPerUnit = cam.proj[5] * canvas.height / 2 / dist;
-  cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height],
-                     y: TILE.height + 0.03, pxPerUnit, stride: rec.display_stride, background: sceneBackground() });
+  cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
+                     y: TILE.height + 0.03, stride: rec.display_stride, background: sceneBackground() });
 }
 
 // ---------------------------------------------------------------- draw

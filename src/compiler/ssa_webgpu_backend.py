@@ -1874,6 +1874,11 @@ class WGSLPassProgram:
         return len(self.entries)
 
 
+#: the declared target device limit on storage bindings per shader stage (Apple's WebGPU
+#: reports 8; the spec guarantees only 8 as well).  The arena's lanes plus its uniform ``head``
+#: never exceed it in ANY pass (step, commit, pack), whatever the arena's size.
+MAX_STORAGE_BINDINGS_PER_STAGE = 8
+
 #: the most operations a rematerialised lane value may cost per use (counted as a tree)
 REMAT_CONE_LIMIT = 96
 
@@ -1888,6 +1893,7 @@ def emit_tensor_program_passes(
     preferred_local_size: int = 64,
     iota_args: Sequence[int] = (),
     binding_bytes: int = 256 * 1024 * 1024,
+    max_storage_bindings: int = MAX_STORAGE_BINDINGS_PER_STAGE,
 ) -> WGSLPassProgram:
     """Compute dispatches for a tensor law in the elementwise + gather kernel-call
     form.  Rank-zero formals are uniforms (element 0 of their slot).  Anything
@@ -1998,8 +2004,17 @@ def emit_tensor_program_passes(
     # The arena is split across storage bindings of at most ``binding_bytes`` each, so no single
     # buffer limit caps the total, and the lane extent need not be a power of two or padded:
     # slot s is in ``lane{s // spb}`` at element (s % spb) * count.
-    spb = max(1, int(binding_bytes) // (4 * int(count)))
+    # Many logical slots are STACKED in one physical binding; a binding is split only where it would
+    # exceed ``binding_bytes`` (the device's binding-size limit), and never into more lanes than the
+    # declared budget leaves beside the ``head`` (the binding is then larger, and the runtime refuses
+    # a device whose maxStorageBufferBindingSize cannot hold it, with the reason on screen).
+    lane_budget = int(max_storage_bindings) - 1
+    if lane_budget < 1:
+        raise ValueError(f"max_storage_bindings={max_storage_bindings} leaves no lane beside the uniform head")
+    spb = max(1, int(binding_bytes) // (4 * int(count)), -(-slots // lane_budget))
     bindings = -(-slots // spb)
+    if bindings + 1 > int(max_storage_bindings):
+        raise ValueError(f"arena needs {bindings + 1} storage bindings per stage; the declared target allows {max_storage_bindings}")
 
     ops_of = {int(item.res.id): str(item.op) for item in instrs if item.res is not None}
     report = tuple(sorted(

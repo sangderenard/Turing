@@ -96,10 +96,10 @@ class GpuProduct {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return { ok: false, reason: "no WebGPU adapter" };
     const L = adapter.limits, abi = rec.wgsl_abi;
-    const bindingBytes = abi.slots_per_binding * rec.pad * 4;
+    const bindingBytes = Math.min(abi.slots_per_binding, abi.slots) * rec.pad * 4;   // the bytes actually bound: the lane holds only the slots it has, not the whole per-binding allowance
     if (bindingBytes > L.maxStorageBufferBindingSize) return { ok: false, reason: `a ${mb(bindingBytes)} binding exceeds this device's maxStorageBufferBindingSize (${mb(L.maxStorageBufferBindingSize)})` };
     if (bindingBytes > L.maxBufferSize) return { ok: false, reason: `a ${mb(bindingBytes)} buffer exceeds this device's maxBufferSize (${mb(L.maxBufferSize)})` };
-    if (abi.bindings + 1 > L.maxStorageBuffersPerShaderStage) return { ok: false, reason: `needs ${abi.bindings + 1} storage bindings per stage; the device allows ${L.maxStorageBuffersPerShaderStage}` };
+    if (abi.bindings + 1 > L.maxStorageBuffersPerShaderStage) return { ok: false, reason: `every pass (step, commit, pack) binds ${abi.bindings + 1} storage buffers (${abi.bindings} stacked lanes + the head); the device allows ${L.maxStorageBuffersPerShaderStage} per stage` };
     if (Math.max(abi.groups[0], abi.groups[1]) > L.maxComputeWorkgroupsPerDimension) return { ok: false, reason: `needs ${abi.groups[0]}x${abi.groups[1]} workgroups; the device allows ${L.maxComputeWorkgroupsPerDimension} per dimension` };
     return { ok: true, adapter, limits: L, bindingBytes };
   }
@@ -108,11 +108,15 @@ class GpuProduct {
     const check = await GpuProduct.limits(rec);
     if (!check.ok) throw new Error("refused: " + check.reason);
     const adapter = check.adapter, A = rec.wgsl_abi, B = A.bindings;
+    // request no more than the adapter reports (an over-ask makes requestDevice itself fail, e.g. on a phone)
+    const AL = adapter.limits, ask = (name, want) => Math.min(AL[name], want);
     this.device = await adapter.requestDevice({ requiredLimits: {
-      maxStorageBufferBindingSize: Math.max(check.bindingBytes, 134217728),
-      maxBufferSize: Math.max(check.bindingBytes, 268435456),
-      maxStorageBuffersPerShaderStage: Math.max(B + 1, 8) } });
+      maxStorageBufferBindingSize: ask("maxStorageBufferBindingSize", Math.max(check.bindingBytes, 134217728)),
+      maxBufferSize: ask("maxBufferSize", Math.max(check.bindingBytes, 268435456)),
+      maxStorageBuffersPerShaderStage: ask("maxStorageBuffersPerShaderStage", Math.max(B + 1, 8)) } });
     this.device.addEventListener?.("uncapturederror", (e) => { this.failure = String((e.error && e.error.message) || e.error); });
+    this.device.lost?.then((i) => { this.failure = `device lost (${i.reason}): ${i.message}`; });
+    this.scopeFaults = 0;
     this.adapterInfo = adapter.info ? [adapter.info.vendor, adapter.info.architecture, adapter.info.device].filter(Boolean).join("/") : "";
     this.rec = rec; this.n = rec.n; this.pad = rec.pad; this.abi = A; this.manifest = manifest;
     this.state = manifest.law.state;
@@ -199,6 +203,8 @@ ${commit}
   }
 
   step(count) {
+    // validation / internal errors of every submission surface in the status line (failure), not only uncaptured ones
+    for (const kind of ["validation", "internal"]) this.device.pushErrorScope(kind);
     const encoder = this.device.createCommandEncoder(), g = this.abi.groups;
     for (let k = 0; k < count; k++) {
       const pass = encoder.beginComputePass();
@@ -227,8 +233,9 @@ ${commit}
       free.buffer.mapAsync(GPUMapMode.READ).then(() => {
         this.latest = new Float32Array(free.buffer.getMappedRange().slice(0));
         free.buffer.unmap(); free.busy = false;
-      }).catch(() => { free.busy = false; });
+      }).catch((e) => { free.busy = false; this.failure = "readback: " + String((e && e.message) || e); });
     } else this.device.queue.submit([encoder.finish()]);
+    for (const kind of ["internal", "validation"]) this.device.popErrorScope().then((e) => { if (e) { this.scopeFaults++; this.failure = `${kind}: ${e.message}`; } });
     this.device.queue.onSubmittedWorkDone().then(settle);
   }
 
@@ -529,64 +536,162 @@ export class ComputeRuntime {
 }
 
 // --------------------------------------------------- GL points (shared scene)
+// Each particle is drawn at its TRUE radius in screen space: radius * (board scale) * focal / clip-w, from its own
+// projection (so zoom, perspective and viewport size all enter exactly, with no minimum and no stand-in size).
+//   * wider than ~one pixel: a disc, its edge antialiased by exact coverage;
+//   * narrower: its AREA (pi r^2 px^2, times the display stride so the omitted ids are accounted for) is splatted with bilinear
+//     sub-pixel weights, additively, as (colour * coverage, coverage) into a float target; a resolve pass over the board's
+//     footprint divides colour by coverage and composites over the scene with alpha = min(coverage, 1).  Dense regions show
+//     their true average colour; sparse ones stay faint.
 const POINT_VS = `#version 300 es
 layout(location=0) in vec2 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
-uniform mat4 uViewProj; uniform vec4 uMap; uniform vec3 uBoard; uniform float uPx; uniform float uDpr; uniform float uMax; uniform float uStride;
-out vec4 vColor; out float vBig;
+uniform mat4 uViewProj; uniform vec4 uMap; uniform vec3 uBoard; uniform float uFocal; uniform vec2 uViewport; uniform float uMax; uniform float uStride;
+uniform int uPass;            // 0 splat (small), 1 disc (large), 2 small directly into the scene (no float target)
+uniform float uThreshold;     // the diameter (px) below which a particle is accumulated
+out vec4 vColor; out float vDiameter; out float vCover; flat out vec2 vCenter;
 void main() {
-  if (aMeta < 50.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vColor = vec4(0.0); vBig = 0.0; return; }
+  vColor = aColor; vDiameter = 0.0; vCover = 0.0; vCenter = vec2(0.0);
+  gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
+  if (aMeta < 50.0) return;
   float flag = floor(aMeta / 100.0 + 0.001);
   float radius = (aMeta - flag * 100.0) * 0.001;
   // world -> board with ONE scale (uMap: centre x, centre y, scale k): circles stay circles at every size
-  gl_Position = uViewProj * vec4(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z, 1.0);
-  float diameter = 2.0 * radius * uMap.z * uPx * sqrt(uStride);
-  float least = flag > 1.5 ? 1.5 * uDpr : 3.5 * uDpr;      // a flying particle is never a speck
-  gl_PointSize = min(max(diameter, least), uMax);
-  vBig = step(5.0, gl_PointSize);
-  vColor = aColor;
+  vec4 clip = uViewProj * vec4(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z, 1.0);
+  if (clip.w <= 0.0) return;
+  float rpx = radius * uMap.z * uFocal / clip.w;              // screen radius in pixels, from the particle's own projection
+  float d = 2.0 * rpx;
+  bool small = d < uThreshold;
+  if (uPass == 1) {
+    if (small) return;
+    gl_Position = clip; gl_PointSize = min(d + 2.0, uMax);   // +2: room for the antialiased rim
+    vDiameter = d;
+  } else {
+    if (!small) return;
+    gl_Position = clip;
+    vCenter = (clip.xy / clip.w * 0.5 + 0.5) * uViewport;
+    vCover = 3.14159265 * rpx * rpx * uStride;
+    gl_PointSize = 2.0;
+  }
 }`;
 const POINT_FS = `#version 300 es
 precision highp float;
-in vec4 vColor; in float vBig; out vec4 FragColor;
-uniform vec3 u_background;   // the page's shared background: what an unfilled (alpha < 1) point fades to
+precision highp int;
+in vec4 vColor; in float vDiameter; in float vCover; flat in vec2 vCenter; out vec4 FragColor;
+uniform vec3 u_background;   // the page's shared background: what an unfilled (alpha < 1) particle fades to
+uniform int uPass;
 void main() {
-  if (vBig > 0.5 && length(gl_PointCoord - 0.5) > 0.5) discard;
-  FragColor = vec4(mix(u_background, vColor.rgb, vColor.a), 1.0);
+  vec3 rgb = mix(u_background, vColor.rgb, vColor.a);
+  if (uPass == 1) {
+    float edge = clamp(0.5 * vDiameter - length(gl_PointCoord - 0.5) * (vDiameter + 2.0) + 0.5, 0.0, 1.0);
+    if (edge <= 0.0) discard;
+    FragColor = vec4(rgb, edge);
+    return;
+  }
+  vec2 off = abs(gl_FragCoord.xy - vCenter);
+  float w = max(0.0, 1.0 - off.x) * max(0.0, 1.0 - off.y);
+  if (uPass == 2) FragColor = vec4(rgb, min(vCover * w, 1.0));
+  else FragColor = vec4(rgb * vCover * w, vCover * w);
+}`;
+const RESOLVE_VS = `#version 300 es
+uniform mat4 uViewProj; uniform vec3 uBoard; uniform float uMargin;
+void main() {
+  vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  vec2 u = (c * 2.0 - 1.0) * (0.5 + uMargin);                 // the board's plane, with a margin for particles beyond its edge
+  gl_Position = uViewProj * vec4(uBoard.x * (0.5 + u.x), uBoard.z, uBoard.y * (0.5 + u.y), 1.0);
+}`;
+const RESOLVE_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uAccum; out vec4 FragColor;
+void main() {
+  vec4 a = texelFetch(uAccum, ivec2(gl_FragCoord.xy), 0);
+  if (a.a <= 1e-4) discard;
+  FragColor = vec4(a.rgb / a.a, min(a.a, 1.0));
 }`;
 
 export class PointCloud {
   constructor(gl, link, compile) {
     this.gl = gl;
     this.program = link(compile(gl.VERTEX_SHADER, POINT_VS), compile(gl.FRAGMENT_SHADER, POINT_FS));
+    this.resolve = link(compile(gl.VERTEX_SHADER, RESOLVE_VS), compile(gl.FRAGMENT_SHADER, RESOLVE_FS));
     this.vao = gl.createVertexArray(); gl.bindVertexArray(this.vao);
     this.dyn = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, this.dyn);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 16, 8);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 16, 12);
     gl.bindVertexArray(null);
+    this.emptyVao = gl.createVertexArray();
     this.max = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
-    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uPx", "uDpr", "uMax", "uStride", "u_background"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
+    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uFocal", "uViewport", "uMax", "uStride", "uPass", "uThreshold", "u_background"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
+    this.rloc = Object.fromEntries(["uViewProj", "uBoard", "uMargin", "uAccum"].map((n) => [n, gl.getUniformLocation(this.resolve, n)]));
+    // a float target to accumulate into; without one, small particles fall back to alpha-blended sub-pixel dots (same area weighting)
+    this.floatOk = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
+    this.target = null;
   }
 
-  // data: packed points ([x, y, rgba8, meta] per displayed id); view: the size's world window
-  draw(data, { viewProj, view, board, y, pxPerUnit, stride, background }) {
+  #target(w, h) {
+    const gl = this.gl;
+    if (this.target && this.target.w === w && this.target.h === h) return this.target;
+    if (this.target) { gl.deleteTexture(this.target.tex); gl.deleteFramebuffer(this.target.fbo); this.target = null; }
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { this.floatOk = false; gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); return null; }
+    return (this.target = { w, h, tex, fbo });
+  }
+
+  // data: packed points ([x, y, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
+  // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
+  draw(data, { viewProj, view, board, y, focal, stride, background }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
+    const vp = gl.getParameter(gl.VIEWPORT), bound = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const W = vp[2], H = vp[3];
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dyn);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    const n = data.length / 4;
+    const setUniforms = (pass) => {
+      gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
+      gl.uniform4f(this.loc.uMap, (x0 + x1) / 2, (y0 + y1) / 2, k, 0);
+      gl.uniform3f(this.loc.uBoard, board[0], board[1], y);
+      gl.uniform1f(this.loc.uFocal, focal * H / 2); gl.uniform2f(this.loc.uViewport, W, H); gl.uniform1f(this.loc.uMax, this.max);
+      gl.uniform1f(this.loc.uStride, stride || 1); gl.uniform1f(this.loc.uThreshold, 1.25);
+      gl.uniform3fv(this.loc.u_background, new Float32Array(background || [0.085, 0.085, 0.1]));
+      gl.uniform1i(this.loc.uPass, pass);
+    };
     gl.useProgram(this.program);
-    gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
-    gl.uniform4f(this.loc.uMap, (x0 + x1) / 2, (y0 + y1) / 2, k, 0);
-    gl.uniform3f(this.loc.uBoard, board[0], board[1], y);
-    gl.uniform1f(this.loc.uPx, pxPerUnit); gl.uniform1f(this.loc.uDpr, window.devicePixelRatio || 1); gl.uniform1f(this.loc.uMax, this.max);
-    gl.uniform1f(this.loc.uStride, stride || 1);
-    gl.uniform3fv(this.loc.u_background, new Float32Array(background || [0.085, 0.085, 0.1]));
-    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(false);
-    gl.drawArrays(gl.POINTS, 0, data.length / 4);
-    gl.depthMask(true); gl.bindVertexArray(null);
+    gl.depthMask(false);
+    const target = this.floatOk ? this.#target(W, H) : null;
+    if (target) {
+      // 1. splat the sub-pixel particles' (colour * coverage, coverage) additively
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo); gl.viewport(0, 0, W, H);
+      gl.clearBufferfv(gl.COLOR, 0, new Float32Array(4));
+      gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+      setUniforms(0);
+      gl.drawArrays(gl.POINTS, 0, n);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bound); gl.viewport(vp[0], vp[1], W, H);
+      // 2. resolve over the board's footprint (depth-tested against the scene like the points always were)
+      gl.bindVertexArray(this.emptyVao);
+      gl.useProgram(this.resolve);
+      gl.uniformMatrix4fv(this.rloc.uViewProj, false, viewProj); gl.uniform3f(this.rloc.uBoard, board[0], board[1], y); gl.uniform1f(this.rloc.uMargin, 2.0);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, target.tex); gl.uniform1i(this.rloc.uAccum, 0);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.bindVertexArray(this.vao); gl.useProgram(this.program);
+    } else {
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      setUniforms(2);
+      gl.drawArrays(gl.POINTS, 0, n);
+    }
+    // 3. the particles wider than a pixel: discs at their true radius
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    setUniforms(1);
+    gl.drawArrays(gl.POINTS, 0, n);
+    gl.disable(gl.BLEND); gl.depthFunc(gl.LESS); gl.depthMask(true); gl.bindVertexArray(null);
   }
 }

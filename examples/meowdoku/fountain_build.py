@@ -107,6 +107,7 @@ def build_size(tag: str, web_dir: Path) -> dict:
     from meowdoku import graph_wasm
     from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
     started = time.perf_counter()
+    from src.compiler import ssa_webgpu_backend as webgpu
     active, pad = SIZES[tag]
     compiled, program, outputs, ids = passes_for(tag)
     if not compiled.complete:
@@ -127,6 +128,10 @@ def build_size(tag: str, web_dir: Path) -> dict:
             "entries": list(compiled.entries), "slots": compiled.slots, "dispatches": compiled.dispatches,
             "lane_base": compiled.lane_base, "arena_elements": compiled.arena_elements,
             "bindings": compiled.bindings, "slots_per_binding": compiled.slots_per_binding,
+            # the logical->physical map, declared once: slot s -> lane s // slots_per_binding, element (s % slots_per_binding) * count;
+            # the uniform head is binding `bindings`.  Every pass (step, commit, pack) binds bindings + 1 storage buffers.
+            "storage_bindings_per_pass": compiled.bindings + 1, "binding_budget": webgpu.MAX_STORAGE_BINDINGS_PER_STAGE,
+            "binding_bytes": min(compiled.slots_per_binding, compiled.slots) * pad * 4,
             "arguments": list(F.ARGUMENTS), "uniforms": list(F.UNIFORMS), "iota": list(F.IOTA),
             "outputs": list(F.OUTPUTS),
             "feed_slots": {name: compiled.feed_slots[ids[name]] for name in F.ARGUMENTS if ids[name] in compiled.feed_slots},
