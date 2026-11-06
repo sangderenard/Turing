@@ -388,7 +388,10 @@ class EntityGame(Game):
             return
         if getattr(self, "trace", None) is None:
             self.trace = PlayTrace()
-        self.trace.record(self, controls, demo)
+        if self.trace.record(self, controls, demo):
+            # enough spans of action gathered: learn from them now, mid-game
+            from meowdoku.autopilot import finish_episode
+            finish_episode(self, self.trace, final=False)
 
     def _end_check(self) -> None:
         """The first landing after the game is over hands its trace to the learner."""

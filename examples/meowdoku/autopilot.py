@@ -904,6 +904,11 @@ DEMO_LEARNING: dict[str, bool] = {name: False for name in GAMES}
 LEARN_STATUS: dict[str, dict] = {name: {} for name in GAMES}
 _DEMO_SCORES: dict[str, list[float]] = {name: [] for name in GAMES}
 POST_EPOCHS, REPLAY_ROWS, MIN_ROWS = 4, 4096, 32
+#: SPANS OF ACTION, not whole tapes: the last SPAN_ROWS decisions wait in a
+#: ring; a rise in score keeps them (the lead-up to a success), damage drops
+#: them; kept rows go to the learner every FLUSH_ROWS, mid-game.  Human
+#: records keep at most RECORD_ROWS (the newest).
+SPAN_ROWS, FLUSH_ROWS, RECORD_ROWS = 48, 256, 20000
 #: The page's learning panel: the last HISTORY runs (score, kept or not) and
 #: training passes (loss), per game.
 HISTORY = 30
@@ -974,22 +979,50 @@ def target_from(game, controls: dict) -> np.ndarray:
 
 
 class PlayTrace:
-    """One episode's decisions, kept by the game while it runs."""
+    """The spans of an episode worth learning from (see SPAN_ROWS): a ring of
+    recent decisions, and the kept rows -- lead-ups to a rise in score."""
 
     def __init__(self):
-        self.x: list[np.ndarray] = []
+        import collections
+        self.ring = collections.deque(maxlen=SPAN_ROWS)
+        self.x: list[np.ndarray] = []       # kept rows
         self.y: list[np.ndarray] = []
         self.demo = None                    # True / False once the first decision lands
+        self.last = None                    # (score, lives, shield) at the last decision
+        self.spans = 0
 
-    def record(self, game, controls: dict, demo: bool) -> None:
+    def record(self, game, controls: dict, demo: bool) -> bool:
+        """One decision; True when enough kept rows wait for the learner."""
         if game.game not in FEATURE_FUNCTIONS or game.session.state is None:
-            return
+            return False
         if self.demo is None:
             self.demo = demo
         elif self.demo != demo:            # who drives changed mid-game: keep one kind per episode
-            return
-        self.x.append(np.asarray(FEATURE_FUNCTIONS[game.game](game), dtype=np.float64).reshape(-1))
-        self.y.append(target_from(game, controls))
+            return False
+        col = game.session.column
+        k = game.PLAYER_LANE or 0
+        now = (float(col("score")[0]), float(col("lives")[0]),
+               float(col("energy")[k]) if "energy" in game.session.columns else 0.0)
+        if self.last is not None:
+            if now[1] < self.last[1] or now[2] < self.last[2] - 1e-9:
+                self.ring.clear()           # hurt: the lead-up is not one to imitate
+            elif now[0] > self.last[0] and self.ring:
+                for x, y in self.ring:      # scored: keep the lead-up
+                    self.x.append(x); self.y.append(y)
+                self.ring.clear()
+                self.spans += 1
+        self.last = now
+        self.ring.append((np.asarray(FEATURE_FUNCTIONS[game.game](game), dtype=np.float64).reshape(-1),
+                          target_from(game, controls)))
+        return len(self.x) >= FLUSH_ROWS
+
+    def take(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The kept rows (and forget them)."""
+        if not self.x:
+            return None
+        x, y = np.stack(self.x), np.stack(self.y)
+        self.x, self.y = [], []
+        return x, y
 
 
 def _fit(params: dict, x: np.ndarray, y: np.ndarray, epochs: int) -> tuple[dict, float]:
@@ -1056,12 +1089,13 @@ def _post_train(name: str, x: np.ndarray, y: np.ndarray, label: str, kept_tail: 
         TRAINING[name] = False
 
 
-def finish_episode(game, trace: PlayTrace) -> None:
-    """A game ended: keep / learn from its trace as described above."""
+def finish_episode(game, trace: PlayTrace, final: bool = True) -> None:
+    """Hand a trace's kept spans to the learner: at the game's end, or
+    mid-game once FLUSH_ROWS have gathered (``final`` False)."""
     name = game.game
     if name not in FEATURE_FUNCTIONS or trace.demo is None or len(trace.x) < MIN_ROWS:
         return
-    x, y = np.stack(trace.x), np.stack(trace.y)
+    x, y = trace.take()
     score = float(game.session.column("score")[0]) if game.session.state is not None else 0.0
     if not trace.demo:
         path = human_records_path(name)
@@ -1072,27 +1106,32 @@ def finish_episode(game, trace: PlayTrace) -> None:
                 episodes = np.concatenate([old["episode_score"], [score]])
             else:
                 kx, ky, episodes = x, y, np.asarray([score])
+            kx, ky = kx[-RECORD_ROWS:], ky[-RECORD_ROWS:]          # the newest rows only
             BUILD.mkdir(parents=True, exist_ok=True)
             partial = path.with_suffix(".partial.npz")
             np.savez(partial, x=kx, y=ky, episode_score=episodes)
             partial.replace(path)
         _HUMAN_GAMES[name] = int(len(episodes))
-        label = f"human game {len(episodes)} (score {score:.0f}, {len(x)} decisions)"
+        label = f"human {'game' if final else 'spans'} {len(episodes)} (score {score:.0f}, {len(x)} span rows)"
         kept_tail = len(x)
     else:
         scores = _DEMO_SCORES[name]
         baseline = float(np.mean(scores[-10:])) if scores else -1.0
-        scores.append(score)
-        kept = bool(DEMO_LEARNING.get(name)) and score >= baseline
+        if final:
+            scores.append(score)             # only finished runs make the running average
+        # mid-game spans are successes by construction (lead-ups to scoring);
+        # a finished run is kept when it beats the running average
+        kept = bool(DEMO_LEARNING.get(name)) and (not final or score >= baseline)
         if DEMO_LEARNING.get(name):
-            _history(name, kind="run", score=score, average=max(baseline, 0.0), kept=kept)
+            _history(name, kind="run" if final else "spans", score=score, average=max(baseline, 0.0), kept=kept)
             _save_learning()
         if not kept:
             LEARN_STATUS[name] = {**LEARN_STATUS.get(name, {}),
                                   "demo": f"demo run {score:.0f} vs average {max(baseline, 0):.0f}"
                                           + ("" if DEMO_LEARNING.get(name) else " (learning off)")}
             return
-        label = f"demo run (score {score:.0f} >= average {max(baseline, 0):.0f})"
+        label = (f"demo run (score {score:.0f} >= average {max(baseline, 0):.0f})" if final
+                 else f"demo spans ({len(x)} rows of lead-ups to scoring)")
         kept_tail = 0
     _threading.Thread(target=_post_train, args=(name, x, y, label, kept_tail), name=f"post-train-{name}", daemon=True).start()
 
