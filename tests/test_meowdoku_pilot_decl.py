@@ -131,7 +131,7 @@ def test_high_loss_and_outcome_spans_are_replayed_more():
 
 # ------------------------------------------------------------------ the idle trainer
 def test_idle_trainer_pauses_on_a_tick_resumes_and_hot_swaps_weights(build):
-    name = "platformer"
+    name = "side_scroller"            # imitable from a short sample (the platformer overfits one this small)
     game = pd.DECLS[name].make(1002)
     game.learns = True
     game.control({}); game.tick()
@@ -220,3 +220,35 @@ def test_selfplay_is_recorded_weighted_and_does_not_regress(build, monkeypatch):
     assert record["self_spans"] >= 3 and record["status"] in ("adopted", "kept")
     after = score(ap.live_params(name))
     assert after >= before, (before, after, record)
+
+
+def _trace_rewards(name, seed, ticks, drive, monkeypatch):
+    monkeypatch.setattr(ap, "SPAN_ROWS", 12)
+    monkeypatch.setattr(ap, "STALL_PENALTY", 1e6)           # unmistakable in the span rewards
+    decl = pd.DECLS[name]
+    game = decl.make(seed)
+    game.control({}); game.tick()
+    teacher = decl.make_teacher(game)
+    trace = ap.PlayTrace()
+    for i in range(ticks):
+        controls = decl.controls_from(game, teacher.act(game)) if drive else {}
+        game.control({"inputs": [{"seq": 1 + i, "dur": decl.step, **controls}]})
+        game.tick()
+        trace.record(game, controls, demo=True)
+    return [r for (_x, _y, _tag, r) in trace.pending]
+
+
+def test_loitering_in_place_is_penalised_and_travel_is_not(monkeypatch):
+    still = _trace_rewards("side_scroller", 1003, 200, False, monkeypatch)
+    late = still[len(still) // 2:]                                    # after STALL_SECONDS of history
+    assert late and all(r < -5e5 for r in late)                       # standing still: charged
+    moving = _trace_rewards("side_scroller", 1003, 200, True, monkeypatch)
+    assert len(moving) > 4
+    assert all(r > -5e5 for r in moving)                              # running the course: never charged
+
+
+def test_stall_penalty_compares_against_recent_average():
+    hist = [(0.0, 0.0), (1.0, 0.0), (0.5, 0.0)]
+    assert ap.stall_penalty(hist[:2], (0.5, 0.0), 3) == 0.0           # too little history
+    assert ap.stall_penalty(hist, (0.6, 0.2), 3) == ap.STALL_PENALTY  # pacing around the same spot
+    assert ap.stall_penalty(hist, (5.0, 0.0), 3) == 0.0               # moved on
