@@ -2418,6 +2418,7 @@ function applyState(game) {
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "";
   renderModes(game);
+  showPads(game);
   const authority = authorityText(game);
   status.textContent = `${game.status} · ${game.title}${best}${authority ? " · " + authority : ""}`;
   $("hud").textContent = `${game.status}${best}`;
@@ -2712,11 +2713,72 @@ function controls() {
   if (twoAxis()) { out.move_axis_y = axisY; out.steer_y = steer ? Math.max(0, steer.z - 1.4) : -1; }
   if (heightAxis()) out.move_axis_z = (held.has("rise") ? 1 : 0) - (held.has("dive") ? 1 : 0);
   if (bombs()) { out.alt_fire = held.has("alt") ? 1 : 0; out.bomb_style = state.bombStyle || 0; }
+  // THE THUMBPADS (analog, mode-2 style): left = turn (sideways) and
+  // throttle (forward = faster); right = climb (forward = up), its sideways
+  // adding to the turn, and holding it fires; a double tap on the left
+  // drops a bomb.  They add to the keys and replace a steering finger.
+  if (pads.left.active || pads.right.active || pads.altUntil > performance.now()) {
+    const clamp = (v) => Math.max(-1, Math.min(1, v));
+    out.move_axis = clamp(out.move_axis + pads.left.x + pads.right.x);
+    out.steer_x = -1;
+    if ("move_axis_y" in out) { out.move_axis_y = clamp(out.move_axis_y + pads.left.y); out.steer_y = -1; }
+    if ("move_axis_z" in out) out.move_axis_z = clamp(out.move_axis_z - pads.right.y);
+    if (pads.right.active) out.fire = 1;
+    if (bombs() && pads.altUntil > performance.now()) out.alt_fire = 1;
+  }
   return out;
 }
 // A game with a third axis (height above the board): E / PageUp rise,
 // Q / PageDown dive, or the Rise / Dive buttons (held).
 function heightAxis() { return !!(state.game && state.game.predict && state.game.predict.z); }
+// THE THUMBPADS: two on-screen sticks for a real-time game (shown on touch
+// screens, or with the Thumbpads control).  Each tracks one pointer: its
+// offset from the pad's centre over the pad's radius is the stick (-1..1).
+const pads = { left: { x: 0, y: 0, active: false, id: null, taps: [] }, right: { x: 0, y: 0, active: false, id: null, taps: [] },
+               altUntil: 0, built: false };
+function buildPads() {
+  if (pads.built) return;
+  pads.built = true;
+  const make = (side) => {
+    const pad = document.createElement("div"), knob = document.createElement("div");
+    pad.className = `thumbpad thumbpad-${side}`; knob.className = "thumbpad-knob";
+    pad.append(knob); document.body.append(pad);
+    const s = pads[side];
+    const move = (e) => {
+      const r = pad.getBoundingClientRect(), radius = r.width / 2;
+      let dx = (e.clientX - (r.left + radius)) / radius, dy = (e.clientY - (r.top + radius)) / radius;
+      const len = Math.hypot(dx, dy); if (len > 1) { dx /= len; dy /= len; }
+      s.x = dx; s.y = dy;
+      knob.style.transform = `translate(${dx * radius * 0.6}px, ${dy * radius * 0.6}px)`;
+    };
+    pad.addEventListener("pointerdown", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      try { pad.setPointerCapture(e.pointerId); } catch (_) { /* a pointer the browser is not tracking */ }
+      s.id = e.pointerId; s.active = true; move(e);
+      const now = performance.now();
+      s.taps = [...s.taps.filter((t0) => now - t0 < 320), now];
+      if (side === "left" && s.taps.length >= 2) { pads.altUntil = now + 260; s.taps = []; }   // double tap: a bomb
+    });
+    pad.addEventListener("pointermove", (e) => { if (s.active && e.pointerId === s.id) { e.preventDefault(); move(e); } });
+    const end = (e) => { if (e.pointerId !== s.id) return; s.active = false; s.id = null; s.x = s.y = 0; knob.style.transform = ""; };
+    pad.addEventListener("pointerup", end); pad.addEventListener("pointercancel", end);
+  };
+  make("left"); make("right");
+  const style = document.createElement("style");
+  style.textContent = `.thumbpad{position:fixed;bottom:22px;width:132px;height:132px;border-radius:50%;
+    background:radial-gradient(circle,rgba(255,255,255,.10),rgba(255,255,255,.04));border:1px solid rgba(255,255,255,.28);
+    touch-action:none;z-index:20;display:none}
+    .thumbpad-left{left:22px}.thumbpad-right{right:22px}
+    .thumbpad-knob{position:absolute;left:36px;top:36px;width:60px;height:60px;border-radius:50%;
+    background:rgba(255,255,255,.32);border:1px solid rgba(255,255,255,.5);pointer-events:none}
+    body.pads-on .thumbpad{display:block}`;
+  document.head.append(style);
+}
+function showPads(game) {
+  buildPads();
+  const wanted = $("pads") ? $("pads").checked : matchMedia("(pointer: coarse)").matches;
+  document.body.classList.toggle("pads-on", !!(wanted && game && game.input === "realtime" && game.predict));
+}
 // ALTERNATE FIRE (a game whose controls take it): B or X drops a bomb (a
 // second press bursts a hanging parachute bomb), C cycles the style.
 const BOMB_STYLES = ["dumb bomb", "parachute bomb", "ground seeker"];
@@ -2883,6 +2945,8 @@ async function submitMove() {
 $("move-submit").onclick = submitMove;
 $("move-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMove(); } e.stopPropagation(); });
 $("bomb-style").onclick = cycleBomb;
+$("pads").checked = matchMedia("(pointer: coarse)").matches;
+$("pads").onchange = () => showPads(state.game);
 function toggleCamera() { state.camMode = state.camMode === "nose" ? "board" : "nose"; $("camera-mode").textContent = state.camMode === "nose" ? "Camera: nose (N)" : "Camera: board (N)"; }
 $("camera-mode").onclick = toggleCamera;
 for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) {
