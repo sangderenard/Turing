@@ -477,6 +477,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--web-dir", default=str(WEB_DIR))
     parser.add_argument("--profiles", default=str(PROFILES),
                         help="profile/score file; a second (dev) server keeps its own so it never clobbers the live one")
+    parser.add_argument("--tls-cert", default=None,
+                        help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
+    parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
     args = parser.parse_args(argv)
     web_dir = Path(args.web_dir)
     if not (web_dir / "boards.json").exists():
@@ -494,7 +497,17 @@ def main(argv: list[str] | None = None) -> int:
     autopilot.load_learning()
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
-    print(f"[meowdoku] serving {web_dir} at http://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
+    scheme = "http"
+    if args.tls_cert:
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        # The handshake runs on the first read, in the request's own thread,
+        # so a slow or refusing client never stalls the accept loop.
+        server.socket = context.wrap_socket(server.socket, server_side=True,
+                                            do_handshake_on_connect=False)
+        scheme = "https"
+    print(f"[meowdoku] serving {web_dir} at {scheme}://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
