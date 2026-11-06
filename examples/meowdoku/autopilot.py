@@ -61,7 +61,8 @@ FEATURES_DEPTH = 7 + 7 * K + 4
 #: two-layer head.  It sees every body in reach, however many, in any order.
 # (the network's layout and forward live in pilot_law.py, the one text the law traces too)
 from meowdoku.pilot_law import (  # noqa: E402,F401
-    TOKENS, TOKEN_F, SHIP_G, TOKEN_H, SHIP_H, HEAD_H, TOKEN_FEATURES, TOKEN_PARAMS, DX, DY, DV, token_policy_forward)
+    TOKENS, TOKEN_F, SHIP_G, TOKEN_H, SHIP_H, HEAD_H, TOKEN_FEATURES, TOKEN_PARAMS, DX, DY, DV, token_policy_forward,
+    ACTIVE_VARIANT, DEFAULT_VARIANT, spec_of, spec_of_shapes, token_param_shapes, features_of, slice_tokens)
 #: bullet hell's five outputs: roll, throttle, fire, pitch, rudder (two sticks)
 GAME_WIDTHS = {"space_invaders": (FEATURES, OUTPUTS), "bullet_hell": (TOKEN_FEATURES, 5)}
 GAME_ARCH = {"space_invaders": "mlp", "bullet_hell": "token"}
@@ -71,15 +72,33 @@ def arch_of(params: dict) -> str:
     return "token" if "We1" in params else "mlp"
 
 
+def variant_of(params: dict) -> str:
+    """The token network's variant id (pilot_law VARIANTS): the params'
+    ``variant`` entry, absent = the default network."""
+    return str(params["variant"]) if "variant" in params else DEFAULT_VARIANT
+
+
+def arch_key(params: dict) -> str:
+    """``arch_of`` plus the variant, for the places that build a product from
+    the architecture alone: ``mlp``, ``token`` or ``token:<variant>``."""
+    if arch_of(params) != "token":
+        return "mlp"
+    variant = variant_of(params)
+    return "token" if variant == DEFAULT_VARIANT else f"token:{variant}"
+
+
 def param_names(params_or_arch) -> tuple[str, ...]:
     arch = params_or_arch if isinstance(params_or_arch, str) else arch_of(params_or_arch)
-    return TOKEN_PARAMS if arch == "token" else PARAMS
+    return TOKEN_PARAMS if arch.startswith("token") else PARAMS
 
 
 def widths_of(params: dict) -> tuple[int, int]:
-    """(features, outputs) of a policy: its first and last layers say."""
+    """(features, outputs) of a policy: its first and last layers say (and,
+    for a token network, its variant's token count)."""
     if arch_of(params) == "token":
-        return (int(params["Wg"].shape[0]) + TOKENS * int(params["We1"].shape[0]) + TOKENS,
+        tokens = spec_of(variant_of(params))["tokens"]
+        return (features_of(tokens) if int(params["We1"].shape[0]) == TOKEN_F else
+                int(params["Wg"].shape[0]) + tokens * int(params["We1"].shape[0]) + tokens,
                 int(params["Wh2"].shape[1]))
     return int(params["W1"].shape[0]), int(params["W3"].shape[1])
 
@@ -256,18 +275,36 @@ def policy_forward(x, W1, b1, W2, b2, W3, b3):
     return (h @ W3 + b3).tanh()
 
 
-def init_token_params(seed: int = 0, outputs: int = 5) -> dict[str, np.ndarray]:
+def init_token_params(seed: int = 0, outputs: int = 5, variant: str | None = None) -> dict[str, np.ndarray]:
+    """Fresh weights of ``variant`` (default the process's active one)."""
+    variant = ACTIVE_VARIANT if variant is None else variant
     rng = np.random.default_rng(seed)
-    w = lambda a, b: rng.normal(0.0, math.sqrt(1.0 / a), (a, b))  # noqa: E731
-    return {"We1": w(TOKEN_F, TOKEN_H), "be1": np.zeros((1, TOKEN_H)), "We2": w(TOKEN_H, TOKEN_H), "be2": np.zeros((1, TOKEN_H)),
-            "Q1": w(TOKEN_H, 1), "Q2": w(TOKEN_H, 1), "Wg": w(SHIP_G, SHIP_H), "bg": np.zeros((1, SHIP_H)),
-            "Wh1": w(2 * TOKEN_H + SHIP_H, HEAD_H), "bh1": np.zeros((1, HEAD_H)), "Wh2": w(HEAD_H, outputs) * 0.1,
-            "bh2": np.zeros((1, outputs))}
+    shapes = token_param_shapes(outputs, variant)
+    params = {}
+    for n in TOKEN_PARAMS:
+        shape = shapes[n]
+        zero = n.startswith("b")
+        params[n] = np.zeros(shape) if zero else rng.normal(0.0, math.sqrt(1.0 / shape[0]), shape) * (0.1 if n == "Wh2" else 1.0)
+    if variant != DEFAULT_VARIANT:
+        params["variant"] = np.array(variant)
+    return params
 
 
 def forward_of(params_or_arch):
-    arch = params_or_arch if isinstance(params_or_arch, str) else arch_of(params_or_arch)
-    return token_policy_forward if arch == "token" else policy_forward
+    """The forward text of an architecture: ``mlp``, ``token`` / ``token:<variant>``
+    or a params dict (whose variant's gate family it carries)."""
+    arch = params_or_arch if isinstance(params_or_arch, str) else arch_key(params_or_arch)
+    if arch == "mlp":
+        return policy_forward
+    variant = arch.partition(":")[2] or DEFAULT_VARIANT
+    act = spec_of(variant)["act"]
+    if variant == ACTIVE_VARIANT or act == spec_of(ACTIVE_VARIANT)["act"]:
+        return token_policy_forward
+
+    def token_policy_forward_act(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2):
+        return token_policy_forward(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2, act=act)
+    token_policy_forward_act.__name__ = f"token_policy_forward_{act}"
+    return token_policy_forward_act
 
 
 def init_params(seed: int = 0, features: int = FEATURES, hidden=HIDDEN, outputs: int = OUTPUTS) -> dict[str, np.ndarray]:
@@ -305,11 +342,17 @@ def load_params(path: Path) -> dict[str, np.ndarray] | None:
         return None
     data = np.load(path)
     names = TOKEN_PARAMS if "We1" in data.files else PARAMS
-    return {n: np.asarray(data[n], dtype=np.float64) for n in names}
+    params = {n: np.asarray(data[n], dtype=np.float64) for n in names}
+    if "variant" in data.files:
+        params["variant"] = np.array(str(data["variant"]))
+    return params
 
 
-def weights_path(game: str) -> Path:
-    return BUILD / f"{game}.npz"
+def weights_path(game: str, variant: str | None = None) -> Path:
+    """The game's weights; a trimmed token variant (MEOWDOKU_PILOT_ARCH or
+    ``variant``) keeps its own file beside the default's."""
+    variant = ACTIVE_VARIANT if variant is None else variant
+    return BUILD / (f"{game}.npz" if variant == DEFAULT_VARIANT or GAME_ARCH.get(game) != "token" else f"{game}.{variant}.npz")
 
 
 def eager_forward(params: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
@@ -336,12 +379,14 @@ def numpy_product(batch: int = 1, features: int = FEATURES, outputs: int = OUTPU
     from src.common.tensors.accelerator_backends import tape_to_source
     from src.common.tensors.accelerator_backends.tape_to_source import emit_tape_source
     forward, names = forward_of(arch), param_names(arch)
-    digest = hashlib.sha256((inspect.getsource(forward) + inspect.getsource(tape_to_source)
-                             + f"{features}{HIDDEN}{outputs}{batch}{arch}{TOKENS}{TOKEN_F}{SHIP_G}").encode()).hexdigest()[:16]
+    import meowdoku.pilot_law as _law
+    digest = hashlib.sha256((inspect.getsource(forward) + inspect.getsource(_law) + inspect.getsource(tape_to_source)
+                             + f"{features}{HIDDEN}{outputs}{batch}{arch}{TOKEN_F}{SHIP_G}").encode()).hexdigest()[:16]
     entry = "autopilot_policy" if arch == "mlp" else "autopilot_token_policy"
     path = BUILD / f"{entry}_b{batch}_{digest}.py"
     if not path.exists():
-        like = init_token_params(outputs=outputs) if arch == "token" else init_params(features=features, outputs=outputs)
+        like = (init_token_params(outputs=outputs, variant=arch.partition(":")[2] or DEFAULT_VARIANT) if arch.startswith("token")
+                else init_params(features=features, outputs=outputs))
         sample = {"x": NumPyTensorOperations.tensor(np.zeros((batch, features))),
                   **{n: NumPyTensorOperations.tensor(like[n]) for n in names}}
         with autograd.forward_capture() as tape:
@@ -387,7 +432,7 @@ class NativePolicy:
         self.batch, self.contract = int(batch), contract
         self.features, self.outputs = widths_of(params)
         self.names, forward = param_names(params), forward_of(params)
-        name = f"autopilot_{arch_of(params)}_policy_b{self.batch}_{contract}"
+        name = f"autopilot_{arch_of(params)}{variant_of(params).replace('.', '_') if arch_of(params) == 'token' and variant_of(params) != DEFAULT_VARIANT else ''}_policy_b{self.batch}_{contract}"
         directory = Path(directory or BUILD / "native")
         started = time.perf_counter()
         with scoped_work_contract(PRESETS[contract]):
@@ -423,17 +468,21 @@ class PolicyTrainer:
         from src.common.tensors import AbstractTensor as AT
         from src.common.tensors.abstract_nn import Adam
         self.names, self.forward = param_names(params), forward_of(params)
+        self.variant = params.get("variant")
+        # a one-query variant carries Q2 as an unused placeholder: it is kept, not trained
+        self.trained = tuple(n for n in self.names if not (n == "Q2" and params["Q2"].shape[0] != params["We1"].shape[1]))
         with AT.use_backend("numpy"):
             self.tensors = {n: AT.tensor(params[n]) for n in self.names}
-            for t in self.tensors.values():
-                t.requires_grad_()
-            self.optimizer = Adam([self.tensors[n] for n in self.names], lr=lr)
+            for n in self.trained:
+                self.tensors[n].requires_grad_()
+            self.optimizer = Adam([self.tensors[n] for n in self.trained], lr=lr)
 
     def step(self, x: np.ndarray, target: np.ndarray) -> float:
         from src.common.tensors import AbstractTensor as AT
         with AT.use_backend("numpy"):
-            params = [self.tensors[n] for n in self.names]
-            out = self.forward(AT.tensor(np.asarray(x, dtype=np.float64)), *params)
+            every = [self.tensors[n] for n in self.names]
+            params = [self.tensors[n] for n in self.trained]
+            out = self.forward(AT.tensor(np.asarray(x, dtype=np.float64)), *every)
             diff = out - AT.tensor(np.asarray(target, dtype=np.float64))
             loss = (diff * diff).mean()
             grads = AT.autograd.grad(loss, params)
@@ -443,7 +492,10 @@ class PolicyTrainer:
             return float(np.asarray(loss.numpy()))
 
     def params(self) -> dict[str, np.ndarray]:
-        return {n: np.asarray(self.tensors[n].numpy(), dtype=np.float64).copy() for n in self.names}
+        out = {n: np.asarray(self.tensors[n].numpy(), dtype=np.float64).copy() for n in self.names}
+        if self.variant is not None:
+            out["variant"] = np.array(str(self.variant))
+        return out
 
 
 # --------------------------------------------------------------- the pilot
@@ -477,7 +529,7 @@ def preload() -> list[str]:
         params = fitting_params(name)
         if params is not None:
             _PILOT_WEIGHTS[name] = params
-            numpy_product(1, *GAME_WIDTHS[name], arch=arch_of(params))
+            numpy_product(1, *GAME_WIDTHS[name], arch=arch_key(params))
             loaded.append(name)
     return loaded
 
@@ -490,7 +542,7 @@ class Pilot:
         self.name, self.params = name, params
         self.features = FEATURE_FUNCTIONS[name]
         self.lane = "numpy"
-        product = numpy_product(1, *widths_of(params), arch=arch_of(params))
+        product = numpy_product(1, *widths_of(params), arch=arch_key(params))
         self.run = lambda x: product(x, self.params)
         # The token network runs native by default (MEOWDOKU_PILOT=numpy opts out);
         # the fixed MLP stays on NumPy unless MEOWDOKU_PILOT=llvm.
@@ -579,7 +631,7 @@ def pilot_controls(game, lane: int) -> tuple[float, float, float, float]:
         return 0.0, 0.0, 0.0, 1.0
     _PILOT_WEIGHTS.setdefault(name, params)
     view = _MirroredView(game, lane)
-    out = numpy_product(1, *widths_of(params), arch=arch_of(params))(FEATURE_FUNCTIONS[name](view), params)[0]
+    out = numpy_product(1, *widths_of(params), arch=arch_key(params))(FEATURE_FUNCTIONS[name](view), params)[0]
     turn = float(out[0]) + (float(out[4]) if len(out) > 4 else 0.0)     # roll and rudder both turn a pilot
     return (max(-1.0, min(1.0, turn)), float(out[1]), float(out[3]) if len(out) > 3 else 0.0, 1.0 if out[2] > 0.0 else 0.0)
 
@@ -807,7 +859,7 @@ def run_episode(name: str, act, seed: int, seconds: float = 40.0, record=None, w
 
 
 def policy_act(name: str, params: dict[str, np.ndarray]):
-    run = numpy_product(1, *widths_of(params), arch=arch_of(params))
+    run = numpy_product(1, *widths_of(params), arch=arch_key(params))
 
     def act(game, f):
         return run(f, params)[0]

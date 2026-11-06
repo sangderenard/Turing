@@ -26,6 +26,8 @@ step for friendly lanes, not done here.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from src.common.tensors import AbstractTensor
@@ -33,46 +35,141 @@ from src.common.tensors import AbstractTensor
 #: THE TOKEN NETWORK (see autopilot.py for the story): the observation is the
 #: ship's own vector (SHIP_G values), then every body in reach as a token
 #: (TOKENS of them, each TOKEN_F values), then the TOKENS-long mask.
-TOKENS, TOKEN_F, SHIP_G = 64, 16, 12
-TOKEN_H, SHIP_H, HEAD_H = 48, 32, 64
-TOKEN_FEATURES = SHIP_G + TOKENS * TOKEN_F + TOKENS
+#:
+#: VARIANTS.  The default network (variant id ``token``) is 64 tokens, a
+#: 48-wide token embedding, two pooling queries, a 64-wide head, tanh gates.
+#: A trimmed one is named by an id of dotted fields -- ``t32.h32.q1.g32.ahard``
+#: = 32 nearest tokens, embedding width 32, one pooling query, head width 32,
+#: hard (clipped) gates.  The widths, the query count and the head are read
+#: back from the PARAMETER SHAPES (``spec_of_shapes``), so a weight file's
+#: arrays alone select them; the two things shapes cannot say (the token
+#: count: the weights are shared across tokens; the gate family) ride in the
+#: params dict as the ``variant`` entry, absent = ``token``.  The law is
+#: compiled for ONE variant per process: MEOWDOKU_PILOT_ARCH (default ``token``).
+SHIP_G, TOKEN_F = 12, 16
+SHIP_H = 32
 TOKEN_PARAMS = ("We1", "be1", "We2", "be2", "Q1", "Q2", "Wg", "bg", "Wh1", "bh1", "Wh2", "bh2")
 #: roll, throttle, fire, pitch, rudder
 OUTPUTS = 5
 #: Scales of the observation (board units to network units).
 DX, DY, DV = 8.0, 10.0, 10.0
+DEFAULT_VARIANT = "token"
+ACTS = ("tanh", "hard", "relu")
+_DEFAULT = {"tokens": 64, "h": 48, "q": 2, "g": 64, "act": "tanh"}
 
 
-def token_param_shapes(outputs: int = OUTPUTS) -> dict[str, tuple[int, ...]]:
-    """The network's parameter arrays by name: the law's declared parameter inputs."""
-    return {"We1": (TOKEN_F, TOKEN_H), "be1": (1, TOKEN_H), "We2": (TOKEN_H, TOKEN_H), "be2": (1, TOKEN_H),
-            "Q1": (TOKEN_H, 1), "Q2": (TOKEN_H, 1), "Wg": (SHIP_G, SHIP_H), "bg": (1, SHIP_H),
-            "Wh1": (2 * TOKEN_H + SHIP_H, HEAD_H), "bh1": (1, HEAD_H), "Wh2": (HEAD_H, outputs), "bh2": (1, outputs)}
+def spec_of(variant: str = DEFAULT_VARIANT) -> dict:
+    """The fields of a variant id (see VARIANTS above)."""
+    spec = dict(_DEFAULT)
+    if variant and variant != DEFAULT_VARIANT:
+        for field in str(variant).split("."):
+            if field.startswith("a"):
+                spec["act"] = field[1:]
+            elif field[0] in "thqg":
+                spec["tokens" if field[0] == "t" else field[0]] = int(field[1:])
+            else:
+                raise ValueError(f"unknown pilot variant field {field!r} in {variant!r}")
+    if spec["act"] not in ACTS or spec["q"] not in (1, 2):
+        raise ValueError(f"bad pilot variant {variant!r}: {spec}")
+    return spec
 
 
-def token_policy_forward(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2):
-    """x (N, TOKEN_FEATURES) -> (N, outputs) in [-1, 1].  AbstractTensor
+def spec_of_shapes(shapes: dict, variant: str = DEFAULT_VARIANT) -> dict:
+    """The variant's fields with widths, query count and head read from the
+    parameter shapes (``shapes``: name -> shape); tokens and gates from ``variant``."""
+    spec = spec_of(variant)
+    h = int(shapes["We1"][1])
+    spec.update(h=h, g=int(shapes["Wh1"][1]), q=(int(shapes["Wh1"][0]) - int(shapes["Wg"][1])) // h)
+    return spec
+
+
+ACTIVE_VARIANT = os.environ.get("MEOWDOKU_PILOT_ARCH", DEFAULT_VARIANT) or DEFAULT_VARIANT
+_ACTIVE = spec_of(ACTIVE_VARIANT)
+TOKEN_COUNT = _ACTIVE["tokens"]
+TOKENS, TOKEN_H, HEAD_H, QUERIES, ACT = _ACTIVE["tokens"], _ACTIVE["h"], _ACTIVE["g"], _ACTIVE["q"], _ACTIVE["act"]
+TOKEN_FEATURES = SHIP_G + TOKENS * (TOKEN_F + 1)
+
+
+def features_of(tokens: int) -> int:
+    return SHIP_G + tokens * (TOKEN_F + 1)
+
+
+def slice_tokens(x, tokens_from: int, tokens_to: int):
+    """An observation at ``tokens_from`` tokens as the one at ``tokens_to`` <= it:
+    the tokens are nearest first, so the nearer ones are a prefix."""
+    x = np.asarray(x)
+    if tokens_to == tokens_from:
+        return x
+    n = tokens_from * TOKEN_F
+    return np.concatenate([x[..., :SHIP_G], x[..., SHIP_G:SHIP_G + tokens_to * TOKEN_F],
+                           x[..., SHIP_G + n:SHIP_G + n + tokens_to]], axis=-1)
+
+
+def token_param_shapes(outputs: int = OUTPUTS, variant: str | None = None) -> dict[str, tuple[int, ...]]:
+    """The network's parameter arrays by name: the law's declared parameter
+    inputs (of ``variant``, default the process's active one)."""
+    spec = _ACTIVE if variant is None else spec_of(variant)
+    H, G, q = spec["h"], spec["g"], spec["q"]
+    return {"We1": (TOKEN_F, H), "be1": (1, H), "We2": (H, H), "be2": (1, H),
+            "Q1": (H, 1), "Q2": (H, 1) if q == 2 else (1, 1), "Wg": (SHIP_G, SHIP_H), "bg": (1, SHIP_H),
+            "Wh1": (q * H + SHIP_H, G), "bh1": (1, G), "Wh2": (G, outputs), "bh2": (1, outputs)}
+
+
+def gate(t, act: str):
+    """The hidden gate of family ``act``: tanh; ``hard`` = clip to [-1, 1];
+    ``relu`` = clip to [0, 6] (relu6)."""
+    if act == "tanh":
+        return t.tanh()
+    return t.clip(0.0, 6.0) if act == "relu" else t.clip(-1.0, 1.0)
+
+
+def embed(tokens, We1, be1, We2, be2, act: str):
+    """(n * T, TOKEN_F) -> (n * T, H): the shared two-layer token embedding."""
+    e = gate(tokens @ We1 + be1, act)
+    return gate(e @ We2 + be2, act)
+
+
+def pool(e, mask, n: int, T: int, queries, act: str):
+    """Attention pooling of the embedded tokens (n * T, H) by each query
+    (H, 1), softmax over the live tokens only: a list of (n, H)."""
+    H = int(e.shape[1])
+    emb = e.reshape((n, T, H))
+    out = []
+    for q in queries:
+        score = e @ q
+        score = score.tanh() if act == "tanh" else score.clip(-1.0, 1.0)
+        weight = (score * 4.0).exp().reshape((n, T, 1)) * mask
+        total = weight.sum(dim=1) + 1e-6
+        out.append((weight * emb).sum(dim=1) / total)
+    return out
+
+
+def head(pooled, ship, Wg, bg, Wh1, bh1, Wh2, bh2, act: str):
+    g = gate(ship @ Wg + bg, act)
+    joined = AbstractTensor.cat([*pooled, g], dim=1)
+    h = gate(joined @ Wh1 + bh1, act)
+    return h @ Wh2 + bh2
+
+
+def token_policy_forward(x, We1, be1, We2, be2, Q1, Q2, Wg, bg, Wh1, bh1, Wh2, bh2, act: str | None = None):
+    """x (N, features) -> (N, outputs) in [-1, 1].  AbstractTensor
     arithmetic only (traced to the NumPy product like ``policy_forward``):
     unpack the ship, the tokens and the mask; embed every token (shared
-    weights); pool by two attention queries over the live tokens; join the
-    ship's embedding; a two-layer head."""
+    weights); pool by the attention queries over the live tokens; join the
+    ship's embedding; a two-layer head.  Widths, token count and query count
+    are read from the shapes (see VARIANTS); ``act`` is the gate family
+    (default the active variant's)."""
+    act = ACT if act is None else act
     n = int(x.shape[0])
-    ship = x[:, 0:SHIP_G]
-    tokens = x[:, SHIP_G:SHIP_G + TOKENS * TOKEN_F].reshape((n * TOKENS, TOKEN_F))
-    mask = x[:, SHIP_G + TOKENS * TOKEN_F:SHIP_G + TOKENS * TOKEN_F + TOKENS].reshape((n, TOKENS, 1))
-    e = (tokens @ We1 + be1).tanh()
-    e = (e @ We2 + be2).tanh()
-    emb = e.reshape((n, TOKENS, TOKEN_H))
-    pooled = []
-    for q in (Q1, Q2):
-        weight = ((e @ q).tanh() * 4.0).exp().reshape((n, TOKENS, 1)) * mask
-        total = weight.sum(dim=1) + 1e-6
-        pooled.append((weight * emb).sum(dim=1) / total)
-    g = (ship @ Wg + bg).tanh()
-    from src.common.tensors import AbstractTensor as _AT
-    joined = _AT.cat([pooled[0], pooled[1], g], dim=1)
-    h = (joined @ Wh1 + bh1).tanh()
-    return (h @ Wh2 + bh2).tanh()
+    G = int(Wg.shape[0])
+    T = (int(x.shape[1]) - G) // (TOKEN_F + 1)
+    ship = x[:, 0:G]
+    tokens = x[:, G:G + T * TOKEN_F].reshape((n * T, TOKEN_F))
+    mask = x[:, G + T * TOKEN_F:G + T * (TOKEN_F + 1)].reshape((n, T, 1))
+    e = embed(tokens, We1, be1, We2, be2, act)
+    queries = (Q1, Q2) if int(Q2.shape[0]) == int(We1.shape[1]) else (Q1,)
+    out = head(pool(e, mask, n, T, queries, act), ship, Wg, bg, Wh1, bh1, Wh2, bh2, act)
+    return out.tanh() if act == "tanh" else out.clip(-1.0, 1.0)
 
 
 def _f(mask):
@@ -90,7 +187,7 @@ def spread(values, rows: tuple[int, int], full):
     return AbstractTensor.cat(parts, dim=0) if len(parts) > 1 else values
 
 
-def observation(rows: tuple[int, int], c: dict):
+def observation(rows: tuple[int, int], c: dict, tokens: int | None = None):
     """The token observation (N, TOKEN_FEATURES) of the lanes in ``rows`` from
     the law's columns ``c`` (name -> span): the ship vector, the TOKENS nearest
     bodies in reach (nearest first, lane order among equals) and the mask --
@@ -99,6 +196,7 @@ def observation(rows: tuple[int, int], c: dict):
     The k-th nearest is found by repeated extraction (see below), so the
     rows are exactly the first TOKENS of the Python path's stable sort."""
     from meowdoku import scroller as sc
+    TOKENS = TOKEN_COUNT if tokens is None else int(tokens)
     r0, r1 = rows
     R = r1 - r0
     blocks = ((sc.SHOTS[0], sc.PICKUPS[1]), tuple(sc.BASES))
