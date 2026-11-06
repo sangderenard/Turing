@@ -26,11 +26,12 @@ deploy to 8766 as soon as work lands.
 
 ## Fountain queue (next, in order)
 
-1. **Run modes:**
-   - the compute spins free in a hot loop into a buffer, and the display reads from the buffer;
-   - cached recordings with rebirth, replay, bounce and continue;
-   - continuous run by default (settle is optional);
-   - phone orientation gives gravity by default, with a toggle (iOS asks permission on tap).
+1. **Run modes** (landed; browser-verified numbers in the commit message):
+   - the compute free-runs (a bounded number of batches in flight, steps per batch adapted to the measured step cost) into a sliding-window recording; the display draws from it at screen rate (`web/compute.js`, `web/recording.js`);
+   - Rebirth, Replay, Bounce and Continue (Continue rebuilds the frame's exact state from a keyframe plus the logged inputs);
+   - the run is continuous by default; "stop at rest" (the energy `SettleDetector`) and the image replay stay as the `run` option;
+   - phone orientation is the gravity vector by default (`web/gravity.js`, runtime inputs `grav_x`, `grav_y`, `lid`, `rows` of the law), with a toggle; iOS asks on the first tap.
+   - **Open:** keyframes cost one state copy per second of simulation (25 MB each at 1M ids), so the 1M+ sizes keep a very short window; the image mapping needs a settled pile (run: stop at rest); a phone-driven lid and grid height are page-side inputs the server does not see.
 2. **Neighbour list:** in-dispatch neighbour-of-neighbour refresh, one dispatch per step, a full rebuild only rarely.
 3. **Counting sort**, with N set at runtime.
 4. **Third dimension (confirmed wanted):**

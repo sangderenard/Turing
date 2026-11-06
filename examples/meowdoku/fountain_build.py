@@ -182,7 +182,8 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
     manifest = {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
-                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT},
+                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
+                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G},
         "emit_span": F.EMIT_SPAN, "initial": {},
         "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"],
                    "radius": "rad", "rest_speed": 0.15},

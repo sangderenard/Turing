@@ -40,6 +40,9 @@ PHYSICS
 * The basin and nozzle scale with ``sqrt(n)`` so the pile keeps its shape, and
   take the screen's aspect (``basin``) at the same pile area; the basin is a
   set of RUNTIME uniforms, so one program serves every aspect.
+* GRAVITY is a vector, a RUNTIME INPUT (``grav_x``, ``grav_y``, default ``(0, -G)``), as are the basin's numbers: a phone's
+  tilt turns it moment by moment with no rebuild.  ``lid`` (a ceiling at that height, off by default) keeps grains in the
+  basin when gravity points up.  The inputs enter the law as plain additions, so the default is bit for bit the old law.
 * DIAGNOSTICS: the law reduces, by a fixed tree of additions, the kinetic +
   rotational energy, the largest speed, and the number of ids that are not
   finite / outside the walls / parked / live, plus the contacts the neighbour
@@ -120,7 +123,15 @@ CELL = 2.0 * max(s[1] for s in SPECIES)
 
 STATE = ("x", "y", "vx", "vy", "w", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
-UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows")   # the first three are the run, the rest its basin
+UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid")   # the first three are the run, then its basin, then the RUNTIME INPUTS
+#: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
+#: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
+#: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
+#: the lid still meet each other.  The server sends their defaults (and the closed values as ``tilt_inputs``); the page's
+#: runtime owns them after that.
+RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows")
+LID_OFF = 1.0e9
+LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
 #: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
@@ -189,6 +200,14 @@ def basin(n: int, aspect: float | None = None) -> dict[str, float]:
     return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
             "cols": cols, "rows": rows, "cells": cols * rows,
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
+
+
+def tilt_inputs(n: int, aspect: float | None = None) -> dict[str, float]:
+    """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
+    jet's reach and a grid tall enough to cover everything under it."""
+    geo = basin(n, aspect)
+    lid = geo["nozzle_y"] + LID_ABOVE
+    return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / CELL))}
 
 
 def board_size(view) -> tuple[float, float]:
@@ -275,7 +294,8 @@ def make_law(n: int, active: int | None = None):
     emit_rate = EMIT_SPAN / float(active)
     scan_shifts = reduction_shifts(n)
 
-    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows):
+    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows,
+                      grav_x, grav_y, lid):
         """One fixed step of every particle (see the module docstring)."""
         cells = cols * rows
 
@@ -451,14 +471,21 @@ def make_law(n: int, active: int | None = None):
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
-        # ---- the integrator: gravity, drag, the forces above.  A pending id with a clear slot is placed at the
+        # the lid: the same contact against a ceiling at the runtime height ``lid`` (a body of infinite mass; far away unless the page closes it)
+        lid_delta = (radius - (lid - y)).clamp(0.0, 1.0e9) * live
+        gx, gy, gt = _contact(lid_delta, y * 0.0, y * 0.0 - 1.0, vx, vy, radius * w, kw, mass, mu)
+        touch = as_float(lid_delta > 0.0)
+        fx = fx + gx * touch
+        fy = fy + gy * touch
+        tq = tq - radius * gt * touch
+        # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
         # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
         just = pending * as_float(blocked < 0.5)
         place = just + arming
         inertia = 0.5 * mass * radius * radius
-        vxn = AbstractTensor.where(just > 0.5, vx0, vx + live * (fx / mass - drag * vx) * DT)
+        vxn = AbstractTensor.where(just > 0.5, vx0, vx + live * (fx / mass + grav_x - drag * vx) * DT)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED,
-                                                                         vy + live * (fy / mass - G - drag * vy) * DT))
+                                                                         vy + live * (fy / mass + grav_y - drag * vy) * DT))
         wn = (w + live * (tq / inertia - SPIN_DRAG * w) * DT) * (1.0 - just)
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
@@ -529,12 +556,15 @@ def _f32(a) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).astype(np.float64)
 
 
-def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None) -> dict[str, np.ndarray]:
-    """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``)
-    and its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin)."""
+def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
+             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF) -> dict[str, np.ndarray]:
+    """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``),
+    its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) and the RUNTIME INPUTS
+    (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
     geo = basin(n, aspect)
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
+    out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid})
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
@@ -656,7 +686,7 @@ class FountainGame(Game):
     allow) and draws the particles in the shared scene.
 
     Actions (``/api/action``): ``fountain_start`` (phase 1; optional ``mix``,
-    ``mode``), ``fountain_mode``, ``fountain_speed``, ``fountain_size``,
+    ``mode``), ``fountain_mode``, ``fountain_speed`` (0 follows the newest frame), ``fountain_run`` (``continuous`` or ``settle``), ``fountain_size``,
     ``fountain_image`` (per-id colours as base64 bytes ``rgb``, three per id,
     or just ``count`` for sizes too large to ship), ``fountain_replay``
     (phase 2) and ``fountain_verify`` (run the law ``steps`` steps from round
@@ -670,6 +700,7 @@ class FountainGame(Game):
         super().__init__(board_id)
         self.size = size
         self.mix, self.mode, self.speed = 0.5, 2, 1
+        self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
         self.epoch = 1                       # bumped whenever the page must restart the fountain
@@ -713,6 +744,12 @@ class FountainGame(Game):
             self.mode = int(payload["mode"])
         elif kind == "fountain_speed":
             self.speed = int(payload["speed"])
+        elif kind == "fountain_run":
+            run = str(payload["run"])
+            if run not in ("continuous", "settle"):
+                raise ValueError(f"fountain_run: unknown run {run!r}")
+            self.run = run
+            self.reset()
         elif kind == "fountain_size":
             tag = str(payload["size"])
             if tag not in SIZES:
@@ -766,8 +803,16 @@ class FountainGame(Game):
             {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start", "aspect": True},
             {"id": "image", "kind": "file", "label": "Image", "sample": sample},
             {"id": "camera", "kind": "file", "label": "Camera", "capture": "environment", "sample": sample},
-            {"id": "replay", "kind": "button", "label": "Replay", "action": "fountain_replay",
+            {"id": "replay", "kind": "button", "label": "Image replay", "action": "fountain_replay",
              "enabled": self.has_image},
+            {"id": "run", "kind": "select", "label": "run", "value": self.run, "action": "fountain_run",
+             "field": "run", "options": [["continuous", "continuous"], ["settle", "stop at rest"]]},
+            # the run modes are the page's own (``local``): the compute runtime's recording, not a server action
+            {"id": "rebirth", "kind": "button", "label": "Rebirth", "local": "rebirth"},
+            {"id": "rec_replay", "kind": "button", "label": "Replay", "local": "replay"},
+            {"id": "bounce", "kind": "button", "label": "Bounce", "local": "bounce"},
+            {"id": "continue", "kind": "button", "label": "Continue", "local": "continue"},
+            {"id": "tilt", "kind": "toggle", "label": "phone gravity", "local": "tilt", "value": True},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
@@ -775,7 +820,7 @@ class FountainGame(Game):
             {"id": "size", "kind": "select", "label": "ids", "value": self.size, "action": "fountain_size",
              "field": "size", "options": sizes, "aspect": True},
             {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
-             "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"]]},
+             "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"], [0, "max"]]},
             {"id": "verify", "kind": "button", "label": "Verify", "action": "fountain_verify"},
         ]
 
@@ -805,7 +850,8 @@ class FountainGame(Game):
                 "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect,
                                                               use_image=1.0 if self.phase == "replay" else 0.0).items()},
                 "view": list(geo["view"]), "aspect": self.aspect,
-                "speed": self.speed, "named": ["ir", "ig", "ib"],
+                "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
+                "tilt": tilt_inputs(self.n, self.aspect),
             },
         })
         return base

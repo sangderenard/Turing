@@ -30,6 +30,20 @@
 // is read by a vertex stage, so devices with no vertex-stage storage buffers
 // (Apple's) are not a case.  The wasm route packs the same layout on the CPU.
 //
+// Run modes.  The page's pump steps the law as fast as the device allows, in batches of whole snapshots, NOT from
+// requestAnimationFrame: each snapshot (the packed points after `snapEvery` steps) is read back into a bounded RECORDING
+// (recording.js: a sliding window under a memory cap, with keyframes of the law's state and a log of the runtime law
+// inputs) and the display draws from that buffer at screen rate, at the pace of the simulation's own clock (x1, x2, x4;
+// "max" follows the newest).  The GPU queue is bounded (a few batches in flight, the steps per batch adapted to the
+// measured step cost) and the pump pauses when the buffer is `LEAD_FRAMES` ahead of the display.  Rebirth restarts from
+// the start state, Replay and Bounce play the recorded window forward / forward-and-back (the pump rests), and Continue
+// resumes the simulation from the displayed frame -- exactly: the state of that frame is rebuilt from the nearest keyframe
+// by running the law again with the logged inputs, which is bit for bit what ran.  The default run is CONTINUOUS (it
+// never stops); "settle" is the stop-at-rest rule below, which the image replay needs.
+//
+// Runtime law inputs (the gravity vector, the lid) are uniforms the page writes between batches, moment by moment, with no
+// rebuild; every change is logged with its step so a re-run reproduces it.
+//
 // Determinism: reset writes the same bytes every time and the law has no
 // atomics and no scatter, so a replay from the same initial state on the same
 // device repeats exactly.  The runtime records the rest positions when phase
@@ -37,6 +51,7 @@
 // so on screen; if a device is not bit-identical it records phase 2's own
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
+import { Recording, Playback } from "./recording.js";
 
 async function json(url) {
   const response = await fetch(url);
@@ -172,12 +187,18 @@ ${commit}
     this.lanes = Array.from({ length: B }, (_, b) => this.device.createBuffer({ size: (b === B - 1 ? lastSlots : spb) * pad * 4, usage: S }));
     this.head = this.device.createBuffer({ size: Math.max(16, Math.ceil(Object.keys(A.uniform_index).length / 4) * 16), usage: S });
     this.pts = this.device.createBuffer({ size: ndisp * 16, usage: S });
-    this.staging = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: ndisp * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
+    // Snapshot batches are read back through a few staging buffers: each holds up to `maxFrames` packed snapshots and, ahead of
+    // them, the law's diagnostics after the snapshots that asked for them.  (32 MB at most per staging buffer.)
+    this.frameBytes = ndisp * 16; this.diagNames = manifest.law.diagnostics; this.pool = [];
+    this.maxFrames = Math.max(1, Math.min(16, Math.floor(33554432 / this.frameBytes)));
+    this.diagRegion = Math.ceil(this.maxFrames * this.diagNames.length * 4 / 256) * 256;
+    this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.diagRegion + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
+    this.stateSlots = this.state.map((name) => A.feed_slots[name]);
     const oom = await this.device.popErrorScope();
     if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + 4 * ndisp * 16)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
     this.group = this.device.createBindGroup({ layout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.head } }] });
     this.packGroup = this.device.createBindGroup({ layout: packLayout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.pts } }] });
-    this.latest = null; this.stepMs = 0; this.pending = 0;
+    this.stepMs = 0;
   }
 
   #check(info, what) {
@@ -192,7 +213,6 @@ ${commit}
     this.device.queue.submit([encoder.finish()]);
     for (const [name, value] of Object.entries(uniforms)) this.setUniform(name, value);
     this.setColours(named);
-    this.latest = null;
   }
 
   setUniform(name, value) { this.device.queue.writeBuffer(this.head, this.abi.uniform_index[name] * 4, new Float32Array([value])); }
@@ -204,45 +224,88 @@ ${commit}
     }
   }
 
-  step(count) {
-    // validation / internal errors of every submission surface in the status line (failure), not only uncaptured ones
-    for (const kind of ["validation", "internal"]) this.device.pushErrorScope(kind);
-    const encoder = this.device.createCommandEncoder(), g = this.abi.groups;
+  #encodeSteps(encoder, count) {
+    const g = this.abi.groups;
     for (let k = 0; k < count; k++) {
       const pass = encoder.beginComputePass();
       pass.setBindGroup(0, this.group);
       for (const pipeline of this.pipelines) { pass.setPipeline(pipeline); pass.dispatchWorkgroups(g[0], g[1], 1); }
       pass.end();
     }
+  }
+
+  #encodePack(encoder) {
     const pack = encoder.beginComputePass();
     pack.setPipeline(this.pack); pack.setBindGroup(0, this.packGroup);
     const tg = Math.ceil(this.ndisp / 64), gx = Math.min(tg, 16384);
     pack.dispatchWorkgroups(gx, Math.ceil(tg / gx), 1);
     pack.end();
-    // back-pressure and a measured cost: the frame loop does not submit more while the last
-    // submission is unfinished, and the time to finish it, per step, is the step cost
-    const submitted = performance.now();
-    this.pending++;
-    const settle = () => {
-      this.pending--;
-      if (count > 0) { const per = (performance.now() - submitted) / count; this.stepMs = this.stepMs ? this.stepMs * 0.8 + per * 0.2 : per; }
-    };
-    const free = this.staging.find((s) => !s.busy);
-    if (free) {
-      free.busy = true;
-      encoder.copyBufferToBuffer(this.pts, 0, free.buffer, 0, this.ndisp * 16);
-      this.device.queue.submit([encoder.finish()]);
-      free.buffer.mapAsync(GPUMapMode.READ).then(() => {
-        this.latest = new Float32Array(free.buffer.getMappedRange().slice(0));
-        free.buffer.unmap(); free.busy = false;
-      }).catch((e) => { free.busy = false; this.failure = "readback: " + String((e && e.message) || e); });
-    } else this.device.queue.submit([encoder.finish()]);
-    for (const kind of ["internal", "validation"]) this.device.popErrorScope().then((e) => { if (e) { this.scopeFaults++; this.failure = `${kind}: ${e.message}`; } });
-    this.device.queue.onSubmittedWorkDone().then(settle);
   }
 
-  get busy() { return this.pending > 0; }
-  points() { return this.latest; }
+  #scoped(submit) {
+    // validation / internal errors of every submission surface in the status line (failure), not only uncaptured ones
+    for (const kind of ["validation", "internal"]) this.device.pushErrorScope(kind);
+    submit();
+    for (const kind of ["internal", "validation"]) this.device.popErrorScope().then((e) => { if (e) { this.scopeFaults++; this.failure = `${kind}: ${e.message}`; } });
+  }
+
+  canBatch() { return this.stages.some((s) => !s.busy); }
+
+  // Run `frames` snapshots: `snapEvery` steps, then pack and keep the points, each; plus the law's diagnostics after the
+  // snapshots in `diagAt` and a copy of the law's state after those in `keyAt` (indices into the batch).  One submit.  Returns
+  // a promise of { frames: Float32Array[], diags: ({name: value} | null)[], keys: ({ payload, bytes } | null)[] }.
+  batch({ frames, snapEvery, diagAt = [], keyAt = [] }) {
+    const stage = this.stages.find((s) => !s.busy);
+    if (!stage) throw new Error("no staging buffer free");
+    stage.busy = true;
+    const nd = this.diagNames.length, keys = new Array(frames).fill(null);
+    const encoder = this.device.createCommandEncoder();
+    for (let j = 0; j < frames; j++) {
+      this.#encodeSteps(encoder, snapEvery);
+      this.#encodePack(encoder);
+      encoder.copyBufferToBuffer(this.pts, 0, stage.buffer, this.diagRegion + j * this.frameBytes, this.frameBytes);
+      if (diagAt.includes(j)) this.diagNames.forEach((name, k) => {
+        const slot = this.abi.output_slots[name];
+        encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, (j * nd + k) * 4, 4);
+      });
+      if (keyAt.includes(j)) {
+        const buffer = this.device.createBuffer({ size: this.stateSlots.length * this.pad * 4, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+        this.stateSlots.forEach((slot, k) => encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), buffer, k * this.pad * 4, this.pad * 4));
+        keys[j] = { payload: buffer, bytes: buffer.size };
+      }
+    }
+    this.#scoped(() => this.device.queue.submit([encoder.finish()]));
+    const used = this.diagRegion + frames * this.frameBytes;
+    return stage.buffer.mapAsync(GPUMapMode.READ, 0, used).then(() => {
+      const range = stage.buffer.getMappedRange(0, used), words = this.frameBytes / 4;
+      const out = { frames: [], diags: [], keys };
+      for (let j = 0; j < frames; j++) {
+        const dst = this.pool.pop() || new Float32Array(words);
+        dst.set(new Float32Array(range, this.diagRegion + j * this.frameBytes, words));
+        out.frames.push(dst);
+        out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.diagNames.map((name, k) => [name, new Float32Array(range, (j * nd + k) * 4, 1)[0]])) : null);
+      }
+      stage.buffer.unmap(); stage.busy = false;
+      return out;
+    }).catch((e) => { stage.busy = false; this.failure = "readback: " + String((e && e.message) || e); throw e; });
+  }
+
+  // advance `count` steps with no snapshot (test hook, and re-running the law to rebuild a frame)
+  step(count) {
+    for (let done = 0; done < count; done += 32) {
+      const encoder = this.device.createCommandEncoder();
+      this.#encodeSteps(encoder, Math.min(32, count - done));
+      this.#scoped(() => this.device.queue.submit([encoder.finish()]));
+    }
+  }
+
+  // the law's state (the keyframe payload) back into the lanes
+  restore(buffer) {
+    const encoder = this.device.createCommandEncoder();
+    this.stateSlots.forEach((slot, k) => encoder.copyBufferToBuffer(buffer, k * this.pad * 4, this.lanes[this.laneOf(slot)], this.byteAt(slot), this.pad * 4));
+    this.device.queue.submit([encoder.finish()]);
+  }
+  freeKey(payload) { payload.destroy(); }
 
   // an event, never per frame: named columns, the first `n` ids of each
   async columnsNow(names) {
@@ -277,7 +340,7 @@ ${commit}
   }
 
   async idle() { await this.device.queue.onSubmittedWorkDone(); }
-  destroy() { for (const b of [...(this.lanes || []), this.head, this.pts]) b?.destroy(); for (const s of this.staging || []) s.buffer.destroy(); this.device.destroy(); }
+  destroy() { for (const b of [...(this.lanes || []), this.head, this.pts]) b?.destroy(); for (const s of this.stages || []) s.buffer.destroy(); this.device.destroy(); }
 }
 
 // ---------------------------------------------------------------- wasm route
@@ -292,9 +355,7 @@ class WasmProduct {
     for (const name of abi.argument_names) this.inputs[name] = this.program.view(abi.inputs[name]);
     for (const out of abi.outputs) this.nexts[out.name] = this.program.view(out.id);
     this.state = manifest.law.state;
-    this.ndisp = this.pad;
-    this.packed = new ArrayBuffer(this.pad * 16);
-    this.f32 = new Float32Array(this.packed); this.u32 = new Uint32Array(this.packed);
+    this.ndisp = this.pad; this.frameBytes = this.pad * 16; this.pool = []; this.maxFrames = 16;
   }
 
   reset({ named, uniforms }) {
@@ -314,8 +375,25 @@ class WasmProduct {
     }
   }
 
-  points() {
-    const p = this.manifest.points, I = this.inputs, O = this.nexts, f = this.f32, u = this.u32, rate = this.rec.emit_rate;
+  canBatch() { return true; }
+
+  // the same batch as the GPU's, run now on this thread (see GpuProduct.batch)
+  batch({ frames, snapEvery, diagAt = [], keyAt = [] }) {
+    const out = { frames: [], diags: [], keys: [] };
+    for (let j = 0; j < frames; j++) {
+      this.step(snapEvery);
+      out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * 4)));
+      out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])) : null);
+      out.keys.push(keyAt.includes(j) ? { payload: Object.fromEntries(this.state.map((name) => [name, this.inputs[name].slice()])), bytes: this.state.length * this.pad * 4 } : null);
+    }
+    return Promise.resolve(out);
+  }
+
+  restore(payload) { for (const name of this.state) this.inputs[name].set(payload[name]); }
+  freeKey() {}
+
+  #pack(f) {
+    const p = this.manifest.points, I = this.inputs, O = this.nexts, u = new Uint32Array(f.buffer, f.byteOffset, f.length), rate = this.rec.emit_rate;
     const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], age = I[p.live[0]];
     const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]], rad = O[p.radius], rest2 = p.rest_speed * p.rest_speed;
     const byte = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
@@ -355,21 +433,34 @@ export class SettleDetector {
 }
 
 // ------------------------------------------------------------------ runtime
+const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
+const TARGET_MS = { gpu: 8, wasm: 6 };  // what one batch should take: short enough to keep the display and the page responsive
+const LEAD_FRAMES = 8;                  // the pump rests when the buffer holds this many snapshots the display has not reached
+const DIAG_MS = 400;                    // continuous runs read the law's diagnostics this often (settle reads every sample)
+
 export class ComputeRuntime {
   constructor({ onStatus, onSamples, onSupport }) {
     this.onStatus = onStatus; this.onSamples = onSamples; this.onSupport = onSupport || (() => {});
     this.spec = null; this.manifest = null; this.product = null; this.productKey = null;
     this.epoch = null; this.uniforms = {}; this.support = null;
     this.named = {}; this.raster = null; this.sampleSpec = null; this.rest = null; this.verdict = null;
-    this.restPending = false; this.stepMs = 0; this.stepsPerFrame = 0; this.recovering = false;
+    this.restPending = false; this.stepMs = 0; this.recovering = false;
     this.steps = 0; this.running = false; this.last = 0; this.fps = 0; this.frames = 0; this.fpsAt = 0;
     this.route = ""; this.why = ""; this.warn = false; this.queue = Promise.resolve(); this.error = null;
     this.ready = false; this.note = "";
-    this.settleStep = null; this.detector = null; this.diag = null; this.sampling = false;
+    this.settleStep = null; this.detector = null; this.diag = null;
+    // the pump, the recording and the display cursor
+    this.tape = null; this.play = new Playback(); this.shown = null; this.token = 0; this.inflight = 0; this.arrived = new Map();
+    this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
+    this.stepsDone = 0; this.stepsPerSec = 0;
+    this.lawInputs = {}; this.gravity = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
   }
 
   get active() { return !!this.spec; }
   get rec() { return this.manifest && this.spec ? this.manifest.sizes[this.spec.size] : null; }
+  get snap() { return this.tape.snapEvery; }
+  get settleMode() { return !!(this.uniforms.use_image || (this.spec && this.spec.run === "settle")); }
+  get runtimeInputs() { return new Set((this.manifest && this.manifest.law.runtime_inputs) || []); }
 
   // Called with each game state: the declared product (or null).
   sync(spec) {
@@ -409,15 +500,18 @@ export class ComputeRuntime {
       this.epoch = spec.epoch; this.uniforms = { ...spec.uniforms };
       this.#reset();
     } else {
+      // the runtime inputs belong to the page from the first reset on: the server's numbers for them are only defaults
+      const mine = this.runtimeInputs;
       for (const [name, value] of Object.entries(spec.uniforms)) {
+        if (mine.has(name)) continue;
         if (this.uniforms[name] !== value) { this.uniforms[name] = value; this.product.setUniform(name, value); }
       }
     }
   }
 
   async #load(spec, key) {
-    this.ready = false; this.running = false; this.error = null;
-    if (this.product) { this.product.destroy(); this.product = null; }
+    this.ready = false; this.running = false; this.error = null; this.token++;
+    if (this.product) { if (this.tape) this.#release(this.tape.clear()); this.product.destroy(); this.product = null; }
     const rec = this.manifest.sizes[spec.size];
     // The compiler decides (rec.route, from its verdict); the browser can only veto.
     const v = rec.verdict, model = this.manifest.cost_model;
@@ -436,19 +530,68 @@ export class ComputeRuntime {
       this.warn = true; this.why = `FALLBACK to wasm: the compiler chose WebGPU compute (${detail}) but navigator.gpu is absent here (needs https and a WebGPU browser)`;
     } else this.why = `compiler verdict: the dispatches do not pay (${detail})`;
     if (!product) { product = new WasmProduct(); await product.init(rec, this.manifest); }
-    this.product = product; this.productKey = key; this.settleStep = null;
+    this.product = product; this.productKey = key; this.settleStep = null; this.stepMs = 0;
     this.route = product.kind;
+    // one snapshot per `snapEvery` steps: about one per displayed frame at x1, and a divisor of the settle rule's sample
+    const set = this.manifest.settle, dt = this.manifest.law.dt;
+    let snap = Math.max(1, Math.round(1 / (60 * dt)));
+    while (set.sample % snap) snap--;
+    this.tape = new Recording({ snapEvery: snap, frameBytes: product.frameBytes, capBytes: this.capBytes, keyEvery: snap * Math.max(1, Math.round(1 / (dt * snap))) });
     this.ready = true;
   }
 
+  // give the recording's frames and keyframes back (frames to the product's pool, keyframes to the device)
+  #release(gone) {
+    if (!gone || !this.product) return;
+    for (const f of gone.frames || []) if (f && f.length === this.product.frameBytes / 4 && this.product.pool.length < 64) this.product.pool.push(f);
+    for (const k of gone.keys || []) if (k && k.snap !== undefined) this.product.freeKey(k.snap);
+  }
+
+  // the runtime inputs as the law should see them now: the server's defaults, replaced by the sensor's gravity (and the lid
+  // and grid height that keep grains in the basin) while the page drives it
+  #inputsNow() {
+    const out = {};
+    for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
+    if (this.gravity) {
+      const G = this.manifest.law.gravity;
+      out.grav_x = this.gravity[0] * G; out.grav_y = this.gravity[1] * G;
+      Object.assign(out, this.spec.tilt || {});
+    }
+    for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
+    return out;
+  }
+
+  // Write the runtime inputs to the device if they changed (or `force`), at this step boundary, and log them with the step.
+  #applyInputs(force) {
+    const now = this.#inputsNow(), changed = Object.keys(now).some((n) => now[n] !== this.lawInputs[n]);
+    if (!changed && !force) return;
+    this.lawInputs = now;
+    for (const [name, value] of Object.entries(now)) this.product.setUniform(name, value);
+    this.tape.setInputs(this.steps, now);
+  }
+
+  // The phone's gravity (or the off switch: null).  Fractions of g in the screen's plane; takes effect at the next batch.
+  setGravity(gx, gy) {
+    const next = gx == null ? null : [gx, gy], old = this.gravity;
+    if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1]) < 0.004) return;
+    this.gravity = next;
+    this.#kick();
+  }
+
   #reset(phase2Rest) {
-    this.product.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms } });
-    this.steps = 0; this.running = true; this.last = performance.now() / 1000;
-    this.restPending = true;
+    this.token++; this.arrived.clear();
+    this.#release(this.tape.clear());
+    this.lawInputs = this.#inputsNow();
+    this.product.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs } });
+    this.steps = 0; this.running = true; this.last = performance.now() / 1000; this.resimming = false;
+    this.restPending = true; this.lastDone = 0; this.diagAt = 0;
+    this.tape.setInputs(0, this.lawInputs);
+    this.play.set("live", this.tape); this.play.pos = 0; this.shown = null;
     // the stop step S belongs to phase 1's run; phase 2 (the image replay) keeps it and stops at exactly S
     if (!this.uniforms.use_image) this.settleStep = null;
-    this.detector = new SettleDetector(this.manifest.settle, this.rec.n, this.rec.pad); this.diag = null; this.sampling = false;
+    this.detector = new SettleDetector(this.manifest.settle, this.rec.n, this.rec.pad); this.diag = null;
     if (!phase2Rest) this.note = "";
+    this.#kick();
   }
 
   // --- image -> per-id feeds (a game's `file` control with a `sample` spec): the real file path ---
@@ -468,7 +611,8 @@ export class ComputeRuntime {
 
   setRaster(raster, spec) {
     this.raster = raster; this.sampleSpec = spec; this.verdict = null;
-    if (this.rest) this.#sample(this.rest); else { this.note = "image loaded: it is mapped when the pile has settled"; this.onStatus(); }
+    if (this.rest) this.#sample(this.rest);
+    else { this.note = this.settleMode ? "image loaded: it is mapped when the pile has settled" : "image loaded: set run to 'stop at rest' to map it onto a settled pile"; this.onStatus(); }
   }
 
   // The image is ONLY sampled into the per-id feeds, at each id's ACTUAL rest position
@@ -519,44 +663,153 @@ export class ComputeRuntime {
     this.onStatus();
   }
 
-  // --- per frame ---
+  // --- the pump: runs as fast as the device allows, apart from the display's frames ---
+  #kick() {
+    if (this.kicked || !this.ready || typeof MessageChannel === "undefined") return;
+    this.kicked = true;
+    if (!this.channel) { this.channel = new MessageChannel(); this.channel.port1.onmessage = () => { this.kicked = false; this.#tick(); }; }
+    this.channel.port2.postMessage(0);
+  }
+
+  #stop() { return this.settleStep ?? Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9); }
+  get turbo() { return !!this.spec && this.spec.speed === 0; }
+  get lead() { return this.steps / this.snap - Math.floor(this.play.pos); }
+
+  #canSubmit() {
+    const p = this.product, settle = this.settleMode;
+    if (!this.ready || !p || !this.running || !this.spec || this.resimming || this.play.mode !== "live") return false;
+    if (!p.canBatch() || this.inflight >= (settle ? 1 : MAX_IN_FLIGHT)) return false;      // settle reads each sample before going on, so it is exact
+    if (settle && this.steps >= this.#stop()) return false;
+    if (!this.turbo && this.lead >= LEAD_FRAMES) return false;
+    return true;
+  }
+
+  #tick() {
+    const p = this.product, t0 = performance.now(), budget = p && p.kind === "wasm" ? 8 : 3;
+    while (this.#canSubmit()) {
+      try { this.#submit(); } catch (error) { this.error = String((error && error.message) || error); this.running = false; this.onStatus(); return; }
+      if (performance.now() - t0 > budget) { this.#kick(); return; }
+    }
+  }
+
+  // how many snapshots the next batch holds: what fits the target time at the measured step cost, the buffer's room, and in
+  // settle mode exactly up to the next sample (or the stop step)
+  #batchFrames() {
+    const p = this.product, snap = this.snap, set = this.manifest.settle;
+    let m = this.stepMs ? Math.floor((p.kind === "wasm" ? TARGET_MS.wasm : TARGET_MS.gpu) / (this.stepMs * snap)) : 1;
+    m = Math.max(1, Math.min(m, p.maxFrames));
+    if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
+    if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
+    return m;
+  }
+
+  #submit() {
+    const p = this.product, snap = this.snap, set = this.manifest.settle, settle = this.settleMode, keyEvery = this.tape.keyEvery;
+    const m = this.#batchFrames(), base = this.steps, first = base / snap + 1, diagAt = [], keyAt = [], now = performance.now();
+    this.#applyInputs(false);
+    for (let j = 0; j < m; j++) {
+      const at = base + (j + 1) * snap;
+      if (settle ? at % set.sample === 0 : (j === m - 1 && now - this.diagAt > DIAG_MS)) diagAt.push(j);
+      if (at % keyEvery === 0) keyAt.push(j);
+    }
+    if (diagAt.length && !settle) this.diagAt = now;
+    this.steps += m * snap; this.inflight++;
+    const token = this.token;
+    p.batch({ frames: m, snapEvery: snap, diagAt, keyAt }).then(
+      (result) => { this.inflight--; this.#land(token, first, m, result, now); },
+      (error) => { this.inflight--; this.error = String((error && error.message) || error); this.running = false; this.onStatus(); });
+  }
+
+  #land(token, first, m, result, started) {
+    const done = performance.now(), snap = this.snap;
+    if (token !== this.token) { this.#release({ frames: result.frames, keys: result.keys.filter(Boolean).map((k) => ({ snap: k.payload })) }); this.#kick(); return; }
+    const per = (done - Math.max(started, this.lastDone)) / (m * snap);
+    this.lastDone = done; this.stepMs = this.stepMs ? this.stepMs * 0.7 + per * 0.3 : per;
+    this.stepsDone += m * snap;
+    this.arrived.set(first, { m, result });
+    while (this.arrived.has(this.tape.hi + 1)) {
+      const k0 = this.tape.hi + 1, { m: count, result: r } = this.arrived.get(k0);
+      this.arrived.delete(k0);
+      for (let j = 0; j < count; j++) {
+        const k = k0 + j, step = k * snap;
+        this.#release(this.tape.push(k, r.frames[j]));
+        if (r.keys[j]) this.#release({ keys: this.tape.addKey(step, r.keys[j].payload, r.keys[j].bytes) });
+        if (r.diags[j]) this.#takeDiag(step, r.diags[j]);
+      }
+    }
+    if (this.settleMode && this.restPending && this.steps >= this.#stop() && this.inflight === 0) { this.restPending = false; this.#recordRest(); }
+    this.#kick();
+  }
+
+  // the law's diagnostics after `step` steps; in settle mode they feed the settle rule (which stops the run)
+  #takeDiag(step, d) {
+    this.diag = { step, ...d };
+    if (!this.settleMode) return;
+    const found = this.detector.push(step, d);
+    if (found !== null && this.settleStep === null) this.settleStep = found;
+    if (step >= Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9) && this.settleStep === null) this.settleStep = step;
+  }
+
+  // --- per displayed frame: move the cursor through the recording ---
   frame(now) {
-    if (!this.ready || !this.running || !this.spec) return;
+    if (!this.ready || !this.spec || !this.tape) return;
     const elapsed = Math.min(0.1, Math.max(0, now - this.last));
     this.last = now;
     this.frames++;
-    if (now - this.fpsAt > 0.5) { this.fps = this.frames / (now - this.fpsAt); this.frames = 0; this.fpsAt = now; this.onStatus(); }
-    const dt = this.manifest.law.dt;
-    // Phase 1 runs until the pile is at rest (SettleDetector, read at multiples of `sample` steps) or the cap; phase 2
-    // stops at EXACTLY the recorded step S, so the two phases' rest positions are comparable
-    const set = this.manifest.settle, cap = Math.ceil(set.max_seconds / dt - 1e-9);
-    const stop = this.settleStep ?? cap;
-    const settled = this.steps >= stop;
-    if (settled && this.restPending) { this.restPending = false; this.#recordRest(); }
-    // the sim runs in real time at speed 1; a slow route takes what its frame budget allows
-    const wanted = settled || this.product.busy || this.sampling ? 0
-      : Math.min(stop - this.steps, set.sample - (this.steps % set.sample), Math.max(1, Math.min(48, Math.round(elapsed / dt * (this.spec.speed || 1)))));
-    const budget = this.product.kind === "wasm" ? 22 : 1e9;
-    const t0 = performance.now();
-    let done = 0;
-    while (done < wanted && (performance.now() - t0) < budget) { const chunk = this.product.kind === "wasm" ? 1 : wanted; this.product.step(chunk); done += chunk; }
-    if (done) { this.steps += done; this.stepsPerFrame = done; if (this.product.kind === "wasm") this.stepMs = (performance.now() - t0) / done; }
-    if (done && this.steps % set.sample === 0) this.#sampleDiag(this.steps);
-    else if (!this.packedAtRest) { this.product.step(0); this.packedAtRest = true; }
-    if (done) this.packedAtRest = false;
+    if (now - this.fpsAt > 0.5) {
+      this.stepsPerSec = this.stepsDone / (now - this.fpsAt); this.stepsDone = 0;
+      this.fps = this.frames / (now - this.fpsAt); this.frames = 0; this.fpsAt = now; this.onStatus();
+    }
+    const speed = this.spec.speed ?? 1, dt = this.manifest.law.dt;
+    this.shown = this.play.advance(this.turbo ? 0 : elapsed * speed / (this.snap * dt), this.tape, { turbo: this.turbo, maxLead: 4 * LEAD_FRAMES });
+    if (this.play.mode === "live") this.#kick();      // the display used up some of the buffer
   }
 
-  // read the law's diagnostics at a sample step (the device finishes the submitted steps first), feed the detector
-  #sampleDiag(step) {
-    this.sampling = true;
-    const epoch = this.epoch;
-    this.product.idle().then(() => this.product.diagNow()).then((d) => {
-      if (epoch !== this.epoch) return;
-      this.diag = { step, ...d };
-      const found = this.detector.push(step, d);
-      if (found !== null && this.settleStep === null) this.settleStep = found;
-      if (step >= Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9) && this.settleStep === null) this.settleStep = step;
-    }).catch((e) => { this.error = "diagnostics: " + String((e && e.message) || e); }).finally(() => { this.sampling = false; });
+  // the packed points to draw now (the cursor's frame of the recording)
+  points() { return this.ready && this.tape && this.shown != null ? this.tape.get(this.shown) : null; }
+
+  // --- the run modes: the page's controls call compute.control(name) ---
+  control(name) {
+    if (!this.ready || !this.tape) return;
+    if (name === "rebirth") this.#reset();
+    else if (name === "replay" || name === "bounce") {
+      if (this.tape.hi < this.tape.lo) return;
+      this.play.set(name, this.tape); this.shown = Math.floor(this.play.pos);
+    } else if (name === "continue") this.#continue();
+  }
+
+  // Resume the simulation from the displayed frame.  The recording after it is dropped (the run branches there) and the law's
+  // state at that frame is rebuilt exactly: the nearest keyframe, then the logged steps and inputs run again.
+  async #continue() {
+    if (this.play.mode === "live" || this.resimming) return;
+    this.resimming = true;
+    const f = Math.floor(this.play.pos), token = this.token;
+    while (this.inflight > 0) await new Promise((resolve) => setTimeout(resolve, 2));
+    if (token !== this.token) return;
+    const tape = this.tape, p = this.product;
+    if (f < tape.hi) {
+      const plan = tape.plan(f);
+      if (plan.key) p.restore(plan.key.snap);
+      else p.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...(plan.initial || {}) } });
+      for (const [name, value] of Object.entries(plan.initial || {})) p.setUniform(name, value);
+      for (const op of plan.ops) {
+        if (op.set) for (const [name, value] of Object.entries(op.set)) p.setUniform(name, value);
+        else p.step(op.steps);
+      }
+      this.#release(tape.truncateAfter(f));
+      this.arrived.clear();
+      this.steps = f * this.snap;
+      await p.idle();
+      if (token !== this.token) return;
+    }
+    this.#applyInputs(true);
+    this.play.set("live", tape); this.play.jump(f); this.shown = f;
+    this.resimming = false; this.#kick();
+  }
+
+  // what the page's controls show about the run modes
+  localState() {
+    return { tilt: this.gravity !== null, mode: this.play.mode, frames: this.tape ? this.tape.length : 0, ready: this.ready };
   }
 
   energyText() {
@@ -578,19 +831,22 @@ export class ComputeRuntime {
   statusText() {
     if (!this.ready) return this.error ? "compute: " + this.error : "compute: loading";
     const adapter = this.product.adapterInfo ? ` [${this.product.adapterInfo}]` : "";
-    const dt = this.manifest.law.dt, t = this.steps * dt;
-    const done = this.settleStep !== null && this.steps >= this.settleStep ? `settled at step ${this.settleStep}` : "settling";
+    const dt = this.manifest.law.dt, snap = this.snap, t = (this.shown ?? 0) * snap * dt;
+    const run = this.settleMode ? (this.settleStep !== null && this.steps >= this.settleStep ? `settled at step ${this.settleStep}` : "settling") : "continuous";
     const fail = this.product.failure ? ` | GPU error: ${this.product.failure}` : "";
-    const ms = this.product.kind === "wasm" ? this.stepMs : this.product.stepMs;
-    const rate = ms ? ` | ${ms.toFixed(2)} ms/step` : "";
-    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${done}${this.energyText()} | ${this.fps.toFixed(0)} fps${rate}${this.note ? " | " + this.note : ""}${this.verdictText()}${fail}`;
+    const rate = this.stepsPerSec ? ` | ${Math.round(this.stepsPerSec).toLocaleString()} steps/s (x${(this.stepsPerSec * dt).toFixed(1)} real time)` : "";
+    const cost = this.stepMs ? ` | ${this.stepMs.toFixed(2)} ms/step` : "";
+    const tape = this.tape, mode = this.play.mode;
+    const rec = tape && tape.length ? ` | ${mode === "live" ? "rec" : mode} ${tape.lo}-${tape.hi} (${mb(tape.bytes)} of ${mb(this.capBytes)})` : "";
+    const grav = this.gravity ? ` | tilt gravity (${this.gravity[0].toFixed(2)}, ${this.gravity[1].toFixed(2)})` : "";
+    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${run}${this.energyText()} | ${this.fps.toFixed(0)} fps${rate}${cost}${rec}${grav}${this.note ? " | " + this.note : ""}${this.verdictText()}${fail}`;
   }
 
-  // test/diagnostics only
+  // test/diagnostics only: step the product directly (not recorded; use while the pump rests)
   advance(count) {
     const total = this.settleStep ?? Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9);
     count = Math.min(count, total - this.steps);
-    this.product.step(count); this.steps += count; this.packedAtRest = false; return this.steps;
+    this.product.step(count); this.steps += count; return this.steps;
   }
   columnsNow(names) { return this.product.columnsNow(names); }
 }

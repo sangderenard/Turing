@@ -29,6 +29,7 @@
   #gamectl { display: contents; }
   #gamectl .gctl-file { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
   #gamectl button:disabled { opacity: .4; }
+  #gamectl button.on { outline: 2px solid currentColor; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: 100vw;
