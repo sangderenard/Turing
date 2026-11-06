@@ -1452,7 +1452,7 @@ function camera() {
   // half-angle, with room for the bar and the hearts; a lower camera sees
   // the board foreshortened and backs off a little more.
   // A free board is sized to the screen already, so it is framed tightly.
-  const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
+  const pad = state.game && state.game.board === "free" ? 0.2 : 1.2, slack = state.game && state.game.board === "free" ? 1.01 : 1.12;
   const x0 = ext.x0 || 0;
   const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width - x0 + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
@@ -3873,7 +3873,7 @@ function renderGameControls(game) {
     box.dataset.key = key;
     box.replaceChildren(...specs.map((s) => {
       let el;
-      if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => act({ type: s.action }); }
+      if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }); }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
@@ -3885,7 +3885,7 @@ function renderGameControls(game) {
         const input = document.createElement(s.kind === "select" ? "select" : "input");
         if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value });
+        input.onchange = () => act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
         el.append(input);
       }
       el.dataset.ctl = s.id;
@@ -3920,7 +3920,7 @@ function pointsFrame(cam, now) {
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
-  cloud.draw(data, { viewProj: cam.viewProj, view: rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
+  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
                      y: TILE.height + 0.03, stride: rec.display_stride, background: sceneBackground() });
 }
 

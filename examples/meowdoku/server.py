@@ -138,7 +138,7 @@ class Table:
         elif kind == "worldwalk":
             self.game = WorldWalk(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "fountain":
-            self.game = FountainGame()       # the page runs the law; the server holds phase, seed, image
+            self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
         elif kind == "purrline":
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:

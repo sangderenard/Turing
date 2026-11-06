@@ -31,10 +31,19 @@ PHYSICS
 * The FOUNTAIN is an emitter: id ``k`` leaves at ``k / n * EMIT_SPAN``, at a
   nozzle position a low-discrepancy step along the bar from the previous id,
   with a hashed launch angle and speed.  Until its age reaches its emit time
-  a particle is parked, takes no part in contacts and is not drawn.  The
-  pile forms and settles by contact forces, so regular and irregular packing
-  emerge from the species mix.
-* The basin and nozzle scale with ``sqrt(n)`` so the pile keeps its shape.
+  a particle is parked, takes no part in contacts and is not drawn.  At its
+  time it is ARMED at its nozzle slot and is emitted at the first step no live
+  grain is within contact distance of the slot (plus what a pair can close in
+  one step): a grain never spawns inside another, so the contact springs
+  inject no energy at the nozzle.  The pile forms and settles by contact
+  forces, so regular and irregular packing emerge from the species mix.
+* The basin and nozzle scale with ``sqrt(n)`` so the pile keeps its shape, and
+  take the screen's aspect (``basin``) at the same pile area; the basin is a
+  set of RUNTIME uniforms, so one program serves every aspect.
+* DIAGNOSTICS: the law reduces, by a fixed tree of additions, the kinetic +
+  rotational energy, the largest speed, and the number of ids that are not
+  finite / outside the walls / parked / live, plus the contacts the neighbour
+  walk dropped.  The page ends phase 1 on the energy (``SETTLE``).
 
 NEIGHBOUR SEARCH (in the law, from tensor ops; deterministic)
 -------------------------------------------------------------
@@ -75,7 +84,11 @@ N_BASE = 4096                          # the basin's reference count (its width 
 WIDTH_BASE = 2.0
 FLOOR_Y = 0.0
 EMIT_SPAN = 6.0                        # seconds over which ids are emitted
-SETTLE_SECONDS = 14.0                  # sim time by which the pile has come to rest
+#: The pile is AT REST (phase 1 ends, at step S; phase 2 stops at exactly S) when everything is emitted and the law's
+#: kinetic + rotational energy has stayed under BOTH ``ke_per_id`` per id and ``relative`` of its peak, with the largest speed
+#: under ``speed``, for ``hold_samples`` consecutive samples taken every ``sample`` steps.  ``max_seconds`` caps a pile that
+#: never quiets.  ``web/compute.js`` ``SettleDetector`` is this rule.
+SETTLE = {"sample": 30, "hold_samples": 12, "relative": 0.01, "ke_per_id": 1.0e-7, "speed": 0.25, "max_seconds": 40.0}
 DT = 1.0 / 360.0
 G = 1.0
 OMEGA = 150.0                          # contact stiffness: kn = m * OMEGA^2 (OMEGA * DT stays well under 1: a grain feels several contacts)
@@ -83,7 +96,15 @@ ZETA = 0.7                             # normal damping ratio
 VREF = 0.02                            # tangential slip speed over which friction saturates
 SPIN_DRAG = 3.0                        # 1/s
 STRATA = 4.0                           # hue cycles over the emission in mode 2 (time strata)
-K_RUN = 16                             # candidates walked per row run
+K_RUN = 24                             # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one)
+ARMED = -1.0e9                         # the vy of an id waiting at its nozzle slot (see ``fountain_step``)
+EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
+#: The share of a contact's slip that ONE step's friction may remove.  Coulomb friction is regularised with a tanh whose slope
+#: mu fn / VREF is stiff, and an explicit step of a force that stiff reverses the slip it acts on (and, for the several contacts
+#: of a grain, pumps energy: a settled pile kept spinning and rattling for ever).  Friction is therefore limited to
+#: ``FRICTION_SHARE`` of the slip per step, in the contact's own slip mass (m_eff / 3 for a disk's slip, spin included); a grain
+#: has up to six neighbours and a wall, so the share is about 1/7.
+FRICTION_SHARE = 0.15
 BAR_HEIGHT = 0.12
 
 #: species: name, radius, density, friction, linear drag (1/s)
@@ -99,9 +120,13 @@ CELL = 2.0 * max(s[1] for s in SPECIES)
 
 STATE = ("x", "y", "vx", "vy", "w", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
-UNIFORMS = ("mode", "use_image", "mix")
+UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows")   # the first three are the run, the rest its basin
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
-OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "cr", "cg", "cb", "rad")
+#: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
+#: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
+#: walls, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
+DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
+OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
 
 TAU = 2.0 * math.pi
@@ -125,21 +150,53 @@ def merge_exchange_stages(n: int) -> list[tuple[int, int, int]]:
     return stages
 
 
+def reduction_shifts(n: int) -> list[int]:
+    """The shifts 1, 2, 4 .. of the law's fixed-order reduction (each is a gather, so a dispatch): after them element 0
+    of a reduced column holds the total over all ``n`` ids."""
+    return [1 << k for k in range((n - 1).bit_length())] if n > 1 else []
+
+
 def pad_count(n: int) -> int:
     """The sort length: ``n`` rounded up to a power of two."""
     return 1 << max(1, (int(n) - 1).bit_length())
 
 
-def basin(n: int) -> dict[str, float]:
-    """Geometry for ``n`` active ids: basin and nozzle scale with sqrt(n / N_BASE)."""
+ASPECT_MIN, ASPECT_MAX = 0.35, 3.0     # the viewport aspects (width / height) a basin will stretch to
+VIEW_BOTTOM, VIEW_TOP, VIEW_SIDE = 0.05, 1.35, 1.02
+
+
+def fit_scale(s: float, aspect: float) -> float:
+    """The width factor ``k`` of a basin whose VIEW (side walls to the top of the plume) has width:height ``aspect``.
+    The pile keeps its area: width goes as ``s k`` and the nozzle height as ``0.6 s / k + 0.7`` (a narrower basin
+    heaps the pile higher), so the view is ``2 VIEW_SIDE s k`` wide and ``VIEW_BOTTOM s + 0.7 + VIEW_TOP + 0.6 s / k`` tall;
+    equating the ratio to ``aspect`` is a quadratic in ``k``."""
+    a = min(max(float(aspect), ASPECT_MIN), ASPECT_MAX)
+    b = a * (0.7 + VIEW_TOP + VIEW_BOTTOM * s)
+    w = 2.0 * VIEW_SIDE * s
+    return (b + math.sqrt(b * b + 4.0 * w * 0.6 * a * s)) / (2.0 * w)
+
+
+def basin(n: int, aspect: float | None = None) -> dict[str, float]:
+    """Geometry for ``n`` active ids: basin and nozzle scale with sqrt(n / N_BASE).  ``aspect`` (the screen's
+    width / height, clamped) stretches it to fill that screen at the same pile area; ``None`` is the reference basin.
+    Every number the law needs is a RUNTIME uniform (see ``uniforms``): one program serves every aspect."""
     s = math.sqrt(n / N_BASE)
-    width = WIDTH_BASE * s
-    nozzle_y = 0.6 * s + 0.7
+    k = 1.0 if not aspect else fit_scale(s, aspect)
+    width = WIDTH_BASE * s * k
+    nozzle_y = 0.6 * s / k + 0.7
     cols = int(math.ceil(width / CELL))
     rows = int(math.ceil((nozzle_y + 0.1) / CELL))
-    return {"scale": s, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y,
+    return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
             "cols": cols, "rows": rows, "cells": cols * rows,
-            "view": (-1.05 * s, 1.05 * s, -0.05 * s, nozzle_y + 1.35)}
+            "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
+
+
+def board_size(view) -> tuple[float, float]:
+    """The free board (scene units) a basin view maps onto: the view's aspect, the reference basin's area."""
+    a = (view[1] - view[0]) / (view[3] - view[2])
+    ref = basin(N_BASE)["view"]
+    a0 = (ref[1] - ref[0]) / (ref[3] - ref[2])
+    return (10.5, 10.5 / a) if a >= a0 else (13.5 * a, 13.5)
 
 
 # --------------------------------------------------------------- id hashing
@@ -189,41 +246,65 @@ def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu):
     # reaches ~75; a tanh built from exp(2x) (Metal/Apple shaders, fast-math) is inf/inf = NaN past
     # |x| ~ 44 in f32, and one NaN force removes the grain and every grain it touches.  tanh(20) is 1
     # to 1e-17, so clamping the argument changes no f64 result and keeps every f32 lane finite.
-    ft = -(mu * fn) * (vt * (1.0 / VREF)).clamp(-20.0, 20.0).tanh()
+    tanh = (vt * (1.0 / VREF)).clamp(-20.0, 20.0).tanh()
+    coulomb = mu * fn * tanh.abs()
+    stick = (FRICTION_SHARE / (3.0 * DT)) * m_eff * vt.abs()          # the most that removes FRICTION_SHARE of the slip in one step
+    ft = -(coulomb - (coulomb - stick).clamp(0.0, 1.0e30)) * (vt / (vt.abs() + 1.0e-30))
     return fn * nx + ft * tx, fn * ny + ft * ty, ft
 
 
+def _cap(v, hi):
+    """``min(v, hi)`` for a RUNTIME bound ``hi`` (a scalar uniform): clamp bounds are compile-time numbers."""
+    return v - (v - hi).clamp(0.0, 1.0e9)
+
+
+def _nozzle(pid, bar_half, nozzle_y):
+    """Where id ``pid`` leaves the nozzle: a low-discrepancy step along the bar (the golden-ratio step 2531/4093, so ids
+    emitted close together in time are far apart along the bar) and a hashed height within it."""
+    bar_x = _mod(_lin(pid, 2531.0), _PRIME) * (1.0 / _PRIME)
+    bar_y = _mod(_lin(pid, 3187.0), _PRIME) * (1.0 / _PRIME)
+    return (bar_x - 0.5) * (2.0 * bar_half), nozzle_y + (bar_y - 0.5) * BAR_HEIGHT
+
+
 def make_law(n: int, active: int | None = None):
-    """The fountain law over ``n`` ids (a power of two); ``active`` of them (default all)
-    are ever emitted, the rest stay parked (a count that is not a power of two)."""
+    """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
+    The basin (``half``, ``nozzle_y``, ``bar_half``, ``cols``, ``rows``) is a runtime uniform: see ``basin``."""
     active = int(n if active is None else active)
-    geo = basin(active)
-    s, half, cols, rows, cells = geo["scale"], geo["half"], geo["cols"], geo["rows"], geo["cells"]
-    nozzle_y, bar_half = geo["nozzle_y"], 0.8 * geo["scale"]
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
     emit_rate = EMIT_SPAN / float(active)
+    scan_shifts = reduction_shifts(n)
 
-    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix):
+    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows):
         """One fixed step of every particle (see the module docstring)."""
-        def frame():
-            """emit time, activity and grid cell of each id, from the id and its state.  Evaluated
-            again after the sort rather than carried across its ~300 dispatches (a value that crosses
-            them holds an arena slot, 4 bytes per id each, for all of them)."""
+        cells = cols * rows
+
+        def frame(search):
+            """emit time and the state of each id, from the id and its state.  Evaluated again after the sort
+            rather than carried across its ~300 dispatches (a value that crosses them holds an arena slot, 4 bytes
+            per id each, for all of them).
+
+            An id is in one of three kinds of state.  PARKED is the exact zero state (x = y = 0: no real grain rests
+            at the origin).  ARMED (``vy`` = ``ARMED``) is an id whose time has come: it waits AT the nozzle slot it
+            will leave from (its stored x, y), takes part in no contact and does not move, and is emitted at the first
+            step its slot is clear (no live grain, where it will be NEXT step, within contact distance).  Anything else is LIVE.  With ``search`` an armed id looks up its neighbours at
+            its slot, as a live id does at its place."""
             t = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
             a = as_float(age >= t)
-            # The step a particle is emitted its stored state is still the parked zero state (x = y = 0,
-            # i.e. a ghost on the floor at the basin's centre); the integrator below replaces it with the
-            # nozzle state.  A ghost must take part in NO contact -- on either side -- or each emission
-            # kicks the grains resting at the centre of the floor.  ``placed`` is "has a real state".
-            placed = a * (1.0 - as_float((age - DT) < t))
-            # only particles inside the grid take part (parked ones, the ghost, and the dilute spray above
-            # the grid's top, get the cell past the end: sorted last, in nobody's block)
-            ix = ((x + half) * (1.0 / CELL)).floor().clamp(0.0, cols - 1.0)
-            iy = ((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, rows - 1.0)
-            return t, a, ix, iy, placed * as_float(y < rows * CELL + FLOOR_Y)
-        t_emit, act, cx, cy, gridded = frame()
-        kc = AbstractTensor.where(gridded > 0.5, cy * float(cols) + cx, cy * 0.0 + float(cells))
+            parked = as_float((x.abs() + y.abs()) < 1.0e-30)
+            armed = as_float(vy < ARMED * 0.5)
+            live = a * (1.0 - parked) * (1.0 - armed)
+            pending = a * armed
+            arming = a * parked
+            # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
+            # get the cell past the end: sorted last, in nobody's block)
+            ix = _cap(((x + half) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), cols - 1.0)
+            iy = _cap(((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), rows - 1.0)
+            inside = as_float(y < rows * CELL + FLOOR_Y)
+            # armed ids are sorted into the grid too (at their slots): they see each other, and live grains see them
+            return t, a, arming, live, pending, ix, iy, (live + pending * float(search)) * inside, (live + pending) * inside
+        t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(False)
+        kc = AbstractTensor.where(gridded > 0.5, cy * cols + cx, cy * 0.0 + cells)
         ki = pid
         # ---- sort of (cell, id) pairs by Knuth's merge exchange (any length, no padding): each stage
         # is a gather of the partner and a compare-exchange; the pairs of one stage are disjoint
@@ -242,18 +323,20 @@ def make_law(n: int, active: int | None = None):
             kc = AbstractTensor.where(keep_self > 0.5, kc, oc)
             ki = AbstractTensor.where(keep_self > 0.5, ki, oi)
         # ---- the run of sorted cells covering each of the three rows of the 3x3 block
-        t_emit, act, cx, cy, gridded = frame()
+        t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(True)
         fx = x * 0.0
         fy = fx
         tq = fx
+        blocked = fx
+        dropped = fx
         top = float(n - 1)
         runs = []
         for dy in (-1.0, 0.0, 1.0):
             row = cy + dy
             ok = as_float(row >= 0.0) * as_float(row <= rows - 1.0)
-            rowc = row.clamp(0.0, rows - 1.0)
-            c_lo = rowc * float(cols) + (cx - 1.0).clamp(0.0, cols - 1.0)
-            c_hi = rowc * float(cols) + (cx + 1.0).clamp(0.0, cols - 1.0)
+            rowc = _cap(row.clamp(0.0, 1.0e9), rows - 1.0)
+            c_lo = rowc * cols + _cap((cx - 1.0).clamp(0.0, 1.0e9), cols - 1.0)
+            c_hi = rowc * cols + _cap((cx + 1.0).clamp(0.0, 1.0e9), cols - 1.0)
             ends = []
             for target in (c_lo, c_hi + 1.0):
                 lo = cx * 0.0
@@ -261,23 +344,22 @@ def make_law(n: int, active: int | None = None):
                 for _ in range(search_steps):
                     mid = ((lo + hi) * 0.5).floor()
                     probe = kc.index_select(0, mid.clamp(0.0, top))
-                    live = as_float(lo < hi)
+                    run_live = as_float(lo < hi)
                     below = as_float(probe < target)
-                    lo = AbstractTensor.where(live * below > 0.5, mid + 1.0, lo)
-                    hi = AbstractTensor.where(live * (1.0 - below) > 0.5, mid, hi)
+                    lo = AbstractTensor.where(run_live * below > 0.5, mid + 1.0, lo)
+                    hi = AbstractTensor.where(run_live * (1.0 - below) > 0.5, mid, hi)
                 ends.append(lo)
             runs.append((ends[0], ends[1], ok))
+            # candidates beyond the walk's reach are DROPPED contacts: counted (the law's dropped output), never silent
+            dropped = dropped + (ends[1] - ends[0] - float(K_RUN)).clamp(0.0, 1.0e9) * ok * searching
         t_emit = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
-        # ---- the rest of what this id is, derived again HERE (not before the sort: a value that
-        # crosses the sort's dispatches would hold an arena slot for all of them)
-        bar_x = _mod(_lin(pid, 2531.0), _PRIME) * (1.0 / _PRIME)
-        bar_y = _mod(_lin(pid, 3187.0), _PRIME) * (1.0 / _PRIME)
+        # ---- the rest of what this id is, derived again HERE (not before the sort: a value that crosses
+        # the sort's dispatches would hold an arena slot for all of them)
+        x0, y0 = _nozzle(pid, bar_half, nozzle_y)
         theta = (_mix(pid, 1759.0, 17.0) * 2.0 - 1.0) * 0.7
         speed = 0.9 + _mix(pid, 2203.0, 29.0) * 0.7
         vx0 = speed * theta.sin()
         vy0 = speed * theta.cos()
-        x0 = (bar_x - 0.5) * (2.0 * bar_half)
-        y0 = nozzle_y + (bar_y - 0.5) * BAR_HEIGHT
         u = _mix(pid, 1237.0, 5.0)
         w0 = (1.0 - mix) * MONO_WEIGHT[0] + mix * POLY_WEIGHT[0]
         w1 = (1.0 - mix) * MONO_WEIGHT[1] + mix * POLY_WEIGHT[1]
@@ -294,7 +376,7 @@ def make_law(n: int, active: int | None = None):
         drag = SPECIES[0][4] + (SPECIES[1][4] - SPECIES[0][4]) * is1 + (SPECIES[2][4] - SPECIES[0][4]) * is2 \
             + (SPECIES[3][4] - SPECIES[0][4]) * is3
         mass = density * math.pi * radius * radius
-        just = act * as_float((age - DT) < t_emit)
+
         # ---- particle-particle contacts: forces from the neighbours' state
         def neighbour_props(j):
             uj = _mix(j, 1237.0, 5.0)
@@ -311,9 +393,10 @@ def make_law(n: int, active: int | None = None):
         for lo, hi, ok in runs:
             for slot in range(K_RUN):
                 idx = lo + float(slot)
-                valid = as_float(idx < hi) * ok * gridded
+                valid = as_float(idx < hi) * ok * searching
                 j = ki.index_select(0, idx.clamp(0.0, top))
                 valid = valid * as_float((j - pid).abs() > 0.5)
+                armed_j = as_float(vy.index_select(0, j) < ARMED * 0.5)         # an armed neighbour is a slot, not a body
                 xj = x.index_select(0, j)
                 yj = y.index_select(0, j)
                 vxj = vx.index_select(0, j)
@@ -328,8 +411,17 @@ def make_law(n: int, active: int | None = None):
                 dx = x - xj + same * side * 1.0e-4
                 dyy = y - yj
                 dist = (dx * dx + dyy * dyy + 1.0e-12).sqrt()
-                delta = (radius + rj - dist) * valid
+                delta = (radius + rj - dist) * valid * (1.0 - armed_j)
                 touch = as_float(delta > 0.0)
+                # an armed id is emitted only into a CLEAR slot: no live neighbour, at the position it moves to this
+                # step, within the contact distance (plus EMIT_MARGIN): the grain is placed overlapping nothing
+                nxt_x = x - (xj + vxj * DT)
+                nxt_y = y - (yj + vyj * DT)
+                blocked = blocked + pending * valid * (1.0 - armed_j) * as_float(
+                    radius + rj + EMIT_MARGIN - (nxt_x * nxt_x + nxt_y * nxt_y + 1.0e-12).sqrt() > 0.0)
+                # ... and not into the slot of a LOWER armed id that is within contact distance of this slot (the lower
+                # id goes first; both are stationary, so the slots' own distance decides)
+                blocked = blocked + pending * valid * armed_j * as_float(j < pid) * as_float(radius + rj + EMIT_MARGIN - dist > 0.0)
                 nx = dx / dist
                 ny = dyy / dist
                 m_eff = mass * mj / (mass + mj)
@@ -341,31 +433,35 @@ def make_law(n: int, active: int | None = None):
                 tq = tq - radius * gt * touch
         # ---- walls and floor: the same contact against a body of infinite mass
         kw = OMEGA * OMEGA * mass
-        floor_delta = (radius - (y - FLOOR_Y)).clamp(0.0, 1.0e9) * act
+        floor_delta = (radius - (y - FLOOR_Y)).clamp(0.0, 1.0e9) * live
         gx, gy, gt = _contact(floor_delta, y * 0.0, y * 0.0 + 1.0, vx, vy, radius * w, kw, mass, mu)
         touch = as_float(floor_delta > 0.0)
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
-        left_delta = (radius - (x + half)).clamp(0.0, 1.0e9) * act
+        left_delta = (radius - (x + half)).clamp(0.0, 1.0e9) * live
         gx, gy, gt = _contact(left_delta, y * 0.0 + 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
         touch = as_float(left_delta > 0.0)
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
-        right_delta = (radius - (half - x)).clamp(0.0, 1.0e9) * act
+        right_delta = (radius - (half - x)).clamp(0.0, 1.0e9) * live
         gx, gy, gt = _contact(right_delta, y * 0.0 - 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
         touch = as_float(right_delta > 0.0)
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
-        # ---- the integrator: gravity, drag, the forces above; emission places the id at the nozzle
+        # ---- the integrator: gravity, drag, the forces above.  A pending id with a clear slot is placed at the
+        # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
+        just = pending * as_float(blocked < 0.5)
+        place = just + arming
         inertia = 0.5 * mass * radius * radius
-        vxn = AbstractTensor.where(just > 0.5, vx0, vx + act * (fx / mass - drag * vx) * DT)
-        vyn = AbstractTensor.where(just > 0.5, vy0, vy + act * (fy / mass - G - drag * vy) * DT)
-        wn = (w + act * (tq / inertia - SPIN_DRAG * w) * DT) * (1.0 - just)
-        xn = AbstractTensor.where(just > 0.5, x0, x + act * vxn * DT)
-        yn = AbstractTensor.where(just > 0.5, y0, y + act * vyn * DT)
+        vxn = AbstractTensor.where(just > 0.5, vx0, vx + live * (fx / mass - drag * vx) * DT)
+        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED,
+                                                                         vy + live * (fy / mass - G - drag * vy) * DT))
+        wn = (w + live * (tq / inertia - SPIN_DRAG * w) * DT) * (1.0 - just)
+        xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
+        yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         age_next = age + DT
         # ---- colour from the angle of the launch vector.  theta is the launch angle from the
         # vertical (+-0.7 rad).  The hue turns four times as fast as theta so the fan spans most of
@@ -397,7 +493,32 @@ def make_law(n: int, active: int | None = None):
         cr = base_r * keep + ir * use_image
         cg = base_g * keep + ig * use_image
         cb = base_b * keep + ib * use_image
-        return xn, yn, vxn, vyn, wn, age_next, cr, cg, cb, radius
+        # ---- CONSERVATION COUNTERS and ENERGY of the state just computed.  Every id is in exactly one class:
+        # nan (not finite), parked (the zero state), outside (past a wall or under the floor) or live.
+        finite = as_float(xn.abs() < 1.0e30) * as_float(yn.abs() < 1.0e30) * as_float(vxn.abs() < 1.0e30) \
+            * as_float(vyn.abs() < 1.0e30) * as_float(wn.abs() < 1.0e30)
+        placed = finite * as_float((xn.abs() + yn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
+        outside = placed * (1.0 - (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)))
+        c_nan = 1.0 - finite
+        c_parked = finite * (1.0 - placed)
+        c_out = outside
+        c_live = placed - outside
+        v2 = AbstractTensor.where(placed > 0.5, vxn * vxn + vyn * vyn, vxn * 0.0)
+        ke = 0.5 * mass * v2 + AbstractTensor.where(placed > 0.5, 0.5 * inertia * wn * wn, vxn * 0.0)
+        c_drop = dropped
+        # ---- fixed-order reduction (Hillis-Steele): after the shifts 1, 2, 4 .. element 0 holds the total,
+        # always as the same tree of additions, so native, wasm and WebGPU add in one order
+        for shift in scan_shifts:
+            gate = as_float(pid + float(shift) < float(n))
+            partner = (pid + float(shift)).clamp(0.0, top_i)
+            ke = ke + ke.index_select(0, partner) * gate
+            c_nan = c_nan + c_nan.index_select(0, partner) * gate
+            c_parked = c_parked + c_parked.index_select(0, partner) * gate
+            c_out = c_out + c_out.index_select(0, partner) * gate
+            c_live = c_live + c_live.index_select(0, partner) * gate
+            c_drop = c_drop + c_drop.index_select(0, partner) * gate
+            v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
+        return xn, yn, vxn, vyn, wn, age_next, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
 
     return fountain_step
 
@@ -408,18 +529,23 @@ def _f32(a) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).astype(np.float64)
 
 
-def uniforms(*, mode: int = 0, use_image: float = 0.0, mix: float = 0.5) -> dict[str, np.ndarray]:
-    """The law's scalar columns (shape ()) as float32-representable values."""
-    return {"mode": _f32(np.float64(mode)), "use_image": _f32(np.float64(use_image)), "mix": _f32(np.float64(mix))}
+def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None) -> dict[str, np.ndarray]:
+    """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``)
+    and its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin)."""
+    geo = basin(n, aspect)
+    out = {"mode": mode, "use_image": use_image, "mix": mix}
+    out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
+    return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
-def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0) -> dict[str, np.ndarray]:
-    """Round zero for ``n`` ids (a power of two): the state is zero, ``pid`` is the iota and the
-    image colours are zero.  Nothing else is per-id."""
+def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0, active: int | None = None,
+                    aspect: float | None = None) -> dict[str, np.ndarray]:
+    """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
+    Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
     columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
-    columns.update(uniforms(mode=mode, use_image=use_image, mix=mix))
+    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect))
     return columns
 
 
@@ -440,6 +566,33 @@ def sample_raster(raster: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarra
     px = np.clip((np.asarray(u) * w).astype(np.int64), 0, w - 1)
     py = np.clip((np.asarray(v) * h).astype(np.int64), 0, h - 1)
     return _f32(raster[py, px, :3] / 255.0)
+
+
+class SettleDetector:
+    """The settle rule over a series of diagnostics sampled every ``SETTLE['sample']`` steps: ``push`` returns the step S
+    that completes the hold, else ``None``."""
+
+    def __init__(self, active: int, pad: int, params: dict | None = None):
+        self.p, self.active, self.pad, self.peak, self.quiet = params or SETTLE, int(active), int(pad), 0.0, 0
+
+    def push(self, step: int, ke: float, vmax2: float, n_parked: float) -> int | None:
+        self.peak = max(self.peak, ke)
+        emitted = n_parked <= self.pad - self.active
+        quiet = (emitted and ke <= self.p["ke_per_id"] * self.active and ke <= self.p["relative"] * self.peak
+                 and math.sqrt(vmax2) <= self.p["speed"])
+        self.quiet = self.quiet + 1 if quiet else 0
+        return step if self.quiet >= self.p["hold_samples"] else None
+
+
+def settle_step(series: dict[str, np.ndarray], active: int, pad: int, params: dict | None = None) -> int | None:
+    """S for a per-step series of the diagnostics (``series[name][k]`` after step ``k + 1``)."""
+    p = params or SETTLE
+    detector = SettleDetector(active, pad, p)
+    for step in range(p["sample"], len(series["ke"]) + 1, p["sample"]):
+        found = detector.push(step, float(series["ke"][step - 1]), float(series["vmax2"][step - 1]), float(series["n_parked"][step - 1]))
+        if found is not None:
+            return found
+    return None
 
 
 # ------------------------------------------------------------------- piece
@@ -475,7 +628,7 @@ def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> d
         produced = dict(zip(OUTPUTS, outputs))
         for name in STATE:
             state[name] = produced[name + "_next"]
-        extra = {name: produced[name] for name in ("cr", "cg", "cb", "rad")}
+        extra = {name: produced[name] for name in ("cr", "cg", "cb", "rad") + DIAGNOSTICS}
     return {**state, **extra}
 
 
@@ -492,7 +645,7 @@ N_FULL = SIZES[DEFAULT_SIZE][0]
 N_SMALL = SIZES["small"][0]
 #: The free board the game occupies in the main scene (board units); the world window of the
 #: default size is mapped onto it, and the page maps the other sizes' windows the same way.
-BOARD = (10.5, 10.5 * (basin(N_FULL)["view"][3] - basin(N_FULL)["view"][2]) / (basin(N_FULL)["view"][1] - basin(N_FULL)["view"][0]))
+BOARD = board_size(basin(N_FULL)["view"])
 
 
 class FountainGame(Game):
@@ -513,10 +666,11 @@ class FountainGame(Game):
     input = "compute"
     title = "Fountain"
 
-    def __init__(self, board_id: str = "", *, size: str = DEFAULT_SIZE):
+    def __init__(self, board_id: str = "", *, size: str = DEFAULT_SIZE, aspect: float | None = None):
         super().__init__(board_id)
         self.size = size
         self.mix, self.mode, self.speed = 0.5, 2, 1
+        self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
         self.epoch = 1                       # bumped whenever the page must restart the fountain
         self.image: np.ndarray | None = None
@@ -535,7 +689,8 @@ class FountainGame(Game):
 
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
-        cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0)
+        cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
+                               active=self.n, aspect=self.aspect)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -550,6 +705,9 @@ class FountainGame(Game):
         if kind == "fountain_start":
             self.mix = float(payload.get("mix", self.mix))
             self.mode = int(payload.get("mode", self.mode))
+            # a run's basin is fixed when it starts (and kept by its replay): a screen that rotates later changes nothing
+            if payload.get("aspect"):
+                self.aspect = float(payload["aspect"])
             self.reset()
         elif kind == "fountain_mode":
             self.mode = int(payload["mode"])
@@ -560,6 +718,8 @@ class FountainGame(Game):
             if tag not in SIZES:
                 raise ValueError(f"fountain_size: unknown size {tag!r}")
             self.size = tag
+            if payload.get("aspect"):
+                self.aspect = float(payload["aspect"])
             self.image, self.has_image, self.piece = None, False, None
             self.reset()
         elif kind == "fountain_image":
@@ -603,24 +763,29 @@ class FountainGame(Game):
                   "post": {"action": "fountain_image", "field": "rgb", "max_ids": 65536}}
         sizes = [[tag, f"{count:,}"] for tag, (count, _pad) in SIZES.items()]
         return [
-            {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start"},
+            {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start", "aspect": True},
             {"id": "image", "kind": "file", "label": "Image", "sample": sample},
             {"id": "camera", "kind": "file", "label": "Camera", "capture": "environment", "sample": sample},
             {"id": "replay", "kind": "button", "label": "Replay", "action": "fountain_replay",
              "enabled": self.has_image},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
-             "value": self.mix, "action": "fountain_start", "field": "mix"},
+             "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
              "field": "mode", "options": [[2, "time strata"], [0, "trig (atan2)"], [1, "rotation"]]},
             {"id": "size", "kind": "select", "label": "ids", "value": self.size, "action": "fountain_size",
-             "field": "size", "options": sizes},
+             "field": "size", "options": sizes, "aspect": True},
             {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
              "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"]]},
             {"id": "verify", "kind": "button", "label": "Verify", "action": "fountain_verify"},
         ]
 
+    def basin(self) -> dict[str, Any]:
+        """The running basin: ``n`` ids at the aspect the run started with."""
+        return basin(self.n, self.aspect)
+
     def state(self) -> dict[str, Any]:
-        width, height = BOARD
+        geo = self.basin()
+        width, height = board_size(geo["view"])
         base = self.base_state(int(round(height)), int(round(width)))
         verified = self.verified
         text = {"fill": "phase 1: the fountain fills the basin by contact forces; hue from the launch angle",
@@ -637,8 +802,9 @@ class FountainGame(Game):
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
-                "uniforms": {"mode": float(self.mode), "use_image": 1.0 if self.phase == "replay" else 0.0,
-                             "mix": float(self.mix)},
+                "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect,
+                                                              use_image=1.0 if self.phase == "replay" else 0.0).items()},
+                "view": list(geo["view"]), "aspect": self.aspect,
                 "speed": self.speed, "named": ["ir", "ig", "ib"],
             },
         })

@@ -259,6 +259,18 @@ ${commit}
     return out;
   }
 
+  // The law's DIAGNOSTICS (energy, largest speed, the id counts, dropped contacts): element 0 of each reduced output,
+  // read in one small copy.  Call when the queue is idle -- it reads the last completed step.
+  async diagNow() {
+    const names = this.manifest.law.diagnostics, read = this.device.createBuffer({ size: names.length * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const encoder = this.device.createCommandEncoder();
+    names.forEach((name, k) => { const slot = this.abi.output_slots[name]; encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), read, k * 4, 4); });
+    this.device.queue.submit([encoder.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(read.getMappedRange().slice(0)); read.unmap(); read.destroy();
+    return Object.fromEntries(names.map((name, k) => [name, v[k]]));
+  }
+
   nudge(ids, dx) {              // test hook: perturb a few ids' x, to exercise the replay-not-identical path
     const slot = this.abi.feed_slots.x;
     for (const id of ids) this.device.queue.writeBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot) + id * 4, new Float32Array([dx]));
@@ -319,9 +331,27 @@ class WasmProduct {
     const n = this.n;
     return Object.fromEntries(names.map((name) => [name, Float32Array.from((this.inputs[name] || this.nexts[name]).subarray(0, n))]));
   }
+  async diagNow() { return Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])); }
   nudge(ids, dx) { for (const id of ids) this.inputs.x[id] = dx; }
   async idle() {}
   destroy() {}
+}
+
+// ------------------------------------------------------------------ settling
+// Phase 1 ends when the pile is AT REST, decided by the law's own energy (a fixed-order reduction on the device), read
+// at fixed step multiples (`sample`): everything is emitted, and the kinetic + rotational energy stays under both its
+// absolute floor (per id) and a fraction of its peak, with the largest speed under a limit, for `hold_samples` samples in
+// a row.  The step of the sample that completes the hold is S; phase 2 stops at exactly S.  `fountain.SettleDetector`
+// is the same rule in Python (held against this one by tests/test_meowdoku_fountain.py).
+export class SettleDetector {
+  constructor(p, active, pad) { this.p = p; this.active = active; this.pad = pad; this.peak = 0; this.quiet = 0; }
+  push(step, d) {
+    this.peak = Math.max(this.peak, d.ke);
+    const emitted = d.n_parked <= this.pad - this.active;
+    const quiet = emitted && d.ke <= this.p.ke_per_id * this.active && d.ke <= this.p.relative * this.peak && Math.sqrt(d.vmax2) <= this.p.speed;
+    this.quiet = quiet ? this.quiet + 1 : 0;
+    return this.quiet >= this.p.hold_samples ? step : null;
+  }
 }
 
 // ------------------------------------------------------------------ runtime
@@ -335,6 +365,7 @@ export class ComputeRuntime {
     this.steps = 0; this.running = false; this.last = 0; this.fps = 0; this.frames = 0; this.fpsAt = 0;
     this.route = ""; this.why = ""; this.warn = false; this.queue = Promise.resolve(); this.error = null;
     this.ready = false; this.note = "";
+    this.settleStep = null; this.detector = null; this.diag = null; this.sampling = false;
   }
 
   get active() { return !!this.spec; }
@@ -405,7 +436,7 @@ export class ComputeRuntime {
       this.warn = true; this.why = `FALLBACK to wasm: the compiler chose WebGPU compute (${detail}) but navigator.gpu is absent here (needs https and a WebGPU browser)`;
     } else this.why = `compiler verdict: the dispatches do not pay (${detail})`;
     if (!product) { product = new WasmProduct(); await product.init(rec, this.manifest); }
-    this.product = product; this.productKey = key;
+    this.product = product; this.productKey = key; this.settleStep = null;
     this.route = product.kind;
     this.ready = true;
   }
@@ -414,6 +445,9 @@ export class ComputeRuntime {
     this.product.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms } });
     this.steps = 0; this.running = true; this.last = performance.now() / 1000;
     this.restPending = true;
+    // the stop step S belongs to phase 1's run; phase 2 (the image replay) keeps it and stops at exactly S
+    if (!this.uniforms.use_image) this.settleStep = null;
+    this.detector = new SettleDetector(this.manifest.settle, this.rec.n, this.rec.pad); this.diag = null; this.sampling = false;
     if (!phase2Rest) this.note = "";
   }
 
@@ -493,20 +527,44 @@ export class ComputeRuntime {
     this.frames++;
     if (now - this.fpsAt > 0.5) { this.fps = this.frames / (now - this.fpsAt); this.frames = 0; this.fpsAt = now; this.onStatus(); }
     const dt = this.manifest.law.dt;
-    // Both phases stop at EXACTLY the same step, so their rest positions are comparable
-    const total = Math.ceil(this.manifest.settle_seconds / dt - 1e-9);
-    const settled = this.steps >= total;
+    // Phase 1 runs until the pile is at rest (SettleDetector, read at multiples of `sample` steps) or the cap; phase 2
+    // stops at EXACTLY the recorded step S, so the two phases' rest positions are comparable
+    const set = this.manifest.settle, cap = Math.ceil(set.max_seconds / dt - 1e-9);
+    const stop = this.settleStep ?? cap;
+    const settled = this.steps >= stop;
     if (settled && this.restPending) { this.restPending = false; this.#recordRest(); }
     // the sim runs in real time at speed 1; a slow route takes what its frame budget allows
-    const wanted = settled || this.product.busy ? 0
-      : Math.min(total - this.steps, Math.max(1, Math.min(48, Math.round(elapsed / dt * (this.spec.speed || 1)))));
+    const wanted = settled || this.product.busy || this.sampling ? 0
+      : Math.min(stop - this.steps, set.sample - (this.steps % set.sample), Math.max(1, Math.min(48, Math.round(elapsed / dt * (this.spec.speed || 1)))));
     const budget = this.product.kind === "wasm" ? 22 : 1e9;
     const t0 = performance.now();
     let done = 0;
     while (done < wanted && (performance.now() - t0) < budget) { const chunk = this.product.kind === "wasm" ? 1 : wanted; this.product.step(chunk); done += chunk; }
     if (done) { this.steps += done; this.stepsPerFrame = done; if (this.product.kind === "wasm") this.stepMs = (performance.now() - t0) / done; }
+    if (done && this.steps % set.sample === 0) this.#sampleDiag(this.steps);
     else if (!this.packedAtRest) { this.product.step(0); this.packedAtRest = true; }
     if (done) this.packedAtRest = false;
+  }
+
+  // read the law's diagnostics at a sample step (the device finishes the submitted steps first), feed the detector
+  #sampleDiag(step) {
+    this.sampling = true;
+    const epoch = this.epoch;
+    this.product.idle().then(() => this.product.diagNow()).then((d) => {
+      if (epoch !== this.epoch) return;
+      this.diag = { step, ...d };
+      const found = this.detector.push(step, d);
+      if (found !== null && this.settleStep === null) this.settleStep = found;
+      if (step >= Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9) && this.settleStep === null) this.settleStep = step;
+    }).catch((e) => { this.error = "diagnostics: " + String((e && e.message) || e); }).finally(() => { this.sampling = false; });
+  }
+
+  energyText() {
+    const d = this.diag;
+    if (!d) return "";
+    const n = this.rec.pad, total = d.n_nan + d.n_out + d.n_parked + d.n_live;
+    const bad = [d.n_nan ? `${d.n_nan} NaN` : "", d.n_out ? `${d.n_out} outside` : "", d.n_drop ? `${d.n_drop} contacts dropped` : "", total !== n ? `COUNT ${total}/${n}` : ""].filter(Boolean);
+    return ` | E ${d.ke.toExponential(2)} v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
   }
 
   verdictText() {
@@ -520,17 +578,17 @@ export class ComputeRuntime {
   statusText() {
     if (!this.ready) return this.error ? "compute: " + this.error : "compute: loading";
     const adapter = this.product.adapterInfo ? ` [${this.product.adapterInfo}]` : "";
-    const dt = this.manifest.law.dt, t = this.steps * dt, span = this.manifest.settle_seconds;
-    const done = t >= span ? "settled" : `${Math.round(100 * t / span)}%`;
+    const dt = this.manifest.law.dt, t = this.steps * dt;
+    const done = this.settleStep !== null && this.steps >= this.settleStep ? `settled at step ${this.settleStep}` : "settling";
     const fail = this.product.failure ? ` | GPU error: ${this.product.failure}` : "";
     const ms = this.product.kind === "wasm" ? this.stepMs : this.product.stepMs;
     const rate = ms ? ` | ${ms.toFixed(2)} ms/step` : "";
-    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${done} | ${this.fps.toFixed(0)} fps${rate}${this.note ? " | " + this.note : ""}${this.verdictText()}${fail}`;
+    return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${done}${this.energyText()} | ${this.fps.toFixed(0)} fps${rate}${this.note ? " | " + this.note : ""}${this.verdictText()}${fail}`;
   }
 
   // test/diagnostics only
   advance(count) {
-    const total = Math.ceil(this.manifest.settle_seconds / this.manifest.law.dt - 1e-9);
+    const total = this.settleStep ?? Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9);
     count = Math.min(count, total - this.steps);
     this.product.step(count); this.steps += count; this.packedAtRest = false; return this.steps;
   }

@@ -103,7 +103,7 @@ def verdict_for(tag_or_pad, active: int | None = None, model=None):
                                  model=model or WebGPUComputeCostModel(), dispatches=compiled.dispatches)
 
 
-def build_size(tag: str, web_dir: Path) -> dict:
+def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
     from meowdoku import graph_wasm
     from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
     started = time.perf_counter()
@@ -143,10 +143,10 @@ def build_size(tag: str, web_dir: Path) -> dict:
                    "display_ids": -(-pad // stride), "display_bytes": 3 * 16 * -(-pad // stride)},
         "display_stride": stride, "emit_rate": F.EMIT_SPAN / active,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
-        "uniforms": {k: float(v) for k, v in F.uniforms().items()},
+        "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
         "source_digest": digest(tag),
     }
-    if pad <= WASM_MAX:
+    if pad <= WASM_MAX and wasm:
         wasm_abi = graph_wasm._compile(
             f"fountain_{tag}", shapes_for(pad),
             lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
@@ -158,7 +158,7 @@ def build_size(tag: str, web_dir: Path) -> dict:
     return record
 
 
-def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES)) -> dict:
+def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True) -> dict:
     """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept."""
     from src.compiler.deployment_classification import WebGPUComputeCostModel
     web_dir.mkdir(parents=True, exist_ok=True)
@@ -168,12 +168,12 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES)) -> dict:
     for tag in sizes:
         previous = (old.get("sizes") or {}).get(tag)
         files = [web_dir / f"fountain_{tag}.wgsl"]
-        if SIZES[tag][1] <= WASM_MAX:
+        if SIZES[tag][1] <= WASM_MAX and wasm:
             files += [web_dir / f"fountain_{tag}.wasm", web_dir / f"fountain_{tag}.abi.json"]
         if previous and previous.get("source_digest") == digest(tag) and all(p.exists() for p in files):
             records[tag] = previous
             continue
-        records[tag] = build_size(tag, web_dir)
+        records[tag] = build_size(tag, web_dir, wasm)
         r = records[tag]
         print(f"[fountain] {tag}: {r['n']} ids (sort {r['pad']}) -> {r['route']} (predicted {r['verdict']['speedup']:.2f}x, "
               f"{r['wgsl_abi']['dispatches']} dispatches, {r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)
@@ -182,13 +182,13 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES)) -> dict:
     manifest = {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
-                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "dt": F.DT},
+                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT},
         "emit_span": F.EMIT_SPAN, "initial": {},
         "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"],
                    "radius": "rad", "rest_speed": 0.15},
         "reference_view": list(geo["view"]),
         "species": [list(item) for item in F.SPECIES],
-        "settle_seconds": F.SETTLE_SECONDS,
+        "settle": F.SETTLE,
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest
