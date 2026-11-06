@@ -31,6 +31,25 @@
   /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
   .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
+  /* A light, readable frame around the lit Meowdoku board. Other games keep
+     their own dark controls and atmosphere. */
+  body[data-game="meowdoku"] { color-scheme: light; background: #e3f0ef; color: #183047; }
+  body[data-game="meowdoku"] #bar { background: rgba(247,251,248,.96); border-bottom: 2px solid #9bcac7;
+                                    box-shadow: 0 3px 14px rgba(25,67,73,.12); }
+  body[data-game="meowdoku"] #bar select, body[data-game="meowdoku"] #bar button,
+  body[data-game="meowdoku"] #bar input[type=text], body[data-game="meowdoku"] #gamectl .gctl-file {
+    background: #fff; color: #183047; border: 1px solid #668e97; font-weight: 600; }
+  body[data-game="meowdoku"] #bar button:hover { background: #e5f5ef; }
+  body[data-game="meowdoku"] #bar .tool.active { background: #186d73; color: #fff; border-color: #104e56; }
+  body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #b14a78; outline-offset: 2px; }
+  body[data-game="meowdoku"] #status { opacity: 1; font-weight: 650; }
+  body[data-game="meowdoku"] #help { opacity: 1; color: #183047; background: rgba(247,251,248,.91);
+                                       padding: 4px 8px; border-radius: 6px; }
+  body[data-game="meowdoku"] #splash { color: #183047; background: rgba(255,255,255,.95); border-color: #668e97; }
+  body[data-game="meowdoku"] #splash.win #splash-title { color: #11635b; }
+  body[data-game="meowdoku"] #splash.loss #splash-title { color: #a33f57; }
+  body[data-game="meowdoku"].immersive #hud { opacity: 1; color: #183047; text-shadow: 0 1px 2px #fff; }
+  body[data-game="meowdoku"].immersive #fs-exit { background: rgba(255,255,255,.92); color: #183047; border-color: #668e97; }
   body[data-game="lichess"] #bar .lichess-only { display: inline-flex; }
   .arena-only, #bar .arena-only { display: none; }
   .pilot-only, #bar .pilot-only { display: none; }
