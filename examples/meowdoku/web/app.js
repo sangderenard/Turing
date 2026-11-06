@@ -138,6 +138,45 @@ function drawSky(cam, now) {
   gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
   gl.bindVertexArray(null);
 }
+// CITY LIGHTS: each pin a glowing point, added up where lights crowd --
+// not meshes, not lamps that light the land: points that read through cloud
+// (drawn after the glass, depth-tested only against the land), brighter the
+// darker the local sky.
+const GLOW_VS = `#version 300 es
+layout(location=0) in vec4 aPoint;      // x y z, light
+uniform mat4 uViewProj; uniform float uScale;
+out float vLight;
+void main() { vLight = aPoint.w; gl_Position = uViewProj * vec4(aPoint.xyz, 1.0);
+  gl_PointSize = clamp(uScale * (0.6 + 2.4 * aPoint.w) / gl_Position.w, 3.0, 22.0); }`;
+const GLOW_FS = `#version 300 es
+precision highp float;
+in float vLight; out vec4 FragColor; uniform float uNight;
+void main() { vec2 d = gl_PointCoord * 2.0 - 1.0; float r = dot(d, d); if (r > 1.0) discard;
+  float core = exp(-r * 3.0); FragColor = vec4(vec3(1.0, 0.82, 0.5) * core * (0.6 + 1.8 * vLight) * uNight, 1.0); }`;
+const GLOW = { prog: null, vao: null, buf: null };
+function drawCityLights(cam) {
+  const pts = state.glowPoints || [];
+  if (!pts.length || state.flat) return;
+  if (!GLOW.prog) {
+    GLOW.prog = link(compile(gl.VERTEX_SHADER, GLOW_VS), compile(gl.FRAGMENT_SHADER, GLOW_FS));
+    GLOW.vao = gl.createVertexArray(); gl.bindVertexArray(GLOW.vao);
+    GLOW.buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, GLOW.buf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+  }
+  const data = new Float32Array(pts.length * 4);
+  pts.forEach((p, i) => data.set([p[0], p[1] + 0.03, p[2], Math.min(1, Math.max(0, (p[3] - 0.06) / 0.06))], i * 4));
+  const sunUp = SKY.dir ? SKY.dir[1] : -1;
+  const night = Math.max(0.12, Math.min(1, (0.12 - sunUp) / 0.3));
+  gl.useProgram(GLOW.prog); gl.bindVertexArray(GLOW.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, GLOW.buf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  gl.uniformMatrix4fv(gl.getUniformLocation(GLOW.prog, "uViewProj"), false, cam.viewProj);
+  gl.uniform1f(gl.getUniformLocation(GLOW.prog, "uScale"), canvas.height * 0.4);
+  gl.uniform1f(gl.getUniformLocation(GLOW.prog, "uNight"), night);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+  gl.drawArrays(gl.POINTS, 0, pts.length);
+  gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
+}
 function link(vs, fs) {
   const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
@@ -985,6 +1024,7 @@ function uploadMaterials(game) {
       { roughness: 0.8, transmission: 0.15, opacity: 0.86 - 0.16 * k, ior: 1.15 }]);
   // Lightning: a glowing ribbon of glass, lit from within.
   records.push(["lightning@glow", [0.9, 0.94, 1.0], { roughness: 0.1, transmission: 0.15, opacity: 0.96, ior: 1.3, emission: [6.0, 6.6, 8.2] }]);
+  records.push(["zap@glow", [0.5, 1.0, 0.4], { roughness: 0.1, transmission: 0.15, opacity: 0.96, ior: 1.3, emission: [1.6, 5.0, 1.2] }]);
   records.push(["bar_tube", [0.85, 0.9, 1.0], { roughness: 0.04, transmission: 0.8, opacity: 0.22, ior: 1.5 }]);
   records.push(["bar_shield", [0.3, 0.6, 1.0], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [0.12, 0.38, 1.1] }]);
   records.push(["bar_health", [1.0, 0.25, 0.3], { roughness: 0.06, transmission: 0.45, opacity: 0.75, ior: 1.4, emission: [1.1, 0.18, 0.22] }]);
@@ -1318,14 +1358,16 @@ function drawLightning(cam, now, drawLit) {
   const ends = state.ribbonEnds || [];
   if (!ends.length || state.flat) return;
   const groups = new Map();
-  for (const piece of ends) { const key = Math.round(piece.t0 * 20); (groups.get(key) || groups.set(key, []).get(key)).push(piece); }
-  const pos = [], nrm = [];
+  for (const piece of ends) { const key = `${piece.color}:${Math.round(piece.t0 * 20)}`; (groups.get(key) || groups.set(key, []).get(key)).push(piece); }
+  const pos = [], nrm = [], zpos = [], znrm = [];
   const eye = cam.eye || [0, 30, 0];
   for (const group of groups.values()) {
     group.sort((a, b) => (b.h || 0) - (a.h || 0));
+    const zap = group[0].color === "zap";
     const top = worldOf(group[0]);
     const bottom = group[1] ? worldOf(group[1]) : [top[0], 0.02 - planetDrop(top[0], top[2]), top[2]];
-    const path = jagged(top, bottom, 5, 0.9);
+    const path = zap ? [top, bottom] : jagged(top, bottom, 5, 0.9);
+    const into = zap ? [zpos, znrm] : [pos, nrm];
     const fade = Math.max(0.2, 1 - (now - group[0].t0) / 0.25);
     const width = 0.07 * fade;
     for (let i = 1; i < path.length; i++) {
@@ -1334,19 +1376,22 @@ function drawLightning(cam, now, drawLit) {
       const a = sub(p, side), b = [p[0] + side[0], p[1] + side[1], p[2] + side[2]];
       const c = sub(q, side), d = [q[0] + side[0], q[1] + side[1], q[2] + side[2]];
       const n = norm(toEye);
-      for (const v of [a, b, d, a, d, c]) { pos.push(...v); nrm.push(...n); }
+      for (const v of [a, b, d, a, d, c]) { into[0].push(...v); into[1].push(...n); }
     }
   }
-  if (!pos.length) return;
+  if (!pos.length && !zpos.length) return;
   if (!bolt.vao) {
     bolt.vao = gl.createVertexArray(); gl.bindVertexArray(bolt.vao);
     bolt.buffers = [0, 1].map((loc) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
       gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0); return b; });
     gl.bindVertexArray(null);
   }
-  gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.DYNAMIC_DRAW);
-  drawLit(bolt.vao, pos.length / 3, M.identity(), state.materialIndex["lightning@glow"]);
+  for (const [P, N, material] of [[pos, nrm, "lightning@glow"], [zpos, znrm, "zap@glow"]]) {
+    if (!P.length) continue;
+    gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[0]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(P), gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bolt.buffers[1]); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(N), gl.DYNAMIC_DRAW);
+    drawLit(bolt.vao, P.length / 3, M.identity(), state.materialIndex[material]);
+  }
 }
 
 // ---------------------------------------------------------------- vital bars
@@ -2084,7 +2129,8 @@ function applySnapshot(view) {
   for (let n = u16(); n > 0; n--) drop(u16());
   for (let n = u16(); n > 0; n--) {
     const lane = u16(), mesh = sock.names[u8()], color = sock.names[u8()], size = u16() / 1000, roll = i16() / 1000, spin = i16() / 1000;
-    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0, ground = (look & 16) !== 0;
+    const look = u8(), bob = look & 1, face = (look & 2) !== 0, translucent = (look & 4) !== 0, ribbon = (look & 8) !== 0, ground = (look & 16) !== 0,
+      glow = (look & 32) !== 0;
     const lean = i16() / 1000, ownerLane = u16(), age = f32();
     const x = f32(), y = f32(), vx = f32(), vy = f32(), h = f32(), vh = f32();
     drop(lane);
@@ -2101,7 +2147,7 @@ function applySnapshot(view) {
     }
     state.pieces.set(id, { id, entity: true, lane, owner: ownerLane === 65535 ? null : ownerLane, sx: x, sz: y, x, z: y, vx, vz: vy,
                            sh: h, h, vh,
-                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon, ground,
+                           tRecv: stamp, mesh, color, size, roll, spin, bob, lean, face, translucent, ribbon, ground, glow,
                            t0: now, removing: null, seed: 0, birth });
   }
   for (let n = u16(); n > 0; n--) {
@@ -2768,7 +2814,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, ground: !!e.ground });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   if (game.input === "realtime") reconcile(game); else pred.ship = null;
@@ -2951,6 +2997,7 @@ function draw(ms) {
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
     if (piece.ribbon) { if (piece.removing == null) (state.ribbonEnds ||= []).push(piece); continue; }
+    if (piece.glow) { if (piece.removing == null) { const m = pieceModel(piece, now); (state.glowPoints ||= []).push([m[12], m[13], m[14], piece.size]); } continue; }
     if (piece.translucent && !state.flat) { (state.glassPieces ||= []).push(piece); continue; }
     // First person: the eye is in the ship's nose -- its body is not drawn
     // (its model is still advanced: the camera rides it).
@@ -2978,6 +3025,8 @@ function draw(ms) {
   if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
   drawSky(cam, now);                                // into whatever target the scene draws in (the lens's, or the screen)
   litPass(cam, now, casters, { plate: plateOn });
+  drawCityLights(cam);
+  state.glowPoints = [];
   state.glassPieces = [];
   state.ribbonEnds = [];
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
@@ -3399,13 +3448,18 @@ function drawLearnPanel(game) {
   panel.classList.toggle("show", on);
   if (!on) return;
   panel.classList.toggle("training", !!L.training);
-  const history = L.history || [], runs = history.filter((h) => h.kind === "run"), passes = history.filter((h) => h.kind === "trained");
+  // Bars: finished demo runs (green kept, grey under the average) and
+  // mid-game SPAN flushes (blue: lead-ups to scoring sent to training).
+  const history = L.history || [], passes = history.filter((h) => h.kind === "trained");
+  const bars = history.filter((h) => h.kind === "run" || h.kind === "spans"), runs = bars.filter((h) => h.kind === "run");
+  const spans = bars.filter((h) => h.kind === "spans");
   const W = 220, H = 64, svg = [];
-  const top = Math.max(1, ...runs.map((r) => r.score));
-  const bw = W / Math.max(12, runs.length);
-  runs.forEach((r, i) => {
+  const top = Math.max(1, ...bars.map((r) => r.score));
+  const bw = W / Math.max(12, bars.length);
+  bars.forEach((r, i) => {
     const h = Math.max(2, (r.score / top) * (H - 14));
-    svg.push(`<rect x="${(i * bw + 1).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${Math.max(1, bw - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${r.kept ? "#7cf7a6" : "#5a5a66"}"/>`);
+    const fill = r.kind === "spans" ? "#6ab8ff" : r.kept ? "#7cf7a6" : "#5a5a66";
+    svg.push(`<rect x="${(i * bw + 1).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${Math.max(1, bw - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}"/>`);
   });
   if (passes.length > 1) {
     const losses = passes.map((p) => Math.log10(Math.max(1e-6, p.loss))), lo = Math.min(...losses), hi = Math.max(...losses);
@@ -3414,8 +3468,11 @@ function drawLearnPanel(game) {
   }
   $("learn-chart").innerHTML = svg.join("");
   const last = passes[passes.length - 1];
-  $("learn-text").textContent = `${runs.filter((r) => r.kept).length} of ${runs.length} demo runs kept`
-    + (last ? ` · last pass loss ${last.loss} on ${last.rows} rows (${last.at})` : " · waiting for a run to finish");
+  const net = L.network;
+  const netText = net ? (net.arch === "token" ? `token net · ${net.tokens} bodies · ${net.params.toLocaleString()} weights · ${net.outputs} controls`
+                                              : `MLP · ${net.params.toLocaleString()} weights · ${net.outputs} controls`) : "no network yet";
+  $("learn-text").textContent = `${netText} · ${spans.length} span flushes · ${runs.filter((r) => r.kept).length} of ${runs.length} runs kept`
+    + (last ? ` · last pass loss ${last.loss} on ${last.rows} rows (${last.at})` : " · waiting for a span of action");
   if (last && last.at !== learnView.lastTrained) {
     if (learnView.lastTrained !== null) {
       panel.classList.add("flash"); clearTimeout(learnView.flashTimer);

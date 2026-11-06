@@ -126,7 +126,10 @@ FLASHES = (425, 429)
 STATIONS = (429, 433)
 BOMBS = (433, 439)
 BLASTS = (439, 443)
-LANES = BLASTS[1]
+PINS = (443, 699)            # city lights: a fixed population of pins on the sphere
+BASES = (699, 705)           # alien ground bases: they zap city lights; bomb them
+ZAPS = (705, 709)            # a base's laser blast: two ends, drawn as a straight ribbon
+LANES = ZAPS[1]
 STATION, STATION_KIND = 9.0, 5.0
 #: ALTERNATE FIRE: bombs (``kind`` is the style) and their blasts.  A DUMB
 #: bomb falls on the trajectory law; a PARACHUTE bomb opens its canopy after
@@ -134,6 +137,25 @@ STATION, STATION_KIND = 9.0, 5.0
 #: SEEKER flies powered at the nearest ground emplacement.  Each blast hurts
 #: what is inside its own radius and leaves a glowing flash in its colour.
 BOMB_SLOT, BLAST_SLOT = 10.0, 11.0
+PIN_SLOT, BASE_SLOT, ZAP_SLOT = 12.0, 13.0, 14.0
+#: CITIES: each pin's ``hp`` is its light (0 dark .. 1).  They GROW like a mold:
+#: at GROW_RATE a second the first dark pin is re-lit GROW_NEAR from a lit
+#: pin the dice pick, so lit regions spread from their edges; a lit pin
+#: brightens by BRIGHTEN a second.  The sun is fixed in the planet's frame
+#: (SUN_DIR): a pin is in NIGHT when it faces away (u . SUN_DIR < NIGHT_EDGE),
+#: and only then can aliens see it.  UFOs (the spinners) seek the nearest lit
+#: night pin within UFO_SENSE, hover over it and ABDUCT its light; alien
+#: BASES zap the nearest lit pin within BASE_RANGE every BASE_RELOAD; bombs
+#: black out the pins inside their blast.  AA is anti-alien: it fires at the
+#: nearest alien in FLAK_RANGE (its shells still hurt the ship they hit).
+SUN_DIR = (0.82, 0.18, 0.55)
+NIGHT_EDGE = 0.05
+CITY_SEEDS, CITY_SPREAD = 8, 2.5
+GROW_RATE, BRIGHTEN = 1.2, 0.08
+GROW_NEAR = (0.6, 1.6)
+UFO_SENSE, ABDUCT_R, ABDUCT_RATE, HOVER_SPD = 30.0, 0.9, 0.5, 0.6
+BASE_HP, BASE_RANGE, BASE_RELOAD, BASE_RESPAWN = 3.0, 3.0, 1.2, 8.0
+ZAP_LIFE = 0.18
 DUMB, CHUTE, SEEKER = 0.0, 1.0, 2.0
 BOMB_DIAMETER, BOMB_DRAG = 0.3, 0.3
 CHUTE_DEPLOY, CHUTE_DIAMETER, CHUTE_DRAG = 0.35, 3.2, 1.4
@@ -185,9 +207,15 @@ MISSILE_DAMAGE = 3.0
 DROP_CHANCE = 0.35
 MAGNET_R = 2.2
 MAGNET_SPEED = 9.0
+PULL_TAU, MAGNET_GRAB = 0.18, 0.45      # the pull's time constant; taken inside this 3-D reach
 #: The missiles' trajectory parameters, in game units (the law is unit-free).
 MISSILE_MASS, MISSILE_DIAMETER, MISSILE_DRAG, AIR_DENSITY, GRAVITY = 1.0, 0.3, 0.3, 1.2, 6.0
 DRIFTER, SPINNER = 1.0, 2.0
+#: Three alien roles: FIGHTERS (drifters) engage the player, ABDUCTORS
+#: (spinners, the UFOs) drain city lights at night, PLANTERS fly to a
+#: settlement and land -- becoming an alien BASE in a free base lane.
+PLANTER = 6.0
+LAND_R, PLANTER_SPD = 0.8, 3.0
 
 #: VITALS.  ``lives`` holds health points (0..HEALTH_MAX, slow regeneration)
 #: and ``energy`` the shield charge as a fraction of SHIELD_POINTS (fast
@@ -343,6 +371,26 @@ def nearest_of_block(u, z, live, rows, cols, radius):
     return target, height, has
 
 
+def near_count_of_block(u, live, rows, cols, reach, radius):
+    """For each lane in ``rows``, how many live lanes of ``cols`` lie within
+    the arc ``reach`` (a full-length span, zero outside ``rows``)."""
+    r0, r1 = rows
+    c0, c1 = cols
+    n = int(u[0].shape[0])
+    a, b = r1 - r0, c1 - c0
+    ru = [u[i][r0:r1].reshape((a, 1)) for i in range(3)]
+    cu = [u[i][c0:c1].reshape((1, b)) for i in range(3)]
+    cross = (ru[1] * cu[2] - ru[2] * cu[1], ru[2] * cu[0] - ru[0] * cu[2], ru[0] * cu[1] - ru[1] * cu[0])
+    gap = radius * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt().atan2(
+        ru[0] * cu[0] + ru[1] * cu[1] + ru[2] * cu[2])
+    counts = as_float((gap < reach) & live[c0:c1].reshape((1, b)) & (gap * 0.0 < 1.0)).sum(dim=1)
+    parts = [u[0][:r0] * 0.0] if r0 > 0 else []
+    parts.append(counts)
+    if r1 < n:
+        parts.append(u[0][r1:] * 0.0)
+    return AbstractTensor.cat(parts, dim=0) if len(parts) > 1 else counts
+
+
 def scroller_step(lane, slot, rx, ry, rz,
                   alive, x, y, z, vx, vy, vz, ux, uy, uz, hx, hy, hz, spd, yaw, vyaw, vspd,
                   hp, boom, born, owner, energy, kind, age, timer,
@@ -364,6 +412,11 @@ def scroller_step(lane, slot, rx, ry, rz,
     is_flash = slot == FLASH
     is_station = slot == STATION
     is_bomb, is_blast = slot == BOMB_SLOT, slot == BLAST_SLOT
+    is_pin, is_base, is_zap = slot == PIN_SLOT, slot == BASE_SLOT, slot == ZAP_SLOT
+    # night: facing away from the sun (fixed in the planet's frame)
+    sun_dot = ux * SUN_DIR[0] + uy * SUN_DIR[1] + uz * SUN_DIR[2]
+    night = sun_dot < NIGHT_EDGE
+    lit = is_pin & live & (hp > 0.05)
     is_boss_lane = lane == BOSS_LANE
     clock_next = clock + dt
     zero = x * 0.0
@@ -483,7 +536,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     in_pop = is_enemy & ~is_boss_lane & ((lane - ENEMIES[0]) < pop)
     respawn = in_pop & ~live & (age >= RESPAWN / tempo) & playing
     roll = noise(lane * 3.7 + clock * 1.3 + 1.0)
-    new_kind = where(roll < 0.75, DRIFTER, SPINNER)
+    new_kind = where(roll < 0.55, DRIFTER, where(roll < 0.8, SPINNER, PLANTER))
     far_arc = FAR_MIN + (FAR_MAX - FAR_MIN) * noise(lane * 1.9 + clock * 0.7)
     far_az = 6.283185307179586 * noise(lane * 2.3 + clock * 1.1 + 4.0)
     far_u = sm.place(u0, h0, far_arc, far_az)
@@ -518,11 +571,13 @@ def scroller_step(lane, slot, rx, ry, rz,
     # their sights; spinners ring the sky when close; anti-aircraft fires one
     # shell straight at where the player IS (no lead), only while the
     # enemies have not been hurting the player (AA_QUIET).
-    aa_awake = (P * age).sum() >= AA_QUIET
+    # AA is anti-alien: each emplacement fires at the alien nearest it in range
+    aa_u, aa_z, aa_has = nearest_of_block(u, z, is_enemy & live, STATIONS, ENEMIES, RADIUS)
+    aa_in_range = aa_has & (sm.arc(u, aa_u, RADIUS) < FLAK_RANGE)
     in_sights = (bearing_p.abs() < SIGHT) & (dist < FIRE_RANGE)
-    craft_ready = is_enemy & where(kind == SPINNER, dist < RING_RANGE, in_sights) & (~piloted | (pfire > 0.0))
+    craft_ready = is_enemy & (kind != PLANTER) & where(kind == SPINNER, dist < RING_RANGE, in_sights) & (~piloted | (pfire > 0.0))
     piloted_ready = piloted & (pfire > 0.0) & (dist < FIRE_RANGE)
-    ready = ((craft_ready & ~piloted) | piloted_ready | (is_station & aa_awake & (dist < FLAK_RANGE))) & live & (timer <= 0.0) & playing
+    ready = ((craft_ready & ~piloted) | piloted_ready | (is_station & aa_in_range)) & live & (timer <= 0.0) & playing
     shooter = first_of(ready, lane)
     fired = f(shooter).sum() > 0.0
     S = f(shooter)
@@ -533,6 +588,10 @@ def scroller_step(lane, slot, rx, ry, rz,
     s_spd = (S * spd).sum()
     skind = (S * kind).sum()
     shooter_lane = (S * lane).sum()
+    # the shooter's mark: the player, or (an emplacement) its alien
+    mark_u = sm.vwhere(skind == STATION_KIND, ((S * aa_u[0]).sum(), (S * aa_u[1]).sum(), (S * aa_u[2]).sum()), u0)
+    mark_z = where(skind == STATION_KIND, (S * aa_z).sum(), pz)
+    mark_dist = sm.arc(su, mark_u, RADIUS)
     count = where(skind == SPINNER, RING, where(skind == BOSS_KIND, 5.0, where(skind == STATION_KIND, 1.0, SPREAD)))
     free_bullet = is_bullet & ~live
     rank = f(free_bullet).cumsum(dim=0) - 1.0
@@ -540,11 +599,11 @@ def scroller_step(lane, slot, rx, ry, rz,
     ring = skind == SPINNER
     flak = skind == STATION_KIND
     spread_angle = where(ring, rank * (6.283185307179586 / RING) + clock * 1.7, (rank - 0.5 * (count - 1.0)) * 0.22)
-    bullet_h = sm.vwhere(flak, sm.toward(su, u0), sm.turn(su, sh, spread_angle + zero))
+    bullet_h = sm.vwhere(flak, sm.toward(su, mark_u), sm.turn(su, sh, spread_angle + zero))
     bullet_speed = where(ring, zero + BULLET_SPEED * 0.8, where(flak, zero + FLAK_SPEED, BULLET_SPEED + s_spd))
     # Forward and flak fire climb or dive toward the ship's height over the
     # flight the arc takes; rings stay level.
-    climb = where(ring, 0.0, bullet_speed * (pz - sz) / (s_dist + 0.5))
+    climb = where(ring, 0.0, bullet_speed * (mark_z - sz) / (mark_dist + 0.5))
 
     # ------------------------------------------------ headings and speeds
     # Enemies hunt HEAD ON: each steers for a point on the player's path a
@@ -568,10 +627,21 @@ def scroller_step(lane, slot, rx, ry, rz,
     facing = sm.dot(h, (h0[0] + zero, h0[1] + zero, h0[2] + zero)) < -0.3
     head_on = (seen_at.abs() < 0.9) & ((dist > TURN_IN) | facing)
     want = where(head_on, bearing_p, sm.bearing(u, h, sm.toward(u, meet)))
+    # UFOs (spinners) see only lit pins at night, and go for them
+    glow_u, _glow_z, glow_has = nearest_of_block(u, z, lit & night, ENEMIES, PINS, RADIUS)
+    glow_gap = sm.arc(u, glow_u, RADIUS)
+    abducting = is_enemy & live & ~piloted & (kind == SPINNER) & glow_has & (glow_gap < UFO_SENSE)
+    want = where(abducting, sm.bearing(u, h, sm.toward(u, glow_u)), want)
+    hovering = abducting & (glow_gap < ABDUCT_R)
+    town_u, _town_z, town_has = nearest_of_block(u, z, lit, ENEMIES, PINS, RADIUS)
+    town_gap = sm.arc(u, town_u, RADIUS)
+    planting = is_enemy & live & ~piloted & (kind == PLANTER) & town_has
+    want = where(planting, sm.bearing(u, h, sm.toward(u, town_u)), want)
+    landing = planting & (town_gap < LAND_R)
     passed = (dist < PASS_R) & (bearing_p.abs() > 1.6)
     hunt = is_enemy & live & ~piloted
     agility = where(kind == SPINNER, SPINNER_TURN, DRIFTER_TURN)
-    hunt_turn = where(passed, zero, (HUNT_GAIN * want).clip(-1.0, 1.0) * agility)
+    hunt_turn = where(passed & ~abducting & ~planting, zero, (HUNT_GAIN * want).clip(-1.0, 1.0) * agility)
     pilot_turn = pax.clip(-1.0, 1.0) * PILOT_TURN
     seeking = is_bomb & live & (kind == SEEKER)
     own_u, own_z, own_has = nearest_of_block(u, z, ground_live, BOMBS, STATIONS, RADIUS)
@@ -583,10 +653,14 @@ def scroller_step(lane, slot, rx, ry, rz,
     h_turned = sm.turn(u, h, turn_angle)
     # Pickups wait where they fell; inside MAGNET_R they fly hard at the ship.
     pull = is_pickup & live & ship_on & (dist < MAGNET_R)
-    pull_speed = MAGNET_SPEED * (1.0 + 2.0 * (1.0 - dist / MAGNET_R))
+    # damped: the pull closes the gap exponentially (speed = gap / PULL_TAU,
+    # capped), so a pickup never overshoots and orbits the ship
+    pull_speed = (dist / PULL_TAU).clip(0.0, MAGNET_SPEED * 3.0)
     h_turned = sm.vwhere(pull, to_player, h_turned)
     hunt_spd = (where(kind == SPINNER, SPINNER_SPD, DRIFTER_SPD) * (0.8 + 0.4 * tempo.clip(0.0, 1.0))
                 * where(facing, 1.0, BEHIND_BOOST))              # racing round until it faces the player
+    hunt_spd = where(hovering, zero + HOVER_SPD, where(abducting, zero + SPINNER_SPD,
+                     where(planting, zero + PLANTER_SPD, hunt_spd)))
     pilot_spd = (PILOT_SPD - PILOT_THROTTLE * pay.clip(-1.0, 1.0))
     spd1 = where(is_player, ship_spd, where(hunt, hunt_spd, where(piloted, pilot_spd,
                  where(is_pickup, where(pull, pull_speed, 0.0), spd))))
@@ -609,7 +683,7 @@ def scroller_step(lane, slot, rx, ry, rz,
     kind1 = where(bomb_spawn, style, kind1)
     age1 = where(spawn, 0.0, age + dt)
     level_hp = 1.0 + 0.5 * (level - 1.0)
-    hp1 = where(respawn, where(new_kind == SPINNER, 9.0, 3.0),
+    hp1 = where(respawn, where(new_kind == SPINNER, 9.0, where(new_kind == PLANTER, 4.0, 3.0)),
                 where(boss_spawn, BOSS_HP * level_hp, where(ace_spawn, ACE_HP * level_hp, hp)))
     reload_of = (where(pw == MISSILE, MISSILE_RELOAD, RELOAD)
                  * where(fm == CONTINUOUS, 0.55, where(fm == BURST, 0.5, 1.0)))
@@ -621,7 +695,7 @@ def scroller_step(lane, slot, rx, ry, rz,
                                timer - dt)))
     vz1 = where(is_player, ship_vz, where(is_enemy, routine_vz, where(bullet_spawn, climb,
                 where(missile_spawn, (tz - z1) / flight + 0.5 * GRAVITY * flight, where(spawn, 0.0, vz)))))
-    vz1 = where(is_pickup, 0.0, vz1)
+    vz1 = where(pull, (pz - z) / PULL_TAU, where(is_pickup, 0.0, vz1))     # ... in height too
     # The guns follow the nose's pitch: a shot climbs or dives at the slope
     # the pitch command (the height axis) asks for -- point and shoot.
     pitch = (P * move_axis_z).sum().clip(-1.0, 1.0)
@@ -713,8 +787,16 @@ def scroller_step(lane, slot, rx, ry, rz,
                     + block_hits(x2, y2, rx, ry, live2, None, MISSILES, STATIONS, z2, rz))
     station_hits = (block_hits(x2, y2, rx, ry, live2, None, STATIONS, SHOTS, z2, rz)
                     + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, STATIONS, MISSILES, z2, rz))
+    base_hits = (block_hits(x2, y2, rx, ry, live2, None, BASES, SHOTS, z2, rz)
+                 + MISSILE_DAMAGE * block_hits(x2, y2, rx, ry, live2, None, BASES, MISSILES, z2, rz))
+    # anti-alien flak hits the aliens it meets (and, as any bullet, the ship)
+    flak_lane = is_bullet & (owner >= STATIONS[0]) & (owner < STATIONS[1])
+    flak_hits = block_hits(x2, y2, rx, ry, live2 & (is_enemy | flak_lane), None, ENEMIES, BULLETS, z2, rz)
     collected = block_hits(x2, y2, rx, ry, live2, None, PICKUPS, (0, 1), z2, rz)
-    got = is_pickup & live2 & (collected > 0.0)
+    # ... and taken the moment it is close in 3-D (it zips in)
+    grab = (((x2 - cx) * (x2 - cx) + (y2 - cy) * (y2 - cy) + (z2 - (P * z2).sum()) * (z2 - (P * z2).sum())).sqrt()
+            < MAGNET_GRAB)
+    got = is_pickup & live2 & ship_on & ((collected > 0.0) | grab)
     got_kind = lambda k: f(got & (kind == k)).sum() > 0.0  # noqa: E731
     weapon_next = where(is_player, pw, weapon)              # the active primary, as drawn and described
     owned_l_next = where(is_player & got_kind(LASER_UP), 1.0 + zero, owned_l)
@@ -766,28 +848,59 @@ def scroller_step(lane, slot, rx, ry, rz,
     seek_arrived = is_bomb & live2 & (kind1 == SEEKER) & (sm.arc(u2, seek_u, RADIUS) < 0.6) & (z2 < seek_z + 0.6)
     blows = is_bomb & live2 & ((z2 <= 0.0) | seek_arrived | burst_chutes)
     blast_hurt = zero
+    blackout = zero
     for style_k in (DUMB, CHUTE, SEEKER):
         radius_k = BLAST_R[style_k]
         mine = blows & (kind1 == style_k)
         reach_x = where(is_bomb, zero + radius_k, rx)
         reach_z = where(is_bomb, zero + 0.8 * radius_k, rz)
         live_k = (mine | ((is_enemy | is_station) & live2))
+        live_k = live_k | is_base & live2
         blast_hurt = blast_hurt + BLAST_DAMAGE[style_k] * (
             block_hits(x2, y2, reach_x, reach_x, live_k, None, ENEMIES, BOMBS, z2.clip(0.0, DEPTH), reach_z)
-            + block_hits(x2, y2, reach_x, reach_x, live_k, None, STATIONS, BOMBS, z2.clip(0.0, DEPTH), reach_z))
+            + block_hits(x2, y2, reach_x, reach_x, live_k, None, STATIONS, BOMBS, z2.clip(0.0, DEPTH), reach_z)
+            + block_hits(x2, y2, reach_x, reach_x, live_k, None, BASES, BOMBS, z2.clip(0.0, DEPTH), reach_z))
+        # ... and blacks out the city lights inside it
+        blackout = blackout + block_hits(x2, y2, reach_x, reach_x, mine | (is_pin & live2), None, PINS, BOMBS,
+                                         z2.clip(0.0, DEPTH), reach_z)
     # The laser's beam: straight up the patch from the ship, at its height;
     # the first craft or emplacement in it burns, and the beam ends there.
     pz2 = (P * z2).sum()
     ahead_gap = cy - y2
-    in_beam = (beaming & (is_enemy | is_station) & live2 & (ahead_gap > 0.0) & (ahead_gap < BEAM_RANGE)
+    in_beam = (beaming & (is_enemy | is_base) & live2 & (ahead_gap > 0.0) & (ahead_gap < BEAM_RANGE)
                & ((x2 - cx).abs() < rx + BEAM_HALF) & ((z2 - pz2).abs() < rz + 2.0 * BEAM_HALF))
     beam_gap = where(in_beam, ahead_gap, 1.0e9)
     burnt = in_beam & (beam_gap == beam_gap.min())
     beam_len = where(beaming, where(f(burnt).sum() > 0.0, (f(burnt) * ahead_gap).sum(), zero + BEAM_RANGE), zero)
     beam_hurt = f(burnt) * BEAM_DPS * (1.0 + 0.5 * pm) * dt
-    hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - LIGHTNING_DAMAGE * f(struck & is_enemy)
-                - blast_hurt - beam_hurt)
-    killed = (is_enemy | is_station) & live2 & (hp2 <= 0.0)
+    hp2 = where(rebuilt, STATION_HP, hp1 - enemy_hits - station_hits - base_hits - flak_hits
+                - LIGHTNING_DAMAGE * f(struck & is_enemy) - blast_hurt - beam_hurt)
+    # ---- the cities: brighten, abduction, the bases' zaps, blackouts, growth
+    zap_u, _zap_z, zap_has = nearest_of_block(u2, z2, is_pin & live2 & (hp > 0.05), BASES, PINS, RADIUS)
+    in_range = is_base & zap_has & (sm.arc(u2, zap_u, RADIUS) < BASE_RANGE)
+    # the first ready base WITH a lit pin in range zaps this step
+    zapper = first_of(in_range & live2 & (timer <= 0.0) & playing, lane)
+    zap_mark = sm.vwhere(zapper, zap_u, u2)
+    zap_ready = zapper
+    zapped = near_count_of_block(zap_mark, zap_ready, PINS, BASES, 0.25, RADIUS) > 0.0
+    drained = near_count_of_block(u2, hovering, PINS, ENEMIES, ABDUCT_R, RADIUS)
+    pin_light = (hp + where(hp > 0.05, BRIGHTEN, 0.0) * dt - drained * ABDUCT_RATE * dt).clip(0.0, 1.0)
+    pin_light = where(zapped | (blackout > 0.0), 0.0, pin_light)
+    lit_now = is_pin & (pin_light > 0.05)
+    n_lit = f(lit_now).sum()
+    grow = playing & (noise(clock * 4.9 + 31.0) < GROW_RATE * dt) & (n_lit > 0.0)
+    sprout = first_of(is_pin & ~lit_now, lane) & grow
+    lit_rank = f(lit_now).cumsum(dim=0) - 1.0
+    pick = (noise(clock * 6.1 + 7.0) * n_lit).floor()
+    parent = lit_now & (lit_rank == pick)
+    Pa = f(parent)
+    pa_u = ((Pa * u2[0]).sum(), (Pa * u2[1]).sum(), (Pa * u2[2]).sum())
+    pa_h = ((Pa * h2[0]).sum(), (Pa * h2[1]).sum(), (Pa * h2[2]).sum())
+    sprout_gap = GROW_NEAR[0] + (GROW_NEAR[1] - GROW_NEAR[0]) * noise(clock * 3.3 + 2.0)
+    sprout_u = sm.place(pa_u, pa_h, zero + sprout_gap / RADIUS, zero + 6.283185307179586 * noise(clock * 2.7 + 5.0))
+    u2 = sm.vwhere(sprout, sprout_u, u2)
+    hp2 = where(is_pin, where(sprout, 0.25, pin_light), hp2)
+    killed = (is_enemy | is_station | is_base) & live2 & (hp2 <= 0.0)
     touched = is_player & live2 & (player_hits > 0.0)
     # Damage drains the shield's points first, the rest comes off health;
     # shield and health pickups refill them; both regenerate (health slowly).
@@ -808,7 +921,17 @@ def scroller_step(lane, slot, rx, ry, rz,
     hit = touched & (wound > 0.0)
     shielded = (damage > 0.0) & (wound <= 0.0)
     was_hit = wound > 0.0
-    gone = (killed | blows | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
+    # a planter that has reached a settlement lands: it becomes the base in
+    # the first free base lane (and leaves the sky)
+    free_base = is_base & ~live2
+    planted_craft = first_of(landing & live2, lane) & (f(free_base).sum() > 0.0)
+    Pl = f(planted_craft)
+    pl_u = ((Pl * u2[0]).sum(), (Pl * u2[1]).sum(), (Pl * u2[2]).sum())
+    base_back = first_of(free_base, lane) & (Pl.sum() > 0.0)
+    u2 = sm.vwhere(base_back, pl_u, u2)
+    hp2 = where(base_back, BASE_HP + zero, hp2)
+    age1 = where(planted_craft, 0.0, age1)                     # its lane's return clock starts
+    gone = (killed | blows | planted_craft | (is_shot & (shot_hits > 0.0)) | (is_missile & (missile_hits > 0.0)) | got
             | (is_bullet & (bullet_hits > 0.0)) | (hit & over))
     live3 = live2 & ~gone
     # A destroyed craft sometimes drops a pickup (into the first free pickup
@@ -834,7 +957,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(left_at, clock, born1)
     age1 = where(left_at, 0.0, age1)
     age1 = where(is_player & (damage > 0.0), 0.0, age1)      # the player's age: time since its last hit
-    age1 = where(killed & is_enemy, 0.0, age1)                # an enemy's age, dead: time to its return
+    age1 = where(killed & (is_enemy | is_base), 0.0, age1)    # an enemy's or base's age, dead: time to its return
+    timer1 = where(zap_ready, BASE_RELOAD + zero, timer1)
+    z2 = where(is_base, zero + STATION_Z, z2)
     live3 = (live3 | drop | puff) & ~(is_smoke & (age1 > SMOKE_LIFE))
     # Lightning ends: at the striking cloud and the nearest craft struck.
     nearest_struck = first_of(struck & (where(struck, reach_l, 1.0e9) == where(struck, reach_l, 1.0e9).min()), lane)
@@ -854,6 +979,20 @@ def scroller_step(lane, slot, rx, ry, rz,
     born1 = where(flashing, clock, born1)
     age1 = where(flashing, 0.0, age1)
     live3 = (live3 | flashing) & ~(is_flash & (age1 > FLASH_LIFE))
+    live3 = live3 | base_back | is_pin                        # pins always stand; dark is hp 0
+    # the zap: two ribbon ends, at the base and at the pin it took
+    Z = f(zapper & zap_ready)
+    zb_u = ((Z * u2[0]).sum(), (Z * u2[1]).sum(), (Z * u2[2]).sum())
+    zt_u = ((Z * zap_u[0]).sum(), (Z * zap_u[1]).sum(), (Z * zap_u[2]).sum())
+    zap_rank = f(is_zap & ~live3).cumsum(dim=0) - 1.0
+    zap_a = is_zap & ~live3 & (zap_rank == 0.0) & (Z.sum() > 0.0)
+    zap_b = is_zap & ~live3 & (zap_rank == 1.0) & (Z.sum() > 0.0)
+    zapping = zap_a | zap_b
+    u2 = sm.vwhere(zap_a, zb_u, sm.vwhere(zap_b, zt_u, u2))
+    z2 = where(zap_a, 0.35 + zero, where(zap_b, zero, z2))
+    spd2, vz1 = where(zapping, 0.0, spd2), where(zapping, 0.0, vz1)
+    born1, age1 = where(zapping, clock, born1), where(zapping, 0.0, age1)
+    live3 = (live3 | zapping) & ~(is_zap & (age1 > ZAP_LIFE))
     # A blast's flash: the first two free blast lanes take the step's first
     # two bursts, glowing in their style's colour (kind) for BLAST_LIFE.
     first_blow = first_of(blows, lane)
@@ -874,11 +1013,16 @@ def scroller_step(lane, slot, rx, ry, rz,
     boss_phase_next = where(boss_killed, 2.0, where(boss_due, 1.0, boss_phase))
     boom3 = where(killed | (hit & over), BOOM, (boom - dt).clip(0.0, BOOM))
     invuln_next = where(was_hit, 0.6, where(shielded, 0.25, (invuln - dt).clip(0.0, INVULN)))
-    score_next = score + (f(killed) * where(kind1 == SPINNER, 300.0, 100.0)).sum()
+    score_next = score + (f(killed & ~is_station) * where(is_base, 250.0, where(kind1 == SPINNER, 300.0, 100.0))).sum()
 
     # ------------------------------------------------ what the page sees
     # Apparent velocity in the patch (relative flight plus the frame's turn);
     # the player sits still at the patch's centre.
+    # (lanes placed after the projection -- sprouted pins, returned bases,
+    # zap ends -- are projected here like everything else)
+    Xn, Yn = sm.project(u2, u0n, h0n, RADIUS)
+    late = sprout | base_back | zapping
+    x2, y2 = where(late, cx + Xn, x2), where(late, cy - Yn, y2)
     X2, Y2 = x2 - cx, cy - y2
     pvx, pvy = sm.patch_velocity(h2, spd2, X2, Y2, h0n, pspd, u0n, dyaw / dt)   # the frame's whole turn (rudder + bank)
     vx2 = where(is_player, zero, pvx)
@@ -975,6 +1119,9 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     slot[stations], rx[stations], ry[stations], rz[stations] = STATION, 0.35, 0.35, 0.35
     slot[slice(*BOMBS)], rx[slice(*BOMBS)], ry[slice(*BOMBS)], rz[slice(*BOMBS)] = BOMB_SLOT, 0.2, 0.2, 0.2
     slot[slice(*BLASTS)] = BLAST_SLOT
+    slot[slice(*PINS)], rx[slice(*PINS)], ry[slice(*PINS)], rz[slice(*PINS)] = PIN_SLOT, 0.1, 0.1, 0.1
+    slot[slice(*BASES)], rx[slice(*BASES)], ry[slice(*BASES)], rz[slice(*BASES)] = BASE_SLOT, 0.35, 0.35, 0.3
+    slot[slice(*ZAPS)] = ZAP_SLOT
     rx[BOSS_LANE], ry[BOSS_LANE], rz[BOSS_LANE] = 1.1, 0.75, 0.75      # the boss: a big hull
     slot[SHOTS[0]:SHOTS[1]], rx[SHOTS[0]:SHOTS[1]], ry[SHOTS[0]:SHOTS[1]] = SHOT, 0.1, 0.3
     slot[ENEMIES[0]:ENEMIES[1]], rx[ENEMIES[0]:ENEMIES[1]], ry[ENEMIES[0]:ENEMIES[1]] = ENEMY, 0.42, 0.36
@@ -1005,13 +1152,38 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
     r, a = SCENERY_FAR * np.sqrt(rng.uniform(0.0, 0.8, n_star)), rng.uniform(0.0, 2 * np.pi, n_star)
     put(stars, r * np.sin(a), r * np.cos(a), rng.uniform(0.0, 2 * np.pi, n_star))
     spd[stars] = CLOUD_DRIFT * (1.0 + z[stars])
+    # CITIES: CITY_SEEDS clusters of lit pins over the sphere (a seed near the
+    # start so there is a city in sight), the rest dark (room to grow);
+    # alien BASES beside the cities
+    pins, bases = slice(*PINS), slice(*BASES)
+    n_pin, n_base = PINS[1] - PINS[0], BASES[1] - BASES[0]
+    centres = rng.normal(size=(CITY_SEEDS, 3))
+    centres[0] = (0.25, 0.35, 1.0)
+    centres /= np.linalg.norm(centres, axis=1, keepdims=True)
+    owner_city = np.arange(n_pin) % CITY_SEEDS
+    lit0 = rng.uniform(size=n_pin) < 0.55
+    pts = centres[owner_city] + rng.normal(scale=CITY_SPREAD / RADIUS, size=(n_pin, 3))
+    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    ux[pins], uy[pins], uz[pins] = pts[:, 0], pts[:, 1], pts[:, 2]
+    bpts = centres[np.arange(n_base) % CITY_SEEDS] + rng.normal(scale=(CITY_SPREAD + 1.5) / RADIUS, size=(n_base, 3))
+    bpts /= np.linalg.norm(bpts, axis=1, keepdims=True)
+    ux[bases], uy[bases], uz[bases] = bpts[:, 0], bpts[:, 1], bpts[:, 2]
+    for lanes_ in (pins, bases):              # a heading tangent at each (ground bodies do not move)
+        uu = np.stack([ux[lanes_], uy[lanes_], uz[lanes_]], axis=1)
+        g = np.tile([[0.0, 1.0, 0.0]], (len(uu), 1))
+        tg = g - (g * uu).sum(axis=1, keepdims=True) * uu
+        tg /= np.linalg.norm(tg, axis=1, keepdims=True) + 1e-12
+        hx[lanes_], hy[lanes_], hz[lanes_] = tg[:, 0], tg[:, 1], tg[:, 2]
     stations = slice(*STATIONS)
     n_st = STATIONS[1] - STATIONS[0]
     put(stations, rng.uniform(-3.5, 3.5, n_st), np.linspace(3.0, AHEAD, n_st), np.zeros(n_st))
     z[stations] = STATION_Z
     z[0] = DEPTH / 2.0
     spd[0] = SPD0
-    alive = ((slot == PLAYER) | (slot == STAR) | (slot == STATION)).astype(np.float64)
+    alive = ((slot == PLAYER) | (slot == STAR) | (slot == STATION) | (slot == PIN_SLOT) | (slot == BASE_SLOT)).astype(np.float64)
+    alive[BASES[0] + 2:BASES[1]] = 0.0          # two bases planted at the start; planters found the rest
+    hp0 = np.where(slot == STATION, STATION_HP, np.where(slot == BASE_SLOT, BASE_HP, 0.0))
+    hp0[pins] = np.where(lit0, rng.uniform(0.4, 1.0, n_pin), 0.0)
     # The population returns one after another: each enemy lane starts dead
     # with its return clock nearly run (half a second apart).
     tempo = pace * (1.0 + LEVEL_STEP * (level - 1.0))
@@ -1026,7 +1198,7 @@ def initial_columns(width: float = WIDTH, pace: float = 1.0, level: int = 1) -> 
         "vx": np.zeros(LANES), "vy": np.zeros(LANES), "vz": np.zeros(LANES),
         "ux": ux, "uy": uy, "uz": uz, "hx": hx, "hy": hy, "hz": hz, "spd": spd,
         "yaw": yaw, "vyaw": np.zeros(LANES), "vspd": np.zeros(LANES),
-        "hp": np.where(slot == STATION, STATION_HP, 0.0),
+        "hp": hp0,
         "boom": np.zeros(LANES), "born": np.zeros(LANES), "owner": np.full(LANES, -1.0),
         "energy": (slot == PLAYER).astype(np.float64), "kind": np.where(slot == STATION, STATION_KIND, 0.0),
         "age": age,
@@ -1120,7 +1292,7 @@ class BulletScroller(EntityGame):
         # Lightning and the three bomb styles' blasts glow (emissive materials;
         # the page also lights the scene from each).
         return {"lightning": [2.6, 2.8, 3.4], "blast_dumb": [3.2, 1.7, 0.5], "blast_chute": [2.4, 2.6, 3.2],
-                "blast_seeker": [3.0, 0.8, 2.6]}
+                "blast_seeker": [3.0, 0.8, 2.6], "zap": [1.2, 3.0, 1.0], "city": [3.0, 2.4, 1.4]}
 
     def palette(self) -> dict[str, list[float]]:
         return {"rocket": [0.85, 0.88, 0.95], "rocket_blink": [0.35, 0.37, 0.45], "bolt": [1.0, 0.92, 0.25],
@@ -1129,6 +1301,7 @@ class BulletScroller(EntityGame):
                 "cloud": [0.96, 0.98, 1.0], "boss": [0.95, 0.2, 0.25], "ace": [0.3, 1.0, 0.55],
                 "rain": [0.5, 0.52, 0.56], "lightning": [0.85, 0.9, 1.0], "storm": [0.28, 0.29, 0.33],
                 "station": [1.0, 0.82, 0.1], "flak": [1.0, 0.9, 0.2],
+                "city": [1.0, 0.86, 0.55], "base": [0.55, 1.0, 0.35], "zap": [0.6, 1.0, 0.4], "planter": [0.4, 0.85, 0.3],
                 "bomb_dumb": [0.3, 0.32, 0.36], "bomb_chute": [0.85, 0.85, 0.8], "chute": [0.95, 0.95, 0.9],
                 "seeker": [1.0, 0.45, 0.2],
                 "blast_dumb": [1.0, 0.6, 0.2], "blast_chute": [0.9, 0.95, 1.0], "blast_seeker": [1.0, 0.3, 0.9],
@@ -1141,7 +1314,7 @@ class BulletScroller(EntityGame):
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "z", "vx", "vy", "vz", "boom", "born", "owner", "kind", "invuln", "weapon",
-                 "ux", "uy", "uz", "hx", "hy", "hz")
+                 "ux", "uy", "uz", "hx", "hy", "hz", "hp")
         # (clouds and flashes are always shown; flashes glow -- see emissive)
         col = {name: self.session.column(name) for name in names}
         clock = float(self.session.column("clock")[0])
@@ -1156,7 +1329,9 @@ class BulletScroller(EntityGame):
         heading = np.arctan2(hd @ r0, hd @ h0)
         # ... and within the land's width either side of the ship (no body
         # floats off the edge of the drawn board).
-        show = (((col["alive"] > 0.0) | (col["boom"] > 0.0)) & (reach < PATCH_R)
+        names_hp = self.session.column("hp")
+        dark_pin = (col["slot"] == PIN_SLOT) & (names_hp <= 0.05)
+        show = (((col["alive"] > 0.0) | (col["boom"] > 0.0)) & ~dark_pin & (reach < PATCH_R)
                 & (np.abs(col["x"] - self.width / 2.0) < self.width / 2.0 + 0.6))
         out = []
         for k in np.flatnonzero(show):
@@ -1175,6 +1350,8 @@ class BulletScroller(EntityGame):
                     mesh, color, size = "ufo", "boss", 1.35
                 elif kind_k == ACE:
                     mesh, color, size = "alien", "ace", 0.5
+                elif kind_k == PLANTER:
+                    mesh, color, size = "crab", "planter", 0.45
                 elif kind_k == SPINNER:
                     mesh, color, size = "ufo", "ufo", 0.55
                 else:
@@ -1196,6 +1373,12 @@ class BulletScroller(EntityGame):
                 mesh, color, size = "bomb", "station", 0.42
             elif slot == FLASH:
                 mesh, color, size = "bolt", "lightning", 0.55
+            elif slot == PIN_SLOT:
+                mesh, color, size = "disc", "city", 0.06 + 0.06 * float(col["hp"][k])
+            elif slot == BASE_SLOT:
+                mesh, color, size = "crab", "base", 0.36
+            elif slot == ZAP_SLOT:
+                mesh, color, size = "bolt", "zap", 0.2
             elif slot == BOMB_SLOT:
                 style_k = float(col["kind"][k])
                 if style_k == SEEKER:
@@ -1238,8 +1421,9 @@ class BulletScroller(EntityGame):
                         "face": False,
                         # drawn with the glass (blended), not in the opaque pass
                         "translucent": bool(slot in (STAR, SMOKE)),
-                        "ribbon": bool(slot == FLASH),       # a lightning end: the page draws the bolt
-                        "ground": bool(slot == STATION),     # emplacements stand on the land's relief
+                        "ribbon": bool(slot in (FLASH, ZAP_SLOT)),   # a ribbon end: lightning, or a base's zap
+                        "ground": bool(slot in (STATION, BASE_SLOT, PIN_SLOT)),   # stands on the land's relief
+                        "glow": bool(slot == PIN_SLOT),      # a city light: a glowing point, not a mesh
                         "spin": 9.0 if slot == FLASH else (2.5 if mesh == "ufo" else 0.0),
                         "owner": int(col["owner"][k]) if slot in (SHOT, BULLET) and not exploding else -1,
                         "age": clock - float(col["born"][k]),
@@ -1290,7 +1474,7 @@ class BulletScroller(EntityGame):
     #: The sun's direction in the planet's frame: fixed, so the local sky is
     #: where the player is -- fly round the globe through dawn, day, dusk
     #: and night.
-    SUN = (0.82, 0.18, 0.55)
+    SUN = SUN_DIR
 
     def _top_speed(self) -> float:
         """The throttle's top as the law applies it: SPD_MAX, CRUISE with the tank dry."""
@@ -1319,6 +1503,8 @@ class BulletScroller(EntityGame):
                               {"name": "Seeker", "count": 1 + int(c("bombs_s")[0])}],
                 "active": int(c("weapon")[0]), "last": "secondary" if c("last_fire")[0] > 0 else "primary",
                 "beam_range": BEAM_RANGE}
+            light = c("hp")[PINS[0]:PINS[1]]
+            st["city"] = {"lit": int((light > 0.05).sum()), "light": round(float(light.sum()), 1), "pins": PINS[1] - PINS[0]}
             boss_live = float(c("alive")[BOSS_LANE]) > 0.0 and float(c("boss_phase")[0]) == 1.0
             st["boss"] = ({"hp": max(0.0, float(c("hp")[BOSS_LANE])),
                            "max": BOSS_HP * (1.0 + 0.5 * (self.level - 1.0))} if boss_live else None)

@@ -193,7 +193,7 @@ def scroller_tokens(game) -> np.ndarray:
     # the bodies in reach
     owner = col("owner")
     is_body = alive > 0.0
-    is_body &= np.isin(slot, (sc.ENEMY, sc.BULLET, sc.STATION, sc.PICKUP, sc.SHOT, sc.MISSILE_SLOT)) | (
+    is_body &= np.isin(slot, (sc.ENEMY, sc.BULLET, sc.BASE_SLOT, sc.PICKUP, sc.SHOT, sc.MISSILE_SLOT)) | (
         (slot == sc.STAR) & (kind > 0.0))
     is_body[k] = False
     dx, dy, dz = x - x[k], y - y[k], z - z[k]
@@ -210,7 +210,7 @@ def scroller_tokens(game) -> np.ndarray:
             (s == sc.ENEMY) & ((kd == sc.ACE) | (kd == sc.BOSS_KIND)),     # ace or boss
             (s == sc.BULLET) & ~flak,                                      # bullet
             flak,                                                          # flak shell
-            s == sc.STATION,                                               # emplacement
+            s == sc.BASE_SLOT,                                             # an alien base (bomb it)
             s == sc.PICKUP,                                                # pickup
             (s == sc.SHOT) | (s == sc.MISSILE_SLOT),                       # the ship's own fire
             s == sc.STAR,                                                  # storm / rain cloud
@@ -1358,6 +1358,13 @@ def learning_summary(name: str) -> dict:
             _HUMAN_GAMES[name] = int(len(np.load(records)["episode_score"])) if records.exists() else 0
         except Exception:  # noqa: BLE001
             _HUMAN_GAMES[name] = 0
+    params = _PILOT_WEIGHTS.get(name)
+    network = None
+    if params is not None:
+        arch = arch_of(params)
+        network = {"arch": arch, "params": int(sum(params[n].size for n in param_names(params))),
+                   "outputs": widths_of(params)[1], "tokens": TOKENS if arch == "token" else None,
+                   "span_rows": SPAN_ROWS, "flush_rows": FLUSH_ROWS}
     return {"demo_learning": bool(DEMO_LEARNING.get(name)), "human_games": _HUMAN_GAMES[name],
             "training": bool(TRAINING.get(name)), "history": list(LEARN_HISTORY.get(name, ())),
-            **LEARN_STATUS.get(name, {})}
+            "network": network, **LEARN_STATUS.get(name, {})}
