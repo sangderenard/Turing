@@ -8,9 +8,12 @@ Gravity pulls toward +y, the bottom of the screen.
 
 Lanes (contiguous blocks):
     0              the player (a frog); feet at ``y + PLAYER_RY``
-    1..24          brick platforms; a brick is square, so a platform's width
-                   ``rx`` is its drawn half size and its top is ``y - ry``
-    25..28         star pickups (alive only while one is on the way down)
+    1..90          FLOORS: ``SLOTS`` floors of ``CELLS`` bricks each (a floor's lanes are contiguous,
+                   lane ``1 + slot * CELLS + cell``); a brick is square, so ``rx`` is its drawn half
+                   size and its top is ``y - ry``.  A floor is a row of bricks across the field with ONE hole
+                   (a brick that is not alive), as Ice Climber's floors: every run of bricks is at least
+                   ``RUN_MIN`` long, so no step of the climb is an isolated brick.
+    91..94         star pickups (alive only while one is on the way down)
 
 The player is integrated, never placed: semi-implicit gravity each step, and
 when the player is falling and its feet cross a platform's top during the step
@@ -20,9 +23,13 @@ only input is sideways (``move_axis`` / a held pointer's ``steer_x``).
 The world scrolls: when the player rises above ``SCROLL_Y`` every lane's y
 increases by the overshoot (``climbed`` and the score grow by it).  A platform
 that falls off the bottom is recycled above the highest remaining platform at
-a gap drawn from the law's ``noise`` (rank-cumulated, so several recycled in
-one step stack); the gap range grows with the climb but never reaches the jump
-height (``JUMP**2 / (2 GRAVITY)``).  Falling below the bottom ends the run.
+a floor spacing drawn from the law's ``noise`` (several floors recycled in one
+step stack); the spacing grows with the climb but stays under what a bounce
+climbs (``BOUNCE_APEX``) and above what the frog and a brick need to stand
+between floors.  The floor's hole is a function of the floor's noise draw: a
+run of 1..``HOLE_MAX`` cells, never within ``RUN_MIN`` cells of the floor's
+ends.  ``tests/test_meowdoku_platformer.py`` proves every floor reachable from
+the one below with the actual bounce and air speed.  Falling below the bottom ends the run.
 
 Columns: lane, slot, rx, ry (static); alive, x, y, vx, vy, born, score, lives,
 climbed, clock (state; ``vy`` of a platform is the scroll velocity of the
@@ -36,8 +43,9 @@ from typing import Any
 
 import numpy as np
 
+from meowdoku import characters
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import G_EARTH, damped_axis, jump_speed, vertical_axis
 from src.common.tensors import AbstractTensor
 
 where = AbstractTensor.where
@@ -47,13 +55,25 @@ WIDTH = 9.0
 #: The field is portrait (phone-shaped) whatever the screen (see scroller.py).
 PORTRAIT = 0.62
 PLAYER, PLATFORM, PICKUP = 0.0, 1.0, 2.0
-PLATFORMS = (1, 25)
-PICKUPS = (25, 29)
+SLOTS = 9                                    # floors alive at once: the field's height plus one above the top
+CELLS = 10                                   # bricks a floor can hold (a floor uses ``floor(field_w)`` of them)
+BRICK = 0.5                                  # a floor brick's half size
+RUN_MIN = 3                                  # every run of bricks on a floor is at least this long
+HOLE_MAX = 3                                 # the widest hole in a floor
+PLATFORMS = (1, 1 + SLOTS * CELLS)
+PICKUPS = (PLATFORMS[1], PLATFORMS[1] + 4)
 LANES = PICKUPS[1]
 
-GRAVITY = 24.0
-JUMP = 12.0                                  # bounce velocity: apex JUMP**2 / (2 GRAVITY) = 3.0 above the feet
-FALL_MAX = 20.0
+# Gravity is the real constant in the game's units: a tile stands for UNIT_M metres, so
+# GRAVITY = 9.80665 m/s^2 / UNIT_M.  The bounce is declared by its height (the launch speed whose rise is exactly
+# BOUNCE_APEX, entity_motion.jump_speed with no hang) and integrated exactly by the shared law
+# entity_motion.vertical_axis, with terminal velocity FALL_MAX.
+UNIT_M = 0.35
+GRAVITY = G_EARTH / UNIT_M                   # 28.02 tiles/s^2
+STAGE_LEAN = 0.2                             # the backdrop plane's lean (radians): see ``SCENE``
+BOUNCE_APEX = 3.0                            # tiles above the feet; the gap limit stays under it
+JUMP = jump_speed(BOUNCE_APEX, GRAVITY, 1.0, 1.0)      # bounce velocity (no hang band: scale 1)
+FALL_MAX = 20.0                              # terminal velocity
 SPEED = 9.0
 TAU = 0.06
 REACH = 0.2
@@ -61,11 +81,13 @@ MARGIN = 0.4
 PLAYER_RX, PLAYER_RY = 0.3, 0.35
 FOOT = 0.2                                   # half width of the feet that land
 SCROLL_Y = 0.4 * HEIGHT                      # the world scrolls to keep the player above this line
-GAP_MIN = 1.1
-GAP_MAX0, GAP_MAX_GROWTH, GAP_MAX_LIMIT = 1.5, 0.01, 2.5      # centre-to-centre; below the 3.0 jump
+# Floor spacing (top to top): room for the frog (0.7 tall) between a floor and the brick (1.0 thick) above it, and under
+# what a bounce climbs (BOUNCE_APEX = 3.0) with room for the sideways travel the climb needs.
+GAP_MIN = 1.9
+GAP_MAX0, GAP_MAX_GROWTH, GAP_MAX_LIMIT = 2.1, 0.005, 2.6
 PICKUP_RX = 0.25
 PICKUP_CHANCE = 0.4
-PICKUP_LIFT = 0.65
+PICKUP_LIFT = 0.85                           # a star rides a brick's top: brick half + star half + a hair
 POINTS_PER_UNIT = 10.0
 POINTS_PER_PICKUP = 100.0
 
@@ -82,6 +104,9 @@ def platformer_step(lane, slot, rx, ry,
     playing = lives > 0.0
     is_player, is_plat, is_pick = slot == PLAYER, slot == PLATFORM, slot == PICKUP
     zero = x * 0.0
+    n = int(lane.shape[0])
+    slot_of = ((lane - 1.0) * (1.0 / CELLS)).floor()              # which floor a platform lane belongs to
+    cell = lane - 1.0 - slot_of * CELLS                           # and which brick of it
     clock_next = clock + dt
 
     # Sideways: the shared damped motion law.
@@ -92,8 +117,9 @@ def platformer_step(lane, slot, rx, ry,
     pxn = (f(me) * ship_x).sum()
 
     # Vertical: gravity, then the bounce when the feet cross a platform's top.
-    fall = (pvy + GRAVITY * dt).clip(-FALL_MAX, FALL_MAX)
-    py_new = py + fall * dt
+    # (no button: the bounce is the platform's, so no press, no coyote, no hang)
+    py_new, fall, _coy, _buf, _jumped = vertical_axis(
+        py, pvy, 1.0, 1.0, 0.0, 0.0, 0.0, dt, GRAVITY, 0.0, 1.0e9, FALL_MAX, 0.0, 1.0, 0.0, 0.0)
     top = y - ry
     crossed = (is_plat & live & playing & (fall > 0.0)
                & (py + PLAYER_RY <= top) & (py_new + PLAYER_RY >= top)
@@ -105,22 +131,31 @@ def platformer_step(lane, slot, rx, ry,
     overshoot = (SCROLL_Y - py_new).clip(0.0, 100.0) * f(playing)
     climbed_next = climbed + overshoot
     x1 = where(is_player & playing, ship_x, x)
-    y1 = where(is_player, where(playing, py_new, y), y) + overshoot * f(live)
+    y1 = where(is_player, where(playing, py_new, y), y) + overshoot * f(live | is_plat)     # (a hole scrolls too)
 
     # Pickups: touched by the player, or fallen off the bottom.
     touched = is_pick & live & playing & (block_hits(x1, y1, rx, ry, live, None, PICKUPS, (0, 1)) > 0.0)
     pick_out = is_pick & (y1 > HEIGHT + 0.5)
 
-    # Platforms off the bottom are recycled above the highest remaining one.
-    gone = is_plat & live & playing & (y1 > HEIGHT + 0.6)
-    anchor = where(is_plat & live & ~gone, y1, 1.0e9).min()
+    # Floors off the bottom are recycled above the highest remaining one: all of a floor's lanes (the holes too, they
+    # scroll with it) are gone together, and the floor returns with a new spacing and a new hole from ONE noise draw
+    # per floor (its slot and the climb), so its lanes agree on it.
+    gone = is_plat & playing & (y1 > HEIGHT + 0.6)
+    anchor = where(is_plat & ~gone, y1, 1.0e9).min()
     gap_max = (GAP_MAX0 + GAP_MAX_GROWTH * climbed_next).clip(GAP_MAX0, GAP_MAX_LIMIT)
-    gap = GAP_MIN + (gap_max - GAP_MIN) * noise(lane * 3.1 + climbed_next * 7.3 + seed + 11.0)
-    new_y = anchor - where(gone, gap, 0.0).cumsum(dim=0)
-    new_x = rx + (field_w - 2.0 * rx) * noise(lane * 1.7 + climbed_next * 5.9 + seed + 2.0)
+    gap = GAP_MIN + (gap_max - GAP_MIN) * noise(slot_of * 3.1 + climbed_next * 7.3 + seed + 11.0)
+    same_floor = f(is_plat.reshape((n, 1)) & is_plat.reshape((1, n)) & (slot_of.reshape((n, 1)) == slot_of.reshape((1, n))))
+    head = gone & (cell == 0.0)
+    stacked = where(head, gap, 0.0).cumsum(dim=0)                 # one spacing per recycled floor, stacked
+    new_y = anchor - (same_floor * where(head, stacked, 0.0).reshape((1, n))).sum(dim=1)     # (each floor reads its head's total)
+    cells_n = field_w.floor().clip(float(2 * RUN_MIN + 1), float(CELLS))
+    hole_w = 1.0 + (noise(slot_of * 2.3 + climbed_next * 4.1 + seed + 5.0) * HOLE_MAX).floor()
+    hole_at = RUN_MIN + (noise(slot_of * 1.7 + climbed_next * 5.9 + seed + 2.0) * (cells_n - 2.0 * RUN_MIN - hole_w + 1.0)).floor()
+    present = (cell < cells_n) & ~((cell >= hole_at) & (cell < hole_at + hole_w))
+    new_x = (field_w - cells_n) * 0.5 + cell + 0.5
 
-    # A pickup may ride the first platform recycled this step.
-    first_gone = first_of(gone, lane)
+    # A pickup may ride the first brick recycled this step.
+    first_gone = first_of(gone & present, lane)
     any_gone = f(first_gone).sum() > 0.0
     gx, gy = (f(first_gone) * new_x).sum(), (f(first_gone) * new_y).sum()
     spawn_pick = (first_of(is_pick & ~live, lane) & any_gone
@@ -132,7 +167,7 @@ def platformer_step(lane, slot, rx, ry,
 
     # The run ends when the player falls below the bottom.
     dead = is_player & live & (y2 > HEIGHT + PLAYER_RY)
-    live2 = (live & ~touched & ~pick_out & ~dead) | spawn_pick
+    live2 = where(gone, present, live & ~touched & ~pick_out & ~dead) | spawn_pick
     lives_next = lives - f(dead).sum()
     score_next = score + POINTS_PER_UNIT * overshoot + POINTS_PER_PICKUP * f(touched).sum()
 
@@ -170,25 +205,38 @@ def field_width(aspect: float | None) -> float:
     return float(np.clip(round(HEIGHT * min(aspect, PORTRAIT) * 2.0) / 2.0, 9.0, HEIGHT * PORTRAIT + 0.5))
 
 
+def floor_pattern(rng, cells: int) -> np.ndarray:
+    """The bricks present on one floor (a boolean per cell): one hole of 1..HOLE_MAX cells, never within RUN_MIN of an end."""
+    width = int(rng.integers(1, HOLE_MAX + 1))
+    at = int(rng.integers(RUN_MIN, cells - RUN_MIN - width + 1))
+    out = np.ones(CELLS, dtype=bool)
+    out[cells:] = False
+    out[at:at + width] = False
+    return out
+
+
 def initial_columns(width: float = WIDTH, seed: int = 0) -> dict[str, np.ndarray]:
     lane = np.arange(LANES, dtype=np.float64)
     slot = np.zeros(LANES)
     rx, ry = np.full(LANES, PLAYER_RX), np.full(LANES, PLAYER_RY)
-    count = PLATFORMS[1] - PLATFORMS[0]
     slot[PLATFORMS[0]:PLATFORMS[1]] = PLATFORM
-    rx[PLATFORMS[0]:PLATFORMS[1]] = 0.28 + 0.04 * (np.arange(count) % 4)      # widths 0.28 .. 0.40
-    ry[PLATFORMS[0]:PLATFORMS[1]] = rx[PLATFORMS[0]:PLATFORMS[1]]             # a brick is square
+    rx[PLATFORMS[0]:PLATFORMS[1]] = ry[PLATFORMS[0]:PLATFORMS[1]] = BRICK         # a brick is square
     slot[PICKUPS[0]:PICKUPS[1]], rx[PICKUPS[0]:PICKUPS[1]], ry[PICKUPS[0]:PICKUPS[1]] = PICKUP, PICKUP_RX, PICKUP_RX
     rng = np.random.default_rng(int(seed))
-    x, y = np.zeros(LANES), np.zeros(LANES)
+    cells = int(np.clip(np.floor(width), 2 * RUN_MIN + 1, CELLS))
+    x, y, alive = np.zeros(LANES), np.zeros(LANES), np.zeros(LANES)
     below = HEIGHT - 0.8
-    for k in range(*PLATFORMS):
-        x[k] = width / 2.0 if k == PLATFORMS[0] else rng.uniform(rx[k], width - rx[k])
-        y[k] = below
+    for k in range(SLOTS):
+        first = PLATFORMS[0] + k * CELLS
+        present = np.ones(CELLS, dtype=bool) if k == 0 else floor_pattern(rng, cells)        # the ground floor is whole
+        present[cells:] = False
+        x[first:first + CELLS] = (width - cells) / 2.0 + np.arange(CELLS) + 0.5
+        y[first:first + CELLS] = below
+        alive[first:first + CELLS] = present
         below -= rng.uniform(GAP_MIN, GAP_MAX0)
     x[0] = width / 2.0
-    y[0] = y[PLATFORMS[0]] - ry[PLATFORMS[0]] - PLAYER_RY - 0.02          # standing on the first brick
-    alive = (slot != PICKUP).astype(np.float64)
+    y[0] = (HEIGHT - 0.8) - BRICK - PLAYER_RY - 0.02                       # standing on the ground floor
+    alive[0] = 1.0
     return {
         "lane": lane, "slot": slot, "rx": rx, "ry": ry,
         "alive": alive, "x": x, "y": y, "vx": np.zeros(LANES), "vy": np.zeros(LANES),
@@ -205,6 +253,13 @@ class Platformer(EntityGame):
     height = HEIGHT
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
+    CHARACTERS_ON = True
+    #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
+    #: bricks are the scenery layer, the frog and stars a layer in front), so the frog's feet meet the brick.
+    #: ``rocket: False``: no shield bubble, marker lights or headlights (a rocket's gear); ``spot``: the one cone
+    #: of intent the page lights the frog with (the vertical velocity of a bouncer is ignored, a climber means up).
+    SCENE = {"floor": True, "glass": True, "arcade": True, "stage": STAGE_LEAN, "rocket": False,
+             "spot": {"inner": 14, "outer": 30, "intensity": 70, "vy_weight": 0.0, "bias": [0.0, -0.55]}}
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None):
         self.width = field_width(aspect)
@@ -218,7 +273,12 @@ class Platformer(EntityGame):
         return initial_columns(self.width, self.seed)
 
     def motion(self) -> dict[str, Any]:
-        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [MARGIN, self.width - MARGIN]}
+        return {"speed": SPEED, "tau": TAU, "reach": REACH, "x": [MARGIN, self.width - MARGIN],
+                "vertical": {"gravity": GRAVITY, "jump": 0.0, "cut": 1.0e9, "fall_max": FALL_MAX, "hang_v": 0.0,
+                             "hang_scale": 1.0, "coyote": 0.0, "buffer": 0.0, "press": None,
+                             # contact (the page's prediction): a brick is landed on from above and passed from below;
+                             # the bounce itself is the server's (a landed frog is sent back up by it)
+                             "ry": PLAYER_RY, "foot": FOOT, "solid": [], "oneway": ["brick"], "bump": 0.0, "bounce": JUMP}}
 
     def reset(self) -> None:
         self.seed = (self.seed + 1) % 1000          # a new climb each run
@@ -236,7 +296,7 @@ class Platformer(EntityGame):
 
     def palette(self) -> dict[str, list[float]]:
         return {"floor": [0.55, 0.78, 0.95], "frog": [0.45, 0.9, 0.35], "brick": [0.75, 0.42, 0.25],
-                "star": [1.0, 0.85, 0.2]}
+                "star": [1.0, 0.85, 0.2], **characters.PALETTE}
 
     def entities(self) -> list[dict[str, Any]]:
         names = ("slot", "alive", "x", "y", "vx", "vy", "born", "rx")
@@ -246,7 +306,7 @@ class Platformer(EntityGame):
         for k in np.flatnonzero(col["alive"] > 0.0):
             slot = col["slot"][k]
             if slot == PLAYER:
-                mesh, size = "frog", PLAYER_RY
+                mesh, size = self.hero_mesh, PLAYER_RY
             elif slot == PLATFORM:
                 mesh, size = "brick", float(col["rx"][k])
             else:
@@ -254,7 +314,7 @@ class Platformer(EntityGame):
             out.append({"id": f"{k}:{col['born'][k]:.4f}", "x": float(col["x"][k]), "y": float(col["y"][k]),
                         "vx": float(col["vx"][k]),
                         "vy": float(col["vy"][k]) if slot != PLAYER else 0.0,
-                        "mesh": mesh, "color": mesh, "size": size, "roll": 0.0,
+                        "mesh": mesh, "color": mesh, "size": size, "roll": 0.0, "scenery": bool(slot == PLATFORM),
                         "lean": 0.25 if slot == PLAYER else 0.55, "owner": -1,
                         "age": clock - float(col["born"][k]),
                         "spin": 1.5 if slot == PICKUP else 0.0, "bob": 0.0})

@@ -488,6 +488,20 @@ class EntityGame(Game):
     #: the walls ``[lo, hi]``.  None: nothing is predicted.
     PLAYER_LANE: int | None = None
     MOTION: dict[str, Any] | None = None
+    #: A platformer-style game offers the character tile set (``characters.py``): the page shows the tiles left of the
+    #: board, a tap chooses (a profile setting, ``avatar``), and the game draws its player as ``hero_mesh``.
+    CHARACTERS_ON = False
+    hero = "frog"
+
+    def set_hero(self, key) -> None:
+        from meowdoku import characters
+        if key in characters.CHARACTERS:
+            self.hero = str(key)
+
+    @property
+    def hero_mesh(self) -> str:
+        from meowdoku import characters
+        return characters.mesh_of(self.hero)
 
     def __init__(self, board_id: str = ""):
         super().__init__(board_id)
@@ -844,6 +858,10 @@ class EntityGame(Game):
         st["cells"] = ["floor"]
         st["marks"], st["hints"] = [], []
         st["entities"] = self.entities() if self.session.state is not None else []
+        if self.CHARACTERS_ON:
+            from meowdoku import characters
+            st["pieces"] = characters.tile_pieces(self.hero)
+            st["characters"] = {"chosen": self.hero, "keys": list(characters.CHARACTERS)}
         seconds, calls = self.session.last_round
         st["clock"] = {"tick_s": seconds, "law_calls": calls, "dt": float(self.session.dt)}
         st["status"] = self.describe()
@@ -888,7 +906,8 @@ class EntityGame(Game):
                                   if self.autopilot else [0.0] * 5)
             # the pilot's decisions, held and pending (law-time intervals: the page integrates them)
             st["you"]["pilot_intervals"] = self.law_pilot_intervals() if self.autopilot else []
-            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz"):
+            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz",
+                         "coy", "buf", "pf"):          # (coy/buf/pf: a platformer's coyote time, buffered press, last press)
                 # the land under it, the laser's reach, its place on a sphere
                 if name in self.session.columns:
                     st["you"][name] = float(col(name)[k])

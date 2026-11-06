@@ -22,14 +22,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from meowdoku.delve_rules import (
-    BUFFER, CLIMB, COYOTE, EMPTY, FALL_MAX, FOOT, GRAVITY, JUMP, JUMP2, JUMP_CUT, LADDER, ONEWAY, PLAYER_RX, PLAYER_RY,
+    BUFFER, CLIMB, COYOTE, EMPTY, FALL_MAX, FOOT, GRAVITY, HANG_SCALE, HANG_V, JUMP, JUMP2, JUMP_CUT, LADDER, ONEWAY, PLAYER_RX, PLAYER_RY,
     REACH, SOLID, SPEED, SPIKE, TAU)
-from meowdoku.entity_motion import damped_axis
+from meowdoku.entity_motion import damped_axis, vertical_axis
 
 PLAN_DT = 1.0 / 60.0                 # a step of the game's own tick; the law's ceiling is ``0.5 * TAU`` = 0.03
 PLAN_STEPS = 130
 Q = 2                                # standing places per tile (every half tile)
-DJ_HOLD = 0.45                       # the second press is held to the top of the rise
+# The repertoire's times are derived from the law, never typed: the rise of a held jump takes RISE_T (ordinary
+# gravity down to the hang band, scaled gravity through it), and the partial holds / the second press are fractions of it.
+RISE_T = (JUMP - HANG_V) / GRAVITY + HANG_V / (GRAVITY * HANG_SCALE)
+DJ_HOLD = 1.12 * RISE_T              # the second press is held to the top of the rise
 
 
 class Mirror:
@@ -55,29 +58,27 @@ class Mirror:
         row_b = np.floor(below)
         on_solid = (t(sl, below) == SOLID) | (t(sr, below) == SOLID)
         on_plank = ((t(sl, below) == ONEWAY) | (t(sr, below) == ONEWAY)) & (feet <= row_b + 0.06)
-        grounded = (on_solid | on_plank) & (vy >= -0.5)
+        grounded = (on_solid | on_plank) & (vy >= -0.05)
         in_ladder = t(x, y) == LADDER
         press = (fire > 0.0) | ((axy < -0.5) & ~in_ladder)
         press_edge = press & (s["pf"] <= 0.0)
         want_climb = in_ladder & ((np.abs(axy) > 0.2) | (s["climb"] > 0.5)) & (fire <= 0.0)
-        ground_jump = grounded | (s["coy"] > 0.0) | (s["climb"] > 0.5)
-        buf_n = np.where(press_edge, BUFFER, np.clip(s["buf"] - dt, 0.0, 9.0))
-        do_jump = (buf_n > 0.0) & ground_jump
-        dbl = press_edge & ~ground_jump & (s["air"] > 0.5) & ability
-        s["air"] = np.where(grounded | (s["climb"] > 0.5), 1.0, np.where(dbl, 0.0, s["air"]))
-        s["coy"] = np.where(grounded, COYOTE, np.where(do_jump | dbl, 0.0, np.clip(s["coy"] - dt, 0.0, 9.0)))
-        s["buf"] = np.where(do_jump, 0.0, buf_n)
-        climbing = want_climb & ~do_jump
-        vy_in = np.where(do_jump, -JUMP, np.where(dbl, -JUMP2, vy))
-        cut = np.where((vy_in < -JUMP_CUT) & ~press & ~do_jump & ~dbl, -JUMP_CUT, vy_in)
-        fall_free = np.clip(cut + GRAVITY * dt, -FALL_MAX, FALL_MAX)
-        fall = np.where(climbing, np.clip(axy, -1.0, 1.0) * CLIMB, fall_free)
+        stands = grounded | (s["climb"] > 0.5)
+        dbl = press_edge & ~(stands | (s["coy"] > 0.0)) & (s["air"] > 0.5) & ability
+        y_free, v_free, coy_f, buf_f, jumped = vertical_axis(
+            y, np.where(dbl, -JUMP2, vy), press.astype(float), s["pf"], stands.astype(float), s["coy"], s["buf"], dt,
+            GRAVITY, JUMP, JUMP_CUT, FALL_MAX, HANG_V, HANG_SCALE, COYOTE, BUFFER)
+        climbing = want_climb & ~(jumped > 0.5)
+        s["air"] = np.where(stands, 1.0, np.where(dbl, 0.0, s["air"]))
+        s["coy"] = np.where(dbl, 0.0, coy_f)
+        s["buf"] = buf_f
+        fall = np.where(climbing, np.clip(axy, -1.0, 1.0) * CLIMB, v_free)
         nx, ship_vx = damped_axis(x, vx, axis, -1.0, -3.0, self.w + 3.0, SPEED, TAU, REACH, dt)
         lead = nx + np.where(ship_vx >= 0.0, rx, -rx)
         hit_x = (t(lead, y - ry + 0.08) == SOLID) | (t(lead, y) == SOLID) | (t(lead, y + ry - 0.08) == SOLID)
         x1 = np.where(hit_x, x, nx)
         vx1 = np.where(hit_x, 0.0, ship_vx)
-        ny = y + fall * dt
+        ny = np.where(climbing, y + fall * dt, y_free)
         bottom = ny + ry
         row_land = np.floor(bottom)
         s_hit = (t(x1 - rx * FOOT, bottom) == SOLID) | (t(x1 + rx * FOOT, bottom) == SOLID)
@@ -122,7 +123,7 @@ def repertoire() -> list[Variant]:
         for hold in (0.05, 0.1, 0.2, 9.0):
             out.append(Variant(axis, run, True, hold))
     for axis, run in starts:
-        for hold in (0.235, 0.325):
+        for hold in (0.59 * RISE_T, 0.81 * RISE_T):
             for gap in (0.03, 0.09, 0.18, 0.30):          # released for a moment, pressed again
                 out.append(Variant(axis, run, True, hold, hold + 0.005 + gap))
     out += [Variant(-1, True, False, 0.0), Variant(1, True, False, 0.0), Variant(0, False, False, 0.0)]

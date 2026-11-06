@@ -1412,12 +1412,13 @@ function rebuildBoards(game) {
     : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
   state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
-  const trayFaces = game.powerups ? trayButtonFaces(game) : null;
+  const trayFaces = game.powerups ? trayButtonFaces(game) : game.characters ? characterFaces(game) : null;
   state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.size
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
-  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0 };
+  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
+                   x0: game.characters ? CHAR.left : 0 };         // (the tile set stands left of the board)
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
   if (game.scene && game.scene.terrain === true && !state.flat) {
     // The plate lies on the planet's curve: a fine grid of glass (it never
@@ -1452,9 +1453,11 @@ function camera() {
   // the board foreshortened and backs off a little more.
   // A free board is sized to the screen already, so it is framed tightly.
   const pad = state.game && state.game.board === "free" ? 0.5 : 1.2, slack = state.game && state.game.board === "free" ? 1.02 : 1.12;
-  const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width + pad) / (2 * aspect)) * slack;
+  const x0 = ext.x0 || 0;
+  const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width - x0 + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
-  const centre = declared && declared.target ? declared.target : [ext.width / 2, 0, extMidZ(ext)];
+  const lean = stageOf();                                           // a stage game: the plane rises behind the board
+  const centre = declared && declared.target ? declared.target : [(ext.width + x0) / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
   const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
@@ -1568,7 +1571,7 @@ function strikeGroups() {
 const HEADLIGHT = { inner: 9 * Math.PI / 180, outer: 18 * Math.PI / 180, intensity: 70, dip: 0.16, spread: 0.16 };
 function headlights(cam) {
   const game = state.game;
-  if (isWalker(game)) return [];               // a walker carries no headlights
+  if (isWalker(game) || !rocketGear(game)) return [];               // a walker carries no headlights
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive || !onPlanet()) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
   if (!ship) return [];
@@ -1582,6 +1585,56 @@ function headlights(cam) {
              spotDir: vdir, spotCone: cone };
   });
 }
+// THE SPOTLIGHT OF INTENT (``scene.spot``: a platformer's frog).  One cone, the SAME spot light the rocket's headlights
+// are (a ``spotDir`` / ``spotCone`` record in the light list), held in front of the character and aimed where the player
+// means to go: the control input (the stick; a held finger's side of the character; a press of the jump aims up),
+// else the velocity it has, smoothed over INTENT_TAU so it never snaps or flickers; with nothing to go on it keeps the
+// way it last pointed.  The game declares the cone (``inner``/``outer`` degrees, ``intensity``), how much of the
+// vertical velocity counts (``vy_weight``: a bouncing climber would swing the beam with every bounce) and a standing
+// ``bias`` (a climber means up).
+const INTENT_TAU = 0.18;
+const intent = { x: 1, y: 0, dirX: 1, dirY: 0, at: null };
+function intentSpot(cam, now) {
+  const game = state.game, cfg = game && game.scene && game.scene.spot;
+  if (!cfg || state.flat || game.input !== "realtime" || !game.you || !game.you.alive) return [];
+  const piece = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
+  const ship = pred.ship || game.you, m = game.predict || {}, c = controls();
+  if (!piece || !ship) return [];
+  // the intent this frame: input first, else the velocity it has
+  const steering = c.steer_x >= 0;
+  let ix = Math.abs(c.move_axis) > 0.05 ? c.move_axis
+    : steering ? Math.max(-1, Math.min(1, (c.steer_x - ship.x) / 1.5)) : (ship.vx || 0) / (m.speed || 8);
+  let iy = Math.abs(c.move_axis_y || 0) > 0.05 ? c.move_axis_y
+    : c.fire > 0 && m.vertical ? -1 : ((ship.vy || 0) / ((m.vertical && m.vertical.jump) || m.speed || 8)) * (cfg.vy_weight ?? 0.5);
+  iy += (cfg.bias || [0, 0])[1]; ix += (cfg.bias || [0, 0])[0];
+  const dt = intent.at == null ? 1 : Math.min(0.1, Math.max(0, now - intent.at)); intent.at = now;
+  const k = 1 - Math.exp(-dt / INTENT_TAU);
+  intent.x += (ix - intent.x) * k; intent.y += (iy - intent.y) * k;
+  const mag = Math.hypot(intent.x, intent.y);
+  if (mag > 0.12) { intent.dirX = intent.x / mag; intent.dirY = intent.y / mag; }          // (idle: keeps its last way)
+  // the character's drawn centre, and the aim in the world: along the intent in the stage plane (or the board), tilted in
+  // toward what it lights
+  const stage = stageOf(), zr = piece.z - viewY(now), xr = piece.x - viewX(now);
+  const tilt = (cfg.tilt ?? 32) * Math.PI / 180;
+  let at, flow, normal;
+  if (stage != null) {
+    const cL = Math.cos(stage), sL = Math.sin(stage);
+    flow = [intent.dirX, intent.dirY * -sL, intent.dirY * cL];                  // game +y runs down the plane: (0, -sinL, +cosL)
+    normal = [0, cL, sL];
+    const out = STAGE.front + (piece.size || 0.4) * 0.3;
+    at = [xr, stageHeight(stage, zr) + out * cL, zr + out * sL];
+  } else {
+    flow = [intent.dirX, 0, intent.dirY]; normal = [0, 1, 0];
+    at = [xr, TILE.height + 0.3, zr];
+  }
+  const lift = cfg.height ?? 1.1;
+  const pos = [at[0] + normal[0] * lift - flow[0] * 0.25, at[1] + normal[1] * lift - flow[1] * 0.25, at[2] + normal[2] * lift - flow[2] * 0.25];
+  const dir = norm(flow.map((v, i) => v * Math.cos(tilt) - normal[i] * Math.sin(tilt)));
+  const a = M.apply(cam.view, pos), b = M.apply(cam.view, [pos[0] + dir[0], pos[1] + dir[1], pos[2] + dir[2]]);
+  const vdir = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+  const cone = [Math.cos((cfg.inner ?? 14) * Math.PI / 180), Math.cos((cfg.outer ?? 30) * Math.PI / 180)];
+  return [{ view: a, colour: cfg.colour || [1.0, 0.94, 0.82], level: 0, intensity: cfg.intensity ?? 70, spotDir: vdir, spotCone: cone }];
+}
 // A bomb's blast lights the scene in its own glow colour (the game's
 // emissive palette entry for it), flaring and fading over its life.
 // MARKER LIGHTS on the player's rocket (aeronautic: red port wingtip, green
@@ -1590,7 +1643,7 @@ function headlights(cam) {
 // Not drawn from inside the cockpit.
 function markerLights(now) {
   const game = state.game;
-  if (isWalker(game)) return [];               // a walker has no wingtip lights or strobe: that is the rocket's
+  if (isWalker(game) || !rocketGear(game)) return [];               // a walker has no wingtip lights or strobe: that is the rocket's
   if (state.flat || state.camMode === "nose" || !game || game.input !== "realtime" || !game.predict || !game.you || !game.you.alive) return [];
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === game.predict.lane && p.removing == null);
   if (!ship) return [];
@@ -1903,7 +1956,7 @@ function drawReticle(now, drawLit) {
 }
 function drawShield(now, drawLit) {
   const game = state.game;
-  if (isWalker(game)) return;                  // (no rocket's shield bubble on a walker)
+  if (isWalker(game) || !rocketGear(game)) return;                  // (no rocket's shield bubble on a walker)
   if (state.camMode === "nose") return;             // first person: the eye is inside the shield
   if (state.flat || !game || game.input !== "realtime" || !game.you || !game.you.alive) return;
   const ship = [...state.pieces.values()].find((p) => p.entity && p.lane === (game.predict ? game.predict.lane : 0) && p.removing == null);
@@ -2403,7 +2456,19 @@ function trayButtonFaces(game) {
   }
   return faces;
 }
+// THE CHARACTER TILE SET (``game.characters``, characters.py): a column of glass cubes left of the board -- the power-up
+// tray's cubes and glyph pieces -- one per character; a tap on one chooses it (a profile setting, ``avatar``).
+const CHAR = { x: -0.95, top: 0.6, step: 1.0, cube: 0.9, cubeHeight: 0.8, left: -1.7 };
+function characterCentre(k) { return [CHAR.x, CHAR.top + Number(k) * CHAR.step]; }
+function characterFaces(game) {
+  const n = game.characters ? game.characters.keys.length : 0, material = state.materialIndex.traycube;
+  if (!n || material == null) return [];
+  const faces = [], h = CHAR.cube / 2;
+  for (let k = 0; k < n; k++) { const [x, z] = characterCentre(k); faces.push(...box(x - h, 0, z - h, x + h, CHAR.cubeHeight, z + h, material)); }
+  return faces;
+}
 function cellPosition(game, cell, rackPiece) {
+  if (typeof cell === "string" && cell.startsWith("char:")) { const [x, z] = characterCentre(cell.slice(5)); return [x, z, "tray"]; }
   if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
   if (typeof cell === "string" && cell.startsWith("hud:")) {
     const k = Number(cell.slice(4));
@@ -2428,6 +2493,9 @@ function cellPosition(game, cell, rackPiece) {
 // (``game.walk.route``: node ids); free walking cancels it, as in the law.
 const walk = { version: null, nodes: null, mat: null, slope: null, routeId: 0, path: null };
 const isWalker = (game = state.game) => !!(game && game.avatar === "walker");
+// The rocket's gear (shield bubble, marker lights, headlights) belongs to a rocket: a game whose character is a frog
+// declares ``scene.rocket = false`` and carries a SPOTLIGHT of intent instead (``scene.spot``, intentSpot below).
+const rocketGear = (game = state.game) => !(game && game.scene && game.scene.rocket === false);
 // (a walker has no rocket to sit in: the first-person cockpit is the ship's)
 const noseCam = () => state.camMode === "nose" && !isWalker();
 function fibonacciNodes(n) {          // roads.fibonacci_sphere: the nodes' places (the world's data, not physics)
@@ -2523,7 +2591,7 @@ function walkTap(e) {
 // integration step sizes) eases out over ~60 ms.
 const pred = { program: null, seq: 0, sent: [], closed: [], open: null, ship: null, offset: [0, 0], at: null, lane: null,
                shots: [], shotSeq: 0, lastShot: -10 };
-window.meowdokuDebug = { pred, get sock() { return sock; } };   // read-only inspection handle (play tests)
+window.meowdokuDebug = { pred, get sock() { return sock; }, get intent() { return intent; } };   // read-only inspection handle (play tests)
 const sameControls = (a, b) => Object.keys(a).every((k) => a[k] === b[k]);
 // ERROR SYNC never jumps the picture.  A correction (the server's word against
 // what is drawn) is eased away over a time that grows with its size -- a
@@ -2880,7 +2948,7 @@ function applySnapshot(view) {
     const birth = r.body ? null : birthOffset(r.owner, r.age, r.x, r.y, r.vx, r.vy, you, stamp);
     const piece = { id, entity: true, lane: r.lane, owner: r.owner === 65535 ? null : r.owner, sx: r.x, sz: r.y, x: r.x, z: r.y, vx: r.vx, vz: r.vy,
                     sh: r.z, h: r.z, vh: r.vz,
-                    tRecv: stamp, mesh: r.mesh, color: r.color, size: r.size, roll: r.roll, rollBase: r.roll, orient: r.orient, spin: r.spin, bob: r.bob, lean: r.lean,
+                    tRecv: stamp, mesh: r.mesh, color: r.color, size: r.size, roll: r.roll, rollBase: r.roll, orient: r.orient, scenery: r.scenery, spin: r.spin, bob: r.bob, lean: r.lean,
                     face: r.face, translucent: r.translucent, ribbon: r.ribbon, ground: r.ground, glow: r.glow,
                     t0: now, removing: null, seed: 0, birth };
     if (r.body) piece.body = BodyFlight.held(r, stamp);
@@ -3193,6 +3261,24 @@ function authorityText(game) {
 // never falls behind the server's view; a view far behind the page's (a new
 // run) is taken at once.
 const view = { x: 0, at: null };
+// THE PREDICTED BODY'S CONTACT with the scenery the server sent (a platformer's tiles: ``scenery`` pieces, each a
+// square card of half size ``size`` centred at the server's (sx, sz)): over a step of the body at ``x`` from ``y`` to
+// ``y1`` (``V``: the game's declared vertical motion -- the meshes it lands on / strikes, its half height ``ry`` and the
+// reach ``foot`` of its feet), the highest top the feet cross (``land``) and the lowest underside the head crosses
+// (``bump``, solid meshes only).  Only what the game declared is touched: contact itself stays the server's word.
+function sceneryContact(x, y, y1, V) {
+  let land = null, bump = null;
+  const feet0 = y + V.ry, feet1 = y1 + V.ry, head0 = y - V.ry, head1 = y1 - V.ry;
+  for (const p of state.pieces.values()) {
+    if (!p.scenery || p.removing != null || Math.abs(p.sx - x) >= p.size + V.foot) continue;
+    const solid = V.solid.includes(p.mesh), plank = V.oneway.includes(p.mesh);
+    if (!solid && !plank) continue;
+    const top = p.sz - p.size, under = p.sz + p.size;
+    if (top >= feet0 - 1e-6 && top <= feet1 && (land == null || top < land)) land = top;
+    if (solid && under <= head0 + 1e-6 && under >= head1 && (bump == null || under > bump)) bump = under;
+  }
+  return { land, bump };
+}
 // A ROOM-GRAPH GAME (``game.roomview``: the room's size in tiles).  The screen is a window ``game.width`` x
 // ``game.height`` tiles onto the room, centred on the player and clamped to the room (a room smaller than the
 // window is centred in it): the formula of delve_rules.camera_axis, on the ship the page draws.
@@ -3202,7 +3288,9 @@ function roomShip(game) {
   const ship = pred.ship || game.you;
   if (!ship) return null;
   const age = pred.ship && ship.at != null ? Math.min(0.1, Math.max(0, performance.now() / 1000 - ship.at)) : 0;
-  return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + (ship.vy || 0) * age };
+  // (a game that declares ``predict.vertical`` has its vertical motion stepped by the engine law already: no linear carry)
+  const carry = pred.ship && game.predict && game.predict.vertical ? 0 : (ship.vy || 0) * age;
+  return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + carry };
 }
 function roomView(now) {
   const game = state.game, rv = game && game.roomview;
@@ -3230,6 +3318,12 @@ function viewX(now) {
   }
   return view.x;
 }
+// A STAGE GAME's plane (``scene.stage``, see placeEntity): the lean of the plane the declaring game stands its bodies
+// on, and the plane's clearances above the floor slab (``base``: the tiles' half thickness, centred on the plane) and
+// between the tile layer and the layer of bodies in front of it (``front``).
+const stageOf = () => { const v = state.game && state.game.scene && state.game.scene.stage; return typeof v === "number" ? v : null; };
+const STAGE = { base: 0.17, front: 0.16 };
+const stageHeight = (lean, z) => TILE.height + STAGE.base + (state.extent.depth - z) * Math.tan(lean);
 const DEPTH_LIFT = 0.5, DEPTH_SCALE = [0.4, 1.8];       // exaggerated: small near the floor, large near the ceiling
 // A SERVER BODY IN THE PATCH (a spherical game: predict.patch).  The body is
 // carried on from the state the server sent -- by the engine's flight laws, as
@@ -3274,9 +3368,30 @@ function placeEntity(piece, now, x, z, mesh) {
   const lift = hRel == null || state.flat ? 0 : (piece.h || 0) * DEPTH_LIFT;
   const lean = state.flat ? 0 : piece.lean ?? 0.55, scale0 = piece.size * grow, scale = scale0 / mesh.extent * Math.max(s, 0.001);
   const land = piece.ground && !state.flat ? landHeight(x, z) : null;
+  // WHERE A CARD RESTS.  An entity is a thin extruded card (half-size ``scale0``, half-thickness ``thick * scale0``)
+  // leaned by ``lean``: it spans ``scale0 * sin(lean) + thick * scale0 * cos(lean)`` below its centre, so the centre
+  // stands that high for the lowest point to touch the surface (the card's thickness used to be left out, so the
+  // back of every card sank into the floor or into the tiles it stood among).
+  const thick = mesh.half[2] / mesh.half[1];
+  const stage = !state.flat && land == null ? stageOf() : null;
+  if (stage) {
+    // A STAGE GAME (``scene.stage`` = a lean): bodies stand on ONE backdrop plane leaning back by ``stage`` radians
+    // (height rises (depth - z) tan(stage) away from the camera, each card stretched by 1/cos along its slope so
+    // it covers its true size on the plane).  Tiles (``scenery``) are the plane's own layer, centred on it; every
+    // other body stands in front, its back face on the tiles' front face -- so a body's feet meet the tile it
+    // stands on, a body in front of a ladder never meets the ladder's volume, and no two cards are coplanar.
+    const cL = Math.cos(stage), sL = Math.sin(stage);
+    const out = piece.scenery ? 0 : STAGE.front + thick * scale0;
+    const h = stageHeight(stage, z) + y + lift;
+    let m = M.translate(x, h + out * cL, z + out * sL);
+    m = M.multiply(m, M.rotateY(piece.spin * now));
+    m = M.multiply(m, M.rotateX(-Math.PI / 2 + stage));
+    m = M.multiply(m, M.rotateZ(piece.roll));
+    return M.multiply(m, M.scale(scale, scale / cL, scale));
+  }
   let m = M.translate(x, state.flat ? TILE.height + FLAT_LIFT
                       : land != null ? land + scale0 * 0.35 - planetDrop(x, z)
-                      : TILE.height + scale0 * Math.sin(lean) + 0.04 + y + lift - planetDrop(x, z), z);
+                      : TILE.height + scale0 * (Math.sin(lean) + thick * Math.cos(lean)) + 0.01 + y + lift - planetDrop(x, z), z);
   m = M.multiply(m, M.rotateY(piece.spin * now));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean));
   m = M.multiply(m, M.rotateZ(piece.roll));
@@ -3603,11 +3718,11 @@ function applyState(game) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "roster" ? TOP.catSize : where === "tray" ? 0.4 : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "roster" ? TOP.catSize : where === "tray" ? (p.lit ? 0.5 : 0.4) : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
       if (where === "roster" && live.color !== p.color && p.lit) live.litAt = now;   // lit now: pop
-      live.mesh = p.mesh; live.color = p.color;
+      live.mesh = p.mesh; live.color = p.color; if (where === "tray") live.size = size;
     } else {
       state.pieces.set(key, { id: key, mesh: p.mesh, color: p.color, x, z, place: where, cellSize: cellSize || 1, size, t0: now, removing: null, seed: Math.random() * 6.28, from: null });
     }
@@ -3621,7 +3736,7 @@ function applyState(game) {
     const live = state.pieces.get(e.id);
     if (live && live.removing == null) Object.assign(live, { sx: e.x, sz: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color, size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, ground: !!e.ground });
     else state.pieces.set(e.id, { id: e.id, entity: true, lane: Number(String(e.id).split(":")[0]), sx: e.x, sz: e.y, x: e.x, z: e.y, vx: e.vx, vz: e.vy, sh: e.z || 0, h: e.z || 0, vh: e.vz || 0, tRecv: stamp, mesh: e.mesh, color: e.color,
-                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, lean: e.lean, t0: now, removing: null, seed: 0 });
+                                  size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, scenery: !!e.scenery, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   syncWalk(game);
@@ -3852,6 +3967,7 @@ function litPass(cam, now, casters, opts = {}) {
   bulbLights.push(...blastLights(cam, now));
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
+  bulbLights.push(...intentSpot(cam, now));
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -4299,6 +4415,11 @@ function hit(clientX, clientY) {
   const t = (TILE.height - near[1]) / (far[1] - near[1]); if (!(t >= 0)) return null;
   const x = near[0] + t * (far[0] - near[0]), z = near[2] + t * (far[2] - near[2]);
   for (const piece of game.pieces || []) {
+    if (piece.character) {
+      const [px, pz] = cellPosition(game, piece.cell);
+      if (Math.abs(x - px) < CHAR.cube / 2 && Math.abs(z - pz) < CHAR.cube / 2) return { kind: "character", character: piece.character, key: `char:${piece.character}` };
+      continue;
+    }
     if (!piece.power) continue;
     const [px, pz] = cellPosition(game, piece.cell);
     if (Math.hypot(x - px, z - pz) < 0.6) return { kind: "power", power: piece.power, key: `power:${piece.power}` };
@@ -4313,6 +4434,11 @@ function hit(clientX, clientY) {
 let press = null, clickTimer = null, lastClick = null, tap = null;
 canvas.addEventListener("pointerdown", (e) => {
   if (state.game && state.game.input === "realtime") {
+    const tile = state.game.characters ? hit(e.clientX, e.clientY) : null;
+    if (tile && tile.kind === "character") {                  // a character tile: choose it (kept in the profile)
+      if (state.game.characters.chosen !== tile.character) act({ type: "settings", values: { avatar: tile.character } }).catch(() => {});
+      return;
+    }
     if (isWalker()) { tap = { x: e.clientX, y: e.clientY, t: performance.now() }; return; }       // a walker is not steered by a held finger
     steer = boardPlane(e.clientX, e.clientY); canvas.setPointerCapture(e.pointerId); return;
   }
@@ -4824,6 +4950,8 @@ function fillPickers() {
     pred.travel = await TuringWasmProgram.load("travel.wasm", "travel.abi.json");
     pred.follow = await TuringWasmProgram.load("follow.wasm", "follow.abi.json");
     pred.bankTurn = await TuringWasmProgram.load("bank.wasm", "bank.abi.json");
+    pred.contact = sceneryContact;                                                  // (the vertical law's contact: below)
+    pred.vertical = await TuringWasmProgram.load("vertical.wasm", "vertical.abi.json");     // a platformer's vertical_axis
     // the sphere: flight (turn, air, advance) and the land's law
     pred.turn = await TuringWasmProgram.load("turn.wasm", "turn.abi.json");
     pred.advance = await TuringWasmProgram.load("advance.wasm", "advance.abi.json");

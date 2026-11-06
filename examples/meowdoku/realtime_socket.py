@@ -19,6 +19,7 @@ DELTA, little-endian:
                       f32 sync hint (the longest a faithful page may wait to check in),
                       f32 z, vz (the ship height above the board; 0 without a third axis),
                       f32 health (fraction; 0 for a game without health points),
+                      f32 coy, buf, pf (a platformer's coyote time, buffered press, last press; 0 elsewhere -- sent after the cannon mount),
                       f32 yaw, vyaw, spd, vspd (a spherical game's turn and
                       throttle axes; 0 elsewhere),
                       f32 map_u, map_v, map_gx, map_gy (the land under its
@@ -46,7 +47,8 @@ DELTA, little-endian:
                       bit3 ribbon: a lightning end, drawn as the bolt between a strike's two ends,
                       bit4 ground: sits on the land's relief, wherever it stands,
                       bit5 glow: a city light -- a glowing point, not a mesh,
-                      bit6 orient: drawn turned by its heading in the patch, which the page reads from the engine's sphere_heading),
+                      bit6 orient: drawn turned by its heading in the patch, which the page reads from the engine's sphere_heading,
+                      bit7 scenery: the stage a stage game's actors stand in front of (its tiles), drawn a layer behind them),
                       i16 lean*1000, u16 owner (65535: none -- the lane that
                       fired a projectile), f32 age (world seconds since it
                       spawned), f32 x, y, vx, vy, z, vz [bodies: u8 flight, f32 ux, uy, uz,
@@ -161,7 +163,7 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #:  11 = the header's pilot controls are followed by the tracking cannon:
 #:       f32 lock (the locked lane; 0 none), mount_yaw, mount_vyaw,
 #:       mount_pitch, mount_vpitch (the gun mount's offsets from the nose).
-PROTOCOL = 11
+PROTOCOL = 12
 
 def _pack_body(body: dict[str, Any]) -> bytes:
     """A body's flight state: u8 flight, f32 u (3), h (3), spd, turn."""
@@ -312,7 +314,7 @@ class SnapshotEncoder:
         self.sim, self.sim_clock = sim, clock
 
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBffffffffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBfffffffffffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),
@@ -324,7 +326,9 @@ class SnapshotEncoder:
                              float(you.get("bank", 0.0)), float(you.get("vbank", 0.0)), float(you.get("beam", 0.0)),
                              *(float(you.get(n, 0.0)) for n in ("ux", "uy", "uz", "hx", "hy", "hz")),
                              *(float(v) for v in (you.get("pilot") or [0.0] * 5)),
-                             *(float(you.get(n, 0.0)) for n in ("lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch")))]
+                             *(float(you.get(n, 0.0)) for n in ("lock", "mount_yaw", "mount_vyaw", "mount_pitch", "mount_vpitch")),
+                             # a platformer's coyote time, buffered press and last press (entity_motion.vertical_axis' state)
+                             *(float(you.get(n, 0.0)) for n in ("coy", "buf", "pf")))]
         intervals = sorted(you.get("pilot_intervals") or (), key=lambda r: r["seq"])
         if intervals and intervals[-1]["seq"] < self.pilot_sent:
             self.pilot_sent = 0                        # the law's counter began again
@@ -347,7 +351,7 @@ class SnapshotEncoder:
                                      (1 if entity.get("bob") else 0) | (2 if entity.get("face") else 0)
                                      | (4 if entity.get("translucent") else 0) | (8 if entity.get("ribbon") else 0)
                                      | (16 if entity.get("ground") else 0) | (32 if entity.get("glow") else 0)
-                                     | (64 if entity.get("orient") else 0),
+                                     | (64 if entity.get("orient") else 0) | (128 if entity.get("scenery") else 0),
                                      int(round(entity.get("lean", 0.55) * 1000)), 65535 if owner < 0 else owner,
                                      float(entity.get("age", 0.0)),
                                      record["x"], record["y"], record["vx"], record["vy"], record["z"], record["vz"]))

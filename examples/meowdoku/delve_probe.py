@@ -101,7 +101,7 @@ def supported(game: delve.Delve) -> bool:
     feet = y + PLAYER_RY
     row = int(np.floor(feet + 0.05))
     below = [tile_at(game, x + dx, feet + 0.05) for dx in (-0.27, 0.27)]
-    return abs(col(game, "vy")) < 0.5 and (SOLID in below or (ONEWAY in below and feet <= row + 0.06))
+    return -0.05 <= col(game, "vy") < 0.5 and (SOLID in below or (ONEWAY in below and feet <= row + 0.02))
 
 
 def place_of(game: delve.Delve):
@@ -144,14 +144,15 @@ def play_edge(game: delve.Delve, plan, src, edge, room_id: int | None = None) ->
                 ty = dst[2] + 0.5
                 if abs(y - ty) < 0.12 or game.room != room_id:
                     break
-                run(game, 0.0, 0.0, 1.0 if ty > y else -1.0, TICK)
+                # a climber keeps to the middle of its ladder (the head clears the ceiling's opening)
+                run(game, float(np.clip((dst[1] + 0.5 - x) * 4.0, -1.0, 1.0)), 0.0, 1.0 if ty > y else -1.0, TICK)
         settle(game, 0.15)
         return
     v: Variant = edge.variant
     sx = src[1] / 2.0 if src[0] == "s" else src[1] + 0.5
     sy = src[2] - PLAYER_RY - 1.0e-3 if src[0] == "s" else src[2] + 0.5
     teleport(game, room_id, sx, sy, vx=v.axis * SPEED if (v.run and src[0] == "s") else 0.0, climbing=src[0] == "l")
-    airborne, left_ladder = False, src[0] == "s"
+    airborne, left_ladder = False, False                       # (the plan arms a ladder grab once the body has left every ladder cell)
     for k in range(int(2.2 / TICK)):
         tt = k * TICK
         in_ladder = tile_at(game, col(game, "x"), col(game, "y")) == LADDER
@@ -282,6 +283,8 @@ def leave(game: delve.Delve, door: int, seconds: float = 4.0) -> bool:
     if d.side == "D" and d.oneway:
         axis, axy = 1.0, 0.0                                     # the exit place is left of the hole
     for _ in range(int(seconds / TICK)):
+        if d.side in ("U", "D") and not d.oneway:                # up or down a ladder: keep to its middle
+            axis = float(np.clip((d.a + 0.5 - col(game, "x")) * 4.0, -1.0, 1.0))
         run(game, axis, 0.0, axy, TICK)
         if game.room != room_id:
             return True

@@ -311,6 +311,15 @@ def export_assets(out: Path) -> dict:
                 pack(name, *largest_component(verts, normals))
             except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
                 print(f"[export] {name} mesh skipped: {error}", flush=True)
+    # The character tile set of the platformer-style games (characters.py): the player's chosen sprite.
+    from meowdoku.characters import EMOJI as HERO_EMOJI
+    for name, glyph in HERO_EMOJI.items():
+        if name not in meshes:
+            try:
+                verts, normals = token_mesh(glyph, "Segoe UI Emoji", "normal", depth_ratio=0.3, outline_subdivisions=1)
+                pack(name, *largest_component(verts, normals))
+            except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
+                print(f"[export] {name} mesh skipped: {error}", flush=True)
     # Boardwalk's own glyphs (the track's tiles and its racers).
     from meowdoku.boardwalk import EMOJI as BOARDWALK_EMOJI
     for name, glyph in BOARDWALK_EMOJI.items():
