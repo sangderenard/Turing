@@ -46,6 +46,7 @@ from meowdoku.scroller import BulletScroller  # noqa: E402
 from meowdoku.platformer import Platformer  # noqa: E402
 from meowdoku.sidescroller import SideScroller  # noqa: E402
 from meowdoku.tilequest import TileQuest  # noqa: E402
+from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 
@@ -73,7 +74,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "side_scroller", "tilequest"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "side_scroller", "tilequest", "boardwalk"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -122,6 +123,8 @@ class Table:
             self.game = SideScroller(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "tilequest":
             self.game = TileQuest(aspect=float(payload.get("aspect") or 0.0))
+        elif kind == "boardwalk":
+            self.game = Boardwalk(aspect=float(payload.get("aspect") or 0.0))
         else:
             raise ValueError(f"unknown game {kind!r}")
         return self.state()
