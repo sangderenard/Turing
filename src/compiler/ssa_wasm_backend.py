@@ -641,9 +641,24 @@ class WasmCoreArtifact:
 
 #: Scalar externs the repository's imported LLVM kernels call, and the one
 #: Wasm instruction that spells each exactly.
+# The module lane's unary math, spelled as the LLVM lane spells it
+# (ssa_llvm_backend ``_UNARY`` / the ``unary_double`` scalar table): an f64
+# operand through the f64 instruction.  ``math.floor`` of a float lowers to
+# ``floor`` with an integer result (Python's floor returns int): the f64
+# instruction, then the exact truncation the cast lane uses (the value is
+# already integral, so truncation is exact).  The floor of an integer is the
+# integer itself, as the LLVM lane spells it.
+_WASM_UNARY_OPS = {
+    "Sqrt": 0x9F, "sqrt": 0x9F, "Floor": 0x9C, "floor": 0x9C,
+    "Ceil": 0x9B, "ceil": 0x9B, "Trunc": 0x9D, "trunc": 0x9D,
+}
+_WASM_INTEGRAL_UNARY = {"floor", "ceil", "trunc"}
 _WASM_UNARY_INTRINSICS = {
     "llvm.fabs.f64": 0x99, "llvm.ceil.f64": 0x9B, "llvm.floor.f64": 0x9C,
     "llvm.trunc.f64": 0x9D, "llvm.sqrt.f64": 0x9F,
+    # rint in the default rounding mode is round-half-to-even: f64.nearest
+    # exactly (tensor ``round`` lowers to llvm.rint since 2026-11-05).
+    "llvm.rint.f64": 0x9E, "llvm.roundeven.f64": 0x9E,
 }
 #: libm functions WebAssembly has no instruction for.  They are imported
 #: from the host under module ``math`` with this arity, the same way the
@@ -1675,6 +1690,27 @@ def emit_ssa_module_to_wasm_core(
                 "i32": _I32_COMPARISONS,
             }[kind][operation])
             builder.local_set(slot_for(env, instruction.res, "i32"))
+            return
+        if operation in _WASM_UNARY_OPS and len(instruction.args) == 1 and instruction.res is not None:
+            source_kind = value_kind(instruction.args[0])
+            target_kind = value_kind(instruction.res) or "f64"
+            if source_kind in ("i32", "i64") and operation.casefold() in _WASM_INTEGRAL_UNARY:
+                if push_as(env, instruction.args[0], target_kind, operation):
+                    builder.local_set(slot_for(env, instruction.res, target_kind))
+                return
+            if target_kind not in ("f64", "i64", "i32"):
+                shortfalls.append(WasmEmissionShortfall(
+                    operation, f"{env.function.name}: unary {operation} into {target_kind} has no exact Wasm kind",
+                ))
+                return
+            if not push_as(env, instruction.args[0], "f64", operation):
+                return
+            builder.raw(_WASM_UNARY_OPS[operation])
+            if target_kind == "i64":
+                builder.raw(0xB0)                 # i64.trunc_f64_s (exact: the value is integral)
+            elif target_kind == "i32":
+                builder.raw(0xAA)                 # i32.trunc_f64_s
+            builder.local_set(slot_for(env, instruction.res, target_kind))
             return
         if operation in TENSOR_OPERATION_SCALAR_SPELLING or operation == "equal":
             shapes = tuple(
