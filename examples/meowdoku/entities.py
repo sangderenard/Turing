@@ -654,7 +654,8 @@ class EntityGame(Game):
             for axis in ("yaw", "spd", "bank"):         # a spherical game's turn, throttle and bank
                 if axis in self.session.columns:
                     st["you"][axis], st["you"]["v" + axis] = float(col(axis)[k]), float(col("v" + axis)[k])
-            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam"):  # the land under it, the laser's reach
+            for name in ("map_u", "map_v", "map_gx", "map_gy", "beam", "ux", "uy", "uz", "hx", "hy", "hz"):
+                # the land under it, the laser's reach, its place on a sphere
                 if name in self.session.columns:
                     st["you"][name] = float(col(name)[k])
         return st

@@ -470,7 +470,7 @@ function depthTexture(unit, exported) {
 }
 // The colour stack holds two layers of STACK_SIZE: 0 the terrain (upsampled
 // once here), 1 the projection glass's broadcast (rendered every frame).
-const STACK_SIZE = 512, BROADCAST_LAYER = 1;
+const STACK_SIZE = 1024, BROADCAST_LAYER = 1;
 function upsample(rgba, n, size) {
   if (n === size) return rgba;
   const out = new Uint8Array(size * size * 4), s = n / size;
@@ -499,6 +499,7 @@ function uploadTerrainTexture(unit, n, rgba) {
     return tex;
   }
   const tex = gl.createTexture();
+  if (unit === 6) state.depthStack = { tex, n };
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
   gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
   gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
@@ -633,12 +634,150 @@ function reliefMesh(exported) {
 // and the colour/depth UVs are rewritten every frame -- the DepthMesh's own
 // grid and strips, re-read, so relief, colour and depth turn together.
 const TURN_LAND = { travel: [0, 0], c: 1, s: 0 };
+// THE GLOBE'S LAND (a game that publishes predict.sphere): the engine's
+// terrain_height law (compiled) sampled once over the whole sphere into a
+// LAND.W x LAND.H latitude/longitude table; each frame the land's grid nodes
+// are mapped from the patch to their points on the sphere about the ship's
+// predicted place and heading, and read from the table -- height for the
+// mesh, height and raw noise for its colour -- so the land is the sphere's,
+// wherever you fly, with no seam and no flat map.
+const LAND = { W: 720, H: 360, height: null, raw: null, frame: null };
+function bakeLand() {
+  if (LAND.height || !pred.terrain) return !!LAND.height;
+  const { W, H } = LAND, height = new Float32Array(W * H), raw = new Float32Array(W * H), started = performance.now();
+  for (let j = 0; j < H; j++) {
+    const lat = -Math.PI / 2 + (j / (H - 1)) * Math.PI, cl = Math.cos(lat), sl = Math.sin(lat);
+    for (let i = 0; i < W; i++) {
+      const lon = -Math.PI + (i / W) * 2 * Math.PI;
+      const r = pred.terrain.invoke({ x: cl * Math.cos(lon), y: cl * Math.sin(lon), z: sl });
+      height[j * W + i] = r.height; raw[j * W + i] = r.raw;
+    }
+  }
+  LAND.height = height; LAND.raw = raw;
+  residentLand();
+  console.info(`[meow] globe's land baked from terrain_height: ${W}x${H} in ${Math.round(performance.now() - started)} ms`);
+  return true;
+}
+// The whole sphere's colour (colour stack layer 0) and relief (depth stack),
+// as longitude x latitude images, uploaded ONCE: the land's vertices carry
+// their latitude/longitude as UVs and the shader slices the resident sphere.
+function residentLand() {
+  const sphere = state.game && state.game.predict && state.game.predict.sphere;
+  if (!sphere) return;
+  const paint = (size, withColour) => {
+    const img = new Uint8Array(size * size * 4);
+    for (let j = 0; j < size; j++) {
+      const lat = -Math.PI / 2 + ((j + 0.5) / size) * Math.PI, cl = Math.cos(lat), sl = Math.sin(lat);
+      for (let i = 0; i < size; i++) {
+        const lon = -Math.PI + ((i + 0.5) / size) * 2 * Math.PI;
+        const [h, raw] = sampleLand(cl * Math.cos(lon), cl * Math.sin(lon), sl), o = (j * size + i) * 4;
+        if (withColour) landColour(h, raw, sphere.sea, sphere.relief, img, o);
+        else { const d = Math.round(255 * h / sphere.relief); img[o] = d; img[o + 1] = d; img[o + 2] = 255; img[o + 3] = 0; }
+      }
+    }
+    return img;
+  };
+  gl.activeTexture(gl.TEXTURE0 + 5); gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.colourStack);
+  gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, STACK_SIZE, STACK_SIZE, 1, gl.RGBA, gl.UNSIGNED_BYTE, paint(STACK_SIZE, true));
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  if (state.depthStack) {
+    const n = state.depthStack.n;
+    gl.activeTexture(gl.TEXTURE0 + 6); gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.depthStack.tex);
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, n, n, 1, gl.RGBA, gl.UNSIGNED_BYTE, paint(n, false));
+    gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  }
+}
+function sampleLand(x, y, z) {
+  const { W, H } = LAND;
+  const lon = Math.atan2(y, x), lat = Math.asin(Math.max(-1, Math.min(1, z)));
+  const fx = ((lon + Math.PI) / (2 * Math.PI)) * W, fy = ((lat + Math.PI / 2) / Math.PI) * (H - 1);
+  const i0 = Math.floor(fx), j0 = Math.min(H - 2, Math.max(0, Math.floor(fy))), tx = fx - i0, ty = Math.min(1, Math.max(0, fy - j0));
+  const a = ((i0 % W) + W) % W, b = (a + 1) % W, r0 = j0 * W, r1 = (j0 + 1) * W;
+  const lerp = (T) => (T[r0 + a] + (T[r0 + b] - T[r0 + a]) * tx) * (1 - ty) + (T[r1 + a] + (T[r1 + b] - T[r1 + a]) * tx) * ty;
+  return [lerp(LAND.height), lerp(LAND.raw)];
+}
+// the patch point (X right, Y ahead of the ship) on the sphere about (u0, h0)
+function patchToSphere(X, Y, f) {
+  const d = Math.hypot(X, Y);
+  if (d < 1e-9) return f.u0;
+  const a = d / f.radius, c = Math.cos(a), s = Math.sin(a);
+  return [0, 1, 2].map((k) => f.u0[k] * c + ((f.h0[k] * Y + f.r0[k] * X) / d) * s);
+}
+function landColour(height, raw, sea, relief, out, o) {
+  // Bands blended smoothly across their edges (smoothstep over a narrow
+  // width), so coastlines and snowlines interpolate instead of stepping.
+  const ss = (a, b, x) => { const k = Math.max(0, Math.min(1, (x - a) / (b - a))); return k * k * (3 - 2 * k); };
+  const mixc = (p, q, k) => [p[0] + (q[0] - p[0]) * k, p[1] + (q[1] - p[1]) * k, p[2] + (q[2] - p[2]) * k];
+  const deep = Math.min(1, Math.max(0, (sea - raw) / 0.12));
+  const water = [0.12 - 0.08 * deep, 0.32 - 0.16 * deep, 0.52 - 0.18 * deep];
+  const f = height / relief;
+  const grass = [0.22 + 0.12 * Math.min(1, f / 0.32), 0.48 - 0.08 * Math.min(1, f / 0.32), 0.2];
+  let land = mixc([0.78, 0.72, 0.5], grass, ss(0.01, 0.05, f));                 // sand into grass
+  land = mixc(land, [0.47, 0.42, 0.36], ss(0.28, 0.4, f));                       // into rock
+  land = mixc(land, [0.9, 0.91, 0.94], ss(0.62, 0.74, f));                       // into snow
+  const c = mixc(water, land, ss(sea - 0.004, sea + 0.004, raw));               // the shore
+  out[o] = c[0] * 255; out[o + 1] = c[1] * 255; out[o + 2] = c[2] * 255; out[o + 3] = 255;
+}
+function sphereLand(relief, now) {
+  const game = state.game, patch = game.predict && game.predict.patch, sphere = game.predict && game.predict.sphere;
+  if (!patch || !sphere || !relief.surface || !bakeLand()) return false;
+  const ship = (pred.ship && pred.ship.ux != null ? pred.ship : game.you) || {};
+  if (ship.ux == null) return false;
+  const u0 = [ship.ux, ship.uy, ship.uz], h0 = [ship.hx, ship.hy, ship.hz];
+  const r0 = [h0[1] * u0[2] - h0[2] * u0[1], h0[2] * u0[0] - h0[0] * u0[2], h0[0] * u0[1] - h0[1] * u0[0]];
+  const frame = LAND.frame = { u0, h0, r0, radius: sphere.radius, relief: sphere.relief, sea: sphere.sea };
+  const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], y0 = origin[1];
+  const ext = state.extent, R = PLANET.radius, step = relief.step;
+  const cols = Math.round(relief.span[0] / step) + 1, rows = Math.round(relief.span[1] / step) + 1;
+  const hgt = new Float32Array(cols * rows), lonU = new Float32Array(cols * rows), latV = new Float32Array(cols * rows);
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const k = j * cols + i, X = x0 + i * step - patch.cx, Y = patch.cy - (z0 + j * step);
+    const p = patchToSphere(X, Y, frame);
+    hgt[k] = sampleLand(p[0], p[1], p[2])[0];
+    // the node's place on the resident sphere image (longitude, latitude)
+    lonU[k] = (Math.atan2(p[1], p[0]) + Math.PI) / (2 * Math.PI);
+    latV[k] = (Math.asin(Math.max(-1, Math.min(1, p[2]))) + Math.PI / 2) / Math.PI;
+  }
+  const S = relief.surface;
+  for (let v = 0; v < S.count; v++) {
+    const k = S.node[v], i = k % cols, j = (k - i) / cols;
+    const bx = x0 + S.base[v * 3], bz = z0 + S.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
+    S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + hgt[k] - (dx * dx + dz * dz) / (2 * R); S.pos[v * 3 + 2] = bz;
+    const hl = hgt[j * cols + Math.max(0, i - 1)], hr = hgt[j * cols + Math.min(cols - 1, i + 1)];
+    const hu = hgt[Math.max(0, j - 1) * cols + i], hd = hgt[Math.min(rows - 1, j + 1) * cols + i];
+    const nx = -(hr - hl) / (2 * step) + dx / R, nz = -(hd - hu) / (2 * step) + dz / R, len = Math.hypot(nx, 1, nz);
+    S.nrm[v * 3] = nx / len; S.nrm[v * 3 + 1] = 1 / len; S.nrm[v * 3 + 2] = nz / len;
+    S.uv[v * 2] = lonU[k]; S.uv[v * 2 + 1] = latV[k];
+  }
+  // a triangle straddling the date line: lift its low longitudes by a turn
+  // (the image repeats), so no triangle smears across the whole sphere
+  for (let v = 0; v < S.count; v += 3) {
+    const a = S.uv[v * 2], b = S.uv[v * 2 + 2], c = S.uv[v * 2 + 4];
+    if (Math.max(a, b, c) - Math.min(a, b, c) > 0.5)
+      for (let w = 0; w < 3; w++) if (S.uv[(v + w) * 2] < 0.5) S.uv[(v + w) * 2] += 1.0;
+  }
+  [S.pos, S.nrm, S.uv].forEach((data, b) => { gl.bindBuffer(gl.ARRAY_BUFFER, S.buffers[b]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, data); });
+  if (relief.shadowSurface) {
+    const C = relief.shadowSurface;
+    for (let v = 0; v < C.count; v++) {
+      const bx = x0 + C.base[v * 3], bz = z0 + C.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
+      const p = patchToSphere(bx - patch.cx, patch.cy - bz, frame), [h] = sampleLand(p[0], p[1], p[2]);
+      C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + h - SHADOW_SINK - (dx * dx + dz * dz) / (2 * R); C.pos[v * 3 + 2] = bz;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, C.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, C.pos);
+  }
+  return true;
+}
 const SHADOW_SINK = 0.07;
 // The land's height under board point (x, z): the relief map read at the
 // same turned, travelling coordinate the land is drawn with, on the land's
 // own base (terrainOrigin) -- what a ground piece stands on.
 function landHeight(x, z) {
   const relief = TERRAIN.relief, game = state.game, patch = game && game.predict && game.predict.patch;
+  if (relief && patch && LAND.frame && LAND.height) {
+    const p = patchToSphere(x - patch.cx, patch.cy - z, LAND.frame);
+    return terrainOrigin(relief)[1] + sampleLand(p[0], p[1], p[2])[0];
+  }
   if (!relief || !relief.map || !patch) return null;
   const c = TURN_LAND.c, s = TURN_LAND.s;
   const X = x - patch.cx, Y = patch.cy - z;
@@ -764,7 +903,7 @@ function drawTerrain(now, drawLit) {
     if (game.predict && game.predict.patch && relief.surface) {
       // the land turns and travels under the ship: one continuous surface
       TERRAIN.scroll = 0;
-      if (turnRelief(relief, now)) { drawLit(relief.surface.vao, relief.surface.count, M.identity(), state.materialIndex.terrain); return; }
+      if (sphereLand(relief, now) || turnRelief(relief, now)) { drawLit(relief.surface.vao, relief.surface.count, M.identity(), state.materialIndex.terrain); return; }
     }
     if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
@@ -1892,7 +2031,7 @@ const syncEase = (error, frame) => 1 - Math.exp(-frame / (0.06 + 0.12 * Math.min
 function stepShip(ship, input, seconds, motion) {
   for (let left = seconds; left > 1e-9;) {
     const dt = Math.min(PRED_STEP, left); left -= dt;
-    const yawBefore = ship.yaw;
+    const yawBefore = ship.yaw, zBefore = ship.z || 0;
     for (const [axis, pos, vel, move, target] of [["x", "x", "vx", "move_axis", "steer_x"], ["y", "y", "vy", "move_axis_y", "steer_y"],
                                                   ["z", "z", "vz", "move_axis_z", "steer_z"],
                                                   ["yaw", "yaw", "vyaw", "move_axis", null], ["spd", "spd", "vspd", "move_axis_y", null],
@@ -1929,6 +2068,16 @@ function stepShip(ship, input, seconds, motion) {
       ship.yaw = pred.bankTurn.invoke({ yaw: ship.yaw, bank: ship.bank, level: motion.bank_turn.level,
                                         gain: motion.bank_turn.gain, dt }).yaw_next;
     }
+    // The ship's flight on the sphere: the engine's sphere_turn by this
+    // step's yaw, then sphere_advance by its speed in the air at its height.
+    if (motion.sphere && pred.advance && pred.turn && pred.air && ship.ux != null) {
+      const t = pred.turn.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: ship.hx, hy: ship.hy, hz: ship.hz,
+                                   angle: (ship.yaw ?? 0) - (yawBefore ?? 0) });
+      const air = pred.air.invoke({ z: zBefore, fall: motion.sphere.air[0], gain: motion.sphere.air[1] }).factor;
+      const a = pred.advance.invoke({ ux: ship.ux, uy: ship.uy, uz: ship.uz, hx: t.hx_next, hy: t.hy_next, hz: t.hz_next,
+                                      distance: (ship.spd || 0) * dt * air, radius: motion.sphere.radius });
+      ship.ux = a.ux_next; ship.uy = a.uy_next; ship.uz = a.uz_next; ship.hx = a.hx_next; ship.hy = a.hy_next; ship.hz = a.hz_next;
+    }
     // The land under the ship: the engine's ground_travel, as the law steps it.
     if (motion.travel && pred.travel && ship.map_gy != null) {
       const g = pred.travel.invoke({ u: ship.map_u, v: ship.map_v, gx: ship.map_gx, gy: ship.map_gy,
@@ -1960,7 +2109,10 @@ function reconcile(game) {
   const adoptable = game.predict.adopt_axes || ["x", "y"];
   const declared = [["x", "vx"], ["y", "vy"], ["z", "vz"], ["yaw", "vyaw"], ["spd", "vspd"], ["bank", "vbank"]].filter(([pos]) => game.predict[pos] && adoptable.includes(pos));
   const land = game.predict.travel && pred.ship && pred.ship.map_u != null
-    ? Math.hypot(pred.ship.map_u - ship.map_u, pred.ship.map_v - ship.map_v) : 0;
+    ? Math.hypot(pred.ship.map_u - ship.map_u, pred.ship.map_v - ship.map_v)
+      + (game.predict.sphere && pred.ship.ux != null
+         ? game.predict.sphere.radius * Math.hypot(pred.ship.ux - ship.ux, pred.ship.uy - ship.uy, pred.ship.uz - ship.uz) : 0)
+    : 0;
   const error = pred.ship ? Math.hypot(...declared.map(([pos]) => pred.ship[pos] - ship[pos]), land) : Infinity;
   const tolerance = Number(game.predict.adopt ?? 0);
   if (pred.ship && error <= tolerance) {
@@ -2133,6 +2285,7 @@ function applySnapshot(view) {
   you.yaw = f32(); you.vyaw = f32(); you.spd = f32(); you.vspd = f32(); you.at = performance.now() / 1000;
   you.map_u = f32(); you.map_v = f32(); you.map_gx = f32(); you.map_gy = f32();
   you.bank = f32(); you.vbank = f32(); you.beam = f32();
+  you.ux = f32(); you.uy = f32(); you.uz = f32(); you.hx = f32(); you.hy = f32(); you.hz = f32();
   for (let n = u8(); n > 0; n--) { const len = u8(); sock.names.push(new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset + o, len))); o += len; }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
@@ -2174,7 +2327,7 @@ function applySnapshot(view) {
   reconcile(frameGame);
 }
 
-const SNAPSHOT_PROTOCOL = 6;           // realtime_socket.PROTOCOL
+const SNAPSHOT_PROTOCOL = 7;           // realtime_socket.PROTOCOL
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
   let payload = { type: "tick", ...controls() };
@@ -2194,7 +2347,9 @@ function sendTick(game) {
                        z: pred.ship.z || 0, vz: pred.ship.vz || 0,
                        yaw: pred.ship.yaw || 0, vyaw: pred.ship.vyaw || 0, spd: pred.ship.spd || 0, vspd: pred.ship.vspd || 0,
                        map_u: pred.ship.map_u || 0, map_v: pred.ship.map_v || 0, map_gx: pred.ship.map_gx || 0,
-                       map_gy: pred.ship.map_gy ?? -1, bank: pred.ship.bank ?? 0, vbank: pred.ship.vbank ?? 0 };
+                       map_gy: pred.ship.map_gy ?? -1, bank: pred.ship.bank ?? 0, vbank: pred.ship.vbank ?? 0,
+                       ux: pred.ship.ux ?? 0, uy: pred.ship.uy ?? 0, uz: pred.ship.uz ?? 1,
+                       hx: pred.ship.hx ?? 0, hy: pred.ship.hy ?? 1, hz: pred.ship.hz ?? 0 };
   }
   if (sock.open) {
     sock.outstanding++;
@@ -3664,6 +3819,11 @@ function fillPickers() {
     pred.travel = await TuringWasmProgram.load("travel.wasm", "travel.abi.json");
     pred.follow = await TuringWasmProgram.load("follow.wasm", "follow.abi.json");
     pred.bankTurn = await TuringWasmProgram.load("bank.wasm", "bank.abi.json");
+    // the sphere: flight (turn, air, advance) and the land's law
+    pred.turn = await TuringWasmProgram.load("turn.wasm", "turn.abi.json");
+    pred.advance = await TuringWasmProgram.load("advance.wasm", "advance.abi.json");
+    pred.air = await TuringWasmProgram.load("air.wasm", "air.abi.json");
+    pred.terrain = await TuringWasmProgram.load("terrain.wasm", "terrain.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
   fillPickers();
   if (rememberedName()) await setPlayer(rememberedName());

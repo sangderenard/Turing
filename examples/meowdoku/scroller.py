@@ -88,7 +88,7 @@ import sys
 from pathlib import Path
 
 from meowdoku.entities import EntityGame, LawPiece, as_float, block_hits, first_of, noise
-from meowdoku.entity_motion import bank_turn, damped_axis, ground_travel
+from meowdoku.entity_motion import air_gain, bank_turn, damped_axis, ground_travel
 from meowdoku import sphere_motion as sm
 from src.common.tensors import AbstractTensor
 
@@ -282,6 +282,10 @@ THROTTLE, THROTTLE_TAU = 4.0, 0.2
 #: (``move_axis_z``) climbs and dives; THROTTLE (``move_axis_y``).
 BANK_MAX, ROLL_RATE, ROLL_TAU, ROLL_REACH = 0.9, 2.6, 0.12, 0.3
 BANK_GAIN = 2.2
+#: AIR: density falls with height (1 / (1 + AIR_FALL * z)); a craft (the
+#: ship, the aliens) meets less resistance up there and flies up to AIR_GAIN
+#: faster on the same throttle (entity_motion.air_gain).
+AIR_FALL, AIR_GAIN = 0.35, 0.5
 RUDDER_RATE = 0.9
 #: FIRE MODES (``fire_mode``): CONTINUOUS (a fast stream: reload x 0.55),
 #: AUTO (repeats while held), BURST (BURST_N volleys per press, reload x
@@ -708,7 +712,9 @@ def scroller_step(lane, slot, rx, ry, rz,
     # Everything flies its great circle at its speed; the player's height and
     # the enemies' routine are set, the rest climb at their own rates.
     moving = (live1 & playing) | is_star | is_station
-    step = where(moving, spd1 * dt, zero)
+    craft = is_player | is_enemy
+    thin_air = air_gain(z1, zero + AIR_FALL, zero + AIR_GAIN)[0]
+    step = where(moving, spd1 * dt * where(craft, thin_air, 1.0), zero)
     # Missiles fly engine_toy's trajectory law in their own frame (forward,
     # height, side): the law's horizontal advance is flown along the heading.
     mx, mz_, my, mvx, mvz_, mvy = trajectory_step(zero, z1, zero, spd1, vz1, zero, dt, MISSILE_MASS, MISSILE_DIAMETER,
@@ -936,7 +942,8 @@ def scroller_step(lane, slot, rx, ry, rz,
     live3 = live2 & ~gone
     # A destroyed craft sometimes drops a pickup (into the first free pickup
     # lane, where the first of the step's kills died) and always leaves smoke.
-    killer = first_of(killed, lane)
+    # (destroying friendly AA is not rewarded: no pickup from it, no points)
+    killer = first_of(killed & ~is_station, lane)
     K = f(killer)
     ku = ((K * u2[0]).sum(), (K * u2[1]).sum(), (K * u2[2]).sum())
     kh = ((K * h2[0]).sum(), (K * h2[1]).sum(), (K * h2[2]).sum())
@@ -1272,7 +1279,10 @@ class BulletScroller(EntityGame):
                 "patch": {"cx": self.width / 2.0, "cy": PLAYER_Y, "radius": RADIUS},
                 # the land's travel law (entity_motion.ground_travel): stepped
                 # here, predicted by the page, adopted with the ship
-                "travel": ["map_u", "map_v", "map_gx", "map_gy"],
+                "travel": ["map_u", "map_v", "map_gx", "map_gy", "ux", "uy", "uz", "hx", "hy", "hz"],
+                # the ship's flight on the sphere (entity_motion.sphere_turn /
+                # air_gain / sphere_advance) and the land's law (terrain_height)
+                "sphere": {"radius": RADIUS, "air": [AIR_FALL, AIR_GAIN], "relief": 0.75, "sea": 0.48},
                 # Twin shots from the nose on a reload, as the law fires them.
                 "weapon": {"muzzles": [[-0.2, -MUZZLE], [0.2, -MUZZLE]], "velocity": [0.0, -SHOT_SPEED],
                            "reload": RELOAD, "max_in_flight": SHOTS[1] - SHOTS[0], "mesh": "bolt", "color": "bolt",

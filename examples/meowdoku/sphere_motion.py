@@ -59,18 +59,18 @@ def right_of(u, h):
 
 
 def advance(u, h, distance, radius):
-    """Fly ``distance`` along the great circle through ``u`` with heading ``h``."""
-    a = distance / radius
-    c, s = a.cos(), a.sin()
-    u1 = normalized(add(scale(u, c), scale(h, s)))
-    h1 = tangent(u1, add(scale(h, c), scale(u, -s)))
-    return u1, h1
+    """Fly ``distance`` along the great circle through ``u`` with heading ``h``
+    (entity_motion.sphere_advance: the law the page compiles too)."""
+    from meowdoku.entity_motion import sphere_advance
+    r = sphere_advance(u[0], u[1], u[2], h[0], h[1], h[2], distance, radius)
+    return (r[0], r[1], r[2]), (r[3], r[4], r[5])
 
 
 def turn(u, h, angle):
-    """Rotate the heading about the local vertical; positive ``angle`` turns right."""
-    c, s = angle.cos(), angle.sin()
-    return tangent(u, add(scale(h, c), scale(right_of(u, h), s)))
+    """Rotate the heading about the local vertical; positive ``angle`` turns
+    right (entity_motion.sphere_turn: the law the page compiles too)."""
+    from meowdoku.entity_motion import sphere_turn
+    return sphere_turn(u[0], u[1], u[2], h[0], h[1], h[2], angle)
 
 
 def bearing(u, h, g):
