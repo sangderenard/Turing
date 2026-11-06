@@ -1208,6 +1208,26 @@ Object.assign(state, {
 });
 const TILE = { height: 0.16, inset: 0.11, gap: 0.03 };
 const GLASS = { thickness: 0.22, margin: 0.6 };
+// Meowdoku's colour and surface finish live at the material-table seam.
+// A future posed cat mesh can use the same "cat" material as today's extrusion.
+const MEOW_LOOK = {
+  background: [0.89, 0.94, 0.94],
+  ink: [0.10, 0.16, 0.23],
+  cat: [0.16, 0.29, 0.43],
+  x: [0.19, 0.20, 0.32],
+  mouse: [0.30, 0.24, 0.39],
+};
+function meowMaterial(name, rgb) {
+  if (name.endsWith("@hint")) return [mix(rgb, [0.18, 0.63, 0.49], 0.28), { roughness: 0.62 }];
+  if (name.endsWith("@sel")) return [mix(rgb, [1.0, 0.72, 0.27], 0.32), { roughness: 0.53 }];
+  if (name.startsWith("region")) return [mix(rgb, [1, 1, 1], 0.24), { roughness: 0.82 }];
+  if (name === "cat") return [MEOW_LOOK.cat, { roughness: 0.48 }];
+  if (name === "x") return [MEOW_LOOK.x, { roughness: 0.88 }];
+  if (name === "mouse") return [MEOW_LOOK.mouse, { roughness: 0.72 }];
+  if (name === "count") return [MEOW_LOOK.ink, { roughness: 0.84 }];
+  if (name === "spent") return [[0.43, 0.47, 0.50], { roughness: 0.9 }];
+  return [rgb, { roughness: 0.58 }];
+}
 
 // ---------------------------------------------------------------- materials from the palette
 function uploadMaterials(game) {
@@ -1222,11 +1242,16 @@ function uploadMaterials(game) {
   for (const name of names) {
     const rgb = colour(game.palette[name]);
     const glow = game.emissive || {};
-    records.push([name, rgb, glow[name] ? { emission: glow[name] } : {}]);
-    records.push([`${name}@hint`, mix(rgb, [0.45, 0.95, 0.45], 0.55), glow["@hint"] ? { emission: glow["@hint"] } : {}]);
-    records.push([`${name}@sel`, mix(rgb, [1.0, 0.85, 0.3], 0.6), {}]);
+    for (const [role, tint, emission] of [[name, rgb, glow[name]],
+      [`${name}@hint`, mix(rgb, [0.45, 0.95, 0.45], 0.55), glow["@hint"]],
+      [`${name}@sel`, mix(rgb, [1.0, 0.85, 0.3], 0.6), null]]) {
+      const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint) : [tint, {}];
+      records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
+    }
   }
-  records.push(["glass", [0.80, 0.90, 1.0], { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : [0.80, 0.90, 1.0],
+    game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
+      : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
@@ -3570,7 +3595,8 @@ function draw(ms) {
   const now = ms / 1000; state.time = now;
   const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  gl.viewport(0, 0, w, h); gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const clear = state.game?.game === "meowdoku" ? MEOW_LOOK.background : [0.085, 0.085, 0.1];
+  gl.viewport(0, 0, w, h); gl.clearColor(...clear, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
@@ -3606,7 +3632,7 @@ function draw(ms) {
   if (plateOn) renderBroadcast(now, casters);
   const lensK = plateOn ? 0 : lensStrength();
   gl.bindFramebuffer(gl.FRAMEBUFFER, lensK > 0 ? lensTarget(w, h).fbo : null); gl.viewport(0, 0, w, h);
-  if (lensK > 0) { gl.clearColor(0.085, 0.085, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
+  if (lensK > 0) { gl.clearColor(...clear, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); }
   drawSky(cam, now);                                // into whatever target the scene draws in (the lens's, or the screen)
   litPass(cam, now, casters, { plate: plateOn });
   drawCityLights(cam);
