@@ -185,7 +185,11 @@ def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu):
     fn = (kn * delta - cn * vn).clamp(0.0, 1.0e9)
     tx, ty = -ny, nx
     vt = vrx * tx + vry * ty - spin_slip
-    ft = -(mu * fn) * (vt * (1.0 / VREF)).tanh()
+    # tanh of the slip speed over VREF.  An emitted grain meets the plume at ~1.5 m/s, so the argument
+    # reaches ~75; a tanh built from exp(2x) (Metal/Apple shaders, fast-math) is inf/inf = NaN past
+    # |x| ~ 44 in f32, and one NaN force removes the grain and every grain it touches.  tanh(20) is 1
+    # to 1e-17, so clamping the argument changes no f64 result and keeps every f32 lane finite.
+    ft = -(mu * fn) * (vt * (1.0 / VREF)).clamp(-20.0, 20.0).tanh()
     return fn * nx + ft * tx, fn * ny + ft * ty, ft
 
 
@@ -208,11 +212,16 @@ def make_law(n: int, active: int | None = None):
             them holds an arena slot, 4 bytes per id each, for all of them)."""
             t = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
             a = as_float(age >= t)
-            # only particles inside the grid take part (parked ones, and the dilute spray above the
-            # grid's top, get the cell past the end: sorted last, in nobody's block)
+            # The step a particle is emitted its stored state is still the parked zero state (x = y = 0,
+            # i.e. a ghost on the floor at the basin's centre); the integrator below replaces it with the
+            # nozzle state.  A ghost must take part in NO contact -- on either side -- or each emission
+            # kicks the grains resting at the centre of the floor.  ``placed`` is "has a real state".
+            placed = a * (1.0 - as_float((age - DT) < t))
+            # only particles inside the grid take part (parked ones, the ghost, and the dilute spray above
+            # the grid's top, get the cell past the end: sorted last, in nobody's block)
             ix = ((x + half) * (1.0 / CELL)).floor().clamp(0.0, cols - 1.0)
             iy = ((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, rows - 1.0)
-            return t, a, ix, iy, a * as_float(y < rows * CELL + FLOOR_Y)
+            return t, a, ix, iy, placed * as_float(y < rows * CELL + FLOOR_Y)
         t_emit, act, cx, cy, gridded = frame()
         kc = AbstractTensor.where(gridded > 0.5, cy * float(cols) + cx, cy * 0.0 + float(cells))
         ki = pid
@@ -311,7 +320,12 @@ def make_law(n: int, active: int | None = None):
                 vyj = vy.index_select(0, j)
                 wj = w.index_select(0, j)
                 rj, mj, muj = neighbour_props(j)
-                dx = x - xj
+                # coincident centres (two ids at one point) have no contact normal; they are pushed apart
+                # along a direction fixed by the ids (antisymmetric, so equal and opposite) instead of
+                # dividing a zero separation
+                same = as_float((x - xj).abs() + (y - yj).abs() < 1.0e-9)
+                side = as_float(pid > j) - as_float(pid < j)
+                dx = x - xj + same * side * 1.0e-4
                 dyy = y - yj
                 dist = (dx * dx + dyy * dyy + 1.0e-12).sqrt()
                 delta = (radius + rj - dist) * valid

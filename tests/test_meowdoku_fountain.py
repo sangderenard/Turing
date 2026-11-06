@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "examples"))
 
 from meowdoku import fountain as F  # noqa: E402
 from meowdoku import fountain_build as B  # noqa: E402
+from src.common.tensors import AbstractTensor  # noqa: E402
 
 
 def test_the_size_ladder_reaches_ten_million_without_padding():
@@ -220,6 +221,38 @@ def test_server_game_declares_a_compute_product_sizes_and_count_only_images():
     assert game.state()["has_image"]
     with pytest.raises(ValueError):
         game.do({"type": "fountain_image", "count": 5})
+
+
+def _one_step(columns, n=256):
+    piece = F.make_piece(n)
+    return F.run_frames(piece, columns, 1)
+
+
+def test_an_id_emitted_this_step_is_not_a_ghost_in_the_pile():
+    """The step an id is emitted its stored state is still the parked zero state, i.e. a body at the
+    floor's centre.  It must take part in no contact, or each emission kicks the grains resting there.
+    Id 0 (emit time 0) is emitted at age 0; id 1 rests overlapping the origin, already placed."""
+    columns = F.initial_columns(256, mix=1.0)
+    columns["age"][1] = 1.0
+    columns["x"][1], columns["y"][1] = 0.01, 0.0145
+    out = _one_step(columns)
+    assert abs(out["vy"][1] - (-F.G * F.DT)) < 1e-4 and abs(out["vx"][1]) < 1e-4
+
+
+def test_slip_friction_stays_finite_for_any_slip_speed_and_coincident_ids_separate():
+    """An emitted grain meets the plume at ~1.5 m/s, so slip / VREF reaches ~75 and a tanh built from
+    exp(2x) overflows f32 (NaN) past ~44: the argument is clamped.  Two ids at one point are pushed
+    apart along an id-fixed direction instead of dividing a zero separation."""
+    t = AbstractTensor.get_tensor([0.0, 5.0, -5.0])
+    fx, fy, ft = F._contact(t + 0.01, t * 0.0, t * 0.0 + 1.0, t, t, t * 0.0, t * 0.0 + 1.0, t * 0.0 + 1.0, t * 0.0 + 0.3)
+    assert np.isfinite(np.asarray(ft)).all()
+    assert abs(float(np.asarray(ft)[1]) + 0.3 * float(np.asarray(fy)[1])) < 1e-6      # saturated: |ft| = mu * fn
+    columns = F.initial_columns(256, mix=1.0)
+    columns["age"][2:4] = 1.0
+    columns["x"][2:4], columns["y"][2:4] = 0.05, 0.5
+    out = _one_step(columns)
+    assert np.isfinite(out["vx"]).all() and np.isfinite(out["vy"]).all()
+    assert out["vx"][2] * out["vx"][3] < 0                                            # equal and opposite, by id
 
 
 def test_the_merge_exchange_network_sorts_every_length():

@@ -69,7 +69,9 @@ export function sampleRasterAt(raster, X, Y, count, into) {
 // size.  The uniforms are their own small `head` buffer.  `ref(slot)` spells "lane<k>[base + i]".
 const PACK_WGSL = `
 __LANES__
-@group(0) @binding(__PTSB__) var<storage, read_write> pts: array<f32>;
+// u32 words, not f32: the colour word is rgba8 bits (alpha 255 puts it in NaN/inf patterns as a float), and a
+// store of a NaN pattern through an f32 may be canonicalised on some GPUs (Apple's), losing the colour and alpha
+@group(0) @binding(__PTSB__) var<storage, read_write> pts: array<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {
   let j = g.x + g.y * grid.x * 64u;
@@ -80,10 +82,10 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) gr
   let vy = __VY__;
   let rest = (vx * vx + vy * vy) < __REST2__;
   let c = pack4x8unorm(vec4<f32>(__R__, __G__, __B__, 1.0));
-  pts[4u * j] = __X__;
-  pts[4u * j + 1u] = __Y__;
-  pts[4u * j + 2u] = bitcast<f32>(c);
-  pts[4u * j + 3u] = select(0.0, select(100.0, 200.0, rest) + __RAD__ * 1000.0, live);
+  pts[4u * j] = bitcast<u32>(__X__);
+  pts[4u * j + 1u] = bitcast<u32>(__Y__);
+  pts[4u * j + 2u] = c;
+  pts[4u * j + 3u] = bitcast<u32>(select(0.0, select(100.0, 200.0, rest) + __RAD__ * 1000.0, live));
 }`;
 
 class GpuProduct {
