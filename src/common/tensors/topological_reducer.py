@@ -6200,6 +6200,10 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             return (value, reads, tuple(dict.fromkeys(proofs))) if with_proof else (value, reads)
 
         if site is None:
+            if with_bounds:
+                # No authored site, so no guard bounds: the half-bound form
+                # returns four members like its other exits.
+                return None, None, (), ()
             return answer(interval, ())
         site_span = source_span_cell(unit, site_id) if site_ast is None else None
         if site_ast is not None:
@@ -6983,7 +6987,9 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     from ...compiler.concordance_declarations import (
         PROCESS_GRAPH_OPERANDS, SOURCE_OPERATOR_KIND,
     )
-    from ...compiler.concorded_literals import origin_cell
+    from ...compiler.concorded_literals import (
+        operator_handler as _operator_handler, origin_cell,
+    )
     from ...transmogrifier.ssa_registry import Handler
     pending_powers = [
         (unit, int(node_id))
@@ -7013,7 +7019,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 continue
             origin = origin_cell(book, node_cell)
             kind = book.latest_ref(SOURCE_OPERATOR_KIND, (origin,))
-            if kind is None or Handler(book.page(SOURCE_OPERATOR_KIND).cell(
+            if kind is None or _operator_handler(book.page(SOURCE_OPERATOR_KIND).cell(
                 kind.row, kind.column,
             )) != Handler.Pow:
                 pending_powers.remove((unit, node_id))
@@ -8456,6 +8462,7 @@ def _normalize_lexical_values(
         navigation_table = build_class_navigation_table(graph)
         graph.G.graph["_class_navigation_table"] = navigation_table
     parameter_class_names: dict[str, str] = {}
+    parameter_contract_declared: set[str] = set()
     parameter_numeric_descriptors: dict[str, NumericFeatureDescriptor] = {}
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
@@ -8721,6 +8728,18 @@ def _normalize_lexical_values(
             parameter_class_names[argument.arg] = (
                 primitive_class_identities[str(declared_class_identity)]
             )
+        if argument.arg not in parameter_class_names and annotation is None:
+            # A ProgramABI record binding declares an unannotated formal's
+            # class as an annotation (``state: PieceState``) would: the
+            # contract binds (function pattern, parameter) to a record whose
+            # identity names exactly one class this source defines.
+            contract_class = contract_bound_parameter_class(
+                graph, statement.name, method_owner, argument.arg,
+                known_class_identities,
+            )
+            if contract_class is not None:
+                parameter_class_names[argument.arg] = contract_class
+                parameter_contract_declared.add(argument.arg)
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
@@ -9734,9 +9753,20 @@ def _normalize_lexical_values(
                     numeric_descriptor.limbs
                     if numeric_descriptor is not None else 1
                 ),
-                source=f"parameter annotation {name}",
+                source=(
+                    f"program ABI record binding {name}"
+                    if name in parameter_contract_declared
+                    else f"parameter annotation {name}"
+                ),
                 provenance=_Derived(tuple(
-                    cell for cell in (annotation_cell, input_cell, argument_span)
+                    cell for cell in (
+                        annotation_cell, input_cell, argument_span,
+                        *(
+                            (contract_class_declaration_cell(
+                                class_identity),)
+                            if name in parameter_contract_declared else ()
+                        ),
+                    )
                     if cell is not None
                 )),
             )
@@ -22454,6 +22484,59 @@ def _post_source_tensor_shape_dimensions(graph: Any) -> None:
             )))),
             mode=Mode.CONCORD,
         )
+
+
+def contract_bound_parameter_class(
+    graph: Any, function_name: str, method_owner: str | None,
+    parameter: str, known_class_identities: Iterable[str],
+) -> str | None:
+    """The class a ProgramABI record binding declares for ``parameter``.
+
+    The extraction contract binds (function pattern, parameter) to a record
+    whose identity names a class the submitted source defines.  That is the
+    declaration an annotation would make; it is read from the compilation's
+    declarative ``program_abi`` receipt, never from a Python object.  Only an
+    identity naming exactly one known class declares a class.
+    """
+
+    from ...compiler.extraction_contract import binding_names_function
+
+    receipt = graph.G.graph.get("program_abi") or {}
+    records = dict(receipt.get("records") or {})
+    matched = [
+        binding for binding in (receipt.get("bindings") or ())
+        if str(binding.get("parameter")) == str(parameter)
+        and binding_names_function(
+            str(binding.get("function")), str(function_name), method_owner,
+        )
+    ]
+    identities = {
+        str(dict(records.get(str(binding.get("record"))) or {}).get("identity")
+            or binding.get("record"))
+        for binding in matched
+    }
+    if len(identities) != 1:
+        return None
+    text = next(iter(identities))
+    known = {str(name) for name in known_class_identities}
+    matches = {
+        name for name in known
+        if name == text or name.rsplit(".", 1)[-1] == text.rsplit(".", 1)[-1]
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def contract_class_declaration_cell(class_identity: str) -> Any:
+    """The CLASS_DECLARATION cell of a submitted class, when unique."""
+
+    from ...compiler.concordance_declarations import CLASS_DECLARATION
+
+    book = current_identity_book()
+    rows = tuple(
+        row for row in book.page(CLASS_DECLARATION).rows()
+        if str(row[1]) == str(class_identity)
+    )
+    return book.latest_ref(CLASS_DECLARATION, rows[0]) if len(rows) == 1 else None
 
 
 def reduce_abstract_tensor_topology(graph: Any) -> Any:

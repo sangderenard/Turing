@@ -16,7 +16,9 @@ from .identity_concordance import Derived, Mode, current_identity_book
 def ingest_source_control_ir(source_graph, preference=None):
     for entry in source_graph.function_table:
         graph = getattr(entry, 'graph', None)
-        if graph is not None:
+        # A retained definition the source pursuit never activated has no
+        # executable control program (see ``finalize_resource_admission_demands``).
+        if graph is not None and graph.G.graph.get('source_pursuit_active', True):
             ingest_function_control(graph, preference)
 
 

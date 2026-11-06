@@ -33963,7 +33963,18 @@ def lower_control_sections_to_ssa(
                     graph_cell,
                 ) if cell is not None)
                 if value_cell is None or record_cell is None or contract_cell is None:
-                    raise ConcordanceRefusal("record field input lacks exact binding causes")
+                    missing = tuple(
+                        name for name, cell in (
+                            ("member value", value_cell),
+                            ("record descriptor", record_cell),
+                            ("value type ABI", contract_cell),
+                        ) if cell is None
+                    )
+                    raise ConcordanceRefusal(
+                        "record field input lacks exact binding causes: "
+                        f"missing {', '.join(missing)} for value {int(value_id)} "
+                        f"(field {field_names[int(slot)]!r})"
+                    )
                 book.post(
                     CONTROL_VALUE_BINDING, row,
                     ControlBinding(value_cell, BindingKind.FIELD_INCUMBENT),

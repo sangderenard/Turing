@@ -23,6 +23,11 @@ def ingest_thread_table(source_graph):
                if getattr(e, "graph", None) is not None}
     for parent_ref, parent_entry in entries.items():
         parent = parent_entry.graph
+        # A retained definition the source pursuit never activated builds no
+        # executable control program, so its create sites own no thread body
+        # (llvm_dt_system's ``Subcycle.start`` beside ``dt_system_over``).
+        if not parent.G.graph.get("source_pursuit_active", True):
+            continue
         for create, data in parent.G.nodes(data=True):
             operation, process_cell = process_operation(parent, int(create))
             if operation is None or operation[0] != "thread_create":

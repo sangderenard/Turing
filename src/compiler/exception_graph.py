@@ -87,6 +87,16 @@ def finalize_resource_admission_demands(source_graph):
     for row in sorted(book.page(SOURCE_RESOURCE_ADMISSION_DEMAND).rows(), key=repr):
         demand = book.latest_ref(SOURCE_RESOURCE_ADMISSION_DEMAND, row)
         graph = by_scope.get(row[0])
+        # A definition the source pursuit did not activate is retained for
+        # lookup only (``SOURCE_PURSUIT_ACTIVATION`` has no row for it); no
+        # executable control program is built from it, so a resource scope
+        # inside it has no native consequence to refuse.  Program:
+        # llvm_dt_system's ``Subcycle`` (a threading ``with self.condition``)
+        # rides in the submitted module text beside ``dt_system_over``, which
+        # never reaches it.  Whole-source compilation activates every
+        # definition, so it keeps every refusal.
+        if graph is not None and not graph.G.graph.get("source_pursuit_active", True):
+            continue
         source, _activity, _calls = book.page(SOURCE_RESOURCE_ADMISSION_DEMAND).cell(
             demand.row, demand.column,
         )

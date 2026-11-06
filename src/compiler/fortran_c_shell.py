@@ -27879,6 +27879,7 @@ def _class_surface_ssa_program(
                     dict(linked_value_abi_by_graph.get(
                         id(source_graph), {}
                     ).get(int(source_id)) or {}),
+                    descriptor_tree(source_graph, int(source_id)),
                     tuple(
                         (
                             str(upstream_graph.graph.get("function_name") or ""),

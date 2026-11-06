@@ -726,6 +726,11 @@ def plan_region_to_ssa_instrs(
                 )
             elif isinstance(literal, float):
                 dtype_of[int(item.outputs[0])] = "float64"
+            elif literal is Ellipsis or isinstance(literal, slice):
+                # A basic-index literal is metadata for the access it feeds:
+                # a handle, never an element type (the planner records the
+                # same ``opaque_ref`` for it).
+                dtype_of[int(item.outputs[0])] = "opaque_ref"
         if item.outputs and opcode in predicate_ops:
             dtype_of[int(item.outputs[0])] = "bool"
         elif item.outputs and opcode in integer_result_ops:

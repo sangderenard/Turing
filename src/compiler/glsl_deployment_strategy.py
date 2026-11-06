@@ -8125,9 +8125,12 @@ def _build_shell_hierarchy_plan(
                             graph, int(value_id), receivers[0],
                         )
                     )
-            if isinstance(attributes.get("value"), slice):
-                # A slice literal is index metadata for the load it feeds:
-                # a handle, as a record identity is, not an element type.
+            if isinstance(attributes.get("value"), slice) or (
+                attributes.get("value") is Ellipsis
+            ):
+                # A slice (or ``...``) literal is index metadata for the load
+                # it feeds: a handle, as a record identity is, not an element
+                # type.
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
@@ -22552,9 +22555,40 @@ def _publish_conditional_tuple_members(
     """Publish position-matched tuple members as control-owned merge values."""
     from ..common.tensors.topological_reducer import (
         node_identity_cell,
-        post_derived_node_identity,
+        post_derived_node_identity as _post_derived_node_identity,
     )
     from .concordance_declarations import PLANNER_TENSOR_SPECIALIZATION
+
+    def post_derived_node_identity(graph, value_id, sources, *, stage, owner=None):
+        """Post a minted node's identity from its real sources and, when it
+        has an owner, bind its source activity to that owner's.
+
+        A merge member, presence value or inactive filler is DERIVED from
+        sources that run in different arms (different activity contracts), so
+        ``control_activity.binding`` could not infer one.  The node runs where
+        its owner runs: the owner's SOURCE_ACTIVITY_BINDING row is posted for
+        the node DERIVED from the owner's row and the node's own cell.
+        """
+        cell = _post_derived_node_identity(graph, value_id, sources, stage=stage)
+        if owner is None:
+            return cell
+        from .concordance_declarations import SOURCE_ACTIVITY_BINDING
+        from .control_activity import binding as _activity_binding
+        from .identity_concordance import (
+            Derived as _OwnerDerived, Mode as _OwnerMode,
+            current_identity_book as _owner_book,
+        )
+
+        points, owner_binding = _activity_binding(graph, int(owner))
+        if points is not None:
+            node_cell = node_identity_cell(graph, int(value_id))
+            _owner_book().post(
+                SOURCE_ACTIVITY_BINDING, (owner_binding.row[0], node_cell), points,
+                stage=stage,
+                provenance=_OwnerDerived((owner_binding, node_cell, *points)),
+                mode=_OwnerMode.CONCORD,
+            )
+        return cell
 
     changed = False
     memberships = _branch_compartments(graph)
@@ -22747,6 +22781,7 @@ def _publish_conditional_tuple_members(
                         node_identity_cell(graph, absent_id),
                     ),
                     stage=PLANNER_TENSOR_SPECIALIZATION,
+                    owner=node_id,
                 )
                 _set_operands(graph, comparison, [
                     (present_id, "lhs"), (absent_id, "rhs"),
@@ -22768,6 +22803,7 @@ def _publish_conditional_tuple_members(
                         node_identity_cell(graph, absent_id),
                     ),
                     stage=PLANNER_TENSOR_SPECIALIZATION,
+                    owner=absent_id,
                 )
                 presence_arms = [None, None]
                 presence_arms[present_arm] = comparison
@@ -22793,6 +22829,7 @@ def _publish_conditional_tuple_members(
                         for source, _role in presence_edges
                     ),
                     stage=PLANNER_TENSOR_SPECIALIZATION,
+                    owner=node_id,
                 )
                 _set_operands(
                     graph, presence_member, presence_edges,
@@ -22836,6 +22873,8 @@ def _publish_conditional_tuple_members(
                         node_identity_cell(graph, int(present_leaf)),
                     ),
                     stage=PLANNER_TENSOR_SPECIALIZATION,
+                    # The filler exists only on the absent arm.
+                    owner=absent_id,
                 )
                 inactive.append(value_id)
             leaves[1 - present_arm] = tuple(inactive)
@@ -22871,6 +22910,7 @@ def _publish_conditional_tuple_members(
                     for source, _role in edges
                 ),
                 stage=PLANNER_TENSOR_SPECIALIZATION,
+                owner=node_id,
             )
             _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
             _append_operand(graph, int(node_id), member, "elts")
@@ -22926,6 +22966,7 @@ def _publish_conditional_tuple_members(
         post_derived_node_identity(
             graph, node, tuple(cell for cell in cells if cell is not None),
             stage=PLANNER_TENSOR_SPECIALIZATION,
+            owner=origin,
         )
         return node
 
@@ -22946,6 +22987,7 @@ def _publish_conditional_tuple_members(
             graph, member,
             tuple(node_identity_cell(graph, source) for source, _ in edges),
             stage=PLANNER_TENSOR_SPECIALIZATION,
+            owner=conditional_id,
         )
         _set_operands(graph, member, edges, cause=_AGGREGATE_MEMBER)
         return member
@@ -23027,6 +23069,7 @@ def _publish_conditional_tuple_members(
                     graph, comparison,
                     (arm_cell, node_identity_cell(graph, int(none_node))),
                     stage=PLANNER_TENSOR_SPECIALIZATION,
+                    owner=node_id,
                 )
                 _set_operands(graph, comparison, [
                     (int(arm_id), "lhs"), (int(none_node), "rhs"),
@@ -38670,8 +38713,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                             "receiver_class": (
                                 None if receiver_class is None
                                 else str(receiver_class)
-                            ),
-                            "why_opaque": why,
+                            ),                            "why_opaque": why,
                             "has_state_output": (
                                 effect.state_output_id is not None
                             ),

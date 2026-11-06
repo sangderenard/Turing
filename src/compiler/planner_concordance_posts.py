@@ -143,7 +143,7 @@ def materialized_sequence_row_dtype(
         )
         if binding is not None
         and (binding_fact := binding_page.cell(binding.row, binding.column)) is not None
-        and binding_fact.authored
+        and getattr(binding_fact, "authored", False)   # an Unresolved cell binds nothing
         and int(binding_fact.value_id) == source_id
     )
     if (

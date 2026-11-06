@@ -28,6 +28,18 @@ def origin_cell(book, cell):
     return cell
 
 
+def operator_handler(kind):
+    """The ``Handler`` a recorded operator kind names, or None.
+
+    The page also records kinds that are not SSA handlers (``compare:Gt``);
+    they are not integer literal operators, so they name no handler.
+    """
+    try:
+        return Handler(kind)
+    except ValueError:
+        return None
+
+
 def literal_from_identity(book, identity, _seen=()):
     """Read one exact literal of a canonical value and its read-scope forks.
 
@@ -72,7 +84,7 @@ def literal_from_identity(book, identity, _seen=()):
             edges = book.latest_ref(PROCESS_GRAPH_OPERANDS, current.row)
             if kind is None or edges is None:
                 continue
-            if Handler(book.page(SOURCE_OPERATOR_KIND).cell(kind.row, kind.column)) != Handler.Neg:
+            if operator_handler(book.page(SOURCE_OPERATOR_KIND).cell(kind.row, kind.column)) != Handler.Neg:
                 continue
             operands = tuple(parent for parent, role in
                              book.page(PROCESS_GRAPH_OPERANDS).cell(edges.row, edges.column)
@@ -133,13 +145,19 @@ def literal(graph, node, seen=()):
     cell = book.latest_ref(PROVEN_LITERAL, (str(graph.G.graph.get('function_name')), int(node)))
     if cell is not None:
         return book.page(cell.page).cell(cell.row, cell.column), (cell,)
-    source = origin_cell(book, node_cell)
+    try:
+        source = origin_cell(book, node_cell)
+    except ValueError:
+        # A compiler-made node (a merge, a relabelled fork of several
+        # sources) has no single authored operator, hence no literal to
+        # derive; ``literal_from_identity`` above treats it the same way.
+        return MISSING, ()
     if source.page != INGESTION_VALUE:
         return MISSING, ()
     kind_cell = book.latest_ref(SOURCE_OPERATOR_KIND, (source,))
     if kind_cell is None:
         return MISSING, ()
-    handler = Handler(book.page(SOURCE_OPERATOR_KIND).cell(kind_cell.row, kind_cell.column))
+    handler = operator_handler(book.page(SOURCE_OPERATOR_KIND).cell(kind_cell.row, kind_cell.column))
     operation = _INTEGER_OPERATORS.get(handler)
     if operation is None:
         return MISSING, ()
