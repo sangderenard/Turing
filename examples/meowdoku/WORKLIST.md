@@ -7,13 +7,18 @@ deploy to 8766 as soon as work lands.
 ## In flight (workers)
 
 - **Fountain stage A:** nozzle energy (the ymax 3.7 vs 2.6 ballistic ceiling), symmetry, particle conservation, energy-aware settle, basin fills the screen aspect. The "graph forward WASM compile failed (5)" build error must be fixed.
-- **Autopilots for the d-pad and map games** (delve, platformer, side scroller, tilequest, boardwalk, worldwalk):
-  - weights and controls per system; a choice of token net or simple graph net;
-  - idle background training by default on player records of any play;
-  - continuous span harvesting, weighted by effect on loss (no waiting for a game to end);
-  - gradient-free inference on the server;
-  - outcome-weighted self-play history used as training data in slow moments.
 - **Platformers** (platformer, side scroller, delve): better gravity law and z clipping.
+- **Platformer level generator:** an ice-climber style climb of wide floors, each reachable under the jump law (proved in a test). No impossible single-brick maps.
+
+## Autopilot follow-ups (the base landed in 727be7c2)
+
+- An autopilot for worldwalk (not yet declared).
+- A page control to pick the token net or the graph net (only the server action `pilot_arch` exists now).
+- Better teachers:
+  - tilequest: rushing the nearest monster scores below standing still;
+  - delve: it dies in rooms and reaches the goal in about 1 of 6 seeds.
+- The platformer and side scroller students are far below their teachers (overfit): more data and DAgger rounds.
+- Verify the live, end-to-end demo handoff for the new games on 8766.
 
 ## Fountain queue (next, in order)
 
