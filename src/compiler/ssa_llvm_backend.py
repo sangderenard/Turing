@@ -540,6 +540,28 @@ def _host_target_lines() -> tuple[str, ...]:
     return lines
 
 
+def _target_declaration(module: _IRModule, symbol: str, declaration: str) -> str:
+    """A ``declare`` line as the module's build target spells it.
+
+    Native targets keep the declaration exactly.  A wasm32 target has no
+    libm, so each libm callee of ``ssa_wasm_backend._MATH_IMPORTS`` (the one
+    table the module lane imports and the page's ``TURING_MATH_IMPORTS``
+    supplies) is declared as an import from the host ``math`` module.
+    """
+
+    from .native_code_retention import build_target_from_metadata
+
+    target = build_target_from_metadata(module.metadata)
+    if target is None or target.architecture != "wasm32":
+        return declaration
+    from .ssa_wasm_backend import _MATH_IMPORTS
+
+    if symbol not in _MATH_IMPORTS:
+        return declaration
+    return (f'{declaration} "wasm-import-module"="math" '
+            f'"wasm-import-name"="{symbol}"')
+
+
 def _module_target_lines(module: _IRModule) -> tuple[str, ...]:
     """LLVM header owned by the module's verified build-target receipt."""
 
@@ -6614,7 +6636,8 @@ def _emit_repository_call_module(
         if symbol in definitions or symbol in declarations:
             continue
         if symbol in _LLVM_INTRINSIC_DECLARATIONS:
-            declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
+            declarations[symbol] = _target_declaration(
+                module, symbol, _LLVM_INTRINSIC_DECLARATIONS[symbol])
             symbol_origins[symbol] = ("intrinsic",)
             pending_kernels.update(set(_re.findall(
                 r"@([A-Za-z_$.-][\w$.-]*)\s*\(", declarations[symbol],
@@ -6633,7 +6656,8 @@ def _emit_repository_call_module(
             definition = extract_llvm_function(symbol)
         except KeyError:
             try:
-                declarations[symbol] = extract_llvm_declaration(symbol)
+                declarations[symbol] = _target_declaration(
+                    module, symbol, extract_llvm_declaration(symbol))
                 symbol_origins[symbol] = ("library",)
             except KeyError:
                 unresolved.add(symbol)
@@ -8932,9 +8956,8 @@ def emit_ssa_function_to_llvm(
             break
         for symbol in sorted(pending):
             if symbol in _LLVM_INTRINSIC_DECLARATIONS:
-                external_declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[
-                    symbol
-                ]
+                external_declarations[symbol] = _target_declaration(
+                    module, symbol, _LLVM_INTRINSIC_DECLARATIONS[symbol])
                 continue
             lane = lane_declaration(symbol)
             if lane is not None:
@@ -8947,7 +8970,8 @@ def emit_ssa_function_to_llvm(
             except KeyError:
                 pass
             try:
-                external_declarations[symbol] = extract_llvm_declaration(symbol)
+                external_declarations[symbol] = _target_declaration(
+                    module, symbol, extract_llvm_declaration(symbol))
             except KeyError:
                 unresolved_symbols.add(symbol)
                 shortfalls.append(LLVMEmissionShortfall(

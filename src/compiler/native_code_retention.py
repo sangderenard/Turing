@@ -381,6 +381,17 @@ ANDROID_ARM64_NATIVE_LINKER = NativeTargetContext(
     minimum_os_version="24",
 )
 
+# Browser WebAssembly: a relocatable wasm object the page instantiates.  The
+# LLVM lane declares the kernel bank's libm calls as imports from the host
+# ``math`` module for this target (see ssa_llvm_backend._target_declaration).
+WASM32_FREESTANDING_LINKER = NativeTargetContext(
+    "wasm32", "freestanding", "wasm32-freestanding", frozenset({"wasm-object"}),
+    accepts_loadable_images=False, name="wasm32-freestanding",
+    llvm_triple="wasm32-unknown-unknown",
+    toolchain_target="wasm32-freestanding",
+    pointer_width_bits=32,
+)
+
 _BUILD_TARGETS = MappingProxyType({
     target.identity: target
     for target in (
@@ -391,6 +402,7 @@ _BUILD_TARGETS = MappingProxyType({
         IOS_ARM64_NATIVE_LINKER,
         ANDROID_ARM64_NATIVE_LINKER,
         LINUX_AMD64_NATIVE_LINKER,
+        WASM32_FREESTANDING_LINKER,
     )
 })
 

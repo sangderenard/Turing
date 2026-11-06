@@ -88,19 +88,15 @@ class NativeGraphForward:
     artifact: Any
 
 
-def compile_native_graph_forward(
-    output: Any,
-    *,
-    bindings: Mapping[str, Any],
-    source: str,
-    name: str,
-    directory: Path,
-) -> NativeGraphForward:
-    """Compile the SSA graph produced by an existing AbstractTensor method."""
+def _forward_graph_module(output: Any, *, build_target: Any = None):
+    """The traced AbstractTensor graph as one returning SSA module.
+
+    Shared by the native and the browser forward so both emit the same graph;
+    ``build_target`` (a registry name) is the module's declared target.
+    """
 
     from ..transmogrifier.ssa import IRModule, Instr
     from ..transmogrifier.ssa_registry import Handler
-    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
     output_items = tuple(output) if isinstance(output, (tuple, list)) else (output,)
     if not output_items:
@@ -128,8 +124,31 @@ def compile_native_graph_forward(
             (f"result_{index}", int(value.value.id))
             for index, value in enumerate(values)
         )
+    module = IRModule({function.name: function})
+    if build_target is not None:
+        from .native_code_retention import resolve_build_target
+
+        module.metadata["build_target"] = resolve_build_target(
+            build_target).to_mapping()
+    return module, values
+
+
+def compile_native_graph_forward(
+    output: Any,
+    *,
+    bindings: Mapping[str, Any],
+    source: str,
+    name: str,
+    directory: Path,
+) -> NativeGraphForward:
+    """Compile the SSA graph produced by an existing AbstractTensor method."""
+
+    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+
+    ir_module, values = _forward_graph_module(output)
+    function = next(iter(ir_module.functions.values()))
     emitted = emit_ssa_function_to_llvm(
-        IRModule({function.name: function}),
+        ir_module,
         function.name,
         entry_name=str(name),
     )
@@ -169,16 +188,17 @@ class BrowserGraphReverse:
     extent_order: tuple[tuple[int, str, int | None], ...]
 
 
-def compile_graph_reverse_to_wasm(
-    reverse: NativeGraphReverse,
-    *,
-    directory: Path,
-) -> BrowserGraphReverse:
-    """Compile the already-emitted LLVM VJP to standalone WebAssembly."""
+def _compile_artifact_to_wasm(artifact: Any, *, directory: Path, what: str) -> Path:
+    """Compile one emitted LLVM artifact to wasm32-freestanding.
 
-    artifact = reverse.artifact
+    The single route for every graph product (forward and reverse).  The
+    artifact's own LLVM IR is the input; a forward emitted for the
+    ``wasm32-freestanding`` build target already declares its libm calls as
+    imports from the host ``math`` module.
+    """
+
     if artifact.shortfalls:
-        raise ValueError("cannot compile an incomplete graph reverse to WASM")
+        raise ValueError(f"cannot compile an incomplete {what} to WASM")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / f"{artifact.name}.ll"
@@ -196,10 +216,14 @@ def compile_graph_reverse_to_wasm(
     )
     if completed.returncode != 0 or not wasm.is_file():
         raise RuntimeError(
-            f"graph reverse WASM compile failed ({completed.returncode}):\n"
+            f"{what} WASM compile failed ({completed.returncode}):\n"
             + completed.stderr[-2000:]
         )
-    return BrowserGraphReverse(
+    return wasm
+
+
+def _browser_abi_fields(artifact: Any, wasm: Path) -> dict[str, Any]:
+    return dict(
         name=str(artifact.name),
         wasm_path=wasm,
         buffer_order=tuple(map(int, artifact.buffer_order)),
@@ -207,6 +231,60 @@ def compile_graph_reverse_to_wasm(
         buffer_dtypes=tuple(artifact.buffer_dtypes),
         extent_order=tuple(tuple(item) for item in artifact.extent_order),
     )
+
+
+def compile_graph_reverse_to_wasm(
+    reverse: NativeGraphReverse,
+    *,
+    directory: Path,
+) -> BrowserGraphReverse:
+    """Compile the already-emitted LLVM VJP to standalone WebAssembly."""
+
+    wasm = _compile_artifact_to_wasm(
+        reverse.artifact, directory=directory, what="graph reverse")
+    return BrowserGraphReverse(**_browser_abi_fields(reverse.artifact, wasm))
+
+
+@dataclass(frozen=True)
+class BrowserGraphForward:
+    """The same traced graph forward compiled for wasm32-freestanding."""
+
+    name: str
+    wasm_path: Path
+    buffer_order: tuple[int, ...]
+    buffer_shapes: tuple[tuple[Any, ...], ...]
+    buffer_dtypes: tuple[str, ...]
+    extent_order: tuple[tuple[int, str, int | None], ...]
+
+
+def compile_graph_forward_to_wasm(
+    output: Any,
+    *,
+    name: str,
+    directory: Path,
+) -> BrowserGraphForward:
+    """Emit the traced forward for the ``wasm32-freestanding`` target and
+    compile it to standalone WebAssembly.
+
+    ``output`` is the same traced AbstractTensor output
+    ``compile_native_graph_forward`` takes; the graph is emitted again for the
+    wasm target (its libm calls become host ``math`` imports) rather than the
+    native artifact's IR text being rewritten.  Buffer value ids match the
+    native forward's.
+    """
+
+    from .ssa_llvm_backend import emit_ssa_function_to_llvm
+
+    ir_module, _values = _forward_graph_module(
+        output, build_target="wasm32-freestanding")
+    function = next(iter(ir_module.functions.values()))
+    emitted = emit_ssa_function_to_llvm(
+        ir_module, function.name, entry_name=str(name))
+    if emitted.shortfalls:
+        raise RuntimeError(f"{name} wasm forward LLVM shortfalls: {emitted.shortfalls!r}")
+    wasm = _compile_artifact_to_wasm(
+        emitted, directory=directory, what="graph forward")
+    return BrowserGraphForward(**_browser_abi_fields(emitted, wasm))
 
 
 def _one_reverse_compile_book(function):
