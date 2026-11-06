@@ -72,3 +72,14 @@ def dictionary(name: str, length: int) -> tuple[str, int, list[str], str]:
         return name, length, found, ""
     except Exception as error:      # noqa: BLE001 (the network or the disk: play on, say why)
         return "builtin", 5, sorted(ALL), f"{LABELS[name]} unavailable ({error}); playing the built-in list"
+
+
+def guessable(length: int) -> frozenset[str]:
+    """Every word accepted as a GUESS at ``length`` letters: the complete
+    (ENABLE) list, whatever dictionary the answers come from -- Wordle does
+    not limit guesses to its answer list.  Empty if it cannot be loaded (the
+    caller then accepts its own dictionary's words only)."""
+    try:
+        return frozenset(word for word in _load("complete") if len(word) == length)
+    except Exception:  # noqa: BLE001 (the network or the disk)
+        return frozenset()

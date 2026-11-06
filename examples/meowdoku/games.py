@@ -667,10 +667,11 @@ class Wordle(Game):
         from meowdoku import words as word_lists
         super().__init__(f"wordle-{seed}")
         self.rng = random.Random(seed)
-        # The ACTIVE dictionary: the answer is any of its words of the chosen
-        # length, and only its words are accepted as guesses.
+        # The ACTIVE dictionary picks the answer (any of its words of the
+        # chosen length); GUESSES are checked against the complete word list
+        # as well, as Wordle accepts any real word, not only its answers.
         self.dictionary, self.length, found, self.note = word_lists.dictionary(dictionary, int(length))
-        self.words = frozenset(found)
+        self.words = frozenset(found) | word_lists.guessable(self.length)
         self.answer = self.rng.choice(found)
         self.guesses: list[str] = []
         self.entry = ""
