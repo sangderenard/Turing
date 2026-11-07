@@ -20,6 +20,7 @@ import * as wl from "./wordle_layout.js";                                       
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 import { GameClock, SPEED, sliderToSpeed, speedToSlider, speedLabel } from "./game_clock.js";   // [SPEED+ZOOM]
 import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } from "./world_zoom.js";                  // [SPEED+ZOOM]
+import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -3864,8 +3865,11 @@ function applySnapshot(view) {
 }
 
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
+const mobroad = new MobroadPage();                                // [MOBROAD] the road-defence game's panels, labels and law link (web/mobroad.js)
+const mobApi = { litMesh, box, disposeMesh, materialIndex: () => state.materialIndex, floorY: () => TILE.height, canvas, model: () => state.caseModel || M.identity() };   // [MOBROAD]
 function sendTick(game) {
   let payload = { type: "tick", ...controls(), ct: gnow() };
+  if (game.mobroad) { const mob = mobroad.report(game, compute); if (mob) payload.mob = mob; }   // [MOBROAD] the law's counts ride the tick
   // [SPEED+ZOOM] the clock speed and the zoom ride every tick (the server clamps both and echoes the speed in the snapshot)
   if (game.speed) payload.speed = gclock.speed;
   if (game.zoom) { payload.zoom = zoomNow(); dials.zoomDirty = false; }
@@ -4650,6 +4654,7 @@ function applyState(game, { meta = false } = {}) {
   if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
+  mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   renderHotbars(game);
   showPads(game);
   renderInventory(game);
@@ -5533,6 +5538,7 @@ function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
   if (g.purrline) sandFeed(g);                                  // purrline sand: the game's solids into the law's inputs (one way)
+  if (g.mobroad) compute.setMobroad(mobroad.collect(state, gnow(now), g));   // [MOBROAD] the bullets into the law's kill segments (one way)
   if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
   if (cameraGravity) {
     const [gx, gy, gz] = cameraDownInLaw(cam.view);
@@ -5546,7 +5552,7 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat) || g.compute.purrline) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
+  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat) || g.compute.purrline || g.compute.mobroad) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
@@ -5747,6 +5753,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   if (state.glassDraws && !state.flat) for (const [m, model] of state.glassDraws) drawLit(m.vao, m.count, model, null);   // Wordle's obsidian tiles
+  if (state.game && state.game.mobroad && !opts.broadcast) mobroad.draw(mobApi, cam, state.game, drawLit);               // [MOBROAD] the panels (glass) and their value labels
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
     const mesh = state.meshes[piece.mesh] || state.meshes.disc;

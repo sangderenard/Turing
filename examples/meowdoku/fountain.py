@@ -632,6 +632,10 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         if _PURRLINE["on"]:
             a = dict(zip(PURRLINE_ARGUMENTS, args))
         # </purrline>
+        # <mobroad>
+        if _MOBROAD["on"]:
+            a = dict(zip(MOBROAD_ARGUMENTS, args))
+        # </mobroad>
         x, y, vx, vy, w, age, rs = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
@@ -654,6 +658,11 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         cell = CELL * a["cell_scale"]
         cells = cols * rows
         emit_rate = emit_period * a["emit_scale"]
+        # <mobroad>
+        if _MOBROAD["on"]:
+            # the wave BUILDS UP: ids leave at t = T u (1 + MOB_RAMP (1 - u)), u = id / active -- the emission rate rises over the run (end : start = (1 + r) / (1 - r))
+            emit_rate = emit_rate * (1.0 + MOB_RAMP * (1.0 - pid * (1.0 / float(active))))
+        # </mobroad>
 
         def tab(name):
             return [a[f"{name}{s}"] for s in range(4)]
@@ -1006,6 +1015,26 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         age_next = age + DT
+        # <mobroad>
+        if _MOBROAD["on"]:
+            # BULLETS KILL, THE GOAL LINE TAKES: a bullet is a SWEPT SEGMENT (last batch's position to this one's) of reach ``kz<k>_r``; a live grain
+            # within reach + its radius of any used segment is KILLED, one past the goal line has ARRIVED.  Either is PARKED for good: the zero state
+            # (x = y = 0, so it is not drawn and takes part in nothing) with ``age`` pinned far below any emit time (-1e9 killed, -2e9 arrived), so
+            # the emitter never re-arms the id.  The counts are the state itself (``n_dead``, ``n_goal``): nothing is lost between batches.
+            m_hit = x * 0.0
+            for k in range(MOB_KZ):
+                kon, kax, kay, kbx, kby, kr = (a[f"kz{k}_{f}"] for f in KZ_FIELDS)
+                kex, key = kbx - kax, kby - kay
+                kt = (((xn - kax) * kex + (yn - kay) * key) * (1.0 / (kex * kex + key * key + 1.0e-12))).clamp(0.0, 1.0)
+                kdx, kdy = xn - (kax + kt * kex), yn - (kay + kt * key)
+                kreach = kr + radius
+                m_hit = m_hit + kon * as_float(kdx * kdx + kdy * kdy < kreach * kreach)
+            m_killed = live * as_float(m_hit > 0.5)
+            m_arrived = live * (1.0 - m_killed) * a["goal_on"] * as_float(yn < a["goal_y"])
+            m_gone = m_killed + m_arrived
+            xn, yn, vxn, vyn, wn = (v * (1.0 - m_gone) for v in (xn, yn, vxn, vyn, wn))
+            age_next = AbstractTensor.where(m_killed > 0.5, age_next * 0.0 - 1.0e9, AbstractTensor.where(m_arrived > 0.5, age_next * 0.0 - 2.0e9, age_next))
+        # </mobroad>
         # ---- ORBEEZ: a swelling species takes up solvent through its OPEN surface.  A grain's surface is closed by what it
         # touches (the grains and walls in contact, ``FULL_COORDINATION`` closing it entirely), so its radius grows at
         # ``swell`` x its initial radius per second times the exposed fraction times the solvent present (0 in air), up to
@@ -1044,6 +1073,14 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         cr = base_r * keep + ir * use_image
         cg = base_g * keep + ig * use_image
         cb = base_b * keep + ib * use_image
+        # <mobroad>
+        if _MOBROAD["on"]:
+            # the mob's colour: calm green, red under crowd crush (the contacts a grain holds: its closed surface, 1 free .. 5 packed)
+            m_crush_t = ((ncont - 1.0) * 0.25).clamp(0.0, 1.0)
+            cr = 0.40 + 0.60 * m_crush_t + 0.12 * is1
+            cg = 0.78 - 0.55 * m_crush_t + 0.10 * is1
+            cb = 0.50 - 0.35 * m_crush_t + 0.10 * is1
+        # </mobroad>
         # ---- CONSERVATION COUNTERS and ENERGY of the state just computed.  Every id is in exactly one class:
         # nan (not finite), parked (the zero state), outside (past a wall or under the floor) or live.
         finite = as_float(xn.abs() < 1.0e30) * as_float(yn.abs() < 1.0e30) * as_float(vxn.abs() < 1.0e30) \
@@ -1085,6 +1122,20 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             th2 = th1 - TAU * (th1 * (1.0 / TAU) + 0.5).floor()
             return (xn, yn, vxn, vyn, wn, age_next, rsn, th2, om2, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop,
                     th2, om2, tau_c)
+        # <mobroad>
+        if _MOBROAD["on"]:
+            # the variant's extra diagnostics, reduced by the same fixed tree: ids killed by a bullet (age -1e9), ids that reached the goal line (age -2e9), live grains crushed (>= MOB_CRUSH_CONTACTS contacts)
+            m_dead = as_float((age_next + 1.0e9).abs() < 1.0e8)
+            m_goal = as_float(age_next < -1.5e9)
+            m_crush = live * as_float(ncont > MOB_CRUSH_CONTACTS - 0.5)
+            for shift in scan_shifts:
+                gate = as_float(pid + float(shift) < float(n))
+                partner = (pid + float(shift)).clamp(0.0, top_i)
+                m_dead = m_dead + m_dead.index_select(0, partner) * gate
+                m_goal = m_goal + m_goal.index_select(0, partner) * gate
+                m_crush = m_crush + m_crush.index_select(0, partner) * gate
+            return (xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop, m_dead, m_goal, m_crush)
+        # </mobroad>
         return xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
 
     return fountain_step
@@ -2163,3 +2214,157 @@ def purrline_spec(size: str = "4k", aspect: float | None = None, params: dict | 
             "chamber_outline": chamber_outline("sdf_purrline", active, aspect, params),
             "tilt": tilt_inputs(active, aspect, cell_needed(p), "sdf_purrline"), "map": mapping}
 # </purrline>
+# <mobroad>
+# ------------------------------------------------------------------------------------------------------------------------
+# MOBROAD (examples/meowdoku/mobroad.py, the road-defence mob shooter): a PRODUCT VARIANT of the law, ``make_law_mobroad``, exactly as purrline is -- its own
+# argument list, manifest (``fountain_mobroad.manifest.json``) and shaders, everything of it between ``# <mobroad>`` markers (here and in fountain_build.py),
+# which the source digest of the DEFAULT, wheel and purrline products leaves out: those are byte for byte the products they were.
+#   THE MOB is the grains.  Gravity (a runtime input) is the march direction, a fluid viscosity gives the walk its pace, and the ROAD is SDF slots
+#   (jaws, pillars, funnel ramps, a peg field) in a long box: the crowd is held by the road's features by the contact law and the pressure at a narrowing is
+#   the grains' own contact count (``ncont``: the colour goes red under crush, ``n_crush`` counts the crushed).
+#   BULLETS KILL (``kz<k>_*``, MOB_KZ swept segments written by the page each batch, one way) and the GOAL LINE (``goal_y``) takes the ones that get through:
+#   both PARK the id for good (the zero state, ``age`` pinned at -1e9 killed / -2e9 arrived: never re-armed), counted as the law's own state
+#   (``n_dead``, ``n_goal``).  The wave builds up: the emission rate rises over the run (MOB_RAMP).
+MOB_KZ = 32
+KZ_FIELDS = ("on", "ax", "ay", "bx", "by", "r")
+MOBROAD_UNIFORMS = tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS) + ("goal_on", "goal_y")
+MOBROAD_ARGUMENTS = ARGUMENTS + MOBROAD_UNIFORMS
+MOBROAD_DIAGNOSTICS = ("n_dead", "n_goal", "n_crush")
+MOBROAD_OUTPUTS = OUTPUTS + MOBROAD_DIAGNOSTICS
+MOBROAD_ALL_UNIFORMS = UNIFORMS + MOBROAD_UNIFORMS
+MOBROAD_RUNTIME_INPUTS = RUNTIME_INPUTS + tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS)
+MOB_RAMP = 0.6                         # the emission rate at the end of the run over the start's: (1 + r) / (1 - r) = 4
+MOB_CRUSH_CONTACTS = 4                 # a grain holding this many contacts is crushed (a free grain holds 0-2, a hex pack 6)
+MOB_ROAD_HALF = 0.62                   # the road's half width, fountain units (a grain is ~0.02 across)
+MOB_BOARD = (12.5, 20.0)               # the game's board (mobroad.py WIDTH, HEIGHT): the road's window maps onto it
+MOB_ROAD_TOP = 2.0 * MOB_ROAD_HALF * MOB_BOARD[1] / MOB_BOARD[0]       # the road's length: the window's height at the board's aspect
+MOB_NOZZLE_Y = MOB_ROAD_TOP - 0.12    # the mob enters here, across the road's top
+MOB_BAR_HALF = 0.45                    # ... over this half width
+MOB_GOAL_Y = 0.20                      # a grain below this line has reached the shooters
+MOB_MARCH = {"grav_y": -0.5, "fl_mu": 6.0e-5, "nozzle_speed": 0.06, "span": 75.0, "mix": 0.0}      # the march (walking pace ~0.15-0.3 / s), the entry speed, the seconds the last id leaves at, the species mix
+#: The road's features, top to bottom (fountain units, y up): what each is and where.  ``sdf_preset`` builds them as slots.
+MOB_FEATURES = (
+    {"name": "pillars", "kind": "circle", "y": 1.62, "x": 0.27, "r": 0.085},                     # two pillars: the stream splits three ways
+    {"name": "narrowing", "kind": "box", "y": 1.34, "gap": 0.17, "half_height": 0.045},          # two jaws leave a 0.34 gap: the crush
+    {"name": "funnel", "kind": "capsule", "y": 1.10, "mouth": 0.12, "drop": 0.16, "r": 0.02},    # two barriers lead the crowd into a 0.24 mouth
+    {"name": "pegs", "kind": "pegs", "y": 0.78, "pitch_x": 0.16, "pitch_y": 0.09, "r": 0.022, "cols": 6, "rows": 3},   # a staggered field
+)
+SDF_SHAPES = SDF_SHAPES + ("sdf_mobroad",)
+_MOBROAD = {"on": False}
+_sdf_preset_mob_base = sdf_preset
+_chamber_basin_mob_base = chamber_basin
+
+
+def mobroad_geometry(cell: float) -> dict[str, float]:
+    """The road's ``basin``-shaped record: fixed (it does not scale with the id count), the view exactly the road."""
+    w, top = MOB_ROAD_HALF, MOB_ROAD_TOP
+    cols, rows = int(math.ceil(2.0 * w / cell)), int(math.ceil(top / cell)) + 1
+    return {"scale": 1.0, "stretch": 1.0, "width": 2.0 * w, "half": w, "nozzle_y": MOB_NOZZLE_Y, "bar_half": MOB_BAR_HALF, "cols": cols, "rows": rows,
+            "cells": cols * rows, "cell": cell, "view": (-w, w, 0.0, top), "top": top}
+
+
+def chamber_basin(shape: str, n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+    """``chamber_basin``; the mob road is fixed: the view is the road."""
+    if shape != "sdf_mobroad":
+        return _chamber_basin_mob_base(shape, n, aspect, cell)
+    return mobroad_geometry(cell)
+
+
+def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
+    """``sdf_preset`` plus the MOB ROAD: a box chamber the width of the road with the ``MOB_FEATURES`` laid along it (typed slots: 3 boxes = chamber +
+    2 jaws, 2 circles, 2 of 3 capsules, the peg array)."""
+    if shape != "sdf_mobroad":
+        return _sdf_preset_mob_base(shape, geo)
+    c, w, top = geo.get("cell", CELL), MOB_ROAD_HALF, MOB_ROAD_TOP
+    slots = [_slot("box", "fluid", 0.0, 0.5 * top, 0.0, w, 0.5 * top, c)]
+    for f in MOB_FEATURES:
+        if f["kind"] == "circle":
+            slots += [_slot("circle", "solid", sx * f["x"], f["y"], 0.0, f["r"]) for sx in (-1.0, 1.0)]
+        elif f["kind"] == "box":
+            g, hh = f["gap"], f["half_height"]
+            slots += [_slot("box", "solid", sx * (w + g + 0.04) * 0.5, f["y"], 0.0, (w - g + 0.04) * 0.5, hh, 0.5 * hh) for sx in (-1.0, 1.0)]
+        elif f["kind"] == "capsule":
+            slots += [_capsule_ramp((sx * w, f["y"] + f["drop"]), (sx * f["mouth"], f["y"]), f["r"]) for sx in (-1.0, 1.0)]
+        elif f["kind"] == "pegs":
+            slots.append(_slot("pegs", "solid", 0.0, f["y"], 0.0, f["pitch_x"], f["pitch_y"], f["r"], f["cols"], f["rows"], 1.0))
+    return {"slots": slots, "nozzle_y": MOB_NOZZLE_Y, "top": top, "half": w, "bar": MOB_BAR_HALF}
+
+
+def mobroad_map() -> dict[str, Any]:
+    """How the game's board maps onto the road (the page's and the server's one formula): board ``(bx, by)`` (x right, y DOWN, ``MOB_BOARD``) is
+    fountain ``(bx / k - half, top - by / k)`` with ``k = board width / road width``."""
+    return {"half": MOB_ROAD_HALF, "top": MOB_ROAD_TOP, "k": MOB_BOARD[0] / (2.0 * MOB_ROAD_HALF), "board": list(MOB_BOARD), "goal_y": MOB_GOAL_Y,
+            "kz": MOB_KZ, "features": [dict(f) for f in MOB_FEATURES]}
+
+
+def mobroad_defaults() -> dict[str, float]:
+    """The variant's uniforms: no bullet, the goal line on."""
+    out = {f"kz{k}_{f}": 0.0 for k in range(MOB_KZ) for f in KZ_FIELDS}
+    out.update({"goal_on": 1.0, "goal_y": float(_f32(np.float64(MOB_GOAL_Y)))})
+    return out
+
+
+def mobroad_inputs(bullets, prev, mapping: dict[str, Any]) -> dict[str, float]:
+    """THE PAGE'S ONE-WAY WRITE: the game's bullets as the variant's kill segments.  ``bullets``: ``{id, x, y, kr}`` in board units (``kr``: the kill reach);
+    ``prev``: id -> the position (board units) last written for it (a bullet without one is a point).  Each used slot is the SWEPT segment from ``prev`` to
+    the bullet's place now, in fountain units; the ``MOB_KZ`` most advanced bullets (smallest board y, then id) are used, the rest slots are off.
+    ``web/mobroad.js`` ``mobroadInputs`` is this function."""
+    k, half, top = float(mapping["k"]), float(mapping["half"]), float(mapping["top"])
+    used = sorted(bullets, key=lambda b: (float(b["y"]), str(b["id"])))[:MOB_KZ]
+    out: dict[str, float] = {}
+    for slot in range(MOB_KZ):
+        if slot < len(used):
+            b = used[slot]
+            px, py = prev.get(b["id"], (b["x"], b["y"])) if prev else (b["x"], b["y"])
+            vals = (1.0, float(px) / k - half, top - float(py) / k, float(b["x"]) / k - half, top - float(b["y"]) / k, float(b["kr"]) / k)
+        else:
+            vals = (0.0,) * len(KZ_FIELDS)
+        out.update({f"kz{slot}_{f}": v for f, v in zip(KZ_FIELDS, vals)})
+    return {name: float(_f32(np.float64(v))) for name, v in out.items()}
+
+
+def mobroad_uniforms(active: int) -> dict[str, float]:
+    """The road's uniforms for ``active`` ids: the chamber, the march (gravity along the road, the viscosity that sets the walking pace, a slow entry),
+    the emission over ``MOB_MARCH['span']`` seconds, the kill segments off and the goal line on."""
+    m = MOB_MARCH
+    u = uniforms(n=int(active), mix=m["mix"], gravity=(0.0, m["grav_y"]), params={"fl_mu": m["fl_mu"]}, shape="sdf_mobroad")
+    u = {k: float(v) for k, v in u.items()}
+    u["nozzle_speed"] = float(_f32(np.float64(m["nozzle_speed"])))                 # (the page's slider stops at 0.3: a mob walks in)
+    u["emit_scale"] = float(_f32(np.float64(m["span"] / EMIT_SPAN)))
+    u.update(mobroad_defaults())
+    return u
+
+
+def mobroad_columns(n: int, *, active: int | None = None) -> dict[str, np.ndarray]:
+    """``initial_columns`` for the road plus the variant's uniforms (ids 0..n-1; ``active`` of them are ever emitted)."""
+    cols = initial_columns(n, active=active, mix=MOB_MARCH["mix"], shape="sdf_mobroad")
+    cols.update({k: np.float64(v) for k, v in mobroad_uniforms(int(n if active is None else active)).items()})
+    return cols
+
+
+def make_law_mobroad(n: int, active: int | None = None):
+    """The fountain law with the kill segments, the goal line, the crush colour and the rising emission (arguments ``MOBROAD_ARGUMENTS``; outputs
+    ``MOBROAD_OUTPUTS``).  The same law as ``make_law``: the hooks between the ``mobroad`` markers in ``fountain_step`` run only while this wrapper's
+    call is traced or evaluated."""
+    law = make_law(n, active)
+
+    def mobroad_step(*args):
+        _MOBROAD["on"] = True
+        try:
+            return law(*args)
+        finally:
+            _MOBROAD["on"] = False
+    return mobroad_step
+
+
+def mobroad_spec(size: str = "4k") -> dict[str, Any]:
+    """What a page needs to run the road at ``size``: the uniforms, the view (exactly the road), the chamber outline (the walls and every feature), the
+    tilt inputs and the board map."""
+    active = SIZES[size][0]
+    params = {"fl_mu": MOB_MARCH["fl_mu"]}
+    cell = cell_needed(species_params(params))
+    geo = chamber_basin("sdf_mobroad", active, None, cell)
+    return {"shape": "sdf_mobroad", "size": size, "uniforms": mobroad_uniforms(active), "view": list(geo["view"]),
+            "chamber_outline": chamber_outline("sdf_mobroad", active, None, params),
+            "tilt": tilt_inputs(active, None, cell, "sdf_mobroad"), "map": mobroad_map()}
+# </mobroad>

@@ -55,6 +55,7 @@ from meowdoku.worldwalk import WorldWalk  # noqa: E402
 from meowdoku.fountain import FountainGame  # noqa: E402
 from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402  (the 3-D fountain: its own law, products and page controls)
 from meowdoku.purrline import Purrline  # noqa: E402
+from meowdoku.mobroad import Mobroad  # noqa: E402  (the road-defence mob shooter: the fountain law as the mob, an entity law for the shooters)
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
@@ -85,7 +86,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "tipjar", "purrline"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "tipjar", "purrline", "mobroad"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -150,6 +151,8 @@ class Table:
             self.game = tipjar.TipJarGameClass()(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "purrline":
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
+        elif kind == "mobroad":
+            self.game = Mobroad(aspect=float(payload.get("aspect") or 0.0), size=str(payload.get("size") or "4k"))
         else:
             raise ValueError(f"unknown game {kind!r}")
         self.new_payload = dict(payload)        # LIFECYCLE: what rebuilds this game after a restart (lifecycle.dump_table)
@@ -698,6 +701,20 @@ def prepare_fountain_purrline(web_dir: Path) -> None:
         print(f"[meowdoku] fountain purrline products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_fountain_mobroad(web_dir: Path) -> None:
+    """The mob road's variant of the 2-D fountain (the kill segments, the goal line, the crush colour; ``fountain_build.build_mobroad``), built after the
+    default, wheel and purrline products and independent of them: WebGPU products first, the CPU fallbacks too unless MEOWDOKU_FOUNTAIN_WASM=0."""
+    from meowdoku import fountain_build
+    try:
+        started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        manifest = fountain_build.build_mobroad(web_dir, wasm=wasm)
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain mobroad products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain mobroad products NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def prepare_fountain3d(web_dir: Path) -> None:
     """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
     from meowdoku import fountain3d_build
@@ -792,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
     # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
     if args.no_wasm:
         os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
-    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain_purrline(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
+    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain_purrline(web_dir), prepare_fountain_mobroad(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
