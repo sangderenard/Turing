@@ -128,6 +128,12 @@ EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live gra
 #: has up to six neighbours and a wall, so the share is about 1/7.
 FRICTION_SHARE = 0.15
 BAR_HEIGHT = 0.12
+#: The ARMED QUEUE is bounded: an id arms (takes its nozzle slot and waits there) only once the id ``queue`` places before it has been
+#: emitted, where ``queue`` is the ids the nominal schedule emits in ``QUEUE_STEPS`` steps.  An inlet that cannot pass the schedule's flow
+#: (a chamber whose nozzle sits in a pocket: the toy) used to let every due id arm and pile up at the slots -- thousands per grid cell,
+#: far past the neighbour walk (``k_run``), so the walk was blind there (millions of dropped contacts), live grains lost their contacts and
+#: several ids were emitted INTO ONE ANOTHER (exactly coincident, same launch velocity), which injects the contact spring's energy.
+QUEUE_STEPS = 16
 
 #: species: name, radius, density, friction, linear drag (1/s)
 SPECIES = (
@@ -624,6 +630,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
     emit_period = EMIT_SPAN / float(active)           # at nozzle rate 1; the runtime uniform ``emit_scale`` (1 / rate) stretches it
     scan_shifts = reduction_shifts(n)
+    queue = max(1, int(active * QUEUE_STEPS * DT / EMIT_SPAN))        # the armed queue's length, in ids (see QUEUE_STEPS)
 
     def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
@@ -686,7 +693,11 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             armed = as_float(vy < ARMED * 0.5)
             live = a * (1.0 - parked) * (1.0 - armed)
             pending = a * armed
-            arming = a * parked
+            # an id arms only when the id ``queue`` before it has been emitted (not parked, not armed): the armed queue stays short
+            before = (pid - float(queue)).clamp(0.0, 1.0e9)
+            x_b, y_b, vy_b = x.index_select(0, before), y.index_select(0, before), vy.index_select(0, before)
+            emitted_b = (1.0 - as_float((x_b.abs() + y_b.abs()) < 1.0e-30)) * (1.0 - as_float(vy_b < ARMED * 0.5))
+            arming = a * parked * AbstractTensor.where(pid < float(queue), pid * 0.0 + 1.0, emitted_b)
             # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
             # get the cell past the end: sorted last, in nobody's block)
             ix = _cap(((x + half) * (1.0 / cell)).floor().clamp(0.0, 1.0e9), cols - 1.0)

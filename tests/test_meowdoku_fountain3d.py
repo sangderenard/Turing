@@ -1826,3 +1826,17 @@ def test_under_gravity_the_letters_collapse_into_a_pile_inside_the_closed_box_an
     u = {k: float(v) for k, v in start.uniforms(mix=0.0).items()}
     assert (F.chamber_distance(u, cols["x"], cols["y"], cols["z"])[0] > -0.2 * float(got["rad"].max())).all()   # inside the closed box
 
+
+
+def test_the_armed_queue_is_bounded_so_a_blocked_inlet_cannot_pile_ids_past_the_neighbour_walk():
+    """As the 2-D law's: with every id due at once, only the ids the schedule emits in ``QUEUE_STEPS`` steps arm; the rest stay parked."""
+    n = 1024
+    columns = F.initial_columns(n, shape="sdf_toy")
+    piece = F.make_piece(n)
+    state = {k: np.zeros(n) for k in F.STATE}
+    state["age"] = np.full(n, 100.0)
+    produced = dict(zip(F.OUTPUTS, piece(*[state[k] if k in state else columns[k] for k in F.ARGUMENTS])))
+    queue = max(1, int(n * F.QUEUE_STEPS * F.DT / F.EMIT_SPAN))
+    armed = np.asarray(produced["vy_next"]) < F.ARMED * 0.5
+    assert 0 < armed.sum() <= queue, (int(armed.sum()), queue)
+    assert armed[:queue].all() and not armed[queue:].any()

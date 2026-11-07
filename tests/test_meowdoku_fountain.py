@@ -2087,3 +2087,21 @@ def test_the_pages_purrline_write_equals_pythons(tmp_path):
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "case.json").write_text(json.dumps({"game": game, "map": m, "boxes": F.MB_COUNT, "expect": F.purrline_inputs(game, m)}), encoding="utf-8")
     assert _run_node(tmp_path, JS_PURRLINE, "compute.js").strip() == "ok"
+
+
+def test_the_armed_queue_is_bounded_so_a_blocked_inlet_cannot_pile_ids_past_the_neighbour_walk():
+    """Every id is due at once (age past every emission time) and the inlet passes none (a grain beside each slot would do; the
+    simplest blocked inlet is one whose slots are all taken by the queue itself): only the ids the nominal schedule emits in
+    ``QUEUE_STEPS`` steps may arm (take their nozzle slot and wait); the rest stay parked, invisible to the grid.  Unbounded, all
+    1024 armed at the slots of a 4093-periodic hash (thousands per grid cell at 64k ids, far past ``k_run``): the walk was blind there
+    (millions of dropped contacts) and ids were emitted INTO one another, the energy source of the toy chamber's violent inlet."""
+    n = 1024
+    columns = F.initial_columns(n, shape="sdf_toy")
+    piece = F.make_piece(n)
+    state = {k: np.zeros(n) for k in F.STATE}
+    state["age"] = np.full(n, 100.0)                                              # every id is due
+    produced = dict(zip(F.OUTPUTS, piece(*[state[k] if k in state else columns[k] for k in F.ARGUMENTS])))
+    queue = max(1, int(n * F.QUEUE_STEPS * F.DT / F.EMIT_SPAN))
+    armed = np.asarray(produced["vy_next"]) < F.ARMED * 0.5
+    assert 0 < armed.sum() <= queue, (int(armed.sum()), queue)
+    assert armed[:queue].all() and not armed[queue:].any()                       # the first ids go first
