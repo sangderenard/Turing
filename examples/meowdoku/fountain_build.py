@@ -282,6 +282,10 @@ def _manifest(records: dict, body: bool = False) -> dict:
         "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"], "placed": ["x", "y"],
                    "radius": "rad", "rest_speed": 0.15},
         "reference_view": list(geo["view"]),
+        # the purrline sand chamber (WORKLIST.md C): its spec per size (the page builds the compute spec from it; the purrline game hosts the
+        # fountain compute) and the law's solid slots the page writes each batch (web/compute.js ``purrlineInputs``)
+        "purrline": {"og": F.OG_SLOT, "mb": list(F.MB_SLOTS)},
+        "presets": {"sdf_purrline": {tag: F.purrline_spec(tag) for tag in SIZES}} if not body else {},
         "species": [list(item) for item in F.SPECIES],
         "settle": F.SETTLE,
     }

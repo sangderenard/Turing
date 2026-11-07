@@ -434,6 +434,31 @@ class WasmProduct {
 // absolute floor (per id) and a fraction of its peak, with the largest speed under a limit, for `hold_samples` samples in
 // a row.  The step of the sample that completes the hold is S; phase 2 stops at exactly S.  `fountain.SettleDetector`
 // is the same rule in Python (held against this one by tests/test_meowdoku_fountain.py).
+// PURRLINE SAND (WORKLIST.md, "Purrline sand mode", C): the game's state as the fountain law's runtime inputs.  This is fountain.py's
+// ``purrline_inputs`` (a test holds the two equal).  ``game`` is the purrline state (occupancy, rows, cols, cell, origin, falling: board units, x right,
+// y DOWN); ``map`` the chamber's board map (the board's centre cx, cy in fountain units and one board cell's width); ``slots`` {og, mb: [..]} the
+// law's occupancy-grid slot and moving-box slots.  The occupied cells are the grid's mask (three words: row r is byte r % 3 of word floor(r / 3));
+// the lowest falling items are the moving boxes (the size of the cell they will fill, centred on the item, carrying its velocity, y flipped);
+// unused boxes are written kind 0.
+export const PURRLINE_ROUND = 0.12;
+export function purrlineInputs(game, map, slots) {
+  const cb = game.cell ?? 1, [ox, oy] = game.origin || [0, 0], rows = game.rows, cols = game.cols;
+  const k = map.cell / cb, bcx = ox + 0.5 * cols * cb, bcy = oy + 0.5 * rows * cb, words = [0, 0, 0], out = {};
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) if (game.occupancy[r * cols + c]) words[Math.floor(r / 3)] += 2 ** (8 * (r % 3) + c);
+  Object.assign(out, { [`q${slots.og}kind`]: 1, [`q${slots.og}cx`]: map.cx, [`q${slots.og}cy`]: map.cy, [`q${slots.og}p0`]: map.cell,
+                       [`q${slots.og}p1`]: cols, [`q${slots.og}p2`]: rows, [`q${slots.og}p3`]: words[0], [`q${slots.og}p4`]: words[1], [`q${slots.og}p5`]: words[2] });
+  const items = [...(game.falling || [])].sort((a, b) => b.y - a.y).slice(0, slots.mb.length), half = 0.5 * map.cell;
+  slots.mb.forEach((slot, i) => {
+    const it = items[i], v = it
+      ? { kind: 1, cx: map.cx + (it.x - bcx) * k, cy: map.cy - (it.y - bcy) * k, rot: 0, p0: half, p1: half, p2: PURRLINE_ROUND * map.cell,
+          p3: (it.vx || 0) * k, p4: -(it.vy || 0) * k, p5: 0 }
+      : { kind: 0, cx: 0, cy: 0, rot: 0, p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 };
+    for (const [name, value] of Object.entries(v)) out[`q${slot}${name}`] = value;
+  });
+  for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
+  return out;
+}
+
 export class SettleDetector {
   constructor(p, active, pad) { this.p = p; this.active = active; this.pad = pad; this.peak = 0; this.quiet = 0; }
   push(step, d) {
@@ -611,6 +636,10 @@ export class ComputeRuntime {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
     if (this.bodyTau != null && this.runtimeInputs.has("body_tau")) out.body_tau = this.bodyTau;   // the hinged body's coupling torque (setBodyTorque)
+    if (this.sand && this.spec.purrline) {                // the purrline game's solids (setPurrline): the occupancy mask and the falling items
+      const mine = this.runtimeInputs, w = purrlineInputs(this.sand, this.spec.purrline.map, this.spec.purrline.slots);
+      for (const name of Object.keys(w)) if (mine.has(name)) out[name] = w[name];
+    }
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (this.runtimeInputs.has("case_omega")) {          // the case's own turn, from the same motion (one mechanism): 0 when it stands still
       const [om, dom] = this.spin ? spinOmega(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : [0, 0];
@@ -651,6 +680,10 @@ export class ComputeRuntime {
     this.#kick();
   }
   get bodySpeed() { return this.diag ? this.diag.body_om ?? null : null; }
+
+  // PURRLINE SAND: the purrline game's state (``purrline`` of the game state, its falling list already at this instant), written to the law's
+  // solids each batch -- ONE WAY: nothing the sand does reaches the game.  null stops it (the solids are then written empty).
+  setPurrline(game) { this.sand = game || null; }
 
   setGravityScale(k) {
     const next = Math.max(0, Number(k));
@@ -811,6 +844,8 @@ export class ComputeRuntime {
     m = Math.max(1, Math.min(m, p.maxFrames));
     if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
     if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
+    // a falling item moves by position, once per batch: with items in the air a batch is one snapshot (6 steps), so a box is never more than that stale
+    if (this.sand && this.sand.falling && this.sand.falling.length) m = 1;
     // the inputs change only between batches: a spinning case keeps each batch to SPIN_TURN of a revolution
     if (this.spin) {
       // the fastest the gravity angle turns, in revolutions per simulated second: |hz| for a spin, pi * arc/360 * |hz| at the

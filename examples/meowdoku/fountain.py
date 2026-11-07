@@ -170,7 +170,7 @@ POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
 NGON_SHAPES = {"ngon3": 3, "ngon4": 4, "ngon5": 5, "ngon6": 6, "ngon7": 7}
 #: SDF chambers (the analytic path): the 2-D sections of the solids (sphere -> circle, cube -> square, tetrahedron -> triangle,
 #: toroidal shell -> annulus), the hourglass, and the oil & glycerine toy.
-SDF_SHAPES = ("sdf_circle", "sdf_square", "sdf_triangle", "sdf_annulus", "sdf_hourglass", "sdf_toy")
+SDF_SHAPES = ("sdf_circle", "sdf_square", "sdf_triangle", "sdf_annulus", "sdf_hourglass", "sdf_toy", "sdf_purrline")
 #: The chamber-shape select's options (key, label); the SDF ones are marked.
 CHAMBER_CHOICES = (("box", "box (open basin)"), ("funnel", "funnel"), ("hexagon", "hexagon"), ("ramp", "ramp"),
                    ("ngon3", "triangle (fast, polyline)"), ("ngon4", "square (fast, polyline)"), ("ngon5", "pentagon (fast, polyline)"),
@@ -178,18 +178,32 @@ CHAMBER_CHOICES = (("box", "box (open basin)"), ("funnel", "funnel"), ("hexagon"
                    ("sdf_circle", "sphere / circle (SDF)"), ("sdf_square", "cube / square (SDF)"), ("sdf_triangle", "tetrahedron / triangle (SDF)"),
                    ("sdf_annulus", "toroidal shell / annulus (SDF)"), ("sdf_hourglass", "hourglass (SDF)"),
                    ("sdf_toy", "oil & glycerine toy: ramps, hourglass, pegs (SDF)"),
+                   ("sdf_purrline", "purrline sand: a full board of solid cells, a sump, an inlet above (SDF)"),
                    ("waterwheel", "waterwheel: a nozzle falls on a hinged paddle wheel (box)"))
 #: ANALYTIC SDF CHAMBERS (runtime uniforms, no recompile when the chamber changes).  ``SDF_SLOTS`` primitive slots, each ``q<k><field>``:
 #: ``kind`` (0 unused), ``role`` (0 FLUID: the chamber's inside; 1 SOLID: an obstacle inside it), the centre ``cx cy``, the rotation ``rot``
 #: and the parameters ``p0..p5`` (see ``sdf_field``).  ``sdf_on`` (0 / 1) picks the SDF walls; 0 is the polyline walls and the old law bit for bit.
-SDF_SLOTS = 12
+SDF_SLOTS = 19
 SDF_FIELDS = ("kind", "role", "cx", "cy", "rot", "p0", "p1", "p2", "p3", "p4", "p5")
-SDF_KINDS = {"box": 1, "circle": 2, "capsule": 3, "annulus": 4, "ngon": 5, "hourglass": 6, "pegs": 7}
+SDF_KINDS = {"box": 1, "circle": 2, "capsule": 3, "annulus": 4, "ngon": 5, "hourglass": 6, "pegs": 7, "occgrid": 8, "mbox": 9}
 SDF_FAR = 1.0e9
 #: TYPED slots: the kind of each slot is fixed at compile time (3 boxes, 2 circles, 3 capsules, an annulus, an n-gon, an hourglass, a
 #: peg array), so a slot evaluates only its own SDF; ``kind`` is just its used flag (0: masked out) and a preset fills the slots it needs.
-SDF_LAYOUT = ("box", "box", "box", "circle", "circle", "capsule", "capsule", "capsule", "annulus", "ngon", "hourglass", "pegs")
+SDF_LAYOUT = ("box", "box", "box", "circle", "circle", "capsule", "capsule", "capsule", "annulus", "ngon", "hourglass", "pegs",
+              "occgrid") + ("mbox",) * 6
 assert len(SDF_LAYOUT) == SDF_SLOTS
+#: The two PURRLINE SAND kinds (WORKLIST.md, "Purrline sand mode", C), both runtime uniforms like every slot:
+#:   OCCUPANCY GRID (one slot, ``OG_SLOT``): ``rows`` x ``cols`` (at most 8 x 8) solid square cells of side ``p0`` centred on ``(cx, cy)`` (turned by
+#:   ``rot``), from a per-cell MASK packed into the three words ``p3 p4 p5``: cell (row r from the TOP, column c from the left) is bit ``8 (r mod 3) + c``
+#:   of word ``r // 3`` (each word below 2**24, so exact in f32); ``p1 = cols``, ``p2 = rows``.  A solid of the composed field: static walls.
+#:   MOVING SOLID BOXES (``MB_SLOTS``, six): half extents ``p0, p1``, corner radius ``p2``, centre ``cx, cy``, angle ``rot``, and a POSE VELOCITY
+#:   ``(p3, p4)`` plus angular velocity ``p5`` (counterclockwise).  A moving box is not in the composed static field: it is a contact against a
+#:   surface that moves at ``v + omega x r`` (the waterwheel's contact), of INFINITE MASS and position-driven -- the law holds no state for it, so
+#:   nothing a grain does can slow it.  ``kind`` 0 is unused for both; unused slots add exact zeros (the default law is the old law bit for bit).
+OG_SLOT = SDF_LAYOUT.index("occgrid")
+MB_SLOTS = tuple(k for k in range(SDF_SLOTS) if SDF_LAYOUT[k] == "mbox")
+OG_MAX = 8
+OG_WORDS = 3
 SDF_UNIFORMS = ("sdf_on",) + tuple(f"q{k}{f}" for k in range(SDF_SLOTS) for f in SDF_FIELDS)
 STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
@@ -203,7 +217,10 @@ UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", 
 #: runtime owns them after that.
 RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "fl_rho", "fl_mu", "omega", "hertz", "coh", "spin_drag", "temp", "k_run", "nozzle_speed",
                   "case_omega", "case_domega") + tuple(
-    f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax", "roll") for s in range(4))      # the radius, its spread and the emission rate (so the grid) are fixed when a run starts
+    f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax", "roll") for s in range(4)) + tuple(
+    # the purrline sand solids, written each batch from the game's state (see ``purrline_inputs``): the grid's mask and size, the boxes' pose and velocity
+    [f"q{OG_SLOT}{f}" for f in ("kind", "cx", "cy", "p0", "p1", "p2", "p3", "p4", "p5")]
+    + [f"q{k}{f}" for k in MB_SLOTS for f in ("kind", "cx", "cy", "rot", "p0", "p1", "p2", "p3", "p4", "p5")])      # the radius, its spread and the emission rate (so the grid) are fixed when a run starts
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 #: The HINGED BODY (the waterwheel): present only in the BODY VARIANT of the law (``make_law(.., body=True)``), whose argument list adds the
@@ -576,6 +593,111 @@ def _sdf_pegs(lx, ly, pitch_x, pitch_y, peg_r, cols, rows, stagger):
     return best, bgx, bgy
 
 
+def _cell_box(ex, ey, half):
+    """A square cell of half side ``half`` at offset ``(ex, ey)`` from the point's frame origin (``ex = lx - cell centre``): the signed distance and
+    its analytic gradient.  EXACT on the faces (no epsilon in the length: the gradient's guard is on the divisor only), so a face is a true zero."""
+    qx, qy = ex.abs() - half, ey.abs() - half
+    ox, oy = qx.clamp(0.0, 1.0e9), qy.clamp(0.0, 1.0e9)
+    out = as_float((ox + oy) > 0.0)
+    ol = (ox * ox + oy * oy).sqrt()
+    inv = 1.0 / (ol + (1.0 - out))                    # out = 0: the divisor is 1 (and the numerators are 0)
+    xdom = as_float(qx > qy)
+    f = ol + _min(_max(qx, qy), 0.0)
+    return f, (out * (ox * inv) + (1.0 - out) * xdom) * _sgn(ex), (out * (oy * inv) + (1.0 - out) * (1.0 - xdom)) * _sgn(ey)
+
+
+def _bit_scale(index, count):
+    """``2 ** -index`` for a whole-number tensor ``index`` in ``[0, count)``, exactly, as a one-hot sum of constants (no pow / exp2)."""
+    out = index * 0.0
+    for k in range(count):
+        out = out + as_float((index - float(k)).abs() < 0.5) * (2.0 ** -k)
+    return out
+
+
+def _sdf_occgrid(lx, ly, cell, cols, rows, w0, w1, w2):
+    """The OCCUPANCY GRID: ``rows`` x ``cols`` square cells of side ``cell`` centred on the local origin, occupied where the packed mask (``w0..w2``,
+    see ``SDF_LAYOUT``) holds a 1; the signed distance to the NEAREST OCCUPIED CELL (negative inside it) and its analytic gradient.  Domain
+    repetition: the grain's own cell and the 3 x 3 around it are checked (every cell nearer than one cell is among them), each by a bit read out of the
+    packed words with exact power-of-two scalings and one-hot picks; a cell off the grid, or empty, is a SELECTED far distance (never a blend)."""
+    c = cell.clamp(1.0e-9, 1.0e9)
+    inv = 1.0 / c
+    i0 = ((lx + 0.5 * cols * c) * inv).floor()
+    j0 = ((0.5 * rows * c - ly) * inv).floor()
+    best, bgx, bgy = None, None, None
+    occs = []
+    for dj in (-1.0, 0.0, 1.0):
+        j = j0 + dj
+        row_ok = as_float(j > -0.5) * as_float(j < rows - 0.5)
+        jc = j.clamp(0.0, float(OG_MAX - 1))
+        g1, g2 = as_float(jc > 2.5), as_float(jc > 5.5)
+        word = w0 * (1.0 - g1) + w1 * (g1 * (1.0 - g2)) + w2 * g2           # exact: 0/1 products of whole numbers below 2**24
+        r3 = jc - 3.0 * (g1 + g2)
+        shifted = (word * (as_float(r3 < 0.5) + as_float((r3 - 1.0).abs() < 0.5) * (1.0 / 256.0) + as_float(r3 > 1.5) * (1.0 / 65536.0))).floor()
+        rowbits = shifted - 256.0 * (shifted * (1.0 / 256.0)).floor()        # this row's 8 bits (a whole number below 256)
+        cy_l = 0.5 * rows * c - (j + 0.5) * c
+        for di in (-1.0, 0.0, 1.0):
+            i = i0 + di
+            ok = row_ok * as_float(i > -0.5) * as_float(i < cols - 0.5)
+            ic = i.clamp(0.0, float(OG_MAX - 1))
+            t = (rowbits * _bit_scale(ic, OG_MAX)).floor()
+            occ = ok * (t - 2.0 * (t * 0.5).floor())
+            occs.append(occ)
+            cx_l = (i + 0.5) * c - 0.5 * cols * c
+            f, gx, gy = _cell_box(lx - cx_l, ly - cy_l, 0.5 * c)
+            f = occ * f + (1.0 - occ) * SDF_FAR
+            if best is None:
+                best, bgx, bgy = f, gx, gy
+            else:
+                take = f < best
+                best = AbstractTensor.where(take, f, best)
+                bgx = AbstractTensor.where(take, gx, bgx)
+                bgy = AbstractTensor.where(take, gy, bgy)
+    # INSIDE the union (the grain's own cell is occupied): the distance to the nearest face that borders a FREE cell (or the grid's edge), not to the
+    # face it shares with an occupied neighbour -- a shared face is not a wall.  The gradient points out through that face.
+    own = occs[4]
+    u = lx - ((i0 + 0.5) * c - 0.5 * cols * c)
+    v = ly - (0.5 * rows * c - (j0 + 0.5) * c)
+    h = 0.5 * c
+    open_l, open_r, open_t, open_b = 1.0 - occs[3], 1.0 - occs[5], 1.0 - occs[1], 1.0 - occs[7]
+    far = 1.0e8
+    dl, dr, dt, db = h + u + (1.0 - open_l) * far, h - u + (1.0 - open_r) * far, h - v + (1.0 - open_t) * far, h + v + (1.0 - open_b) * far
+    m = _min(_min(dl, dr), _min(dt, db))
+    sealed = as_float(m > far * 0.5)                       # no open face: deeper than a cell face; keep the cell's own (more negative) distance
+    ix = as_float(dr <= dl) * 2.0 - 1.0
+    iy = as_float(db >= dt) * 2.0 - 1.0                    # (the nearer of top / bottom: +1 = out the top)
+    xnear = as_float(_min(dl, dr) <= _min(dt, db))
+    in_d = -m * (1.0 - sealed) + sealed * (best - c)
+    in_gx = (1.0 - sealed) * xnear * ix + sealed * bgx
+    in_gy = (1.0 - sealed) * (1.0 - xnear) * as_float(dt <= db) * 1.0 + (1.0 - sealed) * (1.0 - xnear) * as_float(dt > db) * -1.0 + sealed * bgy
+    inside = as_float(own > 0.5)
+    pick = inside > 0.5
+    return (AbstractTensor.where(pick, in_d, best), AbstractTensor.where(pick, in_gx, bgx), AbstractTensor.where(pick, in_gy, bgy))
+
+
+def moving_field(x, y, q):
+    """The MOVING SOLID BOXES at ``(x, y)`` (``q(k, field)`` as for ``sdf_field``): the signed distance to the nearest used box (``SDF_FAR`` with none),
+    the analytic gradient there (unit, pointing out of the box), and that box's SURFACE VELOCITY at the point, ``v + omega x r``, and its angular
+    velocity.  Returns ``(d, nx, ny, svx, svy, som)``.  Every selection is on a per-grain condition; the used flag enters as an exact 0 / 1 product."""
+    zero = x * 0.0
+    d, nx, ny, svx, svy, som = zero + SDF_FAR, zero, zero, zero, zero, zero
+    for k in MB_SLOTS:
+        kind, cx, cy, rot = (q(k, f) for f in ("kind", "cx", "cy", "rot"))
+        hw, hh, rc, bvx, bvy, om = (q(k, f) for f in ("p0", "p1", "p2", "p3", "p4", "p5"))
+        c, s = rot.cos(), rot.sin()
+        dx, dy = x - cx, y - cy
+        f, gx, gy = _sdf_box(c * dx + s * dy, c * dy - s * dx, hw, hh, rc)
+        used = as_float(kind > 0.5)
+        cs = used * f + (1.0 - used) * SDF_FAR
+        take = cs < d
+        d = AbstractTensor.where(take, cs, d)
+        nx = AbstractTensor.where(take, c * gx - s * gy, nx)
+        ny = AbstractTensor.where(take, s * gx + c * gy, ny)
+        svx = AbstractTensor.where(take, bvx - om * dy, svx)       # the surface moves at v + omega x (r - centre)
+        svy = AbstractTensor.where(take, bvy + om * dx, svy)
+        som = AbstractTensor.where(take, om + zero, som)
+    return d, nx, ny, svx, svy, som
+
+
 def sdf_field(x, y, q):
     """The composed chamber SDF at ``(x, y)`` from the slot uniforms (``q(k, field)`` gives slot ``k``'s scalar).
     d = max over FLUID slots of their inside distance, then min with the signed distance to each SOLID: ``d > 0`` is inside the
@@ -585,6 +707,8 @@ def sdf_field(x, y, q):
     d_f, f_nx, f_ny = zero - SDF_FAR, zero, zero
     d_s, s_nx, s_ny = zero + SDF_FAR, zero, zero
     for k in range(SDF_SLOTS):
+        if SDF_LAYOUT[k] == "mbox":
+            continue                                           # a moving box is a contact of its own (``moving_field``), not part of the static field
         kind, role, cx, cy, rot = (q(k, f) for f in ("kind", "role", "cx", "cy", "rot"))
         p0, p1, p2, p3, p4, p5 = (q(k, f) for f in ("p0", "p1", "p2", "p3", "p4", "p5"))
         c, s = rot.cos(), rot.sin()
@@ -594,7 +718,7 @@ def sdf_field(x, y, q):
         fns = {"box": lambda: _sdf_box(lx, ly, p0, p1, p2), "circle": lambda: _sdf_circle(lx, ly, p0),
                "capsule": lambda: _sdf_capsule(lx, ly, p0, p1), "annulus": lambda: _sdf_annulus(lx, ly, p0, p1),
                "ngon": lambda: _sdf_ngon(lx, ly, p0, p1), "hourglass": lambda: _sdf_hourglass(lx, ly, p0, p1, p2, p3),
-               "pegs": lambda: _sdf_pegs(lx, ly, p0, p1, p2, p3, p4, p5)}
+               "pegs": lambda: _sdf_pegs(lx, ly, p0, p1, p2, p3, p4, p5), "occgrid": lambda: _sdf_occgrid(lx, ly, p0, p1, p2, p3, p4, p5)}
         f, gx, gy = fns[SDF_LAYOUT[k]]()                          # TYPED slot: only its own kind's SDF is evaluated
         gwx, gwy = c * gx - s * gy, s * gx + c * gy
         used = as_float(kind > 0.5)
@@ -891,6 +1015,13 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             gap = _cap(radius - d_sdf, 6.0 * radius)
             wall(gap.clamp(0.0, 1.0e9) * live * sdf_on, live * sdf_on, gap, sdf_nx, sdf_ny)
             sdf_gone = live * sdf_on * as_float(d_sdf < -radius)       # the grain centre is more than a radius on the wrong side
+            # ---- the MOVING SOLID BOXES (purrline sand): the same saturating contact against the nearest used box, whose SURFACE moves
+            # (the waterwheel's contact): the relative velocity and relative spin are the grain's less the surface's.  A box has infinite mass
+            # and no state here -- its pose is an input -- so it is pushed by nothing; none used: the distance is SDF_FAR, the overlap and the
+            # weight are exact zeros.
+            d_mv, mv_nx, mv_ny, mv_vx, mv_vy, mv_om = moving_field(x, y, lambda k, field: a[f"q{k}{field}"])
+            gap = _cap(radius - d_mv, 6.0 * radius)
+            wall(gap.clamp(0.0, 1.0e9) * live * sdf_on, live * sdf_on, gap, mv_nx, mv_ny, vx - mv_vx, vy - mv_vy, w - mv_om)
         else:
             sdf_gone = x * 0.0
         tb = x * 0.0
@@ -1184,6 +1315,7 @@ def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
     w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
     slots: list[dict[str, float]] = []
     nozzle_y = None
+    mapping = None
     if shape == "sdf_circle":
         top = 2.0 * w
         slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, w))
@@ -1235,9 +1367,90 @@ def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
             slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
         cols = 2 * int(w // px) + 1
         slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (peg_rows - 1) * py, 0.0, px, py, 0.9 * c, cols, peg_rows, 1.0))
+    elif shape == "sdf_purrline":
+        # PURRLINE SAND (WORKLIST.md C): a box chamber exactly as wide as the board, so sand can only pass THROUGH it; bottom up: the SUMP
+        # (PURRLINE_SUMP cells), the board (8 x 8 solid cells, the occupancy grid, full until the page writes the game's mask) and the headroom
+        # with the inlet PURRLINE_INLET cells above the board.  One board cell is 2 w / 8 wide (the chamber is the board's width).
+        w = min(w, geo["half"])
+        cell_f = 2.0 * w / PURRLINE_COLS
+        top = (PURRLINE_SUMP + PURRLINE_ROWS + PURRLINE_HEAD) * cell_f
+        slots.append(_slot("box", "fluid", 0.0, 0.5 * top, 0.0, w, 0.5 * top, 2.0 * c))
+        cy = (PURRLINE_SUMP + 0.5 * PURRLINE_ROWS) * cell_f
+        words = pack_mask([1] * (PURRLINE_ROWS * PURRLINE_COLS))
+        slots.append(_slot("occgrid", "solid", 0.0, cy, 0.0, cell_f, PURRLINE_COLS, PURRLINE_ROWS, *words))
+        nozzle_y = (PURRLINE_SUMP + PURRLINE_ROWS + PURRLINE_INLET) * cell_f
+        mapping = {"cx": 0.0, "cy": cy, "cell": cell_f, "rows": PURRLINE_ROWS, "cols": PURRLINE_COLS, "sump": PURRLINE_SUMP * cell_f}
     else:
         raise ValueError(f"unknown SDF chamber {shape!r}")
-    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": (0.25 if shape == "sdf_toy" else 0.4) * w}
+    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": {"sdf_toy": 0.25, "sdf_purrline": 0.7}.get(shape, 0.4) * w,
+            "map": mapping}
+
+
+# ------------------------------------------------------------ purrline sand
+#: The purrline sand chamber's proportions, in board cells: the sump under the board, the board (8 x 8), the headroom over it, the inlet's height over the board.
+PURRLINE_ROWS, PURRLINE_COLS = 8, 8
+PURRLINE_SUMP, PURRLINE_HEAD, PURRLINE_INLET = 2.0, 3.0, 1.8
+PURRLINE_BOXES = len(MB_SLOTS)           # the falling items that push at once: the lowest ones (nearest the sand)
+PURRLINE_BOX_ROUND = 0.12                # a falling item's corner radius, in cells
+
+
+def pack_mask(mask) -> tuple[float, float, float]:
+    """The 8 x 8 mask (64 values, row-major, row 0 at the TOP) as the three words of the occupancy-grid slot: row ``r`` is the byte ``r mod 3``
+    of word ``r // 3`` (so rows 0-2 are word 0, 3-5 word 1, 6-7 word 2; every word is below 2**24, exact in f32)."""
+    bits = list(mask)
+    if len(bits) != PURRLINE_ROWS * PURRLINE_COLS:
+        raise ValueError("pack_mask: give the 8 x 8 mask (64 values)")
+    words = [0, 0, 0]
+    for r in range(PURRLINE_ROWS):
+        for c in range(PURRLINE_COLS):
+            if bits[r * PURRLINE_COLS + c]:
+                words[r // 3] |= 1 << (8 * (r % 3) + c)
+    return float(words[0]), float(words[1]), float(words[2])
+
+
+def purrline_inputs(game: dict, mapping: dict[str, float]) -> dict[str, float]:
+    """THE PAGE'S ONE-WAY WRITE: the purrline game's state (``state['purrline']``: ``occupancy``, ``rows``, ``cols``, ``cell``, ``origin``, ``falling``)
+    as the fountain law's runtime inputs.  ``mapping`` is the chamber's ``sdf_preset(..)['map']`` (the board's centre ``cx, cy`` in fountain units
+    and one board cell's width ``cell``).  Board units (x right, y DOWN, a cell ``cell`` wide, the top-left corner ``origin``) map to fountain
+    units (y UP) by a scale ``k = mapping.cell / game.cell`` about the board's centre, y flipped.  The occupied cells fill the grid slot; the
+    ``PURRLINE_BOXES`` lowest falling items are the moving boxes, each the size of the cell it will fill, centred on the item, with its velocity
+    (``vx, -vy`` x k).  Unused boxes are written ``kind`` 0 (exact zeros).  ``web/compute.js`` ``setPurrline`` is this function."""
+    cb = float(game.get("cell", 1.0))
+    ox, oy = (float(v) for v in game.get("origin", (0.0, 0.0)))
+    rows, cols = int(game["rows"]), int(game["cols"])
+    k = float(mapping["cell"]) / cb
+    bcx, bcy = ox + 0.5 * cols * cb, oy + 0.5 * rows * cb
+    mask = [0] * (PURRLINE_ROWS * PURRLINE_COLS)
+    for r in range(rows):
+        for c in range(cols):
+            mask[PURRLINE_COLS * r + c] = 1 if game["occupancy"][r * cols + c] else 0
+    w0, w1, w2 = pack_mask(mask)
+    out = {f"q{OG_SLOT}kind": 1.0, f"q{OG_SLOT}cx": float(mapping["cx"]), f"q{OG_SLOT}cy": float(mapping["cy"]), f"q{OG_SLOT}p0": float(mapping["cell"]),
+           f"q{OG_SLOT}p1": float(cols), f"q{OG_SLOT}p2": float(rows), f"q{OG_SLOT}p3": w0, f"q{OG_SLOT}p4": w1, f"q{OG_SLOT}p5": w2}
+    items = sorted(game.get("falling", ()), key=lambda it: -float(it["y"]))[:PURRLINE_BOXES]
+    names = ("kind", "cx", "cy", "rot", "p0", "p1", "p2", "p3", "p4", "p5")
+    for slot, k_slot in enumerate(MB_SLOTS):
+        if slot < len(items):
+            it = items[slot]
+            half = 0.5 * float(mapping["cell"])
+            vals = (1.0, float(mapping["cx"]) + (float(it["x"]) - bcx) * k, float(mapping["cy"]) - (float(it["y"]) - bcy) * k, 0.0,
+                    half, half, PURRLINE_BOX_ROUND * float(mapping["cell"]), float(it.get("vx", 0.0)) * k, -float(it.get("vy", 0.0)) * k, 0.0)
+        else:
+            vals = (0.0,) * len(names)
+        out.update({f"q{k_slot}{n}": v for n, v in zip(names, vals)})
+    return {name: float(_f32(np.float64(v))) for name, v in out.items()}
+
+
+def purrline_spec(size: str = "4k", aspect: float | None = None, params: dict | None = None) -> dict[str, Any]:
+    """The compute spec a page needs to run the purrline sand chamber at ``size`` (what the server's ``FountainGame.state`` sends for the shape,
+    without a session): the uniforms (the full board, no moving boxes), the view, the chamber outline, the tilt inputs and the board map."""
+    active = SIZES[size][0]
+    p = species_params(params)
+    geo = chamber_basin("sdf_purrline", active, aspect, cell_needed(p))
+    u = uniforms(n=active, aspect=aspect, params=params, shape="sdf_purrline")
+    return {"shape": "sdf_purrline", "size": size, "uniforms": {k: float(v) for k, v in u.items()}, "view": list(geo["view"]),
+            "chamber_outline": chamber_outline("sdf_purrline", active, aspect, params),
+            "tilt": tilt_inputs(active, aspect, cell_needed(p), "sdf_purrline"), "map": sdf_preset("sdf_purrline", geo)["map"]}
 
 
 def chamber_basin(shape: str, n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
@@ -1381,7 +1594,11 @@ def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dic
     if key in _OUTLINES:
         return _OUTLINES[key]
     geo = chamber_basin(shape, n, aspect, cell)
-    if shape in SDF_SHAPES:
+    if shape == "sdf_purrline":                       # the chamber box (the board's cells are the page's own board; the moving state is not an outline)
+        spec = sdf_preset(shape, geo)
+        wd, tp = spec["half"], spec["top"]
+        lines = [[[-wd, 0.0], [wd, 0.0], [wd, tp], [-wd, tp], [-wd, 0.0]]]
+    elif shape in SDF_SHAPES:
         u = uniforms(n=n, aspect=aspect, params=params, shape=shape)
         x0, x1, y0, y1 = geo["view"]
         h = cell * OUTLINE_STEP
