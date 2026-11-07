@@ -63,13 +63,10 @@ def test_the_pile_forms_and_settles_by_contact_forces(native_piece):
     assert np.all(np.abs(final["x"]) <= geo["half"] + 1e-3) and float(final["y"].min()) > -1e-3
     assert float(np.sqrt(final["vx"] ** 2 + final["vy"] ** 2 + final["vz"] ** 2).max()) < 0.2          # at rest
     assert float(np.abs(final["z"]).max()) <= float(columns["dh"])                                   # inside the plexiglass
-    top = float(np.percentile(final["y"], 99))
-    fraction = float((np.pi * final["rad"] ** 2).sum() / (geo["width"] * top))
-    assert 0.55 < fraction < 0.95                  # the thin slab's pile is the 2-D pile: a single layer of disks' areal fraction
-    x, y, r = final["x"], final["y"], final["rad"]
-    gap = np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :]) - (r[:, None] + r[None, :])
+    x, y, z, r = final["x"], final["y"], final["z"], final["rad"]
+    gap = np.sqrt((x[:, None] - x[None, :]) ** 2 + (y[:, None] - y[None, :]) ** 2 + (z[:, None] - z[None, :]) ** 2) - (r[:, None] + r[None, :])
     np.fill_diagonal(gap, 1.0)
-    assert float(gap.min()) > -0.6 * float(r.max())
+    assert float(gap.min()) > -0.6 * float(r.max())                 # no two spheres overlap deeply: a volume, not a sheet
 
 
 def test_the_replay_is_bit_identical_and_the_settled_pile_shows_the_image(native_piece):
@@ -125,6 +122,7 @@ def test_the_compiler_chooses_per_size_and_the_program_carries_no_per_id_data():
     assert compiled.bindings > 1 and compiled.bindings + 1 <= 8       # the binding COUNT budget holds (7 stacked lanes + the head)
     assert compiled.bindings == -(-compiled.slots // compiled.slots_per_binding)
     assert compiled.slots_per_binding * pad * 4 <= 300 * 1024 * 1024    # 49 slots at 10M: 7 per lane, 280 MB
+    assert compiled.slots == F.ARENA_SLOTS and F.binding_bytes(pad) == compiled.slots_per_binding * pad * 4   # the volume adds no per-id column
 
 
 def test_the_wgsl_program_is_generated_from_the_authored_law():
@@ -411,7 +409,7 @@ def test_the_reduction_is_the_sum_of_the_columns(emission_run):
     rad = run["rad"]
     mass = _mass(rad)
     ke = float((0.5 * mass * (vx ** 2 + vy ** 2 + vz ** 2) + 0.5 * (0.4 * mass * rad ** 2) * (wx ** 2 + wy ** 2 + wz ** 2)).sum())
-    assert abs(run["diag"]["ke"][last] - ke) < 1e-9 * max(ke, 1e-12)
+    assert abs(run["diag"]["ke"][last] - ke) < 1e-7 * max(ke, 1e-12)      # the species densities are float32 uniforms (1.6 -> 1.60000002): 1e-8 apart from the table's
     assert abs(run["diag"]["vmax2"][last] - float((vx ** 2 + vy ** 2 + vz ** 2).max())) < 1e-12
 
 
@@ -907,29 +905,53 @@ def _live(f):
     return (np.abs(f["x"]) + np.abs(f["y"]) + np.abs(f["z"])) > 0
 
 
-def test_the_default_chamber_is_a_thin_slab_and_its_pile_stays_flat(native_piece):
-    """Depth is a runtime uniform; the default is about one grain diameter deep, so z never moves (a 2-D pile of spheres)."""
+def test_the_default_chamber_is_a_box_nine_grains_deep_and_the_pile_settles_in_depth(native_piece):
+    """Depth is a runtime uniform; the default is about nine grain diameters, the inlet spans it, and the settled pile is spread through it
+    (the z spread of the grains is many diameters), no grain leaves through the front or back glass, and every id is counted exactly."""
     piece, columns = native_piece
-    assert F.CELL <= 2.0 * float(columns["dh"]) <= F.DEPTH_DEFAULT + 1e-9 and float(columns["bar_z"]) == 0.0
-    out = F.run_frames(piece, columns, 2500)
-    assert float(np.abs(out["z"]).max()) < 1e-9 and float(np.abs(out["vz"]).max()) < 1e-9
-    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
+    dh = float(columns["dh"])
+    assert 8.0 * 2.0 * 0.0105 <= 2.0 * dh <= 10.0 * 2.0 * 0.0105 + 1e-9 and float(columns["bar_z"]) > 0.0
+    assert float(columns["lays"]) == np.ceil(2.0 * dh / float(columns["cell"]) - 1e-9) and float(columns["lays"]) >= 6
+    out = F.run_frames(piece, columns, REST_STEPS)
+    live = _live(out)
+    diameter = 2.0 * float(out["rad"][live].mean())
+    assert float(np.ptp(out["z"][live])) > 5.0 * diameter                              # the pile is deep: many diameters of z spread
+    assert float(np.abs(out["z"][live]).max()) <= dh + 1e-6                            # nothing through the front or back glass
+    n = F.N_SMALL
+    assert float(out["n_nan"][0] + out["n_out"][0] + out["n_parked"][0] + out["n_live"][0]) == n
+    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0 and float(out["n_live"][0]) == n
 
 
-def test_a_deeper_slab_uses_its_depth_and_the_plexiglass_holds_it(native_piece):
+def test_the_z_grid_is_part_of_the_cell_index_and_the_key_stays_exact_in_float32():
+    for tag, (count, _pad) in F.SIZES.items():
+        u = F.uniforms(n=count)
+        cells = float(u["cols"]) * (float(u["rows"]) + F.ROWS_MARGIN) * float(u["lays"])
+        assert cells < 2.0 ** 24, tag                                                   # the sort key is a float32 whole number
+        assert float(u["lays"]) * float(u["cell"]) >= 2.0 * float(u["dh"]) - 1e-6, tag     # the layers cover the depth
+    assert float(F.uniforms(n=4096)["lays"]) >= 6                                      # the default is a volume
+    assert 2.0 * float(F.uniforms(n=10_000_000)["dh"]) < F.DEPTH_DEFAULT                 # 10M is capped honestly (its grid cannot index more layers)
+    assert F.depth_cap(10_000_000) < F.DEPTH_DEFAULT <= F.depth_cap(F.SIZES["4M"][0])
+    assert float(F.uniforms(n=256, params={"depth": F.DEPTH_MAX})["lays"]) > 50        # up to a box as deep as the chamber is wide
+    game = F.FountainGame(size="10M")
+    ids = {item["id"]: item for item in game.state()["controls_ui"]}
+    assert ids["depth"]["max"] < F.DEPTH_DEFAULT and "280 MB" in dict(ids["size"]["options"])["10M"]    # the size control says what 10M needs
+    assert F.binding_bytes(10_000_000) > F.BINDING_CLASS_LIMIT >= F.binding_bytes(F.SIZES["4M"][0])
+
+
+def test_a_deeper_box_uses_its_depth_and_the_plexiglass_holds_it(native_piece):
     piece, _columns = native_piece
-    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": F.DEPTH_MAX})
+    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": 0.4})
     assert float(cols["bar_z"]) > 0.0
     out = F.run_frames(piece, cols, 2500)
     live = _live(out)
     dh = float(cols["dh"])
-    assert float(np.abs(out["z"][live]).max()) > 0.2 * dh and float(np.abs(out["z"][live]).max()) <= dh + 1e-6
-    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0 and float(out["n_drop"][0]) == 0
+    assert float(np.abs(out["z"][live]).max()) > 0.5 * dh and float(np.abs(out["z"][live]).max()) <= dh + 1e-6
+    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
 
 
 def test_a_phone_lying_flat_pulls_the_grains_into_the_slab_against_the_back_wall(native_piece):
     piece, _columns = native_piece
-    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": F.DEPTH_MAX})
+    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": 0.1})
     cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(-F.G))
     out = F.run_frames(piece, cols, 3000)
     live = _live(out)
