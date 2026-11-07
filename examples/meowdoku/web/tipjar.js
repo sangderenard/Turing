@@ -139,11 +139,15 @@ export function initTipJar(hooks) {
             backdrop-filter: blur(6px); color: var(--fg); font: 13px/1.35 system-ui, sans-serif; display: none; }
   #tipjar h3 { margin: 0 0 4px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
   #tipjar .badge { font-size: 11px; padding: 1px 7px; border-radius: 9px; background: #8a5a1a; color: #fff; }
-  #tipjar.min > :not(h3):not(.big):not(.sub) { display: none; }
+  #tipjar.min > .legend, #tipjar.min > .note { display: none; }
+  #tipjar.min canvas { width: 128px; height: 128px; }
+  #tipjar .donate { display: flex; gap: 10px; align-items: center; margin-top: 6px; }
+  #tipjar .donate canvas { margin: 0; flex: none; }
+  #tipjar .donate .side { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
   #tipjar h3 button { margin-left: auto; padding: 0 8px; }
   #tipjar .big { font: 600 20px/1.2 ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   #tipjar .sub, #tipjar .note { opacity: .75; font-size: 12px; }
-  #tipjar .addr { font: 11px/1.3 ui-monospace, monospace; word-break: break-all; margin: 6px 0 4px; user-select: all; }
+  #tipjar .addr { font: 12px/1.3 ui-monospace, monospace; white-space: nowrap; user-select: all; }
   #tipjar button, #tipjar a.btn { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; font: inherit; cursor: pointer; text-decoration: none; display: inline-block; }
   #tipjar canvas { position: static; display: block; width: 168px; height: 168px; margin: 6px 0; border-radius: 4px; image-rendering: pixelated; touch-action: auto; }
   #tipjar .legend { margin-top: 6px; border-top: 1px solid var(--line); padding-top: 6px; }
@@ -171,13 +175,22 @@ export function initTipJar(hooks) {
     panel.append(el("div", "sub", `${withCommas(t.balance_sats)} sats${fiat} · ${t.count} donation${t.count === 1 ? "" : "s"}`));
     if (t.error) panel.append(el("div", "note", "the last poll failed; showing the last list"));
     if (t.address) {
-      panel.append(el("div", "addr", t.address));
-      const row = el("div"); const copy = el("button", null, "Copy");
-      copy.onclick = async () => { try { await navigator.clipboard.writeText(t.address); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select the address"; } setTimeout(() => { copy.textContent = "Copy"; }, 1500); };
-      const open = el("a", "btn", "Open in wallet"); open.href = t.uri; open.style.marginLeft = "6px";
-      row.append(copy, open); panel.append(row);
-      const q = document.createElement("canvas");
-      try { drawQr(q, t.uri); panel.append(q); } catch (e) { panel.append(el("div", "note", "QR unavailable: " + e.message)); }
+      // THE DONATE BLOCK, always visible (also on a minimised phone panel): the QR, the address shortened (its full text is what Copy copies),
+      // a Copy button and the wallet link
+      const block = el("div", "donate"), side = el("div", "side"), q = document.createElement("canvas");
+      try { drawQr(q, t.uri); block.append(q); } catch (e) { side.append(el("div", "note", "QR unavailable: " + e.message)); }
+      const short = t.address.length > 16 ? `${t.address.slice(0, 8)}…${t.address.slice(-6)}` : t.address;
+      const addr = el("div", "addr", short); addr.title = t.address;
+      const copy = el("button", null, "Copy address");
+      copy.onclick = async () => {
+        let ok = false;
+        try { await navigator.clipboard.writeText(t.address); ok = true; } catch (e) {
+          try { const ta = el("textarea"); ta.value = t.address; ta.style.cssText = "position:fixed;opacity:0"; document.body.append(ta); ta.select(); ok = document.execCommand("copy"); ta.remove(); } catch (e2) { ok = false; }
+        }
+        copy.textContent = ok ? "Copied" : "Copy failed"; setTimeout(() => { copy.textContent = "Copy address"; }, 1500);
+      };
+      const open = el("a", "btn", "Open in wallet"); open.href = t.uri;
+      side.append(addr, copy, open); block.append(side); panel.append(block);
     }
     const lg = el("div", "legend");
     lg.append(el("div", null, "How to read a grain"));

@@ -6148,7 +6148,13 @@ function chessClockTick() {
 setInterval(chessClockTick, 100);
 const newGame = (payload) => {
   if (payload.game === "meowdoku" && $("palette").value) payload = { ...payload, palette: $("palette").value };
-  const step = chain.then(async () => { await loading.gate(payload.game, { predictor: state.predictorsLoaded }); /* [LOADING] */ console.log("[meow] new", JSON.stringify(payload)); applyState(await api("/api/new", payload)); }).catch((e) => console.warn(e));
+  const step = chain.then(async () => {
+    // TIP JAR: the donation panel (total, QR, address, copy) shows at once, while the jar's fountain may still be building behind the loading panel
+    const early = payload.game === "tipjar" ? await api("/api/new", payload) : null;
+    if (early) tipjar.update(early);
+    await loading.gate(payload.game, { predictor: state.predictorsLoaded }); /* [LOADING] */
+    console.log("[meow] new", JSON.stringify(payload)); applyState(early || await api("/api/new", payload));
+  }).catch((e) => console.warn(e));
   chain = step;
   return step;
 };
