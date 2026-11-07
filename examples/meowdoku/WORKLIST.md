@@ -31,6 +31,12 @@ A. **Signed-distance chambers:** primitives (box/cube, sphere/circle, capsule/ra
 B. **Ports, pumps and lines:** outlet regions park grains into a line (transit time from length and pump rate) and re-emit them FIFO at an inlet port, deterministically in law state; see-through glass tubing drawn with the transiting grains.
 C. **Hinged rigid actors + waterwheel:** a body of SDF primitives on one hinge, two-way contact forces, angle as law state, coupled through the engine_toy machine-sim torque path; preset "waterwheel fountain" (nozzle -> wheel -> outlet -> pump line -> nozzle).
 
+## Purrline sand mode (the user, 2026-11-07)
+
+A. Finite supply of replenishment items; matched cells stay empty once the stock runs out (in progress).
+B. New items fall from the sky on their own plane and only join the field on landing (in progress, in the purrline law).
+C. A 2D fountain surrounds the board. The board's occupied cells are solids (a new occupancy-grid SDF primitive from a per-cell mask), and falling items are moving solids with "unreasonable push" (position-driven, infinite mass, carrying their velocity). Sand fills and backs up, and only passes through the holes left when the supply runs out, into a sump. The page writes the mask and the item poses into the fountain's runtime inputs each batch; the sand doesn't feed back into the game. Queued after the waterwheel (which owns fountain.py).
+
 ## Render priority (the user, 2026-11-06)
 
 1. Colour modes: grain size, species breakdown; palettes (sea first); "stained glass" grains through the scene's Phong + glass pass; no opaque black backdrop behind the fountain.
