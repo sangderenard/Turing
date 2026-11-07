@@ -339,11 +339,11 @@ def chord(verts: list[tuple[float, float]], y: float) -> tuple[float, float]:
     return (min(xs), max(xs)) if xs else (-1.0e9, 1.0e9)
 
 
-def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL, shape: str = "box") -> dict[str, float]:
     """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
     jet's reach and a grid tall enough to cover everything under it."""
-    geo = basin(n, aspect, cell)
-    lid = geo["nozzle_y"] + LID_ABOVE
+    geo = chamber_basin(shape, n, aspect, cell)
+    lid = max(geo["nozzle_y"] + LID_ABOVE, geo.get("top", 0.0) + cell)             # (a designed SDF chamber may be taller than the jet's reach)
     return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
 
 
@@ -1176,54 +1176,79 @@ def _capsule_ramp(high: tuple[float, float], low: tuple[float, float], rad: floa
 
 
 def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
-    """An SDF chamber as slots (pure data), inscribed in the visible window with the 3-cell margin (|x| <= w, 0 <= y <= top), and where
-    its inlet goes (``nozzle_y``; ``None``: the basin's own height) -- the inlet is checked to be inside the fluid by ``uniforms``."""
+    """An SDF chamber as slots (pure data) at its DESIGNED proportions: the width is the basin's (``|x| <= w``, the window's half width
+    less the 3-cell margin), the HEIGHT is whatever the design needs (``top``), built from ``w`` (which goes as sqrt(ids)) and the grain
+    size (``cell``): a circle's diameter, a funnel's slope, the toy's peg rows, throat and ramps.  ``chamber_basin`` makes the view
+    follow it.  Also where its inlet goes (``nozzle_y``) -- the inlet is checked to be inside the fluid by ``uniforms``."""
     c = geo.get("cell", CELL)
     w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
-    top = geo["view"][3] - 3.0 * c
     slots: list[dict[str, float]] = []
     nozzle_y = None
     if shape == "sdf_circle":
-        slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, min(w, 0.5 * top)))
+        top = 2.0 * w
+        slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, w))
         nozzle_y = 0.5 * top
     elif shape == "sdf_square":
-        half = min(w, 0.5 * top)
-        slots.append(_slot("box", "fluid", 0.0, 0.5 * top, 0.0, half, half, 2.0 * c))
-        nozzle_y = 0.5 * top
+        top = 2.0 * w
+        slots.append(_slot("box", "fluid", 0.0, w, 0.0, w, w, 2.0 * c))
+        nozzle_y = w
     elif shape == "sdf_triangle":
-        r, cy = ngon_fit(3, w, top)
+        ang = [-0.5 * math.pi - math.pi / 3 + TAU * i / 3 for i in range(3)]
+        ys = [math.sin(t) for t in ang]
+        r = 2.0 * w / (max(math.cos(t) for t in ang) - min(math.cos(t) for t in ang))
+        cy = -r * min(ys)
+        top = r * (max(ys) - min(ys))
         slots.append(_slot("ngon", "fluid", 0.0, cy, -0.5 * math.pi, r, 3.0))
         nozzle_y = cy
     elif shape == "sdf_annulus":
-        big = min(w, 0.5 * top)
+        big = w
+        top = 2.0 * big
         band = min(max(0.25 * big, 4.0 * c), 0.4 * big)                          # the ring's half thickness (a tiny window keeps a ring wide enough to pour into)
-        slots.append(_slot("annulus", "fluid", 0.0, 0.5 * top, 0.0, big - band, band))
-        nozzle_y = 0.5 * top + big - band
+        slots.append(_slot("annulus", "fluid", 0.0, big, 0.0, big - band, band))
+        nozzle_y = big + big - band
     elif shape == "sdf_hourglass":
+        top = 2.7 * w
         slots.append(_slot("hourglass", "fluid", 0.0, 0.5 * top, 0.0, w, max(0.1 * w, 3.5 * c), 0.5 * top, 0.0))
         nozzle_y = 0.75 * top
     elif shape == "sdf_toy":
         # ONE hourglass-profile vessel (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall, the floor y = 0 under
-        # it); three capsule ramps (left-down, right-down, left-down) in the upper section; a staggered peg field under the throat
+        # it); three capsule ramps (left-down, right-down, left-down) in the upper section; a staggered peg field under the throat.  Built
+        # bottom up from what each part needs, so the height is the sum, not a fraction of a window: six peg rows (pitch 4.6 grain
+        # diameters) and a 3-cell clearance under the funnel; the funnel (slope 1.7); the ramps (a drop of tan 0.42 across the vessel,
+        # each stepped 0.25 w below the last, 6 cells of clearance above the funnel); the inlet 0.12 above the highest ramp.
         rr = 0.9 * c
-        yc, delta = 0.44 * top, 0.20 * top
         throat = max(0.09 * w, 3.5 * c)
-        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, (w - throat) / delta))
-        tan, y0, step = 0.42, top - 0.10 * top, 0.097 * top
+        slope, tan, step = 1.7, 0.42, 0.25 * w
+        delta = (w - throat) / slope
+        px = py = 4.6 * c
+        y_lo, peg_rows = 4.0 * c, 6
+        pegs_top = y_lo + (peg_rows - 1) * py + 0.9 * c
+        yc = pegs_top + 3.0 * c + delta
         edge = w + 1.5 * rr
+        y0 = yc + delta + 6.0 * c + tan * (edge + 0.1 * w) + 2.0 * step
+        nozzle_y = y0 + 0.12
+        top = nozzle_y + 0.12
+        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, slope))
         for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
             sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
             high = (sign * edge, y0 - i * step)
             slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
-        px = py = 4.6 * c
-        y_lo, y_hi = 0.05 * top, yc - delta - 0.03 * top
-        rows = max(1, int((y_hi - y_lo) // py) + 1)
         cols = 2 * int(w // px) + 1
-        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
-        nozzle_y = top - 0.12
+        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (peg_rows - 1) * py, 0.0, px, py, 0.9 * c, cols, peg_rows, 1.0))
     else:
         raise ValueError(f"unknown SDF chamber {shape!r}")
     return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": (0.25 if shape == "sdf_toy" else 0.4) * w}
+
+
+def chamber_basin(shape: str, n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+    """``basin`` for a chamber shape: the polygon presets and the box are the basin as it always was; an SDF preset keeps its designed
+    proportions, so the VIEW (its top: the chamber's top and the 3-cell margin), the grid's rows and the inlet follow the chamber."""
+    geo = basin(n, aspect, cell)
+    if shape not in SDF_SHAPES:
+        return geo
+    spec = sdf_preset(shape, geo)
+    view = (geo["view"][0], geo["view"][1], geo["view"][2], spec["top"] + 3.0 * cell)
+    return {**geo, "view": view, "nozzle_y": spec["nozzle_y"], "rows": max(geo["rows"], math.ceil(spec["top"] / cell) + 1), "top": spec["top"]}
 
 
 def slot_uniforms(slots: list[dict[str, float]]) -> dict[str, float]:
@@ -1355,7 +1380,7 @@ def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dic
     key = (shape, int(n), aspect, round(cell, 9))
     if key in _OUTLINES:
         return _OUTLINES[key]
-    geo = basin(n, aspect, cell)
+    geo = chamber_basin(shape, n, aspect, cell)
     if shape in SDF_SHAPES:
         u = uniforms(n=n, aspect=aspect, params=params, shape=shape)
         x0, x1, y0, y1 = geo["view"]
@@ -1401,7 +1426,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
     p = species_params(params)
     cell = cell_needed(p)
-    geo = basin(n, aspect, cell)
+    geo = chamber_basin(shape, n, aspect, cell)
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     wheel = shape in BODY_SHAPES
@@ -1807,7 +1832,7 @@ class FountainGame(Game):
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect, cell_needed(species_params(self.params)))
+        return chamber_basin(self.shape, self.n, self.aspect, cell_needed(species_params(self.params)))
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
@@ -1832,7 +1857,7 @@ class FountainGame(Game):
                                                               use_image=1.0 if self.phase == "replay" else 0.0, params=self.params, shape=self.shape).items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "chamber_outline": chamber_outline(self.shape, self.n, self.aspect, self.params),
                 "body": self.body_spec(), "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params))),
+                "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params)), self.shape),
             },
         })
         return base
