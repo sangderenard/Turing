@@ -135,7 +135,7 @@ const outlineBox = (lines) => {
   const pts = lines.flat();
   return pts.length ? [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[1]))] : null;
 };
-export function filterTape(tape, { from, to, maxGrains = 400, fps = 12, bits = 12, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0 }) {
+export function filterTape(tape, { from, to, maxGrains = 400, fps = 12, bits = 12, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0, angleAtStep = null }) {
   from = Math.max(from, tape.lo); to = Math.min(to, tape.hi);
   if (to <= from) throw new Error("filterTape: nothing recorded between the frames");
   const stride = Math.max(1, Math.round(1 / (fps * dt * tape.snapEvery)));          // recorded frames per kept frame
@@ -166,6 +166,7 @@ export function filterTape(tape, { from, to, maxGrains = 400, fps = 12, bits = 1
   const events = tape.inputs.filter((e) => "grav_x" in e.values && "grav_y" in e.values);
   frames.forEach((k, j) => {
     const step = tape.stepOf(k);
+    if (angleAtStep) { const a = angleAtStep(step); angle[j] = Math.round((((-a % TAU) + TAU) % TAU) / TAU * 65536) & 0xffff; return; }
     let e = null; for (const ev of events) { if (ev.step <= step) e = ev; else break; }
     if (e && e.step !== lastStep) {
       lastStep = e.step;

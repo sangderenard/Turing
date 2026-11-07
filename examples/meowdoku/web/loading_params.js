@@ -24,6 +24,8 @@ export const DEFAULTS = Object.freeze({
   settle: 40,                      // the settle threshold: kinetic energy per id, in multiples of the law's `settle.ke_per_id`
   turns: 4,                        // case turns (even: the animation ends in the pose it began in)
   flipSeconds: 0.4,                // how swift the turn is (simulated seconds)
+  flipDirection: 1,                // +1 or -1 about the selected case axis
+  flipAxis: "y",                  // world Y: case normal (2-D); world X/Z use the 3-D hourglass law
   speed: 0,                        // the fountain speed (0: as fast as the device allows)
   cap: 240,                        // the duration cap, simulated seconds
   colour: 2,                       // fountain colour mode (preview and metadata: the stream carries positions only)
@@ -48,6 +50,8 @@ export function normalize(raw = {}) {
     settle: num(r.settle, 1, 400, D.settle),
     turns: turns - (turns % 2),                      // even
     flipSeconds: num(r.flipSeconds, 0.1, 2, D.flipSeconds),
+    flipDirection: pick(Number(r.flipDirection), [-1, 1], D.flipDirection),
+    flipAxis: pick(r.flipAxis, ["x", "y", "z"], D.flipAxis),
     speed: pick(Number(r.speed), [0, 1, 2, 4], D.speed),
     cap: num(r.cap, 10, 900, D.cap),
     colour: pick(Number(r.colour), COLOUR_SOURCES.map((c) => c[0]), D.colour),
