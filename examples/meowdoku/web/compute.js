@@ -453,6 +453,18 @@ export function spinGravity(hz, t, motion = { kind: "spin" }) {
   const a = motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;
   return [Math.sin(a), -Math.cos(a)];
 }
+// The case's angular velocity and acceleration (rad/s, rad/s^2, counterclockwise positive) behind that gravity: gravity seen in
+// the case frame turns by the OPPOSITE of the case's turn, so a spin (gravity angle a = 2 pi hz t) is a case at omega = -da/dt
+// and a rock (a = (arc/2) sin(phase)) has omega = -da/dt, domega = -d2a/dt2.  The law adds the fictitious forces for these (Coriolis,
+// centrifugal, Euler), so a turning case drags its contents even with gravity at 0.
+export function spinOmega(hz, t, motion = { kind: "spin" }) {
+  const w = 2 * Math.PI * hz, phase = w * t + (Math.PI / 180) * (Number(motion.phase) || 0);
+  if (motion.kind === "rock") {
+    const A = (Math.PI / 180) * (motion.arc / 2);
+    return [-A * w * Math.cos(phase), A * w * w * Math.sin(phase)];
+  }
+  return [-w, 0];
+}
 const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)
 const TARGET_MS = { gpu: 8, wasm: 6 };  // what one batch should take: short enough to keep the display and the page responsive
 const LEAD_FRAMES = 8;                  // the pump rests when the buffer holds this many snapshots the display has not reached
@@ -590,6 +602,10 @@ export class ComputeRuntime {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
+    if (this.runtimeInputs.has("case_omega")) {          // the case's own turn, from the same motion (one mechanism): 0 when it stands still
+      const [om, dom] = this.spin ? spinOmega(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : [0, 0];
+      out.case_omega = om; out.case_domega = dom;
+    }
     if (g) {
       const G = this.manifest.law.gravity;
       out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)

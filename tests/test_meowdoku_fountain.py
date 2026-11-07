@@ -1112,3 +1112,61 @@ def test_orbeez_swell_with_open_surface_in_a_solvent_only(native_piece):
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
         assert float(out["n_live"][0] + out["n_parked"][0] + out["n_out"][0] + out["n_nan"][0]) == F.N_SMALL
     assert float(wet["rad"][a]) == pytest.approx(float(wet["rs"][a]))      # the drawn radius is the current one
+
+
+# ------------------------------------------------------------- the turning case (fictitious forces in the case frame)
+def _turning_case(piece, omega, steps, domega=0.0, v0=(0.0, 0.0), at=(0.08, 0.3)):
+    """One pearl (the species with the least drag) at rest in the case frame, gravity off, the case turning about (0, 0.3)."""
+    n = F.N_SMALL
+    probe = F.run_frames(piece, dict(F.initial_columns(n, mix=1.0), age=np.full(n, 1.0e3)), 1)["rad"]
+    i = int(np.where(np.abs(probe - F.SPECIES[3][1]) < 1e-9)[0][0])
+    cols = F.initial_columns(n, mix=1.0)
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), case_omega=np.float64(omega), case_domega=np.float64(domega),
+                pivot_x=np.float64(0.0), pivot_y=np.float64(0.3), age=np.full(n, -1.0e9))
+    cols["age"][i] = 1.0e3
+    cols["x"][i], cols["y"][i], cols["rs"][i], cols["vx"][i], cols["vy"][i] = at[0], at[1], probe[i], v0[0], v0[1]
+    return F.run_frames(piece, cols, steps), i
+
+
+def _rotating_frame_reference(r0, v0, omega, domega, drag, steps):
+    """RK4 of the case-frame equation of motion  v' = -drag v - 2 w x v + w^2 r - dw x r  (r from the pivot), small substeps."""
+    r, v = np.array(r0, float), np.array(v0, float)
+
+    def acc(r, v):
+        w = omega
+        return np.array([-drag * v[0] + 2 * w * v[1] + w * w * r[0] + domega * r[1],
+                         -drag * v[1] - 2 * w * v[0] + w * w * r[1] - domega * r[0]])
+    h, sub = F.DT / 20.0, steps * 20
+    for _ in range(sub):
+        k1r, k1v = v, acc(r, v)
+        k2r, k2v = v + 0.5 * h * k1v, acc(r + 0.5 * h * k1r, v + 0.5 * h * k1v)
+        k3r, k3v = v + 0.5 * h * k2v, acc(r + 0.5 * h * k2r, v + 0.5 * h * k2v)
+        k4r, k4v = v + h * k3v, acc(r + h * k3r, v + h * k3v)
+        r, v = r + h / 6 * (k1r + 2 * k2r + 2 * k3r + k4r), v + h / 6 * (k1v + 2 * k2v + 2 * k3v + k4v)
+    return r, v
+
+
+def test_a_turning_case_drags_its_contents_with_gravity_off(native_piece):
+    """At gravity 0 a turning case throws a resting grain outward (centrifugal) and bends its path sideways (Coriolis); one grain
+    follows the rotating-frame equation of motion; at omega = 0 nothing moves; the angular acceleration (Euler) is a force too."""
+    piece, _columns = native_piece
+    drag = F.SPECIES[3][4]
+    assert {"case_omega", "case_domega"} <= set(F.RUNTIME_INPUTS) and {"pivot_x", "pivot_y"} <= set(F.UNIFORMS)
+    still, i = _turning_case(piece, 0.0, 150)
+    assert float(still["x"][i]) == 0.08 and float(still["y"][i]) == 0.3 and float(still["vx"][i]) == 0.0      # defaults: nothing
+    steps, omega = 150, 3.0
+    turned, i = _turning_case(piece, omega, steps)
+    rel = np.array([float(turned["x"][i]) - 0.0, float(turned["y"][i]) - 0.3])
+    assert rel[0] > 0.08 + 0.02                                              # outward
+    assert rel[1] < -1e-3                                                    # outward motion bends to -y for a case turning counterclockwise
+    ref, ref_v = _rotating_frame_reference((0.08, 0.0), (0.0, 0.0), omega, 0.0, drag, steps)
+    assert np.hypot(*(rel - ref)) < 0.03 * np.hypot(*(ref - np.array([0.08, 0.0]))) + 1e-4, (rel, ref)
+    spun, i = _turning_case(piece, -omega, steps)                            # the other way: the sideways drift flips, the outward does not
+    assert float(spun["y"][i]) - 0.3 > 1e-3 and float(spun["x"][i]) > 0.08 + 0.02
+    # Euler: a case speeding up (domega) pushes a grain off-radius sideways even at omega = 0
+    eul, i = _turning_case(piece, 0.0, steps, domega=4.0)
+    ref_e, _ = _rotating_frame_reference((0.08, 0.0), (0.0, 0.0), 0.0, 4.0, drag, steps)
+    assert float(eul["y"][i]) - 0.3 < -1e-3
+    assert np.hypot(float(eul["x"][i]) - ref_e[0], float(eul["y"][i]) - 0.3 - ref_e[1]) < 0.03 * np.hypot(*(ref_e - np.array([0.08, 0.0]))) + 1e-4
+    for out in (turned, spun, eul):
+        assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
