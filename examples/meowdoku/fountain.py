@@ -2516,7 +2516,13 @@ def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
     d = toy_design(geo)
     pg = d["pegs"]
     slots = [_slot("hourglass", "fluid", 0.0, d["yc"], 0.0, d["w"], d["throat"], d["top"] - d["yc"], d["slope"])]
-    slots += [_capsule_ramp(r["high"], r["low"], r["r"]) for r in d["ramps"]]
+    for r in d["ramps"]:                                                  # each ramp: a capsule (the high part) and a rounded box (the low part) with the dribble hole between
+        for kind, a, b in r["pieces"]:
+            if kind == "capsule":
+                slots.append(_capsule_ramp(a, b, r["r"]))
+            else:
+                slots.append(_slot("box", "solid", 0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), math.atan2(b[1] - a[1], b[0] - a[0]),
+                                   0.5 * math.hypot(b[0] - a[0], b[1] - a[1]) + r["r"], r["r"], r["r"]))
     slots.append(_slot("pegs", "solid", pg["cx"], pg["cy"], 0.0, pg["px"], pg["py"], pg["r"], pg["cols"], pg["rows"], 1.0))
     return {"slots": slots, "nozzle_y": d["nozzle_y"], "top": d["top"], "half": d["w"], "bar": 0.25 * d["w"], "pool": d["pool"], "wheel": d["wheel"], "design": d}
 

@@ -19,6 +19,20 @@ Bottom up, as the toy is built (every height is what the part needs, not a fract
   cells off the case walls -- a gap liquid passes through, which is what lets a turned-over toy pour along the same cascade upside down.  The last ramp
   is SHORT (it ends over the wheel);
 * the inlet ``0.12`` above the highest ramp end, the ceiling ``0.12`` above that.
+
+DESIGN INTENT (why each part is what it is -- change a part by changing its purpose, not its numbers):
+
+* The toy is a real oil-timer toy: a liquid (grains in a fluid) cascades down zig-zag ramps, drains through an hourglass throat, and is sieved by pegs into a
+  pool; turn it over and it runs again.  Everything is built bottom up from what each part needs, so the toy grows taller when a part grows.
+* RAMPS: slope ``TAN`` is gentle enough that grains slide without bouncing off.  Each ramp's lower end overlaps the next ramp (``DRIFT``: the sideways
+  travel of a stream), so a stream always lands on a ramp.  The high ends are OPEN to the case wall (``OPEN_CELLS``) so that, turned over, the liquid
+  can pass the wall end of each ramp instead of damming there.  Each ramp has a small HOLE (``HOLE_CELLS``, a little wider than the largest grain,
+  halfway along): grains that slide across mostly bridge it, a few fall through -- the thin return dribble of a real toy, in both orientations.
+* WHEEL: small, free (no motor), hung under the last ramp's low end and over the funnel, so the stream turns it while the hourglass empties beneath.
+* HOURGLASS: one vessel; its throat sets the drain rate; the funnel slope (``SLOPE``) is steep enough not to arch.
+* PEGS: a staggered field under the throat; ``PEG_FILTER`` makes them a size filter (gap between the species' diameters, outer pegs on the walls so
+  no path around is wider).  A gravity-only stream CLOGS such a sieve (large grains plug the gaps), see WORKLIST "Shape generators found".
+* POOL: an open basin under the lowest peg row where what passes the pegs gathers; deep enough to hold a useful share of the grains.
 """
 from __future__ import annotations
 
@@ -41,6 +55,8 @@ LOW_X = (-0.10, 0.30, 0.30)     # the ramps' low ends, half-widths from the cent
 WHEEL_REACH = 0.15              # the wheel's reach, half-widths (at least ``WHEEL_MIN_CELLS``)
 WHEEL_MIN_CELLS = 3.0
 WHEEL_PADDLES = 8
+HOLE_CELLS = 2.4                # each ramp has a return-dribble hole: a gap in the ramp this many cells wide (a grain bridges a hole under ~1.5 cells at cascade speed)
+HOLE_AT = 0.5                   # ... this fraction of the way from the ramp's high end
 WHEEL_CLEAR = 4.0               # cells between the wheel's tip and the ramp over it / the funnel under it
 #: the species the filter sits between: it passes the smaller half and holds the larger half of ``radii`` (sorted): the gap is the geometric-mean-ish middle
 #: of the two middle species' diameters, as a fraction of the largest diameter
@@ -95,7 +111,16 @@ def toy_parts(w: float, c: float, radii=(0.0090, 0.0105, 0.0120, 0.0140)) -> dic
     ramps = []
     for k in range(3):
         high = (side[k] * edge, low_y[k] + TAN * abs(side[k] * edge - lx[k]))
-        ramps.append({"high": high, "low": (lx[k], low_y[k]), "r": rr})
+        low = (lx[k], low_y[k])
+        length = math.hypot(low[0] - high[0], low[1] - high[1])
+        ux, uy = (low[0] - high[0]) / length, (low[1] - high[1]) / length
+        mid = HOLE_AT * length
+        half = 0.5 * HOLE_CELLS * c + rr                                          # the hole is HOLE_CELLS wide between the two ramp surfaces (each end is rounded by rr)
+        a_end = (high[0] + ux * (mid - half), high[1] + uy * (mid - half))
+        b_start = (high[0] + ux * (mid + half), high[1] + uy * (mid + half))
+        # the ramp is TWO pieces with the hole between them: the upper (high end) a capsule, the lower a rounded box of the same thickness (the capsule slots are only 3)
+        ramps.append({"high": high, "low": low, "r": rr, "hole": {"at": mid, "gap": HOLE_CELLS * c, "dir": (ux, uy)},
+                      "pieces": [("capsule", high, a_end), ("box", b_start, low)]})
     y0 = ramps[0]["high"][1]
     nozzle_y = y0 + 0.12
     top = nozzle_y + 0.12
