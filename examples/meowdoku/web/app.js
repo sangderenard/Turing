@@ -1796,7 +1796,10 @@ function installSavedParticle(tables) {
   if (old) for (const part of [old.opaque, old.glass]) if (part) {
     state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao); for (const buffer of part.buffers) gl.deleteBuffer(buffer);
   }
-  const alpha = (face) => tables.pbr.data[face[3] * tables.pbr.floats_per_record + 7];
+  const alpha = (face) => {
+    const at = face[3] * tables.pbr.floats_per_record, pbr = tables.pbr.data;
+    return Math.min(pbr[at + 7], 1 - 0.8 * pbr[at + 5]); // Pluck's effective alpha under transmission
+  };
   const opaqueFaces = mapped.filter((face) => !isGlass(alpha(face)));
   const glassFaces = mapped.filter((face) => isGlass(alpha(face)));
   const opaque = opaqueFaces.length ? { ...litMesh(opaqueFaces), array: true } : null;
@@ -1820,6 +1823,7 @@ async function refreshSavedParticleList() {
   } catch (error) { savedParticle.note = String(error.message || error); }
 }
 async function selectSavedParticle(digest) {
+  if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics or render selection");
   if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.mesh = null; refreshLocalControls(); return; }
   const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
@@ -1840,7 +1844,6 @@ async function selectSavedParticle(digest) {
   try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
   // The current law has four species.  A selected design occupies species 0;
   // the other shares are zero so every emitted particle uses its coefficients.
-  if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics");
   const updates = [...Object.entries(values), ["wt0", 1], ["wt1", 0], ["wt2", 0], ["wt3", 0]];
   const step = chain.then(async () => {
     for (const [name, value] of updates)
