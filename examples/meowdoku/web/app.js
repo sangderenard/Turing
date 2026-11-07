@@ -32,6 +32,7 @@ import { ComputeRuntime, PointCloud } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
+import { verifySavedMarbleObject } from "./marble_object.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
@@ -571,13 +572,29 @@ function housingFaces(g) {
   const [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0)), mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
   const y = TILE.height + 0.03, dh = u.dh;
   const wp = (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+  const checker = wallFinish.mode === "checker" && state.materialIndex.housing_checker_light != null && state.materialIndex.housing_checker_dark != null;
+  const tile = Math.max(0.05, 4 * Math.max(...[0, 1, 2, 3].map((i) => u[`r${i}`] || 0)));
+  const wallMaterial = (a, b, d) => {
+    if (!checker) return m;
+    const p = [0, 1, 2].map((i) => (a[i] + b[i] + d[i]) / 3);
+    const parity = (Math.floor((p[0] + p[1]) / tile) + Math.floor(p[2] / tile)) & 1;
+    return state.materialIndex[parity ? "housing_checker_dark" : "housing_checker_light"];
+  };
   if (c.chamber_mesh) {                                             // an SDF chamber: the zero surface as a triangle mesh (fountain_game.chamber_mesh: 16-bit vertices over `bounds`, 16-bit indices, base64)
     const m16 = (s) => { const bin = atob(s), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
     const q = m16(c.chamber_mesh.v), t = m16(c.chamber_mesh.t), b = c.chamber_mesh.bounds, faces = [];
-    const vert = (i) => wp(b[0] + q[3 * i] / 65535 * (b[1] - b[0]), b[2] + q[3 * i + 1] / 65535 * (b[3] - b[2]), b[4] + q[3 * i + 2] / 65535 * (b[5] - b[4]));
-    for (let i = 0; i < c.chamber_mesh.nt; i++) faces.push([vert(t[3 * i]), vert(t[3 * i + 1]), vert(t[3 * i + 2]), m]);
+    const law = (i) => [b[0] + q[3 * i] / 65535 * (b[1] - b[0]), b[2] + q[3 * i + 1] / 65535 * (b[3] - b[2]), b[4] + q[3 * i + 2] / 65535 * (b[5] - b[4])];
+    const emit = (a, b, d) => faces.push([wp(...a), wp(...b), wp(...d), wallMaterial(a, b, d)]);
+    const mid = (a, b) => a.map((v, i) => (v + b[i]) * 0.5);
+    for (let i = 0; i < c.chamber_mesh.nt; i++) {
+      const a = law(t[3 * i]), b = law(t[3 * i + 1]), d = law(t[3 * i + 2]);
+      if (checker && c.chamber_mesh.nt <= 15000) {
+        const ab = mid(a, b), bd = mid(b, d), da = mid(d, a);
+        emit(a, ab, da); emit(ab, b, bd); emit(da, bd, d); emit(ab, bd, da);
+      } else emit(a, b, d);
+    }
     // the panes: there is no polygon to trim them to, so "trim" draws none (the mesh is the glass); "frame" / "matte" close the slab's front and back over the whole window
-    const fill = panes.mode === "frame" ? m : panes.mode === "matte" ? state.materialIndex["housing_matte"] : null;
+    const fill = checker || panes.mode === "frame" ? m : panes.mode === "matte" ? state.materialIndex["housing_matte"] : null;
     if (fill != null) for (const z of [-dh, dh]) faces.push([wp(x0, y0, z), wp(x1, y0, z), wp(x1, y1, z), fill], [wp(x0, y0, z), wp(x1, y1, z), wp(x0, y1, z), fill]);
     return faces;
   }
@@ -596,8 +613,20 @@ function housingFaces(g) {
                    [bx + dx * hw - nx * hw, by + dy * hw - ny * hw], [ax - dx * hw - nx * hw, ay - dy * hw - ny * hw]];
     for (let k = 0; k < 4; k++) {                                   // the four sides, each through the depth
       const [p, q] = [quad4[k], quad4[(k + 1) % 4]];
-      const a = wp(p[0], p[1], -dh), b = wp(q[0], q[1], -dh), c = wp(q[0], q[1], dh), d = wp(p[0], p[1], dh);
-      faces.push([a, b, c, m], [a, c, d, m]);
+      if (checker) {
+        const across = Math.min(64, Math.max(1, Math.ceil(Math.hypot(q[0] - p[0], q[1] - p[1]) / tile)));
+        const deep = Math.min(8, Math.max(1, Math.ceil(2 * dh / tile)));
+        const at = (s, z) => [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s, z];
+        for (let a = 0; a < across; a++) for (let b = 0; b < deep; b++) {
+          const v0 = at(a / across, -dh + 2 * dh * b / deep), v1 = at((a + 1) / across, -dh + 2 * dh * b / deep);
+          const v2 = at((a + 1) / across, -dh + 2 * dh * (b + 1) / deep), v3 = at(a / across, -dh + 2 * dh * (b + 1) / deep);
+          faces.push([wp(...v0), wp(...v1), wp(...v2), wallMaterial(v0, v1, v2)],
+                     [wp(...v0), wp(...v2), wp(...v3), wallMaterial(v0, v2, v3)]);
+        }
+      } else {
+        const a = wp(p[0], p[1], -dh), b = wp(q[0], q[1], -dh), c = wp(q[0], q[1], dh), d = wp(p[0], p[1], dh);
+        faces.push([a, b, c, m], [a, c, d, m]);
+      }
     }
     for (const z of [-dh, dh]) {                                    // the end caps (the band's front and back faces)
       const [a, b, c, d] = quad4.map((q) => wp(q[0], q[1], z));
@@ -657,6 +686,10 @@ function paneOutside(ring, lo, hi, bottom, top) {
 // the panes option (page-side, the 3-D fountain): what fills the panes beyond the angled walls
 const panes = { mode: "trim" };
 try { const saved = localStorage.getItem("meowdoku.panes"); if (["trim", "frame", "matte"].includes(saved)) panes.mode = saved; } catch { /* storage may be blocked */ }
+// Checker tiles are drawn on the law's containing zero surface; the front
+// and back slabs remain transparent glass at the law's physical z limits.
+const wallFinish = { mode: "glass" };
+try { if (localStorage.getItem("meowdoku.wallfinish") === "checker") wallFinish.mode = "checker"; } catch { /* storage may be blocked */ }
 // THE 2-D CHAMBER AS GLOWING GLASS RIBBONS: each outline polyline (the server's chamber_outline -- the polygon's vertices or the SDF
 // chamber's zero contour -- else the px/py polyline) becomes a low glass bar along the wall, in the emissive "outline@glass"
 // material, through the scene's own material path; drawn with the case's model (state.caseModel) like the 3-D housing, so it turns
@@ -896,7 +929,7 @@ function updateHousing() {
     return;
   }
   if (state.bodyMesh) { disposeWheelBlur(state.bodyMesh); disposeMesh(state.bodyMesh.mesh); state.bodyMesh = null; }
-  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
+  const key = g && (g.game === "fountain3d" || g.game === "marble_madness") && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, wallFinish.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
   const faces = key ? housingFaces(g) : null;
@@ -1769,6 +1802,90 @@ function litMesh(faces, uvOf) {
   (state.vaoMaterials ||= new Map()).set(vao, [...new Set(mat)]);   // which materials this mesh draws (see sceneNeedsVariant)
   return { vao, count: pos.length / 3, buffers };
 }
+// The saved recipe is the geometry authority.  Install its full generated
+// triangles in the same material tables and Phong path as every scene mesh.
+const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, mesh: null, note: "" };
+function installSavedParticle(tables) {
+  const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
+  if (!snapshot || !geometry) return;
+  const faces = [...geometry.interior, ...geometry.glass];
+  const source = snapshot.materials.tables, used = [...new Set(faces.map((face) => face[3]))].sort((a, b) => a - b);
+  const remap = new Map();
+  for (const id of used) {
+    if (!Number.isInteger(id) || id < 0) throw new Error(`saved object has invalid material ${id}`);
+    const next = tables.pbr.records;
+    for (const kind of ["pbr", "phong", "enamel", "texstack"]) {
+      const target = tables[kind], from = source[kind], stride = target.floats_per_record;
+      if (!from || from.stride !== stride || from.data.length < (id + 1) * stride)
+        throw new Error(`saved object has incomplete ${kind} material ${id}`);
+      target.data.push(...from.data.slice(id * stride, (id + 1) * stride));
+      target.records++;
+    }
+    remap.set(id, next);
+  }
+  const mapped = faces.map((face) => [face[0], face[1], face[2], remap.get(face[3]), face[4]]);
+  const old = savedParticle.mesh;
+  if (old) for (const part of [old.opaque, old.glass]) if (part) {
+    state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao); for (const buffer of part.buffers) gl.deleteBuffer(buffer);
+  }
+  const alpha = (face) => {
+    const at = face[3] * tables.pbr.floats_per_record, pbr = tables.pbr.data;
+    return Math.min(pbr[at + 7], 1 - 0.8 * pbr[at + 5]); // Pluck's effective alpha under transmission
+  };
+  const opaqueFaces = mapped.filter((face) => !isGlass(alpha(face)));
+  const glassFaces = mapped.filter((face) => isGlass(alpha(face)));
+  const opaque = opaqueFaces.length ? { ...litMesh(opaqueFaces), array: true } : null;
+  const glass = glassFaces.length ? { ...litMesh(glassFaces), array: true } : null;
+  const vertices = mapped.flatMap((face) => face.slice(0, 3));
+  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+  for (const v of vertices) for (let k = 0; k < 3; k++) { low[k] = Math.min(low[k], v[k]); high[k] = Math.max(high[k], v[k]); }
+  const center = low.map((v, k) => (v + high[k]) * 0.5);
+  let radius = 0;
+  for (const v of vertices) radius = Math.max(radius, Math.hypot(v[0] - center[0], v[1] - center[1], v[2] - center[2]));
+  savedParticle.mesh = { opaque, glass, count: mapped.length * 3, center, scale: 1 / Math.max(radius, 1e-6) };
+}
+async function refreshSavedParticleList() {
+  try {
+    const response = await fetch("/api/marble_objects", { cache: "no-store" });
+    if (!response.ok) throw new Error(`library HTTP ${response.status}`);
+    const listing = await response.json();
+    savedParticle.entries = Array.isArray(listing) ? listing : listing.entries || [];
+    delete $("gamectl").dataset.key;
+    renderGameControls(state.game);
+  } catch (error) { savedParticle.note = String(error.message || error); }
+}
+async function selectSavedParticle(digest) {
+  if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics or render selection");
+  if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.mesh = null; refreshLocalControls(); return; }
+  const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
+  const snapshot = await response.json();
+  const { geometry } = await verifySavedMarbleObject(snapshot);
+  const physical = snapshot.physical;
+  const values = { r0: physical["sim-radius"], rho0: physical["sim-rho"], mu0: physical["sim-mu"],
+                   e0: physical["sim-e"], roll0: physical["sim-roll"], irr0: physical["sim-irr"] };
+  const ranges = { r0: [0.005, 0.020], rho0: [0.2, 5], mu0: [0, 1], e0: [0.02, 0.95],
+                   roll0: [0, 0.3], irr0: [0, 0.3] };
+  for (const [name, value] of Object.entries(values)) {
+    const [min, max] = ranges[name];
+    if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} outside native law range ${min}–${max}`);
+  }
+  savedParticle.digest = digest; savedParticle.snapshot = snapshot; savedParticle.geometry = geometry;
+  uploadMaterials(state.game);
+  particleStyle = "designed";
+  try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  // The current law has four species.  A selected design occupies species 0;
+  // the other shares are zero so every emitted particle uses its coefficients.
+  const updates = [...Object.entries(values), ["wt0", 1], ["wt1", 0], ["wt2", 0], ["wt3", 0]];
+  const step = chain.then(async () => {
+    for (const [name, value] of updates)
+      applyState(await api("/api/action", { type: "fountain_param", name, value }));
+  });
+  chain = step.catch((error) => console.warn("[meow] saved particle law", error));
+  await step;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: modeled appearance; sphere contact and scalar moment in current law`;
+  refreshLocalControls();
+}
 const MARBLE = { mesh: null, key: "" };
 function marblePreview() {
   if (!$('marble-preview').checked || !state.game || !state.extent) return null;
@@ -1985,6 +2102,8 @@ function uploadMaterials(game) {
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
+  records.push(["housing_checker_light", [0.88, 0.84, 0.76], { roughness: 0.34, specular: 0.48, shininess: 48 }]);
+  records.push(["housing_checker_dark", [0.035, 0.045, 0.07], { roughness: 0.28, specular: 0.60, shininess: 64 }]);
   records.push(["outline@glass", [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22, 0.42, 0.62] }]);   // the 2-D chamber's glowing glass ribbons
   for (let k = 0; k < WHEEL_LEVELS; k++) {   // the same glass ribbon at WHEEL_LEVELS opacities: a drawn copy of the blurred waterwheel picks one (wheel blur)
     const f = levelAlpha(k);
@@ -2061,6 +2180,7 @@ function uploadMaterials(game) {
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
+  installSavedParticle(tables);
   {   // which materials read the transmission variant's fields (see phongVariant)
     const pf = tables.pbr.floats_per_record, tf = tables.texstack.floats_per_record, rows = tables.pbr.records;
     state.variantNeeds = new Uint8Array(rows);
@@ -5093,6 +5213,8 @@ function localValue(s) {
   if (s.local && s.local.startsWith("ghosts")) return rl.settingValue(ghostSettings, s.local) ?? s.value;     // [GHOSTS]
   if (s.local === "wheelblur") return wheelBlur.on;
   if (s.local === "qrwall") return qrWall.on;                                      // [QRWALL]
+  if (s.local === "saved_particle") return savedParticle.digest;
+  if (s.local === "wall_finish") return wallFinish.mode;
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
@@ -5100,6 +5222,15 @@ function localValue(s) {
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
+  if (s.local === "saved_particle") {
+    selectSavedParticle(value).catch((error) => { savedParticle.note = String(error.message || error); status.textContent = savedParticle.note; refreshLocalControls(); });
+    return;
+  }
+  if (s.local === "wall_finish") {
+    wallFinish.mode = value === "checker" ? "checker" : "glass";
+    try { localStorage.setItem("meowdoku.wallfinish", wallFinish.mode); } catch { /* storage may be blocked */ }
+    rebuildBoards(state.game); refreshLocalControls(); return;
+  }
   if (s.local && s.local.startsWith("ghosts")) { ghostControl(s, value); refreshLocalControls(); return; }     // [GHOSTS]
   if (s.local === "wheelblur") {
     wheelBlur.on = !!value;
@@ -5231,6 +5362,17 @@ function refreshLocalControls() {
     if (s.local === "wheelblur") {
       el.querySelector("input").checked = wheelBlur.on;
       el.title = "a waterwheel turning too fast to read is drawn as a smear of copies, then as one spinning blurred disc, instead of a crisp wheel (off: always crisp)";
+      continue;
+    }
+    if (s.local === "saved_particle") {
+      const select = el.querySelector("select");
+      if (select) select.value = savedParticle.digest;
+      el.title = savedParticle.note || "Select a verified Studio design. Current contacts remain spherical; full mesh and material records are rendered.";
+      continue;
+    }
+    if (s.local === "wall_finish") {
+      el.querySelector("select").value = wallFinish.mode;
+      el.title = "Checker tiles subdivide the compiled chamber's containing zero-surface mesh; front and back remain clear glass at the physical slab limits.";
       continue;
     }
     if (s.local === "spin") {
@@ -5572,6 +5714,8 @@ function ghostsDraw(cam, data, g, rec) {
 window.meowdokuDebug.ghosts = { settings: () => ghostSettings, set: ghostSet, job: ghostJob, make: ghostMake, rl };
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 const PANES_SPEC = { id: "panes", kind: "select", label: "panes beyond the walls", local: "panes", options: [["trim", "trimmed"], ["frame", "frame glass"], ["matte", "matte fill"]] };
+const WALL_FINISH_SPEC = { id: "wall_finish", kind: "select", label: "containing walls", local: "wall_finish", group: "Chamber",
+  options: [["glass", "clear glass"], ["checker", "checker walls + glass sides"]] };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
 // products): controls after the server's `look` select, and the material styles appended to that select's options.
 const COLOR_SPECS = [
@@ -5598,7 +5742,7 @@ function pageSpecs(specs) {
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
-    if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
+    if (state.game && (state.game.game === "fountain3d" || state.game.game === "marble_madness")) out = [...out, PANES_SPEC, WALL_FINISH_SPEC];
     if (state.game && state.game.tipjar) out = [...out, QRWALL_SPEC, QRFRONT_SPEC];                 // [QRWALL]
     if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC, ...GHOST_SPECS];     // [GHOSTS]
     const run = out.findIndex((s) => s.local === "rebirth");
@@ -5610,6 +5754,9 @@ function pageSpecs(specs) {
     out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
     out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
   }
+  if ((look >= 0 && state.game.game === "fountain3d" || state.game.game === "marble_madness") && !out.some((s) => s.id === "saved_particle"))
+    out = [...out, { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Grains",
+      value: savedParticle.digest, options: [["", "choose a Studio design"], ...savedParticle.entries.map((e) => [e.digest, e.name || e.digest.slice(0, 12)])] }];
   return out;
 }
 let recordOn = false;
@@ -5669,7 +5816,7 @@ function renderGameControls(game) {
         const input = document.createElement(s.kind === "select" ? "select" : "input");
         if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
         else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
-        else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
+        else for (const [v, text] of s.options) input.add(new Option(text, v));
         if (s.local === "worldcurve") worldCurveInput(input);                          // [CURVE] live while dragging, with its notches
         input.onchange = () => (s.local ? localControl(s, input.value) : act(serverControlPayload(s, s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value)));
         if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
@@ -5737,7 +5884,9 @@ function particleScene(pick) {
   const opacity = id != null && t ? t.data[id * f + 7] : 1;
   const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
   const group = (state.materialGroups || {})[name];
-  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, meshes: state.meshes, materialId: id == null ? 0 : id, shadow: light.viewProj,
+  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, meshes: state.meshes,
+           designedMesh: particleStyle === "designed" ? savedParticle.mesh : null,
+           materialId: id == null ? 0 : id, shadow: light.viewProj,
            glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
 }
 // THE TRANSMISSION VARIANT (Pluck's PLUCK_TRANSMISSION define): the same Phong source with light through transmissive bodies,
@@ -5768,6 +5917,9 @@ function sceneNeedsVariant(casters, pick) {
   const has = (name) => { const id = index[name]; return id != null && needs[id] === 1; };
   if (backlightEmitter()) return true;
   if (state.glass && has("glass")) return true;
+  if (particleStyle === "designed" && savedParticle.mesh &&
+      [savedParticle.mesh.opaque, savedParticle.mesh.glass].some((part) => part &&
+        (state.vaoMaterials.get(part.vao) || []).some((id) => needs[id] === 1))) return true;
   for (const piece of state.glassPieces || []) if (has(`${piece.color}@glass`)) return true;
   for (const c of casters) if (c[3] && c[3].color && has(c[3].color)) return true;
   if (pick) {
@@ -7241,6 +7393,7 @@ async function lifecycleResume() {
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
+  refreshSavedParticleList();
   chain.then(() => { loading.done(); if (state.game) bootReady = true; else loading.release("boot"); });             // [LOADING] a successful game frame releases boot
   if (window.meowdokuAccess.edit && /[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
 })().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });

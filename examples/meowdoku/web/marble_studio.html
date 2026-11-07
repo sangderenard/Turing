@@ -11,11 +11,11 @@
   .stage { position:relative; min-height:65vh; overflow:hidden; background:radial-gradient(circle at 50% 45%,#304762,#09121e 70%); }
   canvas { display:block; width:100%; height:100%; touch-action:none; }
   .stage-note { position:absolute; left:18px; bottom:16px; color:#c5d7e9; background:#0d1727c9; border-radius:8px; padding:7px 10px; }
-  aside { padding:18px; border-left:1px solid #32465c; background:#172438; overflow-y:auto; max-height:calc(100vh - 56px); }
+  aside { min-width:0; padding:18px; border-left:1px solid #32465c; background:#172438; overflow-y:auto; overflow-x:hidden; max-height:calc(100vh - 56px); }
   h1 { font-size:22px; line-height:1.2; margin:0 0 6px; } h2 { font-size:13px; text-transform:uppercase; letter-spacing:.1em; color:#9db4cf; margin:22px 0 10px; }
-  p { color:#aec0d3; margin:0 0 12px; } .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  label { display:grid; gap:3px; color:#d4e3f2; } label span { color:#9db4cf; font-size:12px; }
-  input,select,button { font:inherit; color:#ecf5ff; background:#23354c; border:1px solid #4c6682; border-radius:6px; padding:7px; }
+  p { color:#aec0d3; margin:0 0 12px; } .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  label { display:grid; min-width:0; gap:3px; color:#d4e3f2; } label span { color:#9db4cf; font-size:12px; }
+  input,select,button { min-width:0; max-width:100%; font:inherit; color:#ecf5ff; background:#23354c; border:1px solid #4c6682; border-radius:6px; padding:7px; }
   input[type=range] { padding:0; width:100%; } input[type=color] { width:100%; height:34px; padding:2px; }
   button { cursor:pointer; } button:hover { border-color:#b5e7ff; } .wide { grid-column:1/-1; }
   output { color:#b5e7ff; font-variant-numeric:tabular-nums; } #message { color:#ffd18c; min-height:1.5em; }
@@ -23,18 +23,95 @@
 </style></head><body>
 <header><strong>Meowdoku · Marble studio</strong><a href="/">Games</a><span id="message" role="status"></span></header>
 <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div></div>
-<aside><h1>Design a cat's-eye</h1><p>Turn a real glass shell around a dyed inclusion. Every surface uses the exported Pluck material tables and Phong shader.</p>
+<aside><h1>Design a marble or die</h1><p>Turn closed solids and dyed inclusions under the exported Pluck material tables and Phong shader.</p>
+  <h2>Saved objects</h2><div class="grid">
+    <label class="wide">Object name<input id="object-name" type="text" maxlength="80" value="My marble"></label>
+    <button id="save-object">Save object</button><button id="refresh-objects">Refresh library</button>
+    <label class="wide">Saved design<select id="saved-object"><option value="">Choose a saved object</option></select></label>
+    <button id="load-object" class="wide">Load selected design</button>
+    <output id="object-status" class="wide" role="status">Saved designs are shared with the particle simulator.</output>
+  </div>
   <h2>Shape</h2><div class="grid">
+    <label>Base solid<select id="base-shape"><option value="marble">Spherical marble</option><option value="d4">D4 tetrahedron</option><option value="d6">D6 cube</option><option value="d8">D8 octahedron</option><option value="d10">D10 trapezohedron</option><option value="d12">D12 dodecahedron</option><option value="d20">D20 icosahedron</option></select></label>
+    <label>Die shell preset<select id="die-shell-preset"><option value="porcelain">Opaque porcelain</option><option value="clear">Clear glass, dark numerals</option><option value="milk">Milk glass, dark numerals</option><option value="custom">Custom shell material</option></select></label>
+    <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="clear">No inner decoration</option></select></label>
+    <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
+    <label>Outer material<select id="shell"></select></label>
     <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
     <label>Accent material<select id="accent"><option value="marble_milk_glass">Milk glass</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
+    <label>Confetti material<select id="confetti-material"></select></label>
+    <label>Confetti chips <output id="confetti-count-out"></output><input id="confetti-count" type="range" min="30" max="500" value="220"></label>
     <label>Width <output id="width-out"></output><input id="width" type="range" min="8" max="42" value="28"></label>
     <label>Length <output id="length-out"></output><input id="length" type="range" min="40" max="85" value="75"></label>
     <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="18"></label>
-    <label>Strands <output id="strands-out"></output><input id="strands" type="range" min="1" max="7" value="3"></label>
+    <label>Separate ribbons <output id="strands-out"></output><input id="strands" type="range" min="2" max="7" value="3"></label>
+    <label>Ribbon thickness <output id="thickness-out"></output><input id="thickness" type="range" min="8" max="80" value="35"></label>
+    <label>Twist along curve <output id="twist-out"></output><input id="twist" type="range" min="-320" max="320" value="90"></label>
+    <label>Tip taper <output id="tip-out"></output><input id="tip" type="range" min="60" max="300" value="135"></label>
+    <label>Ribbon flare <output id="flare-out"></output><input id="flare" type="range" min="0" max="60" value="18"></label>
+    <label>Ribbon phase offset <output id="phase-out"></output><input id="phase" type="range" min="0" max="360" value="0"></label>
+    <label>Inclusion yaw <output id="orientation-yaw-out"></output><input id="orientation-yaw" type="range" min="-180" max="180" value="0"></label>
+    <label>Inclusion pitch <output id="orientation-pitch-out"></output><input id="orientation-pitch" type="range" min="-180" max="180" value="0"></label>
+    <label>Inclusion roll <output id="orientation-roll-out"></output><input id="orientation-roll" type="range" min="-180" max="180" value="0"></label>
+    <label>Tube count <output id="tube-count-out"></output><input id="tube-count" type="range" min="1" max="3" value="2"></label>
+    <label>Tube radius <output id="tube-radius-out"></output><input id="tube-radius" type="range" min="8" max="50" value="24"></label>
+    <label>Spiral turns <output id="tube-turns-out"></output><input id="tube-turns" type="range" min="100" max="400" value="220"></label>
     <button id="reroll" class="wide">Reroll dyed shape</button>
   </div>
+  <h2>Outer shell</h2><div class="grid">
+    <label class="wide"><input id="opaque" type="checkbox"> Opaque outer material (transmission 0, opacity 1)</label>
+    <label>Enamel shell coverage <output id="coverage-out"></output><input id="coverage" type="range" min="0" max="100" value="0"></label>
+    <label><input id="checker" type="checkbox" checked> Lit floor and wall</label>
+    <label>Scene pattern<select id="scene-pattern"><option value="checker">Classic checkerboard</option><option value="porcelain">Porcelain tiles</option><option value="metal">Metal bands</option></select></label>
+    <label>Exterior color bands <output id="band-count-out"></output><input id="band-count" type="range" min="0" max="12" value="0"></label>
+    <label>Band width <output id="band-width-out"></output><input id="band-width" type="range" min="2" max="48" value="18"></label>
+    <label>Band swirl <output id="band-curve-out"></output><input id="band-curve" type="range" min="-400" max="400" value="120"></label>
+    <label>Paint A color<input id="paint-a-color" type="color" value="#3769a8"></label>
+    <label>Paint B color<input id="paint-b-color" type="color" value="#e7b35a"></label>
+    <label>Dice marking style<select id="marking-mode"><option value="flat">Flat dye</option><option value="recessed">Recessed relief</option><option value="raised">Raised relief</option></select></label>
+    <label>Dice marking material<select id="mark-material"></select></label>
+    <label>Mark scale <output id="mark-scale-out"></output><input id="mark-scale" type="range" min="30" max="90" value="72"></label>
+    <label>Relief depth <output id="relief-depth-out"></output><input id="relief-depth" type="range" min="0" max="80" value="20"></label>
+    <label>Numeral mesh detail <output id="dice-detail-out">48</output><input id="dice-detail" type="range" min="24" max="96" step="8" value="48"></label>
+    <output id="dice-detail-cost" class="wide">Estimated D20: 138,240 triangles at detail 48</output>
+    <label>Die inclusion size <output id="die-inclusion-size-out">100%</output><input id="die-inclusion-size" type="range" min="10" max="100" value="100"></label>
+    <label>Bevel radius / body radius <output id="dice-bevel-out">0.04</output><input id="dice-bevel" type="range" min="0" max="160" value="40"></label>
+    <label>Face recess <output id="dice-face-relief-out">0.00</output><input id="dice-face-relief" type="range" min="0" max="80" value="0"></label>
+    <label class="wide"><input id="compensate-raised" type="checkbox" checked> Keep raised marks inside face support plane</label>
+    <p class="wide">The selected ribbons, confetti, or tubes fit inside the die and displace its body material. Choose a transparent outer material to see them. Bevel, face recess, and raised marks alter the closed die mesh and its moments of inertia. The bevel generates radius-accurate edge fillets and corner caps at sampled vertices; triangle density controls visible smoothness. Keeping mark peaks inside the rim equalizes the support profile; statistical fairness is not established.</p>
+  </div>
+  <h2>Physical properties</h2><div class="grid">
+    <label>Marble radius (mm)<input id="radius-mm" type="number" min="1" max="100" step="0.1" value="10"></label>
+    <label>Shell density (kg/m³)<input id="shell-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Dye density (kg/m³)<input id="eye-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Accent density (kg/m³)<input id="accent-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Confetti density (kg/m³)<input id="confetti-density" type="number" min="1" max="30000" step="10" value="7800"></label>
+    <label>Enamel density (kg/m³)<input id="enamel-density" type="number" min="1" max="30000" step="10" value="3000"></label>
+    <label>Mark bulk density (kg/m³)<input id="mark-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Simulator relative density (grain = 1)<input id="sim-rho" type="number" min="0.2" max="5" step="0.05" value="1"></label>
+    <label>Simulator radius (board units)<input id="sim-radius" type="number" min="0.005" max="0.020" step="0.001" value="0.010"></label>
+    <label>Sliding friction (μ)<input id="sim-mu" type="number" min="0" max="1" step="0.01" value="0.35"></label>
+    <label>Restitution<input id="sim-e" type="number" min="0.02" max="0.95" step="0.01" value="0.05"></label>
+    <label>Rolling resistance<input id="sim-roll" type="number" min="0" max="0.3" step="0.01" value="0"></label>
+    <label>Radius irregularity<input id="sim-irr" type="number" min="0" max="0.3" step="0.01" value="0"></label>
+    <output id="mass-report" class="wide"></output>
+    <label class="wide"><input id="inertia-lock" type="checkbox" checked> Lock inertia preview</label>
+    <label>Roll force X (mN)<input id="roll-force-x" type="range" min="-10" max="10" step="0.1" value="0.1"></label>
+    <label>Roll force Z (mN)<input id="roll-force-z" type="range" min="-10" max="10" step="0.1" value="0"></label>
+    <button id="reset-roll" class="wide">Reset roll</button>
+    <output id="roll-status" class="wide">Locked</output>
+    <p class="wide">Closed triangle volume integrals provide the first and second mass moments, center of mass, and moment of inertia tensor. Separate inclusions displace shell material. Enamel uses a thin-film area estimate. Dice marking material uses Pluck optics; raised and recessed relief currently retains body density, so a differing mark density is unresolved. Dice rolling needs polyhedron contact dynamics.</p>
+  </div>
+  <h2>Preview motion</h2><div class="grid">
+    <label>Motion<select id="preview-motion"><option value="off">Off</option><option value="rotate">Rotate</option><option value="rock">Rock</option><option value="flip">Flip</option></select></label>
+    <label>Object axis<select id="preview-axis"><option value="x">X</option><option value="y" selected>Y</option><option value="z">Z</option></select></label>
+    <label>Cycles per second<input id="preview-hz" type="range" min="0.05" max="2" step="0.05" value="0.5"><output id="preview-hz-out">0.50 Hz</output></label>
+    <label>Phase offset<input id="preview-phase" type="range" min="0" max="360" step="1" value="0"><output id="preview-phase-out">0°</output></label>
+    <label>Rock arc<input id="preview-arc" type="range" min="5" max="180" step="1" value="60"><output id="preview-arc-out">60°</output></label>
+    <p class="wide">Visual object motion only. The checkerboard and lights stay fixed; the saved object contains its shape, materials and mechanics, not this preview motion. Inertia rolling continues to use the calculated mass and moment of inertia.</p>
+  </div>
   <h2>Material</h2><div class="grid">
-    <label class="wide">Edit layer<select id="layer"><option value="glass">Outer glass</option><option value="eye">Dyed eye</option><option value="accent">Accent</option></select></label>
+    <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="mark">Dice markings</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>
     <label>Albedo<input id="albedo" type="color"></label><label>Inner color<input id="inner" type="color"></label>
     <label>Roughness <output id="roughness-out"></output><input id="roughness" type="range" min="0" max="100" value="10"></label>
     <label>Metallic <output id="metallic-out"></output><input id="metallic" type="range" min="0" max="100" value="0"></label>
@@ -44,13 +121,23 @@
     <label>Ambient <output id="ambient-out"></output><input id="ambient" type="range" min="0" max="12" value="5"></label>
     <label>Specular <output id="specular-out"></output><input id="specular" type="range" min="0" max="100" value="80"></label>
     <label>Shininess <output id="shininess-out"></output><input id="shininess" type="range" min="1" max="300" value="120"></label>
-    <label>Grain <output id="grain-out"></output><input id="grain" type="range" min="0" max="30" value="0"></label>
     <label>Emission<input id="emission" type="color"></label>
     <label>Enamel thickness (nm) <output id="enamel-thickness-out"></output><input id="enamel-thickness" type="range" min="0" max="1000" value="0"></label>
-    <label>Enamel roughness <output id="enamel-roughness-out"></output><input id="enamel-roughness" type="range" min="0" max="100" value="5"></label>
     <label>Enamel index <output id="enamel-ior-out"></output><input id="enamel-ior" type="range" min="100" max="250" value="152"></label>
     <label>Enamel color<input id="enamel-color" type="color"></label>
     <button id="reset-material" class="wide">Restore catalogue material</button>
   </div>
-  <p style="margin-top:14px">These adjustments affect this preview only. Reroll changes the inclusion's mesh while keeping the selected materials.</p>
+  <h2>Lighting</h2><div class="grid">
+    <label>Key strength <output id="light-strength-out"></output><input id="light-strength" type="range" min="0" max="400" value="220"></label>
+    <label>Emitter spread <output id="light-spread-out"></output><input id="light-spread" type="range" min="0" max="200" value="45"></label>
+    <label>Key X <output id="light-x-out"></output><input id="light-x" type="range" min="-500" max="500" value="-250"></label>
+    <label>Key Y <output id="light-y-out"></output><input id="light-y" type="range" min="-500" max="500" value="300"></label>
+    <label>Key Z <output id="light-z-out"></output><input id="light-z" type="range" min="-500" max="500" value="300"></label>
+    <label class="wide"><input id="spot" type="checkbox"> Aim key as a spotlight</label>
+    <label>Spot inner angle <output id="spot-inner-out"></output><input id="spot-inner" type="range" min="5" max="85" value="22"></label>
+    <label>Spot outer angle <output id="spot-outer-out"></output><input id="spot-outer" type="range" min="6" max="89" value="38"></label>
+    <label class="wide">Spot edge hardness <output id="spot-hardness-out"></output><input id="spot-hardness" type="range" min="0" max="100" value="52"></label>
+    <p class="wide">Emitter spread samples five Pluck point lights and changes the Lambertian transition and specular highlight. Spot hardness changes the shader's inner/outer cone gap. The Lambertian cosine law itself has no hardness parameter. Cast-shadow softness is unavailable in this preview.</p>
+  </div>
+  <p style="margin-top:14px">These adjustments affect this preview only. Each dyed ribbon is a closed, tapered mesh with its own light-catching faces. Reroll changes the ribbons while keeping the selected materials.</p>
 </aside></main><script type="module" src="marble_studio.js"></script></body></html>
