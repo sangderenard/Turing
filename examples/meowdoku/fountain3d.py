@@ -1,4 +1,4 @@
-"""Fountain: a soft-sphere (DEM) granular fountain in a 3-D slab chamber that fills a basin, takes an image, fills it again.
+"""Fountain: a soft-sphere (DEM) granular fountain in a 3-D box chamber (a true volume) that fills a basin, takes an image, fills it again.
 
 ONE batched per-step law (``fountain_step``), authored once over spans of
 particle ids in the repository's AbstractTensor style, compiled by the
@@ -15,8 +15,8 @@ and the image colours ``ir ig ib``.
 
 THE CHAMBER (3-D)
 -----------------
-A SLAB between two plexiglass walls ``z = -depth/2`` and ``z = +depth/2`` (``dh`` = depth/2, a runtime uniform; a thin slab,
-about one grain diameter, is the 2-D fountain of before).  The basin outline in the x-y plane is a POLYLINE of up to
+A BOX between two plexiglass walls ``z = -depth/2`` and ``z = +depth/2`` (``dh`` = depth/2, a runtime uniform; the default is
+about nine grain diameters deep, up to as deep as the chamber is wide; a depth of one grain diameter is the 2-D fountain).  The basin outline in the x-y plane is a POLYLINE of up to
 ``NV`` vertices (uniforms ``px0..py7``; unused vertices repeat the last one), extruded through the depth: each segment is a
 wall that is a contact of the same law as a grain (a body of infinite mass).  The default is the old basin (a floor and two
 side walls, open top).  The INLET is a tube: a source line/rectangle of half-widths ``bar_half`` x ``bar_z`` about a runtime
@@ -54,12 +54,13 @@ PHYSICS
 
 NEIGHBOUR SEARCH (in the law, from tensor ops; deterministic)
 -------------------------------------------------------------
-A uniform grid of columns of ``cell`` (the largest diameter) in x and y, running through the WHOLE depth: the slab is
-thin, so a column's z cells are few and the 27-cell neighbourhood is the three rows of 3 columns.  Each step the
-particles are sorted by the pair ``(cell, id)`` with Knuth's merge exchange; each of the three rows is a run of the
-sorted cells found by two binary searches; the contact loop walks the first ``k_run`` (a RUNTIME uniform up to
-``K_RUN_MAX``: the loop is fixed-trip, the cap masks the candidates past it, so a lower cap saves no time on the device
--- it trades accuracy for nothing but the dropped-contact count; the dropped contacts are counted in ``n_drop``).
+A uniform grid of cubes of ``cell`` (the largest diameter) in x, y AND z: ``cols`` x ``rows`` x ``lays`` cells (``lays`` a runtime
+uniform like ``cols`` and ``rows``; the z origin is the back plexiglass), the cell index ``(iz rows + iy) cols + ix``.  Each step the
+particles are sorted by the pair ``(cell, id)`` with Knuth's merge exchange; the 3x3x3 neighbourhood is NINE runs of the sorted cells
+(a run is the three x-adjacent cells of one (y, z) pair, contiguous in the index), each found by two binary searches; the contact loop
+walks the first ``k_run`` candidates of each run (a RUNTIME uniform up to ``K_RUN_MAX``: the loop is fixed-trip, the cap masks the
+candidates past it, so a lower cap saves no time on the device -- it trades accuracy for nothing but the dropped-contact count; the
+dropped contacts are counted in ``n_drop``).  A run is searched and walked at once, so no run's bounds are held across the others.
 
 COLOUR
 ------
@@ -107,8 +108,10 @@ STRATA = 1.0                           # default hue cycles over the emission in
 # the page's render looks for the particle field (web/particle_styles.js STYLES -- a test holds the two lists equal)
 PARTICLE_STYLES = (("points", "points"), ("liquid", "liquid"), ("sand", "sand"), ("glow", "glow"), ("heat", "heat"),
                    ("stamp", "stamp (memory)"))
-K_RUN_MAX = 24                         # candidates walked per row run: the compile-time maximum of the runtime uniform ``k_run``
-K_RUN = 24                             # its default (a hex pack of the smallest grains in a thin slab is ~9-15 per run)
+K_RUN_MAX = 12                         # candidates walked per run (9 runs): the compile-time maximum of the runtime uniform ``k_run``
+K_RUN = 12                             # its default (a run is 3 cells of one (y, z) pair: a few grains per cell, and the 3-D pile's contacts are ~12 in all)
+KEY_MAX = 16_000_000                   # the cell index is carried as a float32 whole number: it must stay under 2**24
+ROWS_MARGIN = 64                       # rows the page may add while a sensor drives gravity (``tilt_inputs``), reserved in the key budget
 ARMED = -1.0e9                         # the vy of an id waiting at its inlet slot (see ``fountain_step``)
 EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
 #: The share of a contact's slip that ONE step's friction may remove (see the 2-D history of this law): friction is limited to
@@ -116,8 +119,8 @@ EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live gra
 FRICTION_SHARE = 0.15
 BAR_HEIGHT = 0.12                      # the source's extent ALONG the stream
 NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
-DEPTH_MAX = 0.05                       # the deepest slab: ~2 grain layers, the most the neighbour walk covers (``n_drop`` says when not)
-DEPTH_DEFAULT = 0.03                   # thin: a bit more than the widest diameter, so the pile is the 2-D one
+DEPTH_MAX = WIDTH_BASE                 # the deepest box: as deep as the reference chamber is wide (a size may cap it lower: ``depth_cap``)
+DEPTH_DEFAULT = 0.18                   # about nine grain diameters: a visibly three-dimensional pile
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 
@@ -179,7 +182,7 @@ def _params() -> dict[str, tuple]:
         "lognormal": ("size distribution (0 uniform, 1 lognormal)", 0.0, 1.0, 1.0, 0.0, True, "Grains"),
         "bi_ratio": ("bidisperse size ratio (large / small)", 1.0, 3.0, 0.05, 1.0, True, "Grains"),
         "bi_frac": ("bidisperse number fraction large", 0.0, 1.0, 0.05, 0.5, True, "Grains"),
-        "depth": ("depth", 0.02, DEPTH_MAX, 0.002, DEPTH_DEFAULT, True, "Chamber"),
+        "depth": ("depth", 0.02, DEPTH_MAX, 0.01, DEPTH_DEFAULT, True, "Chamber"),
         "spread": ("inlet spread (rad)", 0.0, 0.9, 0.05, 0.7, True, "Chamber"),
     })
     return out
@@ -229,7 +232,7 @@ STATE = ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
 _SPECIES_UNIFORMS = tuple(f"{k}{s}" for k in ("r", "rho", "mu", "zeta", "roll", "irr") for s in range(len(SPECIES)))
 POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
-UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows", "cell", "dh", "bar_z", "k_run",
+UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows", "lays", "cell", "dh", "bar_z", "k_run",
              "nozzle_x", "nozzle_z", "in_dx", "in_dy", "in_dz", "e1x", "e1y", "e1z", "e2x", "e2y", "e2z",
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
@@ -320,6 +323,14 @@ def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict
     geo = basin(n, aspect, cell)
     lid = geo["nozzle_y"] + LID_ABOVE
     return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
+
+
+def depth_cap(n: int, cell: float = CELL, aspect: float | None = None) -> float:
+    """The deepest box that ``n`` ids can have: the cell index (cols x rows x lays) is a float32 whole number, so it must stay under
+    ``KEY_MAX`` (< 2**24).  The cap is whole cells of ``cell`` (every size below 10M clears the default depth; 10M is capped lower)."""
+    geo = basin(n, aspect, cell)
+    lays = KEY_MAX // (geo["cols"] * (geo["rows"] + ROWS_MARGIN))
+    return max(1, lays) * cell
 
 
 def board_size(view) -> tuple[float, float]:
@@ -420,8 +431,10 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     verts = shape_vertices(shape, geo)
     out.update(inlet_spec(inlet, geo, p, None if shape == "box" else verts))
     rmax = rmax_of(p)
-    dh = 0.5 * p["depth"]
-    out.update({"cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
+    depth = min(p["depth"], depth_cap(n, cell, aspect))
+    lays = max(1, int(math.ceil(depth / cell - 1.0e-9)))
+    dh = 0.5 * depth
+    out.update({"lays": lays, "cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
                 "spread": p["spread"], "nozzle_speed": p["nozzle_speed"], "emit_rate": EMIT_SPAN / float(n) / p["rate"]})
     if len(verts) > NV:
         raise ValueError(f"a chamber outline has at most {NV} vertices")
@@ -557,6 +570,14 @@ def _cap(v, hi):
     return v - (v - hi).clamp(0.0, 1.0e9)
 
 
+def _cap_i(v, hi):
+    """``min(v, hi)`` for a whole-number cell index ``v`` and a RUNTIME bound ``hi``, spelled with ``v`` used ONCE (``_cap`` uses it
+    twice, so a cap of a cap doubles the expression tree): the grid's index arithmetic stays under the arena's rematerialisation
+    cone limit, so the first search's bounds are recomputed where used and hold no arena slot across the sort's last dispatch.  Exact
+    for whole numbers."""
+    return hi - (hi - v).clamp(0.0, 1.0e9)
+
+
 def _nozzle(pid, centre, e1, e2, d, bar_half, bar_z):
     """Where id ``pid`` leaves the inlet tube: a low-discrepancy step along the source line (the golden-ratio step
     2531/4093, so ids emitted close together in time are far apart along it), a hashed place across the depth and a hashed
@@ -584,7 +605,7 @@ def make_law(n: int, active: int | None = None):
         a = dict(zip(ARGUMENTS, args))
         x, y, z, vx, vy, vz, wx, wy, wz, age = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
-        half, nozzle_y, bar_half, cols, rows, cell, dh, bar_z = (a[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows", "cell", "dh", "bar_z"))
+        half, nozzle_y, bar_half, cols, rows, lays, cell, dh, bar_z = (a[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows", "lays", "cell", "dh", "bar_z"))
         emit_rate, k_run, spread, nozzle_speed = a["emit_rate"], a["k_run"], a["spread"], a["nozzle_speed"]
         grav = (a["grav_x"], a["grav_y"], a["grav_z"])
         lid, strata, mode, use_image = a["lid"], a["strata"], a["mode"], a["use_image"]
@@ -594,7 +615,7 @@ def make_law(n: int, active: int | None = None):
         d_in = (a["in_dx"], a["in_dy"], a["in_dz"])
         e1 = (a["e1x"], a["e1y"], a["e1z"])
         e2 = (a["e2x"], a["e2y"], a["e2z"])
-        cells = cols * rows
+        cells = cols * rows * lays
         weights = [a[f"wt{s}"] for s in range(nsp)]
         total_w = weights[0] + weights[1] + weights[2] + weights[3] + 1.0e-9
         c0 = weights[0] / total_w
@@ -648,13 +669,14 @@ def make_law(n: int, active: int | None = None):
             pending = a_ * armed
             arming = a_ * parked
             # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
-            # get the cell past the end: sorted last, in nobody's block).  A column runs through the whole depth.
-            ix = _cap(((x + half) / cell).floor().clamp(0.0, 1.0e9), cols - 1.0)
-            iy = _cap(((y - FLOOR_Y) / cell).floor().clamp(0.0, 1.0e9), rows - 1.0)
+            # get the cell past the end: sorted last, in nobody's block).  z counts from the back plexiglass (z = -dh).
+            ix = _cap_i(((x + half) / cell).floor().clamp(0.0, 1.0e9), cols - 1.0)
+            iy = _cap_i(((y - FLOOR_Y) / cell).floor().clamp(0.0, 1.0e9), rows - 1.0)
+            iz = _cap_i(((z + dh) / cell).floor().clamp(0.0, 1.0e9), lays - 1.0)
             inside = as_float(y < rows * cell + FLOOR_Y)
-            return t, a_, arming, live, pending, ix, iy, (live + pending * float(search)) * inside, (live + pending) * inside
-        t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(False)
-        kc = AbstractTensor.where(gridded > 0.5, cy * cols + cx, cy * 0.0 + cells)
+            return t, a_, arming, live, pending, ix, iy, iz, (live + pending * float(search)) * inside, (live + pending) * inside
+        t_emit, act, arming, live, pending, cx, cy, cz, searching, gridded = frame(False)
+        kc = AbstractTensor.where(gridded > 0.5, (cz * rows + cy) * cols + cx, cy * 0.0 + cells)
         ki = pid
         # ---- sort of (cell, id) pairs by Knuth's merge exchange (any length, no padding): each stage
         # is a gather of the partner and a compare-exchange; the pairs of one stage are disjoint
@@ -672,53 +694,24 @@ def make_law(n: int, active: int | None = None):
             keep_self = (1.0 - lower - upper) + lower * less + upper * (1.0 - less)
             kc = AbstractTensor.where(keep_self > 0.5, kc, oc)
             ki = AbstractTensor.where(keep_self > 0.5, ki, oi)
-        # ---- the run of sorted cells covering each of the three rows of the 3x3 block
-        t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(True)
+        # ---- the 3x3x3 neighbourhood: nine runs of the sorted cells (the three x-adjacent cells of one (y, z) pair are
+        # contiguous in the index), each SEARCHED and WALKED at once, so no run's bounds are held across the others
+        t_emit, act, arming, live, pending, cx, cy, cz, searching, gridded = frame(True)
         zero = x * 0.0
         f_ = [zero, zero, zero]
         q_ = [zero, zero, zero]
-        blocked = zero
-        dropped = zero
+        blk = [zero, zero]                  # [blocked, dropped] (updated by the walk)
         top = float(n - 1)
-        runs = []
-        for dy in (-1.0, 0.0, 1.0):
-            row = cy + dy
-            ok = as_float(row >= 0.0) * as_float(row <= rows - 1.0)
-            rowc = _cap(row.clamp(0.0, 1.0e9), rows - 1.0)
-            c_lo = rowc * cols + _cap((cx - 1.0).clamp(0.0, 1.0e9), cols - 1.0)
-            c_hi = rowc * cols + _cap((cx + 1.0).clamp(0.0, 1.0e9), cols - 1.0)
-            ends = []
-            for target in (c_lo, c_hi + 1.0):
-                lo = cx * 0.0
-                hi = cx * 0.0 + float(n)
-                for _ in range(search_steps):
-                    mid = ((lo + hi) * 0.5).floor()
-                    probe = kc.index_select(0, mid.clamp(0.0, top))
-                    run_live = as_float(lo < hi)
-                    below = as_float(probe < target)
-                    lo = AbstractTensor.where(run_live * below > 0.5, mid + 1.0, lo)
-                    hi = AbstractTensor.where(run_live * (1.0 - below) > 0.5, mid, hi)
-                ends.append(lo)
-            runs.append((ends[0], ends[1], ok))
-            # candidates beyond the walk's reach (``k_run``) are DROPPED contacts: counted (the law's dropped output), never silent
-            dropped = dropped + (ends[1] - ends[0] - k_run).clamp(0.0, 1.0e9) * ok * searching
-        t_emit = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
-        # ---- the rest of what this id is, derived again HERE (not before the sort: a value that crosses
-        # the sort's dispatches would hold an arena slot for all of them)
-        x0, y0, z0 = _nozzle(pid, centre, e1, e2, d_in, bar_half, bar_z)
-        u_theta = _mix(pid, 1759.0, 17.0) * 2.0 - 1.0
-        theta = u_theta * spread
-        speed = (0.9 + _mix(pid, 2203.0, 29.0) * 0.7) * nozzle_speed
-        ct, st = theta.cos(), theta.sin()
-        vx0 = speed * (d_in[0] * ct + e1[0] * st)
-        vy0 = speed * (d_in[1] * ct + e1[1] * st)
-        vz0 = speed * (d_in[2] * ct + e1[2] * st)
-        radius, density, mass, mu, zeta, roll = species(pid)
-        inertia = 0.4 * mass * radius * radius
-        w_self = (wx, wy, wz)
+        own = []                            # what this id is (its species values), derived at the FIRST walk: after the first search
+        # reads the sorted cells, so no value is derived in the sort's last dispatch and carried into the next (it would hold a slot)
 
-        # ---- particle-particle contacts: forces from the neighbours' state
-        for lo, hi, ok in runs:
+        def walk(lo, hi, ok):
+            """The particle-particle contacts of one run: forces from the neighbours' state."""
+            if not own:
+                own.append(species(pid))
+            radius, density, mass, mu, zeta, roll = own[0]
+            # candidates beyond the walk's reach (``k_run``) are DROPPED contacts: counted (the law's dropped output), never silent
+            blk[1] = blk[1] + (hi - lo - k_run).clamp(0.0, 1.0e9) * ok * searching
             for slot in range(K_RUN_MAX):
                 idx = lo + float(slot)
                 valid = as_float(idx < hi) * ok * searching * as_float(k_run > float(slot) + 0.5)
@@ -747,11 +740,11 @@ def make_law(n: int, active: int | None = None):
                 nxt_x = x - (xj + vxj * DT)
                 nxt_y = y - (yj + vyj * DT)
                 nxt_z = z - (zj + vzj * DT)
-                blocked = blocked + pending * valid * (1.0 - armed_j) * as_float(
+                blk[0] = blk[0] + pending * valid * (1.0 - armed_j) * as_float(
                     radius + rj + EMIT_MARGIN - (nxt_x * nxt_x + nxt_y * nxt_y + nxt_z * nxt_z + 1.0e-12).sqrt() > 0.0)
                 # ... and not into the slot of a LOWER armed id that is within contact distance of this slot (the lower
                 # id goes first; both are stationary, so the slots' own distance decides)
-                blocked = blocked + pending * valid * armed_j * as_float(j < pid) * as_float(radius + rj + EMIT_MARGIN - dist > 0.0)
+                blk[0] = blk[0] + pending * valid * armed_j * as_float(j < pid) * as_float(radius + rj + EMIT_MARGIN - dist > 0.0)
                 nrm = (dx / dist, dyy / dist, dzz / dist)
                 m_eff = mass * mj / (mass + mj)
                 kn = omega * omega * m_eff
@@ -765,6 +758,35 @@ def make_law(n: int, active: int | None = None):
                 for k in range(3):
                     f_[k] = f_[k] + force[k]
                     q_[k] = q_[k] + torque[k]
+
+        for dz in (-1.0, 0.0, 1.0):
+            layer = cz + dz
+            ok_z = as_float(layer >= 0.0) * as_float(layer <= lays - 1.0)
+            layc = _cap_i(layer.clamp(0.0, 1.0e9), lays - 1.0)
+            for dy in (-1.0, 0.0, 1.0):
+                row = cy + dy
+                ok = ok_z * as_float(row >= 0.0) * as_float(row <= rows - 1.0)
+                rowc = _cap_i(row.clamp(0.0, 1.0e9), rows - 1.0)
+                base = (layc * rows + rowc) * cols
+                c_lo = base + _cap_i((cx - 1.0).clamp(0.0, 1.0e9), cols - 1.0)
+                c_hi = base + _cap_i((cx + 1.0).clamp(0.0, 1.0e9), cols - 1.0)
+                ends = []
+                for target in (c_lo, c_hi + 1.0):
+                    lo = cx * 0.0
+                    hi = cx * 0.0 + float(n)
+                    for _ in range(search_steps):
+                        mid = ((lo + hi) * 0.5).floor()
+                        probe = kc.index_select(0, mid.clamp(0.0, top))
+                        run_live = as_float(lo < hi)
+                        below = as_float(probe < target)
+                        lo = AbstractTensor.where(run_live * below > 0.5, mid + 1.0, lo)
+                        hi = AbstractTensor.where(run_live * (1.0 - below) > 0.5, mid, hi)
+                    ends.append(lo)
+                walk(ends[0], ends[1], ok)
+        blocked, dropped = blk
+        radius, density, mass, mu, zeta, roll = own[0]
+        inertia = 0.4 * mass * radius * radius
+        w_self = (wx, wy, wz)
 
         # ---- walls: the same contact against a body of infinite mass.  The basin outline is a polyline (each segment a wall
         # through the depth: the contact is with the nearest point of the segment, in the x-y plane); a segment's two
@@ -805,6 +827,15 @@ def make_law(n: int, active: int | None = None):
         # ---- the integrator: gravity (the runtime vector), the interstitial fluid, the forces above.  A pending id with a clear
         # slot is placed at the inlet with its launch velocity; one with a blocked slot waits for the next step.  The fluid's
         # drag (Stokes 6 pi mu r v and quadratic) is implicit, so any viscosity damps and none explodes.
+        # what this id is at the inlet (derived HERE, after the walk: not held across its dispatches)
+        x0, y0, z0 = _nozzle(pid, centre, e1, e2, d_in, bar_half, bar_z)
+        u_theta = _mix(pid, 1759.0, 17.0) * 2.0 - 1.0
+        theta = u_theta * spread
+        speed = (0.9 + _mix(pid, 2203.0, 29.0) * 0.7) * nozzle_speed
+        ct, st = theta.cos(), theta.sin()
+        vx0 = speed * (d_in[0] * ct + e1[0] * st)
+        vy0 = speed * (d_in[1] * ct + e1[1] * st)
+        vz0 = speed * (d_in[2] * ct + e1[2] * st)
         just = pending * as_float(blocked < 0.5)
         place = just + arming
         buoy = 1.0 - fl_rho / density
@@ -1037,6 +1068,23 @@ N_SMALL = SIZES["small"][0]
 #: The free board the game occupies in the main scene (board units); the world window of the
 #: default size is mapped onto it, and the page maps the other sizes' windows the same way.
 BOARD = board_size(basin(N_FULL)["view"])
+
+
+#: The compiler's arena for this law (``fountain3d_build``: 13 feeds + 22 outputs + the reduction's 14 = 49 slots, 196 B/id; a test holds it equal to the
+#: generated program's), stacked into at most 7 lane bindings beside the uniform head.  The z grid adds no per-id column: the cell index is rebuilt
+#: from the state, so the volume costs what the slab did.  A binding is ``ceil(49 / 7) = 7`` slots of ``n`` floats at the sizes where the 256 MiB split
+#: does not apply: 10M ids need 280 MB per binding, over the 240 MB ``maxStorageBufferBindingSize`` class limit (the runtime refuses a device that
+#: cannot hold it, with the reason on screen).
+ARENA_SLOTS = 49
+STORAGE_LANES = 7
+BINDING_CLASS_LIMIT = 240e6
+BINDING_SPLIT_BYTES = int(BINDING_CLASS_LIMIT)               # the generator splits a binding at the class limit (not 256 MiB)
+
+
+def binding_bytes(n: int) -> float:
+    """The bytes of one storage binding of the generated program at ``n`` ids (``emit_tensor_program_passes``'s stacking)."""
+    per = max(BINDING_SPLIT_BYTES // (4 * int(n)), -(-ARENA_SLOTS // STORAGE_LANES))
+    return float(min(per, ARENA_SLOTS) * int(n) * 4)
 
 
 def measured_temperature(diag) -> float:

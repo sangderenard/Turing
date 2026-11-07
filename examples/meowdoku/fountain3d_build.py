@@ -91,7 +91,7 @@ def passes_for(tag_or_pad, active: int | None = None):
     with scoped_work_contract(PRESETS[WGSL_CONTRACT]):
         compiled = webgpu.emit_tensor_program_passes(
             program.module, "fountain_step", outputs, count=pad, name=f"fountain3d_{pad}",
-            iota_args=[ids[name] for name in F.IOTA])
+            iota_args=[ids[name] for name in F.IOTA], binding_bytes=F.BINDING_SPLIT_BYTES)
     return compiled, program, outputs, ids
 
 
