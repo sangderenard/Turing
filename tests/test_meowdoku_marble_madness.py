@@ -48,6 +48,23 @@ def test_goal_is_inside_law_chamber_and_finish_requires_it():
     assert game.epoch == epoch + 1 and not game.state()["won"] and game.result() is None
 
 
+def test_contact_material_presets_use_bounded_effective_dem_stiffness():
+    game = MarbleMadness()
+    for preset, omega in (("glass", 150), ("metal", 180), ("ceramic", 195)):
+        before = game.epoch
+        game.do({"type": "marble_contact_preset", "value": preset})
+        state = game.state()
+        assert game.epoch == before + 1
+        assert state["marble"]["contact_preset"] == preset
+        assert state["compute"]["uniforms"]["omega"] == pytest.approx(omega)
+        assert omega <= F.OMEGA_MAX
+    game.do({"type": "fountain_param", "name": "omega", "value": 165})
+    assert game.state()["marble"]["contact_preset"] == "custom"
+    assert game.state()["compute"]["uniforms"]["omega"] == pytest.approx(165)
+    with pytest.raises(ValueError, match="unknown contact preset"):
+        game.do({"type": "marble_contact_preset", "value": "diamond"})
+
+
 def test_server_catalog_and_action_route(tmp_path):
     from meowdoku.server import Table
 

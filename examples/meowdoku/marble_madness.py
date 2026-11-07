@@ -15,6 +15,15 @@ from meowdoku import fountain3d as F
 from meowdoku.toy_design import toy_parts
 
 
+# Effective DEM contact frequencies in this law's time/length units. These
+# stay below the explicit solver's omega ceiling; they are not Young moduli.
+CONTACT_PRESETS = {
+    "glass": ("Glass-like", 150.0),
+    "metal": ("Metal-like", 180.0),
+    "ceramic": ("Hard ceramic-like", 195.0),
+}
+
+
 class MarbleMadness(FountainGame):
     game = "marble_madness"
     title = "Marble Madness"
@@ -31,6 +40,7 @@ class MarbleMadness(FountainGame):
                             "fl_mu": F.FLUIDS["air"][1]})
         self.won = False
         self.seconds: float | None = None
+        self.contact_preset = "glass"
 
     def uniforms(self, *, image: bool = False):
         values = super().uniforms(image=image)
@@ -49,8 +59,21 @@ class MarbleMadness(FountainGame):
         kind = str(payload.get("type"))
         if kind == "marble_restart":
             self.reset()
+        elif kind == "marble_contact_preset":
+            preset = str(payload.get("value"))
+            if preset != "custom" and preset not in CONTACT_PRESETS:
+                raise ValueError(f"unknown contact preset {preset!r}")
+            self.contact_preset = preset
+            if preset != "custom":
+                self.params["omega"] = CONTACT_PRESETS[preset][1]
+                self.params["hertz"] = 0.0
+            self.reset()  # runtime uniforms are page-owned until the next epoch
         elif kind == "fountain_param":
             super().do(payload)
+            if payload.get("name") in ("omega", "hertz"):
+                self.contact_preset = "custom"
+            if payload.get("name") in ("mu0", "roll0", "e0", "omega", "hertz"):
+                self.reset()  # apply changed contact uniforms to the browser law
         elif kind == "marble_finish":
             if self.won:
                 return
@@ -77,6 +100,9 @@ class MarbleMadness(FountainGame):
     def controls_ui(self):
         return [
             {"id": "marble_restart", "kind": "button", "label": "Restart marble", "action": "marble_restart", "group": "Run"},
+            {"id": "marble_contact_preset", "kind": "select", "label": "Effective contact stiffness", "action": "marble_contact_preset", "field": "value", "value": self.contact_preset,
+             "options": [(key, label) for key, (label, _) in CONTACT_PRESETS.items()] + [("custom", "Custom")], "group": "Marble contact"},
+            self._control("omega", label="Contact frequency (solver units)", group="Marble contact"),
             self._control("mu0", label="Sliding friction (contact μ)", group="Marble contact"),
             self._control("roll0", label="Rolling resistance", group="Marble contact"),
         ]
@@ -86,7 +112,9 @@ class MarbleMadness(FountainGame):
         state["won"] = self.won
         state["status"] = (f"Goal reached in {self.seconds:.2f} s" if self.won else
                            "Guide the cat's-eye marble down the ramps and through the pegs · arrows/WASD or dual thumbsticks tilt X/Y from the backplate normal · optional phone tilt · R restarts")
-        state["marble"] = {"goal": self.goal(), "seconds": self.seconds, "active_ids": 1}
+        state["marble"] = {"goal": self.goal(), "seconds": self.seconds, "active_ids": 1,
+                           "contact_preset": self.contact_preset,
+                           "contact_note": "Effective soft-sphere DEM frequency; literal glass/metal/ceramic Young moduli exceed this explicit solver's stable time step."}
         return state
 
     def result(self):
