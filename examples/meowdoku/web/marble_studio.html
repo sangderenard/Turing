@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cat's-eye marble studio · Meowdoku</title>
+<style>
+  :root { color-scheme:dark; font:14px/1.5 system-ui,sans-serif; background:#101725; color:#e9f1ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid #32465c; background:#152236; }
+  header strong { font-size:17px; } a { color:#a8dcff; }
+  main { display:grid; grid-template-columns:minmax(400px,1fr) minmax(300px,390px); min-height:calc(100vh - 56px); }
+  .stage { position:relative; min-height:65vh; overflow:hidden; background:radial-gradient(circle at 50% 45%,#304762,#09121e 70%); }
+  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  .stage-note { position:absolute; left:18px; bottom:16px; color:#c5d7e9; background:#0d1727c9; border-radius:8px; padding:7px 10px; }
+  aside { padding:18px; border-left:1px solid #32465c; background:#172438; overflow-y:auto; max-height:calc(100vh - 56px); }
+  h1 { font-size:22px; line-height:1.2; margin:0 0 6px; } h2 { font-size:13px; text-transform:uppercase; letter-spacing:.1em; color:#9db4cf; margin:22px 0 10px; }
+  p { color:#aec0d3; margin:0 0 12px; } .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  label { display:grid; gap:3px; color:#d4e3f2; } label span { color:#9db4cf; font-size:12px; }
+  input,select,button { font:inherit; color:#ecf5ff; background:#23354c; border:1px solid #4c6682; border-radius:6px; padding:7px; }
+  input[type=range] { padding:0; width:100%; } input[type=color] { width:100%; height:34px; padding:2px; }
+  button { cursor:pointer; } button:hover { border-color:#b5e7ff; } .wide { grid-column:1/-1; }
+  output { color:#b5e7ff; font-variant-numeric:tabular-nums; } #message { color:#ffd18c; min-height:1.5em; }
+  @media(max-width:850px) { main { grid-template-columns:1fr; } .stage { min-height:58vh; height:58vh; } aside { max-height:none; border-left:0; border-top:1px solid #32465c; } }
+</style></head><body>
+<header><strong>Meowdoku · Marble studio</strong><a href="/">Games</a><span id="message" role="status"></span></header>
+<main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div></div>
+<aside><h1>Design a cat's-eye</h1><p>Turn a real glass shell around a dyed inclusion. Every surface uses the exported Pluck material tables and Phong shader.</p>
+  <h2>Shape</h2><div class="grid">
+    <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
+    <label>Accent material<select id="accent"><option value="marble_milk_glass">Milk glass</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
+    <label>Width <output id="width-out"></output><input id="width" type="range" min="8" max="42" value="28"></label>
+    <label>Length <output id="length-out"></output><input id="length" type="range" min="40" max="85" value="75"></label>
+    <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="18"></label>
+    <label>Strands <output id="strands-out"></output><input id="strands" type="range" min="1" max="7" value="3"></label>
+    <button id="reroll" class="wide">Reroll dyed shape</button>
+  </div>
+  <h2>Material</h2><div class="grid">
+    <label class="wide">Edit layer<select id="layer"><option value="glass">Outer glass</option><option value="eye">Dyed eye</option><option value="accent">Accent</option></select></label>
+    <label>Albedo<input id="albedo" type="color"></label><label>Inner color<input id="inner" type="color"></label>
+    <label>Roughness <output id="roughness-out"></output><input id="roughness" type="range" min="0" max="100" value="10"></label>
+    <label>Metallic <output id="metallic-out"></output><input id="metallic" type="range" min="0" max="100" value="0"></label>
+    <label>Transmission <output id="transmission-out"></output><input id="transmission" type="range" min="0" max="100" value="80"></label>
+    <label>Opacity <output id="opacity-out"></output><input id="opacity" type="range" min="0" max="100" value="30"></label>
+    <label>Index of refraction <output id="ior-out"></output><input id="ior" type="range" min="100" max="250" value="150"></label>
+    <label>Ambient <output id="ambient-out"></output><input id="ambient" type="range" min="0" max="12" value="5"></label>
+    <label>Specular <output id="specular-out"></output><input id="specular" type="range" min="0" max="100" value="80"></label>
+    <label>Shininess <output id="shininess-out"></output><input id="shininess" type="range" min="1" max="300" value="120"></label>
+    <label>Grain <output id="grain-out"></output><input id="grain" type="range" min="0" max="30" value="0"></label>
+    <label>Emission<input id="emission" type="color"></label>
+    <label>Enamel thickness (nm) <output id="enamel-thickness-out"></output><input id="enamel-thickness" type="range" min="0" max="1000" value="0"></label>
+    <label>Enamel roughness <output id="enamel-roughness-out"></output><input id="enamel-roughness" type="range" min="0" max="100" value="5"></label>
+    <label>Enamel index <output id="enamel-ior-out"></output><input id="enamel-ior" type="range" min="100" max="250" value="152"></label>
+    <label>Enamel color<input id="enamel-color" type="color"></label>
+    <button id="reset-material" class="wide">Restore catalogue material</button>
+  </div>
+  <p style="margin-top:14px">These adjustments affect this preview only. Reroll changes the inclusion's mesh while keeping the selected materials.</p>
+</aside></main><script type="module" src="marble_studio.js"></script></body></html>

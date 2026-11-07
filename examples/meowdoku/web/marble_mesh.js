@@ -11,11 +11,12 @@ function unit(x, y, z) {
 
 function checked(options) {
   const o = { rings: 24, segments: 48, eyeWidth: 0.28, eyeLength: 0.75,
-    eyeCurve: 0.18, strandCount: 3, ...options };
-  for (const key of ["rings", "segments", "strandCount"])
+    eyeCurve: 0.18, strandCount: 3, seed: 0, ...options };
+  for (const key of ["rings", "segments", "strandCount", "seed"])
     if (!Number.isInteger(o[key])) throw new RangeError(`${key} must be an integer`);
   if (o.rings < 8 || o.rings > 96 || o.segments < 12 || o.segments > 192 || o.strandCount < 1 || o.strandCount > 7)
     throw new RangeError("marble tessellation outside supported range");
+  if (o.seed < 0 || o.seed > 0x7fffffff) throw new RangeError("seed outside supported range");
   if (!(o.eyeWidth >= 0.08 && o.eyeWidth <= 0.42 && o.eyeLength >= 0.4 && o.eyeLength <= 0.85 &&
         o.eyeCurve >= -0.28 && o.eyeCurve <= 0.28))
     throw new RangeError("cat's-eye dimensions outside the glass interior");
@@ -54,8 +55,12 @@ export function catEyeMarble(materials, options = {}) {
   const point = (i, j) => {
     const theta = Math.PI * i / o.rings, phi = TAU * j / o.segments;
     const s = Math.sin(theta), y = o.eyeLength * Math.cos(theta);
-    const radius = o.eyeWidth * Math.pow(s, 0.78) * (1 + 0.07 * Math.cos(3 * phi + 2 * theta));
-    return [o.eyeCurve * (1 - y * y) + radius * Math.cos(phi), y, radius * Math.sin(phi)];
+    const phase = (o.seed % 997) / 997 * TAU;
+    const wave = 1 + 0.07 * Math.cos(3 * phi + 2 * theta + phase)
+      + 0.045 * Math.sin(5 * phi - 3 * theta + 1.7 * phase);
+    const radius = o.eyeWidth * Math.pow(s, 0.78) * wave;
+    const bend = o.eyeCurve * (1 - y * y) + 0.06 * Math.sin(2 * theta + phase) * s * s;
+    return [bend + radius * Math.cos(phi), y, radius * Math.sin(phi)];
   };
   // Tangents of the parametric surface provide the normal even where the
   // spindle bends. This avoids lighting the dyed region as a flat decal.
