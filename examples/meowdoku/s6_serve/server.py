@@ -1112,7 +1112,7 @@ def prepare_fountain3d_toy(web_dir: Path, ctx=None) -> None:
     from meowdoku import fountain3d_build
     try:
         started = time.perf_counter()
-        wasm = False  # the toy's CPU product is compiled only on actual fallback demand or an explicit idle build
+        wasm = False  # Startup builds the toy's WebGPU product only; a future fallback/idle path must request Wasm explicitly.
         manifest = fountain3d_build.build(web_dir, sizes=fountain3d_build.WHEEL_SIZES, wasm=wasm, variant="toy")
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d toy products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
