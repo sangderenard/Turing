@@ -75,8 +75,8 @@
     <label>Mark bulk density (kg/m³)<input id="mark-density" type="number" min="1" max="30000" step="10" value="2500"></label>
     <output id="mass-report" class="wide"></output>
     <label class="wide"><input id="inertia-lock" type="checkbox" checked> Lock inertia preview</label>
-    <label>Roll force X (mN)<input id="roll-force-x" type="range" min="-100" max="100" value="3"></label>
-    <label>Roll force Z (mN)<input id="roll-force-z" type="range" min="-100" max="100" value="0"></label>
+    <label>Roll force X (mN)<input id="roll-force-x" type="range" min="-10" max="10" step="0.1" value="0.1"></label>
+    <label>Roll force Z (mN)<input id="roll-force-z" type="range" min="-10" max="10" step="0.1" value="0"></label>
     <button id="reset-roll" class="wide">Reset roll</button>
     <output id="roll-status" class="wide">Locked</output>
     <p class="wide">Closed triangle volume integrals provide the first and second mass moments, center of mass, and moment of inertia tensor. Separate inclusions displace shell material. Enamel uses a thin-film area estimate. Dice marking material uses Pluck optics; raised and recessed relief currently retains body density, so a differing mark density is unresolved. Dice rolling needs polyhedron contact dynamics.</p>
