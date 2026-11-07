@@ -1,7 +1,8 @@
 // [LOG] The log page: the server's text ring (/api/log) drawn as GLYPH MESHES in a small instanced scene -- the exported letter/digit
 // token meshes of assets.json (the ones the main page's Phong scene draws), lit by a Phong light.  Only the lines in view, and only the
 // characters on them, become instances; the text itself lives in plain JS strings.
-import { SOURCES, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms } from "./log_view.js";
+import { SOURCES, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms, groupKeys } from "./log_view.js";
+import { resetSettings, settingsKeys } from "./settings_reset.js";
 
 const $ = (id) => document.getElementById(id);
 const COLORS = { "client-error": [1.0, 0.48, 0.38], "fountain-diag": [0.42, 0.85, 1.0], "server": [0.62, 0.95, 0.55] };
@@ -87,8 +88,7 @@ async function poll() {
 // ---------------------------------------------------------------- layout + draw
 const cell = () => ({ w: Math.round(S.fontPx * 0.72), h: Math.round(S.fontPx * 1.4) });
 function size() {
-  const wrap = $("wrap"), top = $("bar").offsetHeight, dpr = window.devicePixelRatio || 1;
-  wrap.style.top = top + "px";
+  const wrap = $("wrap"), dpr = window.devicePixelRatio || 1;
   const w = Math.max(1, Math.round(wrap.clientWidth * dpr)), h = Math.max(1, Math.round(wrap.clientHeight * dpr));
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; S.dirty = true; }
   return dpr;
@@ -175,6 +175,49 @@ for (const src of SOURCES) {
   l.querySelector("input").onchange = (ev) => { ev.target.checked ? S.sources.add(src) : S.sources.delete(src); l.className = ev.target.checked ? "on" : ""; rebuildLines(); S.dirty = true; };
   $("srcs").appendChild(l);
 }
+
+// The game tab persists its console ring in localStorage. Read it here without
+// installing a second console capture that could overwrite that tab's ring.
+function localEntries() {
+  try {
+    const rows = JSON.parse(localStorage.getItem("meowdoku.locallog") || "[]");
+    return Array.isArray(rows) ? rows : [];
+  } catch (_) { return []; }
+}
+let localShown = [];
+function drawLocal() {
+  const terms = searchTerms($("local-q").value);
+  localShown = localEntries().filter((e) => !terms.length || terms.every((w) => String(e.text).toLowerCase().includes(w)))
+    .map(lineText);
+  const pane = $("local-lines"), atEnd = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 24;
+  pane.textContent = localShown.join("\n");
+  if (atEnd) pane.scrollTop = pane.scrollHeight;
+  $("local-stats").textContent = `${localShown.length} lines`;
+}
+$("local-q").oninput = drawLocal;
+$("local-copy").onclick = (ev) => copy(localShown.join("\n"), ev.target);
+$("local-clear").onclick = () => { localStorage.removeItem("meowdoku.locallog"); drawLocal(); };
+window.addEventListener("storage", (ev) => { if (ev.key === "meowdoku.locallog") drawLocal(); });
+setInterval(drawLocal, POLL_MS);
+drawLocal();
+
+function showReset() {
+  const groups = groupKeys(settingsKeys());
+  const body = $("resetbody"); body.replaceChildren();
+  for (const [group, keys] of Object.entries(groups)) {
+    const h = document.createElement("h3"); h.textContent = `${group} (${keys.length})`; body.appendChild(h);
+    const p = document.createElement("p"); p.textContent = keys.join(" · "); body.appendChild(p);
+  }
+  if (!Object.keys(groups).length) body.textContent = "No saved settings to reset.";
+  $("reset").classList.add("open");
+}
+$("openreset").onclick = showReset;
+$("closereset").onclick = () => $("reset").classList.remove("open");
+$("resetsettings").onclick = () => {
+  const count = resetSettings();
+  $("resetstatus").textContent = `${count} settings cleared. Opening the game with defaults.`;
+  location.href = "index.html";
+};
 
 // ---------------------------------------------------------------- boot
 (async () => {
