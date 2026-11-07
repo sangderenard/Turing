@@ -607,8 +607,56 @@ function paneOutside(ring, lo, hi, bottom, top) {
 // the panes option (page-side, the 3-D fountain): what fills the panes beyond the angled walls
 const panes = { mode: "trim" };
 try { const saved = localStorage.getItem("meowdoku.panes"); if (["trim", "frame", "matte"].includes(saved)) panes.mode = saved; } catch { /* storage may be blocked */ }
+// THE 2-D CHAMBER AS GLOWING GLASS RIBBONS: each outline polyline (the server's chamber_outline -- the polygon's vertices or the SDF
+// chamber's zero contour -- else the px/py polyline) becomes a low glass bar along the wall, in the emissive "outline@glass"
+// material, through the scene's own material path; drawn with the case's model (state.caseModel) like the 3-D housing, so it turns
+// with the case.  Each segment is a band one wall-thickness wide (wall_t, else three grain diameters), extended half a width past
+// its ends so corners overlap, standing RIBBON_H (law units) off the plate.
+const RIBBON_H = 0.035;
+function ribbonFaces(g) {
+  const c = g && g.compute, u = c && c.uniforms, m = state.materialIndex["outline@glass"];
+  if (!u || !c.view || m == null) return null;
+  const [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0)), mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+  const y = TILE.height + 0.03;
+  const wp = (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+  let lines = c.chamber_outline;
+  if (!lines || !lines.length) {
+    const pts = [];
+    for (let i = 0; i < 8; i++) {
+      if (u[`px${i}`] === undefined) break;
+      const q = [u[`px${i}`], Math.min(u[`py${i}`], y1)], last = pts[pts.length - 1];
+      if (!last || Math.hypot(q[0] - last[0], q[1] - last[1]) > 1e-6) pts.push(q);
+    }
+    lines = pts.length > 1 ? [pts] : [];
+  }
+  const rmax = Math.max(...[0, 1, 2, 3].map((i) => (u[`r${i}`] || 0) * (u[`rscale${i}`] || 1)), 0.009);
+  const hw = (u.wall_t > 0 ? u.wall_t : 6 * rmax) / 2, faces = [];
+  for (const line of lines) for (let i = 0; i + 1 < line.length; i++) {
+    const [ax, ay] = line[i], [bx, by] = line[i + 1], len = Math.hypot(bx - ax, by - ay);
+    if (len < 1e-9) continue;
+    const dx = (bx - ax) / len, dy = (by - ay) / len, nx = -dy, ny = dx;
+    const quad = [[ax - dx * hw + nx * hw, ay - dy * hw + ny * hw], [bx + dx * hw + nx * hw, by + dy * hw + ny * hw],
+                  [bx + dx * hw - nx * hw, by + dy * hw - ny * hw], [ax - dx * hw - nx * hw, ay - dy * hw - ny * hw]];
+    for (let s = 0; s < 4; s++) {                                    // the bar's four sides
+      const p0 = quad[s], p1 = quad[(s + 1) % 4];
+      const a = wp(p0[0], p0[1], 0), b2 = wp(p1[0], p1[1], 0), c2 = wp(p1[0], p1[1], RIBBON_H), d = wp(p0[0], p0[1], RIBBON_H);
+      faces.push([a, b2, c2, m], [a, c2, d, m]);
+    }
+    const [a, b2, c2, d] = quad.map((q) => wp(q[0], q[1], RIBBON_H));  // its top
+    faces.push([a, b2, c2, m], [a, c2, d, m]);
+  }
+  return faces.length ? faces : null;
+}
 function updateHousing() {
   const g = state.game, c = g && g.compute;
+  if (g && g.game === "fountain" && c && !state.flat) {
+    const key = JSON.stringify(["2d", c.chamber_outline || 0, c.uniforms && [c.uniforms.px0, c.uniforms.py0, c.uniforms.px1, c.uniforms.py1, c.uniforms.wall_t], c.view, g.width, g.height, state.materialsVersion]);
+    if (state.housing && state.housing.key === key) return;
+    if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
+    const faces = ribbonFaces(g);
+    state.housing = { key, mesh: faces ? litMesh(faces) : null, triangles: faces ? faces.length : 0 };
+    return;
+  }
   const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
@@ -1652,6 +1700,7 @@ function uploadMaterials(game) {
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
+  records.push(["outline@glass", [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22, 0.42, 0.62] }]);   // the 2-D chamber's glowing glass ribbons
   records.push(["housing_matte", [0.10, 0.10, 0.11], { roughness: 0.95, specular: 0.02 }]);   // the panes' matte fill (panes "matte")
   const tables = {};
   state.materialIndex = {};
@@ -5080,7 +5129,7 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d" || g.game === "fountain") drawChamberOutline(cam, g, rec);
+  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat)) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
