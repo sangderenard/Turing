@@ -1742,3 +1742,42 @@ def test_the_sdf_presets_keep_their_designed_height_and_the_view_follows_the_cha
     # the toy at 4k: peg rows, throat, funnel and the three ramps stack to the height the parts need, not a window fraction
     toy = F.sdf_preset("sdf_toy", F.basin(4096))
     assert toy["top"] > 2.8 and F.tilt_inputs(4096, None, F.CELL, "sdf_toy")["lid"] >= toy["top"]
+
+
+def test_the_toy_internal_parts_obstruct_and_guide_grains_and_nothing_leaves_the_chamber():
+    """sdf_toy in the eager lane (the f32 NumPy backend): grains laid on a ramp slide DOWN ALONG it and never sink into it; grains dropped onto the
+    peg field stay out of every peg; the composed distance never goes negative past a radius and no id is outside or not finite (the 'weird
+    gravity pushing things out of containment' report: the law's solids and walls are right; the runtime inputs carry the default pull)."""
+    n = 8
+    cols = F.initial_columns(n, mix=0.0, shape="sdf_toy", active=4096)
+    law = _Eager(n, 4096)
+    u = {k: float(cols[k]) for k in F.UNIFORMS}
+    assert (u["grav_x"], u["grav_y"]) == (0.0, -F.G) and u["sdf_on"] == 1.0
+    spec = F.sdf_preset("sdf_toy", F.chamber_basin("sdf_toy", 4096))
+    ramp = next(s for s in spec["slots"] if s["kind"] == F.SDF_KINDS["capsule"])
+    ax, ay = math.cos(ramp["rot"]), math.sin(ramp["rot"])
+    if ay > 0:
+        ax, ay = -ax, -ay                                     # the axis pointing DOWN the ramp
+    nx_, ny_ = -ay, ax
+    if ny_ < 0:
+        nx_, ny_ = -nx_, -ny_                                 # the ramp's up-facing normal
+    pegs = next(s for s in spec["slots"] if s["kind"] == F.SDF_KINDS["pegs"])
+    cols["age"][:] = -1.0e9
+    along = np.linspace(-0.5, 0.5, 4) * ramp["p0"]
+    for i in range(4):                                        # four grains on the ramp, 0.06 above its surface
+        cols["age"][i], cols["x"][i], cols["y"][i] = 1.0e3, ramp["cx"] - along[i] * ax + 0.06 * nx_, ramp["cy"] - along[i] * ay + 0.06 * ny_
+    for i in range(4, 8):                                     # four above the peg field, over a peg column each
+        cols["age"][i], cols["x"][i], cols["y"][i] = 1.0e3, pegs["cx"] + (i - 5.5) * pegs["p0"], pegs["cy"] + 0.5 * (pegs["p4"] - 1.0) * pegs["p1"] + 0.12 + 0.01 * i
+    start = np.array(cols["x"][:4]) * ax + np.array(cols["y"][:4]) * ay
+    state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
+    worst, out = 0.0, {}
+    for _ in range(120):
+        out = dict(zip(F.OUTPUTS, law(*[state[k] if k in state else cols[k] for k in F.ARGUMENTS])))
+        state = {k: out[k + "_next"] for k in F.STATE}
+        worst = min(worst, float(F.chamber_distance(u, state["x"], state["y"])[0].min()))
+    radius = out["rad"]
+    assert float(out["n_out"][0]) == 0 and float(out["n_nan"][0]) == 0 and worst > -0.2 * float(radius.min())    # no id past a wall, solid or peg
+    moved = (state["x"][:4] * ax + state["y"][:4] * ay) - start                                                    # progress along the DOWN-ramp axis
+    assert np.all(moved > 0.0) and np.all(state["vx"][:4] * ax + state["vy"][:4] * ay > 0.0)                      # they slide down it ...
+    height = (state["x"][:4] - ramp["cx"]) * nx_ + (state["y"][:4] - ramp["cy"]) * ny_
+    assert np.all(height > ramp["p1"] + 0.8 * radius[:4])                                                        # ... riding on its surface, not in it
