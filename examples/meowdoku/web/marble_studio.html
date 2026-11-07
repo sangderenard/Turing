@@ -30,7 +30,11 @@
     <label>Width <output id="width-out"></output><input id="width" type="range" min="8" max="42" value="28"></label>
     <label>Length <output id="length-out"></output><input id="length" type="range" min="40" max="85" value="75"></label>
     <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="18"></label>
-    <label>Strands <output id="strands-out"></output><input id="strands" type="range" min="1" max="7" value="3"></label>
+    <label>Separate ribbons <output id="strands-out"></output><input id="strands" type="range" min="2" max="7" value="3"></label>
+    <label>Ribbon thickness <output id="thickness-out"></output><input id="thickness" type="range" min="8" max="80" value="35"></label>
+    <label>Twist along curve <output id="twist-out"></output><input id="twist" type="range" min="-320" max="320" value="90"></label>
+    <label>Tip taper <output id="tip-out"></output><input id="tip" type="range" min="60" max="300" value="135"></label>
+    <label>Ribbon flare <output id="flare-out"></output><input id="flare" type="range" min="0" max="60" value="18"></label>
     <button id="reroll" class="wide">Reroll dyed shape</button>
   </div>
   <h2>Material</h2><div class="grid">
@@ -52,5 +56,5 @@
     <label>Enamel color<input id="enamel-color" type="color"></label>
     <button id="reset-material" class="wide">Restore catalogue material</button>
   </div>
-  <p style="margin-top:14px">These adjustments affect this preview only. Reroll changes the inclusion's mesh while keeping the selected materials.</p>
+  <p style="margin-top:14px">These adjustments affect this preview only. Each dyed ribbon is a closed, tapered mesh with its own light-catching faces. Reroll changes the ribbons while keeping the selected materials.</p>
 </aside></main><script type="module" src="marble_studio.js"></script></body></html>
