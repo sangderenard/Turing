@@ -6,6 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
+import { STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability } from "./particle_styles.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
@@ -4030,12 +4031,20 @@ function contentPoint(X, Y) {
   return d === 90 ? [w - Y, X] : d === 180 ? [w - X, h - Y] : [Y, h - X];
 }
 for (const type of ["resize", "orientationchange"]) addEventListener(type, () => setTimeout(applyLayoutLock, 0));
+// The particle field's render style (particle_styles.js): a page setting, render only, remembered in the browser.
+let particleStyle = DEFAULT_STYLE;
+try { const saved = localStorage.getItem("meowdoku.pstyle"); if (STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
+window.meowdokuDebug.setParticleStyle = (id) => { particleStyle = id; refreshLocalControls(); };
+Object.defineProperty(window.meowdokuDebug, "cloud", { get: () => cloud });
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
   if (s.local === "tilt") {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
+  } else if (s.local === "particle_style") {
+    particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
+    try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
   } else compute.control(s.local);
   refreshLocalControls();
 }
@@ -4051,6 +4060,15 @@ function refreshLocalControls() {
     if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
+    } else if (s.local === "particle_style") {
+      // what this device can run: an option it cannot is offered but disabled; the title says why a request is drawn as points
+      const caps = capabilitiesOf(gl), select = el.querySelector("select");
+      for (const option of select.options) {
+        const av = styleAvailability(option.value, caps), base = option.dataset.label || (option.dataset.label = option.textContent);
+        option.disabled = !av.ok; option.textContent = av.ok ? base : `${base} (unavailable here)`; option.title = av.note;
+      }
+      select.value = particleStyle;
+      el.title = (cloud && cloud.styles.fallback) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
     } else {
       el.disabled = !st.ready || (s.local === "continue" ? st.mode === "live" : s.local === "rebirth" ? false : st.frames === 0);
       el.classList.toggle("on", s.local === st.mode);
@@ -4083,7 +4101,7 @@ function renderGameControls(game) {
         const input = document.createElement(s.kind === "select" ? "select" : "input");
         if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
+        input.onchange = () => (s.local ? localControl(s, input.value) : act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }));
         el.append(input);
       }
       el.dataset.ctl = s.id;
@@ -4107,9 +4125,16 @@ function renderGameControls(game) {
       }
     }
     if (input && s.kind === "toggle") input.checked = s.local ? gravitySensor.enabled : !!s.value;
-    else if (input && document.activeElement !== input) input.value = String(s.value);
+    else if (input && document.activeElement !== input) input.value = String(s.local === "particle_style" ? particleStyle : s.value);
   }
   refreshLocalControls();
+}
+// The scene's own light for the particle styles: the sun (or the flat view's key), the shared fill, towards the board's centre.
+function particleLighting(g, y) {
+  const sun = sunState(), key = (state.flat ? [1.0, 0.95, 0.86] : sun.colour).map((v) => v * sun.strength);
+  // a floor under both, so a night scene (dim sun, dark fill) leaves the grains readable: the colours are the particles' own, the lighting only shades them
+  const lit = (v, floor) => floor + (1 - floor) * Math.min(1, v);
+  return { dir: norm(sub(light.position, [g.width / 2, y, g.height / 2])), key: key.map((v) => lit(v, 0.3)), fill: ambientFill([0.75, 0.85, 1.0]).map((v) => lit(v, 0.34)) };
 }
 function pointsFrame(cam, now) {
   const g = state.game;
@@ -4120,8 +4145,10 @@ function pointsFrame(cam, now) {
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
+  const y = TILE.height + 0.03;
   cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
-                     y: TILE.height + 0.03, stride: rec.display_stride, background: sceneBackground() });
+                     y, stride: rec.display_stride, background: sceneBackground(),
+                     style: particleStyle, camera: { view: cam.view, proj: cam.proj }, lighting: particleStyle === DEFAULT_STYLE ? null : particleLighting(g, y) });
 }
 
 // ---------------------------------------------------------------- draw

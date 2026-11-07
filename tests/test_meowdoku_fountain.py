@@ -177,6 +177,7 @@ def test_the_pages_image_sampling_equals_pythons_sample_raster(tmp_path):
     (tmp_path / "job.json").write_text(json.dumps({"n": n, "w": w, "h": h}))
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SAMPLE)
     done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
@@ -512,6 +513,7 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
     quiet["vmax2"][len(diag["ke"]):] = 1e-6
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SETTLE)
     for series in (diag, quiet):
@@ -776,3 +778,45 @@ def test_the_recording_window_playback_and_continue_are_exact(tmp_path):
 @pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's gravity code")
 def test_the_phone_orientation_gives_the_screen_plane_gravity_and_the_sensor_asks_on_a_tap(tmp_path):
     assert _run_node(tmp_path, JS_GRAVITY, "gravity.js").strip() == "ok"
+
+
+JS_STYLES = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {STYLES, STYLE_IDS, DEFAULT_STYLE, chooseStyle, styleAvailability} = await import(pathToFileURL(`${dir}/particle_styles.js`).href);
+const full = {floatRender: 'float', maxPointSize: 256}, half = {floatRender: 'half', maxPointSize: 256}, none = {floatRender: null, maxPointSize: 256};
+assert.equal(DEFAULT_STYLE, 'points'); assert.equal(STYLE_IDS[0], 'points'); assert.equal(new Set(STYLE_IDS).size, STYLE_IDS.length);
+// the default and unknown names are always points; an ordinary device runs every style
+assert.deepEqual(chooseStyle('points', null), {style: 'points', requested: 'points', reason: ''});
+assert.equal(chooseStyle('no-such-style', full).style, 'points');
+for (const id of STYLE_IDS) assert.equal(chooseStyle(id, full).style, id);
+// no float render targets: the float styles fall back to points and say why; sand loses only its ambient occlusion; stamp and glow need none
+for (const id of ['liquid', 'heat']) {
+  const c = chooseStyle(id, none);
+  assert.equal(c.style, 'points'); assert.equal(c.requested, id); assert.match(c.reason, /float/);
+}
+for (const id of ['sand', 'glow', 'stamp']) assert.equal(chooseStyle(id, none).style, id);
+assert.match(chooseStyle('sand', none).reason, /ambient/);
+// half float runs them, with the precision noted
+assert.equal(chooseStyle('liquid', half).style, 'liquid'); assert.match(chooseStyle('liquid', half).reason, /half/);
+// tiny point sprites (some phones): every sprite style falls back
+assert.equal(chooseStyle('glow', {floatRender: 'float', maxPointSize: 1}).style, 'points');
+// a style that failed at run time is not retried
+assert.equal(chooseStyle('liquid', full, {liquid: 'incomplete target'}).style, 'points');
+assert.match(chooseStyle('liquid', full, {liquid: 'incomplete target'}).reason, /incomplete target/);
+assert.equal(styleAvailability('liquid', null).ok, false);
+console.log(JSON.stringify(STYLES.map((s) => [s.id, s.label])));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's particle style registry")
+def test_the_particle_styles_registry_picks_a_style_the_device_can_run_and_matches_the_server(tmp_path):
+    """Render-only looks (web/particle_styles.js): the registry, what a device can run, the fallback to points -- and the
+    server's `look` control declares exactly the page's styles, in the page's order."""
+    import json
+    listed = json.loads(_run_node(tmp_path, JS_STYLES, "particle_styles.js").strip().splitlines()[-1])
+    ids = {item["id"]: item for item in F.FountainGame(size="small").state()["controls_ui"]}
+    look = ids["pstyle"]
+    assert look["kind"] == "select" and look["local"] == "particle_style" and look["value"] == "points"
+    assert look["options"] == listed
