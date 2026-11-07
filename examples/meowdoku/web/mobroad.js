@@ -23,6 +23,19 @@ export function mobroadInputs(bullets, prev, map) {
   return out;
 }
 
+// fountain.py ``mobroad_target``: the player at board (bx, by) as the pather's target (the law's ``tgt_x, tgt_y``, fountain units)
+export function mobroadTarget(bx, by, map) {
+  const { k, half, top } = map;
+  return { tgt_x: Math.fround(bx / k - half), tgt_y: Math.fround(top - by / k) };
+}
+
+// fountain.py ``mobroad_pather_inputs``: the pather's weights as the law's uniforms (``pw<i>``)
+export function mobroadPather(w) {
+  const out = {};
+  w.forEach((v, i) => { out[`pw${i}`] = Math.fround(v); });
+  return out;
+}
+
 const KIND_MATERIAL = { split: "sapphire@glass", damage: "jade@glass", rate: "ruby@glass", shooters: "opal@glass" };
 const KIND_LABEL = { split: "SPLIT", damage: "DAMAGE", rate: "FIRE RATE", shooters: "SHOOTERS" };
 const KIND_COLOR = { split: "#7fb2ff", damage: "#7fe3a0", rate: "#ff7f8e", shooters: "#d8e6ff" };
@@ -41,7 +54,25 @@ function project(vp, x, y, z, w, h) {
 }
 
 export class MobroadPage {
-  constructor() { this.meshes = []; this.key = ""; this.root = null; this.labels = new Map(); this.hud = null; }
+  constructor() {
+    this.meshes = []; this.key = ""; this.root = null; this.labels = new Map(); this.hud = null; this.toggle = null;
+    let kind = null;
+    try { kind = new URLSearchParams(location.search).get("pather") || localStorage.getItem("mobroad.pather"); } catch (e) { /* no storage: the default */ }
+    this.patherKind = kind === "hand" ? "hand" : "trained";             // which weights the law walks the mob with
+  }
+
+  // THE PLAYER (the pather's target), board units: the server's player piece (lane 0), else where it starts
+  target(state, game) {
+    for (const piece of state.pieces.values()) if (piece.entity && piece.mesh === "rocket" && piece.removing == null && String(piece.id).startsWith("0:")) return [piece.sx, piece.sz];
+    const m = game.mobroad.map;
+    return [m.board[0] / 2, m.board[1] - 0.9];
+  }
+
+  // THE PATHER'S WEIGHTS the law is given (the spec carries both sets), per the page's toggle
+  pather(game) {
+    const p = game.compute && game.compute.pather;
+    return p ? p[this.patherKind] || p[p.default] : null;
+  }
 
   // THE BULLETS at this instant (the server's, carried on by their velocity since the snapshot), as the kill segments' endpoints: [{id, x, y, kr}]
   collect(state, gameNow, game) {
@@ -70,8 +101,19 @@ export class MobroadPage {
     const hud = document.createElement("div");
     hud.style.cssText = "position:absolute;left:50%;top:150px;transform:translate(-50%,-100%);padding:3px 12px;border-radius:12px;background:#0009;white-space:nowrap";
     root.appendChild(hud);
-    this.root = root; this.hud = hud;
+    const toggle = document.createElement("button");
+    toggle.style.cssText = "position:absolute;right:10px;bottom:10px;pointer-events:auto;padding:4px 10px;border-radius:12px;border:1px solid #fff6;background:#0009;color:#fff;font:600 12px system-ui,sans-serif;cursor:pointer";
+    toggle.title = "the mob's pather: the hand-set weights or the trained ones (runtime uniforms of the law: no recompile)";
+    toggle.onclick = () => {
+      this.patherKind = this.patherKind === "hand" ? "trained" : "hand";
+      try { localStorage.setItem("mobroad.pather", this.patherKind); } catch (e) { /* per-viewer convenience only */ }
+      this.#label();
+    };
+    root.appendChild(toggle);
+    this.root = root; this.hud = hud; this.toggle = toggle; this.#label();
   }
+
+  #label() { if (this.toggle) this.toggle.textContent = `pather: ${this.patherKind}`; }
 
   // called with every state; hides the overlay for any other game
   update(game) {

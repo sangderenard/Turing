@@ -218,6 +218,15 @@ State of the walls now: the 2D law has three planes plus (non-box shapes) a poly
 - Panels: pass-through (`split`: floor(value) bullets, fanned; `damage`: reach x sqrt(value)) and completion (`rate`: fire rate x amount; `shooters`: +escorts) kinds; every bullet crossing a panel hits it (+step); the level uses split and rate.
 - Open: no wasm product for the variant in the dev run; the mob runs ahead of the display by the pump's lead, so a bullet reaches a grain slightly early on screen; `shooters`/`damage` panels are in the law and tests but not in the level; one level; mob size 4k only; no autopilot.
 
+### Mobroad: gravity orthogonal to the scene + a neural pather per grain (the user, 2026-11-07) -- LANDED
+
+"Put gravity orthogonal to the scene so the mobs don't fall, and give them a tiny couple-neuron graph pather that tries to get to the user to attack."
+- **Gravity**: in the variant the in-plane gravity is exactly 0 whatever the page writes (`grav_x, grav_y` are zeroed inside the `# <mobroad>` block; `mobroad_uniforms` writes 0). Ground contact is implicit: the fluid drag (`fl_mu`) that already set the pace is the ground friction; `MOB_MARCH` lost its `grav_y`.
+- **Pather** (`fountain.mob_pather_accel`, in the law, per grain): 6 inputs in the nearest wall's frame (target direction n/t, own velocity n/t, wall distance from `sdf_field`, target distance) -> 6 tanh -> (o_n, o_t), capped to `MOB_WALK` = 0.5 (what gravity was). 56 weights = runtime uniforms `pw0..pw55`; the target is `tgt_x, tgt_y` (the page writes the player's place each batch, `mobroad_target` / `mobroadTarget`); a grain within `atk_r` of the player has ARRIVED (parked, `n_goal`) -- the old goal line is gone (`goal_y` removed).
+- **Weights**: `mob_pather_hand()` (seek + slide along walls) and `mobroad_pather.json` (trained: `python -m meowdoku.mobroad_pather_sim --train`, an evolution strategy from the hand-set weights, scored on a host-side crowd with the law's own SDF, the law's friction and no-overlap crowding -- a SURROGATE, 0.35 s/step makes the eager law unusable for search). The spec carries both sets; the page has a "pather: hand/trained" button (`?pather=hand`). Retraining needs no recompile.
+- **Camera**: `CAMERA_TOP_DOWN` in app.js: mobroad opens straight down.
+- Open: the trained weights were scored on the surrogate, not on the GPU law's crowd; the pather has no memory (no dead-end escape beyond the wall-frame slide); wasm product not built in the dev run.
+
 ## Tip jar (the user, 2026-11-07)
 
 A watch-only Bitcoin piggybank on the 3-D fountain (`tipjar.py`, `web/tipjar.js`, game `tipjar`): one grain per incoming transaction, the jar is the wallet. Config `build/meowdoku/tipjar.json` (gitignored): `{"address": "...", "xpub": "... (xpub or zpub, optional)", "show_txid": false}`; private keys and seeds are refused. Unconfigured: a DEMO from `tipjar_fixture.json`. The mempool.space poll runs once per 60 s on the server.

@@ -297,12 +297,12 @@ class _Eager:
         return dict(zip(F.MOBROAD_OUTPUTS, out))
 
 
-def _mob_world(n, x, y, vy=0.0, gravity=None):
-    """``n`` grains placed (all emitted: ``age`` past every emit time) on the road: (law, columns, state)."""
+def _mob_world(n, x, y, vy=0.0, still=False):
+    """``n`` grains placed (all emitted: ``age`` past every emit time) on the road: (law, columns, state).  ``still``: the pather's weights all zero (no walking)."""
     cols = F.mobroad_columns(n, active=n)
     cols["age"][:] = 1.0e3
-    if gravity is not None:
-        cols["grav_y"] = np.float64(gravity)
+    if still:
+        cols.update({name: np.float64(0.0) for name in F.MOB_PATHER_UNIFORMS})
     cols["x"], cols["y"], cols["vy"] = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64), np.full(n, vy)
     return _Eager(n, n), cols, {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
 
@@ -358,7 +358,7 @@ def test_the_mob_is_held_by_the_roads_features():
 def test_a_swept_bullet_parks_the_grains_it_touches_for_good():
     n = 12
     xs = np.linspace(-0.3, 0.3, n)
-    law, cols, state = _mob_world(n, xs, np.full(n, 0.9), gravity=0.0)         # no march: they stay where they are
+    law, cols, state = _mob_world(n, xs, np.full(n, 0.9), still=True)         # no walking: they stay where they are
     m = F.mobroad_map()
     # one bullet swept across the road at y = 0.9 (fountain) from board x of the road's left third to its middle: it kills the grains in its path
     y_board = (m["top"] - 0.9) * m["k"]
@@ -381,12 +381,129 @@ def test_a_swept_bullet_parks_the_grains_it_touches_for_good():
     assert out["n_live"][0] == n - dead.sum() and np.allclose(state["x"][~dead], before["x"][~dead], atol=1e-3)
 
 
-def test_a_grain_past_the_goal_line_has_arrived_and_stays_parked():
-    law, cols, state = _mob_world(3, [-0.2, 0.0, 0.2], [F.MOB_GOAL_Y - 0.01, 0.9, 0.9], gravity=0.0)
+def test_a_grain_within_the_attack_radius_of_the_player_has_arrived_and_stays_parked():
+    px, py = float(F.mobroad_defaults()["tgt_x"]), float(F.mobroad_defaults()["tgt_y"])
+    law, cols, state = _mob_world(3, [px + 0.5 * F.MOB_ATTACK_R, px + 0.3, -0.2], [py, py, 0.9], still=True)       # one at the player, one a road's width off, one far
     state, out = _run(law, cols, state, 2)
     assert out["n_goal"][0] == 1 and out["n_dead"][0] == 0 and state["age"][0] < -1.5e9 and state["x"][0] == 0.0 and state["y"][0] == 0.0
     state, out = _run(law, cols, state, 4)
     assert out["n_goal"][0] == 1 and out["n_live"][0] == 2 and state["age"][0] < -1.5e9
+
+
+def test_the_pather_arrival_point_is_where_the_game_puts_the_player():
+    d = F.mobroad_defaults()
+    m = F.mobroad_map()
+    assert d["tgt_y"] == pytest.approx(m["top"] - M.PLAYER_Y / m["k"], abs=1e-6) and d["atk_r"] == pytest.approx(F.MOB_ATTACK_R)
+    assert F.mobroad_target(M.WIDTH / 2, M.PLAYER_Y, m) == {"tgt_x": pytest.approx(0.0, abs=1e-6), "tgt_y": pytest.approx(d["tgt_y"], abs=1e-6)}
+
+
+# ------------------------------------------------------------------------------------------------ gravity orthogonal to the scene, and the pather
+
+
+def test_the_in_plane_gravity_is_zero_in_the_variant():
+    u = F.mobroad_uniforms(256)
+    assert u["grav_x"] == 0.0 and u["grav_y"] == 0.0                    # the variant's own uniforms: gravity points into the plane
+    # ... and the law ignores what a page writes there (a sensor, a spinning case): a still grain (no walking) in open road does not move
+    law, cols, state = _mob_world(1, [0.0], [1.0], still=True)
+    cols["grav_x"], cols["grav_y"] = np.float64(0.7), np.float64(-1.3)
+    state, out = _run(law, cols, state, 4)
+    assert abs(state["vx"][0]) < 1e-9 and abs(state["vy"][0]) < 1e-9 and state["x"][0] == pytest.approx(0.0) and state["y"][0] == pytest.approx(1.0)
+    assert F.MOB_MARCH.get("grav_y") is None
+
+
+def _tensor_batch(rng, n):
+    x, y = rng.uniform(-0.6, 0.6, n), rng.uniform(0.0, 2.0, n)
+    vx, vy = rng.normal(0, 0.3, n), rng.normal(0, 0.3, n)
+    d = rng.uniform(-0.05, 0.4, n)
+    ang = rng.uniform(0, 2 * np.pi, n)
+    return x, y, vx, vy, d, np.cos(ang), np.sin(ang)
+
+
+def _pather_tensors(w, x, y, vx, vy, d, nx, ny, tx=0.1, ty=0.09):
+    t = lambda v: AbstractTensor.get_tensor(np.asarray(v, dtype=np.float64))      # noqa: E731
+    ax, ay = F.mob_pather_accel(t(x), t(y), t(vx), t(vy), t(d), t(nx), t(ny), t(np.float64(tx)), t(np.float64(ty)), [t(np.float64(v)) for v in w])
+    return np.asarray(ax.numpy()), np.asarray(ay.numpy())
+
+
+def test_the_pather_output_is_capped_at_the_walking_force_whatever_the_weights():
+    rng = np.random.default_rng(3)
+    batch = _tensor_batch(rng, 200)
+    for scale in (0.0, 1.0, 40.0):
+        w = rng.normal(0.0, 1.0, F.MOB_PW) * scale
+        ax, ay = _pather_tensors(w, *batch)
+        assert (np.hypot(ax, ay) <= F.MOB_WALK * (1 + 1e-9)).all()
+    ax, ay = _pather_tensors(F.mob_pather_hand(), *batch)
+    mag = np.hypot(ax, ay)
+    assert mag.max() <= F.MOB_WALK * (1 + 1e-9) and mag.max() > 0.9 * F.MOB_WALK           # it does walk, up to the cap
+    assert len(F.MOB_PATHER_UNIFORMS) == F.MOB_PW == len(F.mob_pather_hand()) == len(F.mob_pather_weights("trained"))
+
+
+def test_the_trainers_batched_forward_is_the_laws_pather():
+    from meowdoku import mobroad_pather_sim as S
+    rng = np.random.default_rng(5)
+    x, y, vx, vy, d, nx, ny = _tensor_batch(rng, 50)
+    w = rng.normal(0.0, 0.8, F.MOB_PW)
+    ax, ay = _pather_tensors(w, x, y, vx, vy, d, nx, ny, 0.2, 0.09)
+    bx, by = S.forward(w[None], x[None], y[None], vx[None], vy[None], d[None], nx[None], ny[None], np.full((1, 1), 0.2), np.full((1, 1), 0.09))
+    assert np.allclose(ax, bx[0], atol=1e-12) and np.allclose(ay, by[0], atol=1e-12)
+
+
+def test_the_hand_set_pather_walks_a_lone_grain_toward_the_target_and_off_a_pillars_axis():
+    """Eager law, short: a grain just above a pillar's crown with the player below and to its left walks left (around the pillar), not into it."""
+    pillar = F.MOB_FEATURES[0]
+    crown = pillar["y"] + pillar["r"]
+    start = (pillar["x"], crown + 0.03)
+    law, cols, state = _mob_world(1, [start[0]], [start[1]])
+    cols.update({k: np.float64(v) for k, v in F.mobroad_pather_inputs(F.mob_pather_weights("hand")).items()})
+    cols["tgt_x"], cols["tgt_y"] = np.float64(0.0), np.float64(1.2)
+    cols["fl_mu"] = np.float64(0.0)                                     # (no ground friction: the short run shows the push)
+    state, out = _run(law, cols, state, 36)
+    assert out["n_nan"][0] == 0 and out["n_live"][0] == 1
+    assert state["vx"][0] < -0.01 and state["x"][0] < pillar["x"] - 1e-4          # it slides toward the player's side of the pillar
+    d = F.chamber_distance({k: float(v) for k, v in cols.items() if k.startswith("q") or k == "sdf_on"}, state["x"], state["y"])[0]
+    assert d[0] > 0.0                                                  # ... and is not in the pillar
+
+
+def test_a_lone_grain_with_the_hand_set_pather_walks_round_a_pillar_to_the_player():
+    from meowdoku import mobroad_pather_sim as S
+    pillar = F.MOB_FEATURES[0]
+    target_x = 0.0
+    r = S.simulate([F.mob_pather_hand()], [target_x], horizon=20.0, start=([pillar["x"]], [pillar["y"] + pillar["r"] + 0.2]))
+    assert r["arrived"][0, 0] == 1.0
+    xs = np.array([t[0][0] for t in r["track"]])
+    ys = np.array([t[1][0] for t in r["track"]])
+    d = F.chamber_distance(F.mobroad_uniforms(256), xs, ys)[0]
+    assert (d > 0.0).all()                                              # never through a wall or the pillar
+    assert ys[-1] < F.MOB_PLAYER_Y + F.MOB_ATTACK_R and (ys[1:] <= ys[:-1] + 1e-6).sum() > 0.7 * (len(ys) - 1)
+
+
+def test_the_trained_weights_beat_the_hand_set_ones_on_arrival_rate():
+    from meowdoku import mobroad_pather_sim as S
+    hand, trained = S.arrival_rate(F.mob_pather_weights("hand")), S.arrival_rate(F.mob_pather_weights("trained"))
+    print(f"arrival rate at the player, held-out: hand-set {hand:.4f}  trained {trained:.4f}")
+    assert trained > hand + 0.01
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's write")
+def test_the_pages_target_and_pather_writes_equal_pythons(tmp_path):
+    m = F.mobroad_map()
+    w = F.mob_pather_weights("trained")
+    case = {"map": m, "board": [4.2, 18.9], "target": F.mobroad_target(4.2, 18.9, m), "w": w, "pather": F.mobroad_pather_inputs(w)}
+    (tmp_path / "case.json").write_text(json.dumps(case), encoding="utf-8")
+    (tmp_path / "run.mjs").write_text(f"""
+import fs from 'node:fs';
+import {{ pathToFileURL }} from 'node:url';
+const {{ mobroadTarget, mobroadPather }} = await import(pathToFileURL({json.dumps(str(ROOT / 'examples' / 'meowdoku' / 'web' / 'mobroad.js'))}).href);
+const c = JSON.parse(fs.readFileSync({json.dumps(str(tmp_path / 'case.json'))}, 'utf8'));
+let bad = 0;
+const t = mobroadTarget(c.board[0], c.board[1], c.map), p = mobroadPather(c.w);
+for (const [k, v] of Object.entries(c.target)) if (!(Math.abs(t[k] - v) <= 1e-6 * Math.max(1, Math.abs(v)))) {{ bad++; console.log('MISMATCH', k, t[k], v); }}
+for (const [k, v] of Object.entries(c.pather)) if (!(Math.abs(p[k] - v) <= 1e-6 * Math.max(1, Math.abs(v)))) {{ bad++; console.log('MISMATCH', k, p[k], v); }}
+console.log('bad', bad, Object.keys(p).length);
+process.exit(bad || Object.keys(p).length !== Object.keys(c.pather).length ? 1 : 0);
+""", encoding="utf-8")
+    done = subprocess.run(["node", str(tmp_path / "run.mjs")], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_the_variant_fires_only_inside_its_wrapper_and_the_default_law_is_unchanged():

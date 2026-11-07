@@ -994,6 +994,17 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
         fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
         fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
+        # <mobroad>
+        if _MOBROAD["on"]:
+            # GRAVITY IS ORTHOGONAL TO THE SCENE: the mob walks on the ground plane seen from above, gravity points INTO the plane, so the in-plane
+            # gravity is exactly zero here whatever the page writes into ``grav_x, grav_y`` (the sensor, a spinning case); the ground's rolling friction is
+            # the fluid drag already in ``damp`` (``fl_mu``).  What moves a grain is its own PATHER: a tiny net (``mob_pather``) whose output, a walking
+            # acceleration capped at ``MOB_WALK``, enters as the force the legs apply (beside the fictitious terms).
+            grav_x, grav_y = grav_x * 0.0, grav_y * 0.0
+            wlk_x, wlk_y = mob_pather_accel(x, y, vx, vy, d_sdf, sdf_nx, sdf_ny, a["tgt_x"], a["tgt_y"], [a[f"pw{i}"] for i in range(MOB_PW)])
+            fict_x = fict_x + wlk_x
+            fict_y = fict_y + wlk_y
+        # </mobroad>
         vx_a = (vx + live * (fx / mass + grav_x * buoy - drag * vx + fict_x) * DT) * damp
         vy_a = (vy + live * (fy / mass + grav_y * buoy - drag * vy + fict_y) * DT) * damp
         turn = (case_omega * DT) * -2.0                               # Coriolis: the velocity turns by -2 w DT (clockwise for w > 0)
@@ -1018,7 +1029,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         # <mobroad>
         if _MOBROAD["on"]:
             # BULLETS KILL, THE GOAL LINE TAKES: a bullet is a SWEPT SEGMENT (last batch's position to this one's) of reach ``kz<k>_r``; a live grain
-            # within reach + its radius of any used segment is KILLED, one past the goal line has ARRIVED.  Either is PARKED for good: the zero state
+            # within reach + its radius of any used segment is KILLED, one within ``atk_r`` of the player (``tgt_x, tgt_y``) has ARRIVED (it attacks).  Either is PARKED for good: the zero state
             # (x = y = 0, so it is not drawn and takes part in nothing) with ``age`` pinned far below any emit time (-1e9 killed, -2e9 arrived), so
             # the emitter never re-arms the id.  The counts are the state itself (``n_dead``, ``n_goal``): nothing is lost between batches.
             m_hit = x * 0.0
@@ -1030,7 +1041,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
                 kreach = kr + radius
                 m_hit = m_hit + kon * as_float(kdx * kdx + kdy * kdy < kreach * kreach)
             m_killed = live * as_float(m_hit > 0.5)
-            m_arrived = live * (1.0 - m_killed) * a["goal_on"] * as_float(yn < a["goal_y"])
+            m_arrived = live * (1.0 - m_killed) * a["goal_on"] * as_float((xn - a["tgt_x"]) * (xn - a["tgt_x"]) + (yn - a["tgt_y"]) * (yn - a["tgt_y"]) < a["atk_r"] * a["atk_r"])
             m_gone = m_killed + m_arrived
             xn, yn, vxn, vyn, wn = (v * (1.0 - m_gone) for v in (xn, yn, vxn, vyn, wn))
             age_next = AbstractTensor.where(m_killed > 0.5, age_next * 0.0 - 1.0e9, AbstractTensor.where(m_arrived > 0.5, age_next * 0.0 - 2.0e9, age_next))
@@ -2225,14 +2236,23 @@ def purrline_spec(size: str = "4k", aspect: float | None = None, params: dict | 
 #   BULLETS KILL (``kz<k>_*``, MOB_KZ swept segments written by the page each batch, one way) and the GOAL LINE (``goal_y``) takes the ones that get through:
 #   both PARK the id for good (the zero state, ``age`` pinned at -1e9 killed / -2e9 arrived: never re-armed), counted as the law's own state
 #   (``n_dead``, ``n_goal``).  The wave builds up: the emission rate rises over the run (MOB_RAMP).
+import json
+import pathlib
+
 MOB_KZ = 32
 KZ_FIELDS = ("on", "ax", "ay", "bx", "by", "r")
-MOBROAD_UNIFORMS = tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS) + ("goal_on", "goal_y")
+#   THE PATHER (``mob_pather_accel``): every grain is walked by a tiny net, ``MOB_PATHER_IN`` inputs (the player's direction and distance, its own velocity, the
+#   wall distance, all in the nearest wall's frame) -> ``MOB_PATHER_H`` tanh neurons -> a 2-D walking acceleration capped at ``MOB_WALK``.  Its ``MOB_PW`` weights are
+#   RUNTIME UNIFORMS (``pw<i>``): retraining or switching hand-set / trained needs no recompile.  GRAVITY IS ORTHOGONAL to the scene (zero in the plane).
+MOB_PATHER_IN, MOB_PATHER_H = 6, 6
+MOB_PW = MOB_PATHER_H * MOB_PATHER_IN + MOB_PATHER_H + 2 * MOB_PATHER_H + 2        # W1 (h x in), b1, W2 (2 x h), b2 = 56
+MOB_PATHER_UNIFORMS = tuple(f"pw{i}" for i in range(MOB_PW))
+MOBROAD_UNIFORMS = tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS) + ("goal_on", "tgt_x", "tgt_y", "atk_r") + MOB_PATHER_UNIFORMS
 MOBROAD_ARGUMENTS = ARGUMENTS + MOBROAD_UNIFORMS
 MOBROAD_DIAGNOSTICS = ("n_dead", "n_goal", "n_crush")
 MOBROAD_OUTPUTS = OUTPUTS + MOBROAD_DIAGNOSTICS
 MOBROAD_ALL_UNIFORMS = UNIFORMS + MOBROAD_UNIFORMS
-MOBROAD_RUNTIME_INPUTS = RUNTIME_INPUTS + tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS)
+MOBROAD_RUNTIME_INPUTS = RUNTIME_INPUTS + tuple(f"kz{k}_{f}" for k in range(MOB_KZ) for f in KZ_FIELDS) + ("tgt_x", "tgt_y") + MOB_PATHER_UNIFORMS
 MOB_RAMP = 0.6                         # the emission rate at the end of the run over the start's: (1 + r) / (1 - r) = 4
 MOB_CRUSH_CONTACTS = 4                 # a grain holding this many contacts is crushed (a free grain holds 0-2, a hex pack 6)
 MOB_ROAD_HALF = 0.62                   # the road's half width, fountain units (a grain is ~0.02 across)
@@ -2240,8 +2260,11 @@ MOB_BOARD = (12.5, 20.0)               # the game's board (mobroad.py WIDTH, HEI
 MOB_ROAD_TOP = 2.0 * MOB_ROAD_HALF * MOB_BOARD[1] / MOB_BOARD[0]       # the road's length: the window's height at the board's aspect
 MOB_NOZZLE_Y = MOB_ROAD_TOP - 0.12    # the mob enters here, across the road's top
 MOB_BAR_HALF = 0.45                    # ... over this half width
-MOB_GOAL_Y = 0.20                      # a grain below this line has reached the shooters
-MOB_MARCH = {"grav_y": -0.5, "fl_mu": 6.0e-5, "nozzle_speed": 0.06, "span": 75.0, "mix": 0.0}      # the march (walking pace ~0.15-0.3 / s), the entry speed, the seconds the last id leaves at, the species mix
+MOB_PLAYER_Y = 0.9 * 2.0 * MOB_ROAD_HALF / MOB_BOARD[0]      # the player's height above the road's foot (mobroad.py PLAYER_Y = HEIGHT - 0.9: 0.9 board units from the foot)
+MOB_ATTACK_R = 0.12                    # a grain within this of the player has reached it (it attacks)
+MOB_WALK = 0.5                         # the cap of the walking acceleration (what gravity's march was); the pace is this over the ground friction (``fl_mu``)
+MOB_VSCALE, MOB_DSCALE = 0.3, 0.1      # the pather's input scales: a walking speed, a wall distance (fountain units)
+MOB_MARCH = {"fl_mu": 6.0e-5, "nozzle_speed": 0.06, "span": 75.0, "mix": 0.0}      # the ground friction (fl_mu: the walking pace ~0.15-0.3 / s under ``MOB_WALK``), the entry speed, the seconds the last id leaves at, the species mix
 #: The road's features, top to bottom (fountain units, y up): what each is and where.  ``sdf_preset`` builds them as slots.
 MOB_FEATURES = (
     {"name": "pillars", "kind": "circle", "y": 1.62, "x": 0.27, "r": 0.085},                     # two pillars: the stream splits three ways
@@ -2293,14 +2316,95 @@ def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
 def mobroad_map() -> dict[str, Any]:
     """How the game's board maps onto the road (the page's and the server's one formula): board ``(bx, by)`` (x right, y DOWN, ``MOB_BOARD``) is
     fountain ``(bx / k - half, top - by / k)`` with ``k = board width / road width``."""
-    return {"half": MOB_ROAD_HALF, "top": MOB_ROAD_TOP, "k": MOB_BOARD[0] / (2.0 * MOB_ROAD_HALF), "board": list(MOB_BOARD), "goal_y": MOB_GOAL_Y,
+    return {"half": MOB_ROAD_HALF, "top": MOB_ROAD_TOP, "k": MOB_BOARD[0] / (2.0 * MOB_ROAD_HALF), "board": list(MOB_BOARD), "attack_r": MOB_ATTACK_R, "player": [0.0, MOB_PLAYER_Y],
             "kz": MOB_KZ, "features": [dict(f) for f in MOB_FEATURES]}
 
 
+def mob_pather_accel(x, y, vx, vy, d, nx, ny, tx, ty, w):
+    """THE PATHER, per grain: position ``(x, y)``, velocity, the wall distance ``d`` and unit normal ``(nx, ny)`` (``sdf_field``, into the fluid), the target
+    ``(tx, ty)`` and the ``MOB_PW`` weights ``w`` (scalars) -> the walking acceleration ``(ax, ay)``, magnitude at most ``MOB_WALK``.  The inputs are in the
+    wall's frame (normal ``n``, tangent ``t = (-ny, nx)``): the target's unit direction ``(u.n, u.t)``, the velocity ``(v.n, v.t) / MOB_VSCALE``, the wall
+    distance over ``MOB_DSCALE`` and the target's distance over the road's length; ``MOB_PATHER_H`` tanh neurons; the output ``(o_n, o_t)`` is capped to a
+    unit disc and scaled, then turned back to the world.  Layout of ``w``: W1 (hidden-major) | b1 | W2 row n | W2 row t | b2 (n, t)."""
+    ndx, ndy = tx - x, ty - y
+    dist = (ndx * ndx + ndy * ndy + 1.0e-12).sqrt()
+    inv = 1.0 / dist
+    ux, uy = ndx * inv, ndy * inv
+    feats = [ux * nx + uy * ny, uy * nx - ux * ny, (vx * nx + vy * ny) * (1.0 / MOB_VSCALE), (vy * nx - vx * ny) * (1.0 / MOB_VSCALE),
+             d.clamp(0.0, 2.0 * MOB_DSCALE) * (1.0 / MOB_DSCALE), (dist * (1.0 / MOB_ROAD_TOP)).clamp(0.0, 1.0)]
+    nin, nh = MOB_PATHER_IN, MOB_PATHER_H
+    hid = []
+    for j in range(nh):
+        z = feats[0] * w[j * nin] + w[nh * nin + j]
+        for i in range(1, nin):
+            z = z + feats[i] * w[j * nin + i]
+        hid.append(z.tanh())
+    base = nh * nin + nh
+    out = []
+    for k in range(2):
+        o = hid[0] * w[base + k * nh] + w[base + 2 * nh + k]
+        for j in range(1, nh):
+            o = o + hid[j] * w[base + k * nh + j]
+        out.append(o)
+    o_n, o_t = out
+    scale = MOB_WALK * (1.0 / (o_n * o_n + o_t * o_t + 1.0e-12).sqrt().clamp(1.0, 1.0e9))      # capped to MOB_WALK, a smaller output walks slower
+    a_n, a_t = o_n * scale, o_t * scale
+    return a_n * nx - a_t * ny, a_n * ny + a_t * nx
+
+
+def mob_pather_hand() -> list[float]:
+    """The hand-set weights: seek the player (the output is the target's direction in the wall's frame, so it is the direction itself); a unit that fires
+    when the grain heads into a wall and is near it takes the wall's normal component off (so it does not push into it), two more slide it along the
+    tangent toward the side the target is on (a tie goes counter-clockwise), and a last one pushes off a wall that is very close."""
+    nin, nh = MOB_PATHER_IN, MOB_PATHER_H
+    rows = [([1.5, 0, 0, 0, 0, 0], 0.0),                      # h0: seek, normal component
+            ([0, 1.5, 0, 0, 0, 0], 0.0),                      # h1: seek, tangent component
+            ([-5.0, 0, 0, 0, -4.0, 0], 2.0),                  # h2: heading into a near wall
+            ([-6.0, 6.0, 0, 0, -4.0, 0], 0.5),                # h3: ... and the target is toward +t: slide +t
+            ([-6.0, -6.0, 0, 0, -4.0, 0], -0.5),              # h4: ... toward -t: slide -t
+            ([0, 0, 0, 0, -6.0, 0], 3.0)]                     # h5: very close to a wall
+    w = [0.0] * MOB_PW
+    for j, (row, bias) in enumerate(rows):
+        for i, v in enumerate(row):
+            w[j * nin + i] = float(v)
+        w[nh * nin + j] = bias
+    base = nh * nin + nh
+    for j, v in ((0, 1.0), (2, 0.35), (5, 0.1)):
+        w[base + j] = v                                       # o_n
+    w[base + 2 * nh] = 0.45                                   # (the units that rest at -1 when off)
+    for j, v in ((1, 1.0), (3, 0.5), (4, -0.5)):
+        w[base + nh + j] = v                                  # o_t
+    return w
+
+
+def mob_pather_weights(kind: str = "trained") -> list[float]:
+    """The pather's weights: ``hand`` (``mob_pather_hand``) or ``trained`` (``mobroad_pather.json``, written by ``tools/meowdoku_mobroad_train.py``; the hand
+    ones until trained)."""
+    if kind == "trained":
+        path = pathlib.Path(__file__).with_name("mobroad_pather.json")
+        if path.exists():
+            w = json.loads(path.read_text(encoding="utf-8")).get("trained")
+            if w and len(w) == MOB_PW:
+                return [float(v) for v in w]
+    return mob_pather_hand()
+
+
+def mobroad_pather_inputs(w) -> dict[str, float]:
+    """The pather's weights as the law's uniforms (``web/mobroad.js`` ``mobroadPather``)."""
+    return {f"pw{i}": float(_f32(np.float64(v))) for i, v in enumerate(w)}
+
+
+def mobroad_target(bx: float, by: float, mapping: dict[str, Any]) -> dict[str, float]:
+    """THE PAGE'S SECOND ONE-WAY WRITE: the player at board ``(bx, by)`` as the target (fountain units).  ``web/mobroad.js`` ``mobroadTarget`` is this."""
+    k, half, top = float(mapping["k"]), float(mapping["half"]), float(mapping["top"])
+    return {"tgt_x": float(_f32(np.float64(bx / k - half))), "tgt_y": float(_f32(np.float64(top - by / k)))}
+
+
 def mobroad_defaults() -> dict[str, float]:
-    """The variant's uniforms: no bullet, the goal line on."""
+    """The variant's uniforms: no bullet, the arrival on, the player at its start (the road's foot, centred), the trained pather."""
     out = {f"kz{k}_{f}": 0.0 for k in range(MOB_KZ) for f in KZ_FIELDS}
-    out.update({"goal_on": 1.0, "goal_y": float(_f32(np.float64(MOB_GOAL_Y)))})
+    out.update({"goal_on": 1.0, "tgt_x": 0.0, "tgt_y": float(_f32(np.float64(MOB_PLAYER_Y))), "atk_r": float(_f32(np.float64(MOB_ATTACK_R)))})
+    out.update(mobroad_pather_inputs(mob_pather_weights("trained")))
     return out
 
 
@@ -2325,9 +2429,9 @@ def mobroad_inputs(bullets, prev, mapping: dict[str, Any]) -> dict[str, float]:
 
 def mobroad_uniforms(active: int) -> dict[str, float]:
     """The road's uniforms for ``active`` ids: the chamber, the march (gravity along the road, the viscosity that sets the walking pace, a slow entry),
-    the emission over ``MOB_MARCH['span']`` seconds, the kill segments off and the goal line on."""
+    the emission over ``MOB_MARCH['span']`` seconds, the kill segments off, the arrival at the player on and NO in-plane gravity."""
     m = MOB_MARCH
-    u = uniforms(n=int(active), mix=m["mix"], gravity=(0.0, m["grav_y"]), params={"fl_mu": m["fl_mu"]}, shape="sdf_mobroad")
+    u = uniforms(n=int(active), mix=m["mix"], gravity=(0.0, 0.0), params={"fl_mu": m["fl_mu"]}, shape="sdf_mobroad")
     u = {k: float(v) for k, v in u.items()}
     u["nozzle_speed"] = float(_f32(np.float64(m["nozzle_speed"])))                 # (the page's slider stops at 0.3: a mob walks in)
     u["emit_scale"] = float(_f32(np.float64(m["span"] / EMIT_SPAN)))
@@ -2366,5 +2470,6 @@ def mobroad_spec(size: str = "4k") -> dict[str, Any]:
     geo = chamber_basin("sdf_mobroad", active, None, cell)
     return {"shape": "sdf_mobroad", "size": size, "uniforms": mobroad_uniforms(active), "view": list(geo["view"]),
             "chamber_outline": chamber_outline("sdf_mobroad", active, None, params),
-            "tilt": tilt_inputs(active, None, cell, "sdf_mobroad"), "map": mobroad_map()}
+            "tilt": tilt_inputs(active, None, cell, "sdf_mobroad"), "map": mobroad_map(),
+            "pather": {"hand": mob_pather_weights("hand"), "trained": mob_pather_weights("trained"), "default": "trained"}}
 # </mobroad>

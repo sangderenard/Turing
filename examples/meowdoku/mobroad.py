@@ -3,7 +3,7 @@
 A MOB comes down a long road toward your shooters.  The mob is the 2-D fountain law (``fountain.make_law_mobroad``, a product VARIANT of it): every grain
 is a mob member, the road's features (two pillars, a narrowing, a funnel, a peg field) are SDF slots the crowd is pushed through by the law's own contact
 forces, and the pressure at a narrowing is the grains' contact count (the colour goes red, ``n_crush`` counts them).  You keep it off you: bullets kill
-grains, a grain that gets past the goal line has reached you, and when ``LOSE_AT`` have, you lose.
+grains, a grain that gets within the attack radius of you has reached you (every grain is walked toward you by its own tiny neural pather; gravity is orthogonal to the scene), and when ``LOSE_AT`` have, you lose.
 
 WHERE THE AUTHORITY LIVES (one law each, no copy of a law anywhere):
     the MOB     the fountain law, run by the PAGE (GPU compute / wasm: the server has no 4096 grains to look at).  The law itself kills: the page writes
@@ -67,7 +67,7 @@ REACH_PER_SIZE = KILL_REACH / BOLT_SIZE
 FAN = 0.12                            # radians between the bullets a split leaves as
 MAX_COPIES = 6.0
 POINTS_KILL, POINTS_PANEL, POINTS_HIT = 10.0, 25.0, 1.0
-LOSE_AT = 40.0                        # grains past the goal line that end the run
+LOSE_AT = 40.0                        # grains that reach the player that end the run
 PANEL_THICK = 0.18
 
 #: The level's panels: kind, centre (board units), half width, start value, rise per hit, completion target, effect amount, value cap.
@@ -373,7 +373,7 @@ class Mobroad(EntityGame):
         spec = _SPECS.get(self.size) or _SPECS.setdefault(self.size, F.mobroad_spec(self.size))         # (built once: the outline is a marching-squares trace)
         return {"manifest": "fountain_mobroad.manifest.json", "size": self.size, "epoch": self.mob_epoch, "uniforms": spec["uniforms"], "view": spec["view"],
                 "aspect": None, "chamber_outline": spec["chamber_outline"], "body": None, "speed": 1, "named": ["ir", "ig", "ib"], "run": "continuous",
-                "tilt": spec["tilt"], "mobroad": spec["map"]}
+                "tilt": spec["tilt"], "mobroad": spec["map"], "pather": spec["pather"]}
 
     def state(self) -> dict[str, Any]:
         st = super().state()

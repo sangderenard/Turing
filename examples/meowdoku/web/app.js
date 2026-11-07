@@ -5725,7 +5725,10 @@ function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
   if (g.purrline) sandFeed(g);                                  // purrline sand: the game's solids into the law's inputs (one way)
-  if (g.mobroad) compute.setMobroad(mobroad.collect(state, gnow(now), g));   // [MOBROAD] the bullets into the law's kill segments (one way)
+  if (g.mobroad) {                                                // [MOBROAD] the bullets into the law's kill segments, the player's place and the pather's weights (one way)
+    compute.setMobroad(mobroad.collect(state, gnow(now), g));
+    compute.setMobroadAim(mobroad.target(state, g), mobroad.pather(g));
+  }
   if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
   if (cameraGravity) {
     const [gx, gy, gz] = cameraDownInLaw(cam.view);
@@ -6495,7 +6498,8 @@ const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: t
                                   space_invaders: ZOOM_ONLY, boardwalk: ZOOM_ONLY, delve: ZOOM_ONLY };
 // The view a game opens in and returns to on a reset: the 3-D fountain is a BOX nine grains deep, which straight down would hide (the depth is
 // the height axis), so it opens as a slight 3/4 view (yaw about the vertical, the eye tipped toward the front glass).
-const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 } };
+const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 }, mobroad: { yaw: 0, pitch: 0 } };
+const CAMERA_TOP_DOWN = new Set(["mobroad"]);       // [MOBROAD] the TOP VIEW preset: the mob walks on the ground plane seen from straight above (gravity is orthogonal to the scene)
 const cameraViewDefault = (key, k) => (CAMERA_VIEW_DEFAULTS[key] || {})[k] || 0;
 function cameraGestures() {
   const g = state.game; if (!g || (state.camMode === "nose" && !state.flat)) return null;
@@ -6518,7 +6522,10 @@ function clampCamGoal(gest) {
 const AUTO_ROTATE = 0.25;   // rad/s: one turn in ~25 s
 function stepCamView(dt) {
   const g = state.game, key = g ? g.game : null;
-  if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) { camView.cur[k] = camView.goal[k] = cameraViewDefault(key, k); camView.vel[k] = 0; } }
+  if (key !== camView.key) {
+    camView.key = key; for (const k of CV_KEYS) { camView.cur[k] = camView.goal[k] = cameraViewDefault(key, k); camView.vel[k] = 0; }
+    if (CAMERA_TOP_DOWN.has(key)) { state.tiltDeg = 90; const tilt = $("tilt"); if (tilt) tilt.value = 90; }
+  }
   dt = Math.max(0, Math.min(0.1, dt || 0));
   const gest = cameraGestures(), G = camView.goal, C = camView.cur;
   if (gest) clampCamGoal(gest);                                                  // [SPEED+ZOOM] (the limits move with the scene)
