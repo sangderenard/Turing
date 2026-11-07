@@ -11,16 +11,30 @@ const [mode, dir] = process.argv.slice(2);
 
 if (mode === "params") {
   const d = P.normalize({});
-  const wild = P.normalize({ chamber: "nope", size: "10M", mix: 7, grainScale: -3, grains: 1e9, fps: 0, bits: 13, settle: "x", turns: 5, flipSeconds: 99, speed: 3, cap: 1, colour: 9, fit: 0, junk: 1 });
+  const wild = P.normalize({ chamber: "nope", size: "20M", mix: 7, grainScale: -3, grains: 1e9, fps: 0, bits: 13, settle: "x", turns: 5, flipSeconds: 99, speed: 3, cap: 1, colour: 9, fit: 0, junk: 1 });
   const q = P.toQuery({ ...d, chamber: "sdf_circle", bits: 10, mix: 0.25, turns: 6, fit: false });
   const back = P.fromQuery(q);
   console.log(JSON.stringify({
-    defaults: d, wild, bare: P.fromQuery("?record_loading=1"), query: q, back,
+    defaults: d, wild, sizes: P.SIZES, sizeIds: P.SIZE_IDS, bare: P.fromQuery("?record_loading=1"), query: q, back,
     bad: P.fromQuery("?record_loading=1&rp=%7Bnot-json"), off: P.fromQuery("?x=1"),
     legacy: P.attempts(P.DEFAULTS), fixed: P.attempts({ ...P.DEFAULTS, fit: false, fps: 8, grains: 300, bits: 16 }),
     tight: P.attempts({ ...P.DEFAULTS, fit: true, fps: 8, grains: 300, bits: 11 }),
     meta: P.metadata({ ...d, mix: null }, { capped: true }),
   }));
+} else if (mode === "visual") {
+  const { VisualTape, filterTape, encodeStream } = await import(pathToFileURL(path.join(web, "loading_anim.js")).href);
+  const tape = new VisualTape({ sourceSnap: 6, stride: 3, sourceCount: 256, maxGrains: 32, capBytes: 20000 });
+  for (let k = 1; k <= 30; k += 3) {
+    const frame = new Float32Array(256 * 5);
+    for (let i = 0; i < 256; i++) { frame[5 * i] = i / 256; frame[5 * i + 1] = k / 100; frame[5 * i + 4] = 120; }
+    tape.push(k, frame);
+  }
+  tape.inputs.push({ step: 6, values: { grav_x: 0, grav_y: -1 } });
+  const anim = filterTape(tape, { from: tape.lo, to: tape.hi, maxGrains: 16, fps: 20, bits: 12, dt: 1 / 360 });
+  let capped = false;
+  try { const tiny = new VisualTape({ sourceSnap: 6, stride: 1, sourceCount: 256, maxGrains: 32, capBytes: 100 }); tiny.push(1, new Float32Array(256 * 5).fill(120)); }
+  catch (error) { capped = /memory budget/.test(String(error)); }
+  console.log(JSON.stringify({ frames: tape.hi, sampled: tape.get(1).length / 5, step: tape.stepOf(2), grains: anim.grains, raw: encodeStream(anim).length, capped }));
 } else if (mode === "bits") {
   const { Recording } = await import(pathToFileURL(path.join(web, "recording.js")).href);
   const { filterTape, encodeStream } = await import(pathToFileURL(path.join(web, "loading_anim.js")).href);

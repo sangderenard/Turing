@@ -70,7 +70,7 @@
         <div class="row" style="margin-top:14px">
           <button id="record" class="on">Record</button><button id="abort" disabled>Abort</button><button id="reset">Defaults</button>
         </div>
-        <p class="hint">Recording runs the game&rsquo;s own fountain on this page (a minute or so, as fast as the device runs it), filters its state memory, and saves the result into the library. It is not made active until the owner does so.</p>
+        <p class="hint">Recording runs the game&rsquo;s own fountain in the preview (as fast as this device allows). For large simulations it keeps only sampled visual frames, with no physics replay; the saved animation keeps at most 1,024 grains and 1 MiB of raw positions. A save enters the library and needs owner activation before players see it.</p>
       </div>
       <div>
         <div class="pane"><div class="idle" id="idle">The live preview of the simulation appears here while recording.</div><iframe id="live" title="recording preview" hidden></iframe></div>

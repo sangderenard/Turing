@@ -2,12 +2,12 @@
 //  1. the loading screen: the real loading panel (loading_view.html -> loading_panel.js) held on a phase, playing any library entry;
 //  2. re-recording: loading_params.js controls -> the game page in an iframe running loading_record.js with those parameters;
 //  3. the library (/api/loading_library): thumbnails, play, compare two, and -- with the owner's token -- make active / delete.
-import { DEFAULTS, normalize, toQuery, CHAMBERS, SIZES, BITS, COLOUR_SOURCES, RAW_CAP } from "./loading_params.js";
+import { DEFAULTS, normalize, toQuery, CHAMBERS, SIZES, SIZE_IDS, BITS, COLOUR_SOURCES, RAW_CAP } from "./loading_params.js";
 import { decodePacket, seam, angleOf } from "./loading_anim.js";
 const PHASES = { compiling: 1, downloading: 1, initializing: 1 };      // the panel's phases (loading_panel.js PHASES; importing that module would start a panel here)
 
 const $ = (id) => document.getElementById(id);
-const S = { phase: "downloading", entries: [], active: null, playing: null, A: null, B: null, params: { ...DEFAULTS, fit: false }, recFrame: null, thumbs: new Map(), hover: null };
+const S = { phase: "downloading", entries: [], active: null, playing: null, A: null, B: null, params: { ...DEFAULTS }, recFrame: null, thumbs: new Map(), hover: null, deployedSizes: null };
 const TOKEN_KEY = "meowdoku.studio.token";
 
 // ------------------------------------------------------------------ the owner token (sessionStorage only; sent in a header, never a URL)
@@ -53,7 +53,7 @@ $("playActive").addEventListener("click", () => { S.playing = null; paintCards()
 const CONTROLS = [
   ["Scene"],
   { k: "chamber", label: "chamber", type: "select", options: CHAMBERS },
-  { k: "size", label: "sim size (ids)", type: "select", options: SIZES.map((s) => [s, s === "small" ? "small (256)" : "4k (4096)"]) },
+  { k: "size", label: "sim size (ids)", type: "select", options: SIZES.map((s) => [s, `${s} (${SIZE_IDS[s].toLocaleString()})`]) },
   { k: "mix", label: "species mix (poly mix)", type: "range", min: 0, max: 1, step: 0.05, nullable: true },
   { k: "grainScale", label: "grain size (x radius)", type: "range", min: 0.5, max: 2, step: 0.05 },
   { k: "colour", label: "colour source (preview, metadata)", type: "select", options: COLOUR_SOURCES },
@@ -107,10 +107,20 @@ function paintControls() {
     if (c.type === "check") c.input.checked = !!v;
     else if (c.k === "mix") { c.input.value = v === null ? 0.5 : v; $("mixDefault").checked = v === null; c.input.disabled = v === null; }
     else c.input.value = String(v);
+    if (c.k === "size" && S.deployedSizes) for (const o of c.input.options) o.disabled = !S.deployedSizes.has(o.value);
     c.out.textContent = c.type === "select" || c.type === "check" ? "" : (c.k === "mix" && v === null ? "default" : Number(v).toFixed(c.step < 1 ? 2 : 0));
   }
 }
-$("reset").addEventListener("click", () => { S.params = { ...DEFAULTS, fit: false }; paintControls(); });
+async function loadSizes() {
+  try {
+    const r = await fetch("fountain.manifest.json", { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const manifest = await r.json();
+    S.deployedSizes = new Set(Object.keys(manifest.sizes || {}));
+    paintControls();
+  } catch (error) { recMsg(`fountain products unavailable: ${error.message}`, "err"); }
+}
+$("reset").addEventListener("click", () => { S.params = { ...DEFAULTS }; paintControls(); });
 
 const kb = (n) => (n < 10240 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
 function stats(rows) { const dl = $("recStats"); dl.textContent = ""; for (const [k, v] of rows) { const t = document.createElement("dt"), d = document.createElement("dd"); t.textContent = k; d.textContent = v; dl.append(t, d); } }
@@ -121,6 +131,7 @@ function stopLive(keep) {
 }
 $("record").addEventListener("click", () => {
   const params = normalize(S.params);
+  if (!S.deployedSizes || !S.deployedSizes.has(params.size)) { recMsg(`${params.size} has no deployed fountain product; wait for the build or choose a deployed size`, "err"); return; }
   stats([]); $("bar").value = 0; recMsg("starting the game page…");
   const f = $("live"); f.hidden = false; $("idle").hidden = true;
   f.src = "/" + toQuery(params);
@@ -147,7 +158,7 @@ window.addEventListener("message", (e) => {
     $("bar").value = 100;
     const s = m.stored || {};
     recMsg(s.duplicate ? "already in the library (same animation)" : `saved to the library${s.active ? " and active (the first one)" : " (not active)"}`, "ok");
-    stats([["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
+    stats([["simulated ids", Number(m.sim_n).toLocaleString()], ["capture", m.visual_only ? "visual only (no physics replay)" : "state memory"], ["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
            ["tried", (m.tried || []).map((t) => `${t.fps}fps/${t.grains}g/${t.bits}b=${kb(t.raw)}`).join("; ")], ...(m.capped ? [["ended by", "the duration cap"]] : [])]);
     stopLive(false);
     loadLibrary().then(() => { if (s.digest) { S.playing = s.digest; paintCards(); showScreen(); } });
@@ -248,4 +259,4 @@ function paintCompare() {
 $("cmpClear").addEventListener("click", () => { S.A = S.B = null; paintCompare(); paintCards(); });
 $("cmpSync").addEventListener("click", () => { for (const [id, key] of [["viewA", "A"], ["viewB", "B"]]) if (S[key]) post($(id), { anim: S[key] }); });
 
-buildPhases(); buildControls(); loadLibrary();
+buildPhases(); buildControls(); loadSizes(); loadLibrary();

@@ -1,12 +1,42 @@
 // The loading animation (pure: no GPU, no DOM, so node holds it in a test).  Format MLA1 and its loop seam are documented in
 // loading_anim.py, whose codec this twins byte for byte.  The file the page FETCHES is that stream through the octet codec
 // (octet_codec.js); `filterTape` is how the stream is MADE: a reduced filter of the compute runtime's state memory
-// (recording.js `Recording`), not a capture path of its own.
+// (recording.js `Recording`).  For runs whose complete physics tape exceeds its sliding window, VisualTape keeps
+// only selected packed points at the requested output cadence; it cannot resume or replay the law.
 import { decompressOctets } from "./octet_codec.js";
 import { decodeMeta } from "./particle_styles.js";
 
 export const MAGIC = "MLA1", HEADER_BYTES = 4 + 1 + 1 + 2 + 2 + 2 + 2 + 16, MAX_BYTES = 1 << 20;
 const TAU = 2 * Math.PI;
+
+// A bounded, position-filter source for large simulations.  Frames are copied from the same packed point snapshots
+// handed to Recording.push; the full physics state and keyframes remain owned by the compute runtime.
+export class VisualTape {
+  constructor({ sourceSnap, stride, sourceCount, maxGrains, capBytes = 96 * 1048576 }) {
+    this.snapEvery = sourceSnap * stride; this.stride = stride; this.sourceSnap = sourceSnap;
+    this.sourceCount = sourceCount; this.maxGrains = maxGrains; this.capBytes = capBytes;
+    this.frames = []; this.sourceFrames = []; this.inputs = []; this.lo = 1; this.hi = 0;
+    this.ids = null; this.bytes = 0;
+  }
+  get(k) { return this.frames[k - 1] || null; }
+  stepOf(k) { return this.sourceFrames[k - 1] * this.sourceSnap; }
+  push(sourceFrame, data) {
+    if (this.sourceFrames.length && sourceFrame <= this.sourceFrames.at(-1)) return;
+    if (!this.ids) {
+      const live = [];
+      for (let i = 0; i < this.sourceCount; i++) if (data[5 * i + 4] >= 50) live.push(i);
+      const skip = Math.max(1, Math.ceil(live.length / this.maxGrains));
+      this.ids = live.filter((_, j) => j % skip === 0);
+      if (!this.ids.length) throw new Error("visual recording: no live grains");
+    }
+    const bytes = this.ids.length * 20;
+    if (this.bytes + bytes > this.capBytes) throw new Error("visual recording exceeded its 96 MiB memory budget: lower fps, grains or duration cap");
+    const copy = new Float32Array(this.ids.length * 5), words = new Uint32Array(copy.buffer);
+    const sourceWords = new Uint32Array(data.buffer, data.byteOffset, data.length);
+    this.ids.forEach((id, j) => { for (let w = 0; w < 5; w++) words[5 * j + w] = sourceWords[5 * id + w]; });
+    this.frames.push(copy); this.sourceFrames.push(sourceFrame); this.hi = this.frames.length; this.bytes += bytes;
+  }
+}
 
 // ------------------------------------------------------------------ the stream (raw MLA1)
 const planar = (u16) => {
