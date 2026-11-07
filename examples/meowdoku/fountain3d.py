@@ -120,6 +120,7 @@ EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live gra
 #: ``FRICTION_SHARE`` of the slip per step, in the contact's own slip mass (m_eff / 3.5 for a sphere's slip, spin included).
 FRICTION_SHARE = 0.15
 BAR_HEIGHT = 0.12                      # the source's extent ALONG the stream
+QUEUE_STEPS = 16                       # the ARMED QUEUE is bounded as in the 2-D law (``fountain.QUEUE_STEPS``): an id arms once the id ``queue`` before it was emitted
 NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
 DEPTH_MAX = WIDTH_BASE                 # the deepest box: as deep as the reference chamber is wide (a size may cap it lower: ``depth_cap``)
 DEPTH_DEFAULT = 0.18                   # about nine grain diameters: a visibly three-dimensional pile
@@ -1111,6 +1112,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
     scan_shifts = reduction_shifts(n)
+    queue = max(1, int(active * QUEUE_STEPS * DT / EMIT_SPAN))        # the armed queue's length, in ids
     nsp = len(SPECIES)
 
     def fountain_step(*args):
@@ -1192,7 +1194,10 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             armed = as_float(vy < ARMED * 0.5)
             live = a_ * (1.0 - parked) * (1.0 - armed)
             pending = a_ * armed
-            arming = a_ * parked
+            before = (pid - float(queue)).clamp(0.0, 1.0e9)
+            x_b, y_b, z_b, vy_b = x.index_select(0, before), y.index_select(0, before), z.index_select(0, before), vy.index_select(0, before)
+            emitted_b = (1.0 - as_float((x_b.abs() + y_b.abs() + z_b.abs()) < 1.0e-30)) * (1.0 - as_float(vy_b < ARMED * 0.5))
+            arming = a_ * parked * AbstractTensor.where(pid < float(queue), pid * 0.0 + 1.0, emitted_b)
             # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
             # get the cell past the end: sorted last, in nobody's block).  z counts from the back plexiglass (z = -dh).
             ix = _cap_i(((x + half) / cell).floor().clamp(0.0, 1.0e9), cols - 1.0)
