@@ -41,6 +41,7 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
     components[0].massKg-=integral.volume*radiusM**3*glassDensity;
     components.push({name:part.name,material:part.material,volumeM3:integral.volume*radiusM**3,massKg:integral.volume*radiusM**3*density});
   }
+  let approximateCoating=false;
   if (enamelThicknessM>0 && enamelMaterial!==undefined) {
     const density=densityByRole.enamel;
     if (!(density>0)) throw new RangeError("positive enamel density required");
@@ -54,7 +55,8 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
       for(let i=0;i<3;i++) {total.first[i]+=massFactor*center[i];
         for(let j=0;j<3;j++) total.second[i][j]+=massFactor*center[i]*center[j]; }
     }
-    components.push({name:"enamel",volumeM3:area*radiusM**2*enamelThicknessM,massKg:area*radiusM**2*enamelThicknessM*density});
+    if(area>0) approximateCoating=true;
+    components.push({name:"enamel (thin-film estimate)",volumeM3:area*radiusM**2*enamelThicknessM,massKg:area*radiusM**2*enamelThicknessM*density});
   }
   const mass=total.volume*radiusM**3;
   const center=total.first.map((x)=>x*radiusM**4/mass);
@@ -71,9 +73,12 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   const determinant = (a) => a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
     -a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
     +a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]);
-  const valid=Number.isFinite(mass)&&mass>0&&center.every(Number.isFinite)&&
+  const valid=!approximateCoating&&Number.isFinite(mass)&&mass>0&&center.every(Number.isFinite)&&
     inertia.flat().every(Number.isFinite)&&inertia[0][0]>0&&
     inertia[0][0]*inertia[1][1]-inertia[0][1]**2>0&&determinant(inertia)>0&&
-    components.every((c)=>c.volumeM3>=0&&c.massKg>=0);
-  return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,validForRoll:valid};
+    components.every((c)=>c.volumeM3>=0&&c.massKg>=0)&&
+    mesh.interior.every((face)=>face.slice(0,3).every((p)=>Math.hypot(...p)<1));
+  return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,
+    validForRoll:valid,mechanicsNote:approximateCoating?"Enamel thin film uses an area estimate; rolling waits for closed coating geometry":
+      valid?"Closed disjoint volumes integrated":"Final mesh has unresolved mechanical properties"};
 }

@@ -69,7 +69,9 @@ const hybridMass=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enam
 assert(hybridMass.massKg>clearMass.massKg && hybridMass.components.length===decorated.ribbons.length+decorated.confetti.length+2,"inclusions and coating contribute mass");
 assert(Math.abs(hybridMass.components.reduce((s,c)=>s+c.massKg,0)-hybridMass.massKg)<1e-12,
   "component masses account for displaced shell volume exactly");
-assert(hybridMass.validForRoll,"generated hybrid has positive definite final inertia");
+assert(!hybridMass.validForRoll && hybridMass.mechanicsNote.includes("thin film"),"thin-film enamel estimate gates real rolling");
+const uncoatedHybrid=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enamelMaterial:14});
+assert(uncoatedHybrid.validForRoll,"closed disjoint hybrid volumes provide rolling inertia");
 const startRoll={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};
 const rolled=rollingStep(startRoll,clearMass,[0.001,0,0],0.01,0.01);
 assert(rolled.angularAcceleration[2]<0 && rolled.position[0]>0,"applied force rolls marble along floor");

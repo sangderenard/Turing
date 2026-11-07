@@ -132,8 +132,8 @@ function reportMass(geometry) {
     g.count++;g.massKg+=c.massKg;g.volumeM3+=c.volumeM3;grouped.set(c.name,g);}
   const components=[...grouped].map(([name,c])=>`${name} ×${c.count}: ${(c.massKg*1000).toFixed(3)} g / ${(c.volumeM3*1e9).toFixed(2)} mm³`).join("\n");
   $("mass-report").style.whiteSpace="pre-line";
-  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Unresolved"} mass ${(result.massKg*1000).toFixed(3)} g · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nInertia tensor (kg·m²):\n${tensor}\n${components}`;
-  $("roll-status").textContent=result.validForRoll?"Locked · release to roll on the calculated inertia tensor":"Roll unavailable: invalid mass or inertia";
+  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Estimated"} mass ${(result.massKg*1000).toFixed(3)} g · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nInertia tensor (kg·m²):\n${tensor}\n${components}\n${result.mechanicsNote}`;
+  $("roll-status").textContent=result.validForRoll?"Locked · release to roll on the calculated inertia tensor":`Roll unavailable: ${result.mechanicsNote}`;
 }
 function checkerboard() {
   const faces=[], pattern=$("scene-pattern").value;
