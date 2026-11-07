@@ -102,7 +102,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
-  rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
+  rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.85, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -482,7 +482,12 @@ function controls() {
   canvas.addEventListener("pointermove", (event) => { if (!last) return;
     yaw += (event.clientX-last[0])*0.008; pitch = Math.max(-1.2,Math.min(1.2,pitch+(event.clientY-last[1])*0.008)); last=[event.clientX,event.clientY]; });
   for (const type of ["pointerup","pointercancel"]) canvas.addEventListener(type, () => { last=null; });
-  canvas.addEventListener("wheel", (event) => { event.preventDefault(); distance=Math.max(2.3,Math.min(7,distance*Math.exp(event.deltaY*0.001))); }, { passive:false });
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    if ($("preview-engine").value==="particle" && $("preview-camera").value==="marble")
+      followDistance=Math.max(0.35,Math.min(4,followDistance*Math.exp(event.deltaY*0.001)));
+    else distance=Math.max(2.3,Math.min(7,distance*Math.exp(event.deltaY*0.001)));
+  }, { passive:false });
 }
 function frame(now=0) {
   const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
@@ -507,7 +512,7 @@ function frame(now=0) {
   gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
     const follow=simOn&&$("preview-camera").value==="marble";
-    const cameraDistance=simOn&&!follow?Math.max(distance,7):distance;
+    const cameraDistance=follow?followDistance:simOn?Math.max(distance,7):distance;
     const baseView=multiply(translate(-cameraDistance),multiply(rotateX(pitch),rotateY(yaw)));
     const radius=+$("radius-mm").value/1000;
     let object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
