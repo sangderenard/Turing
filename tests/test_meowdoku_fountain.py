@@ -1802,7 +1802,7 @@ class _ToyWorld:
             self.state = {k: out[k + "_next"] for k in F.STATE + F.BODY_STATE}
         return self.last
 
-    def on_ramp(self, k, s, speed, underside=False):
+    def on_ramp(self, k, s, speed, underside=False, first=0):
         """Place the grains on ramp ``k`` at the fractions ``s`` of its length from the HIGH end (on top, or under it), moving ``speed`` down the ramp."""
         r = self.design["ramps"][k]
         (hx, hy), (lx, ly) = r["high"], r["low"]
@@ -1812,7 +1812,7 @@ class _ToyWorld:
         if ny < 0:
             nx, ny = -nx, -ny                                                # the ramp's up-facing normal
         side = -1.0 if underside else 1.0
-        for i, f in enumerate(s):
+        for i, f in enumerate(s, first):
             self.state["x"][i] = hx + ax * length * f + side * nx * (r["r"] + self.rad[i] + 0.002)
             self.state["y"][i] = hy + ay * length * f + side * ny * (r["r"] + self.rad[i] + 0.002)
             self.state["vx"][i], self.state["vy"][i] = ax * speed, ay * speed
@@ -1850,6 +1850,52 @@ def test_the_stream_off_the_last_ramp_turns_the_free_wheel():
     last = world.run(230)
     assert abs(float(last["body_om"][0])) > 0.1 and abs(float(last["body_th"][0])) > 0.01, (last["body_om"][0], last["body_th"][0])      # turning, from rest (the stream lands left of the hinge: counterclockwise)
     assert float(last["n_out"][0]) == 0 and float(last["n_nan"][0]) == 0
+
+
+def _dribble(world, steps, ramps, per, first_of, up=False):
+    """Run ``steps`` and count, per ramp, the grains that went THROUGH its hole (below the ramp, near the hole) and those that crossed it (past the hole
+    along the ramp, still on it); ``up``: turned over, the 'below' is above."""
+    through, crossed = {k: set() for k in ramps}, {k: set() for k in ramps}
+    for _ in range(steps):
+        out = world.step()
+        world.state = {k: out[k + "_next"] for k in F.STATE + F.BODY_STATE}
+        for k in ramps:
+            r = world.design["ramps"][k]
+            (hx, hy), (ux, uy) = r["high"], r["hole"]["dir"]
+            ids = range(first_of(k), first_of(k) + per)
+            nx, ny = (-uy, ux) if ux > 0 else (uy, -ux)                       # the ramp's up-facing normal
+            gap, c = r["hole"]["gap"], world.design["c"]
+            for i in ids:
+                dx, dy = world.state["x"][i] - hx, world.state["y"][i] - hy
+                s_, above = dx * ux + dy * uy, dx * nx + dy * ny                # along the ramp from its high end; over its axis (up-facing positive)
+                near = abs(s_ - r["hole"]["at"]) < gap + c
+                if near and (above > r["r"] + 0.4 * c if up else above < -(r["r"] + 0.4 * c)):
+                    through[k].add(i)                                         # on the far side of the ramp, at the hole: it went through
+                past = s_ < r["hole"]["at"] - gap - c if up else s_ > r["hole"]["at"] + gap + c
+                if past and abs(above) < 2.5 * c:
+                    crossed[k].add(i)                                         # still on the ramp, beyond the hole
+    return {k: (len(through[k]), len(crossed[k])) for k in ramps}
+
+
+def test_each_ramp_has_a_dribble_hole_a_thin_return_flow_below_the_main_flow_and_nothing_escapes():
+    """The three ramps are each two pieces with a hole between (a capsule and a rounded box: the capsule slots are only three).  Grains slide down
+    each ramp: a trickle falls through its hole (a dribble, > 0, not all); a fast stream bridges it; n_out = 0.  The same turned over (grains under the
+    last ramp moving up it)."""
+    n, per = 18, 6
+    world = _ToyWorld(n)
+    for k in range(3):
+        world.on_ramp(k, np.linspace(0.28, 0.46, per), 0.1, first=k * per)
+    counts = _dribble(world, 220, range(3), per, lambda k: k * per)
+    last = world.last
+    assert float(last["n_out"][0]) == 0 and float(last["n_nan"][0]) == 0
+    for k, (through, crossed) in counts.items():
+        assert 0 < through < per, (k, counts)                                  # a slow trickle falls through (a fast stream, 0.6-0.9 m/s, bridges the hole: 0 of 18 fell, all crossed)
+    for r in world.design["ramps"]:
+        assert 2.3 * world.design["c"] < r["hole"]["gap"] < 2.5 * world.design["c"] and len(r["pieces"]) == 2
+    up = _ToyWorld(per, grav_y=+1.0, lid=world.design["top"] + 0.05)
+    up.on_ramp(2, np.linspace(0.55, 0.72, per), -0.5, underside=True)
+    counts_up = _dribble(up, 130, [2], per, lambda k: 0, up=True)
+    assert float(up.last["n_out"][0]) == 0 and counts_up[2][1] + counts_up[2][0] > 0
 
 
 def test_turned_over_the_flow_follows_the_ramps_through_the_open_ends_and_nothing_escapes():
