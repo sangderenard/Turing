@@ -683,7 +683,8 @@ class Wordle(Game):
     game = "wordle"
     input = "text"
     title = "Wordle"
-    RACK = ("QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM")
+    RACK = ("QWERTYUIOP", "ASDFGHJKL", "↵ZXCVBNM⌫")   # the last row's ends are Enter and Backspace keys
+    KEY_MESH = {"↵": "enter", "⌫": "back"}
 
     def __init__(self, seed: int = 0, dictionary: str = "builtin", length: int = 5):
         from meowdoku import words as word_lists
@@ -772,8 +773,8 @@ class Wordle(Game):
         rack_cells, rack_pieces = [], []
         for r, line in enumerate(self.RACK):
             for c, ch in enumerate(line):
-                rack_cells.append(best.get(ch.lower(), "unknown"))
-                rack_pieces.append({"id": f"rack-{ch}", "cell": r * 10 + c, "mesh": ch, "color": "ink", "letter": ch})
+                rack_cells.append("entry" if ch in self.KEY_MESH else best.get(ch.lower(), "unknown"))
+                rack_pieces.append({"id": f"rack-{ch}", "cell": r * 10 + c, "mesh": self.KEY_MESH.get(ch, ch), "color": "ink", "letter": ch})
             rack_cells += [""] * (10 - len(line))
         st["rack"] = {"rows": 3, "cols": 10, "cells": rack_cells, "pieces": rack_pieces,
                       "letters": ["".join(line) for line in self.RACK]}

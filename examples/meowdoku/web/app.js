@@ -1946,13 +1946,13 @@ function uploadMaterials(game) {
 }
 
 // ---------------------------------------------------------------- boards
-function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf) {
+function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf, rowSize = cellSize) {
   const faces = [], g = TILE.gap * cellSize, i = TILE.inset * cellSize, h = TILE.height * cellSize;
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
     const name = cellName(r, c); if (!name) continue;
     const m = state.materialIndex[hintOf ? hintOf(r, c, name) : name] ?? state.materialIndex[name];
     const x0 = origin[0] + c * cellSize + g, x1 = origin[0] + (c + 1) * cellSize - g;
-    const z0 = origin[1] + r * cellSize + g, z1 = origin[1] + (r + 1) * cellSize - g;
+    const z0 = origin[1] + r * rowSize + g, z1 = origin[1] + (r + 1) * rowSize - g;
     const b = [[x0,0,z0],[x1,0,z0],[x1,0,z1],[x0,0,z1]];
     const tp = [[x0+i,h,z0+i],[x1-i,h,z0+i],[x1-i,h,z1-i],[x0+i,h,z1-i]];
     faces.push([tp[0], tp[2], tp[1], m], [tp[0], tp[3], tp[2], m]);
@@ -1960,10 +1960,14 @@ function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf) {
   }
   return faces;
 }
+const RACK_ASPECT = 1.8;
 function rackLayout(game) {
   if (!game.rack) return null;
   const size = game.cols / game.rack.cols;                        // the rack spans the board's width
-  return { size, origin: [0, game.rows + 1.0], rows: game.rack.rows, cols: game.rack.cols };
+  // its keys are TALL (RACK_ASPECT x their width), like a phone keyboard's: a portrait screen has the height to spare, and the keys
+  // become easy to hit; the rack sits closer under the board
+  const zsize = size * RACK_ASPECT;
+  return { size, zsize, origin: [0, game.rows + 0.45], rows: game.rack.rows, cols: game.rack.cols };
 }
 function disposeMesh(mesh) {
   if (!mesh) return;
@@ -1990,10 +1994,10 @@ function rebuildBoards(game) {
     ? litMesh(box(0, 0, 0, game.width, TILE.height, game.height, state.materialIndex.floor))
     : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
   const rack = rackLayout(game);
-  state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size)) : null;
+  state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size, null, rack.zsize)) : null;
   const trayFaces = game.powerups ? trayButtonFaces(game) : game.characters ? characterFaces(game) : null;
   state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
-  const depth = rack ? rack.origin[1] + rack.rows * rack.size
+  const depth = rack ? rack.origin[1] + rack.rows * rack.zsize
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
   const width = game.board === "free" ? game.width : game.cols;
   state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
@@ -3133,7 +3137,7 @@ function cellPosition(game, cell, rackPiece) {
     return [game.cols / 2 + (k - (n - 1) / 2) * step, TOP.roster, "roster"];
   }
   if (rackPiece) { const rack = rackLayout(game), r = Math.floor(cell / rack.cols), c = cell % rack.cols;
-    return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.size, "rack", rack.size]; }
+    return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.zsize, "rack", rack.size]; }
   return [(cell % game.cols) + 0.5, Math.floor(cell / game.cols) + 0.5, "board"];
 }
 // ---------------------------------------------------------------- the walker (World Walk)
@@ -6045,7 +6049,7 @@ function hit(clientX, clientY) {
   const c = Math.floor(x), r = Math.floor(z);
   if (c >= 0 && c < game.cols && r >= 0 && r < game.rows) return { kind: "board", r, c, key: `${r},${c}` };
   const rack = rackLayout(game);
-  if (rack) { const rc = Math.floor((x - rack.origin[0]) / rack.size), rr = Math.floor((z - rack.origin[1]) / rack.size);
+  if (rack) { const rc = Math.floor((x - rack.origin[0]) / rack.size), rr = Math.floor((z - rack.origin[1]) / rack.zsize);
     if (rc >= 0 && rc < rack.cols && rr >= 0 && rr < rack.rows) return { kind: "rack", r: rr, c: rc, key: `rack:${rr},${rc}` }; }
   return null;
 }
@@ -6134,7 +6138,9 @@ canvas.addEventListener("pointerup", async (e) => {
   }
   if (game.input === "text" && h && h.kind === "rack") {
     const letter = (game.rack.letters[h.r] || "")[h.c];
-    if (letter) await act({ type: "text", text: game.text + letter });
+    if (letter === "↵") await act({ type: "submit" });           // the rack's own Enter and Backspace keys
+    else if (letter === "⌫") await act({ type: "backspace" });
+    else if (letter) await act({ type: "text", text: game.text + letter });
   }
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());

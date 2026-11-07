@@ -240,6 +240,12 @@ def export_assets(out: Path) -> dict:
     # them with light outlines.
     for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
         pack(letter, *token_mesh(letter, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
+    # Wordle's rack keys: Enter (U+21B5) and Backspace (U+232B); without the glyph the key is a blank button that still works
+    for name, ch in (("enter", "↵"), ("back", "⌫")):
+        try:
+            pack(name, *token_mesh(ch, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
+        except Exception as error:                                   # noqa: BLE001 - a missing glyph is not an export failure
+            print(f"[export] wordle key {name}: no glyph ({type(error).__name__})", flush=True)
     for name, code in (("king", 0x265A), ("queen", 0x265B), ("rook", 0x265C), ("bishop", 0x265D),
                        ("knight", 0x265E), ("pawn", 0x265F)):
         pack(name, *token_mesh(chr(code), "DejaVu Sans", "normal", depth_ratio=0.45, outline_subdivisions=1))

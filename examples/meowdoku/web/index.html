@@ -51,7 +51,7 @@
      phone) so the bar never covers the board; --bar-h is kept live below. */
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
            height: calc(var(--vh100, 100vh) - var(--bar-h, 0px)); touch-action: none; }
-  #word { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
+  #word { position: fixed; left: 50%; top: calc(var(--bar-h, 0px) + 8px); transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
   #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
                 background: var(--ctl); color: var(--fg-strong); border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px 6px 12px; }
   #word button { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; font: inherit; }
