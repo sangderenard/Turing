@@ -34,7 +34,10 @@ export const STYLES = [
 // products keyed on them) are untouched.
 export const PAGE_STYLES = [
   { id: "material", label: "material (scene spheres)", needs: null, scene: true, fallback: "sand" },
-  { id: "stained", label: "stained glass (scene glass)", needs: null, scene: true, fallback: "sand", budgetScale: 0.6 },   // two passes (back faces, front faces): fewer grains
+  // material-mode glass: the scene shader's own material (its alpha, translucence, enamel, profiles), composited order-independently (OIT)
+  { id: "stained", label: "stained glass (scene glass, OIT)", needs: null, scene: true, fallback: "sand", budgetScale: 0.6 },   // both faces accumulate: fewer grains
+  // the explicit fast mode: plain alpha blending in draw order, back faces then front faces (the look before OIT)
+  { id: "stained_fast", label: "stained glass (fast: alpha blend)", needs: null, scene: true, fallback: "sand", budgetScale: 0.6 },
 ];
 export const ALL_STYLES = [...STYLES, ...PAGE_STYLES];
 export const STYLE_IDS = ALL_STYLES.map((s) => s.id);
@@ -74,6 +77,73 @@ export function chooseStyle(requested, caps, broken = {}, scene = null) {
     return { style: id, requested: id, reason: plan.note, lod: plan.lod, tris: plan.tris };
   }
   return { style: id, requested: id, reason: av.note };
+}
+
+// ---------------------------------------------------------------- glass compositing (pure)
+// How a glass grain (a material with an opacity below OPAQUE_ABOVE, or the stained style) is composited:
+//   "oit"   weighted blended order-independent transparency (McGuire and Bavoil 2013): every glass fragment is accumulated
+//           with a depth weight into an RGBA16F target (premultiplied colour * w, alpha * w) and the optical depth tau = -ln(1 - a)
+//           into a second one (the sum of tau is the product of (1 - a), exactly the "revealage"; the sum form needs no
+//           per-target blend function, which WebGL2 lacks), then ONE composite pass over the scene.  Needs float or half-float
+//           render targets.  The fragment colour and alpha are the scene shader's own (base_material).
+//   "alpha" plain alpha blending in draw order (the stained_fast style, and the fallback without float render targets).
+export const OPAQUE_ABOVE = 0.95;
+export const OIT_WEIGHT_MAX = 100;       // (the sum of w * colour must stay inside half-float range with many overlapping faces)
+// the depth weight of a fragment at eye distance `z` (McGuire and Bavoil's eye-space weight 10 / (1e-5 + (z/5)^2 + (z/200)^6): the
+// window-depth form saturates at its cap for a perspective depth buffer; OIT_FRAG_WRITE is the GLSL twin).  The coverage `a` is
+// already in the accumulated colour (rgb * a) and alpha.
+export function oitWeight(z) {
+  const w = 10 / (1e-5 + Math.pow(Math.abs(z) / 5, 2) + Math.pow(Math.abs(z) / 200, 6));
+  return Math.min(OIT_WEIGHT_MAX, Math.max(1e-2, w));
+}
+export const oitTau = (a) => -Math.log(1 - Math.min(Math.max(a, 0), 0.9999));
+// The light that gets through a stack of fragments of coverages `alphas`: the product of (1 - a), however they are ordered.
+export const transmittance = (alphas) => alphas.reduce((t, a) => t * (1 - Math.min(Math.max(a, 0), 0.9999)), 1);
+// The composite pass: the accumulated (rgb * w, a * w) and the summed tau -> { rgb, alpha } to blend over the scene with
+// (SRC_ALPHA, ONE_MINUS_SRC_ALPHA).
+export function oitComposite(accum, tau) {
+  const reveal = Math.exp(-tau), w = Math.max(accum[3], 1e-5);
+  return { rgb: [accum[0] / w, accum[1] / w, accum[2] / w], alpha: 1 - reveal, reveal };
+}
+// Which compositing a glass draw uses, and why (the reason is shown in the control's title).  `fast`: the explicit fast style.
+// `broken`: why OIT failed at run time here ("" when it has not).
+export function glassMode({ fast = false, caps = null, broken = "" } = {}) {
+  if (fast) return { mode: "alpha", reason: "glass: plain alpha blending in draw order (fast mode; not order-independent)" };
+  if (!caps || !caps.floatRender) return { mode: "alpha", reason: "glass: alpha blending in draw order, not OIT: OIT needs float or half-float render targets (EXT_color_buffer_float / EXT_color_buffer_half_float), which this device lacks" };
+  if (broken) return { mode: "alpha", reason: `glass: alpha blending in draw order, not OIT: ${broken}` };
+  return { mode: "oit", reason: `glass: weighted blended OIT (order-independent), ${caps.floatRender === "float" ? "RGBA16F" : "half-float"} accumulation and optical-depth targets` };
+}
+// The depth formats an OIT target may take (a depth blit needs the scene framebuffer's own format), in the order tried.
+export const OIT_DEPTH_FORMATS = {
+  d24s8: { internal: "DEPTH24_STENCIL8", attach: "DEPTH_STENCIL_ATTACHMENT" },
+  d24: { internal: "DEPTH_COMPONENT24", attach: "DEPTH_ATTACHMENT" },
+  d16: { internal: "DEPTH_COMPONENT16", attach: "DEPTH_ATTACHMENT" },
+  d32f: { internal: "DEPTH_COMPONENT32F", attach: "DEPTH_ATTACHMENT" },
+};
+export const OIT_DEPTH_ORDER = ["d24s8", "d24", "d16", "d32f"];
+// Is a material with this pbr opacity glass (composited, not drawn opaque)?
+export const isGlass = (opacity) => opacity < OPAQUE_ABOVE;
+// The fragment stage's addition for OIT (extendForOit): the accumulation write beside the original colour write.
+export const OIT_FRAG_WRITE = `
+    if (uOit) {
+        float oa = clamp(alpha, 0.0, 0.9999);
+        float oz = abs(vPosV.z);
+        float ow = clamp(10.0 / (1e-5 + pow(oz / 5.0, 2.0) + pow(oz / 200.0, 6.0)), 1e-2, ${OIT_WEIGHT_MAX}.0);
+        FragColor = vec4(srgb * oa, oa) * ow;
+        oitTau = vec4(-log(1.0 - oa), 0.0, 0.0, 0.0);
+    } else {
+        FragColor = vec4(srgb, alpha);
+        oitTau = vec4(0.0);
+    }`;
+// -> the fragment source with the OIT outputs added (the original colour write is kept, unchanged, for uOit = false);
+// throws an Error naming what the source did not have.
+export function extendForOit(frag) {
+  const out = /\bout\s+vec4\s+FragColor\s*;/.exec(frag);
+  if (!out) throw new Error("the fragment shader has no `out vec4 FragColor;`");
+  const write = /FragColor\s*=\s*vec4\s*\(\s*srgb\s*,\s*alpha\s*\)\s*;/.exec(frag);
+  if (!write || write.index < out.index) throw new Error("the fragment shader's final colour write was not found");
+  return frag.slice(0, out.index) + "layout(location = 0) out vec4 FragColor;\nlayout(location = 1) out vec4 oitTau;\nuniform bool uOit;"
+    + frag.slice(out.index + out[0].length, write.index) + OIT_FRAG_WRITE.trim() + frag.slice(write.index + write[0].length);
 }
 
 // ---------------------------------------------------------------- colour source (pure)
@@ -434,6 +504,20 @@ void main() {
   float t = 2.0 * sqrt(1.0 - r2) * vRw * min(1.0, vArea / (3.14159265 * vREff * vREff) + 0.35) * uThickGain;
   FragColor = vec4(vColor.rgb * t, t);
 }`;
+// the OIT composite: the accumulated (rgb * w, a * w) and the optical depth tau (sum of -ln(1 - a)) -> the averaged colour and 1 - exp(-tau)
+const OIT_COMPOSITE_FS = `#version 300 es
+precision highp float; precision highp int;
+uniform sampler2D uAccum;
+uniform sampler2D uTau;
+uniform ivec2 uOrigin;
+out vec4 FragColor;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - uOrigin;
+  vec4 a = texelFetch(uAccum, p, 0);
+  float tau = texelFetch(uTau, p, 0).r;
+  if (tau <= 0.0) discard;
+  FragColor = vec4(a.rgb / max(a.a, 1e-5), 1.0 - exp(-tau));
+}`;
 export const QUAD_VS = `#version 300 es
 void main() { vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)); gl_Position = vec4(c * 2.0 - 1.0, 0.0, 1.0); }`;
 const BLUR_FS = `#version 300 es
@@ -656,10 +740,11 @@ export class ParticleStyles {
   // style, a style this device cannot run, and the stamp style, whose memory lies under the current points).
   draw(style, ctx) {
     const gl = this.gl;
-    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained") ? this.#sceneOf(ctx) : null);
+    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained" || style === "stained_fast") ? this.#sceneOf(ctx) : null);
     this.fallback = choice.style === style ? "" : choice.reason;
     this.note = choice.reason;
     this.heatInfo = choice.style === "heat" ? this.heatInfo : "";
+    this.glassInfo = "";               // how glass grains were composited in the last draw (set by #material)
     if (choice.style === DEFAULT_STYLE || !ctx.camera || !ctx.camera.proj || !ctx.camera.view) return false;
     const guard = new UnitGuard(gl);
     const program = gl.getParameter(gl.CURRENT_PROGRAM);
@@ -673,7 +758,7 @@ export class ParticleStyles {
       else if (choice.style === "glow") this.#glow(ctx, guard);
       else if (choice.style === "heat") this.#heat(ctx, guard);
       else if (choice.style === "stamp") { this.#stamp(ctx, guard); done = false; }
-      else if (choice.style === "material" || choice.style === "stained") this.#material(ctx, choice, choice.style === "stained");
+      else if (choice.style === "material" || choice.style === "stained" || choice.style === "stained_fast") this.#material(ctx, choice, choice.style);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       this.broken[choice.style] = error.message; this.fallback = `${choice.style} unavailable (${error.message}): showing points`;
@@ -788,8 +873,82 @@ export class ParticleStyles {
     gl.bindVertexArray(null);
     return (this.spheres[lod] = { vao, vbo, ibo, count: mesh.indices.length });
   }
-  #material(ctx, choice, glass) {
+  // The OIT targets (accumulation, optical depth) with their own depth buffer (the scene's depth is blitted in per frame).
+  #oitTarget(w, h, fmt) {         // (the depth format `fmt`: see OIT_DEPTH_FORMATS; a depth blit needs the scene framebuffer's)
+    const gl = this.gl;
+    let t = this.oit;
+    if (t && t.w === w && t.h === h && t.fmt === fmt) return t;
+    if (t) { for (const x of t.tex) gl.deleteTexture(x); gl.deleteFramebuffer(t.fbo); gl.deleteRenderbuffer(t.rb); this.oit = null; }
+    const unit = gl.getParameter(gl.ACTIVE_TEXTURE), held = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const tex = [0, 1].map((i) => {
+      const x = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, x); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, x, 0);
+      return x;
+    });
+    const spec = OIT_DEPTH_FORMATS[fmt];
+    const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl[spec.internal], w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl[spec.attach], gl.RENDERBUFFER, rb);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    gl.bindTexture(gl.TEXTURE_2D, held); gl.activeTexture(unit);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      for (const x of tex) gl.deleteTexture(x); gl.deleteFramebuffer(fbo); gl.deleteRenderbuffer(rb);
+      throw new Error(`the OIT targets are incomplete here (0x${status.toString(16)})`);
+    }
+    return (this.oit = { w, h, fmt, fbo, tex, rb });
+  }
+  // Weighted blended OIT for the glass grains: accumulate into the OIT targets (depth-tested against the scene's own depth, which
+  // is blitted in), then one composite over the scene.  Throws an Error (-> the alpha fallback, named in the title) if the device refuses.
+  #oitDraw(ctx, mesh, at, guard) {
+    const gl = this.gl, W = ctx.vp[2], H = ctx.vp[3];
+    // the scene's framebuffer has a depth format of its own (the page's default one is the browser's choice): try the formats until one blits
+    let t = null;
+    const order = this.oitDepth ? [this.oitDepth, ...OIT_DEPTH_ORDER.filter((f) => f !== this.oitDepth)] : OIT_DEPTH_ORDER, tried = [];
+    for (const fmt of order) {
+      t = this.#oitTarget(W, H, fmt);
+      while (gl.getError() !== gl.NO_ERROR) { /* (an earlier error is not this pass's) */ }
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, ctx.bound); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, t.fbo);
+      gl.blitFramebuffer(ctx.vp[0], ctx.vp[1], ctx.vp[0] + W, ctx.vp[1] + H, 0, 0, W, H, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+      const e = gl.getError();
+      if (e === gl.NO_ERROR) { this.oitDepth = fmt; break; }
+      tried.push(`${fmt}: 0x${e.toString(16)}`); t = null;
+    }
+    if (!t) throw new Error(`the scene's depth could not be copied in any depth format (${tried.join(", ")}; ${W}x${H}, ${gl.getParameter(gl.DEPTH_BITS)} depth bits)`);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo); gl.viewport(0, 0, W, H);
+    gl.clearBufferfv(gl.COLOR, 0, new Float32Array(4)); gl.clearBufferfv(gl.COLOR, 1, new Float32Array(4));
+    gl.uniform1i(at("uOit"), 1);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.enable(gl.CULL_FACE);                  // both faces of every bead accumulate: the back faces (the shader's inner colour), then the front
+    gl.cullFace(gl.FRONT); gl.vertexAttribI4i(5, 1, 0, 0, 0);
+    gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
+    gl.cullFace(gl.BACK); gl.vertexAttribI4i(5, 0, 0, 0, 0);
+    gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
+    gl.disable(gl.CULL_FACE);
+    gl.uniform1i(at("uOit"), 0);
+    // the composite: the averaged colour with coverage 1 - exp(-tau) over the scene
+    const cp = this.#program("oit.comp", QUAD_VS, OIT_COMPOSITE_FS);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.bound); gl.viewport(ctx.vp[0], ctx.vp[1], W, H);
+    gl.useProgram(cp.program);
+    guard.bind(0, t.tex[0]); guard.bind(1, t.tex[1]);
+    gl.uniform1i(cp.u.uAccum, 0); gl.uniform1i(cp.u.uTau, 1); gl.uniform2i(cp.u.uOrigin, ctx.vp[0], ctx.vp[1]);
+    gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    this.#quad(ctx.vao);
+  }
+  // style: "material" (opaque grains, or glass when the picked material is), "stained" (glass: OIT), "stained_fast" (glass: alpha)
+  #material(ctx, choice, style) {
     const gl = this.gl, S = ctx.scene, P = S.program, at = (name) => gl.getUniformLocation(P, name);
+    const glass = style !== "material" || !!S.glass, fast = style === "stained_fast";
+    const guard = new UnitGuard(gl);
+    let verdict = null;
+    if (glass) {
+      verdict = glassMode({ fast, caps: this.caps, broken: this.oitBroken || (S.oit ? "" : `the scene shader could not be extended for OIT (${S.oitNote || "unknown"})`) });
+      this.glassInfo = verdict.reason;
+    }
     const mesh = this.#sphere(ctx, choice.lod), cam = ctx.camera;
     gl.bindBuffer(gl.ARRAY_BUFFER, ctx.buffer);
     // the constant attributes the scene's own draws set (aMatId, aUv, aGroupId, aCullImmune = 0: back faces culled in the shader, aVelocity)
@@ -802,13 +961,25 @@ export class ParticleStyles {
     const own = ctx.colorMode === "material";                        // the whole material, its own colour included
     grainUniforms(gl, (n) => at(n), own ? null : ctx.tint, own ? null : ctx.grain);
     gl.uniform1f(at("uInstOwn"), own ? 1 : 0);
-    gl.vertexAttribI4i(2, S.materialId, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0); gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0);
+    // aGroupId: 0 (no group) or the material's own (an emitter group, or the ThermalChunk index of a blackbody finish: uThermalEmission on for it)
+    gl.vertexAttribI4i(2, S.materialId, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0); gl.vertexAttribI4i(4, S.group || 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0);
+    if (S.thermal) gl.uniform1i(at("uThermalEmission"), 1);
     gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
     gl.bindVertexArray(mesh.vao);
-    if (glass) {
+    let oitDone = false;
+    if (glass && verdict.mode === "oit") {
+      try { this.#oitDraw(ctx, mesh, at, guard); oitDone = true; }
+      catch (error) {
+        this.oitBroken = String(error.message || error); this.glassInfo = glassMode({ caps: this.caps, broken: this.oitBroken }).reason;
+        gl.uniform1i(at("uOit"), 0); gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.bound); gl.viewport(ctx.vp[0], ctx.vp[1], ctx.vp[2], ctx.vp[3]);
+        gl.useProgram(P); gl.bindVertexArray(mesh.vao);
+      }
+    }
+    if (oitDone) { /* composited above */ }
+    else if (glass) {
       // The scene's glass pass (litPass): alpha-blended over the opaque scene, depth-TESTED against it, depth NOT written, drawn
       // in submission order (not sorted, not order-independent).  Here each sphere also sorts itself: its back faces first
-      // (shown with the tint's inner colour), then its front faces.
+      // (shown with the tint's inner colour), then its front faces.  (The stained_fast style, and the fallback without OIT.)
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); gl.enable(gl.CULL_FACE);
       gl.cullFace(gl.FRONT); gl.vertexAttribI4i(5, 1, 0, 0, 0);
       gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
@@ -819,7 +990,10 @@ export class ParticleStyles {
       gl.depthMask(true); gl.disable(gl.BLEND);
       gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
     }
+    guard.restore();
+    gl.useProgram(P);
     gl.uniform1i(at("uInstanced"), 0);                              // the scene's pieces never see the flag
+    if (S.thermal) gl.uniform1i(at("uThermalEmission"), 0);
     for (const [i, v] of held) { if (v instanceof Int32Array) gl.vertexAttribI4i(i, v[0], v[1], v[2], v[3]); else if (v instanceof Uint32Array) gl.vertexAttribI4ui(i, v[0], v[1], v[2], v[3]); else gl.vertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
     gl.bindVertexArray(ctx.vao);
   }

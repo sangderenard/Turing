@@ -996,3 +996,58 @@ def test_the_noise_filters_slope_fit_and_classes_read_synthetic_variance_ladders
     assert ids["nfmode"]["local"] == "noise_mode" and ids["nfmode"]["options"] == listed and ids["nfmode"]["value"] == "mean"
     for key, local in (("nfstrength", "noise_strength"), ("nfthr", "noise_threshold")):
         assert ids[key]["kind"] == "range" and ids[key]["local"] == local and ids[key]["min"] < ids[key]["value"] < ids[key]["max"]
+
+
+JS_OIT = r"""
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const P = await import(pathToFileURL(`${dir}/particle_styles.js`).href);
+const near = (a, b, e = 1e-9) => assert.ok(Math.abs(a - b) <= e, `${a} vs ${b}`);
+// transmittance: the product of (1 - a), independent of order; stacked beads of one coverage
+near(P.transmittance([]), 1); near(P.transmittance([0.42]), 0.58);
+near(P.transmittance([0.2, 0.5, 0.9]), P.transmittance([0.9, 0.2, 0.5]));
+near(P.transmittance(Array(2 * 3).fill(0.42)), Math.pow(0.58, 6));          // three beads, two faces each: the old fixed-opacity look (~4 %)
+assert.ok(P.transmittance(Array(2 * 3).fill(0.42)) < 0.05);
+near(P.transmittance(Array(2 * 10).fill(0.12)), Math.pow(0.88, 20));        // ten clear beads still pass light
+// the composite: the summed optical depth gives exactly the product, in any order
+const alphas = [0.3, 0.12, 0.6, 0.12];
+const tau = alphas.reduce((s, a) => s + P.oitTau(a), 0);
+near(P.oitComposite([0, 0, 0, 1], tau).reveal, P.transmittance(alphas), 1e-12);
+near(P.oitComposite([0, 0, 0, 1], tau).alpha, 1 - P.transmittance(alphas), 1e-12);
+// the averaged colour is the weighted mean of the fragments' colours
+const frags = [[1, 0, 0, 0.5, 4], [0, 0, 1, 0.5, 9]];                     // r, g, b, a, eye distance
+let acc = [0, 0, 0, 0];
+for (const [r, g, b, a, z] of frags) { const w = P.oitWeight(z); acc = [acc[0] + r * a * w, acc[1] + g * a * w, acc[2] + b * a * w, acc[3] + a * w]; }
+const c = P.oitComposite(acc, 0.1); near(c.rgb[0] + c.rgb[2], 1, 1e-9); assert.ok(c.rgb[0] > c.rgb[2]);   // the nearer fragment weighs more
+assert.ok(P.oitWeight(4) > P.oitWeight(9)); assert.ok(P.oitWeight(0.01) <= P.OIT_WEIGHT_MAX); assert.ok(P.oitWeight(1e4) >= 1e-2);
+near(P.oitTau(0.5), Math.log(2)); assert.ok(Number.isFinite(P.oitTau(1)));
+// which compositing: OIT with float or half-float targets; alpha (with the reason) otherwise, and always for the fast style
+const full = {floatRender: 'float', maxPointSize: 256}, half = {floatRender: 'half', maxPointSize: 256}, none = {floatRender: null, maxPointSize: 256};
+assert.equal(P.glassMode({caps: full}).mode, 'oit'); assert.equal(P.glassMode({caps: half}).mode, 'oit'); assert.match(P.glassMode({caps: half}).reason, /half/);
+assert.equal(P.glassMode({caps: none}).mode, 'alpha'); assert.match(P.glassMode({caps: none}).reason, /EXT_color_buffer_float/);
+assert.equal(P.glassMode({caps: null}).mode, 'alpha');
+assert.equal(P.glassMode({caps: full, broken: 'blit failed'}).mode, 'alpha'); assert.match(P.glassMode({caps: full, broken: 'blit failed'}).reason, /blit failed/);
+assert.equal(P.glassMode({fast: true, caps: full}).mode, 'alpha'); assert.match(P.glassMode({fast: true, caps: full}).reason, /fast/);
+assert.ok(P.isGlass(0.42) && P.isGlass(0.12) && !P.isGlass(1.0) && !P.isGlass(0.95));
+// both styles exist: stained (OIT) and stained_fast (alpha), each with the sand fallback
+for (const id of ['stained', 'stained_fast']) { assert.ok(P.STYLE_IDS.includes(id)); assert.equal(P.chooseStyle(id, full, {}, {ready: false, count: 10, radiusPx: 5}).style, 'sand'); }
+// the shader extension: a second output and the accumulation write; the original colour write is kept for uOit = false
+const frag = 'precision highp float;\nout vec4 FragColor;\nvoid main() {\n    vec3 srgb = vec3(1.0); float alpha = 0.5;\n    FragColor = vec4(srgb, alpha);\n}\n';
+const ext = P.extendForOit(frag);
+assert.match(ext, /layout\(location = 0\) out vec4 FragColor;/); assert.match(ext, /layout\(location = 1\) out vec4 oitTau;/); assert.match(ext, /uniform bool uOit;/);
+assert.match(ext, /else \{\s*FragColor = vec4\(srgb, alpha\);/); assert.match(ext, /-log\(1\.0 - oa\)/);
+assert.throws(() => P.extendForOit('void main() {}'), /FragColor/);
+assert.throws(() => P.extendForOit('out vec4 FragColor;\nvoid main() {}'), /colour write/);
+// the depth formats a blit may need are all named
+for (const f of P.OIT_DEPTH_ORDER) assert.ok(P.OIT_DEPTH_FORMATS[f].internal && P.OIT_DEPTH_FORMATS[f].attach);
+console.log('ok');
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's glass compositing maths")
+def test_glass_grains_composite_order_independently_and_fall_back_to_alpha_with_a_reason(tmp_path):
+    """Render-only (web/particle_styles.js): weighted blended OIT for the glass grains -- the transmittance of a stack is the product of
+    (1 - a) in any order, the summed optical depth is the revealage, the nearer fragment weighs more -- the choice between OIT and plain
+    alpha (the fast style, a device without float render targets, a failed depth copy) with its reason, and the shader extension."""
+    assert _run_node(tmp_path, JS_OIT, "particle_styles.js").strip() == "ok"
