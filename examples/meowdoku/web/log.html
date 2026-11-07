@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meowdoku log</title>
+<style>
+  :root { --bg: #0c0e13; --fg: #d8dde6; --ctl: #1b2029; --line: #2c3340; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; overflow: hidden; }
+  #bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 10px; background: #12151c; border-bottom: 1px solid var(--line); }
+  #bar button, #bar input[type=search] { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; }
+  #bar label { display: inline-flex; gap: 4px; align-items: center; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+  #bar label.on { background: var(--ctl); }
+  #bar .sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  #stage { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+  #wrap { position: absolute; left: 0; right: 0; bottom: 22px; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  #thumb { position: absolute; right: 2px; width: 6px; border-radius: 3px; background: #556; opacity: .7; pointer-events: none; }
+  #note { position: absolute; left: 10px; right: 10px; bottom: 3px; height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8b93a3; font-size: 12px; }
+  #msg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #e88; font-size: 16px; display: none; text-align: center; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>Log</strong>
+  <span id="srcs"></span>
+  <input id="q" type="search" placeholder="search" size="18" autocomplete="off">
+  <button id="follow" title="stay at the newest line">Follow tail</button>
+  <button id="zoomout" title="smaller glyphs">A-</button><button id="zoomin" title="larger glyphs">A+</button>
+  <button id="copyvis" title="copy the lines in view as text">Copy visible</button>
+  <button id="copyall" title="copy every line that passes the filters as text">Copy all</button>
+  <span id="stats"></span>
+</div>
+<div id="stage"><div id="wrap"><canvas id="c"></canvas><div id="thumb"></div></div><div id="note"></div><div id="msg"></div></div>
+<script type="module" src="log.js"></script>
+</body>
+</html>

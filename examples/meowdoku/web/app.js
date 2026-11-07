@@ -24,7 +24,8 @@ setInterval(() => {
 }, 5000);
 // [ACCESS] local (LAN) and dev visitors get the Studio link in the bar, with the tier named in its title
 { const link = document.getElementById("studio-link"), A = window.meowdokuAccess || {};
-  if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; } }
+  if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; }
+  const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = ""; }     // [LOG] the log page link, same visitors
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
