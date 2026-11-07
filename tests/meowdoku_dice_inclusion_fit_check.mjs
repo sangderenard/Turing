@@ -37,6 +37,7 @@ for(const kind of ['d4','d6','d10','d20']) {
   const empty=fitInclusionsInsideDie(die,source,{scale:0});
   assert.equal(empty.interior.length,0);
   assert.equal(empty.ribbons.length,0);
+  assert.throws(()=>fitInclusionsInsideDie(die,source,{gap:0}),RangeError);
   assert.throws(()=>fitInclusionsInsideDie(die,source,{gap:die.safeInteriorRadius}),RangeError);
   console.log(`${kind}: final-surface insphere and all six interior designs fit with closed mass`);
 }
