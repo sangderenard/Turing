@@ -98,13 +98,14 @@ export const angleOf = (u16) => (u16 / 65536) * TAU;
 //   tape       a Recording
 //   from, to   the frames to keep (inclusive); the loop is this span
 //   maxGrains  grains kept (a stride over the packed ids; a grain must be alive in every kept frame)
+//   bits       position bits kept (the stream stays u16: the value is shifted up, so the low bits are zero and the codec drops them)
 //   fps        output frames per second of simulated time; `law.dt` is the law's step in seconds
 //   turnSeconds  how long the view takes to follow a turn of the case (the drawing eases; the law's gravity changed at once)
 const outlineBox = (lines) => {
   const pts = lines.flat();
   return pts.length ? [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[1]))] : null;
 };
-export function filterTape(tape, { from, to, maxGrains = 400, fps = 24, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0 }) {
+export function filterTape(tape, { from, to, maxGrains = 400, fps = 12, bits = 12, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0 }) {
   from = Math.max(from, tape.lo); to = Math.min(to, tape.hi);
   if (to <= from) throw new Error("filterTape: nothing recorded between the frames");
   const stride = Math.max(1, Math.round(1 / (fps * dt * tape.snapEvery)));          // recorded frames per kept frame
@@ -119,7 +120,7 @@ export function filterTape(tape, { from, to, maxGrains = 400, fps = 24, dt, outl
   const box = view || outlineBox(outline) || [Infinity, -Infinity, Infinity, -Infinity];
   if (!view) for (const k of frames) { const d = tape.get(k); for (const i of ids) { box[0] = Math.min(box[0], d[5 * i]); box[1] = Math.max(box[1], d[5 * i]); box[2] = Math.min(box[2], d[5 * i + 1]); box[3] = Math.max(box[3], d[5 * i + 1]); } }
   const bbox = [box[0], box[1], box[2], box[3]].map(Math.fround), span = Math.max(bbox[1] - bbox[0], bbox[3] - bbox[2]);
-  const q = (v, lo) => Math.max(0, Math.min(65535, Math.round(((v - lo) / span) * 65535)));
+  const top = (1 << bits) - 1, q = (v, lo) => Math.max(0, Math.min(top, Math.round(((v - lo) / span) * top))) << (16 - bits);
   const x = [], y = [];
   for (const k of frames) {
     const d = tape.get(k), xs = new Uint16Array(ids.length), ys = new Uint16Array(ids.length);

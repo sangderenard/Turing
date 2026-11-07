@@ -24,6 +24,7 @@ export async function record({ state, newGame, act, compute }) {
   await newGame({ game: "fountain", aspect });
   await act({ type: "fountain_size", size: "small", aspect });
   await act({ type: "fountain_choice", name: "shape", value: "sdf_hourglass" });
+  await act({ type: "fountain_speed", speed: 0 });                // the run follows the newest frame: the pump runs as fast as the device allows
   await act({ type: "fountain_start", aspect });
   for (let i = 0; i < 600 && !(compute.ready && compute.tape && compute.manifest && compute.rec && compute.rec.tag === "small"); i++) await new Promise((r) => setTimeout(r, 100));
   if (!compute.ready) throw new Error("the fountain's compute product did not come up");
@@ -59,10 +60,10 @@ export async function record({ state, newGame, act, compute }) {
 
   // the FILTER of the state memory; tighten it until the stream fits the budget
   let anim = null, bytes = null;
-  for (const [fps, grains] of [[24, 400], [20, 300], [15, 256], [12, 200]]) {
-    anim = filterTape(compute.tape, { from: out.from, to: out.to, maxGrains: grains, fps, dt, outline, turnSeconds: TURN_SECONDS });
+  for (const [fps, grains, bits] of [[12, 400, 12], [10, 300, 11], [8, 256, 10], [6, 200, 10]]) {          // the panel interpolates between frames
+    anim = filterTape(compute.tape, { from: out.from, to: out.to, maxGrains: grains, fps, bits, dt, outline, turnSeconds: TURN_SECONDS });
     bytes = encodeStream(anim);
-    log(`filtered ${anim.x.length} frames x ${anim.grains} grains at ${fps} fps: ${bytes.length} raw bytes`);
+    log(`filtered ${anim.x.length} frames x ${anim.grains} grains at ${fps} fps, ${bits} bits: ${bytes.length} raw bytes`);
     if (bytes.length <= BUDGET) break;
   }
   const r = await fetch("/api/loading_anim", { method: "POST", headers: { "X-Meowdoku-Loading": "1", "Content-Type": "application/octet-stream" }, body: bytes });

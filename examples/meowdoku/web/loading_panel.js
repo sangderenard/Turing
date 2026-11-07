@@ -115,7 +115,7 @@ function start() {
     #loading-panel[data-on="1"] { opacity: 1; }
     #loading-panel canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
     #loading-panel .lp-caption { position: absolute; left: 0; right: 0; bottom: 9%; text-align: center; font: 600 14px/1.4 system-ui, sans-serif;
-      color: var(--fg, #e8e8ea); letter-spacing: .02em; text-shadow: 0 1px 4px rgba(0,0,0,.6); pointer-events: none; }
+      color: var(--lp-fg, #e8e8ea); letter-spacing: .02em; pointer-events: none; }
     #loading-panel .lp-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: 0; background: var(--lp-tint, #fff); box-shadow: 0 0 8px var(--lp-tint, #fff); }`;
   document.head.appendChild(style);
   const root = document.createElement("div");
@@ -145,7 +145,7 @@ function start() {
       vec2 p = aPos - uCenter; float c = cos(uAngle), s = sin(uAngle);
       p = vec2(c * p.x - s * p.y, s * p.x + c * p.y) * uScale;
       gl_Position = vec4(p / (uRes * 0.5), 0.0, 1.0);
-      gl_PointSize = max(2.5, 2.0 * aRad * uScale * 0.9);
+      gl_PointSize = max(3.0, 3.4 * aRad * uScale);
       vHash = fract(sin(float(gl_VertexID) * 12.9898) * 43758.5453);
     }`;
   const FS_POINTS = `#version 300 es
@@ -188,9 +188,10 @@ function start() {
       float fall = clamp(ph / (period - 1.0), 0.0, 1.0);                       // 0: all above, 1: all below (in the turned frame, "above" is y > 0)
       float topFill = H * (1.0 - fall) * 0.8, botFill = H * fall * 0.8;
       float grain = 0.8 + 0.2 * hash(floor(p * 90.0));
-      float sandTop = inside * step(0.0, p.y) * step(p.y, topFill * (0.35 + 0.65 * smoothstep(0.0, 1.0, p.y / max(topFill, 0.01)) * 0.0 + 0.65)) * step(0.001, topFill);
-      float sandBot = inside * step(p.y, 0.0) * step(-p.y, botFill * (1.0 - 0.7 * smoothstep(0.0, W, abs(p.x))));
-      float stream = step(abs(p.x), 0.012) * step(-H * 0.8 * fall - 0.0, p.y) * step(p.y, 0.0) * step(0.02, 1.0 - fall) * (0.5 + 0.5 * hash(vec2(floor(p.y * 60.0 + uTime * 30.0), 3.0)));
+      float sandTop = inside * step(0.0, p.y) * step(p.y, topFill);
+      float pile = botFill * (1.0 - 0.7 * smoothstep(0.0, W, abs(p.x)));
+      float sandBot = inside * step(p.y, 0.0) * step(p.y, -H * 0.98 + pile);
+      float stream = step(abs(p.x), 0.012) * step(p.y, 0.0) * step(-H * 0.98 + botFill, p.y) * step(fall, 0.97) * (0.55 + 0.45 * hash(vec2(floor(p.y * 60.0 + uTime * 30.0), 3.0)));
       float sand = clamp(sandTop + sandBot + stream, 0.0, 1.0);
       vec2 q = gl_FragCoord.xy / uRes - 0.5;
       vec3 bg = mix(uBg * 0.82, uBg * 1.12, smoothstep(0.85, 0.0, length(q))) + uTint * 0.03;
@@ -262,7 +263,10 @@ function start() {
     const dpr = Math.min(2, window.devicePixelRatio || 1), w = Math.max(2, Math.round(canvas.clientWidth * dpr)), h = Math.max(2, Math.round(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
     gl.viewport(0, 0, w, h);
-    const bgc = cssColor("--scene-bg", [0.09, 0.09, 0.1]), fg = cssColor("--fg", [0.9, 0.9, 0.92]);
+    const bgc = cssColor("--scene-bg", [0.09, 0.09, 0.1]);
+    const light = 0.2126 * bgc[0] + 0.7152 * bgc[1] + 0.0722 * bgc[2] > 0.5;          // a light sky: the ink turns dark so it stays readable
+    const fg = light ? [0.1, 0.12, 0.16] : cssColor("--fg", [0.9, 0.9, 0.92]);
+    root.style.setProperty("--lp-fg", `rgb(${fg.map((v) => Math.round(v * 255)).join(",")})`);
     gl.disable(gl.BLEND);
     const a = S.anim;
     if (!a) {
@@ -295,8 +299,12 @@ function start() {
     gl.uniform3fv(points.u.uTint, S.tint); gl.uniform3fv(points.u.uFg, fg);
     gl.bindBuffer(gl.ARRAY_BUFFER, radBuf); gl.bufferData(gl.ARRAY_BUFFER, a.rad, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+    const tFrame = (((now - S.animT0) / 1000) * a.fps) % 1;                           // between two recorded frames: interpolate (the grains keep their ids)
     const set = (f, alpha) => {
-      for (let i = 0; i < a.n; i++) { a.pos[2 * i] = a.x[f][i] / 65535; a.pos[2 * i + 1] = a.y[f][i] / 65535; }
+      const g = Math.min(f + 1, a.x.length - 1), t = f === fa || f === fb ? tFrame : 0;
+      for (let i = 0; i < a.n; i++) {
+        a.pos[2 * i] = (a.x[f][i] + (a.x[g][i] - a.x[f][i]) * t) / 65535; a.pos[2 * i + 1] = (a.y[f][i] + (a.y[g][i] - a.y[f][i]) * t) / 65535;
+      }
       uniforms(points, angle(f)); gl.uniform1f(points.u.uAlpha, alpha);
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, a.pos, gl.DYNAMIC_DRAW);
       gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -334,7 +342,7 @@ function start() {
     }
   }
   const hold = (id, kind, names = []) => { S.holds.set(id, { kind, names }); if (kind === "compiling") poll(); refresh(); };
-  const release = (id) => { S.holds.delete(id); refresh(); };
+  const release = (id) => { if (id === "boot" && S.holds.has(id)) S.bootMs = Math.round(performance.now()); S.holds.delete(id); refresh(); };
 
   let gateCount = 0;
   const api = {
@@ -361,7 +369,7 @@ function start() {
     release,                                                         // release("boot"): the first game is up
     initializing(detail) { S.init = detail || "GPU"; refresh(); },
     done() { S.init = null; },
-    state: () => ({ phase: S.phase, holds: [...S.holds.keys()], dl: { ...dl }, visible: S.visible, anim: !!S.anim }),
+    state: () => ({ bootMs: S.bootMs, phase: S.phase, holds: [...S.holds.keys()], dl: { ...dl }, visible: S.visible, anim: !!S.anim }),
   };
   window.meowdokuLoading = api;
   hold("boot", "boot");                                              // from the first byte until the first game is drawn
