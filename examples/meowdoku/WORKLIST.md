@@ -131,3 +131,30 @@ deploy to 8766 as soon as work lands.
 - **Pilot:** keep trimming activations and cost; profile server autopilot smoothness.
 - **Arcade and sun:** confirm the black-render fix on the phone (needs a refresh).
 - **Phone fountain:** confirm particles no longer vanish (unit-0, limits and Metal fixes).
+
+## Fountain: signed-distance chambers, ports/pumps/lines, hinged actors (DESIGN, written before any code; none of it is built)
+
+State of the walls now: the 2D law has three planes plus (non-box shapes) a polyline of up to 8 vertices; the 3D law has the polyline (thick, sided, overlapping half-spaces, penetration saturating at 6 radii) plus two plexiglass planes and a lid. Closed shapes are inscribed in the view window.
+
+**A. Signed-distance chambers (2D and 3D).**
+- A chamber is a fixed-capacity list of primitives as uniforms: kind, pose (x, y, z, angle), size (3), flags (union / subtract). The wall contact stays the existing thick sided band: distance d and normal n from the composed SDF (analytic gradient per primitive; a central difference only for the peg array's nearest-peg search), force by `_contact`.
+- CONFLICT / cost: a runtime `kind` switch evaluated for every slot costs every SDF for every slot per grain (7 kinds x 16 slots x gradients) -- far beyond the polyline walls. Proposal: slots are typed, a few per kind (e.g. 4 box/prism, 4 sphere/capsule, 2 torus, 1 hourglass, 1 peg array, 1 tetra), each slot evaluating exactly one SDF; the preset fills them. Measure ms/step against the polyline before widening.
+- CONFLICT: the 3D solids (sphere, cube, tetrahedron, torus) need the true 3D volume first (the neighbour walk is planar with a ~2-layer slab; the z cells of the true-volume item). Until then they are 2D shapes extruded through the slab.
+- Peg array: rows x cols at a pitch, staggered, nearest-peg by index arithmetic (no loop): one primitive.
+- Presets: box, funnel, hexagon, ramp (as now, polylines kept); toroidal shell, sphere, cube, tetrahedron, hourglass; "oil & glycerine toy" = alternating capsule ramps, an hourglass throat, a staggered peg field, a floor; default fluid glycerine, two species of different density and colour.
+- Inlet/outlet placement per preset (the inlet is already clamped to the shape's chord).
+
+**B. Ports, pumps and lines.**
+- An outlet is a region on a wall; a grain whose centre enters it is parked into a LINE: new law state `tdue` (the time it re-emerges = now + length / speed from the pump rate), then it takes the existing ARMED path at the line's inlet port (the slot-clear test and the FIFO by due time then id are already how emission works). Counters gain `n_in_line`; the partition stays exact.
+- CONFLICT: today a grain's emit time is `pid x emit_rate` (a pure function of the id) and `age` is a state shared by all ids; a recycled grain needs its own due time (a new state column, 2 slots/id more: check the 10M binding budget, it is exactly full at 42 slots with the 2D law).
+- A pump: rate (grains/s) and lift are uniforms of the line (rate limits how many may leave the outlet per second: the outlet admits a grain only if the line's counter allows, deterministic in id order).
+- The page draws each line as glass tubing (a path of segments through the scene material path) and the transiting grains interpolated along it from `tdue` (no per-frame readback beyond the packed points: add the due-time fraction to the packing's spare word).
+
+**C. Hinged rigid actors + waterwheel.**
+- A body = SDF primitives (hub + paddles) with one hinge DOF; the grains' wall contact is two-way: the force and torque on the body are the negated sums of the contact forces over grains, a fixed-order reduction (like `ke`), and the body's angle / angular velocity are law state integrated with inertia and hinge damping.
+- CONFLICT: the law is one batched per-id program and a rank-0 state has no home (the WebGPU backend recomputes rank-0 values; a state must be a lane). The body state would live as a small replicated lane (id 0 owns it, the others read it with a gather) or as a second, one-element program stepped between batches by the page -- the second breaks exact replay unless its inputs are logged. To be decided with the engine_toy owner BEFORE coding. The coupling must go through the engine_toy machine-sim torque / coupling path (not read yet by this branch): it must be read first; no parallel torque model.
+- Preset "waterwheel fountain": the nozzle falls on the wheel; the outlet at the bottom feeds a pump line back to the nozzle (needs B).
+
+**True 3D volume (next, before the 3D solids).** z cells in the grid (cells in x, y and z; the 3x3x3 walk = three row runs per z neighbour = 9 runs), depth a runtime uniform up to a box-like depth, default several grain layers. Cost: 3x the binary searches and 3x the candidates per grain; K_RUN_MAX must grow (at depth d the dense-pack candidates per run are ~ 16 d / grain diameter); watch `n_drop`. The compile grows with it (the 3D native 256 compile already exceeds 90 minutes): parity is the NumPy lane (its product emits in ~14 minutes) until the compile is cut down.
+
+**Ports of the 3D tunables to the 2D law:** temperature, stiffness/Hertz, cohesion, spin drag, nozzle speed and rate, k_run with its n_drop readout, fluid, size distributions, roughness/irregularity (orbeez and the polygon walls are in). Each adds uniforms and law terms to the 2D law and so re-keys the 2D products; 2D native 256 compile is ~25 minutes.
