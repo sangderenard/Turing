@@ -40,7 +40,8 @@ deploy to 8766 as soon as work lands.
    - auto-rotate;
    - a colinear tube inlet.
 5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
-6. **Fluids and crystals:**
+6. **Fluids, crystals and temperature:**
+   - temperature: Brownian agitation through a Langevin thermostat tied to the fluid drag (deterministic hashed noise), plus the system's measured kinetic temperature as a law output shown in the status line;
    - an interstitial fluid setting (air, water, glycerine settling toy);
    - particle compressibility (Hertz–Mindlin), so crystalline packings form.
 7. **Grain species:**
