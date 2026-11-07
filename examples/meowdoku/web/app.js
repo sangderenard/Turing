@@ -2337,18 +2337,26 @@ const LAMP = { omega: 1.6 };
 // time of day -- its bearing goes once round the board per day, it stands
 // highest at noon, low and warm at dawn and dusk, and at night it is a dim
 // blue moon on the far side.
-// ?hour=13.5 in the URL (or meowdokuDebug.sunHour) holds the sun at that time of day: the live clock otherwise
-const SUN_HOUR = (() => { try { const h = new URLSearchParams(location.search).get("hour"); return h == null ? null : Number(h); } catch { return null; } })();
+// THE SCENE'S SUN is the sky model's sun (SCENE: NOAA's solar position for the place and clock, see updateBackground):
+// its direction, and its colour as the atmosphere leaves it (sunThroughAir: the same Rayleigh / Mie optical depths the
+// sky pass uses, so the light reddens at sunrise and sunset exactly as the sky does).  Below the horizon the key light
+// is the moon: a dim blue light opposite the sun.  ?hour=13.5 (or meowdokuDebug.sunHour) is a shortcut that sets the
+// scene clock.  sunState's azimuth is the board angle lampTarget uses: x = cos(el) cos(az), z = cos(el) sin(az).
+function hourClock(h) {
+  const v = ((Number(h) % 24) + 24) % 24;
+  return `${String(Math.floor(v)).padStart(2, "0")}:${String(Math.floor((v % 1) * 60)).padStart(2, "0")}`;
+}
 function sunState() {
-  const d = new Date(), pinned = window.meowdokuDebug && window.meowdokuDebug.sunHour != null ? window.meowdokuDebug.sunHour : SUN_HOUR;
-  const hours = pinned != null && isFinite(pinned) ? ((pinned % 24) + 24) % 24 : d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
-  const day = Math.sin((hours - 6) / 24 * 2 * Math.PI);          // +1 noon, 0 dawn/dusk, -1 midnight
-  const azimuth = hours / 24 * 2 * Math.PI;
-  const elevation = (day >= 0 ? 15 + 55 * day : 35) * Math.PI / 180;
-  const warm = Math.max(0, 1 - Math.abs(day) * 3) * (day > -0.2 ? 1 : 0);
-  const colour = day >= 0 ? mix([1.0, 0.97, 0.9], [1.0, 0.72, 0.45], warm) : mix([0.55, 0.65, 1.0], [1.0, 0.72, 0.45], warm);
-  const strength = day >= 0 ? 0.75 + 0.25 * day : 0.42;
-  return { azimuth, elevation, colour, strength };
+  const R = Math.PI / 180, pinned = window.meowdokuDebug && window.meowdokuDebug.sunHour;
+  if (pinned != null && isFinite(pinned) && SCENE.pinnedHour !== pinned) { SCENE.clock = hourClock(pinned); SCENE.pinnedHour = pinned; SCENE.at = -1e9; }
+  const el = SCENE.elevation || 0, az = SCENE.azimuth || 0;
+  if (el > -2 * R) {
+    const d = sunBoardDir(Math.max(el, 0), az), through = sunThroughAir(sunBoardDir(el, az)), peak = Math.max(...through, 1e-4);
+    return { azimuth: Math.atan2(d[2], d[0]), elevation: Math.max(el, 4 * R), colour: through.map((v) => v / peak),
+             strength: Math.max(0.42, Math.min(1, peak * 1.25)) };
+  }
+  const m = sunBoardDir(35 * R, az + Math.PI);                  // the moon: high, opposite the sun
+  return { azimuth: Math.atan2(m[2], m[0]), elevation: 35 * R, colour: [0.55, 0.65, 1.0], strength: 0.42 };
 }
 // THE SUN ON THE GLOBE (a spherical game publishes ``globe``): the sun's
 // direction is fixed in the planet's frame, so its place in the local sky is
@@ -2411,15 +2419,50 @@ function defaultLatitude() {
   if (/^(Africa\/(Lagos|Nairobi|Kinshasa|Accra|Abidjan|Addis_Ababa)|Asia\/(Singapore|Jakarta|Colombo|Kuala_Lumpur))/.test(tz)) return 5;
   return 42;
 }
-try { const g = JSON.parse(localStorage.getItem("meowdoku_geo") || "null"); if (g && Number.isFinite(g.lat) && Number.isFinite(g.lon)) { SCENE.lat = g.lat; SCENE.lon = g.lon; } } catch { /* private window */ }
+try { const g = JSON.parse(localStorage.getItem("meowdoku_geo") || "null"); if (g && Number.isFinite(g.lat) && Number.isFinite(g.lon)) { SCENE.lat = g.lat; SCENE.lon = g.lon; SCENE.homeLat = g.lat; SCENE.homeLon = g.lon; } } catch { /* private window */ }
 try { const q = new URLSearchParams(location.search).get("clock"); if (q) SCENE.clock = q; } catch { /* no location */ }
+try { const h = new URLSearchParams(location.search).get("hour"); if (h != null && isFinite(Number(h))) SCENE.clock = hourClock(h); } catch { /* no location */ }
 window.setSceneClock = (value) => { SCENE.clock = value || null; SCENE.at = -1e9; };
+// A PLACE for the sky: its latitude, longitude and time zone (the sun is where it is THERE; a fixed clock is that place's
+// local time).  "here" is the browser's own zone and the saved / rough location.
+const SKY_PLACES = {
+  here: null,
+  honolulu: { lat: 21.3, lon: -157.9, tz: "Pacific/Honolulu" }, los_angeles: { lat: 34.05, lon: -118.24, tz: "America/Los_Angeles" },
+  chicago: { lat: 41.88, lon: -87.63, tz: "America/Chicago" }, new_york: { lat: 40.71, lon: -74.0, tz: "America/New_York" },
+  reykjavik: { lat: 64.15, lon: -21.94, tz: "Atlantic/Reykjavik" }, london: { lat: 51.51, lon: -0.13, tz: "Europe/London" },
+  cairo: { lat: 30.04, lon: 31.24, tz: "Africa/Cairo" }, mumbai: { lat: 19.08, lon: 72.88, tz: "Asia/Kolkata" },
+  beijing: { lat: 39.9, lon: 116.4, tz: "Asia/Shanghai" }, tokyo: { lat: 35.68, lon: 139.69, tz: "Asia/Tokyo" },
+  sydney: { lat: -33.87, lon: 151.21, tz: "Australia/Sydney" }, ushuaia: { lat: -54.8, lon: -68.3, tz: "America/Argentina/Ushuaia" },
+};
+// the offset (minutes, local - UTC) of time zone ``tz`` at instant ``date``
+function zoneOffsetMin(tz, date) {
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit",
+      day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).formatToParts(date).map((x) => [x.type, x.value]));
+    return Math.round((Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second) - date.getTime()) / 60000);
+  } catch { return -date.getTimezoneOffset(); }
+}
 function sceneDate() {
-  const c = SCENE.clock, now = new Date();
-  if (!c) return now;
+  const c = SCENE.clock, now = new Date(), place = SKY_PLACES[SCENE.place];
+  if (!c) return now;                                           // live: the real instant (the place decides where the sun is)
   const m = /^(\d{1,2}):(\d{2})$/.exec(c);
-  if (m) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(m[1]), Number(m[2]));
+  if (m) {
+    if (!place) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(m[1]), Number(m[2]));
+    const off = zoneOffsetMin(place.tz, now), local = new Date(now.getTime() + off * 60000);     // that time today, in the place's zone
+    return new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), Number(m[1]), Number(m[2])) - off * 60000);
+  }
   const d = new Date(c); return Number.isNaN(d.getTime()) ? now : d;
+}
+function setSkyPlace(name) {
+  SCENE.place = name in SKY_PLACES ? name : "here";
+  const p = SKY_PLACES[SCENE.place];
+  if (p) { SCENE.lat = p.lat; SCENE.lon = p.lon; } else { SCENE.lat = SCENE.homeLat ?? null; SCENE.lon = SCENE.homeLon ?? null; }
+  SCENE.at = -1e9;
+  try { localStorage.setItem("meowdoku.skyplace", SCENE.place); } catch { /* storage may be blocked */ }
+}
+function setSkyClock(value) {
+  SCENE.clock = /^\d{1,2}:\d{2}$/.test(value || "") ? value : null; SCENE.pinnedHour = null; SCENE.at = -1e9;
+  try { localStorage.setItem("meowdoku.skyclock", SCENE.clock || ""); } catch { /* storage may be blocked */ }
 }
 // NOAA's solar position (equation of time and declination); azimuth from north, clockwise.
 function solarPosition(date, latDeg, lonDeg) {
@@ -5484,10 +5527,16 @@ $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 1
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: sun (L)"; }
 $("light").onclick = toggleLight;
 $("sky-mode").onchange = () => setSkyMode($("sky-mode").value);
+// the sky's place and clock (restored, then applied)
+try { const pl = localStorage.getItem("meowdoku.skyplace"); if (pl) setSkyPlace(pl); const ck = localStorage.getItem("meowdoku.skyclock"); if (ck && !SCENE.clock) setSkyClock(ck); } catch { /* storage may be blocked */ }
+if ($("sky-place")) { $("sky-place").value = SCENE.place || "here"; $("sky-place").onchange = () => setSkyPlace($("sky-place").value); }
+if ($("sky-clock")) { $("sky-clock").value = SCENE.clock || ""; $("sky-clock").onchange = () => setSkyClock($("sky-clock").value); }
 $("sky-locate").onclick = () => {      // opt-in only: nothing asks for the location unless this is pressed
   if (!navigator.geolocation) { $("sky-locate").textContent = "No geolocation"; return; }
   navigator.geolocation.getCurrentPosition((p) => {
-    SCENE.lat = p.coords.latitude; SCENE.lon = p.coords.longitude; SCENE.at = -1e9;
+    SCENE.lat = p.coords.latitude; SCENE.lon = p.coords.longitude; SCENE.homeLat = SCENE.lat; SCENE.homeLon = SCENE.lon; SCENE.at = -1e9;
+    SCENE.place = "here"; if ($("sky-place")) $("sky-place").value = "here";
+    try { localStorage.setItem("meowdoku.skyplace", "here"); } catch { /* storage may be blocked */ }
     try { localStorage.setItem("meowdoku_geo", JSON.stringify({ lat: SCENE.lat, lon: SCENE.lon })); } catch { /* private window */ }
     $("sky-locate").textContent = "Located";
   }, () => { $("sky-locate").textContent = "Location denied"; });
