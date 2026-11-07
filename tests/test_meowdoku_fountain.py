@@ -1019,7 +1019,8 @@ def test_species_roughness_irregularity_and_restitution_are_runtime_tunables():
     assert float(u["irr0"]) == pytest.approx(0.2, abs=1e-6) and float(u["roll0"]) == pytest.approx(0.1, abs=1e-6)
     assert float(u["zeta0"]) == pytest.approx(F.zeta_of(0.9), abs=1e-6) and F.restitution_of(F.zeta_of(0.9)) == pytest.approx(0.9)
     assert F.restitution_of(F.ZETA) == pytest.approx(F.PARAMS["e0"][4]) and float(F.uniforms(n=256)["zeta0"]) == pytest.approx(F.ZETA, abs=1e-6)
-    assert float(u["cell"]) == pytest.approx(F.CELL, abs=1e-6)                   # 2 * max(radius * (1 + irr)): 2 * 0.014 (pearl) still the largest
+    assert float(u["cell"]) == pytest.approx(2.0 * 0.012 * 1.2, abs=1e-6)       # 2 * max(radius * (1 + irr)): the widened grain species is now the largest
+    assert float(F.uniforms(n=256)["cell"]) == pytest.approx(F.CELL, abs=1e-6)
     cols = F.initial_columns(256, mix=0.0, params={"irr0": 0.2})
     out = F.run_frames(F.make_piece(256), cols, 1)
     base = F.run_frames(F.make_piece(256), F.initial_columns(256, mix=0.0), 1)
@@ -1099,3 +1100,25 @@ def test_the_server_declares_temperature_on_a_log_slider_in_the_physics_group():
     before = game.state()["compute"]["epoch"]
     game.do({"type": "fountain_param", "name": "temp", "value": 2.0e-7})
     assert game.state()["compute"]["uniforms"]["temp"] == pytest.approx(2.0e-7, rel=1e-6) and game.state()["compute"]["epoch"] == before
+
+
+def test_size_distributions_lognormal_and_bidisperse_are_hashed_per_id_and_off_by_default():
+    n = F.N_SMALL
+
+    def radii(**params):
+        return F.run_frames(F.make_piece(n), F.initial_columns(n, mix=0.0, params=params), 1)["rad"]
+
+    base = radii()
+    assert len(np.unique(np.round(base, 7))) == 2                                   # grain and bead: no spread, ratio 1
+    assert F.uniforms(n=n)["bi_ratio"] == 1.0 and F.uniforms(n=n)["lognormal"] == 0.0
+    uni = radii(irr0=0.2, irr1=0.2)
+    assert len(np.unique(np.round(uni, 7))) > 20 and float(uni.min()) >= 0.0090 * 0.8 - 1e-9 and float(uni.max()) <= 0.0105 * 1.2 + 1e-9
+    logn = radii(irr0=0.2, irr1=0.2, lognormal=1.0)
+    assert len(np.unique(np.round(logn, 7))) > 20 and float(logn.max()) <= 0.0105 * np.exp(0.6) + 1e-9
+    assert not np.array_equal(uni, logn) and np.array_equal(logn, radii(irr0=0.2, irr1=0.2, lognormal=1.0))     # a hash: repeatable
+    assert abs(float(np.mean(np.log(logn / np.where(logn > 0, base, 1.0)))) + 0.02) < 0.03       # lognormal: log-radius has mean -sigma^2/2
+    bi = radii(bi_ratio=2.0, bi_frac=0.3)
+    large, small = bi > base * 1.2, bi < base / 1.2
+    assert abs(float(large.mean()) - 0.3) < 0.08 and (large | small).all()                         # two sizes only
+    assert float(np.max(bi[large] / base[large])) == pytest.approx(2.0 ** 0.5, rel=1e-6) and float(np.max(base[small] / bi[small])) == pytest.approx(2.0 ** 0.5, rel=1e-6)
+    assert float(F.uniforms(n=n, params={"bi_ratio": 2.0})["cell"]) == pytest.approx(F.CELL * 2.0 ** 0.5, rel=1e-6)      # the grid fits the largest

@@ -254,6 +254,11 @@ class FountainGame(Game):
                 ctl["label"] = f"{name} {label}"
                 ctl["species"] = s
                 out.append(ctl)
+        out.append({"id": "lognormal", "kind": "select", "label": "size distribution", "value": int(self.resolved()["lognormal"] > 0.5),
+                    "action": "fountain_param", "name": "lognormal", "field": "value", "group": "Grains", "aspect": True,
+                    "options": [[0, "uniform width"], [1, "lognormal sigma"]]})
+        for name in ("bi_ratio", "bi_frac"):                       # Grains: the optional two-size (bidisperse) mode
+            out.append(self._control(name))
         for name in ("omega", "hertz", "coh", "spin_drag", "temp", "nozzle_speed", "rate", "k_run"):       # Physics
             # the temperature is a logarithmic slider (0 = off, then kT from TEMP_MIN_LOG to TEMP_MAX)
             out.append(self._control(name, scale="log", log_min=TEMP_MIN_LOG) if name == "temp" else self._control(name))

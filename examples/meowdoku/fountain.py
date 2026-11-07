@@ -176,6 +176,9 @@ def _params() -> dict[str, tuple]:
         "rate": ("nozzle rate", 0.25, 4.0, 0.05, 1.0, True, "Physics"),
         "fl_rho": ("fluid density", 0.0, 1.2, 0.01, FLUIDS[DEFAULT_FLUID][0], False, "Fluid"),
         "fl_mu": ("fluid viscosity", 0.0, 5.0e-4, 1.0e-5, FLUIDS[DEFAULT_FLUID][1], False, "Fluid"),
+        "lognormal": ("size distribution (0 uniform, 1 lognormal)", 0.0, 1.0, 1.0, 0.0, True, "Grains"),
+        "bi_ratio": ("bidisperse size ratio (large / small)", 1.0, 3.0, 0.05, 1.0, True, "Grains"),
+        "bi_frac": ("bidisperse number fraction large", 0.0, 1.0, 0.05, 0.5, True, "Grains"),
         "depth": ("depth", 0.02, DEPTH_MAX, 0.002, DEPTH_DEFAULT, True, "Chamber"),
         "spread": ("inlet spread (rad)", 0.0, 0.9, 0.05, 0.7, True, "Chamber"),
     })
@@ -199,9 +202,21 @@ def resolve_params(mix: float = 0.5, params: dict | None = None) -> dict[str, fl
     return p
 
 
+def size_factor_max(p: dict[str, float], s: int) -> float:
+    """The largest multiple of species ``s``'s mean radius any of its grains can have: its uniform width, or the lognormal's
+    tail (the law clamps the normal at 3 sigma), times the bidisperse mode's large-size factor."""
+    spread = p[f"irr{s}"]
+    wide = math.exp(3.0 * spread) if p["lognormal"] > 0.5 else 1.0 + spread
+    return wide * math.sqrt(max(p["bi_ratio"], 1.0))
+
+
+def rmax_of(p: dict[str, float]) -> float:
+    return max(p[f"r{s}"] * size_factor_max(p, s) for s in range(len(SPECIES)))
+
+
 def cell_of(p: dict[str, float]) -> float:
-    """The grid cell: the largest diameter any grain can have (species radius with its irregularity)."""
-    return 2.0 * max(p[f"r{s}"] * (1.0 + p[f"irr{s}"]) for s in range(len(SPECIES)))
+    """The grid cell: the largest diameter any grain can have (species radius with its size spread and bidisperse mode)."""
+    return 2.0 * rmax_of(p)
 
 
 def stiffness_of(p: dict[str, float]) -> float:
@@ -218,7 +233,7 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
              "nozzle_x", "nozzle_z", "in_dx", "in_dy", "in_dz", "e1x", "e1y", "e1z", "e2x", "e2y", "e2z",
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
-            + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu",
+            + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac",
                "wt0", "wt1", "wt2", "wt3")
             + _SPECIES_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
@@ -377,7 +392,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out: dict[str, float] = {"mode": mode, "use_image": use_image}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     out.update(inlet_spec(inlet, geo, p))
-    rmax = max(p[f"r{s}"] * (1.0 + p[f"irr{s}"]) for s in range(len(SPECIES)))
+    rmax = rmax_of(p)
     dh = 0.5 * p["depth"]
     out.update({"cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
                 "spread": p["spread"], "nozzle_speed": p["nozzle_speed"], "emit_rate": EMIT_SPAN / float(n) / p["rate"]})
@@ -389,6 +404,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
                 "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"], "temp": p["temp"],
+                "lognormal": 1.0 if p["lognormal"] > 0.5 else 0.0, "bi_ratio": p["bi_ratio"], "bi_frac": p["bi_frac"],
                 "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
     for s in range(len(SPECIES)):
         out.update({f"wt{s}": p[f"wt{s}"], f"r{s}": p[f"r{s}"], f"rho{s}": p[f"rho{s}"], f"mu{s}": p[f"mu{s}"],
@@ -546,6 +562,7 @@ def make_law(n: int, active: int | None = None):
         grav = (a["grav_x"], a["grav_y"], a["grav_z"])
         lid, strata, mode, use_image = a["lid"], a["strata"], a["mode"], a["use_image"]
         omega, hertz, coh, spin_drag, fl_rho, fl_mu, temp = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu", "temp"))
+        lognormal, bi_ratio, bi_frac = a["lognormal"], a["bi_ratio"], a["bi_frac"]
         centre = (a["nozzle_x"], nozzle_y, a["nozzle_z"])
         d_in = (a["in_dx"], a["in_dy"], a["in_dz"])
         e1 = (a["e1x"], a["e1y"], a["e1z"])
@@ -570,8 +587,18 @@ def make_law(n: int, active: int | None = None):
         def species(ident):
             """radius (with its irregularity jitter), mass, friction, damping ratio, rolling coefficient of an id."""
             m1, m2, m3 = masks(_mix(ident, 1237.0, 5.0))
-            jitter = _mix(ident, 2999.0, 61.0) * 2.0 - 1.0
-            rr = pick(table("r"), m1, m2, m3) * (1.0 + pick(table("irr"), m1, m2, m3) * jitter)
+            # the SIZE DISTRIBUTION, a hash of the id: the species' mean radius times a spread factor (uniform: 1 + irr u,
+            # u in [-1, 1); lognormal: exp(irr z - irr^2 / 2), z a unit normal clamped at 3 sigma, so the mean stays 1) times the
+            # bidisperse mode's factor (a ``bi_frac`` share of the grains are sqrt(bi_ratio) larger, the rest as much smaller;
+            # ratio 1 is exactly 1).  Each is an exact 1.0 when off.
+            u1 = _mix(ident, 2999.0, 61.0)
+            z = ((u1 + _mix(ident, 3511.0, 43.0) - 1.0) * 2.449489742783178).clamp(-3.0, 3.0)
+            spread = pick(table("irr"), m1, m2, m3)
+            size_f = (1.0 - lognormal) * (1.0 + spread * (u1 * 2.0 - 1.0)) + lognormal * (spread * z - 0.5 * spread * spread).exp()
+            big = as_float(_mix(ident, 3733.0, 71.0) < bi_frac)
+            sq = bi_ratio.sqrt()
+            bi_f = 1.0 + big * (sq - 1.0) + (1.0 - big) * (1.0 / sq - 1.0)
+            rr = pick(table("r"), m1, m2, m3) * size_f * bi_f
             rho = pick(table("rho"), m1, m2, m3)
             return (rr, rho, rho * ((4.0 / 3.0) * math.pi) * rr * rr * rr, pick(table("mu"), m1, m2, m3),
                     pick(table("zeta"), m1, m2, m3), pick(table("roll"), m1, m2, m3))
