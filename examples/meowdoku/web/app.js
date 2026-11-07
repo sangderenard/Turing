@@ -5159,7 +5159,7 @@ function cameraDownInLaw(view) {
 // A fountain surrounds the purrline board: sand fills and backs up on the board's solid cells and only passes through the holes the game leaves.
 // HOW THE TWO GAMES SHARE A PAGE: the PURRLINE page HOSTS the fountain compute.  The page holds one game (one session, one socket), and its compute
 // runtime is generic (compute.sync takes any game state's ``compute``), so the purrline game, in sand mode, is given the fountain's compute spec
-// built from the fountain manifest's ``presets.sdf_purrline`` (fountain_build writes it from fountain.py's ``purrline_spec``): the chamber, sized to
+// built from the purrline variant's manifest (fountain_purrline.manifest.json: its own shaders; ``presets.sdf_purrline`` is fountain.py's ``purrline_spec``): the chamber, sized to
 // the board so board unit = the world unit the tiles already use (``view`` is the board's own window).  No server or purrline.py change.
 // THE WRITE IS ONE WAY: each frame ``sandFeed`` hands compute.setPurrline the game's occupancy and the falling items; the compute writes them to
 // the law's occupancy-grid slot and moving-box slots at the next batch (``purrlineInputs``).  The sand never feeds back into the game.
@@ -5170,7 +5170,7 @@ function sandSpec(game) {
   if (!S.manifest) {
     if (!S.loading) {
       S.loading = true;
-      fetch("fountain.manifest.json").then((r) => r.json()).then((m) => {
+      fetch("fountain_purrline.manifest.json").then((r) => r.json()).then((m) => {
         S.manifest = m;
         if (state.game === game && !game.compute) { game.compute = sandSpec(game); compute.sync(game.compute || null); }
       }).catch((error) => { S.loading = false; console.error("[purrline sand]", error); });
@@ -5181,9 +5181,9 @@ function sandSpec(game) {
   if (!preset) return null;
   if (!S.spec) {
     const m = preset.map, c = m.cell, w = 0.5 * m.cols * c;
-    S.spec = { manifest: "fountain.manifest.json", size: S.size, epoch: 1, uniforms: preset.uniforms, speed: 1, run: "continuous", named: ["ir", "ig", "ib"],
+    S.spec = { manifest: "fountain_purrline.manifest.json", size: S.size, epoch: 1, uniforms: preset.uniforms, speed: 1, run: "continuous", named: ["ir", "ig", "ib"],
                tilt: preset.tilt, view: [-w, w, m.cy - 0.5 * m.rows * c, m.cy + 0.5 * m.rows * c], chamber_outline: preset.chamber_outline, aspect: null,
-               body: null, purrline: { map: m, slots: S.manifest.purrline } };
+               body: null, purrline: { map: m, boxes: S.manifest.purrline.boxes } };
   }
   return S.spec;
 }

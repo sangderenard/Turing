@@ -1744,195 +1744,6 @@ def test_the_sdf_presets_keep_their_designed_height_and_the_view_follows_the_cha
     assert toy["top"] > 2.8 and F.tilt_inputs(4096, None, F.CELL, "sdf_toy")["lid"] >= toy["top"]
 
 
-# ------------------------------------------- purrline sand: the occupancy grid and the moving solid boxes (WORKLIST.md, Purrline sand mode, C)
-def _purrline_world(mask=None, falling=(), n=4096):
-    """The purrline chamber's uniforms (``n`` ids' basin) with the game's mask and falling items written the way the page writes them:
-    (uniforms dict, the board map)."""
-    spec = F.sdf_preset("sdf_purrline", F.chamber_basin("sdf_purrline", n))
-    game = {"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [1] * 64 if mask is None else list(mask), "falling": list(falling)}
-    u = {k: float(v) for k, v in F.uniforms(n=n, shape="sdf_purrline").items()}
-    u.update(F.purrline_inputs(game, spec["map"]))
-    return u, spec["map"]
-
-
-def _board_to_fountain(m, bx, by):
-    return m["cx"] + (np.asarray(bx) - 4.0) * m["cell"], m["cy"] - (np.asarray(by) - 4.0) * m["cell"]
-
-
-def _union_reference(mask, m, xs, ys):
-    """The union of the occupied cells' distance OUTSIDE it (exact, float64): the minimum over cells of the box distance."""
-    c, best = m["cell"], np.full(len(xs), 1e9)
-    for r in range(8):
-        for col in range(8):
-            if mask[8 * r + col]:
-                cx, cy = _board_to_fountain(m, col + 0.5, r + 0.5)
-                qx, qy = np.abs(xs - cx) - 0.5 * c, np.abs(ys - cy) - 0.5 * c
-                best = np.minimum(best, np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0))
-    return best
-
-
-def test_the_occupancy_grid_distance_matches_the_mask_with_an_analytic_gradient():
-    rng = np.random.default_rng(11)
-    mask = (rng.random(64) < 0.6).astype(int)
-    mask[3 * 8 + 3] = 0                                      # a known hole, and a known solid beside it
-    mask[3 * 8 + 4] = 1
-    u, m = _purrline_world(mask)
-    c = m["cell"]
-    # (1) the packed words: rows 0-2 are word 0, 3-5 word 1, 6-7 word 2, a byte per row, column c = bit c
-    words = [int(u[f"q{F.OG_SLOT}p{3 + k}"]) for k in range(3)]
-    for r in range(8):
-        for col in range(8):
-            assert (words[r // 3] >> (8 * (r % 3) + col)) & 1 == mask[8 * r + col]
-    assert all(w < 2 ** 24 for w in words)
-    # (2) cell centres: inside a solid cell < 0, in a hole > 0 (its nearest solid is at most a cell away)
-    bx, by = np.meshgrid(np.arange(8) + 0.5, np.arange(8) + 0.5)
-    xs, ys = _board_to_fountain(m, bx.ravel(), by.ravel())
-    d, nx, ny = F.chamber_distance(u, xs, ys)
-    assert np.all(d[mask == 1] < -1e-3) and np.all(d[mask == 0] > 1e-3)
-    # (3) outside the union the distance IS the nearest occupied cell's box distance, to f32 precision
-    px = rng.uniform(-3.9 * c, 3.9 * c, 3000)
-    py = rng.uniform(m["cy"] - 4.0 * c - 0.2 * c, m["cy"] + 4.0 * c + 0.9 * c, 3000)
-    ref = _union_reference(mask, m, px, py)
-    d, nx, ny = F.chamber_distance(u, px, py)
-    wall_d = np.minimum(4.0 * c - np.abs(px), py)                       # the chamber's own walls (side, floor) are a fluid distance of their own
-    near_wall = wall_d < 1.0e-3 + np.maximum(ref, 0.0)
-    out = (ref > 0.0) & (ref < 0.9 * c) & ~near_wall & (py < m["cy"] + 4.0 * c + 0.6 * c)
-    assert out.sum() > 400 and np.max(np.abs(d[out] - ref[out])) < 2e-5
-    assert np.all(d[(ref < -1e-4) & ~near_wall] <= 1e-5)       # inside: never positive
-    assert np.allclose(np.hypot(nx, ny), 1.0, atol=1e-3)
-    # (4) EXACT on cell faces: the top face of an occupied cell with the grid's edge above it is a zero, and so is the face between a hole and a solid
-    top_y = m["cy"] + 4.0 * c
-    cols_top = [col for col in range(8) if mask[col]]
-    fx = np.array([_board_to_fountain(m, col + 0.3, 0)[0] for col in cols_top])
-    d_face = F.chamber_distance(u, fx, np.full(len(fx), top_y))[0]
-    assert len(cols_top) > 2 and np.max(np.abs(d_face)) < 2e-6
-    side_x, side_y = _board_to_fountain(m, 4.0, 3.5)                    # the face between the hole (3,3) and the solid (4,3): the solid's left face
-    assert abs(F.chamber_distance(u, np.array([side_x]), np.array([side_y]))[0][0]) < 2e-6
-    # (5) the gradient is analytic: it matches the central difference of the distance, away from the medial axes
-    e = 2.0e-3
-    gx = (F.chamber_distance(u, px + e, py)[0] - F.chamber_distance(u, px - e, py)[0]) / (2 * e)
-    gy = (F.chamber_distance(u, px, py + e)[0] - F.chamber_distance(u, px, py - e)[0]) / (2 * e)
-    smooth = out & (ref > 0.02 * c) & (np.abs(np.hypot(gx, gy) - 1.0) < 0.05)
-    assert smooth.sum() > 300
-    err = np.maximum(np.abs(nx - gx), np.abs(ny - gy))[smooth]
-    assert np.quantile(err, 0.99) < 3e-2 and err.max() < 0.1
-    # (6) inside a solid cell the gradient points out through a face that borders a free cell (here: into the hole, from the solid beside it)
-    gxh, gyh = _board_to_fountain(m, 4.05, 3.5)                          # inside (4,3), near its left face; (3,3) is the hole
-    dh, nxh, nyh = F.chamber_distance(u, np.array([gxh]), np.array([gyh]))
-    assert dh[0] < 0 and nxh[0] == pytest.approx(-1.0) and abs(nyh[0]) < 1e-6 and dh[0] == pytest.approx(-0.05 * c, abs=1e-5)
-
-
-def test_an_unused_grid_and_unused_boxes_add_exact_zeros_whatever_their_other_fields_hold():
-    """The default is the old law bit for bit: ``kind`` 0 masks a slot with exact 0 / 1 products and selected far distances (the old-law digests
-    of ``test_every_new_tunable_at_its_neutral_value_is_the_old_law_bit_for_bit`` hold with these slots in the law).  Here the unused slots hold
-    garbage and must still change nothing."""
-    piece = _Eager(256)
-    base = F.initial_columns(256, mix=1.0, shape="sdf_toy")
-    rng = np.random.default_rng(3)
-    m = 120
-    placed, _ = _placed(piece, base, {i: (0.0, 0.0) for i in range(m)})
-    placed["x"][:m], placed["y"][:m] = rng.uniform(-0.6, 0.6, m), rng.uniform(0.05, 1.5, m)
-    placed["vx"][:m], placed["vy"][:m] = rng.normal(0, 1.0, m), rng.normal(0, 1.0, m)
-    junk = {k: v for k, v in placed.items()}
-    for slot in [F.OG_SLOT, *F.MB_SLOTS]:
-        for f in ("cx", "cy", "rot", "p0", "p1", "p2", "p3", "p4", "p5"):
-            junk[f"q{slot}{f}"] = np.float64(0.37 if f != "p5" else 5.0)
-        junk[f"q{slot}kind"] = np.float64(0.0)
-    a, b = _eager_run(piece, placed, 20), _eager_run(piece, junk, 20)
-    assert all(np.array_equal(a[k], b[k]) for k in F.STATE)
-    assert F.OG_SLOT == 12 and len(F.MB_SLOTS) == 6 and F.SDF_LAYOUT.count("occgrid") == 1
-
-
-def _purrline_eager(n=4, gravity=(0.0, -F.G)):
-    cols = F.initial_columns(n, mix=0.0, shape="sdf_purrline", active=4096)
-    law = _Eager(n, 4096)
-    cols["age"][:] = -1.0e9
-    cols["grav_x"], cols["grav_y"] = np.float64(gravity[0]), np.float64(gravity[1])
-    return law, cols
-
-
-def _run_columns(law, cols, steps, each=None):
-    state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
-    out = {}
-    track = []
-    for step in range(steps):
-        out = dict(zip(F.OUTPUTS, law(*[state[k] if k in state else cols[k] for k in F.ARGUMENTS])))
-        state = {k: out[k + "_next"] for k in F.STATE}
-        track.append((state["x"][0], state["y"][0], state["vx"][0], state["vy"][0]))
-        if each is not None:
-            each(step, cols, state)
-    return state, np.array(track), out
-
-
-def test_a_grain_resting_on_an_occupied_cell_falls_through_when_the_cell_becomes_a_hole():
-    mask = [1] * 64
-    law, cols = _purrline_eager(gravity=(0.0, -4.0 * F.G))                   # (4 g: the fall is short; the contact law is the same)
-    u, m = _purrline_world(mask)
-    c = m["cell"]
-    cols.update({k: np.float64(v) for k, v in u.items()})
-    cols["grav_x"], cols["grav_y"] = np.float64(0.0), np.float64(-4.0 * F.G)             # (the world's uniforms carry the default pull: set ours after)
-    top = m["cy"] + 4.0 * c
-    x0 = float(_board_to_fountain(m, 3.5, 0)[0])
-    placed, probe = _placed(law, cols, {0: (x0, top + 0.05)})
-    radius = float(probe[0])
-    # phase 1: it settles on the top face of the cell and stays there
-    state, track, out = _run_columns(law, placed, 240)
-    assert abs(track[-1, 1] - (top + radius)) < 0.25 * radius and abs(track[-1, 3]) < 0.05 and float(out["n_out"][0]) == 0
-    # phase 2: the game empties the cell below it (the mask is a runtime input: no rebuild) AND the one under that
-    hole = list(mask)
-    hole[3], hole[8 + 3] = 0, 0
-    placed.update({k: np.float64(v) for k, v in F.purrline_inputs({"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": hole, "falling": []}, m).items()})
-    for k in F.STATE:
-        placed[k] = np.array(state[k], dtype=np.float64)
-    _, track2, out2 = _run_columns(law, placed, 330)
-    assert track2[:, 1].min() < top - 1.5 * c                  # it fell through two rows of holes ...
-    rest = top - 2.0 * c + radius                              # ... onto the face of the first solid cell below them (it bounces a little first)
-    assert rest - 0.5 * radius < track2[-1, 1] < rest + 0.35 * c and track2[:, 1].min() > rest - radius
-    assert abs(track2[-1, 0] - x0) < 0.5 * c and float(out2["n_nan"][0]) == 0
-
-
-def test_a_moving_box_pushes_a_resting_grain_with_its_own_velocity_and_is_not_slowed():
-    law, cols = _purrline_eager(gravity=(0.0, 0.0))                          # no gravity: the push alone
-    v, half = 0.8, 0.1
-    start = -0.5
-    u, m = _purrline_world(None, [])
-    cols.update({k: np.float64(x) for k, x in u.items()})
-    cols["grav_x"], cols["grav_y"] = np.float64(0.0), np.float64(0.0)                       # no gravity: the push alone
-    slot = F.MB_SLOTS[0]
-    y_mid = m["cy"] + 4.0 * m["cell"] + 0.6 * m["cell"]                      # in the headroom over the board
-    cols.update({f"q{slot}kind": np.float64(1.0), f"q{slot}cx": np.float64(start), f"q{slot}cy": np.float64(y_mid), f"q{slot}p0": np.float64(half),
-                 f"q{slot}p1": np.float64(half), f"q{slot}p2": np.float64(0.02), f"q{slot}p3": np.float64(v), f"q{slot}p4": np.float64(0.0)})
-    placed, probe = _placed(law, cols, {0: (0.0, float(y_mid))})
-    pose = []
-
-    def drive(step, cols_, state):                    # POSITION-DRIVEN: the page moves the box; the law never does
-        cols_[f"q{slot}cx"] = np.float64(start + v * (step + 1) * F.DT)
-        pose.append(float(cols_[f"q{slot}cx"]))
-    state, track, out = _run_columns(law, placed, 330, drive)
-    assert track[:100, 2].max() < 1e-6                                       # before contact it is at rest
-    assert abs(track[-1, 2] - v) < 0.12 * v and abs(track[-40:, 2].mean() - v) < 0.12 * v     # (the contact spring overshoots a little) it rides in front of the box at the box's velocity
-    assert track[-1, 0] > 0.15                                              # it was carried a good way
-    assert abs(pose[-1] - (start + v * 330 * F.DT)) < 1e-9                  # the box is exactly where the page put it: the law holds no state to slow
-    assert not any(name.startswith(f"q{slot}") for name in F.STATE + F.OUTPUTS) and float(out["n_nan"][0]) == 0
-
-
-def test_the_page_write_maps_the_board_into_the_chamber_with_y_flipped_and_the_lowest_items_first():
-    spec = F.sdf_preset("sdf_purrline", F.chamber_basin("sdf_purrline", 4096))
-    m = spec["map"]
-    falling = [{"x": 2.5, "y": -3.0, "vx": 0.0, "vy": 12.0}, {"x": 5.5, "y": -1.0, "vx": 0.0, "vy": 20.0}] + [{"x": 0.5, "y": -9.0 - k, "vx": 0.0, "vy": 1.0} for k in range(6)]
-    game = {"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [1, 0] * 32, "falling": falling}
-    w = F.purrline_inputs(game, m)
-    first, second = F.MB_SLOTS[0], F.MB_SLOTS[1]
-    assert w[f"q{first}kind"] == 1.0 and w[f"q{first}cx"] == pytest.approx(m["cx"] + 1.5 * m["cell"], abs=1e-6)       # the lowest (y = -1) first; x 5.5 -> +1.5 cells
-    assert w[f"q{first}cy"] == pytest.approx(m["cy"] + 5.0 * m["cell"], abs=1e-5)                                     # y = -1 is 5 cells ABOVE the board centre (4): up is +
-    assert w[f"q{first}p4"] == pytest.approx(-20.0 * m["cell"], rel=1e-5) and w[f"q{first}p3"] == 0.0                # falling (y down +) is velocity DOWN (-) in the chamber
-    assert w[f"q{first}p0"] == pytest.approx(0.5 * m["cell"], rel=1e-6) and w[f"q{second}cx"] == pytest.approx(m["cx"] - 1.5 * m["cell"], abs=1e-6)
-    assert sum(w[f"q{k}kind"] for k in F.MB_SLOTS) == 6.0                                                             # eight items, six slots
-    none = F.purrline_inputs({**game, "falling": []}, m)
-    assert all(none[f"q{k}{f}"] == 0.0 for k in F.MB_SLOTS for f in ("kind", "cx", "cy", "p0", "p3", "p4"))
-    assert w[f"q{F.OG_SLOT}p0"] == pytest.approx(m["cell"], rel=1e-6) and set(w) <= set(F.RUNTIME_INPUTS)
-
-
 def test_the_toy_internal_parts_obstruct_and_guide_grains_and_nothing_leaves_the_chamber():
     """sdf_toy in the eager lane (the f32 NumPy backend): grains laid on a ramp slide DOWN ALONG it and never sink into it; grains dropped onto the
     peg field stay out of every peg; the composed distance never goes negative past a radius and no id is outside or not finite (the 'weird
@@ -1972,14 +1783,291 @@ def test_the_toy_internal_parts_obstruct_and_guide_grains_and_nothing_leaves_the
     assert np.all(height > ramp["p1"] + 0.8 * radius[:4])                                                        # ... riding on its surface, not in it
 
 
+# ------------------------------------------- purrline sand: the occupancy grid and the moving solid boxes (WORKLIST.md, Purrline sand mode, C)
+# A PRODUCT VARIANT of the law (``make_law_purrline``, ``PURRLINE_ARGUMENTS``): the default and wheel laws are untouched.
+class _EagerPurrline:
+    """The purrline variant as plain AbstractTensor ops, called like a piece: columns in, outputs out."""
+
+    def __init__(self, n, active=None):
+        self.law, self.batch = F.make_law_purrline(n, active), n
+
+    def __call__(self, *columns):
+        tensors = [AbstractTensor.get_tensor(np.asarray(c, dtype=np.float64)) for c in columns]
+        return tuple(np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (self.batch,)).copy() for v in self.law(*tensors))
+
+
+def _purrline_world(mask=None, falling=(), n=4096):
+    """The variant's uniforms (``n`` ids' basin) with the game's mask and falling items written the way the page writes them: (uniforms dict, board map)."""
+    spec = F.sdf_preset("sdf_purrline", F.chamber_basin("sdf_purrline", n))
+    game = {"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [1] * 64 if mask is None else list(mask), "falling": list(falling)}
+    u = {k: float(v) for k, v in F.uniforms(n=n, shape="sdf_purrline").items()}
+    u.update(F.purrline_defaults(spec["map"]))
+    u.update(F.purrline_inputs(game, spec["map"]))
+    return u, spec["map"]
+
+
+def _board_to_fountain(m, bx, by):
+    return m["cx"] + (np.asarray(bx) - 4.0) * m["cell"], m["cy"] - (np.asarray(by) - 4.0) * m["cell"]
+
+
+def _union_reference(mask, m, xs, ys):
+    """The union of the occupied cells' distance OUTSIDE it (exact, float64): the minimum over cells of the box distance."""
+    c, best = m["cell"], np.full(len(xs), 1e9)
+    for r in range(8):
+        for col in range(8):
+            if mask[8 * r + col]:
+                cx, cy = _board_to_fountain(m, col + 0.5, r + 0.5)
+                qx, qy = np.abs(xs - cx) - 0.5 * c, np.abs(ys - cy) - 0.5 * c
+                best = np.minimum(best, np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0))
+    return best
+
+
+def test_the_occupancy_grid_distance_matches_the_mask_with_an_analytic_gradient():
+    rng = np.random.default_rng(11)
+    mask = (rng.random(64) < 0.6).astype(int)
+    mask[3 * 8 + 3] = 0                                      # a known hole, and a known solid beside it
+    mask[3 * 8 + 4] = 1
+    u, m = _purrline_world(mask)
+    c = m["cell"]
+    # (1) the packed words: rows 0-2 are word 0, 3-5 word 1, 6-7 word 2, a byte per row, column c = bit c
+    words = [int(u[f"og_w{k}"]) for k in range(3)]
+    for r in range(8):
+        for col in range(8):
+            assert (words[r // 3] >> (8 * (r % 3) + col)) & 1 == mask[8 * r + col]
+    assert all(w < 2 ** 24 for w in words)
+    # (2) cell centres: inside a solid cell < 0, in a hole > 0 (its nearest solid is at most a cell away)
+    bx, by = np.meshgrid(np.arange(8) + 0.5, np.arange(8) + 0.5)
+    xs, ys = _board_to_fountain(m, bx.ravel(), by.ravel())
+    d, nx, ny = F.grid_distance(u, xs, ys)
+    assert np.all(d[mask == 1] < -1e-3) and np.all(d[mask == 0] > 1e-3)
+    # (3) outside the union the distance IS the nearest occupied cell's box distance, to f32 precision
+    px = rng.uniform(-4.2 * c, 4.2 * c, 3000)
+    py = rng.uniform(m["cy"] - 4.0 * c - 0.3 * c, m["cy"] + 4.0 * c + 0.3 * c, 3000)
+    ref = _union_reference(mask, m, px, py)
+    d, nx, ny = F.grid_distance(u, px, py)
+    out = (ref > 0.0) & (ref < 0.9 * c)
+    assert out.sum() > 400 and np.max(np.abs(d[out] - ref[out])) < 2e-5
+    assert np.all(d[ref < -1e-4] <= 1e-5)                       # inside: never positive
+    assert np.allclose(np.hypot(nx, ny), 1.0, atol=1e-3)
+    # (4) EXACT on cell faces: the top face of an occupied cell with the grid's edge above it is a zero, and so is the face between a hole and a solid
+    top_y = m["cy"] + 4.0 * c
+    cols_top = [col for col in range(8) if mask[col]]
+    fx = np.array([_board_to_fountain(m, col + 0.3, 0)[0] for col in cols_top])
+    assert len(cols_top) > 2 and np.max(np.abs(F.grid_distance(u, fx, np.full(len(fx), top_y))[0])) < 2e-6
+    side_x, side_y = _board_to_fountain(m, 4.0, 3.5)                    # the face between the hole (3,3) and the solid (4,3): the solid's left face
+    assert abs(F.grid_distance(u, np.array([side_x]), np.array([side_y]))[0][0]) < 2e-6
+    # (5) the gradient is analytic: it matches the central difference of the distance, away from the medial axes
+    e = 2.0e-3
+    gx = (F.grid_distance(u, px + e, py)[0] - F.grid_distance(u, px - e, py)[0]) / (2 * e)
+    gy = (F.grid_distance(u, px, py + e)[0] - F.grid_distance(u, px, py - e)[0]) / (2 * e)
+    smooth = out & (ref > 0.02 * c) & (np.abs(np.hypot(gx, gy) - 1.0) < 0.05)
+    assert smooth.sum() > 300
+    err = np.maximum(np.abs(nx - gx), np.abs(ny - gy))[smooth]
+    assert np.quantile(err, 0.99) < 3e-2 and err.max() < 0.1
+    # (6) inside a solid cell the gradient points out through a face that borders a FREE cell (here: into the hole, from the solid beside it)
+    gxh, gyh = _board_to_fountain(m, 4.05, 3.5)                          # inside (4,3), near its left face; (3,3) is the hole
+    dh, nxh, nyh = F.grid_distance(u, np.array([gxh]), np.array([gyh]))
+    assert dh[0] < 0 and nxh[0] == pytest.approx(-1.0) and abs(nyh[0]) < 1e-6 and dh[0] == pytest.approx(-0.05 * c, abs=1e-5)
+
+
+def test_a_grain_inside_a_newly_solid_cell_leaves_through_the_free_face_never_into_an_occupied_neighbour():
+    """A cell with ONE free face (the top): wherever the grain is inside it, the gradient is straight up; with a free side it is that side."""
+    mask = [1] * 64
+    mask[3 * 8 + 3] = 0                                      # a hole at (3,3); the cell (2,3) above it is solid ... free the top of (1,3) too
+    mask[1 * 8 + 3] = 0                                      # (1,3) is a hole: (2,3) has its top free, the hole below (3,3) is free too
+    u, m = _purrline_world(mask)
+    c = m["cell"]
+    rng = np.random.default_rng(4)
+    bx, by = 3.5 + rng.uniform(-0.4, 0.4, 200), 2.5 + rng.uniform(-0.4, 0.4, 200)       # inside (2,3): free above (1,3) and below (3,3), solid left and right
+    d, nx, ny = F.grid_distance(u, *_board_to_fountain(m, bx, by))
+    assert np.all(d < 0) and np.all(np.abs(nx) < 1e-6) and np.all(np.abs(ny) == 1.0)      # out through the top or the bottom, never sideways into (2,2) / (2,4)
+    mask2 = [1] * 64
+    mask2[2 * 8 + 3] = 0                                     # only the cell above (3,3) is free
+    u2, _ = _purrline_world(mask2)
+    d2, nx2, ny2 = F.grid_distance(u2, *_board_to_fountain(m, 3.5 + rng.uniform(-0.4, 0.4, 200), 3.5 + rng.uniform(-0.4, 0.4, 200)))
+    assert np.all(d2 < 0) and np.all(np.abs(nx2) < 1e-6) and np.all(ny2 == 1.0)             # out of the top into the free cell, from anywhere in the cell
+    # the distance is to that face, not to a shared one: the cell centre is half a cell from it
+    dc, _, _ = F.grid_distance(u2, *_board_to_fountain(m, np.array([3.5]), np.array([3.5])))
+    assert dc[0] == pytest.approx(-0.5 * c, abs=1e-5)
+
+
+def test_an_unused_grid_and_unused_boxes_add_exact_zeros_so_the_variant_is_the_default_law():
+    """The variant with ``og_on`` 0 and every box off is the DEFAULT law bit for bit (whatever the unused fields hold); and the default law's
+    argument list has none of the variant's uniforms."""
+    assert not set(F.PURRLINE_UNIFORMS) & set(F.ARGUMENTS) and F.PURRLINE_ARGUMENTS == F.ARGUMENTS + F.PURRLINE_UNIFORMS
+    assert F.OUTPUTS == F.OUTPUTS and not any("purrline" in k for k in F.RUNTIME_INPUTS)
+    base = F.initial_columns(256, mix=1.0, shape="sdf_toy")
+    default, variant = _Eager(256), _EagerPurrline(256)
+    rng = np.random.default_rng(3)
+    m = 120
+    placed, _ = _placed(default, base, {i: (0.0, 0.0) for i in range(m)})
+    placed["x"][:m], placed["y"][:m] = rng.uniform(-0.6, 0.6, m), rng.uniform(0.05, 1.5, m)
+    placed["vx"][:m], placed["vy"][:m] = rng.normal(0, 1.0, m), rng.normal(0, 1.0, m)
+    junk = dict(placed, **{name: np.float64(0.37) for name in F.PURRLINE_UNIFORMS})
+    junk["og_on"] = np.float64(0.0)
+    for k in range(F.MB_COUNT):
+        junk[f"mb{k}_on"] = np.float64(0.0)
+    a = _eager_run(default, placed, 20)
+    state = {k: np.array(junk[k], dtype=np.float64) for k in F.STATE}
+    for _ in range(20):
+        out = dict(zip(F.OUTPUTS, variant(*[state[k] if k in state else junk[k] for k in F.PURRLINE_ARGUMENTS])))
+        state = {k: out[k + "_next"] for k in F.STATE}
+    assert all(np.array_equal(a[k], state[k]) for k in F.STATE)
+
+
+def test_the_default_products_digest_ignores_the_purrline_regions():
+    """The variant lives between ``# <purrline>`` markers; the default and wheel products' source text leaves them out (so they are the products
+    they were), the variant's own digest keeps them."""
+    text = B._sources()
+    assert "# <purrline>" not in text and "make_law_purrline" not in text and "_PURRLINE" not in text
+    assert B.purrline_digest("4k") != B.digest("4k") and B.digest("4k") == B.digest("4k", False)
+    assert "make_law_purrline" in B._module_sources(False)
+
+
+class _PL:
+    """``_placed`` / ``_eager_run`` take the law's module for its name lists: the variant's argument list."""
+    STATE, DIAGNOSTICS, OUTPUTS, ARGUMENTS = F.STATE, F.DIAGNOSTICS, F.OUTPUTS, F.PURRLINE_ARGUMENTS
+
+
+def _purrline_eager(n=4, gravity=(0.0, -F.G)):
+    cols = F.purrline_columns(n, active=4096)
+    law = _EagerPurrline(n, 4096)
+    cols["age"][:] = -1.0e9
+    cols["grav_x"], cols["grav_y"] = np.float64(gravity[0]), np.float64(gravity[1])
+    return law, cols
+
+
+def _run_columns(law, cols, steps, each=None):
+    state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
+    out = {}
+    track = []
+    for step in range(steps):
+        out = dict(zip(F.OUTPUTS, law(*[state[k] if k in state else cols[k] for k in F.PURRLINE_ARGUMENTS])))
+        state = {k: out[k + "_next"] for k in F.STATE}
+        track.append((state["x"][0], state["y"][0], state["vx"][0], state["vy"][0]))
+        if each is not None:
+            each(step, cols, state)
+    return state, np.array(track), out
+
+
+def test_a_grain_resting_on_an_occupied_cell_falls_through_when_the_cell_becomes_a_hole():
+    mask = [1] * 64
+    law, cols = _purrline_eager(gravity=(0.0, -4.0 * F.G))                   # (4 g: the fall is short; the contact law is the same)
+    u, m = _purrline_world(mask)
+    c = m["cell"]
+    cols.update({k: np.float64(v) for k, v in u.items() if k.startswith(("og_", "mb"))})
+    top = m["cy"] + 4.0 * c
+    x0 = float(_board_to_fountain(m, 3.5, 0)[0])
+    placed, probe = _placed(law, cols, {0: (x0, top + 0.05)}, _PL)
+    radius = float(probe[0])
+    # phase 1: it settles on the top face of the cell and stays there
+    state, track, out = _run_columns(law, placed, 240)
+    assert abs(track[-1, 1] - (top + radius)) < 0.25 * radius and abs(track[-1, 3]) < 0.05 and float(out["n_out"][0]) == 0
+    # phase 2: the game empties the cell below it (the mask is a runtime input: no rebuild) AND the one under that
+    hole = list(mask)
+    hole[3], hole[8 + 3] = 0, 0
+    placed.update({k: np.float64(v) for k, v in F.purrline_inputs({"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": hole, "falling": []}, m).items()})
+    for k in F.STATE:
+        placed[k] = np.array(state[k], dtype=np.float64)
+    _, track2, out2 = _run_columns(law, placed, 330)
+    assert track2[:, 1].min() < top - 1.5 * c                  # it fell through two rows of holes ...
+    rest = top - 2.0 * c + radius                              # ... onto the face of the first solid cell below them (it bounces a little first)
+    assert rest - 0.5 * radius < track2[-1, 1] < rest + 0.35 * c and track2[:, 1].min() > rest - radius
+    assert abs(track2[-1, 0] - x0) < 0.5 * c and float(out2["n_nan"][0]) == 0
+
+
+def test_a_moving_box_pushes_a_resting_grain_with_its_own_velocity_and_is_not_slowed():
+    law, cols = _purrline_eager(gravity=(0.0, 0.0))                          # no gravity: the push alone
+    v, half = 0.8, 0.1
+    start = -0.5
+    u, m = _purrline_world(None, [])
+    cols.update({k: np.float64(x) for k, x in u.items() if k.startswith(("og_", "mb"))})
+    y_mid = m["cy"] + 4.0 * m["cell"] + 0.6 * m["cell"]                      # in the headroom over the board
+    cols.update({"mb0_on": np.float64(1.0), "mb0_cx": np.float64(start), "mb0_cy": np.float64(y_mid), "mb0_hw": np.float64(half),
+                 "mb0_hh": np.float64(half), "mb0_rc": np.float64(0.02), "mb0_vx": np.float64(v), "mb0_vy": np.float64(0.0)})
+    placed, probe = _placed(law, cols, {0: (0.0, float(y_mid))}, _PL)
+    pose = []
+
+    def drive(step, cols_, state):                    # POSITION-DRIVEN: the page moves the box; the law never does
+        cols_["mb0_cx"] = np.float64(start + v * (step + 1) * F.DT)
+        pose.append(float(cols_["mb0_cx"]))
+    state, track, out = _run_columns(law, placed, 330, drive)
+    assert track[:100, 2].max() < 1e-6                                       # before contact it is at rest
+    assert abs(track[-1, 2] - v) < 0.12 * v and abs(track[-40:, 2].mean() - v) < 0.12 * v     # (the contact spring overshoots a little) it rides in front of the box
+    assert track[-1, 0] > 0.15                                              # it was carried a good way
+    assert abs(pose[-1] - (start + v * 330 * F.DT)) < 1e-9                  # the box is exactly where the page put it: the law holds no state to slow
+    assert not any(name.startswith("mb") for name in F.STATE + F.OUTPUTS) and float(out["n_nan"][0]) == 0
+
+
+def test_a_box_pressing_sand_onto_the_board_cannot_fire_it_out_the_imparted_speed_is_bounded():
+    """A box drives down at 6 cells/s onto a grain resting on a solid cell (a squeeze: the box one way, the cell the other).  The grain is held between
+    them by the saturating contacts and its speed stays within the contact's own saturation speed (omega x 6 radii) of the box; and a grain inside a
+    cell that has just become solid leaves through its free face within a few steps, at a bounded speed, never downward through the occupied cell."""
+    law, cols = _purrline_eager(gravity=(0.0, -F.G))
+    mask = [1] * 64
+    u, m = _purrline_world(mask)
+    c = m["cell"]
+    cols.update({k: np.float64(v) for k, v in u.items() if k.startswith(("og_", "mb"))})
+    top = m["cy"] + 4.0 * c
+    x0 = float(_board_to_fountain(m, 3.5, 0)[0])
+    placed, probe = _placed(law, cols, {0: (x0, top + 0.012), 1: (x0 + 0.05, top + 0.012), 2: (x0, top + 0.1)}, _PL)
+    radius = float(probe[0])
+    vbox = 6.0 * c                                                           # 6 board cells per second
+    y0 = top + 0.5 * c + 0.03
+    placed.update({"mb0_on": np.float64(1.0), "mb0_cx": np.float64(x0), "mb0_cy": np.float64(y0), "mb0_hw": np.float64(0.5 * c), "mb0_hh": np.float64(0.5 * c),
+                   "mb0_rc": np.float64(0.12 * c), "mb0_vx": np.float64(0.0), "mb0_vy": np.float64(-vbox)})
+    peak = [0.0]
+
+    def drive(step, cols_, state):
+        cols_["mb0_cy"] = np.float64(max(y0 - vbox * (step + 1) * F.DT, top + 0.5 * c - 3.0 * radius))   # the box stops pressing 3 radii into the cell face's reach
+        peak[0] = max(peak[0], float(np.hypot(state["vx"][:3], state["vy"][:3]).max()))
+    cap = 150.0 * 6.0 * radius + vbox
+    state, track, out = _run_columns(law, placed, 150, drive)
+    assert float(out["n_out"][0]) == 0 and float(out["n_nan"][0]) == 0 and peak[0] <= cap
+    d_in = F.grid_distance(dict(placed), state["x"][:3], state["y"][:3])[0]
+    assert np.all(d_in > -0.5 * radius)                                      # the grains are out of the cells (within a half radius of their face)
+    # a cell that has just become solid around a resting grain
+    law2, cols2 = _purrline_eager(gravity=(0.0, -F.G))
+    hole = [1] * 64
+    hole[3 * 8 + 3] = 0
+    hole[2 * 8 + 3] = 0                                                      # a two-cell hole (2,3),(3,3); the grain sits in the lower one ...
+    u2, _ = _purrline_world(hole)
+    cols2.update({k: np.float64(v) for k, v in u2.items() if k.startswith(("og_", "mb"))})
+    xc, yc = (float(v) for v in _board_to_fountain(m, 3.5, 3.4))
+    placed2, probe2 = _placed(law2, cols2, {0: (xc, yc)}, _PL)
+    hole2 = [1] * 64
+    hole2[2 * 8 + 3] = 0                                                     # ... and the lower one (3,3) turns solid under it: free face = the top, into (2,3)
+    placed2.update({k: np.float64(v) for k, v in F.purrline_inputs({"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": hole2, "falling": []}, m).items()})
+    _, track2, out2 = _run_columns(law2, placed2, 25)
+    ytop_free = _board_to_fountain(m, 3.5, 3.0)[1]                           # the face between the two cells
+    assert np.all(np.diff(track2[:8, 1]) > -1e-9) and track2[-1, 1] > float(ytop_free) - 0.5 * float(probe2[0])      # it only moves UP, out of the solid cell
+    assert np.hypot(track2[:, 2], track2[:, 3]).max() <= 150.0 * 6.0 * float(probe2[0]) + 1e-6 and float(out2["n_out"][0]) == 0
+
+
+def test_the_page_write_maps_the_board_into_the_chamber_with_y_flipped_and_the_lowest_items_first():
+    spec = F.sdf_preset("sdf_purrline", F.chamber_basin("sdf_purrline", 4096))
+    m = spec["map"]
+    falling = [{"x": 2.5, "y": -3.0, "vx": 0.0, "vy": 12.0}, {"x": 5.5, "y": -1.0, "vx": 0.0, "vy": 20.0}] + [{"x": 0.5, "y": -9.0 - k, "vx": 0.0, "vy": 1.0} for k in range(6)]
+    game = {"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [1, 0] * 32, "falling": falling}
+    w = F.purrline_inputs(game, m)
+    assert w["mb0_on"] == 1.0 and w["mb0_cx"] == pytest.approx(m["cx"] + 1.5 * m["cell"], abs=1e-6)       # the lowest (y = -1) first; x 5.5 -> +1.5 cells
+    assert w["mb0_cy"] == pytest.approx(m["cy"] + 5.0 * m["cell"], abs=1e-5)                                  # y = -1 is 5 cells ABOVE the board centre (4): up is +
+    assert w["mb0_vy"] == pytest.approx(-20.0 * m["cell"], rel=1e-5) and w["mb0_vx"] == 0.0                   # falling (y down +) is velocity DOWN (-) in the chamber
+    assert w["mb0_hw"] == pytest.approx(0.5 * m["cell"], rel=1e-6) and w["mb1_cx"] == pytest.approx(m["cx"] - 1.5 * m["cell"], abs=1e-6)
+    assert sum(w[f"mb{k}_on"] for k in range(F.MB_COUNT)) == 6.0                                              # eight items, six boxes
+    none = F.purrline_inputs({**game, "falling": []}, m)
+    assert all(none[f"mb{k}_{f}"] == 0.0 for k in range(F.MB_COUNT) for f in F.MB_FIELDS)
+    assert w["og_cell"] == pytest.approx(m["cell"], rel=1e-6) and set(w) == set(F.PURRLINE_UNIFORMS) <= set(F.PURRLINE_RUNTIME_INPUTS)
+
+
 JS_PURRLINE = """
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const [dir] = process.argv.slice(2);
 const {purrlineInputs} = await import(pathToFileURL(`${dir}/compute.js`).href);
-const {game, map, slots, expect} = JSON.parse(fs.readFileSync(`${dir}/case.json`, 'utf8'));
-const got = purrlineInputs(game, map, slots);
+const {game, map, boxes, expect} = JSON.parse(fs.readFileSync(`${dir}/case.json`, 'utf8'));
+const got = purrlineInputs(game, map, boxes);
 assert.deepEqual(Object.keys(got).sort(), Object.keys(expect).sort());
 for (const k of Object.keys(expect)) assert.ok(Math.fround(got[k]) === Math.fround(expect[k]), `${k}: ${got[k]} vs ${expect[k]}`);
 console.log('ok');
@@ -1988,7 +2076,7 @@ console.log('ok');
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's purrline sand write")
 def test_the_pages_purrline_write_equals_pythons(tmp_path):
-    """web/compute.js ``purrlineInputs`` (what the page writes to the law's solids each batch) is fountain.py's ``purrline_inputs``."""
+    """web/compute.js ``purrlineInputs`` (what the page writes to the variant's solids each batch) is fountain.py's ``purrline_inputs``."""
     m = F.sdf_preset("sdf_purrline", F.chamber_basin("sdf_purrline", 4096))["map"]
     rng = np.random.default_rng(2)
     game = {"rows": 8, "cols": 8, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [int(v) for v in rng.integers(0, 2, 64)],
@@ -1997,6 +2085,5 @@ def test_the_pages_purrline_write_equals_pythons(tmp_path):
     for name in ("recording.js", "particle_styles.js", "noise_filter.js"):
         shutil.copyfile(web / name, tmp_path / name)
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
-    (tmp_path / "case.json").write_text(json.dumps({"game": game, "map": m, "slots": {"og": F.OG_SLOT, "mb": list(F.MB_SLOTS)},
-                                                    "expect": F.purrline_inputs(game, m)}), encoding="utf-8")
+    (tmp_path / "case.json").write_text(json.dumps({"game": game, "map": m, "boxes": F.MB_COUNT, "expect": F.purrline_inputs(game, m)}), encoding="utf-8")
     assert _run_node(tmp_path, JS_PURRLINE, "compute.js").strip() == "ok"
