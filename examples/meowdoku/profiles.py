@@ -118,7 +118,10 @@ class Profiles:
         with self.lock:
             inv = self._inventory(self.data["profiles"].setdefault(name, {"created": time.time(), "games": {}}))
             streak = int(inv["streak"].get(game, 0))
-            if game in STREAK_GAMES:
+            if game in STREAK_GAMES and result.get("overtime"):
+                streak = 0                   # an overtime win: the regulation loss still breaks the streak
+                inv["streak"][game] = 0
+            elif game in STREAK_GAMES:
                 streak += 1
                 inv["streak"][game] = streak
             multiplier = min(MULTIPLIER_MAX, streak) if game in STREAK_GAMES else 1

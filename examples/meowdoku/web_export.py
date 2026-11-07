@@ -238,10 +238,10 @@ def export_assets(out: Path) -> dict:
     # The other games' pieces: letters A-Z, the six chess pieces (the filled
     # glyphs U+265A..U+265F), a disc for checkers; DejaVu Sans has all of
     # them with light outlines.
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+":
         pack(letter, *token_mesh(letter, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
     # Wordle's rack keys: Enter (U+21B5) and Backspace (U+232B); without the glyph the key is a blank button that still works
-    for name, ch in (("enter", "↵"), ("back", "⌫")):
+    for name, ch in (("enter", "↵"), ("back", "⌫"), ("giveup", "✕")):
         try:
             pack(name, *token_mesh(ch, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1))
         except Exception as error:                                   # noqa: BLE001 - a missing glyph is not an export failure
@@ -515,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
-    for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "compute.js", "recording.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js"):
+    for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "compute.js", "recording.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "wordle_layout.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
