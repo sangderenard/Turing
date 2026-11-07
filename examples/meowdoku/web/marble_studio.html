@@ -25,8 +25,13 @@
 <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div></div>
 <aside><h1>Design a cat's-eye</h1><p>Turn a real glass shell around a dyed inclusion. Every surface uses the exported Pluck material tables and Phong shader.</p>
   <h2>Shape</h2><div class="grid">
+    <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="clear">Clear shell</option></select></label>
+    <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
+    <label>Outer material<select id="shell"></select></label>
     <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
     <label>Accent material<select id="accent"><option value="marble_milk_glass">Milk glass</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
+    <label>Confetti material<select id="confetti-material"></select></label>
+    <label>Confetti chips <output id="confetti-count-out"></output><input id="confetti-count" type="range" min="30" max="500" value="220"></label>
     <label>Width <output id="width-out"></output><input id="width" type="range" min="8" max="42" value="28"></label>
     <label>Length <output id="length-out"></output><input id="length" type="range" min="40" max="85" value="75"></label>
     <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="18"></label>
@@ -35,10 +40,31 @@
     <label>Twist along curve <output id="twist-out"></output><input id="twist" type="range" min="-320" max="320" value="90"></label>
     <label>Tip taper <output id="tip-out"></output><input id="tip" type="range" min="60" max="300" value="135"></label>
     <label>Ribbon flare <output id="flare-out"></output><input id="flare" type="range" min="0" max="60" value="18"></label>
+    <label>Ribbon phase offset <output id="phase-out"></output><input id="phase" type="range" min="0" max="360" value="0"></label>
     <button id="reroll" class="wide">Reroll dyed shape</button>
   </div>
+  <h2>Outer shell</h2><div class="grid">
+    <label class="wide"><input id="opaque" type="checkbox"> Opaque outer material (transmission 0, opacity 1)</label>
+    <label>Enamel shell coverage <output id="coverage-out"></output><input id="coverage" type="range" min="0" max="100" value="0"></label>
+    <label><input id="checker" type="checkbox" checked> Lit checkerboard scene</label>
+    <label>Exterior color bands <output id="band-count-out"></output><input id="band-count" type="range" min="0" max="12" value="0"></label>
+    <label>Band width <output id="band-width-out"></output><input id="band-width" type="range" min="2" max="48" value="18"></label>
+    <label>Band swirl <output id="band-curve-out"></output><input id="band-curve" type="range" min="-400" max="400" value="120"></label>
+    <label>Paint A color<input id="paint-a-color" type="color" value="#3769a8"></label>
+    <label>Paint B color<input id="paint-b-color" type="color" value="#e7b35a"></label>
+  </div>
+  <h2>Physical properties</h2><div class="grid">
+    <label>Marble radius (mm)<input id="radius-mm" type="number" min="1" max="100" step="0.1" value="10"></label>
+    <label>Shell density (kg/m³)<input id="shell-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Dye density (kg/m³)<input id="eye-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Accent density (kg/m³)<input id="accent-density" type="number" min="1" max="30000" step="10" value="2500"></label>
+    <label>Confetti density (kg/m³)<input id="confetti-density" type="number" min="1" max="30000" step="10" value="7800"></label>
+    <label>Enamel density (kg/m³)<input id="enamel-density" type="number" min="1" max="30000" step="10" value="3000"></label>
+    <output id="mass-report" class="wide"></output>
+    <p class="wide">Volume integrals use each closed triangle component. The shell volume subtracts inclusions; intersecting inclusions are not unioned. Enamel is a thin coating using the shader thickness in nm. Results are nominal where components overlap.</p>
+  </div>
   <h2>Material</h2><div class="grid">
-    <label class="wide">Edit layer<select id="layer"><option value="glass">Outer glass</option><option value="eye">Dyed eye</option><option value="accent">Accent</option></select></label>
+    <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>
     <label>Albedo<input id="albedo" type="color"></label><label>Inner color<input id="inner" type="color"></label>
     <label>Roughness <output id="roughness-out"></output><input id="roughness" type="range" min="0" max="100" value="10"></label>
     <label>Metallic <output id="metallic-out"></output><input id="metallic" type="range" min="0" max="100" value="0"></label>
@@ -48,10 +74,8 @@
     <label>Ambient <output id="ambient-out"></output><input id="ambient" type="range" min="0" max="12" value="5"></label>
     <label>Specular <output id="specular-out"></output><input id="specular" type="range" min="0" max="100" value="80"></label>
     <label>Shininess <output id="shininess-out"></output><input id="shininess" type="range" min="1" max="300" value="120"></label>
-    <label>Grain <output id="grain-out"></output><input id="grain" type="range" min="0" max="30" value="0"></label>
     <label>Emission<input id="emission" type="color"></label>
     <label>Enamel thickness (nm) <output id="enamel-thickness-out"></output><input id="enamel-thickness" type="range" min="0" max="1000" value="0"></label>
-    <label>Enamel roughness <output id="enamel-roughness-out"></output><input id="enamel-roughness" type="range" min="0" max="100" value="5"></label>
     <label>Enamel index <output id="enamel-ior-out"></output><input id="enamel-ior" type="range" min="100" max="250" value="152"></label>
     <label>Enamel color<input id="enamel-color" type="color"></label>
     <button id="reset-material" class="wide">Restore catalogue material</button>

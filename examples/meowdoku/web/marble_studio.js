@@ -1,6 +1,7 @@
 // A close-up on the same exported Pluck Phong shader and MaterialDatabase
 // tables used by the game. All edits are local to this preview.
 import { catEyeMarble } from "./marble_mesh.js";
+import { marbleMass } from "./marble_mass.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
@@ -39,7 +40,8 @@ const hex = (rgb) => "#" + rgb.map((v) => Math.round(Math.max(0, Math.min(1, v))
 const rgb = (value) => [1,3,5].map((k) => parseInt(value.slice(k,k+2),16)/255);
 
 function floatTexture(table, unit) {
-  const data = new Float32Array(table.data), width = 256, height = Math.max(1, Math.ceil(data.length / width));
+  const data = new Float32Array(table.data.length + 3*table.floats_per_record), width = 256, height = Math.max(1, Math.ceil(data.length / width));
+  data.set(table.data);
   const tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -76,17 +78,56 @@ function dispose(mesh) {
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
 
-const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare"];
+const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","confetti-count","coverage","band-count","band-width","band-curve"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
-  specular:["phong",1,100], shininess:["phong",2,1], grain:["phong",3,100],
-  "enamel-thickness":["enamel",0,1], "enamel-roughness":["enamel",3,100], "enamel-ior":["enamel",1,100] };
-let tables, ids, P, interior, glass, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45;
-const idFor = (layer) => ids[layer === "glass" ? "marble_clear_glass" : $(layer === "eye" ? "eye" : "accent").value];
+  specular:["phong",1,100], shininess:["phong",2,1],
+  "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
+let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45;
+let opaqueSaved = null;
+const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
+  ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material"}[layer]).value];
 const slot = (table, id, offset) => id * tables[table].table.floats_per_record + offset;
 const read = (table, id, offset) => tables[table].data[slot(table,id,offset)];
 const write = (table, id, offset, value) => { tables[table].data[slot(table,id,offset)] = value; tables[table].update(); };
 const selected = () => idFor($("layer").value);
+function copyCoating() {
+  for (const table of Object.values(tables)) {
+    const f=table.table.floats_per_record, source=idFor("glass")*f;
+    table.data.set(table.data.subarray(source,source+f),coatedId*f); table.update();
+  }
+  if (+$("coverage").value > 0) {
+    write("enamel",coatedId,0,Math.max(300,read("enamel",coatedId,0)));
+  }
+}
+function copyPaint() {
+  for (const table of Object.values(tables)) {
+    const f=table.table.floats_per_record, source=ids.ceramic_porcelain*f;
+    for (const id of [paintAId,paintBId]) table.data.set(table.data.subarray(source,source+f),id*f);
+    table.update();
+  }
+  for (const [id,color] of [[paintAId,$("paint-a-color").value],[paintBId,$("paint-b-color").value]]) {
+    rgb(color).forEach((v,k)=>{tables.pbr.data[slot("pbr",id,k)]=v;});
+    write("pbr",id,5,0); write("pbr",id,7,1);
+  }
+}
+function reportMass(geometry) {
+  const densityByRole={shell:+$("shell-density").value,eye:+$("eye-density").value,
+    accent:+$("accent-density").value,confetti:+$("confetti-density").value,enamel:+$("enamel-density").value};
+  const result=marbleMass(geometry,{radiusM:+$("radius-mm").value/1000,densityByRole,
+    enamelMaterial:coatedId,enamelThicknessM:read("enamel",coatedId,0)*1e-9});
+  const diag=[0,1,2].map((k)=>result.inertiaKgM2[k][k].toExponential(3)).join(", ");
+  $("mass-report").textContent=`Nominal mass ${result.massKg.toFixed(6)} kg · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm · principal-axis tensor diagonal (${diag}) kg·m² · ${result.components.length-1} inclusions`;
+}
+function checkerboard() {
+  const faces=[], dark=ids.stone_onyx, light=ids.ceramic_porcelain;
+  for (let x=-4;x<4;x++) for (let y=-4;y<4;y++) {
+    const z=-1.8, a=[x,y,z],b=[x+1,y,z],c=[x+1,y+1,z],d=[x,y+1,z];
+    const n=[0,0,1], id=(x+y)&1 ? dark : light;
+    faces.push([a,b,c,id,[n,n,n]],[a,c,d,id,[n,n,n]]);
+  }
+  return mesh(faces);
+}
 function syncMaterial() {
   const id = selected();
   $("albedo").value = hex([0,1,2].map((k) => read("pbr",id,k)));
@@ -101,28 +142,62 @@ function syncMaterial() {
 }
 function rebuild() {
   dispose(interior); dispose(glass);
-  const { interior: inside, glass: outside, triangleCount } = catEyeMarble({
-    glass: idFor("glass"), eye: idFor("eye"), accent: idFor("accent") }, {
+  const geometry = catEyeMarble({
+    glass: idFor("glass"), enamel: coatedId, eye: idFor("eye"), accent: idFor("accent"), confetti: idFor("confetti"),
+    paintA:paintAId,paintB:paintBId }, {
     rings:96, segments:128, eyeWidth:+$("width").value/100,
     eyeLength:+$("length").value/100, eyeCurve:+$("curve").value/100,
     strandCount:+$("strands").value, ribbonThickness:+$("thickness").value/1000,
     ribbonTwist:+$("twist").value/100, ribbonTip:+$("tip").value/100,
-    ribbonFlare:+$("flare").value/100, seed });
-  interior = mesh(inside); glass = mesh(outside);
+    ribbonFlare:+$("flare").value/100, ribbonPhase:+$("phase").value*Math.PI/180,
+    confettiCount:+$("confetti-count").value, enamelCoverage:+$("coverage").value/100,
+    paintBandCount:+$("band-count").value,paintBandWidth:+$("band-width").value/100,
+    paintBandCurve:+$("band-curve").value/100,
+    kind:$("kind").value, seed });
+  const {interior:inside,glass:outside,triangleCount}=geometry;
+  interior = mesh(inside); glass = mesh(outside); lastGeometry=geometry;
   for (const name of dimensions) $(name+"-out").value = $(name).value;
-  message.textContent = `${triangleCount.toLocaleString()} triangles · dye #${seed}`;
+  message.textContent = `${triangleCount.toLocaleString()} triangles · pattern #${seed}`;
+  reportMass(geometry);
 }
 function controls() {
   for (const name of dimensions) $(name).addEventListener("input", rebuild);
-  for (const name of ["eye","accent"]) $(name).addEventListener("change", () => { rebuild(); syncMaterial(); });
+  for (const name of ["eye","accent","confetti-material","kind"]) $(name).addEventListener("change", () => { rebuild(); syncMaterial(); });
+  $("shell").addEventListener("change", () => { copyCoating(); rebuild(); syncMaterial(); });
+  for(const field of ["radius-mm","shell-density","eye-density","accent-density","confetti-density","enamel-density"])
+    $(field).addEventListener("input",()=>{ if(lastGeometry) reportMass(lastGeometry); });
+  for(const field of ["paint-a-color","paint-b-color"]) $(field).addEventListener("input",()=>{copyPaint();syncMaterial();});
+  $("preset").addEventListener("change",()=>{
+    const preset=$("preset").value;
+    if(preset==="classic") {$("kind").value="cat_eye";$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;}
+    if(preset==="galaxy") {$("kind").value="confetti";$("shell").value="marble_clear_glass";$("coverage").value=55;$("band-count").value=0;$("confetti-count").value=400;}
+    if(preset==="uniform") {$("kind").value="confetti";$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;$("confetti-count").value=500;}
+    if(preset==="bare") {$("kind").value="clear";$("coverage").value=0;$("band-count").value=0;}
+    if(preset==="porcelain") {$("kind").value="clear";$("shell").value="ceramic_porcelain";$("coverage").value=0;$("band-count").value=7;$("band-width").value=24;}
+    copyCoating();rebuild();syncMaterial();
+  });
+  $("coverage").addEventListener("input", () => { if (+$("coverage").value > 0 && !read("enamel",coatedId,0)) write("enamel",coatedId,0,300); syncMaterial(); });
+  $("opaque").addEventListener("change", () => {
+    const id=idFor("glass");
+    if ($("opaque").checked) {
+      opaqueSaved=[read("pbr",id,5),read("pbr",id,7),read("pbr",coatedId,5),read("pbr",coatedId,7)];
+      for (const target of [id,coatedId]) { write("pbr",target,5,0); write("pbr",target,7,1); }
+    } else if (opaqueSaved) {
+      for (const [k,target] of [id,coatedId].entries()) { write("pbr",target,5,opaqueSaved[k*2]); write("pbr",target,7,opaqueSaved[k*2+1]); }
+      opaqueSaved=null;
+    }
+    syncMaterial();
+  });
   $("layer").addEventListener("change", syncMaterial);
   $("reroll").addEventListener("click", () => { seed = (Math.random() * 0x7fffffff) | 0; rebuild(); });
   $("reset-material").addEventListener("click", () => { const id = selected();
+    if (id === coatedId) { copyCoating(); syncMaterial(); return; }
     for (const table of Object.values(tables)) { const f = table.table.floats_per_record, start = id*f;
       table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncMaterial(); });
   for (const [name,[table,offset,scale]] of Object.entries(properties)) $(name).addEventListener("input", () => {
     const value = +$(name).value; write(table,selected(),offset,value/scale);
     $(name+"-out").value = (value/scale).toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
+    if(name==="enamel-thickness" && lastGeometry) reportMass(lastGeometry);
   });
   for (const [name,table,offset] of [["albedo","pbr",0],["inner","phong",4],["emission","pbr",8],["enamel-color","enamel",4]])
     $(name).addEventListener("input", () => { const id = selected(); rgb($(name).value).forEach((v,k) => { tables[table].data[slot(table,id,offset+k)] = v; }); tables[table].update(); });
@@ -140,8 +215,9 @@ function frame() {
   if (P && interior) {
     const mv=multiply(translate(-distance),multiply(rotateX(pitch),rotateY(yaw)));
     gl.useProgram(P);
-    gl.uniformMatrix4fv(loc(P,"uMV"),false,mv);
-    gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),mv));
+    const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
+      gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
+    setTransform(mv);
     const lights=[[-2.5,3,3],[3,1,2],[-1,-2,-3]];
     gl.uniform1i(loc(P,"uNumLights"),3);
     gl.uniform3fv(loc(P,"uLightPos[0]"),new Float32Array(lights.flat()));
@@ -158,6 +234,10 @@ function frame() {
     gl.uniformMatrix4fv(loc(P,"uShadowMatrices[0]"),false,identity());
     gl.vertexAttribI4i(4,0,0,0,0); gl.vertexAttribI4i(5,1,0,0,0); gl.vertexAttrib3f(6,0,0,0); gl.vertexAttrib2f(3,0,0);
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+    if ($("checker").checked && checkerMesh) {
+      setTransform(translate(-distance)); gl.bindVertexArray(checkerMesh.vao);
+      gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
+    }
     gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
     gl.bindVertexArray(glass.vao); gl.drawArrays(gl.TRIANGLES,0,glass.count);
@@ -178,7 +258,14 @@ async function boot() {
     const source=fragment.replace(/^(#version[^\n]*\n)/,"$1#define PLUCK_TRANSMISSION 1\n");
     P=program(vertex,source);
     gl.useProgram(P);
+    coatedId=Math.max(...Object.values(ids))+1; paintAId=coatedId+1; paintBId=coatedId+2;
     tables=Object.fromEntries(Object.entries(assets.materials).map(([name,table])=>[name,floatTexture(table,{pbr:0,phong:1,enamel:2,texstack:3}[name])]));
+    const names=Object.keys(ids).filter((name)=>Number.isInteger(ids[name])).sort();
+    for (const [select,initial] of [["shell","marble_clear_glass"],["confetti-material","metal_gold"]]) {
+      for (const name of names) { const option=document.createElement("option"); option.value=name; option.textContent=name.replaceAll("_"," "); $(select).append(option); }
+      $(select).value=initial;
+    }
+    copyCoating(); copyPaint(); checkerMesh=checkerboard();
     for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
       uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10})) integer(P,name,unit);
     flatArray(4,[0,255,128,255]); flatArray(5,[255,255,255,255]); flatArray(6,[128,255,255,255]); flatArray(7,[0,0,0,0]);
