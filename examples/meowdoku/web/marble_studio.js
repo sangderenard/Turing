@@ -253,6 +253,9 @@ function controls() {
     for (const table of Object.values(tables)) { const f = table.table.floats_per_record, start = id*f;
       table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncMaterial(); });
   for (const [name,[table,offset,scale]] of Object.entries(properties)) $(name).addEventListener("input", () => {
+    if ((name==="transmission" || name==="opacity") && ["glass","enamel"].includes($("layer").value)) {
+      $("opaque").checked=false;opaqueSaved=null;
+    }
     const value = +$(name).value; write(table,selected(),offset,value/scale);
     $(name+"-out").value = (value/scale).toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
     if(name==="enamel-thickness" && lastGeometry) reportMass(lastGeometry);
