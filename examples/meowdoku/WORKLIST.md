@@ -25,6 +25,12 @@ deploy to 8766 as soon as work lands.
 - **Solvent flow (later):** a moving interstitial fluid with buoyancy and displacement (the space around grains), so real liquids and gases can be modelled; today's fluid is a still medium (drag + buoyancy only).
 - **Watch the case move (in progress, a render job):** a toggle (default off: the camera rides with the case) that rotates the fountain's objects in the world by the case angle; plus the backlit slide image on the plate (positive or negative) through the plate material's texture layers.
 
+## Chambers, plumbing and the waterwheel (the user, 2026-11-07), queued after the true 3D volume
+
+A. **Signed-distance chambers:** primitives (box/cube, sphere/circle, capsule/ramp, torus/annulus, hourglass, polygon prism, tetrahedron, peg array) composed by union/subtract as runtime uniforms; walls are the thick sided band contact from the composed SDF. Presets: box, funnel, hexagon, ramp, toroidal shell, sphere, cube, tetrahedron, hourglass, and the oil & glycerine toy (alternating ramps, an hourglass, a plinko field).
+B. **Ports, pumps and lines:** outlet regions park grains into a line (transit time from length and pump rate) and re-emit them FIFO at an inlet port, deterministically in law state; see-through glass tubing drawn with the transiting grains.
+C. **Hinged rigid actors + waterwheel:** a body of SDF primitives on one hinge, two-way contact forces, angle as law state, coupled through the engine_toy machine-sim torque path; preset "waterwheel fountain" (nozzle -> wheel -> outlet -> pump line -> nozzle).
+
 ## Render priority (the user, 2026-11-06)
 
 1. Colour modes: grain size, species breakdown; palettes (sea first); "stained glass" grains through the scene's Phong + glass pass; no opaque black backdrop behind the fountain.
