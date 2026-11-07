@@ -595,8 +595,18 @@ export class ComputeRuntime {
       out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)
       Object.assign(out, this.spec.tilt || {});
     }
+    // the gravity scale (a page slider): every source -- the default pull, the phone, the camera, a spinning case -- at k x
+    const k = this.gravityScale ?? 1;
+    if (k !== 1) for (const name of ["grav_x", "grav_y", "grav_z"]) if (name in out) out[name] *= k;
     for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
     return out;
+  }
+
+  setGravityScale(k) {
+    const next = Math.max(0, Number(k));
+    if (next === (this.gravityScale ?? 1)) return;
+    this.gravityScale = next;
+    this.#kick();
   }
 
   // Write the runtime inputs to the device if they changed (or `force`), at this step boundary, and log them with the step.

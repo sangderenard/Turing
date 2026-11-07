@@ -4260,7 +4260,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, spinarc: spinMotion.arc, spinrev: spinReverse, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4272,6 +4272,9 @@ function localControl(s, value) {
     camView.auto = !!value;
     // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
+  } else if (s.local === "gscale") {
+    gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
+    try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
   } else if (s.local === "spinrev") {
     spinReverse = !!value; caseSpin = Math.abs(caseSpin) * (spinReverse ? -1 : 1);
     compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
@@ -4392,6 +4395,11 @@ function refreshLocalControls() {
       el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
       const input = el.querySelector("input, select");
       if (input) input.disabled = !choice.on;
+    } else if (s.local === "gscale") {
+      const input = el.querySelector("input");
+      if (document.activeElement !== input) input.value = String(sliderFromGscale(gravityScale));
+      el.querySelector("span").textContent = `gravity ${gravityScale ? (gravityScale >= 0.1 ? gravityScale.toFixed(2) : gravityScale.toPrecision(2)) + " g" : "off (weightless)"} `;
+      el.title = "scales every gravity source (default, phone, camera, spin/rock): left end weightless, then log from 0.01 g to 10 g";
     } else if (s.local === "spinrev") {
       el.querySelector("input").checked = spinReverse;
       el.title = "the case turns clockwise when on (counterclockwise when off)";
@@ -4473,6 +4481,22 @@ function saveSpinMotion() {
   try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
 }
 const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
+// GRAVITY SCALE: one slider for every gravity source; 0 at the left end is weightless, then log from 0.01 g to 10 g
+const GSCALE_SPEC = { id: "gscale", kind: "range", label: "gravity", min: 0, max: 1, step: 0.001, local: "gscale" };
+const GSCALE_LOG = [-2, 1], GSCALE_NOTCH = 0.01;
+function gscaleFromSlider(s) {
+  s = Number(s);
+  if (s < GSCALE_NOTCH) return 0;
+  return 10 ** (GSCALE_LOG[0] + (s - GSCALE_NOTCH) / (1 - GSCALE_NOTCH) * (GSCALE_LOG[1] - GSCALE_LOG[0]));
+}
+function sliderFromGscale(k) {
+  if (!(k > 0)) return 0;
+  const u = (Math.log10(k) - GSCALE_LOG[0]) / (GSCALE_LOG[1] - GSCALE_LOG[0]);
+  return GSCALE_NOTCH + Math.max(0, Math.min(1, u)) * (1 - GSCALE_NOTCH);
+}
+let gravityScale = 1;
+try { const saved = localStorage.getItem("meowdoku.gscale"); if (saved != null && saved !== "") gravityScale = Math.max(0, Number(saved)); } catch { /* storage may be blocked */ }
+compute.setGravityScale(gravityScale);
 // AUTO ARC: while the case rocks, a slow integral controller live-tunes the rock arc to hold one species' mean height at a
 // target level of the box (default the middle): high-speed rocking swings material up, and there is a fine arc that floats
 // (liquefies) the pile.  Measured from the displayed frame's own positions; the arc is a runtime input, so no rebuild.
@@ -4529,7 +4553,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, CAMGRAV_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
