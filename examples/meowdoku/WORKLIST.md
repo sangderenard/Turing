@@ -95,7 +95,11 @@ deploy to 8766 as soon as work lands.
   - **attraction:** short-range cohesion (liquid-bridge / van der Waals style; the 3D job adds a basic cohesion uniform) and phase behaviour, e.g. a wet clump, a dry flow, a crystal;
   - **dipoles:** each grain carries a moment (a per-id orientation vector) with an orientation-dependent pair force and torque (magnetic/electric), so chains and needles form;
   - **aggregates:** grains bonded at rest fuse into a cluster that moves as one rigid body (fewer degrees of freedom, so the sim calms down and gets cheaper), and break apart when bond stress exceeds a strength; the same rigid-body machinery as the emoji objects;
-  - the bonds and their breakage are law state, deterministic, and replay bit-identically.
+  - the bonds and their breakage are law state, deterministic, and replay bit-identically;
+  - **lattice-sensitive crystal shading** (grouped here by the user):
+    - the law exports per-grain bond-orientational order ψ6 = mean of e^{6iθ} over neighbours, in the existing neighbour walk: crystallinity |ψ6| and lattice angle arg(ψ6)/6;
+    - the scene Phong shader blends crystalline grains into a gem material: facet normals rotated by the lattice angle, so whole domains glint together; rainbow (dispersion-like) glints from the lattice-to-light/view angle; ruby, sapphire, emerald and opal presets and faceted "gem pebbles";
+    - cheap: a few multiply-adds per contact plus a dot product and a hue ramp per fragment.
 - **Late-stage colour from per-id data** (fountain):
   - the law hands the render per-id attributes instead of a baked rgba8: species, grain size, smoothness/roughness, irregularity, speed, age/emission order, contact count, temperature;
   - a late-stage shader composes colour from them through maps (ramps, palettes) and simple blend recipes (e.g. hue = species, value = size, saturation = speed, or a weighted mix of any channels), quick to switch, chosen for dramatic informational and aesthetic effect;
