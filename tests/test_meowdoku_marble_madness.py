@@ -22,6 +22,13 @@ def test_marble_course_uses_one_emitted_id_and_sdf_toy():
     assert uniforms["sdf_on"] == 1
     assert uniforms["emit_rate"] == MarbleMadness.EMIT_INTERVAL
     assert uniforms["wt0"] == 1 and all(uniforms[f"wt{s}"] == 0 for s in (1, 2, 3))
+    assert uniforms["mu0"] == pytest.approx(F.SPECIES[0][3])
+    assert uniforms["roll0"] == pytest.approx(F.SPECIES[0][4])
+    controls = {item["id"]: item for item in state["controls_ui"]}
+    assert controls["mu0"]["name"] == "mu0"
+    assert controls["roll0"]["name"] == "roll0"
+    assert controls["mu0"]["value"] == pytest.approx(uniforms["mu0"])
+    assert controls["roll0"]["value"] == pytest.approx(uniforms["roll0"])
     assert len(state["compute"]["chamber_mesh"]["v"]) > 0
     assert [pid for pid in range(game.n) if pid * uniforms["emit_rate"] < 3600] == [0]
 

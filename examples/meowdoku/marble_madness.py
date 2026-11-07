@@ -75,7 +75,11 @@ class MarbleMadness(FountainGame):
         super().reset()
 
     def controls_ui(self):
-        return [{"id": "marble_restart", "kind": "button", "label": "Restart marble", "action": "marble_restart", "group": "Run"}]
+        return [
+            {"id": "marble_restart", "kind": "button", "label": "Restart marble", "action": "marble_restart", "group": "Run"},
+            self._control("mu0", label="Sliding friction (contact μ)", group="Marble contact"),
+            self._control("roll0", label="Rolling resistance", group="Marble contact"),
+        ]
 
     def state(self):
         state = super().state()
