@@ -6,7 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
-import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing } from "./particle_styles.js";
+import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
@@ -410,6 +410,24 @@ function storageTexture(table, unit) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, padded);
   return tex;
 }
+// The Phong shader's depth stack (uDepthUv: R depth, G thickness, B translucence mask, A scatter mask) holds, after the
+// terrain's layer 0, one constant layer per grain-finish thickness setting (see GRAIN_FINISHES): a finish's texstack record names
+// the layer and scales G into millimetres (thickness_scale_mm), which is the shader's thickness for its translucence term.
+const FINISH_LAYERS = [[0, 255, 255, 0], [0, 255, 255, 255]];     // layer 1: clear (thickness 1, translucence 1, no scatter); 2: frosted (scatter 1)
+const FINISH_LAYER_CLEAR = 1, FINISH_LAYER_FROST = 2;
+function withFinishLayers(n, rgba) {
+  const size = n * n * 4, out = new Uint8Array(size * (1 + FINISH_LAYERS.length));
+  out.set(rgba.subarray(0, size), 0);
+  FINISH_LAYERS.forEach((px, k) => { for (let i = 0; i < n * n; i++) out.set(px, size * (k + 1) + 4 * i); });
+  return out;
+}
+function defaultDepthStack(unit) {      // no terrain export: layer 0 flat, then the finish layers (1x1 each)
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, 1, 1, 1 + FINISH_LAYERS.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, withFinishLayers(1, new Uint8Array([0, 0, 0, 255])));
+  return tex;
+}
 function arrayTexture(unit, rgba) {
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
@@ -515,7 +533,8 @@ function uploadTerrainTexture(unit, n, rgba) {
   const tex = gl.createTexture();
   if (unit === 6) state.depthStack = { tex, n };
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
-  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  if (unit === 6) gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1 + FINISH_LAYERS.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, withFinishLayers(n, rgba));
+  else gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
   gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1243,6 +1262,40 @@ function meowMaterial(name, rgb) {
 }
 
 // ---------------------------------------------------------------- materials from the palette
+// The grain finishes (a family of scene materials the fountain's material / stained styles can take; see uploadMaterials).  Every
+// field below is one the shader reads from its own tables; what each does on screen is stated beside it.  [name, albedo, record].
+//   transmission is recorded in the PBR table; the shader reads opacity (alpha) for how much of the scene shows through, and
+//   the translucence / SSS / enamel terms for the light a bead carries itself.
+const PLATE_GROUP = 40;           // the backlit plate's emitter group (uLightGroupId; its own fragments skip its light)
+const EMBER_GROUP = 90;           // a grain finish whose group id indexes the ThermalChunk (uThermalEmission): a Planck blackbody
+const THERMAL_SLOTS = 128;
+const GRAIN_FINISHES = [
+  // clear glass: a high-index specular, a little translucence (thickness 6 mm x gain 1 x 0.02 of the tint added)
+  ["bead@glass", [0.92, 0.96, 1.0], { roughness: 0.02, transmission: 0.92, opacity: 0.12, ior: 1.52, specular: 1.0, shininess: 220, thicknessMm: 6, translucence: 1.0 }],
+  // frosted (profile 3): the depth layer's scatter mask 1 cuts shininess to 12 % and spec strength to 30 %, adds a diffuse halo
+  ["frost@glass", [0.92, 0.95, 1.0], { roughness: 0.55, transmission: 0.7, opacity: 0.35, ior: 1.5, specular: 0.6, shininess: 40, profile: 3,
+    thicknessMm: 3, thicknessLayer: FINISH_LAYER_FROST, translucence: 1.0 }],
+  // SSS (profile 2: translucence at 4x): jade (5 mm) and milk glass (8 mm) glow by thickness x gain x 0.08 of their own tint
+  ["jade@glass", [0.25, 0.72, 0.46], { roughness: 0.35, transmission: 0.5, opacity: 0.5, ior: 1.6, specular: 0.5, shininess: 60, profile: 2, thicknessMm: 5, translucence: 1.0 }],
+  ["milk@glass", [0.96, 0.94, 0.88], { roughness: 0.5, transmission: 0.4, opacity: 0.6, ior: 1.5, specular: 0.4, shininess: 30, profile: 2, thicknessMm: 8, translucence: 1.0 }],
+  // thin film (the ENAMEL record): iridescent fringes from the optical path 2 n d cos, a colour fringe weight of d / 800 nm (max 0.45), a
+  // coat gloss from its own index; opal 480 nm over clear glass, pearl 320 nm over an opaque SSS body (opacity 1: not glass)
+  ["opal@glass", [0.9, 0.92, 0.96], { roughness: 0.15, transmission: 0.6, opacity: 0.3, ior: 1.45, specular: 0.9, shininess: 140, thicknessMm: 3, translucence: 1.0,
+    enamel: { thicknessNm: 480, ior: 1.55, roughness: 0.1, color: [1, 1, 1] } }],
+  ["pearl", [0.93, 0.90, 0.86], { roughness: 0.25, ior: 1.62, specular: 0.7, shininess: 80, profile: 2, thicknessMm: 2, translucence: 1.0,
+    enamel: { thicknessNm: 320, ior: 1.62, roughness: 0.15, color: [1.0, 0.97, 0.95] } }],
+  // gems: a high index (Schlick F0 17 % at 2.42, 7.7 % at 1.77) and a tinting enamel coat
+  ["ruby@glass", [0.85, 0.04, 0.10], { roughness: 0.02, transmission: 0.8, opacity: 0.4, ior: 1.77, specular: 1.0, shininess: 260, thicknessMm: 6, translucence: 1.0,
+    enamel: { thicknessNm: 200, ior: 1.77, roughness: 0.05, color: [1.0, 0.35, 0.4] } }],
+  ["sapphire@glass", [0.06, 0.15, 0.90], { roughness: 0.02, transmission: 0.8, opacity: 0.4, ior: 1.77, specular: 1.0, shininess: 260, thicknessMm: 6, translucence: 1.0,
+    enamel: { thicknessNm: 200, ior: 1.77, roughness: 0.05, color: [0.4, 0.55, 1.0] } }],
+  // phosphorescence: the remit record (gain 1.2, attack 0.05, decay 4 s) -- the shader reads the gain but does not yet sample the
+  // remit layer, so what shows is the SSS body and the emission floor
+  ["glow@glass", [0.35, 0.90, 0.50], { roughness: 0.2, transmission: 0.5, opacity: 0.3, ior: 1.5, specular: 0.5, shininess: 60, emission: [0.04, 0.32, 0.14], profile: 2,
+    thicknessMm: 4, translucence: 1.0, remit: [1.2, 0.05, 4.0] }],
+  // a blackbody (the ThermalChunk: one temperature per group id, so per finish, not per grain)
+  ["ember", [0.18, 0.06, 0.04], { roughness: 0.7, ior: 1.4, specular: 0.2, shininess: 12, group: EMBER_GROUP, kelvin: 1150 }],
+];
 function uploadMaterials(game) {
   // Base tables hold the three piece materials; every palette colour of the
   // state becomes a record (X mark's template, albedo replaced), plus a
@@ -1334,6 +1387,11 @@ function uploadMaterials(game) {
   records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
   records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [2.4, 2.4, 2.5], roughness: 0.2 }]);
   records.push(["nav_off", [0.12, 0.12, 0.13], { roughness: 0.3 }]);
+  // GRAIN FINISHES (appended after every other record: nothing above moves).  Each one is the shader's own material tables,
+  // nothing else: PBR (ior, roughness, metallic, transmission, opacity, emission), Phong (spec strength, shininess), ENAMEL (a
+  // thin-film coat), TEXSTACK (profile: 1 forward emission cone, 2 SSS 4x translucence, 3 frosted scatter; translucence gain;
+  // thickness scale / bias in mm over a depth-stack layer; remit gain / attack / decay) and, for the ember, the ThermalChunk.
+  for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -1355,6 +1413,17 @@ function uploadMaterials(game) {
       if (tname === "texstack" && extra.colorLayer != null) {
         record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
       }
+      if (tname === "texstack" && extra.profile != null) record[11] = extra.profile;                // model_flags: the profile
+      if (tname === "texstack" && extra.translucence != null) record[15] = extra.translucence;      // translucence_gain
+      if (tname === "texstack" && extra.thicknessMm != null) {        // thickness = (the layer's G = 1) * scale + bias, in mm
+        record[2] = extra.thicknessLayer ?? FINISH_LAYER_CLEAR; record[5] = extra.thicknessMm; record[7] = 0.0;
+      }
+      if (tname === "texstack" && extra.remit) { record[12] = extra.remit[0]; record[13] = extra.remit[1]; record[14] = extra.remit[2]; }   // gain / attack / decay
+      if (tname === "enamel" && extra.enamel) {                       // a thin-film coat: thickness nm (0 = none), real / imaginary index, roughness, colour
+        const e = extra.enamel;
+        record[0] = e.thicknessNm; record[1] = e.ior; record[2] = e.iorImag ?? 0.0; record[3] = e.roughness ?? 0.1;
+        record[4] = e.color[0]; record[5] = e.color[1]; record[6] = e.color[2];
+      }
       if (tname === "texstack" && extra.depthLayer != null) {
         // texstack 2 = depth layer, 4 = depth scale (mm), 6 = depth bias (mm);
         // 5 / 7 = thickness scale / bias (the G channel, same map).
@@ -1373,6 +1442,7 @@ function uploadMaterials(game) {
         // (0.055, 0.055, 0.066): every wall of every piece rendered near-black.  The
         // material is the palette colour on both sides, so inner = albedo.
         record[4] = rgb[0]; record[5] = rgb[1]; record[6] = rgb[2];
+        if (extra.ambient != null) record[0] = extra.ambient;         // (the shader clamps it to 0.12)
       }
       data.push(...record);
       state.materialIndex[name] = base.pbr.records + k;
@@ -1382,6 +1452,12 @@ function uploadMaterials(game) {
   }
   state.materialsVersion = (state.materialsVersion || 0) + 1;
   state.pbrTable = tables.pbr;
+  state.tables = tables;
+  // a finish with a group id and a temperature: the ThermalChunk holds the kelvins by group id (the shader's uThermalEmission reads it)
+  state.materialGroups = {};
+  const thermal = new Float32Array(THERMAL_SLOTS);
+  for (const [name, , extra] of records) if (extra.group != null) { state.materialGroups[name] = { group: extra.group, kelvin: extra.kelvin || 0 }; thermal[extra.group] = extra.kelvin || 0; }
+  storageTexture({ data: thermal }, 10);
   storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
 }
 
@@ -4083,14 +4159,28 @@ try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "cl
 const backdropClear = () => backdrop.mode === "clear" && !!state.game && state.game.game === "fountain";
 // no dark floor tiles under the fountain: "clear" (nothing) and "backlit" (only the glowing plate)
 const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!state.game && state.game.game === "fountain";
-// the backlight's lamps: a row of point lights a little under the plate, in the scene's light list (board frame)
-function backlightLamps() {
-  if (!(backdrop.mode === "backlit" && state.game && state.game.game === "fountain" && !state.flat)) return [];
-  const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth, lamps = [];
-  for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++)
-    lamps.push([w * (i + 0.5) / 3, -0.6, z0 + (d - z0) * (j + 0.5) / 2]);
-  return lamps;
+// The backlit plate is an EMITTER GROUP of the shader's light list ("all direct illumination comes from host emitters"): one light at
+// the plate's centre whose uLightIntensity is the plate's AREA (the shader's emitter radius is sqrt(area / 4 pi)), whose uLightGroupId
+// is PLATE_GROUP -- and the plate is drawn with that aGroupId, so its own fragments skip it.  (board frame)
+const BACKLIGHT_COLOUR = [0.11, 0.108, 0.105];     // linear: the plate's radiance per unit (the shader divides the area by the squared distance + radius^2)
+function backlightEmitter() {
+  if (!(backdrop.mode === "backlit" && state.game && state.game.game === "fountain" && !state.flat)) return null;
+  const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth;
+  return { at: [w / 2, -GLASS.thickness * 0.5, (z0 + d) / 2], area: w * (d - z0) };
 }
+// Debug: draw caller-made packed grains `data` ([x, y, rgba8, meta]) in `style` through the scene's own call (the measurements'
+// path: no rAF needed); the GL context; the material tables as uploaded.
+window.meowdokuDebug.drawGrains = (data, style) => { const g = state.game, rec = compute.rec; if (!g || !rec || !cloud) return null; drawCloud(camera(), data, g, rec, style); return cloud.styles.fallback || cloud.styles.note || ""; };
+window.meowdokuDebug.glx = () => gl;
+window.meowdokuDebug.glassInfo = () => cloud && cloud.styles.glassInfo;
+// the scene's light list as the last lit pass set it: [{ pos (view space), colour, intensity, group }]
+window.meowdokuDebug.lights = () => {
+  const P = state.programs.phong, n = gl.getUniform(P, gl.getUniformLocation(P, "uNumLights")), out = [];
+  for (let i = 0; i < n; i++) out.push({ pos: Array.from(gl.getUniform(P, gl.getUniformLocation(P, `uLightPos[${i}]`))), colour: Array.from(gl.getUniform(P, gl.getUniformLocation(P, `uLightColor[${i}]`))),
+    intensity: gl.getUniform(P, gl.getUniformLocation(P, `uLightIntensity[${i}]`)), group: gl.getUniform(P, gl.getUniformLocation(P, `uLightGroupId[${i}]`)) });
+  return out;
+};
+window.meowdokuDebug.tablesNow = () => ({ names: state.materialIndex, tables: Object.fromEntries(Object.entries(state.tables).map(([k, v]) => [k, { f: v.floats_per_record, n: v.records, data: Array.from(v.data) }])) });
 window.meowdokuDebug.backdrop = backdrop; window.meowdokuDebug.budget = MATERIAL_BUDGET;
 window.meowdokuDebug.pcolor = pcolor;
 // the scene's declared materials a grain may take (name@variants are the pieces' own states of one material)
@@ -4191,7 +4281,10 @@ function refreshLocalControls() {
         option.textContent = drawn && particleStyle === "material" && option.disabled === false ? `${option.dataset.label} (drawing sand: see tooltip)` : option.dataset.label;
       }
       select.value = particleStyle;
-      el.title = drawn || (particleStyle === "heat" && cloud && cloud.styles.heatInfo) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      const glassInfo = cloud && cloud.styles.glassInfo;     // how the glass grains were composited in the last frame (OIT, or alpha and why)
+      el.title = drawn || (glassInfo ? `${glassInfo}` : "") || (particleStyle === "heat" && cloud && cloud.styles.heatInfo) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      for (const option of select.options) if ((option.value === "stained" || option.value === "stained_fast") && option.dataset.label)
+        option.title = option.disabled ? option.title : (option.value === "stained_fast" ? "glass grains: plain alpha blending in draw order (fast mode)" : glassInfo || "glass grains: weighted blended OIT through the scene shader's material tables");
     } else if (s.local === "heat_fixed" || s.local === "heat_gamma") {
       const on = particleStyle === "heat", input = el.querySelector("input");
       input.disabled = !on;
@@ -4387,9 +4480,18 @@ function particleLighting(g, y) {
 // the colour is the grain's), and the key light's matrix for the shadow lookups.
 function particleScene(pick) {
   // stained glass without a chosen material takes the scene's translucent glass cube material (the tray's), else the plain glass
-  const id = pick.mode === "material" ? state.materialIndex[pick.material]
-    : particleStyle === "stained" ? (state.materialIndex["gem@glass"] ?? state.materialIndex.traycube) : (state.materialIndex.gem ?? state.materialIndex.glass);
-  return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj };
+  // (stained = the material-mode glass: the "bead@glass" finish through the shader's tables, composited by OIT; stained_fast = the
+  // alpha-blended look it had before, "gem@glass")
+  const name = pick.mode === "material" ? pick.material
+    : particleStyle === "stained" ? (state.materialIndex["bead@glass"] != null ? "bead@glass" : "gem@glass")
+    : particleStyle === "stained_fast" ? (state.materialIndex["gem@glass"] != null ? "gem@glass" : "traycube") : (state.materialIndex.gem != null ? "gem" : "glass");
+  const id = state.materialIndex[name];
+  const t = state.pbrTable, f = t && t.floats_per_record;
+  const opacity = id != null && t ? t.data[id * f + 7] : 1;
+  const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
+  const group = (state.materialGroups || {})[name];
+  return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj,
+           glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
 }
 // The camera's down in the law's plane: the board maps law x to world +x and law y to world -z (PointCloud's uMap), so the
 // in-plane part of the camera's down (minus its up row of the view matrix) is (d.x, -d.z) -- full strength looking
@@ -4451,7 +4553,6 @@ window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) =>
 // The lit scene from ``cam`` into whatever framebuffer is bound: the main
 // view, or the projection glass's broadcast camera (opts.plate: draw the
 // glass itself -- never into its own broadcast).
-const BACKLIGHT_LAMP = 0.05;                  // each backlight lamp's intensity per span^2 (6 lamps: ~1.6x the scene's fill light)
 function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
   const P = state.programs.phong; gl.useProgram(P);
@@ -4492,7 +4593,8 @@ function litPass(cam, now, casters, opts = {}) {
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
   bulbLights.push(...intentSpot(cam, now));
-  for (const at of backlightLamps()) bulbLights.push({ view: M.apply(cam.view, at), colour: [1.0, 0.98, 0.95], level: 0, intensity: BACKLIGHT_LAMP * span * span });
+  const plate = backlightEmitter();
+  if (plate) bulbLights.push({ view: M.apply(cam.view, plate.at), colour: BACKLIGHT_COLOUR, level: 0, intensity: plate.area, group: PLATE_GROUP });
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -4502,7 +4604,9 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
     (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
     ...bulbLights.slice(0, count - 3).map((b) => (b.intensity ?? ARCADE.lamp * b.level))]));
-  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
+  const groups = new Int32Array(count).fill(-1);               // an emitter's group id: its own surface skips its light
+  bulbLights.slice(0, count - 3).forEach((b, i) => { if (b.group != null) groups[i + 3] = b.group; });
+  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), groups);
   // Spot cones (Pluck's light loop): a direction and (cos inner, cos outer)
   // per light; zero direction = a point light (the key, fills, bulbs, lightning).
   const spotDir = new Float32Array(count * 3), spotCone = new Float32Array(count * 2);
@@ -4525,7 +4629,7 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform2f(gl.getUniformLocation(P, "uShadowTexelSize"), 1 / SHADOW_SIZE, 1 / SHADOW_SIZE);
   gl.uniform1f(gl.getUniformLocation(P, "uShadowBias"), 0.0015);
   const shadowLoc = gl.getUniformLocation(P, "uShadowMatrices[0]");
-  const drawLit = (vao, count, model, materialId) => {
+  const drawLit = (vao, count, model, materialId, groupId = 0) => {
     const mv = M.multiply(cam.view, model);
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, M.multiply(cam.proj, mv));
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, mv);
@@ -4534,7 +4638,7 @@ function litPass(cam, now, casters, opts = {}) {
     if (materialId != null) gl.vertexAttribI4i(2, materialId, 0, 0, 0);
     // aCullImmune = 1: the extruded meshes' walls are wound inward, so draw both sides
     // (the shader flips back-face normals).
-    gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
+    gl.vertexAttribI4i(4, groupId, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, count);
   };
   drawTerrain(now, drawLit);
@@ -4554,7 +4658,7 @@ function litPass(cam, now, casters, opts = {}) {
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, M.identity(), null, plate ? PLATE_GROUP : 0);
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -5465,7 +5569,17 @@ function fillPickers() {
   state.instancing = false; state.instancingNote = "";
   try {
     const extended = extendForInstancing(vert, frag);
-    state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extended.frag));
+    // ...and with the order-independent-transparency outputs (extendForOit: a second output, written only when uOit = 1; the
+    // original colour write is unchanged otherwise).  If that cannot be made or linked, glass falls back to alpha blending, and says so.
+    state.oit = false; state.oitNote = "";
+    try {
+      state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extendForOit(extended.frag)));
+      state.oit = true;
+    } catch (oitError) {
+      state.oitNote = String(oitError.message || oitError).slice(0, 200);
+      console.warn("[meowdoku] the Phong shader could not be extended for OIT:", state.oitNote);
+      state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extended.frag));
+    }
     state.instancing = true;
   } catch (error) {
     state.instancingNote = String(error.message || error).slice(0, 200);
@@ -5479,7 +5593,7 @@ function fillPickers() {
   arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5, assets.terrain);
   // The Phong shader's depth stack (uDepthUv, unit 6): layer 0 is the terrain's
   // height map (exported in the shader's channel layout); no export, the 1x1 default.
-  if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else arrayTexture(6, [0, 0, 0, 255]);
+  if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else defaultDepthStack(6);
   arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,
