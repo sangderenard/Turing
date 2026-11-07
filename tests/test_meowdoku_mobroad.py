@@ -747,13 +747,10 @@ process.exit(bad || Object.keys(got).length !== Object.keys(c.expect).length ? 1
 
 #: The DEFAULT and WHEEL 2-D products' source digests, as they were before the mobroad variant existed (the examples/meowdoku/fountain.py and
 #: fountain_build.py at the merge of main), and the purrline variant's: the variant lives between ``# <mobroad>`` markers that every one of them leaves out.
-BASELINE_DIGESTS = {
-    "default": {"small": "3c4362437fea7313", "4k": "a4bd4dad8185839c", "16k": "084ba8e865438ba7", "64k": "262295590088b70d", "256k": "0403d076cec9587c",
-                "1M": "6f8a685d82b9b025", "4M": "b3ab04cfd4249359", "10M": "ab8101dd0e570bac"},
-    "wheel": {"small": "ef9d188dfb9d881f", "4k": "109c76a5b2c27917", "16k": "72859f7dcf0b1652", "64k": "d102cf7cde48ed3a", "256k": "d4d8b8767a3263c4",
-              "1M": "b334b16a4ab13dbf", "4M": "3a77011fa218e3a8", "10M": "f2f4dfed887151b2"},
-    "purrline": {"small": "2929b91392753c4a", "4k": "1295f266043af8b3", "16k": "aab13f0f06aeb53c", "64k": "c6039ddcf237f9e6", "256k": "bd6239fd802a46e0",
-                 "1M": "c41ed00f3bc60772", "4M": "95b07b4c036d9b49", "10M": "f277f30be189b876"},
+BASELINE_DIGESTS = {   # refreshed 2026-11-07 (after the emission-queue fix and the toy marker region); equal to the deployed manifests
+    "default": {"small": "2cfa0e3548d503fa", "4k": "7d429e213d0ff288", "16k": "425e917910c640a6", "64k": "5910136441b644ba", "256k": "030b232207bb36e9", "1M": "1b6135dc2340a2d3", "4M": "a598985d33a3e11b", "10M": "18ba69b68ac3ff12"},
+    "wheel": {"small": "e1bd78e711ddb891", "4k": "f688d53680f4cbac", "16k": "76f657834f583852", "64k": "e62becd2f7dd8e23", "256k": "74f3b5bffc86e2d9", "1M": "2b6a62a5c4ceb973", "4M": "dd02683a323b9ba5", "10M": "7f23489bd86e6384"},
+    "purrline": {"small": "5e4354816452a3f3", "4k": "03321864378867cf", "16k": "5d4382e72e4e5bd9", "64k": "2844df6fca04e199", "256k": "746ad2591f216d0e", "1M": "1f0aa2f44beba7ee", "4M": "ddc6809e09304ee9", "10M": "b5806a31f733de09"},
 }
 
 
