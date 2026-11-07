@@ -338,6 +338,19 @@ class Delve(EntityGame):
     HOSTILE_LANES = ((1, ENT),)
     #: Tiles beyond the view's edge still sent (the page predicts a little ahead of us).
     TILE_MARGIN = 4
+    SPEED_CONTROL = ZOOM_CONTROL = True
+
+    def zoom_reach(self) -> dict[str, float]:
+        """The room bounds the window can show: half the room's overhang each side (the window itself follows the
+        player, ``view_origin``, and slides inside the room: ``send_reach``)."""
+        room = self.world.rooms[self.room]
+        ox, oy = max(0.0, (room.w - self.width) / 2.0), max(0.0, (room.h - self.height) / 2.0)
+        return {"left": ox, "right": ox, "up": oy, "down": oy}
+
+    def send_reach(self) -> dict[str, float]:
+        room = self.world.rooms[self.room]
+        vx0, vy0 = self.view_origin()
+        return {"left": vx0, "right": max(0.0, room.w - vx0 - self.width), "up": vy0, "down": max(0.0, room.h - vy0 - self.height)}
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None,
                  size: str = "small", gated: bool = True):
@@ -499,8 +512,9 @@ class Delve(EntityGame):
         grid = np.asarray(s.column("tile")[MAP0:]).reshape(MAXH, MAXW)[:room.h, :room.w]
         vx0, vy0 = self.view_origin()
         m = self.TILE_MARGIN
-        x0, x1 = max(0, int(np.floor(vx0)) - m), min(room.w, int(np.ceil(vx0 + self.width)) + m)
-        y0, y1 = max(0, int(np.floor(vy0)) - m), min(room.h, int(np.ceil(vy0 + self.height)) + m)
+        win = self.view_window()          # the view window (world_view.py): the field at zoom 1, wider as the page zooms out
+        x0, x1 = max(0, int(np.floor(vx0 + win["x0"])) - m), min(room.w, int(np.ceil(vx0 + win["x1"])) + m)
+        y0, y1 = max(0, int(np.floor(vy0 + win["y0"])) - m), min(room.h, int(np.ceil(vy0 + win["y1"])) + m)
         out = []
         for cy in range(y0, y1):
             for cx in range(x0, x1):

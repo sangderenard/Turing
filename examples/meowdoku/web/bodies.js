@@ -11,7 +11,7 @@
 // trajectory step of a missile or a bomb; then projected into the patch about
 // the page's own ship by sphere_project.
 
-export const SNAPSHOT_PROTOCOL = 13;          // realtime_socket.PROTOCOL
+export const SNAPSHOT_PROTOCOL = 14;          // realtime_socket.PROTOCOL
 export const FLAG_KEYFRAME = 1, FLAG_CLEAR = 2, FLAG_BODIES = 4, FLAG_PILOTED = 8;
 
 // One frame: { version } when the layout is another version, else the header,
@@ -43,6 +43,9 @@ export function decodeSnapshot(view, names) {
   // the timing exchange (pilot_clock.js): the server wall instant this state stands for, the page's send time of the tick
   // this answers (NaN: none), the server's wall at its receipt and as the reply was cut
   you.lawWall = f64(); you.echo = f64(); you.recv = f64(); you.sent = f64();
+  // (these are in the game's VIRTUAL wall -- the wall integrated by the clock speed -- and the clock speed in force and
+  // how many times it has changed: the page re-bases its law clock when ``speedGen`` moves)
+  you.speed = f32(); you.speedGen = u32();
   you.piloted = (flags & FLAG_PILOTED) !== 0;
   you.intervals = [];
   for (let n = u8(); n > 0; n--) { const seq = u32(), start = f64(), length = f32(); you.intervals.push({ seq, start, length, controls: [f32(), f32(), f32(), f32(), f32()] }); }

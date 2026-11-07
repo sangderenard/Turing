@@ -195,6 +195,9 @@
   <label title="Spring stiffness of the soft bodies; lower is also less damped, so soft pieces jiggle longer">Stiff <input id="wobble-k" type="range" min="0.5" max="16" step="0.25" value="8"></label>
   <label id="wobble-gpu-label" style="display:none"><input id="wobble-gpu" type="checkbox"> WebGPU</label>
   <label>Tilt <input id="tilt" type="range" min="15" max="90" value="90"></label>
+  <!-- [SPEED+ZOOM] shown for the real-time scrolling games that take the controls -->
+  <label id="speed-label" style="display:none" title="Game clock speed: how much play a second of your time runs (the law and its step are the same at any speed). Logarithmic, 0.05x to 2x; remembered per game.">Speed <input id="speed" type="range" min="0" max="1000" value="0"> <span id="speed-read"></span></label>
+  <label id="zoom-label" style="display:none" title="World zoom: below 1x packs more of the world into the same screen (pinch or the wheel also zoom). Limited by how much world the game supplies.">Zoom <input id="zoom" type="range" min="0" max="1000" value="0"> <span id="zoom-read"></span></label>
   <label title="A gentle hyperbolic lens over a planet game: the centre bulges, the rim recedes">Curve <input id="curve" type="range" min="0" max="100" value="30"></label>
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="200"></label>
   <label>Round <input id="round" type="range" min="0" max="4" value="4"></label>

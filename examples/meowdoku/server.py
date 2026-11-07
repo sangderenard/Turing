@@ -421,8 +421,10 @@ def make_handler(sessions: Sessions):
                             game.control(request)
                             game.tick()
                             echo = request.get("ct")
+                            # (the timing exchange is in the game's virtual wall: the wall integrated by its clock speed)
+                            stamp = game.virtual(received) if hasattr(game, "virtual") else received
                             binary, meta = encoder.encode(game, table.state(), echo=echo if isinstance(echo, (int, float)) else None,
-                                                          received=received)
+                                                          received=stamp)
                         if meta is not None:
                             self.wfile.write(frame(0x1, json.dumps({"meta": meta}).encode("utf-8")))
                         self.wfile.write(frame(0x2, binary))

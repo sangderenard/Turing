@@ -168,7 +168,10 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #:       state stands for), f64 echo (the page's send time of the tick this
 #:       answers; NaN if it sent none), f64 recv (the server's wall at its receipt),
 #:       f64 sent (its wall as the reply was cut).
-PROTOCOL = 13
+#:  14 = the timing exchange is in the game's VIRTUAL wall (the wall integrated by the clock speed in force, so the law
+#:       clock and ``law_wall`` still advance together at any speed) and is followed by f32 speed (the clock speed now)
+#:       and u32 gen (how many times it has changed: the page re-bases its law clock when it moves).
+PROTOCOL = 14
 
 def _pack_body(body: dict[str, Any]) -> bytes:
     """A body's flight state: u8 flight, f32 u (3), h (3), spd, turn."""
@@ -340,10 +343,12 @@ class SnapshotEncoder:
         if intervals and intervals[-1]["seq"] < self.pilot_sent:
             self.pilot_sent = 0                        # the law's counter began again
         intervals = [r for r in intervals if keyframe or r["seq"] > self.pilot_sent]
-        stamped = time.perf_counter()
-        parts.append(struct.pack("<d4dB", clock, float(state.get("law_wall") or 0.0),
+        stamped = game.virtual(time.perf_counter()) if hasattr(game, "virtual") else time.perf_counter()
+        speed = state.get("speed") or {}
+        parts.append(struct.pack("<d4dfIB", clock, float(state.get("law_wall") or 0.0),
                                  float("nan") if echo is None else float(echo),
-                                 float("nan") if received is None else float(received), stamped, len(intervals)))
+                                 float("nan") if received is None else float(received), stamped,
+                                 float(speed.get("value", 1.0)), int(speed.get("gen", 0)), len(intervals)))
         for r in intervals:
             parts.append(struct.pack("<Idf5f", int(r["seq"]), float(r["start"]), float(r["length"]), *(float(v) for v in r["controls"])))
             self.pilot_sent = max(self.pilot_sent, int(r["seq"]))

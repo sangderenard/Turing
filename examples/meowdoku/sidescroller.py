@@ -476,6 +476,12 @@ class SideScroller(EntityGame):
     PLAYER_LANE = 0
     CHARACTERS_ON = True
     HOSTILE_LANES = (WALKER_LANES,)
+    SPEED_CONTROL = ZOOM_CONTROL = True
+
+    def zoom_reach(self) -> dict[str, float]:
+        """The world the lane window supplies beyond the field: the columns it keeps (``COLUMNS``) run from a little
+        left of the view's edge (tiles are recycled past ``GONE_X``) to ``COLUMNS - 4`` ahead of it; sky is free."""
+        return {"left": -GONE_X, "right": max(0.0, COLUMNS - 4.0 - self.width), "up": 2.0 * HEIGHT, "down": 0.0}
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None):
         self.width = field_width(aspect)
