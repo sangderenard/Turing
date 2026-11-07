@@ -78,7 +78,7 @@ class MarbleMadness(FountainGame):
         state = super().state()
         state["won"] = self.won
         state["status"] = (f"Goal reached in {self.seconds:.2f} s" if self.won else
-                           "Guide the cat's-eye marble down the ramps and through the pegs · arrows/WASD tilt · R restarts")
+                           "Guide the cat's-eye marble down the ramps and through the pegs · arrows/WASD or dual thumbsticks tilt X/Z · optional phone tilt · R restarts")
         state["marble"] = {"goal": self.goal(), "seconds": self.seconds, "active_ids": 1}
         return state
 
