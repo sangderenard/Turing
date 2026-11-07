@@ -6105,12 +6105,24 @@ for (const [id, name] of [["rise", "rise"], ["dive", "dive"], ["bomb", "alt"]]) 
 // a training pass runs), bars for recent demo runs (green kept for training,
 // grey skipped under the running average), a line of training loss, and a
 // flash each time a pass completes.
-const learnView = { lastTrained: null, flashTimer: null };
+const learnView = { lastTrained: null, flashTimer: null, lastUser: -Infinity };
 const IDLE_PANEL_S = 300;                                           // the panel stays up 5 min after an idle pass
+// THE USER INTERACTING closes the panel: any key, pointer or wheel outside the panel itself, or a held game control; it may show again
+// only after DEMO_IDLE_S of no interaction (the demo player's own idle rule)
+for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+  window.addEventListener(type, (e) => {
+    const panel = document.getElementById("learn-panel");
+    if (!(panel && e.target instanceof Node && panel.contains(e.target))) learnView.lastUser = performance.now() / 1000;
+  }, { capture: true, passive: true });
+}
+setInterval(() => { if (state.game) drawLearnPanel(state.game); }, 500);   // closes on interaction (and reopens after idle) between state updates
 function drawLearnPanel(game) {
   const L = game && game.learning, panel = $("learn-panel");
-  // shown while demo learning is on, while a pass runs, and for a while after the idle trainer finished one
-  const on = !!(L && (L.demo_learning || L.training || (L.idle_age != null && L.idle_age < IDLE_PANEL_S)));
+  const now = performance.now() / 1000;
+  if (userControlling()) learnView.lastUser = now;
+  const userBusy = now - Math.max(learnView.lastUser, demo.lastInput) < DEMO_IDLE_S;
+  // shown while demo learning is on, while a pass runs, and for a while after the idle trainer finished one -- never while the user interacts
+  const on = !userBusy && !!(L && (L.demo_learning || L.training || (L.idle_age != null && L.idle_age < IDLE_PANEL_S)));
   panel.classList.toggle("show", on);
   if (!on) return;
   panel.classList.toggle("training", !!L.training);

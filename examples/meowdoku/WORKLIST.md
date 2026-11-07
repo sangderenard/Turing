@@ -117,6 +117,8 @@ C. A 2D fountain surrounds the board. The board's occupied cells are solids (a n
 
 ## Later desires (the user's, recorded 2026-11-06)
 
+- **Scene light from the camera** (2026-11-07): periodically take photos from the phone's front and rear cameras and interpret them as the scene's light-field conditions (environment lighting for the shader); should be cheap.
+
 - **Rigid objects in the fountain**, built from the platformer's map emojis and other drawing primitives:
   - each object is free, pinned/jointed, or fixed;
   - two-way force interaction with the grains (contacts write forces; only the integrator integrates);
