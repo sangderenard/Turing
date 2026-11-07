@@ -4003,6 +4003,7 @@ window.meowdokuDebug.compute = compute;
 // CAMERA-DOWN GRAVITY (a page switch): gravity is the camera's down vector in the box's frame, so orbiting the camera is the
 // box turning under a fixed view.  Overrides the phone; a spinning / rocking case overrides it.
 let cameraGravity = false;
+const camGravNow = [0, -1];                      // the last camera-down gravity applied (fractions of g), for the control's readout
 try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
 const gravitySensor = new GravitySensor({
   onGravity: (gx, gy) => { if (!cameraGravity) compute.setGravity(gx, gy); },
@@ -4128,6 +4129,7 @@ function localControl(s, value) {
     spinMotion.arc = Number(value); saveSpinMotion();
   } else if (s.local === "camgrav") {
     cameraGravity = !!value;
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);    // camera-down wins over a spinning / rocking case while it is on
     if (!cameraGravity) compute.setGravity(gravitySensor.last ? gravitySensor.last[0] : null, gravitySensor.last ? gravitySensor.last[1] : null);
     try { localStorage.setItem("meowdoku.camgrav", cameraGravity ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "record") {
@@ -4136,7 +4138,7 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.record", recordOn ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "spin") {
     caseSpin = spinFromSlider(value);
-    compute.setSpin(caseSpin, spinMotion);
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
     try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
     particleStyle = ALL_STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
@@ -4229,7 +4231,9 @@ function refreshLocalControls() {
       } else el.title = "rotate: a full turn per cycle; rock: swing through the arc at the case spin rate";
     } else if (s.local === "camgrav") {
       el.querySelector("input").checked = cameraGravity;
-      el.title = "gravity is the camera's down: orbit or tilt the camera and the box turns under it (overrides phone gravity; a spinning or rocking case overrides this)";
+      const mag = Math.hypot(camGravNow[0], camGravNow[1]), ang = Math.atan2(camGravNow[0], -camGravNow[1]) * 180 / Math.PI;
+      el.lastChild.textContent = cameraGravity ? ` gravity = camera down (${(100 * mag).toFixed(0)}% g, ${ang.toFixed(0)}°)` : " gravity = camera down";
+      el.title = "gravity is the camera's down: orbit or tilt the camera and the box turns under it. Full strength looking straight down at the board, less as the camera tilts toward the horizon. Overrides phone gravity and the case spin/rock while on.";
     } else if (s.local === "record") {
       el.querySelector("input").checked = recordOn;
       el.title = recordOn ? "frames and keyframes are read back and kept (memory-capped window): Replay, Bounce, Continue"
@@ -4269,7 +4273,7 @@ function spinText(hz) {
 const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"]] };
 const ARC_SPEC = { id: "spinarc", kind: "range", label: "rock arc", min: 0, max: 360, step: 1, local: "spinarc" };
 function saveSpinMotion() {
-  compute.setSpin(caseSpin, spinMotion);
+  compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
   try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
 }
 const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
@@ -4310,7 +4314,7 @@ let caseSpin = 0;
 let spinMotion = { kind: "spin", arc: 60 };
 try { spinMotion = { ...spinMotion, ...JSON.parse(localStorage.getItem("meowdoku.spinmotion") || "{}") }; } catch { /* storage may be blocked */ }
 try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
-compute.setSpin(caseSpin, spinMotion);
+compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
 function renderGameControls(game) {
   const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;
@@ -4397,7 +4401,7 @@ function cameraDownInLaw(view) {
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
-  if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); compute.setGravity(gx, gy); }
+  if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); camGravNow[0] = gx; camGravNow[1] = gy; compute.setGravity(gx, gy); }
   compute.frame(now);
   const data = compute.points();
   const rec = compute.rec;
