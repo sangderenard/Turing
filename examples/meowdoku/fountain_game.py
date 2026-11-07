@@ -15,8 +15,12 @@ import numpy as np
 
 from meowdoku.fountain3d import *  # noqa: F401,F403  (the law, its constants and the host helpers)
 from meowdoku.fountain3d import _f32  # noqa: F401
+from meowdoku import glyph_start as GS
 from meowdoku.games import Game
 
+#: The chamber choice that starts the run from a text built of the grains (``glyph_start``): a closed box around the string, no nozzle.
+GLYPH_SHAPE = "glyph"
+GLYPH_CHOICE = (GLYPH_SHAPE, "glyph start: your text built of the grains, in a closed box (SDF)")
 #: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
 STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
 # the page's render looks for the particle field (web/particle_styles.js STYLES -- a test holds the two lists equal)
@@ -55,6 +59,7 @@ class FountainGame(Game):
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.params: dict[str, float] = {}       # the page's overrides of PARAMS (the rest are the defaults, the shares follow ``mix``)
         self.shape, self.inlet, self.fluid = "box", "fountain", DEFAULT_FLUID
+        self.glyph_text, self.crystal = GS.DEFAULT_TEXT, False          # the glyph start's text and its crystalline option
         self.phase = "fill"
         self.epoch = 1                       # bumped whenever the page must restart the fountain
         self.image: np.ndarray | None = None
@@ -79,15 +84,32 @@ class FountainGame(Game):
             p["depth"] = chamber_depth(self.n, self.aspect, self.shape, p, self.params, basin(self.n, self.aspect, cell_of(p), self.shape))
         return p
 
+    @property
+    def glyph_live(self) -> bool:
+        """The run is a glyph start: the chamber is chosen and the size's ids can be shipped to the page (``glyph_start.MAX_SHIPPED``)."""
+        return self.shape == GLYPH_SHAPE and self.n <= GS.MAX_SHIPPED
+
+    def glyph(self) -> GS.GlyphStart:
+        return GS.build(self.glyph_text, self.n, mix=self.mix, params=self.params, crystal=self.crystal)
+
+    def _shape(self) -> str:
+        """The law's chamber shape for this game's choice (the glyph start is its own closed box, built by ``glyph_start``; refused, it is the box)."""
+        return "box" if self.shape == GLYPH_SHAPE else self.shape
+
     def uniforms(self, *, image: bool = False) -> dict[str, np.ndarray]:
+        if self.glyph_live:
+            return self.glyph().uniforms(mode=self.mode, use_image=1.0 if image else 0.0, mix=self.mix, strata=self.strata, params=self.params)
         return uniforms(n=self.n, mode=self.mode, use_image=1.0 if image else 0.0, mix=self.mix, aspect=self.aspect,
-                        strata=self.strata, params=self.params, shape=self.shape, inlet=self.inlet)
+                        strata=self.strata, params=self.params, shape=self._shape(), inlet=self.inlet)
 
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
-        cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
-                               active=self.n, aspect=self.aspect, strata=self.strata, params=self.params,
-                               shape=self.shape, inlet=self.inlet)
+        if self.glyph_live:
+            cols = self.glyph().columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0, strata=self.strata, params=self.params)
+        else:
+            cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
+                                   active=self.n, aspect=self.aspect, strata=self.strata, params=self.params,
+                                   shape=self._shape(), inlet=self.inlet)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -129,7 +151,7 @@ class FountainGame(Game):
         elif kind == "fountain_choice":
             name, value = str(payload["name"]), str(payload["value"])
             if name == "shape":
-                if value not in SHAPES and value not in SDF_SHAPES and value not in BODY_SHAPES:
+                if value not in SHAPES and value not in SDF_SHAPES and value not in BODY_SHAPES and value != GLYPH_SHAPE:
                     raise ValueError(f"fountain_choice: unknown shape {value!r}")
                 if (value in SDF_SHAPES) != (self.shape in SDF_SHAPES):          # the depth an SDF solid needs is not the polygons' depth: back to the default
                     self.params.pop("depth", None)
@@ -148,6 +170,13 @@ class FountainGame(Game):
                 self.params["fl_rho"], self.params["fl_mu"] = FLUIDS[value]
             else:
                 raise ValueError(f"fountain_choice: unknown choice {name!r}")
+        elif kind == "fountain_glyph":
+            # the glyph start's text (restarts the run: a different string is a different start) and its crystalline option
+            if "text" in payload:
+                self.glyph_text = GS.normalize_text(str(payload["text"]))
+            if "crystal" in payload:
+                self.crystal = bool(payload["crystal"])
+            self.reset()
         elif kind == "fountain_run":
             run = str(payload["run"])
             if run not in ("continuous", "settle"):
@@ -276,11 +305,17 @@ class FountainGame(Game):
                     "options": [[k, k] for k in FLUIDS] + ([["custom", "custom"]] if self.fluid == "custom" else [])})
         out.extend([self._control("fl_rho"), self._control("fl_mu")])
         out.append({"id": "shape", "kind": "select", "label": "chamber", "value": self.shape, "action": "fountain_choice",
-                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES]})
-        out.append({"id": "inlet", "kind": "select", "label": "inlet", "value": self.inlet, "action": "fountain_choice",
-                    "name": "inlet", "field": "value", "group": "Chamber",
-                    "options": [["fountain", "fan fountain"], ["jet", "colinear jet"], ["pour", "pour from above"], ["side", "side tube"]]})
-        out.extend([self._control("depth"), self._control("spread")])
+                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES + (GLYPH_CHOICE,)]})
+        if self.shape == GLYPH_SHAPE:        # a glyph start has no inlet and no free depth: the string's own extrusion sets the box
+            out.append({"id": "glyph_text", "kind": "text", "label": "glyph text", "value": self.glyph_text, "maxlength": GS.MAX_CHARS,
+                        "action": "fountain_glyph", "field": "text", "group": "Chamber"})
+            out.append({"id": "glyph_crystal", "kind": "toggle", "label": "crystalline start", "value": self.crystal,
+                        "action": "fountain_glyph", "field": "crystal", "group": "Chamber"})
+        else:
+            out.append({"id": "inlet", "kind": "select", "label": "inlet", "value": self.inlet, "action": "fountain_choice",
+                        "name": "inlet", "field": "value", "group": "Chamber",
+                        "options": [["fountain", "fan fountain"], ["jet", "colinear jet"], ["pour", "pour from above"], ["side", "side tube"]]})
+            out.extend([self._control("depth"), self._control("spread")])
         if self.shape in BODY_SHAPES:                            # the hinged wheel: paddles / radius (a new run), inertia, damping, the motor
             out.extend(self._control(name) for name in ("wheel_n", "wheel_r", "wheel_i", "wheel_gam", "wheel_alpha"))
             out.append({"id": "wheel_om", "kind": "readout", "label": "wheel speed (rad/s)", "group": "Wheel", "diag": "body_om"})
@@ -290,15 +325,32 @@ class FountainGame(Game):
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect, cell_of(self.resolved()), self.shape)
+        if self.glyph_live:
+            return {"view": self.glyph().view()}
+        return basin(self.n, self.aspect, cell_of(self.resolved()), self._shape())
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
+        glyph = self.glyph() if self.glyph_live else None
         width, height = board_size(geo["view"])
         base = self.base_state(int(round(height)), int(round(width)))
         verified = self.verified
         text = {"fill": "phase 1: the fountain fills the chamber by contact forces; hue from the launch angle",
                 "replay": "phase 2: the identical simulation, coloured by your image at each id's rest position"}[self.phase]
+        if glyph is not None:
+            st = glyph.stats()
+            text = (f"glyph start \"{glyph.text}\": the string is built of the grains at rest in a closed box ({st['phi']:.2f} packed, "
+                    f"{st['vacancies']} vacancies, spacing {st['spacing']:.4f}); {'crystalline' if glyph.crystal else 'jittered'} lattice")
+        elif self.shape == GLYPH_SHAPE:
+            text = f"glyph start places up to {GS.MAX_SHIPPED:,} ids: choose a smaller size (this run is the box fountain)"
+        if glyph is not None:
+            chamber = {"manifest": "fountain3d.manifest.json", "depth": 2.0 * float(glyph.overrides["dh"]), "chamber_mesh": glyph.chamber_mesh(),
+                       "start": glyph.payload(), "tilt": {"lid": 2.0 * glyph.box["hy"] + glyph.box["cell"], "rows": float(glyph.overrides["rows"])}}
+        else:
+            chamber = {"manifest": ("fountain3d_wheel.manifest.json" if self.shape in BODY_SHAPES
+                                    else "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json"),
+                       "depth": 2.0 * float(self.uniforms()["dh"]), "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
+                       "start": None, "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved()), self._shape())}
         base.update({
             "board": "free", "width": width, "height": height, "input": self.input,
             "palette": {"floor": [0.10, 0.11, 0.16]}, "cells": ["floor"], "marks": [], "hints": [],
@@ -310,15 +362,13 @@ class FountainGame(Game):
             "controls_ui": self.controls_ui(),
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
-                # the flat product (the SDF compiled out, ~21% faster at 64k) whenever the chamber is the box or a polygon
-                "manifest": ("fountain3d_wheel.manifest.json" if self.shape in BODY_SHAPES
-                             else "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json"),
+                # the flat product (the SDF compiled out, ~21% faster at 64k) whenever the chamber is the box or a polygon; the SDF one for the SDF
+                # chambers and the glyph start's closed box.  ``start``: the glyph start's placed grains (see ``glyph_start``), else None.
+                **chamber,
                 "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
-                "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
-                "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params), "body": self.body_spec(),
+                "view": list(geo["view"]), "aspect": self.aspect, "body": self.body_spec(),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved()), self.shape),
             },
         })
         return base

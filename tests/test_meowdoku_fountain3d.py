@@ -1331,7 +1331,7 @@ def test_the_server_offers_the_sdf_chambers_and_builds_each_to_the_depth_its_sol
     from meowdoku import fountain_game as G
     game = G.FountainGame(size="4k")
     ids = {c["id"]: c for c in game.controls_ui()}
-    assert [k for k, _label in ids["shape"]["options"]] == [k for k, _label in F.CHAMBER_CHOICES]
+    assert [k for k, _label in ids["shape"]["options"]] == [k for k, _label in F.CHAMBER_CHOICES] + [G.GLYPH_SHAPE]
     depths = {}
     for shape in F.SDF_SHAPES:
         game.do({"type": "fountain_choice", "name": "shape", "value": shape})
@@ -1677,3 +1677,152 @@ def test_the_game_offers_the_waterwheel_with_its_wheel_controls_manifest_and_bod
     game.do({"type": "fountain_param", "name": "wheel_n", "value": 6.0})                  # what the body IS: a new run
     assert game.state()["compute"]["epoch"] == epoch + 1 and game.state()["compute"]["body"]["paddles"] == 6
     assert {"body_tau", "body_alpha", "body_gam", "body_i"} <= set(B.layout("wheel")["runtime_inputs"])
+
+
+# ------------------------------------------------------------------------------------------------ glyph start (WORKLIST 4b)
+from meowdoku import glyph_start as GS  # noqa: E402
+
+
+def _glyph_overlap(start):
+    """The deepest overlap of any two grains, in the smallest radius (negative: every pair has a gap)."""
+    from scipy.spatial import cKDTree
+    pairs = cKDTree(start.positions).query_pairs(3.0 * float(start.radii.max()), output_type="ndarray")
+    if not len(pairs):
+        return -1.0
+    d = np.linalg.norm(start.positions[pairs[:, 0]] - start.positions[pairs[:, 1]], axis=1)
+    return float((start.radii[pairs[:, 0]] + start.radii[pairs[:, 1]] - d).max() / start.radii.min())
+
+
+@pytest.mark.parametrize("crystal", [False, True])
+def test_glyph_start_places_exactly_n_grains_inside_the_glyph_volumes_without_overlap_on_every_shippable_size(crystal):
+    for tag in ("small", "4k", "16k", "64k"):
+        n = F.SIZES[tag][0]
+        for mix in (0.0, 0.5):
+            start = GS.build("MEOW", n, mix=mix, crystal=crystal)
+            assert len(start.positions) == n and len(start.radii) == n                       # the count is N
+            assert start.inside_glyphs(start.positions).all()                                # every centre is in a glyph's volume (holes count, |z| < depth/2)
+            assert _glyph_overlap(start) < 0.0, (tag, mix)                                   # no two grains overlap at t = 0 (the lattice is built with a gap)
+            assert start.phi <= start.phi_target + 1e-9 and 0.25 < start.phi                 # the achieved packing is reported, never above the target
+            u = {k: float(v) for k, v in start.uniforms(mix=mix).items()}
+            d = F.chamber_distance(u, *start.positions.T)[0]
+            assert (d > start.radii).all()                                                   # inside the closed box with room
+
+
+def test_glyph_start_is_a_pure_function_of_the_text_n_mix_and_option():
+    a = GS.build("MEOW", 4096, crystal=False)
+    GS._BUILDS.clear()
+    b = GS.build("meow", 4096, crystal=False)                                                # upper-cased: the same text
+    assert np.array_equal(a.positions, b.positions) and a.payload() == b.payload()
+    assert not np.array_equal(GS.build("CAT", 4096).positions, a.positions)
+    assert not np.array_equal(GS.build("MEOW", 4096, crystal=True).positions, a.positions)
+    assert GS.normalize_text("  ") == GS.DEFAULT_TEXT and len(GS.normalize_text("x" * 99)) == GS.MAX_CHARS
+
+
+def test_glyph_outlines_are_the_exports_even_odd_contours_and_holes_are_empty():
+    o = GS.glyph("O")
+    assert not o.inside(np.zeros((1, 2)))[0]                                                 # the counter of the O is outside
+    assert o.inside(np.array([[max(float(c[:, 0].max()) for c in o.contours) - 0.01, 0.0]]))[0] and o.area > 0.0
+    assert o.depth == pytest.approx(0.28 * GS.HEIGHT)
+    try:                                                                                      # the export's front cap is triangulated from the same contours
+        from meowdoku import phong_tiles, tiles
+        tiles.SPECTRAL_ROOT = GS.spectral_root()                                              # (a worktree has the sibling checkout further up than tiles looks)
+        meshes = {t: phong_tiles.token_mesh(t, "DejaVu Sans", "bold", depth_ratio=0.28, outline_subdivisions=1, cap_grid=8) for t in "OM"}
+    except RuntimeError:
+        pytest.skip("spectral-analyzer is not beside this checkout")
+    for token, (verts, normals) in meshes.items():
+        front = verts[normals[:, 2] > 0.99]
+        cross = np.cross(front[:, 1] - front[:, 0], front[:, 2] - front[:, 0])[:, 2]
+        cap = 0.5 * float(np.abs(cross).sum())
+        # the cap is the outline's area where it has no concave slivers (the O: equal); the export's cap_grid=8 filter drops thin triangles of a concave
+        # outline (the M), so there it is smaller, never larger
+        assert cap <= GS.glyph(token).area * (1 + 2e-3)
+        if token == "O":
+            assert cap == pytest.approx(o.area, rel=2e-3)
+
+
+def test_glyph_start_columns_are_placed_at_rest_with_nothing_to_emit_and_the_payload_round_trips():
+    n = 256
+    start = GS.build("MEOW", n, mix=0.0)
+    cols = start.columns(n, mix=0.0)
+    assert float(cols["emit_rate"]) == 0.0 and float(cols["sdf_on"]) == 1.0 and float(cols["lid"]) == F.LID_OFF
+    assert (cols["vx"] == 0).all() and (cols["vy"] == 0).all() and (cols["wz"] == 0).all()
+    got = GS.decode_payload(start.payload(), n)                                              # the page's decode (compute.js decodeStart) is this formula
+    for c, name in enumerate("xyz"):
+        assert np.array_equal(got[name].astype(np.float64), cols[name]) and np.array_equal(cols[name], start.positions[:, c])
+    assert np.array_equal(cols["pid"], np.arange(n))
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's decode")
+def test_the_pages_start_decode_equals_pythons(tmp_path):
+    start = GS.build("MEOW", 256, mix=0.0)
+    (tmp_path / "start.json").write_text(json.dumps(start.payload()))
+    for name in ("compute.js", "recording.js", "particle_styles.js", "noise_filter.js"):
+        shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / name, tmp_path / name)
+    shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
+    (tmp_path / "run.mjs").write_text("""
+import fs from 'node:fs';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {decodeStart} = await import(pathToFileURL(`${dir}/compute.js`).href);
+const out = decodeStart(JSON.parse(fs.readFileSync(`${dir}/start.json`, 'utf8')), 256);
+fs.writeFileSync(`${dir}/out.bin`, Buffer.concat(['x', 'y', 'z'].map((k) => Buffer.from(out[k].buffer))));
+""")
+    done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-1500:]
+    got = np.frombuffer((tmp_path / "out.bin").read_bytes(), dtype="<f4").reshape(3, 256).T.astype(np.float64)
+    assert np.array_equal(got, start.positions)
+
+
+def test_the_law_reads_a_glyph_start_as_live_grains_with_the_radii_the_host_packed():
+    """One eager step: every id is live (none parked, none emitted late), nothing is outside the closed box, the law's own radius of each id is the
+    one the packing used, and the grains are at rest to within one step of gravity (no polygon wall or inlet touches them)."""
+    n = 256
+    start = GS.build("MEOW", n, mix=0.0)
+    cols = start.columns(n, mix=0.0)
+    _nxt, got = _eager_step(F.make_law(n, n), cols, n)
+    assert (got["n_live"][0], got["n_parked"][0], got["n_out"][0], got["n_nan"][0]) == (n, 0, 0, 0)
+    assert np.abs(got["rad"] - start.radii).max() < 1e-6 * start.radii.max()
+    assert float(np.sqrt(got["vmax2"][0])) < 0.05
+
+
+def test_the_server_offers_the_glyph_start_with_its_text_control_and_ships_the_placed_grains():
+    from meowdoku import fountain_game as G
+    game = G.FountainGame(size="small")
+    assert game.state()["compute"]["start"] is None
+    game.do({"type": "fountain_choice", "name": "shape", "value": G.GLYPH_SHAPE})
+    state = game.state()
+    ids = {c["id"]: c for c in state["controls_ui"]}
+    assert ids["glyph_text"]["kind"] == "text" and ids["glyph_text"]["value"] == "MEOW" and ids["glyph_text"]["action"] == "fountain_glyph"
+    assert "inlet" not in ids and ids["glyph_crystal"]["kind"] == "toggle"
+    c = state["compute"]
+    assert c["manifest"] == "fountain3d.manifest.json" and c["chamber_mesh"] is not None and c["uniforms"]["emit_rate"] == 0.0
+    assert c["start"]["n"] == 256 and c["uniforms"]["sdf_on"] == 1.0
+    mesh_v, mesh_t = G.unpack_mesh(c["chamber_mesh"])
+    assert len(mesh_v) == 8 and len(mesh_t) == 12                                           # the closed box, drawn through the housing's glass
+    before = c["epoch"]
+    game.do({"type": "fountain_glyph", "text": "cat"})                                       # changing the text restarts with a different start
+    after = game.state()["compute"]
+    assert after["epoch"] == before + 1 and after["start"]["xyz"] != c["start"]["xyz"] and game.glyph_text == "CAT"
+    game.do({"type": "fountain_size", "size": "256k"})                                       # more ids than the state ships: the box fountain, said on the status line
+    big = game.state()
+    assert big["compute"]["start"] is None and "choose a smaller size" in big["status"]
+
+
+
+def test_under_gravity_the_letters_collapse_into_a_pile_inside_the_closed_box_and_nothing_leaves_it():
+    """Eager NumPy lane (the native 3-D compile is out of reach for a test): 64 grains spell "MI" in a closed box and fall under the default gravity.
+    The string's top comes down, the centre of mass drops, every grain stays in the box (n_out = 0, all live), and the pile is a pile (the column heights shrink)."""
+    n, steps = 64, 150
+    start = GS.build("MI", n, mix=0.0)
+    cols = start.columns(n, mix=0.0)
+    law = F.make_law(n, n)
+    top0, com0 = float(cols["y"].max()), float(cols["y"].mean())
+    worst_out = 0.0
+    for _ in range(steps):
+        cols, got = _eager_step(law, cols, n)
+        worst_out = max(worst_out, float(got["n_out"][0]))
+    assert worst_out == 0.0 and (got["n_live"][0], got["n_parked"][0], got["n_nan"][0]) == (n, 0, 0)
+    assert float(cols["y"].max()) < 0.75 * top0 and float(cols["y"].mean()) < 0.7 * com0           # the letters came down
+    u = {k: float(v) for k, v in start.uniforms(mix=0.0).items()}
+    assert (F.chamber_distance(u, cols["x"], cols["y"], cols["z"])[0] > -0.2 * float(got["rad"].max())).all()   # inside the closed box
+
