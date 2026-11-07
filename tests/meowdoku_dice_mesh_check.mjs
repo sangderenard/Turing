@@ -43,6 +43,9 @@ for(const kind of kinds) {
     if(kind==='d10') {
       assert.deepEqual(infos.filter(x=>x.normal[1]>0).map(x=>x.number).sort((a,b)=>a-b),[0,2,4,6,8]);
       assert.deepEqual(infos.filter(x=>x.normal[1]<0).map(x=>x.number).sort((a,b)=>a-b),[1,3,5,7,9]);
+      const around=infos.filter(x=>x.normal[1]>0).sort((a,b)=>
+        Math.atan2(a.normal[2],a.normal[0])-Math.atan2(b.normal[2],b.normal[0]));
+      assert.deepEqual(around.map(x=>x.number),[0,8,2,6,4]);
     }
   }
   console.log(`${kind}: closed mesh, face numbering, marking material and relief mass passed`);

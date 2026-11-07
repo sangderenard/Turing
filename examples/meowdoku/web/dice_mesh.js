@@ -74,17 +74,18 @@ function numberFaces(faces,kind) {
   if(kind==='d4') return faces.map((face)=>({face,number:null}));
   const count=faces.length, first=kind==='d10'?0:1, numbers=new Array(count);
   if(kind==='d10') {
-    // The five faces meeting the upper pole carry the even values in order;
-    // the lower ring carries odd values and each antipodal pair sums to nine.
+    // A common d10 ordering is 0,8,2,6,4 around one pole. The lower ring
+    // carries the odd values and each antipodal pair sums to nine.
     const upper=faces.map((f,i)=>i).filter(i=>faces[i].normal[1]>0)
       .sort((a,b)=>Math.atan2(faces[a].normal[2],faces[a].normal[0])-
                    Math.atan2(faces[b].normal[2],faces[b].normal[0]));
     if(upper.length!==5) throw new Error('d10 must have five upper faces');
+    const upperValues=[0,8,2,6,4];
     for(let k=0;k<5;k++) {
-      const a=upper[k];numbers[a]=2*k;
+      const a=upper[k];numbers[a]=upperValues[k];
       const opposite=faces.findIndex((f,i)=>i!==a&&dot(f.normal,faces[a].normal)<-0.999);
       if(opposite<0) throw new Error('d10 antipodal face missing');
-      numbers[opposite]=9-2*k;
+      numbers[opposite]=9-upperValues[k];
     }
     return faces.map((face,i)=>({face,number:numbers[i]}));
   }
