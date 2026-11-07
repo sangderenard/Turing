@@ -196,6 +196,8 @@ class FountainGame(Game):
 
     def _control(self, name: str, kind: str = "range", **extra) -> dict[str, Any]:
         label, lo, hi, step, default, restart, group = PARAMS[name]
+        if name == "depth":                      # the deepest box this size's grid can index (a float32 cell index: 10M ids cap lower)
+            hi = min(hi, depth_cap(self.n, cell_of(self.resolved()), self.aspect))
         value = self.resolved()[name]
         spec = {"id": name, "kind": kind, "label": label, "min": lo, "max": hi, "step": step, "value": value,
                 "action": "fountain_param", "name": name, "field": "value", "group": group}
@@ -207,7 +209,9 @@ class FountainGame(Game):
     def controls_ui(self) -> list[dict[str, Any]]:
         sample = {"fit": "extent", "read": ["x", "y"], "into": ["ir", "ig", "ib"], "raster": [96, 72],
                   "post": {"action": "fountain_image", "field": "rgb", "max_ids": 65536}}
-        sizes = [[tag, f"{count:,}"] for tag, (count, _pad) in SIZES.items()]
+        # a size whose storage binding exceeds the 240 MB class limit says so in its label (the page refuses it on a device that cannot hold it)
+        sizes = [[tag, f"{count:,}" + (f" (needs {binding_bytes(count) / 1e6:.0f} MB bindings)" if binding_bytes(count) > BINDING_CLASS_LIMIT else "")]
+                 for tag, (count, _pad) in SIZES.items()]
         p = self.resolved()
         out: list[dict[str, Any]] = [
             {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start", "aspect": True},
@@ -299,7 +303,7 @@ class FountainGame(Game):
             "compute": {
                 "manifest": "fountain3d.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
-                "view": list(geo["view"]), "aspect": self.aspect, "depth": self.resolved()["depth"],
+                "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
                 "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved())),
             },

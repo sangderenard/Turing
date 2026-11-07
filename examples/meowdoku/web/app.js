@@ -5750,6 +5750,10 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 //   mouse: wheel = zoom, right/middle drag = orbit, shift+drag = pan, left drag = orbit when orbit "one"
 // A game that declares nothing may be given a default here (below).
 const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: true, tilt: true } };
+// The view a game opens in and returns to on a reset: the 3-D fountain is a BOX nine grains deep, which straight down would hide (the depth is
+// the height axis), so it opens as a slight 3/4 view (yaw about the vertical, the eye tipped toward the front glass).
+const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 } };
+const cameraViewDefault = (key, k) => (CAMERA_VIEW_DEFAULTS[key] || {})[k] || 0;
 function cameraGestures() {
   const g = state.game; if (!g || (state.camMode === "nose" && !state.flat)) return null;
   const d = g.camera_gestures === undefined ? CAMERA_GESTURE_DEFAULTS[g.game] : g.camera_gestures;
@@ -5761,7 +5765,7 @@ function cameraGestures() {
            panLim: lim.pan != null ? lim.pan : Math.max(ext.width, extLength(ext)) };
 }
 const CV_KEYS = ["yaw", "pitch", "lz", "px", "pz"];
-function resetCameraView() { for (const k of CV_KEYS) { camView.goal[k] = 0; camView.vel[k] = 0; } }
+function resetCameraView() { const key = state.game ? state.game.game : null; for (const k of CV_KEYS) { camView.goal[k] = cameraViewDefault(key, k); camView.vel[k] = 0; } }
 function clampCamGoal(gest) {
   const G = camView.goal, base = state.tiltDeg * Math.PI / 180;
   G.lz = Math.max(gest.zoomLim[0], Math.min(gest.zoomLim[1], G.lz));
@@ -5771,7 +5775,7 @@ function clampCamGoal(gest) {
 const AUTO_ROTATE = 0.25;   // rad/s: one turn in ~25 s
 function stepCamView(dt) {
   const g = state.game, key = g ? g.game : null;
-  if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) camView.cur[k] = camView.goal[k] = camView.vel[k] = 0; }
+  if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) { camView.cur[k] = camView.goal[k] = cameraViewDefault(key, k); camView.vel[k] = 0; } }
   dt = Math.max(0, Math.min(0.1, dt || 0));
   const gest = cameraGestures(), G = camView.goal, C = camView.cur;
   if (gest && camView.auto && !camView.active) G.yaw += AUTO_ROTATE * dt;
