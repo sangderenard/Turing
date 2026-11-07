@@ -74,6 +74,11 @@ deploy to 8766 as soon as work lands.
   - **dipoles:** each grain carries a moment (a per-id orientation vector) with an orientation-dependent pair force and torque (magnetic/electric), so chains and needles form;
   - **aggregates:** grains bonded at rest fuse into a cluster that moves as one rigid body (fewer degrees of freedom, so the sim calms down and gets cheaper), and break apart when bond stress exceeds a strength; the same rigid-body machinery as the emoji objects;
   - the bonds and their breakage are law state, deterministic, and replay bit-identically.
+- **Client/server load share for the fountain page:**
+  - a percentage control that splits the simulation between the page's GPU and the server, by dividing the adjacency (neighbour) list: a partition of the grid cells, so each side steps its own grains;
+  - the boundary grains are exchanged each step as a halo; the same law text runs on both sides;
+  - the split moves with the measured step cost on each side;
+  - the result stays deterministic and bit-identical to a single-side run.
 - **Fountain regions inside platform games:** a granular material that spills through a course (platformer, side scroller, delve). The same fountain law runs as a region of the level, and its grains interact with the level's tiles and the player.
 
 ## Other open items
