@@ -1294,9 +1294,10 @@ def test_the_regular_ngons_are_equilateral_closed_and_inscribed_and_the_sdf_pres
             d = F.chamber_distance(u, np.array([0.0]), np.array([float(u["nozzle_y"])]))[0][0]
             if not (shape == "sdf_annulus" and n == 256):                                # (a ring in the tiny window is too narrow for a bar)
                 assert d > geo["cell"], (shape, n)
-            for line in F.chamber_outline(shape, n):                                     # the outline lies inside the window
+            cx0, cx1, cy0, cy1 = F.chamber_basin(shape, n)["view"]                       # the view follows the designed chamber
+            for line in F.chamber_outline(shape, n):                                     # the outline lies inside it
                 a = np.asarray(line)
-                assert a[:, 0].min() >= x0 and a[:, 0].max() <= x1 and a[:, 1].min() >= y_bottom and a[:, 1].max() <= y1
+                assert a[:, 0].min() >= cx0 and a[:, 0].max() <= cx1 and a[:, 1].min() >= cy0 and a[:, 1].max() <= cy1
     assert float(F.uniforms(n=256)["sdf_on"]) == 0.0 and F.chamber_outline("box", 256) == []
 
 
@@ -1310,7 +1311,8 @@ def test_the_sdf_normal_is_the_analytic_gradient_and_walls_face_into_the_fluid()
     gy = (F.chamber_distance(u, xs, ys + e)[0] - F.chamber_distance(u, xs, ys - e)[0]) / (2 * e)
     smooth = (np.abs(d) < 0.3) & (np.abs(d) > 0.01) & (np.abs(np.hypot(gx, gy) - 1.0) < 0.05)
     assert smooth.sum() > 20
-    assert np.abs(nx[smooth] - gx[smooth]).max() < 3e-2 and np.abs(ny[smooth] - gy[smooth]).max() < 3e-2
+    err = np.maximum(np.abs(nx - gx), np.abs(ny - gy))[smooth]
+    assert np.quantile(err, 0.99) < 3e-2 and err.max() < 0.1          # (a sample straddling a switch of the nearest feature differs by a few percent)
     assert np.allclose(np.hypot(nx, ny), 1.0, atol=1e-3)
 
 
@@ -1320,7 +1322,7 @@ def test_an_sdf_grain_thrown_at_the_wall_stays_inside():
     u = {k: float(cols[k]) for k in F.UNIFORMS}
     law = F.make_law(n, active)
     cols["age"][:] = 1.0e3
-    cols["x"][:], cols["y"][:] = [0.7, -0.7, 0.0, 0.3], [1.28, 1.3, 0.5, 2.0]
+    cols["x"][:], cols["y"][:] = [0.7, -0.7, 0.0, 0.3], [0.95, 0.97, 0.5, 1.7]        # (the circle sits on the floor now: centre (0, R))
     cols["vx"][:], cols["vy"][:] = [12.0, -9.0, 0.0, 6.0], [0.0, 3.0, -12.0, 8.0]
     state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
     worst = 0.0
@@ -1389,7 +1391,7 @@ def _contact_rich_digest(mod, piece, shape) -> str:
 PRE_TUNABLES_DIGESTS = {
     "box": "aaaf79a4f6f13b4b66555b012fc8af23d084d6465cc175b8c1e384d85e8dee61",
     "funnel": "d5aa47283e4ea2fb2b4f6e08e68b15c887c82cfabfbcb4e94c0ebbaf918b4972",
-    "sdf_toy": "6805a06714f97601106a3fc46db2782ea2d814c5aa921e5738fa17291a196eea",   # refreshed 2026-11-07: the SDF where() f32 fix changed the toy
+    "sdf_toy": "fbaf1f467c01b19f32d4ceb062305d379090072e35a3d6d379d62b6f3497071a",   # refreshed 2026-11-07: the SDF where() f32 fix, then the designed-height toy (box and funnel are untouched)
 }
 
 
@@ -1715,3 +1717,28 @@ def test_the_wheel_replay_is_bit_identical_and_split_runs_agree():
     assert all(np.array_equal(one[0][k], two[0][k]) for k in one[0]) and np.array_equal(one[1], two[1])
     # every id carries the same copy of the body state
     assert np.all(one[0]["bth"] == one[0]["bth"][0]) and np.all(one[0]["bom"] == one[0]["bom"][0])
+
+
+def test_the_sdf_presets_keep_their_designed_height_and_the_view_follows_the_chamber():
+    for n in (256, 4096, 65536):
+        base = F.basin(n)
+        heights = {}
+        for shape in F.SDF_SHAPES:
+            geo = F.chamber_basin(shape, n)
+            u = F.uniforms(n=n, shape=shape)
+            assert geo["view"][:3] == base["view"][:3] and geo["view"][3] > 0.0               # only the top follows
+            lines = F.chamber_outline(shape, n)
+            top = max(max(pt[1] for pt in line) for line in lines)
+            assert geo["view"][3] - 3.5 * geo["cell"] <= top <= geo["view"][3]          # the view is the chamber plus the margin
+            assert float(u["rows"]) * geo["cell"] >= top and float(u["pivot_y"]) == pytest.approx(0.5 * (geo["view"][2] + geo["view"][3]), rel=1e-6)
+            assert F.board_size(geo["view"])[0] > 0.0
+            heights[shape] = top
+            d = F.chamber_distance(u, np.array([0.0]), np.array([float(u["nozzle_y"])]))[0][0]
+            if not (shape == "sdf_annulus" and n == 256):
+                assert d > geo["cell"], (shape, n)
+    # defaults: the box and the polygons are the basin as it was
+    for shape in ("box", "funnel", "hexagon", "ramp", "ngon5", "waterwheel"):
+        assert F.chamber_basin(shape, 4096) == F.basin(4096)
+    # the toy at 4k: peg rows, throat, funnel and the three ramps stack to the height the parts need, not a window fraction
+    toy = F.sdf_preset("sdf_toy", F.basin(4096))
+    assert toy["top"] > 2.8 and F.tilt_inputs(4096, None, F.CELL, "sdf_toy")["lid"] >= toy["top"]
