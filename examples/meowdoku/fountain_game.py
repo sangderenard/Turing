@@ -74,6 +74,8 @@ class FountainGame(Game):
         p = resolve_params(self.mix, self.params)
         if "spread" not in self.params:
             p["spread"] = inlet_default_spread(self.inlet)
+        if self.shape in SDF_SHAPES and "depth" not in self.params:        # an SDF chamber is built to the depth its solid needs, until the page sets one
+            p["depth"] = chamber_depth(self.n, self.aspect, self.shape, p, self.params, basin(self.n, self.aspect, cell_of(p)))
         return p
 
     def uniforms(self, *, image: bool = False) -> dict[str, np.ndarray]:
@@ -126,8 +128,10 @@ class FountainGame(Game):
         elif kind == "fountain_choice":
             name, value = str(payload["name"]), str(payload["value"])
             if name == "shape":
-                if value not in SHAPES:
+                if value not in SHAPES and value not in SDF_SHAPES:
                     raise ValueError(f"fountain_choice: unknown shape {value!r}")
+                if (value in SDF_SHAPES) != (self.shape in SDF_SHAPES):          # the depth an SDF solid needs is not the polygons' depth: back to the default
+                    self.params.pop("depth", None)
                 self.shape = value
                 self.reset()
             elif name == "inlet":
@@ -269,8 +273,8 @@ class FountainGame(Game):
                     "name": "fluid", "field": "value", "group": "Fluid",
                     "options": [[k, k] for k in FLUIDS] + ([["custom", "custom"]] if self.fluid == "custom" else [])})
         out.extend([self._control("fl_rho"), self._control("fl_mu")])
-        out.append({"id": "shape", "kind": "select", "label": "polygon", "value": self.shape, "action": "fountain_choice",
-                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, k] for k in SHAPES]})
+        out.append({"id": "shape", "kind": "select", "label": "chamber", "value": self.shape, "action": "fountain_choice",
+                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES]})
         out.append({"id": "inlet", "kind": "select", "label": "inlet", "value": self.inlet, "action": "fountain_choice",
                     "name": "inlet", "field": "value", "group": "Chamber",
                     "options": [["fountain", "fan fountain"], ["jet", "colinear jet"], ["pour", "pour from above"], ["side", "side tube"]]})

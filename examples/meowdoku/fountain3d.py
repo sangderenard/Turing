@@ -232,13 +232,32 @@ STATE = ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
 _SPECIES_UNIFORMS = tuple(f"{k}{s}" for k in ("r", "rho", "mu", "zeta", "roll", "irr") for s in range(len(SPECIES)))
 POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
+#: ANALYTIC SDF CHAMBERS (true 3-D solids; runtime uniforms, no recompile when the chamber changes).  ``SDF_SLOTS`` primitive slots, each
+#: ``q<k><field>``: ``kind`` (0 unused), ``role`` (0 FLUID: the chamber's inside; 1 SOLID: an obstacle inside it), the centre ``cx cy cz``, the
+#: rotation ``rot`` about the z axis and the parameters ``p0..p5`` (see ``sdf_field``).  ``sdf_on`` (0 / 1) picks the SDF walls; 0 is the old
+#: law bit for bit (the contact is multiplied by an exact zero).
+SDF_SLOTS = 12
+SDF_FIELDS = ("kind", "role", "cx", "cy", "cz", "rot", "p0", "p1", "p2", "p3", "p4", "p5")
+SDF_KINDS = {"box": 1, "sphere": 2, "capsule": 3, "torus": 4, "tetra": 5, "hourglass": 6, "pegs": 7}
+SDF_FAR = 1.0e9
+#: TYPED slots: the kind of each slot is fixed at compile time (3 boxes, 2 spheres, 3 capsules, a torus, a tetrahedron, a revolved hourglass,
+#: a peg field), so a slot evaluates only its own SDF; ``kind`` is just its used flag and a preset fills the slots it needs.
+SDF_LAYOUT = ("box", "box", "box", "sphere", "sphere", "capsule", "capsule", "capsule", "torus", "tetra", "hourglass", "pegs")
+assert len(SDF_LAYOUT) == SDF_SLOTS
+SDF_UNIFORMS = ("sdf_on",) + tuple(f"q{k}{f}" for k in range(SDF_SLOTS) for f in SDF_FIELDS)
+SDF_SHAPES = ("sdf_sphere", "sdf_cube", "sdf_tetra", "sdf_torus", "sdf_hourglass", "sdf_toy")
+#: The chamber-shape select's options (key, label): the polygons (extruded through the depth) and the SDF solids.
+CHAMBER_CHOICES = (("box", "box (open basin)"), ("funnel", "funnel"), ("hexagon", "hexagon"), ("ramp", "ramp"),
+                   ("sdf_sphere", "sphere (SDF)"), ("sdf_cube", "cube (SDF)"), ("sdf_tetra", "tetrahedron (SDF)"),
+                   ("sdf_torus", "toroidal shell (SDF)"), ("sdf_hourglass", "hourglass (SDF)"),
+                   ("sdf_toy", "oil & glycerine toy: ramps, throat, pegs (SDF)"))
 UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows", "lays", "cell", "dh", "bar_z", "k_run",
              "nozzle_x", "nozzle_z", "in_dx", "in_dy", "in_dz", "e1x", "e1y", "e1z", "e2x", "e2y", "e2z",
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
             + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac",
                "wt0", "wt1", "wt2", "wt3", "case_omega", "case_domega", "pivot_x", "pivot_y")
-            + _SPECIES_UNIFORMS)
+            + _SPECIES_UNIFORMS + SDF_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
 #: ``rows`` (a ceiling and the grid's height, which the page closes while a sensor drives gravity), and the live tunables.  The
 #: server sends their defaults; the page's runtime owns them after that and LOGS each change with its step, so a re-run
@@ -414,6 +433,197 @@ def inlet_default_spread(inlet: str) -> float:
     return PARAMS["spread"][4] if inlet == "fountain" else 0.0
 
 
+# ----------------------------------------------- SDF chambers: presets, slots, the inlet fit (host side)
+def _slot(kind: str, role: str, cx: float, cy: float, cz: float, rot: float, *p: float) -> dict[str, float]:
+    """One SDF primitive slot as uniforms ``{field: value}`` (``p`` pads with zeros to p0..p5)."""
+    ps = list(p) + [0.0] * (6 - len(p))
+    return {"kind": float(SDF_KINDS[kind]), "role": 0.0 if role == "fluid" else 1.0, "cx": cx, "cy": cy, "cz": cz, "rot": rot,
+            **{f"p{i}": float(ps[i]) for i in range(6)}}
+
+
+def _ramp_slot(high: tuple[float, float], low: tuple[float, float], rad: float, half_z: float) -> dict[str, float]:
+    """A RAMP from its ``high`` end to its ``low`` end (x, y), thickened by ``rad`` and spanning the depth (``half_z`` past the glass): a capsule
+    slot whose segment is stretched across z."""
+    (hx, hy), (lx, ly) = high, low
+    return _slot("capsule", "solid", 0.5 * (hx + lx), 0.5 * (hy + ly), 0.0, math.atan2(ly - hy, lx - hx),
+                 0.5 * math.hypot(hx - lx, hy - ly), rad, half_z)
+
+
+_TET_C = math.sqrt(8.0) / 3.0
+_TET_S = math.sqrt(3.0) / 2.0
+TET_X, TET_Z_HI, TET_Z_LO = _TET_S * _TET_C, _TET_C, 0.5 * _TET_C         # a unit-circumradius tetrahedron's extents (apex up)
+TET_Z_MID = 0.5 * (TET_Z_HI - TET_Z_LO)                                     # its z extent is [-TET_Z_LO, TET_Z_HI]: the slot is shifted to centre it
+TET_HALF_Z = 0.5 * (TET_Z_HI + TET_Z_LO)
+Z_MARGIN_CELLS = 1.5                                                          # a solid keeps this many cells from the front and back glass
+
+
+def window_fit(geo: dict[str, float]) -> tuple[float, float, float]:
+    """(cell, w, top): the window the SDF solids are inscribed in, |x| <= w, 0 <= y <= top, a margin of three cells inside the view."""
+    c = geo.get("cell", CELL)
+    return c, 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c, geo["view"][3] - 3.0 * c
+
+
+def _torus_fit(big: float, c: float, dm: float) -> float:
+    """The tube radius of the toroidal shell whose outer radius is ``big``: a quarter of it, at least four cells, at most 0.4 of it and the depth."""
+    return min(max(0.25 * big, 4.0 * c), 0.4 * big, dm)
+
+
+def sdf_default_depth(shape: str, geo: dict[str, float]) -> float:
+    """The depth an SDF chamber is built for when the page has not set one: the z extent of the solid inscribed in the WINDOW, plus the margin
+    to the glass (a sphere needs a ball's depth; the toy keeps the old default, its parts all run through the depth)."""
+    c, w, top = window_fit(geo)
+    if shape == "sdf_toy":
+        return DEPTH_DEFAULT
+    if shape in ("sdf_sphere", "sdf_cube"):
+        ext = min(w, 0.5 * top)
+    elif shape == "sdf_tetra":
+        ext = TET_HALF_Z * min(w / TET_X, 0.75 * top)
+    elif shape == "sdf_torus":
+        ext = _torus_fit(min(w, 0.5 * top), c, 1.0e9)
+    elif shape == "sdf_hourglass":
+        ext = w
+    else:
+        raise ValueError(f"unknown SDF chamber {shape!r}")
+    return 2.0 * ext + 2.0 * Z_MARGIN_CELLS * c
+
+
+def sdf_preset(shape: str, geo: dict[str, float], dh: float) -> dict[str, Any]:
+    """An SDF chamber as slots (pure data): the solid INSCRIBED in the visible window (|x| <= w, 0 <= y <= top, a margin of three cells) AND in
+    the depth (|z| <= dh less ``Z_MARGIN_CELLS`` cells), as large as fits; and where its inlet goes (``nozzle_y``) -- the inlet is then fitted
+    inside the fluid by ``fit_inlet``.  Revolved and standing solids are centred in z; the toy's parts all run through the depth."""
+    c, w, top = window_fit(geo)
+    dm = max(dh - Z_MARGIN_CELLS * c, 0.5 * c)
+    slots: list[dict[str, float]] = []
+    bar = 0.4 * w
+    if shape == "sdf_sphere":
+        rad = min(w, 0.5 * top, dm)
+        slots.append(_slot("sphere", "fluid", 0.0, rad, 0.0, 0.0, rad))
+        nozzle_y = rad
+    elif shape == "sdf_cube":
+        half = min(w, 0.5 * top, dm)
+        slots.append(_slot("box", "fluid", 0.0, half, 0.0, 0.0, half, half, half, min(2.0 * c, 0.5 * half)))
+        nozzle_y = half
+    elif shape == "sdf_tetra":
+        rad = min(w / TET_X, dm / TET_HALF_Z, 0.75 * top)
+        slots.append(_slot("tetra", "fluid", 0.0, rad / 3.0, -TET_Z_MID * rad, 0.0, rad))
+        nozzle_y = rad / 3.0
+    elif shape == "sdf_torus":
+        big = min(w, 0.5 * top)
+        tube = _torus_fit(big, c, dm)
+        slots.append(_slot("torus", "fluid", 0.0, big, 0.0, 0.0, big - tube, tube))
+        nozzle_y = big + big - tube
+    elif shape == "sdf_hourglass":
+        top_w = min(w, dm)
+        slots.append(_slot("hourglass", "fluid", 0.0, 0.5 * top, 0.0, 0.0, top_w, min(max(0.1 * top_w, 3.5 * c), 0.5 * top_w), 0.5 * top, 0.0, 0.0))
+        nozzle_y = 0.75 * top
+    elif shape == "sdf_toy":
+        # ONE hourglass-profile vessel EXTRUDED through the depth (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall);
+        # three ramps (capsule slots stretched across z: left-down, right-down, left-down) in the upper section; a staggered field of peg
+        # cylinders (one slot, domain repetition) under the throat, each peg spanning the depth
+        rr = 0.9 * c
+        yc, delta = 0.5 * top, 0.20 * top                                            # the vessel spans y = 0 .. top (the lower bulb rests on the window floor)
+        throat = max(0.09 * w, 3.5 * c)
+        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, 0.0, w, throat, top - yc, (w - throat) / delta, 1.0))
+        tan, y0, step = 0.42, top - 0.10 * top, 0.097 * top
+        edge = w + 1.5 * rr
+        for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
+            sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
+            high = (sign * edge, y0 - i * step)
+            slots.append(_ramp_slot(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr, dh + 2.0 * c))
+        px = py = 4.6 * c
+        y_lo, y_hi = 0.05 * top, yc - delta - 0.03 * top
+        rows = max(1, int((y_hi - y_lo) // py) + 1)
+        cols = 2 * int(w // px) + 1
+        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
+        nozzle_y = top - 0.12
+        bar = 0.25 * w
+    else:
+        raise ValueError(f"unknown SDF chamber {shape!r}")
+    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": bar}
+
+
+def slot_uniforms(slots: list[dict[str, float]]) -> dict[str, float]:
+    """Each slot dict goes to the next free slot of its kind (``SDF_LAYOUT``); the rest are unused (all zero)."""
+    names = {v: k for k, v in SDF_KINDS.items()}
+    placed: dict[int, dict[str, float]] = {}
+    for slot in slots:
+        kind = names[int(slot["kind"])]
+        free = [k for k in range(SDF_SLOTS) if SDF_LAYOUT[k] == kind and k not in placed]
+        if not free:
+            raise ValueError(f"a chamber has at most {SDF_LAYOUT.count(kind)} SDF slots of kind {kind}")
+        placed[free[0]] = slot
+    out = {"sdf_on": 1.0 if slots else 0.0}
+    for k in range(SDF_SLOTS):
+        out.update({f"q{k}{f}": float(placed.get(k, {}).get(f, 0.0)) for f in SDF_FIELDS})
+    return out
+
+
+def chamber_distance(u: dict[str, float], xs, ys, zs) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The law's own ``sdf_field`` (the same code, on the NumPy backend) at points: ``(d, nx, ny, nz)``.  Host side: the mesh, the inlet check, tests."""
+    xs, ys, zs = (np.asarray(v, dtype=np.float64) for v in (xs, ys, zs))
+    xs, ys, zs = np.broadcast_arrays(xs, ys, zs)
+    q = lambda k, f: AbstractTensor.get_tensor(np.asarray(float(_f32(np.float64(u[f"q{k}{f}"])))))
+    out = sdf_field(AbstractTensor.get_tensor(xs), AbstractTensor.get_tensor(ys), AbstractTensor.get_tensor(zs), q)
+    return tuple(np.asarray(v.numpy(), dtype=np.float64) for v in out)
+
+
+def source_points(u: dict[str, float], bar_half: float, bar_z: float, na: int = 21, nb: int = 9) -> np.ndarray:
+    """Points of the inlet's source volume (the rectangle ``bar_half`` x ``bar_z`` about the nozzle, across the stream; the grains leave within
+    +-BAR_HEIGHT/2 of it along the stream), shape (3, count)."""
+    c0 = np.array([u["nozzle_x"], u["nozzle_y"], u["nozzle_z"]])
+    e1 = np.array([u["e1x"], u["e1y"], u["e1z"]])
+    e2 = np.array([u["e2x"], u["e2y"], u["e2z"]])
+    d = np.array([u["in_dx"], u["in_dy"], u["in_dz"]])
+    a, b, h = np.meshgrid(np.linspace(-1.0, 1.0, na) * bar_half, np.linspace(-1.0, 1.0, nb) * bar_z, np.array([-0.5, 0.0, 0.5]) * BAR_HEIGHT)
+    pts = c0[:, None] + e1[:, None] * a.ravel() + e2[:, None] * b.ravel() + d[:, None] * h.ravel()
+    return pts
+
+
+def fit_inlet(u: dict[str, float], cell: float) -> tuple[float, float]:
+    """The widest source (``bar_half``, ``bar_z`` scaled together by 0.9 steps from the uniforms' own) whose whole volume is deeper than one
+    grain diameter (``cell``) inside the SDF fluid -- d > 2 r along the inlet; the narrowest (0.01) if none is."""
+    bar, bz = float(u["bar_half"]), float(u["bar_z"])
+    while bar >= 0.01:
+        px, py, pz = source_points(u, bar, bz)
+        if float(chamber_distance(u, px, py, pz)[0].min()) > cell:
+            return bar, bz
+        bar *= 0.9
+        bz *= 0.9
+    return 0.01, 0.0                          # no source is clear of the walls (a tiny window): the narrowest, the walls push any grain that starts in them out
+
+
+def chamber_depth(n: int, aspect: float | None, shape: str, p: dict[str, float], params: dict | None, geo: dict[str, float]) -> float:
+    """The depth the run has: the page's ``depth``; an SDF chamber the page has not given one is built to the depth its solid needs
+    (``sdf_default_depth``); either way no deeper than the grid can index."""
+    depth = p["depth"]
+    if shape in SDF_SHAPES and "depth" not in (params or {}):
+        depth = min(max(sdf_default_depth(shape, geo), PARAMS["depth"][1]), PARAMS["depth"][2])
+    return min(depth, depth_cap(n, geo["cell"], aspect))
+
+
+_SDF_SETUPS: dict[tuple, tuple[dict[str, float], list[dict[str, float]]]] = {}
+
+
+def sdf_setup(out: dict[str, float], shape: str, geo: dict[str, float], inlet: str, p: dict[str, float]) -> list[dict[str, float]]:
+    """Fill ``out`` (the uniforms so far) with the SDF chamber's inlet and grid height, and return its slots.  The inlet goes where the preset says
+    (all four inlet kinds start at that point, with their own direction and cross-section), its source is fitted inside the fluid, and the grid
+    covers the whole chamber.  Cached: the fit evaluates the SDF at a few thousand points."""
+    key = (shape, round(geo["scale"], 9), round(geo["stretch"], 9), round(geo["cell"], 9), round(out["dh"], 9), inlet, round(p["spread"], 9),
+           round(out["bar_z"], 9))
+    if key not in _SDF_SETUPS:
+        spec = sdf_preset(shape, geo, out["dh"])
+        geo2 = {**geo, "nozzle_y": spec["nozzle_y"], "bar_half": min(geo["bar_half"], spec["bar"])}
+        spot = inlet_spec(inlet, geo2, p, None)
+        spot.update({"nozzle_x": 0.0, "nozzle_y": spec["nozzle_y"], "nozzle_z": 0.0})
+        u = {**out, **spot, **slot_uniforms(spec["slots"])}
+        bar, bz = fit_inlet(u, geo["cell"])
+        spot.update({"bar_half": bar, "bar_z": bz, "rows": max(out["rows"], math.ceil(spec["top"] / geo["cell"]) + 1)})
+        _SDF_SETUPS[key] = (spot, spec["slots"])
+    spot, slots = _SDF_SETUPS[key]
+    out.update(spot)
+    return slots
+
+
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
              gravity: tuple[float, float, float] = (0.0, -G, 0.0), lid: float = LID_OFF, strata: float = STRATA,
              params: dict | None = None, shape: str = "box", inlet: str = "fountain") -> dict[str, np.ndarray]:
@@ -428,17 +638,24 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     geo = basin(n, aspect, cell)
     out: dict[str, float] = {"mode": mode, "use_image": use_image}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
-    verts = shape_vertices(shape, geo)
-    out.update(inlet_spec(inlet, geo, p, None if shape == "box" else verts))
+    sdf = shape in SDF_SHAPES
+    if not sdf:
+        verts = shape_vertices(shape, geo)
+        out.update(inlet_spec(inlet, geo, p, None if shape == "box" else verts))
     rmax = rmax_of(p)
-    depth = min(p["depth"], depth_cap(n, cell, aspect))
+    depth = chamber_depth(n, aspect, shape, p, params, geo)
     lays = max(1, int(math.ceil(depth / cell - 1.0e-9)))
     dh = 0.5 * depth
     out.update({"lays": lays, "cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
                 "spread": p["spread"], "nozzle_speed": p["nozzle_speed"], "emit_rate": EMIT_SPAN / float(n) / p["rate"]})
+    slots: list[dict[str, float]] = []
+    if sdf:
+        verts = [(0.0, 0.0)] * NV                                                # no polyline: the SDF walls
+        slots = sdf_setup(out, shape, geo, inlet, p)
     if len(verts) > NV:
         raise ValueError(f"a chamber outline has at most {NV} vertices")
     verts = verts + [verts[-1]] * (NV - len(verts))
+    out.update(slot_uniforms(slots))
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
@@ -591,9 +808,181 @@ def _nozzle(pid, centre, e1, e2, d, bar_half, bar_z):
     return tuple(centre[k] + a * e1[k] + b * e2[k] + c * d[k] for k in range(3))
 
 
-def make_law(n: int, active: int | None = None):
+# ----------------------------------------------------- analytic SDF chambers (3-D solids)
+def _sgn(v):
+    """+1 where ``v >= 0`` else -1 (never 0: a gradient on an axis of symmetry picks a side)."""
+    return as_float(v >= 0.0) * 2.0 - 1.0
+
+
+def _max(a, b):
+    return b + (a - b).clamp(0.0, 1.0e30)
+
+
+def _min(a, b):
+    return a - (a - b).clamp(0.0, 1.0e30)
+
+
+def _sdf_box(lx, ly, lz, hx, hy, hz, rc):
+    """Rounded box: half extents ``hx, hy, hz``, corner radius ``rc``.  Returns (f, gx, gy, gz): f < 0 inside, the gradient of f."""
+    sx, sy, sz = _sgn(lx), _sgn(ly), _sgn(lz)
+    qx, qy, qz = lx.abs() - (hx - rc), ly.abs() - (hy - rc), lz.abs() - (hz - rc)
+    ox, oy, oz = qx.clamp(0.0, 1.0e9), qy.clamp(0.0, 1.0e9), qz.clamp(0.0, 1.0e9)
+    ol = (ox * ox + oy * oy + oz * oz + 1.0e-24).sqrt()
+    qm = _max(_max(qx, qy), qz)
+    f = ol + _min(qm, 0.0) - rc
+    out = as_float((ox + oy + oz) > 0.0)
+    xdom = as_float(qx >= qy) * as_float(qx >= qz)                 # inside: the nearest face is the axis with the largest q
+    ydom = (1.0 - xdom) * as_float(qy >= qz)
+    zdom = 1.0 - xdom - ydom
+    return (f, (out * (ox / ol) + (1.0 - out) * xdom) * sx, (out * (oy / ol) + (1.0 - out) * ydom) * sy,
+            (out * (oz / ol) + (1.0 - out) * zdom) * sz)
+
+
+def _sdf_sphere(lx, ly, lz, rad):
+    r = (lx * lx + ly * ly + lz * lz + 1.0e-12).sqrt()
+    return r - rad, lx / r, ly / r, lz / r
+
+
+def _clamp_to(v, half):
+    """``v`` clamped to ``[-half, half]`` for a RUNTIME ``half``."""
+    m1 = v - (v - half).clamp(0.0, 1.0e30)
+    return m1 + (-half - m1).clamp(0.0, 1.0e30)
+
+
+def _sdf_capsule(lx, ly, lz, half_len, rad, half_z):
+    """The rectangle ``[-half_len, half_len] x {0} x [-half_z, half_z]`` (a segment along the local x axis when ``half_z`` = 0) thickened by
+    ``rad``: a capsule, or a RAMP that spans the depth (``half_z`` past the glass).  Exact."""
+    ex = lx - _clamp_to(lx, half_len)
+    ez = lz - _clamp_to(lz, half_z)
+    er = (ex * ex + ly * ly + ez * ez + 1.0e-12).sqrt()
+    return er - rad, ex / er, ly / er, ez / er
+
+
+def _sdf_torus(lx, ly, lz, big_r, small_r):
+    """A torus whose axis is the local z axis (a ring standing in the x-y plane, as the 2-D annulus): major radius ``big_r``, tube radius ``small_r``."""
+    rho = (lx * lx + ly * ly + 1.0e-12).sqrt()
+    qx = rho - big_r
+    d = (qx * qx + lz * lz + 1.0e-12).sqrt()
+    return d - small_r, (qx / d) * (lx / rho), (qx / d) * (ly / rho), lz / d
+
+
+#: the outward unit normals of a regular tetrahedron with its apex up (+y): the face under it, then three slanted faces
+_TET_NORMALS = ((0.0, -1.0, 0.0), (0.0, 1.0 / 3.0, -_TET_C), (_TET_S * _TET_C, 1.0 / 3.0, 0.5 * _TET_C), (-_TET_S * _TET_C, 1.0 / 3.0, 0.5 * _TET_C))
+
+
+def _sdf_tetra(lx, ly, lz, rad):
+    """A REGULAR tetrahedron of circumradius ``rad`` about its centre, apex up: ``f = max over the four faces of the plane distance``
+    (each face is at the inradius ``rad / 3``).  Exact inside, and outside wherever the nearest point is a face's interior; past an edge
+    or a vertex it is the largest face distance (a lower bound), as the 2-D n-gon is."""
+    best, bgx, bgy, bgz = None, None, None, None
+    for nx, ny, nz in _TET_NORMALS:
+        f = nx * lx + ny * ly + nz * lz - rad * (1.0 / 3.0)
+        if best is None:
+            best, bgx, bgy, bgz = f, f * 0.0 + nx, f * 0.0 + ny, f * 0.0 + nz
+        else:
+            take = as_float(f > best)
+            best = best + take * (f - best)
+            bgx = bgx + take * (nx - bgx)
+            bgy = bgy + take * (ny - bgy)
+            bgz = bgz + take * (nz - bgz)
+    return best, bgx, bgy, bgz
+
+
+def _sdf_hourglass(lx, ly, lz, top_w, throat_w, half_h, slope, planar):
+    """A profile REVOLVED about the vertical (local y) axis: radius <= min(top_w, throat_w + slope |y|), |y| <= half_h, each side
+    Lipschitz-normalised (slope 0: the full taper from the throat to ``top_w`` at the caps).  ``planar`` = 1 extrudes the profile through z
+    instead (the radius is |x|: the 2-D hourglass vessel through the depth)."""
+    hh = half_h.clamp(1.0e-6, 1.0e9)
+    sy = _sgn(ly)
+    ay = ly.abs()
+    rho = (lx * lx + (1.0 - planar) * lz * lz + 1.0e-12).sqrt()
+    ux, uz = lx / rho, (1.0 - planar) * lz / rho
+    kdef = (top_w - throat_w) * (1.0 / hh)
+    has = as_float(slope > 1.0e-9)
+    kk = kdef + has * (slope - kdef)
+    inv = 1.0 / (1.0 + kk * kk).sqrt()
+    fa = (rho - throat_w - kk * ay) * inv                                    # the tapering wall
+    gax, gay, gaz = ux * inv, -kk * sy * inv, uz * inv
+    fb = rho - top_w                                                          # the vertical wall
+    fc = ay - hh                                                              # the cap
+    pb = as_float(fa >= fb)
+    f1 = _max(fa, fb)
+    g1x, g1y, g1z = pb * gax + (1.0 - pb) * ux, pb * gay, pb * gaz + (1.0 - pb) * uz
+    pc = as_float(f1 >= fc)
+    return _max(f1, fc), pc * g1x, pc * g1y + (1.0 - pc) * sy, pc * g1z
+
+
+def _sdf_pegs(lx, ly, pitch_x, pitch_y, peg_r, cols, rows, stagger):
+    """A PEG FIELD of cylinders along z (through the whole depth) by domain repetition with clamped indices: the nearest peg in each of the
+    three rows around the point's own.  Returns (f, gx, gy) of the nearest peg (the gradient has no z part)."""
+    px = pitch_x.clamp(1.0e-6, 1.0e9)
+    py = pitch_y.clamp(1.0e-6, 1.0e9)
+    rm = (rows - 1.0).clamp(0.0, 1.0e9)
+    cm = (cols - 1.0).clamp(0.0, 1.0e9)
+    j0 = (ly * (1.0 / py) + 0.5 * rm + 0.5).floor()
+    best, bgx, bgy = None, None, None
+    for dj in (-1.0, 0.0, 1.0):
+        j = _min((j0 + dj).clamp(0.0, 1.0e9), rm)
+        odd = j - 2.0 * (j * 0.5).floor()
+        shift = stagger * 0.5 * px * odd
+        i = _min(((lx - shift) * (1.0 / px) + 0.5 * cm + 0.5).floor().clamp(0.0, 1.0e9), cm)
+        ex = lx - ((i - 0.5 * cm) * px + shift)
+        ey = ly - (j - 0.5 * rm) * py
+        er = (ex * ex + ey * ey + 1.0e-12).sqrt()
+        f = er - peg_r
+        if best is None:
+            best, bgx, bgy = f, ex / er, ey / er
+        else:
+            take = as_float(f < best)
+            best = best + take * (f - best)
+            bgx = bgx + take * (ex / er - bgx)
+            bgy = bgy + take * (ey / er - bgy)
+    return best, bgx, bgy
+
+
+def sdf_field(x, y, z, q):
+    """The composed chamber SDF at ``(x, y, z)`` from the slot uniforms (``q(k, field)`` gives slot ``k``'s scalar).
+    d = max over FLUID slots of their inside distance, then min with the signed distance to each SOLID: ``d > 0`` is inside the fluid, the
+    distance to the nearest wall.  Returns ``(d, nx, ny, nz)``: ``n`` is the ANALYTIC gradient of the active primitive (unit, pointing into the
+    fluid), chosen by masks, no finite differences.  Each slot evaluates only its own kind's SDF (``SDF_LAYOUT``)."""
+    zero = x * 0.0
+    d_f, f_n = zero - SDF_FAR, [zero, zero, zero]
+    d_s, s_n = zero + SDF_FAR, [zero, zero, zero]
+    for k in range(SDF_SLOTS):
+        kind, role, cx, cy, cz, rot = (q(k, f) for f in ("kind", "role", "cx", "cy", "cz", "rot"))
+        p0, p1, p2, p3, p4, p5 = (q(k, f) for f in ("p0", "p1", "p2", "p3", "p4", "p5"))
+        c, s = rot.cos(), rot.sin()
+        dx, dy = x - cx, y - cy
+        lx, ly, lz = c * dx + s * dy, c * dy - s * dx, z - cz
+
+        fns = {"box": lambda: _sdf_box(lx, ly, lz, p0, p1, p2, p3), "sphere": lambda: _sdf_sphere(lx, ly, lz, p0),
+               "capsule": lambda: _sdf_capsule(lx, ly, lz, p0, p1, p2), "torus": lambda: _sdf_torus(lx, ly, lz, p0, p1),
+               "tetra": lambda: _sdf_tetra(lx, ly, lz, p0), "hourglass": lambda: _sdf_hourglass(lx, ly, lz, p0, p1, p2, p3, p4),
+               "pegs": lambda: _sdf_pegs(lx, ly, p0, p1, p2, p3, p4, p5)}
+        f, gx, gy, *rest = fns[SDF_LAYOUT[k]]()                   # TYPED slot: only its own kind's SDF is evaluated
+        gz = rest[0] if rest else zero
+        gwx, gwy = c * gx - s * gy, s * gx + c * gy
+        used = as_float(kind > 0.5)
+        fluid = used * as_float(role < 0.5)
+        solid = used * (1.0 - fluid)
+        cf = fluid * (-f) + (1.0 - fluid) * (-SDF_FAR)
+        take = as_float(cf > d_f)
+        d_f = d_f + take * (cf - d_f)
+        for i, g in enumerate((-gwx, -gwy, -gz)):
+            f_n[i] = f_n[i] + take * (g - f_n[i])
+        cs = solid * f + (1.0 - solid) * SDF_FAR
+        take = as_float(cs < d_s)
+        d_s = d_s + take * (cs - d_s)
+        for i, g in enumerate((gwx, gwy, gz)):
+            s_n[i] = s_n[i] + take * (g - s_n[i])
+    pick = as_float(d_s < d_f)
+    return (d_f + pick * (d_s - d_f),) + tuple(f_n[i] + pick * (s_n[i] - f_n[i]) for i in range(3))
+
+
+def make_law(n: int, active: int | None = None, sdf: bool = True):
     """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
-    The chamber, inlet, species table and every tunable are runtime uniforms: see ``uniforms``."""
+    The chamber, inlet, species table and every tunable are runtime uniforms: see ``uniforms``.  ``sdf`` = False compiles the SDF walls out
+    (the law as it was before them; the reference the tests hold ``sdf_on = 0`` bit-identical to)."""
     active = int(n if active is None else active)
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
@@ -824,6 +1213,17 @@ def make_law(n: int, active: int | None = None):
         wall(radius - (dh - z), live, (zero, zero, zero - 1.0))             # the front plexiglass (+z), its normal points at the grain: -z
         wall(radius - (z + dh), live, (zero, zero, zero + 1.0))             # the back plexiglass (-z)
         wall(radius - (lid - y), live, (zero, zero - 1.0, zero))            # the lid: a ceiling at the runtime height ``lid`` (far unless the page closes it)
+        # the SDF walls (``sdf_on`` = 1): the SAME thick sided saturating contact against the composed analytic chamber SDF of the true 3-D solids.
+        # Contact when d < radius, the penetration (radius - d) saturating at 6 radii, the force along the SDF's analytic gradient (into the
+        # fluid): a grain on the wrong side of a wall is pushed back by a bounded force, never clamped or moved.  sdf_on = 0: the validity
+        # weight is an exact zero, so every term is an exact zero (and the law is the old law bit for bit).
+        if sdf:
+            sdf_on = a["sdf_on"]
+            d_sdf, sdf_nx, sdf_ny, sdf_nz = sdf_field(x, y, z, lambda k, field: a[f"q{k}{field}"])
+            wall(_cap(radius - d_sdf, 6.0 * radius), live * sdf_on, (sdf_nx, sdf_ny, sdf_nz))
+            sdf_gone = live * sdf_on * as_float(d_sdf < -radius)           # the grain centre is more than a radius on the wrong side
+        else:
+            sdf_gone = x * 0.0
         # ---- the integrator: gravity (the runtime vector), the interstitial fluid, the forces above.  A pending id with a clear
         # slot is placed at the inlet with its launch velocity; one with a blocked slot waits for the next step.  The fluid's
         # drag (Stokes 6 pi mu r v and quadratic) is implicit, so any viscosity damps and none explodes.
@@ -925,7 +1325,7 @@ def make_law(n: int, active: int | None = None):
             * as_float(wxn.abs() < 1.0e30) * as_float(wyn.abs() < 1.0e30) * as_float(wzn.abs() < 1.0e30)
         placed = finite * as_float((xn.abs() + yn.abs() + zn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
         inside_box = (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) \
-            * (1.0 - as_float(zn.abs() > dh + radius))
+            * (1.0 - as_float(zn.abs() > dh + radius)) * (1.0 - sdf_gone)
         outside = placed * (1.0 - inside_box)
         c_nan = 1.0 - finite
         c_parked = finite * (1.0 - placed)

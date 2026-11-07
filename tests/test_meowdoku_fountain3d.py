@@ -1196,3 +1196,103 @@ def test_every_shape_is_inscribed_in_the_visible_window_closed_when_a_polygon_an
             xl, xr = F.chord(verts, float(u["nozzle_y"]))
             assert xl < float(u["nozzle_x"]) - float(u["bar_half"]) and float(u["nozzle_x"]) + float(u["bar_half"]) < xr    # the inlet bar is inside the chord
             assert float(u["nozzle_y"]) < max(ys)
+
+
+# ------------------------------------------------------------------------------- SDF chambers (true 3-D solids)
+def _eager_step(law, cols, n):
+    tensors = [AbstractTensor.get_tensor(np.asarray(cols[k], dtype=np.float64)) for k in F.ARGUMENTS]
+    out = law(*tensors)
+    got = {nm: np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (n,)).copy() for nm, v in zip(F.OUTPUTS, out)}
+    nxt = dict(cols)
+    for s in F.STATE:
+        nxt[s] = got[s + "_next"]
+    return nxt, got
+
+
+def _thrown(n, uni, seed=0, box=((-0.15, 0.15), (0.012, 0.09))):
+    """``n`` live grains packed into a small region with random velocities and spin (contact-rich from the first step)."""
+    rng = np.random.default_rng(seed)
+    cols = {k: np.zeros(n) for k in F.STATE + ("ir", "ig", "ib")}
+    cols["pid"] = np.arange(n, dtype=np.float64)
+    cols.update({k: float(v) for k, v in uni.items()})
+    dh = float(cols["dh"])
+    cols["x"], cols["y"] = rng.uniform(*box[0], n), rng.uniform(*box[1], n)
+    cols["z"] = rng.uniform(-dh + 0.012, dh - 0.012, n)
+    for k in ("vx", "vy", "vz"):
+        cols[k] = rng.uniform(-1.0, 1.0, n)
+    for k in ("wx", "wy", "wz"):
+        cols[k] = rng.uniform(-3.0, 3.0, n)
+    cols["age"] = np.full(n, 100.0)
+    return cols
+
+
+def test_sdf_off_is_the_old_law_bit_for_bit_over_contact_rich_steps():
+    """``sdf_on = 0`` multiplies the SDF contact by an exact zero: the law with the SDF walls equals the law compiled without them, every state and
+    every output, over steps in which the grains collide with each other and every wall (eager NumPy lane; the native 3-D compile is too long to run here).
+    (The same run was also held equal to the law at the commit before the SDF walls: 40 steps, 64 ids.)"""
+    n = 24
+    uni = F.uniforms(n=n)
+    assert float(uni["sdf_on"]) == 0.0 and all(float(uni[f"q{k}kind"]) == 0.0 for k in range(F.SDF_SLOTS))
+    off, base = F.make_law(n, n, True), F.make_law(n, n, False)
+    a, b = _thrown(n, uni), _thrown(n, uni)
+    for _ in range(12):
+        a, ga = _eager_step(off, a, n)
+        b, gb = _eager_step(base, b, n)
+        assert all(np.array_equal(ga[k], gb[k]) for k in F.OUTPUTS)
+    assert float(np.abs(a["vy"]).max()) > 0.0 and ga["n_out"][0] == 0                          # the grains moved and none left
+
+
+def test_sdf_gradients_are_analytic_and_the_distances_exact_where_the_solids_are_simple():
+    rng = np.random.default_rng(1)
+    for shape in F.SDF_SHAPES:
+        u = F.uniforms(n=4096, shape=shape)
+        _c, w, top = F.window_fit(F.basin(4096))
+        dh = float(u["dh"])
+        xs, ys, zs = rng.uniform(-w, w, 1500), rng.uniform(0.0, top, 1500), rng.uniform(-dh, dh, 1500)
+        d, nx, ny, nz = F.chamber_distance(u, xs, ys, zs)
+        h = 2.0e-3
+        fd = []
+        for ax in range(3):
+            e = [0.0, 0.0, 0.0]
+            e[ax] = h
+            fd.append((F.chamber_distance(u, xs + e[0], ys + e[1], zs + e[2])[0] - F.chamber_distance(u, xs - e[0], ys - e[1], zs - e[2])[0]) / (2.0 * h))
+        err = np.sqrt((nx - fd[0]) ** 2 + (ny - fd[1]) ** 2 + (nz - fd[2]) ** 2)
+        near = np.abs(d) < 0.3
+        assert near.any() and (err[near] < 6.0e-3).mean() > 0.95, shape                      # the rest are the kinks / medial surfaces the difference straddles
+        assert (np.abs(np.sqrt(nx ** 2 + ny ** 2 + nz ** 2) - 1.0) < 2.0e-3).mean() > 0.999, shape       # a unit gradient everywhere (bar a measure-zero sliver at a face)
+    # exact: the ball and the tetrahedron (inside) against their closed forms
+    u = F.uniforms(n=4096, shape="sdf_sphere")
+    rad, cy = float(u["q3p0"]), float(u["q3cy"])
+    p = rng.uniform(-0.5, 0.5, (3, 200)) * rad
+    assert np.abs(F.chamber_distance(u, p[0], cy + p[1], p[2])[0] - (rad - np.sqrt((p ** 2).sum(0)))).max() < 1.0e-6
+    u = F.uniforms(n=4096, shape="sdf_tetra")
+    rad, cy, cz = float(u["q9p0"]), float(u["q9cy"]), float(u["q9cz"])
+    pts = np.array([[0.0, 0.0, 0.0], [0.1, 0.2, 0.05], [-0.1, -0.1, 0.1]]) * rad
+    d = F.chamber_distance(u, pts[:, 0], cy + pts[:, 1], cz + pts[:, 2])[0]
+    normals = np.array(F._TET_NORMALS)
+    assert np.abs(d - (rad / 3.0 - (pts @ normals.T).max(1))).max() < 1.0e-6                # inside: the distance to the nearest face plane (the inradius at the centre)
+    assert abs(float(F.chamber_distance(u, [0.0], [cy], [cz])[0][0]) - rad / 3.0) < 1.0e-6
+
+
+def test_sdf_presets_are_inscribed_in_the_window_and_the_depth_and_the_inlet_is_inside_the_fluid():
+    for n in (256, 4096, 65536):
+        geo = F.basin(n)
+        c, w, top = F.window_fit(geo)
+        for shape in F.SDF_SHAPES:
+            u = F.uniforms(n=n, shape=shape)
+            dh = float(u["dh"])
+            assert float(u["sdf_on"]) == 1.0 and dh <= 0.5 * F.DEPTH_MAX + 1.0e-9
+            # the fluid (d > 0), sampled over the window and the slab (and a margin around them), lies inside |x| <= w, 0 <= y <= top and the depth
+            xs, ys, zs = np.meshgrid(np.linspace(-w - 0.1, w + 0.1, 41), np.linspace(-0.05, top + 0.1, 61), np.linspace(-dh, dh, 15), indexing="ij")
+            d = F.chamber_distance(u, xs.ravel(), ys.ravel(), zs.ravel())[0]
+            fx, fy, fz = (a.ravel()[d > 0.0] for a in (xs, ys, zs))
+            assert fx.size > 0, shape
+            assert np.abs(fx).max() <= w + 1.0e-6 and fy.min() >= -1.0e-6 and fy.max() <= top + 1.0e-6, (shape, n)          # inscribed in the window
+            assert shape == "sdf_toy" or np.abs(fz).max() <= dh - F.Z_MARGIN_CELLS * c + 1.0e-6, (shape, n)                   # and in the depth, a margin from the glass
+            # the inlet: the whole source volume is deeper than one grain diameter (> 2 r) inside the fluid
+            px, py, pz = F.source_points({k: float(v) for k, v in u.items()}, float(u["bar_half"]), float(u["bar_z"]))
+            assert float(F.chamber_distance(u, px, py, pz)[0].min()) > (c if n >= 4096 else 0.0), (shape, n)       # (a 256-id window is too small for a source clear by a diameter: it is at least inside)
+            assert float(u["rows"]) * c >= top                                                                                  # the grid covers the whole chamber
+    # the polygon presets and the box are untouched: sdf off, no slots
+    for shape in ("box", "funnel", "hexagon", "ramp"):
+        assert float(F.uniforms(n=256, shape=shape)["sdf_on"]) == 0.0
