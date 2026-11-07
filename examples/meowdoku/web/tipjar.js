@@ -73,8 +73,8 @@ export function qrMatrix(text) {
   const modules = Array.from({ length: size }, () => new Array(size).fill(false)), isFn = Array.from({ length: size }, () => new Array(size).fill(false));
   const setFn = (x, y, dark) => { if (x >= 0 && y >= 0 && x < size && y < size) { modules[y][x] = dark; isFn[y][x] = true; } };
   const finder = (cx, cy) => { for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) { const d = Math.max(Math.abs(dx), Math.abs(dy)); setFn(cx + dx, cy + dy, d !== 4 && d !== 2); } };
+  for (let i = 0; i < size; i++) { setFn(6, i, i % 2 === 0); setFn(i, 6, i % 2 === 0); }     // [QRWALL] the timing lines FIRST: the finders are drawn over them (they were drawn first, which cut a gap in each finder's edge and made every code unreadable)
   finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
-  for (let i = 0; i < size; i++) { setFn(6, i, i % 2 === 0); setFn(i, 6, i % 2 === 0); }
   if (ALIGN[version]) { const p = ALIGN[version]; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) setFn(p + dx, p + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1); }
   const drawFormat = (mask) => {
     const f = formatBits(mask), bit = (i) => ((f >>> i) & 1) !== 0;
