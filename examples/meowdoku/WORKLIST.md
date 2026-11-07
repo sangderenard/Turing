@@ -33,9 +33,16 @@ C. **Hinged rigid actors + waterwheel:** a body of SDF primitives on one hinge, 
 
 ## Purrline sand mode (the user, 2026-11-07)
 
-A. Finite supply of replenishment items; matched cells stay empty once the stock runs out (in progress).
-B. New items fall from the sky on their own plane and only join the field on landing (in progress, in the purrline law).
+A. Finite supply of replenishment items; matched cells stay empty once the stock runs out (DONE: purrline mode "sand", the page's "Finite sky stock" toggle; `stock` is a law column, shown in the status line; the game is over when the board settles with no legal swap, result = score).
+B. New items fall from the sky on their own plane and only join the field on landing (DONE, in the purrline law: per-cell `sky_on sky_kind sky_tid sky_y sky_vy`, gravity `SKY_G`, the board is busy while anything is in the air, landing makes the cell's tile; survivors still fall, a hole counts as a cleared cell, so holes collect at the top of a column and a column emptied completely is a through-channel).
 C. A 2D fountain surrounds the board. The board's occupied cells are solids (a new occupancy-grid SDF primitive from a per-cell mask), and falling items are moving solids with "unreasonable push" (position-driven, infinite mass, carrying their velocity). Sand fills and backs up, and only passes through the holes left when the supply runs out, into a sump. The page writes the mask and the item poses into the fountain's runtime inputs each batch; the sand doesn't feed back into the game. Queued after the waterwheel (which owns fountain.py).
+
+   **What the page receives for C** (game state key `purrline`, in the meta JSON; no snapshot wire change, PROTOCOL stays 13; board units: x right, y down, a cell is `cell` = 1.0 wide, the board's top-left corner is `origin` = [0, 0], so cell (row, col) spans x in [col, col+1], y in [row, row+1]):
+   - `occupancy`: `rows * cols` ints, row-major, 1 where the cell holds a tile (a flashing, about-to-pop tile still counts; a sliding tile is counted in its logical cell), 0 for a hole or a cell waiting for an item to land. Plus `rows`, `cols`, `cell`, `origin`. Build the fountain's occupancy-grid solid from it each batch.
+   - `falling`: one record per item in the sky: `id` ("tid:0", the same id the item keeps once landed and the entity list carries), `col`, `row` (the cell it will land in), `x` (column centre), `y` (its centre now), `vx` (0), `vy` (cells/s, the law's), `size` (the tile's half-size, `TILE_SIZE`), `plane_z` (its plane's height toward the camera). Feed them as moving solids with "unreasonable push" (position-driven, infinite mass, carrying `vy`). They also ride the binary snapshot as ordinary entities with `z = plane_z`.
+   - `stock`, `stock0`, `sand` (bool), `over`.
+   - Holes only appear once the stock is out: a completely emptied column lets sand through to the sump.
+   - Not yet exposed: tiles mid-slide (a swap, a fall of survivors) are in their logical cell; if C needs their drawn position, add per-cell `ox oy` (the law columns exist).
 
 ## Render priority (the user, 2026-11-06)
 
