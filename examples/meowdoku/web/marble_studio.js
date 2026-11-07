@@ -3,6 +3,7 @@
 import { catEyeMarble } from "./marble_mesh.js";
 import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
+import { diceSolid } from "./dice_mesh.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
@@ -85,7 +86,7 @@ function dispose(mesh) {
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
 
-const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve"];
+const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve","mark-scale","relief-depth"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
@@ -95,7 +96,7 @@ let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, 
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
-  ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material"}[layer]).value];
+  ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material",mark:"mark-material"}[layer]).value];
 const slot = (table, id, offset) => id * tables[table].table.floats_per_record + offset;
 const read = (table, id, offset) => tables[table].data[slot(table,id,offset)];
 const write = (table, id, offset, value) => { tables[table].data[slot(table,id,offset)] = value; tables[table].update(); };
@@ -122,7 +123,8 @@ function copyPaint() {
 }
 function reportMass(geometry) {
   const densityByRole={shell:+$("shell-density").value,eye:+$("eye-density").value,
-    accent:+$("accent-density").value,confetti:+$("confetti-density").value,enamel:+$("enamel-density").value};
+    accent:+$("accent-density").value,confetti:+$("confetti-density").value,enamel:+$("enamel-density").value,
+    mark:+$("mark-density").value};
   const result=marbleMass(geometry,{radiusM:+$("radius-mm").value/1000,densityByRole,
     enamelMaterial:coatedId,enamelThicknessM:read("enamel",coatedId,0)*1e-9});
   rollProps=result; resetRoll();
@@ -133,7 +135,7 @@ function reportMass(geometry) {
     g.count++;g.massKg+=c.massKg;g.volumeM3+=c.volumeM3;grouped.set(c.name,g);}
   const components=[...grouped].map(([name,c])=>`${name} ×${c.count}: ${(c.massKg*1000).toFixed(3)} g / ${(c.volumeM3*1e9).toFixed(2)} mm³`).join("\n");
   $("mass-report").style.whiteSpace="pre-line";
-  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Estimated"} mass ${(result.massKg*1000).toFixed(3)} g · center of mass (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nPrincipal moments of inertia:\n${moments}\nFull inertia tensor (kg·m²):\n${tensor}\n${components}\n${result.mechanicsNote}`;
+  $("mass-report").textContent=`${result.massExact?"Calculated":"Estimated"} mass ${(result.massKg*1000).toFixed(3)} g · center of mass (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nPrincipal moments of inertia:\n${moments}\nFull inertia tensor (kg·m²):\n${tensor}\n${components}\n${result.mechanicsNote}`;
   $("roll-status").textContent=result.validForRoll?"Locked · release to roll on the calculated inertia tensor":`Roll unavailable: ${result.mechanicsNote}`;
 }
 function checkerboard() {
@@ -160,14 +162,17 @@ function syncMaterial() {
   $("emission").value = hex([8,9,10].map((k) => read("pbr",id,k)));
   $("enamel-color").value = hex([4,5,6].map((k) => read("enamel",id,k)));
   for (const [name,[table,offset,scale]] of Object.entries(properties)) {
-    const value = read(table,id,offset) * scale;
-    $(name).value = String(value);
-    $(name+"-out").value = value.toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
+    const actual = read(table,id,offset);
+    $(name).value = String(actual*scale);
+    $(name+"-out").value = actual.toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
   }
 }
 function rebuild() {
   dispose(interior); dispose(glass);
-  const geometry = catEyeMarble({
+  const geometry = $("base-shape").value!=="marble" ? diceSolid($("base-shape").value,{
+    shellMaterial:idFor("glass"),markMaterial:idFor("mark"),markingMode:$("marking-mode").value,
+    reliefDepth:+$("relief-depth").value/1000,markScale:+$("mark-scale").value/100,
+    subdivisions:$("base-shape").value==="d4"?48:24}) : catEyeMarble({
     glass: idFor("glass"), enamel: coatedId, eye: idFor("eye"), accent: idFor("accent"), confetti: idFor("confetti"),
     paintA:paintAId,paintB:paintBId }, {
     rings:96, segments:128, eyeWidth:+$("width").value/100,
@@ -191,6 +196,11 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
+  for(const field of ["base-shape","marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
+    $(name).addEventListener("input",()=>{$(name+"-out").value=(+$(name).value/(name.startsWith("spot")?1:10)).toFixed(name.startsWith("spot")?0:1);});
+  for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
+    $(name+"-out").value=(+$(name).value/(name.startsWith("spot")?1:10)).toFixed(name.startsWith("spot")?0:1);
   $("reset-roll").addEventListener("click",resetRoll);
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
@@ -200,7 +210,7 @@ function controls() {
     for(const name of ["orientation-yaw","orientation-pitch","orientation-roll"]) {if(hybrid) $(name).value=0;$(name).disabled=hybrid;$(name+"-out").value=$(name).value;}};
   $("kind").addEventListener("change", () => {syncKind();rebuild();syncMaterial();});
   $("shell").addEventListener("change", () => {$("opaque").checked=false;opaqueSaved=null;copyCoating(); rebuild(); syncMaterial(); });
-  for(const field of ["radius-mm","shell-density","eye-density","accent-density","confetti-density","enamel-density"])
+  for(const field of ["radius-mm","shell-density","eye-density","accent-density","confetti-density","enamel-density","mark-density"])
     $(field).addEventListener("input",()=>{ if(lastGeometry) reportMass(lastGeometry); });
   for(const field of ["paint-a-color","paint-b-color"]) $(field).addEventListener("input",()=>{copyPaint();syncMaterial();});
   $("preset").addEventListener("change",()=>{
@@ -266,14 +276,22 @@ function frame(now=0) {
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
       gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
     setTransform(mv);
-    const lights=[[-2.5,3,3],[3,1,2],[-1,-2,-3]];
-    gl.uniform1i(loc(P,"uNumLights"),3);
+    const key=[+$("light-x").value/100,+$("light-y").value/100,+$("light-z").value/100];
+    const spread=+$("light-spread").value/100;
+    const lights=[[0,0,0],[-spread,0,0],[spread,0,0],[0,-spread,0],[0,spread,0]]
+      .map((offset)=>key.map((x,i)=>x+offset[i])).concat([[3,1,2],[-1,-2,-3]]);
+    const keyStrength=+$("light-strength").value/10;
+    const inner=Math.min(+$("spot-inner").value,+$("spot-outer").value-1),outer=+$("spot-outer").value;
+    const direction=key.map((x)=>-x/Math.max(0.001,Math.hypot(...key)));
+    const spotDirections=lights.map((_,i)=>$("spot").checked&&i<5?direction:[0,0,0]);
+    const cones=lights.map((_,i)=>i<5?[Math.cos(inner*Math.PI/180),Math.cos(outer*Math.PI/180)]:[0,0]);
+    gl.uniform1i(loc(P,"uNumLights"),lights.length);
     gl.uniform3fv(loc(P,"uLightPos[0]"),new Float32Array(lights.flat()));
-    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array([1,0.9,0.78,0.52,0.72,1,0.5,0.6,1]));
-    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array([22,10,7]));
-    gl.uniform1iv(loc(P,"uLightGroupId[0]"),new Int32Array([-1,-1,-1]));
-    gl.uniform3fv(loc(P,"uLightSpotDir[0]"),new Float32Array(9));
-    gl.uniform2fv(loc(P,"uLightSpotCone[0]"),new Float32Array(6));
+    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(lights.map((_,i)=>i<5?[1,0.9,0.78]:i===5?[0.52,0.72,1]:[0.5,0.6,1]).flat()));
+    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(lights.map((_,i)=>i<5?keyStrength/5:i===5?10:7)));
+    gl.uniform1iv(loc(P,"uLightGroupId[0]"),new Int32Array(lights.map(()=>-1)));
+    gl.uniform3fv(loc(P,"uLightSpotDir[0]"),new Float32Array(spotDirections.flat()));
+    gl.uniform2fv(loc(P,"uLightSpotCone[0]"),new Float32Array(cones.flat()));
     field(P,"uLightCalibration",1); field(P,"uExposure",1); field(P,"uFieldGain",0);
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
@@ -309,7 +327,7 @@ async function boot() {
     coatedId=Math.max(...Object.values(ids))+1; paintAId=coatedId+1; paintBId=coatedId+2;
     tables=Object.fromEntries(Object.entries(assets.materials).map(([name,table])=>[name,floatTexture(table,{pbr:0,phong:1,enamel:2,texstack:3}[name])]));
     const names=Object.keys(ids).filter((name)=>Number.isInteger(ids[name])).sort();
-    for (const [select,initial] of [["shell","marble_clear_glass"],["confetti-material","metal_gold"]]) {
+    for (const [select,initial] of [["shell","marble_clear_glass"],["confetti-material","metal_gold"],["mark-material","metal_gold"]]) {
       for (const name of names) { const option=document.createElement("option"); option.value=name; option.textContent=name.replaceAll("_"," "); $(select).append(option); }
       $(select).value=initial;
     }

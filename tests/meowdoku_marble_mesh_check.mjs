@@ -1,6 +1,7 @@
 import { catEyeMarble } from "../examples/meowdoku/web/marble_mesh.js";
 import { marbleMass, principalMoments } from "../examples/meowdoku/web/marble_mass.js";
 import { rollingStep } from "../examples/meowdoku/web/marble_roll.js";
+import { diceSolid } from "../examples/meowdoku/web/dice_mesh.js";
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const mesh = catEyeMarble({ glass: 11, eye: 12, accent: 13 });
@@ -86,6 +87,11 @@ assert(Math.abs(rollX.angularAcceleration[2])<Math.abs(rollZ.angularAcceleration
   "full anisotropic tensor changes torque response by axis");
 let gated=false;try{rollingStep(startRoll,{...clearMass,validForRoll:false},[0.001,0,0],0.01,0.01);}catch(e){gated=e instanceof RangeError;}
 assert(gated,"rolling rejects unresolved mass and inertia");
+const die=diceSolid("d6",{shellMaterial:11,markMaterial:12,markingMode:"raised",reliefDepth:0.03});
+const dieMass=marbleMass(die,{radiusM:0.01,densityByRole:{shell:2500,mark:2500,enamel:3000}});
+assert(dieMass.massExact && !dieMass.validForRoll,"die has exact body-substrate mass but sphere roll is gated");
+const mixedMark=marbleMass(die,{radiusM:0.01,densityByRole:{shell:2500,mark:7800,enamel:3000}});
+assert(!mixedMark.massExact && !mixedMark.validForRoll,"distinct bulk relief density is unresolved and gated");
 for(const kind of ["spiral","rings"]) {
   const design=catEyeMarble({glass:11,eye:12,accent:13},{kind,tubeCount:2});
   assert(design.tubes.length===2 && design.interior.length>1000,`${kind} consists of triangulated tubes`);
