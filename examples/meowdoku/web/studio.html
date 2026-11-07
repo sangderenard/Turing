@@ -1,0 +1,100 @@
+<!doctype html>
+<!-- [STUDIO] The loading studio: the loading screen at full size, re-recording and scene controls, and the library of recordings.
+     Anyone may view; making a recording active or deleting one needs the owner's admin token (typed here, kept in sessionStorage). -->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meowdoku loading studio</title>
+<style>
+  :root { --bg:#14151a; --panel:#1d1f27; --line:#2f3240; --fg:#e8e8ea; --dim:#9a9caa; --accent:#6aa9ff; --warn:#ffb14a; --bad:#ff6a6a; --ok:#6fe39a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px 20px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; font-weight:700; }
+  header a { color:var(--accent); text-decoration:none; }
+  main { max-width:1280px; margin:0 auto; padding:16px; display:grid; gap:18px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  section > h2 { margin:0 0 10px; font-size:15px; }
+  button, select, input { font:inherit; color:var(--fg); background:#262935; border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
+  button { cursor:pointer; } button:hover:not(:disabled) { border-color:var(--accent); } button:disabled { opacity:.45; cursor:default; }
+  button.on { background:var(--accent); color:#06101e; border-color:var(--accent); font-weight:600; }
+  button.danger:hover:not(:disabled) { border-color:var(--bad); color:var(--bad); }
+  label { display:grid; gap:3px; font-size:12px; color:var(--dim); } label > span { display:flex; justify-content:space-between; }
+  label b { color:var(--fg); font-weight:600; }
+  input[type=range] { padding:0; width:100%; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .screen { position:relative; width:100%; aspect-ratio:16/9; max-height:70vh; background:#000; border-radius:8px; overflow:hidden; border:1px solid var(--line); margin:auto; }
+  .screen iframe, .pane iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
+  .cols { display:grid; grid-template-columns:minmax(300px, 1fr) minmax(300px, 1fr); gap:18px; }
+  @media (max-width: 900px) { .cols { grid-template-columns:1fr; } }
+  .controls { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:10px 14px; }
+  .controls h3 { grid-column:1/-1; margin:8px 0 0; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); }
+  .pane { position:relative; aspect-ratio:1/1; background:#000; border-radius:8px; overflow:hidden; border:1px solid var(--line); max-height:480px; }
+  .pane .idle { position:absolute; inset:0; display:grid; place-items:center; color:var(--dim); text-align:center; padding:20px; }
+  progress { width:100%; height:12px; accent-color:var(--accent); }
+  .stats { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; } .stats dt { color:var(--dim); } .stats dd { margin:0; font-variant-numeric:tabular-nums; }
+  .msg { min-height:1.4em; font-size:13px; } .msg.err { color:var(--bad); } .msg.ok { color:var(--ok); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:8px; background:#191b22; display:grid; gap:6px; }
+  .card.active { border-color:var(--ok); } .card.sel { outline:2px solid var(--accent); }
+  .card canvas { width:100%; aspect-ratio:4/3; background:#101116; border-radius:6px; display:block; }
+  .card .meta { font-size:12px; color:var(--dim); } .card .meta b { color:var(--fg); font-weight:600; }
+  .badge { display:inline-block; padding:0 7px; border-radius:9px; font-size:11px; background:var(--ok); color:#06210f; font-weight:700; margin-left:4px; }
+  .card .btns { display:flex; flex-wrap:wrap; gap:5px; } .card .btns button { padding:3px 8px; font-size:12px; }
+  .compare { display:grid; grid-template-columns:1fr 1fr; gap:12px; } .compare .screen { aspect-ratio:4/3; }
+  .compare h4 { margin:0 0 4px; font-size:12px; color:var(--dim); font-weight:600; }
+  .hint { font-size:12px; color:var(--dim); }
+</style>
+</head><body>
+<header>
+  <h1>Loading studio</h1>
+  <a href="/">back to the game</a>
+  <span class="row"><span class="hint">phase</span><span id="phases" class="row"></span></span>
+  <span class="row" style="margin-left:auto">
+    <label style="grid-auto-flow:column;align-items:center;gap:8px"><span class="hint">owner token</span>
+      <input id="token" type="password" autocomplete="off" placeholder="admin token (activate / delete)" size="30"></label>
+    <span id="tokenNote" class="hint"></span>
+  </span>
+</header>
+<main>
+  <section>
+    <h2>The loading screen <span class="hint" id="playingNote"></span></h2>
+    <div class="screen"><iframe id="screen" title="loading screen" src="about:blank"></iframe></div>
+    <p class="hint">This is the real loading panel (the same script the game loads), held on the chosen phase. Pick a recording in the library below to play it here; &ldquo;Active&rdquo; is what players get.</p>
+    <div class="row"><button id="playActive">Play the active one</button><span id="screenMsg" class="msg"></span></div>
+  </section>
+
+  <section>
+    <h2>Record a new animation</h2>
+    <div class="cols">
+      <div>
+        <div class="controls" id="controls"></div>
+        <div class="row" style="margin-top:14px">
+          <button id="record" class="on">Record</button><button id="abort" disabled>Abort</button><button id="reset">Defaults</button>
+        </div>
+        <p class="hint">Recording runs the game&rsquo;s own fountain on this page (a minute or so, as fast as the device runs it), filters its state memory, and saves the result into the library. It is not made active until the owner does so.</p>
+      </div>
+      <div>
+        <div class="pane"><div class="idle" id="idle">The live preview of the simulation appears here while recording.</div><iframe id="live" title="recording preview" hidden></iframe></div>
+        <progress id="bar" max="100" value="0" style="margin-top:8px"></progress>
+        <div id="recMsg" class="msg">idle</div>
+        <dl class="stats" id="recStats"></dl>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Library <span class="hint" id="libNote"></span></h2>
+    <div id="libMsg" class="msg"></div>
+    <div class="grid" id="lib"></div>
+  </section>
+
+  <section id="cmpSection" hidden>
+    <h2>Compare <button id="cmpClear" style="float:right">Close</button></h2>
+    <div class="compare">
+      <div><h4 id="cmpA">A</h4><div class="screen"><iframe id="viewA" title="A" src="about:blank"></iframe></div></div>
+      <div><h4 id="cmpB">B</h4><div class="screen"><iframe id="viewB" title="B" src="about:blank"></iframe></div></div>
+    </div>
+    <div class="row" style="margin-top:8px"><button id="cmpSync">Restart both together</button><span class="hint">Pick &ldquo;A&rdquo; and &ldquo;B&rdquo; on two cards.</span></div>
+  </section>
+</main>
+<script type="module" src="studio.js"></script>
+</body></html>

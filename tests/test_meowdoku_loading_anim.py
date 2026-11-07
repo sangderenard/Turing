@@ -107,7 +107,7 @@ def test_loop_seam_matches_in_js_and_is_continuous():
     assert [r[0] for r in py[:period]] == [r[0] for r in py[period:2 * period]]            # periodic
 
 
-def test_store_is_write_once_and_validates(tmp_path):
+def test_store_keeps_the_first_as_active_and_validates(tmp_path):
     store = L.Store(tmp_path)
     assert store.info() is None
     with pytest.raises(L.AnimError):
@@ -115,11 +115,10 @@ def test_store_is_write_once_and_validates(tmp_path):
     assert store.info() is None
     raw = L.encode(_anim())
     meta = store.put(raw)
-    assert meta["raw_bytes"] == len(raw) and meta["bytes"] == store.path.stat().st_size and meta["frames"] == 60 and meta["grains"] == 24
+    assert meta["raw_bytes"] == len(raw) and meta["bytes"] == (store.root / f"{meta['digest']}.mla").stat().st_size and meta["frames"] == 60 and meta["grains"] == 24
     assert L.unpack(store.read()) == raw
-    with pytest.raises(FileExistsError):
-        store.put(L.encode(_anim(seed=5)))
-    assert store.info()["digest"] == meta["digest"]
+    second = store.put(L.encode(_anim(seed=5)))                      # [STUDIO] a later one joins the library; the first stays the one players get
+    assert second["active"] is False and store.info()["digest"] == meta["digest"]
 
 
 # ---------------------------------------------------------------- the endpoint
@@ -163,7 +162,8 @@ def test_upload_rules(server):
     assert sessions.anim.info() is None
     status, reply = _post(port, raw)
     assert status == 201 and reply["stored"]["raw_bytes"] == len(raw)
-    assert _post(port, L.encode(_anim(seed=7)))[0] == 409                                  # write-once
+    assert _post(port, L.encode(_anim(seed=7)))[0] == 201                                  # [STUDIO] a later save joins the library (not active)
+    assert sessions.anim.info()["digest"] == reply["stored"]["digest"]
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     conn.request("GET", "/api/ready")
     ready = json.loads(conn.getresponse().read())
