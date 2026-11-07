@@ -3364,7 +3364,8 @@ function stepShip(ship, input, seconds, motion) {
 // motion.pilot.predelay of law time after it is taken and is streamed ahead of
 // its start (you.intervals), and the page applies it over exactly its span of
 // law time, on the same compiled laws.  Only its own flying is sent.
-const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
+// [LIVEVIEW] a viewer never predicts: the ship is the owner's snapshot, not a local guess at inputs it does not have
+const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict && !share.share.viewOnly);
 // Who flies is the SNAPSHOT's word (its pilot flag rides with the very state it describes); the status frame that says
 // ``autopilot`` comes up to a quarter second later, and a page that waited for it flew the first stretch of a hand-over
 // on its own controls while the server's pilot flew the ship.
@@ -4011,6 +4012,10 @@ function syncFaithfulness(correction) {
 setInterval(() => {
   const game = state.game;
   if (!game || game.input !== "realtime" || game.over || document.hidden || ticks.inFlight + sock.outstanding >= 3) return;
+  if (share.share.viewOnly) {            // [LIVEVIEW] a viewer sends no ticks: it holds the read-only socket open and reconnects (share.js)
+    if (!sock.ws && !share.share.ended && performance.now() >= (sock.retryAt || 0)) { sock.retryAt = performance.now() + 1500; ensureSocket(); }
+    return;
+  }
   const now = performance.now() / 1000;
   // Holding fire is activity: the server must hear of it at once to spawn the
   // real shots the page is already showing.
@@ -6076,6 +6081,7 @@ async function api(path, body) {
 // several, and a late reply must never overwrite a newer state.
 let chain = Promise.resolve();
 const act = (payload) => {
+  if (share.share.viewOnly) return Promise.resolve();       // [LIVEVIEW] a viewer acts on nothing: no tick, no control, no request
   const step = chain.then(async () => { if (payload.type !== "tick") console.log("[meow] action", JSON.stringify(payload)); applyState(await api("/api/action", payload)); }).catch((e) => console.warn(e));
   chain = step;
   return step;
@@ -7075,6 +7081,9 @@ async function lifecycleResume() {
     aspect: () => canvas.clientWidth / Math.max(1, canvas.clientHeight),
     selectGame: (g) => { const sel = $("game"); if ([...sel.options].some((o) => o.value === g)) sel.value = g; document.body.dataset.game = g; },
     camera: { get: () => ({ ...camView.goal, auto: !!camView.auto }), set: (c) => { const { auto, ...pose } = c; Object.assign(camView.goal, pose); Object.assign(camView.cur, pose); camView.auto = !!auto; } },
+    // [LIVEVIEW] the fountain's state columns, for the owner's position keyframes and a viewer applying them (WebGPU product only)
+    fountain: { ready: () => !!(compute.ready && !compute.resimming && compute.product && compute.product.writeColumn && state.game && /^fountain/.test(state.game.game)),
+                steps: () => compute.steps, read: (names) => compute.columnsNow(names), write: (name, values) => compute.writeColumn(name, values) },
     runtime: { get: () => ({ gravity: compute.gravity ? Array.from(compute.gravity) : null }),
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });

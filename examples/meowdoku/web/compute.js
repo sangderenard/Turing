@@ -344,6 +344,15 @@ ${commit}
     return Object.fromEntries(names.map((name, k) => [name, v[k]]));
   }
 
+  // [LIVEVIEW] write a whole named state column (the first `n` ids): a viewer taking the owner's position keyframe.  Same queue
+  // write as `nudge` below, in order with the steps already submitted.
+  writeColumn(name, values) {
+    const slot = this.abi.feed_slots[name];
+    if (slot === undefined || values.length !== this.n) return false;
+    this.device.queue.writeBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), values);
+    return true;
+  }
+
   nudge(ids, dx) {              // test hook: perturb a few ids' x, to exercise the replay-not-identical path
     const slot = this.abi.feed_slots.x;
     for (const id of ids) this.device.queue.writeBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot) + id * 4, new Float32Array([dx]));
@@ -1067,6 +1076,7 @@ export class ComputeRuntime {
     this.product.step(count); this.steps += count; return this.steps;
   }
   columnsNow(names) { return this.product.columnsNow(names); }
+  writeColumn(name, values) { return !!(this.product && this.product.writeColumn && this.product.writeColumn(name, values)); }    // [LIVEVIEW] (the WebGPU product only)
 }
 
 // --------------------------------------------------- GL points (shared scene)

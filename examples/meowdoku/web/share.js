@@ -24,13 +24,15 @@
 //
 // Nothing here evaluates anything: the view is JSON, every value is validated through its spec's own min / max / options.
 
+import { decompressOctets } from "./octet_codec.js";      // [LIVEVIEW] the fountain keyframe is served through the octet codec
+
 export const MAX_FRAGMENT = 1800;
 export const VIEWER_HEADER = "X-Meowdoku-Viewer";
 const SECRET_KEY = /token|secret|passw|credential|auth|cookie|session|api[_-]?key|lichess|player|geo/i;
 const SHARED_KEY = /^meowdoku[._][A-Za-z0-9_.\-]{1,80}$/;
 const VALUE_KINDS = new Set(["range", "toggle", "select", "color"]);
 const FORBIDDEN_PROPS = new Set(["__proto__", "constructor", "prototype"]);
-const POLL_MS = 400, PUSH_MS = 250;
+const POLL_MS = 250, PUSH_MS = 250, PUSH_RETRY_MS = 5000;     // [LIVEVIEW] POLL_MS 400 -> 250: a board move shows within ~0.35 s
 
 // ---------------------------------------------------------------- values (pure: tested in node)
 export const isSharedKey = (key) => typeof key === "string" && SHARED_KEY.test(key) && !SECRET_KEY.test(key);
@@ -162,9 +164,71 @@ export async function decodeView(text) {
   return JSON.parse(new TextDecoder().decode(raw));
 }
 
+// ---------------------------------------------------------------- [LIVEVIEW] the fountain position keyframe (MFK1)
+// A viewer runs the owner's fountain law locally from the owner's inputs, and drifts: its inputs land a poll later, its steps start
+// later.  Every KEY_MS the owner reads its state columns (the fountain's x, y, vx, vy: one event-level readback, never per frame),
+// quantizes them in the loading animation's manner (the value shifted up so the low bits are zero and the codec drops them), and
+// posts them; the server packs them with the octet codec (loading_anim.pack) and hands each viewer the newest; the viewer decodes
+// (octet_codec.js) and writes them into its own state columns.  At most KEY_MAX_IDS ids are sent (a stride over the ids).
+//   MFK1: "MFK1" u8 ver=1 u8 0 u16 stride u32 steps u32 total u16 count, 8 x f32 ranges (x lo hi, y lo hi, vx lo hi, vy lo hi), then
+//   four planar u16 columns of `count` (x, y at 12 bits, vx, vy at 10 bits, each shifted up to u16).
+export const KEY_MS = 5000, KEY_MAX_IDS = 4096, KEY_HEADER = 50;
+const KEY_BITS = { x: 12, y: 12, vx: 10, vy: 10 }, KEY_NAMES = ["x", "y", "vx", "vy"];
+export function encodeKey({ steps, total, stride, cols }) {
+  const count = Math.ceil(total / stride), range = {};
+  for (const name of KEY_NAMES) {
+    let lo = Infinity, hi = -Infinity;
+    for (let j = 0; j < count; j++) { const v = cols[name][j * stride]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (name[0] === "v") { hi = Math.max(Math.abs(lo), Math.abs(hi), 1e-6); lo = -hi; }
+    if (!(hi > lo)) hi = lo + 1e-6;
+    range[name] = [Math.fround(lo), Math.fround(hi)];
+  }
+  const out = new Uint8Array(KEY_HEADER + 8 * count), head = new DataView(out.buffer);
+  "MFK1".split("").forEach((c, i) => head.setUint8(i, c.charCodeAt(0)));
+  head.setUint8(4, 1); head.setUint16(6, stride, true); head.setUint32(8, steps >>> 0, true); head.setUint32(12, total, true); head.setUint16(16, count, true);
+  KEY_NAMES.forEach((name, k) => { head.setFloat32(18 + 8 * k, range[name][0], true); head.setFloat32(22 + 8 * k, range[name][1], true); });
+  KEY_NAMES.forEach((name, k) => {
+    const [lo, hi] = range[name], top = (1 << KEY_BITS[name]) - 1, shift = 16 - KEY_BITS[name], at = KEY_HEADER + 2 * count * k;
+    for (let j = 0; j < count; j++) {
+      const u = (Math.max(0, Math.min(top, Math.round(((cols[name][j * stride] - lo) / (hi - lo)) * top))) << shift) & 0xffff;
+      out[at + j] = u & 255; out[at + count + j] = u >> 8;
+    }
+  });
+  return out;
+}
+export function decodeKey(bytes) {
+  if (bytes.length < KEY_HEADER || String.fromCharCode(...bytes.subarray(0, 4)) !== "MFK1") throw new Error("not a fountain keyframe");
+  const head = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  const stride = head.getUint16(6, true), steps = head.getUint32(8, true), total = head.getUint32(12, true), count = head.getUint16(16, true);
+  if (!stride || !count || bytes.length !== KEY_HEADER + 8 * count || count !== Math.ceil(total / stride)) throw new Error("malformed fountain keyframe");
+  const out = { stride, steps, total, count };
+  KEY_NAMES.forEach((name, k) => {
+    const lo = head.getFloat32(18 + 8 * k, true), hi = head.getFloat32(22 + 8 * k, true), top = (1 << KEY_BITS[name]) - 1, shift = 16 - KEY_BITS[name], at = KEY_HEADER + 2 * count * k;
+    const col = new Float32Array(count);
+    for (let j = 0; j < count; j++) col[j] = lo + (((bytes[at + j] | (bytes[at + count + j] << 8)) >> shift) / top) * (hi - lo);
+    out[name] = col;
+  });
+  return out;
+}
+const b64std = (bytes) => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64std = (text) => { const s = atob(text), out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; };
+// a viewer takes the keyframe: the sampled ids' columns replaced, the rest left to the viewer's own law
+async function applyKey(host, packet) {
+  const f = host.fountain; if (!f || !f.ready()) return false;
+  const k = decodeKey(decompressOctets(packet));
+  for (const name of KEY_NAMES) {
+    let col;
+    if (k.stride === 1) col = k[name];
+    else { col = (await f.read([name]))[name]; if (!col || col.length !== k.total) return false; for (let j = 0; j < k.count; j++) col[j * k.stride] = k[name][j]; }
+    if (col.length !== k.total || !f.write(name, col)) return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------- the page-side module state
 const inBrowser = typeof window !== "undefined" && typeof document !== "undefined" && typeof location !== "undefined";
-export const share = { mode: "owner", view: null, parsed: null, token: null, viewOnly: false, host: null, overlay: null, error: null };
+export const share = { mode: "owner", view: null, parsed: null, token: null, viewOnly: false, host: null, overlay: null, error: null,
+  socketOpen: false, ended: false, rxAt: 0, rxBytes: 0 };      // [LIVEVIEW] the viewer's socket state
 
 // Redirect the page's storage reads / writes of its own keys to memory (preview and viewer modes).  Keys the view does not carry
 // read as unset (the defaults), so the view is shown as the owner has it, not mixed with the viewer's own settings.
@@ -200,7 +264,20 @@ function installViewerGuards(token) {
     }
     return realFetch(input, init);
   };
-  window.WebSocket = function () { throw new Error("view-only: no socket"); };
+  // [LIVEVIEW] the only socket a viewer may open is the read-only spectate socket.  app.js asks for its own "/ws" (the owner's
+  // input socket); that request is answered by /ws/spectate with the token in the subprotocol (a browser cannot set a header,
+  // and the token stays out of the URL).  The instance's send() is dropped here AND refused by the server (1008).
+  const RealWS = window.WebSocket;
+  window.WebSocket = function (url) {
+    const u = new URL(url, location.href);
+    if (u.pathname !== "/ws" && u.pathname !== "/ws/spectate") throw new Error("view-only: no input socket");
+    const ws = new RealWS(`${u.protocol}//${u.host}/ws/spectate`, ["mdv." + token]);
+    ws.send = () => {};
+    ws.addEventListener("open", () => { share.socketOpen = true; share.rxAt = performance.now(); });
+    ws.addEventListener("message", (e) => { share.rxAt = performance.now(); share.rxBytes += typeof e.data === "string" ? e.data.length : e.data.byteLength || 0; });
+    ws.addEventListener("close", (e) => { share.socketOpen = false; if (e.code === 4410 || e.code === 1008) share.ended = true; });
+    return ws;
+  };
 }
 
 function hashParams() { return new URLSearchParams(location.hash.replace(/^#/, "")); }
@@ -281,7 +358,7 @@ async function onShare() {
 }
 
 // ---- the owner's live share
-const live = { on: false, token: null, timer: null, statusTimer: null, last: "", busy: false };
+const live = { on: false, token: null, timer: null, statusTimer: null, last: "", busy: false, tried: "", retryAt: 0 };
 const post = (path, body) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || r.status); return d; });
 function liveView() {
   const h = share.host, game = h.getGame();
@@ -290,15 +367,36 @@ function liveView() {
 }
 function startPushing() {
   if (live.timer) return;
+  live.keyTimer = setInterval(pushKey, KEY_MS);
   live.timer = setInterval(async () => {
     if (live.busy || !share.host.getGame()) return;
     const text = JSON.stringify(liveView());
-    if (text === live.last) return;
-    live.busy = true;
-    try { await post("/api/spectate/live", { live: JSON.parse(text) }); live.last = text; } catch (e) { if (/not sharing/.test(String(e.message))) stopPushing(); } finally { live.busy = false; }
+    // [LIVEVIEW] push on change only, and never retry a refused payload in a loop: a payload the server refused (e.g. 413 too
+    // large) used to be re-sent every PUSH_MS forever (dozens of POSTs in a row).  It is remembered as attempted and not
+    // re-sent until it changes or PUSH_RETRY_MS has passed.
+    if (text === live.last || (text === live.tried && performance.now() < live.retryAt)) return;
+    live.busy = true; live.tried = text;
+    try { await post("/api/spectate/live", { live: JSON.parse(text) }); live.last = text; }
+    catch (e) { live.retryAt = performance.now() + PUSH_RETRY_MS; if (/not sharing/.test(String(e.message))) stopPushing(); }
+    finally { live.busy = false; }
   }, PUSH_MS);
 }
-function stopPushing() { clearInterval(live.timer); clearInterval(live.statusTimer); live.timer = live.statusTimer = null; live.on = false; live.last = ""; }
+function stopPushing() { clearInterval(live.timer); clearInterval(live.statusTimer); clearInterval(live.keyTimer); live.timer = live.statusTimer = live.keyTimer = null; live.on = false; live.last = ""; }
+// [LIVEVIEW] the owner's fountain position keyframe, every KEY_MS while a viewer exists (the server says how many watch)
+async function pushKey() {
+  const f = share.host && share.host.fountain;
+  if (!live.on || !f || !f.ready() || live.keyBusy) return;
+  live.keyBusy = true;
+  try {
+    const s = await post("/api/spectate", { op: "status" });                       // (no viewer: no readback)
+    if (!s.sharing) { stopPushing(); return; }
+    if (!s.viewers) return;
+    const steps = f.steps(), cols = await f.read(KEY_NAMES), total = cols.x.length, stride = Math.max(1, Math.ceil(total / KEY_MAX_IDS));
+    const raw = encodeKey({ steps, total, stride, cols });
+    await post("/api/spectate/key", { key: b64std(raw) });
+    live.keys = (live.keys || 0) + 1; live.keyRaw = raw.length;
+  } catch (e) { if (/not sharing/.test(String(e.message))) stopPushing(); } finally { live.keyBusy = false; }
+}
 function renderLive(status, box) {
   const url = `${location.origin}${location.pathname}#watch=${status.token}`;
   const link = el("textarea", { value: url, readOnly: true, rows: 2 }); link.style.cssText = "width:100%;font:12px monospace";
@@ -349,7 +447,10 @@ function banner(text, ...buttons) {
 // ---- applying a parsed view
 function applyLocals(local) {
   const h = share.host, game = h.getGame(); if (!game) return;
-  const byId = new Map(h.pageSpecs(game.controls_ui).filter((s) => s.local).map((s) => [s.id, s]));
+  // [LIVEVIEW] ROOT CAUSE of "one picture": pageSpecs(undefined) is undefined for a game with no declared controls (every board
+  // game and real-time entity game); this .filter threw inside the viewer's FIRST step, applyViewer rejected before its poll
+  // loop was ever started, and bootGame fell through to the page's own "new game".  Tolerate it, and never let a step end the loop.
+  const byId = new Map((h.pageSpecs(game.controls_ui) || []).filter((s) => s.local).map((s) => [s.id, s]));
   for (const [id, v] of Object.entries(local)) { const s = byId.get(id); if (s) h.localControl(s, v); }
 }
 
@@ -380,16 +481,32 @@ async function applyPreview() {
 async function applyViewer() {
   const h = share.host, token = share.token;
   let vid = share.first.vid, rev = null, liveRev = -1, applied = {}, stopped = false, lastLive = {};
-  const bar = banner("Live view (read-only).");
+  // [LIVEVIEW] the badge: LIVE · watching, with the age of the last update (a polled state, or a snapshot on the socket).
+  const bar = banner("");
+  bar.style.borderColor = "#3c9";
+  const view = { viewers: 1, rate: "", polled: 0, pollBytes: 0, since: performance.now(), err: null, lastAt: performance.now(), okAt: performance.now() };
+  const badge = () => {
+    if (stopped) return;
+    const now = performance.now(), last = Math.max(view.lastAt, share.rxAt), age = (now - last) / 1000;
+    const via = share.socketOpen ? "socket" : "poll";
+    const kbs = ((view.pollBytes + share.rxBytes) / Math.max(1, (now - view.since) / 1000) / 1024).toFixed(2);
+    const stale = (now - Math.max(view.okAt, share.rxAt)) / 1000 > 4 || view.err;       // (live = the link answers; an idle game is still live)
+    bar.firstChild.textContent = `${stale ? "RECONNECTING" : "LIVE · watching"} · ${view.err ? view.err + " · " : ""}last update ${age.toFixed(1)} s ago · ${view.viewers} watching · ${kbs} kB/s via ${via} · read-only `;
+    bar.style.borderColor = stale ? "#e93" : "#3c9";
+  };
+  let keySeq = 0;
+  share.viewerView = view;                               // (test / debug hook: the badge's numbers)
+  const heldKey = () => { const g = h.getGame(); return g ? `${g.game ?? ""}|${g.id ?? ""}` : ""; };
   const poll = async () => {
-    const r = await fetch(`/api/spectate/watch?${vid ? `vid=${encodeURIComponent(vid)}&` : ""}rev=${rev || ""}&lrev=${liveRev}`, { headers: { [VIEWER_HEADER]: token } });
-    const d = await r.json();
+    const r = await fetch(`/api/spectate/watch?${vid ? `vid=${encodeURIComponent(vid)}&` : ""}rev=${rev || ""}&lrev=${liveRev}${share.socketOpen && h.getGame() && h.getGame().input === "realtime" ? `&nostate=1&gk=${encodeURIComponent(heldKey())}` : ""}&kseq=${keySeq}`, { headers: { [VIEWER_HEADER]: token } });
+    const text = await r.text(); view.pollBytes += text.length + 180;
+    const d = JSON.parse(text);
     if (!r.ok) { const e = new Error(d.error || r.status); e.status = r.status; throw e; }
     return d;
   };
   const step = (d) => {
-    vid = d.vid;
-    if (d.state) { rev = d.state_rev; h.applyState(d.state); h.selectGame(d.state.game); }
+    vid = d.vid; view.viewers = d.viewers || view.viewers; view.err = null; view.okAt = performance.now();
+    if (d.state) { view.lastAt = performance.now(); rev = d.state_rev; h.applyState(d.state); h.selectGame(d.state.game); }
     if (d.live) lastLive = d.live;
     if (d.live_rev !== liveRev || d.state) {
       liveRev = d.live_rev;
@@ -401,16 +518,24 @@ async function applyViewer() {
       Object.assign(applied, diff); applyLocals(diff);
       if (parsed.rt) h.runtime.set(parsed.rt);
     }
-    if (d.stats) bar.firstChild.textContent = `Live view (read-only). ${d.viewers} watching; ${(d.stats.bytes_per_s / 1024).toFixed(2)} kB/s received. `;
+    if (d.live) view.lastAt = performance.now();
+    if (d.key && d.key_seq !== keySeq) {                // the owner's newest fountain position keyframe
+      keySeq = d.key_seq; view.keys = (view.keys || 0) + 1;
+      applyKey(h, unb64std(d.key)).then((ok) => { if (ok) { view.lastAt = performance.now(); view.keyApplied = (view.keyApplied || 0) + 1; } }).catch((e) => console.warn("[meowdoku] live view keyframe:", e));
+    }
+    badge();
   };
-  step(share.first);
+  try { step(share.first); } catch (e) { console.warn("[meowdoku] live view first step:", e); }
+  setInterval(badge, 200);
   const loop = async () => {
     while (!stopped) {
-      await new Promise((ok) => setTimeout(ok, POLL_MS));
+      await new Promise((ok) => setTimeout(ok, share.socketOpen && h.getGame() && h.getGame().input === "realtime" ? 1000 : POLL_MS));      // (the socket carries a real-time game; the poll carries the controls)
       try { step(await poll()); }
       catch (e) {
-        if (e.status === 410 || e.status === 403 || e.status === 429) { stopped = true; bar.firstChild.textContent = `${e.message} `; return; }
-        await new Promise((ok) => setTimeout(ok, 2000));
+        if (!e.status) console.warn("[meowdoku] live view step:", e);
+        if (e.status === 410 || e.status === 403 || e.status === 429) { stopped = true; bar.firstChild.textContent = `LIVE view ended: ${e.message} `; bar.style.borderColor = "#e55"; return; }
+        view.err = "reconnecting"; badge();                                                // a dropped poll retries; never gives up on a network error
+        await new Promise((ok) => setTimeout(ok, 1500));
       }
     }
   };

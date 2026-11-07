@@ -32,6 +32,7 @@ import argparse
 import os
 import json
 import secrets
+import struct
 import sys
 import threading
 import time
@@ -86,6 +87,7 @@ class Table:
         self.boards = {board["id"]: board for board in database["boards"]}
         self.levels = database["levels"]
         self.game = None
+        self.rt_seq = 0                      # [LIVEVIEW] real-time ticks landed on this table (a viewer socket sends a snapshot when it moves)
         self.chess_clock = None              # the time control the player last picked (chess against the network)
 
     def catalog(self) -> dict:
@@ -454,8 +456,8 @@ def make_handler(sessions: Sessions):
             Each text frame is one tick's input; each answer is a binary
             snapshot delta, preceded by a ``meta`` text frame when one is due."""
             key = self.headers.get("Sec-WebSocket-Key")
-            if self._is_viewer() or "viewer=" in self.path:
-                return self._refuse_viewer()
+            if self._is_viewer() or "viewer=" in self.path or "mdv." in (self.headers.get("Sec-WebSocket-Protocol") or ""):
+                return self._refuse_viewer()           # [LIVEVIEW] a viewer token never opens the owner's (input) socket
             if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
                 return self._json({"error": "expected a WebSocket upgrade"}, HTTPStatus.BAD_REQUEST)
             table = self._table()
@@ -487,6 +489,7 @@ def make_handler(sessions: Sessions):
                             idle_trainer.touch()          # a realtime tick: play is on
                             game.control(request)
                             game.tick()
+                            table.rt_seq += 1          # [LIVEVIEW]
                             echo = request.get("ct")
                             # (the timing exchange is in the game's virtual wall: the wall integrated by its clock speed)
                             stamp = game.virtual(received) if hasattr(game, "virtual") else received
@@ -500,6 +503,95 @@ def make_handler(sessions: Sessions):
             except (ConnectionError, OSError):
                 pass
             finally:
+                self.close_connection = True
+
+        def _spectate_socket(self) -> None:
+            """[LIVEVIEW] ``/ws/spectate``: the viewer's READ-ONLY push socket.  The owner's page gets one snapshot delta per tick
+            over ``/ws``; this sends a viewer the same frames (its own SnapshotEncoder over the owner's game, so a late viewer
+            starts on a keyframe) whenever the owner's table has ticked (``Table.rt_seq``).  The token rides the WebSocket
+            subprotocol (``mdv.<token>``; a browser cannot set a header, and it stays out of the URL and the log).  The socket
+            NEVER reads a message's content: any data frame from the viewer closes the socket (1008).  The registry's heartbeat
+            (keep_stream) closes it the moment the token is revoked, expires, or its owner's session ends."""
+            key = self.headers.get("Sec-WebSocket-Key")
+            protocols = [p.strip() for p in (self.headers.get("Sec-WebSocket-Protocol") or "").split(",")]
+            token = next((p[4:] for p in protocols if p.startswith("mdv.")), "")
+            if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+                return self._json({"error": "expected a WebSocket upgrade"}, HTTPStatus.BAD_REQUEST)
+            alive = lambda o: o in sessions.tables           # noqa: E731
+            try:
+                owner, vid = sessions.spectate.open_stream(token, alive)
+            except share_mod.ShareError as error:
+                return self._share_error(error)
+            self._set_cookie = []
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_key(key))
+            self.send_header("Sec-WebSocket-Protocol", "mdv." + token)
+            self.end_headers()
+            self.wfile.flush()
+            wlock, done = threading.Lock(), threading.Event()
+
+            def send(opcode: int, payload: bytes) -> int:
+                with wlock:
+                    self.wfile.write(frame(opcode, payload))
+                return len(payload) + 4
+
+            def listen() -> None:               # a viewer may only ping and close; every data frame ends the socket unread
+                try:
+                    while not done.is_set():
+                        head = self.rfile.read(2)
+                        if len(head) < 2:
+                            break
+                        op, length = head[0] & 0x0F, head[1] & 0x7F
+                        if op in (0x8, 0x9, 0xA) and length < 126:
+                            if head[1] & 0x80:
+                                mask = self.rfile.read(4)
+                            data = self.rfile.read(length)
+                            if op == 0x8:
+                                break
+                            if op == 0x9:
+                                send(0xA, data)
+                            continue
+                        send(0x8, struct.pack(">H", 1008) + b"view-only: this socket accepts no inputs")
+                        sessions.spectate_refused = getattr(sessions, "spectate_refused", 0) + 1
+                        break
+                except (ConnectionError, OSError, ValueError):
+                    pass
+                finally:
+                    done.set()
+            threading.Thread(target=listen, name="spectate-listen", daemon=True).start()
+            encoder, last_seq, last_at, sent_bytes, reason = SnapshotEncoder(), -1, 0.0, 0, 1000
+            try:
+                while not done.is_set():
+                    if not sessions.spectate.keep_stream(token, vid, sent_bytes, alive):
+                        reason = 4410
+                        break
+                    sent_bytes = 0
+                    entry = sessions.tables.get(owner)
+                    table = entry[0] if entry else None
+                    now = time.perf_counter()
+                    if table is not None and table.rt_seq != last_seq and now - last_at >= 0.03:
+                        with table.lock:
+                            last_seq, game = table.rt_seq, table.game
+                            if game is not None and hasattr(game, "session"):
+                                stamp = game.virtual(now) if hasattr(game, "virtual") else now
+                                binary, meta = encoder.encode(game, table.state(), echo=None, received=stamp)
+                            else:
+                                binary = meta = None
+                        if binary is not None:
+                            if meta is not None:
+                                sent_bytes += send(0x1, json.dumps({"meta": meta}).encode("utf-8"))
+                            sent_bytes += send(0x2, binary)
+                            last_at = now
+                    done.wait(0.01)
+                if not done.is_set():
+                    send(0x8, struct.pack(">H", reason) + b"the shared session has ended")
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                done.set()
+                sessions.spectate.close_stream(token, vid)
                 self.close_connection = True
 
         # ---- share links and the view-only stream (share.py).  A request that presents the viewer header is a viewer's:
@@ -524,6 +616,16 @@ def make_handler(sessions: Sessions):
             token = self.headers.get(share_mod.VIEWER_HEADER) or ""
             vid, rev, lrev = (query.get(k, [None])[0] for k in ("vid", "rev", "lrev"))
 
+            # [LIVEVIEW] "nostate=1" (a socket carries the game) is honoured only while the viewer holds the owner's CURRENT game
+            # (its game name and id, ``gk``): a switch to another game still sends the state.
+            want_state = True
+            if query.get("nostate", ["0"])[0] == "1":
+                try:
+                    game = sessions.tables[sessions.spectate.by_token[token].owner][0].game
+                    want_state = query.get("gk", [""])[0] != f"{getattr(game, 'game', '')}|{getattr(game, 'id', '')}"
+                except (KeyError, AttributeError):
+                    want_state = True
+
             def owner_state():
                 owner = sessions.spectate.by_token[token].owner
                 table = sessions.tables[owner][0]
@@ -531,7 +633,9 @@ def make_handler(sessions: Sessions):
                     return share_mod.public_state(table.state())
             try:
                 payload = sessions.spectate.watch(token, vid, rev, owner_state, owner_alive=lambda o: o in sessions.tables,
-                                                  have_live=int(lrev) if lrev and lrev.lstrip("-").isdigit() else None)
+                                                  have_live=int(lrev) if lrev and lrev.lstrip("-").isdigit() else None,
+                                                  want_state=want_state,
+                                                  have_key=int(query["kseq"][0]) if query.get("kseq", [""])[0].isdigit() else None)
             except KeyError:
                 return self._share_error(share_mod.ShareError("the shared session has ended", 410))
             except share_mod.ShareError as error:
@@ -574,6 +678,8 @@ def make_handler(sessions: Sessions):
                 return self._library_get()
             if path == "/api/spectate/watch":
                 return self._watch()
+            if path == "/ws/spectate":                           # [LIVEVIEW] the viewer's read-only push socket
+                return self._spectate_socket()
             if path.startswith("/api/share/"):
                 try:
                     return self._json(sessions.shares.get(path[len("/api/share/"):]))
@@ -800,6 +906,9 @@ def make_handler(sessions: Sessions):
                         elif op != "status":
                             raise share_mod.ShareError("unknown op")
                         return self._json(sessions.spectate.status(self._token))
+                    if path == "/api/spectate/key":              # [LIVEVIEW] the owner's fountain position keyframe (base64 MFK1)
+                        import base64
+                        return self._json({"seq": sessions.spectate.push_key(self._token, base64.b64decode(str(body.get("key", "")), validate=True))})
                     if path == "/api/spectate/live":
                         return self._json({"rev": sessions.spectate.push_live(self._token, body.get("live"))})
                 except (ValueError, TypeError) as error:
