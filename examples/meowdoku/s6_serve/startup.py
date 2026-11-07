@@ -24,7 +24,7 @@ SETTLED = (READY, FAILED, SKIPPED)
 
 #: the fountain families (a GPU product, then its CPU/wasm fallbacks: ``<name>`` and ``<name>_cpu``), most specific file prefix first
 FOUNTAIN_FAMILIES = (
-    ("fountain3d_wheel", "fountain3d_wheel"), ("fountain3d_flat", "fountain3d_flat"), ("fountain3d", "fountain3d"),
+    ("fountain3d_wheel", "fountain3d_wheel"), ("fountain3d_flat", "fountain3d_flat"), ("fountain3d_toy", "fountain3d_toy"), ("fountain3d", "fountain3d"),
     ("fountain_wheel", "fountain_wheel"), ("fountain_purrline", "fountain_purrline"), ("fountain_mobroad", "fountain_mobroad"), ("fountain", "fountain"),
 )
 FAMILY_NAMES = tuple(name for _prefix, name in FOUNTAIN_FAMILIES)
@@ -50,6 +50,7 @@ LABELS = {
     "fountain_mobroad": "mob road crowd", "fountain_mobroad_cpu": "mob road CPU fallback",
     "fountain3d_flat": "3-D fountain", "fountain3d_flat_cpu": "3-D fountain CPU fallback", "fountain3d": "3-D fountain SDF chambers",
     "fountain3d_cpu": "3-D SDF CPU fallback", "fountain3d_wheel": "3-D waterwheel", "fountain3d_wheel_cpu": "3-D waterwheel CPU fallback",
+    "fountain3d_toy": "3-D oil toy", "fountain3d_toy_cpu": "3-D oil toy CPU fallback",
 }
 
 

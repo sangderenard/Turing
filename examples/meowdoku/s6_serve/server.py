@@ -1107,6 +1107,21 @@ def prepare_fountain3d_wheel(web_dir: Path, ctx=None) -> None:
         _fail_family(ctx, "fountain3d_wheel", error)
 
 
+def prepare_fountain3d_toy(web_dir: Path, ctx=None) -> None:
+    """The shared oil toy's extruded SDF chamber and free hinged wheel."""
+    from meowdoku import fountain3d_build
+    try:
+        started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        manifest = fountain3d_build.build(web_dir, sizes=fountain3d_build.WHEEL_SIZES, wasm=wasm, variant="toy")
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain3d toy products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain3d_toy", wasm)
+    except Exception as error:
+        print(f"[meowdoku] fountain3d toy products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain3d_toy", error)
+
+
 def prepare_policy(web_dir: Path, ctx=None) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
@@ -1178,7 +1193,8 @@ def prepare_lanes(web_dir: Path, args) -> dict:
                      step(both("fountain_purrline"), lambda c: prepare_fountain_purrline(web_dir, c)),
                      step(both("fountain_mobroad"), lambda c: prepare_fountain_mobroad(web_dir, c)),
                      step(both("fountain3d_flat") + both("fountain3d"), lambda c: prepare_fountain3d(web_dir, c)),
-                     step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c))],
+                     step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c)),
+                     step(both("fountain3d_toy"), lambda c: prepare_fountain3d_toy(web_dir, c))],
         "autopilot": [step(("autopilot",), lambda c: prepare_autopilot(args))],
     }
 

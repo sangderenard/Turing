@@ -4,6 +4,8 @@
 
 This checkout is `codex/meowdoku-claude-integration-20261107`, based on main `66e24497`. It combines the three layout stages with the committed log backend and page work. It has **not** been merged into main or deployed. The live 8766 process was not restarted.
 
+Later update: main now carries the log backend and the browser/server log page, and live 8766 was restarted from its recorded Python command. This branch has a separate, **unbuilt** 3-D toy product implementation below. The opening paragraph and original branch inventory remain as the integration receipt at the time they were written.
+
 | Integration commit | Source | Result |
 |---|---|---|
 | `457b7fbf` | `c535e5c8` | Stage 1 module moves; `s6_serve/share.py` contains current main's newer live-view implementation. |
@@ -24,6 +26,10 @@ The stage 3 mover (`python tools/meowdoku_layout_move.py --stage 3 --dry`) now r
 - Main's November 5 uncommitted chess `search.py` was copied byte-for-byte into the moved `s2_titles/chess/search.py`, along with its untracked `test_meowdoku_search.py`, in this isolated branch. The three chess-search tests pass here. Main's files were not changed by this copy; compare again before landing if the owner's work advances.
 
 The law and fountain product digest changes described in `LAYOUT_AUDIT.md` require rebuild when this branch lands. Do not treat the test counts as a full product or browser gate.
+
+## 3-D toy product prepared after the integration receipt
+
+The 3-D `sdf_toy` now consumes `toy_design.toy_parts`, extrudes its split ramps and dribble holes, shares the pool/peg/hourglass dimensions, and places a free hinged wheel from the same design. The `toy` builder variant combines SDF walls and body state and routes to `fountain3d_toy.manifest.json`; readiness has its own family. Host geometry, mesh, startup and routing checks passed. **No compiler product was built or deployed** under the workspace's explicit build-approval rule. The live 8766 server still serves the prior 3-D toy product. The 2-D `PEG_FILTER` flag is still false because the current size-filter configuration clogs; do not describe that filtering behavior as finished.
 
 ## Live branches and remaining work
 

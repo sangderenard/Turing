@@ -1555,7 +1555,10 @@ def test_sdf_presets_keep_their_designed_proportions_and_the_view_follows_the_ch
     for n in (256, 4096):
         for cell in (F.CELL, 2.0 * F.CELL, 4.0 * F.CELL):
             _c, w, top = F.sdf_design("sdf_toy", math.sqrt(n / F.N_BASE), cell)
-            assert top >= F.TOY_ASPECT_W * w + F.TOY_ASPECT_C * cell - 1e-12 and 0.22 * top >= (F.TOY_PEG_ROWS - 1) * 4.6 * cell - 1e-12
+            from meowdoku import toy_design as TD
+            d = TD.toy_parts(w, cell, [s[1] for s in F.SPECIES])
+            assert top == pytest.approx(d["top"])
+            assert d["pool"] > 0 and d["pegs"]["rows"] >= TD.PEG_ROWS
     small = F.sdf_design("sdf_toy", 0.25, F.CELL)
     assert small[2] / small[1] > F.sdf_design("sdf_toy", 1.0, F.CELL)[2] / F.sdf_design("sdf_toy", 1.0, F.CELL)[1]     # a small chamber is relatively taller
     # the polygons and the box are untouched by the shape argument
@@ -1605,6 +1608,36 @@ def test_the_default_3d_law_has_no_body_columns_and_the_wheel_variant_adds_exact
     assert B.layout("wheel")["state"] == F.STATE + F.BODY_STATE and B.layout("flat")["state"] == F.STATE
     u = F.uniforms(n=256, shape="waterwheel")
     assert float(u["sdf_on"]) == 0.0 and float(u["body_np"]) == 8.0 and float(u["body_i"]) > 0.0 and float(u["bar_half"]) == pytest.approx(F.WHEEL_NOZZLE_BAR * 0.25, rel=1e-5)
+
+
+def test_the_3d_oil_toy_extrudes_the_shared_parts_and_routes_to_sdf_body_product():
+    from meowdoku import toy_design as TD
+    from meowdoku import fountain_game as G
+    geo = F.basin(4096, shape="sdf_toy")
+    c, w, top = F.window_fit("sdf_toy", geo)
+    design = TD.toy_parts(w, c, [s[1] for s in F.SPECIES])
+    u = F.uniforms(n=4096, shape="sdf_toy")
+    preset = F.sdf_preset("sdf_toy", geo, float(u["dh"]))
+    assert top == pytest.approx(design["top"]) and preset["nozzle_y"] == pytest.approx(design["nozzle_y"])
+    assert [int(s["kind"]) for s in preset["slots"]].count(F.SDF_KINDS["pegs"]) == 1
+    assert len(preset["slots"]) == 9  # vessel, upper fluid, three split ramps, peg field
+    assert float(u["body_x"]) == pytest.approx(design["wheel"]["x"], abs=1e-6)
+    assert float(u["body_y"]) == pytest.approx(design["wheel"]["y"], abs=1e-6)
+    assert float(u["body_pl"]) == pytest.approx(design["wheel"]["reach"], abs=1e-6)
+    assert "bth" in F.initial_columns(16, shape="sdf_toy")
+    ramp = design["ramps"][0]
+    high, low = ramp["high"], ramp["low"]
+    upper, lower = ramp["pieces"]
+    gap = (high[0] + ramp["hole"]["dir"][0] * ramp["hole"]["at"],
+           high[1] + ramp["hole"]["dir"][1] * ramp["hole"]["at"])
+    points = [gap, ((high[0] + upper[2][0]) / 2, (high[1] + upper[2][1]) / 2),
+              ((lower[1][0] + low[0]) / 2, (lower[1][1] + low[1]) / 2)]
+    dist = F.chamber_distance(u, np.array([p[0] for p in points]), np.array([p[1] for p in points]), np.zeros(3))[0]
+    assert dist[0] > 0 and dist[1] < 0 and dist[2] < 0  # the dribble hole stays open through the extrusion
+    game = G.FountainGame(size="4k"); game.shape = "sdf_toy"
+    state = game.state()["compute"]
+    assert state["manifest"] == "fountain3d_toy.manifest.json" and state["body"]
+    assert B.VARIANTS["toy"] == ("fountain3d_toy", True) and B.layout("toy")["state"] == F.STATE + F.BODY_STATE
 
 
 def test_the_3d_waterwheel_spins_the_way_the_stream_hits_it():
