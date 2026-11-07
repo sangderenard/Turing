@@ -41,7 +41,7 @@ deploy to 8766 as soon as work lands.
    - a colinear tube inlet.
 4b. **Glyph start (a 3D must, as soon as 3D is stable):**
    - you type a glyph sequence; its bounding box becomes a closed cube shell (all six walls);
-   - inside, the glyph or glyph string is built from the run's N particles, with the grain size chosen so N grains fill the glyphs' volume at a packing fraction (extruded glyph meshes from the export's letter/emoji assets, sampled deterministically into a packing);
+   - inside, the glyph or glyph string is built from the run's N particles filling each glyph's ENCLOSED solid volume (not its surface). The glyph meshes are extrusions of an outline (token_mesh in web_export: outline with holes, depth_ratio), so "inside" is exact and cheap: an even-odd point-in-outline test (holes count) and |z| < depth/2, from the same outline data the exported mesh used (emoji keep only their largest component). Grain size from N·(4/3)πr³ = φ·V (φ ≈ 0.64 random, or ≈ 0.74 on a lattice for a crystalline start); with a species mix, scale the drawn radii to fit;
    - the simulation starts from that state at rest, then evolves (gravity, tilt, temperature and the rest apply as usual);
    - the starting state is part of the replay (same text, same N, same result).
 5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
