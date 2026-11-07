@@ -4534,7 +4534,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), panes: panes.mode, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), casetilt: caseTiltDeg, panes: panes.mode, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4565,6 +4565,10 @@ function localControl(s, value) {
   } else if (s.local === "panes") {
     panes.mode = ["trim", "frame", "matte"].includes(value) ? value : "trim";
     try { localStorage.setItem("meowdoku.panes", panes.mode); } catch { /* storage may be blocked */ }
+  } else if (s.local === "casetilt") {
+    caseTiltDeg = Number(value) || 0; applyCaseTilt();
+  } else if (s.local === "turnover") {
+    caseTiltDeg = (caseTiltDeg + 180) % 360; applyCaseTilt();
   } else if (s.local === "gscale") {
     gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
     try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
@@ -4589,6 +4593,7 @@ function localControl(s, value) {
   } else if (s.local === "camgrav") {
     cameraGravity = !!value;
     compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);    // camera-down wins over a spinning / rocking case while it is on
+    applyCaseTilt();
     if (!cameraGravity) compute.setGravity(gravitySensor.last ? gravitySensor.last[0] : null, gravitySensor.last ? gravitySensor.last[1] : null);
     try { localStorage.setItem("meowdoku.camgrav", cameraGravity ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "record") {
@@ -4701,6 +4706,13 @@ function refreshLocalControls() {
       el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
       const input = el.querySelector("input, select");
       if (input) input.disabled = !choice.on;
+    } else if (s.local === "casetilt") {
+      const input = el.querySelector("input");
+      if (document.activeElement !== input) input.value = String(caseTiltDeg);
+      el.querySelector("span").textContent = `case angle ${Math.round(caseTiltDeg)}\u00b0 `;
+      el.title = "the case held turned by this angle: gravity turns with it (turn on 'watch the case move' to see the case turn); camera-down gravity ignores it";
+    } else if (s.local === "turnover") {
+      el.disabled = false; el.title = "flip the case 180 degrees, like turning an hourglass over";
     } else if (s.local === "gscale") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromGscale(gravityScale));
@@ -4791,6 +4803,16 @@ const STATUSPLATE_SPEC = { id: "statusplate", kind: "toggle", label: "status tex
 const WATCH_SPEC = { id: "watchcase", kind: "toggle", label: "watch the case move", local: "watchcase" };
 // GRAVITY SCALE: one slider for every gravity source; 0 at the left end is weightless, then log from 0.01 g to 10 g
 const GSCALE_SPEC = { id: "gscale", kind: "range", label: "gravity", min: 0, max: 1, step: 0.001, local: "gscale" };
+// THE CASE ANGLE: the case held turned (0-360 degrees; gravity turns with it in the case's frame), and a "turn over" button that
+// flips it by 180 (an hourglass turned over).  A spin or rock turns on top of it; camera-down gravity ignores it.
+const TILT_SPEC = { id: "casetilt", kind: "range", label: "case angle", min: 0, max: 360, step: 1, local: "casetilt" };
+const TURN_SPEC = { id: "turnover", kind: "button", label: "Turn over", local: "turnover" };
+let caseTiltDeg = 0;
+try { caseTiltDeg = Number(localStorage.getItem("meowdoku.casetilt")) || 0; } catch { /* storage may be blocked */ }
+function applyCaseTilt() {
+  compute.setCaseTilt(cameraGravity ? 0 : caseTiltDeg * Math.PI / 180);
+  try { localStorage.setItem("meowdoku.casetilt", String(caseTiltDeg)); } catch { /* storage may be blocked */ }
+}
 const GSCALE_LOG = [-2, 1], GSCALE_NOTCH = 0.01;
 function gscaleFromSlider(s) {
   s = Number(s);
@@ -4805,6 +4827,7 @@ function sliderFromGscale(k) {
 let gravityScale = 1;
 try { const saved = localStorage.getItem("meowdoku.gscale"); if (saved != null && saved !== "") gravityScale = Math.max(0, Number(saved)); } catch { /* storage may be blocked */ }
 compute.setGravityScale(gravityScale);
+compute.setCaseTilt(caseTiltDeg * Math.PI / 180);
 // AUTO ARC: while the case rocks, a slow integral controller live-tunes the rock arc to hold one species' mean height at a
 // target level of the box (default the middle): high-speed rocking swings material up, and there is a fine arc that floats
 // (liquefies) the pile.  Measured from the displayed frame's own positions; the arc is a runtime input, so no rebuild.
@@ -4867,7 +4890,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
@@ -5037,14 +5060,19 @@ function sceneNeedsVariant(casters, pick) {
 // in-plane part of the camera's down (minus its up row of the view matrix) is (d.x, -d.z) -- full strength looking
 // straight down at the board, none looking along it (the box then lies flat in the camera's frame).
 function cameraDownInLaw(view) {
+  // world -> law: law x = world x, law y = -world z, law z (the 3-D slab's depth) = world height y (PointCloud's mapping)
   const down = [-view[1], -view[5], -view[9]];
-  return [down[0], -down[2]];
+  return [down[0], -down[2], down[1]];
 }
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
   if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
-  if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); camGravNow[0] = gx; camGravNow[1] = gy; compute.setGravity(gx, gy); }
+  if (cameraGravity) {
+    const [gx, gy, gz] = cameraDownInLaw(cam.view);
+    camGravNow[0] = gx; camGravNow[1] = gy;
+    compute.setGravity(gx, gy, g.game === "fountain3d" ? gz : 0);     // the 3-D law takes the whole vector: turning the camera over turns gravity over
+  }
   compute.frame(now);
   const data = compute.points();
   const rec = compute.rec;
@@ -5259,10 +5287,12 @@ function litPass(cam, now, casters, opts = {}) {
 const watchCase = { on: false };
 try { watchCase.on = localStorage.getItem("meowdoku.watchcase") === "1"; } catch { /* storage may be blocked */ }
 function caseAngleNow() {
-  if (!compute.spin || cameraGravity) return 0;                    // (camera-down gravity turns nothing: the case is still)
+  if (cameraGravity) return 0;                                     // (camera-down gravity turns nothing: the case is still)
+  const tilt = (caseTiltDeg || 0) * Math.PI / 180;
+  if (!compute.spin) return tilt;
   const forced = window.meowdokuDebug.caseTime;
   const t = forced != null ? Number(forced) : compute.ready && compute.tape && compute.manifest && compute.shown != null ? compute.shown * compute.snap * compute.manifest.law.dt : 0;
-  return gravityAngle(compute.spin, t, compute.spinMotion);
+  return tilt + gravityAngle(compute.spin, t, compute.spinMotion);
 }
 function caseModelNow() {
   if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
