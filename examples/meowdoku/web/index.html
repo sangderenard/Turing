@@ -56,8 +56,7 @@
   #word { position: fixed; left: 0; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; display: none; }
   #word input { font: 16px/1 monospace; width: 1px; height: 1px; border: 0; padding: 0; margin: 0; text-transform: uppercase; }
   body[data-game="wordle"] #status { text-align: center; }
-  @media (max-width: 700px), (max-height: 500px) { #help { display: none; } }   /* the long help line would cover the board on a phone */
-  #help { position: fixed; bottom: 8px; left: 12px; opacity: 0.6; font-size: 12px; pointer-events: none; }   /* never takes a tap meant for the board or the tray */
+  #help { display: none; }   /* instructions remain in HTML source, outside the visible layout */
   /* Scoped under #bar so they outrank "#bar label { display: inline-flex }". */
   .meowdoku-only, .wordle-only, .lichess-only, #bar .meowdoku-only, #bar .lichess-only { display: none; }
   body[data-game="meowdoku"] #bar .meowdoku-only { display: inline-flex; }
@@ -73,8 +72,6 @@
   body[data-game="meowdoku"] #bar .tool.active { background: #186d73; color: #fff; border-color: #104e56; }
   body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #b14a78; outline-offset: 2px; }
   body[data-game="meowdoku"] #status { opacity: 1; font-weight: 650; }
-  body[data-game="meowdoku"] #help { opacity: 1; color: #183047; background: rgba(247,251,248,.91);
-                                       padding: 4px 8px; border-radius: 6px; }
   body[data-game="meowdoku"] #splash { color: #183047; background: rgba(255,255,255,.95); border-color: #668e97; }
   body[data-game="meowdoku"] #splash.win #splash-title { color: #11635b; }
   body[data-game="meowdoku"] #splash.loss #splash-title { color: #a33f57; }
@@ -122,7 +119,7 @@
   /* Fullscreen: the canvas takes the whole screen; a status line and an exit
      button float over it. */
   #hud, #fs-exit { display: none; position: fixed; z-index: 3; }
-  body.immersive #bar, body.immersive #help, body.immersive #scores { display: none; }
+  body.immersive #bar, body.immersive #scores { display: none; }
   body.immersive canvas { top: 0; height: var(--vh100, 100vh); }
   body.immersive #hud { display: block; left: 10px; top: 8px; right: 64px; font-size: 13px; opacity: 0.8; pointer-events: none;
                         text-shadow: 0 1px 2px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -153,14 +150,13 @@
   :root[data-night="1"] body[data-game="meowdoku"] #bar button:hover { background: var(--ctl-hover); }
   :root[data-night="1"] body[data-game="meowdoku"] #bar .tool.active { background: #2f7f86; color: #fff; border-color: #7fd0d6; }
   :root[data-night="1"] body[data-game="meowdoku"] #bar :focus-visible { outline: 3px solid #ffd76a; outline-offset: 2px; }
-  :root[data-night="1"] body[data-game="meowdoku"] #help { color: var(--fg); background: color-mix(in srgb, var(--panel) 91%, transparent); opacity: 1; }
   :root[data-night="1"] body[data-game="meowdoku"] #splash { color: var(--fg); background: color-mix(in srgb, var(--panel) 92%, transparent); border-color: var(--line); }
   :root[data-night="1"] body[data-game="meowdoku"] #splash.win #splash-title { color: #ffd76a; }
   :root[data-night="1"] body[data-game="meowdoku"] #splash.loss #splash-title { color: #ff8a7a; }
   :root[data-night="1"] body[data-game="meowdoku"].immersive #hud { color: var(--fg); text-shadow: 0 1px 2px #000; }
   :root[data-night="1"] body[data-game="meowdoku"].immersive #fs-exit { background: color-mix(in srgb, var(--ctl) 85%, transparent); color: var(--fg); border-color: var(--line); }
   /* night: dim helper text is raised for contrast */
-  :root[data-night="1"] #help, :root[data-night="1"] #status { opacity: 1; }
+  :root[data-night="1"] #status { opacity: 1; }
   :root[data-night="1"] #scores .muted, :root[data-night="1"] #shop .muted { opacity: .85; }
 </style>
 </head>
@@ -252,7 +248,7 @@
 <div id="word">
   <input id="entry" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="word" tabindex="-1">
 </div>
-<div id="help">meowdoku: pick Cats or X marks, then tap; swipe paints X marks, double-tap is always a cat; tap the cat, mouse or bulb under the board to use a power-up · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go · bullet_hell: arrows or WASD fly, space fires; on a phone hold a finger below the ship · tilequest: arrows or WASD walk, space swings the sword; villagers commute, towers shoot monsters · boardwalk: turn race round a forking track; on your turn left/right picks the fork, up runs, down rests, space rolls and goes · worldwalk: you are a wizard on foot, not a rocket: tap the globe to walk there along the cheapest path (roads are fastest, water a slow swim), or A/D turn and W/S walk (let go and you stop; any key cancels the walk), space swings the sword; the bar's tap menu turns a tap into a house, wall, tower or market placed beside a road, Build here places one near you; settlers commute along the roads, builders found lights, towers shoot raiders · purrline: match three; tap a tile then a neighbour (or drag it) to swap; 4 in a row makes a pounce (row + column), an L or T a hairball (3x3), 5 a catnip (swap it with any tile to clear that kind); cascades multiply the score · delve: a map of rooms; A/D or arrows run, Space (or W/Up) jumps (hold for height), W/S climb ladders, walk off the edge of a room through a door or down a ladder shaft to the next one, M shows the map; the double-jump orb opens the high ledges · worldwalk: A/D turn, W/S throttle (as bullet_hell), space swings the sword; settlers commute along the roads, builders found lights, towers shoot raiders</div>
+<div id="help" hidden aria-hidden="true">meowdoku: pick Cats or X marks, then tap; swipe paints X marks, double-tap is always a cat; tap the cat, mouse or bulb under the board to use a power-up · chess/checkers: tap a piece, then a lit square · wordle: type or tap the rack · space_invaders: arrows or A/D move, space fires; on a phone hold a finger where the rocket should go · bullet_hell: arrows or WASD fly, space fires; on a phone hold a finger below the ship · tilequest: arrows or WASD walk, space swings the sword; villagers commute, towers shoot monsters · boardwalk: turn race round a forking track; on your turn left/right picks the fork, up runs, down rests, space rolls and goes · worldwalk: you are a wizard on foot, not a rocket: tap the globe to walk there along the cheapest path (roads are fastest, water a slow swim), or A/D turn and W/S walk (let go and you stop; any key cancels the walk), space swings the sword; the bar's tap menu turns a tap into a house, wall, tower or market placed beside a road, Build here places one near you; settlers commute along the roads, builders found lights, towers shoot raiders · purrline: match three; tap a tile then a neighbour (or drag it) to swap; 4 in a row makes a pounce (row + column), an L or T a hairball (3x3), 5 a catnip (swap it with any tile to clear that kind); cascades multiply the score · delve: a map of rooms; A/D or arrows run, Space (or W/Up) jumps (hold for height), W/S climb ladders, walk off the edge of a room through a door or down a ladder shaft to the next one, M shows the map; the double-jump orb opens the high ledges · worldwalk: A/D turn, W/S throttle (as bullet_hell), space swings the sword; settlers commute along the roads, builders found lights, towers shoot raiders</div>
 <script>
   // Keep the canvas below the control bar as the bar wraps or unwraps.
   (() => { const bar = document.getElementById("bar");
