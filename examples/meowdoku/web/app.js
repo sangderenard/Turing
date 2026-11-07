@@ -14,6 +14,7 @@ import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirecti
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
+import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 
 const canvas = document.getElementById("gl");
@@ -676,17 +677,126 @@ function updateBodyMesh(g) {
   const b = g.compute.body;
   const key = b ? JSON.stringify([b.hinge, b.hub, b.paddles, b.reach, b.half_thickness, g.compute.view, g.width, g.height, state.materialsVersion]) : "";
   if (state.bodyMesh && state.bodyMesh.key === key) return;
+  disposeWheelBlur(state.bodyMesh);
   if (state.bodyMesh && state.bodyMesh.mesh) disposeMesh(state.bodyMesh.mesh);
   const faces = b ? ribbonFaces(g, bodyLines(b), Math.max(0.004, 0.6 * b.half_thickness)) : null;
   state.bodyMesh = { key, mesh: faces ? litMesh(faces) : null, hinge: b ? lawToWorld(g)(b.hinge[0], b.hinge[1], 0) : null };
+  wheelBlurMeshes(state.bodyMesh);
 }
-function bodyModel(g) {
+function bodyModel(g, angle) {                                   // (angle: another turn than the law's, for a blurred copy)
   const b = g && g.compute && g.compute.body, bm = state.bodyMesh;
   if (!b || !bm || !bm.mesh) return null;
-  const th = (compute.diag && compute.diag[b.angle]) || 0, h = bm.hinge;
+  const th = angle ?? ((compute.diag && compute.diag[b.angle]) || 0), h = bm.hinge;
   // a law-plane turn by +th (x toward y) is a world turn about +Y by +th (law y is world -z)
   const turn = M.multiply(M.translate(h[0], 0, h[2]), M.multiply(M.rotateY(th), M.translate(-h[0], 0, -h[2])));
   return state.caseModel ? M.multiply(state.caseModel, turn) : turn;
+}
+// THE WATERWHEEL'S MOTION BLUR (wheel_blur.js holds the pure part).  A wheel too fast to read is not drawn crisp: from the angle swept since the
+// last DRAWN frame it is one crisp wheel (slow), K <= 8 copies across the swept arc through the same glass material at WHEEL_LEVELS opacity
+// steps (fast), or ONE disc sprite -- the wheel's angular average rasterised into rings by sectors (hub ring solid, paddle annulus at its
+// coverage, faint streaks), a flat mesh in the same material path, turned slowly (very fast).  Crossfaded, so nothing pops; off = today's wheel.
+const wheelBlur = { on: true, theta: null, d: 0, regime: null, px: 0, copies: 0, drew: "crisp" };
+try { const saved = localStorage.getItem("meowdoku.wheelblur"); if (saved != null) wheelBlur.on = saved === "1"; } catch { /* storage may be blocked */ }
+const WHEELBLUR_SPEC = { id: "wheelblur", kind: "toggle", label: "wheel blur", local: "wheelblur" };
+const DISC_GAIN = 2.4, DISC_FADES = 8, OUTLINE_ALPHA = 0.55;
+// the screen pixels one law unit spans at the hinge (the wheel is flat in the board's plane)
+function wheelPxPerUnit(g, cam) {
+  const b = g.compute.body, wp = lawToWorld(g), a = wp(b.hinge[0], b.hinge[1], 0), c = wp(b.hinge[0] + 1, b.hinge[1], 0);
+  const pa = M.apply(cam.viewProj, a), pc = M.apply(cam.viewProj, c);
+  return Math.hypot((pc[0] - pa[0]) * canvas.width / 2, (pc[1] - pa[1]) * canvas.height / 2);
+}
+// once per drawn frame: the swept angle since the last DRAWN frame (unwrapped: the law's angle may be wrapped or continuous), and the regime.
+// A frame that arrives before the law has stepped again sweeps 0; the previous sweep decays (x0.8) instead of snapping to 0 so the picture does not flicker.
+function wheelBlurFrame(g, cam) {
+  const b = g && g.compute && g.compute.body;
+  if (!b || !wheelBlur.on) { wheelBlur.theta = null; wheelBlur.d = 0; wheelBlur.regime = null; return; }
+  const th = (compute.diag && compute.diag[b.angle]) || 0;
+  const fresh = wheelBlur.theta == null ? 0 : wrapDelta(th - wheelBlur.theta);
+  wheelBlur.theta = th;
+  wheelBlur.d = Math.abs(fresh) >= 0.8 * Math.abs(wheelBlur.d) ? fresh : 0.8 * wheelBlur.d;
+  wheelBlur.px = wheelPxPerUnit(g, cam);
+  wheelBlur.regime = wheelRegime({ dTheta: wheelBlur.d, reach: b.reach, pxPerUnit: wheelBlur.px, paddles: b.paddles });
+}
+// the 2-D glass wheel's extras: a copy of the ribbon VAO with the material attribute off (so drawLit's material id applies), and the disc meshes (lazily)
+function wheelBlurMeshes(bm) {
+  if (!bm || !bm.mesh) return;
+  const m = bm.mesh, vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  for (const [loc, buf] of [[0, m.buffers[0]], [1, m.buffers[1]]]) { gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0); }
+  gl.bindVertexArray(null);
+  bm.flat = { vao, count: m.count }; bm.discs = new Map();
+}
+function disposeWheelBlur(bm) {
+  if (!bm) return;
+  if (bm.flat) { gl.deleteVertexArray(bm.flat.vao); bm.flat = null; }
+  for (const mesh of (bm.discs && bm.discs.values()) || []) disposeMesh(mesh);
+  bm.discs = null;
+}
+function wheelDiscMesh(g, bm, fade) {                                 // fade 1..DISC_FADES
+  if (bm.discs.has(fade)) return bm.discs.get(fade);
+  const b = g.compute.body, r = polarBlurRaster(b, { nr: 10, nth: 40 }), wp = lawToWorld(g), faces = [], [hx, hy] = b.hinge, f = fade / DISC_FADES;
+  const pt = (rad, ph) => wp(hx + rad * Math.cos(ph), hy + rad * Math.sin(ph), RIBBON_H * 0.5);
+  for (let i = 0; i < r.nr; i++) for (let j = 0; j < r.nth; j++) {
+    const lv = levelOf(Math.min(1, r.data[i * r.nth + j] * DISC_GAIN) * f);
+    if (lv < 0) continue;
+    const m = state.materialIndex[`outline@glass~${lv}`];
+    const r0 = r.R * i / r.nr, r1 = r.R * (i + 1) / r.nr, p0 = 2 * Math.PI * j / r.nth, p1 = 2 * Math.PI * (j + 1) / r.nth;
+    const a = pt(r0, p0), c = pt(r1, p0), d = pt(r1, p1), e = pt(r0, p1);
+    faces.push([a, c, d, m], [a, d, e, m]);
+  }
+  const mesh = faces.length ? litMesh(faces) : null;
+  bm.discs.set(fade, mesh);
+  return mesh;
+}
+// the 2-D glass wheel for this frame (called where the crisp wheel was drawn)
+function drawWheel2D(g, drawLit) {
+  const bm = state.bodyMesh, rg = wheelBlur.regime;
+  if (!wheelBlur.on || !rg || rg.mode === 1 || !bm.flat) {
+    const bmodel = bodyModel(g);
+    if (bmodel) drawLit(bm.mesh.vao, bm.mesh.count, bmodel, null);
+    wheelBlur.drew = "crisp"; wheelBlur.copies = 1;
+    return;
+  }
+  const th = wheelBlur.theta;
+  let n = 0;
+  for (const w of smearWeights(rg.K, rg.smear, rg.disc)) {
+    const lv = levelOf(w.alpha), id = state.materialIndex[`outline@glass~${lv}`];
+    if (lv < 0 || id == null) continue;
+    const model = bodyModel(g, th - w.offset * wheelBlur.d);
+    if (model) { drawLit(bm.flat.vao, bm.flat.count, model, id); n++; }
+  }
+  if (rg.disc > 0) {
+    const mesh = wheelDiscMesh(g, bm, Math.max(1, Math.ceil(rg.disc * DISC_FADES)));
+    const model = mesh && bodyModel(g, discSpin(th));
+    if (model) { drawLit(mesh.vao, mesh.count, model, null); n++; }
+  }
+  wheelBlur.drew = rg.disc >= 1 ? "disc" : rg.disc > 0 ? "smear+disc" : "smear"; wheelBlur.copies = n;
+}
+// the same regimes for the wireframe wheel (the 3-D fountain, and the flat page): outlines with alpha
+function drawBodyBlur(b, frame, dh = 0) {
+  const rg = wheelBlur.regime;
+  if (!b) return;
+  if (!wheelBlur.on || !rg || rg.mode === 1) { drawBody(b, frame, dh); wheelBlur.drew = "crisp"; wheelBlur.copies = 1; return; }
+  const th = wheelBlur.theta;
+  let n = 0;
+  for (const w of smearWeights(rg.K, rg.smear, rg.disc)) {
+    if (levelOf(w.alpha) < 0) continue;
+    drawBody(b, frame, dh, th - w.offset * wheelBlur.d, w.alpha); n++;
+  }
+  if (rg.disc > 0) {                                                  // the sprite as outlines: a ring per raster ring at its density, streaks as spokes
+    const r = polarBlurRaster(b, { nr: 8, nth: 24 }), [hx, hy] = b.hinge, spin = discSpin(th), color = (a) => [0.85, 0.9, 1.0, OUTLINE_ALPHA * Math.min(1, a)];
+    for (let i = 0; i < r.nr; i++) {
+      const rad = r.R * (i + 0.5) / r.nr, a = Math.min(1, r.profile[i] * DISC_GAIN) * rg.disc;
+      if (levelOf(a) < 0) continue;
+      cloud.drawOutline(Array.from({ length: 25 }, (_, k) => [hx + rad * Math.cos(2 * Math.PI * k / 24), hy + rad * Math.sin(2 * Math.PI * k / 24)]), dh, frame, color(a)); n++;
+    }
+    for (let j = 0; j < r.nth; j += 2) {
+      const a = Math.min(1, r.data[4 * r.nth + j] * DISC_GAIN) * rg.disc * 0.8, ph = spin + 2 * Math.PI * (j + 0.5) / r.nth;
+      if (levelOf(a) < 0) continue;
+      cloud.drawOutline([[hx + b.hub * Math.cos(ph), hy + b.hub * Math.sin(ph)], [hx + r.R * Math.cos(ph), hy + r.R * Math.sin(ph)]], dh, frame, color(a)); n++;
+    }
+  }
+  wheelBlur.drew = rg.disc >= 1 ? "disc" : rg.disc > 0 ? "smear+disc" : "smear"; wheelBlur.copies = n;
 }
 function updateHousing() {
   const g = state.game, c = g && g.compute;
@@ -699,7 +809,7 @@ function updateHousing() {
     updateBodyMesh(g);
     return;
   }
-  if (state.bodyMesh) { disposeMesh(state.bodyMesh.mesh); state.bodyMesh = null; }
+  if (state.bodyMesh) { disposeWheelBlur(state.bodyMesh); disposeMesh(state.bodyMesh.mesh); state.bodyMesh = null; }
   const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
@@ -1744,6 +1854,10 @@ function uploadMaterials(game) {
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
   records.push(["outline@glass", [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22, 0.42, 0.62] }]);   // the 2-D chamber's glowing glass ribbons
+  for (let k = 0; k < WHEEL_LEVELS; k++) {   // the same glass ribbon at WHEEL_LEVELS opacities: a drawn copy of the blurred waterwheel picks one (wheel blur)
+    const f = levelAlpha(k);
+    records.push([`outline@glass~${k}`, [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55 * f, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22 * f, 0.42 * f, 0.62 * f] }]);
+  }
   records.push(["housing_matte", [0.10, 0.10, 0.11], { roughness: 0.95, specular: 0.02 }]);   // the panes' matte fill (panes "matte")
   const tables = {};
   state.materialIndex = {};
@@ -4625,6 +4739,7 @@ function colorPick() {
 }
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
+  if (s.local === "wheelblur") return wheelBlur.on;
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
@@ -4632,6 +4747,11 @@ function localValue(s) {
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
+  if (s.local === "wheelblur") {
+    wheelBlur.on = !!value;
+    try { localStorage.setItem("meowdoku.wheelblur", wheelBlur.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+    return;
+  }
   if (s.local === "tilt") {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
@@ -4736,6 +4856,11 @@ function refreshLocalControls() {
     if (!s.local) continue;
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
+    if (s.local === "wheelblur") {
+      el.querySelector("input").checked = wheelBlur.on;
+      el.title = "a waterwheel turning too fast to read is drawn as a smear of copies, then as one spinning blurred disc, instead of a crisp wheel (off: always crisp)";
+      continue;
+    }
     if (s.local === "spin") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
@@ -4995,6 +5120,7 @@ function pageSpecs(specs) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
+    if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -5200,14 +5326,14 @@ function pointsFrame(cam, now) {
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
 // The 2-D fountain's hinged body (the waterwheel): its SDF outline (hub circle, capsule paddles) at the angle the law reports (diagnostic body_th).
-function drawBody(b, frame, dh = 0) {                       // dh: the 3-D fountain's half depth (the body is extruded through the slab); 0 = flat
+function drawBody(b, frame, dh = 0, angle = null, alpha = 1) {                       // dh: the 3-D fountain's half depth (the body is extruded through the slab); 0 = flat; angle / alpha: a blurred copy
   if (!b) return;
-  const th = (compute.diag && compute.diag[b.angle]) || 0, [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
-  cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), dh, frame);
+  const th = angle ?? ((compute.diag && compute.diag[b.angle]) || 0), color = [0.85, 0.9, 1.0, 0.55 * alpha], [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
+  cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), dh, frame, color);
   for (let k = 0; k < b.paddles; k++) {
     const a = th + 2 * Math.PI * k / b.paddles, t = b.half_thickness, l = b.reach, cap = [];
     for (let j = 0; j <= 6; j++) cap.push([hx + l * Math.cos(a) + t * Math.cos(a + Math.PI / 2 - Math.PI * j / 6), hy + l * Math.sin(a) + t * Math.sin(a + Math.PI / 2 - Math.PI * j / 6)]);
-    cloud.drawOutline([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)], dh, frame);
+    cloud.drawOutline([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)], dh, frame, color);
   }
 }
 function drawChamberOutline(cam, g, rec) {
@@ -5216,7 +5342,7 @@ function drawChamberOutline(cam, g, rec) {
   // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
   if (g.compute.chamber_mesh) return;                         // an SDF chamber's walls are the glass mesh (housingFaces)
   const lines = g.compute.chamber_outline;
-  if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); drawBody(g.compute.body, frame); return; }
+  if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); drawBodyBlur(g.compute.body, frame); return; }
   for (let k = 0; k < 8; k++) {
     const p = [u[`px${k}`], u[`py${k}`]];
     if (!(p[0] !== undefined && p[1] !== undefined)) break;
@@ -5224,7 +5350,7 @@ function drawChamberOutline(cam, g, rec) {
     if (!last || last[0] !== p[0] || last[1] !== p[1]) pts.push(p);
   }
   cloud.drawOutline(pts, u.dh || 0, frame);
-  drawBody(g.compute.body, frame, u.dh || 0);                 // the 3-D fountain's hinged body (waterwheel), extruded through the slab
+  drawBodyBlur(g.compute.body, frame, u.dh || 0);             // the 3-D fountain's hinged body (waterwheel), extruded through the slab
 }
 function drawCloud(cam, data, g, rec, style) {
   const y = TILE.height + 0.03;
@@ -5393,7 +5519,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, state.caseModel || M.identity(), null, plate ? PLATE_GROUP : 0);
   if (!opts.broadcast && statusPlateWanted()) { drawStatusPlate(cam, state.caseModel); gl.useProgram(P); }
   if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);
-  if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) { const bmodel = bodyModel(state.game); if (bmodel) drawLit(state.bodyMesh.mesh.vao, state.bodyMesh.mesh.count, bmodel, null); }   // the waterwheel   // the 3-D fountain's polygon housing
+  if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -5427,7 +5553,7 @@ function caseModelNow() {
   return caseModel(caseAngleNow(), state.extent.width / 2, extMidZ());
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
-window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;
+window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;
 window.meowdokuDebug.drawFrame = (ms) => { const keep = window.requestAnimationFrame; window.requestAnimationFrame = () => 0; try { draw(ms); } finally { window.requestAnimationFrame = keep; } };   // one frame, no rAF (a hidden pane)
 
 function draw(ms) {
@@ -5442,6 +5568,7 @@ function draw(ms) {
   const cam = camera(); updateLight(now);
   state.caseModel = caseModelNow();
   updateHousing();
+  wheelBlurFrame(state.game, cam);
   status.style.visibility = statusPlateWanted() ? "hidden" : "";       // the status text is on the plate instead (layout unchanged)
   const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropNoFloor()) ? []
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
