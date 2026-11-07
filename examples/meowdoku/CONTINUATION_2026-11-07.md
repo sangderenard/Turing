@@ -75,3 +75,13 @@ Unstaged / untracked: examples/meowdoku/search.py, docs/MEOWDOKU_WEB_2026-11-05.
 ## 8. The user's standing preferences
 
 Terse, no padding (fact, cause, gap, next). Sonnet workers, one narrow task each, in worktrees. Deploy as soon as work lands. Restart 8766 freely. One law text for server and page. Never patch generated output; fix the generator.
+
+## Addendum (coordinator, late 2026-11-07)
+- **Layout audit:** DONE on branch worktree-agent-acae7257c8e4ec853 (commits c535e5c8, 9156fe5b, 0300bf66 stages 1-3, 0e7a19a7 audit doc; LAYOUT_AUDIT.md; tools/meowdoku_layout_move.py, an idempotent staged mover). NOT merged on purpose: merge AFTER the toy redesign worker lands.
+  - Stage 1 is digest-neutral.
+  - Stage 2 rebuilds the law products once.
+  - Stage 3 rebuilds all 40 fountain products and moves fountain.py and the builders; rerun `--stage 3` after merging the others.
+  - Found 10 upward imports, 17 cross-title imports, and 5 unreferenced files.
+- **2D toy regression report:** a clean desktop profile on the live product is correct (ramps top, pegs bottom, n_out 0). The user's iPhone showed the toy inverted, with drawn pegs not where the law's pegs are. Suspect the iOS phone-gravity / layout-lock screen-angle path (web/gravity.js #angle(): lockedAngle vs screen.orientation.angle vs window.orientation). Unresolved; the user wants the toy feature work prioritised.
+- **Toy redesign worker** (worktree-agent-ac855d0e9de67d5e1), in this order: space under pegs FIRST (own commit), then filtering pegs, the shortened last ramp plus a free-spin wheel, open arm ends at the case sides, dribble holes in the ramps and wheel, then the 3D toy = the 2D toy extruded (one shared description). It deploys per commit.
+- **QR wall worker** (obsidian/frosted cube QR back wall for the tip jar, decode tests at 0/25/40 degrees), and the mobroad top-down + neural pather worker: in flight.
