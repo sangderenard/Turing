@@ -4000,8 +4000,12 @@ const compute = new ComputeRuntime({
 window.meowdokuDebug.compute = compute;
 // The phone's orientation is the fountain's gravity (a runtime input of the law), on by default, with an off switch.  iOS only
 // delivers the events after a permission asked for on a tap: the first tap anywhere asks.
+// CAMERA-DOWN GRAVITY (a page switch): gravity is the camera's down vector in the box's frame, so orbiting the camera is the
+// box turning under a fixed view.  Overrides the phone; a spinning / rocking case overrides it.
+let cameraGravity = false;
+try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
 const gravitySensor = new GravitySensor({
-  onGravity: (gx, gy) => compute.setGravity(gx, gy),
+  onGravity: (gx, gy) => { if (!cameraGravity) compute.setGravity(gx, gy); },
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
@@ -4021,7 +4025,7 @@ function clearLayoutTurn() {
   layoutLock.turn = null;
 }
 function applyLayoutLock() {
-  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin);
+  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin && !cameraGravity);
   if (!want) {
     if (layoutLock.angle != null) {
       layoutLock.angle = null; gravitySensor.lockedAngle = null; clearLayoutTurn();
@@ -4109,7 +4113,7 @@ function colorPick() {
 function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn,
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn, camgrav: cameraGravity,
            spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
@@ -4122,6 +4126,10 @@ function localControl(s, value) {
     spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
   } else if (s.local === "spinarc") {
     spinMotion.arc = Number(value); saveSpinMotion();
+  } else if (s.local === "camgrav") {
+    cameraGravity = !!value;
+    if (!cameraGravity) compute.setGravity(gravitySensor.last ? gravitySensor.last[0] : null, gravitySensor.last ? gravitySensor.last[1] : null);
+    try { localStorage.setItem("meowdoku.camgrav", cameraGravity ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "record") {
     recordOn = !!value;
     compute.setRecording(recordOn);
@@ -4219,6 +4227,9 @@ function refreshLocalControls() {
         input.disabled = spinMotion.kind !== "rock";
         el.title = "the swing: gravity rocks +-half this angle about straight down, one swing out and back per cycle at the case spin rate";
       } else el.title = "rotate: a full turn per cycle; rock: swing through the arc at the case spin rate";
+    } else if (s.local === "camgrav") {
+      el.querySelector("input").checked = cameraGravity;
+      el.title = "gravity is the camera's down: orbit or tilt the camera and the box turns under it (overrides phone gravity; a spinning or rocking case overrides this)";
     } else if (s.local === "record") {
       el.querySelector("input").checked = recordOn;
       el.title = recordOn ? "frames and keyframes are read back and kept (memory-capped window): Replay, Bounce, Continue"
@@ -4261,6 +4272,7 @@ function saveSpinMotion() {
   compute.setSpin(caseSpin, spinMotion);
   try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
 }
+const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
 // Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
@@ -4279,7 +4291,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...out.slice(tilt + 1)];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -4375,9 +4387,17 @@ function particleScene(pick) {
     : particleStyle === "stained" ? (state.materialIndex["gem@glass"] ?? state.materialIndex.traycube) : (state.materialIndex.gem ?? state.materialIndex.glass);
   return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj };
 }
+// The camera's down in the law's plane: the board maps law x to world +x and law y to world -z (PointCloud's uMap), so the
+// in-plane part of the camera's down (minus its up row of the view matrix) is (d.x, -d.z) -- full strength looking
+// straight down at the board, none looking along it (the box then lies flat in the camera's frame).
+function cameraDownInLaw(view) {
+  const down = [-view[1], -view[5], -view[9]];
+  return [down[0], -down[2]];
+}
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
+  if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); compute.setGravity(gx, gy); }
   compute.frame(now);
   const data = compute.points();
   const rec = compute.rec;
