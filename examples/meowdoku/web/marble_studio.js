@@ -86,7 +86,7 @@ function dispose(mesh) {
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
 
-const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve","mark-scale","relief-depth"];
+const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
@@ -218,11 +218,14 @@ function controls() {
     diceCost();rebuild();syncMaterial();
   });
   for(const field of ["marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
-  for(const field of ["dice-detail","dice-bevel","dice-face-relief"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
-  for(const field of ["dice-detail","dice-bevel","dice-face-relief"]) $(field).addEventListener("input",()=>{
-    $(field+"-out").value=field==="dice-detail"?$(field).value:(+$(field).value/1000).toFixed(3);
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth"]) $(field).addEventListener("input",()=>{
+    $(field+"-out").value=field==="dice-detail"?$(field).value:
+      field==="mark-scale"?(+$(field).value/100).toFixed(2):(+$(field).value/1000).toFixed(3);
     if(field==="dice-detail")diceCost();
   });
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth"])
+    $(field).dispatchEvent(new Event("input"));
   $("compensate-raised").addEventListener("change",()=>{rebuild();syncMaterial();});
   diceCost();
   const lightValue=(name)=>{const divisor=name==="light-strength"?10:name.startsWith("spot")?1:100;
