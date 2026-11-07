@@ -53,6 +53,8 @@ deploy to 8766 as soon as work lands.
    - every particle is handed to fragment shaders;
    - persistent textures act as memory the points stamp sprites into (per-species sprites, trails and layering over time);
    - colour covers all particles.
+  - **Landed (first cut):** a page control "look" (web/particle_styles.js, render only): points (default), liquid (screen-space fluid), sand (shaded impostors + density AO), glow, heat (density and moving share: the packed points carry no velocity), stamp (a decaying 8-bit memory under the points, in board coordinates).
+  - **Open:** per-species sprites, stamped layers and trails per id, the memory following the 3D law, a velocity channel in the packed points (heat by speed).
 
 ## Other open items
 
