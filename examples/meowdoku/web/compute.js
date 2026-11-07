@@ -466,6 +466,8 @@ function decodeIdStart(start, pad, bytes) {
     out.rs[id] = r[k] / 65535 * start.rmax; out.age[id] = start.age;
     out.ir[id] = rgb[3 * k] / 255; out.ig[id] = rgb[3 * k + 1] / 255; out.ib[id] = rgb[3 * k + 2] / 255;
   }
+  return out;
+}
 
 // PURRLINE SAND (WORKLIST.md, "Purrline sand mode", C): the game's state as the purrline variant's runtime inputs (fountain_purrline.manifest.json).
 // This is fountain.py's ``purrline_inputs`` (a test holds the two equal).  ``game`` is the purrline state (occupancy, rows, cols, cell, origin, falling:

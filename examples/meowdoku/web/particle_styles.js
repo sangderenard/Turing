@@ -21,6 +21,9 @@
 //
 // The pure part (the registry, what a device can run, which style is used instead) is at the top and is node-tested.
 
+import { sizeDepth } from "./world_curve.js";                               // [CURVE] a grain's size depth: the eye depth, or 1 under an orthographic projection
+const PERSPECTIVE_W = (() => { const m = new Array(16).fill(0); m[11] = -1; return m; })();       // (no projection given: a perspective one)
+
 export const STYLES = [
   { id: "points", label: "points", needs: null },
   { id: "liquid", label: "liquid", needs: "float" },
@@ -1031,7 +1034,7 @@ export class ParticleStyles {
     let radiusPx = 4;
     if (view) {
       const eye = -(view[2] * ctx.board[0] * 0.5 + view[6] * ctx.y + view[10] * ctx.board[1] * 0.5 + view[14]);
-      radiusPx = typicalRadius(ctx.data) * ctx.map[2] * ctx.focal * ctx.H / 2 / Math.max(1e-3, Math.abs(eye));
+      radiusPx = typicalRadius(ctx.data) * ctx.map[2] * ctx.focal * ctx.H / 2 / sizeDepth(c.proj || PERSPECTIVE_W, -eye);       // [CURVE] clip.w: the eye depth, 1 under an orthographic projection
     }
     const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: ctx.n, radiusPx };
     const tris = this.#emojiTris(ctx.scene);
@@ -1371,7 +1374,7 @@ export class ParticleStyles {
     // 3. a separable narrow-range bilateral blur of the depth
     const rWorld = ParticleStyles.typicalRadius(ctx.data) * ctx.map[2] * grow;
     const eyeC = -(ctx.camera.view[2] * ctx.board[0] * 0.5 + ctx.camera.view[6] * ctx.y + ctx.camera.view[10] * ctx.board[1] * 0.5 + ctx.camera.view[14]);
-    const rPx = rWorld * ctx.focal * H / 2 * scale / Math.max(1e-3, Math.abs(eyeC));
+    const rPx = rWorld * ctx.focal * H / 2 * scale / sizeDepth(ctx.camera.proj || PERSPECTIVE_W, -eyeC);       // [CURVE] clip.w (1 under an orthographic projection)
     gl.useProgram(bp.program); gl.uniform1i(bp.u.uD, 0); gl.uniform1f(bp.u.uStep, Math.max(1, Math.round(rPx * 0.45))); gl.uniform1f(bp.u.uRange, Math.max(1e-4, rWorld * 1.5));
     gl.bindFramebuffer(gl.FRAMEBUFFER, A.fbo); guard.bind(0, D.tex); gl.uniform2i(bp.u.uDir, 1, 0); this.#quad(ctx.vao);
     gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); guard.bind(0, A.tex); gl.uniform2i(bp.u.uDir, 0, 1); this.#quad(ctx.vao);
