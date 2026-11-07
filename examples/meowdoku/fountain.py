@@ -2379,3 +2379,43 @@ def mobroad_spec(size: str = "4k") -> dict[str, Any]:
             "chamber_outline": chamber_outline("sdf_mobroad", active, None, params),
             "tilt": tilt_inputs(active, None, cell, "sdf_mobroad"), "map": mobroad_map()}
 # </mobroad>
+# <toy>
+# ------------------------------------------------------------------------------------------------------------------------
+# THE OIL & GLYCERINE TOY's PRESET is host-side data (slots), so it lives between ``# <toy>`` markers, which ``fountain_build`` leaves out of EVERY product's
+# source digest (the default, wheel, purrline and mobroad ones): editing the toy rebuilds no product.  The ``sdf_toy`` branch of ``sdf_preset`` above is dead
+# (this definition replaces it) and stays only so that the law's digests are the digests they were.
+TOY_POOL_W = 0.35                       # the collection pool under the peg field: its depth, in half widths of the vessel ...
+TOY_POOL_MIN_CELLS = 8.0                # ... and at least this many grain cells
+_sdf_preset_toy_base = sdf_preset
+
+
+def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
+    """``sdf_preset`` with the toy's COLLECTION POOL: an open basin ``TOY_POOL_W`` half widths deep (at least ``TOY_POOL_MIN_CELLS`` cells) between the
+    floor and the lowest peg row, where what passes the pegs gathers.  Everything else of the toy is as it was (the vessel, the funnel, the peg rows and
+    pitch, the three ramps); built bottom up, so the toy grows TALLER by what the pool adds."""
+    if shape != "sdf_toy":
+        return _sdf_preset_toy_base(shape, geo)
+    c = geo.get("cell", CELL)
+    w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
+    rr = 0.9 * c
+    throat = max(0.09 * w, 3.5 * c)
+    slope, tan, step = 1.7, 0.42, 0.25 * w
+    delta = (w - throat) / slope
+    px = py = 4.6 * c
+    pool = max(TOY_POOL_W * w, TOY_POOL_MIN_CELLS * c)
+    y_lo, peg_rows = pool + 0.9 * c, 6                                                   # the lowest peg row's centre: the pool is the open space under it
+    pegs_top = y_lo + (peg_rows - 1) * py + 0.9 * c
+    yc = pegs_top + 3.0 * c + delta
+    edge = w + 1.5 * rr
+    y0 = yc + delta + 6.0 * c + tan * (edge + 0.1 * w) + 2.0 * step
+    nozzle_y = y0 + 0.12
+    top = nozzle_y + 0.12
+    slots = [_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, slope)]
+    for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
+        sign = 1.0 if i % 2 == 0 else -1.0                                               # +: high end at the right wall (the ramp runs left-down)
+        high = (sign * edge, y0 - i * step)
+        slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
+    cols = 2 * int(w // px) + 1
+    slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (peg_rows - 1) * py, 0.0, px, py, 0.9 * c, cols, peg_rows, 1.0))
+    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": 0.25 * w, "pool": pool}
+# </toy>
