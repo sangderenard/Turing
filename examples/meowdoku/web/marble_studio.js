@@ -76,7 +76,7 @@ function dispose(mesh) {
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
 
-const dimensions = ["width","length","curve","strands"];
+const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1], grain:["phong",3,100],
@@ -103,9 +103,11 @@ function rebuild() {
   dispose(interior); dispose(glass);
   const { interior: inside, glass: outside, triangleCount } = catEyeMarble({
     glass: idFor("glass"), eye: idFor("eye"), accent: idFor("accent") }, {
-    rings:40, segments:80, eyeWidth:+$("width").value/100,
+    rings:96, segments:128, eyeWidth:+$("width").value/100,
     eyeLength:+$("length").value/100, eyeCurve:+$("curve").value/100,
-    strandCount:+$("strands").value, seed });
+    strandCount:+$("strands").value, ribbonThickness:+$("thickness").value/1000,
+    ribbonTwist:+$("twist").value/100, ribbonTip:+$("tip").value/100,
+    ribbonFlare:+$("flare").value/100, seed });
   interior = mesh(inside); glass = mesh(outside);
   for (const name of dimensions) $(name+"-out").value = $(name).value;
   message.textContent = `${triangleCount.toLocaleString()} triangles · dye #${seed}`;
