@@ -44,6 +44,12 @@ deploy to 8766 as soon as work lands.
    - inside, the glyph or glyph string is built from the run's N particles filling each glyph's ENCLOSED solid volume (not its surface). The glyph meshes are extrusions of an outline (token_mesh in web_export: outline with holes, depth_ratio), so "inside" is exact and cheap: an even-odd point-in-outline test (holes count) and |z| < depth/2, from the same outline data the exported mesh used (emoji keep only their largest component). Grain size from N·(4/3)πr³ = φ·V (φ ≈ 0.64 random, or ≈ 0.74 on a lattice for a crystalline start); with a species mix, scale the drawn radii to fit;
    - the simulation starts from that state at rest, then evolves (gravity, tilt, temperature and the rest apply as usual);
    - the starting state is part of the replay (same text, same N, same result).
+4c. **Teeter-totter case (after 3D, with glyph start):**
+   - the whole chamber sits on a fulcrum: one rotational degree of freedom, a pivot under (or beside) the case;
+   - the grains' own mass drives it: the contact forces the grains put on the walls (plus gravity on the case itself) give the torque about the pivot, and the case angle is integrated from that over time, like the desk-toy wave rockers;
+   - options: case mass and inertia, pivot position, pivot friction or damping, an optional restoring spring, start tilt;
+   - the case angle is law state (exact replay). In the case frame the law sees gravity rotated by the angle, plus the frame's inertial terms (Euler and centrifugal), which is the honest version of the case spin, which only rotates gravity;
+   - the pivot is the first rigid-body coupling, so build it on the engine_toy machine-sim coupling/torque path that the rigid emoji objects and the waterwheel will use, not as a one-off.
 5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
 6. **Fluids, crystals and temperature:**
    - temperature: Brownian agitation through a Langevin thermostat tied to the fluid drag (deterministic hashed noise), plus the system's measured kinetic temperature as a law output shown in the status line;
