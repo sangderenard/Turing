@@ -74,6 +74,12 @@ deploy to 8766 as soon as work lands.
   - **dipoles:** each grain carries a moment (a per-id orientation vector) with an orientation-dependent pair force and torque (magnetic/electric), so chains and needles form;
   - **aggregates:** grains bonded at rest fuse into a cluster that moves as one rigid body (fewer degrees of freedom, so the sim calms down and gets cheaper), and break apart when bond stress exceeds a strength; the same rigid-body machinery as the emoji objects;
   - the bonds and their breakage are law state, deterministic, and replay bit-identically.
+- **Late-stage colour from per-id data** (fountain):
+  - the law hands the render per-id attributes instead of a baked rgba8: species, grain size, smoothness/roughness, irregularity, speed, age/emission order, contact count, temperature;
+  - a late-stage shader composes colour from them through maps (ramps, palettes) and simple blend recipes (e.g. hue = species, value = size, saturation = speed, or a weighted mix of any channels), quick to switch, chosen for dramatic informational and aesthetic effect;
+  - colour modes: species, grain size, grain smoothness, plus the existing time strata, launch angle and image;
+  - in 3D: depth shadow (grains shadow those behind them in the slab) and depth alpha (fade with depth) as recipe terms;
+  - this is the same per-id data the noise filter and the render styles consume.
 - **Client/server load share for the fountain page:**
   - a percentage control that splits the simulation between the page's GPU and the server, by dividing the adjacency (neighbour) list: a partition of the grid cells, so each side steps its own grains;
   - the boundary grains are exchanged each step as a halo; the same law text runs on both sides;
