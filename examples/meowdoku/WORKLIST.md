@@ -39,6 +39,11 @@ deploy to 8766 as soon as work lands.
    - polygon chambers;
    - auto-rotate;
    - a colinear tube inlet.
+4b. **Glyph start (a 3D must, as soon as 3D is stable):**
+   - you type a glyph sequence; its bounding box becomes a closed cube shell (all six walls);
+   - inside, the glyph or glyph string is built from the run's N particles, with the grain size chosen so N grains fill the glyphs' volume at a packing fraction (extruded glyph meshes from the export's letter/emoji assets, sampled deterministically into a packing);
+   - the simulation starts from that state at rest, then evolves (gravity, tilt, temperature and the rest apply as usual);
+   - the starting state is part of the replay (same text, same N, same result).
 5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
 6. **Fluids, crystals and temperature:**
    - temperature: Brownian agitation through a Langevin thermostat tied to the fluid drag (deterministic hashed noise), plus the system's measured kinetic temperature as a law output shown in the status line;
