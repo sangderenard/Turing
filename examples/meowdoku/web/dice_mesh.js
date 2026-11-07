@@ -122,8 +122,12 @@ function evaluateMark(point,face,marks,vertices,scale) {
   for(const mark of marks) {
     const location=kindLocation(mark,center,inradius,scale);
     const offset=sub(point,location.center);
-    const x=dot(offset,tangent)/location.height*1.5+0.5;
-    const y=dot(offset,bitangent)/location.height+0.5;
+    // On a top-read d4, each corner numeral is upright toward its own apex.
+    // A single face-wide basis would turn two of the three values sideways.
+    const up=location.corner?unit(sub(mark.center,center)):bitangent;
+    const right=location.corner?cross(up,n):tangent;
+    const x=dot(offset,right)/location.height*1.5+0.5;
+    const y=dot(offset,up)/location.height+0.5;
     if(inText(x,y,mark.label)) return true;
   }
   return false;
@@ -131,7 +135,7 @@ function evaluateMark(point,face,marks,vertices,scale) {
 function kindLocation(mark,faceCenter,inradius,scale) {
   const isCorner=Math.hypot(...sub(mark.center,faceCenter))>inradius*0.5;
   return {center:isCorner?mark.center.map((x,i)=>faceCenter[i]*0.48+x*0.52):mark.center,
-    height:inradius*(isCorner?0.46:scale)};
+    height:inradius*(isCorner?0.46:scale),corner:isCorner};
 }
 
 /**
