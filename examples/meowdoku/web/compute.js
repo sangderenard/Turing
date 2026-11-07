@@ -622,6 +622,9 @@ export class ComputeRuntime {
 
   async #load(spec, key) {
     this.ready = false; this.running = false; this.error = null; this.token++;
+    // A prior batch may still be mapping a staging buffer. The invalidated
+    // batch releases its frames in #land; only then may we destroy its device.
+    while (this.inflight > 0) await new Promise((resolve) => setTimeout(resolve, 2));
     if (this.product) { if (this.tape) this.#release(this.tape.clear()); this.product.destroy(); this.product = null; }
     const rec = this.manifest.sizes[spec.size];
     // The compiler decides (rec.route, from its verdict); the browser can only veto.
