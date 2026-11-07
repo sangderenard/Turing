@@ -4,6 +4,7 @@ no per-id tables, and deterministic image verification."""
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -251,7 +252,8 @@ def test_slip_friction_stays_finite_for_any_slip_speed_and_coincident_ids_separa
     exp(2x) overflows f32 (NaN) past ~44: the argument is clamped.  Two ids at one point are pushed
     apart along an id-fixed direction instead of dividing a zero separation."""
     t = AbstractTensor.get_tensor([0.0, 5.0, -5.0])
-    fx, fy, ft = F._contact(t + 0.01, t * 0.0, t * 0.0 + 1.0, t, t, t * 0.0, t * 0.0 + 1.0, t * 0.0 + 1.0, t * 0.0 + 0.3)
+    z, one = t * 0.0, t * 0.0 + 1.0
+    fx, fy, ft, _roll = F._contact(t + 0.01, one, t + 0.01, z, one, t, t, z, z, one, one, z + 0.3, z + F.ZETA, z, one, one, z, z)
     assert np.isfinite(np.asarray(ft)).all()
     assert abs(float(np.asarray(ft)[1]) + 0.3 * float(np.asarray(fy)[1])) < 1e-6      # saturated: |ft| = mu * fn
     columns = F.initial_columns(256, mix=1.0)
@@ -1113,7 +1115,7 @@ def test_glass_grains_composite_order_independently_and_fall_back_to_alpha_with_
 def test_the_species_table_is_runtime_uniforms_with_wide_clamped_ranges_and_the_default_is_exactly_one():
     u = F.uniforms(n=256)
     assert all(float(u[f"{k}{i}"]) == 1.0 for k in ("rscale", "fscale", "dscale", "zscale") for i in range(4))
-    assert float(u["cell_scale"]) == 1.0 and float(u["solvent"]) == 0.0 and all(float(u[f"swell{i}"]) == 0.0 for i in range(4))
+    assert float(u["cell_scale"]) == 1.0 and float(u["fl_rho"]) == 0.0 and float(u["fl_mu"]) == 0.0 and all(float(u[f"swell{i}"]) == 0.0 for i in range(4))
     wide = F.uniforms(n=256, params={"r0": 10.0, "mu0": 100.0, "r1": 1.0e-9, "mu1": -3.0, "e2": 5.0, "rho3": 0.0})
     assert float(wide["rscale0"]) == pytest.approx(10.0) and float(wide["rscale1"]) == pytest.approx(0.1)        # radius 0.1x..10x, clamped
     assert float(wide["fscale0"]) == pytest.approx(2.0 / F.SPECIES[0][3]) and float(wide["fscale1"]) == 0.0         # friction 0..2 absolute
@@ -1125,16 +1127,16 @@ def test_the_species_table_is_runtime_uniforms_with_wide_clamped_ranges_and_the_
     swelling = F.uniforms(n=256, params={"swell3": 0.2, "swmax3": 3.0})
     assert float(swelling["cell_scale"]) * F.CELL == pytest.approx(2.0 * 3.0 * F.SPECIES[3][1], rel=1e-6)
     assert "cell_scale" in F.UNIFORMS and "rs" in F.STATE and "rs_next" in F.OUTPUTS
-    assert {"solvent", "fscale0", "swell0", "swmax3"} <= set(F.RUNTIME_INPUTS) and "rscale0" not in F.RUNTIME_INPUTS
+    assert {"fl_rho", "fl_mu", "fscale0", "swell0", "swmax3"} <= set(F.RUNTIME_INPUTS) and "solvent" not in F.UNIFORMS and "rscale0" not in F.RUNTIME_INPUTS
 
 
-def _orbeez_scene(piece, solvent=1.0, rate=0.3, steps=360):
+def _orbeez_scene(piece, fluid="water", rate=0.3, steps=360):
     """Species-0 grains: A free, B3 touching three inert species-1 grains, B6 touching six; all others parked.  Gravity off."""
     n = F.N_SMALL
     probe = F.run_frames(piece, dict(F.initial_columns(n, mix=0.0), age=np.full(n, 1.0e3)), 1)["rad"]
     s0 = [int(i) for i in np.where(np.abs(probe - F.SPECIES[0][1]) < 1e-9)[0]]
     s1 = [int(i) for i in np.where(np.abs(probe - F.SPECIES[1][1]) < 1e-9)[0]]
-    cols = F.initial_columns(n, mix=0.0, params={"swell0": rate, "swmax0": 3.0, "solvent": solvent})
+    cols = F.initial_columns(n, mix=0.0, params={"swell0": rate, "swmax0": 3.0, "fl_rho": F.FLUIDS[fluid][0], "fl_mu": F.FLUIDS[fluid][1]})
     cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), age=np.full(n, -1.0e9))
     a, b3, b6 = s0[0], s0[1], s0[2]
     ring3, ring6 = s1[:3], s1[3:9]
@@ -1156,12 +1158,12 @@ def test_orbeez_swell_with_open_surface_in_a_solvent_only(native_piece):
     ~ rate x r0 x t.  In air nothing grows.  Counters stay exact."""
     piece, _columns = native_piece
     r0, rate = F.SPECIES[0][1], 0.3
-    first, a, b3, b6 = _orbeez_scene(piece, solvent=1.0, steps=1)
+    first, a, b3, b6 = _orbeez_scene(piece, "water", steps=1)
     share = lambda i: (float(first["rs"][i]) - r0) / (rate * r0 * F.DT)
     assert share(a) == pytest.approx(1.0, abs=1e-3) and share(b3) == pytest.approx(0.5, abs=1e-3) and abs(share(b6)) < 1e-3
-    wet, a, b3, b6 = _orbeez_scene(piece, solvent=1.0)
+    wet, a, b3, b6 = _orbeez_scene(piece, "water")
     assert float(wet["rs"][a]) / r0 == pytest.approx(1.0 + rate * 1.0, abs=0.01)        # t = 360 steps = 1 s, fully exposed throughout
-    dry, a, b3, b6 = _orbeez_scene(piece, solvent=0.0)
+    dry, a, b3, b6 = _orbeez_scene(piece, "air")
     assert all(float(dry["rs"][i]) == r0 for i in (a, b3, b6))             # air: nothing swells
     for out in (first, wet, dry):
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
@@ -1328,3 +1330,271 @@ def test_an_sdf_grain_thrown_at_the_wall_stays_inside():
         state = {k: out[k + "_next"] for k in F.STATE}
         worst = min(worst, float(F.chamber_distance(u, state["x"], state["y"])[0].min()))
     assert float(out["n_out"][0]) == 0 and float(out["n_nan"][0]) == 0 and worst > -0.05
+
+
+# ------------------------------------------------- the 3-D law's tunables in the 2-D law (eager lane: no compile needed)
+class _Eager:
+    """The law as plain AbstractTensor ops (the eager lane), called like a piece: columns in, outputs out.  ``mod`` is the law's module."""
+
+    def __init__(self, n, active=None, mod=F):
+        self.law, self.batch = mod.make_law(n, active), n
+
+    def __call__(self, *columns):
+        tensors = [AbstractTensor.get_tensor(np.asarray(c, dtype=np.float64)) for c in columns]
+        return tuple(np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (self.batch,)).copy() for v in self.law(*tensors))
+
+
+def _eager_run(piece, columns, steps, mod=F):
+    """``steps`` steps from ``columns``; returns the final state, the last step's colours and radii, and each diagnostic per step."""
+    state = {k: np.array(columns[k], dtype=np.float64) for k in mod.STATE}
+    series = {k: [] for k in mod.DIAGNOSTICS}
+    out = {}
+    for _ in range(steps):
+        out = dict(zip(mod.OUTPUTS, piece(*[state[k] if k in state else columns[k] for k in mod.ARGUMENTS])))
+        state = {k: out[k + "_next"] for k in mod.STATE}
+        for k in mod.DIAGNOSTICS:
+            series[k].append(float(out[k][0]))
+    return {**state, **{k: out[k] for k in ("rad", "cr", "cg", "cb")}, **{k: np.array(v) for k, v in series.items()}}
+
+
+def _placed(piece, columns, ids_xy, mod=F):
+    """``columns`` with every id parked except ``ids_xy`` = {id: (x, y)}, which are placed at rest at their species radius (read from the law);
+    also returns that radius of every id."""
+    n = len(columns["pid"])
+    probe = _eager_run(piece, dict(columns, age=np.full(n, 1.0e3)), 1, mod)["rad"]
+    out = dict(columns, age=np.full(n, -1.0e9))
+    for k in ("x", "y", "vx", "vy", "w", "rs"):
+        out[k] = np.array(columns[k], dtype=np.float64)
+    for i, (x, y) in ids_xy.items():
+        out["age"][i], out["x"][i], out["y"][i], out["rs"][i] = 1.0e3, x, y, probe[i]
+    return out, probe
+
+
+def _contact_rich_digest(mod, piece, shape) -> str:
+    """sha256 of the state after 30 steps of a crowded, overlapping, spinning block of 200 grains (mix 1: all four species) in chamber ``shape``."""
+    import hashlib
+    n, m = 256, 200
+    columns = mod.initial_columns(n, mix=1.0, shape=shape)
+    rng = np.random.default_rng(5)
+    placed, _probe = _placed(piece, columns, {i: (0.0, 0.0) for i in range(m)}, mod)
+    half = float(columns["half"])
+    placed["x"][:m], placed["y"][:m] = rng.uniform(-0.6, 0.6, m) * half, rng.uniform(0.05, 0.6, m)
+    placed["vx"][:m], placed["vy"][:m], placed["w"][:m] = rng.normal(0, 1.0, m), rng.normal(0, 1.0, m), rng.normal(0, 3.0, m)
+    final = _eager_run(piece, placed, 30, mod)
+    return hashlib.sha256(b"".join(np.ascontiguousarray(final[k], dtype=np.float64).tobytes() for k in mod.STATE + ("rad",))).hexdigest()
+
+
+#: sha256 of that block after 30 steps, as the 2-D law ran BEFORE the 3-D law's tunables were ported to it (the previous commit's
+#: ``fountain.py``, run in this same eager lane).  The neutral defaults must reproduce them bit for bit.
+PRE_TUNABLES_DIGESTS = {
+    "box": "aaaf79a4f6f13b4b66555b012fc8af23d084d6465cc175b8c1e384d85e8dee61",
+    "funnel": "d5aa47283e4ea2fb2b4f6e08e68b15c887c82cfabfbcb4e94c0ebbaf918b4972",
+    "sdf_toy": "eb448f7acb94723ba4b60001f39b0525ee3888a591c48563766e7a00fcb43193",
+}
+
+
+def test_every_new_tunable_at_its_neutral_value_is_the_old_law_bit_for_bit():
+    """30 contact-rich steps (floor, side walls, polygon walls and SDF walls, four species, spin) in the eager lane."""
+    piece = _Eager(256)
+    for shape, digest in PRE_TUNABLES_DIGESTS.items():
+        assert _contact_rich_digest(F, piece, shape) == digest, shape
+
+
+def test_the_new_tunables_add_uniforms_and_no_per_id_column():
+    """Memory: the state is still seven columns (x y vx vy w age rs) and the outputs are unchanged; the tunables are uniforms."""
+    assert F.STATE == ("x", "y", "vx", "vy", "w", "age", "rs") and F.CONSTANTS == ("pid", "ir", "ig", "ib")
+    assert len(F.OUTPUTS) == 11 + len(F.DIAGNOSTICS)
+    new = ("omega", "hertz", "coh", "spin_drag", "temp", "k_run", "nozzle_speed", "emit_scale", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac")
+    assert set(new) <= set(F.UNIFORMS) and all(f"{k}{s}" in F.UNIFORMS for k in ("roll", "irr") for s in range(4))
+    live = ("omega", "hertz", "coh", "spin_drag", "temp", "k_run", "nozzle_speed", "fl_rho", "fl_mu") + tuple(f"roll{s}" for s in range(4))
+    assert set(live) <= set(F.RUNTIME_INPUTS) and not ({"emit_scale", "lognormal", "bi_ratio", "bi_frac", "irr0", "rscale0"} & set(F.RUNTIME_INPUTS))
+    u = F.uniforms(n=256)
+    assert [float(u[k]) for k in ("omega", "hertz", "coh", "spin_drag", "temp", "k_run")] == [150.0, 0.0, 0.0, 3.0, 0.0, 24.0]
+    assert [float(u[k]) for k in ("nozzle_speed", "emit_scale", "fl_rho", "fl_mu", "lognormal", "bi_ratio")] == [1.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    assert all(float(u[f"{k}{s}"]) == 0.0 for k in ("roll", "irr") for s in range(4))
+    assert float(F.uniforms(n=256, params={"omega": 1000.0, "hertz": 1.0})["omega"]) == pytest.approx(F.OMEGA_MAX / 3 ** 0.5, rel=1e-6)    # the CFL bound drops with Hertz
+    assert float(F.uniforms(n=256, params={"rate": 2.0})["emit_scale"]) == 0.5 and float(F.uniforms(n=256, params={"k_run": 99})["k_run"]) == F.K_RUN_MAX
+
+
+def test_the_temperature_thermostat_settles_near_the_set_kT_for_small_grains_in_a_fluid_with_gravity_off():
+    """Small grains (r ~ 1e-3) in glycerine: a strong drag, so the measured kT = ke / (1.5 n_live) is at the set kT within a few steps.
+    At kT = 0 nothing moves, exactly; the noise is a hash of (id, step, component), so a rerun repeats it."""
+    n, m, kT = 256, 100, 1.0e-9
+    piece = _Eager(n)
+    params = {"r0": 0.0010, "r1": 0.0011, "fl_rho": F.FLUIDS["glycerine"][0], "fl_mu": F.FLUIDS["glycerine"][1]}
+    gx, gy = np.meshgrid(np.linspace(-0.2, 0.2, 10), np.linspace(0.2, 0.7, 10))
+    ids = {i: (float(x), float(y)) for i, (x, y) in enumerate(zip(gx.ravel(), gy.ravel()))}
+
+    def run(temp, steps):
+        cols = F.initial_columns(n, mix=0.0, params=dict(params, temp=temp))
+        cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0))
+        cols, _ = _placed(piece, cols, ids)
+        return _eager_run(piece, cols, steps)
+
+    cold = run(0.0, 3)
+    assert float(np.abs(cold["vx"]).max()) == 0.0 and float(np.abs(cold["vy"]).max()) == 0.0 and float(np.abs(cold["w"]).max()) == 0.0
+    hot = run(kT, 50)
+    measured = np.array([F.measured_temperature({"ke": ke, "n_live": nl}) for ke, nl in zip(hot["ke"], hot["n_live"])])
+    assert float(hot["n_live"][-1]) == m and float(hot["n_out"].max()) == 0 and float(hot["n_nan"].max()) == 0
+    assert 0.9 * kT < float(measured[10:].mean()) < 1.1 * kT, measured[10:].mean() / kT
+    assert np.array_equal(run(kT, 5)["ke"], hot["ke"][:5])                      # a replay repeats the noise
+
+
+def test_fluid_presets_change_the_terminal_velocity_in_the_right_order():
+    """One grain per fluid (the fluid is a per-id uniform here: they share a run, far apart): after 60 steps of free fall the fall speed
+    is air > water > glycerine, each within a few percent of the grain's own species + Stokes drag relaxing toward its buoyed terminal
+    velocity (the quadratic drag is small at these speeds)."""
+    n = 256
+    piece = _Eager(n)
+    cols = F.initial_columns(n, mix=0.0)
+    probe = _eager_run(piece, dict(cols, age=np.full(n, 1.0e3)), 1)["rad"]
+    ids = [i for i in range(n) if abs(probe[i] - F.SPECIES[0][1]) < 1e-9][:3]
+    rho, mu = np.zeros(n), np.zeros(n)
+    for i, name in zip(ids, ("air", "water", "glycerine")):
+        rho[i], mu[i] = F.FLUIDS[name]
+    cols.update(fl_rho=rho, fl_mu=mu)
+    cols, _ = _placed(piece, cols, {i: (-0.15 + 0.15 * k, 1.0) for k, i in enumerate(ids)})
+    final = _eager_run(piece, cols, 60)
+    v = [-float(final["vy"][i]) for i in ids]
+    assert v[0] > v[1] > v[2] > 0.0
+    r, rho0, drag = F.SPECIES[0][1], F.SPECIES[0][2], F.SPECIES[0][4]
+    for vi, name in zip(v, ("air", "water", "glycerine")):
+        fl_rho, fl_mu = F.FLUIDS[name]
+        gamma = drag + 4.5 * fl_mu / (rho0 * r * r)
+        expect = F.G * (1.0 - fl_rho / rho0) / gamma * (1.0 - math.exp(-gamma * 60 * F.DT))
+        assert vi == pytest.approx(expect, rel=0.06), (name, vi, expect)
+
+
+def test_cohesion_holds_a_small_clump_together():
+    """Two clumps of seven disks (a hexagon around one), the outer ones given an outward speed, gravity off: with cohesion (coh = 3,
+    adhesion reaching 0.1 radius) the outer disks stay at contact; without, they fly apart.  Each disk feels its own ``coh``
+    (a per-id uniform here: a clump's disks share one value, so a pair is symmetric)."""
+    n, r = 256, 0.009
+    piece = _Eager(n)
+    cols = F.initial_columns(n, mix=0.0)
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), coh=np.where(np.arange(n) < 7, 3.0, 0.0))
+    ids, d = {}, 2.0 * r * 0.995
+    for cx, first in ((-0.12, 0), (0.12, 7)):
+        for k in range(7):
+            ang = 2.0 * math.pi * (k - 1) / 6.0
+            ids[first + k] = (cx, 0.5) if k == 0 else (cx + d * math.cos(ang), 0.5 + d * math.sin(ang))
+    cols, _ = _placed(piece, cols, ids)
+    for first in (0, 7):
+        cols["rs"][first:first + 7] = r
+        for k in range(1, 7):
+            ang = 2.0 * math.pi * (k - 1) / 6.0
+            cols["vx"][first + k], cols["vy"][first + k] = 0.03 * math.cos(ang), 0.03 * math.sin(ang)
+    final = _eager_run(piece, cols, 60)
+    spread = lambda first: np.hypot(final["x"][first + 1:first + 7] - final["x"][first], final["y"][first + 1:first + 7] - final["y"][first]) / (2.0 * r)
+    assert spread(0).max() < 1.02 and spread(7).min() > 1.2                     # held at contact / flown apart
+    assert float(final["n_nan"][-1]) == 0 and float(final["n_out"][-1]) == 0
+
+
+def test_roughness_is_rolling_resistance_that_slows_a_spinning_grain_on_the_floor():
+    """A frictionless disk spinning on the floor keeps its spin (up to the spin drag) unless its species is rough: rolling resistance
+    is a torque against the relative spin, limited like friction (a per-id ``roll0`` here: ids 0 and 2 are both species 0)."""
+    n = 256
+    piece = _Eager(n)
+    cols = F.initial_columns(n, mix=0.0, params={"mu0": 0.0, "mu1": 0.0})
+    cols.update(roll0=np.where(np.arange(n) == 0, 0.3, 0.0), roll1=np.zeros(n))
+    cols, probe = _placed(piece, cols, {0: (-0.1, 0.0), 2: (0.1, 0.0)})
+    assert abs(probe[0] - probe[2]) < 1e-12
+    for i in (0, 2):
+        cols["y"][i], cols["w"][i] = probe[i] * 0.999, 5.0
+    final = _eager_run(piece, cols, 20)
+    assert float(final["w"][2]) > 4.0 and float(final["w"][0]) < 0.5 * float(final["w"][2])
+
+
+def test_size_distributions_are_hashed_per_id_and_off_by_default():
+    n = 256
+    piece = _Eager(n)
+
+    def radii(**params):
+        return _eager_run(piece, {**F.initial_columns(n, mix=0.0, params=params), "age": np.full(n, 1.0e3)}, 1)["rad"]
+
+    base = radii()
+    assert len(np.unique(np.round(base, 7))) == 2                                  # grain and bead: no spread, ratio 1
+    uni = radii(irr0=0.2, irr1=0.2)
+    assert len(np.unique(np.round(uni, 7))) > 20 and float(uni.min()) >= 0.0090 * 0.8 - 1e-9 and float(uni.max()) <= 0.0105 * 1.2 + 1e-9
+    logn = radii(irr0=0.2, irr1=0.2, lognormal=1.0)
+    assert len(np.unique(np.round(logn, 7))) > 20 and float(logn.max()) <= 0.0105 * math.exp(0.6) + 1e-9
+    assert not np.array_equal(uni, logn) and np.array_equal(logn, radii(irr0=0.2, irr1=0.2, lognormal=1.0))     # a hash: repeatable
+    ratio = radii(bi_ratio=2.0, bi_frac=0.5) / base
+    assert set(np.unique(np.round(ratio, 6))) == {round(2.0 ** 0.5, 6), round(2.0 ** -0.5, 6)} and 0.3 < float((ratio > 1).mean()) < 0.7
+    # the grid cell follows the widest grain the distribution can produce
+    wide = F.uniforms(n=n, params={"irr0": 0.2, "lognormal": 1.0})["cell_scale"]
+    assert float(wide) == pytest.approx(max(math.exp(0.6) * F.SPECIES[0][1], F.SPECIES[3][1]) / F.SPECIES[3][1], rel=1e-6)
+
+
+def test_nozzle_speed_and_rate_scale_the_launch_and_the_emission():
+    n = 256
+    piece = _Eager(n)
+
+    def launch(**params):
+        cols = F.initial_columns(n, mix=0.0, params=params)
+        cols["age"][:] = 0.5                                         # the first ids are due: armed at their slots on step 1, launched on step 2
+        out = _eager_run(piece, cols, 2)
+        launched = out["vy"] > 0.5 * F.ARMED
+        assert launched.any()
+        return float(np.hypot(out["vx"], out["vy"])[launched].max())
+
+    assert launch(nozzle_speed=2.0) == pytest.approx(4.0 * launch(nozzle_speed=0.5), rel=1e-4)
+    # at rate 2 the second id leaves at half the time: id k is due at k * EMIT_SPAN / active / rate
+    for rate in (1.0, 2.0):
+        cols = F.initial_columns(n, mix=0.0, params={"rate": rate})
+        due = F.EMIT_SPAN / n / rate
+        cols["age"][:] = 0.5 * due                                  # before id 1's time at either rate...
+        cols["age"][1] = 1.5 * due                                  # ...and id 1 is past its own
+        out = _eager_run(piece, cols, 1)
+        assert float(out["y"][1]) != 0.0 and float(out["y"][2]) == 0.0
+
+
+def test_one_fluid_drives_the_drag_the_buoyancy_and_the_orbeez_uptake():
+    """The orbeez 'solvent' IS the fluid: in ONE step a free swelling grain grows at the full rate in water, at half of it in glycerine
+    (viscosity-limited uptake), and not at all in air; a custom fluid (density, viscosity) sets the uptake the same way."""
+    n = 256
+    piece = _Eager(n)
+    r0, rate = F.SPECIES[0][1], 0.3
+
+    def growth(**fluid):
+        cols = F.initial_columns(n, mix=0.0, params={"swell0": rate, "swmax0": 3.0, **fluid})
+        cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0))
+        cols, probe = _placed(piece, cols, {0: (0.0, 0.4)})
+        out = _eager_run(piece, cols, 1)
+        return (float(out["rs"][0]) - float(probe[0])) / (rate * r0 * F.DT)
+
+    air, water, glycerine = growth(), growth(fl_rho=0.38, fl_mu=2.5e-5), growth(fl_rho=0.48, fl_mu=2.0e-4)
+    assert air == 0.0 and water == pytest.approx(1.0, abs=1e-3) and glycerine == pytest.approx(0.5, abs=1e-3)
+    assert growth(fl_rho=0.19, fl_mu=2.5e-5) == pytest.approx(0.5, abs=1e-3)                  # half as dense a fluid soaks half as much
+
+
+def test_the_game_declares_the_grouped_controls_the_fluid_choice_and_the_temperature_readout():
+    game = F.FountainGame(size="small")
+    state = game.state()
+    ids = {c["id"]: c for c in state["controls_ui"]}
+    for name in ("omega", "hertz", "coh", "spin_drag", "temp", "nozzle_speed", "rate", "k_run"):
+        assert ids[name]["group"] == "Physics" and ids[name]["action"] == "fountain_param"
+    for name in ("fl_rho", "fl_mu"):
+        assert ids[name]["group"] == "Fluid"
+    for name in ("bi_ratio", "bi_frac", "lognormal", "roll0", "irr3"):
+        assert ids[name]["group"] == "Grains"
+    assert ids["fluid"]["group"] == "Fluid" and ids["fluid"]["kind"] == "select" and "solvent" not in ids
+    assert [o[0] for o in ids["fluid"]["options"]] == list(F.FLUIDS)
+    assert ids["temp"]["scale"] == "log" and ids["temp"]["min"] == 0.0 and ids["temp"]["log_min"] == F.TEMP_MIN_LOG
+    assert ids["k_run_drop"]["kind"] == "readout" and ids["k_run_drop"]["diag"] == "n_drop" and ids["shape"]["group"] == "Chamber"
+    assert ids["irr0"]["aspect"] and ids["rate"]["aspect"] and ids["lognormal"]["aspect"] and "aspect" not in ids["coh"]
+    epoch = state["compute"]["epoch"]
+    game.do({"type": "fountain_param", "name": "temp", "value": 2.0e-7})                       # a live tunable: no restart
+    after = game.state()["compute"]
+    assert after["uniforms"]["temp"] == pytest.approx(2.0e-7, rel=1e-6) and after["epoch"] == epoch
+    game.do({"type": "fountain_choice", "name": "fluid", "value": "glycerine"})
+    after = game.state()
+    assert after["compute"]["uniforms"]["fl_rho"] == pytest.approx(0.48, rel=1e-6) and after["compute"]["uniforms"]["fl_mu"] == pytest.approx(2.0e-4, rel=1e-6)
+    assert {c["id"]: c for c in after["controls_ui"]}["fluid"]["value"] == "glycerine" and after["compute"]["epoch"] == epoch
+    game.do({"type": "fountain_param", "name": "fl_mu", "value": 1.0e-4})                      # setting the viscosity by hand makes the fluid custom
+    assert {c["id"]: c for c in game.state()["controls_ui"]}["fluid"]["value"] == "custom"
+    game.do({"type": "fountain_param", "name": "lognormal", "value": 1})                       # a restart tunable begins a new run
+    assert game.state()["compute"]["epoch"] == epoch + 1
+    with pytest.raises(ValueError):
+        game.do({"type": "fountain_choice", "name": "solvent", "value": "water"})
+    assert F.measured_temperature({"ke": 3.0, "n_live": 2.0}) == pytest.approx(1.0) and B._manifest({})["law"]["dof"] == F.DOF == 3
