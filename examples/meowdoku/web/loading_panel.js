@@ -16,6 +16,14 @@ export const PHASES = {
   downloading: { tint: [0.28, 0.66, 1.0], title: "downloading" },
   initializing: { tint: [0.42, 0.92, 0.55], title: "initializing" },
 };
+export const MIN_STAGE_MS = 700;
+
+export function advanceStage(stage, stages, stageAt, now) {
+  const since = stageAt == null ? now : stageAt;
+  return stages.length && now - since >= MIN_STAGE_MS
+    ? { stage: stages[0], stages: stages.slice(1), stageAt: now }
+    : { stage, stages, stageAt: since };
+}
 
 // the products a game's page needs (server: startup.py GAME_NEEDS), for a browser with / without WebGPU
 export function needsOf(data, game, webgpu) {
@@ -52,7 +60,7 @@ function start() {
     holds: new Map(),            // id -> { kind: "boot" | "compiling", names }
     init: null,                  // the initializing phase's detail while the page sets up the GPU
     data: null, fails: 0, timer: null, waiters: new Set(),
-    shownAt: 0, visible: false, showTimer: null, raf: 0, gl: null, anim: null, animUrl: null, animTried: false,
+    shownAt: 0, visible: false, stageAt: null, stage: { phase: "downloading", detail: "", names: [] }, stages: [], raf: 0, gl: null, anim: null, animUrl: null, animTried: false,
     tint: PHASES.downloading.tint.slice(), phase: "downloading", t0: performance.now(),
     forced: window.meowdokuAccess.shader ? "downloading" : window.meowdokuAccess.dev ? new URLSearchParams(location.search).get("loading_demo") : null,   // [ACCESS]
     pick: new URLSearchParams(location.search).get("loading_anim"),      // [STUDIO] play this library entry (a digest) instead of the active one
@@ -113,7 +121,7 @@ function start() {
   const style = document.createElement("style");
   style.textContent = `
     #loading-panel { position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw); height: calc(var(--vh100, 100vh) - var(--bar-h, 0px));
-      z-index: 1; pointer-events: none; opacity: 0; transition: opacity .45s ease; background: var(--scene-bg, #16161a); display: none; }
+      z-index: 1; pointer-events: none; opacity: 0; transition: opacity .2s ease; background: var(--scene-bg, #16161a); display: none; }
     #loading-panel[data-on="1"] { opacity: 1; }
     #loading-panel canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
     #loading-panel .lp-caption { position: absolute; left: 0; right: 0; bottom: 9%; text-align: center; font: 600 14px/1.4 system-ui, sans-serif;
@@ -242,23 +250,27 @@ function start() {
     } catch (error) { console.warn("[loading] animation unavailable, using the procedural one:", error.message || error); }
   }
 
-  function phaseNow() {
-    if (S.forced && PHASES[S.forced]) return S.forced;
-    if ([...S.holds.values()].some((h) => h.kind === "compiling")) return "compiling";
-    if (S.init) return "initializing";
-    return "downloading";
+  // Record real phase entries as they happen.  A fast phase still gets its own
+  // readable interval; a later phase waits in order instead of replacing it.
+  function enterStage(phase, detail = "", names = []) {
+    const stage = { phase, detail, names };
+    if (!S.visible) { S.stage = stage; S.stageAt = null; S.stages.length = 0; return; }
+    const last = S.stages.at(-1) || S.stage;
+    if (last.phase !== phase) S.stages.push(stage);
+    else if (S.stages.length) S.stages[S.stages.length - 1] = stage;
   }
 
   function frame(now) {
     S.raf = 0;
     if (!S.visible) return;
-    const phase = phaseNow(); S.phase = phase;
+    Object.assign(S, advanceStage(S.stage, S.stages, S.stageAt, now));
+    const phase = S.forced && PHASES[S.forced] ? S.forced : S.stage.phase; S.phase = phase;
     S.tint = mix(S.tint, PHASES[phase].tint, 0.08);
-    const names = [...S.holds.values()].filter((h) => h.kind === "compiling").flatMap((h) => h.names);
-    text.textContent = captionOf(phase, { data: S.data, names, dl, detail: S.init || "" });
+    text.textContent = captionOf(phase, { data: S.data, names: S.stage.names, dl, detail: S.stage.detail });
     root.style.setProperty("--lp-tint", `rgb(${S.tint.map((v) => Math.round(v * 255)).join(",")})`);
     const g = initGL();
     if (g) draw(g, now);
+    refresh();
     S.raf = requestAnimationFrame(frame);
   }
 
@@ -319,9 +331,8 @@ function start() {
 
   // ---- show / hide
   function show() {
-    S.showTimer = null;
-    if (!S.holds.size && !S.forced) return;
-    S.visible = true; S.shownAt = performance.now();
+    if (!S.holds.size && !S.forced && !S.stages.length) return;
+    S.visible = true; S.shownAt = performance.now(); S.stageAt = null;
     root.style.display = "block";
     requestAnimationFrame(() => { root.dataset.on = "1"; });
     fetchReady().then(loadAnimation);
@@ -329,22 +340,15 @@ function start() {
   }
   function hide() {
     if (!S.visible) return;
-    const left = Math.max(0, 700 - (performance.now() - S.shownAt));                 // once shown, stay long enough to read
-    setTimeout(() => {
-      if (S.holds.size || S.forced) return;
-      root.dataset.on = "0"; S.visible = false;
-      setTimeout(() => { if (!S.visible) root.style.display = "none"; }, 500);
-    }, left);
+    root.dataset.on = "0"; S.visible = false;
+    setTimeout(() => { if (!S.visible) root.style.display = "none"; }, 500);
   }
   function refresh() {
-    if (S.holds.size || S.forced) {
-      if (!S.visible && !S.showTimer) S.showTimer = setTimeout(show, S.visible ? 0 : 250);       // a wait under a quarter second shows nothing
-    } else {
-      if (S.showTimer) { clearTimeout(S.showTimer); S.showTimer = null; }
-      hide();
-    }
+    if (S.holds.size || S.forced || S.stages.length || (S.visible && (S.stageAt == null || performance.now() - S.stageAt < MIN_STAGE_MS))) {
+      if (!S.visible) show();
+    } else hide();
   }
-  const hold = (id, kind, names = []) => { S.holds.set(id, { kind, names }); if (kind === "compiling") poll(); refresh(); };
+  const hold = (id, kind, names = []) => { S.holds.set(id, { kind, names }); if (kind === "compiling") { enterStage("compiling", "", names); poll(); } refresh(); };
   const release = (id) => { if (id === "boot" && S.holds.has(id)) S.bootMs = Math.round(performance.now()); S.holds.delete(id); refresh(); };
 
   let gateCount = 0;
@@ -370,7 +374,7 @@ function start() {
       await wait(names);
     },
     release,                                                         // release("boot"): the first game is up
-    initializing(detail) { S.init = detail || "GPU"; refresh(); },
+    initializing(detail) { S.init = detail || "GPU"; enterStage("initializing", S.init); refresh(); },
     done() { S.init = null; },
     state: () => ({ bootMs: S.bootMs, phase: S.phase, holds: [...S.holds.keys()], dl: { ...dl }, visible: S.visible, anim: !!S.anim }),
   };

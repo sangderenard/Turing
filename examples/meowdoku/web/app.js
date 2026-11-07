@@ -5,6 +5,7 @@
 // animates the difference between states; it decides nothing.
 
 import "./access.js";   // [ACCESS] window.meowdokuAccess: the tier (server-enforced); development options below are shown by it
+import "./loading_panel.js";  // [LOADING] establish the panel before the game module takes its API
 // FOUNTAIN DIAGNOSTICS to the server log (owner devices only: LAN/dev tier): every 5 s while a fountain game runs, the law's live inputs
 // (gravity, case rates/tilt), the gravity source and the readback's speed/escape counts -- so a fault seen on a phone is visible in the log.
 setInterval(() => {
