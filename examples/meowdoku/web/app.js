@@ -491,7 +491,8 @@ function bakeSlide() {
 }
 // the plate material's slide finish (uploadMaterials): the layers, and the backlight's strength = the brightness
 function slideFinish() {
-  return { emission: [0.10, 0.10, 0.104].map((v) => v * slide.bright), colorLayer: SLIDE_LAYER, colorBlend: 1.0, emitLayer: SLIDE_LAYER,
+  // the backlight leaves THROUGH the slide (filmEmission): emission tinted by the colour layer, so the slide shows in colour
+  return { emission: [0.55, 0.55, 0.57].map((v) => v * slide.bright), filmEmission: true, colorLayer: SLIDE_LAYER, colorBlend: 1.0, emitLayer: SLIDE_LAYER,
            profile: 2, thicknessMm: 8.0 * slide.bright, translucence: 1.0, transmission: 0.0, opacity: 1.0, roughness: 0.9, specular: 0.0 };
 }
 const slideOnPlate = () => !!slide.image && backdrop.mode === "backlit";
@@ -1617,7 +1618,11 @@ function uploadMaterials(game) {
       if (tname === "texstack" && extra.colorLayer != null) {
         record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
       }
-      if (tname === "texstack" && extra.profile != null) record[11] = extra.profile;                // model_flags: the profile
+      if (tname === "texstack" && (extra.profile != null || extra.filmEmission)) {
+        // model_flags: the low byte is the profile; bit 8 (256) makes the emission leave through the colour layer, tinted
+        // by it (base_material.frag.glsl: a backlit transparency)
+        record[11] = (extra.profile ?? (record[11] & 0xFF)) | (extra.filmEmission ? 256 : 0);
+      }
       if (tname === "texstack" && extra.translucence != null) record[15] = extra.translucence;      // translucence_gain
       if (tname === "texstack" && extra.thicknessMm != null) {        // thickness = (the layer's G = 1) * scale + bias, in mm
         record[2] = extra.thicknessLayer ?? FINISH_LAYER_CLEAR; record[5] = extra.thicknessMm; record[7] = 0.0;
