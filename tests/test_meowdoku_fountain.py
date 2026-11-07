@@ -1248,7 +1248,7 @@ def test_the_2d_shapes_are_closed_polygons_inscribed_in_the_window_and_the_box_a
     state = game.state()["compute"]
     assert state["epoch"] == before + 1 and state["uniforms"]["py3"] > 0.0
     ids = {c["id"]: c for c in game.state()["controls_ui"]}
-    assert ids["shape"]["kind"] == "select" and [o[0] for o in ids["shape"]["options"]] == list(F.SHAPES)
+    assert ids["shape"]["kind"] == "select" and [o[0] for o in ids["shape"]["options"]] == [k for k, _ in F.CHAMBER_CHOICES]
 
 
 def test_a_violent_grain_stays_inside_every_polygon_chamber(native_piece):
@@ -1269,3 +1269,62 @@ def test_a_violent_grain_stays_inside_every_polygon_chamber(native_piece):
             xl, xr = F.chord(verts, float(out["y"][i]))
             assert xl - 0.01 <= float(out["x"][i]) <= xr + 0.01 and 0.0 <= float(out["y"][i]) <= max(v[1] for v in verts) + 0.01, (shape, i)
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0, shape
+
+
+# ------------------------------------------------------------- SDF chambers and the regular n-gon presets
+def test_the_regular_ngons_are_equilateral_closed_and_inscribed_and_the_sdf_presets_hold_the_inlet_inside():
+    for n in (256, 4096):
+        geo = F.basin(n)
+        x0, x1, y_bottom, y1 = geo["view"]
+        for shape, count in F.NGON_SHAPES.items():
+            verts = F.shape_vertices(shape, geo)
+            assert verts[0] == verts[-1] and len(verts) == count + 1 <= F.NV
+            edges = [np.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(verts[:-1], verts[1:])]
+            assert max(edges) == pytest.approx(min(edges))                              # equilateral
+            xs, ys = [v[0] for v in verts], [v[1] for v in verts]
+            assert min(xs) >= x0 + 2.0 * geo["cell"] and max(xs) <= x1 - 2.0 * geo["cell"] and min(ys) >= -1e-9 and max(ys) <= y1 - 2.0 * geo["cell"]
+            u = F.uniforms(n=n, shape=shape)
+            xl, xr = F.chord(verts, float(u["nozzle_y"]))
+            assert xl < -float(u["bar_half"]) and float(u["bar_half"]) < xr
+        for shape in F.SDF_SHAPES:
+            u = F.uniforms(n=n, shape=shape)
+            assert float(u["sdf_on"]) == 1.0 and all(float(u[f"{c}{k}"]) == 0.0 for c in ("px", "py") for k in range(F.NV))
+            d = F.chamber_distance(u, np.array([0.0]), np.array([float(u["nozzle_y"])]))[0][0]
+            if not (shape == "sdf_annulus" and n == 256):                                # (a ring in the tiny window is too narrow for a bar)
+                assert d > geo["cell"], (shape, n)
+            for line in F.chamber_outline(shape, n):                                     # the outline lies inside the window
+                a = np.asarray(line)
+                assert a[:, 0].min() >= x0 and a[:, 0].max() <= x1 and a[:, 1].min() >= y_bottom and a[:, 1].max() <= y1
+    assert float(F.uniforms(n=256)["sdf_on"]) == 0.0 and F.chamber_outline("box", 256) == []
+
+
+def test_the_sdf_normal_is_the_analytic_gradient_and_walls_face_into_the_fluid():
+    u = F.uniforms(n=4096, shape="sdf_toy")
+    rng = np.random.default_rng(5)
+    xs, ys = rng.uniform(-0.9, 0.9, 400), rng.uniform(0.05, 2.5, 400)
+    d, nx, ny = F.chamber_distance(u, xs, ys)
+    e = 2.0e-3                                                                         # (the NumPy backend is float32: a smaller step is noise)
+    gx = (F.chamber_distance(u, xs + e, ys)[0] - F.chamber_distance(u, xs - e, ys)[0]) / (2 * e)
+    gy = (F.chamber_distance(u, xs, ys + e)[0] - F.chamber_distance(u, xs, ys - e)[0]) / (2 * e)
+    smooth = (np.abs(d) < 0.3) & (np.abs(d) > 0.01) & (np.abs(np.hypot(gx, gy) - 1.0) < 0.05)
+    assert smooth.sum() > 20
+    assert np.abs(nx[smooth] - gx[smooth]).max() < 3e-2 and np.abs(ny[smooth] - gy[smooth]).max() < 3e-2
+    assert np.allclose(np.hypot(nx, ny), 1.0, atol=1e-3)
+
+
+def test_an_sdf_grain_thrown_at_the_wall_stays_inside():
+    n, active = 4, 4096
+    cols = F.initial_columns(n, mix=0.0, shape="sdf_circle", active=active)
+    u = {k: float(cols[k]) for k in F.UNIFORMS}
+    law = F.make_law(n, active)
+    cols["age"][:] = 1.0e3
+    cols["x"][:], cols["y"][:] = [0.7, -0.7, 0.0, 0.3], [1.28, 1.3, 0.5, 2.0]
+    cols["vx"][:], cols["vy"][:] = [12.0, -9.0, 0.0, 6.0], [0.0, 3.0, -12.0, 8.0]
+    state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
+    worst = 0.0
+    for _ in range(40):
+        ts = [AbstractTensor.get_tensor(np.asarray(state[k] if k in state else cols[k], dtype=np.float64)) for k in F.ARGUMENTS]
+        out = dict(zip(F.OUTPUTS, (np.broadcast_to(np.asarray(v.numpy()), (n,)).copy() for v in law(*ts))))
+        state = {k: out[k + "_next"] for k in F.STATE}
+        worst = min(worst, float(F.chamber_distance(u, state["x"], state["y"])[0].min()))
+    assert float(out["n_out"][0]) == 0 and float(out["n_nan"][0]) == 0 and worst > -0.05

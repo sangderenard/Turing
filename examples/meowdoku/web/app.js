@@ -5042,19 +5042,23 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d") drawChamberOutline(cam, g, rec);
+  if (g.game === "fountain3d" || g.game === "fountain") drawChamberOutline(cam, g, rec);
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
 function drawChamberOutline(cam, g, rec) {
-  const u = g.compute.uniforms || {}, pts = [];
+  const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
+  // the 2-D fountain's server sends its chamber as polylines (g.compute.chamber_outline: the polyline chambers' vertices, the SDF chambers'
+  // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
+  const lines = g.compute.chamber_outline;
+  if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); return; }
   for (let k = 0; k < 8; k++) {
     const p = [u[`px${k}`], u[`py${k}`]];
     if (!(p[0] !== undefined && p[1] !== undefined)) break;
     const last = pts[pts.length - 1];
     if (!last || last[0] !== p[0] || last[1] !== p[1]) pts.push(p);
   }
-  cloud.drawOutline(pts, u.dh || 0, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 });
+  cloud.drawOutline(pts, u.dh || 0, frame);
 }
 function drawCloud(cam, data, g, rec, style) {
   const y = TILE.height + 0.03;

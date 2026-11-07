@@ -145,10 +145,34 @@ SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax")
 NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
 SHAPES = ("box", "funnel", "hexagon", "ramp")       # box: the old basin (the three planes); the others add the polygon walls
 POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
+#: FAST chambers: REGULAR (equilateral) n-gons on the polyline path (n + 1 <= NV vertices), closed, one edge flat at the bottom.
+NGON_SHAPES = {"ngon3": 3, "ngon4": 4, "ngon5": 5, "ngon6": 6, "ngon7": 7}
+#: SDF chambers (the analytic path): the 2-D sections of the solids (sphere -> circle, cube -> square, tetrahedron -> triangle,
+#: toroidal shell -> annulus), the hourglass, and the oil & glycerine toy.
+SDF_SHAPES = ("sdf_circle", "sdf_square", "sdf_triangle", "sdf_annulus", "sdf_hourglass", "sdf_toy")
+#: The chamber-shape select's options (key, label); the SDF ones are marked.
+CHAMBER_CHOICES = (("box", "box (open basin)"), ("funnel", "funnel"), ("hexagon", "hexagon"), ("ramp", "ramp"),
+                   ("ngon3", "triangle (fast, polyline)"), ("ngon4", "square (fast, polyline)"), ("ngon5", "pentagon (fast, polyline)"),
+                   ("ngon6", "hexagon, regular (fast, polyline)"), ("ngon7", "heptagon (fast, polyline)"),
+                   ("sdf_circle", "sphere / circle (SDF)"), ("sdf_square", "cube / square (SDF)"), ("sdf_triangle", "tetrahedron / triangle (SDF)"),
+                   ("sdf_annulus", "toroidal shell / annulus (SDF)"), ("sdf_hourglass", "hourglass (SDF)"),
+                   ("sdf_toy", "oil & glycerine toy: ramps, hourglass, pegs (SDF)"))
+#: ANALYTIC SDF CHAMBERS (runtime uniforms, no recompile when the chamber changes).  ``SDF_SLOTS`` primitive slots, each ``q<k><field>``:
+#: ``kind`` (0 unused), ``role`` (0 FLUID: the chamber's inside; 1 SOLID: an obstacle inside it), the centre ``cx cy``, the rotation ``rot``
+#: and the parameters ``p0..p5`` (see ``sdf_field``).  ``sdf_on`` (0 / 1) picks the SDF walls; 0 is the polyline walls and the old law bit for bit.
+SDF_SLOTS = 12
+SDF_FIELDS = ("kind", "role", "cx", "cy", "rot", "p0", "p1", "p2", "p3", "p4", "p5")
+SDF_KINDS = {"box": 1, "circle": 2, "capsule": 3, "annulus": 4, "ngon": 5, "hourglass": 6, "pegs": 7}
+SDF_FAR = 1.0e9
+#: TYPED slots: the kind of each slot is fixed at compile time (3 boxes, 2 circles, 3 capsules, an annulus, an n-gon, an hourglass, a
+#: peg array), so a slot evaluates only its own SDF; ``kind`` is just its used flag (0: masked out) and a preset fills the slots it needs.
+SDF_LAYOUT = ("box", "box", "box", "circle", "circle", "capsule", "capsule", "capsule", "annulus", "ngon", "hourglass", "pegs")
+assert len(SDF_LAYOUT) == SDF_SLOTS
+SDF_UNIFORMS = ("sdf_on",) + tuple(f"q{k}{f}" for k in range(SDF_SLOTS) for f in SDF_FIELDS)
 STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
 UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata",   # the run, its basin, the RUNTIME INPUTS, then the colour rate
-            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + POLYGON_UNIFORMS + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
+            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + POLYGON_UNIFORMS + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4)) + SDF_UNIFORMS
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
@@ -245,7 +269,30 @@ def shape_vertices(shape: str, geo: dict[str, float]) -> list[tuple[float, float
         return [(-w, mid), (-0.5 * w, 0.0), (0.5 * w, 0.0), (w, mid), (0.5 * w, top), (-0.5 * w, top), (-w, mid)]
     if shape == "ramp":
         return [(-w, top), (-w, 0.3 * top), (w, 0.0), (w, top), (-w, top)]
+    if shape in NGON_SHAPES:
+        return ngon_vertices(NGON_SHAPES[shape], w, top)
     raise ValueError(f"unknown chamber shape {shape!r}")
+
+
+def ngon_fit(count: int, w: float, top: float) -> tuple[float, float]:
+    """The circumradius and the centre height of the REGULAR (equilateral) ``count``-gon, one edge flat at the bottom, as large as
+    fits inside ``|x| <= w``, ``0 <= y <= top`` (uniform scale: both axes inscribed, whichever binds), centred in both."""
+    ang = [-0.5 * math.pi - math.pi / count + TAU * i / count for i in range(count)]
+    xs, ys = [math.cos(t) for t in ang], [math.sin(t) for t in ang]
+    width, height = max(xs) - min(xs), max(ys) - min(ys)
+    r = min(2.0 * w / width, top / height)
+    return r, 0.5 * top - 0.5 * r * (max(ys) + min(ys))
+
+
+def ngon_vertices(count: int, w: float, top: float) -> list[tuple[float, float]]:
+    """A closed regular ``count``-gon polyline (first vertex repeated), counterclockwise, inscribed in the window (see ``ngon_fit``)."""
+    r, cy = ngon_fit(count, w, top)
+    pts = [(r * math.cos(-0.5 * math.pi - math.pi / count + TAU * i / count),
+            cy + r * math.sin(-0.5 * math.pi - math.pi / count + TAU * i / count)) for i in range(count)]
+    xs = [p[0] for p in pts]
+    mid = 0.5 * (max(xs) + min(xs))
+    pts = [(p[0] - mid, p[1]) for p in pts]
+    return pts + [pts[0]]
 
 
 def chord(verts: list[tuple[float, float]], y: float) -> tuple[float, float]:
@@ -340,7 +387,151 @@ def _nozzle(pid, bar_half, nozzle_y):
     return (bar_x - 0.5) * (2.0 * bar_half), nozzle_y + (bar_y - 0.5) * BAR_HEIGHT
 
 
-def make_law(n: int, active: int | None = None):
+# ----------------------------------------------------- analytic SDF chambers
+def _sgn(v):
+    """+1 where ``v >= 0`` else -1 (never 0: a gradient on an axis of symmetry picks a side)."""
+    return as_float(v >= 0.0) * 2.0 - 1.0
+
+
+def _max(a, b):
+    return b + (a - b).clamp(0.0, 1.0e30)
+
+
+def _min(a, b):
+    return a - (a - b).clamp(0.0, 1.0e30)
+
+
+def _sdf_box(lx, ly, hw, hh, rc):
+    """Rounded box: half extents ``hw, hh``, corner radius ``rc``.  Returns (f, gx, gy): f < 0 inside, the gradient of f."""
+    sx, sy = _sgn(lx), _sgn(ly)
+    qx, qy = lx.abs() - (hw - rc), ly.abs() - (hh - rc)
+    ox, oy = qx.clamp(0.0, 1.0e9), qy.clamp(0.0, 1.0e9)
+    ol = (ox * ox + oy * oy + 1.0e-12).sqrt()
+    qm = _max(qx, qy)
+    f = ol + _min(qm, 0.0) - rc
+    out = as_float((ox + oy) > 0.0)
+    xdom = as_float(qx > qy)
+    return f, (out * (ox / ol) + (1.0 - out) * xdom) * sx, (out * (oy / ol) + (1.0 - out) * (1.0 - xdom)) * sy
+
+
+def _sdf_circle(lx, ly, rad):
+    r = (lx * lx + ly * ly + 1.0e-12).sqrt()
+    return r - rad, lx / r, ly / r
+
+
+def _sdf_capsule(lx, ly, half_len, rad):
+    """A segment along the local x axis from ``-half_len`` to ``half_len``, thickened by ``rad``."""
+    m1 = lx - (lx - half_len).clamp(0.0, 1.0e30)
+    t = m1 + (-half_len - m1).clamp(0.0, 1.0e30)
+    ex = lx - t
+    er = (ex * ex + ly * ly + 1.0e-12).sqrt()
+    return er - rad, ex / er, ly / er
+
+
+def _sdf_annulus(lx, ly, big_r, half_t):
+    r = (lx * lx + ly * ly + 1.0e-12).sqrt()
+    u = r - big_r
+    s = _sgn(u)
+    return u.abs() - half_t, s * lx / r, s * ly / r
+
+
+def _sdf_ngon(lx, ly, rad, count):
+    """Regular ``count``-gon of circumradius ``rad`` with an edge normal along +x: the plane distance to the nearest edge
+    (exact inside; a bound outside), found by folding the angle into the nearest edge's sector."""
+    nn = count.clamp(3.0, 64.0)
+    sector = TAU * (1.0 / nn)
+    k = (ly.atan2(lx) * (1.0 / sector) + 0.5).floor()
+    ca, sa = (k * sector).cos(), (k * sector).sin()
+    return lx * ca + ly * sa - rad * (sector * 0.5).cos(), ca, sa
+
+
+def _sdf_hourglass(lx, ly, top_w, throat_w, half_h, slope):
+    """|x| <= min(top_w, throat_w + slope |y|), |y| <= half_h, each side Lipschitz-normalised (slope 0: the full taper from the
+    throat to ``top_w`` at the caps)."""
+    hh = half_h.clamp(1.0e-6, 1.0e9)
+    sx, sy = _sgn(lx), _sgn(ly)
+    ax, ay = lx.abs(), ly.abs()
+    kdef = (top_w - throat_w) * (1.0 / hh)
+    has = as_float(slope > 1.0e-9)
+    kk = kdef + has * (slope - kdef)
+    inv = 1.0 / (1.0 + kk * kk).sqrt()
+    fa, gax, gay = (ax - throat_w - kk * ay) * inv, sx * inv, -kk * sy * inv      # the tapering wall
+    fb = ax - top_w                                                                  # the vertical wall (gradient (sx, 0))
+    fc = ay - hh                                                                     # the cap (gradient (0, sy))
+    pb = as_float(fa >= fb)
+    f1 = _max(fa, fb)
+    g1x, g1y = pb * gax + (1.0 - pb) * sx, pb * gay
+    pc = as_float(f1 >= fc)
+    return _max(f1, fc), pc * g1x, pc * g1y + (1.0 - pc) * sy
+
+
+def _sdf_pegs(lx, ly, pitch_x, pitch_y, peg_r, cols, rows, stagger):
+    """A PEG ARRAY by domain repetition with clamped indices: the nearest peg in each of the three rows around the point's own.
+    Returns (f, gx, gy) of the nearest peg."""
+    px = pitch_x.clamp(1.0e-6, 1.0e9)
+    py = pitch_y.clamp(1.0e-6, 1.0e9)
+    rm = (rows - 1.0).clamp(0.0, 1.0e9)
+    cm = (cols - 1.0).clamp(0.0, 1.0e9)
+    j0 = (ly * (1.0 / py) + 0.5 * rm + 0.5).floor()
+    best, bgx, bgy = None, None, None
+    for dj in (-1.0, 0.0, 1.0):
+        j = _min((j0 + dj).clamp(0.0, 1.0e9), rm)
+        odd = j - 2.0 * (j * 0.5).floor()
+        shift = stagger * 0.5 * px * odd
+        i = _min(((lx - shift) * (1.0 / px) + 0.5 * cm + 0.5).floor().clamp(0.0, 1.0e9), cm)
+        ex = lx - ((i - 0.5 * cm) * px + shift)
+        ey = ly - (j - 0.5 * rm) * py
+        er = (ex * ex + ey * ey + 1.0e-12).sqrt()
+        f = er - peg_r
+        if best is None:
+            best, bgx, bgy = f, ex / er, ey / er
+        else:
+            take = as_float(f < best)
+            best = best + take * (f - best)
+            bgx = bgx + take * (ex / er - bgx)
+            bgy = bgy + take * (ey / er - bgy)
+    return best, bgx, bgy
+
+
+def sdf_field(x, y, q):
+    """The composed chamber SDF at ``(x, y)`` from the slot uniforms (``q(k, field)`` gives slot ``k``'s scalar).
+    d = max over FLUID slots of their inside distance, then min with the signed distance to each SOLID: ``d > 0`` is inside the
+    fluid, the distance to the nearest wall.  Returns ``(d, nx, ny)``: ``n`` is the ANALYTIC gradient of the active primitive
+    (unit, pointing into the fluid), chosen by masks, no finite differences."""
+    zero = x * 0.0
+    d_f, f_nx, f_ny = zero - SDF_FAR, zero, zero
+    d_s, s_nx, s_ny = zero + SDF_FAR, zero, zero
+    for k in range(SDF_SLOTS):
+        kind, role, cx, cy, rot = (q(k, f) for f in ("kind", "role", "cx", "cy", "rot"))
+        p0, p1, p2, p3, p4, p5 = (q(k, f) for f in ("p0", "p1", "p2", "p3", "p4", "p5"))
+        c, s = rot.cos(), rot.sin()
+        dx, dy = x - cx, y - cy
+        lx, ly = c * dx + s * dy, c * dy - s * dx
+
+        fns = {"box": lambda: _sdf_box(lx, ly, p0, p1, p2), "circle": lambda: _sdf_circle(lx, ly, p0),
+               "capsule": lambda: _sdf_capsule(lx, ly, p0, p1), "annulus": lambda: _sdf_annulus(lx, ly, p0, p1),
+               "ngon": lambda: _sdf_ngon(lx, ly, p0, p1), "hourglass": lambda: _sdf_hourglass(lx, ly, p0, p1, p2, p3),
+               "pegs": lambda: _sdf_pegs(lx, ly, p0, p1, p2, p3, p4, p5)}
+        f, gx, gy = fns[SDF_LAYOUT[k]]()                          # TYPED slot: only its own kind's SDF is evaluated
+        gwx, gwy = c * gx - s * gy, s * gx + c * gy
+        used = as_float(kind > 0.5)
+        fluid = used * as_float(role < 0.5)
+        solid = used * (1.0 - fluid)
+        cf = fluid * (-f) + (1.0 - fluid) * (-SDF_FAR)
+        take = as_float(cf > d_f)
+        d_f = d_f + take * (cf - d_f)
+        f_nx = f_nx + take * (-gwx - f_nx)
+        f_ny = f_ny + take * (-gwy - f_ny)
+        cs = solid * f + (1.0 - solid) * SDF_FAR
+        take = as_float(cs < d_s)
+        d_s = d_s + take * (cs - d_s)
+        s_nx = s_nx + take * (gwx - s_nx)
+        s_ny = s_ny + take * (gwy - s_ny)
+    pick = as_float(d_s < d_f)
+    return d_f + pick * (d_s - d_f), f_nx + pick * (s_nx - f_nx), f_ny + pick * (s_ny - f_ny)
+
+
+def make_law(n: int, active: int | None = None, sdf: bool = True):
     """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
     The basin (``half``, ``nozzle_y``, ``bar_half``, ``cols``, ``rows``) is a runtime uniform: see ``basin``."""
     active = int(n if active is None else active)
@@ -590,6 +781,22 @@ def make_law(n: int, active: int | None = None):
             fx = fx + gx * touch
             fy = fy + gy * touch
             tq = tq - radius * gt * touch
+        # the SDF walls (``sdf_on`` = 1): the SAME thick sided saturating contact against the composed analytic chamber SDF.  Contact when
+        # d < radius, the penetration (radius - d) saturating at 6 radii, the force along the SDF's analytic gradient (into the fluid): a
+        # grain on the wrong side of a wall is pushed back by a bounded force, never clamped or moved.  sdf_on = 0: exact zeros.
+        sdf_on = a["sdf_on"]
+        if sdf:
+            d_sdf, sdf_nx, sdf_ny = sdf_field(x, y, lambda k, field: a[f"q{k}{field}"])
+            sdf_delta = _cap(radius - d_sdf, 6.0 * radius).clamp(0.0, 1.0e9) * live * sdf_on
+            gx, gy, gt = _contact(sdf_delta, sdf_nx, sdf_ny, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
+            touch = as_float(sdf_delta > 0.0)
+            ncont = ncont + touch
+            fx = fx + gx * touch
+            fy = fy + gy * touch
+            tq = tq - radius * gt * touch
+            sdf_gone = live * sdf_on * as_float(d_sdf < -radius)       # the grain centre is more than a radius on the wrong side
+        else:
+            sdf_gone = x * 0.0
         # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
         # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
         just = pending * as_float(blocked < 0.5)
@@ -663,7 +870,7 @@ def make_law(n: int, active: int | None = None):
         finite = as_float(xn.abs() < 1.0e30) * as_float(yn.abs() < 1.0e30) * as_float(vxn.abs() < 1.0e30) \
             * as_float(vyn.abs() < 1.0e30) * as_float(wn.abs() < 1.0e30)
         placed = finite * as_float((xn.abs() + yn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
-        outside = placed * (1.0 - (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)))
+        outside = placed * (1.0 - (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) * (1.0 - sdf_gone))
         c_nan = 1.0 - finite
         c_parked = finite * (1.0 - placed)
         c_out = outside
@@ -730,6 +937,223 @@ def cell_needed(p: dict[str, float]) -> float:
     return 2.0 * max(p[f"r{s}"] * (p[f"swmax{s}"] if p[f"swell{s}"] > 0.0 else 1.0) for s in range(len(SPECIES)))
 
 
+def _slot(kind: str, role: str, cx: float, cy: float, rot: float, *p: float) -> dict[str, float]:
+    """One SDF primitive slot as uniforms ``{field: value}`` (``p`` pads with zeros to p0..p5)."""
+    ps = list(p) + [0.0] * (6 - len(p))
+    return {"kind": float(SDF_KINDS[kind]), "role": 0.0 if role == "fluid" else 1.0, "cx": cx, "cy": cy, "rot": rot,
+            **{f"p{i}": float(ps[i]) for i in range(6)}}
+
+
+def _capsule_ramp(high: tuple[float, float], low: tuple[float, float], rad: float) -> dict[str, float]:
+    """A capsule ramp from its ``high`` end to its ``low`` end, thickened by ``rad`` (centre, angle and half length)."""
+    (hx, hy), (lx, ly) = high, low
+    return _slot("capsule", "solid", 0.5 * (hx + lx), 0.5 * (hy + ly), math.atan2(ly - hy, lx - hx), 0.5 * math.hypot(hx - lx, hy - ly), rad)
+
+
+def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
+    """An SDF chamber as slots (pure data), inscribed in the visible window with the 3-cell margin (|x| <= w, 0 <= y <= top), and where
+    its inlet goes (``nozzle_y``; ``None``: the basin's own height) -- the inlet is checked to be inside the fluid by ``uniforms``."""
+    c = geo.get("cell", CELL)
+    w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
+    top = geo["view"][3] - 3.0 * c
+    slots: list[dict[str, float]] = []
+    nozzle_y = None
+    if shape == "sdf_circle":
+        slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, min(w, 0.5 * top)))
+        nozzle_y = 0.5 * top
+    elif shape == "sdf_square":
+        half = min(w, 0.5 * top)
+        slots.append(_slot("box", "fluid", 0.0, 0.5 * top, 0.0, half, half, 2.0 * c))
+        nozzle_y = 0.5 * top
+    elif shape == "sdf_triangle":
+        r, cy = ngon_fit(3, w, top)
+        slots.append(_slot("ngon", "fluid", 0.0, cy, -0.5 * math.pi, r, 3.0))
+        nozzle_y = cy
+    elif shape == "sdf_annulus":
+        big = min(w, 0.5 * top)
+        band = min(max(0.25 * big, 4.0 * c), 0.4 * big)                          # the ring's half thickness (a tiny window keeps a ring wide enough to pour into)
+        slots.append(_slot("annulus", "fluid", 0.0, 0.5 * top, 0.0, big - band, band))
+        nozzle_y = 0.5 * top + big - band
+    elif shape == "sdf_hourglass":
+        slots.append(_slot("hourglass", "fluid", 0.0, 0.5 * top, 0.0, w, max(0.1 * w, 3.5 * c), 0.5 * top, 0.0))
+        nozzle_y = 0.75 * top
+    elif shape == "sdf_toy":
+        # ONE hourglass-profile vessel (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall, the floor y = 0 under
+        # it); three capsule ramps (left-down, right-down, left-down) in the upper section; a staggered peg field under the throat
+        rr = 0.9 * c
+        yc, delta = 0.44 * top, 0.20 * top
+        throat = max(0.09 * w, 3.5 * c)
+        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, (w - throat) / delta))
+        tan, y0, step = 0.42, top - 0.10 * top, 0.097 * top
+        edge = w + 1.5 * rr
+        for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
+            sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
+            high = (sign * edge, y0 - i * step)
+            slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
+        px = py = 4.6 * c
+        y_lo, y_hi = 0.05 * top, yc - delta - 0.03 * top
+        rows = max(1, int((y_hi - y_lo) // py) + 1)
+        cols = 2 * int(w // px) + 1
+        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
+        nozzle_y = top - 0.12
+    else:
+        raise ValueError(f"unknown SDF chamber {shape!r}")
+    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": (0.25 if shape == "sdf_toy" else 0.4) * w}
+
+
+def slot_uniforms(slots: list[dict[str, float]]) -> dict[str, float]:
+    """Each slot dict goes to the next free slot of its kind (``SDF_LAYOUT``); the rest are unused (all zero)."""
+    names = {v: k for k, v in SDF_KINDS.items()}
+    placed: dict[int, dict[str, float]] = {}
+    for slot in slots:
+        kind = names[int(slot["kind"])]
+        free = [k for k in range(SDF_SLOTS) if SDF_LAYOUT[k] == kind and k not in placed]
+        if not free:
+            raise ValueError(f"a chamber has at most {SDF_LAYOUT.count(kind)} SDF slots of kind {kind}")
+        placed[free[0]] = slot
+    out = {"sdf_on": 1.0 if slots else 0.0}
+    for k in range(SDF_SLOTS):
+        out.update({f"q{k}{f}": float(placed.get(k, {}).get(f, 0.0)) for f in SDF_FIELDS})
+    return out
+
+
+def chamber_distance(u: dict[str, float], xs: np.ndarray, ys: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The law's own ``sdf_field`` (the same code, on the NumPy backend) at points: ``(d, nx, ny)``.  Host side: outlines, the inlet check, tests."""
+    xs, ys = np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+    q = lambda k, f: AbstractTensor.get_tensor(np.asarray(float(_f32(np.float64(u[f"q{k}{f}"])))))
+    d, nx, ny = sdf_field(AbstractTensor.get_tensor(xs), AbstractTensor.get_tensor(ys), q)
+    return tuple(np.asarray(v.numpy(), dtype=np.float64) for v in (d, nx, ny))
+
+
+def fit_inlet(u: dict[str, float], cell: float) -> float:
+    """The widest inlet bar (half width at most ``u['bar_half']``) whose whole rectangle (the grains leave within +-BAR_HEIGHT/2 of
+    ``nozzle_y``) is deeper than one grain diameter (``cell``) inside the SDF fluid; the narrowest (0.01) if none is."""
+    bar = float(u["bar_half"])
+    while bar >= 0.01:
+        xs = np.linspace(-bar, bar, 41)
+        pts = [(xs, np.full_like(xs, u["nozzle_y"] + dy)) for dy in (-0.5 * BAR_HEIGHT, 0.0, 0.5 * BAR_HEIGHT)]
+        if min(float(chamber_distance(u, px, py)[0].min()) for px, py in pts) > cell:
+            return bar
+        bar *= 0.9
+    return 0.01                                   # no bar is clear of the walls (a tiny window): the narrowest, the walls push any grain that starts in them out
+
+
+def zero_contours(field: np.ndarray, x0: float, y0: float, h: float) -> list[list[tuple[float, float]]]:
+    """The zero contour of ``field[j, i]`` (the value at ``(x0 + i h, y0 + j h)``) by marching squares with linear interpolation:
+    deterministic (cells in raster order, the saddle decided by the cell's mean, polylines started from the smallest edge key).
+    Returns polylines of ``(x, y)``; a closed one repeats its first point."""
+    pos = field > 0.0
+    corners = pos[:-1, :-1].astype(np.int8) + 2 * pos[:-1, 1:] + 4 * pos[1:, 1:] + 8 * pos[1:, :-1]
+    # edge keys: ("h", i, j) joins (i, j)-(i + 1, j); ("v", i, j) joins (i, j)-(i, j + 1).  A cell (i, j) has bottom h(i, j), right v(i + 1, j),
+    # top h(i, j + 1), left v(i, j).  Corner bits: 1 bl, 2 br, 4 tr, 8 tl.
+    table = {1: [("L", "B")], 2: [("B", "R")], 3: [("L", "R")], 4: [("R", "T")], 6: [("B", "T")], 7: [("L", "T")],
+             8: [("T", "L")], 9: [("T", "B")], 11: [("T", "R")], 12: [("R", "L")], 13: [("B", "R")], 14: [("B", "L")]}
+    adjacency: dict[tuple, list[tuple]] = {}
+    for j, i in zip(*np.nonzero((corners != 0) & (corners != 15))):
+        i, j, case = int(i), int(j), int(corners[j, i])
+        edge = {"B": ("h", i, j), "R": ("v", i + 1, j), "T": ("h", i, j + 1), "L": ("v", i, j)}
+        if case in (5, 10):
+            centre = 0.25 * (field[j, i] + field[j, i + 1] + field[j + 1, i + 1] + field[j + 1, i])
+            # case 5: bl and tr positive; case 10: br and tl.  The mean says whether the positive diagonal is joined through the cell
+            cut_negatives = [("B", "R"), ("L", "T")] if case == 5 else [("L", "B"), ("T", "R")]
+            cut_positives = [("L", "B"), ("T", "R")] if case == 5 else [("B", "R"), ("L", "T")]
+            pairs = cut_negatives if centre > 0.0 else cut_positives
+        else:
+            pairs = table[case]
+        for a, b in pairs:
+            adjacency.setdefault(edge[a], []).append(edge[b])
+            adjacency.setdefault(edge[b], []).append(edge[a])
+
+    def point(key):
+        kind, i, j = key
+        i2, j2 = (i + 1, j) if kind == "h" else (i, j + 1)
+        va, vb = field[j, i], field[j2, i2]
+        t = va / (va - vb) if va != vb else 0.5
+        return (x0 + h * (i + t * (i2 - i)), y0 + h * (j + t * (j2 - j)))
+    seen: set[tuple] = set()
+    lines = []
+    # open chains first (from an end), then closed loops (from the smallest key), each walked once
+    for start in sorted(adjacency, key=lambda k: (len(adjacency[k]) != 1, k)):
+        if start in seen:
+            continue
+        chain, prev, cur = [start], None, start
+        seen.add(start)
+        while True:
+            nxt = [k for k in adjacency[cur] if k != prev and k not in seen]
+            if not nxt:
+                if len(chain) > 2 and start in adjacency[cur]:
+                    chain.append(start)                                  # a closed loop: the walk met its start again
+                break
+            prev, cur = cur, nxt[0]
+            seen.add(cur)
+            chain.append(cur)
+        lines.append([point(k) for k in chain])
+    return lines
+
+
+def simplify(line: list[tuple[float, float]], tol: float) -> list[tuple[float, float]]:
+    """Douglas-Peucker, iterative (a closed line is cut at its two farthest-apart points first)."""
+    if len(line) < 3:
+        return line
+    pts = np.asarray(line)
+    keep = np.zeros(len(pts), dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    if np.allclose(pts[0], pts[-1]):
+        far = int(np.argmax(np.hypot(*(pts - pts[0]).T)))
+        keep[far] = True
+        stack = [(0, far), (far, len(pts) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi <= lo + 1:
+            continue
+        a, b = pts[lo], pts[hi]
+        seg = b - a
+        norm = float(np.hypot(*seg)) or 1.0
+        dist = np.abs(seg[0] * (pts[lo + 1:hi, 1] - a[1]) - seg[1] * (pts[lo + 1:hi, 0] - a[0])) / norm
+        k = int(np.argmax(dist))
+        if dist[k] > tol:
+            keep[lo + 1 + k] = True
+            stack += [(lo, lo + 1 + k), (lo + 1 + k, hi)]
+    return [tuple(p) for p in pts[keep]]
+
+
+_OUTLINES: dict[tuple, list[list[list[float]]]] = {}
+
+
+def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dict | None = None) -> list[list[list[float]]]:
+    """The chamber's walls as a list of polylines ``[[x, y], ...]`` for the page to draw: the polyline chambers' own vertices; the
+    SDF chambers' zero contour of the composed SDF (marching squares, ``OUTLINE_STEP`` cells fine over the window, simplified to
+    ``OUTLINE_TOL``).  Deterministic; ``box`` has none."""
+    p = species_params(params)
+    cell = cell_needed(p)
+    key = (shape, int(n), aspect, round(cell, 9))
+    if key in _OUTLINES:
+        return _OUTLINES[key]
+    geo = basin(n, aspect, cell)
+    if shape in SDF_SHAPES:
+        u = uniforms(n=n, aspect=aspect, params=params, shape=shape)
+        x0, x1, y0, y1 = geo["view"]
+        h = cell * OUTLINE_STEP
+        xs = x0 + h * np.arange(int(math.ceil((x1 - x0) / h)) + 1)
+        ys = y0 + h * np.arange(int(math.ceil((y1 - y0) / h)) + 1)
+        gx, gy = np.meshgrid(xs, ys)
+        d = chamber_distance(u, gx.ravel(), gy.ravel())[0].reshape(gx.shape)
+        d = np.clip(d, -1.0, 1.0)
+        lines = [[[float(round(px, 5)), float(round(py, 5))] for px, py in simplify(line, OUTLINE_TOL)]
+                 for line in zero_contours(d, float(xs[0]), float(ys[0]), h)]
+    elif shape == "box":
+        lines = []
+    else:
+        lines = [[[float(vx), float(vy)] for vx, vy in shape_vertices(shape, geo)]]
+    _OUTLINES[key] = lines
+    return lines
+
+
+OUTLINE_STEP = 1.0 / 3.0                 # the outline's sampling step, in grid cells
+OUTLINE_TOL = 5.0e-4                     # the outline's simplification tolerance (scene units; a pixel is ~2e-3)
+
+
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
              gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA,
              params: dict | None = None, shape: str = "box") -> dict[str, np.ndarray]:
@@ -744,18 +1168,35 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
     out.update({"cell_scale": cell / CELL, "solvent": p["solvent"], "case_omega": 0.0, "case_domega": 0.0,
                 "pivot_x": 0.5 * (geo["view"][0] + geo["view"][1]), "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3])})
-    if shape == "box":
+    slots: list[dict[str, float]] = []
+    spec = None
+    if shape in SDF_SHAPES:
+        verts = [(0.0, 0.0)] * NV                                                # no polyline: the SDF walls
+        spec = sdf_preset(shape, geo)
+        slots = spec["slots"]
+        if spec["nozzle_y"] is not None:
+            out["nozzle_y"] = spec["nozzle_y"]
+        out["rows"] = max(out["rows"], math.ceil(spec["top"] / cell) + 1)         # the grid covers the whole chamber
+    elif shape == "box":
         verts = [(0.0, 0.0)] * NV                                                # no polygon: zero-length segments, exact zeros
     else:
         verts = shape_vertices(shape, geo)
         if len(verts) > NV:
             raise ValueError(f"a chamber outline has at most {NV} vertices")
         # the inlet bar INSIDE the shape: its half-width at most 80% of the chord at the nozzle's height
-        xl, xr = chord(verts, geo["nozzle_y"])
+        if shape in NGON_SHAPES:
+            out["nozzle_y"] = 0.5 * (min(v[1] for v in verts) + max(v[1] for v in verts))    # the inlet at the middle of the polygon
+        xl, xr = chord(verts, out["nozzle_y"])
         out["bar_half"] = min(geo["bar_half"], 0.8 * 0.5 * (xr - xl))
+        if shape in NGON_SHAPES:
+            out["rows"] = max(out["rows"], math.ceil(max(v[1] for v in verts) / cell) + 1)    # the grid covers the whole chamber
         verts = verts + [verts[-1]] * (NV - len(verts))
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
+    out.update(slot_uniforms(slots))
+    if slots:
+        out["bar_half"] = min(geo["bar_half"], spec["bar"])
+        out["bar_half"] = fit_inlet(out, cell)                                   # the inlet is inside the fluid
     for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):                 # multiples of the defaults: exactly 1.0 when untouched
         out.update({f"rscale{s}": p[f"r{s}"] / r, f"fscale{s}": p[f"mu{s}"] / mu if mu else 1.0, f"dscale{s}": p[f"rho{s}"] / rho,
                     f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
@@ -954,7 +1395,7 @@ class FountainGame(Game):
                 self.reset()
         elif kind == "fountain_choice":
             name, value = str(payload["name"]), str(payload["value"])
-            if name == "shape" and value in SHAPES:
+            if name == "shape" and value in dict(CHAMBER_CHOICES):
                 self.shape = value
                 self.reset()
             elif name == "solvent" and value in SOLVENTS:
@@ -1038,7 +1479,7 @@ class FountainGame(Game):
             out.append(ctl("swell", "swell rate (orbeez, 1/s)", 0.0, SWELL_RATE_MAX, 0.01))
             out.append(ctl("swmax", "max swell (x radius)", 1.0, SWELL_MAX_RATIO, 0.1))
         out.append({"id": "shape", "kind": "select", "label": "chamber shape", "value": self.shape, "action": "fountain_choice",
-                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, k] for k in SHAPES]})
+                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES]})
         out.append({"id": "solvent", "kind": "select", "label": "solvent", "value": self.solvent_name(), "action": "fountain_choice",
                     "name": "solvent", "field": "value", "group": "Grains",
                     "options": [[k, k] for k in SOLVENTS] + ([["custom", "custom"]] if self.solvent_name() == "custom" else [])})
@@ -1109,7 +1550,7 @@ class FountainGame(Game):
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
                                                               use_image=1.0 if self.phase == "replay" else 0.0, params=self.params, shape=self.shape).items()},
-                "view": list(geo["view"]), "aspect": self.aspect,
+                "view": list(geo["view"]), "aspect": self.aspect, "chamber_outline": chamber_outline(self.shape, self.n, self.aspect, self.params),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
                 "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params))),
             },
