@@ -65,6 +65,7 @@ from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped te
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
 from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE] immutable saved designs
+from meowdoku import marble_photo as marble_photo_mod  # noqa: E402  [MARBLE PHOTO] Spectral worker process
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -333,6 +334,7 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(web_dir.parent / "marble_objects")
+        self.marble_photos = marble_photo_mod.PhotoJobs(web_dir.parent / "marble_photos", ROOT.parent / "spectral-analyzer")
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
         self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
@@ -699,6 +701,27 @@ def make_handler(sessions: Sessions):
                 return self._anim_get()
             if path == "/api/loading_library":                    # [STUDIO] the library listing: anyone may view
                 return self._library_get()
+            if path in ("/api/marble_photo", "/api/marble_photo/image"):
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                from urllib.parse import parse_qs
+                query = parse_qs(self.path.partition("?")[2])
+                digest = (query.get("digest") or [""])[0]
+                try:
+                    if path == "/api/marble_photo":
+                        return self._json(sessions.marble_photos.status(digest))
+                    name = (query.get("name") or [""])[0]
+                    body = sessions.marble_photos.image(digest, name)
+                except marble_photo_mod.PhotoError as error:
+                    return self._json({"error": str(error)}, error.status)
+                self._set_cookie = []
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/api/marble_objects":
                 return self._json({"entries": sessions.marble_objects.entries()})
             if path == "/api/marble_preview_spec":
@@ -940,6 +963,28 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.marble_objects.put(value), HTTPStatus.CREATED)
                 except (ValueError, TypeError, marble_objects_mod.ObjectError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            if path0 in ("/api/marble_photo", "/api/marble_photo/cancel") and not self._is_viewer():
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if path0 == "/api/marble_photo":
+                    if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/octet-stream":
+                        return self._json({"error": "expected MRP1 application/octet-stream"}, HTTPStatus.BAD_REQUEST)
+                    if length < 16 or length > marble_photo_mod.MAX_UPLOAD_BYTES:
+                        self.close_connection = True
+                        return self._json({"error": "marble photo upload size is invalid"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    try:
+                        return self._json(sessions.marble_photos.start(self.rfile.read(length), sessions.marble_objects),
+                                          HTTPStatus.ACCEPTED)
+                    except marble_photo_mod.PhotoError as error:
+                        return self._json({"error": str(error)}, error.status)
+                if length <= 0 or length > 1024:
+                    return self._json({"error": "invalid photo cancel request"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    digest = json.loads(self.rfile.read(length)).get("digest", "")
+                    return self._json(sessions.marble_photos.cancel(digest))
+                except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 in ("/api/loading_library/activate", "/api/loading_library/delete") and not self._is_viewer():     # [STUDIO]
                 if not access_mod.require_tier(self, "edit"):          # [ACCESS] the tier is in addition to the owner token checked inside
                     return
@@ -1281,6 +1326,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        sessions.marble_photos.close()
         if not lc.exit_code:
             lc.save_all()                                   # LIFECYCLE: a Ctrl-C keeps the sessions too
         server.server_close()
