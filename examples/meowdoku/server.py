@@ -64,6 +64,7 @@ from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announce
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
+from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE] immutable saved designs
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -331,6 +332,7 @@ class Sessions:
         self.lifecycle = None                   # LIFECYCLE: set by main(); restores a saved session for a cookie that has a file
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
+        self.marble_objects = marble_objects_mod.Store(web_dir.parent / "marble_objects")
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
         self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
@@ -697,6 +699,15 @@ def make_handler(sessions: Sessions):
                 return self._anim_get()
             if path == "/api/loading_library":                    # [STUDIO] the library listing: anyone may view
                 return self._library_get()
+            if path == "/api/marble_objects":
+                return self._json({"entries": sessions.marble_objects.entries()})
+            if path.startswith("/api/marble_objects/"):
+                try:
+                    return self._json(sessions.marble_objects.get(path.rsplit("/", 1)[1]))
+                except (KeyError, FileNotFoundError):
+                    return self._json({"error": "no such marble object"}, HTTPStatus.NOT_FOUND)
+                except marble_objects_mod.ObjectError as error:
+                    return self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             if path == "/api/spectate/watch":
                 return self._watch()
             if path == "/ws/spectate":                           # [LIVEVIEW] the viewer's read-only push socket
@@ -904,6 +915,20 @@ def make_handler(sessions: Sessions):
                 return
             if path0 == "/api/loading_anim" and not self._is_viewer():
                 return self._anim_post(int(self.headers.get("Content-Length") or 0))
+            if path0 == "/api/marble_objects" and not self._is_viewer():
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if self.headers.get("X-Meowdoku-Marble") != "1":
+                    return self._json({"error": "missing marble object header"}, HTTPStatus.FORBIDDEN)
+                if length <= 0 or length > marble_objects_mod.MAX_BYTES:
+                    self.close_connection = True
+                    return self._json({"error": "marble object is too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                try:
+                    value = json.loads(self.rfile.read(length))
+                    return self._json(sessions.marble_objects.put(value), HTTPStatus.CREATED)
+                except (ValueError, TypeError, marble_objects_mod.ObjectError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             if path0 in ("/api/loading_library/activate", "/api/loading_library/delete") and not self._is_viewer():     # [STUDIO]
                 if not access_mod.require_tier(self, "edit"):          # [ACCESS] the tier is in addition to the owner token checked inside
                     return

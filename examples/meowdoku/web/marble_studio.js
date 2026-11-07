@@ -1,9 +1,10 @@
 // A close-up on the same exported Pluck Phong shader and MaterialDatabase
 // tables used by the game. All edits are local to this preview.
-import { catEyeMarble } from "./marble_mesh.js";
 import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
-import { diceSolid, fitInclusionsInsideDie } from "./dice_mesh.js";
+import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
+  buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
+  verifySavedMarbleObject } from "./marble_object.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
@@ -91,10 +92,79 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
-let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
+let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
   rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
+const objectStatus=(message)=>{$("object-status").textContent=message;};
+async function refreshObjects(selected="") {
+  const response=await fetch("/api/marble_objects",{cache:"no-store"});
+  if(!response.ok)throw new Error(`object library HTTP ${response.status}`);
+  const entries=(await response.json()).entries||[],box=$("saved-object");
+  box.textContent="";
+  const empty=document.createElement("option");empty.value="";empty.textContent="Choose a saved object";box.append(empty);
+  for(const item of entries) {
+    const option=document.createElement("option");option.value=item.digest;
+    option.textContent=`${item.name} · ${item.shape.toUpperCase()} · ${item.digest.slice(0,8)}`;
+    box.append(option);
+  }
+  if(selected)box.value=selected;
+  return entries.length;
+}
+async function saveObject() {
+  if(!lastGeometry||!lastMass)throw new Error("the object is not ready yet");
+  const design=readDesign(document,seed);design.opaqueSaved=opaqueSaved;
+  const value={v:MARBLE_OBJECT_VERSION,name:$("object-name").value.trim(),
+    generator:"meowdoku-marble-object-v1",design,
+    materials:{index:{...ids},extra:{coated:coatedId,paintA:paintAId,paintB:paintBId},
+      tables:Object.fromEntries(Object.entries(tables).map(([name,table])=>[name,
+        {stride:table.table.floats_per_record,data:Array.from(table.data)}]))},
+    physical:readPhysical(document),derived:lastMass,
+    geometry_sha256:await geometrySha256(lastGeometry)};
+  const response=await fetch("/api/marble_objects",{method:"POST",
+    headers:{"Content-Type":"application/json","X-Meowdoku-Marble":"1"},body:JSON.stringify(value)});
+  const result=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(result.error||`save HTTP ${response.status}`);
+  await refreshObjects(result.digest);
+  objectStatus(`${result.duplicate?"Already saved":"Saved"} ${value.name} · ${result.digest.slice(0,12)} · available to particle simulator`);
+}
+async function loadObject() {
+  const digest=$("saved-object").value;
+  if(!digest)throw new Error("select a saved design first");
+  const response=await fetch(`/api/marble_objects/${digest}`,{cache:"no-store"});
+  if(!response.ok)throw new Error(`load HTTP ${response.status}`);
+  const value=await response.json();
+  const {geometry}=await verifySavedMarbleObject(value);
+  if(Object.keys(value.materials.index).length!==Object.keys(ids).length||
+      Object.entries(ids).some(([name,id])=>value.materials.index[name]!==id)||
+      value.materials.extra.coated!==coatedId||value.materials.extra.paintA!==paintAId||
+      value.materials.extra.paintB!==paintBId)
+    throw new Error("saved material IDs differ from this catalogue; migration is required");
+  for(const [name,saved] of Object.entries(value.materials.tables)) {
+    const table=tables[name];
+    if(!table||saved.stride!==table.table.floats_per_record||saved.data.length!==table.data.length)
+      throw new Error("saved material layout differs from this catalogue");
+  }
+  for(const [name,saved] of Object.entries(value.materials.tables)) {
+    tables[name].data.set(saved.data);tables[name].update();
+  }
+  seed=applyDesign(document,value.design);applyPhysical(document,value.physical);
+  opaqueSaved=value.design.opaqueSaved||null;dieDefaultsApplied=value.design["base-shape"]!=="marble";
+  $("object-name").value=value.name;
+  rebuild();syncMaterial();
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth","die-inclusion-size"])
+    $(field).dispatchEvent(new Event("input"));
+  objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
+}
+function objectLibraryControls() {
+  const run=(action)=>action().catch(error=>objectStatus(error.message||String(error)));
+  $("save-object").addEventListener("click",()=>run(saveObject));
+  $("load-object").addEventListener("click",()=>run(loadObject));
+  $("refresh-objects").addEventListener("click",()=>run(async()=>{
+    const count=await refreshObjects();objectStatus(`${count} saved object${count===1?"":"s"}`);
+  }));
+  run(refreshObjects);
+}
 function repartitionExterior(force=false) {
   if(!lastGeometry)return;
   const classes=new Map();
@@ -141,6 +211,7 @@ function reportMass(geometry) {
     mark:+$("mark-density").value};
   const result=marbleMass(geometry,{radiusM:+$("radius-mm").value/1000,densityByRole,
     enamelMaterial:coatedId,enamelThicknessM:read("enamel",coatedId,0)*1e-9});
+  lastMass=result;
   rollProps=result; resetRoll();
   const tensor=result.inertiaKgM2.map((row)=>row.map((x)=>x.toExponential(3)).join("  ")).join("\n");
   const moments=result.principalMoments.map((p,i)=>`I${i+1} ${p.momentKgM2.toExponential(3)} kg·m² on (${p.axis.map((x)=>x.toFixed(2)).join(", ")})`).join("\n");
@@ -183,29 +254,9 @@ function syncMaterial() {
 }
 function rebuild() {
   dispose(interior);
-  const inclusions=catEyeMarble({
-    glass: idFor("glass"), enamel: coatedId, eye: idFor("eye"), accent: idFor("accent"), confetti: idFor("confetti"),
-    paintA:paintAId,paintB:paintBId }, {
-    rings:96, segments:128, eyeWidth:+$("width").value/100,
-    eyeLength:+$("length").value/100, eyeCurve:+$("curve").value/100,
-    strandCount:+$("strands").value, ribbonThickness:+$("thickness").value/1000,
-    ribbonTwist:+$("twist").value/100, ribbonTip:+$("tip").value/100,
-    ribbonFlare:+$("flare").value/100, ribbonPhase:+$("phase").value*Math.PI/180,
-    orientationYaw:+$("orientation-yaw").value*Math.PI/180,
-    orientationPitch:+$("orientation-pitch").value*Math.PI/180,
-    orientationRoll:+$("orientation-roll").value*Math.PI/180,
-    confettiCount:+$("confetti-count").value, enamelCoverage:+$("coverage").value/100,
-    paintBandCount:+$("band-count").value,paintBandWidth:+$("band-width").value/100,
-    paintBandCurve:+$("band-curve").value/100,
-    tubeCount:+$("tube-count").value,tubeRadius:+$("tube-radius").value/1000,
-    tubeTurns:+$("tube-turns").value/100,
-    kind:$("kind").value, seed });
-  const geometry = $("base-shape").value!=="marble" ? fitInclusionsInsideDie(diceSolid($("base-shape").value,{
-    shellMaterial:idFor("glass"),markMaterial:idFor("mark"),markingMode:$("marking-mode").value,
-    reliefDepth:+$("relief-depth").value/1000,markScale:+$("mark-scale").value/100,
-    subdivisions:+$("dice-detail").value,bevelRadius:+$("dice-bevel").value/1000,
-    faceRelief:+$("dice-face-relief").value/1000,compensateRaised:$("compensate-raised").checked}),inclusions,
-    {scale:+$("die-inclusion-size").value/100}) : inclusions;
+  const design=readDesign(document,seed);
+  const geometry=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
+    {coated:coatedId,paintA:paintAId,paintB:paintBId}));
   const {interior:inside,glass:outside,triangleCount}=geometry;
   interior = mesh(inside); lastGeometry=geometry;
   repartitionExterior(true);
@@ -413,7 +464,7 @@ async function boot() {
     gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
     gl.texStorage3D(gl.TEXTURE_2D_ARRAY,1,gl.DEPTH_COMPONENT24,1,1,1);
     floatTexture({data:[0],floats_per_record:1},10);
-    controls(); syncMaterial(); rebuild(); frame();
+    controls(); objectLibraryControls(); syncMaterial(); rebuild(); frame();
   } catch (error) { message.textContent=String(error.message||error); console.error("[marble studio]",error); }
 }
 boot();
