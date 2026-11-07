@@ -6,7 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
-import { STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability } from "./particle_styles.js";
+import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
@@ -1367,6 +1367,7 @@ function uploadMaterials(game) {
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
   state.materialsVersion = (state.materialsVersion || 0) + 1;
+  state.pbrTable = tables.pbr;
   storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
 }
 
@@ -4034,7 +4035,7 @@ function contentPoint(X, Y) {
 for (const type of ["resize", "orientationchange"]) addEventListener(type, () => setTimeout(applyLayoutLock, 0));
 // The particle field's render style (particle_styles.js): a page setting, render only, remembered in the browser.
 let particleStyle = DEFAULT_STYLE;
-try { const saved = localStorage.getItem("meowdoku.pstyle"); if (STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
+try { const saved = localStorage.getItem("meowdoku.pstyle"); if (ALL_STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
 window.meowdokuDebug.setParticleStyle = (id) => { particleStyle = id; refreshLocalControls(); };
 Object.defineProperty(window.meowdokuDebug, "cloud", { get: () => cloud });
 // The spectral noise filter (noise_filter.js) layered over the look: also the page's own, render only, remembered in the browser.
@@ -4043,9 +4044,44 @@ try { Object.assign(noiseFx, JSON.parse(localStorage.getItem("meowdoku.noisefx")
 noiseFx.on = !!noiseFx.on; if (!NOISE_MODES.some(([id]) => id === noiseFx.mode)) noiseFx.mode = NOISE_DEFAULTS.mode;
 for (const key of ["strength", "threshold"]) if (!Number.isFinite(noiseFx[key])) noiseFx[key] = NOISE_DEFAULTS[key];
 window.meowdokuDebug.noiseFx = noiseFx;
+// The particle colour source (particle_styles.js resolveColorSource): the simulation's per-id colour, one solid colour, or a
+// declared scene material.  A page setting like the style: render only, remembered in the browser.
+// The heat style's manual override (particle_styles.js "heat tone mapping"): a fixed range instead of the adaptive one, and a gamma.
+const heatFx = { fixed: false, gamma: 1 };
+try { Object.assign(heatFx, JSON.parse(localStorage.getItem("meowdoku.heatfx") || "{}")); } catch { /* storage may be blocked or hold junk */ }
+heatFx.fixed = !!heatFx.fixed; if (!Number.isFinite(heatFx.gamma)) heatFx.gamma = 1;
+const pcolor = { ...DEFAULT_COLOR };
+try { Object.assign(pcolor, JSON.parse(localStorage.getItem("meowdoku.pcolor") || "{}")); } catch { /* storage may be blocked or hold junk */ }
+if (!COLOR_SOURCES.some(([id]) => id === pcolor.source)) pcolor.source = DEFAULT_COLOR.source;
+if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palette;
+// The fountain's backdrop (page-side, render only): "floor" is today's dark slab and glass plate under the grains; "clear" draws
+// neither, so the scene's sky / background, lights and the glass styles' reflections show through.
+const backdrop = { mode: "floor" };
+try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor") backdrop.mode = saved; } catch { /* storage may be blocked */ }
+const backdropClear = () => backdrop.mode === "clear" && !!state.game && state.game.game === "fountain";
+window.meowdokuDebug.backdrop = backdrop; window.meowdokuDebug.budget = MATERIAL_BUDGET;
+window.meowdokuDebug.pcolor = pcolor;
+// the scene's declared materials a grain may take (name@variants are the pieces' own states of one material)
+// (the generated families -- bulbs, shield steps, nav lights, bars, smoke steps -- and the pieces' @hint / @sel states are left out;
+// the @glass ones are the scene's translucent materials)
+function materialChoices() {
+  return Object.keys(state.materialIndex).filter((n) => !/^(bulb\d|shield_|nav_|bar_|smoke_|sight|reticle|beam|broadcast|terrain)/.test(n) && !/@(hint|sel)$/.test(n)).sort();
+}
+function albedoOfMaterial(name) {
+  const id = state.materialIndex[name], t = state.pbrTable;
+  if (id == null || !t) return null;
+  const f = t.floats_per_record, o = id * f;
+  return t.data.length >= o + 3 ? [t.data[o], t.data[o + 1], t.data[o + 2]] : null;
+}
+function colorPick() {
+  const names = materialChoices();
+  return resolveColorSource({ ...pcolor, material: names.includes(pcolor.material) ? pcolor.material : "" }, albedoOfMaterial,
+                            compute && compute.manifest ? compute.manifest.species : null);
+}
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
-  return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
+  return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
+           particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin) }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
@@ -4059,8 +4095,18 @@ function localControl(s, value) {
     compute.setSpin(caseSpin);
     try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
-    particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
+    particleStyle = ALL_STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
     try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  } else if (s.local.startsWith("heat_")) {
+    heatFx[s.local.slice(5)] = s.local === "heat_fixed" ? !!value : Number(value);
+    try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
+  } else if (s.local === "backdrop") {
+    backdrop.mode = value === "clear" ? "clear" : "floor";
+    try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
+  } else if (s.local.startsWith("pcolor_")) {
+    pcolor[s.local.slice(7)] = s.local === "pcolor_source" && !COLOR_SOURCES.some(([id]) => id === value) ? DEFAULT_COLOR.source
+      : s.local === "pcolor_palette" && !PALETTE_IDS.includes(value) ? DEFAULT_COLOR.palette : String(value);
+    try { localStorage.setItem("meowdoku.pcolor", JSON.stringify(pcolor)); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("noise_")) {
     const key = s.local.slice(6);
     noiseFx[key] = key === "on" ? !!value : key === "mode" ? (NOISE_MODES.some(([id]) => id === value) ? value : NOISE_DEFAULTS.mode) : Number(value);
@@ -4093,8 +4139,32 @@ function refreshLocalControls() {
         const av = styleAvailability(option.value, caps), base = option.dataset.label || (option.dataset.label = option.textContent);
         option.disabled = !av.ok; option.textContent = av.ok ? base : `${base} (unavailable here)`; option.title = av.note;
       }
+      const drawn = cloud && cloud.styles.fallback;
+      for (const option of select.options) if (option.value === "material" && option.dataset.label) {
+        option.textContent = drawn && particleStyle === "material" && option.disabled === false ? `${option.dataset.label} (drawing sand: see tooltip)` : option.dataset.label;
+      }
       select.value = particleStyle;
-      el.title = (cloud && cloud.styles.fallback) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      el.title = drawn || (particleStyle === "heat" && cloud && cloud.styles.heatInfo) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+    } else if (s.local === "heat_fixed" || s.local === "heat_gamma") {
+      const on = particleStyle === "heat", input = el.querySelector("input");
+      input.disabled = !on;
+      el.title = (on && cloud && cloud.styles.heatInfo) || "heat style: fixed range on/off (off = the range follows the field's 2nd..98th percentiles over about a second) and gamma";
+    } else if (s.local === "pcolor_source") {
+      const picked = colorPick();
+      el.title = picked.reason || "where the grains' colour comes from: the simulation (per grain), one solid colour, or a declared scene material (the material style takes the whole material); render only";
+    } else if (s.local === "pcolor_palette") {
+      el.title = "a palette the size ramp, the species colours and the simulation's own hues are mapped through (sea, ember, meadow); native leaves them as they are";
+    } else if (s.local === "backdrop") {
+      el.title = "floor: the dark slab and glass plate under the fountain (contrast); clear: neither, so the sky, background and lights show through and glass has something to reflect";
+    } else if (s.local === "pcolor_solid") {
+      el.querySelector("input").disabled = pcolor.source !== "solid";
+      el.title = "the grains' colour when the source is 'solid colour'";
+    } else if (s.local === "pcolor_material") {
+      const select = el.querySelector("select"), names = materialChoices(), have = Array.from(select.options).map((o) => o.value).join(",");
+      if (have !== names.join(",")) select.replaceChildren(...names.map((n) => Object.assign(document.createElement("option"), { value: n, textContent: n })));
+      select.value = names.includes(pcolor.material) ? pcolor.material : names[0] || "";
+      select.disabled = pcolor.source !== "material" || !names.length;
+      el.title = "the scene material the grains take when the source is 'scene material': its colour, and for the material style its whole surface (roughness, metal, gloss)";
     } else if (s.local.startsWith("noise_")) {
       // without float render targets the filter is off, and the title says why
       const caps = capabilitiesOf(gl), choice = chooseNoise(true, caps, cloud && cloud.noise.broken);
@@ -4131,10 +4201,31 @@ function spinText(hz) {
   const per = period < 120 ? `${period.toPrecision(3)} s` : period < 7200 ? `${(period / 60).toPrecision(3)} min` : `${(period / 3600).toPrecision(3)} h`;
   return `${hz < 0 ? "-" : ""}${a.toPrecision(2)} Hz (1 turn / ${per})`;
 }
+// The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
+// products): three controls after the server's `look` select, and the material style appended to that select's options.
+const COLOR_SPECS = [
+  { id: "heat_fixed", kind: "toggle", label: "heat fixed range", local: "heat_fixed", value: false },
+  { id: "heat_gamma", kind: "range", label: "heat gamma", min: 0.4, max: 2.5, step: 0.05, local: "heat_gamma", value: 1 },
+  { id: "pcolor_source", kind: "select", label: "colour", local: "pcolor_source", value: "simulation", options: COLOR_SOURCES },
+  { id: "pcolor_palette", kind: "select", label: "palette", local: "pcolor_palette", value: "native", options: PALETTE_IDS.map((p) => [p, p]) },
+  { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["clear", "clear (scene shows)"]] },
+  { id: "pcolor_solid", kind: "color", label: "solid", local: "pcolor_solid", value: DEFAULT_COLOR.solid },
+  { id: "pcolor_material", kind: "select", label: "material", local: "pcolor_material", value: "", options: [] },
+];
 function pageSpecs(specs) {
-  if (!specs || specs.some((s) => s.id === SPIN_SPEC.id)) return specs;
-  const at = specs.findIndex((s) => s.local === "tilt");
-  return at < 0 ? specs : [...specs.slice(0, at + 1), SPIN_SPEC, ...specs.slice(at + 1)];
+  if (!specs) return specs;
+  let out = specs;
+  if (!out.some((s) => s.id === SPIN_SPEC.id)) {
+    const at = out.findIndex((s) => s.local === "tilt");
+    if (at >= 0) out = [...out.slice(0, at + 1), SPIN_SPEC, ...out.slice(at + 1)];
+  }
+  const look = out.findIndex((s) => s.local === "particle_style");
+  if (look >= 0 && !out.some((s) => s.id === COLOR_SPECS[0].id)) {
+    const extra = PAGE_STYLES.filter((p) => !out[look].options.some(([id]) => id === p.id)).map((p) => [p.id, p.label]);
+    out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
+    out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
+  }
+  return out;
 }
 let caseSpin = 0;
 try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
@@ -4153,6 +4244,12 @@ function renderGameControls(game) {
         el = document.createElement("label"); const input = document.createElement("input"); input.type = "checkbox";
         input.onchange = () => (s.local ? localControl(s, input.checked) : act({ type: s.action, [s.field]: input.checked }));
         el.append(input, " " + s.label);
+      }
+      else if (s.kind === "color") {
+        el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
+        const input = document.createElement("input"); input.type = "color"; input.value = s.value;
+        input.onchange = () => localControl(s, input.value);
+        el.append(input);
       }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
@@ -4200,6 +4297,15 @@ function particleLighting(g, y) {
   const lit = (v, floor) => floor + (1 - floor) * Math.min(1, v);
   return { dir: norm(sub(light.position, [g.width / 2, y, g.height / 2])), key: key.map((v) => lit(v, 0.3)), fill: ambientFill([0.75, 0.85, 1.0]).map((v) => lit(v, 0.34)) };
 }
+// The scene's own material path for the material particle style: the Phong program (lights and units are already set by the
+// lit pass of this frame), the material id (the chosen scene material, else the plain `glass` one: only its surface parameters,
+// the colour is the grain's), and the key light's matrix for the shadow lookups.
+function particleScene(pick) {
+  // stained glass without a chosen material takes the scene's translucent glass cube material (the tray's), else the plain glass
+  const id = pick.mode === "material" ? state.materialIndex[pick.material]
+    : particleStyle === "stained" ? (state.materialIndex.traycube ?? state.materialIndex.glass) : state.materialIndex.glass;
+  return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj };
+}
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
@@ -4209,11 +4315,44 @@ function pointsFrame(cam, now) {
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
-  const y = TILE.height + 0.03;
-  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
-                     y, stride: rec.display_stride, background: sceneBackground(),
-                     style: particleStyle, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: particleStyle === DEFAULT_STYLE ? null : particleLighting(g, y) });
+  drawCloud(cam, data, g, rec, particleStyle);
 }
+function drawCloud(cam, data, g, rec, style) {
+  const y = TILE.height + 0.03;
+  const pick = colorPick();
+  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
+                     y, stride: rec.display_stride, background: sceneBackground(), tint: pick.tint, colorMode: pick.mode,
+                     grain: pick.grain, scene: state.flat ? null : particleScene(pick), heat: heatFx,
+                     style, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: style === DEFAULT_STYLE ? null : particleLighting(g, y) });
+}
+// Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, rgba8, meta], 16 bytes), spread over the live
+// view window at a constant area coverage, drawn `frames` times through the same call the scene makes; returns ms per frame
+// (wall time around gl.finish), with the scene's own lights as set by the last lit pass.
+window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) => {
+  const g = state.game, rec = compute.rec;
+  if (!g || !rec || !cloud) return null;
+  const [x0, x1, y0, y1] = g.compute.view || rec.geometry.view, w = x1 - x0, h = y1 - y0;
+  const radius = Math.sqrt(coverage * w * h / (n * Math.PI));
+  const data = new Float32Array(n * 4), bits = new Uint32Array(data.buffer);
+  let seed = 12345;
+  const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < n; i++) {
+    const s = i % 4, r = radius * (0.8 + 0.1 * s);
+    data[4 * i] = x0 + rnd() * w; data[4 * i + 1] = y0 + rnd() * h;
+    bits[4 * i + 2] = (255 << 24) | (Math.floor(rnd() * 256) << 16) | (Math.floor(rnd() * 256) << 8) | Math.floor(rnd() * 256);
+    data[4 * i + 3] = (i % 7 ? 200 : 100) + r * 1000;
+  }
+  const cam = camera();
+  const run = () => { gl.clear(gl.DEPTH_BUFFER_BIT); drawCloud(cam, data, g, rec, style); };
+  const sync = new Uint8Array(4), wait = () => { gl.finish(); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, sync); };   // (readPixels forces the queue to drain)
+  for (let i = 0; i < 3; i++) run();
+  wait();
+  const t0 = performance.now();
+  for (let i = 0; i < frames; i++) run();
+  wait();
+  const ms = (performance.now() - t0) / frames;
+  return { n, style, ms: +ms.toFixed(2), radiusPx: +(radius * (cloud.styles.heatInfo ? 1 : 1)).toFixed(5), drawn: cloud.styles.fallback || cloud.styles.note || "" };
+};
 
 // ---------------------------------------------------------------- draw
 // The lit scene from ``cam`` into whatever framebuffer is bound: the main
@@ -4320,7 +4459,7 @@ function litPass(cam, now, casters, opts = {}) {
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -4345,7 +4484,7 @@ function draw(ms) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
-  const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
+  const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropClear()) ? []
     : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
@@ -5225,7 +5364,19 @@ function fillPickers() {
     fetch("/api/catalog").then((r) => r.json()),
   ]);
   state.assets = assets; state.catalog = catalog;
-  state.programs.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
+  // The scene's Phong program, extended for instancing (particle_styles.js extendForInstancing: the original main runs first,
+  // unchanged; only the material particle style turns instancing on).  If the extension cannot be made or linked, the program
+  // is the original and the material style says why it is not drawn.
+  state.instancing = false; state.instancingNote = "";
+  try {
+    const extended = extendForInstancing(vert, frag);
+    state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extended.frag));
+    state.instancing = true;
+  } catch (error) {
+    state.instancingNote = String(error.message || error).slice(0, 200);
+    console.warn("[meowdoku] the Phong shader could not be extended for instancing:", state.instancingNote);
+    state.programs.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
+  }
   state.programs.flat = link(compile(gl.VERTEX_SHADER, FLAT_VS), compile(gl.FRAGMENT_SHADER, FLAT_FS));
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));

@@ -824,6 +824,109 @@ def test_the_particle_styles_registry_picks_a_style_the_device_can_run_and_match
     assert look["options"] == listed
 
 
+JS_RENDER = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const P = await import(pathToFileURL(`${dir}/particle_styles.js`).href);
+const full = {floatRender: 'float', maxPointSize: 256};
+// ---- colour source
+const albedo = (n) => ({glass: [0.2, 0.4, 0.8]})[n] || null;
+assert.equal(P.resolveColorSource({source: 'simulation'}).tint[3], 0);
+assert.equal(P.resolveColorSource({source: 'nonsense'}).mode, 'simulation');
+const solid = P.resolveColorSource({source: 'solid', solid: '#ff8000'});
+assert.deepEqual(solid.tint.map((v) => Math.round(v * 255)), [255, 128, 0, 255]); assert.equal(solid.mode, 'solid');
+assert.equal(P.resolveColorSource({source: 'solid', solid: 'zz'}).mode, 'simulation');
+assert.match(P.resolveColorSource({source: 'solid', solid: 'zz'}).reason, /not a colour/);
+const mat = P.resolveColorSource({source: 'material', material: 'glass'}, albedo);
+assert.equal(mat.mode, 'material'); assert.equal(mat.material, 'glass'); assert.equal(mat.tint[3], 1);
+assert.ok(mat.tint[2] > mat.tint[0]);
+assert.equal(P.resolveColorSource({source: 'material', material: 'nope'}, albedo).mode, 'simulation');
+assert.match(P.resolveColorSource({source: 'material', material: ''}, albedo).reason, /no material chosen/);
+// size and species, through palettes
+const size = P.resolveColorSource({source: 'size', palette: 'sea'});
+assert.equal(size.grain.mode, 2); assert.equal(size.tint[3], 0); assert.equal(size.grain.lut.length, 48);
+assert.ok(size.grain.lut[2] > size.grain.lut[0]);
+const sea = P.paletteLut('sea'); assert.ok(sea[45] > 0.8 && sea[46] > 0.8 && sea[47] > 0.8);
+assert.deepEqual(Array.from(P.paletteLut('native')).slice(0, 3), Array.from(P.paletteLut('nonsense')).slice(0, 3));
+const species = P.resolveColorSource({source: 'species', palette: 'ember'}, undefined, [['a', 0.009], ['b', 0.0105], ['c', 0.012], ['d', 0.014]]);
+assert.equal(species.grain.mode, 3); assert.equal(species.species.length, 4);
+assert.equal(P.resolveColorSource({source: 'simulation', palette: 'sea'}).grain.mode, 4);
+assert.equal(P.resolveColorSource({source: 'simulation', palette: 'native'}).grain.mode, 0);
+// species from the radius: the nearest of the manifest's radii, one function
+const table = P.speciesTable([['pearl', 0.014], ['grain', 0.009], ['bead', 0.0105], ['dust', 0.012]]);
+assert.deepEqual(table.map((t) => t.name), ['grain', 'bead', 'dust', 'pearl']);
+for (const [r, want] of [[0.0085, 0], [0.009, 0], [0.0101, 1], [0.0108, 1], [0.0119, 2], [0.0131, 3], [0.02, 3]]) assert.equal(P.speciesOf(r, table), want, `radius ${r}`);
+const bands = P.speciesBands(table); assert.ok(Math.abs(bands[0] - 0.00975) < 1e-6); assert.equal(bands[3], 1e9);
+// ---- packing is read in one place
+const data = new Float32Array([0.5, 0.25, 0, 109, 1, 2, 0, 214, 0, 0, 0, 0]);
+assert.equal(P.pointCount(data), 3);
+const p0 = P.readPoint(data, 0); assert.ok(p0.alive && p0.moving && Math.abs(p0.radius - 0.009) < 1e-6);
+const p1 = P.readPoint(data, 1); assert.ok(!p1.moving && Math.abs(p1.radius - 0.014) < 1e-6);
+assert.ok(!P.readPoint(data, 2).alive);
+// ---- LOD and the fallback to sand
+const plan = (count, radiusPx) => P.materialPlan({count, radiusPx});
+assert.equal(plan(4000, 12).tris, 320); assert.equal(plan(4000, 5).tris, 80); assert.equal(plan(4000, 1).tris, 20);
+assert.equal(plan(60000, 12).tris, 20);
+assert.equal(plan(20000, 12).tris, 80); assert.equal(plan(5000, 12).tris, 320);
+assert.equal(plan(P.MATERIAL_BUDGET.maxInstances, 4).ok, true); assert.equal(plan(P.MATERIAL_BUDGET.maxInstances + 1, 4).ok, false);
+assert.match(plan(1e6, 4).reason, /frame rate/); assert.match(plan(4000, 0.1).reason, /too small/);
+assert.equal(P.materialPlan({ready: false}).ok, false);
+let c = P.chooseStyle('material', full, {}, {ready: true, count: 4000, radiusPx: 5});
+assert.equal(c.style, 'material'); assert.equal(c.lod, 1);
+c = P.chooseStyle('material', full, {}, {ready: true, count: 1e6, radiusPx: 5});
+assert.equal(c.style, 'sand'); assert.equal(c.requested, 'material'); assert.match(c.reason, /showing sand/);
+c = P.chooseStyle('material', full, {}, {ready: false, count: 4000, radiusPx: 5}); assert.equal(c.style, 'sand');
+c = P.chooseStyle('stained', full, {}, {ready: true, count: 100000, radiusPx: 5}); assert.equal(c.style, 'sand');
+assert.equal(P.chooseStyle('material', full, {}, {ready: true, count: 100000, radiusPx: 5}).style, 'material');
+assert.equal(P.chooseStyle('material', full, {material: 'link failed'}).style, 'sand');
+assert.equal(P.chooseStyle('material', {floatRender: null, maxPointSize: 1}, {}, {ready: true, count: 10, radiusPx: 5}).style, 'material');
+assert.equal(P.chooseStyle('material', null).style, 'points');
+// ---- icospheres
+for (const [lvl, tris, verts] of [[0, 20, 12], [1, 80, 42], [2, 320, 162]]) {
+  const m = P.icosphere(lvl); assert.equal(m.triangles, tris); assert.equal(m.positions.length / 3, verts); assert.equal(m.indices.length, tris * 3);
+  for (let i = 0; i < verts; i++) assert.ok(Math.abs(Math.hypot(m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2]) - 1) < 1e-5);
+  let vol = 0;
+  for (let t = 0; t < tris; t++) { const [a, b, d] = [0, 1, 2].map((k) => m.indices[3 * t + k] * 3); const A = m.positions.slice(a, a + 3), B = m.positions.slice(b, b + 3), D = m.positions.slice(d, d + 3);
+    vol += (A[0] * (B[1] * D[2] - B[2] * D[1]) - A[1] * (B[0] * D[2] - B[2] * D[0]) + A[2] * (B[0] * D[1] - B[1] * D[0])) / 6; }
+  assert.ok(vol > 0);
+}
+// ---- the scene shader's instancing extension keeps the original code and adds the instance path
+const vert = '#version 300 es\\nlayout(location = 0) in vec3 aPos;\\nlayout(location = 1) in vec3 aNorm;\\nuniform mat4 uMVP;\\nuniform mat4 uMV;\\nout vec3 vNormV;\\nout vec3 vPosV;\\nout vec3 vPosObj;\\nvoid main() {\\n  gl_Position = uMVP * vec4(aPos, 1.0);\\n}\\n';
+const frag = '#version 300 es\\nvoid main() {\\n    int id = 0;\\n    vec3  albedo   = mat_albedo   (id);\\n    vec3  inner    = ph_inner    (id);\\n    FragColor = vec4(albedo, 1.0);\\n}\\n';
+const ext = P.extendForInstancing(vert, frag);
+assert.ok(ext.vert.includes('void main_scene() {') && ext.vert.includes('uInstanced') && ext.vert.includes('aInstPos') && ext.vert.includes('grainColor'));
+assert.ok(ext.vert.includes('gl_Position = uMVP * vec4(aPos, 1.0);'));
+assert.ok(ext.frag.includes('if (vInstUse > 0.5) albedo = vInstColor;') && ext.frag.includes('if (vInstUse > 0.5) inner = vInstColor;'));
+assert.ok(ext.frag.indexOf('flat in float vInstUse') < ext.frag.indexOf('void main()'));
+assert.throws(() => P.extendForInstancing(vert, frag.replace('mat_albedo', 'other')), /albedo/);
+assert.throws(() => P.extendForInstancing(vert.replace('uMV;', 'uMX;'), frag), /uMV/);
+// ---- heat tone mapping
+const hist = new Float64Array(P.HEAT_HIST_BINS); hist.fill(1);
+const t = P.heatTarget(hist); assert.ok(t[0] < t[1]); assert.ok(Math.abs(t[0] - 0.02 * P.HEAT_X_MAX) < 0.05 && Math.abs(t[1] - 0.98 * P.HEAT_X_MAX) < 0.05);
+assert.equal(P.heatTarget(new Float64Array(P.HEAT_HIST_BINS)), null);
+const flat = new Float64Array(P.HEAT_HIST_BINS); flat[100] = 500; assert.ok(P.heatTarget(flat)[1] - P.heatTarget(flat)[0] >= P.HEAT_MIN_SPAN - 1e-9);
+let r = P.adaptRange(null, [1, 3], 0.1); assert.deepEqual(r, [1, 3]);
+for (let i = 0; i < 10; i++) r = P.adaptRange(r, [2, 6], 0.1);
+assert.ok(Math.abs(r[0] - (1 + (1 - Math.exp(-1)))) < 1e-9);
+assert.equal(P.adaptRange([1, 2], null, 1)[0], 1);
+assert.equal(P.heatMap(0, [0.5, 3]), 0); assert.equal(P.heatMap(1e6, [0.5, 3]), 1);
+const range = [P.quantityToX(0.05), P.quantityToX(2)];
+assert.ok(P.heatMap(0.2, range) > 0 && P.heatMap(1.0, range) < 1);
+assert.ok(Math.abs(P.xToQuantity(P.quantityToX(1.7)) - 1.7) < 1e-9);
+assert.ok(P.heatMap(0.5, range, 2) < P.heatMap(0.5, range, 1));
+console.log('ok');
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's render styles")
+def test_the_material_style_colour_sources_lod_fallback_and_heat_curve_are_exact(tmp_path):
+    """Render-only pure parts (web/particle_styles.js): the colour source (simulation / solid / material / size / species,
+    through palettes), the species-from-radius function, the packing reads, the material style's LOD and its fallback to sand
+    by count and size, the icospheres, the scene shader's instancing extension, and the heat style's adaptive tone map."""
+    assert _run_node(tmp_path, JS_RENDER, "particle_styles.js").strip().splitlines()[-1] == "ok"
+
+
 JS_NOISE = """
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
