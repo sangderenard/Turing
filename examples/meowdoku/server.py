@@ -684,6 +684,20 @@ def prepare_fountain_wheel(web_dir: Path) -> None:
         print(f"[meowdoku] fountain wheel products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_fountain_purrline(web_dir: Path) -> None:
+    """The 2-D fountain's purrline sand variant (the occupancy grid and the moving boxes; ``fountain_build.build_purrline``), built after the
+    default and wheel products and independent of them: WebGPU products first, the CPU fallbacks too unless MEOWDOKU_FOUNTAIN_WASM=0."""
+    from meowdoku import fountain_build
+    try:
+        started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        manifest = fountain_build.build_purrline(web_dir, wasm=wasm)
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain purrline products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain purrline products NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def prepare_fountain3d(web_dir: Path) -> None:
     """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
     from meowdoku import fountain3d_build
@@ -778,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
     if args.no_wasm:
         os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
-    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
+    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain_purrline(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

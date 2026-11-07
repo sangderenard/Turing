@@ -628,6 +628,10 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
     def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
         a = dict(zip(BODY_ARGUMENTS if body else ARGUMENTS, args))
+        # <purrline>
+        if _PURRLINE["on"]:
+            a = dict(zip(PURRLINE_ARGUMENTS, args))
+        # </purrline>
         x, y, vx, vy, w, age, rs = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
@@ -893,6 +897,26 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             sdf_gone = live * sdf_on * as_float(d_sdf < -radius)       # the grain centre is more than a radius on the wrong side
         else:
             sdf_gone = x * 0.0
+        # <purrline>
+        if _PURRLINE["on"]:
+            # ---- PURRLINE SAND: the occupancy grid (static solid cells) and the moving boxes (a contact against a moving surface), both the wall
+            # contact law with the penetration saturating at 6 radii.  A grain pressed into the grid by a box leaves along the grid's free face (the
+            # box's normal is replaced by the grid's), never into an occupied cell.  ``pl_near`` marks the grains in touch of a solid (for the speed bound
+            # below) and ``pl_sx, pl_sy`` the surface velocity they are bounded against.
+            og_on = a["og_on"]
+            d_g, g_nx, g_ny = _sdf_occgrid(x - a["og_cx"], y - a["og_cy"], a["og_cell"], a["og_cols"], a["og_rows"], a["og_w0"], a["og_w1"], a["og_w2"])
+            gap = _cap(radius - d_g, 6.0 * radius)
+            wall(gap.clamp(0.0, 1.0e9) * live * og_on, live * og_on, gap, g_nx, g_ny)
+            d_mv, mv_nx, mv_ny, mv_vx, mv_vy = moving_field(x, y, lambda k, f: a[f"mb{k}_{f}"], x * 0.0)
+            squeeze = as_float(d_g < 2.0 * radius) * og_on * as_float(mv_nx * g_nx + mv_ny * g_ny < 0.0) * as_float(d_mv < radius)
+            mv_nx = AbstractTensor.where(squeeze > 0.5, g_nx, mv_nx)
+            mv_ny = AbstractTensor.where(squeeze > 0.5, g_ny, mv_ny)
+            gap = _cap(radius - d_mv, PURRLINE_PUSH * radius)             # a box's spring saturates at one radius: a grain it squeezes against a wall or a cell sits ON the surface, not through it
+            wall(gap.clamp(0.0, 1.0e9) * live, live, gap, mv_nx, mv_ny, vx - mv_vx, vy - mv_vy)
+            pl_box = as_float(d_mv < 2.0 * radius)
+            pl_near = live * (pl_box + (1.0 - pl_box) * as_float(d_g < 2.0 * radius) * og_on)
+            pl_sx, pl_sy = mv_vx * pl_box, mv_vy * pl_box
+        # </purrline>
         tb = x * 0.0
         if body:
             # ---- the HINGED BODY (waterwheel): a hub circle and ``body_np`` capsule paddles in the body frame (hinge ``body_x, body_y``,
@@ -969,6 +993,15 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
         vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
+        # <purrline>
+        if _PURRLINE["on"]:
+            # the velocity a solid can impart is BOUNDED: relative to the surface it touches, at most the contact's own saturation speed (omega x 6 radii)
+            vcap = a["omega"] * 6.0 * radius
+            rvx, rvy = vxn - pl_sx * pl_near, vyn - pl_sy * pl_near
+            keep = 1.0 - pl_near * (1.0 - (vcap * (1.0 / (rvx * rvx + rvy * rvy + 1.0e-12).sqrt())).clamp(0.0, 1.0))
+            vxn = pl_sx * pl_near + rvx * keep
+            vyn = pl_sy * pl_near + rvy * keep
+        # </purrline>
         wn = (w + live * (tq / inertia - spin_drag * w - case_domega) * DT) * (1.0 - just) * (1.0 / (1.0 + live * gamma_f * DT))
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
@@ -1874,3 +1907,259 @@ class FountainGame(Game):
 
     def result(self):
         return None
+# <purrline>
+# ------------------------------------------------------------------------------------------------------------------------
+# PURRLINE SAND (WORKLIST.md, "Purrline sand mode", C): a PRODUCT VARIANT of the law, ``make_law_purrline``, with its own argument list,
+# manifest (``fountain_purrline.manifest.json``) and shaders.  Everything of it lives between ``# <purrline>`` markers, which
+# ``fountain_build`` leaves out of the source digest of the DEFAULT and wheel products: they are the same law, the same shaders and the same
+# digests as before this variant existed.  The variant adds two solids to the law, as runtime uniforms:
+#   OCCUPANCY GRID (``og_*``): rows x cols (at most 8 x 8) solid square cells of side ``og_cell`` centred on ``(og_cx, og_cy)``, from a per-cell mask
+#   packed into the three words ``og_w0..og_w2`` (row r from the TOP is byte r % 3 of word r // 3, column c is bit c of the byte; each word is
+#   below 2**24, exact in f32).  Its distance is the nearest occupied cell's (domain repetition + a 3 x 3 check), exact on faces, with the
+#   analytic gradient; INSIDE an occupied cell it is the distance to the nearest face that borders a FREE cell, and the gradient points out
+#   through it, so a grain caught in a cell that became solid leaves through free space, never into an occupied neighbour.
+#   MOVING SOLID BOXES (``mb<k>_*``, six): centre ``cx cy``, half extents ``hw hh``, corner radius ``rc`` and pose velocity ``vx vy``.  A contact of
+#   the wall law against a SURFACE THAT MOVES (the waterwheel's contact: relative velocity = the grain's less the box's), infinite mass, position
+#   driven: the law holds no state for a box, so nothing a grain does can slow it.
+# Both are far/zero when unused (``og_on`` 0, ``mb<k>_on`` 0).  The grains' speed relative to the solid they touch is bounded by the contact's own
+# saturation (omega x 6 radii) so a squeeze cannot fire them out of the chamber.
+MB_COUNT = 6
+OG_MAX = 8
+PURRLINE_ROWS, PURRLINE_COLS = 8, 8
+PURRLINE_SUMP, PURRLINE_HEAD, PURRLINE_INLET = 2.0, 3.0, 1.8       # the chamber in board cells: the sump under the board, the headroom over it, the inlet over the board
+PURRLINE_BOX_ROUND = 0.12                                          # a falling item's corner radius, in cells
+PURRLINE_JET = 1.6                                                 # the clear height over the inlet (the jet's apex is ~1.34 above it; absolute, in fountain units)
+PURRLINE_POUR = {"nozzle_speed": 0.3, "rate": 0.5}                      # the inlet POURS sand (the slowest nozzle, half the rate), it is not the fountain's jet: the 64k jet's blast is what fired grains through the board
+PURRLINE_PUSH = 1.0                                                # a moving box's overlap saturates at this many radii (the wall law's own saturation is 6)
+MB_FIELDS = ("on", "cx", "cy", "hw", "hh", "rc", "vx", "vy")
+OG_FIELDS = ("on", "cx", "cy", "cell", "cols", "rows", "w0", "w1", "w2")
+PURRLINE_UNIFORMS = tuple(f"og_{f}" for f in OG_FIELDS) + tuple(f"mb{k}_{f}" for k in range(MB_COUNT) for f in MB_FIELDS)
+PURRLINE_ARGUMENTS = ARGUMENTS + PURRLINE_UNIFORMS
+PURRLINE_ALL_UNIFORMS = UNIFORMS + PURRLINE_UNIFORMS
+PURRLINE_RUNTIME_INPUTS = RUNTIME_INPUTS + PURRLINE_UNIFORMS
+SDF_SHAPES = SDF_SHAPES + ("sdf_purrline",)
+_PURRLINE = {"on": False}
+
+
+def _cell_box(ex, ey, half):
+    """A square cell of half side ``half`` at offset ``(ex, ey)``: the signed distance and its analytic gradient.  EXACT on the faces (no epsilon in
+    the length; the gradient's guard is on the divisor only)."""
+    qx, qy = ex.abs() - half, ey.abs() - half
+    ox, oy = qx.clamp(0.0, 1.0e9), qy.clamp(0.0, 1.0e9)
+    out = as_float((ox + oy) > 0.0)
+    ol = (ox * ox + oy * oy).sqrt()
+    inv = 1.0 / (ol + (1.0 - out))                    # out = 0: the divisor is 1 (and the numerators are 0)
+    xdom = as_float(qx > qy)
+    f = ol + _min(_max(qx, qy), 0.0)
+    return f, (out * (ox * inv) + (1.0 - out) * xdom) * _sgn(ex), (out * (oy * inv) + (1.0 - out) * (1.0 - xdom)) * _sgn(ey)
+
+
+def _bit_scale(index, count):
+    """``2 ** -index`` for a whole-number tensor ``index`` in ``[0, count)``, exactly, as a one-hot sum of constants (no pow / exp2)."""
+    out = index * 0.0
+    for k in range(count):
+        out = out + as_float((index - float(k)).abs() < 0.5) * (2.0 ** -k)
+    return out
+
+
+def _sdf_occgrid(lx, ly, cell, cols, rows, w0, w1, w2):
+    """The OCCUPANCY GRID at the point ``(lx, ly)`` (relative to the grid's centre): ``(f, gx, gy)``, the signed distance to the NEAREST OCCUPIED CELL
+    (negative inside) and its analytic gradient.  The grain's own cell and the 3 x 3 around it are checked (every cell nearer than one cell is among
+    them), each by a bit read out of the packed words with exact power-of-two scalings and one-hot picks; a cell off the grid or empty is a SELECTED
+    far distance (never a blend).  Inside an occupied cell: the distance to the nearest face that borders a free cell (or the grid's edge) and the
+    gradient out through it; with no such face (sealed) the distance is a cell deeper and the gradient points up."""
+    c = cell.clamp(1.0e-9, 1.0e9)
+    inv = 1.0 / c
+    i0 = ((lx + 0.5 * cols * c) * inv).floor()
+    j0 = ((0.5 * rows * c - ly) * inv).floor()
+    best, bgx, bgy = None, None, None
+    occs = []
+    for dj in (-1.0, 0.0, 1.0):
+        j = j0 + dj
+        row_ok = as_float(j > -0.5) * as_float(j < rows - 0.5)
+        jc = j.clamp(0.0, float(OG_MAX - 1))
+        g1, g2 = as_float(jc > 2.5), as_float(jc > 5.5)
+        word = w0 * (1.0 - g1) + w1 * (g1 * (1.0 - g2)) + w2 * g2           # exact: 0/1 products of whole numbers below 2**24
+        r3 = jc - 3.0 * (g1 + g2)
+        shifted = (word * (as_float(r3 < 0.5) + as_float((r3 - 1.0).abs() < 0.5) * (1.0 / 256.0) + as_float(r3 > 1.5) * (1.0 / 65536.0))).floor()
+        rowbits = shifted - 256.0 * (shifted * (1.0 / 256.0)).floor()        # this row's 8 bits (a whole number below 256)
+        cy_l = 0.5 * rows * c - (j + 0.5) * c
+        for di in (-1.0, 0.0, 1.0):
+            i = i0 + di
+            ok = row_ok * as_float(i > -0.5) * as_float(i < cols - 0.5)
+            ic = i.clamp(0.0, float(OG_MAX - 1))
+            t = (rowbits * _bit_scale(ic, OG_MAX)).floor()
+            occ = ok * (t - 2.0 * (t * 0.5).floor())
+            occs.append(occ)
+            cx_l = (i + 0.5) * c - 0.5 * cols * c
+            f, gx, gy = _cell_box(lx - cx_l, ly - cy_l, 0.5 * c)
+            f = occ * f + (1.0 - occ) * SDF_FAR
+            if best is None:
+                best, bgx, bgy = f, gx, gy
+            else:
+                take = f < best
+                best = AbstractTensor.where(take, f, best)
+                bgx = AbstractTensor.where(take, gx, bgx)
+                bgy = AbstractTensor.where(take, gy, bgy)
+    own = occs[4]
+    u = lx - ((i0 + 0.5) * c - 0.5 * cols * c)
+    v = ly - (0.5 * rows * c - (j0 + 0.5) * c)
+    h = 0.5 * c
+    open_l, open_r, open_t, open_b = 1.0 - occs[3], 1.0 - occs[5], 1.0 - occs[1], 1.0 - occs[7]
+    far = 1.0e8
+    dl, dr, dt, db = h + u + (1.0 - open_l) * far, h - u + (1.0 - open_r) * far, h - v + (1.0 - open_t) * far, h + v + (1.0 - open_b) * far
+    m = _min(_min(dl, dr), _min(dt, db))
+    sealed = as_float(m > far * 0.5)
+    ix = as_float(dr <= dl) * 2.0 - 1.0
+    xnear = as_float(_min(dl, dr) <= _min(dt, db))
+    iy = as_float(dt <= db) * 2.0 - 1.0                    # +1: out the top
+    in_d = -m * (1.0 - sealed) + sealed * (best - c)
+    in_gx = (1.0 - sealed) * xnear * ix
+    in_gy = (1.0 - sealed) * (1.0 - xnear) * iy + sealed
+    pick = as_float(own > 0.5) > 0.5
+    return (AbstractTensor.where(pick, in_d, best), AbstractTensor.where(pick, in_gx, bgx), AbstractTensor.where(pick, in_gy, bgy))
+
+
+def moving_field(x, y, q, zero):
+    """The MOVING SOLID BOXES at ``(x, y)`` (``q(k, field)`` gives box ``k``'s ``MB_FIELDS``): the signed distance to the nearest used box (``SDF_FAR``
+    with none), the analytic gradient there (unit, out of the box) and that box's surface velocity.  Returns ``(d, nx, ny, svx, svy)``."""
+    d, nx, ny, svx, svy = zero + SDF_FAR, zero, zero, zero, zero
+    for k in range(MB_COUNT):
+        on, cx, cy, hw, hh, rc, bvx, bvy = (q(k, f) for f in MB_FIELDS)
+        f, gx, gy = _sdf_box(x - cx, y - cy, hw, hh, rc)
+        used = as_float(on > 0.5)
+        cs = used * f + (1.0 - used) * SDF_FAR
+        take = cs < d
+        d = AbstractTensor.where(take, cs, d)
+        nx = AbstractTensor.where(take, gx, nx)
+        ny = AbstractTensor.where(take, gy, ny)
+        svx = AbstractTensor.where(take, bvx + zero, svx)
+        svy = AbstractTensor.where(take, bvy + zero, svy)
+    return d, nx, ny, svx, svy
+
+
+def grid_distance(u: dict, xs, ys):
+    """The law's own occupancy-grid distance (the same code on the NumPy backend) at points: ``(d, gx, gy)``.  Host side: tests."""
+    xs, ys = np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+    q = lambda name: AbstractTensor.get_tensor(np.asarray(float(_f32(np.float64(u[name])))))
+    out = _sdf_occgrid(AbstractTensor.get_tensor(xs) - q("og_cx"), AbstractTensor.get_tensor(ys) - q("og_cy"), q("og_cell"), q("og_cols"), q("og_rows"),
+                       q("og_w0"), q("og_w1"), q("og_w2"))
+    return tuple(np.asarray(v.numpy(), dtype=np.float64) for v in out)
+
+
+_sdf_preset_base = sdf_preset
+_chamber_outline_base = chamber_outline
+
+
+def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
+    """``sdf_preset`` plus the PURRLINE SAND chamber (WORKLIST.md C): a box chamber exactly as wide as the board, so sand can only pass THROUGH it; bottom
+    up: the SUMP (``PURRLINE_SUMP`` cells), the board (8 x 8 cells; the occupancy grid, not a slot) and the headroom with the inlet ``PURRLINE_INLET``
+    cells above the board.  One board cell is ``2 w / 8`` wide.  ``map``: the board's centre in fountain units and one cell's width."""
+    if shape != "sdf_purrline":
+        return _sdf_preset_base(shape, geo)
+    c = geo.get("cell", CELL)
+    w = min(0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c, geo["half"])
+    cell_f = 2.0 * w / PURRLINE_COLS
+    nozzle_y = (PURRLINE_SUMP + PURRLINE_ROWS + PURRLINE_INLET) * cell_f
+    top = max((PURRLINE_SUMP + PURRLINE_ROWS + PURRLINE_HEAD) * cell_f, nozzle_y + PURRLINE_JET)      # the ceiling clears the jet's apex (an ABSOLUTE height: it does not scale with the board)
+    cy = (PURRLINE_SUMP + 0.5 * PURRLINE_ROWS) * cell_f
+    return {"slots": [_slot("box", "fluid", 0.0, 0.5 * top, 0.0, w, 0.5 * top, 2.0 * c)], "nozzle_y": nozzle_y,
+            "top": top, "half": w, "bar": 0.7 * w,
+            "map": {"cx": 0.0, "cy": cy, "cell": cell_f, "rows": PURRLINE_ROWS, "cols": PURRLINE_COLS, "sump": PURRLINE_SUMP * cell_f}}
+
+
+def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dict | None = None) -> list[list[list[float]]]:
+    """``chamber_outline``; the purrline chamber's is its box (the board's cells are the page's own board)."""
+    if shape != "sdf_purrline":
+        return _chamber_outline_base(shape, n, aspect, params)
+    spec = sdf_preset(shape, chamber_basin(shape, n, aspect, cell_needed(species_params(params))))
+    wd, tp = spec["half"], spec["top"]
+    return [[[-wd, 0.0], [wd, 0.0], [wd, tp], [-wd, tp], [-wd, 0.0]]]
+
+
+def pack_mask(mask) -> tuple[float, float, float]:
+    """The 8 x 8 mask (64 values, row-major, row 0 at the TOP) as the three words of the occupancy grid: row ``r`` is the byte ``r mod 3`` of word
+    ``r // 3`` (rows 0-2 word 0, 3-5 word 1, 6-7 word 2; each word below 2**24)."""
+    bits = list(mask)
+    if len(bits) != PURRLINE_ROWS * PURRLINE_COLS:
+        raise ValueError("pack_mask: give the 8 x 8 mask (64 values)")
+    words = [0, 0, 0]
+    for r in range(PURRLINE_ROWS):
+        for c in range(PURRLINE_COLS):
+            if bits[r * PURRLINE_COLS + c]:
+                words[r // 3] |= 1 << (8 * (r % 3) + c)
+    return float(words[0]), float(words[1]), float(words[2])
+
+
+def purrline_inputs(game: dict, mapping: dict[str, float]) -> dict[str, float]:
+    """THE PAGE'S ONE-WAY WRITE: the purrline game's state (``state['purrline']``: ``occupancy``, ``rows``, ``cols``, ``cell``, ``origin``, ``falling``)
+    as the variant's runtime inputs.  ``mapping`` is the chamber's ``sdf_preset(..)['map']`` (the board's centre ``cx, cy`` in fountain units and one
+    board cell's width ``cell``).  Board units (x right, y DOWN, a cell ``cell`` wide, the top-left corner ``origin``) map to fountain units (y UP) by
+    a scale ``k = mapping.cell / game.cell`` about the board's centre, y flipped.  The occupied cells fill the grid's mask; the ``MB_COUNT`` lowest
+    falling items are the moving boxes, each the size of the cell it will fill, centred on the item, carrying its velocity (``vx, -vy`` x k).  Unused
+    boxes are written off.  ``web/compute.js`` ``purrlineInputs`` is this function."""
+    cb = float(game.get("cell", 1.0))
+    ox, oy = (float(v) for v in game.get("origin", (0.0, 0.0)))
+    rows, cols = int(game["rows"]), int(game["cols"])
+    k = float(mapping["cell"]) / cb
+    bcx, bcy = ox + 0.5 * cols * cb, oy + 0.5 * rows * cb
+    mask = [0] * (PURRLINE_ROWS * PURRLINE_COLS)
+    for r in range(rows):
+        for c in range(cols):
+            mask[PURRLINE_COLS * r + c] = 1 if game["occupancy"][r * cols + c] else 0
+    w0, w1, w2 = pack_mask(mask)
+    out = {"og_on": 1.0, "og_cx": float(mapping["cx"]), "og_cy": float(mapping["cy"]), "og_cell": float(mapping["cell"]), "og_cols": float(cols),
+           "og_rows": float(rows), "og_w0": w0, "og_w1": w1, "og_w2": w2}
+    items = sorted(game.get("falling", ()), key=lambda it: -float(it["y"]))[:MB_COUNT]
+    half = 0.5 * float(mapping["cell"])
+    for slot in range(MB_COUNT):
+        if slot < len(items):
+            it = items[slot]
+            vals = (1.0, float(mapping["cx"]) + (float(it["x"]) - bcx) * k, float(mapping["cy"]) - (float(it["y"]) - bcy) * k, half, half,
+                    PURRLINE_BOX_ROUND * float(mapping["cell"]), float(it.get("vx", 0.0)) * k, -float(it.get("vy", 0.0)) * k)
+        else:
+            vals = (0.0,) * len(MB_FIELDS)
+        out.update({f"mb{slot}_{n}": v for n, v in zip(MB_FIELDS, vals)})
+    return {name: float(_f32(np.float64(v))) for name, v in out.items()}
+
+
+def purrline_defaults(mapping: dict[str, float]) -> dict[str, float]:
+    """The variant's uniforms for a FULL board and no falling item."""
+    return purrline_inputs({"rows": PURRLINE_ROWS, "cols": PURRLINE_COLS, "cell": 1.0, "origin": [0.0, 0.0], "occupancy": [1] * 64, "falling": []}, mapping)
+
+
+def purrline_columns(n: int, *, active: int | None = None, aspect: float | None = None, params: dict | None = None, **kw) -> dict[str, np.ndarray]:
+    """``initial_columns`` for the purrline chamber plus the variant's uniforms (a full board)."""
+    cols = initial_columns(n, active=active, aspect=aspect, params=params, shape="sdf_purrline", **kw)
+    mapping = sdf_preset("sdf_purrline", chamber_basin("sdf_purrline", int(n if active is None else active), aspect, cell_needed(species_params(params))))["map"]
+    cols.update({k: np.float64(v) for k, v in purrline_defaults(mapping).items()})
+    return cols
+
+
+def make_law_purrline(n: int, active: int | None = None):
+    """The fountain law with the occupancy grid and the moving boxes (arguments ``PURRLINE_ARGUMENTS``; outputs ``OUTPUTS``).  The same law as
+    ``make_law``: the hooks between the ``purrline`` markers in ``fountain_step`` run only while this wrapper's call is traced or evaluated."""
+    law = make_law(n, active)
+
+    def purrline_step(*args):
+        _PURRLINE["on"] = True
+        try:
+            return law(*args)
+        finally:
+            _PURRLINE["on"] = False
+    return purrline_step
+
+
+def purrline_spec(size: str = "4k", aspect: float | None = None, params: dict | None = None) -> dict[str, Any]:
+    """What a page needs to run the purrline sand chamber at ``size``: the uniforms (the variant's, a full board, no moving boxes), the view, the
+    chamber outline, the tilt inputs and the board map."""
+    active = SIZES[size][0]
+    params = {**PURRLINE_POUR, **(params or {})}
+    p = species_params(params)
+    geo = chamber_basin("sdf_purrline", active, aspect, cell_needed(p))
+    mapping = sdf_preset("sdf_purrline", geo)["map"]
+    u = uniforms(n=active, aspect=aspect, params=params, shape="sdf_purrline")
+    return {"shape": "sdf_purrline", "size": size, "uniforms": {**{k: float(v) for k, v in u.items()}, **purrline_defaults(mapping)}, "view": list(geo["view"]),
+            "chamber_outline": chamber_outline("sdf_purrline", active, aspect, params),
+            "tilt": tilt_inputs(active, aspect, cell_needed(p), "sdf_purrline"), "map": mapping}
+# </purrline>

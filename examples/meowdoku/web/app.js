@@ -4593,6 +4593,7 @@ function applyState(game, { meta = false } = {}) {
   renderModes(game);
   renderGameControls(game);
   chessClockSync(game);
+  if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   renderHotbars(game);
@@ -5414,9 +5415,70 @@ function cameraDownInLaw(view) {
   const down = [-view[1], -view[5], -view[9]];
   return [down[0], -down[2], down[1]];
 }
+// ---------------------------------------------------------------- purrline sand (WORKLIST.md, "Purrline sand mode", C)
+// A fountain surrounds the purrline board: sand fills and backs up on the board's solid cells and only passes through the holes the game leaves.
+// HOW THE TWO GAMES SHARE A PAGE: the PURRLINE page HOSTS the fountain compute.  The page holds one game (one session, one socket), and its compute
+// runtime is generic (compute.sync takes any game state's ``compute``), so the purrline game, in sand mode, is given the fountain's compute spec
+// built from the purrline variant's manifest (fountain_purrline.manifest.json: its own shaders; ``presets.sdf_purrline`` is fountain.py's ``purrline_spec``): the chamber, sized to
+// the board so board unit = the world unit the tiles already use (``view`` is the board's own window).  No server or purrline.py change.
+// THE WRITE IS ONE WAY: each frame ``sandFeed`` hands compute.setPurrline the game's occupancy and the falling items; the compute writes them to
+// the law's occupancy-grid slot and moving-box slots at the next batch (``purrlineInputs``).  The sand never feeds back into the game.
+const sandFountain = { manifest: null, loading: false, spec: null, size: "4k", sky: new Map(), targets: new Map(), ghosts: new Map(), planeZ: 0.9 };
+function sandSpec(game) {
+  if (!(game && game.game === "purrline" && game.purrline && game.purrline.sand)) return null;
+  const S = sandFountain;
+  if (!S.manifest) {
+    if (!S.loading) {
+      S.loading = true;
+      fetch("fountain_purrline.manifest.json").then((r) => r.json()).then((m) => {
+        S.manifest = m;
+        if (state.game === game && !game.compute) { game.compute = sandSpec(game); compute.sync(game.compute || null); }
+      }).catch((error) => { S.loading = false; console.error("[purrline sand]", error); });
+    }
+    return null;
+  }
+  const preset = S.manifest.presets && S.manifest.presets.sdf_purrline && S.manifest.presets.sdf_purrline[S.size];
+  if (!preset) return null;
+  if (!S.spec) {
+    const m = preset.map, c = m.cell, w = 0.5 * m.cols * c;
+    S.spec = { manifest: "fountain_purrline.manifest.json", size: S.size, epoch: 1, uniforms: preset.uniforms, speed: 1, run: "continuous", named: ["ir", "ig", "ib"],
+               tilt: preset.tilt, view: [-w, w, m.cy - 0.5 * m.rows * c, m.cy + 0.5 * m.rows * c], chamber_outline: preset.chamber_outline, aspect: null,
+               body: null, purrline: { map: m, boxes: S.manifest.purrline.boxes } };
+  }
+  return S.spec;
+}
+// The falling items at THIS instant, from the entity list the snapshot carries (they ride it at ``plane_z``, with the id they keep once landed), moved on by
+// their velocity since they arrived; and, for an item that has just landed, a still box in the cell it fills until the game's occupancy shows the cell taken
+// (the occupancy comes with the status a few times a second, the entities every tick).
+function sandFeed(g) {
+  const pl = g.purrline, S = sandFountain;
+  if (!pl || !g.compute || !g.compute.purrline) { compute.setPurrline(null); return; }
+  const now = state.time, known = new Map();
+  for (const it of pl.falling || []) { known.set(it.id, it); S.planeZ = it.plane_z || S.planeZ; }
+  const sky = new Map();
+  for (const piece of state.pieces.values()) {
+    if (!piece.entity || piece.removing != null || !((piece.sh || 0) > 0.5 * S.planeZ)) continue;
+    const dt = Math.min(0.1, Math.max(0, now - (piece.tRecv ?? now))), meta = known.get(piece.id);
+    if (meta) S.targets.set(piece.id, [meta.col, meta.row]);
+    sky.set(piece.id, { id: piece.id, x: piece.sx + piece.vx * dt, y: piece.sz + piece.vz * dt, vx: piece.vx, vy: piece.vz });
+  }
+  for (const id of S.sky.keys()) {
+    const target = S.targets.get(id);
+    if (!sky.has(id) && target && !S.ghosts.has(id)) S.ghosts.set(id, { id, x: target[0] + 0.5, y: target[1] + 0.5, vx: 0, vy: 0, cell: target[1] * pl.cols + target[0], until: now + 2 });
+  }
+  S.sky = sky;
+  const falling = [...sky.values()];
+  for (const [id, ghost] of S.ghosts) {
+    if (sky.has(id) || pl.occupancy[ghost.cell] || now > ghost.until) { S.ghosts.delete(id); S.targets.delete(id); continue; }
+    falling.push(ghost);
+  }
+  compute.setPurrline({ ...pl, falling });
+}
+
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
+  if (g.purrline) sandFeed(g);                                  // purrline sand: the game's solids into the law's inputs (one way)
   if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
   if (cameraGravity) {
     const [gx, gy, gz] = cameraDownInLaw(cam.view);
@@ -5430,7 +5492,7 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat)) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
+  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat) || g.compute.purrline) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
