@@ -544,16 +544,62 @@ function housingFaces(g) {
       faces.push([a, b, c, m], [a, c, d, m]);
     }
   }
+  // THE PANES (front and back): the chamber's own region is glass; what of the bounding rectangle lies beyond the angled walls is the
+  // panes option -- "trim" (default: cut away, the panes are the polygon), "frame" (the walls' glass) or "matte" (an opaque matte)
   const lo = Math.min(...pts.map((q) => q[0])), hi = Math.max(...pts.map((q) => q[0])), bottom = Math.min(...pts.map((q) => q[1])), top = Math.max(...pts.map((q) => q[1]));
+  const ring = paneRing(pts), outside = paneOutside(ring, lo, hi, bottom, top);
+  const fill = panes.mode === "frame" ? m : panes.mode === "matte" ? state.materialIndex["housing_matte"] : null;
+  const cx = ring.reduce((s, q) => s + q[0], 0) / ring.length, cy = ring.reduce((s, q) => s + q[1], 0) / ring.length;
   for (const z of [-dh, dh]) {
-    const a = wp(lo, bottom, z), b = wp(hi, bottom, z), d = wp(hi, top, z), e = wp(lo, top, z);
-    faces.push([a, b, d, m], [a, d, e, m]);
+    for (let i = 0; i < ring.length; i++) {                         // the chamber (convex shapes: a fan from the centroid)
+      const p = ring[i], q = ring[(i + 1) % ring.length];
+      faces.push([wp(cx, cy, z), wp(p[0], p[1], z), wp(q[0], q[1], z), m]);
+    }
+    if (fill != null) for (const [a, b, c, d] of outside) faces.push([wp(...a, z), wp(...b, z), wp(...c, z), fill], [wp(...a, z), wp(...c, z), wp(...d, z), fill]);
   }
   return faces;
 }
+// the outline as a closed ring (an open container is closed across its top) without the repeated end
+function paneRing(pts) {
+  const ring = pts.slice();
+  const f = ring[0], l = ring[ring.length - 1];
+  if (Math.hypot(f[0] - l[0], f[1] - l[1]) < 1e-6) ring.pop();
+  return ring;
+}
+// the bounding rectangle minus the (star-shaped) ring, as exact quads: sweeping the angles of every ring vertex and rectangle
+// corner about the ring's centroid, each angular interval holds one straight piece of each boundary
+function paneOutside(ring, lo, hi, bottom, top) {
+  const cx = ring.reduce((s, q) => s + q[0], 0) / ring.length, cy = ring.reduce((s, q) => s + q[1], 0) / ring.length;
+  const rect = [[lo, bottom], [hi, bottom], [hi, top], [lo, top]];
+  const hit = (poly, ang) => {                                       // the ray from the centroid at ``ang`` against a closed polygon
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    let best = null;
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i], [bx, by] = poly[(i + 1) % poly.length], ex = bx - ax, ey = by - ay;
+      const den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-12) continue;
+      const s = ((ax - cx) * ey - (ay - cy) * ex) / den, u = ((ax - cx) * dy - (ay - cy) * dx) / den;
+      if (s > 1e-9 && u >= -1e-9 && u <= 1 + 1e-9 && (best == null || s < best)) best = s;
+    }
+    return best == null ? [cx, cy] : [cx + dx * best, cy + dy * best];
+  };
+  const angs = [...ring, ...rect].map(([x, y]) => Math.atan2(y - cy, x - cx)).sort((a, b) => a - b);
+  const quads = [];
+  for (let i = 0; i < angs.length; i++) {
+    const a0 = angs[i], a1 = i + 1 < angs.length ? angs[i + 1] : angs[0] + 2 * Math.PI;
+    if (a1 - a0 < 1e-9) continue;
+    const p0 = hit(ring, a0), p1 = hit(ring, a1), r0 = hit(rect, a0), r1 = hit(rect, a1);
+    if (Math.hypot(r0[0] - p0[0], r0[1] - p0[1]) + Math.hypot(r1[0] - p1[0], r1[1] - p1[1]) < 1e-6) continue;   // the boundaries agree here
+    quads.push([p0, r0, r1, p1]);
+  }
+  return quads;
+}
+// the panes option (page-side, the 3-D fountain): what fills the panes beyond the angled walls
+const panes = { mode: "trim" };
+try { const saved = localStorage.getItem("meowdoku.panes"); if (["trim", "frame", "matte"].includes(saved)) panes.mode = saved; } catch { /* storage may be blocked */ }
 function updateHousing() {
   const g = state.game, c = g && g.compute;
-  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion]) : "";
+  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
   const faces = key ? housingFaces(g) : null;
@@ -1596,6 +1642,7 @@ function uploadMaterials(game) {
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
+  records.push(["housing_matte", [0.10, 0.10, 0.11], { roughness: 0.95, specular: 0.02 }]);   // the panes' matte fill (panes "matte")
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -4477,7 +4524,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), panes: panes.mode, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4505,6 +4552,9 @@ function localControl(s, value) {
   } else if (s.local === "slide_bright") {
     slide.bright = Math.max(0.2, Math.min(3, Number(value))); saveSlide();
     if (slide.image && isFountainGame(state.game)) uploadMaterials(state.game);
+  } else if (s.local === "panes") {
+    panes.mode = ["trim", "frame", "matte"].includes(value) ? value : "trim";
+    try { localStorage.setItem("meowdoku.panes", panes.mode); } catch { /* storage may be blocked */ }
   } else if (s.local === "gscale") {
     gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
     try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
@@ -4785,6 +4835,7 @@ function autoArcStep(data) {
 }
 // Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
+const PANES_SPEC = { id: "panes", kind: "select", label: "panes beyond the walls", local: "panes", options: [["trim", "trimmed"], ["frame", "frame glass"], ["matte", "matte fill"]] };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
 // products): controls after the server's `look` select, and the material styles appended to that select's options.
 const COLOR_SPECS = [
@@ -4807,6 +4858,7 @@ function pageSpecs(specs) {
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
