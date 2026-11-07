@@ -549,6 +549,23 @@ def test_gravity_is_a_runtime_input_the_default_is_the_old_law_and_a_tilt_change
     assert np.isfinite(other["x"]).all() and float(other["n_nan"][0]) == 0 and float(other["n_out"][0]) == 0
 
 
+def test_colour_rate_is_a_runtime_uniform_that_changes_only_the_colours(native_piece):
+    piece, columns = native_piece
+    assert "strata" in F.UNIFORMS and F.STRATA in F.STRATA_CHOICES
+    strata = dict(columns, mode=np.float64(2.0))
+    slow = F.run_frames(piece, dict(strata, strata=np.float64(1.0)), 400)
+    fast = F.run_frames(piece, dict(strata, strata=np.float64(4.0)), 400)   # the same compiled piece
+    for k in F.STATE:                                                       # the physics is untouched
+        assert np.array_equal(slow[k], fast[k]), k
+    live = (np.abs(slow["x"]) + np.abs(slow["y"])) > 0
+    colour = lambda f: np.stack([f["cr"], f["cg"], f["cb"]], axis=1)[live]
+    assert not np.array_equal(colour(slow), colour(fast))                   # the hue turns at the chosen rate
+    # slower = fewer colour changes between neighbours in emission order (wider bands in place)
+    order = np.argsort(columns["pid"][live]) if columns["pid"].shape == live.shape else None
+    jumps = lambda c: float(np.abs(np.diff(c[order], axis=0)).sum())
+    assert jumps(colour(slow)) < jumps(colour(fast))
+
+
 def test_the_lid_keeps_grains_in_the_basin_when_gravity_points_up(native_piece):
     piece, columns = native_piece
     geo = F.basin(F.N_SMALL)

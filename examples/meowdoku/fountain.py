@@ -98,7 +98,9 @@ OMEGA = 150.0                          # contact stiffness: kn = m * OMEGA^2 (OM
 ZETA = 0.7                             # normal damping ratio
 VREF = 0.02                            # tangential slip speed over which friction saturates
 SPIN_DRAG = 3.0                        # 1/s
-STRATA = 4.0                           # hue cycles over the emission in mode 2 (time strata)
+STRATA = 1.0                           # default hue cycles over the emission in mode 2 (time strata); a runtime uniform ``strata``
+#: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
+STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
 K_RUN = 24                             # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one)
 ARMED = -1.0e9                         # the vy of an id waiting at its nozzle slot (see ``fountain_step``)
 EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
@@ -123,7 +125,7 @@ CELL = 2.0 * max(s[1] for s in SPECIES)
 
 STATE = ("x", "y", "vx", "vy", "w", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
-UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid")   # the first three are the run, then its basin, then the RUNTIME INPUTS
+UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata")   # the run, its basin, the RUNTIME INPUTS, then the colour rate
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
@@ -295,7 +297,7 @@ def make_law(n: int, active: int | None = None):
     scan_shifts = reduction_shifts(n)
 
     def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows,
-                      grav_x, grav_y, lid):
+                      grav_x, grav_y, lid, strata):
         """One fixed step of every particle (see the module docstring)."""
         cells = cols * rows
 
@@ -505,10 +507,10 @@ def make_law(n: int, active: int | None = None):
         rot_r = (c * (2.0 / 3.0)) * 0.85 + 0.5
         rot_g = (c * (-1.0 / 3.0) + sn * root3) * 0.85 + 0.5
         rot_b = (c * (-1.0 / 3.0) - sn * root3) * 0.85 + 0.5
-        # mode 2: TIME STRATA -- hue turns STRATA times over the emission, so the settled pile is layered
-        # by the order its grains arrived (ids are emitted in order)
+        # mode 2: TIME STRATA -- hue turns ``strata`` times over the emission (a runtime uniform: the page's colour-rate
+        # option), so the settled pile is layered by the order its grains arrived (ids are emitted in order)
         m2 = as_float(mode > 1.5)
-        hue = hue + m2 * (pid * (STRATA / float(active)) - hue)
+        hue = hue + m2 * (pid * (strata * (1.0 / float(active))) - hue)
         m = as_float(mode > 0.5) * (1.0 - m2)
         hue_r = _ramp(hue, 0.0)
         hue_g = _ramp(hue, 2.0 / 3.0)
@@ -557,25 +559,25 @@ def _f32(a) -> np.ndarray:
 
 
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
-             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF) -> dict[str, np.ndarray]:
+             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA) -> dict[str, np.ndarray]:
     """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``),
     its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) and the RUNTIME INPUTS
     (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
     geo = basin(n, aspect)
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
-    out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid})
+    out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
 def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0, active: int | None = None,
-                    aspect: float | None = None) -> dict[str, np.ndarray]:
+                    aspect: float | None = None, strata: float = STRATA) -> dict[str, np.ndarray]:
     """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
     Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
     columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
-    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect))
+    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata))
     return columns
 
 
@@ -700,6 +702,7 @@ class FountainGame(Game):
         super().__init__(board_id)
         self.size = size
         self.mix, self.mode, self.speed = 0.5, 2, 1
+        self.strata = STRATA
         self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
@@ -721,7 +724,7 @@ class FountainGame(Game):
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
         cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
-                               active=self.n, aspect=self.aspect)
+                               active=self.n, aspect=self.aspect, strata=self.strata)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -742,6 +745,8 @@ class FountainGame(Game):
             self.reset()
         elif kind == "fountain_mode":
             self.mode = int(payload["mode"])
+        elif kind == "fountain_strata":
+            self.strata = float(payload["strata"])
         elif kind == "fountain_speed":
             self.speed = int(payload["speed"])
         elif kind == "fountain_run":
@@ -817,6 +822,8 @@ class FountainGame(Game):
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
              "field": "mode", "options": [[2, "time strata"], [0, "trig (atan2)"], [1, "rotation"]]},
+            {"id": "strata", "kind": "select", "label": "colour rate", "value": self.strata, "action": "fountain_strata",
+             "field": "strata", "options": [[s, f"{s:g} cycle" + ("" if s == 1 else "s")] for s in STRATA_CHOICES]},
             {"id": "size", "kind": "select", "label": "ids", "value": self.size, "action": "fountain_size",
              "field": "size", "options": sizes, "aspect": True},
             {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
@@ -847,7 +854,7 @@ class FountainGame(Game):
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
-                "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect,
+                "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
                                                               use_image=1.0 if self.phase == "replay" else 0.0).items()},
                 "view": list(geo["view"]), "aspect": self.aspect,
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
