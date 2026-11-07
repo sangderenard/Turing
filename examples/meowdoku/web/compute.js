@@ -757,6 +757,15 @@ export class ComputeRuntime {
   }
 
   caseMotionAt(step) {
+    if (this.casePeriodic && this.manifest) {
+      const p = this.casePeriodic, t = step * this.manifest.law.dt;
+      const w = 2 * Math.PI * p.hz, phase = w * t + p.phase;
+      if (p.kind === "rock") {
+        const A = p.arc * Math.PI / 360;
+        return { angle: A * Math.sin(phase), omega: -A * w * Math.cos(phase), domega: A * w * w * Math.sin(phase) };
+      }
+      return { angle: phase, omega: -w, domega: 0 };
+    }
     const flips = this.caseFlips || [];
     let motion = { angle: this.caseTilt || 0, omega: 0, domega: 0 };
     for (const flip of flips) if (step >= flip.startStep) motion = caseFlipAt(flip, step); else break;
@@ -765,6 +774,26 @@ export class ComputeRuntime {
   caseAngleAt(step) {
     const held = this.caseMotionAt(step).angle;
     return held + (this.spin && this.manifest && (this.caseAxis || "y") === "y" ? gravityAngle(this.spin, step * this.manifest.law.dt, this.spinMotion) : 0);
+  }
+  // Continuous prescribed case motion through the same angular inputs as
+  // finite physical flips. The requested rate is bounded by contact capacity.
+  setCasePeriodic(kind, hz = 0, arc = 60, phaseDegrees = 0, axis = "y") {
+    if (!kind || kind === "off") { this.casePeriodic = null; this.#kick(); return { hz: 0, axis }; }
+    if (!this.ready || !this.manifest || !["spin", "rock"].includes(kind) || !["x", "y", "z"].includes(axis)) return null;
+    if (axis !== "y" && !["case_omega_x", "case_omega_y", "case_domega_x", "case_domega_y", "grav_z"].every((name) => this.runtimeInputs.has(name))) return null;
+    const u = { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs };
+    const cell = u.cell ?? 0.028 * u.cell_scale;
+    const reach = Math.hypot(u.half, 0.5 * u.rows * cell, axis === "y" ? 0 : u.dh) + 1e-6;
+    const radius = Math.min(...[0, 1, 2, 3].map((i) => u[`r${i}`]).filter((r) => r > 0));
+    const maxOmega = 0.98 * u.omega * Math.sqrt(0.5 * radius / reach);
+    const maxDomega = 0.98 * u.omega * u.omega * 0.5 * radius / reach;
+    const A = kind === "rock" ? Math.max(1e-3, Math.PI * Number(arc) / 360) : 1;
+    const limit = kind === "rock" ? Math.min(maxOmega / A, Math.sqrt(maxDomega / A)) : maxOmega;
+    const effectiveHz = Math.max(0, Math.min(Number(hz) || 0, limit / (2 * Math.PI)));
+    this.spin = null; this.caseTilt = 0; this.caseFlips = []; this.caseAxis = axis;
+    this.casePeriodic = { kind, hz: effectiveHz, arc: Number(arc), phase: Number(phaseDegrees) * Math.PI / 180 };
+    this.#kick();
+    return { hz: effectiveHz, axis, limited: effectiveHz < Number(hz) - 1e-6 };
   }
   // Prescribed finite case turn about the selected world axis (2-D supports the case normal only).
   // The law limits angular terms by spring contact capacity per grain.  Choose a duration that stays below even the

@@ -2,6 +2,9 @@
 // tables used by the game. All edits are local to this preview.
 import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
+import { ComputeRuntime } from "./compute.js";
+import { caseModel } from "./gravity.js";
+import { marblePreviewSpec, livePreviewParticle, previewLawToScene } from "./marble_sim_preview.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
@@ -40,6 +43,7 @@ function rotateQuaternion(q) {
     r[0][2],r[1][2],r[2][2],0,0,0,0,1]);
 }
 const translate3=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
+const scale3=(s)=>new Float32Array([s,0,0,0,0,s,0,0,0,0,s,0,0,0,0,1]);
 function perspective(aspect) {
   const f = 1 / Math.tan(Math.PI / 7), near = 0.1, far = 30;
   return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0]);
@@ -97,6 +101,65 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
   rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
+const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
+  status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
+const simStatus=()=>{$("preview-sim-status").textContent=sim.runtime?.error?`Particle simulation error: ${sim.runtime.error}`:sim.status;};
+function simCage(spec) {
+  const packed=spec.chamber_mesh;
+  if(!packed)throw new Error("compiled chamber has no containing mesh");
+  const decode=(base64)=>{const bytes=Uint8Array.from(atob(base64),(c)=>c.charCodeAt(0));return new Uint16Array(bytes.buffer);};
+  const vertices=decode(packed.v),triangles=decode(packed.t),b=packed.bounds;
+  const low=spec.view[2],high=spec.view[3],dz=b[5]-b[4],tile=Math.max(0.025,(b[1]-b[0])/9);
+  const opaque=[],glass=[];
+  const vertex=(id)=>[b[0]+vertices[3*id]/65535*(b[1]-b[0]),
+    b[2]+vertices[3*id+1]/65535*(b[3]-b[2]),b[4]+vertices[3*id+2]/65535*dz];
+  for(let i=0;i<packed.nt;i++) {
+    const law=[vertex(triangles[3*i]),vertex(triangles[3*i+1]),vertex(triangles[3*i+2])];
+    const scene=law.map(sim.map.point),[a,c,d]=scene;
+    const ab=[c[0]-a[0],c[1]-a[1],c[2]-a[2]],ad=[d[0]-a[0],d[1]-a[1],d[2]-a[2]];
+    const n=[ab[1]*ad[2]-ab[2]*ad[1],ab[2]*ad[0]-ab[0]*ad[2],ab[0]*ad[1]-ab[1]*ad[0]];
+    const len=Math.max(1e-9,Math.hypot(...n)),normal=n.map((v)=>v/len);
+    const center=law[0].map((_,k)=>(law[0][k]+law[1][k]+law[2][k])/3);
+    const checked=center[2]<b[4]+0.12*dz || center[1]>high-0.12*(high-low);
+    const parity=(Math.floor(center[0]/tile)+Math.floor(center[1]/tile)+Math.floor(center[2]/tile))&1;
+    const id=checked ? (parity?ids.stone_onyx:ids.ceramic_porcelain) : ids.marble_clear_glass;
+    (checked?opaque:glass).push([a,c,d,id,[normal,normal,normal]]);
+  }
+  return { opaque:mesh(opaque), glass:mesh(glass) };
+}
+function configureSimMotion() {
+  const runtime=sim.runtime;if(!runtime?.ready)return;
+  const kind=$("preview-motion").value,axis=$("preview-axis").value,hz=+$("preview-hz").value;
+  const phase=+$("preview-phase").value,arc=+$("preview-arc").value;
+  runtime.setSpin(0);runtime.setGravity(0,0,-1);
+  if(kind==="rotate"||kind==="rock") {
+    const result=runtime.setCasePeriodic(kind==="rotate"?"spin":"rock",hz,arc,phase,axis);
+    if(!result)throw new Error(`this compiled product cannot rotate about ${axis.toUpperCase()}`);
+    sim.status=`Compiled particle · ${result.hz.toFixed(2)} Hz ${kind} about ${axis.toUpperCase()}${result.limited?" (bounded by contacts)":""} · sphere contact, fixed visual orientation`;
+  } else {
+    runtime.setCasePeriodic(null);runtime.setCaseTilt(0);
+    sim.nextFlipStep=runtime.steps+Math.round((phase/360)/(hz*runtime.manifest.law.dt));
+    sim.status=`Compiled particle · ${kind==="flip"?`physical Flip about ${axis.toUpperCase()}`:"case at rest"} · sphere contact, fixed visual orientation`;
+  }
+  simStatus();
+}
+async function startSim() {
+  if(!sim.base) {
+    const response=await fetch("/api/marble_preview_spec",{cache:"no-store"});
+    if(!response.ok)throw new Error(`compiled preview spec HTTP ${response.status}`);
+    sim.base=await response.json();
+  }
+  if(!sim.runtime) sim.runtime=new ComputeRuntime({onStatus:simStatus,onSamples:()=>{},onSupport:()=>{}});
+  sim.spec=marblePreviewSpec(sim.base,readPhysical(document),++sim.epoch);
+  sim.runtime.setGravity(0,0,-1);
+  sim.runtime.sync(sim.spec);
+  await sim.runtime.queue;
+  if(!sim.runtime.ready)throw new Error(sim.runtime.error||"compiled particle unavailable");
+  sim.map=previewLawToScene(sim.spec.view,sim.spec.depth,sim.spec.uniforms.r0);
+  dispose(sim.cageOpaque);dispose(sim.cageGlass);
+  const cage=simCage(sim.spec);sim.cageOpaque=cage.opaque;sim.cageGlass=cage.glass;
+  configureSimMotion();
+}
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
 const objectStatus=(message)=>{$("object-status").textContent=message;};
 async function refreshObjects(selected="") {
@@ -324,9 +387,20 @@ function controls() {
     $("preview-hz-out").value=`${(+$("preview-hz").value).toFixed(2)} Hz`;
     $("preview-phase-out").value=`${$("preview-phase").value}°`;
     $("preview-arc-out").value=`${$("preview-arc").value}°`;
+    if($("preview-engine").value==="particle"&&sim.runtime?.ready) {
+      try {configureSimMotion();} catch(error) {sim.status=String(error.message||error);simStatus();}
+    }
   };
-  for(const name of ["preview-motion","preview-hz","preview-phase","preview-arc"])
+  for(const name of ["preview-motion","preview-axis","preview-hz","preview-phase","preview-arc"])
     $(name).addEventListener("input",syncPreviewMotion);
+  $("preview-engine").addEventListener("change",()=>{
+    if($("preview-engine").value==="particle") {
+      sim.status="Loading compiled particle and native containing case…";simStatus();
+      startSim().catch((error)=>{sim.status=`Particle simulation unavailable: ${error.message||error}`;simStatus();});
+    } else {sim.runtime?.sync(null);sim.status="Visual preview (cheap): object motion only";simStatus();}
+  });
+  for(const id of ["sim-radius","sim-rho","sim-mu","sim-e","sim-roll","sim-irr"])
+    $(id).addEventListener("change",()=>{if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});});
   syncPreviewMotion();
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
@@ -389,7 +463,17 @@ function controls() {
 }
 function frame(now=0) {
   const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
-  if(dt>0 && rollState && rollProps?.validForRoll && !$("inertia-lock").checked) {
+  const simOn=$("preview-engine").value==="particle";
+  if(simOn&&sim.runtime?.ready) {
+    sim.runtime.frame(now/1000);
+    if($("preview-motion").value==="flip"&&sim.runtime.shown!=null&&sim.runtime.steps>=sim.nextFlipStep) {
+      const hz=+$("preview-hz").value;
+      const turn=sim.runtime.startCaseFlip(Math.min(0.7/hz,1/hz),1,$("preview-axis").value);
+      if(turn) {sim.flipSeconds=turn.seconds;sim.nextFlipStep=sim.runtime.steps+Math.ceil(Math.max(turn.seconds,1/hz)/sim.runtime.manifest.law.dt);
+        sim.status=`Compiled particle · physical Flip ${turn.seconds.toFixed(2)} s about ${turn.axis.toUpperCase()} · sphere contact, fixed visual orientation`;simStatus();}
+    }
+  }
+  if(!simOn&&dt>0 && rollState && rollProps?.validForRoll && !$("inertia-lock").checked) {
     try {rollState=rollingStep(rollState,rollProps,[+$("roll-force-x").value/1000,0,+$("roll-force-z").value/1000],
       dt,+$("radius-mm").value/1000);
       $("roll-status").textContent=`Rolling · angular speed ${Math.hypot(...rollState.angularVelocity).toFixed(2)} rad/s · contact force ${Math.hypot(...rollState.contactForce).toFixed(3)} N`;
@@ -399,13 +483,20 @@ function frame(now=0) {
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
   gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
-    const view=multiply(translate(-distance),multiply(rotateX(pitch),rotateY(yaw)));
+    const view=multiply(translate(simOn? -Math.max(distance,7): -distance),multiply(rotateX(pitch),rotateY(yaw)));
     const radius=+$("radius-mm").value/1000;
-    const object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
+    let object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
     const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
     const axis=$("preview-axis").value;
     const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
-    const mv=multiply(view,multiply(object,preview));
+    let caseM=identity(),haveParticle=true;
+    if(simOn) {
+      const runtime=sim.runtime,pt=livePreviewParticle(runtime?.points());
+      haveParticle=!!(runtime?.ready&&pt&&sim.map);
+      if(runtime?.ready&&runtime.shown!=null) caseM=caseModel(runtime.caseAngleAt(runtime.shown*runtime.snap),0,0,runtime.caseAxis||axis,0);
+      if(haveParticle) {const p=sim.map.point([pt.x,pt.y,pt.z]);object=multiply(caseM,multiply(translate3(...p),scale3(pt.radius*sim.map.scale)));}
+    }
+    const mv=multiply(view,simOn?object:multiply(object,preview));
     gl.useProgram(P);
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
       gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
@@ -434,16 +525,25 @@ function frame(now=0) {
     gl.uniformMatrix4fv(loc(P,"uShadowMatrices[0]"),false,identity());
     gl.vertexAttribI4i(4,0,0,0,0); gl.vertexAttribI4i(5,1,0,0,0); gl.vertexAttrib3f(6,0,0,0); gl.vertexAttrib2f(3,0,0);
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
-    if ($("checker").checked && checkerMesh) {
+    if (simOn&&sim.cageOpaque) {
+      setTransform(multiply(view,caseM));gl.bindVertexArray(sim.cageOpaque.vao);
+      gl.drawArrays(gl.TRIANGLES,0,sim.cageOpaque.count);setTransform(mv);
+    } else if (!simOn&&$("checker").checked && checkerMesh) {
       setTransform(view); gl.bindVertexArray(checkerMesh.vao);
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
-    gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
-    gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
-    gl.disable(gl.BLEND);gl.depthMask(true);
-    gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);
-    gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
-    gl.bindVertexArray(glass.vao); gl.drawArrays(gl.TRIANGLES,0,glass.count);
+    if(haveParticle) {
+      gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
+      gl.disable(gl.BLEND);gl.depthMask(true);
+      gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);
+      gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+      gl.bindVertexArray(glass.vao); gl.drawArrays(gl.TRIANGLES,0,glass.count);
+    }
+    if(simOn&&sim.cageGlass) {
+      setTransform(multiply(view,caseM));gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+      gl.bindVertexArray(sim.cageGlass.vao);gl.drawArrays(gl.TRIANGLES,0,sim.cageGlass.count);
+    }
     gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
   }
   requestAnimationFrame(frame);
