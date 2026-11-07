@@ -325,6 +325,7 @@ class Sessions:
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
+        self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -527,6 +528,8 @@ def make_handler(sessions: Sessions):
                 return self._ready()
             if path == "/api/loading_anim":
                 return self._anim_get()
+            if path == "/api/loading_library":                    # [STUDIO] the library listing: anyone may view
+                return self._library_get()
             if path == "/api/spectate/watch":
                 return self._watch()
             if path.startswith("/api/share/"):
@@ -567,16 +570,24 @@ def make_handler(sessions: Sessions):
             self._json(out)
 
         def _anim_get(self) -> None:
+            """The ACTIVE animation; with ``?v=<digest>`` that library entry (any visitor may view one: the studio plays them)."""
+            from urllib.parse import parse_qs, urlparse
             self._set_cookie = []
-            info = sessions.anim.info()
-            body = sessions.anim.read() if info else None
+            wanted = (parse_qs(urlparse(self.path).query).get("v") or [None])[0]
+            if wanted:
+                info = sessions.anim.meta(wanted)
+                body = sessions.anim.read(wanted) if info else None
+            else:
+                info = sessions.anim.info()
+                body = sessions.anim.read() if info else None
             if body is None:
-                return self._json({"error": "no loading animation recorded yet"}, HTTPStatus.NOT_FOUND)
+                return self._json({"error": "no loading animation recorded yet" if not wanted else "no such library entry"}, HTTPStatus.NOT_FOUND)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("ETag", f'"{info["digest"]}"')
-            self.send_header("Cache-Control", "public, max-age=31536000, immutable")        # the URL carries the digest
+            # the URL carries the digest: immutable.  Without one the answer is whatever is active now (the owner can change it).
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable" if wanted else "no-cache")
             self.end_headers()
             self.wfile.write(body)
 
@@ -592,8 +603,6 @@ def make_handler(sessions: Sessions):
                 return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
             if length <= 0 or length > anim_mod.MAX_BYTES:
                 return refuse(f"the animation must be 1..{anim_mod.MAX_BYTES} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-            if sessions.anim.info() is not None:
-                return refuse("a loading animation already exists", HTTPStatus.CONFLICT)
             now, hits = time.time(), sessions.anim_hits.setdefault(self.client_address[0], [])
             hits[:] = [t for t in hits if now - t < 600]
             if len(hits) >= 5:
@@ -603,13 +612,62 @@ def make_handler(sessions: Sessions):
             if not sessions.anim_busy.acquire(blocking=False):
                 return self._json({"error": "an animation is being stored"}, HTTPStatus.CONFLICT)
             try:
-                return self._json({"stored": sessions.anim.put(raw)}, HTTPStatus.CREATED)
+                # [STUDIO] a save goes into the LIBRARY; it becomes the one players get only when there is none (activating needs the owner)
+                from urllib.parse import unquote
+                try:
+                    params = json.loads(unquote(self.headers.get("X-Meowdoku-Params") or "")[:anim_mod.MAX_PARAMS_BYTES] or "{}")
+                except ValueError:
+                    params = {}
+                return self._json({"stored": sessions.anim.put(raw, params)}, HTTPStatus.CREATED)
             except anim_mod.AnimError as error:
                 return self._json({"error": f"not a valid animation: {error}"}, HTTPStatus.BAD_REQUEST)
-            except FileExistsError:
-                return self._json({"error": "a loading animation already exists"}, HTTPStatus.CONFLICT)
+            except anim_mod.LibraryFull as error:
+                return self._json({"error": str(error)}, HTTPStatus.INSUFFICIENT_STORAGE)
             finally:
                 sessions.anim_busy.release()
+
+        # ---- [STUDIO] the library listing (anyone), and the owner's two verbs: make active, delete
+        def _library_get(self) -> None:
+            self._set_cookie = []
+            self._json({"entries": sessions.anim.entries(), "active": sessions.anim.active_digest(), "caps": sessions.anim.caps()})
+
+        def _library_post(self, path: str, length: int) -> None:
+            """``/api/loading_library/activate`` and ``/delete`` with ``{"digest": ...}``: what every player sees changes, so the owner's
+            lifecycle admin token (header ``X-Meowdoku-Admin``, never a URL; constant-time compare) over HTTPS only, a few wrong tries per
+            address.  The server never prints or sends the token."""
+            self._set_cookie = []
+            def refuse(message, status):
+                self.close_connection = True
+                return self._json({"error": message}, status)
+            lc = sessions.lifecycle
+            if lc is None:
+                return refuse("owner actions are not available on this server", HTTPStatus.SERVICE_UNAVAILABLE)
+            if length <= 0 or length > 1024:
+                return refuse("expected {\"digest\": ...}", HTTPStatus.BAD_REQUEST)
+            import ssl
+            forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
+            host = (self.headers.get("Host") or "").strip()
+            host = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+            direct = self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and not forwarded and host in ("127.0.0.1", "localhost", "[::1]")
+            now, misses = time.time(), sessions.anim_misses.setdefault(self.client_address[0], [])
+            misses[:] = [t for t in misses if now - t < 600]
+            if len(misses) >= 5:
+                return refuse("too many wrong tokens from this address", HTTPStatus.TOO_MANY_REQUESTS)
+            ok, status, why = anim_mod.owner_authorize(isinstance(self.connection, ssl.SSLSocket), self.headers.get("X-Forwarded-Proto"), direct,
+                                                       self.headers.get("X-Meowdoku-Admin"), lc.token)
+            if not ok:
+                if status == 401:
+                    misses.append(now)
+                return refuse(why, status)
+            try:
+                digest = str(json.loads(self.rfile.read(length) or b"{}").get("digest", ""))
+                done = sessions.anim.activate(digest) if path.endswith("/activate") else sessions.anim.delete(digest)
+            except KeyError:
+                return self._json({"error": "no such library entry"}, HTTPStatus.NOT_FOUND)
+            except (ValueError, TypeError, AttributeError):
+                return self._json({"error": "expected {\"digest\": ...}"}, HTTPStatus.BAD_REQUEST)
+            print(f"[meowdoku] loading library: {path.rsplit('/', 1)[1]} {done['digest']} from {self.client_address[0]}", flush=True)
+            return self._json({"ok": True, "entry": done, "active": sessions.anim.active_digest()})
 
         # ---- LIFECYCLE (lifecycle.py): the announcement every page reads, the page's copy re-seeding a session, and the admin trigger.
         def _lifecycle_get(self) -> None:
@@ -663,6 +721,8 @@ def make_handler(sessions: Sessions):
                 return
             if path0 == "/api/loading_anim" and not self._is_viewer():
                 return self._anim_post(int(self.headers.get("Content-Length") or 0))
+            if path0 in ("/api/loading_library/activate", "/api/loading_library/delete") and not self._is_viewer():     # [STUDIO]
+                return self._library_post(path0, int(self.headers.get("Content-Length") or 0))
             if path0 in ("/api/admin/lifecycle", "/api/lifecycle/restore") and not self._is_viewer():
                 return self._lifecycle_post(path0, int(self.headers.get("Content-Length") or 0))
             if self._is_viewer():

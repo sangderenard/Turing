@@ -54,6 +54,7 @@ function start() {
     shownAt: 0, visible: false, showTimer: null, raf: 0, gl: null, anim: null, animUrl: null, animTried: false,
     tint: PHASES.downloading.tint.slice(), phase: "downloading", t0: performance.now(),
     forced: new URLSearchParams(location.search).get("loading_demo"),
+    pick: new URLSearchParams(location.search).get("loading_anim"),      // [STUDIO] play this library entry (a digest) instead of the active one
   };
   const dl = { loaded: 0, total: 0, inflight: 0 };
   const webgpu = !!navigator.gpu;
@@ -224,10 +225,10 @@ function start() {
   async function loadAnimation() {
     if (S.animTried || !S.data) return;
     const info = S.data.loading_anim;
-    if (!info || !info.present) return;
+    if (!S.pick && (!info || !info.present)) return;
     S.animTried = true;
     try {
-      const r = await nativeFetch(info.url);
+      const r = await nativeFetch(S.pick ? `/api/loading_anim?v=${encodeURIComponent(S.pick)}` : info.url);
       if (!r.ok) throw new Error(String(r.status));
       const a = decodePacket(new Uint8Array(await r.arrayBuffer()));
       const n = a.radius.length, span = Math.max(a.bbox[1] - a.bbox[0], a.bbox[3] - a.bbox[2]);
@@ -376,4 +377,10 @@ function start() {
   window.addEventListener("error", () => release("boot"), { once: true });
   if (S.forced) refresh();
   fetchReady().then(loadAnimation);
+  // [STUDIO] a page held on a demo phase (?loading_demo=) can be steered by its same-origin parent (studio.html): the phase, the entry played
+  if (S.forced) window.addEventListener("message", (e) => {
+    if (e.origin !== location.origin || !e.data || e.data.type !== "loading-view") return;
+    if (PHASES[e.data.phase]) S.forced = e.data.phase;
+    if ("anim" in e.data) { S.pick = e.data.anim || null; S.anim = null; S.animTried = false; fetchReady().then(loadAnimation); }
+  });
 }

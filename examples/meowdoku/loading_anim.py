@@ -21,11 +21,14 @@ number of turns), so the cross-fade is between two resting piles.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
 import struct
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -143,42 +146,176 @@ def unpack(packet: bytes) -> bytes:
     return decompress_octets(packet)
 
 
-class Store:
-    """``build/meowdoku/loading_anim.mla`` (the octet-codec packet of the animation) and ``loading_anim.json`` (its numbers).
-    Written once, only when valid; an upload never replaces it."""
+#: [STUDIO] the library's caps: an upload that would pass either is refused (nothing is evicted without the owner)
+MAX_ENTRIES = 24
+MAX_LIBRARY_BYTES = 32 << 20
+MAX_PARAMS_BYTES = 2048
+DIGEST_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+class LibraryFull(RuntimeError):
+    """The library is at its entry or byte cap."""
+
+
+def clean_params(params) -> dict:
+    """The recording parameters kept as metadata: flat, short keys, number / bool / short string values, at most MAX_PARAMS_BYTES of JSON."""
+    out = {}
+    if isinstance(params, dict):
+        for k, v in list(params.items())[:40]:
+            if isinstance(k, str) and len(k) <= 40 and isinstance(v, (bool, int, float, str)) and not (isinstance(v, float) and not math.isfinite(v)):
+                out[k] = v[:80] if isinstance(v, str) else v
+    return out if len(json.dumps(out)) <= MAX_PARAMS_BYTES else {}
+
+
+def owner_authorize(tls: bool, forwarded_proto: str | None, loopback_direct: bool, supplied: str | None, token: str) -> tuple[bool, int, str]:
+    """[STUDIO] Making an entry active or deleting one changes what every player sees: the owner's lifecycle admin token (a constant-time
+    compare), over HTTPS only.  HTTPS means this socket is TLS, or a proxy says it terminated TLS (X-Forwarded-Proto: https), or the caller
+    is on this machine's loopback with no proxy in between (nothing crosses a network)."""
+    if not (tls or (forwarded_proto or "").strip().lower() == "https" or loopback_direct):
+        return False, 403, "owner actions need HTTPS"
+    if not token or not supplied or not hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+        return False, 401, "bad owner token"
+    return True, 200, "ok"
+
+
+class Library:
+    """[STUDIO] ``<dir>/loading_library/<digest>.mla`` (the octet-codec packet) + ``<digest>.json`` (date, parameters, bytes, frames) and
+    ``active.json`` (``{"digest": ...}``: the entry players get from /api/loading_anim).  The pre-library single file
+    ``<dir>/loading_anim.mla`` + ``.json`` is MIGRATED in as the active entry the first time a library without an active pointer opens
+    (the old files are left where they are).  ``info()`` / ``read()`` keep the old store's shape for the active entry."""
 
     def __init__(self, directory: Path):
         self.directory = Path(directory)
-        self.path, self.meta_path = self.directory / "loading_anim.mla", self.directory / "loading_anim.json"
-        self._lock = threading.Lock()
+        self.root = self.directory / "loading_library"
+        self.pointer = self.root / "active.json"
+        self.legacy_path, self.legacy_meta = self.directory / "loading_anim.mla", self.directory / "loading_anim.json"
+        self._lock = threading.RLock()
+        self.migrate()
+
+    # -- files
+    def _files(self, digest_: str) -> tuple[Path, Path]:
+        if not DIGEST_RE.match(digest_ or ""):
+            raise KeyError(digest_)
+        return self.root / f"{digest_}.mla", self.root / f"{digest_}.json"
+
+    @staticmethod
+    def _atomic(path: Path, data: bytes) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+
+    def _set_active(self, digest_: str | None) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._atomic(self.pointer, json.dumps({"digest": digest_}).encode("utf-8"))
+
+    def migrate(self) -> None:
+        with self._lock:
+            if self.pointer.exists():
+                return
+            try:
+                meta = json.loads(self.legacy_meta.read_text(encoding="utf-8"))
+                if self.legacy_path.stat().st_size != meta["bytes"] or not DIGEST_RE.match(meta["digest"]):
+                    return
+                packet = self.legacy_path.read_bytes()
+                decode(unpack(packet))                              # only a valid animation is migrated
+            except (OSError, ValueError, KeyError, AnimError):
+                return
+            self.root.mkdir(parents=True, exist_ok=True)
+            mla, js = self._files(meta["digest"])
+            when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.legacy_path.stat().st_mtime))
+            self._atomic(mla, packet)
+            self._atomic(js, json.dumps({**meta, "date": when, "params": {"migrated": True}}).encode("utf-8"))
+            self._set_active(meta["digest"])
+
+    # -- reading
+    def meta(self, digest_: str) -> dict | None:
+        try:
+            mla, js = self._files(digest_)
+            meta = json.loads(js.read_text(encoding="utf-8"))
+            return meta if mla.stat().st_size == meta["bytes"] else None
+        except (KeyError, OSError, ValueError):
+            return None
+
+    def active_digest(self) -> str | None:
+        try:
+            digest_ = json.loads(self.pointer.read_text(encoding="utf-8")).get("digest")
+        except (OSError, ValueError):
+            return None
+        return digest_ if digest_ and self.meta(digest_) else None
+
+    def entries(self) -> list[dict]:
+        """Every entry's metadata, newest first, each with ``active``."""
+        active, out = self.active_digest(), []
+        if self.root.is_dir():
+            for js in self.root.glob("*.json"):
+                if js.stem != "active" and (meta := self.meta(js.stem)):
+                    out.append({**meta, "active": meta["digest"] == active})
+        return sorted(out, key=lambda m: (m.get("date", ""), m["digest"]), reverse=True)
+
+    def caps(self) -> dict:
+        entries = self.entries()
+        return {"max_entries": MAX_ENTRIES, "max_bytes": MAX_LIBRARY_BYTES, "entries": len(entries), "used_bytes": sum(e["bytes"] for e in entries)}
 
     def info(self) -> dict | None:
-        """{"digest", "raw_bytes", "bytes" (the packet), "frames", "grains", "fps"} of the stored animation, or None."""
+        """The ACTIVE entry's metadata ({"digest", "raw_bytes", "bytes" (the packet), "frames", "grains", "fps", "date", "params"}), or None."""
+        digest_ = self.active_digest()
+        return self.meta(digest_) if digest_ else None
+
+    def read(self, digest_: str | None = None) -> bytes | None:
+        """The packet of ``digest_`` (default: the active entry), or None."""
+        digest_ = digest_ or self.active_digest()
         try:
-            meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
-            if self.path.stat().st_size == meta["bytes"]:
-                return meta
-        except (OSError, ValueError, KeyError):
-            pass
-        return None
+            return self._files(digest_)[0].read_bytes() if digest_ and self.meta(digest_) else None
+        except (KeyError, OSError):
+            return None
 
-    def read(self) -> bytes | None:
-        return self.path.read_bytes() if self.info() else None
-
-    def put(self, raw: bytes) -> dict:
-        """Store a new animation if (and only if) there is none; raises :class:`AnimError` (invalid) or ``FileExistsError`` (present)."""
-        anim = decode(raw)                                         # raises on anything invalid
+    # -- writing
+    def put(self, raw: bytes, params=None) -> dict:
+        """Validate, pack and keep an animation.  The first one into a library with no active entry becomes active; a later one is only
+        added.  The same animation twice is one entry.  Raises :class:`AnimError` (invalid) or :class:`LibraryFull`."""
+        anim = decode(raw)
         with self._lock:
-            if self.info() is not None:
-                raise FileExistsError(str(self.path))
-            self.directory.mkdir(parents=True, exist_ok=True)
             packet = pack(raw)
             if unpack(packet) != raw:                              # the codec must give back exactly what was validated
                 raise RuntimeError("octet codec round trip failed")
-            meta = {"digest": digest(packet), "raw_bytes": len(raw), "bytes": len(packet),
-                    "frames": int(anim["x"].shape[0]), "grains": int(anim["x"].shape[1]), "fps": int(anim["fps"])}
-            tmp = self.path.with_suffix(".mla.tmp")
-            tmp.write_bytes(packet)
-            os.replace(tmp, self.path)
-            self.meta_path.write_text(json.dumps(meta), encoding="utf-8")
-        return meta
+            digest_ = digest(packet)
+            if self.meta(digest_):
+                return {**self.meta(digest_), "active": digest_ == self.active_digest(), "duplicate": True}
+            caps = self.caps()
+            if caps["entries"] >= MAX_ENTRIES or caps["used_bytes"] + len(packet) > MAX_LIBRARY_BYTES:
+                raise LibraryFull(f"the library is full ({caps['entries']}/{MAX_ENTRIES} entries, {caps['used_bytes']}/{MAX_LIBRARY_BYTES} bytes): delete one first")
+            self.root.mkdir(parents=True, exist_ok=True)
+            meta = {"digest": digest_, "raw_bytes": len(raw), "bytes": len(packet), "frames": int(anim["x"].shape[0]),
+                    "grains": int(anim["x"].shape[1]), "fps": int(anim["fps"]), "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "params": clean_params(params)}
+            mla, js = self._files(digest_)
+            self._atomic(mla, packet)
+            self._atomic(js, json.dumps(meta).encode("utf-8"))
+            became = self.active_digest() is None
+            if became:
+                self._set_active(digest_)
+            return {**meta, "active": became}
+
+    def activate(self, digest_: str) -> dict:
+        with self._lock:
+            meta = self.meta(digest_)
+            if meta is None:
+                raise KeyError(digest_)
+            self._set_active(digest_)
+            return meta
+
+    def delete(self, digest_: str) -> dict:
+        """Remove an entry (the active one too: players then get the procedural animation until one is made active)."""
+        with self._lock:
+            meta = self.meta(digest_)
+            if meta is None:
+                raise KeyError(digest_)
+            was_active = digest_ == self.active_digest()
+            for path in self._files(digest_):
+                path.unlink(missing_ok=True)
+            if was_active:
+                self._set_active(None)
+            return {**meta, "was_active": was_active}
+
+
+Store = Library                                                    # the name the server and the tests used before the library
