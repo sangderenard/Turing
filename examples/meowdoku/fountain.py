@@ -588,18 +588,20 @@ def sdf_field(x, y, q):
         used = as_float(kind > 0.5)
         fluid = used * as_float(role < 0.5)
         solid = used * (1.0 - fluid)
-        cf = fluid * (-f) + (1.0 - fluid) * (-SDF_FAR)
-        take = as_float(cf > d_f)
-        d_f = d_f + take * (cf - d_f)
-        f_nx = f_nx + take * (-gwx - f_nx)
-        f_ny = f_ny + take * (-gwy - f_ny)
-        cs = solid * f + (1.0 - solid) * SDF_FAR
-        take = as_float(cs < d_s)
-        d_s = d_s + take * (cs - d_s)
-        s_nx = s_nx + take * (gwx - s_nx)
-        s_ny = s_ny + take * (gwy - s_ny)
-    pick = as_float(d_s < d_f)
-    return d_f + pick * (d_s - d_f), f_nx + pick * (s_nx - f_nx), f_ny + pick * (s_ny - f_ny)
+        # SELECT, never blend: with the SDF_FAR sentinel, ``d + take * (c - d)`` is (-1e9) + (1e9 + c), which float32 (the GPU)
+        # rounds to 0 -- the composed distance was 0 everywhere on the GPU while the float64 eager lane hid it.
+        cf = AbstractTensor.where(fluid > 0.5, zero - f, zero - SDF_FAR)
+        take = cf > d_f
+        d_f = AbstractTensor.where(take, cf, d_f)
+        f_nx = AbstractTensor.where(take, zero - gwx, f_nx)
+        f_ny = AbstractTensor.where(take, zero - gwy, f_ny)
+        cs = AbstractTensor.where(solid > 0.5, f, zero + SDF_FAR)
+        take = cs < d_s
+        d_s = AbstractTensor.where(take, cs, d_s)
+        s_nx = AbstractTensor.where(take, gwx, s_nx)
+        s_ny = AbstractTensor.where(take, gwy, s_ny)
+    pick = d_s < d_f
+    return AbstractTensor.where(pick, d_s, d_f), AbstractTensor.where(pick, s_nx, f_nx), AbstractTensor.where(pick, s_ny, f_ny)
 
 
 def make_law(n: int, active: int | None = None, sdf: bool = True):
