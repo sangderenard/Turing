@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Meowdoku</title>
 <style>
   /* The shared background: --scene-bg is set by app.js from the Rayleigh sky model for the viewer's local
@@ -13,6 +13,12 @@
           --line: #3a3a42; --fg: #e8e8ea; --fg-strong: #f0f0f3; }
   :root[data-night="1"] { --panel: color-mix(in srgb, var(--scene-bg) 55%, #04060c); --ctl: #151b2e; --ctl-hover: #212b48;
           --line: #55648c; --fg: #f4f6ff; --fg-strong: #ffffff; }
+  /* MOBILE: the page never zooms (the scene owns pinch and pan): no double-tap zoom anywhere, no gestures leaving the canvas, and no
+     iOS focus-zoom on text fields (it zooms any field under 16px) */
+  html, body { touch-action: manipulation; overscroll-behavior: none; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  @media (pointer: coarse) { input, select, textarea { font-size: 16px; } }
+  #unzoom { position: fixed; z-index: 99; left: 50%; top: 10px; transform: translateX(-50%); display: none; padding: 8px 14px;
+            border-radius: 18px; border: 1px solid var(--line); background: var(--ctl); color: var(--fg-strong); font: 600 15px system-ui; }
   html, body { margin: 0; height: 100%; background: var(--scene-bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
   #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
          background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
@@ -239,6 +245,27 @@
     // border-box, so the clamp (max-height) is seen; and again after a window resize has settled
     new ResizeObserver(fit).observe(bar, { box: "border-box" }); fit();
     addEventListener("resize", () => { fit(); requestAnimationFrame(fit); }); })();
+</script>
+<button id="unzoom" type="button">Reset zoom</button>
+<script>
+  // THE PAGE DOES NOT ZOOM.  The viewport meta stops it on Android; iOS Safari ignores user-scalable for pinch, so its gesture
+  // events and any multi-finger touchmove outside the canvas are cancelled here (the canvas handles its own pinch: touch-action
+  // none).  If the page is zoomed anyway (an older browser, an accessibility zoom), a "Reset zoom" pill appears: tapping it
+  // re-applies the viewport meta, which snaps the page back to scale 1 in Safari and Chrome.
+  (() => {
+    const stop = (e) => { e.preventDefault(); };
+    for (const type of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(type, stop, { passive: false });
+    document.addEventListener("touchmove", (e) => { if (e.touches.length > 1 || (e.scale !== undefined && e.scale !== 1)) e.preventDefault(); }, { passive: false });
+    const meta = document.getElementById("viewport-meta"), pill = document.getElementById("unzoom"), base = meta.content;
+    const vv = window.visualViewport;
+    const check = () => { pill.style.display = vv && vv.scale > 1.02 ? "block" : "none"; };
+    pill.addEventListener("click", () => {
+      meta.content = base + ", minimum-scale=1";
+      requestAnimationFrame(() => { meta.content = base; window.scrollTo(0, 0); setTimeout(check, 300); });
+    });
+    if (vv) { vv.addEventListener("resize", check); vv.addEventListener("scroll", check); }
+    check();
+  })();
 </script>
 <script type="module" src="lifecycle.js"></script>
 <script type="module" src="app.js"></script>
