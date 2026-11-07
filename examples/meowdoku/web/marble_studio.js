@@ -178,7 +178,8 @@ function rebuild() {
   const geometry = $("base-shape").value!=="marble" ? diceSolid($("base-shape").value,{
     shellMaterial:idFor("glass"),markMaterial:idFor("mark"),markingMode:$("marking-mode").value,
     reliefDepth:+$("relief-depth").value/1000,markScale:+$("mark-scale").value/100,
-    subdivisions:$("base-shape").value==="d4"?48:24}) : catEyeMarble({
+    subdivisions:+$("dice-detail").value,bevelRadius:+$("dice-bevel").value/1000,
+    faceRelief:+$("dice-face-relief").value/1000,compensateRaised:$("compensate-raised").checked}) : catEyeMarble({
     glass: idFor("glass"), enamel: coatedId, eye: idFor("eye"), accent: idFor("accent"), confetti: idFor("confetti"),
     paintA:paintAId,paintB:paintBId }, {
     rings:96, segments:128, eyeWidth:+$("width").value/100,
@@ -203,15 +204,27 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
+  const diceCost=()=>{const kind=$("base-shape").value,
+    factor={d4:12,d6:24,d8:24,d10:40,d12:60,d20:60}[kind]||0;
+    $("dice-detail-cost").value=kind==="marble"?"Die detail applies to polyhedra":
+      `Estimated ${kind.toUpperCase()}: ${(factor*(+$("dice-detail").value)**2).toLocaleString()} triangles`;
+  };
   $("base-shape").addEventListener("change",()=>{
     if($("base-shape").value!=="marble"&&!dieDefaultsApplied) {
       $("shell").value="ceramic_porcelain";$("mark-material").value="stone_onyx";
       $("layer").value="mark";$("opaque").checked=false;opaqueSaved=null;
       yaw=-0.65;pitch=0.42;dieDefaultsApplied=true;copyCoating();
     }
-    rebuild();syncMaterial();
+    diceCost();rebuild();syncMaterial();
   });
   for(const field of ["marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  for(const field of ["dice-detail","dice-bevel","dice-face-relief"]) $(field).addEventListener("input",()=>{
+    $(field+"-out").value=field==="dice-detail"?$(field).value:(+$(field).value/1000).toFixed(3);
+    if(field==="dice-detail")diceCost();
+  });
+  $("compensate-raised").addEventListener("change",()=>{rebuild();syncMaterial();});
+  diceCost();
   const lightValue=(name)=>{const divisor=name==="light-strength"?10:name.startsWith("spot")?1:100;
     return (+$(name).value/divisor).toFixed(name.startsWith("spot")?0:2);};
   for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
