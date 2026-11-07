@@ -4,6 +4,11 @@ The single list of user-requested items still open. Update it as items land.
 Rules: the server and page run the same law text; fix generators, not output;
 deploy to 8766 as soon as work lands.
 
+## Fountain lane rules
+
+- No fountain lane waits on the large native: law tests and parity run on the 256-id native piece only, render-only work never compiles the law, and the 4k native/wasm fallbacks build only in the background (the server builds WebGPU first, then the fallbacks).
+- A dynamic-N law (sort stages, search and candidate walk as real loops, n as a runtime uniform) is being measured by the 3D job: if it compiles in minutes, it becomes the parity reference at any size.
+
 ## In flight (workers)
 
 - **Fountain stage A follow-ups** (stage A landed in ee0883d7):
