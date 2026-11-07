@@ -701,6 +701,17 @@ def make_handler(sessions: Sessions):
                 return self._library_get()
             if path == "/api/marble_objects":
                 return self._json({"entries": sessions.marble_objects.entries()})
+            if path == "/api/marble_preview_spec":
+                # Independent one-particle run of the compiled 3-D fountain
+                # law. Opening Studio does not replace the user's game.
+                preview = Fountain3DGame(size="small")
+                preview.shape = "sdf_cube"
+                preview.fluid = "air"
+                preview.params.update({"wt0": 1.0, "wt1": 0.0, "wt2": 0.0, "wt3": 0.0,
+                                       "r0": 0.01, "irr0": 0.0, "fl_rho": 0.0, "fl_mu": 0.0})
+                spec = preview.state()["compute"]
+                spec["uniforms"]["emit_rate"] = 1.0e9
+                return self._json(spec)
             if path.startswith("/api/marble_objects/"):
                 try:
                     return self._json(sessions.marble_objects.get(path.rsplit("/", 1)[1]))

@@ -103,12 +103,14 @@
     <p class="wide">Closed triangle volume integrals provide the first and second mass moments, center of mass, and moment of inertia tensor. Separate inclusions displace shell material. Enamel uses a thin-film area estimate. Dice marking material uses Pluck optics; raised and recessed relief currently retains body density, so a differing mark density is unresolved. Dice rolling needs polyhedron contact dynamics.</p>
   </div>
   <h2>Preview motion</h2><div class="grid">
+    <label>Engine<select id="preview-engine"><option value="visual">Visual preview (cheap)</option><option value="particle">Particle simulation (compiled law)</option></select></label>
     <label>Motion<select id="preview-motion"><option value="off">Off</option><option value="rotate">Rotate</option><option value="rock">Rock</option><option value="flip">Flip</option></select></label>
     <label>Object axis<select id="preview-axis"><option value="x">X</option><option value="y" selected>Y</option><option value="z">Z</option></select></label>
     <label>Cycles per second<input id="preview-hz" type="range" min="0.05" max="2" step="0.05" value="0.5"><output id="preview-hz-out">0.50 Hz</output></label>
     <label>Phase offset<input id="preview-phase" type="range" min="0" max="360" step="1" value="0"><output id="preview-phase-out">0°</output></label>
     <label>Rock arc<input id="preview-arc" type="range" min="5" max="180" step="1" value="60"><output id="preview-arc-out">60°</output></label>
-    <p class="wide">Visual object motion only. The checkerboard and lights stay fixed; the saved object contains its shape, materials and mechanics, not this preview motion. Inertia rolling continues to use the calculated mass and moment of inertia.</p>
+    <p class="wide">Visual preview moves the displayed object only; it is the cheap close-up option. Particle simulation runs one particle inside the compiled 3-D fountain case, including moving-case forces and native wall contacts. The saved object supplies the law's supported radius, relative density, friction, restitution, and rolling settings; the current law still uses spherical contact and scalar moment of inertia.</p>
+    <output id="preview-sim-status" class="wide">Particle simulation loads when selected. It uses the compiled sphere-contact law; modeled dice appearance does not yet supply shape contact or spin orientation.</output>
   </div>
   <h2>Material</h2><div class="grid">
     <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="mark">Dice markings</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>
