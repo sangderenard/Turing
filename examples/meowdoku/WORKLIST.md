@@ -56,6 +56,15 @@ deploy to 8766 as soon as work lands.
   - **Landed (first cut):** a page control "look" (web/particle_styles.js, render only): points (default), liquid (screen-space fluid), sand (shaded impostors + density AO), glow, heat (density and moving share: the packed points carry no velocity), stamp (a decaying 8-bit memory under the points, in board coordinates).
   - **Open:** per-species sprites, stamped layers and trails per id, the memory following the 3D law, a velocity channel in the packed points (heat by speed).
 
+## Later desires (the user's, recorded 2026-11-06)
+
+- **Rigid objects in the fountain**, built from the platformer's map emojis and other drawing primitives:
+  - each object is free, pinned/jointed, or fixed;
+  - two-way force interaction with the grains (contacts write forces; only the integrator integrates);
+  - coupled through engine_toy's machine sim and its torque negotiation (its couplings, the dyno pattern), so a waterwheel in the sand toy can be driven (a motor turns it) or receptive (the sand turns it, delivering torque);
+  - first study the existing coupling and collision rules: collisions are force transfer, not penalties.
+- **Fountain regions inside platform games:** a granular material that spills through a course (platformer, side scroller, delve). The same fountain law runs as a region of the level, and its grains interact with the level's tiles and the player.
+
 ## Other open items
 
 - **Pilot:** keep trimming activations and cost; profile server autopilot smoothness.
