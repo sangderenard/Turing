@@ -132,7 +132,7 @@ class GpuProduct {
     return { ok: true, adapter, limits: L, bindingBytes };
   }
 
-  async init(rec, manifest) {
+  async init(rec, manifest, angularCount = 1) {
     const check = await GpuProduct.limits(rec);
     if (!check.ok) throw new Error("refused: " + check.reason);
     const adapter = check.adapter, A = rec.wgsl_abi, B = A.bindings;
@@ -207,7 +207,8 @@ ${commit}
     this.diagRegion = Math.ceil(this.maxFrames * this.diagNames.length * 4 / 256) * 256;
     this.angularSlots = ["wx", "wy", "wz"].every((name) => A.feed_slots[name] !== undefined)
       ? ["wx", "wy", "wz"].map((name) => A.feed_slots[name]) : null;
-    this.angularRegion = this.angularSlots ? Math.ceil(this.maxFrames * 12 / 256) * 256 : 0;
+    this.angularCount = this.angularSlots ? Math.min(rec.n, angularCount) : 0;
+    this.angularRegion = this.angularSlots ? Math.ceil(this.maxFrames * this.angularCount * 12 / 256) * 256 : 0;
     this.frameOffset = this.diagRegion + this.angularRegion;
     this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.frameOffset + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
     this.stateSlots = this.state.map((name) => A.feed_slots[name]);
@@ -281,8 +282,9 @@ ${commit}
       this.#encodeSteps(encoder, snapEvery);
       this.#encodePack(encoder);
       encoder.copyBufferToBuffer(this.pts, 0, stage.buffer, this.frameOffset + j * this.frameBytes, this.frameBytes);
-      if (this.angularSlots) this.angularSlots.forEach((slot, k) =>
-        encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, this.diagRegion + j * 12 + k * 4, 4));
+      if (this.angularSlots) for (let id = 0; id < this.angularCount; id++) this.angularSlots.forEach((slot, k) =>
+        encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot) + id * 4, stage.buffer,
+          this.diagRegion + (j * this.angularCount + id) * 12 + k * 4, 4));
       if (diagAt.includes(j)) this.diagNames.forEach((name, k) => {
         const slot = this.abi.output_slots[name];
         encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, (j * nd + k) * 4, 4);
@@ -302,7 +304,8 @@ ${commit}
         const dst = this.pool.pop() || new Float32Array(words);
         dst.set(new Float32Array(range, this.frameOffset + j * this.frameBytes, words));
         out.frames.push(dst);
-        out.spins.push(this.angularSlots ? Array.from(new Float32Array(range, this.diagRegion + j * 12, 3)) : null);
+        out.spins.push(this.angularSlots ? Array.from({ length: this.angularCount }, (_, id) =>
+          Array.from(new Float32Array(range, this.diagRegion + (j * this.angularCount + id) * 12, 3))) : null);
         out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.diagNames.map((name, k) => [name, new Float32Array(range, (j * nd + k) * 4, 1)[0]])) : null);
       }
       stage.buffer.unmap(); stage.busy = false;
@@ -376,7 +379,7 @@ ${commit}
 class WasmProduct {
   kind = "wasm";
 
-  async init(rec, manifest) {
+  async init(rec, manifest, angularCount = 1) {
     this.rec = rec; this.n = rec.n; this.pad = rec.pad; this.manifest = manifest;
     this.program = await TuringGraphProgram.load(rec.wasm, rec.wasm_abi);
     const abi = this.program.abi;
@@ -384,6 +387,7 @@ class WasmProduct {
     for (const name of abi.argument_names) this.inputs[name] = this.program.view(abi.inputs[name]);
     for (const out of abi.outputs) this.nexts[out.name] = this.program.view(out.id);
     this.state = manifest.law.state;
+    this.angularCount = Math.min(rec.n, angularCount);
     this.ndisp = this.pad; this.frameBytes = this.pad * PT_BYTES; this.pool = []; this.maxFrames = 16;
   }
 
@@ -413,7 +417,7 @@ class WasmProduct {
       this.step(snapEvery);
       out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * PT_WORDS)));
       out.spins.push(["wx", "wy", "wz"].every((name) => this.inputs[name])
-        ? [this.inputs.wx[0], this.inputs.wy[0], this.inputs.wz[0]] : null);
+        ? Array.from({ length: this.angularCount }, (_, id) => [this.inputs.wx[id], this.inputs.wy[id], this.inputs.wz[id]]) : null);
       out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])) : null);
       out.keys.push(keyAt.includes(j) ? { payload: Object.fromEntries(this.state.map((name) => [name, this.inputs[name].slice()])), bytes: this.state.length * this.pad * 4 } : null);
     }
@@ -577,7 +581,7 @@ export class ComputeRuntime {
     this.settleStep = null; this.detector = null; this.diag = null;
     // the pump, the recording and the display cursor
     this.tape = null; this.play = new Playback(); this.shown = null; this.token = 0; this.inflight = 0; this.arrived = new Map();
-    this.rotations = new Map(); // first particle's physical omega and integrated pose, keyed with the recording
+    this.rotations = new Map(); // per-id physical omega and integrated pose, keyed with the recording
     this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
     this.stepsDone = 0; this.stepsPerSec = 0;
     this.lawInputs = {}; this.gravity = null; this.vibration = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
@@ -620,7 +624,8 @@ export class ComputeRuntime {
     if (!this.manifest || this.manifestName !== spec.manifest) {
       this.manifest = await json(spec.manifest); this.manifestName = spec.manifest; await this.#capabilities();
     }
-    const key = `${spec.manifest}:${spec.size}`;
+    const angularCount = Math.max(1, Math.min(16, Math.floor(spec.studio_count || 1)));
+    const key = `${spec.manifest}:${spec.size}:angular${angularCount}`;
     const verdict = this.support[spec.size];
     if (key !== this.productKey) {
       if (verdict && !verdict.ok) throw new Error(`${spec.size} refused: ${verdict.reason}`);
@@ -653,7 +658,7 @@ export class ComputeRuntime {
     const detail = `n=${rec.n.toLocaleString()}, ${rec.wgsl_abi.dispatches} dispatches, ${mb(rec.memory.arena_bytes)}: predicted ${v.speedup.toFixed(2)}x, needs ${model.min_speedup.toFixed(1)}x`;
     let product = null; this.warn = false;
     if (rec.route === "webgpu-compute" && navigator.gpu) {
-      try { product = new GpuProduct(); await product.init(rec, this.manifest); this.why = `compiler verdict: the dispatches pay (${detail})`; }
+      try { product = new GpuProduct(); await product.init(rec, this.manifest, Math.max(1, Math.min(16, Math.floor(spec.studio_count || 1)))); this.why = `compiler verdict: the dispatches pay (${detail})`; }
       catch (error) {
         try { product?.destroy(); } catch { /* the device may be gone */ }
         product = null; this.warn = true;
@@ -664,7 +669,7 @@ export class ComputeRuntime {
       if (!rec.wasm) throw new Error("needs WebGPU: this size has no wasm product");
       this.warn = true; this.why = `FALLBACK to wasm: the compiler chose WebGPU compute (${detail}) but navigator.gpu is absent here (needs https and a WebGPU browser)`;
     } else this.why = `compiler verdict: the dispatches do not pay (${detail})`;
-    if (!product) { product = new WasmProduct(); await product.init(rec, this.manifest); }
+    if (!product) { product = new WasmProduct(); await product.init(rec, this.manifest, Math.max(1, Math.min(16, Math.floor(spec.studio_count || 1)))); }
     this.product = product; this.productKey = key; this.settleStep = null; this.stepMs = 0;
     this.route = product.kind;
     // one snapshot per `snapEvery` steps: about one per displayed frame at x1, and a divisor of the settle rule's sample
@@ -1108,11 +1113,16 @@ export class ComputeRuntime {
         const k = k0 + j, step = k * snap;
         if (this.onSnapshot) this.onSnapshot(k, r.frames[j]);
         this.#release(this.tape.push(k, r.frames[j], r.diags[j]));
-        const omega = r.spins?.[j];
-        if (omega && omega.every(Number.isFinite)) {
-          const prior = this.rotations.get(k - 1), mean = prior ? omega.map((v, i) => (v + prior.omega[i]) / 2) : omega;
-          const quaternion = integrateAngular(prior?.quaternion || [0, 0, 0, 1], mean, snap * this.manifest.law.dt);
-          this.rotations.set(k, { frame: k, quaternion, omega });
+        const omegas = r.spins?.[j];
+        if (omegas) {
+          const prior = this.rotations.get(k - 1);
+          this.rotations.set(k, omegas.map((omega, id) => {
+            if (!omega.every(Number.isFinite)) return null;
+            const previous = prior?.[id];
+            const mean = previous ? omega.map((v, i) => (v + previous.omega[i]) / 2) : omega;
+            const quaternion = integrateAngular(previous?.quaternion || [0, 0, 0, 1], mean, snap * this.manifest.law.dt);
+            return { frame: k, quaternion, omega };
+          }));
         }
         while (this.rotations.size && this.rotations.keys().next().value < this.tape.lo)
           this.rotations.delete(this.rotations.keys().next().value);
@@ -1150,7 +1160,8 @@ export class ComputeRuntime {
 
   // the packed points to draw now (the cursor's frame of the recording)
   points() { return this.ready && this.tape && this.shown != null ? this.tape.get(this.shown) : null; }
-  rotation() { return this.shown == null ? null : this.rotations.get(this.shown) || null; }
+  rotationFor(id) { return this.shown == null ? null : this.rotations.get(this.shown)?.[id] || null; }
+  rotation() { return this.rotationFor(0); }
 
   // --- the run modes: the page's controls call compute.control(name) ---
   control(name) {
