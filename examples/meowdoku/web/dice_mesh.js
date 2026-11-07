@@ -168,20 +168,53 @@ export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,marking
   const supports=facets.map(f=>dot(f.normal,vertices[f.ids[0]]));
   const support=supports.reduce((a,b)=>a+b,0)/supports.length;
   if(supports.some(h=>Math.abs(h-support)>1e-6)) throw new Error('dice bevel requires equal-support faces');
+  const inset=supports.map(h=>h-bevelRadius), roundedCache=new Map();
   const rounded=(p)=>{
     if(!bevelRadius) return p;
-    // The same global map is evaluated on both sides of every seam. It
-    // preserves face centers, rounds edges/corners, and keeps the mesh closed.
-    // The parameter controls the smoothing width; it is not an exact circular
-    // fillet radius on a polyhedron's unequal-angle edges.
-    const normal=[0,0,0], width=bevelRadius*1.2;
-    for(let k=0;k<facets.length;k++) {
-      const gap=Math.max(0,supports[k]-dot(facets[k].normal,p));
-      const w=Math.max(0,1-gap/width)**3;
-      for(let j=0;j<3;j++) normal[j]+=w*facets[k].normal[j];
-    }
-    const n=unit(normal);
-    return p.map((x,i)=>x*(1-bevelRadius/support)+bevelRadius*n[i]);
+    const key=p.map(x=>x.toFixed(12)).join(','),cached=roundedCache.get(key);
+    if(cached) return cached;
+    // Project the original surface point onto the polyhedron inset by r,
+    // then offset that closest point by an exact distance r. The boundary of
+    // this inset-solid + radius-r ball has planar faces, circular edge
+    // fillets, and spherical corner caps. Using the same global map for each
+    // face keeps every seam closed.
+    const candidates=facets.map((f,i)=>i).filter(i=>supports[i]-dot(facets[i].normal,p)<4*bevelRadius);
+    let best=null,bestD=Infinity;
+    const consider=(indices)=>{
+      const ns=indices.map(i=>facets[i].normal);
+      const rhs=indices.map(i=>dot(facets[i].normal,p)-inset[i]);
+      const gram=ns.map(a=>ns.map(b=>dot(a,b)));
+      const augmented=gram.map((row,i)=>[...row,rhs[i]]);
+      for(let col=0;col<indices.length;col++) {
+        let pivot=col;
+        for(let row=col+1;row<indices.length;row++)
+          if(Math.abs(augmented[row][col])>Math.abs(augmented[pivot][col])) pivot=row;
+        if(Math.abs(augmented[pivot][col])<1e-10) return;
+        [augmented[col],augmented[pivot]]=[augmented[pivot],augmented[col]];
+        const divisor=augmented[col][col];
+        for(let j=col;j<=indices.length;j++) augmented[col][j]/=divisor;
+        for(let row=0;row<indices.length;row++) if(row!==col) {
+          const factor=augmented[row][col];
+          for(let j=col;j<=indices.length;j++) augmented[row][j]-=factor*augmented[col][j];
+        }
+      }
+      const lambda=augmented.map(row=>row[indices.length]);
+      if(lambda.some(x=>x< -1e-8)) return;
+      const q=p.map((x,k)=>x-indices.reduce((s,i,j)=>s+lambda[j]*facets[i].normal[k],0));
+      if(facets.some((f,i)=>dot(f.normal,q)>inset[i]+1e-8)) return;
+      const d=dot(sub(p,q),sub(p,q));
+      if(d<bestD) {bestD=d;best=q;}
+    };
+    for(let a=0;a<candidates.length;a++) consider([candidates[a]]);
+    for(let a=0;a<candidates.length;a++) for(let b=a+1;b<candidates.length;b++)
+      consider([candidates[a],candidates[b]]);
+    for(let a=0;a<candidates.length;a++) for(let b=a+1;b<candidates.length;b++)
+      for(let c=b+1;c<candidates.length;c++) consider([candidates[a],candidates[b],candidates[c]]);
+    if(!best) throw new Error(`no feasible inset projection for ${kind}`);
+    const direction=unit(sub(p,best));
+    const result=best.map((x,i)=>x+bevelRadius*direction[i]);
+    roundedCache.set(key,result);
+    return result;
   };
   const numbered=numberFaces(facets,kind), glass=[], faceInfo=[];
   for(let faceIndex=0;faceIndex<numbered.length;faceIndex++) {
@@ -193,11 +226,16 @@ export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,marking
       const b=polygon[(k+1)%polygon.length];
       return Math.abs(dot(cross(sub(b,a),sub(center,a)),face.normal))/Math.hypot(...sub(b,a));
     }));
+    const reliefEdges=polygon.map((a,k)=>{
+      const b=polygon[(k+1)%polygon.length],idA=face.ids[k],idB=face.ids[(k+1)%polygon.length];
+      const neighbor=facets.find(other=>other!==face&&other.ids.includes(idA)&&other.ids.includes(idB));
+      if(!neighbor) throw new Error(`${kind} missing bevel neighbor`);
+      const cosine=Math.max(-0.999999,Math.min(0.999999,dot(face.normal,neighbor.normal)));
+      return {a,b,margin:bevelRadius*Math.sqrt((1-cosine)/(1+cosine))};
+    });
     const edgeFade=(p)=>{
-      const d=Math.min(...polygon.map((a,k)=>{
-        const b=polygon[(k+1)%polygon.length];
-        return Math.abs(dot(cross(sub(b,a),sub(p,a)),face.normal))/Math.hypot(...sub(b,a));
-      }));
+      const d=Math.min(...reliefEdges.map(({a,b,margin})=>
+        Math.abs(dot(cross(sub(b,a),sub(p,a)),face.normal))/Math.hypot(...sub(b,a))-margin));
       const t=Math.min(1,Math.max(0,d/(0.18*inradius)));
       return t*t*(3-2*t);
     };
