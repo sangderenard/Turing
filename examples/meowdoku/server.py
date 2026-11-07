@@ -59,8 +59,11 @@ from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
+from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
+from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
+PRODUCT_WAIT_SECONDS = 90       # [LOADING] how long a request for a building product file waits before "503, retry"
 PROFILES = ROOT / "build" / "meowdoku" / "profiles.json"
 
 
@@ -315,6 +318,10 @@ class Sessions:
         boards = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.board_count = len(boards["boards"])
         self.lifecycle = None                   # LIFECYCLE: set by main(); restores a saved session for a cookie that has a file
+        self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
+        self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
+        self.anim_busy = threading.Lock()
+        self.anim_hits: dict[str, list] = {}
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -513,6 +520,10 @@ def make_handler(sessions: Sessions):
             path = self.path.split("?", 1)[0]
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
                 return self._lifecycle_get()
+            if path == "/api/ready":                              # [LOADING] per-product readiness, polled by the page (loading_panel.js)
+                return self._ready()
+            if path == "/api/loading_anim":
+                return self._anim_get()
             if path == "/api/spectate/watch":
                 return self._watch()
             if path.startswith("/api/share/"):
@@ -535,7 +546,67 @@ def make_handler(sessions: Sessions):
                 table = self._table()
                 with table.lock:
                     return self._json(table.profile())
+            if not path.startswith("/api/") and not sessions.readiness.wait_for_path(path, PRODUCT_WAIT_SECONDS):
+                # [LOADING] a product file that is still building: wait for it (above); past the limit, "try again", never a 404 into a broken page
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.send_header("Retry-After", "5"); self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             return super().do_GET()
+
+        # ---- [LOADING] readiness and the loading animation
+        def _ready(self) -> None:
+            self._set_cookie = []
+            out = sessions.readiness.snapshot()
+            info = sessions.anim.info()
+            out["loading_anim"] = ({"present": True, "url": f"/api/loading_anim?v={info['digest']}", **info} if info
+                                   else {"present": False, "upload": True})
+            self._json(out)
+
+        def _anim_get(self) -> None:
+            self._set_cookie = []
+            info = sessions.anim.info()
+            body = sessions.anim.read() if info else None
+            if body is None:
+                return self._json({"error": "no loading animation recorded yet"}, HTTPStatus.NOT_FOUND)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", f'"{info["digest"]}"')
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")        # the URL carries the digest
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _anim_post(self, length: int) -> None:
+            """Accept a loading animation (the raw MLA1 stream the page filtered from its state memory): only when none exists, only a
+            valid stream under the size cap, from a same-origin script (the custom header forces a CORS preflight no one answers),
+            a few tries per address, one compression at a time.  The octet codec packs it; the packet is what is stored."""
+            self._set_cookie = []
+            def refuse(message, status):
+                self.close_connection = True                       # the body may be unread
+                return self._json({"error": message}, status)
+            if self.headers.get("X-Meowdoku-Loading") != "1":
+                return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
+            if length <= 0 or length > anim_mod.MAX_BYTES:
+                return refuse(f"the animation must be 1..{anim_mod.MAX_BYTES} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            if sessions.anim.info() is not None:
+                return refuse("a loading animation already exists", HTTPStatus.CONFLICT)
+            now, hits = time.time(), sessions.anim_hits.setdefault(self.client_address[0], [])
+            hits[:] = [t for t in hits if now - t < 600]
+            if len(hits) >= 5:
+                return refuse("too many uploads from this address", HTTPStatus.TOO_MANY_REQUESTS)
+            hits.append(now)
+            raw = self.rfile.read(length)
+            if not sessions.anim_busy.acquire(blocking=False):
+                return self._json({"error": "an animation is being stored"}, HTTPStatus.CONFLICT)
+            try:
+                return self._json({"stored": sessions.anim.put(raw)}, HTTPStatus.CREATED)
+            except anim_mod.AnimError as error:
+                return self._json({"error": f"not a valid animation: {error}"}, HTTPStatus.BAD_REQUEST)
+            except FileExistsError:
+                return self._json({"error": "a loading animation already exists"}, HTTPStatus.CONFLICT)
+            finally:
+                sessions.anim_busy.release()
 
         # ---- LIFECYCLE (lifecycle.py): the announcement every page reads, the page's copy re-seeding a session, and the admin trigger.
         def _lifecycle_get(self) -> None:
@@ -587,6 +658,8 @@ def make_handler(sessions: Sessions):
                 print(f"[client-error] {self.client_address[0]}: {line}", flush=True)
                 self.send_response(204); self.end_headers()
                 return
+            if path0 == "/api/loading_anim" and not self._is_viewer():
+                return self._anim_post(int(self.headers.get("Content-Length") or 0))
             if path0 in ("/api/admin/lifecycle", "/api/lifecycle/restore") and not self._is_viewer():
                 return self._lifecycle_post(path0, int(self.headers.get("Content-Length") or 0))
             if self._is_viewer():
@@ -634,23 +707,47 @@ def make_handler(sessions: Sessions):
     return Handler
 
 
-def prepare_predictor(web_dir: Path) -> None:
-    """The page's ship predictor: ``entity_motion.damped_axis`` lowered to a
-    WebAssembly core (rebuilt only when its source changes), and the mobile
-    reference app's loader for it."""
+def install_shell(web_dir: Path) -> None:
+    """The mobile reference app's wasm loader, which app.js imports: copied before the server listens (a file copy), because the page
+    cannot start without it."""
     import shutil
-    from meowdoku.entity_motion import build_predictor
     shell = ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js"
     shutil.copyfile(shell, web_dir / "turing-wasm-shell.js")
+
+
+def prepare_predictor(web_dir: Path, ctx=None) -> None:
+    """The page's ship predictor: ``entity_motion.damped_axis`` lowered to a
+    WebAssembly core (rebuilt only when its source changes)."""
+    from meowdoku.entity_motion import build_predictor
     try:
         build_predictor(web_dir)
         print("[meowdoku] engine laws for the page: every entity_motion.PREDICTORS core (motion, travel, ..., shot, climb, project, heading, gate, ballistic) ready", flush=True)
     except Exception as error:  # the page plays without prediction
         print(f"[meowdoku] ship predictor NOT built ({type(error).__name__}: {error}); "
               "free-board games run unpredicted", flush=True)
+        if ctx is not None:
+            ctx.failed("predictor", f"{type(error).__name__}: {error}"[:300])
 
 
-def prepare_fountain(web_dir: Path) -> None:
+def _settle_family(ctx, family: str, wasm: bool) -> None:
+    """[LOADING] A fountain family's build finished: its GPU product and (unless MEOWDOKU_FOUNTAIN_WASM=0) its CPU fallbacks are ready."""
+    if ctx is None:
+        return
+    if ctx.readiness.state(family) not in startup_mod.SETTLED:
+        ctx.ready(family)
+    (ctx.ready if wasm else ctx.skipped)(f"{family}_cpu", "" if wasm else "MEOWDOKU_FOUNTAIN_WASM=0")
+
+
+def _fail_family(ctx, family: str, error) -> None:
+    if ctx is None:
+        return
+    detail = f"{type(error).__name__}: {error}"[:300]
+    for name in (family, f"{family}_cpu"):
+        if ctx.readiness.state(name) not in startup_mod.SETTLED:
+            ctx.failed(name, detail)
+
+
+def prepare_fountain(web_dir: Path, ctx=None) -> None:
     """The fountain's compute product (the page's generic compute runtime loads it) (``fountain_build.build``):
     the generated WebGPU compute shader and the wasm product for each size, and
     the manifest holding the compiler's deployment verdicts.  Rebuilt only when
@@ -662,16 +759,20 @@ def prepare_fountain(web_dir: Path) -> None:
             routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
             print(f"[meowdoku] fountain WebGPU products ready ({routes}; {time.perf_counter() - started:.1f}s); "
                   f"CPU fallbacks follow in the background", flush=True)
+            if ctx is not None:
+                ctx.ready("fountain", "WebGPU products")            # [LOADING] the page can run on a WebGPU browser now
         # MEOWDOKU_FOUNTAIN_WASM=0 skips the CPU (wasm) fallbacks entirely: WebGPU products only (a rushed deploy)
         wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
         fountain_build.build(web_dir, wasm=wasm, on_gpu_ready=gpu_ready)
         print(f"[meowdoku] fountain CPU fallbacks {'ready' if wasm else 'skipped (MEOWDOKU_FOUNTAIN_WASM=0)'} "
               f"({time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain", wasm)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain", error)
 
 
-def prepare_fountain_wheel(web_dir: Path) -> None:
+def prepare_fountain_wheel(web_dir: Path, ctx=None) -> None:
     """The 2-D fountain's hinged-body (waterwheel) products, beside the default ones (``fountain_build.build_wheel``)."""
     from meowdoku import fountain_build
     try:
@@ -680,11 +781,13 @@ def prepare_fountain_wheel(web_dir: Path) -> None:
         manifest = fountain_build.build_wheel(web_dir, wasm=wasm)
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain wheel products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain_wheel", wasm)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain wheel products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain_wheel", error)
 
 
-def prepare_fountain_purrline(web_dir: Path) -> None:
+def prepare_fountain_purrline(web_dir: Path, ctx=None) -> None:
     """The 2-D fountain's purrline sand variant (the occupancy grid and the moving boxes; ``fountain_build.build_purrline``), built after the
     default and wheel products and independent of them: WebGPU products first, the CPU fallbacks too unless MEOWDOKU_FOUNTAIN_WASM=0."""
     from meowdoku import fountain_build
@@ -694,11 +797,13 @@ def prepare_fountain_purrline(web_dir: Path) -> None:
         manifest = fountain_build.build_purrline(web_dir, wasm=wasm)
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain purrline products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain_purrline", wasm)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain purrline products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain_purrline", error)
 
 
-def prepare_fountain3d(web_dir: Path) -> None:
+def prepare_fountain3d(web_dir: Path, ctx=None) -> None:
     """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
     from meowdoku import fountain3d_build
     try:
@@ -707,14 +812,18 @@ def prepare_fountain3d(web_dir: Path) -> None:
         manifest = fountain3d_build.build(web_dir, wasm=wasm, variant="flat")      # the box and polygons first: the common case
         flat = time.perf_counter() - started
         print(f"[meowdoku] fountain3d flat products ready ({flat:.1f}s); the SDF products follow", flush=True)
+        _settle_family(ctx, "fountain3d_flat", wasm)
         manifest = fountain3d_build.build(web_dir, wasm=wasm, variant="sdf")
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain3d", wasm)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain3d products NOT built ({type(error).__name__}: {error})", flush=True)
+        for family in ("fountain3d_flat", "fountain3d"):
+            _fail_family(ctx, family, error)
 
 
-def prepare_fountain3d_wheel(web_dir: Path) -> None:
+def prepare_fountain3d_wheel(web_dir: Path, ctx=None) -> None:
     """The 3-D fountain's hinged-body (waterwheel) products, after the flat and SDF sets (``fountain3d_build.build(variant="wheel")``)."""
     from meowdoku import fountain3d_build
     try:
@@ -723,11 +832,13 @@ def prepare_fountain3d_wheel(web_dir: Path) -> None:
         manifest = fountain3d_build.build(web_dir, sizes=fountain3d_build.WHEEL_SIZES, wasm=wasm, variant="wheel")
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d wheel products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain3d_wheel", wasm)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain3d wheel products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain3d_wheel", error)
 
 
-def prepare_policy(web_dir: Path) -> None:
+def prepare_policy(web_dir: Path, ctx=None) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
     with the live weights as ``policy.weights.json`` for the page to feed.
@@ -745,9 +856,11 @@ def prepare_policy(web_dir: Path) -> None:
             print(f"[meowdoku] autopilot policy for the page ({name}): policy.wasm + policy.weights.json ready", flush=True)
         except Exception as error:  # the page plays without it
             print(f"[meowdoku] autopilot policy NOT built for {name} ({type(error).__name__}: {error})", flush=True)
+            if ctx is not None:
+                ctx.failed("policy", f"{name}: {type(error).__name__}: {error}"[:300])
 
 
-def prepare_graph_products(web_dir: Path) -> None:
+def prepare_graph_products(web_dir: Path, ctx=None) -> None:
     """The bullet-hell law and the token pilot as buffer-table WebAssembly
     products (``graph_wasm.py``): ``law.wasm`` + ``law.abi.json`` and
     ``pilot.wasm`` + ``pilot.abi.json`` + ``pilot.weights.json``, rebuilt only
@@ -763,6 +876,41 @@ def prepare_graph_products(web_dir: Path) -> None:
                   f"{time.perf_counter() - started:.1f}s)", flush=True)
         except Exception as error:  # the page plays without it
             print(f"[meowdoku] page {label} graph product NOT built ({type(error).__name__}: {error})", flush=True)
+            if ctx is not None:
+                ctx.failed("graph", f"{label}: {type(error).__name__}: {error}"[:300])
+
+
+def predictor_stems() -> tuple[str, ...]:
+    from meowdoku.entity_motion import PREDICTORS
+    return tuple(p[3] for p in PREDICTORS)
+
+
+def prepare_autopilot(args, ctx=None) -> None:
+    from meowdoku import autopilot
+    print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
+    autopilot.load_learning()
+    from meowdoku import idle_trainer
+    if not args.no_idle_train:
+        idle_trainer.start_default()                    # studies recorded play whenever the server is idle
+
+
+def prepare_lanes(web_dir: Path, args) -> dict:
+    """[LOADING] The prepare steps as lanes (startup.Lanes): each lane runs its steps in order on its own thread, the lanes side by side.
+    ``laws``: the page's engine laws first (the free-board games need them), then the inspection-only policy and graph products;
+    ``fountain``: the fountain families as they always ran (GPU products before CPU fallbacks within each); ``autopilot``: the weights."""
+    step = lambda products, fn: (products, fn)                                  # noqa: E731
+    both = lambda family: (family, f"{family}_cpu")                             # noqa: E731
+    return {
+        "laws": [step(("predictor",), lambda c: prepare_predictor(web_dir, c)),
+                 step(("policy",), lambda c: prepare_policy(web_dir, c)),
+                 step(("graph",), lambda c: prepare_graph_products(web_dir, c))],
+        "fountain": [step(both("fountain"), lambda c: prepare_fountain(web_dir, c)),
+                     step(both("fountain_wheel"), lambda c: prepare_fountain_wheel(web_dir, c)),
+                     step(both("fountain_purrline"), lambda c: prepare_fountain_purrline(web_dir, c)),
+                     step(both("fountain3d_flat") + both("fountain3d"), lambda c: prepare_fountain3d(web_dir, c)),
+                     step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c))],
+        "autopilot": [step(("autopilot",), lambda c: prepare_autopilot(args))],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -784,29 +932,23 @@ def main(argv: list[str] | None = None) -> int:
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
-    prepare_predictor(web_dir)
-    prepare_policy(web_dir)
-    prepare_graph_products(web_dir)
-    # The fountains' products can take a long compile (the 256 / 4k native + wasm fallbacks): every other game serves
-    # meanwhile, and the fountain pages read their manifests once written.  The 2-D fountain first, then the 3-D one
-    # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
+    # [LOADING] BIND FIRST.  Nothing below the listening socket waits on a compile: the prepare steps run in background lanes
+    # (startup.py), each product reporting its state to /api/ready; a game's page starts when ITS products are ready (the Meowdoku
+    # puzzle, chess, ... need none: playable at once) and a request for a file that is still building waits for it.
+    install_shell(web_dir)
     if args.no_wasm:
-        os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
-    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain_purrline(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
+        os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"                   # the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
-    from meowdoku import autopilot
-    print(f"[meowdoku] autopilot weights loaded: {', '.join(autopilot.preload()) or 'none (train with autopilot.py)'}", flush=True)
-    autopilot.load_learning()
-    from meowdoku import idle_trainer
-    if not args.no_idle_train:
-        idle_trainer.start_default()                    # studies recorded play whenever the server is idle
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     lc = lifecycle_mod.Lifecycle(sessions, web_dir.parent, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
     lc.server, sessions.lifecycle = server, lc
+    sessions.readiness.predictor_stems = predictor_stems()
+    lanes = prepare_lanes(web_dir, args)
+    startup_mod.Lanes(sessions.readiness).declare(lanes)            # every product is visible as "pending" from the first request
     lifecycle_mod.record_launch(lc.paths, args.port, args.bind, web_dir)
     threading.Thread(target=lc.run, name="lifecycle", daemon=True).start()
     scheme = "http"
@@ -820,6 +962,7 @@ def main(argv: list[str] | None = None) -> int:
                                             do_handshake_on_connect=False)
         scheme = "https"
     print(f"[meowdoku] serving {web_dir} at {scheme}://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
+    startup_mod.Lanes(sessions.readiness).start(lanes)               # [LOADING] the builds begin once the socket is accepting
     try:
         server.serve_forever()
     except KeyboardInterrupt:
