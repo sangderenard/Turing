@@ -92,9 +92,15 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
-  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
+  rollState, exteriorOpaque=false, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
+function syncExteriorOpacity() {
+  exteriorOpaque=!!lastGeometry?.glass.every((face)=>{
+    const id=face[3], transmission=read("pbr",id,5), opacity=read("pbr",id,7);
+    return Math.min(opacity,1-0.8*transmission)>=0.999;
+  });
+}
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
   ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material",mark:"mark-material"}[layer]).value];
 const slot = (table, id, offset) => id * tables[table].table.floats_per_record + offset;
@@ -191,6 +197,7 @@ function rebuild() {
     kind:$("kind").value, seed });
   const {interior:inside,glass:outside,triangleCount}=geometry;
   interior = mesh(inside); glass = mesh(outside); lastGeometry=geometry;
+  syncExteriorOpacity();
   for (const name of dimensions) $(name+"-out").value = $(name).value;
   message.textContent = `${triangleCount.toLocaleString()} triangles · pattern #${seed}`;
   reportMass(geometry);
@@ -211,6 +218,15 @@ function controls() {
     $(name).addEventListener("input",()=>{$(name+"-out").value=lightValue(name);});
   for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
     $(name+"-out").value=lightValue(name);
+  const setInnerFromHardness=()=>{const outer=+$("spot-outer").value,hardness=+$("spot-hardness").value/100;
+    $("spot-inner").value=Math.max(5,Math.min(outer-1,Math.round(outer-(outer-5)*(1-hardness))));
+    $("spot-inner-out").value=$("spot-inner").value;$("spot-hardness-out").value=`${Math.round(hardness*100)}%`;};
+  $("spot-hardness").addEventListener("input",setInnerFromHardness);
+  $("spot-outer").addEventListener("input",setInnerFromHardness);
+  $("spot-inner").addEventListener("input",()=>{const outer=+$("spot-outer").value,inner=+$("spot-inner").value;
+    $("spot-hardness").value=Math.max(0,Math.min(100,Math.round(100*(1-(outer-inner)/(outer-5)))));
+    $("spot-hardness-out").value=`${$("spot-hardness").value}%`;});
+  setInnerFromHardness();
   $("reset-roll").addEventListener("click",resetRoll);
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
@@ -243,20 +259,22 @@ function controls() {
       for (const [k,target] of [id,coatedId].entries()) { write("pbr",target,5,opaqueSaved[k*2]); write("pbr",target,7,opaqueSaved[k*2+1]); }
       opaqueSaved=null;
     }
+    syncExteriorOpacity();
     syncMaterial();
   });
   $("layer").addEventListener("change", syncMaterial);
   $("reroll").addEventListener("click", () => { seed = (Math.random() * 0x7fffffff) | 0; rebuild(); });
   $("reset-material").addEventListener("click", () => { const id = selected();
-    if (id === coatedId) { copyCoating(); syncMaterial(); return; }
-    if (id === paintAId || id === paintBId) { copyPaint(); syncMaterial(); return; }
+    if (id === coatedId) { copyCoating(); syncExteriorOpacity();syncMaterial(); return; }
+    if (id === paintAId || id === paintBId) { copyPaint(); syncExteriorOpacity();syncMaterial(); return; }
     for (const table of Object.values(tables)) { const f = table.table.floats_per_record, start = id*f;
-      table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncMaterial(); });
+      table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncExteriorOpacity();syncMaterial(); });
   for (const [name,[table,offset,scale]] of Object.entries(properties)) $(name).addEventListener("input", () => {
     if ((name==="transmission" || name==="opacity") && ["glass","enamel"].includes($("layer").value)) {
       $("opaque").checked=false;opaqueSaved=null;
     }
     const value = +$(name).value; write(table,selected(),offset,value/scale);
+    if(name==="transmission"||name==="opacity") syncExteriorOpacity();
     $(name+"-out").value = (value/scale).toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
     if(name==="enamel-thickness" && lastGeometry) reportMass(lastGeometry);
   });
@@ -317,8 +335,10 @@ function frame(now=0) {
       setTransform(view); gl.bindVertexArray(checkerMesh.vao);
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
+    gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
     gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
-    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    if(!exteriorOpaque) {gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);}
+    else {gl.disable(gl.BLEND);gl.depthMask(true);}
     gl.bindVertexArray(glass.vao); gl.drawArrays(gl.TRIANGLES,0,glass.count);
     gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
   }
