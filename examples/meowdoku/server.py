@@ -9,7 +9,7 @@ prebaked board database) and a JSON API over the games in ``games.py``:
     POST /api/new     {"game": "meowdoku", "id": "<board id>"}
                       {"game": "chess"|"checkers"} | {"game": "wordle", "seed": 3}
     POST /api/action  {"type": "cell", "r", "c", "button"} | {"type": "text", "text"}
-                      | {"type": "submit"|"backspace"|"undo"|"reset"}
+                      | {"type": "submit"|"backspace"|"undo"|"reset"|"give_up"}
                       | {"type": "tick", "move_axis", "fire"}  (free-board games)
                       | {"type": "autopilot", "on": true|false}  (entity games: the trained policy
                         in ``autopilot.py`` supplies each tick's controls; state field ``autopilot``)
@@ -249,7 +249,7 @@ class Table:
             if not hasattr(self.game, "set_mode"):
                 raise ValueError("this game has no modes")
             self.game.set_mode(str(payload.get("name", "")), bool(payload.get("on")))
-        elif kind in ("submit", "backspace", "undo", "reset"):
+        elif kind in ("submit", "backspace", "undo", "reset", "give_up"):
             getattr(self.game, kind)()
             if kind in ("undo", "reset"):
                 self.recorded = None if self.game.result() is None else self.recorded

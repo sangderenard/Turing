@@ -680,9 +680,18 @@ class Checkers(BoardGame):
 # ---------------------------------------------------------------------------
 
 class Wordle(Game):
+    """Six rows on the board, and OVERTIME.  The sixth wrong guess does not end the game: the board is a WINDOW of six rows (the
+    guesses already made that still fit, then the row being typed), and each guess past the fifth slides the window up one row.
+    ``offset`` = the guesses scrolled off the top = the "+n" the page shows.  The rack's evidence uses ALL guesses.  The answer is
+    revealed only by ``give_up()`` (the page's give-up tile) or by solving it.
+
+    Result and awards: a regulation win (within six) scores 7 - guesses as always.  A win in overtime scores 0 and carries
+    ``overtime`` (guesses - 6), so it never beats a regulation win and the profile's streak is broken, not grown (profiles.award);
+    a regulation loss stays a loss even when the word is found later.  ``lost`` = gave up."""
     game = "wordle"
     input = "text"
     title = "Wordle"
+    ROWS = 6
     RACK = ("QWERTYUIOP", "ASDFGHJKL", "↵ZXCVBNM⌫")   # the last row's ends are Enter and Backspace keys
     KEY_MESH = {"↵": "enter", "⌫": "back"}
 
@@ -699,6 +708,16 @@ class Wordle(Game):
         self.guesses: list[str] = []
         self.entry = ""
         self.won = False
+        self.gave_up = False
+
+    @property
+    def over(self) -> bool:
+        return self.won or self.gave_up
+
+    def offset(self) -> int:
+        """Guesses scrolled off the top of the six-row window.  While playing the window holds the last five guesses and the
+        entry row; once over (won or given up) it holds the last six."""
+        return max(0, len(self.guesses) - (self.ROWS if self.over else self.ROWS - 1))
 
     def text(self, value: str) -> None:
         self.entry = "".join(ch for ch in value.lower() if ch.isalpha())[:self.length]
@@ -707,7 +726,7 @@ class Wordle(Game):
         self.entry = self.entry[:-1]
 
     def submit(self) -> None:
-        if self.won or len(self.guesses) >= 6:
+        if self.over:
             return
         if len(self.entry) != self.length:
             self.status = f"{self.length} letters"
@@ -721,17 +740,28 @@ class Wordle(Game):
         self.entry = ""
         self.status = "" if not self.won else "got it!"
 
+    def give_up(self) -> None:
+        """End the game and reveal the answer (the give-up tile)."""
+        if not self.over:
+            self.gave_up = True
+            self.entry = ""
+            self.status = ""
+
     def result(self) -> dict[str, Any] | None:
         if not self.won:
             return None
+        extra = len(self.guesses) - self.ROWS
+        if extra > 0:
+            return {"score": 0, "overtime": extra, "detail": f"{self.answer.upper()} in {self.ROWS}+{extra}"}
         return {"score": 7 - len(self.guesses), "detail": f"{self.answer.upper()} in {len(self.guesses)}"}
 
     def undo(self) -> None:
         if self.guesses and not self.won:
             self.guesses.pop(); self.moves -= 1
+            self.gave_up = False          # the answer is hidden again with the guess that led there
 
     def reset(self) -> None:
-        self.guesses, self.entry, self.won, self.moves, self.status = [], "", False, 0, ""
+        self.guesses, self.entry, self.won, self.gave_up, self.moves, self.status = [], "", False, False, 0, ""
 
     @staticmethod
     def score(guess: str, answer: str) -> list[str]:
@@ -749,27 +779,38 @@ class Wordle(Game):
         return result
 
     def state(self) -> dict[str, Any]:
-        n = self.length
-        st = self.base_state(6, n)
-        st["palette"] = {"cell": [0.22, 0.22, 0.25], "entry": [0.32, 0.32, 0.36], "green": [0.33, 0.65, 0.30],
-                         "yellow": [0.78, 0.66, 0.2], "absent": [0.30, 0.30, 0.33], "unknown": [0.62, 0.62, 0.66],
-                         "letter": [0.93, 0.93, 0.95], "ink": [0.08, 0.08, 0.1]}
-        cells, pieces = ["cell"] * (6 * n), []
+        n, rows = self.length, self.ROWS
+        st = self.base_state(rows, n)
+        # obsidian: dark-but-bright volcanic glass, tinted by evidence (the page gives these names its glass material)
+        st["palette"] = {"cell": [0.20, 0.24, 0.34], "entry": [0.34, 0.42, 0.58], "typed": [0.40, 0.52, 0.74], "green": [0.14, 0.72, 0.32],
+                         "yellow": [0.92, 0.68, 0.10], "absent": [0.17, 0.18, 0.23], "unknown": [0.38, 0.44, 0.60],
+                         "letter": [0.97, 0.97, 1.0], "ink": [0.98, 0.98, 1.0], "badge": [1.0, 0.78, 0.25]}
+        st["emissive"] = {"badge": [0.9, 0.6, 0.1], "ink": [0.55, 0.55, 0.6], "letter": [0.55, 0.55, 0.6]}
+        cells = ["cell"] * (rows * n)
+        pieces: list[dict[str, Any]] = []
         best: dict[str, str] = {}
         rank = {"absent": 0, "yellow": 1, "green": 2}
-        for g, guess in enumerate(self.guesses):
+        off = self.offset()
+        for g, guess in enumerate(self.guesses):          # the rack learns from ALL guesses, the board shows the window
             colours = self.score(guess, self.answer)
             for i, ch in enumerate(guess):
-                cells[g * n + i] = colours[i]
-                pieces.append({"id": f"g{g}-{i}", "cell": g * n + i, "mesh": ch.upper(), "color": "letter"})
                 if rank[colours[i]] >= rank.get(best.get(ch, "absent"), -1):
                     best[ch] = colours[i]
-        row = len(self.guesses)
-        if row < 6:
+                if g < off:
+                    continue
+                cells[(g - off) * n + i] = colours[i]
+                pieces.append({"id": f"g{g}-{i}", "cell": (g - off) * n + i, "mesh": ch.upper(), "color": "letter"})
+        row = len(self.guesses) - off
+        if not self.over and row < rows:
             for i, ch in enumerate(self.entry):
                 cells[row * n + i] = "entry"
                 pieces.append({"id": f"entry-{i}-{ch}", "cell": row * n + i, "mesh": ch.upper(), "color": "ink"})
+        if off:                                            # the "+n" over regulation, glowing beside the board
+            for k, ch in enumerate("+" + str(off)):
+                pieces.append({"id": f"badge-{off}-{k}", "cell": f"badge:{k}:{len(str(off)) + 1}", "mesh": ch, "color": "badge"})
         st["cells"], st["pieces"] = cells, pieces
+        st["overtime"], st["window_offset"] = off, off
+        st["give_up"] = None if self.over or not off else {"cell": "absent", "mesh": "giveup", "color": "ink"}
         rack_cells, rack_pieces = [], []
         for r, line in enumerate(self.RACK):
             for c, ch in enumerate(line):
@@ -778,15 +819,23 @@ class Wordle(Game):
             rack_cells += [""] * (10 - len(line))
         st["rack"] = {"rows": 3, "cols": 10, "cells": rack_cells, "pieces": rack_pieces,
                       "letters": ["".join(line) for line in self.RACK]}
+        # the entry bar above the board: Enter, one backing tile per letter of the word, Backspace (the same obsidian key family)
+        bar_cells = ["entry"] + ["typed" if i < len(self.entry) else "unknown" for i in range(n)] + ["entry"]
+        bar_pieces = [{"id": "bar-enter", "cell": 0, "mesh": "enter", "color": "ink"}, {"id": "bar-back", "cell": n + 1, "mesh": "back", "color": "ink"}]
+        bar_pieces += [{"id": f"bar-{i}-{ch}", "cell": i + 1, "mesh": ch.upper(), "color": "ink"} for i, ch in enumerate(self.entry)]
+        st["bar"] = {"rows": 1, "cols": n + 2, "cells": bar_cells, "pieces": bar_pieces}
+        if st["give_up"]:
+            st["pieces"].append({"id": "giveup", "cell": "giveup", "mesh": "giveup", "color": "ink"})
         st["text"], st["text_max"] = self.entry.upper(), n
         from meowdoku import words as word_lists
         st["dictionary"] = {"name": self.dictionary, "length": n, "size": len(self.words),
                             "choices": dict(word_lists.LABELS),
                             "lengths": {k: list(v) for k, v in word_lists.LENGTHS.items()}}
         st["won"] = self.won
-        st["lost"] = (not self.won) and len(self.guesses) >= 6
+        st["lost"] = self.gave_up and not self.won
+        n_guess = len(self.guesses) + 1
         st["status"] = self.status or self.note or ("got it!" if self.won else f"the word was {self.answer.upper()}" if st["lost"]
-                                                    else f"guess {len(self.guesses) + 1} of 6")
+                                                    else f"guess {n_guess}" + (f" ({rows}+{n_guess - rows})" if n_guess > rows else f" of {rows}"))
         return st
 
 

@@ -16,6 +16,7 @@ import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalContr
 import { LawClock } from "./pilot_clock.js";
 import { initTipJar } from "./tipjar.js";                                                              // the tip jar's panel and grain picker
 import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
+import * as wl from "./wordle_layout.js";                                                             // Wordle: the rack, entry bar and give-up tile layout (pure)
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 import { GameClock, SPEED, sliderToSpeed, speedToSlider, speedLabel } from "./game_clock.js";   // [SPEED+ZOOM]
 import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } from "./world_zoom.js";                  // [SPEED+ZOOM]
@@ -1726,6 +1727,15 @@ function meowMaterial(name, rgb) {
   return [rgb, { roughness: 0.58 }];
 }
 
+// Wordle's tiles are OBSIDIAN: volcanic glass, dark but bright, through the scene's advanced material path (the PBR record's transmission,
+// ior, roughness and specular, and the Phong record's specular strength and shininess; as "housing@glass" / "outline@glass" are).  The
+// evidence colours are tinted obsidian; a little emission of the tint keeps the glass bright where nothing lights it.
+const WORDLE_TILES = new Set(["cell", "entry", "typed", "green", "yellow", "absent", "unknown"]);
+function wordleMaterial(role, tint) {
+  const base = role.replace(/@.*/, "");
+  if (!WORDLE_TILES.has(base)) return [tint, {}];
+  return [tint.map((v) => 0.62 * v), { roughness: 0.07, transmission: 0.55, opacity: 0.84, ior: 1.5, specular: 1.0, shininess: 150, emission: tint.map((v) => 0.12 * v) }];
+}
 // ---------------------------------------------------------------- materials from the palette
 // The grain finishes (a family of scene materials the fountain's material / stained styles can take; see uploadMaterials).  Every
 // field below is one the shader reads from its own tables; what each does on screen is stated beside it.  [name, albedo, record].
@@ -1780,6 +1790,7 @@ function uploadMaterials(game) {
       // against it and the sun leaves a soft highlight.  (It was always drawn
       // this dark, but by accident -- see pointsFrame.)  Declared here as a finish.
       const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint)
+        : game.game === "wordle" ? wordleMaterial(role, tint)
         : isFountainGame(game) ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
@@ -1949,13 +1960,15 @@ function uploadMaterials(game) {
 }
 
 // ---------------------------------------------------------------- boards
-function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf, rowSize = cellSize) {
-  const faces = [], g = TILE.gap * cellSize, i = TILE.inset * cellSize, h = TILE.height * cellSize;
+function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf, rowSize = cellSize, look = {}) {
+  // look: { gapX, gapZ } the gap on each side of a tile (default the board's), { rowLeft(r) } the x of row r's first tile (default origin[0])
+  const faces = [], gx = look.gapX ?? TILE.gap * cellSize, gz = look.gapZ ?? TILE.gap * cellSize, i = TILE.inset * cellSize, h = TILE.height * cellSize;
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
     const name = cellName(r, c); if (!name) continue;
     const m = state.materialIndex[hintOf ? hintOf(r, c, name) : name] ?? state.materialIndex[name];
-    const x0 = origin[0] + c * cellSize + g, x1 = origin[0] + (c + 1) * cellSize - g;
-    const z0 = origin[1] + r * rowSize + g, z1 = origin[1] + (r + 1) * rowSize - g;
+    const left = look.rowLeft ? look.rowLeft(r) : origin[0];
+    const x0 = left + c * cellSize + gx, x1 = left + (c + 1) * cellSize - gx;
+    const z0 = origin[1] + r * rowSize + gz, z1 = origin[1] + (r + 1) * rowSize - gz;
     const b = [[x0,0,z0],[x1,0,z0],[x1,0,z1],[x0,0,z1]];
     const tp = [[x0+i,h,z0+i],[x1-i,h,z0+i],[x1-i,h,z1-i],[x0+i,h,z1-i]];
     faces.push([tp[0], tp[2], tp[1], m], [tp[0], tp[3], tp[2], m]);
@@ -1963,14 +1976,46 @@ function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf, rowSize = c
   }
   return faces;
 }
-const RACK_ASPECT = 1.5, RACK_WIDE = 1.5;   // keys 0.75 board cells wide, 1.125 tall (Wordle: 10 per row)
+// WORDLE's layouts (wordle_layout.js holds the pure part): the rack's rows each centred by their own key count, the entry bar above the
+// board, and the give-up tile beside it in overtime
 function rackLayout(game) {
   if (!game.rack) return null;
-  const span = game.cols * RACK_WIDE, size = span / game.rack.cols;  // the rack runs RACK_WIDE x the board's width, centred under it
-  // its keys are TALL (RACK_ASPECT x their width), like a phone keyboard's: a portrait screen has the height to spare, and the keys
-  // become easy to hit; the rack sits closer under the board
-  const zsize = size * RACK_ASPECT;
-  return { size, zsize, span, origin: [(game.cols - span) / 2, game.rows + 0.45], rows: game.rack.rows, cols: game.rack.cols };
+  return wl.rackLayout(game.cols, game.rows, game.rack.rows, game.rack.cols, game.rack.letters.map((l) => l.length));
+}
+function barLayout(game) { return game.bar ? wl.barLayout(game.cols, game.bar.cols, game.rack ? game.rack.cols : 10) : null; }
+function giveLayout(game) { return game.give_up ? wl.giveLayout(game.cols, game.rows) : null; }
+// WORDLE's glass tiles beyond the board and rack: the board's last row (the row being typed, which floats in when the window slides), the
+// entry bar, the give-up tile, and a ghost of the row that slid off the top.  They are drawn BLENDED after the plate (wordleTileDraws).
+const ROW_SLIDE = 0.45;                                           // s: the same as a piece's slide
+function disposeWordle() { const w = state.wordleTiles; if (w) for (const k of ["last", "bar", "give", "ghost"]) disposeMesh(w[k]); state.wordleTiles = null; }
+function wordleTiles(game, bar, give, keyLook) {
+  const n = game.cols, off = game.window_offset || 0, prev = state.wordleSeen;
+  if (prev && prev.id === game.id && off > prev.off) state.rowSlide = { t0: state.time || 0, ghost: prev.top };    // the window moved up
+  else if (!prev || prev.id !== game.id || off < prev.off) state.rowSlide = null;
+  state.wordleSeen = { id: game.id, off, top: game.cells.slice(0, n) };
+  const row = (cells, r) => litMesh(buttonFaces(1, n, (_, c) => cells[c], [0, r], 1.0, null));
+  const w = { last: litMesh(buttonFaces(1, n, (_, c) => game.cells[(game.rows - 1) * n + c], [0, game.rows - 1], 1.0, null)),
+              bar: bar ? litMesh(buttonFaces(1, bar.cols, (_, c) => game.bar.cells[c], bar.origin, bar.size, null, bar.zsize, keyLook(bar))) : null,
+              give: give ? litMesh(buttonFaces(1, 1, () => game.give_up.cell, give.origin, give.size, null, give.zsize, keyLook(give))) : null,
+              ghost: state.rowSlide && state.rowSlide.ghost ? row(state.rowSlide.ghost, 0) : null };
+  state.wordleTiles = w;
+}
+// [mesh, model] of everything Wordle draws as glass this frame; the board's rows ride the slide
+function wordleTileDraws(now) {
+  const w = state.wordleTiles; if (!w) return null;
+  const caseM = state.caseModel || M.identity(), s = state.rowSlide;
+  const t = s ? Math.min(1, Math.max(0, (now - s.t0) / ROW_SLIDE)) : 1, k = ease.out(t);
+  if (s && t >= 1) state.rowSlide = null;
+  const out = [];
+  const up = M.multiply(caseM, M.translate(0, 0, 1 - k));          // the rows start one row LOW and rise to their place
+  if (state.buttons) out.push([state.buttons, up]);
+  if (w.last) out.push([w.last, s ? M.multiply(caseM, M.translate(0, 1.4 * (1 - k), 0)) : caseM]);   // the fresh row floats down into place
+  if (w.ghost && t < 1) {                                            // the row that left: rises and shrinks out
+    const cx = state.game.cols / 2, cz = 0.5, sc = Math.max(0.001, 1 - ease.in(t));
+    out.push([w.ghost, M.multiply(caseM, M.multiply(M.translate(cx, 0.5 * t, cz - t), M.multiply(M.scale(sc, sc, sc), M.translate(-cx, 0, -cz))))]);
+  }
+  for (const m of [state.rackButtons, w.bar, w.give]) if (m) out.push([m, M.identity()]);
+  return out;
 }
 function disposeMesh(mesh) {
   if (!mesh) return;
@@ -1982,10 +2027,10 @@ function rebuildBoards(game) {
   // a second with the same board, and every rebuild used to allocate (and
   // never free) a new set of GPU buffers.
   const key = JSON.stringify([state.materialsVersion, game.board, game.width, game.height, game.rows, game.cols,
-                              game.cells, game.hints, game.selected, game.hearts != null, game.rack && game.rack.cells]);
+                              game.cells, game.hints, game.selected, game.hearts != null, game.rack && game.rack.cells, game.bar && game.bar.cells, !!game.give_up]);
   if (key === state.boardKey) return;
   state.boardKey = key;
-  disposeMesh(state.buttons); disposeMesh(state.rackButtons); disposeMesh(state.trayButtons); state.trayButtons = null; disposeMesh(state.glass);
+  disposeMesh(state.buttons); disposeMesh(state.rackButtons); disposeWordle(); disposeMesh(state.trayButtons); state.trayButtons = null; disposeMesh(state.glass);
   const hintOf = (r, c, name) => {
     const i = r * game.cols + c;
     if (game.selected === i) return `${name}@sel`;
@@ -1995,15 +2040,18 @@ function rebuildBoards(game) {
   // A free board has no cells: one floor slab the entities move over.
   state.buttons = game.board === "free"
     ? litMesh(box(0, 0, 0, game.width, TILE.height, game.height, state.materialIndex.floor))
-    : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
-  const rack = rackLayout(game);
-  state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => game.rack.cells[r * rack.cols + c] || null, rack.origin, rack.size, null, rack.zsize)) : null;
+    : litMesh(buttonFaces(game.rows, game.cols, (r, c) => game.game === "wordle" && r === game.rows - 1 ? null : game.cells[r * game.cols + c], [0, 0], 1.0, hintOf));
+  const rack = rackLayout(game), bar = barLayout(game), give = giveLayout(game);
+  const keyLook = (L) => ({ gapX: L.gapX, gapZ: L.gapZ, rowLeft: L.rowLens ? (r) => wl.rackRowLeft(L, r) : undefined });
+  state.rackButtons = rack ? litMesh(buttonFaces(rack.rows, rack.cols, (r, c) => (c < rack.rowLens[r] ? game.rack.cells[r * rack.cols + c] : null) || null, rack.origin, rack.size, null, rack.zsize, keyLook(rack))) : null;
+  if (game.game === "wordle") wordleTiles(game, bar, give, keyLook);
   const trayFaces = game.powerups ? trayButtonFaces(game) : game.characters ? characterFaces(game) : null;
   state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
-  const depth = rack ? rack.origin[1] + rack.rows * rack.zsize
+  const wx = rack && bar ? wl.wordleExtent(game.cols, game.rows, rack, bar, give) : null;
+  const depth = wx ? wx.depth : rack ? rack.origin[1] + rack.rows * rack.zsize
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
-  const width = game.board === "free" ? game.width : rack ? Math.max(game.cols, rack.span) : game.cols;
-  state.extent = { width, left: rack ? Math.min(0, rack.origin[0]) : 0, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
+  const width = game.board === "free" ? game.width : wx ? wx.width : rack ? Math.max(game.cols, rack.span) : game.cols;
+  state.extent = { width, left: wx ? wx.left : rack ? Math.min(0, rack.origin[0]) : 0, depth: game.board === "free" ? game.height : depth, z0: wx ? wx.z0 : game.roster ? -TOP.height : 0,
                    x0: game.characters ? CHAR.left : 0 };         // (the tile set stands left of the board)
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
   // the plate's UVs span the whole plate (u along x, v along z, v = 0 at the far edge): the slide image is fit inside them (bakeSlide)
@@ -2054,7 +2102,7 @@ function camera() {
   const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width - x0 + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
   const lean = stageOf();                                           // a stage game: the plane rises behind the board
-  const centre = declared && declared.target ? declared.target : [(ext.width + x0) / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
+  const centre = declared && declared.target ? declared.target : [extMidX(ext) + x0 / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
   const zs = zoomShift(V.lz);                                      // [SPEED+ZOOM] the zoom window slides inside the supplied world
   const target = [centre[0] + V.px + zs[0], centre[1], centre[2] + V.pz + zs[1]];
   if (state.flat) {
@@ -3128,6 +3176,11 @@ function characterFaces(game) {
   return faces;
 }
 function cellPosition(game, cell, rackPiece) {
+  if (rackPiece === "bar") { const B = barLayout(game), [x, z] = wl.barCentre(B, cell); return [x, z, "rack", B.size]; }
+  if (cell === "giveup") { const G = giveLayout(game); return [G.origin[0] + G.size / 2, G.origin[1] + G.zsize / 2, "rack", G.size]; }
+  if (typeof cell === "string" && cell.startsWith("badge:")) {        // Wordle's "+n": glyph k of len, glowing beside the board's top row
+    const [, k, len] = cell.split(":").map(Number); return [game.cols + 0.85 + (k - (len - 1) / 2) * 0.46, 0.7, "badge"];
+  }
   if (typeof cell === "string" && cell.startsWith("char:")) { const [x, z] = characterCentre(cell.slice(5)); return [x, z, "tray"]; }
   if (typeof cell === "string" && cell.startsWith("tray:")) return trayPosition(game, cell);
   if (typeof cell === "string" && cell.startsWith("hud:")) {
@@ -3139,8 +3192,8 @@ function cellPosition(game, cell, rackPiece) {
     const k = Number(cell.slice(7)), n = Math.max(1, (game.roster || []).length), step = Math.min(TOP.catSpacing, (game.cols - 0.4) / n);
     return [game.cols / 2 + (k - (n - 1) / 2) * step, TOP.roster, "roster"];
   }
-  if (rackPiece) { const rack = rackLayout(game), r = Math.floor(cell / rack.cols), c = cell % rack.cols;
-    return [rack.origin[0] + (c + 0.5) * rack.size, rack.origin[1] + (r + 0.5) * rack.zsize, "rack", rack.size]; }
+  if (rackPiece) { const rack = rackLayout(game), r = Math.floor(cell / rack.cols), c = cell % rack.cols, [x, z] = wl.rackCentre(rack, r, c);
+    return [x, z, "rack", rack.size]; }
   return [(cell % game.cols) + 0.5, Math.floor(cell / game.cols) + 0.5, "board"];
 }
 // ---------------------------------------------------------------- the walker (World Walk)
@@ -4270,7 +4323,7 @@ function pieceModel(piece, now) {
   if (flat) { y = 0; tilt = 0; }                                   // no hop, no lean
   const lean = flat ? 0 : LEAN[fam] ?? 0.35;
   const base = piece.place === "hud" || piece.place === "traycount" || piece.place === "roster" ? 0.0 : piece.place === "tray" ? 0.08 : TILE.height * (piece.cellSize || 1);
-  const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s;
+  const rest = flat ? base + FLAT_LIFT : base + scale0 * Math.sin(lean + tilt) + 0.04 * s + (state.game && state.game.game === "wordle" ? 0.55 * scale0 : 0);   // (Wordle's letters stand clear of the glass tiles)
   let m = M.translate(x, rest + y, z);
   m = M.multiply(m, M.rotateY(spin));
   m = M.multiply(m, M.rotateX(-Math.PI / 2 + lean + tilt));
@@ -4564,7 +4617,7 @@ function applyState(game, { meta = false } = {}) {
     const key = rackPiece ? `rack:${p.id}` : p.id;
     seen.add(key);
     const live = state.pieces.get(key);
-    const size = where === "roster" ? TOP.catSize : where === "tray" ? (p.lit ? 0.5 : 0.4) : where === "traycount" ? 0.19 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
+    const size = where === "roster" ? TOP.catSize : where === "tray" ? (p.lit ? 0.5 : 0.4) : where === "traycount" ? 0.19 : where === "badge" ? 0.5 : where === "hud" ? (game.roster ? TOP.fishSize : 0.42) : family(p.mesh) === "cat" ? 0.38 : family(p.mesh) === "chess" ? 0.42 : family(p.mesh) === "disc" ? 0.34 : 0.36;
     if (live && live.removing == null) {
       if (Math.abs(live.x - x) > 1e-6 || Math.abs(live.z - z) > 1e-6) { live.from = [live.x, live.z]; live.t0 = now; live.x = x; live.z = z; }
       if (where === "roster" && live.color !== p.color && p.lit) live.litAt = now;   // lit now: pop
@@ -4585,6 +4638,7 @@ function applyState(game, { meta = false } = {}) {
                                   size: e.size, roll: e.roll, spin: e.spin, bob: e.bob, face: !!e.face, translucent: !!e.translucent, ribbon: !!e.ribbon, ground: !!e.ground, glow: !!e.glow, scenery: !!e.scenery, lean: e.lean, t0: now, removing: null, seed: 0 });
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
+  if (game.bar) for (const p of game.bar.pieces) place(p, "bar");
   syncWalk(game);
   if (game.input !== "realtime") pred.ship = null;
   else if (!meta) reconcile(game);               // (a socket's meta frame leaves the ship to the snapshot that carries its clock)
@@ -4637,7 +4691,7 @@ function applyState(game, { meta = false } = {}) {
   // Real time: the next tick leaves as soon as this one is in (a short breath
   // for the UI thread), carrying the held controls; the server lands the
   // wall time between ticks.
-  if (game.input === "text") { const entry = $("entry"); if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
+  if (game.input === "text") { const entry = $("entry"); entry.maxLength = game.text_max || 5; if (entry.value.toUpperCase() !== game.text) entry.value = game.text; }
 }
 
 // ---------------------------------------------------------------- room-graph overlays
@@ -5692,6 +5746,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);
   if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
+  if (state.glassDraws && !state.flat) for (const [m, model] of state.glassDraws) drawLit(m.vao, m.count, model, null);   // Wordle's obsidian tiles
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
     const mesh = state.meshes[piece.mesh] || state.meshes.disc;
@@ -5741,9 +5796,11 @@ function draw(ms) {
   updateHousing();
   wheelBlurFrame(state.game, cam);
   status.style.visibility = statusPlateWanted() ? "hidden" : "";       // the status text is on the plate instead (layout unchanged)
+  const glassTiles = state.glassDraws = wordleTileDraws(now);                       // Wordle's tiles are translucent obsidian: drawn blended after the plate, not as casters
   const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropNoFloor()) ? []
+    : glassTiles ? (state.flat ? glassTiles.map(([m, model]) => [m.vao, m.count, model, null]) : [])
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
-  if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
+  if (state.rackButtons && !glassTiles) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
@@ -6113,9 +6170,10 @@ function hit(clientX, clientY) {
   }
   const c = Math.floor(x), r = Math.floor(z);
   if (c >= 0 && c < game.cols && r >= 0 && r < game.rows) return { kind: "board", r, c, key: `${r},${c}` };
-  const rack = rackLayout(game);
-  if (rack) { const rc = Math.floor((x - rack.origin[0]) / rack.size), rr = Math.floor((z - rack.origin[1]) / rack.zsize);
-    if (rc >= 0 && rc < rack.cols && rr >= 0 && rr < rack.rows) return { kind: "rack", r: rr, c: rc, key: `rack:${rr},${rc}` }; }
+  const bar = barLayout(game), give = giveLayout(game), rack = rackLayout(game);
+  const bh = bar && wl.barHit(bar, x, z); if (bh) return { kind: "bar", c: bh.c, key: `bar:${bh.c}` };
+  if (give && x >= give.origin[0] && x < give.origin[0] + give.size && z >= give.origin[1] && z < give.origin[1] + give.zsize) return { kind: "give", key: "give" };
+  const rh = rack && wl.rackHit(rack, x, z); if (rh) return { kind: "rack", r: rh.r, c: rh.c, key: `rack:${rh.r},${rh.c}` };
   return null;
 }
 let press = null, clickTimer = null, lastClick = null, tap = null;
@@ -6201,6 +6259,14 @@ canvas.addEventListener("pointerup", async (e) => {
     if (h && h.kind === "board") { optimisticMove(game, h); await act({ type: "cell", r: h.r, c: h.c, button: "primary" }); }
     return;
   }
+  if (game.input === "text" && h && h.kind === "give") { await act({ type: "give_up" }); return; }
+  if (game.input === "text" && h && h.kind === "bar") {
+    const B = barLayout(game), key = wl.barKey(B, h.c);
+    if (key === "enter") await act({ type: "submit" });
+    else if (key === "back") await act({ type: "backspace" });
+    else focusEntry();                                           // the bar's letter tiles open the keyboard
+    return;
+  }
   if (game.input === "text" && h && h.kind === "rack") {
     const letter = (game.rack.letters[h.r] || "")[h.c];
     if (letter === "↵") await act({ type: "submit" });           // the rack's own Enter and Backspace keys
@@ -6209,6 +6275,9 @@ canvas.addEventListener("pointerup", async (e) => {
   }
 });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+// read-only inspection handle for the Wordle play test: where a board point (x, z) is on the screen, and the scene state
+window.meowdokuDebug.screenOf = (x, z) => { const rect = canvas.getBoundingClientRect(), p = M.apply(camera().viewProj, [x, TILE.height, z]); return [rect.left + (p[0] * 0.5 + 0.5) * rect.width, rect.top + (0.5 - p[1] * 0.5) * rect.height]; };
+window.meowdokuDebug.scene = { get state() { return state; }, rackLayout, barLayout, giveLayout };
 
 // ---------------------------------------------------------------- scene-camera gestures
 // One generic layer for every game.  A game declares in its state which input
@@ -6497,8 +6566,8 @@ $("lichess-stop").onclick = () => act({ type: "lichess_pause" });
 $("lichess-resume").onclick = () => act({ type: "lichess_resume" });
 $("entry").addEventListener("input", (e) => act({ type: "text", text: e.target.value }));
 $("entry").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); act({ type: "submit" }); } });
-$("enter").onclick = () => act({ type: "submit" });
-$("back").onclick = () => act({ type: "backspace" });
+// the scene's entry bar opens this visually hidden (off-screen, but focusable) input, so a phone's soft keyboard and a physical one both type into the bar
+function focusEntry() { const entry = $("entry"); try { entry.focus({ preventScroll: true }); } catch { entry.focus(); } }
 $("round").oninput = (e) => { roundParams.iters = Number(e.target.value); rebuildRoundedMeshes(); };
 $("crease").oninput = (e) => { roundParams.creaseDeg = Number(e.target.value); rebuildRoundedMeshes(); };
 $("tilt").oninput = (e) => { state.tiltDeg = Number(e.target.value); };

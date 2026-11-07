@@ -134,7 +134,7 @@ def dump_table(table) -> dict[str, Any] | None:
                         "bank_start": {k: int(v) for k, v in table.bank_start.items()},
                         "free_start": {k: int(v) for k, v in table.free_start.items()}}
     elif kind == "wordle":
-        dump["game"] = {"guesses": list(game.guesses), "entry": game.entry}
+        dump["game"] = {"guesses": list(game.guesses), "entry": game.entry, "gave_up": bool(game.gave_up)}
     elif kind in ("chess", "checkers"):
         dump["game"] = {"pieces": [[int(c), k, side, game.ids.get(c, "")] for c, (k, side) in sorted(game.pieces.items())],
                         "turn": game.turn, "moves": int(game.moves),
@@ -239,8 +239,8 @@ def _restore_meowdoku(table, game, data: dict[str, Any]) -> None:
 
 def _restore_wordle(table, game, data: dict[str, Any]) -> None:
     guesses = data.get("guesses", [])
-    if not isinstance(guesses, list) or len(guesses) > 6:
-        raise LifecycleError("guesses must be at most 6 words")
+    if not isinstance(guesses, list) or len(guesses) > 60:
+        raise LifecycleError("guesses must be at most 60 words")
     kept: list[str] = []
     for word in guesses:
         if not isinstance(word, str) or len(word) != game.length or not word.isalpha() or not word.islower():
@@ -250,8 +250,9 @@ def _restore_wordle(table, game, data: dict[str, Any]) -> None:
             break
     game.guesses, game.moves = kept, len(kept)
     game.won = bool(kept) and kept[-1] == game.answer
+    game.gave_up = bool(data.get("gave_up")) and not game.won
     entry = data.get("entry", "")
-    game.entry = "".join(ch for ch in entry.lower() if ch.isalpha())[:game.length] if isinstance(entry, str) and not game.won else ""
+    game.entry = "".join(ch for ch in entry.lower() if ch.isalpha())[:game.length] if isinstance(entry, str) and not game.over else ""
 
 
 def _restore_board(table, game, data: dict[str, Any]) -> None:
