@@ -448,10 +448,13 @@ def make_handler(sessions: Sessions):
 
         def _refuse_viewer(self) -> None:
             self._set_cookie = []
+            self.close_connection = True      # the refused request's body is unread: the connection must not carry on
             self._json({"error": "this is a view-only link: it cannot send inputs or controls"}, HTTPStatus.FORBIDDEN)
 
         def _share_error(self, error) -> None:
             self._set_cookie = []
+            if getattr(error, "status", 0) == 413:
+                self.close_connection = True  # a too-large body was not read
             self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
 
         def _watch(self) -> None:
