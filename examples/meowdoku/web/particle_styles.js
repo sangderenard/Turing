@@ -45,6 +45,7 @@ export const PAGE_STYLES = [
   // depth-written per sprite; (b) instanced extruded emoji meshes through the scene's material shader, which falls back to (a)
   { id: "emoji", label: "emoji (image sprites)", needs: "float", sprite: true },
   { id: "emoji_mesh", label: "emoji (3-D meshes)", needs: "float", scene: true, emojiMesh: true, fallback: "emoji" },
+  { id: "designed", label: "saved marble / die (full mesh)", needs: null, scene: true, designed: true },
 ];
 export const ALL_STYLES = [...STYLES, ...PAGE_STYLES];
 export const STYLE_IDS = ALL_STYLES.map((s) => s.id);
@@ -80,6 +81,11 @@ export function chooseStyle(requested, caps, broken = {}, scene = null) {
   if (!av.ok) return instead(av.note);
   if (spec.scene && scene) {
     const budget = { ...MATERIAL_BUDGET, maxInstances: MATERIAL_BUDGET.maxInstances * (spec.budgetScale || 1) };
+    if (spec.designed) {
+      const plan = designedMeshPlan(scene);
+      if (!plan.ok) return instead(plan.reason);
+      return { style: id, requested: id, reason: plan.note };
+    }
     if (spec.emojiMesh) {
       const plan = emojiMeshPlan({ ...scene, budget, force: EMOJI_OPTIONS.forceMesh });
       if (!plan.ok) return instead(plan.reason);
@@ -344,6 +350,17 @@ export function materialPlan({ ready = true, count = 0, radiusPx = 4, budget = M
   return { ok: true, lod, tris: SPHERE_TRIS[lod], note: `${count.toLocaleString("en-US")} grains as ${SPHERE_TRIS[lod]}-triangle spheres` };
 }
 
+// A saved object is always drawn from its generated triangle mesh.  Do not quietly
+// replace it with a sphere or a point when the full mesh exceeds the frame budget.
+export function designedMeshPlan({ ready = false, designedMesh = null, count = 0 } = {}) {
+  if (!ready) return { ok: false, reason: "the scene's instanced Phong shader is unavailable" };
+  if (!designedMesh || !designedMesh.count) return { ok: false, reason: "select a saved marble or die first" };
+  const triangles = designedMesh.count / 3 * count;
+  if (triangles > MATERIAL_BUDGET.maxTriangles)
+    return { ok: false, reason: `${Math.round(triangles).toLocaleString("en-US")} modeled triangles exceed this device's ${MATERIAL_BUDGET.maxTriangles.toLocaleString("en-US")} triangle budget` };
+  return { ok: true, note: `${count.toLocaleString("en-US")} fully modeled objects; ${Math.round(triangles).toLocaleString("en-US")} triangles` };
+}
+
 // ---------------------------------------------------------------- emoji style (pure)
 // Every grain an animal emoji.  Two looks, one assignment: which emoji a grain is depends only on its displayed slot (the
 // packed point's index, stable from frame to frame), its true radius and the assignment the page picked, so the image variant
@@ -508,11 +525,11 @@ layout(location = ${INSTANCE_LOCATIONS.color}) in vec4 aInstColor;
 layout(location = ${INSTANCE_LOCATIONS.meta}) in float aInstMeta;
 layout(location = ${INSTANCE_LOCATIONS.id}) in float aInstId;     // the displayed slot (emoji batches only; the instance's own rotation key)
 uniform bool uInstanced;
-uniform float uInstRot;     // 1: a mesh batch (emoji): the mesh is re-centred, scaled to a unit half-width and turned by the slot's fixed rotation
+uniform float uInstRot;     // 1: emoji batch slot; 2: direct instanced mesh slot; fixed pose until the law exports orientation
 uniform vec4 uInstMesh;     // the mesh's centre (xyz) and 1 / its larger half-width in the glyph's plane
 uint instHash(uint x) { x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
 mat3 instanceRotation() {   // the glyph lies in its xy plane facing +z: stand it on the board facing up, +y toward the board's top, then yaw it round and tilt it a little, all fixed by the slot
-  uint h = instHash(uint(aInstId) ^ 0x9e3779b9u);
+  uint h = instHash((uInstRot > 1.5 ? uint(gl_InstanceID) : uint(aInstId)) ^ 0x9e3779b9u);
   float yaw = float(h & 0xffffu) * (6.2831853 / 65536.0);
   float a = (float((h >> 16) & 0xffu) / 255.0 - 0.5) * 0.9, b = (float((h >> 24) & 0xffu) / 255.0 - 0.5) * 0.9;
   float ca = cos(a), sa = sin(a), cb = cos(b), sb = sin(b), cy = cos(yaw), sy = sin(yaw);
@@ -917,7 +934,7 @@ export class ParticleStyles {
     const gl = this.gl;
     const emojiStyle = style === "emoji" || style === "emoji_mesh";
     if (emojiStyle) this.#emojiLoad();
-    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained" || style === "stained_fast" || emojiStyle) ? this.#sceneOf(ctx) : null);
+    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained" || style === "stained_fast" || style === "designed" || emojiStyle) ? this.#sceneOf(ctx) : null);
     this.fallback = choice.style === style ? "" : choice.reason;
     this.note = choice.reason;
     this.heatInfo = choice.style === "heat" ? this.heatInfo : "";
@@ -942,6 +959,7 @@ export class ParticleStyles {
       else if (choice.style === "material" || choice.style === "stained" || choice.style === "stained_fast") this.#material(ctx, choice, choice.style);
       else if (choice.style === "emoji") this.#emoji(ctx, guard);
       else if (choice.style === "emoji_mesh") this.#emojiMesh(ctx, choice);
+      else if (choice.style === "designed") this.#designedMesh(ctx);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       this.broken[choice.style] = error.message; this.fallback = `${choice.style} unavailable (${error.message}): showing points`;
@@ -1036,7 +1054,13 @@ export class ParticleStyles {
       const eye = -(view[2] * ctx.board[0] * 0.5 + view[6] * ctx.y + view[10] * ctx.board[1] * 0.5 + view[14]);
       radiusPx = typicalRadius(ctx.data) * ctx.map[2] * ctx.focal * ctx.H / 2 / sizeDepth(c.proj || PERSPECTIVE_W, -eye);       // [CURVE] clip.w: the eye depth, 1 under an orthographic projection
     }
-    const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: ctx.n, radiusPx };
+    let liveCount = ctx.n;
+    if (ctx.scene && ctx.scene.designedMesh) {
+      liveCount = 0;
+      for (let i = 0; i < ctx.n; i++) if (ctx.data[5 * i + 4] >= 50) liveCount++;
+    }
+    const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: liveCount, radiusPx,
+      designedMesh: ctx.scene && ctx.scene.designedMesh };
     const tris = this.#emojiTris(ctx.scene);
     if (tris) out.tris = tris;
     return out;
@@ -1125,9 +1149,11 @@ export class ParticleStyles {
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
     gl.enable(gl.CULL_FACE);                  // both faces of every bead accumulate: the back faces (the shader's inner colour), then the front
     gl.cullFace(gl.FRONT); gl.vertexAttribI4i(5, 1, 0, 0, 0);
-    gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
+    if (mesh.array) gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, ctx.n);
+    else gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
     gl.cullFace(gl.BACK); gl.vertexAttribI4i(5, 0, 0, 0, 0);
-    gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
+    if (mesh.array) gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, ctx.n);
+    else gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
     gl.disable(gl.CULL_FACE);
     gl.uniform1i(at("uOit"), 0);
     // the composite: the averaged colour with coverage 1 - exp(-tau) over the scene
@@ -1193,7 +1219,7 @@ export class ParticleStyles {
     gl.uniformMatrix4fv(at("uMVP"), false, ctx.viewProj); gl.uniformMatrix4fv(at("uMV"), false, cam.view);
     gl.uniformMatrix4fv(at("uShadowMatrices[0]"), false, S.shadow);
     gl.uniform4f(at("uInstMap"), ctx.map[0], ctx.map[1], ctx.map[2], 0); gl.uniform3f(at("uInstBoard"), ctx.board[0], ctx.board[1], ctx.y);
-    const own = ctx.colorMode === "material";                        // the whole material, its own colour included
+    const own = ctx.colorMode === "material" || !!S.designedMesh;     // saved meshes retain every designed material colour
     grainUniforms(gl, (n) => at(n), own ? null : ctx.tint, own ? null : ctx.grain);
     gl.uniform1f(at("uInstOwn"), own ? 1 : 0);
     // aGroupId: 0 (no group) or the material's own (an emitter group, or the ThermalChunk index of a blackbody finish: uThermalEmission on for it)
@@ -1346,6 +1372,72 @@ export class ParticleStyles {
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
     for (const at of [INSTANCE_LOCATIONS.position, INSTANCE_LOCATIONS.color, INSTANCE_LOCATIONS.meta, INSTANCE_LOCATIONS.id]) { gl.enableVertexAttribArray(at); gl.vertexAttribDivisor(at, 1); }
     vaos.set(name, { mesh, vao });
+    return vao;
+  }
+
+  #designedMesh(ctx) {
+    const gl = this.gl, mesh = ctx.scene.designedMesh;
+    if (!mesh || !mesh.count) throw new Unavailable("no saved object mesh is loaded");
+    const held = this.#sceneBegin(ctx), at = (name) => gl.getUniformLocation(ctx.scene.program, name);
+    gl.uniform1f(at("uInstRot"), 2);
+    gl.uniform4f(at("uInstMesh"), mesh.center[0], mesh.center[1], mesh.center[2], mesh.scale);
+    // The packed display slot is the orientation key.  The current sphere law
+    // does not export spin/orientation, so this pose is deliberately fixed.
+    gl.enable(gl.DEPTH_TEST); gl.depthMask(true); gl.disable(gl.BLEND);
+    if (mesh.opaque) {
+      gl.bindVertexArray(this.#designedVao(mesh.opaque, ctx.buffer));
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.opaque.count, ctx.n);
+    }
+    if (mesh.glass) {
+      gl.bindVertexArray(this.#designedVao(mesh.glass, ctx.buffer));
+      const guard = new UnitGuard(gl);
+      let composited = false;
+      if (ctx.scene.oit && this.caps.floatRender) {
+        try { this.#oitDraw(ctx, mesh.glass, at, guard); composited = true; this.glassInfo = "saved object glass: weighted blended OIT"; }
+        catch (error) {
+          this.oitBroken = String(error.message || error);
+          gl.useProgram(ctx.scene.program); gl.bindVertexArray(this.#designedVao(mesh.glass, ctx.buffer));
+          gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.bound); gl.viewport(ctx.vp[0], ctx.vp[1], ctx.vp[2], ctx.vp[3]);
+          gl.uniform1i(at("uOit"), 0);
+        }
+      }
+      if (!composited) {
+        this.glassInfo = `saved object glass: alpha blend${this.oitBroken ? ` (${this.oitBroken})` : ""}`;
+        gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+        gl.enable(gl.CULL_FACE); gl.cullFace(gl.FRONT); gl.vertexAttribI4i(5, 1, 0, 0, 0);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.glass.count, ctx.n);
+        gl.cullFace(gl.BACK); gl.vertexAttribI4i(5, 0, 0, 0, 0);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.glass.count, ctx.n);
+        gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+      }
+      guard.restore();
+    }
+    this.#sceneEnd(ctx, held);
+    gl.bindVertexArray(ctx.vao);
+  }
+  #designedVao(mesh, pointBuffer) {
+    const gl = this.gl, vaos = (this.designedVaos ||= new WeakMap()), held = vaos.get(mesh);
+    if (held && held.mesh === mesh && held.pointBuffer === pointBuffer) return held.vao;
+    if (held) gl.deleteVertexArray(held.vao);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    for (const [at, size, integer] of [[0, 3, false], [1, 3, false], [2, 1, true]]) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffers[at]);
+      gl.enableVertexAttribArray(at);
+      if (integer) gl.vertexAttribIPointer(at, size, gl.INT, 0, 0);
+      else gl.vertexAttribPointer(at, size, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+    for (const [at, size, type, normalized, offset] of [
+      [L.position, 3, gl.FLOAT, false, PACKING.position.offset],
+      [L.color, 4, gl.UNSIGNED_BYTE, true, PACKING.color.offset],
+      [L.meta, 1, gl.FLOAT, false, PACKING.meta.offset],
+    ]) {
+      gl.enableVertexAttribArray(at); gl.vertexAttribPointer(at, size, type, normalized, PACKING.stride, offset); gl.vertexAttribDivisor(at, 1);
+    }
+    // Without a separate batch the vertex shader receives the instance index
+    // through gl_InstanceID; location 10 remains a constant zero for this path.
+    gl.bindVertexArray(null);
+    vaos.set(mesh, { vao, mesh, pointBuffer });
     return vao;
   }
 

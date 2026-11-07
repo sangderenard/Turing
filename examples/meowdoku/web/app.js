@@ -32,6 +32,7 @@ import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
+import { verifySavedMarbleObject } from "./marble_object.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
@@ -1769,6 +1770,87 @@ function litMesh(faces, uvOf) {
   (state.vaoMaterials ||= new Map()).set(vao, [...new Set(mat)]);   // which materials this mesh draws (see sceneNeedsVariant)
   return { vao, count: pos.length / 3, buffers };
 }
+// The saved recipe is the geometry authority.  Install its full generated
+// triangles in the same material tables and Phong path as every scene mesh.
+const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, mesh: null, note: "" };
+function installSavedParticle(tables) {
+  const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
+  if (!snapshot || !geometry) return;
+  const faces = [...geometry.interior, ...geometry.glass];
+  const source = snapshot.materials.tables, used = [...new Set(faces.map((face) => face[3]))].sort((a, b) => a - b);
+  const remap = new Map();
+  for (const id of used) {
+    if (!Number.isInteger(id) || id < 0) throw new Error(`saved object has invalid material ${id}`);
+    const next = tables.pbr.records;
+    for (const kind of ["pbr", "phong", "enamel", "texstack"]) {
+      const target = tables[kind], from = source[kind], stride = target.floats_per_record;
+      if (!from || from.stride !== stride || from.data.length < (id + 1) * stride)
+        throw new Error(`saved object has incomplete ${kind} material ${id}`);
+      target.data.push(...from.data.slice(id * stride, (id + 1) * stride));
+      target.records++;
+    }
+    remap.set(id, next);
+  }
+  const mapped = faces.map((face) => [face[0], face[1], face[2], remap.get(face[3]), face[4]]);
+  const old = savedParticle.mesh;
+  if (old) for (const part of [old.opaque, old.glass]) if (part) {
+    state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao); for (const buffer of part.buffers) gl.deleteBuffer(buffer);
+  }
+  const alpha = (face) => tables.pbr.data[face[3] * tables.pbr.floats_per_record + 7];
+  const opaqueFaces = mapped.filter((face) => !isGlass(alpha(face)));
+  const glassFaces = mapped.filter((face) => isGlass(alpha(face)));
+  const opaque = opaqueFaces.length ? { ...litMesh(opaqueFaces), array: true } : null;
+  const glass = glassFaces.length ? { ...litMesh(glassFaces), array: true } : null;
+  const vertices = mapped.flatMap((face) => face.slice(0, 3));
+  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+  for (const v of vertices) for (let k = 0; k < 3; k++) { low[k] = Math.min(low[k], v[k]); high[k] = Math.max(high[k], v[k]); }
+  const center = low.map((v, k) => (v + high[k]) * 0.5);
+  let radius = 0;
+  for (const v of vertices) radius = Math.max(radius, Math.hypot(v[0] - center[0], v[1] - center[1], v[2] - center[2]));
+  savedParticle.mesh = { opaque, glass, count: mapped.length * 3, center, scale: 1 / Math.max(radius, 1e-6) };
+}
+async function refreshSavedParticleList() {
+  try {
+    const response = await fetch("/api/marble_objects", { cache: "no-store" });
+    if (!response.ok) throw new Error(`library HTTP ${response.status}`);
+    const listing = await response.json();
+    savedParticle.entries = Array.isArray(listing) ? listing : listing.entries || [];
+    delete $("gamectl").dataset.key;
+    renderGameControls(state.game);
+  } catch (error) { savedParticle.note = String(error.message || error); }
+}
+async function selectSavedParticle(digest) {
+  if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.mesh = null; refreshLocalControls(); return; }
+  const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
+  const snapshot = await response.json();
+  const { geometry } = await verifySavedMarbleObject(snapshot);
+  const physical = snapshot.physical;
+  const values = { r0: physical["sim-radius"], rho0: physical["sim-rho"], mu0: physical["sim-mu"],
+                   e0: physical["sim-e"], roll0: physical["sim-roll"], irr0: physical["sim-irr"] };
+  const ranges = { r0: [0.005, 0.020], rho0: [0.2, 5], mu0: [0, 1], e0: [0.02, 0.95],
+                   roll0: [0, 0.3], irr0: [0, 0.3] };
+  for (const [name, value] of Object.entries(values)) {
+    const [min, max] = ranges[name];
+    if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} outside native law range ${min}–${max}`);
+  }
+  savedParticle.digest = digest; savedParticle.snapshot = snapshot; savedParticle.geometry = geometry;
+  uploadMaterials(state.game);
+  particleStyle = "designed";
+  try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  // The current law has four species.  A selected design occupies species 0;
+  // the other shares are zero so every emitted particle uses its coefficients.
+  if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics");
+  const updates = [...Object.entries(values), ["wt0", 1], ["wt1", 0], ["wt2", 0], ["wt3", 0]];
+  const step = chain.then(async () => {
+    for (const [name, value] of updates)
+      applyState(await api("/api/action", { type: "fountain_param", name, value }));
+  });
+  chain = step.catch((error) => console.warn("[meow] saved particle law", error));
+  await step;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: modeled appearance; sphere contact and scalar moment in current law`;
+  refreshLocalControls();
+}
 const MARBLE = { mesh: null, key: "" };
 function marblePreview() {
   if (!$('marble-preview').checked || !state.game || !state.extent) return null;
@@ -2061,6 +2143,7 @@ function uploadMaterials(game) {
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
+  installSavedParticle(tables);
   {   // which materials read the transmission variant's fields (see phongVariant)
     const pf = tables.pbr.floats_per_record, tf = tables.texstack.floats_per_record, rows = tables.pbr.records;
     state.variantNeeds = new Uint8Array(rows);
@@ -5091,6 +5174,7 @@ function localValue(s) {
   if (s.local && s.local.startsWith("ghosts")) return rl.settingValue(ghostSettings, s.local) ?? s.value;     // [GHOSTS]
   if (s.local === "wheelblur") return wheelBlur.on;
   if (s.local === "qrwall") return qrWall.on;                                      // [QRWALL]
+  if (s.local === "saved_particle") return savedParticle.digest;
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
@@ -5098,6 +5182,10 @@ function localValue(s) {
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
+  if (s.local === "saved_particle") {
+    selectSavedParticle(value).catch((error) => { savedParticle.note = String(error.message || error); status.textContent = savedParticle.note; refreshLocalControls(); });
+    return;
+  }
   if (s.local && s.local.startsWith("ghosts")) { ghostControl(s, value); refreshLocalControls(); return; }     // [GHOSTS]
   if (s.local === "wheelblur") {
     wheelBlur.on = !!value;
@@ -5222,6 +5310,12 @@ function refreshLocalControls() {
     if (s.local === "wheelblur") {
       el.querySelector("input").checked = wheelBlur.on;
       el.title = "a waterwheel turning too fast to read is drawn as a smear of copies, then as one spinning blurred disc, instead of a crisp wheel (off: always crisp)";
+      continue;
+    }
+    if (s.local === "saved_particle") {
+      const select = el.querySelector("select");
+      if (select) select.value = savedParticle.digest;
+      el.title = savedParticle.note || "Select a verified Studio design. Current contacts remain spherical; full mesh and material records are rendered.";
       continue;
     }
     if (s.local === "spin") {
@@ -5601,6 +5695,9 @@ function pageSpecs(specs) {
     out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
     out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
   }
+  if ((look >= 0 && state.game.game === "fountain3d" || state.game.game === "marble_madness") && !out.some((s) => s.id === "saved_particle"))
+    out = [...out, { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Grains",
+      value: savedParticle.digest, options: [["", "choose a Studio design"], ...savedParticle.entries.map((e) => [e.digest, e.name || e.digest.slice(0, 12)])] }];
   return out;
 }
 let recordOn = false;
@@ -5660,7 +5757,7 @@ function renderGameControls(game) {
         const input = document.createElement(s.kind === "select" ? "select" : "input");
         if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
         else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
-        else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
+        else for (const [v, text] of s.options) input.add(new Option(text, v));
         if (s.local === "worldcurve") worldCurveInput(input);                          // [CURVE] live while dragging, with its notches
         input.onchange = () => (s.local ? localControl(s, input.value) : act(serverControlPayload(s, s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value)));
         if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
@@ -5728,7 +5825,9 @@ function particleScene(pick) {
   const opacity = id != null && t ? t.data[id * f + 7] : 1;
   const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
   const group = (state.materialGroups || {})[name];
-  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, meshes: state.meshes, materialId: id == null ? 0 : id, shadow: light.viewProj,
+  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, meshes: state.meshes,
+           designedMesh: particleStyle === "designed" ? savedParticle.mesh : null,
+           materialId: id == null ? 0 : id, shadow: light.viewProj,
            glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
 }
 // THE TRANSMISSION VARIANT (Pluck's PLUCK_TRANSMISSION define): the same Phong source with light through transmissive bodies,
@@ -5759,6 +5858,9 @@ function sceneNeedsVariant(casters, pick) {
   const has = (name) => { const id = index[name]; return id != null && needs[id] === 1; };
   if (backlightEmitter()) return true;
   if (state.glass && has("glass")) return true;
+  if (particleStyle === "designed" && savedParticle.mesh &&
+      [savedParticle.mesh.opaque, savedParticle.mesh.glass].some((part) => part &&
+        (state.vaoMaterials.get(part.vao) || []).some((id) => needs[id] === 1))) return true;
   for (const piece of state.glassPieces || []) if (has(`${piece.color}@glass`)) return true;
   for (const c of casters) if (c[3] && c[3].color && has(c[3].color)) return true;
   if (pick) {
@@ -7232,6 +7334,7 @@ async function lifecycleResume() {
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
+  refreshSavedParticleList();
   chain.then(() => { loading.done(); if (state.game) bootReady = true; else loading.release("boot"); });             // [LOADING] a successful game frame releases boot
   if (window.meowdokuAccess.edit && /[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
 })().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });
