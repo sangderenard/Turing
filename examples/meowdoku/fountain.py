@@ -590,12 +590,12 @@ def sdf_field(x, y, q):
         solid = used * (1.0 - fluid)
         # SELECT, never blend: with the SDF_FAR sentinel, ``d + take * (c - d)`` is (-1e9) + (1e9 + c), which float32 (the GPU)
         # rounds to 0 -- the composed distance was 0 everywhere on the GPU while the float64 eager lane hid it.
-        cf = AbstractTensor.where(fluid > 0.5, zero - f, zero - SDF_FAR)
+        cf = fluid * (-f) + (1.0 - fluid) * (-SDF_FAR)             # exact: the role is 0 or 1 (a scalar uniform: no where(), it would broadcast)
         take = cf > d_f
         d_f = AbstractTensor.where(take, cf, d_f)
         f_nx = AbstractTensor.where(take, zero - gwx, f_nx)
         f_ny = AbstractTensor.where(take, zero - gwy, f_ny)
-        cs = AbstractTensor.where(solid > 0.5, f, zero + SDF_FAR)
+        cs = solid * f + (1.0 - solid) * SDF_FAR
         take = cs < d_s
         d_s = AbstractTensor.where(take, cs, d_s)
         s_nx = AbstractTensor.where(take, gwx, s_nx)
