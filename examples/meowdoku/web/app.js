@@ -6,7 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
-import { GravitySensor } from "./gravity.js";
+import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 
@@ -3892,6 +3892,47 @@ gravitySensor.start();
 const firstTap = () => { for (const type of ["click", "touchend"]) removeEventListener(type, firstTap, true); gravitySensor.grant(); };
 for (const type of ["click", "touchend"]) addEventListener(type, firstTap, true);
 window.meowdokuDebug.gravitySensor = gravitySensor;
+// THE LAYOUT LOCK.  While the phone's tilt drives a compute game's gravity, turning the phone must not re-lay the page out:
+// the world is to be tipped, not re-framed.  Where the browser can hold the orientation (screen.orientation.lock, mostly
+// Android in fullscreen) it does; elsewhere (iOS Safari) the page turns its own body back by the screen's turn, so the
+// content stays fixed to the device, and the sensor reads gravity in that fixed frame (``lockedAngle``).
+const layoutLock = { angle: null, w: 0, h: 0, turn: null };
+function clearLayoutTurn() {
+  const b = document.body.style;
+  for (const k of ["position", "left", "top", "width", "height", "transform", "transformOrigin"]) b[k] = "";
+  b.removeProperty("--vw100"); b.removeProperty("--vh100");
+  layoutLock.turn = null;
+}
+function applyLayoutLock() {
+  const want = !!(state.game && state.game.compute && gravitySensor.enabled);
+  if (!want) {
+    if (layoutLock.angle != null) {
+      layoutLock.angle = null; gravitySensor.lockedAngle = null; clearLayoutTurn();
+      try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch { /* not lockable */ }
+    }
+    return;
+  }
+  if (layoutLock.angle == null) {
+    layoutLock.angle = screenAngle(window); layoutLock.w = innerWidth; layoutLock.h = innerHeight;
+    gravitySensor.lockedAngle = layoutLock.angle;
+    try { const o = screen.orientation; if (o && o.lock) o.lock(o.type).catch(() => {}); } catch { /* not lockable */ }
+  }
+  const turn = layoutTransform(layoutLock.angle, screenAngle(window), layoutLock.w, layoutLock.h);
+  if (turn === layoutLock.turn) return;
+  if (!turn) { clearLayoutTurn(); return; }
+  const b = document.body.style;
+  Object.assign(b, { position: "fixed", left: "0px", top: "0px", width: `${layoutLock.w}px`, height: `${layoutLock.h}px`,
+                     transformOrigin: "0 0", transform: turn });
+  b.setProperty("--vw100", `${layoutLock.w}px`); b.setProperty("--vh100", `${layoutLock.h}px`);
+  layoutLock.turn = turn;
+}
+// a finger on a turned page: the screen point back in the content's frame (the inverse of layoutTransform)
+function contentPoint(X, Y) {
+  if (!layoutLock.turn) return [X, Y];
+  const d = (((screenAngle(window) - layoutLock.angle) % 360) + 360) % 360, w = layoutLock.w, h = layoutLock.h;
+  return d === 90 ? [w - Y, X] : d === 180 ? [w - X, h - Y] : [Y, h - X];
+}
+for (const type of ["resize", "orientationchange"]) addEventListener(type, () => setTimeout(applyLayoutLock, 0));
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
   if (s.local === "tilt") {
@@ -3902,6 +3943,7 @@ function localControl(s, value) {
   refreshLocalControls();
 }
 function refreshLocalControls() {
+  applyLayoutLock();
   const box = $("gamectl"), g = state.game;
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
@@ -4647,7 +4689,8 @@ function twoPoints() { const [a, b] = [...gpointers.values()]; return { cx: (a.x
 canvas.addEventListener("pointerdown", (e) => {
   const gest = cameraGestures(); if (!gest) return;
   const now = performance.now();
-  gpointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: now, type: e.pointerType });
+  const [ex, ey] = contentPoint(e.clientX, e.clientY);
+  gpointers.set(e.pointerId, { x: ex, y: ey, sx: ex, sy: ey, t: now, type: e.pointerType });
   camView.active = gpointers.size;
   for (const k of CV_KEYS) camView.vel[k] = 0;
   if (e.pointerType === "mouse") {
@@ -4664,8 +4707,9 @@ canvas.addEventListener("pointerdown", (e) => {
 canvas.addEventListener("pointermove", (e) => {
   const P = gpointers.get(e.pointerId); if (!P || !gsession) return;
   const gest = cameraGestures(); if (!gest) return;
-  const now = performance.now(), dt = (now - gsession.last) / 1000, dx = e.clientX - P.x, dy = e.clientY - P.y;
-  P.x = e.clientX; P.y = e.clientY;
+  const [ex, ey] = contentPoint(e.clientX, e.clientY);
+  const now = performance.now(), dt = (now - gsession.last) / 1000, dx = ex - P.x, dy = ey - P.y;
+  P.x = ex; P.y = ey;
   const S = gsession;
   if (S.mode === "pending") {
     if (!(gest.orbit === "one" && Math.hypot(P.x - P.sx, P.y - P.sy) > 8)) return;   // under the threshold: still a tap for the game

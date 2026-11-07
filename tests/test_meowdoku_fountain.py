@@ -703,7 +703,7 @@ JS_GRAVITY = """
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const [dir] = process.argv.slice(2);
-const {gravityInScreen, gravityFromAcceleration, GravitySensor} = await import(pathToFileURL(`${dir}/gravity.js`).href);
+const {gravityInScreen, gravityFromAcceleration, GravitySensor, layoutTransform} = await import(pathToFileURL(`${dir}/gravity.js`).href);
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} vs ${b}`);
 let g = gravityInScreen(90, 0, 0); near(g[0], 0); near(g[1], -1);              // held upright: straight down the screen
 g = gravityInScreen(0, 0, 0); near(g[0], 0); near(g[1], 0);                     // lying flat: no pull in the screen's plane
@@ -735,6 +735,24 @@ assert.equal(await denied.grant(), 'denied');
 const plain = {addEventListener: (type, fn) => { listeners['plain' + type] = fn; }, screen: {orientation: {angle: 0}}};
 const other = new GravitySensor({win: plain, onGravity: (x, y) => calls.push([x, y])});
 assert.equal(other.enabled, true); other.start(); assert.ok(listeners.plaindeviceorientation);
+// iOS: BOTH permission requests are made inside the tap.  A request issued after an await has lost the tap's activation
+// and throws (it used to fail the whole grant, so the switch had to be cycled before gravity followed the phone).
+let active = true;
+const strict = (answer) => () => { if (!active) throw new Error('NotAllowedError: no user activation'); queueMicrotask(() => { active = false; }); return Promise.resolve(answer); };
+const L2 = {};
+const ios = new GravitySensor({win: {DeviceOrientationEvent: {requestPermission: strict('granted')}, DeviceMotionEvent: {requestPermission: strict('granted')},
+                                     screen: {orientation: {angle: 0}}, addEventListener: (type, fn) => { L2[type] = fn; }}, onGravity: () => {}});
+assert.equal(await ios.grant(), 'waiting'); assert.ok(L2.deviceorientation);
+// the layout lock: a turn of the screen is undone, and gravity is read in the locked frame
+assert.equal(layoutTransform(0, 0, 390, 844), null);
+assert.equal(layoutTransform(0, 90, 390, 844), 'translate(0px, 390px) rotate(-90deg)');
+assert.equal(layoutTransform(0, 270, 390, 844), 'translate(844px, 0px) rotate(90deg)');
+assert.equal(layoutTransform(90, 0, 844, 390), 'translate(390px, 0px) rotate(90deg)');
+const held = []; const L3 = {};
+const locked = new GravitySensor({win: {screen: {orientation: {angle: 90}}, addEventListener: (type, fn) => { L3[type] = fn; }}, onGravity: (x, y) => held.push([x, y])});
+locked.lockedAngle = 0; locked.start();
+L3.deviceorientation({beta: 90, gamma: 0});            // upright in the locked (portrait) frame, whatever the screen says
+near(held[0][0], 0); near(held[0][1], -1);
 console.log('ok');
 """
 

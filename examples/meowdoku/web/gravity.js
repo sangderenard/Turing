@@ -34,10 +34,29 @@ export function gravityFromAcceleration(ax, ay, az, angle = 0, reaction = true) 
   return [v[0], v[1]];
 }
 
+// screen.orientation.angle where there is one (iOS before 16.4 has only window.orientation)
+export function screenAngle(w) {
+  if (!w) return 0;
+  const a = (w.screen && w.screen.orientation && w.screen.orientation.angle) ?? w.orientation ?? 0;
+  return ((Number(a) % 360) + 360) % 360;
+}
+
+// How the page holds its layout while the phone turns: the CSS transform that turns content laid out at ``lockedAngle``
+// (``w`` x ``h`` CSS px) so it stays fixed to the device when the screen is at ``angle``.  The browser rotated the
+// content by the turn; this turns it back (CSS positive = clockwise; a screen angle grows counterclockwise), then
+// shifts it back on screen.  ``null``: no turn, nothing to do.
+export function layoutTransform(lockedAngle, angle, w, h) {
+  const d = (((angle - lockedAngle) % 360) + 360) % 360;
+  if (d === 0) return null;
+  if (d === 90) return `translate(0px, ${w}px) rotate(-90deg)`;
+  if (d === 180) return `translate(${w}px, ${h}px) rotate(180deg)`;
+  return `translate(${h}px, 0px) rotate(90deg)`;
+}
+
 export class GravitySensor {
   constructor({ onGravity, win = typeof window === "undefined" ? null : window, onState = () => {} }) {
     this.onGravity = onGravity; this.win = win; this.onState = onState;
-    this.wanted = true; this.state = "idle"; this.listening = false; this.last = null;
+    this.wanted = true; this.state = "idle"; this.listening = false; this.last = null; this.lockedAngle = null;
     this.ios = !!(win && win.DeviceOrientationEvent && typeof win.DeviceOrientationEvent.requestPermission === "function");
     this.haveOrientation = false;
     this.orient = (e) => {
@@ -52,9 +71,11 @@ export class GravitySensor {
     };
   }
 
+  // The angle of the frame the world is drawn in: the screen's, unless the page holds its layout fixed against a turn of
+  // the phone (``lockedAngle``, see app.js layoutLock) -- then the world turns with the device and gravity is read in it.
   #angle() {
-    const w = this.win;
-    return (w.screen && w.screen.orientation && w.screen.orientation.angle) ?? w.orientation ?? 0;
+    if (this.lockedAngle != null) return this.lockedAngle;
+    return screenAngle(this.win);
   }
 
   #emit(g) {
@@ -64,15 +85,20 @@ export class GravitySensor {
   }
 
   // the first tap (iOS needs it); a no-op elsewhere.  Returns the resulting state.
+  // Both iOS requests are made SYNCHRONOUSLY inside the gesture: a request issued after an await has lost the tap's user
+  // activation and throws, which used to fail the whole grant (the switch then had to be cycled to try again).  The
+  // orientation answer decides; the motion one is only the fallback source.
   async grant() {
     if (!this.wanted || this.listening || !this.win) return this.state;
-    try {
-      if (this.ios) {
-        const r = await this.win.DeviceOrientationEvent.requestPermission();
-        if (r !== "granted") { this.state = "denied"; this.onState(this.state); return this.state; }
-        if (this.win.DeviceMotionEvent && typeof this.win.DeviceMotionEvent.requestPermission === "function") await this.win.DeviceMotionEvent.requestPermission();
-      }
-    } catch (error) { this.state = "denied"; this.onState(this.state); return this.state; }
+    if (this.ios) {
+      const W = this.win, ask = (E) => {
+        try { return Promise.resolve(E && typeof E.requestPermission === "function" ? E.requestPermission() : "absent"); }
+        catch (error) { return Promise.resolve("error"); }
+      };
+      const orientation = ask(W.DeviceOrientationEvent), motion = ask(W.DeviceMotionEvent);
+      const [o, m] = await Promise.all([orientation.catch(() => "error"), motion.catch(() => "error")]);
+      if (o === "denied" || (o !== "granted" && m !== "granted")) { this.state = "denied"; this.onState(this.state); return this.state; }
+    }
     this.#listen();
     return this.state;
   }
