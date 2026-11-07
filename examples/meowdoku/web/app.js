@@ -14,6 +14,7 @@ import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirecti
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
+import { initTipJar } from "./tipjar.js";                                                              // the tip jar's panel and grain picker
 import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 import { GameClock, SPEED, sliderToSpeed, speedToSlider, speedLabel } from "./game_clock.js";   // [SPEED+ZOOM]
@@ -4586,6 +4587,7 @@ function applyState(game, { meta = false } = {}) {
   renderGameControls(game);
   chessClockSync(game);
   compute.sync(game.compute || null);
+  tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   renderHotbars(game);
   showPads(game);
   renderInventory(game);
@@ -4703,6 +4705,12 @@ const compute = new ComputeRuntime({
   onSupport: () => { if (state.game) renderGameControls(state.game); },
 });
 window.meowdokuDebug.compute = compute;
+// TIP JAR (tipjar.js): the panel, the grain picker and the state poll of the tip jar game (a game state that carries `tipjar`); inert otherwise.
+const tipjar = initTipJar({
+  canvas, getState: () => state.game, getCompute: () => compute, applyState: (g) => applyState(g),
+  getView: () => { const cam = camera(); return { viewProj: state.caseModel ? M.multiply(cam.viewProj, state.caseModel) : cam.viewProj, proj: cam.proj, toWorld: lawToWorld }; },
+});
+window.meowdokuDebug.tipjar = tipjar;
 // The phone's orientation is the fountain's gravity (a runtime input of the law), on by default, with an off switch.  iOS only
 // delivers the events after a permission asked for on a tap: the first tap anywhere asks.
 // CAMERA-DOWN GRAVITY (a page switch): gravity is the camera's down vector in the box's frame, so orbiting the camera is the
