@@ -1210,6 +1210,7 @@ function litMesh(faces) {
   const mb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, mb); gl.bufferData(gl.ARRAY_BUFFER, new Int32Array(mat), gl.STATIC_DRAW);
   gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.INT, 0, 0);
   gl.bindVertexArray(null);
+  (state.vaoMaterials ||= new Map()).set(vao, [...new Set(mat)]);   // which materials this mesh draws (see sceneNeedsVariant)
   return { vao, count: pos.length / 3, buffers: [pb, nb, mb] };
 }
 function box(x0, y0, z0, x1, y1, z1, m) {   // outward faces
@@ -4703,6 +4704,7 @@ function sceneNeedsVariant(casters, pick) {
   const mode = state.debug.transmission || "auto";
   if (mode === "off") return false;
   if (mode === "on") return true;
+  if (state.variantSeen) return true;     // the previous lit pass drew a material that needs it (meshes whose materials this check cannot name)
   const needs = state.variantNeeds, index = state.materialIndex; if (!needs) return false;
   const has = (name) => { const id = index[name]; return id != null && needs[id] === 1; };
   if (backlightEmitter()) return true;
@@ -4745,6 +4747,12 @@ function drawCloud(cam, data, g, rec, style) {
                      grain: pick.grain, scene: state.flat ? null : particleScene(pick), heat: heatFx,
                      style, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: style === DEFAULT_STYLE ? null : particleLighting(g, y) });
 }
+// Debug: one scene frame on demand (the lit pass included), for measurement where requestAnimationFrame is paused (a hidden pane);
+// the frame's own re-request of itself is suppressed.
+window.meowdokuDebug.frame = (ms = performance.now()) => {
+  const raf = window.requestAnimationFrame; window.requestAnimationFrame = () => 0;
+  try { draw(ms); } finally { window.requestAnimationFrame = raf; }
+};
 // Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, rgba8, meta], 16 bytes), spread over the live
 // view window at a constant area coverage, drawn `frames` times through the same call the scene makes; returns ms per frame
 // (wall time around gl.finish), with the scene's own lights as set by the last lit pass.
@@ -4781,7 +4789,7 @@ window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) =>
 function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
   const P = (sceneNeedsVariant(casters, state.game && state.game.game === "fountain" ? colorPick() : null) && phongVariant()) || state.programs.phong;
-  state.activePhong = P; gl.useProgram(P);
+  state.activePhong = P; state.variantSeen = false; gl.useProgram(P);
   const span = Math.max(state.extent.width, extLength());
   const keyView = M.apply(cam.view, light.position);
   const sun = sunState(), boardCentre = [state.extent.width / 2, 0, extMidZ()];
@@ -4855,7 +4863,9 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform2f(gl.getUniformLocation(P, "uShadowTexelSize"), 1 / SHADOW_SIZE, 1 / SHADOW_SIZE);
   gl.uniform1f(gl.getUniformLocation(P, "uShadowBias"), 0.0015);
   const shadowLoc = gl.getUniformLocation(P, "uShadowMatrices[0]");
+  const needs = state.variantNeeds;
   const drawLit = (vao, count, model, materialId, groupId = 0) => {
+    if (needs && !state.variantSeen) { const ids = materialId != null ? [materialId] : state.vaoMaterials && state.vaoMaterials.get(vao); if (ids && ids.some((i) => needs[i] === 1)) state.variantSeen = true; }
     const mv = M.multiply(cam.view, model);
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, M.multiply(cam.proj, mv));
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, mv);
