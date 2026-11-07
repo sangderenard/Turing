@@ -25,7 +25,12 @@
   #bar input[type=range] { width: 90px; }
   #bar .tool.active { background: #3b5a8a; border-color: #6a9be0; }
   #bar .tool, #hint { align-items: center; }
-  #status { margin-left: auto; opacity: 0.85; }
+  /* The status / instruction line never takes layout space (a long one used to wrap the bar and shift the canvas): it
+     floats over the bottom of the scene, see-through and click-through.  (On the fountain the page also draws it into
+     the scene, on the plate under the grains.) */
+  #status { position: fixed; left: 12px; right: 12px; bottom: 10px; z-index: 2; pointer-events: none; margin: 0;
+            opacity: 0.55; font-size: 12px; line-height: 1.35; max-height: 4.2em; overflow: hidden;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7); }
   #gamectl { display: contents; }
   #gamectl .gctl-file { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
   #gamectl button:disabled { opacity: .4; }
