@@ -698,6 +698,26 @@ export class ComputeRuntime {
     return out;
   }
 
+  // [GHOSTS] (replay_layers.js) a second runtime that re-runs `from`'s settings from the start as a background ghost run: the page's
+  // gravity sources and case angle (plus `caseTiltAdd`, the seed's perturbation) and the image feeds are taken over; nothing is shared.
+  inheritFrom(from, { caseTiltAdd = 0 } = {}) {
+    this.gravity = from.gravity ? [...from.gravity] : null; this.spin = from.spin; this.spinMotion = from.spinMotion ? { ...from.spinMotion } : this.spinMotion;
+    this.caseTilt = (from.caseTilt || 0) + caseTiltAdd; this.gravityScale = from.gravityScale; this.bodyTau = from.bodyTau; this.named = from.named;
+  }
+  // [GHOSTS] the spec's uniforms with the nozzle speed scaled by 1 + rel (a runtime input; absent in a law without a nozzle)
+  perturbedUniforms(uniforms, rel) {
+    const out = { ...uniforms };
+    if (rel && typeof out.nozzle_speed === "number") out.nozzle_speed = out.nozzle_speed * (1 + rel);
+    return out;
+  }
+  // [GHOSTS] stop and free this runtime (a ghost run's, once its frames are taken)
+  dispose() {
+    this.running = false; this.spec = null; this.token++;
+    if (this.tape) this.#release(this.tape.clear());
+    if (this.product) { try { this.product.destroy(); } catch { /* the device may be gone */ } this.product = null; }
+    this.ready = false;
+  }
+
   setCaseTilt(radians) {
     const next = Number(radians) || 0;
     if (next === (this.caseTilt || 0)) return;

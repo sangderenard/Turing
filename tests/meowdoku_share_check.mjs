@@ -10,6 +10,7 @@ import path from "node:path";
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../examples/meowdoku/web");
 const S = await import(pathToFileURL(path.join(web, "share.js")).href);
 const P = await import(pathToFileURL(path.join(web, "particle_styles.js")).href);
+const RL = await import(pathToFileURL(path.join(web, "replay_layers.js")).href);
 const src = fs.readFileSync(path.join(web, "app.js"), "utf8");
 
 // cut a balanced declaration / function starting at `start` (string and comment aware)
@@ -28,7 +29,7 @@ function cut(start) {
 }
 const decls = [...src.matchAll(/^const ([A-Z_]+SPECS?) = /gm)].map((m) => cut(m.index));
 const fn = cut(src.indexOf("function pageSpecs(specs)"));
-const ctx = vm.createContext({ ...P, state: { game: { game: "fountain3d" } } });          // (particle_styles.js exports: COLOR_SOURCES, PALETTE_IDS, ...)
+const ctx = vm.createContext({ ...P, rl: RL, state: { game: { game: "fountain3d" } } });          // (particle_styles.js exports: COLOR_SOURCES, PALETTE_IDS, ...)
 vm.runInContext(decls.map((d) => d.replace(/^const /, "var ")).join("\n") + "\n" + fn + "\nthis.pageSpecs = pageSpecs;", ctx);
 const pageSpecs = ctx.pageSpecs;
 

@@ -515,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
-    for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "wordle_layout.js"):
+    for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "wordle_layout.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])

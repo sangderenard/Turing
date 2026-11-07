@@ -14,6 +14,7 @@ import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirecti
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
+import * as rl from "./replay_layers.js";                                                          // [GHOSTS] replay layers (pure logic)
 import { initTipJar } from "./tipjar.js";                                                              // the tip jar's panel and grain picker
 import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
 import * as wl from "./wordle_layout.js";                                                             // Wordle: the rack, entry bar and give-up tile layout (pure)
@@ -4971,6 +4972,7 @@ function colorPick() {
 }
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
+  if (s.local && s.local.startsWith("ghosts")) return rl.settingValue(ghostSettings, s.local) ?? s.value;     // [GHOSTS]
   if (s.local === "wheelblur") return wheelBlur.on;
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
@@ -4979,6 +4981,7 @@ function localValue(s) {
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
+  if (s.local && s.local.startsWith("ghosts")) { ghostControl(s, value); refreshLocalControls(); return; }     // [GHOSTS]
   if (s.local === "wheelblur") {
     wheelBlur.on = !!value;
     try { localStorage.setItem("meowdoku.wheelblur", wheelBlur.on ? "1" : "0"); } catch { /* storage may be blocked */ }
@@ -5084,6 +5087,7 @@ function refreshLocalControls() {
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
   for (const s of pageSpecs(g.controls_ui)) {
+    if (s.local && s.local.startsWith("ghosts")) { ghostRefresh(s, box.querySelector(`[data-ctl="${s.id}"]`)); continue; }     // [GHOSTS]
     if (s.kind === "readout") {                       // a number the law reports (the dropped neighbour contacts beside the cap)
       const el = box.querySelector(`[data-ctl="${s.id}"]`), d = compute.diag;
       if (el) el.textContent = `${s.label}: ${d ? Math.round(d[s.diag]).toLocaleString() : "-"}`;
@@ -5332,6 +5336,108 @@ function autoArcStep(data) {
 // Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
 // [CURVE] the world curve control (world_curve.js): a log slider over R, then FLAT, then ORTHOGRAPHIC flat.  value = the notch of R 36.
 const CURVE_SPEC = { id: "worldcurve", kind: "range", label: "world curve", min: 0, max: 1, step: 0.005, local: "worldcurve", value: 0.311 };
+// [GHOSTS] REPLAY LAYERS (replay_layers.js): recorded runs of the fountain drawn at once with the live one, on its clock.
+// Settings are page specs (so a share link carries them); the recordings themselves are not shared.
+const GHOST_CAP_BYTES = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 24 : 64) * 1048576;
+let ghostSettings = rl.sanitizeSettings(null);
+try { ghostSettings = rl.sanitizeSettings(JSON.parse(localStorage.getItem("meowdoku.ghosts") || "null")); } catch { /* storage may be blocked */ }
+const ghostSet = new rl.LayerSet(GHOST_CAP_BYTES);
+const ghostJob = { running: false, stop: false, note: "", at: null, seed: 1, product: null };
+const ghostBuf = [];
+function ghostSave() { try { localStorage.setItem("meowdoku.ghosts", JSON.stringify(ghostSettings)); } catch { /* storage may be blocked */ } }
+const GHOST_SPECS = [
+  { id: "ghosts_comp", kind: "select", label: "ghost layers", local: "ghosts_comp", group: "Ghosts", options: [["off", "off"], ["behind", "behind each other (planes)"], ["single", "composed on one layer"]] },
+  { id: "ghosts_mode", kind: "select", label: "at a layer's end", local: "ghosts_mode", group: "Ghosts", options: [["loop", "loop"], ["hold", "hold the last frame"], ["bounce", "bounce"]] },
+  { id: "ghosts_depth", kind: "range", label: "plane spacing", min: 0, max: 0.5, step: 0.005, local: "ghosts_depth", group: "Ghosts" },
+  { id: "ghosts_amount", kind: "range", label: "tint amount", min: 0, max: 1, step: 0.05, local: "ghosts_amount", group: "Ghosts" },
+  { id: "ghosts_diverge", kind: "toggle", label: "divergence colouring", local: "ghosts_diverge", group: "Ghosts" },
+  { id: "ghosts_dscale", kind: "range", label: "diverged at", min: 0.002, max: 0.5, step: 0.002, local: "ghosts_dscale", group: "Ghosts" },
+  ...rl.TINTS.flatMap((tint, i) => [
+    { id: `ghosts${i + 1}_on`, kind: "toggle", label: `layer ${i + 1}`, local: `ghosts${i + 1}_on`, group: "Ghosts" },
+    { id: `ghosts${i + 1}_alpha`, kind: "range", label: "opacity", min: 0, max: 1, step: 0.05, local: `ghosts${i + 1}_alpha`, group: "Ghosts" },
+    { id: `ghosts${i + 1}_tint`, kind: "color", label: "tint", local: `ghosts${i + 1}_tint`, value: tint, group: "Ghosts" },
+  ]),
+  { id: "ghosts_k", kind: "range", label: "ghosts to make", min: 1, max: rl.MAX_LAYERS, step: 1, local: "ghosts_k", group: "Ghosts" },
+  { id: "ghosts_secs", kind: "range", label: "seconds each", min: 0.5, max: 30, step: 0.5, local: "ghosts_secs", group: "Ghosts" },
+  { id: "ghosts_amp", kind: "range", label: "perturbation", min: 0, max: 4, step: 0.1, local: "ghosts_amp", group: "Ghosts" },
+  { id: "ghosts_make", kind: "button", label: "make ghosts", local: "ghosts_make", group: "Ghosts" },
+  { id: "ghosts_capture", kind: "button", label: "capture the recording", local: "ghosts_capture", group: "Ghosts" },
+  { id: "ghosts_clear", kind: "button", label: "clear layers", local: "ghosts_clear", group: "Ghosts" },
+  { id: "ghosts_info", kind: "readout", label: "ghosts", local: "ghosts_info", group: "Ghosts" },
+];
+const mbText = (b) => (b / 1048576).toFixed(b < 10485760 ? 2 : 1) + " MB";
+function ghostControl(s, value) {
+  if (s.local === "ghosts_make") { ghostMake(); return; }
+  if (s.local === "ghosts_clear") { ghostSet.clear(); ghostJob.note = "layers cleared"; return; }
+  if (s.local === "ghosts_capture") {
+    const layer = rl.layerFromRecording(compute.tape, { name: "recorded", stride: compute.rec ? compute.rec.display_stride : 1, room: ghostSet.room });
+    if (!layer) ghostJob.note = recordOn ? "nothing to capture (the window is empty or does not fit the cap)" : "switch on record (readback) to capture the recording";
+    else { const slot = ghostSet.add(layer); ghostJob.note = slot < 0 ? "no free layer slot or no room under the cap" : `captured frames ${layer.first}-${layer.first + layer.count - 1} as layer ${slot + 1}`; }
+    return;
+  }
+  rl.applySetting(ghostSettings, s.local, s.kind === "toggle" ? !!value : s.kind === "range" ? Number(value) : value);
+  ghostSave();
+}
+function ghostRefresh(s, el) {
+  if (!el) return;
+  const m = /^ghosts([1-9])_/.exec(s.local), slot = m ? ghostSet.slots[Number(m[1]) - 1] : null;
+  if (s.local === "ghosts_info") {
+    const bytes = ghostSet.bytes, parts = ghostSet.slots.map((l, i) => l && `${i + 1}: ${l.name}, ${l.count} frames, ${mbText(l.bytes)}${l.lastStats && l.lastStats.joined ? `, mean divergence ${l.lastStats.mean.toExponential(1)}` : ""}`).filter(Boolean);
+    const per = compute.tape ? rl.reducedBytes(compute.tape.frameBytes / 20) : 0;
+    el.textContent = `ghosts: ${ghostSet.used} layer(s), ${mbText(bytes)} of ${mbText(ghostSet.capBytes)} cap${per ? ` (${per} B per frame per layer, ${(per / (compute.tape.frameBytes / 20)).toFixed(0)} B per grain)` : ""}${parts.length ? " | " + parts.join(" | ") : ""}${ghostJob.running ? ` | making: ${ghostJob.at}` : ""}${ghostJob.note ? ` | ${ghostJob.note}` : ""}`;
+    return;
+  }
+  if (s.local === "ghosts_make") { el.textContent = ghostJob.running ? "stop making" : "make ghosts"; return; }
+  if (s.local === "ghosts_capture") { el.title = recordOn ? "keep the recorder's window as a layer" : "switch on record (readback) first"; return; }
+  if (!m) {
+    const span = el.querySelector("span");
+    if (span && s.kind === "range") span.textContent = `${s.label} ${Number(rl.settingValue(ghostSettings, s.local)).toPrecision(2)} `;
+    return;
+  }
+  const kind = s.local.split("_")[1];
+  if (kind === "on") el.lastChild.textContent = slot ? ` layer ${m[1]}: ${slot.name} (${slot.count} f, ${mbText(slot.bytes)})` : ` layer ${m[1]} (empty)`;
+  else el.classList.toggle("dim", !slot);
+}
+// make `ghostSettings.k` ghosts through the existing recorder: a second runtime per ghost, from the start, with a seeded perturbation
+async function ghostMake() {
+  if (ghostJob.running) { ghostJob.stop = true; return; }
+  if (!isFountainGame(state.game) || !compute.ready || !compute.tape || !compute.rec) { ghostJob.note = "the fountain is not running"; return; }
+  const st = ghostSettings, free = ghostSet.slots.map((l, i) => (l ? -1 : i)).filter((i) => i >= 0).slice(0, st.k);
+  if (!free.length) { ghostJob.note = "no free layer slot: clear layers first"; return; }
+  const n = compute.tape.frameBytes / 20, plan = rl.planGhosts({ room: ghostSet.room, k: free.length, n, snapEvery: compute.snap, dt: compute.manifest.law.dt, seconds: st.secs });
+  if (plan.frames < 8) { ghostJob.note = `no room: ${mbText(ghostSet.room)} left for ${free.length} layer(s) of ${n} grains`; return; }
+  const seeds = free.map(() => ghostJob.seed++);
+  ghostJob.running = true; ghostJob.stop = false; ghostJob.note = plan.truncated ? `memory cap: ${plan.frames} of ${plan.wanted} frames per ghost` : ""; ghostJob.at = "starting";
+  try {
+    const made = await rl.makeGhosts({
+      live: compute, makeRuntime: () => new ComputeRuntime({ onStatus() {}, onSamples() {}, onSupport() {} }), seeds, frames: plan.frames, amp: st.amp, stride: compute.rec.display_stride,
+      onProgress: (p) => { ghostJob.at = `ghost ${Math.min(p.ghost + 1, p.of)}/${p.of}, frame ${p.frame}/${p.frames}`; refreshLocalControls(); },
+      shouldStop: () => ghostJob.stop,
+      onLayer: (layer, k) => { const slot = ghostSet.add(layer, free[k]); if (slot < 0) ghostJob.note = "a layer did not fit the cap"; },
+    });
+    ghostJob.note = `${made.length} ghost(s) made${ghostJob.stop ? " (stopped)" : ""}, ${mbText(ghostSet.bytes)} held; the law has no seed: a seed perturbs the case angle and the nozzle speed`;
+  } catch (e) { ghostJob.note = "making failed: " + String((e && e.message) || e); console.warn("[ghosts]", e); }
+  ghostJob.running = false; ghostJob.at = null; refreshLocalControls();
+}
+// the layers behind / under the live run: each enabled layer's frame for the live run's displayed frame, through the page's particle style
+function ghostsDraw(cam, data, g, rec) {
+  if (ghostJob.product !== compute.productKey) { ghostJob.product = compute.productKey; ghostSet.clear(); }     // layers belong to one product (grain ids mean the same thing)
+  if (ghostSettings.comp === "off" || !ghostSet.used) return;
+  const view = g.compute.view || rec.geometry.view, width = view[1] - view[0];
+  const plan = rl.planDraw(ghostSet, ghostSettings, compute.shown, width);
+  if (!plan.length) return;
+  const pick = colorPick(), own = ghostSettings.diverge || ghostSettings.amount > 0 ? { tint: [0, 0, 0, 0], mode: "simulation", grain: { ...pick.grain, mode: 0 } } : { tint: pick.tint, mode: pick.mode, grain: pick.grain };
+  for (const item of plan) {
+    const n = item.frame.n;
+    let buf = ghostBuf[item.slot];
+    if (!buf || buf.length !== 5 * n) buf = ghostBuf[item.slot] = new Float32Array(5 * n);
+    item.layer.lastStats = rl.buildGhostFrame(buf, item.frame, data, {
+      zOffset: item.zOffset, tint: item.tint, tintAmount: ghostSettings.amount, alpha: item.alpha, stride: item.layer.stride, liveStride: rec.display_stride,
+      diverge: ghostSettings.diverge ? { scale: ghostSettings.dscale * width } : null });
+    drawCloud(cam, buf, g, rec, particleStyle, own);
+  }
+}
+window.meowdokuDebug.ghosts = { settings: () => ghostSettings, set: ghostSet, job: ghostJob, make: ghostMake, rl };
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 const PANES_SPEC = { id: "panes", kind: "select", label: "panes beyond the walls", local: "panes", options: [["trim", "trimmed"], ["frame", "frame glass"], ["matte", "matte fill"]] };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
@@ -5361,7 +5467,7 @@ function pageSpecs(specs) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
-    if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC];
+    if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC, ...GHOST_SPECS];     // [GHOSTS]
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -5623,6 +5729,7 @@ function pointsFrame(cam, now) {
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
+  ghostsDraw(cam, data, g, rec);                                // [GHOSTS] the replay layers, behind / under the live run
   drawCloud(cam, data, g, rec, particleStyle);
   if (g.game === "fountain3d" || (g.game === "fountain" && state.flat) || g.compute.purrline) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
@@ -5655,7 +5762,7 @@ function drawChamberOutline(cam, g, rec) {
   cloud.drawOutline(pts, u.dh || 0, frame);
   drawBodyBlur(g.compute.body, frame, u.dh || 0);             // the 3-D fountain's hinged body (waterwheel), extruded through the slab
 }
-function drawCloud(cam, data, g, rec, style) {
+function drawCloud(cam, data, g, rec, style, ghost = null) {       // [GHOSTS] `ghost`: a replay layer's colour source (its own packed colour), drawn without the noise filter
   const y = TILE.height + 0.03;
   const pick = colorPick();
   // watch the case move: the grains are in the case's frame, so the case's model turn goes into viewProj and the view (every style reads
@@ -5668,9 +5775,9 @@ function drawCloud(cam, data, g, rec, style) {
     if (scene) scene = { ...scene, shadow: M.multiply(light.viewProj, model) };
   }
   cloud.draw(data, { viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
-                     y, stride: rec.display_stride, background: sceneBackground(), tint: pick.tint, colorMode: pick.mode,
-                     grain: pick.grain, scene, heat: heatFx,
-                     style, noise: noiseFx.on ? noiseFx : null, camera: { view, proj: cam.proj }, lighting });
+                     y, stride: rec.display_stride, background: sceneBackground(), tint: ghost ? ghost.tint : pick.tint, colorMode: ghost ? ghost.mode : pick.mode,
+                     grain: ghost ? ghost.grain : pick.grain, scene, heat: heatFx,
+                     style, noise: noiseFx.on && !ghost ? noiseFx : null, camera: { view, proj: cam.proj }, lighting });
 }
 // Debug: one scene frame on demand (the lit pass included), for measurement where requestAnimationFrame is paused (a hidden pane);
 // the frame's own re-request of itself is suppressed.
