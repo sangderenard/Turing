@@ -8,6 +8,7 @@ lists below are still reachable through ``meowdoku.fountain3d`` (its module ``__
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any
 
 import numpy as np
@@ -308,6 +309,7 @@ class FountainGame(Game):
                 "manifest": "fountain3d.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
+                "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
                 "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved())),
             },
@@ -316,3 +318,156 @@ class FountainGame(Game):
 
     def result(self):
         return None
+
+
+# ------------------------------------------------------- the SDF chamber's glass: a triangle mesh of the zero surface (host side, for the page)
+MESH_STEP_CELLS = 2.0                    # the 3-D marching grid starts this fine (in grid cells) and coarsens by 1.25 until the mesh fits the triangle budget
+MESH_TRIANGLES = 8000                    # the most triangles of a solid chamber mesh (~100 KB base64): a smooth solid needs no more
+MESH_CONTOUR_CELLS = 1.0 / 3.0           # the planar chambers' contour step, in cells (the thin ramps and pegs need it fine)
+MESH_CONTOUR_TOL = 5.0e-4                # their polyline simplification tolerance (scene units)
+_TETS = ((0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6), (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6))      # a cube as six tetrahedra about its 0-6 diagonal
+_CORNERS = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
+_MESHES: dict[tuple, dict | None] = {}
+
+
+def _tet_triangles(mask: int) -> list[tuple[tuple[int, int], ...]]:
+    """The triangles of one tetrahedron whose corners ``mask`` (bit k = corner k is inside the fluid) says are inside, as triples of edges (a, b)."""
+    inside = [k for k in range(4) if mask >> k & 1]
+    outside = [k for k in range(4) if not mask >> k & 1]
+    if len(inside) in (0, 4):
+        return []
+    if len(inside) in (1, 3):
+        odd = inside if len(inside) == 1 else outside
+        rest = [k for k in range(4) if k != odd[0]]
+        return [tuple((odd[0], t) for t in rest)]
+    (a, b), (c, d) = inside, outside
+    return [((a, c), (a, d), (b, d)), ((a, c), (b, d), (b, c))]
+
+
+_TET_TABLE = [_tet_triangles(m) for m in range(16)]
+
+
+def marching_tetrahedra(field: np.ndarray, origin: tuple[float, float, float], step: float) -> tuple[np.ndarray, np.ndarray]:
+    """The zero surface of ``field[i, j, k]`` (the value at ``origin + step (i, j, k)``; > 0 is inside) as a triangle mesh by marching tetrahedra with
+    linear interpolation: deterministic (cells in raster order, vertices numbered by their sorted edge keys, no tables beyond the sixteen tetrahedron
+    cases), watertight (a tetrahedron's edges are shared with its neighbours', so a vertex is one per grid edge).  Returns (vertices (m, 3), triangles
+    (t, 3)); triangles are wound so their normals point out of the fluid."""
+    nx, ny, nz = field.shape
+    gid = np.arange(nx * ny * nz, dtype=np.int64).reshape(field.shape)
+    flat = field.ravel()
+    keys, tris_local = [], []
+    base = (np.arange(nx - 1)[:, None, None], np.arange(ny - 1)[None, :, None], np.arange(nz - 1)[None, None, :])
+    cid = [gid[base[0] + di, base[1] + dj, base[2] + dk].ravel() for di, dj, dk in _CORNERS]
+    val = [flat[c] for c in cid]
+    for tet in _TETS:
+        mask = sum((val[c] > 0.0).astype(np.int64) << s for s, c in enumerate(tet))
+        for case in range(1, 15):
+            cells = np.nonzero(mask == case)[0]
+            if not len(cells):
+                continue
+            for tri in _TET_TABLE[case]:
+                ids = []
+                for a, b in tri:
+                    ga, gb = cid[tet[a]][cells], cid[tet[b]][cells]
+                    ids.append(np.minimum(ga, gb) * (nx * ny * nz) + np.maximum(ga, gb))
+                keys.append(np.stack(ids, axis=1))
+    if not keys:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    keys = np.concatenate(keys)
+    uniq, inverse = np.unique(keys.ravel(), return_inverse=True)
+    total = nx * ny * nz
+    lo, hi = uniq // total, uniq % total
+    idx = lambda g: np.stack(np.unravel_index(g, field.shape), axis=1).astype(np.float64)
+    va, vb = flat[lo], flat[hi]
+    t = (va / (va - vb))[:, None]
+    verts = np.asarray(origin) + step * (idx(lo) + t * (idx(hi) - idx(lo)))
+    tris = inverse.reshape(-1, 3)
+    # wind each triangle so that its normal points toward decreasing field (out of the fluid)
+    p = verts[tris]
+    normal = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    toward = (idx(hi) - idx(lo))[tris[:, 0]] * np.sign(va - vb)[tris[:, 0], None]          # from the inside corner to the outside corner of the first edge
+    flip = (normal * toward).sum(1) < 0.0
+    tris[flip] = tris[flip][:, ::-1]
+    return verts, tris
+
+
+def _planar(u: dict[str, float]) -> bool:
+    """Every part of the chamber runs through the whole depth (pegs, the extruded hourglass, ramps stretched past the glass): it is the same at every z."""
+    for k in range(SDF_SLOTS):
+        if u[f"q{k}kind"] > 0.5:
+            kind = SDF_LAYOUT[k]
+            if not (kind == "pegs" or (kind == "hourglass" and u[f"q{k}p4"] > 0.5) or (kind == "capsule" and u[f"q{k}p2"] >= u["dh"])):
+                return False
+    return True
+
+
+def _pack(verts: np.ndarray, tris: np.ndarray, bounds: list[float]) -> dict:
+    import base64
+    lo, hi = np.array(bounds[0::2]), np.array(bounds[1::2])
+    q = np.rint((verts - lo) / (hi - lo) * 65535.0).astype(np.uint16)
+    return {"bounds": [float(b) for b in bounds], "nv": int(len(verts)), "nt": int(len(tris)),
+            "v": base64.b64encode(q.astype("<u2").tobytes()).decode("ascii"),
+            "t": base64.b64encode(tris.astype("<u2").tobytes()).decode("ascii")}
+
+
+def chamber_mesh(shape: str, n: int, aspect: float | None = None, params: dict | None = None) -> dict | None:
+    """The SDF chamber's walls as a triangle mesh for the page (``None`` for the box and the polygons, which the page draws from their vertices):
+    the zero surface of the composed SDF over the window x the depth, quantised to 16 bits over its bounding box and base64'd
+    (``{bounds, nv, nt, v, t}``: ``v`` is ``nv`` x 3 uint16, ``t`` is ``nt`` x 3 uint16 indices).  A chamber that is the same at every z (the toy) is the
+    extrusion of its marching-squares contour (fine enough for the pegs and ramps, simplified); a true solid is marching tetrahedra at ``MESH_STEP_CELLS``
+    cells.  Deterministic and cached."""
+    if shape not in SDF_SHAPES:
+        return None
+    p = resolve_params(0.5, params)
+    cell = cell_of(p)
+    key = (shape, int(n), aspect, round(cell, 9), round(float((params or {}).get("depth", 0.0)), 9))
+    if key in _MESHES:
+        return _MESHES[key]
+    u = {k: float(v) for k, v in uniforms(n=n, aspect=aspect, params=params, shape=shape).items()}
+    geo = basin(n, aspect, cell)
+    x0, x1, y0, y1 = geo["view"]
+    dh = u["dh"]
+    if _planar(u):
+        from meowdoku.fountain import simplify, zero_contours
+        h = max(cell * MESH_CONTOUR_CELLS, max(x1 - x0, y1 - y0) / 450.0)
+        xs = x0 - h + h * np.arange(int(math.ceil((x1 - x0) / h)) + 3)
+        ys = y0 - h + h * np.arange(int(math.ceil((y1 - y0) / h)) + 3)
+        gx, gy = np.meshgrid(xs, ys)
+        d = np.clip(chamber_distance(u, gx.ravel(), gy.ravel(), 0.0)[0].reshape(gx.shape), -1.0, 1.0)
+        verts, tris = [], []
+        for line in zero_contours(d, float(xs[0]), float(ys[0]), h):
+            line = simplify(line, MESH_CONTOUR_TOL)
+            base = len(verts)
+            for px, py in line:
+                verts += [(px, py, -dh), (px, py, dh)]
+            for i in range(len(line) - 1):
+                a = base + 2 * i
+                tris += [(a, a + 2, a + 3), (a, a + 3, a + 1)]
+        verts, tris = np.array(verts).reshape(-1, 3), np.array(tris, dtype=np.int64).reshape(-1, 3)
+    else:
+        step = MESH_STEP_CELLS * cell
+        while True:
+            xs = x0 - step + step * np.arange(int(math.ceil((x1 - x0) / step)) + 3)
+            ys = y0 - step + step * np.arange(int(math.ceil((y1 - y0) / step)) + 3)
+            zs = -dh - step + step * np.arange(int(math.ceil(2.0 * dh / step)) + 3)
+            gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+            d = np.clip(chamber_distance(u, gx.ravel(), gy.ravel(), gz.ravel())[0].reshape(gx.shape), -1.0, 1.0)
+            verts, tris = marching_tetrahedra(d, (float(xs[0]), float(ys[0]), float(zs[0])), step)
+            if len(tris) <= MESH_TRIANGLES:
+                break
+            step *= 1.25                                                   # over the triangle budget: a coarser grid
+    mesh = None
+    if len(verts):
+        lo, hi = verts.min(0), verts.max(0)
+        hi = np.maximum(hi, lo + 1.0e-6)
+        mesh = _pack(verts, tris, [lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]])
+    _MESHES[key] = mesh
+    return mesh
+
+
+def unpack_mesh(mesh: dict) -> tuple[np.ndarray, np.ndarray]:
+    """The page's decode of ``chamber_mesh`` (for tests): (vertices (nv, 3), triangles (nt, 3))."""
+    import base64
+    b = np.array(mesh["bounds"])
+    q = np.frombuffer(base64.b64decode(mesh["v"]), dtype="<u2").reshape(-1, 3).astype(np.float64)
+    return b[0::2] + q / 65535.0 * (b[1::2] - b[0::2]), np.frombuffer(base64.b64decode(mesh["t"]), dtype="<u2").reshape(-1, 3).astype(np.int64)

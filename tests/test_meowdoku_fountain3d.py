@@ -1296,3 +1296,51 @@ def test_sdf_presets_are_inscribed_in_the_window_and_the_depth_and_the_inlet_is_
     # the polygon presets and the box are untouched: sdf off, no slots
     for shape in ("box", "funnel", "hexagon", "ramp"):
         assert float(F.uniforms(n=256, shape=shape)["sdf_on"]) == 0.0
+
+
+def test_the_sdf_chamber_mesh_is_a_deterministic_compact_watertight_surface_the_page_can_draw():
+    from collections import Counter
+    from meowdoku import fountain_game as G
+    game = G.FountainGame(size="small")
+    assert game.state()["compute"]["chamber_mesh"] is None                                   # the box and the polygons are drawn from their vertices
+    for shape in F.SDF_SHAPES:
+        game = G.FountainGame(size="4k")
+        game.do({"type": "fountain_choice", "name": "shape", "value": shape})
+        mesh = game.state()["compute"]["chamber_mesh"]
+        G._MESHES.clear()
+        again = G.chamber_mesh(shape, game.n, game.aspect, game.params)
+        assert again == mesh, shape                                                           # deterministic (same bytes)
+        assert mesh["nt"] <= max(G.MESH_TRIANGLES, 10000) and len(json.dumps(mesh)) < 200_000, shape      # compact
+        verts, tris = G.unpack_mesh(mesh)
+        assert len(verts) == mesh["nv"] and len(tris) == mesh["nt"] and tris.max() < len(verts)
+        u = {k: float(v) for k, v in game.uniforms().items()}
+        d = F.chamber_distance(u, verts[:, 0], verts[:, 1], verts[:, 2])[0]
+        assert np.abs(d).mean() < 0.01 and np.abs(d).max() < 0.08, shape                      # every vertex lies on the zero surface, to the grid (a coarse step cuts a cube corner by a few hundredths)
+        assert np.abs(verts[:, 2]).max() <= u["dh"] + 1.0e-3                                  # inside the slab
+        if shape != "sdf_toy":                                                                # a true solid is a closed surface: every edge has two triangles
+            edges = Counter()
+            for a, b, c in tris:
+                for p, q in ((a, b), (b, c), (c, a)):
+                    edges[(min(p, q), max(p, q))] += 1
+            assert set(edges.values()) == {2}, shape
+        else:                                                                                 # the toy is the extruded contour: its walls span the whole depth
+            assert abs(verts[:, 2].min() + u["dh"]) < 1.0e-3 and abs(verts[:, 2].max() - u["dh"]) < 1.0e-3
+
+
+def test_the_server_offers_the_sdf_chambers_and_builds_each_to_the_depth_its_solid_needs():
+    from meowdoku import fountain_game as G
+    game = G.FountainGame(size="4k")
+    ids = {c["id"]: c for c in game.controls_ui()}
+    assert [k for k, _label in ids["shape"]["options"]] == [k for k, _label in F.CHAMBER_CHOICES]
+    depths = {}
+    for shape in F.SDF_SHAPES:
+        game.do({"type": "fountain_choice", "name": "shape", "value": shape})
+        st = game.state()
+        depths[shape] = st["compute"]["depth"]
+        assert st["compute"]["uniforms"]["sdf_on"] == 1.0 and st["compute"]["chamber_mesh"] is not None
+        assert {c["id"]: c for c in st["controls_ui"]}["depth"]["value"] == pytest.approx(depths[shape], abs=1e-6)
+    assert depths["sdf_sphere"] > 10 * depths["sdf_toy"] and depths["sdf_toy"] == pytest.approx(F.DEPTH_DEFAULT, abs=1e-6)
+    game.do({"type": "fountain_param", "name": "depth", "value": 0.4})                         # a depth the page sets is kept: the sphere shrinks to fit it
+    assert game.state()["compute"]["depth"] == pytest.approx(0.4, abs=1e-6)
+    game.do({"type": "fountain_choice", "name": "shape", "value": "funnel"})                  # back to a polygon: the polygons' default depth
+    assert game.state()["compute"]["depth"] == pytest.approx(F.DEPTH_DEFAULT, abs=1e-6) and game.state()["compute"]["chamber_mesh"] is None

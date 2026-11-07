@@ -521,6 +521,16 @@ function housingFaces(g) {
   const [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0)), mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
   const y = TILE.height + 0.03, dh = u.dh;
   const wp = (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+  if (c.chamber_mesh) {                                             // an SDF chamber: the zero surface as a triangle mesh (fountain_game.chamber_mesh: 16-bit vertices over `bounds`, 16-bit indices, base64)
+    const m16 = (s) => { const bin = atob(s), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
+    const q = m16(c.chamber_mesh.v), t = m16(c.chamber_mesh.t), b = c.chamber_mesh.bounds, faces = [];
+    const vert = (i) => wp(b[0] + q[3 * i] / 65535 * (b[1] - b[0]), b[2] + q[3 * i + 1] / 65535 * (b[3] - b[2]), b[4] + q[3 * i + 2] / 65535 * (b[5] - b[4]));
+    for (let i = 0; i < c.chamber_mesh.nt; i++) faces.push([vert(t[3 * i]), vert(t[3 * i + 1]), vert(t[3 * i + 2]), m]);
+    // the panes: there is no polygon to trim them to, so "trim" draws none (the mesh is the glass); "frame" / "matte" close the slab's front and back over the whole window
+    const fill = panes.mode === "frame" ? m : panes.mode === "matte" ? state.materialIndex["housing_matte"] : null;
+    if (fill != null) for (const z of [-dh, dh]) faces.push([wp(x0, y0, z), wp(x1, y0, z), wp(x1, y1, z), fill], [wp(x0, y0, z), wp(x1, y1, z), wp(x0, y1, z), fill]);
+    return faces;
+  }
   const pts = [];
   for (let i = 0; i < 8; i++) {
     const q = [u[`px${i}`], Math.min(u[`py${i}`], y1)], last = pts[pts.length - 1];       // (the walls end at the view's top edge)
@@ -599,7 +609,7 @@ const panes = { mode: "trim" };
 try { const saved = localStorage.getItem("meowdoku.panes"); if (["trim", "frame", "matte"].includes(saved)) panes.mode = saved; } catch { /* storage may be blocked */ }
 function updateHousing() {
   const g = state.game, c = g && g.compute;
-  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode]) : "";
+  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
   const faces = key ? housingFaces(g) : null;
@@ -5050,6 +5060,7 @@ function drawChamberOutline(cam, g, rec) {
   const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
   // the 2-D fountain's server sends its chamber as polylines (g.compute.chamber_outline: the polyline chambers' vertices, the SDF chambers'
   // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
+  if (g.compute.chamber_mesh) return;                         // an SDF chamber's walls are the glass mesh (housingFaces)
   const lines = g.compute.chamber_outline;
   if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); return; }
   for (let k = 0; k < 8; k++) {
