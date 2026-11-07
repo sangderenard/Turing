@@ -92,17 +92,21 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
-  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
+  rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
-function repartitionExterior() {
+function repartitionExterior(force=false) {
   if(!lastGeometry)return;
+  const classes=new Map();
+  for(const face of lastGeometry.glass) if(!classes.has(face[3])) {
+    const id=face[3],transmission=read("pbr",id,5),opacity=read("pbr",id,7);
+    classes.set(id,Math.min(opacity,1-0.8*transmission)>=0.999);
+  }
+  if(!force&&classes.size===exteriorClass.size&&[...classes].every(([id,value])=>exteriorClass.get(id)===value))return;
+  exteriorClass=classes;
   dispose(glass);dispose(glassOpaque);
   const opaque=[],transparent=[];
-  for(const face of lastGeometry.glass) {
-    const id=face[3], transmission=read("pbr",id,5), opacity=read("pbr",id,7);
-    (Math.min(opacity,1-0.8*transmission)>=0.999?opaque:transparent).push(face);
-  }
+  for(const face of lastGeometry.glass) (classes.get(face[3])?opaque:transparent).push(face);
   glassOpaque=mesh(opaque);glass=mesh(transparent);
 }
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
@@ -204,7 +208,7 @@ function rebuild() {
     {scale:+$("die-inclusion-size").value/100}) : inclusions;
   const {interior:inside,glass:outside,triangleCount}=geometry;
   interior = mesh(inside); lastGeometry=geometry;
-  repartitionExterior();
+  repartitionExterior(true);
   for (const name of dimensions) $(name+"-out").value = $(name).value;
   message.textContent = `${triangleCount.toLocaleString()} triangles · pattern #${seed}`+
     (geometry.inclusionFit?` · inclusion fit ×${geometry.inclusionFit.factor.toFixed(2)}`:"");
