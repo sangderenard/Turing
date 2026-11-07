@@ -5636,7 +5636,9 @@ function refreshLocalControls() {
       }
       select.value = particleStyle;
       const glassInfo = cloud && cloud.styles.glassInfo;     // how the glass grains were composited in the last frame (OIT, or alpha and why)
-      el.title = drawn || (glassInfo ? `${glassInfo}` : "") || (particleStyle === "heat" && cloud && cloud.styles.heatInfo) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      el.title = drawn || (glassInfo ? `${glassInfo}` : "") || (particleStyle === "heat" && cloud && cloud.styles.heatInfo)
+        || (particleStyle === "emoji_mesh" ? "3-D law: physical emoji tumble for up to 8,192 displayed grains. 2-D laws have no angular state, so glyph poses stay fixed." : "")
+        || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
       for (const option of select.options) if ((option.value === "stained" || option.value === "stained_fast") && option.dataset.label)
         option.title = option.disabled ? option.title : (option.value === "stained_fast" ? "glass grains: plain alpha blending in draw order (fast mode)" : glassInfo || "glass grains: weighted blended OIT through the scene shader's material tables");
     } else if (s.local === "heat_fixed" || s.local === "heat_gamma") {
@@ -6345,6 +6347,7 @@ function drawChamberOutline(cam, g, rec) {
   drawBodyBlur(g.compute.body, frame, u.dh || 0);             // the 3-D fountain's hinged body (waterwheel), extruded through the slab
 }
 function drawCloud(cam, data, g, rec, style, ghost = null) {       // [GHOSTS] `ghost`: a replay layer's colour source (its own packed colour), drawn without the noise filter
+  if (!ghost) compute.setEmojiTumble(style === "emoji_mesh");
   const y = TILE.height + 0.03 + marbleCourseLift(g);
   const pick = colorPick();
   // watch the case move: the grains are in the case's frame, so the case's model turn goes into viewProj and the view (every style reads
@@ -6358,7 +6361,7 @@ function drawCloud(cam, data, g, rec, style, ghost = null) {       // [GHOSTS] `
   }
   cloud.draw(data, { viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
                      y, stride: rec.display_stride, background: sceneBackground(), tint: ghost ? ghost.tint : pick.tint, colorMode: ghost ? ghost.mode : pick.mode,
-                     grain: ghost ? ghost.grain : pick.grain, scene, heat: heatFx,
+                     grain: ghost ? ghost.grain : pick.grain, scene, heat: heatFx, spinPose: ghost ? null : compute.emojiPose(),
                      style, noise: noiseFx.on && !ghost ? noiseFx : null, camera: { view, proj: cam.proj }, lighting });
 }
 // Debug: one scene frame on demand (the lit pass included), for measurement where requestAnimationFrame is paused (a hidden pane);

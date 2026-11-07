@@ -495,7 +495,7 @@ export const PACKING = {                         // the packed point: [x, y, z, 
   color: { offset: 12 },                         // 4 normalised bytes
   meta: { offset: 16 },                          // float: 100 (moving) / 200 (at rest) + radius * 1000; below 50 = not alive
 };
-export const INSTANCE_LOCATIONS = { position: 7, color: 8, meta: 9, id: 10 };
+export const INSTANCE_LOCATIONS = { position: 7, color: 8, meta: 9, id: 10, quaternion: 11 };
 // A partitioned batch (the emoji meshes: one batch per kind) carries the grain's displayed slot as a sixth word, so its fixed
 // rotation does not depend on where the grain sits in the batch.
 export const BATCH_PACKING = { stride: 24, id: { offset: 20 } };
@@ -524,8 +524,10 @@ layout(location = ${INSTANCE_LOCATIONS.position}) in vec3 aInstPos;
 layout(location = ${INSTANCE_LOCATIONS.color}) in vec4 aInstColor;
 layout(location = ${INSTANCE_LOCATIONS.meta}) in float aInstMeta;
 layout(location = ${INSTANCE_LOCATIONS.id}) in float aInstId;     // the displayed slot (emoji batches only; the instance's own rotation key)
+layout(location = ${INSTANCE_LOCATIONS.quaternion}) in vec4 aInstQuat; // physical orientation in the law's xyz frame
 uniform bool uInstanced;
-uniform float uInstRot;     // 1: emoji batch slot; 2: direct instanced mesh slot; fixed pose until the law exports orientation
+uniform float uInstRot;     // 1: emoji batch slot; 2: direct instanced mesh slot
+uniform bool uInstSpin;     // emoji batch supplies the law's integrated orientation
 uniform vec4 uInstMesh;     // the mesh's centre (xyz) and 1 / its larger half-width in the glyph's plane
 uint instHash(uint x) { x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
 mat3 instanceRotation() {   // the glyph lies in its xy plane facing +z: stand it on the board facing up, +y toward the board's top, then yaw it round and tilt it a little, all fixed by the slot
@@ -536,6 +538,14 @@ mat3 instanceRotation() {   // the glyph lies in its xy plane facing +z: stand i
   mat3 base = mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0));
   mat3 tx = mat3(1.0, 0.0, 0.0, 0.0, ca, sa, 0.0, -sa, ca), tz = mat3(cb, sb, 0.0, -sb, cb, 0.0, 0.0, 0.0, 1.0), ry = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
   return ry * tx * tz * base;
+}
+vec3 physicalSpin(vec3 v) {
+  // Board/world basis is (law x, law z, -law y). Rotate in law coordinates,
+  // then return to world coordinates so a law-axis roll tumbles the mesh.
+  vec3 law = vec3(v.x, -v.z, v.y);
+  vec3 t = 2.0 * cross(aInstQuat.xyz, law);
+  law += aInstQuat.w * t + cross(aInstQuat.xyz, t);
+  return vec3(law.x, law.z, -law.y);
 }
 uniform vec4 uInstMap;      // board window centre x, y and the board -> world scale k
 uniform vec3 uInstBoard;    // board width, height, and the plane's height
@@ -556,6 +566,7 @@ void main() {
   if (!instanceAlive()) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 lp = aPos, nrm = aNorm;
   if (uInstRot > 0.5) { mat3 R = instanceRotation(); lp = R * ((aPos - uInstMesh.xyz) * uInstMesh.w); nrm = R * aNorm; }
+  if (uInstSpin) { lp = physicalSpin(lp); nrm = physicalSpin(nrm); }
   vec3 world = instanceCenter() + lp * instanceRadius();
   vec4 posV = uMV * vec4(world, 1.0);
   vPosV = posV.xyz; vNormV = mat3(uMV) * nrm; vPosObj = world;
@@ -1233,6 +1244,7 @@ export class ParticleStyles {
     gl.useProgram(P);
     gl.uniform1i(at("uInstanced"), 0);                              // the scene's pieces never see the flag
     gl.uniform1f(at("uInstRot"), 0);
+    gl.uniform1i(at("uInstSpin"), 0);
     if (S.thermal) gl.uniform1i(at("uThermalEmission"), 0);
     for (const [i, v] of held) { if (v instanceof Int32Array) gl.vertexAttribI4i(i, v[0], v[1], v[2], v[3]); else if (v instanceof Uint32Array) gl.vertexAttribI4ui(i, v[0], v[1], v[2], v[3]); else gl.vertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
   }
@@ -1312,27 +1324,42 @@ export class ParticleStyles {
     const native = emojiNative(ctx.tint, ctx.grain) && ctx.colorMode !== "material";
     const sc = (this.emojiScratch ||= { kind: new Uint8Array(0), out: new Float32Array(0) });
     if (sc.kind.length < n) { sc.kind = new Uint8Array(n); sc.out = new Float32Array(n * 6); }
-    const counts = new Uint32Array(K), starts = new Uint32Array(K + 1);
+    const poseLimit = Math.min(n, ctx.spinPose?.length / 4 || 0);
+    const counts = new Uint32Array(K), spinCounts = new Uint32Array(K), starts = new Uint32Array(K + 1), spinStarts = new Uint32Array(K + 1);
     for (let i = 0; i < n; i++) {
       const meta = data[5 * i + 4];
       if (!(meta >= 50)) { sc.kind[i] = 255; continue; }
       const flag = Math.floor(meta / 100 + 0.001), k = emojiKind(assign, i, (meta - flag * 100) * 0.001, K, grain.bands, grain.range);
       sc.kind[i] = k; counts[k]++;
+      if (i < poseLimit) spinCounts[k]++;
     }
-    for (let k = 0; k < K; k++) starts[k + 1] = starts[k] + counts[k];
+    for (let k = 0; k < K; k++) { starts[k + 1] = starts[k] + counts[k]; spinStarts[k + 1] = spinStarts[k] + spinCounts[k]; }
     const total = starts[K], cursor = starts.slice(0, K), out = sc.out, outBits = new Uint32Array(out.buffer);
+    const poses = ctx.spinPose;
+    const spinTotal = spinStarts[K], spinOut = spinTotal ? (sc.spin ||= new Float32Array(0)) : null;
+    if (spinOut && spinOut.length < spinTotal * 4) sc.spin = new Float32Array(spinTotal * 4);
+    const spinCursor = spinStarts.slice(0, K);
     for (let i = 0; i < n; i++) {
       const k = sc.kind[i];
       if (k === 255) continue;
-      const o = cursor[k]++ * 6, s = 5 * i;
+      const j = cursor[k]++, o = j * 6, s = 5 * i;
       out[o] = data[s]; out[o + 1] = data[s + 1]; out[o + 2] = data[s + 2];
       outBits[o + 3] = native ? E.words[k] : bits[s + 3];
       out[o + 4] = data[s + 4]; out[o + 5] = i;
+      if (spinOut && i < poseLimit) {
+        const q = i * 4, d = spinCursor[k]++ * 4;
+        sc.spin[d] = poses[q]; sc.spin[d + 1] = poses[q + 1]; sc.spin[d + 2] = poses[q + 2]; sc.spin[d + 3] = poses[q + 3];
+      }
     }
     if (!total) return;
     const buffer = (E.batchBuffer ||= gl.createBuffer());
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, out, gl.DYNAMIC_DRAW, 0, total * 6);
+    if (spinOut) {
+      const spinBuffer = (E.spinBuffer ||= gl.createBuffer());
+      gl.bindBuffer(gl.ARRAY_BUFFER, spinBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, sc.spin, gl.DYNAMIC_DRAW, 0, spinTotal * 4);
+    }
     const partitionMs = performance.now() - t0;
     // ---- draw one batch per kind
     const held = this.#sceneBegin(ctx), at = (name) => gl.getUniformLocation(S.program, name);
@@ -1344,16 +1371,33 @@ export class ParticleStyles {
       const mesh = meshes[k], vao = this.#emojiVao(E, kinds[k].mesh + suffix, mesh);
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);                                   // (the batch's byte offset moves with the counts)
-      const base = starts[k] * BATCH_PACKING.stride;
-      gl.vertexAttribPointer(L.position, PACKING.position.size, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.position.offset);
-      gl.vertexAttribPointer(L.color, 4, gl.UNSIGNED_BYTE, true, BATCH_PACKING.stride, base + PACKING.color.offset);
-      gl.vertexAttribPointer(L.meta, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.meta.offset);
-      gl.vertexAttribPointer(L.id, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + BATCH_PACKING.id.offset);
+      const setBatch = (first) => {
+        const base = first * BATCH_PACKING.stride;
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.vertexAttribPointer(L.position, PACKING.position.size, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.position.offset);
+        gl.vertexAttribPointer(L.color, 4, gl.UNSIGNED_BYTE, true, BATCH_PACKING.stride, base + PACKING.color.offset);
+        gl.vertexAttribPointer(L.meta, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.meta.offset);
+        gl.vertexAttribPointer(L.id, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + BATCH_PACKING.id.offset);
+      };
       gl.uniform4f(at("uInstMesh"), mesh.center[0], mesh.center[1], mesh.center[2], 1 / Math.max(mesh.half[0], mesh.half[1], 1e-4));
-      gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, counts[k]);
+      if (spinCounts[k]) {
+        setBatch(starts[k]);
+        gl.bindBuffer(gl.ARRAY_BUFFER, E.spinBuffer);
+        gl.enableVertexAttribArray(L.quaternion);
+        gl.vertexAttribPointer(L.quaternion, 4, gl.FLOAT, false, 16, spinStarts[k] * 16);
+        gl.uniform1i(at("uInstSpin"), 1);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, spinCounts[k]);
+      }
+      if (counts[k] > spinCounts[k]) {
+        setBatch(starts[k] + spinCounts[k]);
+        gl.disableVertexAttribArray(L.quaternion);
+        gl.vertexAttrib4f(L.quaternion, 0, 0, 0, 1);
+        gl.uniform1i(at("uInstSpin"), 0);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, counts[k] - spinCounts[k]);
+      }
       tris += counts[k] * mesh.count / 3;
     }
-    this.emojiInfo = `${total.toLocaleString("en-US")} grains in ${counts.filter((c) => c).length} batches, ${Math.round(tris).toLocaleString("en-US")} triangles, partition + upload ${partitionMs.toFixed(2)} ms`;
+    this.emojiInfo = `${total.toLocaleString("en-US")} grains in ${counts.filter((c) => c).length} batches, ${Math.round(tris).toLocaleString("en-US")} triangles, partition + upload ${partitionMs.toFixed(2)} ms${spinOut ? `; physical tumble for the first ${Math.min(n, poses.length / 4).toLocaleString("en-US")} displayed IDs` : ""}`;
     this.#sceneEnd(ctx, held);
     gl.bindVertexArray(ctx.vao);
   }
@@ -1371,6 +1415,7 @@ export class ParticleStyles {
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
     for (const at of [INSTANCE_LOCATIONS.position, INSTANCE_LOCATIONS.color, INSTANCE_LOCATIONS.meta, INSTANCE_LOCATIONS.id]) { gl.enableVertexAttribArray(at); gl.vertexAttribDivisor(at, 1); }
+    gl.vertexAttribDivisor(INSTANCE_LOCATIONS.quaternion, 1);
     vaos.set(name, { mesh, vao });
     return vao;
   }

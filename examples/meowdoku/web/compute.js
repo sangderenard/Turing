@@ -58,6 +58,7 @@ import { NoiseFilter } from "./noise_filter.js";
 import { mobroadInputs, mobroadTarget, mobroadPather } from "./mobroad.js";               // [MOBROAD]
 import { caseFlipAt, caseFlipSteps, lawAxis, rotateLawVector } from "./case_motion.js";
 import { integrateAngular } from "./marble_rotation.js";
+import { EmojiTumble, EMOJI_TUMBLE_LIMIT } from "./emoji_tumble.js";
 const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
@@ -209,13 +210,32 @@ ${commit}
       ? ["wx", "wy", "wz"].map((name) => A.feed_slots[name]) : null;
     this.angularCount = this.angularSlots ? Math.min(rec.n, angularCount) : 0;
     this.angularRegion = this.angularSlots ? Math.ceil(this.maxFrames * this.angularCount * 12 / 256) * 256 : 0;
-    this.frameOffset = this.diagRegion + this.angularRegion;
+    this.emojiAngularCount = this.angularSlots ? Math.min(ndisp, EMOJI_TUMBLE_LIMIT) : 0;
+    this.emojiRegion = Math.ceil(this.maxFrames * this.emojiAngularCount * 12 / 256) * 256;
+    this.emojiOffset = this.diagRegion + this.angularRegion;
+    this.frameOffset = this.emojiOffset + this.emojiRegion;
+    if (this.emojiAngularCount) {
+      const spinCode = `${lanes("read_write")}
+@group(0) @binding(${B}) var<storage, read_write> spin: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  if (g.x >= ${this.emojiAngularCount}u) { return; }
+  let i = g.x * ${stride}u;
+  spin[g.x * 3u] = ${this.ref(this.angularSlots[0])};
+  spin[g.x * 3u + 1u] = ${this.ref(this.angularSlots[1])};
+  spin[g.x * 3u + 2u] = ${this.ref(this.angularSlots[2])};
+}`;
+      const spinModule = this.device.createShaderModule({ code: spinCode });
+      this.#check(await spinModule.getCompilationInfo(), "emoji angular gather WGSL");
+      this.emojiPack = await this.device.createComputePipelineAsync({ layout: this.device.createPipelineLayout({ bindGroupLayouts: [packLayout] }), compute: { module: spinModule, entryPoint: "main" } });
+      this.emojiBuffer = this.device.createBuffer({ size: this.emojiAngularCount * 12, usage: S });
+    }
     this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.frameOffset + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
     this.stateSlots = this.state.map((name) => A.feed_slots[name]);
     const oom = await this.device.popErrorScope();
     if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + ndisp * PT_BYTES)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
     this.group = this.device.createBindGroup({ layout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.head } }] });
     this.packGroup = this.device.createBindGroup({ layout: packLayout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.pts } }] });
+    if (this.emojiBuffer) this.emojiGroup = this.device.createBindGroup({ layout: packLayout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.emojiBuffer } }] });
     this.stepMs = 0;
   }
 
@@ -272,7 +292,7 @@ ${commit}
   // Run `frames` snapshots: `snapEvery` steps, then pack and keep the points, each; plus the law's diagnostics after the
   // snapshots in `diagAt` and a copy of the law's state after those in `keyAt` (indices into the batch).  One submit.  Returns
   // a promise of { frames: Float32Array[], diags: ({name: value} | null)[], keys: ({ payload, bytes } | null)[] }.
-  batch({ frames, snapEvery, diagAt = [], keyAt = [] }) {
+  batch({ frames, snapEvery, diagAt = [], keyAt = [], emojiSpin = false }) {
     const stage = this.stages.find((s) => !s.busy);
     if (!stage) throw new Error("no staging buffer free");
     stage.busy = true;
@@ -285,6 +305,12 @@ ${commit}
       if (this.angularSlots) for (let id = 0; id < this.angularCount; id++) this.angularSlots.forEach((slot, k) =>
         encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot) + id * 4, stage.buffer,
           this.diagRegion + (j * this.angularCount + id) * 12 + k * 4, 4));
+      if (emojiSpin && this.emojiPack) {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(this.emojiPack); pass.setBindGroup(0, this.emojiGroup);
+        pass.dispatchWorkgroups(Math.ceil(this.emojiAngularCount / 64)); pass.end();
+        encoder.copyBufferToBuffer(this.emojiBuffer, 0, stage.buffer, this.emojiOffset + j * this.emojiAngularCount * 12, this.emojiAngularCount * 12);
+      }
       if (diagAt.includes(j)) this.diagNames.forEach((name, k) => {
         const slot = this.abi.output_slots[name];
         encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, (j * nd + k) * 4, 4);
@@ -299,13 +325,15 @@ ${commit}
     const used = this.frameOffset + frames * this.frameBytes;
     return stage.buffer.mapAsync(GPUMapMode.READ, 0, used).then(() => {
       const range = stage.buffer.getMappedRange(0, used), words = this.frameBytes / 4;
-      const out = { frames: [], diags: [], keys, spins: [] };
+      const out = { frames: [], diags: [], keys, spins: [], emojiSpins: [] };
       for (let j = 0; j < frames; j++) {
         const dst = this.pool.pop() || new Float32Array(words);
         dst.set(new Float32Array(range, this.frameOffset + j * this.frameBytes, words));
         out.frames.push(dst);
         out.spins.push(this.angularSlots ? Array.from({ length: this.angularCount }, (_, id) =>
           Array.from(new Float32Array(range, this.diagRegion + (j * this.angularCount + id) * 12, 3))) : null);
+        out.emojiSpins.push(emojiSpin && this.emojiPack
+          ? new Float32Array(new Float32Array(range, this.emojiOffset + j * this.emojiAngularCount * 12, this.emojiAngularCount * 3)) : null);
         out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.diagNames.map((name, k) => [name, new Float32Array(range, (j * nd + k) * 4, 1)[0]])) : null);
       }
       stage.buffer.unmap(); stage.busy = false;
@@ -372,7 +400,7 @@ ${commit}
   }
 
   async idle() { await this.device.queue.onSubmittedWorkDone(); }
-  destroy() { for (const b of [...(this.lanes || []), this.head, this.pts]) b?.destroy(); for (const s of this.stages || []) s.buffer.destroy(); this.device.destroy(); }
+  destroy() { for (const b of [...(this.lanes || []), this.head, this.pts, this.emojiBuffer]) b?.destroy(); for (const s of this.stages || []) s.buffer.destroy(); this.device.destroy(); }
 }
 
 // ---------------------------------------------------------------- wasm route
@@ -411,13 +439,20 @@ class WasmProduct {
   canBatch() { return true; }
 
   // the same batch as the GPU's, run now on this thread (see GpuProduct.batch)
-  batch({ frames, snapEvery, diagAt = [], keyAt = [] }) {
-    const out = { frames: [], diags: [], keys: [], spins: [] };
+  batch({ frames, snapEvery, diagAt = [], keyAt = [], emojiSpin = false }) {
+    const out = { frames: [], diags: [], keys: [], spins: [], emojiSpins: [] };
     for (let j = 0; j < frames; j++) {
       this.step(snapEvery);
       out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * PT_WORDS)));
       out.spins.push(["wx", "wy", "wz"].every((name) => this.inputs[name])
         ? Array.from({ length: this.angularCount }, (_, id) => [this.inputs.wx[id], this.inputs.wy[id], this.inputs.wz[id]]) : null);
+      if (emojiSpin && ["wx", "wy", "wz"].every((name) => this.inputs[name])) {
+        const count = Math.min(this.ndisp, EMOJI_TUMBLE_LIMIT), spin = new Float32Array(count * 3), stride = this.rec.display_stride;
+        for (let id = 0; id < count; id++) {
+          spin[id * 3] = this.inputs.wx[id * stride]; spin[id * 3 + 1] = this.inputs.wy[id * stride]; spin[id * 3 + 2] = this.inputs.wz[id * stride];
+        }
+        out.emojiSpins.push(spin);
+      } else out.emojiSpins.push(null);
       out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])) : null);
       out.keys.push(keyAt.includes(j) ? { payload: Object.fromEntries(this.state.map((name) => [name, this.inputs[name].slice()])), bytes: this.state.length * this.pad * 4 } : null);
     }
@@ -582,6 +617,7 @@ export class ComputeRuntime {
     // the pump, the recording and the display cursor
     this.tape = null; this.play = new Playback(); this.shown = null; this.token = 0; this.inflight = 0; this.arrived = new Map();
     this.rotations = new Map(); // per-id physical omega and integrated pose, keyed with the recording
+    this.emojiTumble = new EmojiTumble(); this.emojiTumbleOn = false;
     this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
     this.stepsDone = 0; this.stepsPerSec = 0;
     this.lawInputs = {}; this.gravity = null; this.vibration = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
@@ -947,7 +983,7 @@ export class ComputeRuntime {
   #reset(phase2Rest) {
     this.caseTilt = this.caseMotionAt(this.steps).angle;
     this.caseFlips = [];
-    this.token++; this.arrived.clear(); this.rotations.clear();
+    this.token++; this.arrived.clear(); this.rotations.clear(); this.emojiTumble.clear();
     this.#release(this.tape.clear());
     this.lawInputs = this.#inputsNow();
     this.product.reset({ named: { ...this.named, ...this.start }, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs } });
@@ -1094,7 +1130,7 @@ export class ComputeRuntime {
     if (diagAt.length && !settle) this.diagAt = now;
     this.steps += m * snap; this.inflight++;
     const token = this.token;
-    p.batch({ frames: m, snapEvery: snap, diagAt, keyAt }).then(
+    p.batch({ frames: m, snapEvery: snap, diagAt, keyAt, emojiSpin: this.emojiTumbleOn }).then(
       (result) => { this.inflight--; this.#land(token, first, m, result, now); },
       (error) => { this.inflight--; this.error = String((error && error.message) || error); this.running = false; this.onStatus(); });
   }
@@ -1126,6 +1162,7 @@ export class ComputeRuntime {
         }
         while (this.rotations.size && this.rotations.keys().next().value < this.tape.lo)
           this.rotations.delete(this.rotations.keys().next().value);
+        if (r.emojiSpins?.[j]) this.emojiTumble.add(k, r.emojiSpins[j], snap * this.manifest.law.dt, this.tape.lo);
         if (r.keys[j]) this.#release({ keys: this.tape.addKey(step, r.keys[j].payload, r.keys[j].bytes) });
         if (r.diags[j]) this.#takeDiag(step, r.diags[j]);
       }
@@ -1162,6 +1199,8 @@ export class ComputeRuntime {
   points() { return this.ready && this.tape && this.shown != null ? this.tape.get(this.shown) : null; }
   rotationFor(id) { return this.shown == null ? null : this.rotations.get(this.shown)?.[id] || null; }
   rotation() { return this.rotationFor(0); }
+  setEmojiTumble(on) { this.emojiTumbleOn = !!on; }
+  emojiPose() { return this.shown == null ? null : this.emojiTumble.get(this.shown); }
 
   // --- the run modes: the page's controls call compute.control(name) ---
   control(name) {
@@ -1193,6 +1232,7 @@ export class ComputeRuntime {
       }
       this.#release(tape.truncateAfter(f));
       for (const frame of this.rotations.keys()) if (frame > f) this.rotations.delete(frame);
+      this.emojiTumble.truncateAfter(f);
       this.arrived.clear();
       this.steps = f * this.snap;
       await p.idle();
@@ -1408,7 +1448,7 @@ export class PointCloud {
     if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y, tint: opts.tint }, opts.noise);
     else this.noise.fallback = "";
   }
-  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera, tint, colorMode, grain, scene, heat }) {
+  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera, tint, colorMode, grain, scene, heat, spinPose }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
@@ -1419,7 +1459,7 @@ export class PointCloud {
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
     const n = data.length / PT_WORDS;
     // a selected style (particle_styles.js) draws the frame itself; "points", and a style this device cannot run, go on below
-    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, buffer: this.dyn, tint, colorMode, grain, scene, heat, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
+    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, buffer: this.dyn, tint, colorMode, grain, scene, heat, spinPose, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
                                                                  map: [(x0 + x1) / 2, (y0 + y1) / 2, k], now: performance.now() })) return;
     const setUniforms = (pass) => {
       gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
