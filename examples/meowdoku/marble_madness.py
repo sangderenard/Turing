@@ -12,6 +12,7 @@ import math
 
 from meowdoku.fountain_game import FountainGame
 from meowdoku import fountain3d as F
+from meowdoku import toy_design
 
 
 class MarbleMadness(FountainGame):
@@ -40,7 +41,7 @@ class MarbleMadness(FountainGame):
         p = self.resolved()
         geo = F.basin(self.n, self.aspect, F.cell_of(p), self.shape)
         cell, width, top = F.window_fit(self.shape, geo)
-        h0 = min(F._toy_parts(width, cell), top)
+        h0 = min(toy_design.toy_parts(width, cell, [s[1] for s in F.SPECIES])["top"], top)
         return {"x": 0.0, "y": 0.075 * h0, "half_width": 0.30 * width,
                 "ceiling": 0.11 * h0}
 
