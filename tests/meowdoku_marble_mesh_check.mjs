@@ -1,4 +1,5 @@
 import { catEyeMarble } from "../examples/meowdoku/web/marble_mesh.js";
+import { marbleMass } from "../examples/meowdoku/web/marble_mass.js";
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const mesh = catEyeMarble({ glass: 11, eye: 12, accent: 13 });
@@ -38,4 +39,23 @@ for (const invalid of [{ eyeWidth: 0.7 }, { rings: 3 }, { eyeLength: 1 }, { ribb
 const detail = catEyeMarble({ glass: 11, eye: 12, accent: 13 }, { rings: 96, segments: 128, strandCount: 5, ribbonTwist: 2.4, ribbonTip: 2.3 });
 assert(detail.triangleCount > 100000, "high detail studio mesh has over 100k actual triangles");
 assert(detail.ribbons.length === 5, "high detail mesh keeps separate ribbons");
+const phase = catEyeMarble({glass:11,eye:12,accent:13},{ribbonPhase:Math.PI/2});
+assert(JSON.stringify(phase.interior[100][0]) !== JSON.stringify(mesh.interior[100][0]), "phase rotates ribbon geometry");
+assert(JSON.stringify(phase.glass[100][0]) === JSON.stringify(mesh.glass[100][0]), "phase leaves bare shell geometry unchanged");
+const decorated = catEyeMarble({glass:11,eye:12,accent:13,enamel:14,confetti:15,paintA:16,paintB:17},
+  {kind:"hybrid",confettiCount:100,enamelCoverage:0.3,paintBandCount:7,seed:42});
+assert(decorated.confetti.length === 100 && decorated.ribbons.length === 3, "hybrid has discrete confetti and ribbons");
+assert(decorated.confetti.every((c)=>volume(decorated.interior.slice(c.start,c.start+c.count))>0), "each chip is a positively wound closed tetrahedron");
+assert(new Set(decorated.glass.map((f)=>f[3])).size === 4, "paint bands, enamel and bare shell assign real triangle materials");
+assert(decorated.confetti.every((c)=>decorated.interior.slice(c.start,c.start+c.count).every((f)=>f.slice(0,3).every((p)=>Math.hypot(...p)<0.96))), "chips stay inside glass");
+const clear=catEyeMarble({glass:11,eye:12,accent:13},{kind:"clear"});
+assert(clear.interior.length===0 && clear.glass.length>0,"clear shell omits all inclusions");
+const densities={shell:2500,eye:2500,accent:2500,enamel:3000,confetti:7800};
+const clearMass=marbleMass(clear,{radiusM:0.01,densityByRole:densities});
+const analyticMass=4*Math.PI/3*0.01**3*2500;
+assert(Math.abs(clearMass.massKg/analyticMass-1)<0.01,"closed shell mass approaches analytic sphere");
+const analyticInertia=0.4*analyticMass*0.01**2;
+assert(Math.abs(clearMass.inertiaKgM2[0][0]/analyticInertia-1)<0.02,"tetrahedral rotational inertia approaches analytic sphere");
+const hybridMass=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enamelMaterial:14,enamelThicknessM:300e-9});
+assert(hybridMass.massKg>clearMass.massKg && hybridMass.components.length===decorated.ribbons.length+decorated.confetti.length+2,"inclusions and coating contribute mass");
 console.log(`PASS cat's-eye marble: ${mesh.interior.length} inclusion and ${mesh.glass.length} shell triangles`);
