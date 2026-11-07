@@ -51,20 +51,3 @@ export function matches(e, sources, terms) {
   return terms.every((w) => t.includes(w));
 }
 export function searchTerms(q) { return String(q || "").toLowerCase().split(/\s+/).filter(Boolean); }
-
-/** The reset panel's grouping of this site's localStorage keys by feature (first match wins; unknown keys are "other"). */
-export const KEY_GROUPS = [
-  ["camera / sky", /^meowdoku\.(camgrav|skyplace|skyclock|backdrop|panes|slide|autoarc|record)/],
-  ["fountain / particles", /^meowdoku\.(pstyle|pemoji|pcolor|noisefx|heatfx|gscale|spin|spinmotion|wheelblur)|^mobroad\./],
-  ["gravity / case tilt", /^meowdoku\.(tilt|casetilt|watchcase|statusplate)/],
-  ["curve", /^meowdoku\.worldcurve\./],
-  ["speed", /^meowdoku\.speed\./],
-  ["ghosts", /^meowdoku\.ghosts/],
-  ["wordle", /^wordleChoice/],
-  ["share overlay / qr", /^meowdoku\.qrwall|^meowdoku_geo/],
-  ["session copy", /^meowdoku\.session_copy/],
-  ["player (identity)", /^meowdoku_player$/],
-  ["local log", /^meowdoku\.locallog$/],
-];
-export function groupKey(key) { for (const [name, re] of KEY_GROUPS) if (re.test(key)) return name; return /^meowdoku_/.test(key) ? "per-game toggles" : "other"; }
-export function groupKeys(keys) { const out = {}; for (const k of keys) (out[groupKey(k)] ||= []).push(k); return out; }

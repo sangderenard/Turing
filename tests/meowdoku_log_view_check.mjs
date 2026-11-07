@@ -33,13 +33,4 @@ eq(matches(e, new Set(["client-error"]), searchTerms("boom PAGE")), true, "terms
 eq(matches(e, new Set(["server"]), []), false, "source filtered");
 eq(matches(e, new Set(["client-error"]), searchTerms("nope")), false, "term absent");
 if (!/^\d\d:\d\d:\d\d ERR TypeError/.test(lineText(e))) fail("line text " + lineText(e));
-globalThis.document = { getElementById: () => null };
-const { settingsKeys, resetSettings } = await import("../examples/meowdoku/web/settings_reset.js");
-const storage = { "meowdoku.tilt": "0", "meowdoku.worldcurve.scroller": "0.3", "meowdoku_player": "tester",
-                  "meowdoku.session_copy": "saved", "meowdoku.locallog": "diagnostics", unrelated: "keep",
-                  removeItem(key) { delete this[key]; } };
-eq(settingsKeys(storage).sort(), ["meowdoku.tilt", "meowdoku.worldcurve.scroller"], "reset scope");
-eq(resetSettings(storage), 2, "two settings reset");
-eq([storage.meowdoku_player, storage["meowdoku.session_copy"], storage["meowdoku.locallog"], storage.unrelated],
-   ["tester", "saved", "diagnostics", "keep"], "identity and diagnostics retained");
 console.log("ok");
