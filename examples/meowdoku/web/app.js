@@ -28,7 +28,7 @@ setInterval(() => {
   if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; }
   const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = ""; }     // [LOG] the log page link, same visitors
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
-import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
+import { ComputeRuntime, PointCloud } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
@@ -4965,11 +4965,13 @@ window.meowdokuDebug.tipjar = tipjar;
 let cameraGravity = false;
 const camGravNow = [0, -1];                      // the last camera-down gravity applied (fractions of g), for the control's readout
 try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
+if (new URLSearchParams(location.search).get("studio") === "1") cameraGravity = false;
 const gravitySensor = new GravitySensor({
   onGravity: (gx, gy, gz) => { if (!cameraGravity) compute.setGravity(gx, gy, gz); },
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
+if (new URLSearchParams(location.search).get("studio") === "1") gravitySensor.wanted = false;
 gravitySensor.start();
 const firstTap = () => { for (const type of ["click", "touchend"]) removeEventListener(type, firstTap, true); gravitySensor.grant(); };
 for (const type of ["click", "touchend"]) addEventListener(type, firstTap, true);
@@ -5144,7 +5146,14 @@ function localControl(s, value) {
   } else if (s.local === "casetilt") {
     caseTiltDeg = Number(value) || 0; applyCaseTilt();
   } else if (s.local === "turnover") {
-    caseTiltDeg = (caseTiltDeg + 180) % 360; applyCaseTilt();
+    if (cameraGravity) return;
+    const requested = spinMotion.kind === "flip" && caseSpin ? 1 / (2 * Math.abs(caseSpin)) : 0.4;
+    const flip = compute.startCaseFlip(requested, spinReverse ? -1 : 1);
+    if (flip) {
+      caseTiltDeg = (caseTiltDeg + (spinReverse ? -180 : 180) + 360) % 360;
+      try { localStorage.setItem("meowdoku.casetilt", String(caseTiltDeg)); } catch { /* storage may be blocked */ }
+      compute.note = `case flip ${flip.seconds.toFixed(2)} s (requested ${requested.toFixed(2)} s; spring contact cap)`;
+    }
   } else if (s.local === "gscale") {
     gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
     try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
@@ -5155,7 +5164,7 @@ function localControl(s, value) {
   } else if (s.local === "spinphase") {
     spinMotion.phase = Number(value); saveSpinMotion();
   } else if (s.local === "spinmotion") {
-    spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
+    spinMotion.kind = ["rock", "flip"].includes(value) ? value : "spin"; saveSpinMotion();
   } else if (s.local === "spinarc") {
     spinMotion.arc = Number(value); saveSpinMotion();
   } else if (s.local === "autoarc") {
@@ -5227,9 +5236,9 @@ function refreshLocalControls() {
     if (s.local === "spin") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
-      el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, left end = off`
+      el.title = spinMotion.kind === "flip" ? "flip on button: this rate sets the requested duration of a half turn (the spring contact limit may make it longer)" : caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, left end = off`
                           : "left end = off; log scale from 1 turn in 2.8 h up to 30 Hz (the Nyquist rate of the 60 Hz input updates); the reverse switch sets the direction";
-      el.querySelector("span").textContent = `case spin ${spinText(caseSpin)} `;
+      el.querySelector("span").textContent = `${spinMotion.kind === "flip" ? "flip rate" : "case spin"} ${spinText(caseSpin)} `;
     } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
@@ -5302,7 +5311,7 @@ function refreshLocalControls() {
       el.querySelector("span").textContent = `case angle ${Math.round(caseTiltDeg)}\u00b0 `;
       el.title = "the case held turned by this angle: gravity turns with it (turn on 'watch the case move' to see the case turn); camera-down gravity ignores it";
     } else if (s.local === "turnover") {
-      el.disabled = false; el.title = "flip the case 180 degrees, like turning an hourglass over";
+      el.disabled = cameraGravity; el.title = cameraGravity ? "turn off camera-down gravity to flip the case" : "turn the actual case 180 degrees about its normal; reverse chooses the direction; contact limits may lengthen it";
     } else if (s.local === "gscale") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromGscale(gravityScale));
@@ -5382,7 +5391,7 @@ function spinText(hz) {
   return `${hz < 0 ? "-" : ""}${a.toPrecision(2)} Hz (1 turn / ${per})`;
 }
 // How the case moves at the spin rate: a full rotation, or a rock through an arc (degrees, centred on straight down).
-const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"]] };
+const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"], ["flip", "flip on button"]] };
 const ARC_SPEC = { id: "spinarc", kind: "range", label: "rock arc", min: 0, max: 360, step: 1, local: "spinarc" };
 function saveSpinMotion() {
   compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
@@ -5396,7 +5405,7 @@ const GSCALE_SPEC = { id: "gscale", kind: "range", label: "gravity", min: 0, max
 // THE CASE ANGLE: the case held turned (0-360 degrees; gravity turns with it in the case's frame), and a "turn over" button that
 // flips it by 180 (an hourglass turned over).  A spin or rock turns on top of it; camera-down gravity ignores it.
 const TILT_SPEC = { id: "casetilt", kind: "range", label: "case angle", min: 0, max: 360, step: 1, local: "casetilt" };
-const TURN_SPEC = { id: "turnover", kind: "button", label: "Turn over", local: "turnover" };
+const TURN_SPEC = { id: "turnover", kind: "button", label: "Flip case", local: "turnover" };
 let caseTiltDeg = 0;
 try { caseTiltDeg = Number(localStorage.getItem("meowdoku.casetilt")) || 0; } catch { /* storage may be blocked */ }
 function applyCaseTilt() {
@@ -5875,7 +5884,8 @@ function drawBody(b, frame, dh = 0, angle = null, alpha = 1) {                  
   }
 }
 function drawChamberOutline(cam, g, rec) {
-  const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
+  const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: state.caseModel ? M.multiply(cam.viewProj, state.caseModel) : cam.viewProj,
+    view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
   // the 2-D fountain's server sends its chamber as polylines (g.compute.chamber_outline: the polyline chambers' vertices, the SDF chambers'
   // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
   if (g.compute.chamber_mesh) return;                         // an SDF chamber's walls are the glass mesh (housingFaces)
@@ -6082,17 +6092,16 @@ function litPass(cam, now, casters, opts = {}) {
 // time of the displayed frame (frame x snapEvery x dt), not the wall clock.  (meowdokuDebug.caseTime overrides t, in seconds.)
 const watchCase = { on: false };
 try { watchCase.on = localStorage.getItem("meowdoku.watchcase") === "1"; } catch { /* storage may be blocked */ }
+if (new URLSearchParams(location.search).get("studio") === "1") watchCase.on = true;
 function caseAngleNow() {
   if (cameraGravity) return 0;                                     // (camera-down gravity turns nothing: the case is still)
-  const tilt = (caseTiltDeg || 0) * Math.PI / 180;
-  if (!compute.spin) return tilt;
   const forced = window.meowdokuDebug.caseTime;
   const t = forced != null ? Number(forced) : compute.ready && compute.tape && compute.manifest && compute.shown != null ? compute.shown * compute.snap * compute.manifest.law.dt : 0;
-  return tilt + gravityAngle(compute.spin, t, compute.spinMotion);
+  return compute.caseAngleAt(compute.manifest ? Math.round(t / compute.manifest.law.dt) : 0);
 }
 function caseModelNow() {
   if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
-  return caseModel(caseAngleNow(), extMidX(), extMidZ());
+  return caseModel(caseAngleNow(), extMidX(), extMidZ(), compute.caseAxis || "y", TILE.height + 0.03);
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
 window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;

@@ -283,14 +283,16 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
             + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac",
-               "wt0", "wt1", "wt2", "wt3", "case_omega", "case_domega", "pivot_x", "pivot_y")
+               "wt0", "wt1", "wt2", "wt3", "case_omega", "case_domega", "case_omega_x", "case_omega_y",
+               "case_domega_x", "case_domega_y", "pivot_x", "pivot_y", "pivot_z")
             + _SPECIES_UNIFORMS + SDF_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
 #: ``rows`` (a ceiling and the grid's height, which the page closes while a sensor drives gravity), and the live tunables.  The
 #: server sends their defaults; the page's runtime owns them after that and LOGS each change with its step, so a re-run
 #: (Continue) reproduces it exactly.
 LIVE_PARAMS = tuple(k for k, v in PARAMS.items() if not v[5])
-RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "case_omega", "case_domega", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
+RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "case_omega", "case_domega", "case_omega_x", "case_omega_y",
+                  "case_domega_x", "case_domega_y", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
                   "nozzle_speed", "fl_rho", "fl_mu") \
     + tuple(f"{k}{s}" for k in ("rho", "mu", "zeta", "roll") for s in range(len(SPECIES)))
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -751,7 +753,9 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
-                "case_omega": 0.0, "case_domega": 0.0, "pivot_x": 0.0, "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3]),
+                "case_omega": 0.0, "case_domega": 0.0, "case_omega_x": 0.0, "case_omega_y": 0.0,
+                "case_domega_x": 0.0, "case_domega_y": 0.0,
+                "pivot_x": 0.0, "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3]), "pivot_z": 0.0,
                 "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"], "temp": p["temp"],
                 "lognormal": 1.0 if p["lognormal"] > 0.5 else 0.0, "bi_ratio": p["bi_ratio"], "bi_frac": p["bi_frac"],
                 "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
@@ -1433,8 +1437,8 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         for k in range(3):
             f_[k] = f_[k] + f_amp * _noise(pid, step_now, k)
             q_[k] = q_[k] + q_amp * _noise(pid, step_now, 3 + k)
-        # the CASE FRAME (the walls are static here; the case turns about the z axis through (pivot_x, pivot_y) at ``case_omega``
-        # rad/s, counterclockwise positive, with ``case_domega``): besides the rotated gravity a grain feels the centrifugal
+        # the CASE FRAME (the walls are static here; legacy z turns use case_omega/case_domega, with x/y components
+        # available for a full 3-D turn): besides the rotated gravity a grain feels the centrifugal
         # w^2 (r - p) and Euler -dw x (r - p) accelerations, and its velocity turns by -2 w DT (Coriolis, an exact rotation, so any
         # rate is stable); its own z-spin gains -dw/dt.  The defaults (0) add exact zeros.
         # The turning case is capped at what the walls can hold: the centrifugal load of a grain at the far wall (w^2 R) must be
@@ -1448,8 +1452,30 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         case_omega = -_cap(-_cap(a["case_omega"], w_cap), w_cap)
         case_domega = -_cap(-_cap(a["case_domega"], a_cap), a_cap)
         rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
-        fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
-        fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
+        old_fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
+        old_fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
+        # A vector turn uses -Omega x (Omega x r) - alpha x r.  Its vector magnitude, rather than each component,
+        # obeys the same contact-spring bound; the slab depth enters the farthest-wall reach.  The zero-x/y path keeps
+        # the original z law bit for bit.
+        vector_on = (zero + a["case_omega_x"].abs() + a["case_omega_y"].abs() + a["case_domega_x"].abs() + a["case_domega_y"].abs()) > 0.0
+        reach3 = (half * half + half_height * half_height + dh * dh).sqrt() + 1.0e-6
+        w_cap3 = omega * (0.5 * radius * (1.0 / reach3)).sqrt()
+        a_cap3 = omega * omega * 0.5 * radius * (1.0 / reach3)
+        raw_om = (a["case_omega_x"], a["case_omega_y"], a["case_omega"])
+        raw_al = (a["case_domega_x"], a["case_domega_y"], a["case_domega"])
+        om_mag = (_dot(raw_om, raw_om) + 1.0e-20).sqrt()
+        al_mag = (_dot(raw_al, raw_al) + 1.0e-20).sqrt()
+        om_scale = _cap(w_cap3 * (1.0 / om_mag), 1.0)
+        al_scale = _cap(a_cap3 * (1.0 / al_mag), 1.0)
+        om = tuple(v * om_scale for v in raw_om)
+        al = tuple(v * al_scale for v in raw_al)
+        om_eff_mag = (_dot(om, om) + 1.0e-20).sqrt()
+        rel = (rel_x, rel_y, z - a["pivot_z"])
+        cent = _cross(om, _cross(om, rel))
+        euler = _cross(al, rel)
+        fict_x = AbstractTensor.where(vector_on, -cent[0] - euler[0], old_fict_x)
+        fict_y = AbstractTensor.where(vector_on, -cent[1] - euler[1], old_fict_y)
+        fict_z = AbstractTensor.where(vector_on, -cent[2] - euler[2], zero)
         vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x) * DT) * damp
         vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y) * DT) * damp
         turn = (case_omega * DT) * -2.0
@@ -1458,11 +1484,24 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
         vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
-        vzn = AbstractTensor.where(just > 0.5, vz0, (vz + live * (f_[2] / mass + grav[2] * buoy) * DT) * damp)
+        vz_a = (vz + live * (f_[2] / mass + grav[2] * buoy + fict_z) * DT) * damp
+        # Rodrigues' exact Coriolis rotation about the full case angular vector; legacy z rotations retain their
+        # original arithmetic.  omega=0 gives the identity because both cross products are zero.
+        axis = tuple(v * (1.0 / om_eff_mag) for v in om)
+        turn3 = om_eff_mag * (-2.0 * DT)
+        c3, s3 = turn3.cos(), turn3.sin()
+        va = (vx_a, vy_a, vz_a)
+        cross_v = _cross(axis, va)
+        along = _dot(axis, va) * (1.0 - c3)
+        rotated = tuple(va[k] * c3 + cross_v[k] * s3 + axis[k] * along for k in range(3))
+        vx_c = AbstractTensor.where(vector_on, AbstractTensor.where(live > 0.5, rotated[0], vx_a), vx_c)
+        vy_c = AbstractTensor.where(vector_on, AbstractTensor.where(live > 0.5, rotated[1], vy_a), vy_c)
+        vz_c = AbstractTensor.where(vector_on, AbstractTensor.where(live > 0.5, rotated[2], vz_a), vz_a)
+        vzn = AbstractTensor.where(just > 0.5, vz0, vz_c)
         sdamp = (1.0 - just) / (1.0 + live * gamma_r * DT)
-        wxn = (wx + live * (q_[0] / inertia) * DT) * sdamp
-        wyn = (wy + live * (q_[1] / inertia) * DT) * sdamp
-        wzn = (wz + live * (q_[2] / inertia - case_domega) * DT) * sdamp
+        wxn = (wx + live * (q_[0] / inertia - AbstractTensor.where(vector_on, al[0], zero)) * DT) * sdamp
+        wyn = (wy + live * (q_[1] / inertia - AbstractTensor.where(vector_on, al[1], zero)) * DT) * sdamp
+        wzn = (wz + live * (q_[2] / inertia - AbstractTensor.where(vector_on, al[2], case_domega)) * DT) * sdamp
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * DT)

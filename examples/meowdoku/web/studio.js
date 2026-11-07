@@ -66,6 +66,8 @@ const CONTROLS = [
   { k: "settle", label: "settle threshold (x law KE/id)", type: "range", min: 1, max: 400, step: 1 },
   { k: "turns", label: "turns (even)", type: "range", min: 2, max: 12, step: 2 },
   { k: "flipSeconds", label: "flip speed (turn takes s)", type: "range", min: 0.1, max: 2, step: 0.05 },
+  { k: "flipAxis", label: "flip axis", type: "select", options: [["y", "world Y / case normal (2-D)"], ["x", "world X / horizontal (3-D)"], ["z", "world Z / vertical (3-D)"]] },
+  { k: "flipDirection", label: "flip direction", type: "select", options: [[1, "one way"], [-1, "reverse"]] },
   { k: "speed", label: "sim speed", type: "select", options: [[0, "max"], [1, "1x"], [2, "2x"], [4, "4x"]] },
   ["Budget"],
   { k: "fit", label: "tighten automatically to fit ~900 KB", type: "check" },
@@ -107,7 +109,7 @@ function paintControls() {
     if (c.type === "check") c.input.checked = !!v;
     else if (c.k === "mix") { c.input.value = v === null ? 0.5 : v; $("mixDefault").checked = v === null; c.input.disabled = v === null; }
     else c.input.value = String(v);
-    if (c.k === "size" && S.deployedSizes) for (const o of c.input.options) o.disabled = !S.deployedSizes.has(o.value);
+    if (c.k === "size" && S.deployedSizes) for (const o of c.input.options) o.disabled = !S.deployedSizes[S.params.flipAxis].has(o.value);
     c.out.textContent = c.type === "select" || c.type === "check" ? "" : (c.k === "mix" && v === null ? "default" : Number(v).toFixed(c.step < 1 ? 2 : 0));
   }
 }
@@ -116,7 +118,15 @@ async function loadSizes() {
     const r = await fetch("fountain.manifest.json", { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const manifest = await r.json();
-    S.deployedSizes = new Set(Object.keys(manifest.sizes || {}));
+    let three = new Set();
+    try {
+      const r3 = await fetch("fountain3d.manifest.json", { cache: "no-store" });
+      if (r3.ok) {
+        const m3 = await r3.json(), inputs = new Set(m3.law && m3.law.runtime_inputs || []);
+        if (["case_omega_x", "case_omega_y", "case_domega_x", "case_domega_y"].every((name) => inputs.has(name))) three = new Set(Object.keys(m3.sizes || {}));
+      }
+    } catch { /* the 3-D product has not been built yet */ }
+    S.deployedSizes = { y: new Set(Object.keys(manifest.sizes || {})), x: three, z: three };
     paintControls();
   } catch (error) { recMsg(`fountain products unavailable: ${error.message}`, "err"); }
 }
@@ -131,7 +141,7 @@ function stopLive(keep) {
 }
 $("record").addEventListener("click", () => {
   const params = normalize(S.params);
-  if (!S.deployedSizes || !S.deployedSizes.has(params.size)) { recMsg(`${params.size} has no deployed fountain product; wait for the build or choose a deployed size`, "err"); return; }
+  if (!S.deployedSizes || !S.deployedSizes[params.flipAxis].has(params.size)) { recMsg(`${params.size} has no deployed ${params.flipAxis === "y" ? "2-D" : "3-D axis-enabled"} fountain product; wait for the build or choose an available size`, "err"); return; }
   stats([]); $("bar").value = 0; recMsg("starting the game page…");
   const f = $("live"); f.hidden = false; $("idle").hidden = true;
   f.src = "/" + toQuery(params);
@@ -158,7 +168,7 @@ window.addEventListener("message", (e) => {
     $("bar").value = 100;
     const s = m.stored || {};
     recMsg(s.duplicate ? "already in the library (same animation)" : `saved to the library${s.active ? " and active (the first one)" : " (not active)"}`, "ok");
-    stats([["simulated ids", Number(m.sim_n).toLocaleString()], ["capture", m.visual_only ? "visual only (no physics replay)" : "state memory"], ["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
+    stats([["simulated ids", Number(m.sim_n).toLocaleString()], ["capture", m.visual_only ? "visual only (no physics replay)" : "state memory"], ["flip", `${Number(m.effective_flip_seconds).toFixed(2)} simulated s (requested ${Number(S.recParams.flipSeconds).toFixed(2)} s)`], ["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
            ["tried", (m.tried || []).map((t) => `${t.fps}fps/${t.grains}g/${t.bits}b=${kb(t.raw)}`).join("; ")], ...(m.capped ? [["ended by", "the duration cap"]] : [])]);
     stopLive(false);
     loadLibrary().then(() => { if (s.digest) { S.playing = s.digest; paintCards(); showScreen(); } });
