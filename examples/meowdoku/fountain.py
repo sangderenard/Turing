@@ -36,6 +36,11 @@ PHYSICS
 * An INTERSTITIAL FLUID of density ``fl_rho`` and viscosity ``fl_mu`` acts on every grain: buoyancy (gravity times
   1 - fl_rho / rho), Stokes drag (6 pi mu r v) and quadratic drag, integrated IMPLICITLY so a stiff setting damps and
   never explodes.  Air, water and glycerine are presets of the page.
+* TEMPERATURE: a Langevin thermostat.  ``temp`` (kT, a runtime uniform; 0 = off, exactly) adds to every live grain a
+  random force and torque whose variance follows from the drag it feels (fluctuation-dissipation: 2 gamma m kT / DT), so
+  small, light grains in a viscous fluid jitter most, like dust in water.  The noise is a hash of (id, step, component).
+  The measured temperature is ``ke / (3 n_live)`` of the diagnostics (translational + rotational energy over the six
+  degrees of freedom: each holds kT / 2).
 * Contacts WRITE FORCES (and torques); the integrator (semi-implicit Euler, fixed ``DT``) is the only thing that moves
   anything.  Both sides of a pair evaluate the same symmetric expressions, so they are equal and opposite without any
   per-pair bookkeeping.
@@ -95,6 +100,8 @@ ZETA = 0.7                             # default normal damping ratio (restituti
 VREF = 0.02                            # tangential slip speed over which friction saturates
 WREF = 2.0                             # relative spin (rad/s) over which rolling resistance saturates
 SPIN_DRAG = 3.0                        # 1/s
+TEMP_MAX = 3.0e-6                      # the hottest kT the page offers (a grain of mass 3e-6 then moves at ~1.7 rms; the slider is logarithmic)
+TEMP_MIN_LOG = 1.0e-10                 # the coldest non-zero kT on the page's logarithmic slider
 HERTZ_REF = 0.04                       # the overlap (in mean radii) at which the Hertz and linear springs agree
 COH_RANGE = 0.1                        # adhesion acts to this gap (in mean radii)
 STRATA = 1.0                           # default hue cycles over the emission in mode 2 (time strata); a runtime uniform ``strata``
@@ -166,6 +173,7 @@ def _params() -> dict[str, tuple]:
         "hertz": ("Hertz blend", 0.0, 1.0, 0.05, 0.0, False, "Physics"),
         "coh": ("cohesion", 0.0, 3.0, 0.05, 0.0, False, "Physics"),
         "spin_drag": ("spin drag", 0.0, 20.0, 0.5, SPIN_DRAG, False, "Physics"),
+        "temp": ("temperature kT", 0.0, TEMP_MAX, 1.0e-9, 0.0, False, "Physics"),
         "k_run": ("neighbour cap", 4.0, float(K_RUN_MAX), 1.0, float(K_RUN), False, "Physics"),
         "nozzle_speed": ("nozzle speed", 0.3, 2.0, 0.05, 1.0, False, "Physics"),
         "rate": ("nozzle rate", 0.25, 4.0, 0.05, 1.0, True, "Physics"),
@@ -213,7 +221,7 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
              "nozzle_x", "nozzle_z", "in_dx", "in_dy", "in_dz", "e1x", "e1y", "e1z", "e2x", "e2y", "e2z",
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
-            + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu",
+            + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu",
                "wt0", "wt1", "wt2", "wt3")
             + _SPECIES_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
@@ -221,7 +229,7 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
 #: server sends their defaults; the page's runtime owns them after that and LOGS each change with its step, so a re-run
 #: (Continue) reproduces it exactly.
 LIVE_PARAMS = tuple(k for k, v in PARAMS.items() if not v[5])
-RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "omega", "hertz", "coh", "spin_drag", "k_run",
+RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
                   "nozzle_speed", "fl_rho", "fl_mu") \
     + tuple(f"{k}{s}" for k in ("rho", "mu", "zeta", "roll") for s in range(len(SPECIES)))
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -383,7 +391,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
-                "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"],
+                "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"], "temp": p["temp"],
                 "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
     for s in range(len(SPECIES)):
         out.update({f"wt{s}": p[f"wt{s}"], f"r{s}": p[f"r{s}"], f"rho{s}": p[f"rho{s}"], f"mu{s}": p[f"mu{s}"],
@@ -414,6 +422,35 @@ def _mix(pid, a, c):
     r2 = _mod(_lin(pid, a + 6.0) + 2.0 * c + 1.0, _PRIME)
     r2 = _mod(r2 * r2 + 5.0 * r2 + 13.0, _PRIME)
     return (r1 + r2 * (1.0 / _PRIME)) * (1.0 / _PRIME)
+
+
+def _lin_t(pid, a):
+    """``pid * a mod 4093`` for a pid up to 2**24 and a RUNTIME multiplier ``a`` < 4093 (4096 = 3 mod 4093)."""
+    hi = (pid * (1.0 / 4096.0)).floor()
+    lo = pid - hi * 4096.0
+    return _mod(_mod(lo * a, _PRIME) + _mod(hi * _mod(a * 3.0, _PRIME), _PRIME), _PRIME)
+
+
+def _mix_t(pid, a, c):
+    """``_mix`` with a runtime multiplier ``a`` and offset ``c`` (exact in f32 and f64 like ``_mix``)."""
+    r1 = _mod(_lin_t(pid, a) + c, _PRIME)
+    r1 = _mod(r1 * r1 + 3.0 * r1 + 11.0, _PRIME)
+    r2 = _mod(_lin_t(pid, a + 6.0) + 2.0 * c + 1.0, _PRIME)
+    r2 = _mod(r2 * r2 + 5.0 * r2 + 13.0, _PRIME)
+    return (r1 + r2 * (1.0 / _PRIME)) * (1.0 / _PRIME)
+
+
+def _noise(pid, step, comp):
+    """A zero-mean, unit-variance random number that is a PURE FUNCTION of (id, step, component): the sum of two hashed
+    uniforms (triangular, variance 1/6, scaled).  No generator state: a replay from any step repeats it bit for bit.  ``step``
+    is a whole number below 2**24 (the run's step count), ``comp`` a Python integer."""
+    hi = (step * (1.0 / 4093.0)).floor()
+    lo = step - hi * 4093.0
+    a1 = 1.0 + 2.0 * _mod(hi * 7.0 + comp * 131.0 + 17.0, 1999.0)
+    c1 = _mod(lo * 31.0 + comp * 977.0 + 5.0, _PRIME)
+    a2 = 1.0 + 2.0 * _mod(hi * 11.0 + comp * 173.0 + 29.0, 1999.0)
+    c2 = _mod(lo * 37.0 + comp * 811.0 + 3.0, _PRIME)
+    return (_mix_t(pid, a1, c1) + _mix_t(pid, a2, c2) - 1.0) * 2.449489742783178
 
 
 # ------------------------------------------------------------------ the law
@@ -511,7 +548,7 @@ def make_law(n: int, active: int | None = None):
         emit_rate, k_run, spread, nozzle_speed = a["emit_rate"], a["k_run"], a["spread"], a["nozzle_speed"]
         grav = (a["grav_x"], a["grav_y"], a["grav_z"])
         lid, strata, mode, use_image = a["lid"], a["strata"], a["mode"], a["use_image"]
-        omega, hertz, coh, spin_drag, fl_rho, fl_mu = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu"))
+        omega, hertz, coh, spin_drag, fl_rho, fl_mu, temp = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu", "temp"))
         centre = (a["nozzle_x"], nozzle_y, a["nozzle_z"])
         d_in = (a["in_dx"], a["in_dy"], a["in_dz"])
         e1 = (a["e1x"], a["e1y"], a["e1z"])
@@ -712,11 +749,23 @@ def make_law(n: int, active: int | None = None):
         speed_now = (vx * vx + vy * vy + vz * vz).sqrt()
         kdrag = 4.5 * fl_mu / (density * radius * radius) + 0.176 * fl_rho / (density * radius) * speed_now
         damp = 1.0 / (1.0 + live * kdrag * DT)
+        # THERMOSTAT (Langevin): a random force per component of variance 2 gamma m kT / DT, with gamma the drag rate just
+        # added (fluctuation-dissipation), so the grain's velocity relaxes to a Maxwell distribution of temperature kT; the
+        # factor sqrt(1 + gamma DT / 2) makes the implicit drag's stationary variance exactly kT / m.  The same for the spin
+        # (its rate: the spin drag plus the fluid's rotational Stokes drag).  The noise is a pure hash of (id, step, component),
+        # so a replay repeats it; at kT = 0 every term is an exact zero.
+        gamma_r = spin_drag + 10.0 * fl_mu / (density * radius * radius)
+        step_now = (age * (1.0 / DT) + 0.5).floor()
+        f_amp = (2.0 * kdrag * mass * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * kdrag * DT).sqrt()
+        q_amp = (2.0 * gamma_r * inertia * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * gamma_r * DT).sqrt()
+        for k in range(3):
+            f_[k] = f_[k] + f_amp * _noise(pid, step_now, k)
+            q_[k] = q_[k] + q_amp * _noise(pid, step_now, 3 + k)
         vxn = AbstractTensor.where(just > 0.5, vx0, (vx + live * (f_[0] / mass + grav[0] * buoy) * DT) * damp)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(
             arming > 0.5, vy * 0.0 + ARMED, (vy + live * (f_[1] / mass + grav[1] * buoy) * DT) * damp))
         vzn = AbstractTensor.where(just > 0.5, vz0, (vz + live * (f_[2] / mass + grav[2] * buoy) * DT) * damp)
-        sdamp = (1.0 - just) / (1.0 + live * spin_drag * DT)
+        sdamp = (1.0 - just) / (1.0 + live * gamma_r * DT)
         wxn = (wx + live * (q_[0] / inertia) * DT) * sdamp
         wyn = (wy + live * (q_[1] / inertia) * DT) * sdamp
         wzn = (wz + live * (q_[2] / inertia) * DT) * sdamp
@@ -1127,8 +1176,9 @@ class FountainGame(Game):
                 ctl["label"] = f"{name} {label}"
                 ctl["species"] = s
                 out.append(ctl)
-        for name in ("omega", "hertz", "coh", "spin_drag", "nozzle_speed", "rate", "k_run"):       # Physics
-            out.append(self._control(name))
+        for name in ("omega", "hertz", "coh", "spin_drag", "temp", "nozzle_speed", "rate", "k_run"):       # Physics
+            # the temperature is a logarithmic slider (0 = off, then kT from TEMP_MIN_LOG to TEMP_MAX)
+            out.append(self._control(name, scale="log", log_min=TEMP_MIN_LOG) if name == "temp" else self._control(name))
         out.append({"id": "k_run_drop", "kind": "readout", "label": "dropped contacts", "group": "Physics", "diag": "n_drop"})
         out.append({"id": "fluid", "kind": "select", "label": "fluid", "value": self.fluid, "action": "fountain_choice",
                     "name": "fluid", "field": "value", "group": "Fluid",
@@ -1177,3 +1227,9 @@ class FountainGame(Game):
 
     def result(self):
         return None
+
+
+def measured_temperature(diag) -> float:
+    """kT measured from the law's diagnostics: the kinetic + rotational energy over the live grains' six degrees of freedom
+    (each holds kT / 2), so ``ke = 3 n_live kT``."""
+    return float(diag["ke"]) / (3.0 * max(float(diag["n_live"]), 1.0))

@@ -4086,6 +4086,9 @@ function refreshLocalControls() {
     }
   }
 }
+// a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off, then log-spaced from spec.log_min to spec.max
+function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? 0 : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
+function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
 function renderGameControls(game) {
   const box = $("gamectl"), specs = game && game.controls_ui;
   if (!box) return;
@@ -4112,10 +4115,11 @@ function renderGameControls(game) {
       else {
         el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
         const input = document.createElement(s.kind === "select" ? "select" : "input");
-        if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
+        if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });   // 0 = off, then log-spaced from log_min to max
+        else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" || typeof s.options?.[0]?.[0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
-        if (s.kind === "range") { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(input.value).toPrecision(3); }; el.append(input, val); }
+        input.onchange = () => s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options?.[0]?.[0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
+        if (s.kind === "range") { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
         else el.append(input);
       }
       el.dataset.ctl = s.id;
@@ -4152,7 +4156,7 @@ function renderGameControls(game) {
     }
     if (input && s.kind === "toggle") input.checked = s.local === "orbit" ? !!camView.auto : s.local ? gravitySensor.enabled : !!s.value;
     else if (input && document.activeElement !== input) {
-      input.value = String(s.local === "particle_style" ? particleStyle : s.value);
+      input.value = String(s.local === "particle_style" ? particleStyle : s.kind === "range" ? toSlider(s, s.value) : s.value);
       const val = el.querySelector("output.gctl-val"); if (val) val.textContent = Number(s.value).toPrecision(3);
     }
   }

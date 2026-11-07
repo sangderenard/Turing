@@ -822,7 +822,8 @@ export class ComputeRuntime {
     if (!d) return "";
     const n = this.rec.pad, total = d.n_nan + d.n_out + d.n_parked + d.n_live;
     const bad = [d.n_nan ? `${d.n_nan} NaN` : "", d.n_out ? `${d.n_out} outside` : "", d.n_drop ? `${d.n_drop} contacts dropped` : "", total !== n ? `COUNT ${total}/${n}` : ""].filter(Boolean);
-    return ` | E ${d.ke.toExponential(2)} v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
+    const kT = d.ke / (3 * Math.max(d.n_live, 1)), set = this.lawInputs.temp ?? this.spec.uniforms.temp ?? 0;       // ke = 3 n kT: six degrees of freedom of kT/2 each
+    return ` | E ${d.ke.toExponential(2)} T ${kT.toExponential(2)} (set ${set.toExponential(1)}) v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
   }
 
   verdictText() {

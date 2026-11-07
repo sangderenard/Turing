@@ -984,3 +984,45 @@ def test_the_server_declares_the_grouped_tunables_and_live_ones_do_not_restart_t
             game.do(bad)
     game.do({"type": "fountain_start", "mix": 1.0})                               # the poly mix is the macro that sets the shares
     assert game.state()["compute"]["uniforms"]["wt2"] == pytest.approx(F.POLY_WEIGHT[2], rel=1e-6)
+
+
+def _dust(piece_cols, fluid, temp, steps, *, mix=0.0):
+    """256 grains spread out so none touch (a lattice), at rest, gravity off, in a fluid at kT = ``temp``."""
+    rho, mu = F.FLUIDS[fluid]
+    cols = F.initial_columns(F.N_SMALL, mix=mix, params={"fl_rho": rho, "fl_mu": 5.0e-4, "temp": temp, "depth": F.DEPTH_MAX})
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(0.0))
+    ix, iy = np.meshgrid(np.arange(16), np.arange(16))
+    cols["x"] = (ix.ravel() - 7.5) * 0.026
+    cols["y"] = 0.15 + iy.ravel() * 0.04
+    cols["age"] = np.full(F.N_SMALL, 1.0e3)
+    return cols
+
+
+def test_temperature_is_a_langevin_thermostat_whose_measured_kT_settles_near_the_set_one(native_piece):
+    """Gravity off, small grains in glycerine (a strong drag, so a short relaxation), the measured kT = ke / (3 n_live)
+    settles near the set kT; at kT = 0 nothing moves and the run is bit-identical to itself (the noise terms are exact zeros)."""
+    piece, columns = native_piece
+    assert "temp" in F.UNIFORMS and "temp" in F.RUNTIME_INPUTS and float(columns["temp"]) == 0.0
+    cold = F.run_frames(piece, _dust(columns, "glycerine", 0.0, 0), 400)
+    again = F.run_frames(piece, _dust(columns, "glycerine", 0.0, 0), 400)
+    assert all(np.array_equal(cold[k], again[k]) for k in F.STATE)
+    assert float(np.abs(cold["vx"]).max()) == 0.0 and float(np.abs(cold["wz"]).max()) == 0.0            # kT = 0: exactly still
+    kT = 1.0e-9
+    cols = _dust(columns, "glycerine", kT, 0)
+    series = _series(piece, cols, 1800)[1]
+    measured = series["ke"] / (3.0 * series["n_live"])
+    hot = float(measured[600:].mean())                                      # after many relaxation times (gamma >= 12 /s, a few steps apiece)
+    assert 0.9 * kT < hot < 1.1 * kT, (hot, kT)
+    assert series["n_nan"].max() == 0 and series["n_out"].max() == 0
+    replay = _series(piece, cols, 600)[1]                                   # the noise is a hash of (id, step, component): a replay repeats it
+    assert np.array_equal(replay["ke"], series["ke"][:600])
+    assert F.measured_temperature({"ke": series["ke"][-1], "n_live": series["n_live"][-1]}) == pytest.approx(float(measured[-1]))
+
+
+def test_the_server_declares_temperature_on_a_log_slider_in_the_physics_group():
+    ids = {c["id"]: c for c in F.FountainGame(size="small").state()["controls_ui"]}
+    assert ids["temp"]["group"] == "Physics" and ids["temp"]["scale"] == "log" and ids["temp"]["min"] == 0.0 and ids["temp"]["log_min"] > 0
+    game = F.FountainGame(size="small")
+    before = game.state()["compute"]["epoch"]
+    game.do({"type": "fountain_param", "name": "temp", "value": 2.0e-7})
+    assert game.state()["compute"]["uniforms"]["temp"] == pytest.approx(2.0e-7, rel=1e-6) and game.state()["compute"]["epoch"] == before
