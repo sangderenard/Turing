@@ -6,6 +6,7 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
+import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
@@ -4204,7 +4205,7 @@ function colorPick() {
 function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn, camgrav: cameraGravity,
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
            spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
@@ -4217,6 +4218,14 @@ function localControl(s, value) {
     spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
   } else if (s.local === "spinarc") {
     spinMotion.arc = Number(value); saveSpinMotion();
+  } else if (s.local === "autoarc") {
+    autoArc.on = !!value; autoArc.level = null; autoArc.steps = null; saveAutoArc();
+  } else if (s.local === "autoarc_species") {
+    autoArc.species = Number(value) || 0; autoArc.level = null; saveAutoArc();
+  } else if (s.local === "autoarc_target") {
+    autoArc.target = Number(value); saveAutoArc();
+  } else if (s.local === "autoarc_gain") {
+    autoArc.gain = Number(value); saveAutoArc();
   } else if (s.local === "camgrav") {
     cameraGravity = !!value;
     compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);    // camera-down wins over a spinning / rocking case while it is on
@@ -4322,6 +4331,19 @@ function refreshLocalControls() {
         input.disabled = spinMotion.kind !== "rock";
         el.title = "the swing: gravity rocks +-half this angle about straight down, one swing out and back per cycle at the case spin rate";
       } else el.title = "rotate: a full turn per cycle; rock: swing through the arc at the case spin rate";
+    } else if (s.local === "autoarc") {
+      el.querySelector("input").checked = autoArc.on;
+      const live = caseSpin && spinMotion.kind === "rock" && !cameraGravity;
+      el.lastChild.textContent = autoArc.on ? ` auto arc (level ${autoArc.level == null ? "-" : autoArc.level.toFixed(2)}, arc ${spinMotion.arc.toFixed(1)}°${live ? "" : ", idle: set case motion rock and a spin rate"})` : " auto arc";
+      el.title = "live-tunes the rock arc so the chosen species' mean height sits at the target level of the box (integral control in simulated time)";
+    } else if (s.local === "autoarc_species") {
+      const select = el.querySelector("select"), table = speciesTable(compute.manifest && compute.manifest.species);
+      const have = Array.from(select.options).map((o) => o.textContent).join(",");
+      if (have !== table.map((r) => r.name).join(",")) select.replaceChildren(...table.map((r, i) => Object.assign(document.createElement("option"), { value: String(i), textContent: r.name })));
+      select.value = String(autoArc.species); select.disabled = !autoArc.on;
+    } else if (s.local === "autoarc_target" || s.local === "autoarc_gain") {
+      const input = el.querySelector("input"); input.disabled = !autoArc.on;
+      el.querySelector("span").textContent = s.local === "autoarc_target" ? `target level ${autoArc.target.toFixed(2)} ` : `arc gain ${autoArc.gain}°/s `;
     } else if (s.local === "camgrav") {
       el.querySelector("input").checked = cameraGravity;
       const mag = Math.hypot(camGravNow[0], camGravNow[1]), ang = Math.atan2(camGravNow[0], -camGravNow[1]) * 180 / Math.PI;
@@ -4370,6 +4392,44 @@ function saveSpinMotion() {
   try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
 }
 const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
+// AUTO ARC: while the case rocks, a slow integral controller live-tunes the rock arc to hold one species' mean height at a
+// target level of the box (default the middle): high-speed rocking swings material up, and there is a fine arc that floats
+// (liquefies) the pile.  Measured from the displayed frame's own positions; the arc is a runtime input, so no rebuild.
+const AUTOARC_SPECS = [
+  { id: "autoarc", kind: "toggle", label: "auto arc", local: "autoarc" },
+  { id: "autoarc_species", kind: "select", label: "species", local: "autoarc_species", options: [] },
+  { id: "autoarc_target", kind: "range", label: "target level", min: 0.05, max: 0.95, step: 0.01, local: "autoarc_target" },
+  { id: "autoarc_gain", kind: "range", label: "arc gain", min: 5, max: 400, step: 5, local: "autoarc_gain" },
+];
+const autoArc = { on: false, species: 0, target: 0.5, gain: 60, level: null, steps: null, frame: null };
+try { Object.assign(autoArc, JSON.parse(localStorage.getItem("meowdoku.autoarc") || "{}"), { level: null, steps: null, frame: null }); } catch { /* storage may be blocked */ }
+const AUTOARC_SMOOTH_S = 0.8;                       // the level's smoothing, in simulated seconds
+function saveAutoArc() {
+  try { localStorage.setItem("meowdoku.autoarc", JSON.stringify({ on: autoArc.on, species: autoArc.species, target: autoArc.target, gain: autoArc.gain })); } catch { /* storage may be blocked */ }
+}
+// One controller step on a new displayed frame: the species' mean height over the box height (floor 0 to the lid the
+// rocking case closes, else the nozzle), smoothed in simulated time; the arc integrates (target - level) * gain deg/s.
+function autoArcStep(data) {
+  if (!autoArc.on || !compute.rec || compute.shown == null || compute.shown === autoArc.frame) return;
+  autoArc.frame = compute.shown;
+  const spec = compute.spec || {}, u = spec.uniforms || {}, tilt = spec.tilt || {};
+  const top = (spinMotion.kind === "rock" && caseSpin ? tilt.lid : null) || u.nozzle_y || 1;
+  const table = speciesTable(compute.manifest && compute.manifest.species);
+  let sum = 0, n = 0;
+  const count = pointCount(data), stride = Math.max(1, Math.floor(count / 20000));
+  for (let i = 0; i < count; i += stride) {
+    const pt = readPoint(data, i);
+    if (pt.alive && speciesOf(pt.radius, table) === autoArc.species) { sum += pt.y; n++; }
+  }
+  if (!n) return;
+  const level = Math.max(0, Math.min(1, sum / n / top));
+  const now = compute.steps * compute.manifest.law.dt, dt = autoArc.steps == null ? 0 : Math.max(0, now - autoArc.steps);
+  autoArc.steps = now;
+  autoArc.level = autoArc.level == null ? level : autoArc.level + (level - autoArc.level) * (1 - Math.exp(-dt / AUTOARC_SMOOTH_S));
+  if (!(caseSpin && spinMotion.kind === "rock" && !cameraGravity) || dt <= 0) return;      // it tunes a rocking case only
+  spinMotion.arc = Math.max(0, Math.min(360, spinMotion.arc + autoArc.gain * (autoArc.target - autoArc.level) * dt));
+  compute.setSpin(caseSpin, spinMotion);
+}
 // Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
@@ -4388,7 +4448,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -4503,6 +4563,7 @@ function cameraDownInLaw(view) {
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
+  if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
   if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); camGravNow[0] = gx; camGravNow[1] = gy; compute.setGravity(gx, gy); }
   compute.frame(now);
   const data = compute.points();
