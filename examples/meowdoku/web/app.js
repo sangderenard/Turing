@@ -2246,8 +2246,11 @@ const LAMP = { omega: 1.6 };
 // time of day -- its bearing goes once round the board per day, it stands
 // highest at noon, low and warm at dawn and dusk, and at night it is a dim
 // blue moon on the far side.
+// ?hour=13.5 in the URL (or meowdokuDebug.sunHour) holds the sun at that time of day: the live clock otherwise
+const SUN_HOUR = (() => { try { const h = new URLSearchParams(location.search).get("hour"); return h == null ? null : Number(h); } catch { return null; } })();
 function sunState() {
-  const d = new Date(), hours = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+  const d = new Date(), pinned = window.meowdokuDebug && window.meowdokuDebug.sunHour != null ? window.meowdokuDebug.sunHour : SUN_HOUR;
+  const hours = pinned != null && isFinite(pinned) ? ((pinned % 24) + 24) % 24 : d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
   const day = Math.sin((hours - 6) / 24 * 2 * Math.PI);          // +1 noon, 0 dawn/dusk, -1 midnight
   const azimuth = hours / 24 * 2 * Math.PI;
   const elevation = (day >= 0 ? 15 + 55 * day : 35) * Math.PI / 180;
