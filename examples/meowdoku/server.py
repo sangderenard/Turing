@@ -61,6 +61,7 @@ from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
+from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
@@ -379,7 +380,7 @@ def make_handler(sessions: Sessions):
 
         def log_message(self, format, *args):  # noqa: A002 - quiet static and polling logs
             line = str(args[0]) if args else ""
-            if "/api/" in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
+            if "/api/" in line and "/api/log" not in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
                 sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
         def _table(self) -> Table:
@@ -423,6 +424,20 @@ def make_handler(sessions: Sessions):
                 self.path = access_mod.SHADER_PAGE                # any other page address is the shader page
             super().do_GET()
             return True
+
+        def _log_get(self) -> None:                               # [LOG]
+            from urllib.parse import parse_qs
+            if not access_mod.require_tier(self, "dev"):
+                return
+            if self._is_viewer():
+                return self._refuse_viewer()
+            q = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            try:
+                since, limit = int(q.get("since", ["0"])[0]), int(q.get("limit", ["500"])[0])
+            except ValueError:
+                return self._json({"error": "since and limit are integers"}, HTTPStatus.BAD_REQUEST)
+            self._set_cookie = []
+            self._json(logring_mod.RING.fetch(since, limit, set(q["src"][0].split(",")) if q.get("src") else None))
 
         def _whoami(self) -> None:
             self._set_cookie = []
@@ -670,6 +685,8 @@ def make_handler(sessions: Sessions):
             self._classify()                                      # [ACCESS]
             if self._tier == "shader" and self._shader_request(path, "GET"):
                 return
+            if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
+                return self._log_get()
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
@@ -1197,6 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
+    logring_mod.RING = logring_mod.Ring(path=web_dir.parent / "log_ring.jsonl"); logring_mod.tee_stdout()   # [LOG]
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
