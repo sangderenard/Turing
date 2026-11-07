@@ -1267,10 +1267,19 @@ function uploadMaterials(game) {
     }
   }
   records.push(["traycube", [0.86, 0.95, 1.0], { roughness: 0.04, transmission: 0.88, opacity: 0.2, ior: 1.5 }]);
+  // GRAIN FINISHES for the fountain's material / stained styles: what the Phong shader needs for visible highlights --
+  // a high declared spec strength and shininess, and a high index (Schlick F0 from the ior: 1.5 gives 4 %, a gem's 2.42
+  // gives 17 %), or a metal (F0 = albedo).  The albedo here is a default: the grain's own colour replaces it.
+  records.push(["gem", [0.85, 0.12, 0.18], { roughness: 0.02, ior: 2.42, specular: 1.0, shininess: 220 }]);
+  records.push(["gem@glass", [0.9, 0.15, 0.22], { roughness: 0.02, transmission: 0.82, opacity: 0.42, ior: 2.42, specular: 1.0, shininess: 260 }]);
+  records.push(["gloss", [0.8, 0.8, 0.8], { roughness: 0.06, ior: 1.6, specular: 0.8, shininess: 120 }]);
+  records.push(["metal", [0.9, 0.8, 0.55], { roughness: 0.12, metallic: 1.0, ior: 1.5, specular: 0.9, shininess: 90 }]);
   // (the fountain's glass slab matches its dark floor)
   records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
-      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
+      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5,
+          // the backlight (backdrop "backlit"): the plate glows a mild white from within
+          ...(typeof backdrop !== "undefined" && backdrop.mode === "backlit" ? { emission: [0.32, 0.32, 0.34] } : {}) }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
@@ -1336,7 +1345,7 @@ function uploadMaterials(game) {
       const record = template.slice();
       if (tname === "pbr") {
         record[0] = rgb[0]; record[1] = rgb[1]; record[2] = rgb[2];
-        record[3] = extra.roughness ?? 0.72; record[4] = 0.0; record[5] = extra.transmission ?? 0.0;
+        record[3] = extra.roughness ?? 0.72; record[4] = extra.metallic ?? 0.0; record[5] = extra.transmission ?? 0.0;
         record[6] = extra.ior ?? 1.5; record[7] = extra.opacity ?? 1.0;
         const emission = extra.emission || [0, 0, 0];
         record[8] = emission[0]; record[9] = emission[1]; record[10] = emission[2];
@@ -1351,7 +1360,10 @@ function uploadMaterials(game) {
         record[5] = extra.depthScaleMm ?? 0.0; record[7] = 0.0;
       }
       if (tname === "phong") {
-        record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
+        record[1] = extra.specular ?? (extra.transmission ? 0.5 : Math.min(record[1], 0.10));
+        // phong [1] spec strength, [2] shininess: a material may declare them (the grain gems); the rest keep the
+        // template's, the spec strength capped as before
+        if (extra.shininess != null) record[2] = extra.shininess;
         // The extruded meshes' walls are wound inward (measured: wall signed volume is
         // negative, stored normals follow the winding), so seen from outside they are
         // BACK faces, and the shader paints back faces with the phong record's "inner"
@@ -4060,7 +4072,7 @@ if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palett
 // The fountain's backdrop (page-side, render only): "floor" is today's dark slab and glass plate under the grains; "clear" draws
 // neither, so the scene's sky / background, lights and the glass styles' reflections show through.
 const backdrop = { mode: "floor" };
-try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor") backdrop.mode = saved; } catch { /* storage may be blocked */ }
+try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor" || saved === "backlit") backdrop.mode = saved; } catch { /* storage may be blocked */ }
 const backdropClear = () => backdrop.mode === "clear" && !!state.game && state.game.game === "fountain";
 window.meowdokuDebug.backdrop = backdrop; window.meowdokuDebug.budget = MATERIAL_BUDGET;
 window.meowdokuDebug.pcolor = pcolor;
@@ -4113,7 +4125,8 @@ function localControl(s, value) {
     heatFx[s.local.slice(5)] = s.local === "heat_fixed" ? !!value : Number(value);
     try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
   } else if (s.local === "backdrop") {
-    backdrop.mode = value === "clear" ? "clear" : "floor";
+    backdrop.mode = value === "clear" || value === "backlit" ? value : "floor";
+    if (state.game && state.game.game === "fountain") uploadMaterials(state.game);   // the plate's glow is its material's emission
     try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("pcolor_")) {
     pcolor[s.local.slice(7)] = s.local === "pcolor_source" && !COLOR_SOURCES.some(([id]) => id === value) ? DEFAULT_COLOR.source
@@ -4167,7 +4180,7 @@ function refreshLocalControls() {
     } else if (s.local === "pcolor_palette") {
       el.title = "a palette the size ramp, the species colours and the simulation's own hues are mapped through (sea, ember, meadow); native leaves them as they are";
     } else if (s.local === "backdrop") {
-      el.title = "floor: the dark slab and glass plate under the fountain (contrast); clear: neither, so the sky, background and lights show through and glass has something to reflect";
+      el.title = "floor: the dark slab and glass plate under the fountain (contrast); backlit: the same plate glowing a mild white from within; clear: neither, so the sky, background and lights show through and glass has something to reflect";
     } else if (s.local === "pcolor_solid") {
       el.querySelector("input").disabled = pcolor.source !== "solid";
       el.title = "the grains' colour when the source is 'solid colour'";
@@ -4245,7 +4258,7 @@ const COLOR_SPECS = [
   { id: "heat_gamma", kind: "range", label: "heat gamma", min: 0.4, max: 2.5, step: 0.05, local: "heat_gamma", value: 1 },
   { id: "pcolor_source", kind: "select", label: "colour", local: "pcolor_source", value: "simulation", options: COLOR_SOURCES },
   { id: "pcolor_palette", kind: "select", label: "palette", local: "pcolor_palette", value: "native", options: PALETTE_IDS.map((p) => [p, p]) },
-  { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["clear", "clear (scene shows)"]] },
+  { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["backlit", "backlit (glowing plate)"], ["clear", "clear (scene shows)"]] },
   { id: "pcolor_solid", kind: "color", label: "solid", local: "pcolor_solid", value: DEFAULT_COLOR.solid },
   { id: "pcolor_material", kind: "select", label: "material", local: "pcolor_material", value: "", options: [] },
 ];
@@ -4347,7 +4360,7 @@ function particleLighting(g, y) {
 function particleScene(pick) {
   // stained glass without a chosen material takes the scene's translucent glass cube material (the tray's), else the plain glass
   const id = pick.mode === "material" ? state.materialIndex[pick.material]
-    : particleStyle === "stained" ? (state.materialIndex.traycube ?? state.materialIndex.glass) : state.materialIndex.glass;
+    : particleStyle === "stained" ? (state.materialIndex["gem@glass"] ?? state.materialIndex.traycube) : (state.materialIndex.gem ?? state.materialIndex.glass);
   return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj };
 }
 function pointsFrame(cam, now) {

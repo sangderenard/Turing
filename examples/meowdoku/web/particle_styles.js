@@ -244,7 +244,7 @@ export const MATERIAL_BUDGET = {
   maxInstances: 130000,          // above this many displayed grains the material style is not drawn (GTX 1660 SUPER, 641x207: 65k 4.8 ms, 262k 16.9 ms, 1M 53 ms)
   maxTriangles: 2.6e6,           // instances x triangles per frame the detail is chosen to stay under
   minRadiusPx: 0.4,              // a grain under this (screen radius, px) is a speck: sand draws it with coverage
-  detailAtPx: [2.5, 8],          // below the first: 20 triangles; below the second: 80; else 320
+  detailAtPx: [1.5, 4],          // below the first: 20 triangles; below the second: 80; else 320 (finer than the silhouette needs: a highlight is a small part of a sphere)
 };
 export function materialPlan({ ready = true, count = 0, radiusPx = 4, budget = MATERIAL_BUDGET } = {}) {
   if (!ready) return { ok: false, reason: "the scene's material shader is not in use here (flat view, or it could not be extended for instancing)" };

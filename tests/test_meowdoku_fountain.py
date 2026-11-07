@@ -866,13 +866,13 @@ const p1 = P.readPoint(data, 1); assert.ok(!p1.moving && Math.abs(p1.radius - 0.
 assert.ok(!P.readPoint(data, 2).alive);
 // ---- LOD and the fallback to sand
 const plan = (count, radiusPx) => P.materialPlan({count, radiusPx});
-assert.equal(plan(4000, 12).tris, 320); assert.equal(plan(4000, 5).tris, 80); assert.equal(plan(4000, 1).tris, 20);
+assert.equal(plan(4000, 12).tris, 320); assert.equal(plan(4000, 3).tris, 80); assert.equal(plan(4000, 1).tris, 20);   // detailAtPx [1.5, 4]
 assert.equal(plan(60000, 12).tris, 20);
 assert.equal(plan(20000, 12).tris, 80); assert.equal(plan(5000, 12).tris, 320);
 assert.equal(plan(P.MATERIAL_BUDGET.maxInstances, 4).ok, true); assert.equal(plan(P.MATERIAL_BUDGET.maxInstances + 1, 4).ok, false);
 assert.match(plan(1e6, 4).reason, /frame rate/); assert.match(plan(4000, 0.1).reason, /too small/);
 assert.equal(P.materialPlan({ready: false}).ok, false);
-let c = P.chooseStyle('material', full, {}, {ready: true, count: 4000, radiusPx: 5});
+let c = P.chooseStyle('material', full, {}, {ready: true, count: 4000, radiusPx: 3});
 assert.equal(c.style, 'material'); assert.equal(c.lod, 1);
 c = P.chooseStyle('material', full, {}, {ready: true, count: 1e6, radiusPx: 5});
 assert.equal(c.style, 'sand'); assert.equal(c.requested, 'material'); assert.match(c.reason, /showing sand/);
