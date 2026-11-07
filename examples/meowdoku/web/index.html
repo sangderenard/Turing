@@ -29,6 +29,12 @@
   #gamectl { display: contents; }
   #gamectl .gctl-file { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
   #gamectl button:disabled { opacity: .4; }
+  #gamectl .gctl-group { position: relative; display: inline-block; }
+  #gamectl .gctl-group > summary { cursor: pointer; background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; list-style: none; }
+  #gamectl .gctl-body { position: absolute; z-index: 30; top: 100%; left: 0; width: min(24rem, 92vw); max-height: 70vh; overflow: auto; display: grid; gap: 4px; padding: 8px; background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; }
+  #gamectl .gctl-body label { display: grid; grid-template-columns: 9rem 1fr 3rem; align-items: center; gap: 6px; }
+  #gamectl .gctl-body select { grid-column: 2 / 4; }
+  #gamectl .gctl-val { font-variant-numeric: tabular-nums; opacity: .7; }
   #gamectl button.on { outline: 2px solid currentColor; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */

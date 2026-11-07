@@ -7,7 +7,7 @@
 //
 // `GravitySensor` is the live source.  It is ON by default and has an off switch.  iOS only delivers the events after
 // `requestPermission()` was called from a user gesture, so `grant()` is to be called from the first tap.  The values go
-// to `onGravity(gx, gy)` as fractions of g in the screen's plane: gravity = (gx, gy) * G in the law's own units.
+// to `onGravity(gx, gy, gz)` as fractions of g in the screen frame (z out of the screen): gravity = (gx, gy, gz) * G in the law's own units.
 const RAD = Math.PI / 180;
 
 export function downInDevice(beta, gamma) {
@@ -26,12 +26,18 @@ export function gravityInScreen(beta, gamma, angle = 0) {
   return [v[0], v[1]];
 }
 
+// The full vector in the screen frame (x right, y up the screen, z out of it toward the viewer): the fountain is a 3-D slab, so a
+// phone lying flat pulls INTO it (z = -1), against the back wall.
+export function gravityVector(beta, gamma, angle = 0) {
+  return toScreen(downInDevice(beta, gamma), angle);
+}
+
 // DeviceMotion fallback: `accelerationIncludingGravity` is the reaction to gravity on Android (+y when upright) and its
 // opposite on iOS; either way gravity points the other way from the reaction.
 export function gravityFromAcceleration(ax, ay, az, angle = 0, reaction = true) {
   const m = Math.hypot(ax, ay, az) || 1, sign = reaction ? -1 : 1;
   const v = toScreen([sign * ax / m, sign * ay / m, sign * az / m], angle);
-  return [v[0], v[1]];
+  return [v[0], v[1], v[2]];
 }
 
 // screen.orientation.angle where there is one (iOS before 16.4 has only window.orientation)
@@ -62,7 +68,7 @@ export class GravitySensor {
     this.orient = (e) => {
       if (e.beta == null || e.gamma == null) return;
       this.haveOrientation = true;
-      this.#emit(gravityInScreen(e.beta, e.gamma, this.#angle()));
+      this.#emit(gravityVector(e.beta, e.gamma, this.#angle()));
     };
     this.motion = (e) => {
       const a = e.accelerationIncludingGravity;
@@ -81,7 +87,7 @@ export class GravitySensor {
   #emit(g) {
     this.last = g;
     if (this.state !== "on") { this.state = "on"; this.onState(this.state); }
-    this.onGravity(g[0], g[1]);
+    this.onGravity(g[0], g[1], g[2]);
   }
 
   // the first tap (iOS needs it); a no-op elsewhere.  Returns the resulting state.
@@ -115,7 +121,7 @@ export class GravitySensor {
 
   set enabled(on) {
     this.wanted = !!on;
-    if (!on) { this.state = "off"; this.last = null; this.onState(this.state); this.onGravity(null, null); }
+    if (!on) { this.state = "off"; this.last = null; this.onState(this.state); this.onGravity(null, null, null); }
     else { this.state = "idle"; this.onState(this.state); this.listening ? (this.state = "waiting") : this.start(); }
   }
   get enabled() { return this.wanted; }

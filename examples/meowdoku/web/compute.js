@@ -23,7 +23,7 @@
 // Presentation: the main renderer is WebGL2, which cannot read WebGPU
 // buffers.  The product's `points` description (position, velocity for the
 // at-rest flag, colour, radius, liveness) is packed on the device by one
-// small generic compute pass into 16 bytes per DISPLAYED id -- [x, y, rgba8
+// small generic compute pass into 20 bytes per DISPLAYED id -- [x, y, z, rgba8
 // (as bits), meta] -- every `display_stride`-th id when the count is large,
 // and that packed buffer alone is copied back (triple buffered, one or two
 // frames late) for WebGL to draw as GL points in the shared scene.  No WGSL
@@ -62,6 +62,8 @@ async function json(url) {
   return response.json();
 }
 
+// One displayed id is PT_WORDS 32-bit words: [x, y, z, rgba8 (bits), meta].
+const PT_WORDS = 5, PT_BYTES = PT_WORDS * 4;
 const mb = (bytes) => (bytes / 1048576).toFixed(0) + " MB";
 
 // The pure sampling step of the image control, exported so a test can hold it against
@@ -95,15 +97,17 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) gr
   let j = g.x + g.y * grid.x * 64u;
   if (j >= __NDISP__u) { return; }
   let i = j * __STRIDE__u;
-  let live = __AGE__ >= f32(i) * __RATE__f;
+  let live = __LIVE__;
   let vx = __VX__;
   let vy = __VY__;
-  let rest = (vx * vx + vy * vy) < __REST2__;
+  let vz = __VZ__;
+  let rest = (vx * vx + vy * vy + vz * vz) < __REST2__;
   let c = pack4x8unorm(vec4<f32>(__R__, __G__, __B__, 1.0));
-  pts[4u * j] = bitcast<u32>(__X__);
-  pts[4u * j + 1u] = bitcast<u32>(__Y__);
-  pts[4u * j + 2u] = c;
-  pts[4u * j + 3u] = bitcast<u32>(select(0.0, select(100.0, 200.0, rest) + __RAD__ * 1000.0, live));
+  pts[5u * j] = bitcast<u32>(__X__);
+  pts[5u * j + 1u] = bitcast<u32>(__Y__);
+  pts[5u * j + 2u] = bitcast<u32>(__Z__);
+  pts[5u * j + 3u] = c;
+  pts[5u * j + 4u] = bitcast<u32>(select(0.0, select(100.0, 200.0, rest) + __RAD__ * 1000.0, live));
 }`;
 
 class GpuProduct {
@@ -172,9 +176,10 @@ ${commit}
     // the pack pass reads element j * stride of a slot, not i
     const at = (s) => `lane${Math.floor(s / spb)}[${(s % spb) * pad}u + i]`;
     const packCode = PACK_WGSL.replace("__LANES__", lanes("read_write")).replace("__PTSB__", String(B))
-      .replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride)).replaceAll("__RATE__", rec.emit_rate.toPrecision(9))
-      .replaceAll("__AGE__", at(slot(p.live[0]))).replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y)))
-      .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy)))
+      .replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride))
+      .replaceAll("__LIVE__", Array.isArray(p.live) ? `${at(slot(p.live[0]))} >= f32(i) * ${rec.emit_rate.toPrecision(9)}f` : `${at(oslot(p.live))} > 0.5`)   // 2-D product: emitted by age; 3-D: its `shown` output
+      .replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y))).replaceAll("__Z__", p.z === undefined ? "0.0" : at(slot(p.z)))       // a 2-D product has no z: 0
+      .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy))).replaceAll("__VZ__", p.vz === undefined ? "0.0" : at(slot(p.vz)))
       .replaceAll("__R__", at(oslot(p.rgb[0]))).replaceAll("__G__", at(oslot(p.rgb[1]))).replaceAll("__RAD__", at(oslot(p.radius)))
       .replaceAll("__B__", at(oslot(p.rgb[2]))).replaceAll("__REST2__", (p.rest_speed * p.rest_speed).toFixed(8));
     const pack = this.device.createShaderModule({ code: packCode });
@@ -189,16 +194,16 @@ ${commit}
     const lastSlots = A.slots - spb * (B - 1);
     this.lanes = Array.from({ length: B }, (_, b) => this.device.createBuffer({ size: (b === B - 1 ? lastSlots : spb) * pad * 4, usage: S }));
     this.head = this.device.createBuffer({ size: Math.max(16, Math.ceil(Object.keys(A.uniform_index).length / 4) * 16), usage: S });
-    this.pts = this.device.createBuffer({ size: ndisp * 16, usage: S });
+    this.pts = this.device.createBuffer({ size: ndisp * PT_BYTES, usage: S });
     // Snapshot batches are read back through a few staging buffers: each holds up to `maxFrames` packed snapshots and, ahead of
     // them, the law's diagnostics after the snapshots that asked for them.  (32 MB at most per staging buffer.)
-    this.frameBytes = ndisp * 16; this.diagNames = manifest.law.diagnostics; this.pool = [];
+    this.frameBytes = ndisp * PT_BYTES; this.diagNames = manifest.law.diagnostics; this.pool = [];
     this.maxFrames = Math.max(1, Math.min(16, Math.floor(33554432 / this.frameBytes)));
     this.diagRegion = Math.ceil(this.maxFrames * this.diagNames.length * 4 / 256) * 256;
     this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.diagRegion + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
     this.stateSlots = this.state.map((name) => A.feed_slots[name]);
     const oom = await this.device.popErrorScope();
-    if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + 4 * ndisp * 16)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
+    if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + ndisp * PT_BYTES)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
     this.group = this.device.createBindGroup({ layout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.head } }] });
     this.packGroup = this.device.createBindGroup({ layout: packLayout, entries: [...this.lanes.map((buffer, binding) => ({ binding, resource: { buffer } })), { binding: B, resource: { buffer: this.pts } }] });
     this.stepMs = 0;
@@ -218,7 +223,7 @@ ${commit}
     this.setColours(named);
   }
 
-  setUniform(name, value) { this.device.queue.writeBuffer(this.head, this.abi.uniform_index[name] * 4, new Float32Array([value])); }
+  setUniform(name, value) { const k = this.abi.uniform_index[name]; if (k !== undefined) this.device.queue.writeBuffer(this.head, k * 4, new Float32Array([value])); }   // a name this product has no uniform for (grav_z on the 2-D one) is ignored
 
   setColours(named) {
     for (const [name, values] of Object.entries(named)) {
@@ -358,17 +363,17 @@ class WasmProduct {
     for (const name of abi.argument_names) this.inputs[name] = this.program.view(abi.inputs[name]);
     for (const out of abi.outputs) this.nexts[out.name] = this.program.view(out.id);
     this.state = manifest.law.state;
-    this.ndisp = this.pad; this.frameBytes = this.pad * 16; this.pool = []; this.maxFrames = 16;
+    this.ndisp = this.pad; this.frameBytes = this.pad * PT_BYTES; this.pool = []; this.maxFrames = 16;
   }
 
   reset({ named, uniforms }) {
     for (const view of Object.values(this.inputs)) if (view.length > 1) view.fill(0);
     for (let i = 0; i < this.pad; i++) this.inputs.pid[i] = i;
     for (const [name, values] of Object.entries(named)) if (this.inputs[name] && this.inputs[name].length >= values.length) this.inputs[name].set(values);
-    for (const [name, value] of Object.entries(uniforms)) this.inputs[name][0] = value;
+    for (const [name, value] of Object.entries(uniforms)) if (this.inputs[name]) this.inputs[name][0] = value;
   }
 
-  setUniform(name, value) { this.inputs[name][0] = value; }
+  setUniform(name, value) { if (this.inputs[name]) this.inputs[name][0] = value; }
   setColours(named) { for (const [name, values] of Object.entries(named)) this.inputs[name].set(values); }
 
   step(count) {
@@ -385,7 +390,7 @@ class WasmProduct {
     const out = { frames: [], diags: [], keys: [] };
     for (let j = 0; j < frames; j++) {
       this.step(snapEvery);
-      out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * 4)));
+      out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * PT_WORDS)));
       out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])) : null);
       out.keys.push(keyAt.includes(j) ? { payload: Object.fromEntries(this.state.map((name) => [name, this.inputs[name].slice()])), bytes: this.state.length * this.pad * 4 } : null);
     }
@@ -396,14 +401,17 @@ class WasmProduct {
   freeKey() {}
 
   #pack(f) {
-    const p = this.manifest.points, I = this.inputs, O = this.nexts, u = new Uint32Array(f.buffer, f.byteOffset, f.length), rate = this.rec.emit_rate;
-    const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], age = I[p.live[0]];
+    const p = this.manifest.points, I = this.inputs, O = this.nexts, u = new Uint32Array(f.buffer, f.byteOffset, f.length);
+    const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], rate = this.rec.emit_rate;
+    const z = p.z === undefined ? null : I[p.z], vz = p.vz === undefined ? null : I[p.vz];
+    const age = Array.isArray(p.live) ? I[p.live[0]] : null, shown = age ? null : O[p.live];
     const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]], rad = O[p.radius], rest2 = p.rest_speed * p.rest_speed;
     const byte = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
     for (let i = 0; i < this.pad; i++) {
-      f[4 * i] = x[i]; f[4 * i + 1] = y[i];
-      u[4 * i + 2] = (255 << 24) | (byte(b[i]) << 16) | (byte(g[i]) << 8) | byte(r[i]);
-      f[4 * i + 3] = age[i] >= i * rate ? ((vx[i] * vx[i] + vy[i] * vy[i]) < rest2 ? 200 : 100) + rad[i] * 1000 : 0;
+      f[5 * i] = x[i]; f[5 * i + 1] = y[i]; f[5 * i + 2] = z ? z[i] : 0;
+      u[5 * i + 3] = (255 << 24) | (byte(b[i]) << 16) | (byte(g[i]) << 8) | byte(r[i]);
+      const on = age ? age[i] >= i * rate : shown[i] > 0.5, v2 = vx[i] * vx[i] + vy[i] * vy[i] + (vz ? vz[i] * vz[i] : 0);
+      f[5 * i + 4] = on ? (v2 < rest2 ? 200 : 100) + rad[i] * 1000 : 0;
     }
     return f;
   }
@@ -583,7 +591,7 @@ export class ComputeRuntime {
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (g) {
       const G = this.manifest.law.gravity;
-      out.grav_x = g[0] * G; out.grav_y = g[1] * G;
+      out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)
       Object.assign(out, this.spec.tilt || {});
     }
     for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
@@ -612,9 +620,9 @@ export class ComputeRuntime {
     this.#kick();
   }
 
-  setGravity(gx, gy) {
-    const next = gx == null ? null : [gx, gy], old = this.gravity;
-    if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1]) < 0.004) return;
+  setGravity(gx, gy, gz = 0) {
+    const next = gx == null ? null : [gx, gy, gz], old = this.gravity;
+    if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1], next[2] - old[2]) < 0.004) return;
     this.gravity = next;
     this.#kick();
   }
@@ -865,7 +873,8 @@ export class ComputeRuntime {
     if (!d) return "";
     const n = this.rec.pad, total = d.n_nan + d.n_out + d.n_parked + d.n_live;
     const bad = [d.n_nan ? `${d.n_nan} NaN` : "", d.n_out ? `${d.n_out} outside` : "", d.n_drop ? `${d.n_drop} contacts dropped` : "", total !== n ? `COUNT ${total}/${n}` : ""].filter(Boolean);
-    return ` | E ${d.ke.toExponential(2)} v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
+    const kT = d.ke / (3 * Math.max(d.n_live, 1)), set = this.lawInputs.temp ?? this.spec.uniforms.temp ?? 0;       // ke = 3 n kT: six degrees of freedom of kT/2 each
+    return ` | E ${d.ke.toExponential(2)} T ${kT.toExponential(2)} (set ${set.toExponential(1)}) v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
   }
 
   verdictText() {
@@ -886,7 +895,7 @@ export class ComputeRuntime {
     const cost = this.stepMs ? ` | ${this.stepMs.toFixed(2)} ms/step` : "";
     const tape = this.tape, mode = this.play.mode;
     const rec = tape && tape.length ? ` | ${mode === "live" ? "rec" : mode} ${tape.lo}-${tape.hi} (${mb(tape.bytes)} of ${mb(this.capBytes)})` : "";
-    const grav = this.gravity ? ` | tilt gravity (${this.gravity[0].toFixed(2)}, ${this.gravity[1].toFixed(2)})` : "";
+    const grav = this.gravity ? ` | tilt gravity (${this.gravity[0].toFixed(2)}, ${this.gravity[1].toFixed(2)}, ${this.gravity[2].toFixed(2)})` : "";
     return `${this.route}${adapter}: ${this.why} | t ${t.toFixed(1)} s ${run}${this.energyText()} | ${this.fps.toFixed(0)} fps${rate}${cost}${rec}${grav}${this.note ? " | " + this.note : ""}${this.verdictText()}${fail}`;
   }
 
@@ -909,7 +918,7 @@ export class ComputeRuntime {
 //     their true average colour; sparse ones stay faint.
 const POINT_VS = `#version 300 es
 ${GRAIN_COLOR_GLSL}
-layout(location=0) in vec2 aPos;
+layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
 uniform mat4 uViewProj; uniform vec4 uMap; uniform vec3 uBoard; uniform float uFocal; uniform vec2 uViewport; uniform float uMax; uniform float uStride;
@@ -923,7 +932,7 @@ void main() {
   float flag = floor(aMeta / 100.0 + 0.001);
   float radius = (aMeta - flag * 100.0) * 0.001;
   // world -> board with ONE scale (uMap: centre x, centre y, scale k): circles stay circles at every size
-  vec4 clip = uViewProj * vec4(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z, 1.0);
+  vec4 clip = uViewProj * vec4(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z + aPos.z * uMap.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z, 1.0);   // the slab's depth axis stands off the board toward the camera
   if (clip.w <= 0.0) return;
   float rpx = radius * uMap.z * uFocal / clip.w;              // screen radius in pixels, from the particle's own projection
   float d = 2.0 * rpx;
@@ -984,9 +993,9 @@ export class PointCloud {
     this.resolve = link(compile(gl.VERTEX_SHADER, RESOLVE_VS), compile(gl.FRAGMENT_SHADER, RESOLVE_FS));
     this.vao = gl.createVertexArray(); gl.bindVertexArray(this.vao);
     this.dyn = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, this.dyn);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 16, 8);
-    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 16, 12);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, PT_BYTES, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, PT_BYTES, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, PT_BYTES, 16);
     gl.bindVertexArray(null);
     this.emptyVao = gl.createVertexArray();
     this.max = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
@@ -1013,7 +1022,7 @@ export class PointCloud {
     return (this.target = { w, h, tex, fbo });
   }
 
-  // data: packed points ([x, y, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
+  // data: packed points ([x, y, z, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
   draw(data, opts) {
     this.#drawField(data, opts);
@@ -1029,7 +1038,7 @@ export class PointCloud {
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dyn);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-    const n = data.length / 4;
+    const n = data.length / PT_WORDS;
     // a selected style (particle_styles.js) draws the frame itself; "points", and a style this device cannot run, go on below
     if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, buffer: this.dyn, tint, colorMode, grain, scene, heat, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
                                                                  map: [(x0 + x1) / 2, (y0 + y1) / 2, k], now: performance.now() })) return;

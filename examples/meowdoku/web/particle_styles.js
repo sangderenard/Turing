@@ -360,11 +360,11 @@ export function icosphere(level) {
 // The instance attributes are read in ONE place in the GPU (instanceAlive / instanceRadius / instanceCenter below) and ONE
 // place in JS (PACKING, with readPoint / pointCount / decodeMeta): a z column added to the packing is a change to PACKING and
 // to instanceCenter.
-export const PACKING = {                         // the packed point: [x, y, rgba8, meta], 16 bytes (compute.js PointCloud's layout)
-  stride: 16,
-  position: { size: 2, offset: 0 },              // floats (a 3-float position: size 3, plus the new stride / offsets)
-  color: { offset: 8 },                          // 4 normalised bytes
-  meta: { offset: 12 },                          // float: 100 (moving) / 200 (at rest) + radius * 1000; below 50 = not alive
+export const PACKING = {                         // the packed point: [x, y, z, rgba8, meta], 20 bytes (compute.js PointCloud's layout)
+  stride: 20,
+  position: { size: 3, offset: 0 },              // floats: x, y on the board's plane, z the slab's depth toward the camera (0 for a 2-D product)
+  color: { offset: 12 },                         // 4 normalised bytes
+  meta: { offset: 16 },                          // float: 100 (moving) / 200 (at rest) + radius * 1000; below 50 = not alive
 };
 export const INSTANCE_LOCATIONS = { position: 7, color: 8, meta: 9 };
 // JS twin of the metadata decode: meta -> { alive, moving, radius }
@@ -376,7 +376,7 @@ export function decodeMeta(meta) {
 // One packed point as an object (every JS read of the packing goes through here, and through PACKING for the GL layout).
 export function readPoint(data, i) {
   const k = i * (PACKING.stride / 4);
-  return { x: data[k], y: data[k + 1], ...decodeMeta(data[k + 3]) };
+  return { x: data[k], y: data[k + 1], z: data[k + 2], ...decodeMeta(data[k + 4]) };
 }
 export function pointCount(data) { return Math.floor(data.length / (PACKING.stride / 4)); }
 // the largest true radius among the first live points (board units)
@@ -400,7 +400,7 @@ flat out vec3 vInstColor;
 bool instanceAlive() { return aInstMeta >= 50.0; }
 float instanceRadius() { float flag = floor(aInstMeta / 100.0 + 0.001); return (aInstMeta - flag * 100.0) * 0.001 * uInstMap.z; }
 vec3 instanceCenter() {     // the grain's centre in world space (the packed x, y on the board's plane, resting on it)
-  return vec3(uInstBoard.x * 0.5 + (aInstPos.x - uInstMap.x) * uInstMap.z, uInstBoard.z + instanceRadius(), uInstBoard.y * 0.5 - (aInstPos.y - uInstMap.y) * uInstMap.z);
+  return vec3(uInstBoard.x * 0.5 + (aInstPos.x - uInstMap.x) * uInstMap.z, uInstBoard.z + instanceRadius() + aInstPos.z * uInstMap.z, uInstBoard.y * 0.5 - (aInstPos.y - uInstMap.y) * uInstMap.z);
 }
 `;
 const INSTANCE_VERT_MAIN = `
@@ -449,7 +449,7 @@ export function capabilitiesOf(gl) {
 // vertex layout (location 0 position, 1 colour, 2 meta), with the sprite sized in TARGET pixels (uFocal is already scaled).
 const SPRITE_VS = `#version 300 es
 ${GRAIN_COLOR_GLSL}
-layout(location=0) in vec2 aPos;
+layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
 uniform mat4 uViewProj; uniform mat4 uView; uniform vec4 uMap; uniform vec3 uBoard;
@@ -465,7 +465,7 @@ void main() {
   if (aMeta < 50.0) return;
   float flag = floor(aMeta / 100.0 + 0.001);
   float radius = (aMeta - flag * 100.0) * 0.001;
-  vec3 pos = vec3(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z);
+  vec3 pos = vec3(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z + aPos.z * uMap.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z);   // z: the slab's depth, toward the camera
   vec4 clip = uViewProj * vec4(pos, 1.0);
   if (clip.w <= 0.0) return;
   float eye = -(uView * vec4(pos, 1.0)).z;
@@ -675,7 +675,7 @@ void main() {
 // the memory: stamps are drawn in the board's own coordinates (the texture covers the board), so the camera may move
 const STAMP_VS = `#version 300 es
 ${GRAIN_COLOR_GLSL}
-layout(location=0) in vec2 aPos;
+layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
 uniform vec4 uMap; uniform vec3 uBoard; uniform float uTexel; uniform float uMax; uniform float uGrow;

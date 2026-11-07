@@ -53,6 +53,7 @@ from meowdoku.tilequest import TileQuest  # noqa: E402
 from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.worldwalk import WorldWalk  # noqa: E402
 from meowdoku.fountain import FountainGame  # noqa: E402
+from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402  (the 3-D fountain: its own law, products and page controls)
 from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
@@ -82,7 +83,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "purrline"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "purrline"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -140,6 +141,8 @@ class Table:
             self.game = WorldWalk(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "fountain":
             self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
+        elif kind == "fountain3d":
+            self.game = Fountain3DGame(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "purrline":
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:
@@ -502,6 +505,19 @@ def prepare_fountain(web_dir: Path) -> None:
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_fountain3d(web_dir: Path) -> None:
+    """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
+    from meowdoku import fountain3d_build
+    try:
+        started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        manifest = fountain3d_build.build(web_dir, wasm=wasm)
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain3d products NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def prepare_policy(web_dir: Path) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
@@ -550,6 +566,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default=None,
                         help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
     parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
+    parser.add_argument("--no-wasm", action="store_true",
+                        help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -560,9 +578,12 @@ def main(argv: list[str] | None = None) -> int:
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
-    # The fountain's products can take a long compile (the 256 / 4k native + wasm fallbacks): every other game serves
-    # meanwhile, and the fountain page reads the manifest once it is written.
-    threading.Thread(target=prepare_fountain, args=(web_dir,), name="fountain-build", daemon=True).start()
+    # The fountains' products can take a long compile (the 256 / 4k native + wasm fallbacks): every other game serves
+    # meanwhile, and the fountain pages read their manifests once written.  The 2-D fountain first, then the 3-D one
+    # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
+    if args.no_wasm:
+        os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
+    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain3d(web_dir)), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

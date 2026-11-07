@@ -536,7 +536,8 @@ PRE_GRAVITY_DIGEST_700 = "576e50eb1463aa61fa3727fae820dadd018e01f587c0e54a46a70d
 
 def _digest(final) -> str:
     import hashlib
-    return hashlib.sha256(b"".join(np.ascontiguousarray(final[k], dtype=np.float64).tobytes() for k in F.STATE + ("cr", "cg", "cb"))).hexdigest()
+    return hashlib.sha256(b"".join(np.ascontiguousarray(final[k], dtype=np.float64).tobytes()
+                                   for k in ("x", "y", "vx", "vy", "w", "age") + ("cr", "cg", "cb"))).hexdigest()
 
 
 def test_gravity_is_a_runtime_input_the_default_is_the_old_law_and_a_tilt_changes_it_without_a_rebuild(native_piece):
@@ -859,11 +860,11 @@ assert.deepEqual(table.map((t) => t.name), ['grain', 'bead', 'dust', 'pearl']);
 for (const [r, want] of [[0.0085, 0], [0.009, 0], [0.0101, 1], [0.0108, 1], [0.0119, 2], [0.0131, 3], [0.02, 3]]) assert.equal(P.speciesOf(r, table), want, `radius ${r}`);
 const bands = P.speciesBands(table); assert.ok(Math.abs(bands[0] - 0.00975) < 1e-6); assert.equal(bands[3], 1e9);
 // ---- packing is read in one place
-const data = new Float32Array([0.5, 0.25, 0, 109, 1, 2, 0, 214, 0, 0, 0, 0]);
+const data = new Float32Array([0.5, 0.25, 0.1, 0, 109,  1, 2, -0.05, 0, 214,  0, 0, 0, 0, 0]);       // [x, y, z, rgba8, meta]: 5 words, 20 bytes
 assert.equal(P.pointCount(data), 3);
 const p0 = P.readPoint(data, 0); assert.ok(p0.alive && p0.moving && Math.abs(p0.radius - 0.009) < 1e-6);
 const p1 = P.readPoint(data, 1); assert.ok(!p1.moving && Math.abs(p1.radius - 0.014) < 1e-6);
-assert.ok(!P.readPoint(data, 2).alive);
+assert.ok(!P.readPoint(data, 2).alive); assert.equal(P.PACKING.stride, 20); assert.ok(Math.abs(P.readPoint(data, 0).z - 0.1) < 1e-6 && Math.abs(P.readPoint(data, 1).z + 0.05) < 1e-6);
 // ---- LOD and the fallback to sand
 const plan = (count, radiusPx) => P.materialPlan({count, radiusPx});
 assert.equal(plan(4000, 12).tris, 320); assert.equal(plan(4000, 3).tris, 80); assert.equal(plan(4000, 1).tris, 20);   // detailAtPx [1.5, 4]
@@ -1051,3 +1052,63 @@ def test_glass_grains_composite_order_independently_and_fall_back_to_alpha_with_
     (1 - a) in any order, the summed optical depth is the revealage, the nearer fragment weighs more -- the choice between OIT and plain
     alpha (the fast style, a device without float render targets, a failed depth copy) with its reason, and the shader extension."""
     assert _run_node(tmp_path, JS_OIT, "particle_styles.js").strip() == "ok"
+
+
+# ------------------------------------------------------------- species tunables (runtime uniforms) and orbeez
+def test_the_species_table_is_runtime_uniforms_with_wide_clamped_ranges_and_the_default_is_exactly_one():
+    u = F.uniforms(n=256)
+    assert all(float(u[f"{k}{i}"]) == 1.0 for k in ("rscale", "fscale", "dscale", "zscale") for i in range(4))
+    assert float(u["cell_scale"]) == 1.0 and float(u["solvent"]) == 0.0 and all(float(u[f"swell{i}"]) == 0.0 for i in range(4))
+    wide = F.uniforms(n=256, params={"r0": 10.0, "mu0": 100.0, "r1": 1.0e-9, "mu1": -3.0, "e2": 5.0, "rho3": 0.0})
+    assert float(wide["rscale0"]) == pytest.approx(10.0) and float(wide["rscale1"]) == pytest.approx(0.1)        # radius 0.1x..10x, clamped
+    assert float(wide["fscale0"]) == pytest.approx(2.0 / F.SPECIES[0][3]) and float(wide["fscale1"]) == 0.0         # friction 0..2 absolute
+    assert F.restitution_of(F.ZETA) == pytest.approx(0.0461, abs=1e-3)
+    assert float(wide["zscale2"]) == pytest.approx(F.zeta_of(0.95) / F.ZETA, rel=1e-6)                              # restitution clamped to 0.95
+    assert float(wide["dscale3"]) == pytest.approx(F.DENSITY_RANGE[0] / F.SPECIES[3][2], rel=1e-6)
+    # the grid cell follows the largest radius a grain can reach (a swelling species grows to swmax x)
+    assert float(wide["cell_scale"]) * F.CELL == pytest.approx(2.0 * 10.0 * F.SPECIES[0][1], rel=1e-6)
+    swelling = F.uniforms(n=256, params={"swell3": 0.2, "swmax3": 3.0})
+    assert float(swelling["cell_scale"]) * F.CELL == pytest.approx(2.0 * 3.0 * F.SPECIES[3][1], rel=1e-6)
+    assert "cell_scale" in F.UNIFORMS and "rs" in F.STATE and "rs_next" in F.OUTPUTS
+    assert {"solvent", "fscale0", "swell0", "swmax3"} <= set(F.RUNTIME_INPUTS) and "rscale0" not in F.RUNTIME_INPUTS
+
+
+def _orbeez_scene(piece, solvent=1.0, rate=0.3, steps=360):
+    """Species-0 grains: A free, B3 touching three inert species-1 grains, B6 touching six; all others parked.  Gravity off."""
+    n = F.N_SMALL
+    probe = F.run_frames(piece, dict(F.initial_columns(n, mix=0.0), age=np.full(n, 1.0e3)), 1)["rad"]
+    s0 = [int(i) for i in np.where(np.abs(probe - F.SPECIES[0][1]) < 1e-9)[0]]
+    s1 = [int(i) for i in np.where(np.abs(probe - F.SPECIES[1][1]) < 1e-9)[0]]
+    cols = F.initial_columns(n, mix=0.0, params={"swell0": rate, "swmax0": 3.0, "solvent": solvent})
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), age=np.full(n, -1.0e9))
+    a, b3, b6 = s0[0], s0[1], s0[2]
+    ring3, ring6 = s1[:3], s1[3:9]
+    gap = F.SPECIES[0][1] + F.SPECIES[1][1] - 0.0004
+    place = {a: (-0.15, 0.4), b3: (0.0, 0.4), b6: (0.12, 0.4)}
+    for ids, centre in ((ring3, place[b3]), (ring6, place[b6])):
+        for k, i in enumerate(ids):
+            ang = 2.0 * np.pi * k / len(ids)
+            place[i] = (centre[0] + gap * np.cos(ang), centre[1] + gap * np.sin(ang))
+    for i, (px, py) in place.items():
+        cols["x"][i], cols["y"][i], cols["age"][i], cols["rs"][i] = px, py, 1.0e3, probe[i]      # placed grains, at their species radius
+    out = F.run_frames(piece, cols, steps)
+    return out, a, b3, b6
+
+
+def test_orbeez_swell_with_open_surface_in_a_solvent_only(native_piece):
+    """Growth is proportional to the exposed surface: in ONE step in water a free grain grows at the full rate, one touching
+    three of its six possible neighbours at half of it, one closed in by six not at all.  Over a second a free grain grows
+    ~ rate x r0 x t.  In air nothing grows.  Counters stay exact."""
+    piece, _columns = native_piece
+    r0, rate = F.SPECIES[0][1], 0.3
+    first, a, b3, b6 = _orbeez_scene(piece, solvent=1.0, steps=1)
+    share = lambda i: (float(first["rs"][i]) - r0) / (rate * r0 * F.DT)
+    assert share(a) == pytest.approx(1.0, abs=1e-3) and share(b3) == pytest.approx(0.5, abs=1e-3) and abs(share(b6)) < 1e-3
+    wet, a, b3, b6 = _orbeez_scene(piece, solvent=1.0)
+    assert float(wet["rs"][a]) / r0 == pytest.approx(1.0 + rate * 1.0, abs=0.01)        # t = 360 steps = 1 s, fully exposed throughout
+    dry, a, b3, b6 = _orbeez_scene(piece, solvent=0.0)
+    assert all(float(dry["rs"][i]) == r0 for i in (a, b3, b6))             # air: nothing swells
+    for out in (first, wet, dry):
+        assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
+        assert float(out["n_live"][0] + out["n_parked"][0] + out["n_out"][0] + out["n_nan"][0]) == F.N_SMALL
+    assert float(wet["rad"][a]) == pytest.approx(float(wet["rs"][a]))      # the drawn radius is the current one

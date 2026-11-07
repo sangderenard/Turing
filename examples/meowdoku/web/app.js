@@ -1316,7 +1316,7 @@ function uploadMaterials(game) {
       // against it and the sun leaves a soft highlight.  (It was always drawn
       // this dark, but by accident -- see pointsFrame.)  Declared here as a finish.
       const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint)
-        : game.game === "fountain" ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
+        : isFountainGame(game) ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
   }
@@ -1329,13 +1329,13 @@ function uploadMaterials(game) {
   records.push(["gloss", [0.8, 0.8, 0.8], { roughness: 0.06, ior: 1.6, specular: 0.8, shininess: 120 }]);
   records.push(["metal", [0.9, 0.8, 0.55], { roughness: 0.12, metallic: 1.0, ior: 1.5, specular: 0.9, shininess: 90 }]);
   // (the fountain's glass slab matches its dark floor)
-  const backlit = game.game === "fountain" && typeof backdrop !== "undefined" && backdrop.mode === "backlit";
-  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : backlit ? [0.92, 0.93, 0.95] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
+  const backlit = isFountainGame(game) && typeof backdrop !== "undefined" && backdrop.mode === "backlit";
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : backlit ? [0.92, 0.93, 0.95] : isFountainGame(game) ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
       // the backlight (backdrop "backlit"): a white diffusing plate glowing from within (the lights under it, see litPass,
       // are what light the grains: an emissive surface glows but lights nothing)
       : backlit ? { roughness: 0.5, transmission: 0.6, opacity: 0.88, ior: 1.5, emission: [0.55, 0.55, 0.57] }
-      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
+      : isFountainGame(game) ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
@@ -1535,8 +1535,10 @@ function rebuildBoards(game) {
 // SCENE-CAMERA GESTURES: a view offset (yaw, pitch, log-zoom, pan on the ground)
 // that composes on top of whatever camera the game is in (board, flat, follow);
 // the gesture layer further down moves the goal, stepCamView eases `cur` toward it.
+const isFountainGame = (g) => !!g && (g.game === "fountain" || g.game === "fountain3d");     // the 2-D and the 3-D fountain are one page
 const camView = {
   key: null, lastR: 1, active: 0,
+  auto: false,                    // AUTO-ROTATE: a slow orbit (the yaw goal turns at AUTO_ROTATE rad/s) while no finger is on the view
   cur: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 }, goal: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
   vel: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
 };
@@ -2224,7 +2226,7 @@ function arcadeActivity(data, rec, g, now) {
                             pulse: 0, pulsePeak: 1, phase: 0, emitCi: ARCADE_WHITE, at: now, step: 0, hadMotion: false, done: false };
   }
   const dt = Math.min(0.25, Math.max(0.001, now - A.at)); A.at = now;
-  const n = data.length / 4, stride = Math.max(1, Math.floor(n / 6000)), ns = Math.ceil(n / stride);
+  const n = data.length / 5, stride = Math.max(1, Math.floor(n / 6000)), ns = Math.ceil(n / stride);
   const u = new Uint32Array(data.buffer, data.byteOffset, data.length);
   if (!A.prev || A.prev.length !== 2 * ns) A.prev = new Float32Array(2 * ns).fill(NaN);
   const [vx0, vx1, vy0, vy1] = rec.geometry.view, bw = g.width, bh = g.height;
@@ -2234,12 +2236,12 @@ function arcadeActivity(data, rec, g, now) {
   const em = { d: Infinity, r: 0, g: 0, b: 0, n: 0 };
   let moving = 0, rest = 0;
   for (let i = 0, j = 0; i < n; i += stride, j++) {
-    const px = data[4 * i], py = data[4 * i + 1], flag = Math.floor(data[4 * i + 3] / 100 + 0.001);
+    const px = data[5 * i], py = data[5 * i + 1], flag = Math.floor(data[5 * i + 4] / 100 + 0.001);
     const qx = A.prev[2 * j], qy = A.prev[2 * j + 1]; A.prev[2 * j] = px; A.prev[2 * j + 1] = py;
     if (flag < 1) continue;
     if (flag >= 2) { rest++; continue; }
     moving++;
-    const rgba = u[4 * i + 2], r = (rgba & 255) / 255, gg = ((rgba >> 8) & 255) / 255, b = ((rgba >> 16) & 255) / 255;
+    const rgba = u[5 * i + 3], r = (rgba & 255) / 255, gg = ((rgba >> 8) & 255) / 255, b = ((rgba >> 16) & 255) / 255;
     const nd = Math.hypot(px - cx, py - nozzle);
     if (nd < em.d - tol) { em.d = nd; em.r = em.g = em.b = 0; em.n = 0; }
     if (nd <= em.d + tol) { em.r += r; em.g += gg; em.b += b; em.n++; }
@@ -4126,7 +4128,7 @@ let cameraGravity = false;
 const camGravNow = [0, -1];                      // the last camera-down gravity applied (fractions of g), for the control's readout
 try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
 const gravitySensor = new GravitySensor({
-  onGravity: (gx, gy) => { if (!cameraGravity) compute.setGravity(gx, gy); },
+  onGravity: (gx, gy, gz) => { if (!cameraGravity) compute.setGravity(gx, gy, gz); },
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
@@ -4200,15 +4202,15 @@ if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palett
 // neither, so the scene's sky / background, lights and the glass styles' reflections show through.
 const backdrop = { mode: "floor" };
 try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor" || saved === "backlit") backdrop.mode = saved; } catch { /* storage may be blocked */ }
-const backdropClear = () => backdrop.mode === "clear" && !!state.game && state.game.game === "fountain";
+const backdropClear = () => backdrop.mode === "clear" && !!isFountainGame(state.game);
 // no dark floor tiles under the fountain: "clear" (nothing) and "backlit" (only the glowing plate)
-const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!state.game && state.game.game === "fountain";
+const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!isFountainGame(state.game);
 // The backlit plate is an EMITTER GROUP of the shader's light list ("all direct illumination comes from host emitters"): one light at
 // the plate's centre whose uLightIntensity is the plate's AREA (the shader's emitter radius is sqrt(area / 4 pi)), whose uLightGroupId
 // is PLATE_GROUP -- and the plate is drawn with that aGroupId, so its own fragments skip it.  (board frame)
 const BACKLIGHT_COLOUR = [0.11, 0.108, 0.105];     // linear: the plate's radiance per unit (the shader divides the area by the squared distance + radius^2)
 function backlightEmitter() {
-  if (!(backdrop.mode === "backlit" && state.game && state.game.game === "fountain" && !state.flat)) return null;
+  if (!(backdrop.mode === "backlit" && isFountainGame(state.game) && !state.flat)) return null;
   const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth;
   return { at: [w / 2, -GLASS.thickness * 0.5, (z0 + d) / 2], area: w * (d - z0) };
 }
@@ -4248,7 +4250,7 @@ function colorPick() {
 function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
            spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
@@ -4257,6 +4259,10 @@ function localControl(s, value) {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
+  } else if (s.local === "orbit") {
+    camView.auto = !!value;
+    // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
+    if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
   } else if (s.local === "spinmotion") {
     spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
   } else if (s.local === "spinarc") {
@@ -4290,7 +4296,7 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
   } else if (s.local === "backdrop") {
     backdrop.mode = value === "clear" || value === "backlit" ? value : "floor";
-    if (state.game && state.game.game === "fountain") uploadMaterials(state.game);   // the plate's glow is its material's emission
+    if (isFountainGame(state.game)) uploadMaterials(state.game);   // the plate's glow is its material's emission
     try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("pcolor_")) {
     pcolor[s.local.slice(7)] = s.local === "pcolor_source" && !COLOR_SOURCES.some(([id]) => id === value) ? DEFAULT_COLOR.source
@@ -4309,6 +4315,11 @@ function refreshLocalControls() {
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
   for (const s of pageSpecs(g.controls_ui)) {
+    if (s.kind === "readout") {                       // a number the law reports (the dropped neighbour contacts beside the cap)
+      const el = box.querySelector(`[data-ctl="${s.id}"]`), d = compute.diag;
+      if (el) el.textContent = `${s.label}: ${d ? Math.round(d[s.diag]).toLocaleString() : "-"}`;
+      continue;
+    }
     if (!s.local) continue;
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
@@ -4511,6 +4522,9 @@ let spinMotion = { kind: "spin", arc: 60 };
 try { spinMotion = { ...spinMotion, ...JSON.parse(localStorage.getItem("meowdoku.spinmotion") || "{}") }; } catch { /* storage may be blocked */ }
 try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
 compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
+// a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off (or log_min with log_floor), then log-spaced from spec.log_min to spec.max
+function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? (s.log_floor ? s.log_min : 0) : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
+function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
 function renderGameControls(game) {
   const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;
@@ -4518,7 +4532,8 @@ function renderGameControls(game) {
   const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;
   if (box.dataset.key !== key) {
     box.dataset.key = key;
-    box.replaceChildren(...specs.map((s) => {
+    const groups = new Map();                          // a spec's `group` collects its controls into a collapsible panel
+    const built = specs.map((s) => {
       let el;
       if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => (s.local ? localControl(s) : act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) })); }
       else if (s.kind === "toggle") {
@@ -4532,6 +4547,7 @@ function renderGameControls(game) {
         input.onchange = () => localControl(s, input.value);
         el.append(input);
       }
+      else if (s.kind === "readout") { el = document.createElement("span"); el.className = "gctl-readout"; }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
@@ -4541,14 +4557,28 @@ function renderGameControls(game) {
       } else {
         el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
         const input = document.createElement(s.kind === "select" ? "select" : "input");
-        if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
+        if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
+        else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => (s.local ? localControl(s, input.value) : act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }));
-        el.append(input);
+        input.onchange = () => (s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }));
+        if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
+        else el.append(input);
       }
       el.dataset.ctl = s.id;
       return el;
-    }));
+    });
+    const top = [];
+    specs.forEach((s, i) => {
+      if (!s.group || s.group === "Run") { top.push(built[i]); return; }
+      if (!groups.has(s.group)) {
+        const d = document.createElement("details"); d.className = "gctl-group"; d.dataset.group = s.group;
+        const sum = document.createElement("summary"); sum.textContent = s.group;
+        const body = document.createElement("div"); body.className = "gctl-body"; d.append(sum, body);
+        groups.set(s.group, body); top.push(d);
+      }
+      groups.get(s.group).append(built[i]);
+    });
+    box.replaceChildren(...top);
   }
   for (const s of specs) {
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
@@ -4567,7 +4597,10 @@ function renderGameControls(game) {
       }
     }
     if (input && s.kind === "toggle") input.checked = s.local ? !!localValue(s) : !!s.value;
-    else if (input && document.activeElement !== input) input.value = String(s.local ? localValue(s) : s.value);
+    else if (input && document.activeElement !== input) {
+      input.value = String(s.local ? localValue(s) : s.kind === "range" ? toSlider(s, s.value) : s.value);
+      const val = el.querySelector("output.gctl-val"); if (val) val.textContent = Number(s.value).toPrecision(3);
+    }
   }
   refreshLocalControls();
 }
@@ -5285,11 +5318,13 @@ function clampCamGoal(gest) {
   G.pitch = Math.max(gest.elLim[0] - base, Math.min(gest.elLim[1] - base, G.pitch));
   const r = Math.hypot(G.px, G.pz); if (r > gest.panLim) { G.px *= gest.panLim / r; G.pz *= gest.panLim / r; }
 }
+const AUTO_ROTATE = 0.25;   // rad/s: one turn in ~25 s
 function stepCamView(dt) {
   const g = state.game, key = g ? g.game : null;
   if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) camView.cur[k] = camView.goal[k] = camView.vel[k] = 0; }
   dt = Math.max(0, Math.min(0.1, dt || 0));
   const gest = cameraGestures(), G = camView.goal, C = camView.cur;
+  if (gest && camView.auto && !camView.active) G.yaw += AUTO_ROTATE * dt;
   if (gest && !camView.active) {                                        // inertia: a released flick coasts and damps
     const decay = Math.exp(-dt * 4);
     for (const k of CV_KEYS) { G[k] += camView.vel[k] * dt; camView.vel[k] *= decay; if (Math.abs(camView.vel[k]) < 1e-4) camView.vel[k] = 0; }

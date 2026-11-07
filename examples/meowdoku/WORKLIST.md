@@ -53,11 +53,13 @@ deploy to 8766 as soon as work lands.
    - **Open:** keyframes cost one state copy per second of simulation (25 MB each at 1M ids), so the 1M+ sizes keep a very short window; the image mapping needs a settled pile (run: stop at rest); a phone-driven lid and grid height are page-side inputs the server does not see.
 2. **Neighbour list:** in-dispatch neighbour-of-neighbour refresh, one dispatch per step, a full rebuild only rarely.
 3. **Counting sort**, with N set at runtime.
-4. **Third dimension (confirmed wanted):**
-   - a plexiglass slab chamber with depth;
-   - polygon chambers;
-   - auto-rotate;
-   - a colinear tube inlet.
+4. **Third dimension** (landed, one law change; browser numbers in the commit message):
+   - the state is 3-D (`x y z`, `vx vy vz`, spin vector `wx wy wz`); the chamber is a slab between two plexiglass walls at `z = +-depth/2` (runtime `dh`; default 0.03, about one grain diameter, so the pile is the 2-D one; range 0.02-0.06);
+   - the basin outline is a polyline of up to 8 vertices (uniforms `px0..py7`; presets box (the old basin), funnel, hexagon, ramp); each segment is a wall of the same contact law;
+   - the inlet is a tube: runtime position, direction, cross-section and cone half-angle (`spread` 0 = colinear); presets fan fountain, colinear jet, pour from above, side tube;
+   - gravity is a full 3-vector runtime input (`grav_x/y/z`); `web/gravity.js` gives all three, so a phone lying flat pulls into the slab;
+   - camera: auto-rotate toggle (slow yaw orbit in the scene-camera layer, tips the view so the depth shows); points are drawn at true radius with z as depth (`PointCloud`, 20-byte points);
+   - **Open:** the glass walls are not drawn; the neighbour walk covers about 2 layers (`k_run` / `n_drop` say when it does not); 10M ids need 7-slot (280 MB) bindings, 49 slots/id (was 40): packing the colours (4 slots) or serialising the diagnostics' reduction would bring it back to 6.
 4b. **Glyph start (a 3D must, as soon as 3D is stable):**
    - you type a glyph sequence; its bounding box becomes a closed cube shell (all six walls);
    - inside, the glyph or glyph string is built from the run's N particles filling each glyph's ENCLOSED solid volume (not its surface). The glyph meshes are extrusions of an outline (token_mesh in web_export: outline with holes, depth_ratio), so "inside" is exact and cheap: an even-odd point-in-outline test (holes count) and |z| < depth/2, from the same outline data the exported mesh used (emoji keep only their largest component). Grain size from N·(4/3)πr³ = φ·V (φ ≈ 0.64 random, or ≈ 0.74 on a lattice for a crystalline start); with a species mix, scale the drawn radii to fit;
@@ -69,14 +71,10 @@ deploy to 8766 as soon as work lands.
    - options: case mass and inertia, pivot position, pivot friction or damping, an optional restoring spring, start tilt;
    - the case angle is law state (exact replay). In the case frame the law sees gravity rotated by the angle, plus the frame's inertial terms (Euler and centrifugal), which is the honest version of the case spin, which only rotates gravity;
    - the pivot is the first rigid-body coupling, so build it on the engine_toy machine-sim coupling/torque path that the rigid emoji objects and the waterwheel will use, not as a one-off.
-5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
-6. **Fluids, crystals and temperature:**
-   - temperature: Brownian agitation through a Langevin thermostat tied to the fluid drag (deterministic hashed noise), plus the system's measured kinetic temperature as a law output shown in the status line;
-   - an interstitial fluid setting (air, water, glycerine settling toy);
-   - particle compressibility (Hertz–Mindlin), so crystalline packings form.
-7. **Grain species:**
-   - several species, each with its own size, roughness and shape irregularity;
-   - mixed populations.
+5. **Page controls** (landed): Grains (per species radius, density, friction, restitution, roughness, irregularity, share), Physics (stiffness, Hertz blend, cohesion, spin drag, nozzle speed and rate, neighbour cap with the dropped-contact readout), Fluid (air / water / glycerine presets plus density and viscosity), Chamber (depth, polygon, inlet, spread); all server-declared `controls_ui` (`fountain_param`, `fountain_choice`); the live ones are runtime inputs of the law, logged by the recording, the restart ones begin a new run.
+6. **Fluids, crystals and temperature** (landed): temperature `temp` (kT) is a Langevin thermostat tied to the fluid drag (variance 2 gamma m kT / DT per component, noise a hash of id, step and component; 0 = off exactly), log slider in Physics, measured T = ke / (3 n_live) in the status line; buoyancy plus implicit Stokes and quadratic drag; stiffness `omega` (clamped to the CFL bound) and a Hertz blend; cohesion. **Open:** a measured crystal (a near-monodisperse stiff pile reaching a hexagonal packing) has not been demonstrated.
+7. **Grain species** (landed): four species, each with radius, density, friction, restitution, rolling roughness and per-id size jitter (irregularity), and mix shares; the poly-mix slider is the macro that sets the shares.
+2D: the same tunables landed in the 2D law (`fountain.py`, unchanged in dimension): species radius 0.1x-10x (log; restart), friction 0-2, restitution, density, grid cell as a runtime uniform; ORBEEZ species (swell rate, max ratio; the radius is state `rs`; growth ~ exposed surface x solvent; air does not swell). The 3D law is its own module and products (`fountain3d.py`, `fountain3d_build.py`, game "fountain3d"); the 2D one is the page's `fountain`.
 8. **Pipe and laminar flow:**
    - large grains at a reasonable population fill the area;
    - set by spawn flow rate, or by spawning inside an enclosed vessel that empties through a tube.
