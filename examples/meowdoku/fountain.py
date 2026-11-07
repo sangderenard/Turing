@@ -538,6 +538,16 @@ def make_law(n: int, active: int | None = None):
         just = pending * as_float(blocked < 0.5)
         place = just + arming
         inertia = 0.5 * mass * radius * radius
+        # The turning case is capped at what the walls can hold: the centrifugal load of a grain at the far wall (w^2 R) must be met
+        # by the contact spring (OMEGA^2 x penetration), so w is limited to OMEGA sqrt(0.5 r / R) for the grain's radius r and the
+        # chamber's reach R (its half-diagonal), and the angular acceleration to OMEGA^2 0.5 r / R (the Euler load); the planes
+        # are sided, so a grain that does outrun the spring is still pushed back.
+        half_height = 0.5 * rows * cell
+        reach = (half * half + half_height * half_height).sqrt() + 1.0e-6
+        w_cap = OMEGA * (0.5 * radius * (1.0 / reach)).sqrt()
+        a_cap = OMEGA * OMEGA * 0.5 * radius * (1.0 / reach)
+        case_omega = -_cap(-_cap(case_omega, w_cap), w_cap)
+        case_domega = -_cap(-_cap(case_domega, a_cap), a_cap)
         rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
         fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
         fict_y = case_omega * case_omega * rel_y - case_domega * rel_x

@@ -1012,9 +1012,20 @@ void main() {
   FragColor = vec4(a.rgb / a.a, min(a.a, 1.0));
 }`;
 
+const OUTLINE_VS = `#version 300 es
+layout(location=0) in vec3 aP;
+uniform mat4 uViewProj; uniform vec4 uMap; uniform vec3 uBoard;
+void main() {
+  gl_Position = uViewProj * vec4(uBoard.x * 0.5 + (aP.x - uMap.x) * uMap.z, uBoard.z + aP.z * uMap.z, uBoard.y * 0.5 - (aP.y - uMap.y) * uMap.z, 1.0);
+}`;
+const OUTLINE_FS = `#version 300 es
+precision highp float;
+uniform vec4 uColor; out vec4 FragColor;
+void main() { FragColor = uColor; }`;
+
 export class PointCloud {
   constructor(gl, link, compile) {
-    this.gl = gl;
+    this.gl = gl; this.link = link; this.compile = compile; this.outlineProgram = null;
     this.styles = new ParticleStyles(gl, link, compile);       // the selectable looks (particle_styles.js); `style` of draw picks one
     this.noise = new NoiseFilter(gl, link, compile);            // the render-only spectral noise filter layered over any look (noise_filter.js); `noise` of draw
     this.program = link(compile(gl.VERTEX_SHADER, POINT_VS), compile(gl.FRAGMENT_SHADER, POINT_FS));
@@ -1048,6 +1059,33 @@ export class PointCloud {
     gl.bindTexture(gl.TEXTURE_2D, held); gl.activeTexture(unit);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { this.floatOk = false; gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); return null; }
     return (this.target = { w, h, tex, fbo });
+  }
+
+  // The chamber's walls as a wireframe: the basin outline (a polyline of vertices [x, y]) at the front and back plexiglass
+  // (z = +-dh) and a rib at each vertex, in the same board mapping as the points.  Render only: the law's walls are the
+  // contacts; this is what the grains are held by, drawn so the shape is visible (a funnel looks like a funnel).
+  drawOutline(outline, dh, { viewProj, view, board, y }, color = [0.85, 0.9, 1.0, 0.55]) {
+    const gl = this.gl;
+    if (!outline || outline.length < 2) return;
+    if (!this.outlineProgram) {
+      this.outlineProgram = this.link(this.compile(gl.VERTEX_SHADER, OUTLINE_VS), this.compile(gl.FRAGMENT_SHADER, OUTLINE_FS));
+      this.outlineVao = gl.createVertexArray(); this.outlineBuf = gl.createBuffer();
+      gl.bindVertexArray(this.outlineVao); gl.bindBuffer(gl.ARRAY_BUFFER, this.outlineBuf);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0); gl.bindVertexArray(null);
+      this.outlineLoc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uColor"].map((n) => [n, gl.getUniformLocation(this.outlineProgram, n)]));
+    }
+    const lines = [];
+    for (let i = 0; i + 1 < outline.length; i++) for (const z of [dh, -dh]) lines.push(outline[i][0], outline[i][1], z, outline[i + 1][0], outline[i + 1][1], z);
+    for (const [px, py] of outline) lines.push(px, py, dh, px, py, -dh);
+    const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
+    gl.useProgram(this.outlineProgram);
+    gl.uniformMatrix4fv(this.outlineLoc.uViewProj, false, viewProj); gl.uniform4f(this.outlineLoc.uMap, (x0 + x1) / 2, (y0 + y1) / 2, k, 0);
+    gl.uniform3f(this.outlineLoc.uBoard, board[0], board[1], y); gl.uniform4fv(this.outlineLoc.uColor, color);
+    gl.bindVertexArray(this.outlineVao); gl.bindBuffer(gl.ARRAY_BUFFER, this.outlineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lines), gl.DYNAMIC_DRAW);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    gl.drawArrays(gl.LINES, 0, lines.length / 3);
+    gl.depthMask(true); gl.disable(gl.BLEND); gl.depthFunc(gl.LESS); gl.bindVertexArray(null);
   }
 
   // data: packed points ([x, y, z, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
