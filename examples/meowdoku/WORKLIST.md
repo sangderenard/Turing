@@ -31,6 +31,8 @@ A. **Signed-distance chambers:** primitives (box/cube, sphere/circle, capsule/ra
 B. **Ports, pumps and lines:** outlet regions park grains into a line (transit time from length and pump rate) and re-emit them FIFO at an inlet port, deterministically in law state; see-through glass tubing drawn with the transiting grains.
 C. **Hinged rigid actors + waterwheel:** a body of SDF primitives on one hinge, two-way contact forces, angle as law state, coupled through the engine_toy machine-sim torque path; preset "waterwheel fountain" (nozzle -> wheel -> outlet -> pump line -> nozzle).
 
+- **Waterwheel in 3D (queued, after orbeez and designed heights):** the 2D wheel ported to fountain3d: a hub plus paddles extruded through the depth, hinged about z, as its own 3D wheel product.
+
 ## Purrline sand mode (the user, 2026-11-07)
 
 A. Finite supply of replenishment items; matched cells stay empty once the stock runs out (DONE: purrline mode "sand", the page's "Finite sky stock" toggle; `stock` is a law column, shown in the status line; the game is over when the board settles with no legal swap, result = score).
