@@ -1854,7 +1854,7 @@ const GRAIN_FINISHES = [
   ["ember", [0.18, 0.06, 0.04], { roughness: 0.7, ior: 1.4, specular: 0.2, shininess: 12, group: EMBER_GROUP, kelvin: 1150 }],
 ];
 function uploadMaterials(game) {
-  // Base tables hold the three piece materials; every palette colour of the
+  // Base tables hold the three piece materials and the authored catalogue; every palette colour of the
   // state becomes a record (X mark's template, albedo replaced), plus a
   // lit "@hint" and "@sel" variant per colour and a glass record.
   const base = state.assets.materials, x = state.assets.meshes.x_mark.material;
@@ -1964,7 +1964,7 @@ function uploadMaterials(game) {
   records.push([OBSIDIAN, [0.022, 0.022, 0.028], { roughness: 0.06, transmission: 0.2, opacity: 0.96, ior: 1.5, specular: 0.8, shininess: 140 }]);
   records.push([FROST, [0.97, 0.98, 1.0], { roughness: 0.75, transmission: 0.3, opacity: 0.9, ior: 1.5, specular: 0.25, shininess: 20, profile: 3, thicknessMm: 3, thicknessLayer: FINISH_LAYER_FROST, translucence: 1.0, emission: [0.40, 0.41, 0.43] }]);
   const tables = {};
-  state.materialIndex = {};
+  state.materialIndex = { ...(state.assets.material_index || {}) };
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
   {
     const f = base.pbr.floats_per_record;
@@ -2011,13 +2011,15 @@ function uploadMaterials(game) {
         // phong [1] spec strength, [2] shininess: a material may declare them (the grain gems); the rest keep the
         // template's, the spec strength capped as before
         if (extra.shininess != null) record[2] = extra.shininess;
+        if (extra.grain != null) record[3] = extra.grain;
         // The extruded meshes' walls are wound inward (measured: wall signed volume is
         // negative, stored normals follow the winding), so seen from outside they are
         // BACK faces, and the shader paints back faces with the phong record's "inner"
         // colour (floats 4..6) instead of albedo.  The X-mark template's inner is
         // (0.055, 0.055, 0.066): every wall of every piece rendered near-black.  The
         // material is the palette colour on both sides, so inner = albedo.
-        record[4] = rgb[0]; record[5] = rgb[1]; record[6] = rgb[2];
+        const inner = extra.innerColor || rgb;
+        record[4] = inner[0]; record[5] = inner[1]; record[6] = inner[2];
         if (extra.ambient != null) record[0] = extra.ambient;         // (the shader clamps it to 0.12)
       }
       data.push(...record);
