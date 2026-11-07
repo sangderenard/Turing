@@ -280,7 +280,7 @@ def _restore_board(table, game, data: dict[str, Any]) -> None:
 
 def _restore_fountain(table, game, data: dict[str, Any]) -> None:
     """Through the game's own ``do`` actions, so every value is validated as a page's action would be."""
-    from meowdoku.fountain import FLUIDS
+    from meowdoku.s2_titles.fountain.fountain import FLUIDS
     size = data.get("size")
     if not isinstance(size, str):
         raise LifecycleError("bad size")

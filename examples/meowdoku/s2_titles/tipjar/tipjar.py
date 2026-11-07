@@ -552,7 +552,7 @@ def decode_rgb(rgb: tuple[int, int, int]) -> dict[str, Any]:
 # ---------------------------------------------------------------- the jar as a glyph-start state
 def build_jar(donations: list[dict], n_ids: int, *, mix: float = 1.0, params: dict | None = None):
     """The ``JarStart`` of a list of donations (oldest first) for ``n_ids`` ids.  Pure function of (donations, n_ids, mix, params)."""
-    from meowdoku import fountain3d as F
+    from meowdoku.s2_titles.fountain import fountain3d as F
     from meowdoku.s2_titles.fountain import glyph_start as GS
     donations = donations[-n_ids:]                                      # more donations than ids: the newest fill the jar
     count = len(donations)
@@ -592,7 +592,7 @@ def build_jar(donations: list[dict], n_ids: int, *, mix: float = 1.0, params: di
 
 
 def _jar_class():
-    from meowdoku import fountain3d as F
+    from meowdoku.s2_titles.fountain import fountain3d as F
     from meowdoku.s2_titles.fountain import glyph_start as GS
 
     @dataclass

@@ -34,8 +34,8 @@ for _path in (str(ROOT), str(ROOT / "examples")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from meowdoku import fountain as F  # noqa: E402
-from meowdoku import fountain_build as B  # noqa: E402
+from meowdoku.s2_titles.fountain import fountain as F  # noqa: E402
+from meowdoku.s4_generate import fountain_build as B  # noqa: E402
 
 SHELL = ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js"
 WORK = ROOT / "build" / "meowdoku" / "fountain_parity"
