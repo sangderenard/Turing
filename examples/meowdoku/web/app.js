@@ -312,6 +312,9 @@ function projectionGlassOn() { return onPlanet() && viewerWants("projection") &&
 function extZ0(ext = state.extent) { return (ext && ext.z0) || 0; }
 function extLength(ext = state.extent) { return ext.depth - extZ0(ext); }
 function extMidZ(ext = state.extent) { return (ext.depth + extZ0(ext)) / 2; }
+// the scene's x span is [left, left + width]: left is 0 except where something runs wider than the board (the Wordle rack)
+function extLeft(ext = state.extent) { return ext.left || 0; }
+function extMidX(ext = state.extent) { return extLeft(ext) + ext.width / 2; }
 function broadcastSpan() { return Math.max(state.extent.width, extLength()) * 1.12; }
 function renderBroadcast(now, casters) {
   const B = BROADCAST, n = B.size;
@@ -330,7 +333,7 @@ function renderBroadcast(now, casters) {
   }
   // the broadcast camera: straight down over the field's centre, wide angle
   const S = broadcastSpan(), height = (S / 2) / Math.tan(B.fov / 2);
-  const target = [state.extent.width / 2, 0, extMidZ()], eye = [target[0], height, target[2]];
+  const target = [extMidX(), 0, extMidZ()], eye = [target[0], height, target[2]];
   const view = M.lookAt(eye, target, [0, 0, -1]), proj = M.perspective(B.fov, 1, 0.1, 300);
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); gl.viewport(0, 0, n, n);
   gl.clearColor(...sceneBackground(), 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
@@ -353,7 +356,7 @@ function drawProjectionGlass(cam, drawLit) {
   // exactly the broadcast's footprint on the board; hovering above everything.
   const S = broadcastSpan(), y = TILE.height + 4.0 * DEPTH_LIFT + 1.2;
   const eyeHeight = Math.max(y + 0.5, cam.eye ? cam.eye[1] : y + 10);
-  const side = S * (eyeHeight - y) / eyeHeight, cx = state.extent.width / 2, cz = extMidZ();
+  const side = S * (eyeHeight - y) / eyeHeight, cx = extMidX(), cz = extMidZ();
   if (!BROADCAST.quad) {
     const pos = new Float32Array([-0.5, 0, -0.5, 0.5, 0, 0.5, 0.5, 0, -0.5, -0.5, 0, -0.5, -0.5, 0, 0.5, 0.5, 0, 0.5]);
     const nrm = new Float32Array(18); for (let i = 0; i < 6; i++) nrm[i * 3 + 1] = 1;
@@ -868,11 +871,11 @@ function drawStatusPlate(cam, model) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   }
   // the quad: the board's far edge, as wide as the board, text-aspect deep, just above the floor slab (or the plate)
-  const w = state.extent.width, z0 = state.extent.z0 || 0, y = backdropNoFloor() ? 0.012 : TILE.height + 0.012, qk = [w, z0, y].join("|");
+  const w = state.extent.width, z0 = state.extent.z0 || 0, y = backdropNoFloor() ? 0.012 : TILE.height + 0.012, qk = [w, z0, y, extLeft()].join("|");
   if (statusPlate.quadKey !== qk) {
     for (const b of statusPlate.buffers) gl.deleteBuffer(b);
     if (statusPlate.vao) gl.deleteVertexArray(statusPlate.vao);
-    const d = w * STATUS_H / STATUS_W, x0 = 0, x1 = w, zA = z0, zB = z0 + d;
+    const d = w * STATUS_H / STATUS_W, x0 = extLeft(), x1 = x0 + w, zA = z0, zB = z0 + d;
     const pos = new Float32Array([x0, y, zA, x0, y, zB, x1, y, zB, x0, y, zA, x1, y, zB, x1, y, zA]);
     const uv = new Float32Array([0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0]);
     statusPlate.vao = gl.createVertexArray(); gl.bindVertexArray(statusPlate.vao); statusPlate.buffers = [];
@@ -1034,7 +1037,7 @@ const PLANET = { radius: 36.0, strip: 0.4, shadowStrip: 0.6 };
 function onPlanet() { const g = state.game; return !state.flat && !!(g && g.scene && g.scene.terrain === true); }
 function planetDrop(x, z) {
   if (!onPlanet()) return 0;
-  const dx = x - state.extent.width / 2, dz = z - extMidZ();
+  const dx = x - extMidX(), dz = z - extMidZ();
   return (dx * dx + dz * dz) / (2 * PLANET.radius);
 }
 function stripsOf(positions, extras, span, length = PLANET.strip) {
@@ -1424,7 +1427,7 @@ function turnRelief(relief, now) {
 }
 function terrainOrigin(relief) {
   // Centred across the field; starting one tile above it and sliding down.
-  return [state.extent.width / 2 - relief.span[0] / 2, -0.05, -relief.tile - 2.0 + TERRAIN.scroll];
+  return [extMidX() - relief.span[0] / 2, -0.05, -relief.tile - 2.0 + TERRAIN.scroll];
 }
 function stripModel(relief, strip) {
   const [x0, y0, z0] = terrainOrigin(relief), z = z0 + strip.centre, d = z - state.extent.depth / 2;
@@ -1960,14 +1963,14 @@ function buttonFaces(rows, cols, cellName, origin, cellSize, hintOf, rowSize = c
   }
   return faces;
 }
-const RACK_ASPECT = 1.8;
+const RACK_ASPECT = 1.5, RACK_WIDE = 1.5;   // keys 0.75 board cells wide, 1.125 tall (Wordle: 10 per row)
 function rackLayout(game) {
   if (!game.rack) return null;
-  const size = game.cols / game.rack.cols;                        // the rack spans the board's width
+  const span = game.cols * RACK_WIDE, size = span / game.rack.cols;  // the rack runs RACK_WIDE x the board's width, centred under it
   // its keys are TALL (RACK_ASPECT x their width), like a phone keyboard's: a portrait screen has the height to spare, and the keys
   // become easy to hit; the rack sits closer under the board
   const zsize = size * RACK_ASPECT;
-  return { size, zsize, origin: [0, game.rows + 0.45], rows: game.rack.rows, cols: game.rack.cols };
+  return { size, zsize, span, origin: [(game.cols - span) / 2, game.rows + 0.45], rows: game.rack.rows, cols: game.rack.cols };
 }
 function disposeMesh(mesh) {
   if (!mesh) return;
@@ -1999,17 +2002,17 @@ function rebuildBoards(game) {
   state.trayButtons = trayFaces && trayFaces.length ? litMesh(trayFaces) : null;
   const depth = rack ? rack.origin[1] + rack.rows * rack.zsize
     : game.rows + (game.powerups ? TRAY.row + TRAY.countDrop + 0.45 : game.hearts != null ? 1.5 : 0);
-  const width = game.board === "free" ? game.width : game.cols;
-  state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
+  const width = game.board === "free" ? game.width : rack ? Math.max(game.cols, rack.span) : game.cols;
+  state.extent = { width, left: rack ? Math.min(0, rack.origin[0]) : 0, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
                    x0: game.characters ? CHAR.left : 0 };         // (the tile set stands left of the board)
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
   // the plate's UVs span the whole plate (u along x, v along z, v = 0 at the far edge): the slide image is fit inside them (bakeSlide)
-  const z0p = state.extent.z0 - m, P = state.plate = { x0: -m, z0: z0p, w: width + 2 * m, d: state.extent.depth + m - z0p };
+  const L = extLeft(), z0p = state.extent.z0 - m, P = state.plate = { x0: L - m, z0: z0p, w: width + 2 * m, d: state.extent.depth + m - z0p };
   const plateUv = (q) => [(q[0] - P.x0) / P.w, (q[2] - P.z0) / P.d];
   if (game.scene && game.scene.terrain === true && !state.flat) {
     // The plate lies on the planet's curve: a fine grid of glass (it never
     // scrolls, so the curve is baked once).
-    const faces = [], step = 0.5, x0 = -m, x1 = width + m, zA = state.extent.z0 - m, z1 = state.extent.depth + m;
+    const faces = [], step = 0.5, x0 = L - m, x1 = L + width + m, zA = state.extent.z0 - m, z1 = state.extent.depth + m;
     const at = (x, z) => [x, -planetDrop(x, z), z];
     for (let x = x0; x < x1 - 1e-6; x += step) for (let z = zA; z < z1 - 1e-6; z += step) {
       const xa = Math.min(x + step, x1), za = Math.min(z + step, z1);
@@ -2017,7 +2020,7 @@ function rebuildBoards(game) {
     }
     state.glass = litMesh(faces, plateUv);
   } else {
-    const faces = box(-m, -t, state.extent.z0 - m, width + m, 0.0, state.extent.depth + m, gm);
+    const faces = box(L - m, -t, state.extent.z0 - m, L + width + m, 0.0, state.extent.depth + m, gm);
     // With a slide on the plate the top face is wound the way the shader treats as the FRONT (as the terrain quad is: a clockwise
     // triangle from above) with its normal given up: the albedo path -- and so the colour layer -- is the front face's; the back face
     // paints the material's flat inner colour.  (Without a slide the plate is exactly as it was.)
@@ -4809,7 +4812,7 @@ const BACKLIGHT_COLOUR = [0.11, 0.108, 0.105];     // linear: the plate's radian
 function backlightEmitter() {
   if (!(backdrop.mode === "backlit" && isFountainGame(state.game) && !state.flat)) return null;
   const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth;
-  return { at: [w / 2, -GLASS.thickness * 0.5, (z0 + d) / 2], area: w * (d - z0) };
+  return { at: [extMidX(), -GLASS.thickness * 0.5, (z0 + d) / 2], area: w * (d - z0) };
 }
 // Debug: draw caller-made packed grains `data` ([x, y, rgba8, meta]) in `style` through the scene's own call (the measurements'
 // path: no rAF needed); the GL context; the material tables as uploaded.
@@ -5520,7 +5523,7 @@ function litPass(cam, now, casters, opts = {}) {
   state.activePhong = P; state.variantSeen = false; gl.useProgram(P);
   const span = Math.max(state.extent.width, extLength());
   const keyView = M.apply(cam.view, light.position);
-  const sun = sunState(), boardCentre = [state.extent.width / 2, 0, extMidZ()];
+  const sun = sunState(), boardCentre = [extMidX(), 0, extMidZ()];
   const sunReach = Math.hypot(...sub(light.position, boardCentre));
   let keyColour = state.flat ? [1.0, 0.95, 0.86] : sun.colour, fillColour = [0.75, 0.85, 1.0];
   const globe = !state.flat && SKY.dir && state.game && state.game.globe ? SKY.dir : null;
@@ -5656,7 +5659,7 @@ function caseAngleNow() {
 }
 function caseModelNow() {
   if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
-  return caseModel(caseAngleNow(), state.extent.width / 2, extMidZ());
+  return caseModel(caseAngleNow(), extMidX(), extMidZ());
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
 window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;
