@@ -4327,7 +4327,7 @@ function refreshLocalControls() {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
       el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, centre = off`
-                          : "centre = off; log scale out to 2 Hz either way, down to 1 turn in 2.8 h";
+                          : "centre = off; log scale out to 30 Hz either way (the Nyquist rate of the 60 Hz input updates), down to 1 turn in 2.8 h";
       el.querySelector("span").textContent = `case spin ${spinText(caseSpin)} `;
     } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
@@ -4418,8 +4418,8 @@ function refreshLocalControls() {
 // turning at a set rate, a runtime input of the law like the tilt, so no rebuild).  Declared here until the fountain's
 // controls next change server-side (an edit there re-keys the compiled products).
 // The slider is LOGARITHMIC in the rate (grain-size studies want the near-DC end): position s in [-1, 1] -> sign(s) x
-// 10^(SPIN_LOG[0] + |s| (SPIN_LOG[1] - SPIN_LOG[0])) Hz, from 1e-4 Hz (one turn in ~2.8 h) to 2 Hz; the centre notch is off.
-const SPIN_LOG = [-4, Math.log10(2)], SPIN_NOTCH = 0.01;
+// 10^(SPIN_LOG[0] + |s| (SPIN_LOG[1] - SPIN_LOG[0])) Hz, from 1e-4 Hz (one turn in ~2.8 h) to 30 Hz; the centre notch is off.
+const SPIN_LOG = [-4, Math.log10(30)], SPIN_NOTCH = 0.01;      // 30 Hz: the Nyquist rate of the 60 Hz input updates
 const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin", min: -1, max: 1, step: 0.002, local: "spin" };
 function spinFromSlider(s) {
   s = Number(s);
