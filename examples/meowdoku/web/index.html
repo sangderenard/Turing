@@ -249,6 +249,20 @@
     new ResizeObserver(fit).observe(bar, { box: "border-box" }); fit();
     addEventListener("resize", () => { fit(); requestAnimationFrame(fit); }); })();
 </script>
+<script>
+  // CLIENT ERRORS to the server log (a phone has no console to read): uncaught errors and rejections, at most 20 per page load
+  (() => {
+    let sent = 0;
+    const send = (kind, msg, where, stack) => {
+      if (sent++ >= 20) return;
+      const body = JSON.stringify({ kind, msg: String(msg || ""), where: String(where || ""), stack: String(stack || "").slice(0, 1500), ua: navigator.userAgent });
+      try { navigator.sendBeacon ? navigator.sendBeacon("/api/clientlog", new Blob([body], { type: "application/json" }))
+                                 : fetch("/api/clientlog", { method: "POST", body, keepalive: true }); } catch (_) { /* never let reporting throw */ }
+    };
+    addEventListener("error", (e) => send("error", e.message, `${e.filename}:${e.lineno}:${e.colno}`, e.error && e.error.stack), true);
+    addEventListener("unhandledrejection", (e) => { const r = e.reason || {}; send("rejection", r.message || r, "", r.stack); });
+  })();
+</script>
 <button id="unzoom" type="button">Reset zoom</button>
 <script>
   // THE PAGE DOES NOT ZOOM.  The viewport meta stops it on Android; iOS Safari ignores user-scalable for pinch, so its gesture

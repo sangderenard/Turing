@@ -577,6 +577,16 @@ def make_handler(sessions: Sessions):
 
         def do_POST(self):  # noqa: N802
             path0 = self.path.split("?", 1)[0]
+            if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
+                length = min(int(self.headers.get("Content-Length") or 0), 4096)
+                try:
+                    note = json.loads(self.rfile.read(length) or b"{}")
+                    line = " | ".join(str(note.get(k, ""))[:600] for k in ("kind", "msg", "where", "stack", "ua"))
+                except (ValueError, TypeError):
+                    line = "(unreadable)"
+                print(f"[client-error] {self.client_address[0]}: {line}", flush=True)
+                self.send_response(204); self.end_headers()
+                return
             if path0 in ("/api/admin/lifecycle", "/api/lifecycle/restore") and not self._is_viewer():
                 return self._lifecycle_post(path0, int(self.headers.get("Content-Length") or 0))
             if self._is_viewer():
