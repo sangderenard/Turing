@@ -967,16 +967,16 @@ def sdf_field(x, y, z, q):
         solid = used * (1.0 - fluid)
         cf = fluid * (-f) + (1.0 - fluid) * (-SDF_FAR)
         take = as_float(cf > d_f)
-        d_f = d_f + take * (cf - d_f)
+        d_f = AbstractTensor.where(take > 0.5, cf, d_f)                 # a SELECT, not d_f + take (cf - d_f): with the SDF_FAR sentinel that is (-1e9) + (1e9 + cf), which f32 rounds to 0
         for i, g in enumerate((-gwx, -gwy, -gz)):
             f_n[i] = f_n[i] + take * (g - f_n[i])
         cs = solid * f + (1.0 - solid) * SDF_FAR
         take = as_float(cs < d_s)
-        d_s = d_s + take * (cs - d_s)
+        d_s = AbstractTensor.where(take > 0.5, cs, d_s)
         for i, g in enumerate((gwx, gwy, gz)):
             s_n[i] = s_n[i] + take * (g - s_n[i])
     pick = as_float(d_s < d_f)
-    return (d_f + pick * (d_s - d_f),) + tuple(f_n[i] + pick * (s_n[i] - f_n[i]) for i in range(3))
+    return (AbstractTensor.where(pick > 0.5, d_s, d_f),) + tuple(f_n[i] + pick * (s_n[i] - f_n[i]) for i in range(3))
 
 
 def make_law(n: int, active: int | None = None, sdf: bool = True):
