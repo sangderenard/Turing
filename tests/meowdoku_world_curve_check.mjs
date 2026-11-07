@@ -11,6 +11,7 @@ const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../examp
 const C = await import(pathToFileURL(path.join(web, "world_curve.js")).href);
 const S = await import(pathToFileURL(path.join(web, "share.js")).href);
 const P = await import(pathToFileURL(path.join(web, "particle_styles.js")).href);
+const rl = await import(pathToFileURL(path.join(web, "replay_layers.js")).href);
 const near = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg || ""} ${a} vs ${b} (tol ${tol})`);
 const { CURVE } = C;
 
@@ -209,7 +210,7 @@ const camAt = (d0, s, base = ABOVE()) => {
   }
   const decls = [...src.matchAll(/^const ([A-Z_]+SPECS?) = /gm)].map((m) => cut(m.index));
   const fn = cut(src.indexOf("function pageSpecs(specs)"));
-  const ctx = vm.createContext({ ...P, state: { game: null } });
+  const ctx = vm.createContext({ ...P, rl, state: { game: null } });
   vm.runInContext(decls.map((d) => d.replace(/^const /, "var ")).join("\n") + "\n" + fn + "\nthis.pageSpecs = pageSpecs;", ctx);
   const terrain = { game: "scroller", scene: { terrain: true } }, plain = { game: "boardwalk", scene: { floor: true } };
   // a terrain game with NO server controls (the bullet hell) still has the control; a game without a curve has none

@@ -20,6 +20,7 @@ The stage 3 mover (`python tools/meowdoku_layout_move.py --stage 3 --dry`) now r
 - Stage 2: `test_meowdoku_vertical_law.py`, `test_meowdoku_pilot_decl.py` with `MEOWDOKU_LAW=numpy`: 24 passed.
 - Log commit: `test_meowdoku_logring.py`: 5 passed; Node module syntax checks for `log.js` and `log_view.js` and `tests/meowdoku_log_view_check.mjs` passed.
 - After stage 3: compileall on the moved title/generator/export/serve packages passed; access, startup, share, logring and loading animation tests: 68 passed. `git -c core.whitespace=cr-at-eol diff --check` was clean. No compiler rebuild or live site test was run.
+- The two stale Node failures listed in `LAYOUT_AUDIT.md` are repaired in the test setup: the world-curve check now loads the real replay-layer tint table, and the emoji-style check copies `world_curve.js` and its `world_zoom.js` dependency beside the module under test. Both checks pass (2 passed); no page source was changed.
 
 The law and fountain product digest changes described in `LAYOUT_AUDIT.md` require rebuild when this branch lands. Do not treat the test counts as a full product or browser gate.
 

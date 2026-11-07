@@ -105,6 +105,8 @@ console.log('ok');
 
 def _node(tmp_path, script):
     shutil.copyfile(WEB / "particle_styles.js", tmp_path / "particle_styles.js")
+    shutil.copyfile(WEB / "world_curve.js", tmp_path / "world_curve.js")
+    shutil.copyfile(WEB / "world_zoom.js", tmp_path / "world_zoom.js")
     (tmp_path / "run.mjs").write_text(script, encoding="utf-8")
     done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
     assert done.returncode == 0, (done.stdout + done.stderr)[-2500:]
