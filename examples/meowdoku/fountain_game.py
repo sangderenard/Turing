@@ -129,7 +129,7 @@ class FountainGame(Game):
         elif kind == "fountain_choice":
             name, value = str(payload["name"]), str(payload["value"])
             if name == "shape":
-                if value not in SHAPES and value not in SDF_SHAPES:
+                if value not in SHAPES and value not in SDF_SHAPES and value not in BODY_SHAPES:
                     raise ValueError(f"fountain_choice: unknown shape {value!r}")
                 if (value in SDF_SHAPES) != (self.shape in SDF_SHAPES):          # the depth an SDF solid needs is not the polygons' depth: back to the default
                     self.params.pop("depth", None)
@@ -189,7 +189,7 @@ class FountainGame(Game):
             raise ValueError("fountain_verify: the native lane is built for sizes up to 4096 ids")
         columns = self.columns(image=image)
         if self.piece is None:
-            self.piece = make_piece(pad, active)
+            self.piece = make_piece(pad, active, body=self.shape in BODY_SHAPES)
             self.piece.compile(columns)
         final = run_frames(self.piece, columns, steps)
         digest = hashlib.sha256(b"".join(np.ascontiguousarray(final[n], dtype=np.float32).tobytes()
@@ -281,6 +281,9 @@ class FountainGame(Game):
                     "name": "inlet", "field": "value", "group": "Chamber",
                     "options": [["fountain", "fan fountain"], ["jet", "colinear jet"], ["pour", "pour from above"], ["side", "side tube"]]})
         out.extend([self._control("depth"), self._control("spread")])
+        if self.shape in BODY_SHAPES:                            # the hinged wheel: paddles / radius (a new run), inertia, damping, the motor
+            out.extend(self._control(name) for name in ("wheel_n", "wheel_r", "wheel_i", "wheel_gam", "wheel_alpha"))
+            out.append({"id": "wheel_om", "kind": "readout", "label": "wheel speed (rad/s)", "group": "Wheel", "diag": "body_om"})
         for ctl in out:
             ctl.setdefault("group", "Run")
         return out
@@ -308,16 +311,27 @@ class FountainGame(Game):
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
                 # the flat product (the SDF compiled out, ~21% faster at 64k) whenever the chamber is the box or a polygon
-                "manifest": "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json",
+                "manifest": ("fountain3d_wheel.manifest.json" if self.shape in BODY_SHAPES
+                             else "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json"),
                 "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
-                "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
+                "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params), "body": self.body_spec(),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
                 "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved()), self.shape),
             },
         })
         return base
+
+    def body_spec(self) -> dict[str, Any] | None:
+        """The hinged body for the page to draw (its outline at the angle the law reports in ``diag.body_th``, extruded through the depth) and to couple
+        (``body_tau`` is the runtime input a machine-sim coupling writes; ``body_om`` is read back from the diagnostics)."""
+        if self.shape not in BODY_SHAPES:
+            return None
+        u = self.uniforms()
+        return {"hinge": [float(u["body_x"]), float(u["body_y"])], "hub": float(u["body_rh"]), "reach": float(u["body_pl"]),
+                "half_thickness": float(u["body_ht"]), "paddles": int(round(float(u["body_np"]))), "angle": "body_th",
+                "speed": "body_om", "torque_input": "body_tau", "dh": float(u["dh"])}
 
     def result(self):
         return None
