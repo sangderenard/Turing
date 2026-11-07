@@ -112,7 +112,7 @@ def _compile(stem: str, shapes: dict, run, output_names, contract: str, web_dir:
 # ----------------------------------------------------------------------- law
 
 def law_shapes() -> dict:
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     columns = sc.initial_columns()
     piece = sc.ScrollerPiece
     shapes = {n: (tuple(np.shape(columns[n])) if n in columns else ()) for n in piece.argument_names}
@@ -124,7 +124,7 @@ def law_shapes() -> dict:
 def build_law(web_dir: Path, contract: str = CONTRACT) -> dict:
     """``law.wasm`` + ``law.abi.json``: ``scroller_step``, traced as
     ``LawPiece._compile_native`` traces it."""
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     piece = sc.ScrollerPiece
     shapes = law_shapes()
     digest = _digest(piece._captured_sources or piece._read_sources(),
@@ -229,7 +229,7 @@ def _node_run(work: Path, stem: str, job: str, inputs: list, timing: int = 200) 
 def parity_law(work: Path) -> dict:
     """The page loader's ``law.wasm`` against the native DLL (``develop``) on
     a real state: a bullet-hell game flown a few seconds with fire held."""
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     build_law(work)
     game = sc.BulletScroller(level=1)
     for _ in range(40):

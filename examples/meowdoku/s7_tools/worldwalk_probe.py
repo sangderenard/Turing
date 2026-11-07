@@ -184,7 +184,7 @@ def hold(game: ww.WorldWalk, seconds: float, **controls) -> None:
 
 def walk(seed: int) -> dict:
     """Speeds per material, a click path over land, a swim, free walking and its cancel."""
-    from meowdoku import entity_motion as em
+    from meowdoku.s1_engine import entity_motion as em
     w = ww.world()
     out = {"speed_by_material": {}}
     for name, (index, _f) in em.WALK_MATERIALS.items():

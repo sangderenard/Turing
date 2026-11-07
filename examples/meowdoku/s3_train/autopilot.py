@@ -120,7 +120,7 @@ def make_game(name: str, seed: int | None = None):
     if declared(name) is not None:
         return declared(name).make(int(seed if seed is not None else 0))
     from meowdoku.s2_titles.invaders.invaders import SpaceInvaders
-    from meowdoku.scroller import BulletScroller
+    from meowdoku.s2_titles.scroller.scroller import BulletScroller
     game = {"space_invaders": SpaceInvaders, "bullet_hell": BulletScroller}[name]("autopilot")
     game.learns = False          # training / evaluation episodes are not play to learn from
     return game
@@ -187,7 +187,7 @@ def invaders_features(game) -> np.ndarray:
 
 
 def scroller_features(game) -> np.ndarray:
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
 
     def kind(col, lanes):
         slot, k = col("slot")[lanes], col("kind")[lanes]
@@ -205,7 +205,7 @@ def scroller_tokens(game) -> np.ndarray:
     reach (enemies, aces and the boss, bullets and flak, emplacements,
     pickups, the ship's own shots and missiles, storm and rain clouds) as a
     token, nearest first, and the mask."""
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     col = game.session.column
     k = game.PLAYER_LANE
     alive, slot, kind = col("alive"), col("slot"), col("kind")
@@ -617,7 +617,7 @@ class _MirroredView:
     player flies it unchanged."""
 
     def __init__(self, game, lane: int):
-        from meowdoku import scroller as sc
+        from meowdoku.s2_titles.scroller import scroller as sc
         self.game = game.game
         self.PLAYER_LANE = lane
         self.HOSTILE_LANES = ((0, 1), sc.SHOTS, sc.MISSILES)
@@ -827,7 +827,7 @@ def _scroller_dodger(game):
     """Bullet hell teacher: 27 candidate moves (x, y, height) rolled forward
     0.6 s against straight-line hostiles; a hit needs depth overlap too.
     Prefers to sit under / level with the nearest enemy so its shots land."""
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     col = game.session.column
     alive, x, y, vx, vy, slot = col("alive"), col("x"), col("y"), col("vx"), col("vy"), col("slot")
     z, vz, rz = col("z"), col("vz"), col("rz")

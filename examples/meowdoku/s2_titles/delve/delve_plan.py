@@ -24,7 +24,7 @@ import numpy as np
 from meowdoku.s2_titles.delve.delve_rules import (
     BUFFER, CLIMB, COYOTE, EMPTY, FALL_MAX, FOOT, GRAVITY, HANG_SCALE, HANG_V, JUMP, JUMP2, JUMP_CUT, LADDER, ONEWAY, PLAYER_RX, PLAYER_RY,
     REACH, SOLID, SPEED, SPIKE, TAU)
-from meowdoku.entity_motion import damped_axis, vertical_axis
+from meowdoku.s1_engine.entity_motion import damped_axis, vertical_axis
 
 PLAN_DT = 1.0 / 60.0                 # a step of the game's own tick; the law's ceiling is ``0.5 * TAU`` = 0.03
 PLAN_STEPS = 130
