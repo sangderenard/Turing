@@ -1,5 +1,6 @@
 // The page's generic COMPUTE-PRODUCT runtime.
 //
+import { caseVibration } from "./case_vibration.js";
 // A game declares a compute product in its state:
 //
 //   game.compute = { manifest, size, epoch, uniforms, speed, named }
@@ -455,11 +456,20 @@ class WasmProduct {
 // absolute floor (per id) and a fraction of its peak, with the largest speed under a limit, for `hold_samples` samples in
 // a row.  The step of the sample that completes the hold is S; phase 2 stops at exactly S.  `fountain.SettleDetector`
 // is the same rule in Python (held against this one by tests/test_meowdoku_fountain.py).
+// Initial state columns: Studio can supply a packed float32 age column to
+// bound the active ids of an existing 4k product without changing its law.
 // The glyph start's placed grains (game.compute.start, glyph_start.GlyphStart.payload): x y z (and rs for a swelling species) as 16-bit fixed
 // point over `bounds`, decoded to float32 columns of the product's length.  They are fed beside the image colours (reset({named})): the
 // run starts from these positions at rest.  Python's glyph_start.decode_payload is this formula.
 export function decodeStart(start, pad) {
   const bytes = (text) => { const bin = atob(text), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
+  if (start.age_f32) {
+    const raw = atob(start.age_f32);
+    if (raw.length !== pad * 4) throw new Error("initial age column length differs from compiled particle count");
+    const data = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+    return { age: new Float32Array(data.buffer) };
+  }
   if (start.ids) return decodeIdStart(start, pad, bytes);        // TIP JAR: a start that names the ids its rows belong to
   const q = bytes(start.xyz), b = start.bounds, out = {};
   ["x", "y", "z"].forEach((name, c) => {
@@ -570,7 +580,7 @@ export class ComputeRuntime {
     this.rotations = new Map(); // first particle's physical omega and integrated pose, keyed with the recording
     this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
     this.stepsDone = 0; this.stepsPerSec = 0;
-    this.lawInputs = {}; this.gravity = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
+    this.lawInputs = {}; this.gravity = null; this.vibration = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
   }
 
   get active() { return !!this.spec; }
@@ -717,6 +727,11 @@ export class ComputeRuntime {
         out.case_domega_x = x * flip.domega; out.case_domega_y = y * flip.domega; out.case_domega = z * flip.domega;
       }
     }
+    if (["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => this.runtimeInputs.has(name))) {
+      // Uniforms are held for the next snapshot's steps; sample its midpoint.
+      const a = this.caseDisplacementAt(this.steps + this.snap / 2).acceleration;
+      out.case_acc_x = a[0]; out.case_acc_y = a[1]; out.case_acc_z = a[2];
+    }
     if (g) {
       const G = this.manifest.law.gravity;
       out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)
@@ -745,6 +760,7 @@ export class ComputeRuntime {
   // gravity sources and case angle (plus `caseTiltAdd`, the seed's perturbation) and the image feeds are taken over; nothing is shared.
   inheritFrom(from, { caseTiltAdd = 0 } = {}) {
     this.gravity = from.gravity ? [...from.gravity] : null; this.spin = from.spin; this.spinMotion = from.spinMotion ? { ...from.spinMotion } : this.spinMotion;
+    this.vibration = from.vibration ? { ...from.vibration } : null;
     this.caseTilt = (from.caseTilt || 0) + caseTiltAdd; this.gravityScale = from.gravityScale; this.bodyTau = from.bodyTau; this.named = from.named;
   }
   // [GHOSTS] the spec's uniforms with the nozzle speed scaled by 1 + rel (a runtime input; absent in a law without a nozzle)
@@ -899,6 +915,23 @@ export class ComputeRuntime {
     this.#kick();
   }
 
+  setCaseVibration(kind, hz, amplitude, axis = "z", phase = 0) {
+    const supported = ["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => this.runtimeInputs.has(name));
+    const mode = ["sander", "vibrator"].includes(kind) ? kind : null;
+    if (!supported && mode) { this.vibration = null; return null; }
+    this.vibration = mode ? { kind: mode, hz: Math.min(8, Math.max(0.1, Number(hz) || 1)),
+      amplitude: Math.min(0.04, Math.max(0, Number(amplitude) || 0)), axis: ["x", "y", "z"].includes(axis) ? axis : "z",
+      phase: Number(phase) || 0 } : null;
+    this.#kick();
+    return this.vibration;
+  }
+
+  caseDisplacementAt(step) {
+    const v = this.vibration && ["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => this.runtimeInputs.has(name)) ? this.vibration : null;
+    return v ? caseVibration(v.kind, v.hz, v.amplitude, v.axis, v.phase, step * (this.manifest?.law?.dt || 0))
+      : { displacement: [0, 0, 0], acceleration: [0, 0, 0] };
+  }
+
   setGravity(gx, gy, gz = 0) {
     const next = gx == null ? null : [gx, gy, gz], old = this.gravity;
     if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1], next[2] - old[2]) < 0.004) return;
@@ -1039,6 +1072,7 @@ export class ComputeRuntime {
       const rate = Math.abs(this.spin) * (this.spinMotion && this.spinMotion.kind === "rock" ? Math.PI * this.spinMotion.arc / 360 : 1);
       if (rate > 0) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (rate * this.manifest.law.dt * snap))));
     }
+    if (this.vibration) m = Math.max(1, Math.min(m, Math.floor(1 / (12 * this.vibration.hz * this.manifest.law.dt * snap))));
     if ((this.caseFlips || []).some((f) => this.steps >= f.startStep && this.steps < f.startStep + f.steps)) m = 1;
     return m;
   }

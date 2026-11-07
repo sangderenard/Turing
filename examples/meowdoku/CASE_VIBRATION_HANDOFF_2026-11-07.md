@@ -1,0 +1,9 @@
+# Translating case motion — 2026-11-07
+
+The 3D fountain law now accepts separate `case_acc_x/y/z` runtime inputs. They are the prescribed container translation's second derivative in the law frame; the law applies their negative as a non-inertial acceleration with the same displaced-fluid buoyancy factor as gravity. The containing geometry stays fixed in law coordinates, so contact forces and torque respond to the shaking. Existing zero defaults leave static cases unchanged.
+
+The page's `case_vibration.js` defines two deterministic motions in simulated time: **sander** circles in law X/Y, and **vibrator** oscillates on a selected law X/Y/Z axis. `ComputeRuntime.setCaseVibration(kind,hz,amplitude,axis,phase)` supplies the physical acceleration to a 3D product only when all three uniforms are in its manifest. `caseDisplacementAt(step)` supplies the identical prescribed translation for the rendered case. The acceleration is sampled at the midpoint of each snapshot; vibration constrains batches to one snapshot. At 360 law steps/s and six steps/snapshot, frequencies near the 8 Hz cap are only sampled about 7.5 times/cycle, so physical accuracy should be checked before raising the cap.
+
+The 2D fountain has no case-translation input. A 2D sander/vibrator control must wait for an actual law and product extension; showing this choice on old or 2D products would be false. The 3D source change changes the compiler fingerprint. Rebuild 3D WebGPU products before advertising it in the served page. Do not eagerly build Wasm; the user's fallback/idle-only rule still applies. Existing older manifests lack `case_acc_*`, and `setCaseVibration` returns null there.
+
+Focused checks: `node tests/meowdoku_case_vibration_check.mjs`, JS syntax, Python syntax, and the 3D uniform/runtime-input/default contract. A full browser simulation and penetration measurement at the highest amplitude/frequency remain.

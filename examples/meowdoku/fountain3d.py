@@ -285,6 +285,7 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
             + POLYGON_UNIFORMS
             + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac",
                "wt0", "wt1", "wt2", "wt3", "case_omega", "case_domega", "case_omega_x", "case_omega_y",
+               "case_acc_x", "case_acc_y", "case_acc_z",
                "case_domega_x", "case_domega_y", "pivot_x", "pivot_y", "pivot_z")
             + _SPECIES_UNIFORMS + SDF_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
@@ -293,7 +294,7 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
 #: (Continue) reproduces it exactly.
 LIVE_PARAMS = tuple(k for k, v in PARAMS.items() if not v[5])
 RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "case_omega", "case_domega", "case_omega_x", "case_omega_y",
-                  "case_domega_x", "case_domega_y", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
+                  "case_domega_x", "case_domega_y", "case_acc_x", "case_acc_y", "case_acc_z", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
                   "nozzle_speed", "fl_rho", "fl_mu") \
     + tuple(f"{k}{s}" for k in ("rho", "mu", "zeta", "roll") for s in range(len(SPECIES)))
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -737,6 +738,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
                 "case_omega": 0.0, "case_domega": 0.0, "case_omega_x": 0.0, "case_omega_y": 0.0,
+                "case_acc_x": 0.0, "case_acc_y": 0.0, "case_acc_z": 0.0,
                 "case_domega_x": 0.0, "case_domega_y": 0.0,
                 "pivot_x": 0.0, "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3]), "pivot_z": 0.0,
                 "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"], "temp": p["temp"],
@@ -1464,15 +1466,22 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         fict_x = AbstractTensor.where(vector_on, -cent[0] - euler[0], old_fict_x)
         fict_y = AbstractTensor.where(vector_on, -cent[1] - euler[1], old_fict_y)
         fict_z = AbstractTensor.where(vector_on, -cent[2] - euler[2], zero)
-        vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x) * DT) * damp
-        vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y) * DT) * damp
+        # Translating case frame: the housing is static here, while the
+        # particles feel -d²(case displacement)/dt².  The same displaced-fluid
+        # buoyancy factor as gravity applies to this inertial acceleration.
+        shake_cap = omega * omega * 0.5 * radius
+        shake_x = -_cap(-_cap(a["case_acc_x"], shake_cap), shake_cap)
+        shake_y = -_cap(-_cap(a["case_acc_y"], shake_cap), shake_cap)
+        shake_z = -_cap(-_cap(a["case_acc_z"], shake_cap), shake_cap)
+        vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x - shake_x * buoy) * DT) * damp
+        vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y - shake_y * buoy) * DT) * damp
         turn = (case_omega * DT) * -2.0
         c_turn, s_turn = turn.cos(), turn.sin()
         vx_c = AbstractTensor.where(live > 0.5, vx_a * c_turn - vy_a * s_turn, vx_a)
         vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
         vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
-        vz_a = (vz + live * (f_[2] / mass + grav[2] * buoy + fict_z) * DT) * damp
+        vz_a = (vz + live * (f_[2] / mass + grav[2] * buoy + fict_z - shake_z * buoy) * DT) * damp
         # Rodrigues' exact Coriolis rotation about the full case angular vector; legacy z rotations retain their
         # original arithmetic.  omega=0 gives the identity because both cross products are zero.
         axis = tuple(v * (1.0 / om_eff_mag) for v in om)

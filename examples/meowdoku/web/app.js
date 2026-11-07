@@ -5191,9 +5191,18 @@ let cloud = null;
 const compute = new ComputeRuntime({
   onStatus: () => { const g = state.game; if (g && g.compute) { status.textContent = `${g.status} · ${compute.statusText()}`; refreshLocalControls(); } },
   onSamples: (post, fields) => act({ type: post.action, ...fields }),
-  onSupport: () => { if (state.game) renderGameControls(state.game); },
+  onSupport: () => { if (state.game) { renderGameControls(state.game); applyCaseVibration(); } },
 });
 window.meowdokuDebug.compute = compute;
+const caseVibration = { kind: "off", hz: 3, amplitude: 0.01, axis: "z", phase: 0 };
+try { Object.assign(caseVibration, JSON.parse(localStorage.getItem("meowdoku.caseVibration") || "{}")); } catch { /* storage may be blocked */ }
+if (!["off", "sander", "vibrator"].includes(caseVibration.kind)) caseVibration.kind = "off";
+function applyCaseVibration() {
+  if (!compute.manifest) return;
+  const active = state.game && ["fountain3d", "marble_madness"].includes(state.game.game);
+  compute.setCaseVibration(active && caseVibration.kind !== "off" ? caseVibration.kind : null,
+    caseVibration.hz, caseVibration.amplitude, caseVibration.axis, caseVibration.phase);
+}
 let candidateCapture = null;
 $("capture-candidate").onclick = () => {
   try {
@@ -5429,6 +5438,7 @@ function localValue(s) {
   if (s.local === "qrwall") return qrWall.on;                                      // [QRWALL]
   if (s.local === "saved_particle") return savedParticle.digest;
   if (s.local === "wall_finish") return wallFinish.mode;
+  if (s.local?.startsWith("vibe_")) return caseVibration[s.local.slice(5)];
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
@@ -5436,6 +5446,14 @@ function localValue(s) {
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
+  if (s.local?.startsWith("vibe_")) {
+    const key = s.local.slice(5);
+    caseVibration[key] = ["hz", "amplitude", "phase"].includes(key) ? Number(value) : value;
+    try { localStorage.setItem("meowdoku.caseVibration", JSON.stringify(caseVibration)); } catch { /* storage may be blocked */ }
+    if (caseVibration.kind !== "off") { watchCase.on = true; $("marble-watch-case").checked = true;
+      try { localStorage.setItem("meowdoku.watchcase", "1"); } catch { /* storage may be blocked */ } }
+    applyCaseVibration(); refreshLocalControls(); return;
+  }
   if (s.local === "saved_particle") {
     selectSavedParticle(value).catch((error) => { savedParticle.note = String(error.message || error); status.textContent = savedParticle.note; refreshLocalControls(); });
     return;
@@ -5587,6 +5605,15 @@ function refreshLocalControls() {
       el.title = "Checker tiles subdivide the compiled chamber's containing zero-surface mesh; front and back remain clear glass at the physical slab limits.";
       continue;
     }
+    if (s.local.startsWith("vibe_")) {
+      const key = s.local.slice(5), input = el.querySelector("input, select");
+      if (document.activeElement !== input) input.value = String(caseVibration[key]);
+      input.disabled = key !== "kind" && (caseVibration.kind === "off" || (key === "axis" && caseVibration.kind === "sander"));
+      const value = el.querySelector("span");
+      if (value) value.textContent = `${s.label} ${key === "kind" || key === "axis" ? "" : caseVibration[key]} `;
+      el.title = "Prescribed translation of the physical case. The law uses its acceleration; the same displacement moves the rendered case. WebGPU 3-D product only.";
+      continue;
+    }
     if (s.local === "spin") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
@@ -5638,7 +5665,7 @@ function refreshLocalControls() {
       el.title = "the status and compute lines are drawn into a texture on the plate (behind the grains, layout unchanged) instead of the page's text; dark ink on the backlit plate, light on the dark floor";
     } else if (s.local === "watchcase") {
       el.querySelector("input").checked = watchCase.on;
-      el.title = "off: the camera rides with the case (the case looks still, gravity turns); on: the camera stays in the world and the case turns by the same angle as the gravity (floor tiles, plate and grains; the sky and the arcade ring stay)";
+      el.title = "off: the camera rides with the case; on: the case, plate, grains, and mounted arcade bulbs move together while the sky stays in place";
     } else if (s.local === "backdrop") {
       el.title = "floor: the dark slab and glass plate under the fountain (contrast); backlit: the same plate glowing a mild white from within; clear: neither, so the sky, background and lights show through and glass has something to reflect";
     } else if (s.local === "pcolor_solid") {
@@ -5749,6 +5776,13 @@ function spinText(hz) {
 }
 // How the case moves at the spin rate: a full rotation, or a rock through an arc (degrees, centred on straight down).
 const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"], ["flip", "flip on button"]] };
+const VIBRATION_SPECS = [
+  { id: "vibe_kind", kind: "select", label: "case shake", local: "vibe_kind", group: "Case shake", options: [["off", "off"], ["sander", "sander (circular)"], ["vibrator", "vibrator (axial)"]] },
+  { id: "vibe_hz", kind: "range", label: "rate Hz", local: "vibe_hz", group: "Case shake", min: 0.1, max: 8, step: 0.1 },
+  { id: "vibe_amplitude", kind: "range", label: "travel (law units)", local: "vibe_amplitude", group: "Case shake", min: 0, max: 0.04, step: 0.001 },
+  { id: "vibe_axis", kind: "select", label: "axis", local: "vibe_axis", group: "Case shake", options: [["x", "X"], ["y", "Y"], ["z", "Z"]] },
+  { id: "vibe_phase", kind: "range", label: "phase°", local: "vibe_phase", group: "Case shake", min: 0, max: 360, step: 1 },
+];
 const ARC_SPEC = { id: "spinarc", kind: "range", label: "rock arc", min: 0, max: 360, step: 1, local: "spinarc" };
 function saveSpinMotion() {
   compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
@@ -6002,6 +6036,9 @@ function pageSpecs(specs) {
   if ((look >= 0 && state.game.game === "fountain3d" || state.game.game === "marble_madness") && !out.some((s) => s.id === "saved_particle"))
     out = [...out, { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Grains",
       value: savedParticle.digest, options: [["", "choose a Studio design"], ...savedParticle.entries.map((e) => [e.digest, e.name || e.digest.slice(0, 12)])] }];
+  if (["fountain3d", "marble_madness"].includes(state.game?.game) &&
+      ["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => compute.runtimeInputs.has(name)))
+    out = [...out, ...VIBRATION_SPECS];
   return out;
 }
 let recordOn = false;
@@ -6514,8 +6551,8 @@ function litPass(cam, now, casters, opts = {}) {
 }
 
 // WATCH THE CASE MOVE (page toggle, default off = the camera rides with the case, as it always has).  On: the fountain's own objects
-// (floor tiles, glass plate, grains) are drawn turned about the case centre by the case's angle, in the board plane; the camera and the
-// rest of the world (sky, sun, arcade ring) stay.  theta(t) is the angle the gravity uses (compute.js gravityAngle), at the SIMULATED
+// (floor tiles, glass plate, grains, mounted arcade bulbs) are drawn turned about the case centre by the case's angle, in the board plane; the camera and the
+// rest of the world (sky, sun) stay.  theta(t) is the angle the gravity uses (compute.js gravityAngle), at the SIMULATED
 // time of the displayed frame (frame x snapEvery x dt), not the wall clock.  (meowdokuDebug.caseTime overrides t, in seconds.)
 const watchCase = { on: false };
 try { watchCase.on = localStorage.getItem("meowdoku.watchcase") === "1"; } catch { /* storage may be blocked */ }
@@ -6532,14 +6569,21 @@ function caseAngleNow() {
   const t = forced != null ? Number(forced) : compute.ready && compute.tape && compute.manifest && compute.shown != null ? compute.shown * compute.snap * compute.manifest.law.dt : 0;
   return compute.caseAngleAt(compute.manifest ? Math.round(t / compute.manifest.law.dt) : 0);
 }
+function withCaseShake(model) {
+  const g = state.game, view = g?.compute?.view;
+  if (!compute.vibration || compute.shown == null || !view || !["fountain3d", "marble_madness"].includes(g.game)) return model;
+  const [x0, x1, y0, y1] = view, k = Math.min(g.width / (x1 - x0), g.height / (y1 - y0));
+  const [dx, dy, dz] = compute.caseDisplacementAt(compute.shown * compute.snap).displacement;
+  return M.multiply(model || M.identity(), M.translate(dx * k, dz * k, -dy * k));
+}
 function caseModelNow() {
-  if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
+  if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return withCaseShake(null);
   if (state.game.game === "marble_madness") {
     // The law's X/Y plane is horizontal here. Rotate its gravity vector onto
     // world down so the rendered course tips as the physical controls do.
     const [gx, gy, gz] = marbleCase.gravity;
     const sx = -gy, sz = -gx, magnitude = Math.hypot(sx, sz);
-    if (magnitude < 1e-6) return M.identity();
+    if (magnitude < 1e-6) return withCaseShake(M.identity());
     const x = sx / magnitude, z = sz / magnitude, c = Math.max(-1, Math.min(1, -gz));
     const s = magnitude, t = 1 - c;
     const turn = new Float32Array([
@@ -6549,9 +6593,9 @@ function caseModelNow() {
       0, 0, 0, 1,
     ]);
     const cx = extMidX(), cy = TILE.height + 0.03, cz = extMidZ();
-    return M.multiply(M.translate(cx, cy, cz), M.multiply(turn, M.translate(-cx, -cy, -cz)));
+    return withCaseShake(M.multiply(M.translate(cx, cy, cz), M.multiply(turn, M.translate(-cx, -cy, -cz))));
   }
-  return caseModel(caseAngleNow(), extMidX(), extMidZ(), compute.caseAxis || "y", TILE.height + 0.03);
+  return withCaseShake(caseModel(caseAngleNow(), extMidX(), extMidZ(), compute.caseAxis || "y", TILE.height + 0.03));
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
 window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;

@@ -1,0 +1,15 @@
+// Prescribed translation of a containing case in its law frame.  The law sees
+// the second derivative as a separate inertial acceleration; the renderer
+// uses the very same displacement.  Time is simulated time, never wall time.
+export function caseVibration(kind, hz, amplitude, axis, phase, time) {
+  if (!['sander', 'vibrator'].includes(kind) || !(hz > 0) || !(amplitude > 0))
+    return { displacement: [0, 0, 0], acceleration: [0, 0, 0] };
+  const w = 2 * Math.PI * hz, u = w * time + phase * Math.PI / 180;
+  let displacement;
+  if (kind === 'sander') displacement = [amplitude * Math.cos(u), amplitude * Math.sin(u), 0];
+  else {
+    const index = { x: 0, y: 1, z: 2 }[axis] ?? 2;
+    displacement = [0, 0, 0]; displacement[index] = amplitude * Math.sin(u);
+  }
+  return { displacement, acceleration: displacement.map((v) => -w * w * v) };
+}
