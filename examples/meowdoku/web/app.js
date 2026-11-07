@@ -7,6 +7,7 @@
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
+import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection } from "./gravity.js";
@@ -4555,6 +4556,8 @@ for (const type of ["resize", "orientationchange"]) addEventListener(type, () =>
 let particleStyle = DEFAULT_STYLE;
 try { const saved = localStorage.getItem("meowdoku.pstyle"); if (ALL_STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
 window.meowdokuDebug.setParticleStyle = (id) => { particleStyle = id; refreshLocalControls(); };
+try { const saved = localStorage.getItem("meowdoku.pemoji"); if (EMOJI_ASSIGN_IDS.includes(saved)) EMOJI_OPTIONS.assign = saved; } catch { /* storage may be blocked */ }
+window.meowdokuDebug.emojiOptions = EMOJI_OPTIONS;               // debug: { assign, forceMesh, forceSprite (measurement: ignore the mesh budget / the too-small check) }
 Object.defineProperty(window.meowdokuDebug, "cloud", { get: () => cloud });
 // The spectral noise filter (noise_filter.js) layered over the look: also the page's own, render only, remembered in the browser.
 const noiseFx = { ...NOISE_DEFAULTS };
@@ -4698,6 +4701,9 @@ function localControl(s, value) {
   } else if (s.local === "particle_style") {
     particleStyle = ALL_STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
     try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  } else if (s.local === "pemoji_assign") {                       // which emoji a grain is (emoji styles: by id, species or size)
+    EMOJI_OPTIONS.assign = EMOJI_ASSIGN_IDS.includes(value) ? value : "id";
+    try { localStorage.setItem("meowdoku.pemoji", EMOJI_OPTIONS.assign); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("heat_")) {
     heatFx[s.local.slice(5)] = s.local === "heat_fixed" ? !!value : Number(value);
     try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
@@ -4762,6 +4768,11 @@ function refreshLocalControls() {
     } else if (s.local === "pcolor_source") {
       const picked = colorPick();
       el.title = picked.reason || "where the grains' colour comes from: the simulation (per grain), one solid colour, or a declared scene material (the material style takes the whole material); render only";
+    } else if (s.local === "pemoji_assign") {
+      const on = particleStyle === "emoji" || particleStyle === "emoji_mesh", select = el.querySelector("select");
+      if (select) { select.value = EMOJI_OPTIONS.assign; select.disabled = !on; }
+      el.classList.toggle("inactive", !on);
+      el.title = on ? "which animal each grain is: a stable hash of its id, its species, or its size (the colour source tints them; native keeps the emoji's own colours)" : 'active when the look is "emoji"';
     } else if (s.local === "pcolor_palette") {
       el.title = "a palette the size ramp, the species colours and the simulation's own hues are mapped through (sea, ember, meadow); native leaves them as they are";
     } else if (s.local.startsWith("slide_")) {
@@ -4967,6 +4978,7 @@ const COLOR_SPECS = [
   { id: "heat_gamma", kind: "range", label: "heat gamma", min: 0.4, max: 2.5, step: 0.05, local: "heat_gamma", value: 1 },
   { id: "pcolor_source", kind: "select", label: "colour", local: "pcolor_source", value: "simulation", options: COLOR_SOURCES },
   { id: "pcolor_palette", kind: "select", label: "palette", local: "pcolor_palette", value: "native", options: PALETTE_IDS.map((p) => [p, p]) },
+  { id: "pemoji_assign", kind: "select", label: "emoji by", local: "pemoji_assign", value: "id", options: EMOJI_ASSIGN },
   { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["backlit", "backlit (glowing plate)"], ["clear", "clear (scene shows)"]] },
   // the backlit slide (backdrop = backlit): an image on the glowing plate, positive or negative, through the plate material's texture layers
   { id: "slide_image", kind: "file", label: "slide image", local: "slide_image" },
@@ -5111,7 +5123,7 @@ function particleScene(pick) {
   const opacity = id != null && t ? t.data[id * f + 7] : 1;
   const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
   const group = (state.materialGroups || {})[name];
-  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj,
+  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, meshes: state.meshes, materialId: id == null ? 0 : id, shadow: light.viewProj,
            glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
 }
 // THE TRANSMISSION VARIANT (Pluck's PLUCK_TRANSMISSION define): the same Phong source with light through transmissive bodies,

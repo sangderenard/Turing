@@ -38,6 +38,10 @@ export const PAGE_STYLES = [
   { id: "stained", label: "stained glass (scene glass, OIT)", needs: null, scene: true, fallback: "sand", budgetScale: 0.6 },   // both faces accumulate: fewer grains
   // the explicit fast mode: plain alpha blending in draw order, back faces then front faces (the look before OIT)
   { id: "stained_fast", label: "stained glass (fast: alpha blend)", needs: null, scene: true, fallback: "sand", budgetScale: 0.6 },
+  // every grain an animal emoji (see "emoji style" below): (a) sprites textured from an atlas baked at export, alpha-tested and
+  // depth-written per sprite; (b) instanced extruded emoji meshes through the scene's material shader, which falls back to (a)
+  { id: "emoji", label: "emoji (image sprites)", needs: "float", sprite: true },
+  { id: "emoji_mesh", label: "emoji (3-D meshes)", needs: "float", scene: true, emojiMesh: true, fallback: "emoji" },
 ];
 export const ALL_STYLES = [...STYLES, ...PAGE_STYLES];
 export const STYLE_IDS = ALL_STYLES.map((s) => s.id);
@@ -65,16 +69,26 @@ export function chooseStyle(requested, caps, broken = {}, scene = null) {
   if (id === DEFAULT_STYLE) return { style: id, requested: id, reason: "" };
   const spec = ALL_STYLES.find((s) => s.id === id), fallback = spec.fallback || DEFAULT_STYLE;
   const instead = (why) => {
-    const next = fallback === DEFAULT_STYLE ? { style: DEFAULT_STYLE } : chooseStyle(fallback, caps, broken);
+    const next = fallback === DEFAULT_STYLE ? { style: DEFAULT_STYLE } : chooseStyle(fallback, caps, broken, scene);
     return { style: next.style, requested: id, reason: `${id} unavailable (${why}): showing ${next.style}` };
   };
   if (broken[id]) return instead(broken[id]);
   const av = styleAvailability(id, caps);
   if (!av.ok) return instead(av.note);
   if (spec.scene && scene) {
-    const plan = materialPlan({ ...scene, budget: { ...MATERIAL_BUDGET, maxInstances: MATERIAL_BUDGET.maxInstances * (spec.budgetScale || 1) } });
+    const budget = { ...MATERIAL_BUDGET, maxInstances: MATERIAL_BUDGET.maxInstances * (spec.budgetScale || 1) };
+    if (spec.emojiMesh) {
+      const plan = emojiMeshPlan({ ...scene, budget, force: EMOJI_OPTIONS.forceMesh });
+      if (!plan.ok) return instead(plan.reason);
+      return { style: id, requested: id, reason: plan.note, lod: plan.lod, tris: plan.tris };
+    }
+    const plan = materialPlan({ ...scene, budget });
     if (!plan.ok) return instead(plan.reason);
     return { style: id, requested: id, reason: plan.note, lod: plan.lod, tris: plan.tris };
+  }
+  if (spec.sprite && scene) {
+    const plan = emojiSpritePlan({ ...scene, force: EMOJI_OPTIONS.forceSprite });
+    if (!plan.ok) return instead(plan.reason);
   }
   return { style: id, requested: id, reason: av.note };
 }
@@ -327,6 +341,101 @@ export function materialPlan({ ready = true, count = 0, radiusPx = 4, budget = M
   return { ok: true, lod, tris: SPHERE_TRIS[lod], note: `${count.toLocaleString("en-US")} grains as ${SPHERE_TRIS[lod]}-triangle spheres` };
 }
 
+// ---------------------------------------------------------------- emoji style (pure)
+// Every grain an animal emoji.  Two looks, one assignment: which emoji a grain is depends only on its displayed slot (the
+// packed point's index, stable from frame to frame), its true radius and the assignment the page picked, so the image variant
+// (GLSL, per vertex) and the mesh variant (JS, one instanced batch per kind) show the SAME animal on the same grain.
+// The kinds, their cells and colours are web_export.py's (emoji_atlas.json: {cell, cols, rows, ink, kinds: [{name, mesh,
+// color}]}); this file holds no list of its own.  The packing carries no spin, so a mesh's orientation is a fixed hash of the slot.
+export const EMOJI_ASSIGN = [["id", "by id (hashed mix)"], ["species", "by species"], ["size", "by size"]];
+export const EMOJI_ASSIGN_IDS = EMOJI_ASSIGN.map(([id]) => id);
+export const EMOJI_OPTIONS = { assign: "id", forceMesh: false, forceSprite: false };     // the page's setting (the force flags: measurement only, they ignore the budget / the too-small check)
+export const MAX_EMOJI = 16;                      // the atlas holds at most this many kinds (the shader's uniform array)
+export const EMOJI_MIN_PX = 2;                    // a sprite grain smaller than this (screen radius, px) is a speck: points
+export const EMOJI_MESH_TRIS = [850, 250];        // triangles per instance of the full mesh and of its front-cap LOD (the export's mean; the draw counts the real ones)
+export const EMOJI_MESH_FULL_AT_PX = 4;           // the full mesh from this screen radius up (a coarser grain shows only its front)
+// the integer hash both sides use (Chris Wellons' lowbias32); the GLSL twin is EMOJI_HASH_GLSL
+export function emojiHash(i) {
+  let x = i >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0; x = Math.imul(x, 0x7feb352d) >>> 0;
+  x = (x ^ (x >>> 15)) >>> 0; x = Math.imul(x, 0x846ca68b) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
+// the species count a band table describes (unused edges are 1e9)
+export const speciesCountOf = (bands) => 1 + Array.from(bands).filter((b) => b < 1e8).length;
+// The kind (index into the atlas's kinds) of one grain.  assign "id": a stable hashed mix of the slot; "species": the grain's
+// species (the nearest species radius, see speciesOf) spread evenly over the kinds; "size": the radius's place in the size
+// ramp `range` = [low radius, 1 / span] spread evenly over the kinds.  GLSL twin: emojiKindOf.
+export function emojiKind(assign, slot, radius, K, bands, range) {
+  if (!(K > 0)) return 0;
+  if (assign === "species") {
+    let s = 0;
+    for (const b of bands) if (radius > b) s++;
+    return Math.min(K - 1, Math.floor((s + 0.5) * K / speciesCountOf(bands)));
+  }
+  if (assign === "size") return Math.min(K - 1, Math.max(0, Math.floor((radius - range[0]) * range[1] * K)));
+  return emojiHash(slot) % K;
+}
+// the cell of kind `index` as [u0, v0, du, dv] (the texture's row 0 is the image's top, v grows downward like gl_PointCoord)
+export function atlasRect(index, meta) {
+  const c = index % meta.cols, r = Math.floor(index / meta.cols);
+  return [c / meta.cols, r / meta.rows, 1 / meta.cols, 1 / meta.rows];
+}
+export function atlasRects(meta) {
+  const out = new Float32Array(MAX_EMOJI * 4);
+  for (let i = 0; i < Math.min(meta.kinds.length, MAX_EMOJI); i++) out.set(atlasRect(i, meta), i * 4);
+  return out;
+}
+// the atlas meta as the page may use it, or the reason it may not
+export function checkAtlasMeta(meta) {
+  if (!meta || !Array.isArray(meta.kinds) || !meta.kinds.length) return "the emoji atlas lists no kinds";
+  if (meta.kinds.length > MAX_EMOJI) return `the emoji atlas lists ${meta.kinds.length} kinds (the shader holds ${MAX_EMOJI})`;
+  if (!(meta.cols > 0 && meta.rows > 0 && meta.cols * meta.rows >= meta.kinds.length)) return "the emoji atlas's grid does not hold its kinds";
+  return "";
+}
+// 8-bit rgba words (little-endian rgba8, the packing's colour) of the kinds' native colours (display values 0..1)
+export const packRgba8 = (rgb) => ((255 << 24) | (Math.round(rgb[2] * 255) << 16) | (Math.round(rgb[1] * 255) << 8) | Math.round(rgb[0] * 255)) >>> 0;
+// "native": the emoji's own colours (no source or palette recolours the grains)
+export const emojiNative = (tint, grain) => !(tint && tint[3] > 0.5) && !(grain && grain.mode > 0);
+// Sprite variant: drawn unless the grains are specks on the screen (then points, which do accumulate sub-pixel coverage).
+export function emojiSpritePlan({ radiusPx = 4, force = false } = {}) {
+  if (!force && radiusPx < EMOJI_MIN_PX) return { ok: false, reason: `grains are ${radiusPx.toFixed(2)} px in radius at this zoom: too small to read as emoji` };
+  return { ok: true, note: "" };
+}
+// Mesh variant: the scene shader instancing it needs (ready), and the material style's budget in instances and triangles per
+// frame.  The full mesh from EMOJI_MESH_FULL_AT_PX up while it fits; else its front cap (a quarter of the triangles); else
+// not drawn (the image variant is).  `tris` = [full, front cap] per instance (the loaded meshes' mean; else EMOJI_MESH_TRIS);
+// `force`: ignore the triangle and instance budget (measurement only).
+export function emojiMeshPlan({ ready = true, count = 0, radiusPx = 4, budget = MATERIAL_BUDGET, tris = EMOJI_MESH_TRIS, force = false } = {}) {
+  if (!ready) return { ok: false, reason: "the scene's material shader is not in use here (flat view, or it could not be extended for instancing)" };
+  if (radiusPx < budget.minRadiusPx) return { ok: false, reason: `grains are ${radiusPx.toFixed(2)} px in radius at this zoom: too small to mesh` };
+  const fits = (lod) => force || (count <= budget.maxInstances && count * tris[lod] <= budget.maxTriangles);
+  const lod = radiusPx >= EMOJI_MESH_FULL_AT_PX && fits(0) ? 0 : fits(1) ? 1 : -1;
+  if (lod < 0) {
+    return { ok: false, reason: count > budget.maxInstances ? `${count.toLocaleString("en-US")} grains is more than the ${budget.maxInstances.toLocaleString("en-US")} meshes hold a frame rate for here`
+      : `${count.toLocaleString("en-US")} grains of about ${Math.round(tris[1])} triangles is more than the ${budget.maxTriangles.toLocaleString("en-US")} a frame holds here` };
+  }
+  return { ok: true, lod, tris: tris[lod], note: `${count.toLocaleString("en-US")} grains as ${Math.round(tris[lod])}-triangle ${lod ? "front-cap" : "extruded"} emoji` };
+}
+// GLSL twin of emojiHash and emojiKind (a vertex stage declares the uniforms below)
+export const EMOJI_HASH_GLSL = `
+uint emojiHash(uint x) { x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
+`;
+export const EMOJI_KIND_GLSL = EMOJI_HASH_GLSL + `
+uniform vec4 uEmoji;           // x: assignment (0 id, 1 species, 2 size), y: the kinds' count, z: the size ramp's low radius, w: 1 / its span
+uniform float uEmojiBands[${MAX_SPECIES - 1}];
+int emojiKindOf(int slot, float radius) {
+  int K = int(uEmoji.y);
+  if (uEmoji.x > 1.5) return clamp(int(floor((radius - uEmoji.z) * uEmoji.w * float(K))), 0, K - 1);
+  if (uEmoji.x > 0.5) {
+    int s = 0, n = 1;
+    for (int i = 0; i < ${MAX_SPECIES - 1}; i++) { if (radius > uEmojiBands[i]) s++; if (uEmojiBands[i] < 1e8) n++; }
+    return min(K - 1, int(floor((float(s) + 0.5) * float(K) / float(n))));
+  }
+  return int(emojiHash(uint(slot)) % uint(K));
+}
+`;
+
 // An icosphere of unit radius: subdivision 0 / 1 / 2 gives 12 / 42 / 162 vertices and 20 / 80 / 320 triangles.  Indexed,
 // outward (counter-clockwise) winding; the vertex position doubles as the smooth normal.
 export function icosphere(level) {
@@ -366,7 +475,10 @@ export const PACKING = {                         // the packed point: [x, y, z, 
   color: { offset: 12 },                         // 4 normalised bytes
   meta: { offset: 16 },                          // float: 100 (moving) / 200 (at rest) + radius * 1000; below 50 = not alive
 };
-export const INSTANCE_LOCATIONS = { position: 7, color: 8, meta: 9 };
+export const INSTANCE_LOCATIONS = { position: 7, color: 8, meta: 9, id: 10 };
+// A partitioned batch (the emoji meshes: one batch per kind) carries the grain's displayed slot as a sixth word, so its fixed
+// rotation does not depend on where the grain sits in the batch.
+export const BATCH_PACKING = { stride: 24, id: { offset: 20 } };
 // JS twin of the metadata decode: meta -> { alive, moving, radius }
 export function decodeMeta(meta) {
   if (!(meta >= 50)) return { alive: false, moving: false, radius: 0 };
@@ -391,7 +503,20 @@ const INSTANCE_VERT_DECLS = GRAIN_COLOR_GLSL + `
 layout(location = ${INSTANCE_LOCATIONS.position}) in vec3 aInstPos;
 layout(location = ${INSTANCE_LOCATIONS.color}) in vec4 aInstColor;
 layout(location = ${INSTANCE_LOCATIONS.meta}) in float aInstMeta;
+layout(location = ${INSTANCE_LOCATIONS.id}) in float aInstId;     // the displayed slot (emoji batches only; the instance's own rotation key)
 uniform bool uInstanced;
+uniform float uInstRot;     // 1: a mesh batch (emoji): the mesh is re-centred, scaled to a unit half-width and turned by the slot's fixed rotation
+uniform vec4 uInstMesh;     // the mesh's centre (xyz) and 1 / its larger half-width in the glyph's plane
+uint instHash(uint x) { x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
+mat3 instanceRotation() {   // the glyph lies in its xy plane facing +z: stand it on the board facing up, +y toward the board's top, then yaw it round and tilt it a little, all fixed by the slot
+  uint h = instHash(uint(aInstId) ^ 0x9e3779b9u);
+  float yaw = float(h & 0xffffu) * (6.2831853 / 65536.0);
+  float a = (float((h >> 16) & 0xffu) / 255.0 - 0.5) * 0.9, b = (float((h >> 24) & 0xffu) / 255.0 - 0.5) * 0.9;
+  float ca = cos(a), sa = sin(a), cb = cos(b), sb = sin(b), cy = cos(yaw), sy = sin(yaw);
+  mat3 base = mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0));
+  mat3 tx = mat3(1.0, 0.0, 0.0, 0.0, ca, sa, 0.0, -sa, ca), tz = mat3(cb, sb, 0.0, -sb, cb, 0.0, 0.0, 0.0, 1.0), ry = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+  return ry * tx * tz * base;
+}
 uniform vec4 uInstMap;      // board window centre x, y and the board -> world scale k
 uniform vec3 uInstBoard;    // board width, height, and the plane's height
 uniform float uInstOwn;     // 1: the material's own colour (colour source "material"); else the grain's colour from grainColor()
@@ -409,9 +534,11 @@ void main() {
   vInstUse = 0.0; vInstColor = vec3(0.0);
   if (!uInstanced) return;
   if (!instanceAlive()) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
-  vec3 world = instanceCenter() + aPos * instanceRadius();
+  vec3 lp = aPos, nrm = aNorm;
+  if (uInstRot > 0.5) { mat3 R = instanceRotation(); lp = R * ((aPos - uInstMesh.xyz) * uInstMesh.w); nrm = R * aNorm; }
+  vec3 world = instanceCenter() + lp * instanceRadius();
   vec4 posV = uMV * vec4(world, 1.0);
-  vPosV = posV.xyz; vNormV = mat3(uMV) * aNorm; vPosObj = world;
+  vPosV = posV.xyz; vNormV = mat3(uMV) * nrm; vPosObj = world;
   gl_Position = uMVP * vec4(world, 1.0);
   vInstUse = uInstOwn > 0.5 ? 0.0 : 1.0;
   vInstColor = pow(grainColor(aInstColor, aInstMeta).rgb, vec3(2.2));             // display colour -> the shader's linear
@@ -629,6 +756,51 @@ void main() {
   float k = uGain * min(1.0, 0.25 + vArea);
   FragColor = vec4(vColor.rgb * g * 0.16 * k + mix(vColor.rgb, vec3(1.0), 0.5) * pow(g, 6.0) * 0.3 * k, 1.0);   // a soft halo and a hot core
 }`;
+// ---- emoji, image variant: a point sprite per grain, sized to the grain's true radius (the glyph's ink fills `ink` of its cell),
+// showing its cell of the atlas; alpha-tested and depth-written per sprite (the sprite's centre, z included: the slab's depth
+// is part of the position), so it sorts against the scene and against other grains exactly like the sand impostors
+const EMOJI_VS = `#version 300 es
+${GRAIN_COLOR_GLSL}${EMOJI_KIND_GLSL}
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec4 aColor;
+layout(location=2) in float aMeta;
+uniform mat4 uViewProj; uniform mat4 uView; uniform vec4 uMap; uniform vec3 uBoard;
+uniform float uFocal; uniform float uMax;
+uniform float uMinPx;       // the least sprite diameter, target pixels
+uniform float uInk;         // the glyph's longer side as a share of its cell
+uniform vec4 uEmojiRect[${MAX_EMOJI}];
+out vec4 vTint; flat out vec4 vCell; out float vEye;
+void main() {
+  vTint = grainColor(aColor, aMeta); vCell = vec4(0.0); vEye = 0.0;
+  gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
+  if (aMeta < 50.0) return;
+  float flag = floor(aMeta / 100.0 + 0.001);
+  float radius = (aMeta - flag * 100.0) * 0.001;
+  vec3 pos = vec3(uBoard.x * 0.5 + (aPos.x - uMap.x) * uMap.z, uBoard.z + aPos.z * uMap.z, uBoard.y * 0.5 - (aPos.y - uMap.y) * uMap.z);
+  vec4 clip = uViewProj * vec4(pos, 1.0);
+  if (clip.w <= 0.0) return;
+  float rpx = radius * uMap.z * uFocal / clip.w;                      // the true radius, target pixels
+  gl_Position = clip;
+  gl_PointSize = clamp(max(2.0 * rpx / uInk, uMinPx), 1.0, uMax);
+  vEye = -(uView * vec4(pos, 1.0)).z;
+  vCell = uEmojiRect[emojiKindOf(gl_VertexID, radius)];
+}`;
+const EMOJI_FS = `#version 300 es
+precision highp float; precision highp int;
+in vec4 vTint; flat in vec4 vCell; in float vEye;
+uniform vec4 uProjZ;        // proj[10], proj[14], proj[11], proj[15]
+uniform sampler2D uAtlas;
+uniform float uNative;      // 1: the emoji's own colours; else the colour source tints them (keeping their shading)
+out vec4 FragColor;
+float eyeToDepth(float e) { float w = uProjZ.z * (-e) + uProjZ.w; return ((uProjZ.x * (-e) + uProjZ.y) / w) * 0.5 + 0.5; }
+void main() {
+  vec4 t = texture(uAtlas, vCell.xy + gl_PointCoord * vCell.zw);
+  if (t.a < 0.5) discard;
+  vec3 c = t.rgb;
+  if (uNative < 0.5) c = clamp(vTint.rgb * (0.3 + 0.95 * dot(t.rgb, vec3(0.299, 0.587, 0.114))), 0.0, 1.0);
+  FragColor = vec4(c, 1.0);
+  gl_FragDepth = eyeToDepth(vEye);
+}`;
 // a quad over the board's plane (the board's rectangle, plus a margin), like compute.js's RESOLVE_VS
 export const PLANE_VS = `#version 300 es
 uniform mat4 uViewProj; uniform vec3 uBoard; uniform float uMargin; out vec2 vUV;
@@ -740,17 +912,23 @@ export class ParticleStyles {
   // style, a style this device cannot run, and the stamp style, whose memory lies under the current points).
   draw(style, ctx) {
     const gl = this.gl;
-    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained" || style === "stained_fast") ? this.#sceneOf(ctx) : null);
+    const emojiStyle = style === "emoji" || style === "emoji_mesh";
+    if (emojiStyle) this.#emojiLoad();
+    const choice = chooseStyle(style, this.caps, this.broken, (style === "material" || style === "stained" || style === "stained_fast" || emojiStyle) ? this.#sceneOf(ctx) : null);
     this.fallback = choice.style === style ? "" : choice.reason;
     this.note = choice.reason;
     this.heatInfo = choice.style === "heat" ? this.heatInfo : "";
     this.glassInfo = "";               // how glass grains were composited in the last draw (set by #material)
     if (choice.style === DEFAULT_STYLE || !ctx.camera || !ctx.camera.proj || !ctx.camera.view) return false;
+    if (choice.style === "emoji" || choice.style === "emoji_mesh") {      // the atlas is a page asset fetched once: until it is here the grains are points
+      const wait = this.#emojiWait(choice.style);
+      if (wait) { this.fallback = this.note = `${style} unavailable (${wait}): showing points`; return false; }
+    }
     const guard = new UnitGuard(gl);
     const program = gl.getParameter(gl.CURRENT_PROGRAM);
     const keep = { cull: gl.isEnabled(gl.CULL_FACE), scissor: gl.isEnabled(gl.SCISSOR_TEST) };
     gl.disable(gl.CULL_FACE); gl.disable(gl.SCISSOR_TEST);
-    let done = true;
+    let done = true, retry = false;
     try {
       gl.bindVertexArray(ctx.vao);
       if (choice.style === "liquid") this.#liquid(ctx, guard);
@@ -759,10 +937,13 @@ export class ParticleStyles {
       else if (choice.style === "heat") this.#heat(ctx, guard);
       else if (choice.style === "stamp") { this.#stamp(ctx, guard); done = false; }
       else if (choice.style === "material" || choice.style === "stained" || choice.style === "stained_fast") this.#material(ctx, choice, choice.style);
+      else if (choice.style === "emoji") this.#emoji(ctx, guard);
+      else if (choice.style === "emoji_mesh") this.#emojiMesh(ctx, choice);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       this.broken[choice.style] = error.message; this.fallback = `${choice.style} unavailable (${error.message}): showing points`;
       done = false;
+      retry = choice.style === "emoji_mesh";           // (the image variant is its fallback: draw it this frame)
     } finally {
       guard.restore();
       gl.useProgram(program);
@@ -773,7 +954,7 @@ export class ParticleStyles {
       if (keep.scissor) gl.enable(gl.SCISSOR_TEST);
       gl.bindVertexArray(done ? null : ctx.vao);
     }
-    return done;
+    return retry ? this.draw(style, ctx) : done;
   }
 
   // ---- plumbing
@@ -852,7 +1033,24 @@ export class ParticleStyles {
       const eye = -(view[2] * ctx.board[0] * 0.5 + view[6] * ctx.y + view[10] * ctx.board[1] * 0.5 + view[14]);
       radiusPx = typicalRadius(ctx.data) * ctx.map[2] * ctx.focal * ctx.H / 2 / Math.max(1e-3, Math.abs(eye));
     }
-    return { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: ctx.n, radiusPx };
+    const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: ctx.n, radiusPx };
+    const tris = this.#emojiTris(ctx.scene);
+    if (tris) out.tris = tris;
+    return out;
+  }
+  // the emoji meshes' mean triangles per instance [full, front cap], from the meshes the page uploaded (null until atlas and meshes are here)
+  #emojiTris(scene) {
+    const E = this.emoji, meshes = scene && scene.meshes;
+    if (!E || !E.meta || !meshes) return null;
+    if (E.trisFor === meshes) return E.tris;
+    const mean = (suffix) => {
+      let sum = 0, k = 0;
+      for (const kind of E.meta.kinds) { const m = kind.mesh && meshes[kind.mesh + suffix]; if (m) { sum += m.count / 3; k++; } }
+      return k ? sum / k : 0;
+    };
+    const full = mean(""), lod = mean("_lod");
+    E.trisFor = meshes; E.tris = full && lod ? [full, lod] : null;
+    return E.tris;
   }
   #sphere(ctx, lod) {
     const gl = this.gl;
@@ -949,22 +1147,9 @@ export class ParticleStyles {
       verdict = glassMode({ fast, caps: this.caps, broken: this.oitBroken || (S.oit ? "" : `the scene shader could not be extended for OIT (${S.oitNote || "unknown"})`) });
       this.glassInfo = verdict.reason;
     }
-    const mesh = this.#sphere(ctx, choice.lod), cam = ctx.camera;
+    const mesh = this.#sphere(ctx, choice.lod);
     gl.bindBuffer(gl.ARRAY_BUFFER, ctx.buffer);
-    // the constant attributes the scene's own draws set (aMatId, aUv, aGroupId, aCullImmune = 0: back faces culled in the shader, aVelocity)
-    const held = [2, 3, 4, 5, 6].map((i) => [i, gl.getVertexAttrib(i, gl.CURRENT_VERTEX_ATTRIB)]);
-    gl.useProgram(P);
-    gl.uniform1i(at("uInstanced"), 1);
-    gl.uniformMatrix4fv(at("uMVP"), false, ctx.viewProj); gl.uniformMatrix4fv(at("uMV"), false, cam.view);
-    gl.uniformMatrix4fv(at("uShadowMatrices[0]"), false, S.shadow);
-    gl.uniform4f(at("uInstMap"), ctx.map[0], ctx.map[1], ctx.map[2], 0); gl.uniform3f(at("uInstBoard"), ctx.board[0], ctx.board[1], ctx.y);
-    const own = ctx.colorMode === "material";                        // the whole material, its own colour included
-    grainUniforms(gl, (n) => at(n), own ? null : ctx.tint, own ? null : ctx.grain);
-    gl.uniform1f(at("uInstOwn"), own ? 1 : 0);
-    // aGroupId: 0 (no group) or the material's own (an emitter group, or the ThermalChunk index of a blackbody finish: uThermalEmission on for it)
-    gl.vertexAttribI4i(2, S.materialId, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0); gl.vertexAttribI4i(4, S.group || 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0);
-    if (S.thermal) gl.uniform1i(at("uThermalEmission"), 1);
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+    const held = this.#sceneBegin(ctx);
     gl.bindVertexArray(mesh.vao);
     let oitDone = false;
     if (glass && verdict.mode === "oit") {
@@ -991,11 +1176,174 @@ export class ParticleStyles {
       gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0, ctx.n);
     }
     guard.restore();
+    this.#sceneEnd(ctx, held);
+    gl.bindVertexArray(ctx.vao);
+  }
+  // The scene's Phong program set up for instanced grains (the material and emoji-mesh styles): the flag on, the matrices, the board's
+  // window, the colour source, and the constant attributes the scene's own draws set (aMatId, aUv, aGroupId, aCullImmune = 0: back
+  // faces culled in the shader, aVelocity).  -> the attributes' held values for #sceneEnd.
+  #sceneBegin(ctx) {
+    const gl = this.gl, S = ctx.scene, P = S.program, at = (name) => gl.getUniformLocation(P, name), cam = ctx.camera;
+    const held = [2, 3, 4, 5, 6].map((i) => [i, gl.getVertexAttrib(i, gl.CURRENT_VERTEX_ATTRIB)]);
+    gl.useProgram(P);
+    gl.uniform1i(at("uInstanced"), 1);
+    gl.uniformMatrix4fv(at("uMVP"), false, ctx.viewProj); gl.uniformMatrix4fv(at("uMV"), false, cam.view);
+    gl.uniformMatrix4fv(at("uShadowMatrices[0]"), false, S.shadow);
+    gl.uniform4f(at("uInstMap"), ctx.map[0], ctx.map[1], ctx.map[2], 0); gl.uniform3f(at("uInstBoard"), ctx.board[0], ctx.board[1], ctx.y);
+    const own = ctx.colorMode === "material";                        // the whole material, its own colour included
+    grainUniforms(gl, (n) => at(n), own ? null : ctx.tint, own ? null : ctx.grain);
+    gl.uniform1f(at("uInstOwn"), own ? 1 : 0);
+    // aGroupId: 0 (no group) or the material's own (an emitter group, or the ThermalChunk index of a blackbody finish: uThermalEmission on for it)
+    gl.vertexAttribI4i(2, S.materialId, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0); gl.vertexAttribI4i(4, S.group || 0, 0, 0, 0); gl.vertexAttribI4i(5, 0, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0);
+    if (S.thermal) gl.uniform1i(at("uThermalEmission"), 1);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+    return held;
+  }
+  #sceneEnd(ctx, held) {
+    const gl = this.gl, S = ctx.scene, P = S.program, at = (name) => gl.getUniformLocation(P, name);
     gl.useProgram(P);
     gl.uniform1i(at("uInstanced"), 0);                              // the scene's pieces never see the flag
+    gl.uniform1f(at("uInstRot"), 0);
     if (S.thermal) gl.uniform1i(at("uThermalEmission"), 0);
     for (const [i, v] of held) { if (v instanceof Int32Array) gl.vertexAttribI4i(i, v[0], v[1], v[2], v[3]); else if (v instanceof Uint32Array) gl.vertexAttribI4ui(i, v[0], v[1], v[2], v[3]); else gl.vertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
+  }
+
+  // ---- emoji: the atlas and meta are page assets (web_export.py: emoji_atlas.png, emoji_atlas.json), fetched once on first use
+  #emojiLoad() {
+    if (this.emoji) return;
+    const E = this.emoji = { meta: null, rects: null, words: null, bitmap: null, tex: null, tris: null, trisFor: null };
+    const url = (name) => new URL(name, import.meta.url).href;
+    const fail = (ids, why) => { for (const id of ids) this.broken[id] = why; };
+    fetch(url("emoji_atlas.json")).then((r) => { if (!r.ok) throw new Error(`emoji_atlas.json: HTTP ${r.status}`); return r.json(); }).then((meta) => {
+      const bad = checkAtlasMeta(meta);
+      if (bad) return fail(["emoji", "emoji_mesh"], bad);
+      E.meta = meta; E.rects = atlasRects(meta); E.words = meta.kinds.map((k) => packRgba8(k.color || [0.8, 0.8, 0.8]));
+      return fetch(url("emoji_atlas.png")).then((r) => { if (!r.ok) throw new Error(`emoji_atlas.png: HTTP ${r.status}`); return r.blob(); })
+        .then((blob) => createImageBitmap(blob, { premultiplyAlpha: "none", colorSpaceConversion: "none" }))
+        .then((bitmap) => { E.bitmap = bitmap; }, (error) => fail(["emoji"], `the emoji atlas image did not load (${error.message || error})`));
+    }).catch((error) => fail(["emoji", "emoji_mesh"], `the emoji atlas did not load (${error.message || error})`));
+  }
+  // "" when the style's assets are here, else why not yet (the image variant needs the picture, the mesh variant only the meta)
+  #emojiWait(style) {
+    const E = this.emoji;
+    if (!E || !E.meta) return "loading the emoji atlas";
+    if (style === "emoji" && !E.bitmap && !E.tex) return "loading the emoji atlas image";
+    return "";
+  }
+  #emojiTexture(guard) {
+    const E = this.emoji, gl = this.gl;
+    if (E.tex) return E.tex;
+    const tex = gl.createTexture();
+    guard.bind(0, tex);
+    const flip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL), pre = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    while (gl.getError() !== gl.NO_ERROR) { /* (an earlier error is not this upload's) */ }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, E.bitmap);
+    const error = gl.getError();
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, pre);
+    if (error !== gl.NO_ERROR) { gl.deleteTexture(tex); throw new Unavailable(`the emoji atlas could not be uploaded (0x${error.toString(16)})`); }
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (E.bitmap.close) E.bitmap.close();
+    E.bitmap = null; E.tex = tex;
+    return tex;
+  }
+  // the assignment's uniforms (EMOJI_KIND_GLSL): which kind a grain is, from its slot and radius
+  #emojiKindUniforms(p, ctx) {
+    const gl = this.gl, grain = ctx.grain || resolveColorSource({}).grain;
+    gl.uniform4f(p.u.uEmoji, Math.max(0, EMOJI_ASSIGN_IDS.indexOf(EMOJI_OPTIONS.assign)), this.emoji.meta.kinds.length, grain.range[0], grain.range[1]);
+    gl.uniform1fv(p.u.uEmojiBands, grain.bands);
+  }
+  #emoji(ctx, guard) {
+    const gl = this.gl, E = this.emoji;
+    let p;
+    try { p = this.#program("emoji", EMOJI_VS, EMOJI_FS); } catch (error) { throw new Unavailable(`the emoji shader did not build (${String(error.message || error).slice(0, 160)})`); }
+    gl.useProgram(p.program); this.#sprite(p, ctx, 1, { grow: 1, minPx: 3, pad: 0 });
+    this.#emojiKindUniforms(p, ctx);
+    gl.uniform1f(p.u.uInk, E.meta.ink); gl.uniform4fv(p.u.uEmojiRect, E.rects);
+    gl.uniform1f(p.u.uNative, emojiNative(ctx.tint, ctx.grain) ? 1 : 0);
+    guard.bind(0, this.#emojiTexture(guard)); gl.uniform1i(p.u.uAtlas, 0);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.depthMask(true); gl.disable(gl.BLEND);
+    gl.drawArrays(gl.POINTS, 0, ctx.n);
+  }
+  // The mesh variant: the grains partitioned by kind (one counting pass, one placing pass over the packed points, on the CPU), each
+  // kind drawn as ONE instanced batch of its mesh through the scene's Phong program.  A batch is the packed points of its grains
+  // plus the displayed slot (BATCH_PACKING), so a grain keeps its fixed rotation as the others around it come and go.
+  #emojiMesh(ctx, choice) {
+    const gl = this.gl, S = ctx.scene, E = this.emoji, L = INSTANCE_LOCATIONS, kinds = E.meta.kinds, K = kinds.length;
+    const suffix = choice.lod ? "_lod" : "";
+    const meshes = kinds.map((k) => (k.mesh && S.meshes && S.meshes[k.mesh + suffix]) || null);
+    const missing = kinds.filter((k, i) => !meshes[i]).map((k) => `${k.name}${suffix}`);
+    if (missing.length) throw new Unavailable(`the scene has no emoji mesh for ${missing.join(", ")}`);
+    // ---- partition by kind
+    const t0 = performance.now();
+    const n = ctx.n, data = ctx.data, bits = new Uint32Array(data.buffer, data.byteOffset, data.length);
+    const grain = ctx.grain || resolveColorSource({}).grain, assign = EMOJI_OPTIONS.assign;
+    const native = emojiNative(ctx.tint, ctx.grain) && ctx.colorMode !== "material";
+    const sc = (this.emojiScratch ||= { kind: new Uint8Array(0), out: new Float32Array(0) });
+    if (sc.kind.length < n) { sc.kind = new Uint8Array(n); sc.out = new Float32Array(n * 6); }
+    const counts = new Uint32Array(K), starts = new Uint32Array(K + 1);
+    for (let i = 0; i < n; i++) {
+      const meta = data[5 * i + 4];
+      if (!(meta >= 50)) { sc.kind[i] = 255; continue; }
+      const flag = Math.floor(meta / 100 + 0.001), k = emojiKind(assign, i, (meta - flag * 100) * 0.001, K, grain.bands, grain.range);
+      sc.kind[i] = k; counts[k]++;
+    }
+    for (let k = 0; k < K; k++) starts[k + 1] = starts[k] + counts[k];
+    const total = starts[K], cursor = starts.slice(0, K), out = sc.out, outBits = new Uint32Array(out.buffer);
+    for (let i = 0; i < n; i++) {
+      const k = sc.kind[i];
+      if (k === 255) continue;
+      const o = cursor[k]++ * 6, s = 5 * i;
+      out[o] = data[s]; out[o + 1] = data[s + 1]; out[o + 2] = data[s + 2];
+      outBits[o + 3] = native ? E.words[k] : bits[s + 3];
+      out[o + 4] = data[s + 4]; out[o + 5] = i;
+    }
+    if (!total) return;
+    const buffer = (E.batchBuffer ||= gl.createBuffer());
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, out, gl.DYNAMIC_DRAW, 0, total * 6);
+    const partitionMs = performance.now() - t0;
+    // ---- draw one batch per kind
+    const held = this.#sceneBegin(ctx), at = (name) => gl.getUniformLocation(S.program, name);
+    gl.uniform1f(at("uInstRot"), 1);
+    gl.depthMask(true); gl.disable(gl.BLEND);
+    let tris = 0;
+    for (let k = 0; k < K; k++) {
+      if (!counts[k]) continue;
+      const mesh = meshes[k], vao = this.#emojiVao(E, kinds[k].mesh + suffix, mesh);
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);                                   // (the batch's byte offset moves with the counts)
+      const base = starts[k] * BATCH_PACKING.stride;
+      gl.vertexAttribPointer(L.position, PACKING.position.size, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.position.offset);
+      gl.vertexAttribPointer(L.color, 4, gl.UNSIGNED_BYTE, true, BATCH_PACKING.stride, base + PACKING.color.offset);
+      gl.vertexAttribPointer(L.meta, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + PACKING.meta.offset);
+      gl.vertexAttribPointer(L.id, 1, gl.FLOAT, false, BATCH_PACKING.stride, base + BATCH_PACKING.id.offset);
+      gl.uniform4f(at("uInstMesh"), mesh.center[0], mesh.center[1], mesh.center[2], 1 / Math.max(mesh.half[0], mesh.half[1], 1e-4));
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, mesh.count, counts[k]);
+      tris += counts[k] * mesh.count / 3;
+    }
+    this.emojiInfo = `${total.toLocaleString("en-US")} grains in ${counts.filter((c) => c).length} batches, ${Math.round(tris).toLocaleString("en-US")} triangles, partition + upload ${partitionMs.toFixed(2)} ms`;
+    this.#sceneEnd(ctx, held);
     gl.bindVertexArray(ctx.vao);
+  }
+  // a kind's VAO: the scene mesh's own vertex buffer (positions, normals: its interleaved layout, see app.js uploadMesh) plus the
+  // instance attributes (whose pointers are set per draw, over the batch's current offset)
+  #emojiVao(E, name, mesh) {
+    const gl = this.gl, vaos = (E.vaos ||= new Map());
+    const held = vaos.get(name);
+    if (held && held.mesh === mesh) return held.vao;
+    if (held) gl.deleteVertexArray(held.vao);
+    gl.bindVertexArray(mesh.vao);
+    const vbo = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
+    for (const at of [INSTANCE_LOCATIONS.position, INSTANCE_LOCATIONS.color, INSTANCE_LOCATIONS.meta, INSTANCE_LOCATIONS.id]) { gl.enableVertexAttribArray(at); gl.vertexAttribDivisor(at, 1); }
+    vaos.set(name, { mesh, vao });
+    return vao;
   }
 
   // ---- liquid

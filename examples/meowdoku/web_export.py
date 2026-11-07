@@ -348,6 +348,20 @@ def export_assets(out: Path) -> dict:
                 pack(name, *largest_component(verts, normals))
             except Exception as error:  # noqa: BLE001  (the page falls back to a disc)
                 print(f"[export] {name} mesh skipped: {error}", flush=True)
+    # The particle field's emoji style (emoji_kinds below): one mesh per animal for the instanced variant, under its own names
+    # ("emoji_<name>"; the games' hero_* meshes are sized and trimmed for a tile, and hero_owl keeps only a speck of the glyph),
+    # and "emoji_<name>_lod": its flat front cap alone (a quarter of the triangles; seen from the front it is the same shape).
+    for kind in emoji_kinds():
+        try:
+            verts, normals = token_mesh(kind["glyph"], "Segoe UI Emoji", "normal", depth_ratio=0.3, outline_subdivisions=1)
+            body_verts, body_normals = largest_component(verts, normals)
+            if np.abs(body_verts[..., :2]).max() >= 0.8 * np.abs(verts[..., :2]).max():      # the body is the glyph, not one speck of it
+                verts, normals = body_verts, body_normals
+            pack(kind["mesh"], verts, normals)
+            front = normals[:, 2] > 0.99
+            pack(kind["mesh"] + "_lod", verts[front], normals[front])
+        except Exception as error:  # noqa: BLE001  (the page falls back to the image variant)
+            print(f"[export] emoji mesh {kind['name']} skipped: {error}", flush=True)
     assets = {
         "meshes": meshes,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
@@ -358,6 +372,96 @@ def export_assets(out: Path) -> dict:
     }
     (out / "assets.json").write_text(json.dumps(assets), encoding="utf-8")
     return assets
+
+
+# ---------------------------------------------------------------- emoji atlas
+#: The particle field's "emoji" style (web/particle_styles.js): every grain an animal emoji.  The image variant samples one
+#: atlas of the glyphs, baked here from the SAME Segoe UI Emoji source the entity meshes are extruded from (so it looks the
+#: same on every device, not the device's own emoji font); the mesh variant draws the exported meshes named here.  The kinds
+#: are the animal glyphs the games already declare (characters.py, sidescroller, delve, tilequest, invaders), in this order;
+#: the page reads the order, the cells and the colours from emoji_atlas.json and holds no list of its own.
+EMOJI_ATLAS_CELL = 128         # texels per cell edge
+EMOJI_ATLAS_COLS = 4
+EMOJI_ATLAS_INK = 0.875        # the glyph's longer side as a share of the cell (the rest is a margin that mip levels do not bleed across)
+EMOJI_FONT = "C:/Windows/Fonts/seguiemj.ttf"
+
+
+def emoji_kinds() -> list[dict]:
+    """[{name, glyph, mesh, color}]: ``mesh`` is the entity mesh the glyph is exported under, ``color`` its display colour
+    (the games' own palette entries: characters.PALETTE and the walker colours) for the mesh variant's native look."""
+    from meowdoku.characters import CHARACTERS, PALETTE as HERO_PALETTE
+    from meowdoku.sidescroller import EMOJI as SIDE_EMOJI
+    from meowdoku.delve import EMOJI as DELVE_EMOJI
+    from meowdoku.tilequest import EMOJI as TILE_EMOJI
+    from meowdoku.invaders import EMOJI as INVADER_EMOJI
+    kinds = [{"name": key, "glyph": glyph, "color": HERO_PALETTE[f"hero_{key}"]} for key, glyph in CHARACTERS.items()]
+    kinds += [{"name": "snail", "glyph": SIDE_EMOJI["snail"], "color": [0.92, 0.62, 0.35]},
+              {"name": "bat", "glyph": DELVE_EMOJI["bat"], "color": [0.55, 0.42, 0.7]},
+              {"name": "wolf", "glyph": TILE_EMOJI["wolf"], "color": [0.62, 0.64, 0.7]},
+              {"name": "fish", "glyph": "\U0001F41F", "color": [0.98, 0.62, 0.2]},
+              {"name": "crab", "glyph": INVADER_EMOJI["crab"], "color": [0.9, 0.3, 0.22]}]
+    for kind in kinds:
+        kind["mesh"] = f"emoji_{kind['name']}"
+    return kinds
+
+
+def bake_emoji_atlas(kinds: list[dict], cell: int = EMOJI_ATLAS_CELL, cols: int = EMOJI_ATLAS_COLS,
+                     ink: float = EMOJI_ATLAS_INK, font_path: str = EMOJI_FONT):
+    """-> (RGBA uint8 (rows*cell, cols*cell, 4), meta).  Each glyph is drawn large in colour, cropped to its ink, scaled so
+    its longer side is ``ink`` of the cell and centred by its bounding box (as ``largest_component`` centres the meshes).
+    The colour of the ink is spread into the transparent texels around it so mip levels and linear filtering do not pull
+    black into the edge."""
+    from PIL import Image, ImageDraw, ImageFont
+    rows = -(-len(kinds) // cols)
+    atlas = np.zeros((rows * cell, cols * cell, 4), np.uint8)
+    big = 4 * cell
+    font = ImageFont.truetype(font_path, int(big * 0.85))
+    for index, kind in enumerate(kinds):
+        canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        ImageDraw.Draw(canvas).text((big // 2, big // 2), kind["glyph"], font=font, embedded_color=True, anchor="mm")
+        box = canvas.getbbox()
+        if box is None:
+            raise RuntimeError(f"{kind['name']}: the font drew nothing for {kind['glyph']!r}")
+        glyph = canvas.crop(box)
+        scale = ink * cell / max(glyph.size)
+        glyph = glyph.resize((max(1, round(glyph.width * scale)), max(1, round(glyph.height * scale))), Image.LANCZOS)
+        tile = Image.new("RGBA", (cell, cell), (0, 0, 0, 0))
+        tile.paste(glyph, ((cell - glyph.width) // 2, (cell - glyph.height) // 2))
+        pixels = np.asarray(tile, np.uint8).copy()
+        # (only texels that are mostly ink keep their own colour: a faint edge texel's colour is rounding noise)
+        covered = pixels[..., 3] >= 128
+        solid = covered.copy()
+        colour = pixels[..., :3].astype(np.float32)
+        for _ in range(cell // 8):                               # spread the colour outward, one texel per pass
+            if covered.all():
+                break
+            weight = covered.astype(np.float32)
+            total = np.zeros_like(colour)
+            count = np.zeros_like(weight)
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                total += np.roll(colour * weight[..., None], (dy, dx), (0, 1))
+                count += np.roll(weight, (dy, dx), (0, 1))
+            fill = (~covered) & (count > 0)
+            colour[fill] = total[fill] / count[fill][:, None]
+            covered = covered | fill
+        pixels[..., :3][~solid] = colour[~solid].round().astype(np.uint8)
+        r, c = divmod(index, cols)
+        atlas[r * cell:(r + 1) * cell, c * cell:(c + 1) * cell] = pixels
+    meta = {"cell": cell, "cols": cols, "rows": rows, "ink": ink, "size": [cols * cell, rows * cell],
+            "kinds": [{"name": k["name"], "mesh": k["mesh"], "color": k["color"], "glyph": k["glyph"]} for k in kinds]}
+    return atlas, meta
+
+
+def export_emoji_atlas(out: Path, meshes: dict) -> dict:
+    """Writes emoji_atlas.png and emoji_atlas.json; a kind whose mesh was not exported keeps its cell and says ``mesh: null``."""
+    from PIL import Image
+    atlas, meta = bake_emoji_atlas(emoji_kinds())
+    for kind in meta["kinds"]:
+        if kind["mesh"] not in meshes:
+            kind["mesh"] = None
+    Image.fromarray(atlas, "RGBA").save(out / "emoji_atlas.png", optimize=True)
+    (out / "emoji_atlas.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return meta
 
 
 def export_boards(out: Path, sizes: tuple[int, ...], per_style: int, seed: int) -> dict:
@@ -409,6 +513,8 @@ def main(argv: list[str] | None = None) -> int:
                  "particle_styles.js", "noise_filter.js", "share.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
+    atlas = export_emoji_atlas(out, assets["meshes"])
+    print(f"[export] emoji atlas {atlas['size'][0]}x{atlas['size'][1]}: {[k['name'] for k in atlas['kinds']]}", flush=True)
     print("[export] assets:", {role: mesh["triangles"] for role, mesh in assets["meshes"].items()},
           {name: table["records"] for name, table in assets["materials"].items()}, flush=True)
     if args.skip_boards and (out / "boards.json").exists():
