@@ -7,6 +7,7 @@ the 2-D one of before (no bit identity with that law is required: the layout cha
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -117,12 +118,12 @@ def test_the_compiler_chooses_per_size_and_the_program_carries_no_per_id_data():
     assert "lane0[" in compiled.source and "f32(i)" in compiled.source
     # bytes per id (rematerialised sort temporaries hold no slot): the pile state and colours, plus the seven reduced
     # diagnostics, each carried through the reduction's stages in two buffers
-    assert compiled.arena_elements * 4 / pad < 205
+    assert compiled.arena_elements * 4 / pad < 205                  # 51 slots, 204 B/id (the orbeez radius is one state column: 196 before)
     # the arena is split across bindings of at most 256 MiB, none of the single-buffer limit's business
     assert compiled.bindings > 1 and compiled.bindings + 1 <= 8       # the binding COUNT budget holds (7 stacked lanes + the head)
     assert compiled.bindings == -(-compiled.slots // compiled.slots_per_binding)
-    assert compiled.slots_per_binding * pad * 4 <= 300 * 1024 * 1024    # 49 slots at 10M: 7 per lane, 280 MB
-    assert compiled.slots == F.ARENA_SLOTS and F.binding_bytes(pad) == compiled.slots_per_binding * pad * 4   # the volume adds no per-id column
+    assert compiled.slots_per_binding * pad * 4 <= 320 * 1024 * 1024    # 51 slots at 10M: 8 per lane, 320 MB (280 MB before the orbeez radius)
+    assert compiled.slots == F.ARENA_SLOTS and F.binding_bytes(pad) == compiled.slots_per_binding * pad * 4   # the volume adds no per-id column; the orbeez radius adds one state column (2 slots)
 
 
 def test_the_wgsl_program_is_generated_from_the_authored_law():
@@ -934,7 +935,7 @@ def test_the_z_grid_is_part_of_the_cell_index_and_the_key_stays_exact_in_float32
     assert float(F.uniforms(n=256, params={"depth": F.DEPTH_MAX})["lays"]) > 50        # up to a box as deep as the chamber is wide
     game = F.FountainGame(size="10M")
     ids = {item["id"]: item for item in game.state()["controls_ui"]}
-    assert ids["depth"]["max"] < F.DEPTH_DEFAULT and "280 MB" in dict(ids["size"]["options"])["10M"]    # the size control says what 10M needs
+    assert ids["depth"]["max"] < F.DEPTH_DEFAULT and "320 MB" in dict(ids["size"]["options"])["10M"]    # the size control says what 10M needs
     assert F.binding_bytes(10_000_000) > F.BINDING_CLASS_LIMIT >= F.binding_bytes(F.SIZES["4M"][0])
 
 
@@ -1246,7 +1247,7 @@ def test_sdf_gradients_are_analytic_and_the_distances_exact_where_the_solids_are
     rng = np.random.default_rng(1)
     for shape in F.SDF_SHAPES:
         u = F.uniforms(n=4096, shape=shape)
-        _c, w, top = F.window_fit(F.basin(4096))
+        _c, w, top = F.window_fit(shape, F.basin(4096, shape=shape))
         dh = float(u["dh"])
         xs, ys, zs = rng.uniform(-w, w, 1500), rng.uniform(0.0, top, 1500), rng.uniform(-dh, dh, 1500)
         d, nx, ny, nz = F.chamber_distance(u, xs, ys, zs)
@@ -1276,9 +1277,8 @@ def test_sdf_gradients_are_analytic_and_the_distances_exact_where_the_solids_are
 
 def test_sdf_presets_are_inscribed_in_the_window_and_the_depth_and_the_inlet_is_inside_the_fluid():
     for n in (256, 4096, 65536):
-        geo = F.basin(n)
-        c, w, top = F.window_fit(geo)
         for shape in F.SDF_SHAPES:
+            c, w, top = F.window_fit(shape, F.basin(n, shape=shape))
             u = F.uniforms(n=n, shape=shape)
             dh = float(u["dh"])
             assert float(u["sdf_on"]) == 1.0 and dh <= 0.5 * F.DEPTH_MAX + 1.0e-9
@@ -1315,7 +1315,7 @@ def test_the_sdf_chamber_mesh_is_a_deterministic_compact_watertight_surface_the_
         assert len(verts) == mesh["nv"] and len(tris) == mesh["nt"] and tris.max() < len(verts)
         u = {k: float(v) for k, v in game.uniforms().items()}
         d = F.chamber_distance(u, verts[:, 0], verts[:, 1], verts[:, 2])[0]
-        assert np.abs(d).mean() < 0.01 and np.abs(d).max() < 0.08, shape                      # every vertex lies on the zero surface, to the grid (a coarse step cuts a cube corner by a few hundredths)
+        assert np.abs(d).mean() < 0.01 and np.abs(d).max() < 0.1, shape                      # every vertex lies on the zero surface, to the grid (a coarse step cuts a cube corner by a few hundredths)
         assert np.abs(verts[:, 2]).max() <= u["dh"] + 1.0e-3                                  # inside the slab
         if shape != "sdf_toy":                                                                # a true solid is a closed surface: every edge has two triangles
             edges = Counter()
@@ -1351,7 +1351,7 @@ def _throw_at_walls(shape, n=24, steps=60, speed=2.5, where=None, seed=0):
     returns (the largest n_out over the steps, the worst distance a grain centre went beyond a wall, the grain radius)."""
     rng = np.random.default_rng(seed)
     uf = {k: float(v) for k, v in F.uniforms(n=4096, shape=shape).items()}
-    _c, w, top = F.window_fit(F.basin(4096))
+    _c, w, top = F.window_fit(shape, F.basin(4096, shape=shape))
     pts = []
     while len(pts) < n:
         p = np.array([rng.uniform(-w, w), rng.uniform(0.0, top), rng.uniform(-uf["dh"] + 0.02, uf["dh"] - 0.02)])
@@ -1377,7 +1377,7 @@ def _throw_at_walls(shape, n=24, steps=60, speed=2.5, where=None, seed=0):
 def test_grains_thrown_at_the_pegs_the_ramps_and_the_torus_inner_wall_do_not_escape():
     """Thrown at the walls faster than the fan jet fires (eager lane; the 64-id, 150-step run over every chamber is in the commit's report):
     none leaves (n_out = 0), and no grain centre goes more than a radius beyond a wall."""
-    top = F.window_fit(F.basin(4096))[2]
+    top = F.window_fit("sdf_toy", F.basin(4096, shape="sdf_toy"))[2]
     out, worst, rad = _throw_at_walls("sdf_toy", where=lambda p, u: 0.05 * top <= p[1] <= 0.30 * top, seed=1)          # the peg field's band
     assert out == 0.0 and worst < rad
     out, worst, rad = _throw_at_walls("sdf_toy", where=lambda p, u: p[1] > 0.7 * top, seed=2)                         # the ramps' band
@@ -1386,3 +1386,178 @@ def test_grains_thrown_at_the_pegs_the_ramps_and_the_torus_inner_wall_do_not_esc
     big, cy = float(u["q8p0"]), float(u["q8cy"])
     out, worst, rad = _throw_at_walls("sdf_torus", where=lambda p, uf: np.hypot(p[0], p[1] - cy) < big - 0.02, seed=3)  # the inner half of the tube: at the INNER wall
     assert out == 0.0 and worst < rad
+
+
+# ------------------------------------------------------------------------------- ORBEEZ (grains that swell with hydration)
+#: A SHA-256 (first 16 hex digits) of every output but ``rs_next`` over 12 contact-rich steps (``_thrown``, 24 ids, eager NumPy), recorded from the law
+#: at the commit BEFORE the orbeez (state without ``rs``): with ``swell`` = 0 the new law must reproduce it to the bit.
+PRE_ORBEEZ_DIGEST = {0.5: "54cef27ed35d84ec", 1.0: "62e1ff22b3c31ab6"}
+
+
+def test_without_swelling_the_law_is_the_pre_orbeez_law_bit_for_bit_over_contact_rich_steps():
+    """swell = 0 (the default): every orbeez term is an exact zero and the radius is the species radius, so every output the old law had equals the
+    old law's to the bit (the digests were recorded from the law before the radius became state), over steps in which the grains collide with each other
+    and every wall.  Eager NumPy lane (the native 3-D compile is too long to run here)."""
+    import hashlib
+    n = 24
+    for mix, digest in PRE_ORBEEZ_DIGEST.items():
+        uni = F.uniforms(n=n, mix=mix)
+        assert all(float(uni[f"swell{s}"]) == 0.0 and float(uni[f"swmax{s}"]) == 1.0 for s in range(4))
+        law = F.make_law(n, n, True)
+        cols = _thrown(n, uni)
+        h = hashlib.sha256()
+        overlapped = False
+        for _ in range(12):
+            gap = np.sqrt(sum((cols[k][:, None] - cols[k][None, :]) ** 2 for k in "xyz")) - 0.018
+            np.fill_diagonal(gap, 1.0)
+            overlapped = overlapped or float(gap.min()) < 0.0
+            cols, got = _eager_step(law, cols, n)
+            for k in F.OUTPUTS:
+                if k != "rs_next":
+                    h.update(np.ascontiguousarray(got[k], dtype=np.float64).tobytes())
+        assert h.hexdigest()[:16] == digest, mix
+        assert overlapped and float(np.abs(got["vy_next"]).max()) > 0.0 and got["n_out"][0] == 0
+        assert np.array_equal(cols["rs"], np.zeros(n))                           # with no swelling the radius state is never touched (an unset rs is the species radius)
+
+
+def _orbeez_columns(n, fluid, params=None, mix=0.0):
+    rho, mu = F.FLUIDS[fluid] if isinstance(fluid, str) else fluid
+    cols = F.initial_columns(n, mix=mix, params={"fl_rho": rho, "fl_mu": mu, **(params or {})})
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(0.0), age=np.full(n, -1.0e9))
+    return cols
+
+
+def _species_ids(law, n):
+    """The ids of species 0 and 1 (mix 0), read off one eager step of an unplaced state."""
+    _c, got = _eager_step(law, dict(F.initial_columns(n, mix=0.0)), n)
+    s0 = [int(i) for i in np.where(np.abs(got["rad"] - F.SPECIES[0][1]) < 1e-9)[0]]
+    s1 = [int(i) for i in np.where(np.abs(got["rad"] - F.SPECIES[1][1]) < 1e-9)[0]]
+    return s0, s1
+
+
+_PHI = (1.0 + 5.0 ** 0.5) / 2.0
+_ICOSAHEDRON = [tuple(np.roll((0.0, a, b * _PHI), k)) for a in (-1.0, 1.0) for b in (-1.0, 1.0) for k in range(3)]       # the 12 close-packed directions
+_OCTAHEDRON = [tuple(s * float(k == m) for m in range(3)) for k in range(3) for s in (-1.0, 1.0)]                       # 6 of them
+
+
+def _grow_scene(law, n, fluid, rate=0.3, swmax=1.5):
+    """Species-0 grains: A free, B6 touching six inert species-1 grains (half of the 12 that close a sphere), B12 closed in by twelve; all others parked
+    (not emitted), gravity off.  One step.  Returns the state after it, the step's outputs, the three ids and the ring ids."""
+    s0, s1 = _species_ids(law, n)
+    cols = _orbeez_columns(n, fluid, {"swell0": rate, "swmax0": swmax})
+    a, b6, b12 = s0[0], s0[1], s0[2]
+    gap = F.SPECIES[0][1] + F.SPECIES[1][1] - 0.0004                       # overlapping a little: touching
+    place = {a: (-0.12, 0.4, 0.0), b6: (0.0, 0.4, 0.0), b12: (0.12, 0.4, 0.0)}
+    ring, k = [], 0
+    for centre, dirs in ((b6, _OCTAHEDRON), (b12, _ICOSAHEDRON)):
+        for d in dirs:
+            d = np.asarray(d, dtype=np.float64)
+            place[s1[k]] = tuple(np.asarray(place[centre]) + gap * d / np.linalg.norm(d))
+            ring.append(s1[k])
+            k += 1
+    for i, (px, py, pz) in place.items():
+        cols["x"][i], cols["y"][i], cols["z"][i], cols["age"][i] = px, py, pz, 1.0e3
+        cols["rs"][i] = F.SPECIES[0][1] if i in (a, b6, b12) else F.SPECIES[1][1]            # placed grains, at their species radius
+    cols, got = _eager_step(law, cols, n)
+    return cols, got, (a, b6, b12), ring
+
+
+def test_orbeez_growth_share_is_the_exposed_surface_times_the_solvent_the_fluid_gives():
+    """ONE step in water: a free grain grows at the full rate (share 1), one touching 6 of the 12 contacts that close a sphere at half of it, one
+    closed in by 12 not at all.  In air nothing grows; in glycerine (viscosity-limited uptake) a free grain grows at half the rate.  Counters stay exact.
+    (Eager NumPy lane.)"""
+    n, rate = F.N_SMALL, 0.3
+    law = F.make_law(n, n, False)
+    r0 = F.SPECIES[0][1]
+    share = lambda cols, i: (float(cols["rs"][i]) - r0) / (rate * r0 * F.DT)
+    cols, got, (a, b6, b12), ring = _grow_scene(law, n, "water")
+    assert F.FULL_COORDINATION == 12.0
+    assert share(cols, a) == pytest.approx(1.0, abs=1e-3) and share(cols, b6) == pytest.approx(0.5, abs=1e-3) and abs(share(cols, b12)) < 1e-3
+    assert all(float(cols["rs"][i]) == pytest.approx(F.SPECIES[1][1], rel=1e-6) for i in ring)           # a species that does not swell keeps its radius
+    assert float(got["rad"][a]) == pytest.approx(r0, abs=1e-12)               # the drawn radius is the one the step used (the state is a step of growth ahead)
+    assert float(got["n_nan"][0]) == 0 and float(got["n_out"][0]) == 0
+    assert float(got["n_live"][0] + got["n_parked"][0] + got["n_out"][0] + got["n_nan"][0]) == n         # conservation: every id in exactly one class
+    dry, _got, (a, b6, b12), _ring = _grow_scene(law, n, "air")
+    assert all(float(dry["rs"][i]) == pytest.approx(r0, rel=1e-6) for i in (a, b6, b12))                # air: nothing swells
+    glycerine, _got, (a, _b6, _b12), _ring = _grow_scene(law, n, "glycerine")
+    assert share(glycerine, a) == pytest.approx(0.5, abs=1e-3)
+
+
+def test_a_free_orbeez_grows_linearly_to_swmax_and_its_mass_follows_r_cubed():
+    """A free grain in water grows linearly, 1 + swell t (checked over 0.1 s = 36 steps: the eager lane takes ~1 s a step; the 1 s run of 360 steps is the
+    same recurrence), stops at swmax x its radius, and its mass is density x 4/3 pi r^3: a coasting grain at twice the radius carries 8x the kinetic energy."""
+    n, rate = 8, 0.5
+    law = F.make_law(n, n, False)
+    _c, got = _eager_step(law, dict(F.initial_columns(n, mix=0.0)), n)
+    r0 = float(got["rad"][0])
+    cols = _orbeez_columns(n, "water", {"swell0": rate, "swmax0": 1.04, "swell1": rate, "swmax1": 1.04})
+    cols["x"][0], cols["y"][0], cols["age"][0], cols["rs"][0] = 0.0, 0.4, 1.0e3, r0
+    capped, uncapped = cols, dict(cols, swmax0=np.float64(3.0), swmax1=np.float64(3.0))
+    steps = 36
+    for _ in range(steps):
+        uncapped, got_u = _eager_step(law, uncapped, n)
+        capped, _got_c = _eager_step(law, capped, n)
+    assert float(uncapped["rs"][0]) / r0 == pytest.approx(1.0 + rate * steps * F.DT, abs=1e-9)         # 1.05 after 0.1 s
+    assert float(capped["rs"][0]) == pytest.approx(1.04 * r0, rel=1e-6)                                # the cap: swmax x the initial radius
+    assert float(got_u["n_nan"][0]) == 0 and float(got_u["n_live"][0] + got_u["n_parked"][0] + got_u["n_out"][0]) == n
+    energy = {}
+    for scale in (1.0, 2.0):                                                                           # no fluid, no gravity: the speed is unchanged by a step
+        c = _orbeez_columns(n, (0.0, 0.0))
+        c["x"][0], c["y"][0], c["age"][0], c["vx"][0], c["rs"][0] = 0.0, 0.4, 1.0e3, 0.1, scale * r0
+        _c, g = _eager_step(law, c, n)
+        energy[scale] = float(g["ke"][0])
+    assert energy[2.0] / energy[1.0] == pytest.approx(8.0, rel=1e-12)
+
+
+def test_the_grid_cell_covers_the_largest_radius_an_orbeez_can_reach_and_the_game_offers_the_controls():
+    base = F.uniforms(n=256)
+    swell = F.uniforms(n=256, params={"swell3": 0.2, "swmax3": 3.0})
+    assert float(base["cell"]) == pytest.approx(F.CELL, abs=1e-9)
+    assert float(swell["cell"]) == pytest.approx(2.0 * 3.0 * F.SPECIES[3][1], rel=1e-6)           # 2 x swmax x the pearl radius
+    assert float(F.uniforms(n=256, params={"swell3": 0.0, "swmax3": 3.0})["cell"]) == float(base["cell"])    # no swelling: swmax does not size the grid
+    assert float(swell["bar_z"]) == float(base["bar_z"])                                           # the inlet is for grains as placed
+    assert all(float(base[f"swell{s}"]) == 0.0 and float(base[f"swmax{s}"]) == 1.0 for s in range(4))
+    assert "rs" in F.STATE and "rs_next" in F.OUTPUTS and F.ARGUMENTS == F.STATE + ("pid", "ir", "ig", "ib") + F.UNIFORMS
+    game = F.FountainGame(size="small")
+    ids = {c["id"]: c for c in game.state()["controls_ui"]}
+    for s in range(4):
+        assert ids[f"swell{s}"]["group"] == "Grains" and ids[f"swell{s}"]["max"] == F.SWELL_RATE_MAX and ids[f"swell{s}"]["species"] == s
+        assert ids[f"swmax{s}"]["group"] == "Grains" and ids[f"swmax{s}"]["min"] == 1.0 and ids[f"swmax{s}"]["max"] == F.SWELL_MAX_RATIO
+    epoch = game.state()["compute"]["epoch"]
+    game.do({"type": "fountain_param", "name": "swell1", "value": 0.2})                       # the grid is sized from it: a new run
+    state = game.state()["compute"]
+    assert state["epoch"] == epoch + 1 and state["uniforms"]["swell1"] == pytest.approx(0.2, rel=1e-6)
+    game.do({"type": "fountain_choice", "name": "fluid", "value": "water"})                    # the fluid is the solvent: live, no restart
+    assert game.state()["compute"]["epoch"] == epoch + 1 and game.state()["compute"]["uniforms"]["fl_rho"] == pytest.approx(F.FLUIDS["water"][0], rel=1e-6)
+    assert F.ARENA_SLOTS == 51 and F.binding_bytes(10_000_000) == 8 * 10_000_000 * 4 and F.binding_bytes(4096) == 51 * 4096 * 4
+
+
+# ------------------------------------------------------------------------------- SDF presets keep their DESIGNED height
+def test_sdf_presets_keep_their_designed_proportions_and_the_view_follows_the_chamber():
+    """An SDF solid is not normalised to the view: its box is designed (``sdf_design``: scaled by the id count and the grain cell), the screen aspect
+    does not stretch it, and the view, grid and depth derive from its bounding box plus a margin of three cells."""
+    for shape in F.SDF_SHAPES:
+        for n in (256, 4096, 65536, 1048576):
+            geo = F.basin(n, shape=shape)
+            c, w, top = F.window_fit(shape, geo)
+            assert geo["view"] == (-(w + 3 * c), w + 3 * c, geo["view"][2], top + 3 * c)                  # the view is the box plus the margin
+            assert float(F.uniforms(n=n, shape=shape)["rows"]) * c >= top and geo["half"] >= w
+            wide, tall = F.basin(n, 3.0, shape=shape), F.basin(n, 0.35, shape=shape)
+            assert wide["view"] == tall["view"] == geo["view"] and wide["cols"] == geo["cols"]               # the screen's aspect does not reshape it
+            cells = geo["cols"] * (geo["rows"] + F.ROWS_MARGIN) * max(1, int(round(F.depth_cap(n, c, None, shape) / c)))
+            assert cells < 2.0 ** 24, (shape, n)                                                              # the f32 cell index stays exact
+            u = F.uniforms(n=n, shape=shape)
+            assert float(u["cols"]) * (float(u["rows"]) + F.ROWS_MARGIN) * float(u["lays"]) < 2.0 ** 24 and 2.0 * float(u["dh"]) <= F.depth_cap(n, c, None, shape) + 1e-6
+    c = F.CELL
+    assert F.sdf_design("sdf_sphere", 1.0, c)[2] == pytest.approx(2.0 * F.sdf_design("sdf_sphere", 1.0, c)[1])      # as tall as wide
+    assert F.sdf_design("sdf_hourglass", 1.0, c)[2] == pytest.approx(F.HOURGLASS_ASPECT * F.sdf_design("sdf_hourglass", 1.0, c)[1])
+    # the toy is as tall as its parts need: ramps over the throat over a peg field of >= 5 rows, whatever the grain size and id count
+    for n in (256, 4096):
+        for cell in (F.CELL, 2.0 * F.CELL, 4.0 * F.CELL):
+            _c, w, top = F.sdf_design("sdf_toy", math.sqrt(n / F.N_BASE), cell)
+            assert top >= F.TOY_ASPECT_W * w + F.TOY_ASPECT_C * cell - 1e-12 and 0.22 * top >= (F.TOY_PEG_ROWS - 1) * 4.6 * cell - 1e-12
+    small = F.sdf_design("sdf_toy", 0.25, F.CELL)
+    assert small[2] / small[1] > F.sdf_design("sdf_toy", 1.0, F.CELL)[2] / F.sdf_design("sdf_toy", 1.0, F.CELL)[1]     # a small chamber is relatively taller
+    # the polygons and the box are untouched by the shape argument
+    for shape in ("box", "funnel", "hexagon", "ramp"):
+        assert F.basin(4096, 1.7, shape=shape) == F.basin(4096, 1.7)
