@@ -145,13 +145,13 @@ SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax")
 STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
 UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata",   # the run, its basin, the RUNTIME INPUTS, then the colour rate
-            "cell_scale", "solvent") + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
+            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
 #: the lid still meet each other.  The server sends their defaults (and the closed values as ``tilt_inputs``); the page's
 #: runtime owns them after that.
-RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "solvent") + tuple(
+RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "solvent", "case_omega", "case_domega") + tuple(
     f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax") for s in range(4))      # the radius (and so the grid) is fixed when a run starts
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
@@ -325,6 +325,12 @@ def make_law(n: int, active: int | None = None):
         mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
             a[k] for k in ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata"))
         solvent = a["solvent"]
+        # the CASE FRAME: the walls are static in the frame the law runs in, and the case turns at ``case_omega`` (rad/s, about
+        # the pivot, counterclockwise positive) with angular acceleration ``case_domega``.  A grain feels, besides gravity
+        # (which the page rotates), the fictitious accelerations  -2 w x v  (Coriolis: applied as an exact rotation of the
+        # velocity, so any rate is stable),  w^2 (r - p)  (centrifugal) and  -dw/dt x (r - p)  (Euler); its own spin, measured
+        # in this frame, gains -dw/dt.  Defaults (0, and the box centre as pivot) add exact zeros: the old law bit for bit.
+        case_omega, case_domega = a["case_omega"], a["case_domega"]
         cell = CELL * a["cell_scale"]
         cells = cols * rows
 
@@ -532,10 +538,18 @@ def make_law(n: int, active: int | None = None):
         just = pending * as_float(blocked < 0.5)
         place = just + arming
         inertia = 0.5 * mass * radius * radius
-        vxn = AbstractTensor.where(just > 0.5, vx0, vx + live * (fx / mass + grav_x - drag * vx) * DT)
-        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED,
-                                                                         vy + live * (fy / mass + grav_y - drag * vy) * DT))
-        wn = (w + live * (tq / inertia - SPIN_DRAG * w) * DT) * (1.0 - just)
+        rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
+        fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
+        fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
+        vx_a = vx + live * (fx / mass + grav_x - drag * vx + fict_x) * DT
+        vy_a = vy + live * (fy / mass + grav_y - drag * vy + fict_y) * DT
+        turn = (case_omega * DT) * -2.0                               # Coriolis: the velocity turns by -2 w DT (clockwise for w > 0)
+        c_turn, s_turn = turn.cos(), turn.sin()
+        vx_c = AbstractTensor.where(live > 0.5, vx_a * c_turn - vy_a * s_turn, vx_a)      # only a live grain's velocity (an armed id's vy is a sentinel)
+        vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
+        vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
+        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
+        wn = (w + live * (tq / inertia - SPIN_DRAG * w - case_domega) * DT) * (1.0 - just)
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         age_next = age + DT
@@ -661,7 +675,8 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
-    out.update({"cell_scale": cell / CELL, "solvent": p["solvent"]})
+    out.update({"cell_scale": cell / CELL, "solvent": p["solvent"], "case_omega": 0.0, "case_domega": 0.0,
+                "pivot_x": 0.5 * (geo["view"][0] + geo["view"][1]), "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3])})
     for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):                 # multiples of the defaults: exactly 1.0 when untouched
         out.update({f"rscale{s}": p[f"r{s}"] / r, f"fscale{s}": p[f"mu{s}"] / mu if mu else 1.0, f"dscale{s}": p[f"rho{s}"] / rho,
                     f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
