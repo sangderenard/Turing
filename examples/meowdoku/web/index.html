@@ -51,6 +51,11 @@
      phone) so the bar never covers the board; --bar-h is kept live below. */
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
            height: calc(var(--vh100, 100vh) - var(--bar-h, 0px)); touch-action: none; }
+  #marble-pad { box-sizing: border-box; max-width: min(96vw, 760px); max-height: calc(var(--vh100, 100vh) - var(--bar-h, 0px) - 20px);
+                overflow: auto; flex-wrap: wrap; justify-content: center; border: 2px solid #f3cc7b;
+                background: rgba(12, 19, 31, .96) !important; box-shadow: 0 6px 28px #000b; }
+  #marble-pad input[type=range] { accent-color: #f3cc7b; height: 24px; }
+  #marble-pad label { white-space: nowrap; }
   /* Wordle's entry is drawn in the scene (the entry bar); this input is only its keyboard: visually hidden, off-screen, still focusable
      (16px font so a phone does not zoom on focus) */
   #word { position: fixed; left: 0; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; display: none; }
@@ -230,6 +235,7 @@
   <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
   <span id="modes"></span>
   <span id="gamectl"></span>
+  <span id="compact-capture" style="display:none;align-items:center;gap:5px"><button id="capture-candidate">Record compact animation</button><button id="submit-candidate" disabled>Stop and submit</button><small id="capture-candidate-status" aria-live="polite"></small></span>
   <span id="hotbars"></span>
   <span id="wordle-opts"></span>
   <label title="Two on-screen thumbsticks: left turns and throttles (double tap: bomb), right climbs and fires while held">Thumbpads <input id="pads" type="checkbox"></label>
@@ -251,8 +257,15 @@
 <div id="marble-pad" style="display:none;position:fixed;right:14px;bottom:18px;z-index:25;gap:10px;align-items:center;background:#111a;padding:8px;border-radius:12px;color:white;touch-action:none">
   <label><input id="marble-phone-tilt" type="checkbox"> Phone tilt</label>
   <label title="Allow touch camera gestures to pitch the view; marble gravity is controlled separately"><input id="marble-camera-tilt" type="checkbox" checked> Camera tilt</label>
-  <label style="text-align:center">Across X<br><input id="marble-stick-x" type="range" min="-70" max="70" value="0" aria-label="Across course tilt, left thumb" style="width:100px;touch-action:none"></label>
-  <label style="text-align:center">Depth Z<br><input id="marble-stick-z" type="range" min="-70" max="70" value="0" aria-label="Course depth tilt, right thumb" style="width:100px;touch-action:none"></label>
+  <label title="Keep the camera close to the simulated marble"><input id="marble-follow" type="checkbox" checked> Follow marble</label>
+  <label title="Rotate the course with its tilt"><input id="marble-watch-case" type="checkbox"> Watch case move</label>
+  <label title="Use the existing glowing glass backdrop behind the course"><input id="marble-backlit" type="checkbox"> Backlit plate</label>
+  <label title="A lamp mounted above the course and aimed at the marble"><input id="marble-spot" type="checkbox" checked> Follow spot</label>
+  <label>Marble light <select id="marble-light-mode"><option value="lit">Lit</option><option value="glow">Glow only</option><option value="both">Lit + glow</option></select></label>
+  <label>Glow color <input id="marble-glow-color" type="color" value="#8bcaff"></label>
+  <label>Glow strength <input id="marble-glow-strength" type="range" min="0" max="8" step="0.1" value="2"></label>
+  <label style="text-align:center">Across X<br><input id="marble-stick-x" type="range" min="-95" max="95" value="0" aria-label="Across course tilt, left thumb" style="width:100px;touch-action:none"></label>
+  <label style="text-align:center">Down Y<br><input id="marble-stick-down" type="range" min="-95" max="95" value="0" aria-label="Down course tilt, right thumb" style="width:100px;touch-action:none"></label>
 </div>
 <div id="word">
   <input id="entry" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="word" tabindex="-1">

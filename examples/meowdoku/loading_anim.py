@@ -40,6 +40,7 @@ MAX_GRAINS = 4096
 MAX_FRAMES = 4096
 MAX_POLYLINES = 8
 MAX_POINTS = 4096
+TEMP_SECONDS = 3 * 24 * 60 * 60       # ungraduated fountain captures live for three days
 HEADER = struct.Struct("<4sBBHHHH4f")       # magic, version, fps, n, frames, seam, polylines, bbox
 
 
@@ -149,6 +150,8 @@ def unpack(packet: bytes) -> bytes:
 #: [STUDIO] the library's caps: an upload that would pass either is refused (nothing is evicted without the owner)
 MAX_ENTRIES = 24
 MAX_LIBRARY_BYTES = 32 << 20
+MAX_TEMP_ENTRIES = 8
+MAX_TEMP_BYTES = 8 << 20
 MAX_PARAMS_BYTES = 2048
 DIGEST_RE = re.compile(r"^[0-9a-f]{16}$")
 
@@ -232,6 +235,8 @@ class Library:
         try:
             mla, js = self._files(digest_)
             meta = json.loads(js.read_text(encoding="utf-8"))
+            if meta.get("expires_at") and meta["expires_at"] <= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()):
+                return None
             return meta if mla.stat().st_size == meta["bytes"] else None
         except (KeyError, OSError, ValueError):
             return None
@@ -245,6 +250,7 @@ class Library:
 
     def entries(self) -> list[dict]:
         """Every entry's metadata, newest first, each with ``active``."""
+        self.prune_expired()
         active, out = self.active_digest(), []
         if self.root.is_dir():
             for js in self.root.glob("*.json"):
@@ -252,9 +258,29 @@ class Library:
                     out.append({**meta, "active": meta["digest"] == active})
         return sorted(out, key=lambda m: (m.get("date", ""), m["digest"]), reverse=True)
 
+    def prune_expired(self) -> None:
+        """Delete expired candidates and their octet packets during normal library reads/writes."""
+        with self._lock:
+            if not self.root.is_dir():
+                return
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for js in self.root.glob("*.json"):
+                if js.stem == "active" or not DIGEST_RE.match(js.stem):
+                    continue
+                try:
+                    meta = json.loads(js.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if meta.get("expires_at") and meta["expires_at"] <= now:
+                    for path in self._files(js.stem):
+                        path.unlink(missing_ok=True)
+
     def caps(self) -> dict:
         entries = self.entries()
-        return {"max_entries": MAX_ENTRIES, "max_bytes": MAX_LIBRARY_BYTES, "entries": len(entries), "used_bytes": sum(e["bytes"] for e in entries)}
+        pending = [e for e in entries if e.get("expires_at")]
+        return {"max_entries": MAX_ENTRIES, "max_bytes": MAX_LIBRARY_BYTES, "entries": len(entries), "used_bytes": sum(e["bytes"] for e in entries),
+                "max_temporary_entries": MAX_TEMP_ENTRIES, "max_temporary_bytes": MAX_TEMP_BYTES,
+                "temporary_entries": len(pending), "temporary_bytes": sum(e["bytes"] for e in pending)}
 
     def info(self) -> dict | None:
         """The ACTIVE entry's metadata ({"digest", "raw_bytes", "bytes" (the packet), "frames", "grains", "fps", "date", "params"}), or None."""
@@ -270,36 +296,58 @@ class Library:
             return None
 
     # -- writing
-    def put(self, raw: bytes, params=None) -> dict:
+    def put(self, raw: bytes, params=None, *, temporary: bool = False) -> dict:
         """Validate, pack and keep an animation.  The first one into a library with no active entry becomes active; a later one is only
         added.  The same animation twice is one entry.  Raises :class:`AnimError` (invalid) or :class:`LibraryFull`."""
         anim = decode(raw)
         with self._lock:
+            self.prune_expired()
             packet = pack(raw)
             if unpack(packet) != raw:                              # the codec must give back exactly what was validated
                 raise RuntimeError("octet codec round trip failed")
             digest_ = digest(packet)
             if self.meta(digest_):
+                if not temporary and self.meta(digest_).get("expires_at"):
+                    return {**self.graduate(digest_), "active": digest_ == self.active_digest(), "duplicate": True}
                 return {**self.meta(digest_), "active": digest_ == self.active_digest(), "duplicate": True}
             caps = self.caps()
+            if temporary:
+                pending = [e for e in self.entries() if e.get("expires_at")]
+                if len(pending) >= MAX_TEMP_ENTRIES or sum(e["bytes"] for e in pending) + len(packet) > MAX_TEMP_BYTES:
+                    raise LibraryFull("the temporary capture shelf is full; wait for expiry or graduate a capture")
             if caps["entries"] >= MAX_ENTRIES or caps["used_bytes"] + len(packet) > MAX_LIBRARY_BYTES:
                 raise LibraryFull(f"the library is full ({caps['entries']}/{MAX_ENTRIES} entries, {caps['used_bytes']}/{MAX_LIBRARY_BYTES} bytes): delete one first")
             self.root.mkdir(parents=True, exist_ok=True)
             meta = {"digest": digest_, "raw_bytes": len(raw), "bytes": len(packet), "frames": int(anim["x"].shape[0]),
                     "grains": int(anim["x"].shape[1]), "fps": int(anim["fps"]), "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "params": clean_params(params)}
+            if temporary:
+                meta["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + TEMP_SECONDS))
             mla, js = self._files(digest_)
             self._atomic(mla, packet)
             self._atomic(js, json.dumps(meta).encode("utf-8"))
             became = self.active_digest() is None
-            if became:
+            if became and not temporary:
                 self._set_active(digest_)
-            return {**meta, "active": became}
+            return {**meta, "active": became and not temporary}
+
+    def graduate(self, digest_: str) -> dict:
+        """Keep a candidate permanently; activation remains a separate owner action."""
+        with self._lock:
+            meta = self.meta(digest_)
+            if meta is None:
+                raise KeyError(digest_)
+            if "expires_at" in meta:
+                meta = {k: v for k, v in meta.items() if k != "expires_at"}
+                self._atomic(self._files(digest_)[1], json.dumps(meta).encode("utf-8"))
+            return meta
 
     def activate(self, digest_: str) -> dict:
         with self._lock:
             meta = self.meta(digest_)
             if meta is None:
+                raise KeyError(digest_)
+            if meta.get("expires_at"):
                 raise KeyError(digest_)
             self._set_active(digest_)
             return meta

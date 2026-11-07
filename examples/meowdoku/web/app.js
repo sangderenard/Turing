@@ -51,6 +51,7 @@ import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, 
          dollyParams, projectionMatrix, pickPlane } from "./world_curve.js";                                                 // [CURVE]
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
 import { catEyeMarble } from "./marble_mesh.js";
+import { beginCandidate } from "./loading_candidate.js";
 import { marbleGravityVector } from "./marble_controls.js";
 
 const canvas = document.getElementById("gl");
@@ -571,7 +572,7 @@ function housingFaces(g) {
   const c = g && g.compute, u = c && c.uniforms, m = state.materialIndex["housing@glass"];
   if (!u || u.px0 === undefined || !c.view || m == null) return null;
   const [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0)), mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
-  const y = TILE.height + 0.03, dh = u.dh;
+  const y = TILE.height + 0.03 + marbleCourseLift(g), dh = u.dh;
   const wp = (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
   const checker = wallFinish.mode === "checker" && state.materialIndex.housing_checker_light != null && state.materialIndex.housing_checker_dark != null;
   const tile = Math.max(0.05, 4 * Math.max(...[0, 1, 2, 3].map((i) => u[`r${i}`] || 0)));
@@ -703,8 +704,14 @@ const RIBBON_H = 0.035;
 // the law -> world map of a 2-D fountain state (PointCloud's uMap: law x -> +X, law y -> -Z)
 function lawToWorld(g) {
   const c = g.compute, [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0));
-  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2, y = TILE.height + 0.03;
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2, y = TILE.height + 0.03 + marbleCourseLift(g);
   return (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+}
+function marbleCourseLift(g) {
+  if (g?.game !== "marble_madness" || !g.compute?.view) return 0;
+  const [x0, x1, y0, y1] = g.compute.view;
+  const k = Math.min(g.width / (x1 - x0), g.height / (y1 - y0));
+  return (g.compute.uniforms?.dh || 0) * k + 0.04;
 }
 // the chamber's walls as polylines: the server's outline, else the px/py polyline, else (the box: its walls are planes, its polygon
 // uniforms are zero) the basin's floor and two side walls up to the view's top
@@ -1809,6 +1816,19 @@ function litMesh(faces, uvOf) {
 // The saved recipe is the geometry authority.  Install its full generated
 // triangles in the same material tables and Phong path as every scene mesh.
 const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, mesh: null, note: "" };
+// Marble Madness can override the exterior's light response at the material-table seam.
+// The interior keeps every material authored in Studio.
+function marbleBaseLight(tables, id) {
+  if (state.game?.game !== "marble_madness" || !Number.isInteger(id)) return;
+  const pbr = tables.pbr, phong = tables.phong, p = id * pbr.floats_per_record, h = id * phong.floats_per_record;
+  const glow = marbleLight.mode !== "lit", lit = marbleLight.mode !== "glow";
+  const rgb = marbleLight.color.match(/[0-9a-f]{2}/gi).map((v) => parseInt(v, 16) / 255);
+  for (let k = 0; k < 3; k++) {
+    pbr.data[p + 8 + k] = glow ? rgb[k] * marbleLight.strength : 0;
+    if (!lit) { pbr.data[p + k] = 0; phong.data[h + 4 + k] = 0; }
+  }
+  if (!lit) { phong.data[h] = 0; phong.data[h + 1] = 0; }
+}
 function installSavedParticle(tables) {
   const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
   if (!snapshot || !geometry) return;
@@ -1825,6 +1845,8 @@ function installSavedParticle(tables) {
       target.data.push(...from.data.slice(id * stride, (id + 1) * stride));
       target.records++;
     }
+    const shell = snapshot.materials.index?.[snapshot.design?.shell];
+    if (id === shell || id === snapshot.materials.extra?.coated) marbleBaseLight(tables, next);
     remap.set(id, next);
   }
   const mapped = faces.map((face) => [face[0], face[1], face[2], remap.get(face[3]), face[4]]);
@@ -2211,6 +2233,7 @@ function uploadMaterials(game) {
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
+  marbleBaseLight(tables, state.materialIndex.marble_clear_glass);
   installSavedParticle(tables);
   {   // which materials read the transmission variant's fields (see phongVariant)
     const pf = tables.pbr.floats_per_record, tf = tables.texstack.floats_per_record, rows = tables.pbr.records;
@@ -2375,9 +2398,13 @@ function camera() {
   const halfFit = Math.max((extLength(ext) + pad) / 2, (ext.width - x0 + pad) / (2 * aspect)) * slack;
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
   const lean = stageOf();                                           // a stage game: the plane rises behind the board
-  const centre = declared && declared.target ? declared.target : [extMidX(ext) + x0 / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
+  const marblePoint = state.game?.game === "marble_madness" && marbleFollow && compute.ready && compute.points()
+    ? readPoint(compute.points(), 0) : null;
+  const marbleAt = marblePoint?.alive ? lawToWorld(state.game)(marblePoint.x, marblePoint.y, marblePoint.z) : null;
+  const follow = marbleAt && state.caseModel ? M.apply(state.caseModel, marbleAt) : marbleAt;
+  const centre = follow || (declared && declared.target ? declared.target : [extMidX(ext) + x0 / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)]);
   const zs = zoomShift(V.lz);                                      // [SPEED+ZOOM] the zoom window slides inside the supplied world
-  const target = [centre[0] + V.px + zs[0], centre[1], centre[2] + V.pz + zs[1]];
+  const target = follow ? centre : [centre[0] + V.px + zs[0], centre[1], centre[2] + V.pz + zs[1]];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
     const eye = [target[0], 60, target[2]], view = M.lookAt(eye, target, [-Math.sin(az), 0, -Math.cos(az)]);
@@ -2401,7 +2428,10 @@ function camera() {
     const proj = M.perspective(COCKPIT.fov, aspect, 0.05, 300);
     return { view, proj, viewProj: M.multiply(proj, view), eye, nose: true, aspect };
   }
-  const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el)) * Math.exp(V.lz);
+  const followScale = follow ? Math.min(state.game.width / (state.game.compute.view[1] - state.game.compute.view[0]),
+    state.game.height / (state.game.compute.view[3] - state.game.compute.view[2])) : 0;
+  const dist = (follow ? Math.max(1.0, 4.0 * marblePoint.radius * followScale)
+    : RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el))) * Math.exp(V.lz);
   camView.lastR = dist;
   const el2 = Math.max(0.05, Math.min(Math.PI / 2, el + V.pitch));    // the gesture tilt, on top of the game's own
   // [CURVE] the dolly zoom: blend 0 is this perspective camera exactly, 1 the orthographic camera with the same view
@@ -2571,6 +2601,23 @@ function intentSpot(cam, now) {
   const vdir = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
   const cone = [Math.cos((cfg.inner ?? 14) * Math.PI / 180), Math.cos((cfg.outer ?? 30) * Math.PI / 180)];
   return [{ view: a, colour: cfg.colour || [1.0, 0.94, 0.82], level: 0, intensity: cfg.intensity ?? 70, spotDir: vdir, spotCone: cone }];
+}
+function marbleSpot(cam) {
+  const game = state.game, data = compute.points();
+  if (game?.game !== "marble_madness" || !marbleLight.spot || !data || !compute.ready) return null;
+  const point = readPoint(data, 0);
+  if (!point.alive) return null;
+  const local = lawToWorld(game)(point.x, point.y, point.z);
+  const span = Math.max(state.extent.width, extLength());
+  const mount = [local[0], local[1] + 0.62 * span, local[2] - 0.08 * span];
+  const model = state.caseModel;
+  const at = model ? M.apply(model, local) : local;
+  const pos = model ? M.apply(model, mount) : mount;
+  const a = M.apply(cam.view, pos), b = M.apply(cam.view, at);
+  const dir = norm(sub(b, a));
+  return { at: pos, view: a, colour: [1.0, 0.95, 0.82], level: 0,
+    intensity: 2.5 * span * span, spotDir: dir,
+    spotCone: [Math.cos(18 * Math.PI / 180), Math.cos(32 * Math.PI / 180)] };
 }
 // A bomb's blast lights the scene in its own glow colour (the game's
 // emissive palette entry for it), flaring and fading over its life.
@@ -4946,6 +4993,8 @@ function syncWobbleUi() {
 }
 
 function applyState(game, { meta = false } = {}) {
+  $("compact-capture").style.display = ["fountain", "fountain3d"].includes(game.game) ? "inline-flex" : "none";
+  if (candidateCapture && !["fountain", "fountain3d"].includes(game.game)) candidateCapture.cancel();
   // While the real-time socket is open it owns the entities; a state that
   // arrives by HTTP (reset, layout, the socket's own meta) leaves them alone.
   if (game.input === "realtime" && sock.open) delete game.entities;
@@ -5006,7 +5055,7 @@ function applyState(game, { meta = false } = {}) {
   chessClockSync(game);
   if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
-  if (game.game === "marble_madness") { compute.setSpin(0); compute.setCaseTilt(0); compute.setGravity(0, -1, 0); }
+  if (game.game === "marble_madness") { compute.setSpin(0); compute.setCaseTilt(0); compute.setGravity(0, 0, -1); }
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   mobroad.state = state;
@@ -5127,6 +5176,20 @@ const compute = new ComputeRuntime({
   onSupport: () => { if (state.game) renderGameControls(state.game); },
 });
 window.meowdokuDebug.compute = compute;
+let candidateCapture = null;
+$("capture-candidate").onclick = () => {
+  try {
+    candidateCapture = beginCandidate({ compute, game: state.game,
+      onStatus: (message) => { $("capture-candidate-status").textContent = message; },
+      onDone: () => { candidateCapture = null; $("capture-candidate").disabled = false; $("submit-candidate").disabled = true; } });
+    $("capture-candidate").disabled = true; $("submit-candidate").disabled = false;
+  } catch (error) { $("capture-candidate-status").textContent = error.message || String(error); }
+};
+$("submit-candidate").onclick = () => {
+  if (!candidateCapture) return;
+  $("submit-candidate").disabled = true;
+  void candidateCapture.stop();
+};
 const marbleKeys = new Set();
 const marbleKey = (key) => ({ ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right",
   ArrowUp: "up", w: "up", W: "up", ArrowDown: "down", s: "down", S: "down" })[key];
@@ -5137,13 +5200,47 @@ for (const type of ["keydown", "keyup"]) window.addEventListener(type, (event) =
   if (type === "keydown") marbleKeys.add(key); else marbleKeys.delete(key);
 });
 window.addEventListener("blur", () => marbleKeys.clear());
-const marbleSticks = { x: $("marble-stick-x"), z: $("marble-stick-z") };
+const marbleSticks = { x: $("marble-stick-x"), down: $("marble-stick-down") };
+const marbleCase = { gravity: [0, 0, -1] };
+const marbleLight = { spot: true, mode: "lit", color: "#8bcaff", strength: 2 };
+try {
+  const saved = JSON.parse(localStorage.getItem("meowdoku.marble.light") || "null");
+  if (saved && typeof saved === "object") {
+    marbleLight.spot = saved.spot !== false;
+    if (["lit", "glow", "both"].includes(saved.mode)) marbleLight.mode = saved.mode;
+    if (/^#[0-9a-f]{6}$/i.test(saved.color)) marbleLight.color = saved.color;
+    if (Number.isFinite(saved.strength)) marbleLight.strength = Math.max(0, Math.min(8, saved.strength));
+  }
+} catch { /* storage may be blocked */ }
+const marbleLightInputs = { spot: $("marble-spot"), mode: $("marble-light-mode"), color: $("marble-glow-color"), strength: $("marble-glow-strength") };
+marbleLightInputs.spot.checked = marbleLight.spot;
+marbleLightInputs.mode.value = marbleLight.mode;
+marbleLightInputs.color.value = marbleLight.color;
+marbleLightInputs.strength.value = String(marbleLight.strength);
+function updateMarbleLight() {
+  const next = { spot: marbleLightInputs.spot.checked, mode: marbleLightInputs.mode.value,
+    color: marbleLightInputs.color.value, strength: Number(marbleLightInputs.strength.value) };
+  const materialChanged = next.mode !== marbleLight.mode || next.color !== marbleLight.color || next.strength !== marbleLight.strength;
+  Object.assign(marbleLight, next);
+  marbleLightInputs.color.disabled = marbleLightInputs.strength.disabled = marbleLight.mode === "lit";
+  try { localStorage.setItem("meowdoku.marble.light", JSON.stringify(marbleLight)); } catch { /* storage may be blocked */ }
+  if (materialChanged && state.game?.game === "marble_madness") uploadMaterials(state.game);
+}
+for (const input of Object.values(marbleLightInputs)) input.addEventListener("input", updateMarbleLight);
+marbleLightInputs.color.disabled = marbleLightInputs.strength.disabled = marbleLight.mode === "lit";
 let marblePhoneTilt = false;
 let marbleCameraTilt = true;
+let marbleFollow = true;
 try { marblePhoneTilt = localStorage.getItem("meowdoku.marble.phoneTilt") === "1"; } catch { /* storage may be blocked */ }
 try { marbleCameraTilt = localStorage.getItem("meowdoku.marble.cameraTilt") !== "0"; } catch { /* storage may be blocked */ }
+try { marbleFollow = localStorage.getItem("meowdoku.marble.follow") !== "0"; } catch { /* storage may be blocked */ }
 $("marble-phone-tilt").checked = marblePhoneTilt;
 $("marble-camera-tilt").checked = marbleCameraTilt;
+$("marble-follow").checked = marbleFollow;
+$("marble-follow").addEventListener("change", (event) => {
+  marbleFollow = event.target.checked;
+  try { localStorage.setItem("meowdoku.marble.follow", marbleFollow ? "1" : "0"); } catch { /* storage may be blocked */ }
+});
 $("marble-camera-tilt").addEventListener("change", (event) => {
   marbleCameraTilt = event.target.checked;
   if (!marbleCameraTilt) camView.vel.pitch = 0;
@@ -5161,11 +5258,12 @@ for (const stick of Object.values(marbleSticks)) {
   stick.addEventListener("lostpointercapture", release);
 }
 function marbleGravity() {
-  const x = ((marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0)) * 0.7 + Number(marbleSticks.x.value) / 100;
-  const z = ((marbleKeys.has("down") ? 1 : 0) - (marbleKeys.has("up") ? 1 : 0)) * 0.7 + Number(marbleSticks.z.value) / 100;
-  const manual = x !== 0 || z !== 0;
+  const x = ((marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0)) * 0.9 + Number(marbleSticks.x.value) / 100;
+  const down = ((marbleKeys.has("down") ? 1 : 0) - (marbleKeys.has("up") ? 1 : 0)) * 0.9 + Number(marbleSticks.down.value) / 100;
+  const manual = x !== 0 || down !== 0;
   const phone = marblePhoneTilt && !manual && gravitySensor.enabled ? gravitySensor.last : null;
-  compute.setGravity(...marbleGravityVector(x, z, phone));
+  marbleCase.gravity = marbleGravityVector(x, down, phone);
+  compute.setGravity(...marbleCase.gravity);
 }
 // TIP JAR (tipjar.js): the panel, the grain picker and the state poll of the tip jar game (a game state that carries `tipjar`); inert otherwise.
 const tipjar = initTipJar({
@@ -5260,6 +5358,8 @@ if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palett
 // neither, so the scene's sky / background, lights and the glass styles' reflections show through.
 const backdrop = { mode: "floor" };
 try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor" || saved === "backlit") backdrop.mode = saved; } catch { /* storage may be blocked */ }
+$("marble-backlit").checked = backdrop.mode === "backlit";
+$("marble-backlit").addEventListener("change", (event) => localControl({ local: "backdrop" }, event.target.checked ? "backlit" : "floor"));
 const backdropClear = () => backdrop.mode === "clear" && !!isFountainGame(state.game);
 // no dark floor tiles under the fountain: "clear" (nothing) and "backlit" (only the glowing plate)
 const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!isFountainGame(state.game);
@@ -5353,6 +5453,7 @@ function localControl(s, value) {
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
   } else if (s.local === "watchcase") {
     watchCase.on = !!value;
+    $("marble-watch-case").checked = watchCase.on;
     try { localStorage.setItem("meowdoku.watchcase", watchCase.on ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "statusplate") {
     statusPlate.on = !!value;
@@ -5423,6 +5524,7 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
   } else if (s.local === "backdrop") {
     backdrop.mode = value === "clear" || value === "backlit" ? value : "floor";
+    $("marble-backlit").checked = backdrop.mode === "backlit";
     if (isFountainGame(state.game)) { uploadMaterials(state.game); rebuildBoards(state.game); }   // the plate's glow is its material's emission
     try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("pcolor_")) {
@@ -6172,7 +6274,7 @@ function drawBody(b, frame, dh = 0, angle = null, alpha = 1) {                  
 }
 function drawChamberOutline(cam, g, rec) {
   const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: state.caseModel ? M.multiply(cam.viewProj, state.caseModel) : cam.viewProj,
-    view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
+    view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 + marbleCourseLift(g) };
   // the 2-D fountain's server sends its chamber as polylines (g.compute.chamber_outline: the polyline chambers' vertices, the SDF chambers'
   // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
   if (g.compute.chamber_mesh) return;                         // an SDF chamber's walls are the glass mesh (housingFaces)
@@ -6188,7 +6290,7 @@ function drawChamberOutline(cam, g, rec) {
   drawBodyBlur(g.compute.body, frame, u.dh || 0);             // the 3-D fountain's hinged body (waterwheel), extruded through the slab
 }
 function drawCloud(cam, data, g, rec, style, ghost = null) {       // [GHOSTS] `ghost`: a replay layer's colour source (its own packed colour), drawn without the noise filter
-  const y = TILE.height + 0.03;
+  const y = TILE.height + 0.03 + marbleCourseLift(g);
   const pick = colorPick();
   // watch the case move: the grains are in the case's frame, so the case's model turn goes into viewProj and the view (every style reads
   // one of them); the sun's direction (world) is un-turned for the view-space lighting, and the key light's shadow matrix takes the model
@@ -6277,8 +6379,9 @@ function litPass(cam, now, casters, opts = {}) {
   const arcadeOn = !state.flat && layerOn("arcade");
   const house = arcadeOn ? 1.0 : 1.6;
   const bulbs = arcadeOn ? arcadeBulbs() : [];
+  const mountedBulbs = state.caseModel && isFountainGame(state.game) ? bulbs.map((p) => M.apply(state.caseModel, p)) : bulbs;
   const bulbStates = bulbs.map((_, i) => arcadeBulb(i, bulbs, now));
-  const bulbLights = bulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[bulbStates[i].ci],
+  const bulbLights = mountedBulbs.map((p, i) => ({ view: M.apply(cam.view, p), colour: ARCADE.colours[bulbStates[i].ci],
                                            level: bulbStates[i].level }));
   // Lightning lights the scene: each strike is a blue-white point light at
   // the cloud, the impact and the bolt's middle, fading with the strike.
@@ -6287,8 +6390,10 @@ function litPass(cam, now, casters, opts = {}) {
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
   bulbLights.push(...intentSpot(cam, now));
+  const courseSpot = marbleSpot(cam);
+  if (courseSpot) bulbLights.push(courseSpot);
   const plate = backlightEmitter();
-  if (plate) bulbLights.push({ view: M.apply(cam.view, plate.at), colour: BACKLIGHT_COLOUR, level: 0, intensity: plate.area, group: PLATE_GROUP });
+  if (plate) bulbLights.push({ view: M.apply(cam.view, state.caseModel ? M.apply(state.caseModel, plate.at) : plate.at), colour: BACKLIGHT_COLOUR, level: 0, intensity: plate.area, group: PLATE_GROUP });
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -6345,18 +6450,24 @@ function litPass(cam, now, casters, opts = {}) {
     const orb = state.meshes.__sphere;
     if (state.game && state.game.game === "marble_madness") {
       const goal = state.game.marble.goal, at = lawToWorld(state.game)(goal.x, goal.y, 0);
-      drawLit(orb.vao, orb.count, M.multiply(M.translate(...at), M.scale(0.12, 0.12, 0.12)), state.materialIndex.nav_green);
+      const mounted = state.caseModel ? M.apply(state.caseModel, at) : at;
+      drawLit(orb.vao, orb.count, M.multiply(M.translate(...mounted), M.scale(0.12, 0.12, 0.12)), state.materialIndex.nav_green);
     }
     if (lampAmount > 0.1 && state.meshes.bulb) {
       const bulb = state.meshes.bulb;
       drawLit(bulb.vao, bulb.count, M.multiply(M.translate(...light.position), M.scale(0.54, 0.54, 0.54)),
         state.materialIndex[`night_lamp_${nightLamp.color}`]);
     } else drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
-    bulbs.forEach((p, i) => {
+    mountedBulbs.forEach((p, i) => {
       const { level, ci } = bulbStates[i];
       const step = ARCADE_LEVELS.reduce((best, v, k) => (Math.abs(v - 2.4 * level) < Math.abs(ARCADE_LEVELS[best] - 2.4 * level) ? k : best), 0);
       drawLit(orb.vao, orb.count, M.multiply(M.translate(...p), M.scale(0.075, 0.075, 0.075)), state.materialIndex[`bulb${ci}_${step}`]);
     });
+    if (courseSpot && state.meshes.bulb) {
+      const mesh = state.meshes.bulb;
+      drawLit(mesh.vao, mesh.count, M.multiply(M.translate(...courseSpot.at), M.scale(0.26, 0.26, 0.26)),
+        state.materialIndex.night_lamp_neutral);
+    }
     for (const nav of markerLights(now)) drawLit(orb.vao, orb.count, M.multiply(M.translate(...nav.at), M.scale(nav.size, nav.size, nav.size)), state.materialIndex[nav.material]);
   }
   drawCockpit(cam, drawLit);
@@ -6391,6 +6502,12 @@ function litPass(cam, now, casters, opts = {}) {
 const watchCase = { on: false };
 try { watchCase.on = localStorage.getItem("meowdoku.watchcase") === "1"; } catch { /* storage may be blocked */ }
 if (new URLSearchParams(location.search).get("studio") === "1") watchCase.on = true;
+$("marble-watch-case").checked = watchCase.on;
+$("marble-watch-case").addEventListener("change", (event) => {
+  watchCase.on = event.target.checked;
+  try { localStorage.setItem("meowdoku.watchcase", watchCase.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+  refreshLocalControls();
+});
 function caseAngleNow() {
   if (cameraGravity) return 0;                                     // (camera-down gravity turns nothing: the case is still)
   const forced = window.meowdokuDebug.caseTime;
@@ -6399,6 +6516,23 @@ function caseAngleNow() {
 }
 function caseModelNow() {
   if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
+  if (state.game.game === "marble_madness") {
+    // The law's X/Y plane is horizontal here. Rotate its gravity vector onto
+    // world down so the rendered course tips as the physical controls do.
+    const [gx, gy, gz] = marbleCase.gravity;
+    const sx = -gy, sz = -gx, magnitude = Math.hypot(sx, sz);
+    if (magnitude < 1e-6) return M.identity();
+    const x = sx / magnitude, z = sz / magnitude, c = Math.max(-1, Math.min(1, -gz));
+    const s = magnitude, t = 1 - c;
+    const turn = new Float32Array([
+      t*x*x+c, z*s, t*x*z, 0,
+      -z*s, c, x*s, 0,
+      t*x*z, -x*s, t*z*z+c, 0,
+      0, 0, 0, 1,
+    ]);
+    const cx = extMidX(), cy = TILE.height + 0.03, cz = extMidZ();
+    return M.multiply(M.translate(cx, cy, cz), M.multiply(turn, M.translate(-cx, -cy, -cz)));
+  }
   return caseModel(caseAngleNow(), extMidX(), extMidZ(), compute.caseAxis || "y", TILE.height + 0.03);
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
@@ -6415,8 +6549,8 @@ function draw(ms) {
   gl.viewport(0, 0, w, h); gl.clearColor(...clear, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(drawFrame); return; }
-  const cam = camera(); updateLight(now);
   state.caseModel = caseModelNow();
+  const cam = camera(); updateLight(now);
   updateHousing();
   updateQrWall();                                                                   // [QRWALL]
   wheelBlurFrame(state.game, cam);
@@ -6427,6 +6561,8 @@ function draw(ms) {
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
   if (state.rackButtons && !glassTiles) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   state.marblePreview = state.flat ? null : marblePreview();
+  if (state.marblePreview && state.game.game === "marble_madness" && state.caseModel)
+    state.marblePreview.model = M.multiply(state.caseModel, state.marblePreview.model);
   if (state.marblePreview?.interior) casters.push([state.marblePreview.interior.vao, state.marblePreview.interior.count, state.marblePreview.model, null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {

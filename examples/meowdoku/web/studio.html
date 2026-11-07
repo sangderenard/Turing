@@ -50,7 +50,7 @@
   <span class="row"><span class="hint">phase</span><span id="phases" class="row"></span></span>
   <span class="row" style="margin-left:auto">
     <label style="grid-auto-flow:column;align-items:center;gap:8px"><span class="hint">owner token</span>
-      <input id="token" type="password" autocomplete="off" placeholder="admin token (activate / delete)" size="30"></label>
+      <input id="token" type="password" autocomplete="off" placeholder="admin token (graduate / activate / delete)" size="30"></label>
     <span id="tokenNote" class="hint"></span>
   </span>
 </header>
@@ -82,7 +82,13 @@
   </section>
 
   <section>
-    <h2>Library <span class="hint" id="libNote"></span></h2>
+    <h2>Temporary Fountain captures <span class="hint" id="candidateNote"></span></h2>
+    <p class="hint">Record compact visual motion in Fountain or Fountain3D, then submit it here. Captures expire after three days. Graduate one to keep it permanently; making it active is a separate action.</p>
+    <div class="grid" id="candidates"></div>
+  </section>
+
+  <section>
+    <h2>Permanent library <span class="hint" id="libNote"></span></h2>
     <div id="libMsg" class="msg"></div>
     <div class="grid" id="lib"></div>
   </section>

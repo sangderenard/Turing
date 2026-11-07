@@ -182,17 +182,20 @@ async function loadLibrary() {
     const body = await r.json();
     S.entries = body.entries || []; S.active = body.active;
     const c = body.caps || {};
-    $("libNote").textContent = `${S.entries.length}/${c.max_entries} recordings, ${kb(c.used_bytes || 0)} of ${kb(c.max_bytes || 0)}`;
+    const candidates = S.entries.filter((e) => e.expires_at);
+    $("candidateNote").textContent = `${candidates.length}/${c.max_temporary_entries || 8} awaiting graduation, ${kb(c.temporary_bytes || 0)} of ${kb(c.max_temporary_bytes || 8 * 1048576)}`;
+    $("libNote").textContent = `${S.entries.length - candidates.length} permanent / ${S.entries.length}/${c.max_entries} total, ${kb(c.used_bytes || 0)} of ${kb(c.max_bytes || 0)}`;
   } catch (error) { $("libMsg").textContent = `could not read the library: ${error.message}`; $("libMsg").className = "msg err"; }
   if (S.A && !S.entries.some((e) => e.digest === S.A)) S.A = null;
   if (S.B && !S.entries.some((e) => e.digest === S.B)) S.B = null;
   if (S.playing && !S.entries.some((e) => e.digest === S.playing)) S.playing = null;
   paintCards(); showScreen(); paintCompare();
 }
-const paramsLine = (p) => (p && p.chamber ? `${p.chamber.replace("sdf_", "")}, ${p.size}, ${p.kept_grains || p.grains} grains, ${p.bits} bit, ${p.fps} fps, ${p.turns} turns, grain x${Number(p.grainScale).toFixed(2)}${p.mix === "default" ? "" : `, mix ${p.mix}`}` : (p && p.migrated ? "migrated from the single-file store" : ""));
+const paramsLine = (p) => (p && p.chamber ? `${p.chamber.replace("sdf_", "")}, ${p.size}, ${p.kept_grains || p.grains} grains, ${p.bits} bit, ${p.fps} fps, ${p.turns} turns, grain x${Number(p.grainScale).toFixed(2)}${p.mix === "default" ? "" : `, mix ${p.mix}`}` : (p && p.source ? `${p.source}${p.size ? ` ${p.size}` : ""}, visual-only${p.projected_3d ? " (3-D motion projected to X/Y)" : ""}, ${p.bits} bit, ${p.fps} fps` : (p && p.migrated ? "migrated from the single-file store" : "")));
 function paintCards() {
-  const box = $("lib"); box.textContent = "";
-  if (!S.entries.length) { const p = document.createElement("p"); p.className = "hint"; p.textContent = "Nothing recorded yet: players see the procedural hourglass. Record one above."; box.appendChild(p); return; }
+  const box = $("lib"), shelf = $("candidates"); box.textContent = ""; shelf.textContent = "";
+  if (!S.entries.some((e) => !e.expires_at)) { const p = document.createElement("p"); p.className = "hint"; p.textContent = "No permanent recordings yet: players see the procedural hourglass until one is made active."; box.appendChild(p); }
+  if (!S.entries.some((e) => e.expires_at)) { const p = document.createElement("p"); p.className = "hint"; p.textContent = "No temporary captures. Start one from the Fountain or Fountain3D game controls."; shelf.appendChild(p); }
   for (const e of S.entries) {
     const card = document.createElement("div"); card.className = "card" + (e.active ? " active" : "") + (e.digest === S.playing ? " sel" : "");
     const cv = document.createElement("canvas"); cv.width = 320; cv.height = 240; card.appendChild(cv);
@@ -202,15 +205,18 @@ function paintCards() {
     const line1 = document.createElement("div"); line1.textContent = `${(e.date || "").replace("T", " ").replace("Z", "")}  ${e.frames} frames, ${e.grains} grains`;
     const line2 = document.createElement("div"); line2.textContent = `raw ${kb(e.raw_bytes)} / codec ${kb(e.bytes)} (${(100 * e.bytes / e.raw_bytes).toFixed(1)}%)`;
     const line3 = document.createElement("div"); line3.textContent = paramsLine(e.params);
-    meta.append(title, line1, line2, line3); card.appendChild(meta);
+    meta.append(title, line1, line2, line3);
+    if (e.expires_at) { const expiry = document.createElement("div"); expiry.textContent = `Expires ${e.expires_at.replace("T", " ").replace("Z", " UTC")}`; meta.appendChild(expiry); }
+    card.appendChild(meta);
     const btns = document.createElement("div"); btns.className = "btns";
     const mk = (text, fn, cls) => { const x = document.createElement("button"); x.textContent = text; if (cls) x.className = cls; x.addEventListener("click", fn); btns.appendChild(x); return x; };
     mk("Play", () => { S.playing = e.digest; paintCards(); showScreen(); window.scrollTo({ top: 0, behavior: "smooth" }); });
     mk(S.A === e.digest ? "A ✓" : "A", () => { S.A = e.digest; paintCompare(); paintCards(); });
     mk(S.B === e.digest ? "B ✓" : "B", () => { S.B = e.digest; paintCompare(); paintCards(); });
-    mk("Make active", async () => { await ownerAction("/api/loading_library/activate", e, "made active"); }).disabled = e.active;
+    if (e.expires_at) mk("Keep permanently", async () => { await ownerAction("/api/loading_library/graduate", e, "graduated to the permanent library"); });
+    else mk("Make active", async () => { await ownerAction("/api/loading_library/activate", e, "made active"); }).disabled = e.active;
     mk("Delete", async () => { if (confirm(`Delete recording ${e.digest.slice(0, 8)}${e.active ? " (the ACTIVE one: players get the procedural hourglass until another is made active)" : ""}?`)) await ownerAction("/api/loading_library/delete", e, "deleted"); }, "danger");
-    card.appendChild(btns); box.appendChild(card);
+    card.appendChild(btns); (e.expires_at ? shelf : box).appendChild(card);
     thumb(e, cv);
     card.addEventListener("pointerenter", () => { S.hover = { digest: e.digest, cv, t0: performance.now() }; });
     card.addEventListener("pointerleave", () => { if (S.hover && S.hover.cv === cv) S.hover = null; });

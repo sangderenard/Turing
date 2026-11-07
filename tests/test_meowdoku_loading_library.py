@@ -82,6 +82,25 @@ def test_caps(tmp_path, monkeypatch):
         lib.put(_raw(11))
 
 
+def test_temporary_capture_graduation_and_expiry(tmp_path, monkeypatch):
+    lib = L.Library(tmp_path)
+    candidate = lib.put(_raw(23), {"source": "fountain3d", "projected_3d": True}, temporary=True)
+    digest = candidate["digest"]
+    assert candidate["expires_at"] and lib.active_digest() is None
+    assert lib.read(digest) and lib.entries()[0]["expires_at"] == candidate["expires_at"]
+    with pytest.raises(KeyError):
+        lib.activate(digest)
+    permanent = lib.graduate(digest)
+    assert "expires_at" not in permanent and "expires_at" not in L.Library(tmp_path).meta(digest)
+    assert lib.activate(digest)["digest"] == digest
+
+    monkeypatch.setattr(L, "TEMP_SECONDS", -1)
+    expired = lib.put(_raw(24), temporary=True)["digest"]
+    assert expired not in [entry["digest"] for entry in lib.entries()]
+    assert not (lib.root / f"{expired}.mla").exists()
+    assert not (lib.root / f"{expired}.json").exists()
+
+
 def test_migrates_the_old_single_file_as_the_active_entry(tmp_path):
     raw = _raw(5)
     packet = L.pack(raw)
@@ -164,6 +183,24 @@ def test_saves_go_to_the_library_and_the_first_is_active(server):
     assert status == 200 and lib["active"] == r1["stored"]["digest"] and len(lib["entries"]) == 2 and lib["caps"]["entries"] == 2
     assert {e["digest"]: e["params"] for e in lib["entries"]}[r1["stored"]["digest"]] == {"chamber": "sdf_circle", "bits": 10}
     assert "token" not in json.dumps(lib).lower()
+
+
+def test_temporary_upload_requires_graduation_before_activation(server):
+    port, sessions = server
+    raw = _raw(31)
+    headers = {"X-Meowdoku-Loading": "1", "Content-Type": "application/octet-stream"}
+    status, body, _ = _req(port, "POST", "/api/loading_candidate", raw, headers)
+    assert status == 201
+    candidate = json.loads(body)["stored"]
+    digest = candidate["digest"]
+    assert candidate["expires_at"] and not candidate["active"]
+    assert _req(port, "GET", "/api/loading_anim")[0] == 404
+    assert _req(port, "GET", f"/api/loading_anim?v={digest}")[0] == 200
+    assert _owner(port, "activate", digest)[0] == 404
+    status, reply = _owner(port, "graduate", digest)
+    assert status == 200 and "expires_at" not in reply["entry"]
+    assert _owner(port, "activate", digest)[0] == 200
+    assert L.unpack(_req(port, "GET", "/api/loading_anim")[1]) == raw
 
 
 def test_loading_anim_serves_the_active_entry(server):

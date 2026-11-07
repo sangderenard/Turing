@@ -811,15 +811,15 @@ def make_handler(sessions: Sessions):
             self.end_headers()
             self.wfile.write(body)
 
-        def _anim_post(self, length: int) -> None:
-            """Accept a loading animation (the raw MLA1 stream the page filtered from its state memory): only when none exists, only a
-            valid stream under the size cap, from a same-origin script (the custom header forces a CORS preflight no one answers),
-            a few tries per address, one compression at a time.  The octet codec packs it; the packet is what is stored."""
+        def _anim_post(self, length: int, *, temporary: bool = False) -> None:
+            """Accept a filtered MLA1 stream from Studio or a Fountain capture. Candidate uploads are temporary and never activate;
+            permanent Studio uploads can activate only when the library has no active entry. The custom header forces a CORS
+            preflight, and all uploads share the size cap, per-address rate limit, and single compressor."""
             self._set_cookie = []
             def refuse(message, status):
                 self.close_connection = True                       # the body may be unread
                 return self._json({"error": message}, status)
-            if not access_mod.require_tier(self, "edit"):          # [ACCESS] recording the animation is an owner tool
+            if not access_mod.require_tier(self, "play" if temporary else "edit"):
                 return
             if self.headers.get("X-Meowdoku-Loading") != "1":
                 return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
@@ -840,7 +840,7 @@ def make_handler(sessions: Sessions):
                     params = json.loads(unquote(self.headers.get("X-Meowdoku-Params") or "")[:anim_mod.MAX_PARAMS_BYTES] or "{}")
                 except ValueError:
                     params = {}
-                return self._json({"stored": sessions.anim.put(raw, params)}, HTTPStatus.CREATED)
+                return self._json({"stored": sessions.anim.put(raw, params, temporary=temporary)}, HTTPStatus.CREATED)
             except anim_mod.AnimError as error:
                 return self._json({"error": f"not a valid animation: {error}"}, HTTPStatus.BAD_REQUEST)
             except anim_mod.LibraryFull as error:
@@ -848,13 +848,13 @@ def make_handler(sessions: Sessions):
             finally:
                 sessions.anim_busy.release()
 
-        # ---- [STUDIO] the library listing (anyone), and the owner's two verbs: make active, delete
+        # ---- [STUDIO] the library listing (anyone), and the owner's activation, graduation, deletion
         def _library_get(self) -> None:
             self._set_cookie = []
             self._json({"entries": sessions.anim.entries(), "active": sessions.anim.active_digest(), "caps": sessions.anim.caps()})
 
         def _library_post(self, path: str, length: int) -> None:
-            """``/api/loading_library/activate`` and ``/delete`` with ``{"digest": ...}``: what every player sees changes, so the owner's
+            """``/api/loading_library/activate``, ``/graduate`` and ``/delete`` with ``{"digest": ...}``: library state changes, so the owner's
             lifecycle admin token (header ``X-Meowdoku-Admin``, never a URL; constant-time compare) over HTTPS only, a few wrong tries per
             address.  The server never prints or sends the token."""
             self._set_cookie = []
@@ -889,7 +889,8 @@ def make_handler(sessions: Sessions):
                 return refuse(why, status)
             try:
                 digest = str(json.loads(self.rfile.read(length) or b"{}").get("digest", ""))
-                done = sessions.anim.activate(digest) if path.endswith("/activate") else sessions.anim.delete(digest)
+                done = (sessions.anim.activate(digest) if path.endswith("/activate") else
+                        sessions.anim.graduate(digest) if path.endswith("/graduate") else sessions.anim.delete(digest))
             except KeyError:
                 return self._json({"error": "no such library entry"}, HTTPStatus.NOT_FOUND)
             except (ValueError, TypeError, AttributeError):
@@ -953,8 +954,8 @@ def make_handler(sessions: Sessions):
                 print(f"[client-error] {self.client_address[0]}: {line}", flush=True)
                 self.send_response(204); self.end_headers()
                 return
-            if path0 == "/api/loading_anim" and not self._is_viewer():
-                return self._anim_post(int(self.headers.get("Content-Length") or 0))
+            if path0 in ("/api/loading_anim", "/api/loading_candidate") and not self._is_viewer():
+                return self._anim_post(int(self.headers.get("Content-Length") or 0), temporary=path0.endswith("candidate"))
             if path0 == "/api/marble_objects" and not self._is_viewer():
                 if not access_mod.require_tier(self, "edit"):
                     return
@@ -991,7 +992,7 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.marble_photos.cancel(digest))
                 except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
-            if path0 in ("/api/loading_library/activate", "/api/loading_library/delete") and not self._is_viewer():     # [STUDIO]
+            if path0 in ("/api/loading_library/activate", "/api/loading_library/delete", "/api/loading_library/graduate") and not self._is_viewer():     # [STUDIO]
                 if not access_mod.require_tier(self, "edit"):          # [ACCESS] the tier is in addition to the owner token checked inside
                     return
                 return self._library_post(path0, int(self.headers.get("Content-Length") or 0))
