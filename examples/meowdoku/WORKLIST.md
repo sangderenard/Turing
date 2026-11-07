@@ -17,6 +17,12 @@ deploy to 8766 as soon as work lands.
 - the first target is a ROTATING POLYGON container or drum that sorts grains (size and shape segregation: the rotating-drum / Brazil-nut effects), so it needs the detailed per-species size distribution, roughness and shape irregularity at the same time;
 - the fixed shapes can later use the baked distance-field colliders (prebake item).
 
+## Fountain physics follow-ups (the user, 2026-11-06)
+
+- **Rotating-frame forces (in progress, the 3D job's next landing):** case spin and rock only rotate gravity today, so at gravity 0 they do nothing. Fix: in the case frame add the Coriolis, centrifugal and Euler terms from runtime uniforms omega, domega and the pivot; the page writes them from the spin or rock motion.
+- **Solvent flow (later):** a moving interstitial fluid with buoyancy and displacement (the space around grains), so real liquids and gases can be modelled; today's fluid is a still medium (drag + buoyancy only).
+- **Watch the case move (in progress, a render job):** a toggle (default off: the camera rides with the case) that rotates the fountain's objects in the world by the case angle; plus the backlit slide image on the plate (positive or negative) through the plate material's texture layers.
+
 ## Render priority (the user, 2026-11-06)
 
 1. Colour modes: grain size, species breakdown; palettes (sea first); "stained glass" grains through the scene's Phong + glass pass; no opaque black backdrop behind the fountain.
