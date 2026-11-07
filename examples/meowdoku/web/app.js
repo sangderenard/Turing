@@ -1275,11 +1275,13 @@ function uploadMaterials(game) {
   records.push(["gloss", [0.8, 0.8, 0.8], { roughness: 0.06, ior: 1.6, specular: 0.8, shininess: 120 }]);
   records.push(["metal", [0.9, 0.8, 0.55], { roughness: 0.12, metallic: 1.0, ior: 1.5, specular: 0.9, shininess: 90 }]);
   // (the fountain's glass slab matches its dark floor)
-  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
+  const backlit = game.game === "fountain" && typeof backdrop !== "undefined" && backdrop.mode === "backlit";
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : backlit ? [0.92, 0.93, 0.95] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
-      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5,
-          // the backlight (backdrop "backlit"): the plate glows a mild white from within
-          ...(typeof backdrop !== "undefined" && backdrop.mode === "backlit" ? { emission: [0.32, 0.32, 0.34] } : {}) }
+      // the backlight (backdrop "backlit"): a white diffusing plate glowing from within (the lights under it, see litPass,
+      // are what light the grains: an emissive surface glows but lights nothing)
+      : backlit ? { roughness: 0.5, transmission: 0.6, opacity: 0.88, ior: 1.5, emission: [0.55, 0.55, 0.57] }
+      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
@@ -4074,6 +4076,16 @@ if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palett
 const backdrop = { mode: "floor" };
 try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor" || saved === "backlit") backdrop.mode = saved; } catch { /* storage may be blocked */ }
 const backdropClear = () => backdrop.mode === "clear" && !!state.game && state.game.game === "fountain";
+// no dark floor tiles under the fountain: "clear" (nothing) and "backlit" (only the glowing plate)
+const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!state.game && state.game.game === "fountain";
+// the backlight's lamps: a row of point lights a little under the plate, in the scene's light list (board frame)
+function backlightLamps() {
+  if (!(backdrop.mode === "backlit" && state.game && state.game.game === "fountain" && !state.flat)) return [];
+  const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth, lamps = [];
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++)
+    lamps.push([w * (i + 0.5) / 3, -0.6, z0 + (d - z0) * (j + 0.5) / 2]);
+  return lamps;
+}
 window.meowdokuDebug.backdrop = backdrop; window.meowdokuDebug.budget = MATERIAL_BUDGET;
 window.meowdokuDebug.pcolor = pcolor;
 // the scene's declared materials a grain may take (name@variants are the pieces' own states of one material)
@@ -4415,6 +4427,7 @@ window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) =>
 // The lit scene from ``cam`` into whatever framebuffer is bound: the main
 // view, or the projection glass's broadcast camera (opts.plate: draw the
 // glass itself -- never into its own broadcast).
+const BACKLIGHT_LAMP = 0.05;                  // each backlight lamp's intensity per span^2 (6 lamps: ~1.6x the scene's fill light)
 function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
   const P = state.programs.phong; gl.useProgram(P);
@@ -4455,6 +4468,7 @@ function litPass(cam, now, casters, opts = {}) {
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
   bulbLights.push(...intentSpot(cam, now));
+  for (const at of backlightLamps()) bulbLights.push({ view: M.apply(cam.view, at), colour: [1.0, 0.98, 0.95], level: 0, intensity: BACKLIGHT_LAMP * span * span });
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -4541,7 +4555,7 @@ function draw(ms) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
-  const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropClear()) ? []
+  const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropNoFloor()) ? []
     : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
