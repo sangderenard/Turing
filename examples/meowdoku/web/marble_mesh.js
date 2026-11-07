@@ -65,7 +65,7 @@ export function catEyeMarble(materials, options = {}) {
       const theta = Math.PI * i / o.rings, phi = TAU * j / o.segments;
       const s = Math.max(0, Math.sin(theta)), y = o.eyeLength * Math.cos(theta);
       const t = y / o.eyeLength, centre = o.eyeCurve * (1 - t*t);
-      const angle = 0.12 * lane + o.ribbonTwist * t + 0.18 * Math.sin(theta + phase);
+      const angle = 0.38 * lane + o.ribbonTwist * t + 0.18 * Math.sin(theta + phase);
       const ux = Math.cos(angle), uz = Math.sin(angle), vx = -uz, vz = ux;
       const width = o.eyeWidth * (0.46 + 0.08 * Math.sin(phase + strand)) * Math.pow(s, o.ribbonTip)
         * (1 + o.ribbonFlare * Math.sin(2 * theta + phase) * s);
@@ -74,10 +74,11 @@ export function catEyeMarble(materials, options = {}) {
       // narrow rounded edges without open seams at a twist or at a tip.
       const p = Math.sign(Math.cos(phi)) * Math.sqrt(Math.abs(Math.cos(phi)));
       const q = Math.sign(Math.sin(phi)) * Math.sqrt(Math.abs(Math.sin(phi)));
-      const offset = lane * Math.min(0.07, 0.22 / Math.max(1, o.strandCount - 1));
+      const spread = Math.min(0.12, 0.30 / Math.max(1, (o.strandCount - 1) / 2));
+      const offsetX = lane * spread, offsetZ = lane * Math.min(0.07, spread * 0.7);
       const sway = 0.024 * Math.sin(2 * theta + phase) * s*s;
-      return [centre + 0.35 * offset + sway + width * p * ux + thick * q * vx,
-        y, offset + width * p * uz + thick * q * vz];
+      return [centre + offsetX + sway + width * p * ux + thick * q * vx,
+        y, offsetZ + width * p * uz + thick * q * vz];
     };
     const normal = (i, j) => {
       if (i <= 0) return [0, 1, 0];
