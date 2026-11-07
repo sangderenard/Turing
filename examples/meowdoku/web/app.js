@@ -4046,7 +4046,7 @@ window.meowdokuDebug.noiseFx = noiseFx;
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
   return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin) }[s.local] ?? s.value;
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), record: recordOn, spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4054,9 +4054,17 @@ function localControl(s, value) {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
+  } else if (s.local === "spinmotion") {
+    spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
+  } else if (s.local === "spinarc") {
+    spinMotion.arc = Number(value); saveSpinMotion();
+  } else if (s.local === "record") {
+    recordOn = !!value;
+    compute.setRecording(recordOn);
+    try { localStorage.setItem("meowdoku.record", recordOn ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "spin") {
     caseSpin = spinFromSlider(value);
-    compute.setSpin(caseSpin);
+    compute.setSpin(caseSpin, spinMotion);
     try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
     particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
@@ -4101,8 +4109,21 @@ function refreshLocalControls() {
       el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
       const input = el.querySelector("input, select");
       if (input) input.disabled = !choice.on;
+    } else if (s.local === "spinmotion" || s.local === "spinarc") {
+      const input = el.querySelector("input, select");
+      if (document.activeElement !== input) input.value = String(s.local === "spinmotion" ? spinMotion.kind : spinMotion.arc);
+      if (s.local === "spinarc") {
+        el.querySelector("span").textContent = `rock arc ${spinMotion.arc}° `;
+        input.disabled = spinMotion.kind !== "rock";
+        el.title = "the swing: gravity rocks +-half this angle about straight down, one swing out and back per cycle at the case spin rate";
+      } else el.title = "rotate: a full turn per cycle; rock: swing through the arc at the case spin rate";
+    } else if (s.local === "record") {
+      el.querySelector("input").checked = recordOn;
+      el.title = recordOn ? "frames and keyframes are read back and kept (memory-capped window): Replay, Bounce, Continue"
+                          : "off: only the display's few frames are read back; switch on to record";
     } else {
-      el.disabled = !st.ready || (s.local === "continue" ? st.mode === "live" : s.local === "rebirth" ? false : st.frames === 0);
+      el.disabled = !st.ready || (s.local === "rebirth" ? false : !st.recording || (s.local === "continue" ? st.mode === "live" : st.frames === 0));
+      if (s.local !== "rebirth") el.title = st.recording ? "" : "switch on record (readback) to keep frames for this";
       el.classList.toggle("on", s.local === st.mode);
     }
   }
@@ -4131,14 +4152,32 @@ function spinText(hz) {
   const per = period < 120 ? `${period.toPrecision(3)} s` : period < 7200 ? `${(period / 60).toPrecision(3)} min` : `${(period / 3600).toPrecision(3)} h`;
   return `${hz < 0 ? "-" : ""}${a.toPrecision(2)} Hz (1 turn / ${per})`;
 }
+// How the case moves at the spin rate: a full rotation, or a rock through an arc (degrees, centred on straight down).
+const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"]] };
+const ARC_SPEC = { id: "spinarc", kind: "range", label: "rock arc", min: 0, max: 360, step: 1, local: "spinarc" };
+function saveSpinMotion() {
+  compute.setSpin(caseSpin, spinMotion);
+  try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
+}
+// Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
+const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 function pageSpecs(specs) {
   if (!specs || specs.some((s) => s.id === SPIN_SPEC.id)) return specs;
-  const at = specs.findIndex((s) => s.local === "tilt");
-  return at < 0 ? specs : [...specs.slice(0, at + 1), SPIN_SPEC, ...specs.slice(at + 1)];
+  let out = specs;
+  const tilt = out.findIndex((s) => s.local === "tilt");
+  if (tilt >= 0) out = [...out.slice(0, tilt + 1), SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...out.slice(tilt + 1)];
+  const run = out.findIndex((s) => s.local === "rebirth");
+  if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
+  return out;
 }
+let recordOn = false;
+try { recordOn = localStorage.getItem("meowdoku.record") === "1"; } catch { /* storage may be blocked */ }
+compute.setRecording(recordOn);
 let caseSpin = 0;
+let spinMotion = { kind: "spin", arc: 60 };
+try { spinMotion = { ...spinMotion, ...JSON.parse(localStorage.getItem("meowdoku.spinmotion") || "{}") }; } catch { /* storage may be blocked */ }
 try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
-compute.setSpin(caseSpin);
+compute.setSpin(caseSpin, spinMotion);
 function renderGameControls(game) {
   const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;

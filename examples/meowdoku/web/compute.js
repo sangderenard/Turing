@@ -438,8 +438,9 @@ export class SettleDetector {
 const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
 // the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
 // turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
-export function spinGravity(hz, t) {
-  const a = 2 * Math.PI * hz * t;
+export function spinGravity(hz, t, motion = { kind: "spin" }) {
+  const phase = 2 * Math.PI * hz * t;
+  const a = motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;
   return [Math.sin(a), -Math.cos(a)];
 }
 const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)
@@ -546,7 +547,24 @@ export class ComputeRuntime {
     let snap = Math.max(1, Math.round(1 / (60 * dt)));
     while (set.sample % snap) snap--;
     this.tape = new Recording({ snapEvery: snap, frameBytes: product.frameBytes, capBytes: this.capBytes, keyEvery: snap * Math.max(1, Math.round(1 / (dt * snap))) });
+    this.#recordCap();
     this.ready = true;
+  }
+
+  // RECORDING (readback saving) is OFF by default and switchable: off, the window holds only what the display needs (the
+  // pump's lead plus a margin) and no keyframe state copies are read back, so Replay / Bounce / Continue are unavailable
+  // (Rebirth needs nothing recorded).  On, the window grows to the memory cap and keyframes are kept again.
+  setRecording(on) {
+    this.recordOn = !!on;
+    if (!this.tape) return;
+    this.#recordCap();
+    if (!this.recordOn) this.#release({ keys: this.tape.keys.splice(0) });
+    this.onStatus();
+  }
+
+  #recordCap() {
+    const t = this.tape;
+    t.capFrames = this.recordOn ? Math.max(2, Math.floor(this.capBytes / t.frameBytes)) : LEAD_FRAMES + 4;
   }
 
   // give the recording's frames and keyframes back (frames to the product's pool, keyframes to the device)
@@ -561,7 +579,7 @@ export class ComputeRuntime {
   #inputsNow() {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
-    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt) : this.gravity;
+    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (g) {
       const G = this.manifest.law.gravity;
       out.grav_x = g[0] * G; out.grav_y = g[1] * G;
@@ -584,9 +602,11 @@ export class ComputeRuntime {
   // A SPINNING CASE: gravity turns at ``hz`` revolutions per SIMULATED second (negative = clockwise), as if the box rotated
   // at a prescribed speed; 0 or null stops it.  The angle follows the law's own step count (not the wall clock), so a
   // free-running or replayed run turns the same way, and it overrides the phone's gravity while it runs.
-  setSpin(hz) {
+  // ``motion``: "spin" (a full turn per cycle) or "rock" (gravity swings sinusoidally through ``arc`` degrees, centred on
+  // straight down, one swing out and back per cycle) -- a scripted rocker until the teeter-totter case is a law body.
+  setSpin(hz, motion = this.spinMotion || { kind: "spin", arc: 60 }) {
     const next = hz ? Number(hz) : null;
-    if (next === this.spin) return;
+    this.spinMotion = { kind: motion.kind === "rock" ? "rock" : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)) };
     this.spin = next;
     this.#kick();
   }
@@ -721,7 +741,12 @@ export class ComputeRuntime {
     if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
     if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
     // the inputs change only between batches: a spinning case keeps each batch to SPIN_TURN of a revolution
-    if (this.spin) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (Math.abs(this.spin) * this.manifest.law.dt * snap))));
+    if (this.spin) {
+      // the fastest the gravity angle turns, in revolutions per simulated second: |hz| for a spin, pi * arc/360 * |hz| at the
+      // middle of a rock's swing
+      const rate = Math.abs(this.spin) * (this.spinMotion && this.spinMotion.kind === "rock" ? Math.PI * this.spinMotion.arc / 360 : 1);
+      if (rate > 0) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (rate * this.manifest.law.dt * snap))));
+    }
     return m;
   }
 
@@ -732,7 +757,7 @@ export class ComputeRuntime {
     for (let j = 0; j < m; j++) {
       const at = base + (j + 1) * snap;
       if (settle ? at % set.sample === 0 : (j === m - 1 && now - this.diagAt > DIAG_MS)) diagAt.push(j);
-      if (at % keyEvery === 0) keyAt.push(j);
+      if (this.recordOn && at % keyEvery === 0) keyAt.push(j);
     }
     if (diagAt.length && !settle) this.diagAt = now;
     this.steps += m * snap; this.inflight++;
@@ -831,7 +856,7 @@ export class ComputeRuntime {
 
   // what the page's controls show about the run modes
   localState() {
-    return { tilt: this.gravity !== null, mode: this.play.mode, frames: this.tape ? this.tape.length : 0, ready: this.ready };
+    return { tilt: this.gravity !== null, mode: this.play.mode, frames: this.tape ? this.tape.length : 0, ready: this.ready, recording: !!this.recordOn };
   }
 
   energyText() {
