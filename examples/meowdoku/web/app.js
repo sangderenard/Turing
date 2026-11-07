@@ -5117,8 +5117,16 @@ for (const type of ["keydown", "keyup"]) window.addEventListener(type, (event) =
 window.addEventListener("blur", () => marbleKeys.clear());
 const marbleSticks = { x: $("marble-stick-x"), z: $("marble-stick-z") };
 let marblePhoneTilt = false;
+let marbleCameraTilt = true;
 try { marblePhoneTilt = localStorage.getItem("meowdoku.marble.phoneTilt") === "1"; } catch { /* storage may be blocked */ }
+try { marbleCameraTilt = localStorage.getItem("meowdoku.marble.cameraTilt") !== "0"; } catch { /* storage may be blocked */ }
 $("marble-phone-tilt").checked = marblePhoneTilt;
+$("marble-camera-tilt").checked = marbleCameraTilt;
+$("marble-camera-tilt").addEventListener("change", (event) => {
+  marbleCameraTilt = event.target.checked;
+  if (!marbleCameraTilt) camView.vel.pitch = 0;
+  try { localStorage.setItem("meowdoku.marble.cameraTilt", marbleCameraTilt ? "1" : "0"); } catch { /* storage may be blocked */ }
+});
 $("marble-phone-tilt").addEventListener("change", (event) => {
   marblePhoneTilt = event.target.checked;
   try { localStorage.setItem("meowdoku.marble.phoneTilt", marblePhoneTilt ? "1" : "0"); } catch { /* storage may be blocked */ }
@@ -6925,7 +6933,8 @@ function cameraGestures() {
   const d = g.camera_gestures === undefined ? CAMERA_GESTURE_DEFAULTS[g.game] : g.camera_gestures;
   if (!d) return null;
   const ext = state.extent || { width: 6, depth: 6 }, lim = d.limits || {};
-  return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false, tilt: d.tilt !== false,
+  return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false,
+           tilt: d.tilt !== false && (g.game !== "marble_madness" || marbleCameraTilt),
            target: Array.isArray(d.target) ? d.target : null,
            zoomLim: g.zoom ? [-Math.log(zoomLimits(g).max), -Math.log(zoomLimits(g).min)] : (lim.zoom || (g.tipjar ? [0.1, 3] : [0.3, 3])).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],     // [QRWALL] (the tip jar zooms in further: a tall jar's wall is small on its board)
            panLim: lim.pan != null ? lim.pan : Math.max(ext.width, extLength(ext)) };
