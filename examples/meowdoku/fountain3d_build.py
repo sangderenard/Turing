@@ -57,19 +57,25 @@ def _sources() -> str:
                                                      deployment_classification, llvm_training_runtime))
 
 
-def digest(tag: str) -> str:
-    return hashlib.sha256(f"{tag}:{SIZES[tag]}\0{_sources()}".encode()).hexdigest()[:16]
+# TWO PRODUCTS per size: "sdf" (the law with the SDF chamber walls) and "flat" (``make_law(..., sdf=False)``: the SDF compiled out,
+# for the box and the polygon chambers).  With sdf_on = 0 the two are the same law bit for bit, but the sdf product's shader still
+# evaluates the SDF every step (~21% of a 64k step), so the page runs the flat one whenever the chamber is not an SDF.
+VARIANTS = {"sdf": ("fountain3d", True), "flat": ("fountain3d_flat", False)}
+
+
+def digest(tag: str, variant: str = "sdf") -> str:
+    return hashlib.sha256(f"{tag}:{SIZES[tag]}:{variant}\0{_sources()}".encode()).hexdigest()[:16]
 
 
 def shapes_for(pad: int) -> dict:
     return {name: ((pad,) if name in F.STATE + F.CONSTANTS else ()) for name in F.ARGUMENTS}
 
 
-def trace(pad: int, active: int, contract: str):
+def trace(pad: int, active: int, contract: str, sdf: bool = True):
     """The law traced at ``pad`` ids: (program, output values, bindings)."""
     from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
     from src.compiler.work_contract import PRESETS, scoped_work_contract
-    law = F.make_law(pad, active)
+    law = F.make_law(pad, active, sdf=sdf)
     with scoped_work_contract(PRESETS[contract]):
         program = SSATensorProgram("fountain_step")
         shapes = shapes_for(pad)
@@ -80,17 +86,18 @@ def trace(pad: int, active: int, contract: str):
     return program, outputs, bindings
 
 
-def passes_for(tag_or_pad, active: int | None = None):
+def passes_for(tag_or_pad, active: int | None = None, variant: str = "sdf"):
     """The compiler-generated dispatch program (and the trace it came from) for a size tag,
     or for ``(pad, active)``."""
     from src.compiler import ssa_webgpu_backend as webgpu
     from src.compiler.work_contract import PRESETS, scoped_work_contract
     pad, act = SIZES[tag_or_pad][1], SIZES[tag_or_pad][0] if isinstance(tag_or_pad, str) else (int(tag_or_pad), int(active or tag_or_pad))
-    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT)
+    prefix, sdf = VARIANTS[variant]
+    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT, sdf=sdf)
     ids = {name: int(getattr(binding.data, "value").id) for name, binding in bindings.items()}
     with scoped_work_contract(PRESETS[WGSL_CONTRACT]):
         compiled = webgpu.emit_tensor_program_passes(
-            program.module, "fountain_step", outputs, count=pad, name=f"fountain3d_{pad}",
+            program.module, "fountain_step", outputs, count=pad, name=f"{prefix}_{pad}",
             iota_args=[ids[name] for name in F.IOTA], binding_bytes=F.BINDING_SPLIT_BYTES)
     return compiled, program, outputs, ids
 
@@ -103,18 +110,19 @@ def verdict_for(tag_or_pad, active: int | None = None, model=None):
                                  model=model or WebGPUComputeCostModel(), dispatches=compiled.dispatches)
 
 
-def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
+def build_size(tag: str, web_dir: Path, wasm: bool = True, variant: str = "sdf") -> dict:
     from meowdoku import graph_wasm
     from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
     started = time.perf_counter()
     from src.compiler import ssa_webgpu_backend as webgpu
     active, pad = SIZES[tag]
-    compiled, program, outputs, ids = passes_for(tag)
+    prefix, sdf = VARIANTS[variant]
+    compiled, program, outputs, ids = passes_for(tag, variant=variant)
     if not compiled.complete:
         raise RuntimeError("fountain shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
                                    model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
-    (web_dir / f"fountain3d_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    (web_dir / f"{prefix}_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
     out_ids = [int(v.id) for v in outputs]
     geo = F.basin(active)
     stride = max(1, -(-pad // DISPLAY_MAX))
@@ -122,7 +130,7 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         "tag": tag, "n": active, "pad": pad,
         "route": "webgpu-compute" if payoff.pays else "wasm",
         "verdict": payoff.as_record(),
-        "wgsl": f"fountain3d_{tag}.wgsl",
+        "wgsl": f"{prefix}_{tag}.wgsl", "variant": variant,
         "wgsl_abi": {
             "count": pad, "workgroup_size": list(compiled.workgroup_size), "groups": list(compiled.groups),
             "entries": list(compiled.entries), "slots": compiled.slots, "dispatches": compiled.dispatches,
@@ -135,7 +143,8 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
             "arguments": list(F.ARGUMENTS), "uniforms": list(F.UNIFORMS), "iota": list(F.IOTA),
             "outputs": list(F.OUTPUTS),
             "feed_slots": {name: compiled.feed_slots[ids[name]] for name in F.ARGUMENTS if ids[name] in compiled.feed_slots},
-            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in F.UNIFORMS},
+            # (the flat product compiles the SDF out: its slot uniforms have no index, and the page skips names a product lacks)
+            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in F.UNIFORMS if ids[name] in compiled.uniform_index},
             "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(F.OUTPUTS)},
             "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
         },
@@ -144,36 +153,37 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         "display_stride": stride,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
         "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
-        "source_digest": digest(tag),
+        "source_digest": digest(tag, variant),
     }
     if pad <= WASM_MAX and wasm:
         wasm_abi = graph_wasm._compile(
-            f"fountain3d_{tag}", shapes_for(pad),
-            lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
+            f"{prefix}_{tag}", shapes_for(pad),
+            lambda b: F.make_law(pad, active, sdf=sdf)(*(b[name] for name in F.ARGUMENTS)),
             F.OUTPUTS, WASM_CONTRACT, web_dir,
             {"argument_names": list(F.ARGUMENTS), "count": pad})
-        record.update({"wasm": f"fountain3d_{tag}.wasm", "wasm_abi": f"fountain3d_{tag}.abi.json",
+        record.update({"wasm": f"{prefix}_{tag}.wasm", "wasm_abi": f"{prefix}_{tag}.abi.json",
                        "wasm_buffers": len(wasm_abi["order"])})
     record["build_seconds"] = round(time.perf_counter() - started, 1)
     return record
 
 
-def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True) -> dict:
+def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True, variant: str = "sdf") -> dict:
     """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept."""
     from src.compiler.deployment_classification import WebGPUComputeCostModel
     web_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = web_dir / "fountain3d.manifest.json"
+    prefix, _sdf = VARIANTS[variant]
+    manifest_path = web_dir / f"{prefix}.manifest.json"
     old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     records = {}
     for tag in sizes:
         previous = (old.get("sizes") or {}).get(tag)
-        files = [web_dir / f"fountain3d_{tag}.wgsl"]
+        files = [web_dir / f"{prefix}_{tag}.wgsl"]
         if SIZES[tag][1] <= WASM_MAX and wasm:
-            files += [web_dir / f"fountain3d_{tag}.wasm", web_dir / f"fountain3d_{tag}.abi.json"]
-        if previous and previous.get("source_digest") == digest(tag) and all(p.exists() for p in files):
+            files += [web_dir / f"{prefix}_{tag}.wasm", web_dir / f"{prefix}_{tag}.abi.json"]
+        if previous and previous.get("source_digest") == digest(tag, variant) and all(p.exists() for p in files):
             records[tag] = previous
             continue
-        records[tag] = build_size(tag, web_dir, wasm)
+        records[tag] = build_size(tag, web_dir, wasm, variant)
         r = records[tag]
         print(f"[fountain] {tag}: {r['n']} ids (sort {r['pad']}) -> {r['route']} (predicted {r['verdict']['speedup']:.2f}x, "
               f"{r['wgsl_abi']['dispatches']} dispatches, {r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)

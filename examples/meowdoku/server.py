@@ -511,7 +511,10 @@ def prepare_fountain3d(web_dir: Path) -> None:
     try:
         started = time.perf_counter()
         wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
-        manifest = fountain3d_build.build(web_dir, wasm=wasm)
+        manifest = fountain3d_build.build(web_dir, wasm=wasm, variant="flat")      # the box and polygons first: the common case
+        flat = time.perf_counter() - started
+        print(f"[meowdoku] fountain3d flat products ready ({flat:.1f}s); the SDF products follow", flush=True)
+        manifest = fountain3d_build.build(web_dir, wasm=wasm, variant="sdf")
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest

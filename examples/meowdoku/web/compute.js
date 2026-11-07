@@ -525,7 +525,11 @@ export class ComputeRuntime {
   }
 
   async #apply(spec) {
-    if (!this.manifest) { this.manifest = await json(spec.manifest); await this.#capabilities(); }
+    // a game may switch products (fountain3d: the flat product for the box and polygons, the sdf one for SDF chambers): the manifest
+    // follows the spec's name
+    if (!this.manifest || this.manifestName !== spec.manifest) {
+      this.manifest = await json(spec.manifest); this.manifestName = spec.manifest; await this.#capabilities();
+    }
     const key = `${spec.manifest}:${spec.size}`;
     const verdict = this.support[spec.size];
     if (key !== this.productKey) {

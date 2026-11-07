@@ -306,7 +306,9 @@ class FountainGame(Game):
             "controls_ui": self.controls_ui(),
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
-                "manifest": "fountain3d.manifest.json", "size": self.size, "epoch": self.epoch,
+                # the flat product (the SDF compiled out, ~21% faster at 64k) whenever the chamber is the box or a polygon
+                "manifest": "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json",
+                "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
                 "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
