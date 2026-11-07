@@ -92,6 +92,8 @@ const dieMass=marbleMass(die,{radiusM:0.01,densityByRole:{shell:2500,mark:2500,e
 assert(dieMass.massExact && !dieMass.validForRoll,"die has exact body-substrate mass but sphere roll is gated");
 const mixedMark=marbleMass(die,{radiusM:0.01,densityByRole:{shell:2500,mark:7800,enamel:3000}});
 assert(!mixedMark.massExact && !mixedMark.validForRoll,"distinct bulk relief density is unresolved and gated");
+assert(!marbleMass({...die,mechanicsResolved:false},{radiusM:0.01,densityByRole:{shell:2500,mark:2500,enamel:3000}}).massExact,
+  "unresolved die geometry cannot be reported as exact");
 for(const kind of ["spiral","rings"]) {
   const design=catEyeMarble({glass:11,eye:12,accent:13},{kind,tubeCount:2});
   assert(design.tubes.length===2 && design.interior.length>1000,`${kind} consists of triangulated tubes`);

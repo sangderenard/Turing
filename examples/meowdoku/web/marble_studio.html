@@ -64,6 +64,12 @@
     <label>Dice marking material<select id="mark-material"></select></label>
     <label>Mark scale <output id="mark-scale-out"></output><input id="mark-scale" type="range" min="30" max="90" value="72"></label>
     <label>Relief depth <output id="relief-depth-out"></output><input id="relief-depth" type="range" min="0" max="80" value="20"></label>
+    <label>Numeral mesh detail <output id="dice-detail-out">48</output><input id="dice-detail" type="range" min="24" max="96" step="8" value="48"></label>
+    <output id="dice-detail-cost" class="wide">Estimated D20: 138,240 triangles at detail 48</output>
+    <label>Corner bevel <output id="dice-bevel-out">0.04</output><input id="dice-bevel" type="range" min="0" max="160" value="40"></label>
+    <label>Face recess <output id="dice-face-relief-out">0.00</output><input id="dice-face-relief" type="range" min="0" max="80" value="0"></label>
+    <label class="wide"><input id="compensate-raised" type="checkbox" checked> Keep raised marks inside face support plane</label>
+    <p class="wide">Bevel, face recess, and raised marks alter the closed die mesh and its moments of inertia. Keeping mark peaks inside the rim equalizes the support profile; statistical fairness is not established.</p>
   </div>
   <h2>Physical properties</h2><div class="grid">
     <label>Marble radius (mm)<input id="radius-mm" type="number" min="1" max="100" step="0.1" value="10"></label>
