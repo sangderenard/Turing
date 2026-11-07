@@ -127,12 +127,13 @@ function reportMass(geometry) {
     enamelMaterial:coatedId,enamelThicknessM:read("enamel",coatedId,0)*1e-9});
   rollProps=result; resetRoll();
   const tensor=result.inertiaKgM2.map((row)=>row.map((x)=>x.toExponential(3)).join("  ")).join("\n");
+  const moments=result.principalMoments.map((p,i)=>`I${i+1} ${p.momentKgM2.toExponential(3)} kg·m² on (${p.axis.map((x)=>x.toFixed(2)).join(", ")})`).join("\n");
   const grouped=new Map();
   for(const c of result.components) {const g=grouped.get(c.name)||{count:0,massKg:0,volumeM3:0};
     g.count++;g.massKg+=c.massKg;g.volumeM3+=c.volumeM3;grouped.set(c.name,g);}
   const components=[...grouped].map(([name,c])=>`${name} ×${c.count}: ${(c.massKg*1000).toFixed(3)} g / ${(c.volumeM3*1e9).toFixed(2)} mm³`).join("\n");
   $("mass-report").style.whiteSpace="pre-line";
-  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Estimated"} mass ${(result.massKg*1000).toFixed(3)} g · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nInertia tensor (kg·m²):\n${tensor}\n${components}\n${result.mechanicsNote}`;
+  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Estimated"} mass ${(result.massKg*1000).toFixed(3)} g · center of mass (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nPrincipal moments of inertia:\n${moments}\nFull inertia tensor (kg·m²):\n${tensor}\n${components}\n${result.mechanicsNote}`;
   $("roll-status").textContent=result.validForRoll?"Locked · release to roll on the calculated inertia tensor":`Roll unavailable: ${result.mechanicsNote}`;
 }
 function checkerboard() {

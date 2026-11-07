@@ -1,5 +1,5 @@
 import { catEyeMarble } from "../examples/meowdoku/web/marble_mesh.js";
-import { marbleMass } from "../examples/meowdoku/web/marble_mass.js";
+import { marbleMass, principalMoments } from "../examples/meowdoku/web/marble_mass.js";
 import { rollingStep } from "../examples/meowdoku/web/marble_roll.js";
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
@@ -65,6 +65,10 @@ const analyticMass=4*Math.PI/3*0.01**3*2500;
 assert(Math.abs(clearMass.massKg/analyticMass-1)<0.01,"closed shell mass approaches analytic sphere");
 const analyticInertia=0.4*analyticMass*0.01**2;
 assert(Math.abs(clearMass.inertiaKgM2[0][0]/analyticInertia-1)<0.02,"tetrahedral rotational inertia approaches analytic sphere");
+const principal=principalMoments([[2,0.3,0],[0.3,4,0],[0,0,8]]);
+assert(principal.every((p,i)=>i===0||principal[i-1].momentKgM2<=p.momentKgM2),"principal moments sorted");
+assert(Math.abs(principal.reduce((s,p)=>s+p.momentKgM2,0)-14)<1e-9,"principal moments preserve tensor trace");
+assert(Math.abs(principal[0].axis.reduce((s,x,i)=>s+x*[[2,0.3,0],[0.3,4,0],[0,0,8]][i].reduce((t,y,j)=>t+y*principal[0].axis[j],0),0)-principal[0].momentKgM2)<1e-9,"principal axis matches eigenvalue");
 const hybridMass=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enamelMaterial:14,enamelThicknessM:300e-9});
 assert(hybridMass.massKg>clearMass.massKg && hybridMass.components.length===decorated.ribbons.length+decorated.confetti.length+2,"inclusions and coating contribute mass");
 assert(Math.abs(hybridMass.components.reduce((s,c)=>s+c.massKg,0)-hybridMass.massKg)<1e-12,
