@@ -248,6 +248,12 @@
 <div id="splash"><div id="splash-title"></div><div id="splash-detail"></div></div>
 <button id="fs-exit" title="Leave fullscreen (F or Esc)">✕</button>
 <canvas id="gl"></canvas>
+<div id="marble-pad" style="display:none;position:fixed;right:14px;bottom:18px;z-index:25;gap:8px;align-items:center;background:#111a;padding:8px;border-radius:12px;color:white">
+  <span>Steer</span><button data-marble-key="left" aria-label="Steer marble left">◀</button>
+  <button data-marble-key="up" aria-label="Slow descent">▲</button>
+  <button data-marble-key="down" aria-label="Faster descent">▼</button>
+  <button data-marble-key="right" aria-label="Steer marble right">▶</button>
+</div>
 <div id="word">
   <input id="entry" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="word" tabindex="-1">
 </div>

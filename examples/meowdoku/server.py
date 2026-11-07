@@ -55,6 +55,7 @@ from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.worldwalk import WorldWalk  # noqa: E402
 from meowdoku.fountain import FountainGame  # noqa: E402
 from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402  (the 3-D fountain: its own law, products and page controls)
+from meowdoku.marble_madness import MarbleMadness  # noqa: E402  (one marble in the existing 3-D DEM/SDF product)
 from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.mobroad import Mobroad  # noqa: E402  (the road-defence mob shooter: the fountain law as the mob, an entity law for the shooters)
 from meowdoku.profiles import Profiles  # noqa: E402
@@ -93,7 +94,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "tipjar", "purrline", "mobroad"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "marble_madness", "tipjar", "purrline", "mobroad"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -153,6 +154,8 @@ class Table:
             self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
         elif kind == "fountain3d":
             self.game = Fountain3DGame(aspect=float(payload.get("aspect") or 0.0) or None)
+        elif kind == "marble_madness":
+            self.game = MarbleMadness(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "tipjar":
             from meowdoku import tipjar            # the watch-only Bitcoin tip jar on the 3-D fountain (build/meowdoku/tipjar.json; else a DEMO)
             self.game = tipjar.TipJarGameClass()(aspect=float(payload.get("aspect") or 0.0) or None)
@@ -188,7 +191,7 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
-        elif kind.startswith("fountain_") or kind.startswith("worldwalk_") or kind.startswith("delve_"):
+        elif kind.startswith("fountain_") or kind.startswith("marble_") or kind.startswith("worldwalk_") or kind.startswith("delve_"):
             if not hasattr(self.game, "do"):
                 raise ValueError("this game takes no such action")
             self.game.do(payload)
