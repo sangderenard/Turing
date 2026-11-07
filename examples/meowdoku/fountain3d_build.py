@@ -60,28 +60,42 @@ def _sources() -> str:
 # TWO PRODUCTS per size: "sdf" (the law with the SDF chamber walls) and "flat" (``make_law(..., sdf=False)``: the SDF compiled out,
 # for the box and the polygon chambers).  With sdf_on = 0 the two are the same law bit for bit, but the sdf product's shader still
 # evaluates the SDF every step (~21% of a 64k step), so the page runs the flat one whenever the chamber is not an SDF.
-VARIANTS = {"sdf": ("fountain3d", True), "flat": ("fountain3d_flat", False)}
+VARIANTS = {"sdf": ("fountain3d", True), "flat": ("fountain3d_flat", False), "wheel": ("fountain3d_wheel", False)}
+# the third, "wheel", is the hinged-body (waterwheel) law: the flat law plus the body's two state columns and uniforms (``make_law(.., body=True)``),
+# with its own argument list and manifest; the 10M size is not offered for it (+4 arena slots)
+WHEEL_SIZES = tuple(tag for tag in SIZES if SIZES[tag][0] < 10_000_000)
+
+
+def layout(variant: str) -> dict:
+    """The law's names for a variant: the default law's, or the hinged-body variant's."""
+    if variant != "wheel":
+        return {"arguments": F.ARGUMENTS, "state": F.STATE, "outputs": F.OUTPUTS, "diagnostics": F.DIAGNOSTICS, "uniforms": F.UNIFORMS,
+                "runtime_inputs": F.RUNTIME_INPUTS}
+    return {"arguments": F.BODY_ARGUMENTS, "state": F.STATE + F.BODY_STATE, "outputs": F.BODY_OUTPUTS, "diagnostics": F.DIAGNOSTICS + F.BODY_DIAGNOSTICS,
+            "uniforms": F.UNIFORMS + F.BODY_UNIFORMS, "runtime_inputs": F.RUNTIME_INPUTS + F.BODY_RUNTIME_INPUTS}
 
 
 def digest(tag: str, variant: str = "sdf") -> str:
     return hashlib.sha256(f"{tag}:{SIZES[tag]}:{variant}\0{_sources()}".encode()).hexdigest()[:16]
 
 
-def shapes_for(pad: int) -> dict:
-    return {name: ((pad,) if name in F.STATE + F.CONSTANTS else ()) for name in F.ARGUMENTS}
+def shapes_for(pad: int, variant: str = "sdf") -> dict:
+    lay = layout(variant)
+    return {name: ((pad,) if name in lay["state"] + F.CONSTANTS else ()) for name in lay["arguments"]}
 
 
-def trace(pad: int, active: int, contract: str, sdf: bool = True):
+def trace(pad: int, active: int, contract: str, sdf: bool = True, variant: str = "sdf"):
     """The law traced at ``pad`` ids: (program, output values, bindings)."""
     from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
     from src.compiler.work_contract import PRESETS, scoped_work_contract
-    law = F.make_law(pad, active, sdf=sdf)
+    law = F.make_law(pad, active, sdf=sdf, body=variant == "wheel")
+    names = layout(variant)["arguments"]
     with scoped_work_contract(PRESETS[contract]):
         program = SSATensorProgram("fountain_step")
-        shapes = shapes_for(pad)
-        bindings = {name: SSATensorOperations.input(program, shapes[name]) for name in F.ARGUMENTS}
+        shapes = shapes_for(pad, variant)
+        bindings = {name: SSATensorOperations.input(program, shapes[name]) for name in names}
         with program.activate():
-            produced = law(*(bindings[name] for name in F.ARGUMENTS))
+            produced = law(*(bindings[name] for name in names))
         outputs = [item.data.value for item in produced]
     return program, outputs, bindings
 
@@ -93,7 +107,7 @@ def passes_for(tag_or_pad, active: int | None = None, variant: str = "sdf"):
     from src.compiler.work_contract import PRESETS, scoped_work_contract
     pad, act = SIZES[tag_or_pad][1], SIZES[tag_or_pad][0] if isinstance(tag_or_pad, str) else (int(tag_or_pad), int(active or tag_or_pad))
     prefix, sdf = VARIANTS[variant]
-    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT, sdf=sdf)
+    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT, sdf=sdf, variant=variant)
     ids = {name: int(getattr(binding.data, "value").id) for name, binding in bindings.items()}
     with scoped_work_contract(PRESETS[WGSL_CONTRACT]):
         compiled = webgpu.emit_tensor_program_passes(
@@ -118,6 +132,7 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True, variant: str = "sdf")
     active, pad = SIZES[tag]
     prefix, sdf = VARIANTS[variant]
     compiled, program, outputs, ids = passes_for(tag, variant=variant)
+    lay = layout(variant)
     if not compiled.complete:
         raise RuntimeError("fountain shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
@@ -140,27 +155,27 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True, variant: str = "sdf")
             # the uniform head is binding `bindings`.  Every pass (step, commit, pack) binds bindings + 1 storage buffers.
             "storage_bindings_per_pass": compiled.bindings + 1, "binding_budget": webgpu.MAX_STORAGE_BINDINGS_PER_STAGE,
             "binding_bytes": min(compiled.slots_per_binding, compiled.slots) * pad * 4,
-            "arguments": list(F.ARGUMENTS), "uniforms": list(F.UNIFORMS), "iota": list(F.IOTA),
-            "outputs": list(F.OUTPUTS),
-            "feed_slots": {name: compiled.feed_slots[ids[name]] for name in F.ARGUMENTS if ids[name] in compiled.feed_slots},
+            "arguments": list(lay["arguments"]), "uniforms": list(lay["uniforms"]), "iota": list(F.IOTA),
+            "outputs": list(lay["outputs"]),
+            "feed_slots": {name: compiled.feed_slots[ids[name]] for name in lay["arguments"] if ids[name] in compiled.feed_slots},
             # (the flat product compiles the SDF out: its slot uniforms have no index, and the page skips names a product lacks)
-            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in F.UNIFORMS if ids[name] in compiled.uniform_index},
-            "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(F.OUTPUTS)},
+            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in lay["uniforms"] if ids[name] in compiled.uniform_index},
+            "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(lay["outputs"])},
             "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
         },
         "memory": {"arena_bytes": compiled.arena_elements * 4, "bytes_per_id": compiled.arena_elements * 4 / pad,
                    "display_ids": -(-pad // stride), "display_bytes": 3 * 20 * -(-pad // stride)},
         "display_stride": stride,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
-        "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
+        "uniforms": {k: float(v) for k, v in F.uniforms(n=active, shape="waterwheel" if variant == "wheel" else "box").items()},
         "source_digest": digest(tag, variant),
     }
     if pad <= WASM_MAX and wasm:
         wasm_abi = graph_wasm._compile(
-            f"{prefix}_{tag}", shapes_for(pad),
-            lambda b: F.make_law(pad, active, sdf=sdf)(*(b[name] for name in F.ARGUMENTS)),
-            F.OUTPUTS, WASM_CONTRACT, web_dir,
-            {"argument_names": list(F.ARGUMENTS), "count": pad})
+            f"{prefix}_{tag}", shapes_for(pad, variant),
+            lambda b: F.make_law(pad, active, sdf=sdf, body=variant == "wheel")(*(b[name] for name in lay["arguments"])),
+            lay["outputs"], WASM_CONTRACT, web_dir,
+            {"argument_names": list(lay["arguments"]), "count": pad})
         record.update({"wasm": f"{prefix}_{tag}.wasm", "wasm_abi": f"{prefix}_{tag}.abi.json",
                        "wasm_buffers": len(wasm_abi["order"])})
     record["build_seconds"] = round(time.perf_counter() - started, 1)
@@ -172,6 +187,7 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
     from src.compiler.deployment_classification import WebGPUComputeCostModel
     web_dir.mkdir(parents=True, exist_ok=True)
     prefix, _sdf = VARIANTS[variant]
+    lay = layout(variant)
     manifest_path = web_dir / f"{prefix}.manifest.json"
     old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     records = {}
@@ -191,9 +207,9 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
     geo = F.basin(F.N_FULL)
     manifest = {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
-        "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
-                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
-                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G, "k_run_max": F.K_RUN_MAX, "depth_max": F.DEPTH_MAX},
+        "law": {"arguments": list(lay["arguments"]), "state": list(lay["state"]), "constants": list(F.CONSTANTS),
+                "uniforms": list(lay["uniforms"]), "outputs": list(lay["outputs"]), "diagnostics": list(lay["diagnostics"]), "dt": F.DT,
+                "runtime_inputs": list(lay["runtime_inputs"]), "gravity": F.G, "k_run_max": F.K_RUN_MAX, "depth_max": F.DEPTH_MAX},
         "emit_span": F.EMIT_SPAN, "initial": {},
         "points": {"x": "x", "y": "y", "z": "z", "vx": "vx", "vy": "vy", "vz": "vz", "rgb": ["cr", "cg", "cb"], "live": "shown",
                    "radius": "rad", "rest_speed": 0.15, "bytes": 20},

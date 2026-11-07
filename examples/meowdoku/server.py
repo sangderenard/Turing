@@ -534,6 +534,19 @@ def prepare_fountain3d(web_dir: Path) -> None:
         print(f"[meowdoku] fountain3d products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_fountain3d_wheel(web_dir: Path) -> None:
+    """The 3-D fountain's hinged-body (waterwheel) products, after the flat and SDF sets (``fountain3d_build.build(variant="wheel")``)."""
+    from meowdoku import fountain3d_build
+    try:
+        started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        manifest = fountain3d_build.build(web_dir, sizes=fountain3d_build.WHEEL_SIZES, wasm=wasm, variant="wheel")
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain3d wheel products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain3d wheel products NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def prepare_policy(web_dir: Path) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
@@ -599,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
     if args.no_wasm:
         os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
-    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain3d(web_dir)), name="fountain-build", daemon=True).start()
+    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain_wheel(web_dir), prepare_fountain3d(web_dir), prepare_fountain3d_wheel(web_dir)), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

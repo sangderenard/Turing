@@ -5175,14 +5175,14 @@ function pointsFrame(cam, now) {
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
 // The 2-D fountain's hinged body (the waterwheel): its SDF outline (hub circle, capsule paddles) at the angle the law reports (diagnostic body_th).
-function drawBody(b, frame) {
+function drawBody(b, frame, dh = 0) {                       // dh: the 3-D fountain's half depth (the body is extruded through the slab); 0 = flat
   if (!b) return;
   const th = (compute.diag && compute.diag[b.angle]) || 0, [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
-  cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), 0, frame);
+  cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), dh, frame);
   for (let k = 0; k < b.paddles; k++) {
     const a = th + 2 * Math.PI * k / b.paddles, t = b.half_thickness, l = b.reach, cap = [];
     for (let j = 0; j <= 6; j++) cap.push([hx + l * Math.cos(a) + t * Math.cos(a + Math.PI / 2 - Math.PI * j / 6), hy + l * Math.sin(a) + t * Math.sin(a + Math.PI / 2 - Math.PI * j / 6)]);
-    cloud.drawOutline([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)], 0, frame);
+    cloud.drawOutline([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)], dh, frame);
   }
 }
 function drawChamberOutline(cam, g, rec) {
@@ -5199,6 +5199,7 @@ function drawChamberOutline(cam, g, rec) {
     if (!last || last[0] !== p[0] || last[1] !== p[1]) pts.push(p);
   }
   cloud.drawOutline(pts, u.dh || 0, frame);
+  drawBody(g.compute.body, frame, u.dh || 0);                 // the 3-D fountain's hinged body (waterwheel), extruded through the slab
 }
 function drawCloud(cam, data, g, rec, style) {
   const y = TILE.height + 0.03;

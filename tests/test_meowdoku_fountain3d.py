@@ -1561,3 +1561,119 @@ def test_sdf_presets_keep_their_designed_proportions_and_the_view_follows_the_ch
     # the polygons and the box are untouched by the shape argument
     for shape in ("box", "funnel", "hexagon", "ramp"):
         assert F.basin(4096, 1.7, shape=shape) == F.basin(4096, 1.7)
+
+
+# ------------------------------------------------------------- the hinged waterwheel (body variant of the 3-D law; eager NumPy lane, ~1 s a step)
+class _WheelWorld:
+    def __init__(self, n=16, **uniform_overrides):
+        self.n = n
+        self.law = F.make_law(n, n, False, True)
+        self.cols = F.initial_columns(n, mix=0.0, shape="waterwheel")
+        self.cols["age"][:] = -1.0e9                                        # every id parked (never emitted); grains are placed by hand
+        for k, v in uniform_overrides.items():
+            self.cols[k] = np.float64(v)
+
+    def place(self, grains):
+        """{id: (x, y, z, vx, vy)}: live grains."""
+        for i, (x, y, z, vx, vy) in grains.items():
+            self.cols["age"][i], self.cols["x"][i], self.cols["y"][i], self.cols["z"][i], self.cols["vx"][i], self.cols["vy"][i] = 1.0e3, x, y, z, vx, vy
+
+    def steps(self, steps, each=None):
+        """Step ``steps`` times; returns the state, the per-step (body_th, body_om, body_tq) and the last outputs."""
+        names = F.STATE + F.BODY_STATE
+        state = {k: np.array(self.cols[k], dtype=np.float64) for k in names}
+        series, out = [], {}
+        for step in range(steps):
+            tensors = [AbstractTensor.get_tensor(np.asarray(state[k] if k in state else self.cols[k], dtype=np.float64)) for k in F.BODY_ARGUMENTS]
+            produced = self.law(*tensors)
+            out = {nm: np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (self.n,)).copy() for nm, v in zip(F.BODY_OUTPUTS, produced)}
+            state = {k: out[k + "_next"] for k in names}
+            series.append((float(out["body_th"][0]), float(out["body_om"][0]), float(out["body_tq"][0])))
+            if each is not None:
+                each(step, self.cols, out)
+        return state, np.array(series), out
+
+
+def test_the_default_3d_law_has_no_body_columns_and_the_wheel_variant_adds_exactly_them():
+    assert F.BODY_ARGUMENTS == F.STATE + F.BODY_STATE + F.CONSTANTS + F.UNIFORMS + F.BODY_UNIFORMS
+    assert not set(F.BODY_STATE + F.BODY_UNIFORMS) & set(F.ARGUMENTS) and len(F.BODY_ARGUMENTS) == len(set(F.BODY_ARGUMENTS))
+    assert F.BODY_OUTPUTS == tuple(f"{s}_next" for s in F.STATE + F.BODY_STATE) + ("cr", "cg", "cb", "rad", "shown") + F.DIAGNOSTICS + F.BODY_DIAGNOSTICS
+    assert "bth" not in F.initial_columns(16) and "bth" in F.initial_columns(16, shape="waterwheel")
+    assert F.OUTPUTS == tuple(f"{s}_next" for s in F.STATE) + ("cr", "cg", "cb", "rad", "shown") + F.DIAGNOSTICS            # the default law's signature is unchanged
+    assert "waterwheel" in dict(F.CHAMBER_CHOICES)
+    assert B.VARIANTS["wheel"] == ("fountain3d_wheel", False) and "10M" not in B.WHEEL_SIZES and "4k" in B.WHEEL_SIZES
+    assert B.layout("wheel")["state"] == F.STATE + F.BODY_STATE and B.layout("flat")["state"] == F.STATE
+    u = F.uniforms(n=256, shape="waterwheel")
+    assert float(u["sdf_on"]) == 0.0 and float(u["body_np"]) == 8.0 and float(u["body_i"]) > 0.0 and float(u["bar_half"]) == pytest.approx(F.WHEEL_NOZZLE_BAR * 0.25, rel=1e-5)
+
+
+def test_the_3d_waterwheel_spins_the_way_the_stream_hits_it():
+    for side, sign in ((+1.0, -1.0), (-1.0, +1.0)):                     # a stream on the right half turns it clockwise, on the left counterclockwise
+        world = _WheelWorld(16)
+        bx, by, reach = (float(world.cols[k]) for k in ("body_x", "body_y", "body_pl"))
+        world.place({i: (bx + side * (0.45 * reach + 0.012 * (i % 2)), by + reach + 0.02 + 0.025 * i, 0.0, 0.0, -2.5) for i in range(6)})
+        _state, series, out = world.steps(45)
+        assert sign * series[-1, 1] > 0.05, (side, series[-1])
+        assert np.isfinite(series).all() and float(out["n_nan"][0]) == 0
+
+
+def test_a_grain_hitting_a_paddle_changes_the_3d_wheel_by_impulse_times_arm_over_inertia():
+    world = _WheelWorld(16, grav_x=0.0, grav_y=0.0, body_gam=0.0)
+    bx, by, reach, inertia = (float(world.cols[k]) for k in ("body_x", "body_y", "body_pl", "body_i"))
+    world.place({0: (bx + 0.6 * reach, by + 0.05, 0.0, 0.0, -2.0)})
+    state = {k: np.array(world.cols[k], dtype=np.float64) for k in F.STATE + F.BODY_STATE}
+
+    def angular_momentum(st, rad):
+        mass = [s[2] for s in F.SPECIES if abs(s[1] - rad) < 1.0e-9][0] * (4.0 / 3.0) * np.pi * rad ** 3
+        return mass * ((st["x"][0] - bx) * st["vy"][0] - (st["y"][0] - by) * st["vx"][0]) + 0.4 * mass * rad * rad * st["wz"][0]
+    first = {nm: np.asarray(v.numpy(), dtype=np.float64) for nm, v in zip(F.BODY_OUTPUTS, world.law(*[
+        AbstractTensor.get_tensor(np.asarray(state[k] if k in state else world.cols[k], dtype=np.float64)) for k in F.BODY_ARGUMENTS]))}
+    rad = float(np.broadcast_to(first["rad"], (16,))[0])
+    before = angular_momentum(state, rad)
+    final, _series, _ = world.steps(30)                       # the hit is over by step 10; the grain is then clear of the wheel
+    after = angular_momentum(final, rad)
+    delta_wheel = inertia * final["bom"][0]
+    assert abs(delta_wheel) > 0.2 * abs(before)                                 # the paddle did take it
+    assert abs(delta_wheel + (after - before)) < 0.06 * abs(before), (delta_wheel, after - before)     # the pair's angular momentum about the hinge axis is conserved (to the air drag)
+
+
+def test_a_3d_motor_torque_drives_the_wheel_to_the_semi_implicit_terminal_speed_and_body_tau_adds_its_impulse():
+    gam, alpha = 100.0, 40.0
+    world = _WheelWorld(8, body_alpha=alpha, body_gam=gam)
+    _s, series, _ = world.steps(70)
+    # applied torque first, then the hinge impulse (engine_toy's order): omega = alpha (1 - gam DT) / gam, which is alpha / gam to O(gam DT)
+    assert abs(series[-1, 1] - alpha * (1.0 - gam * F.DT) / gam) < 1.0e-6 and abs(series[-1, 1] - series[-2, 1]) < 1.0e-6
+    free = _WheelWorld(8, body_alpha=0.0, body_gam=gam)                           # free: it stays at rest
+    assert np.all(free.steps(3)[1][:, 1] == 0.0)
+    driven = _WheelWorld(8, body_gam=0.0, body_tau=0.002)                         # an absolute torque from a machine-sim coupling: omega = tau / I dt
+    om = driven.steps(1)[1][0, 1]
+    assert om == pytest.approx(0.002 / float(driven.cols["body_i"]) * F.DT, rel=1e-6)
+
+
+def test_the_3d_wheel_replay_is_bit_identical_and_every_id_carries_the_same_body_state():
+    world = _WheelWorld(16)
+    bx, by, reach = (float(world.cols[k]) for k in ("body_x", "body_y", "body_pl"))
+    world.place({i: (bx + 0.4 * reach, by + reach + 0.02 + 0.025 * i, 0.0, 0.0, -2.0) for i in range(6)})
+    one = world.steps(35)
+    two = world.steps(35)
+    assert all(np.array_equal(one[0][k], two[0][k]) for k in one[0]) and np.array_equal(one[1], two[1])
+    assert np.all(one[0]["bth"] == one[0]["bth"][0]) and np.all(one[0]["bom"] == one[0]["bom"][0])
+
+
+def test_the_game_offers_the_waterwheel_with_its_wheel_controls_manifest_and_body_spec():
+    from meowdoku import fountain_game as G
+    game = G.FountainGame(size="small")
+    assert game.state()["compute"]["body"] is None and game.state()["compute"]["manifest"] == "fountain3d_flat.manifest.json"
+    game.do({"type": "fountain_choice", "name": "shape", "value": "waterwheel"})
+    st = game.state()
+    ids = {c["id"]: c for c in st["controls_ui"]}
+    assert st["compute"]["manifest"] == "fountain3d_wheel.manifest.json" and st["compute"]["uniforms"]["sdf_on"] == 0.0
+    assert ids["wheel_n"]["group"] == "Wheel" and ids["wheel_om"]["diag"] == "body_om" and ids["wheel_alpha"]["action"] == "fountain_param"
+    body = st["compute"]["body"]
+    assert body["paddles"] == 8 and body["angle"] == "body_th" and body["torque_input"] == "body_tau" and body["dh"] == pytest.approx(0.5 * st["compute"]["depth"], rel=1e-6)
+    epoch = st["compute"]["epoch"]
+    game.do({"type": "fountain_param", "name": "wheel_alpha", "value": 5.0})              # a runtime input: the same run
+    assert game.state()["compute"]["epoch"] == epoch and game.state()["compute"]["uniforms"]["body_alpha"] == 5.0
+    game.do({"type": "fountain_param", "name": "wheel_n", "value": 6.0})                  # what the body IS: a new run
+    assert game.state()["compute"]["epoch"] == epoch + 1 and game.state()["compute"]["body"]["paddles"] == 6
+    assert {"body_tau", "body_alpha", "body_gam", "body_i"} <= set(B.layout("wheel")["runtime_inputs"])

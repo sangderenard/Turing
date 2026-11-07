@@ -31,7 +31,7 @@ A. **Signed-distance chambers:** primitives (box/cube, sphere/circle, capsule/ra
 B. **Ports, pumps and lines:** outlet regions park grains into a line (transit time from length and pump rate) and re-emit them FIFO at an inlet port, deterministically in law state; see-through glass tubing drawn with the transiting grains.
 C. **Hinged rigid actors + waterwheel:** a body of SDF primitives on one hinge, two-way contact forces, angle as law state, coupled through the engine_toy machine-sim torque path; preset "waterwheel fountain" (nozzle -> wheel -> outlet -> pump line -> nozzle).
 
-- **Waterwheel in 3D (queued, after orbeez and designed heights):** the 2D wheel ported to fountain3d: a hub plus paddles extruded through the depth, hinged about z, as its own 3D wheel product.
+- **Waterwheel in 3D (DONE, `make_law(.., body=True)` in `fountain3d.py`, variant `wheel` in `fountain3d_build`, `fountain3d_wheel.manifest.json`):** the 2D wheel ported: a hub plus paddles extruded through the depth, hinged about z; `bth`/`bom` replicated state only in the body variant (default 3D law and products unchanged); contact through the existing 3D `wall()` (surface velocity and relative spin passed in), torque about the hinge from the reduction's element 0, semi-implicit step in engine_toy's order, `body_tau`/`body_om` coupling. Not built at 10M. Verified in the eager NumPy lane only (native 3D compiles exceed 90 minutes).
 
 ## Purrline sand mode (the user, 2026-11-07)
 
