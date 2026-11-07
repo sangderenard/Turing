@@ -1913,6 +1913,24 @@ async function selectSavedParticle(digest) {
   refreshLocalControls();
 }
 const MARBLE = { mesh: null, key: "" };
+function marbleRollModel(at, radius, center = null) {
+  const q = compute.rotation?.()?.quaternion;
+  let turn = M.identity();
+  if (q && q.length === 4 && q.every(Number.isFinite)) {
+    const [x, y, z, w] = q, xx = x*x, yy = y*y, zz = z*z;
+    const spinLaw = new Float32Array([
+      1-2*(yy+zz), 2*(x*y+z*w), 2*(x*z-y*w), 0,
+      2*(x*y-z*w), 1-2*(xx+zz), 2*(y*z+x*w), 0,
+      2*(x*z+y*w), 2*(y*z-x*w), 1-2*(xx+yy), 0,
+      0, 0, 0, 1,
+    ]);
+    const basis = M.rotateX(-Math.PI / 2);
+    turn = M.multiply(basis, M.multiply(spinLaw, M.rotateX(Math.PI / 2)));
+  }
+  let model = M.multiply(M.translate(...at), M.multiply(turn, M.scale(radius, radius, radius)));
+  if (center) model = M.multiply(model, M.translate(...center.map((v) => -v)));
+  return model;
+}
 function marblePreview() {
   if (!state.game || !state.extent || (state.game.game !== "marble_madness" && !$('marble-preview').checked)) return null;
   if (state.game.game === "marble_madness" && savedParticle.mesh) {
@@ -1925,7 +1943,7 @@ function marblePreview() {
     const at = lawToWorld(state.game)(point.x, point.y, point.z), mesh = savedParticle.mesh;
     const r = point.radius * scale * mesh.scale;
     return { interior: mesh.opaque, glass: mesh.glass,
-      model: M.multiply(M.multiply(M.translate(...at), M.scale(r, r, r)), M.translate(...mesh.center.map((v) => -v))) };
+      model: marbleRollModel(at, r, mesh.center) };
   }
   const eye = $('marble-eye').value;
   const ids = { glass: state.materialIndex.marble_clear_glass,
@@ -1953,7 +1971,7 @@ function marblePreview() {
     const scale = Math.min(state.game.width / (x1 - x0), state.game.height / (y1 - y0));
     const at = lawToWorld(state.game)(point.x, point.y, point.z);
     const r = point.radius * scale;
-    return { ...MARBLE.mesh, model: M.multiply(M.translate(...at), M.scale(r, r, r)) };
+    return { ...MARBLE.mesh, model: marbleRollModel(at, r) };
   }
   const center = M.translate(extMidX(), 1.25, extMidZ());
   return { ...MARBLE.mesh, model: M.multiply(center, M.scale(0.35, 0.35, 0.35)) };

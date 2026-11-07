@@ -56,6 +56,7 @@ import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms, decodeMeta } from "./p
 import { NoiseFilter } from "./noise_filter.js";
 import { mobroadInputs, mobroadTarget, mobroadPather } from "./mobroad.js";               // [MOBROAD]
 import { caseFlipAt, caseFlipSteps, lawAxis, rotateLawVector } from "./case_motion.js";
+import { integrateAngular } from "./marble_rotation.js";
 const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
@@ -203,7 +204,11 @@ ${commit}
     this.frameBytes = ndisp * PT_BYTES; this.diagNames = manifest.law.diagnostics; this.pool = [];
     this.maxFrames = Math.max(1, Math.min(16, Math.floor(33554432 / this.frameBytes)));
     this.diagRegion = Math.ceil(this.maxFrames * this.diagNames.length * 4 / 256) * 256;
-    this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.diagRegion + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
+    this.angularSlots = ["wx", "wy", "wz"].every((name) => A.feed_slots[name] !== undefined)
+      ? ["wx", "wy", "wz"].map((name) => A.feed_slots[name]) : null;
+    this.angularRegion = this.angularSlots ? Math.ceil(this.maxFrames * 12 / 256) * 256 : 0;
+    this.frameOffset = this.diagRegion + this.angularRegion;
+    this.stages = [0, 1, 2].map(() => ({ buffer: this.device.createBuffer({ size: this.frameOffset + this.maxFrames * this.frameBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }), busy: false }));
     this.stateSlots = this.state.map((name) => A.feed_slots[name]);
     const oom = await this.device.popErrorScope();
     if (oom) throw new Error(`out of memory: the device could not allocate ${mb(rec.memory.arena_bytes + ndisp * PT_BYTES)} for ${rec.n.toLocaleString()} ids (${oom.message})`);
@@ -274,7 +279,9 @@ ${commit}
     for (let j = 0; j < frames; j++) {
       this.#encodeSteps(encoder, snapEvery);
       this.#encodePack(encoder);
-      encoder.copyBufferToBuffer(this.pts, 0, stage.buffer, this.diagRegion + j * this.frameBytes, this.frameBytes);
+      encoder.copyBufferToBuffer(this.pts, 0, stage.buffer, this.frameOffset + j * this.frameBytes, this.frameBytes);
+      if (this.angularSlots) this.angularSlots.forEach((slot, k) =>
+        encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, this.diagRegion + j * 12 + k * 4, 4));
       if (diagAt.includes(j)) this.diagNames.forEach((name, k) => {
         const slot = this.abi.output_slots[name];
         encoder.copyBufferToBuffer(this.lanes[this.laneOf(slot)], this.byteAt(slot), stage.buffer, (j * nd + k) * 4, 4);
@@ -286,14 +293,15 @@ ${commit}
       }
     }
     this.#scoped(() => this.device.queue.submit([encoder.finish()]));
-    const used = this.diagRegion + frames * this.frameBytes;
+    const used = this.frameOffset + frames * this.frameBytes;
     return stage.buffer.mapAsync(GPUMapMode.READ, 0, used).then(() => {
       const range = stage.buffer.getMappedRange(0, used), words = this.frameBytes / 4;
-      const out = { frames: [], diags: [], keys };
+      const out = { frames: [], diags: [], keys, spins: [] };
       for (let j = 0; j < frames; j++) {
         const dst = this.pool.pop() || new Float32Array(words);
-        dst.set(new Float32Array(range, this.diagRegion + j * this.frameBytes, words));
+        dst.set(new Float32Array(range, this.frameOffset + j * this.frameBytes, words));
         out.frames.push(dst);
+        out.spins.push(this.angularSlots ? Array.from(new Float32Array(range, this.diagRegion + j * 12, 3)) : null);
         out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.diagNames.map((name, k) => [name, new Float32Array(range, (j * nd + k) * 4, 1)[0]])) : null);
       }
       stage.buffer.unmap(); stage.busy = false;
@@ -399,10 +407,12 @@ class WasmProduct {
 
   // the same batch as the GPU's, run now on this thread (see GpuProduct.batch)
   batch({ frames, snapEvery, diagAt = [], keyAt = [] }) {
-    const out = { frames: [], diags: [], keys: [] };
+    const out = { frames: [], diags: [], keys: [], spins: [] };
     for (let j = 0; j < frames; j++) {
       this.step(snapEvery);
       out.frames.push(this.#pack(this.pool.pop() || new Float32Array(this.pad * PT_WORDS)));
+      out.spins.push(["wx", "wy", "wz"].every((name) => this.inputs[name])
+        ? [this.inputs.wx[0], this.inputs.wy[0], this.inputs.wz[0]] : null);
       out.diags.push(diagAt.includes(j) ? Object.fromEntries(this.manifest.law.diagnostics.map((name) => [name, this.nexts[name][0]])) : null);
       out.keys.push(keyAt.includes(j) ? { payload: Object.fromEntries(this.state.map((name) => [name, this.inputs[name].slice()])), bytes: this.state.length * this.pad * 4 } : null);
     }
@@ -557,6 +567,7 @@ export class ComputeRuntime {
     this.settleStep = null; this.detector = null; this.diag = null;
     // the pump, the recording and the display cursor
     this.tape = null; this.play = new Playback(); this.shown = null; this.token = 0; this.inflight = 0; this.arrived = new Map();
+    this.rotations = new Map(); // first particle's physical omega and integrated pose, keyed with the recording
     this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
     this.stepsDone = 0; this.stepsPerSec = 0;
     this.lawInputs = {}; this.gravity = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
@@ -898,7 +909,7 @@ export class ComputeRuntime {
   #reset(phase2Rest) {
     this.caseTilt = this.caseMotionAt(this.steps).angle;
     this.caseFlips = [];
-    this.token++; this.arrived.clear();
+    this.token++; this.arrived.clear(); this.rotations.clear();
     this.#release(this.tape.clear());
     this.lawInputs = this.#inputsNow();
     this.product.reset({ named: { ...this.named, ...this.start }, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs } });
@@ -1063,6 +1074,14 @@ export class ComputeRuntime {
         const k = k0 + j, step = k * snap;
         if (this.onSnapshot) this.onSnapshot(k, r.frames[j]);
         this.#release(this.tape.push(k, r.frames[j], r.diags[j]));
+        const omega = r.spins?.[j];
+        if (omega && omega.every(Number.isFinite)) {
+          const prior = this.rotations.get(k - 1), mean = prior ? omega.map((v, i) => (v + prior.omega[i]) / 2) : omega;
+          const quaternion = integrateAngular(prior?.quaternion || [0, 0, 0, 1], mean, snap * this.manifest.law.dt);
+          this.rotations.set(k, { frame: k, quaternion, omega });
+        }
+        while (this.rotations.size && this.rotations.keys().next().value < this.tape.lo)
+          this.rotations.delete(this.rotations.keys().next().value);
         if (r.keys[j]) this.#release({ keys: this.tape.addKey(step, r.keys[j].payload, r.keys[j].bytes) });
         if (r.diags[j]) this.#takeDiag(step, r.diags[j]);
       }
@@ -1097,6 +1116,7 @@ export class ComputeRuntime {
 
   // the packed points to draw now (the cursor's frame of the recording)
   points() { return this.ready && this.tape && this.shown != null ? this.tape.get(this.shown) : null; }
+  rotation() { return this.shown == null ? null : this.rotations.get(this.shown) || null; }
 
   // --- the run modes: the page's controls call compute.control(name) ---
   control(name) {
@@ -1127,6 +1147,7 @@ export class ComputeRuntime {
         else p.step(op.steps);
       }
       this.#release(tape.truncateAfter(f));
+      for (const frame of this.rotations.keys()) if (frame > f) this.rotations.delete(frame);
       this.arrived.clear();
       this.steps = f * this.snap;
       await p.idle();
