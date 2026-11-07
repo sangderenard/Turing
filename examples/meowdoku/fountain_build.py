@@ -43,7 +43,7 @@ for _path in (str(ROOT), str(ROOT / "examples")):
 
 from meowdoku import fountain as F  # noqa: E402
 
-SCHEMA = "turing.fountain-products.v3"
+SCHEMA = "turing.fountain-products.v4"
 SIZES = dict(F.SIZES)                    # tag -> (active ids, sort length)
 WASM_MAX = 4096                          # sizes up to this also get a wasm product
 WGSL_CONTRACT = "fast"                   # float64 storage -> f32 through a declared backend identity
@@ -140,8 +140,8 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
             "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
         },
         "memory": {"arena_bytes": compiled.arena_elements * 4, "bytes_per_id": compiled.arena_elements * 4 / pad,
-                   "display_ids": -(-pad // stride), "display_bytes": 3 * 16 * -(-pad // stride)},
-        "display_stride": stride, "emit_rate": F.EMIT_SPAN / active,
+                   "display_ids": -(-pad // stride), "display_bytes": 3 * 20 * -(-pad // stride)},
+        "display_stride": stride,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
         "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
         "source_digest": digest(tag),
@@ -183,12 +183,12 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
                 "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
-                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G},
+                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G, "k_run_max": F.K_RUN_MAX, "depth_max": F.DEPTH_MAX},
         "emit_span": F.EMIT_SPAN, "initial": {},
-        "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"],
-                   "radius": "rad", "rest_speed": 0.15},
+        "points": {"x": "x", "y": "y", "z": "z", "vx": "vx", "vy": "vy", "vz": "vz", "rgb": ["cr", "cg", "cb"], "live": "shown",
+                   "radius": "rad", "rest_speed": 0.15, "bytes": 20},
         "reference_view": list(geo["view"]),
-        "species": [list(item) for item in F.SPECIES],
+        "species": [list(item) for item in F.SPECIES], "fluids": {k: list(v) for k, v in F.FLUIDS.items()},
         "settle": F.SETTLE,
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")

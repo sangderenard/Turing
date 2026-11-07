@@ -34,18 +34,16 @@ deploy to 8766 as soon as work lands.
    - **Open:** keyframes cost one state copy per second of simulation (25 MB each at 1M ids), so the 1M+ sizes keep a very short window; the image mapping needs a settled pile (run: stop at rest); a phone-driven lid and grid height are page-side inputs the server does not see.
 2. **Neighbour list:** in-dispatch neighbour-of-neighbour refresh, one dispatch per step, a full rebuild only rarely.
 3. **Counting sort**, with N set at runtime.
-4. **Third dimension (confirmed wanted):**
-   - a plexiglass slab chamber with depth;
-   - polygon chambers;
-   - auto-rotate;
-   - a colinear tube inlet.
-5. **Page controls** for grain and physics details: size, density, friction, restitution, cohesion, compressibility, fluid, gravity, and so on, all set on the page and fed into the law as inputs, without recompiling.
-6. **Fluids and crystals:**
-   - an interstitial fluid setting (air, water, glycerine settling toy);
-   - particle compressibility (Hertz–Mindlin), so crystalline packings form.
-7. **Grain species:**
-   - several species, each with its own size, roughness and shape irregularity;
-   - mixed populations.
+4. **Third dimension** (landed, one law change; browser numbers in the commit message):
+   - the state is 3-D (`x y z`, `vx vy vz`, spin vector `wx wy wz`); the chamber is a slab between two plexiglass walls at `z = +-depth/2` (runtime `dh`; default 0.03, about one grain diameter, so the pile is the 2-D one; range 0.02-0.06);
+   - the basin outline is a polyline of up to 8 vertices (uniforms `px0..py7`; presets box (the old basin), funnel, hexagon, ramp); each segment is a wall of the same contact law;
+   - the inlet is a tube: runtime position, direction, cross-section and cone half-angle (`spread` 0 = colinear); presets fan fountain, colinear jet, pour from above, side tube;
+   - gravity is a full 3-vector runtime input (`grav_x/y/z`); `web/gravity.js` gives all three, so a phone lying flat pulls into the slab;
+   - camera: auto-rotate toggle (slow yaw orbit in the scene-camera layer, tips the view so the depth shows); points are drawn at true radius with z as depth (`PointCloud`, 20-byte points);
+   - **Open:** the glass walls are not drawn; the neighbour walk covers about 2 layers (`k_run` / `n_drop` say when it does not); 10M ids need 7-slot (280 MB) bindings, 49 slots/id (was 40): packing the colours (4 slots) or serialising the diagnostics' reduction would bring it back to 6.
+5. **Page controls** (landed): Grains (per species radius, density, friction, restitution, roughness, irregularity, share), Physics (stiffness, Hertz blend, cohesion, spin drag, nozzle speed and rate, neighbour cap with the dropped-contact readout), Fluid (air / water / glycerine presets plus density and viscosity), Chamber (depth, polygon, inlet, spread); all server-declared `controls_ui` (`fountain_param`, `fountain_choice`); the live ones are runtime inputs of the law, logged by the recording, the restart ones begin a new run.
+6. **Fluids and crystals** (landed): buoyancy plus implicit Stokes and quadratic drag; stiffness `omega` (clamped to the CFL bound) and a Hertz blend; cohesion. **Open:** a measured crystal (a near-monodisperse stiff pile reaching a hexagonal packing) has not been demonstrated.
+7. **Grain species** (landed): four species, each with radius, density, friction, restitution, rolling roughness and per-id size jitter (irregularity), and mix shares; the poly-mix slider is the macro that sets the shares.
 8. **Pipe and laminar flow:**
    - large grains at a reasonable population fill the area;
    - set by spawn flow rate, or by spawning inside an enclosed vessel that empties through a tube.

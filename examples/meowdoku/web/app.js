@@ -1442,6 +1442,7 @@ function rebuildBoards(game) {
 // the gesture layer further down moves the goal, stepCamView eases `cur` toward it.
 const camView = {
   key: null, lastR: 1, active: 0,
+  auto: false,                    // AUTO-ROTATE: a slow orbit (the yaw goal turns at AUTO_ROTATE rad/s) while no finger is on the view
   cur: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 }, goal: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
   vel: { yaw: 0, pitch: 0, lz: 0, px: 0, pz: 0 },
 };
@@ -2107,7 +2108,7 @@ function arcadeBulbs() {
   }
   return bulbs;
 }
-// The ring driven from a compute game's packed points ([x, y, rgba8, meta] per
+// The ring driven from a compute game's packed points ([x, y, z, rgba8, meta] per
 // displayed id; meta/100: 0 not launched, 1 in flight, 2 at rest), once per
 // frame, from what the simulation already gives the page -- no readback of its
 // own.  Three signals, all through the one arcadeBulb mechanism:
@@ -2129,7 +2130,7 @@ function arcadeActivity(data, rec, g, now) {
                             pulse: 0, pulsePeak: 1, phase: 0, emitCi: ARCADE_WHITE, at: now, step: 0, hadMotion: false, done: false };
   }
   const dt = Math.min(0.25, Math.max(0.001, now - A.at)); A.at = now;
-  const n = data.length / 4, stride = Math.max(1, Math.floor(n / 6000)), ns = Math.ceil(n / stride);
+  const n = data.length / 5, stride = Math.max(1, Math.floor(n / 6000)), ns = Math.ceil(n / stride);
   const u = new Uint32Array(data.buffer, data.byteOffset, data.length);
   if (!A.prev || A.prev.length !== 2 * ns) A.prev = new Float32Array(2 * ns).fill(NaN);
   const [vx0, vx1, vy0, vy1] = rec.geometry.view, bw = g.width, bh = g.height;
@@ -2139,12 +2140,12 @@ function arcadeActivity(data, rec, g, now) {
   const em = { d: Infinity, r: 0, g: 0, b: 0, n: 0 };
   let moving = 0, rest = 0;
   for (let i = 0, j = 0; i < n; i += stride, j++) {
-    const px = data[4 * i], py = data[4 * i + 1], flag = Math.floor(data[4 * i + 3] / 100 + 0.001);
+    const px = data[5 * i], py = data[5 * i + 1], flag = Math.floor(data[5 * i + 4] / 100 + 0.001);
     const qx = A.prev[2 * j], qy = A.prev[2 * j + 1]; A.prev[2 * j] = px; A.prev[2 * j + 1] = py;
     if (flag < 1) continue;
     if (flag >= 2) { rest++; continue; }
     moving++;
-    const rgba = u[4 * i + 2], r = (rgba & 255) / 255, gg = ((rgba >> 8) & 255) / 255, b = ((rgba >> 16) & 255) / 255;
+    const rgba = u[5 * i + 3], r = (rgba & 255) / 255, gg = ((rgba >> 8) & 255) / 255, b = ((rgba >> 16) & 255) / 255;
     const nd = Math.hypot(px - cx, py - nozzle);
     if (nd < em.d - tol) { em.d = nd; em.r = em.g = em.b = 0; em.n = 0; }
     if (nd <= em.d + tol) { em.r += r; em.g += gg; em.b += b; em.n++; }
@@ -3884,7 +3885,7 @@ window.meowdokuDebug.compute = compute;
 // The phone's orientation is the fountain's gravity (a runtime input of the law), on by default, with an off switch.  iOS only
 // delivers the events after a permission asked for on a tap: the first tap anywhere asks.
 const gravitySensor = new GravitySensor({
-  onGravity: (gx, gy) => compute.setGravity(gx, gy),
+  onGravity: (gx, gy, gz) => compute.setGravity(gx, gy, gz),
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
@@ -3898,6 +3899,10 @@ function localControl(s, value) {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
+  } else if (s.local === "orbit") {
+    camView.auto = !!value;
+    // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
+    if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
   } else compute.control(s.local);
   refreshLocalControls();
 }
@@ -3906,9 +3911,15 @@ function refreshLocalControls() {
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
   for (const s of g.controls_ui) {
+    if (s.kind === "readout") {                       // a number the law reports (the dropped neighbour contacts beside the cap)
+      const el = box.querySelector(`[data-ctl="${s.id}"]`), d = compute.diag;
+      if (el) el.textContent = `${s.label}: ${d ? Math.round(d[s.diag]).toLocaleString() : "-"}`;
+      continue;
+    }
     if (!s.local) continue;
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
+    if (s.local === "orbit") { el.querySelector("input").checked = !!camView.auto; continue; }
     if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
@@ -3925,7 +3936,8 @@ function renderGameControls(game) {
   const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;
   if (box.dataset.key !== key) {
     box.dataset.key = key;
-    box.replaceChildren(...specs.map((s) => {
+    const groups = new Map();                          // a spec's `group` collects its controls into a collapsible panel
+    const built = specs.map((s) => {
       let el;
       if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => (s.local ? localControl(s) : act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) })); }
       else if (s.kind === "toggle") {
@@ -3939,17 +3951,31 @@ function renderGameControls(game) {
         if (s.capture) input.setAttribute("capture", s.capture);
         input.onchange = async () => { const f = input.files[0]; input.value = ""; await compute.pickImage(f, s.sample); };
         el.append(input);
-      } else {
+      } else if (s.kind === "readout") { el = document.createElement("span"); el.className = "gctl-readout"; }
+      else {
         el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
         const input = document.createElement(s.kind === "select" ? "select" : "input");
         if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => act({ type: s.action, [s.field]: s.kind === "range" || typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
-        el.append(input);
+        input.onchange = () => act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" || typeof s.options?.[0]?.[0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
+        if (s.kind === "range") { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(input.value).toPrecision(3); }; el.append(input, val); }
+        else el.append(input);
       }
       el.dataset.ctl = s.id;
       return el;
-    }));
+    });
+    const top = [];
+    specs.forEach((s, i) => {
+      if (!s.group || s.group === "Run") { top.push(built[i]); return; }
+      if (!groups.has(s.group)) {
+        const d = document.createElement("details"); d.className = "gctl-group"; d.dataset.group = s.group;
+        const sum = document.createElement("summary"); sum.textContent = s.group;
+        const body = document.createElement("div"); body.className = "gctl-body"; d.append(sum, body);
+        groups.set(s.group, body); top.push(d);
+      }
+      groups.get(s.group).append(built[i]);
+    });
+    box.replaceChildren(...top);
   }
   for (const s of specs) {
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
@@ -3967,8 +3993,11 @@ function renderGameControls(game) {
         if (verdict && !verdict.ok) input.title = verdict.reason;
       }
     }
-    if (input && s.kind === "toggle") input.checked = s.local ? gravitySensor.enabled : !!s.value;
-    else if (input && document.activeElement !== input) input.value = String(s.value);
+    if (input && s.kind === "toggle") input.checked = s.local === "orbit" ? !!camView.auto : s.local ? gravitySensor.enabled : !!s.value;
+    else if (input && document.activeElement !== input) {
+      input.value = String(s.value);
+      const val = el.querySelector("output.gctl-val"); if (val) val.textContent = Number(s.value).toPrecision(3);
+    }
   }
   refreshLocalControls();
 }
@@ -4613,11 +4642,13 @@ function clampCamGoal(gest) {
   G.pitch = Math.max(gest.elLim[0] - base, Math.min(gest.elLim[1] - base, G.pitch));
   const r = Math.hypot(G.px, G.pz); if (r > gest.panLim) { G.px *= gest.panLim / r; G.pz *= gest.panLim / r; }
 }
+const AUTO_ROTATE = 0.25;   // rad/s: one turn in ~25 s
 function stepCamView(dt) {
   const g = state.game, key = g ? g.game : null;
   if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) camView.cur[k] = camView.goal[k] = camView.vel[k] = 0; }
   dt = Math.max(0, Math.min(0.1, dt || 0));
   const gest = cameraGestures(), G = camView.goal, C = camView.cur;
+  if (gest && camView.auto && !camView.active) G.yaw += AUTO_ROTATE * dt;
   if (gest && !camView.active) {                                        // inertia: a released flick coasts and damps
     const decay = Math.exp(-dt * 4);
     for (const k of CV_KEYS) { G[k] += camView.vel[k] * dt; camView.vel[k] *= decay; if (Math.abs(camView.vel[k]) < 1e-4) camView.vel[k] = 0; }

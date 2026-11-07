@@ -1,72 +1,66 @@
-"""Fountain: a soft-sphere (DEM) granular fountain that fills a basin, takes an image, fills it again.
+"""Fountain: a soft-sphere (DEM) granular fountain in a 3-D slab chamber that fills a basin, takes an image, fills it again.
 
 ONE batched per-step law (``fountain_step``), authored once over spans of
 particle ids in the repository's AbstractTensor style, compiled by the
 repository to native, wasm and (generated) WebGPU compute.
 
 NO PER-ID TABLES.  Everything an id is -- its emit time, where it leaves the
-nozzle, its launch velocity, its species and so radius, mass, friction and
-drag -- is DERIVED IN THE LAW from the id itself by an integer hash done in
-exact float arithmetic (every intermediate is a whole number below 2**24, so
-f64 and f32 agree to the bit and native, wasm and WGSL cannot disagree).  The
-only per-id columns are the state (x y vx vy w age), the iota ``pid`` (which
+inlet, its launch velocity, its species and so radius, mass and friction -- is
+DERIVED IN THE LAW from the id itself by an integer hash done in exact float
+arithmetic (every intermediate is a whole number below 2**24, so f64 and f32
+agree to the bit and native, wasm and WGSL cannot disagree).  The only per-id
+columns are the state (x y z vx vy vz wx wy wz age), the iota ``pid`` (which
 the generated shader reads from its own invocation index, never from memory)
-and the image colours ``ir ig ib``.  So the id count can run to millions
-without shipping a byte of layout.
+and the image colours ``ir ig ib``.
+
+THE CHAMBER (3-D)
+-----------------
+A SLAB between two plexiglass walls ``z = -depth/2`` and ``z = +depth/2`` (``dh`` = depth/2, a runtime uniform; a thin slab,
+about one grain diameter, is the 2-D fountain of before).  The basin outline in the x-y plane is a POLYLINE of up to
+``NV`` vertices (uniforms ``px0..py7``; unused vertices repeat the last one), extruded through the depth: each segment is a
+wall that is a contact of the same law as a grain (a body of infinite mass).  The default is the old basin (a floor and two
+side walls, open top).  The INLET is a tube: a source line/rectangle of half-widths ``bar_half`` x ``bar_z`` about a runtime
+position, perpendicular to a runtime direction ``(in_dx, in_dy, in_dz)``, launching grains along it within a cone of
+half-angle ``spread`` (0 = a colinear stream).  GRAVITY is a full 3-vector runtime input.
 
 PHYSICS
 -------
-* Disks of four SPECIES that differ in radius, density (so mass), friction
-  and drag.  Contacts are SOFT SPHERES: a normal spring-dashpot (stiffness
-  proportional to the pair's reduced mass, damping from a damping ratio) plus
-  tangential Coulomb friction (regularised with a tanh of the contact's slip
-  speed) acting on the slip of the contact point, spin included, so disks
-  roll.  The basin is a floor and two side walls that are contacts of the
-  same law (a wall is a disk of infinite mass).  Gravity and linear air drag
-  act on every particle.
-* Contacts WRITE FORCES (and torques); the integrator (semi-implicit Euler,
-  fixed ``DT``) is the only thing that moves anything.  Both sides of a pair
-  evaluate the same symmetric expressions, so they are equal and opposite
-  without any per-pair bookkeeping, impulse or position correction.
-* The FOUNTAIN is an emitter: id ``k`` leaves at ``k / n * EMIT_SPAN``, at a
-  nozzle position a low-discrepancy step along the bar from the previous id,
-  with a hashed launch angle and speed.  Until its age reaches its emit time
-  a particle is parked, takes no part in contacts and is not drawn.  At its
-  time it is ARMED at its nozzle slot and is emitted at the first step no live
-  grain is within contact distance of the slot (plus what a pair can close in
-  one step): a grain never spawns inside another, so the contact springs
-  inject no energy at the nozzle.  The pile forms and settles by contact
-  forces, so regular and irregular packing emerge from the species mix.
-* The basin and nozzle scale with ``sqrt(n)`` so the pile keeps its shape, and
-  take the screen's aspect (``basin``) at the same pile area; the basin is a
-  set of RUNTIME uniforms, so one program serves every aspect.
-* GRAVITY is a vector, a RUNTIME INPUT (``grav_x``, ``grav_y``, default ``(0, -G)``), as are the basin's numbers: a phone's
-  tilt turns it moment by moment with no rebuild.  ``lid`` (a ceiling at that height, off by default) keeps grains in the
-  basin when gravity points up.  The inputs enter the law as plain additions, so the default is bit for bit the old law.
-* DIAGNOSTICS: the law reduces, by a fixed tree of additions, the kinetic +
-  rotational energy, the largest speed, and the number of ids that are not
-  finite / outside the walls / parked / live, plus the contacts the neighbour
-  walk dropped.  The page ends phase 1 on the energy (``SETTLE``).
+* SPHERES of four SPECIES, each with a radius, density (mass = rho 4/3 pi r^3), sliding friction, restitution (the
+  contact's damping ratio), ROLLING resistance (roughness) and shape IRREGULARITY.  Irregularity is modelled as a
+  deterministic per-id radius jitter: grain ``k`` of a species has radius ``r (1 + irr h(k))`` with ``h`` in [-1, 1) hashed
+  from its id, so a species is a population of different sizes.  (Rolling resistance is the separate roughness term.)
+* Contacts are SOFT SPHERES: a normal spring-dashpot (stiffness ``omega^2`` times the pair's reduced mass), blended
+  from linear toward HERTZ (force ~ overlap^1.5) by ``hertz``, with an adhesion (COHESION ``coh`` weights, within a
+  short range), tangential Coulomb friction regularised with a tanh of the slip speed, acting on the slip of the contact
+  point, spin included, so spheres roll, and a constant-torque rolling resistance on the relative spin.
+* An INTERSTITIAL FLUID of density ``fl_rho`` and viscosity ``fl_mu`` acts on every grain: buoyancy (gravity times
+  1 - fl_rho / rho), Stokes drag (6 pi mu r v) and quadratic drag, integrated IMPLICITLY so a stiff setting damps and
+  never explodes.  Air, water and glycerine are presets of the page.
+* Contacts WRITE FORCES (and torques); the integrator (semi-implicit Euler, fixed ``DT``) is the only thing that moves
+  anything.  Both sides of a pair evaluate the same symmetric expressions, so they are equal and opposite without any
+  per-pair bookkeeping.
+* STABILITY: the explicit contact spring needs ``omega * DT * sqrt(contacts)`` well under 2.  ``uniforms`` clamps the
+  stiffness to ``OMEGA_MAX / sqrt(1 + 2 hertz)`` (Hertz stiffens the spring as the overlap grows); damping and drag are
+  implicit; the friction and rolling forces are limited to a share of the slip per step.
+* The inlet EMITS: id ``k`` leaves at ``k * emit_rate`` (runtime), armed at its slot until no live grain is within contact
+  distance of it (see ``fountain_step``), so a grain never spawns inside another.
+* DIAGNOSTICS: the law reduces, by a fixed tree of additions, the kinetic + rotational energy, the largest speed, and the
+  number of ids that are not finite / outside the chamber / parked / live, plus the contacts the neighbour walk dropped.
 
 NEIGHBOUR SEARCH (in the law, from tensor ops; deterministic)
 -------------------------------------------------------------
-A uniform grid of cells of the largest diameter.  Each step the particles are
-sorted by the pair ``(cell, id)`` with a BITONIC SORT written as gathers and
-compare-exchanges over two carried arrays (``log2(P)(log2(P)+1)/2`` stages;
-pairs are unique, so the order is unique and nothing about thread scheduling
-can change it).  ``P`` is the id count rounded up to a power of two; the
-extra ids are parked forever.  Each of the three rows of the 3x3 block is a
-run of the sorted cells found by two binary searches (gathers); the contact
-loop walks the first ``K_RUN`` of each run.  No atomics and no scatter.
+A uniform grid of columns of ``cell`` (the largest diameter) in x and y, running through the WHOLE depth: the slab is
+thin, so a column's z cells are few and the 27-cell neighbourhood is the three rows of 3 columns.  Each step the
+particles are sorted by the pair ``(cell, id)`` with Knuth's merge exchange; each of the three rows is a run of the
+sorted cells found by two binary searches; the contact loop walks the first ``k_run`` (a RUNTIME uniform up to
+``K_RUN_MAX``: the loop is fixed-trip, the cap masks the candidates past it, so a lower cap saves no time on the device
+-- it trades accuracy for nothing but the dropped-contact count; the dropped contacts are counted in ``n_drop``).
 
 COLOUR
 ------
-Phase 1: hue from the ANGLE of the id's launch vector, as a trig ramp
-(``mode 0``: ``atan2``) or as a rotation of the chroma vector about the grey
-axis with cos/sin read off the vector (``mode 1``, no ``atan2``).  The image
-step samples the picked image at every id's ACTUAL rest position into per-id
-colours ``ir ig ib``; phase 2 replays the identical simulation with
-``use_image = 1`` and the law emits ``hue * (1 - use) + image * use``.
+Phase 1: hue from the ANGLE of the id's launch vector (mode 0 atan2, mode 1 rotation) or from the id's emission order
+(mode 2, time strata, ``strata`` cycles).  The image step samples the picked image at every id's rest position into per-id
+colours; phase 2 replays the identical simulation with ``use_image = 1``.
 """
 
 from __future__ import annotations
@@ -86,60 +80,153 @@ from src.common.tensors import numpy_backend  # noqa: F401  (registers the NumPy
 N_BASE = 4096                          # the basin's reference count (its width is WIDTH_BASE)
 WIDTH_BASE = 2.0
 FLOOR_Y = 0.0
-EMIT_SPAN = 6.0                        # seconds over which ids are emitted
+EMIT_SPAN = 6.0                        # seconds over which ids are emitted (at nozzle rate 1)
 #: The pile is AT REST (phase 1 ends, at step S; phase 2 stops at exactly S) when everything is emitted and the law's
 #: kinetic + rotational energy has stayed under BOTH ``ke_per_id`` per id and ``relative`` of its peak, with the largest speed
 #: under ``speed``, for ``hold_samples`` consecutive samples taken every ``sample`` steps.  ``max_seconds`` caps a pile that
-#: never quiets.  ``web/compute.js`` ``SettleDetector`` is this rule.
-SETTLE = {"sample": 30, "hold_samples": 12, "relative": 0.01, "ke_per_id": 1.0e-7, "speed": 0.25, "max_seconds": 40.0}
+#: never quiets.  ``web/compute.js`` ``SettleDetector`` is this rule.  (``ke_per_id`` is per SPHERE: a sphere's mass is ~80x
+#: less than the disk it replaced, so the floor is 80x lower.)
+SETTLE = {"sample": 30, "hold_samples": 12, "relative": 0.01, "ke_per_id": 1.0e-9, "speed": 0.25, "max_seconds": 40.0}
 DT = 1.0 / 360.0
 G = 1.0
-OMEGA = 150.0                          # contact stiffness: kn = m * OMEGA^2 (OMEGA * DT stays well under 1: a grain feels several contacts)
-ZETA = 0.7                             # normal damping ratio
+OMEGA = 150.0                          # default contact stiffness: kn = m_eff * omega^2
+OMEGA_MAX = 200.0                      # the CFL bound at one contact blend: omega * DT * sqrt(contacts) stays under 2
+ZETA = 0.7                             # default normal damping ratio (restitution ~0.046)
 VREF = 0.02                            # tangential slip speed over which friction saturates
+WREF = 2.0                             # relative spin (rad/s) over which rolling resistance saturates
 SPIN_DRAG = 3.0                        # 1/s
+HERTZ_REF = 0.04                       # the overlap (in mean radii) at which the Hertz and linear springs agree
+COH_RANGE = 0.1                        # adhesion acts to this gap (in mean radii)
 STRATA = 1.0                           # default hue cycles over the emission in mode 2 (time strata); a runtime uniform ``strata``
 #: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
 STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
-K_RUN = 24                             # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one)
-ARMED = -1.0e9                         # the vy of an id waiting at its nozzle slot (see ``fountain_step``)
+K_RUN_MAX = 32                         # candidates walked per row run: the compile-time maximum of the runtime uniform ``k_run``
+K_RUN = 24                             # its default (a hex pack of the smallest grains in a thin slab is ~9-15 per run)
+ARMED = -1.0e9                         # the vy of an id waiting at its inlet slot (see ``fountain_step``)
 EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
-#: The share of a contact's slip that ONE step's friction may remove.  Coulomb friction is regularised with a tanh whose slope
-#: mu fn / VREF is stiff, and an explicit step of a force that stiff reverses the slip it acts on (and, for the several contacts
-#: of a grain, pumps energy: a settled pile kept spinning and rattling for ever).  Friction is therefore limited to
-#: ``FRICTION_SHARE`` of the slip per step, in the contact's own slip mass (m_eff / 3 for a disk's slip, spin included); a grain
-#: has up to six neighbours and a wall, so the share is about 1/7.
+#: The share of a contact's slip that ONE step's friction may remove (see the 2-D history of this law): friction is limited to
+#: ``FRICTION_SHARE`` of the slip per step, in the contact's own slip mass (m_eff / 3.5 for a sphere's slip, spin included).
 FRICTION_SHARE = 0.15
-BAR_HEIGHT = 0.12
+BAR_HEIGHT = 0.12                      # the source's extent ALONG the stream
+NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
+DEPTH_MAX = 0.06                       # the deepest slab: ~2 grain layers, the most the neighbour walk covers (``n_drop`` says when not)
+DEPTH_DEFAULT = 0.03                   # thin: a bit more than the widest diameter, so the pile is the 2-D one
+LID_OFF = 1.0e9
+LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 
-#: species: name, radius, density, friction, linear drag (1/s)
+#: species: name, radius, density, sliding friction, rolling resistance, irregularity (the DEFAULTS of the page's table)
 SPECIES = (
-    ("grain", 0.0090, 1.0, 0.35, 0.10),
-    ("bead",  0.0105, 1.6, 0.20, 0.06),
-    ("dust",  0.0120, 0.7, 0.55, 0.25),
-    ("pearl", 0.0140, 2.2, 0.10, 0.04),
+    ("grain", 0.0090, 1.0, 0.35, 0.0, 0.0),
+    ("bead",  0.0105, 1.6, 0.20, 0.0, 0.0),
+    ("dust",  0.0120, 0.7, 0.55, 0.0, 0.0),
+    ("pearl", 0.0140, 2.2, 0.10, 0.0, 0.0),
 )
 MONO_WEIGHT = (0.6, 0.4, 0.0, 0.0)       # mix 0: near-monodisperse grains and beads (a crystal wants to form)
 POLY_WEIGHT = (0.15, 0.15, 0.35, 0.35)   # mix 1: all four species, widely polydisperse
-CELL = 2.0 * max(s[1] for s in SPECIES)
+CELL = 2.0 * max(s[1] for s in SPECIES)  # the reference grid cell; the running one is ``cell_of(params)``
 
-STATE = ("x", "y", "vx", "vy", "w", "age")
+#: interstitial fluids: name -> (density relative to a grain of density 1, viscosity in the sim's units).  Sim units: grain
+#: density 1, g = 1, grain radius ~0.01.  Stokes damping rate of the grain = 4.5 mu / (rho r^2) (1/s): air 0.1, water 1.5,
+#: glycerine 11 (a grain falls ~0.05 per second in it).
+FLUIDS = {"air": (0.0005, 3.0e-6), "water": (0.38, 2.5e-5), "glycerine": (0.48, 2.0e-4)}
+DEFAULT_FLUID = "air"
+
+SHAPES = ("box", "funnel", "hexagon", "ramp")
+INLETS = ("fountain", "jet", "pour", "side")
+
+
+def zeta_of(restitution: float) -> float:
+    """Damping ratio of a spring-dashpot contact that returns ``restitution`` of the approach speed."""
+    ln = math.log(min(max(float(restitution), 1.0e-4), 0.9999))
+    return -ln / math.sqrt(math.pi ** 2 + ln * ln)
+
+
+def restitution_of(zeta: float) -> float:
+    return math.exp(-math.pi * zeta / math.sqrt(1.0 - zeta * zeta))
+
+
+#: The tunables the page sets (no rebuild).  name -> (label, lo, hi, step, default, restart, group).  ``restart`` ones change
+#: what an id IS at emission or the grid itself (radius, irregularity, mix weights, the chamber, the inlet, the rate): a
+#: new run.  The others are RUNTIME INPUTS of the law, applied at a step boundary and logged with their step.
+def _params() -> dict[str, tuple]:
+    out: dict[str, tuple] = {}
+    for s, (name, r, rho, mu, roll, irr) in enumerate(SPECIES):
+        out[f"r{s}"] = (f"{name} radius", 0.005, 0.020, 0.0005, r, True, "Grains")
+        out[f"rho{s}"] = (f"{name} density", 0.2, 5.0, 0.1, rho, False, "Grains")
+        out[f"mu{s}"] = (f"{name} friction", 0.0, 1.0, 0.05, mu, False, "Grains")
+        out[f"e{s}"] = (f"{name} restitution", 0.02, 0.95, 0.01, restitution_of(ZETA), False, "Grains")
+        out[f"roll{s}"] = (f"{name} roughness", 0.0, 0.3, 0.01, roll, False, "Grains")
+        out[f"irr{s}"] = (f"{name} irregularity", 0.0, 0.3, 0.01, irr, True, "Grains")
+        out[f"wt{s}"] = (f"{name} share", 0.0, 1.0, 0.05, MONO_WEIGHT[s], True, "Grains")
+    out.update({
+        "omega": ("stiffness (compressibility)", 40.0, OMEGA_MAX, 5.0, OMEGA, False, "Physics"),
+        "hertz": ("Hertz blend", 0.0, 1.0, 0.05, 0.0, False, "Physics"),
+        "coh": ("cohesion", 0.0, 3.0, 0.05, 0.0, False, "Physics"),
+        "spin_drag": ("spin drag", 0.0, 20.0, 0.5, SPIN_DRAG, False, "Physics"),
+        "k_run": ("neighbour cap", 4.0, float(K_RUN_MAX), 1.0, float(K_RUN), False, "Physics"),
+        "nozzle_speed": ("nozzle speed", 0.3, 2.0, 0.05, 1.0, False, "Physics"),
+        "rate": ("nozzle rate", 0.25, 4.0, 0.05, 1.0, True, "Physics"),
+        "fl_rho": ("fluid density", 0.0, 1.2, 0.01, FLUIDS[DEFAULT_FLUID][0], False, "Fluid"),
+        "fl_mu": ("fluid viscosity", 0.0, 5.0e-4, 1.0e-5, FLUIDS[DEFAULT_FLUID][1], False, "Fluid"),
+        "depth": ("depth", 0.02, DEPTH_MAX, 0.002, DEPTH_DEFAULT, True, "Chamber"),
+        "spread": ("inlet spread (rad)", 0.0, 0.9, 0.05, 0.7, True, "Chamber"),
+    })
+    return out
+
+
+PARAMS = _params()
+
+
+def resolve_params(mix: float = 0.5, params: dict | None = None) -> dict[str, float]:
+    """Every tunable's value: the defaults, the mix weights from ``mix`` (poly mix is the macro that sets the four shares),
+    then the caller's overrides, each clamped to its range."""
+    p = {k: float(v[4]) for k, v in PARAMS.items()}
+    for s in range(len(SPECIES)):
+        p[f"wt{s}"] = (1.0 - mix) * MONO_WEIGHT[s] + mix * POLY_WEIGHT[s]
+    for k, v in (params or {}).items():
+        if k in PARAMS:
+            p[k] = min(max(float(v), PARAMS[k][1]), PARAMS[k][2])
+    if sum(p[f"wt{s}"] for s in range(len(SPECIES))) < 1.0e-6:
+        p["wt0"] = 1.0
+    return p
+
+
+def cell_of(p: dict[str, float]) -> float:
+    """The grid cell: the largest diameter any grain can have (species radius with its irregularity)."""
+    return 2.0 * max(p[f"r{s}"] * (1.0 + p[f"irr{s}"]) for s in range(len(SPECIES)))
+
+
+def stiffness_of(p: dict[str, float]) -> float:
+    """The contact stiffness the law is given: the page's ``omega`` clamped to the CFL bound (Hertz stiffens the spring up
+    to 1 + 2 hertz times its linear tangent, so the bound drops with it)."""
+    return min(p["omega"], OMEGA_MAX / math.sqrt(1.0 + 2.0 * p["hertz"]))
+
+
+STATE = ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz", "age")
 CONSTANTS = ("pid", "ir", "ig", "ib")
-UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata")   # the run, its basin, the RUNTIME INPUTS, then the colour rate
-#: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
-#: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
-#: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
-#: the lid still meet each other.  The server sends their defaults (and the closed values as ``tilt_inputs``); the page's
-#: runtime owns them after that.
-RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows")
-LID_OFF = 1.0e9
-LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
+_SPECIES_UNIFORMS = tuple(f"{k}{s}" for k in ("r", "rho", "mu", "zeta", "roll", "irr") for s in range(len(SPECIES)))
+POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
+UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows", "cell", "dh", "bar_z", "k_run",
+             "nozzle_x", "nozzle_z", "in_dx", "in_dy", "in_dz", "e1x", "e1y", "e1z", "e2x", "e2y", "e2z",
+             "spread", "nozzle_speed", "emit_rate")
+            + POLYGON_UNIFORMS
+            + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu",
+               "wt0", "wt1", "wt2", "wt3")
+            + _SPECIES_UNIFORMS)
+#: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
+#: ``rows`` (a ceiling and the grid's height, which the page closes while a sensor drives gravity), and the live tunables.  The
+#: server sends their defaults; the page's runtime owns them after that and LOGS each change with its step, so a re-run
+#: (Continue) reproduces it exactly.
+LIVE_PARAMS = tuple(k for k, v in PARAMS.items() if not v[5])
+RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "omega", "hertz", "coh", "spin_drag", "k_run",
+                  "nozzle_speed", "fl_rho", "fl_mu") \
+    + tuple(f"{k}{s}" for k in ("rho", "mu", "zeta", "roll") for s in range(len(SPECIES)))
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
 #: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
-#: walls, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
+#: chamber, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
 DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
-OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
+OUTPUTS = tuple(f"{s}_next" for s in STATE) + ("cr", "cg", "cb", "rad", "shown") + DIAGNOSTICS
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
 
 TAU = 2.0 * math.pi
@@ -189,27 +276,27 @@ def fit_scale(s: float, aspect: float) -> float:
     return (b + math.sqrt(b * b + 4.0 * w * 0.6 * a * s)) / (2.0 * w)
 
 
-def basin(n: int, aspect: float | None = None) -> dict[str, float]:
+def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
     """Geometry for ``n`` active ids: basin and nozzle scale with sqrt(n / N_BASE).  ``aspect`` (the screen's
     width / height, clamped) stretches it to fill that screen at the same pile area; ``None`` is the reference basin.
-    Every number the law needs is a RUNTIME uniform (see ``uniforms``): one program serves every aspect."""
+    ``cell`` is the grid cell (``cell_of``).  Every number the law needs is a RUNTIME uniform (see ``uniforms``)."""
     s = math.sqrt(n / N_BASE)
     k = 1.0 if not aspect else fit_scale(s, aspect)
     width = WIDTH_BASE * s * k
     nozzle_y = 0.6 * s / k + 0.7
-    cols = int(math.ceil(width / CELL))
-    rows = int(math.ceil((nozzle_y + 0.1) / CELL))
+    cols = int(math.ceil(width / cell))
+    rows = int(math.ceil((nozzle_y + 0.1) / cell))
     return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
             "cols": cols, "rows": rows, "cells": cols * rows,
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
 
 
-def tilt_inputs(n: int, aspect: float | None = None) -> dict[str, float]:
+def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
     """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
     jet's reach and a grid tall enough to cover everything under it."""
-    geo = basin(n, aspect)
+    geo = basin(n, aspect, cell)
     lid = geo["nozzle_y"] + LID_ABOVE
-    return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / CELL))}
+    return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
 
 
 def board_size(view) -> tuple[float, float]:
@@ -218,6 +305,87 @@ def board_size(view) -> tuple[float, float]:
     ref = basin(N_BASE)["view"]
     a0 = (ref[1] - ref[0]) / (ref[3] - ref[2])
     return (10.5, 10.5 / a) if a >= a0 else (13.5 * a, 13.5)
+
+
+def shape_vertices(shape: str, geo: dict[str, float]) -> list[tuple[float, float]]:
+    """The basin outline as a polyline (at most ``NV`` vertices; the law pads it by repeating the last).  All inside
+    ``|x| <= half`` and ``y >= 0``.  ``box`` is the old basin: a floor and two side walls, open top.  A polyline end
+    carries half a wall's weight; repeat the first vertex to close a polygon."""
+    h, ny = geo["half"], geo["nozzle_y"]
+    top = ny + 2.5
+    if shape == "box":
+        return [(-h, top), (-h, 0.0), (h, 0.0), (h, top)]
+    if shape == "funnel":
+        return [(-h, top), (-h, 0.55 * ny), (-0.25 * h, 0.0), (0.25 * h, 0.0), (h, 0.55 * ny), (h, top)]
+    if shape == "hexagon":
+        return [(-h, top), (-h, 0.3 * ny), (-0.55 * h, 0.0), (0.55 * h, 0.0), (h, 0.3 * ny), (h, top)]
+    if shape == "ramp":
+        return [(-h, top), (-h, 0.35 * ny), (h, 0.0), (h, top)]
+    raise ValueError(f"unknown chamber shape {shape!r}")
+
+
+def inlet_spec(inlet: str, geo: dict[str, float], p: dict[str, float]) -> dict[str, float]:
+    """The inlet (a tube: position, direction, cross-section) for a preset, as the law's uniforms.  ``fountain`` is the old
+    bar with a fan; the others are colinear tubes (``spread`` 0 unless the page raised it)."""
+    h, ny = geo["half"], geo["nozzle_y"]
+    if inlet == "fountain":
+        pos, d, half_w = (0.0, ny, 0.0), (0.0, 1.0, 0.0), geo["bar_half"]
+    elif inlet == "jet":
+        pos, d, half_w = (0.0, 0.25 * ny, 0.0), (0.0, 1.0, 0.0), 0.04
+    elif inlet == "pour":
+        pos, d, half_w = (0.0, ny, 0.0), (0.0, -1.0, 0.0), 0.04
+    elif inlet == "side":
+        pos, d, half_w = (-h + 0.06, 0.55 * ny, 0.0), (1.0, 0.25, 0.0), 0.04
+    else:
+        raise ValueError(f"unknown inlet {inlet!r}")
+    norm = math.sqrt(sum(c * c for c in d))
+    d = tuple(c / norm for c in d)
+    ref = (0.0, 0.0, 1.0) if abs(d[2]) <= 0.9 else (1.0, 0.0, 0.0)          # e1 = d x ref, e2 = d x e1
+    e1 = (d[1] * ref[2] - d[2] * ref[1], d[2] * ref[0] - d[0] * ref[2], d[0] * ref[1] - d[1] * ref[0])
+    n1 = math.sqrt(sum(c * c for c in e1))
+    e1 = tuple(c / n1 for c in e1)
+    e2 = (d[1] * e1[2] - d[2] * e1[1], d[2] * e1[0] - d[0] * e1[2], d[0] * e1[1] - d[1] * e1[0])
+    return {"nozzle_x": pos[0], "nozzle_y": pos[1], "nozzle_z": pos[2], "bar_half": half_w,
+            "in_dx": d[0], "in_dy": d[1], "in_dz": d[2], "e1x": e1[0], "e1y": e1[1], "e1z": e1[2],
+            "e2x": e2[0], "e2y": e2[1], "e2z": e2[2]}
+
+
+def inlet_default_spread(inlet: str) -> float:
+    return PARAMS["spread"][4] if inlet == "fountain" else 0.0
+
+
+def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
+             gravity: tuple[float, float, float] = (0.0, -G, 0.0), lid: float = LID_OFF, strata: float = STRATA,
+             params: dict | None = None, shape: str = "box", inlet: str = "fountain") -> dict[str, np.ndarray]:
+    """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``), the chamber
+    for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) with its ``shape`` outline, depth and
+    ``inlet``, the RUNTIME INPUTS (``gravity`` vector, ``lid``, the live tunables of ``params``) and the species table.
+    ``mix`` sets the four species shares unless ``params`` overrides them.  The stiffness is clamped to the CFL bound."""
+    p = resolve_params(mix, params)
+    if "spread" not in (params or {}):
+        p["spread"] = inlet_default_spread(inlet)
+    cell = cell_of(p)
+    geo = basin(n, aspect, cell)
+    out: dict[str, float] = {"mode": mode, "use_image": use_image}
+    out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
+    out.update(inlet_spec(inlet, geo, p))
+    rmax = max(p[f"r{s}"] * (1.0 + p[f"irr{s}"]) for s in range(len(SPECIES)))
+    dh = 0.5 * p["depth"]
+    out.update({"cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
+                "spread": p["spread"], "nozzle_speed": p["nozzle_speed"], "emit_rate": EMIT_SPAN / float(n) / p["rate"]})
+    verts = shape_vertices(shape, geo)
+    if len(verts) > NV:
+        raise ValueError(f"a chamber outline has at most {NV} vertices")
+    verts = verts + [verts[-1]] * (NV - len(verts))
+    out.update({f"px{k}": verts[k][0] for k in range(NV)})
+    out.update({f"py{k}": verts[k][1] for k in range(NV)})
+    out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
+                "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"],
+                "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
+    for s in range(len(SPECIES)):
+        out.update({f"wt{s}": p[f"wt{s}"], f"r{s}": p[f"r{s}"], f"rho{s}": p[f"rho{s}"], f"mu{s}": p[f"mu{s}"],
+                    f"zeta{s}": zeta_of(p[f"e{s}"]), f"roll{s}": p[f"roll{s}"], f"irr{s}": p[f"irr{s}"]})
+    return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
 # --------------------------------------------------------------- id hashing
@@ -253,25 +421,55 @@ def _ramp(h, offset):
     return ((f * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0)
 
 
-def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu):
-    """Force and torque on the particle from one contact (``delta`` > 0 overlap,
-    ``n`` the unit normal pointing at THIS particle, ``vr`` its velocity relative
-    to the other body, ``spin_slip`` the spin part of the contact slip).  Returns
-    (fx, fy, tangential force); torque = -radius * the third value."""
-    vn = vrx * nx + vry * ny
-    cn = 2.0 * ZETA * (kn * m_eff).sqrt()
-    fn = (kn * delta - cn * vn).clamp(0.0, 1.0e9)
-    tx, ty = -ny, nx
-    vt = vrx * tx + vry * ty - spin_slip
-    # tanh of the slip speed over VREF.  An emitted grain meets the plume at ~1.5 m/s, so the argument
-    # reaches ~75; a tanh built from exp(2x) (Metal/Apple shaders, fast-math) is inf/inf = NaN past
-    # |x| ~ 44 in f32, and one NaN force removes the grain and every grain it touches.  tanh(20) is 1
-    # to 1e-17, so clamping the argument changes no f64 result and keeps every f32 lane finite.
-    tanh = (vt * (1.0 / VREF)).clamp(-20.0, 20.0).tanh()
-    coulomb = mu * fn * tanh.abs()
-    stick = (FRICTION_SHARE / (3.0 * DT)) * m_eff * vt.abs()          # the most that removes FRICTION_SHARE of the slip in one step
-    ft = -(coulomb - (coulomb - stick).clamp(0.0, 1.0e30)) * (vt / (vt.abs() + 1.0e-30))
-    return fn * nx + ft * tx, fn * ny + ft * ty, ft
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _contact(dl, valid, n, vr, spin_slip, wrel, kn, m_eff, mu, zeta, roll, radius, reff, rbar, hertz, coh):
+    """Force (3-vector) and torque (3-vector) on the particle from one contact.  ``dl`` is the signed overlap (> 0
+    touching), ``valid`` the weight of the contact (0 or 1 for a pair; a wall's share), ``n`` the unit normal pointing at
+    THIS particle, ``vr`` its velocity relative to the other body, ``spin_slip`` = (r_i w_i + r_j w_j) x n, ``wrel`` =
+    w_i - w_j, ``reff`` the effective radius of the rolling contact, ``rbar`` the mean radius.
+
+    Normal: spring blended from linear to Hertz by ``hertz`` (the Hertz force equals the linear one at HERTZ_REF mean
+    radii of overlap; past 4x that the blend stays linear), dashpot of damping ratio ``zeta``, minus an adhesion of
+    ``coh`` weights of the pair within COH_RANGE.  Tangential: Coulomb friction limited to a share of the slip per step.
+    Rolling: a constant torque against the relative spin, limited the same way."""
+    vn = _dot(vr, n)
+    cn = 2.0 * zeta * (kn * m_eff).sqrt()
+    over = dl.clamp(0.0, 1.0e9)
+    xr = (over * (1.0 / (HERTZ_REF * rbar + 1.0e-12))).clamp(0.0, 4.0)
+    elastic = kn * over * ((1.0 - hertz) + hertz * xr.sqrt())
+    rep = (elastic - cn * vn).clamp(0.0, 1.0e9) * as_float(dl > 0.0)
+    near = as_float(dl > -COH_RANGE * rbar)
+    fn = (rep - coh * (m_eff * G) * near) * valid
+    rep = rep * valid
+    # slip of the contact point (tangential): relative velocity less its normal part, less the spin's
+    vt = (vr[0] - vn * n[0] - spin_slip[0], vr[1] - vn * n[1] - spin_slip[1], vr[2] - vn * n[2] - spin_slip[2])
+    vtn = (_dot(vt, vt) + 1.0e-20).sqrt()
+    # tanh of the slip speed over VREF, argument clamped (a tanh built from exp(2x) is inf/inf = NaN past ~44 in f32)
+    tanh = (vtn * (1.0 / VREF)).clamp(0.0, 20.0).tanh()
+    coulomb = mu * rep * tanh
+    stick = (FRICTION_SHARE / (3.5 * DT)) * m_eff * vtn          # the most that removes FRICTION_SHARE of the slip in one step
+    ft_mag = coulomb - (coulomb - stick).clamp(0.0, 1.0e30)
+    ft = (-(ft_mag / vtn) * vt[0], -(ft_mag / vtn) * vt[1], -(ft_mag / vtn) * vt[2])
+    tq_f = _cross(n, ft)
+    # rolling resistance
+    wn = _dot(wrel, n)
+    wt = (wrel[0] - wn * n[0], wrel[1] - wn * n[1], wrel[2] - wn * n[2])
+    wtn = (_dot(wt, wt) + 1.0e-20).sqrt()
+    tanh_r = (wtn * (1.0 / WREF)).clamp(0.0, 20.0).tanh()
+    r_max = roll * rep * reff * tanh_r
+    r_stick = (FRICTION_SHARE / DT) * (0.4 * m_eff * rbar * rbar) * wtn
+    r_mag = r_max - (r_max - r_stick).clamp(0.0, 1.0e30)
+    force = (fn * n[0] + ft[0], fn * n[1] + ft[1], fn * n[2] + ft[2])
+    torque = (-radius * tq_f[0] - (r_mag / wtn) * wt[0], -radius * tq_f[1] - (r_mag / wtn) * wt[1],
+              -radius * tq_f[2] - (r_mag / wtn) * wt[2])
+    return force, torque
 
 
 def _cap(v, hi):
@@ -279,52 +477,91 @@ def _cap(v, hi):
     return v - (v - hi).clamp(0.0, 1.0e9)
 
 
-def _nozzle(pid, bar_half, nozzle_y):
-    """Where id ``pid`` leaves the nozzle: a low-discrepancy step along the bar (the golden-ratio step 2531/4093, so ids
-    emitted close together in time are far apart along the bar) and a hashed height within it."""
-    bar_x = _mod(_lin(pid, 2531.0), _PRIME) * (1.0 / _PRIME)
-    bar_y = _mod(_lin(pid, 3187.0), _PRIME) * (1.0 / _PRIME)
-    return (bar_x - 0.5) * (2.0 * bar_half), nozzle_y + (bar_y - 0.5) * BAR_HEIGHT
+def _nozzle(pid, centre, e1, e2, d, bar_half, bar_z):
+    """Where id ``pid`` leaves the inlet tube: a low-discrepancy step along the source line (the golden-ratio step
+    2531/4093, so ids emitted close together in time are far apart along it), a hashed place across the depth and a hashed
+    height along the stream.  ``centre``, ``e1``, ``e2``, ``d`` are 3-tuples of runtime scalars."""
+    u1 = _mod(_lin(pid, 2531.0), _PRIME) * (1.0 / _PRIME)
+    u2 = _mod(_lin(pid, 3187.0), _PRIME) * (1.0 / _PRIME)
+    u3 = _mod(_lin(pid, 1613.0), _PRIME) * (1.0 / _PRIME)
+    a = (u1 - 0.5) * (2.0 * bar_half)
+    b = (u3 - 0.5) * (2.0 * bar_z)
+    c = (u2 - 0.5) * BAR_HEIGHT
+    return tuple(centre[k] + a * e1[k] + b * e2[k] + c * d[k] for k in range(3))
 
 
 def make_law(n: int, active: int | None = None):
     """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
-    The basin (``half``, ``nozzle_y``, ``bar_half``, ``cols``, ``rows``) is a runtime uniform: see ``basin``."""
+    The chamber, inlet, species table and every tunable are runtime uniforms: see ``uniforms``."""
     active = int(n if active is None else active)
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
-    emit_rate = EMIT_SPAN / float(active)
     scan_shifts = reduction_shifts(n)
+    nsp = len(SPECIES)
 
-    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows,
-                      grav_x, grav_y, lid, strata):
+    def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
+        a = dict(zip(ARGUMENTS, args))
+        x, y, z, vx, vy, vz, wx, wy, wz, age = (a[k] for k in STATE)
+        pid, ir, ig, ib = (a[k] for k in CONSTANTS)
+        half, nozzle_y, bar_half, cols, rows, cell, dh, bar_z = (a[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows", "cell", "dh", "bar_z"))
+        emit_rate, k_run, spread, nozzle_speed = a["emit_rate"], a["k_run"], a["spread"], a["nozzle_speed"]
+        grav = (a["grav_x"], a["grav_y"], a["grav_z"])
+        lid, strata, mode, use_image = a["lid"], a["strata"], a["mode"], a["use_image"]
+        omega, hertz, coh, spin_drag, fl_rho, fl_mu = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu"))
+        centre = (a["nozzle_x"], nozzle_y, a["nozzle_z"])
+        d_in = (a["in_dx"], a["in_dy"], a["in_dz"])
+        e1 = (a["e1x"], a["e1y"], a["e1z"])
+        e2 = (a["e2x"], a["e2y"], a["e2z"])
         cells = cols * rows
+        weights = [a[f"wt{s}"] for s in range(nsp)]
+        total_w = weights[0] + weights[1] + weights[2] + weights[3] + 1.0e-9
+        c0 = weights[0] / total_w
+        c1 = (weights[0] + weights[1]) / total_w
+        c2 = (weights[0] + weights[1] + weights[2]) / total_w
+
+        def table(name):
+            return [a[f"{name}{s}"] for s in range(nsp)]
+
+        def pick(vals, m1, m2, m3):
+            return vals[0] + (vals[1] - vals[0]) * m1 + (vals[2] - vals[0]) * m2 + (vals[3] - vals[0]) * m3
+
+        def masks(u):
+            sp = as_float(u >= c0) + as_float(u >= c1) + as_float(u >= c2)
+            return tuple(as_float((sp - float(k)).abs() < 0.5) for k in (1, 2, 3))
+
+        def species(ident):
+            """radius (with its irregularity jitter), mass, friction, damping ratio, rolling coefficient of an id."""
+            m1, m2, m3 = masks(_mix(ident, 1237.0, 5.0))
+            jitter = _mix(ident, 2999.0, 61.0) * 2.0 - 1.0
+            rr = pick(table("r"), m1, m2, m3) * (1.0 + pick(table("irr"), m1, m2, m3) * jitter)
+            rho = pick(table("rho"), m1, m2, m3)
+            return (rr, rho, rho * ((4.0 / 3.0) * math.pi) * rr * rr * rr, pick(table("mu"), m1, m2, m3),
+                    pick(table("zeta"), m1, m2, m3), pick(table("roll"), m1, m2, m3))
 
         def frame(search):
             """emit time and the state of each id, from the id and its state.  Evaluated again after the sort
             rather than carried across its ~300 dispatches (a value that crosses them holds an arena slot, 4 bytes
             per id each, for all of them).
 
-            An id is in one of three kinds of state.  PARKED is the exact zero state (x = y = 0: no real grain rests
-            at the origin).  ARMED (``vy`` = ``ARMED``) is an id whose time has come: it waits AT the nozzle slot it
-            will leave from (its stored x, y), takes part in no contact and does not move, and is emitted at the first
-            step its slot is clear (no live grain, where it will be NEXT step, within contact distance).  Anything else is LIVE.  With ``search`` an armed id looks up its neighbours at
-            its slot, as a live id does at its place."""
+            An id is in one of three kinds of state.  PARKED is the exact zero state (x = y = z = 0: no real grain rests
+            at the origin).  ARMED (``vy`` = ``ARMED``) is an id whose time has come: it waits AT the inlet slot it
+            will leave from (its stored x, y, z), takes part in no contact and does not move, and is emitted at the first
+            step its slot is clear (no live grain, where it will be NEXT step, within contact distance).  Anything else is
+            LIVE.  With ``search`` an armed id looks up its neighbours at its slot, as a live id does at its place."""
             t = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
-            a = as_float(age >= t)
-            parked = as_float((x.abs() + y.abs()) < 1.0e-30)
+            a_ = as_float(age >= t)
+            parked = as_float((x.abs() + y.abs() + z.abs()) < 1.0e-30)
             armed = as_float(vy < ARMED * 0.5)
-            live = a * (1.0 - parked) * (1.0 - armed)
-            pending = a * armed
-            arming = a * parked
+            live = a_ * (1.0 - parked) * (1.0 - armed)
+            pending = a_ * armed
+            arming = a_ * parked
             # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
-            # get the cell past the end: sorted last, in nobody's block)
-            ix = _cap(((x + half) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), cols - 1.0)
-            iy = _cap(((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), rows - 1.0)
-            inside = as_float(y < rows * CELL + FLOOR_Y)
-            # armed ids are sorted into the grid too (at their slots): they see each other, and live grains see them
-            return t, a, arming, live, pending, ix, iy, (live + pending * float(search)) * inside, (live + pending) * inside
+            # get the cell past the end: sorted last, in nobody's block).  A column runs through the whole depth.
+            ix = _cap(((x + half) / cell).floor().clamp(0.0, 1.0e9), cols - 1.0)
+            iy = _cap(((y - FLOOR_Y) / cell).floor().clamp(0.0, 1.0e9), rows - 1.0)
+            inside = as_float(y < rows * cell + FLOOR_Y)
+            return t, a_, arming, live, pending, ix, iy, (live + pending * float(search)) * inside, (live + pending) * inside
         t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(False)
         kc = AbstractTensor.where(gridded > 0.5, cy * cols + cx, cy * 0.0 + cells)
         ki = pid
@@ -346,11 +583,11 @@ def make_law(n: int, active: int | None = None):
             ki = AbstractTensor.where(keep_self > 0.5, ki, oi)
         # ---- the run of sorted cells covering each of the three rows of the 3x3 block
         t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(True)
-        fx = x * 0.0
-        fy = fx
-        tq = fx
-        blocked = fx
-        dropped = fx
+        zero = x * 0.0
+        f_ = [zero, zero, zero]
+        q_ = [zero, zero, zero]
+        blocked = zero
+        dropped = zero
         top = float(n - 1)
         runs = []
         for dy in (-1.0, 0.0, 1.0):
@@ -372,143 +609,135 @@ def make_law(n: int, active: int | None = None):
                     hi = AbstractTensor.where(run_live * (1.0 - below) > 0.5, mid, hi)
                 ends.append(lo)
             runs.append((ends[0], ends[1], ok))
-            # candidates beyond the walk's reach are DROPPED contacts: counted (the law's dropped output), never silent
-            dropped = dropped + (ends[1] - ends[0] - float(K_RUN)).clamp(0.0, 1.0e9) * ok * searching
+            # candidates beyond the walk's reach (``k_run``) are DROPPED contacts: counted (the law's dropped output), never silent
+            dropped = dropped + (ends[1] - ends[0] - k_run).clamp(0.0, 1.0e9) * ok * searching
         t_emit = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
         # ---- the rest of what this id is, derived again HERE (not before the sort: a value that crosses
         # the sort's dispatches would hold an arena slot for all of them)
-        x0, y0 = _nozzle(pid, bar_half, nozzle_y)
-        theta = (_mix(pid, 1759.0, 17.0) * 2.0 - 1.0) * 0.7
-        speed = 0.9 + _mix(pid, 2203.0, 29.0) * 0.7
-        vx0 = speed * theta.sin()
-        vy0 = speed * theta.cos()
-        u = _mix(pid, 1237.0, 5.0)
-        w0 = (1.0 - mix) * MONO_WEIGHT[0] + mix * POLY_WEIGHT[0]
-        w1 = (1.0 - mix) * MONO_WEIGHT[1] + mix * POLY_WEIGHT[1]
-        w2 = (1.0 - mix) * MONO_WEIGHT[2] + mix * POLY_WEIGHT[2]
-        c0, c1, c2 = w0, w0 + w1, w0 + w1 + w2
-        sp = as_float(u >= c0) + as_float(u >= c1) + as_float(u >= c2)
-        is1, is2, is3 = (as_float((sp - float(k)).abs() < 0.5) for k in (1, 2, 3))
-        radius = SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * is1 + (SPECIES[2][1] - SPECIES[0][1]) * is2 \
-            + (SPECIES[3][1] - SPECIES[0][1]) * is3
-        density = SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * is1 + (SPECIES[2][2] - SPECIES[0][2]) * is2 \
-            + (SPECIES[3][2] - SPECIES[0][2]) * is3
-        mu = SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * is1 + (SPECIES[2][3] - SPECIES[0][3]) * is2 \
-            + (SPECIES[3][3] - SPECIES[0][3]) * is3
-        drag = SPECIES[0][4] + (SPECIES[1][4] - SPECIES[0][4]) * is1 + (SPECIES[2][4] - SPECIES[0][4]) * is2 \
-            + (SPECIES[3][4] - SPECIES[0][4]) * is3
-        mass = density * math.pi * radius * radius
+        x0, y0, z0 = _nozzle(pid, centre, e1, e2, d_in, bar_half, bar_z)
+        u_theta = _mix(pid, 1759.0, 17.0) * 2.0 - 1.0
+        theta = u_theta * spread
+        speed = (0.9 + _mix(pid, 2203.0, 29.0) * 0.7) * nozzle_speed
+        ct, st = theta.cos(), theta.sin()
+        vx0 = speed * (d_in[0] * ct + e1[0] * st)
+        vy0 = speed * (d_in[1] * ct + e1[1] * st)
+        vz0 = speed * (d_in[2] * ct + e1[2] * st)
+        radius, density, mass, mu, zeta, roll = species(pid)
+        inertia = 0.4 * mass * radius * radius
+        w_self = (wx, wy, wz)
 
         # ---- particle-particle contacts: forces from the neighbours' state
-        def neighbour_props(j):
-            uj = _mix(j, 1237.0, 5.0)
-            spj = as_float(uj >= c0) + as_float(uj >= c1) + as_float(uj >= c2)
-            j1, j2, j3 = (as_float((spj - float(k)).abs() < 0.5) for k in (1, 2, 3))
-            rj = SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * j1 + (SPECIES[2][1] - SPECIES[0][1]) * j2 \
-                + (SPECIES[3][1] - SPECIES[0][1]) * j3
-            dj = SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * j1 + (SPECIES[2][2] - SPECIES[0][2]) * j2 \
-                + (SPECIES[3][2] - SPECIES[0][2]) * j3
-            muj = SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * j1 + (SPECIES[2][3] - SPECIES[0][3]) * j2 \
-                + (SPECIES[3][3] - SPECIES[0][3]) * j3
-            return rj, dj * math.pi * rj * rj, muj
-
         for lo, hi, ok in runs:
-            for slot in range(K_RUN):
+            for slot in range(K_RUN_MAX):
                 idx = lo + float(slot)
-                valid = as_float(idx < hi) * ok * searching
+                valid = as_float(idx < hi) * ok * searching * as_float(k_run > float(slot) + 0.5)
                 j = ki.index_select(0, idx.clamp(0.0, top))
                 valid = valid * as_float((j - pid).abs() > 0.5)
-                armed_j = as_float(vy.index_select(0, j) < ARMED * 0.5)         # an armed neighbour is a slot, not a body
+                vyj = vy.index_select(0, j)
+                armed_j = as_float(vyj < ARMED * 0.5)                           # an armed neighbour is a slot, not a body
                 xj = x.index_select(0, j)
                 yj = y.index_select(0, j)
+                zj = z.index_select(0, j)
                 vxj = vx.index_select(0, j)
-                vyj = vy.index_select(0, j)
-                wj = w.index_select(0, j)
-                rj, mj, muj = neighbour_props(j)
+                vzj = vz.index_select(0, j)
+                wj = (wx.index_select(0, j), wy.index_select(0, j), wz.index_select(0, j))
+                rj, _dj, mj, muj, zetaj, rollj = species(j)
                 # coincident centres (two ids at one point) have no contact normal; they are pushed apart
                 # along a direction fixed by the ids (antisymmetric, so equal and opposite) instead of
                 # dividing a zero separation
-                same = as_float((x - xj).abs() + (y - yj).abs() < 1.0e-9)
+                same = as_float((x - xj).abs() + (y - yj).abs() + (z - zj).abs() < 1.0e-9)
                 side = as_float(pid > j) - as_float(pid < j)
                 dx = x - xj + same * side * 1.0e-4
                 dyy = y - yj
-                dist = (dx * dx + dyy * dyy + 1.0e-12).sqrt()
-                delta = (radius + rj - dist) * valid * (1.0 - armed_j)
-                touch = as_float(delta > 0.0)
+                dzz = z - zj
+                dist = (dx * dx + dyy * dyy + dzz * dzz + 1.0e-12).sqrt()
                 # an armed id is emitted only into a CLEAR slot: no live neighbour, at the position it moves to this
                 # step, within the contact distance (plus EMIT_MARGIN): the grain is placed overlapping nothing
                 nxt_x = x - (xj + vxj * DT)
                 nxt_y = y - (yj + vyj * DT)
+                nxt_z = z - (zj + vzj * DT)
                 blocked = blocked + pending * valid * (1.0 - armed_j) * as_float(
-                    radius + rj + EMIT_MARGIN - (nxt_x * nxt_x + nxt_y * nxt_y + 1.0e-12).sqrt() > 0.0)
+                    radius + rj + EMIT_MARGIN - (nxt_x * nxt_x + nxt_y * nxt_y + nxt_z * nxt_z + 1.0e-12).sqrt() > 0.0)
                 # ... and not into the slot of a LOWER armed id that is within contact distance of this slot (the lower
                 # id goes first; both are stationary, so the slots' own distance decides)
                 blocked = blocked + pending * valid * armed_j * as_float(j < pid) * as_float(radius + rj + EMIT_MARGIN - dist > 0.0)
-                nx = dx / dist
-                ny = dyy / dist
+                nrm = (dx / dist, dyy / dist, dzz / dist)
                 m_eff = mass * mj / (mass + mj)
-                kn = OMEGA * OMEGA * m_eff
-                gx, gy, gt = _contact(delta, nx, ny, vx - vxj, vy - vyj, radius * w + rj * wj, kn, m_eff,
-                                      (mu * muj).sqrt())
-                fx = fx + gx * touch
-                fy = fy + gy * touch
-                tq = tq - radius * gt * touch
-        # ---- walls and floor: the same contact against a body of infinite mass
-        kw = OMEGA * OMEGA * mass
-        floor_delta = (radius - (y - FLOOR_Y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(floor_delta, y * 0.0, y * 0.0 + 1.0, vx, vy, radius * w, kw, mass, mu)
-        touch = as_float(floor_delta > 0.0)
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        left_delta = (radius - (x + half)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(left_delta, y * 0.0 + 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
-        touch = as_float(left_delta > 0.0)
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        right_delta = (radius - (half - x)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(right_delta, y * 0.0 - 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
-        touch = as_float(right_delta > 0.0)
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        # the lid: the same contact against a ceiling at the runtime height ``lid`` (a body of infinite mass; far away unless the page closes it)
-        lid_delta = (radius - (lid - y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(lid_delta, y * 0.0, y * 0.0 - 1.0, vx, vy, radius * w, kw, mass, mu)
-        touch = as_float(lid_delta > 0.0)
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
-        # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
+                kn = omega * omega * m_eff
+                vr = (vx - vxj, vy - vyj, vz - vzj)
+                sp_sum = (radius * wx + rj * wj[0], radius * wy + rj * wj[1], radius * wz + rj * wj[2])
+                spin_slip = _cross(sp_sum, nrm)
+                wrel = (wx - wj[0], wy - wj[1], wz - wj[2])
+                force, torque = _contact(radius + rj - dist, valid * (1.0 - armed_j), nrm, vr, spin_slip, wrel, kn, m_eff,
+                                         (mu * muj).sqrt(), (zeta * zetaj).sqrt(), (roll * rollj).sqrt(), radius,
+                                         radius * rj / (radius + rj), 0.5 * (radius + rj), hertz, coh)
+                for k in range(3):
+                    f_[k] = f_[k] + force[k]
+                    q_[k] = q_[k] + torque[k]
+
+        # ---- walls: the same contact against a body of infinite mass.  The basin outline is a polyline (each segment a wall
+        # through the depth: the contact is with the nearest point of the segment, in the x-y plane); a segment's two
+        # ends carry half a wall each where it meets the next segment (or is a free end), so a vertex is one wall
+        kw = omega * omega * mass
+
+        def wall(dl, valid, n_vec):
+            force, torque = _contact(dl, valid, n_vec, (vx, vy, vz), _cross((radius * wx, radius * wy, radius * wz), n_vec),
+                                     w_self, kw, mass, mu, zeta, roll, radius, radius, radius, hertz, coh)
+            for k in range(3):
+                f_[k] = f_[k] + force[k]
+                q_[k] = q_[k] + torque[k]
+        for k in range(NV - 1):
+            ax, ay, bx, by = a[f"px{k}"], a[f"py{k}"], a[f"px{k + 1}"], a[f"py{k + 1}"]
+            ex, ey = bx - ax, by - ay
+            len2 = ex * ex + ey * ey
+            t_raw = ((x - ax) * ex + (y - ay) * ey) / (len2 + 1.0e-12)
+            t_c = t_raw.clamp(0.0, 1.0)
+            dxw = x - (ax + t_c * ex)
+            dyw = y - (ay + t_c * ey)
+            dw = (dxw * dxw + dyw * dyw + 1.0e-12).sqrt()
+            share = as_float(len2 > 1.0e-8) * (1.0 - 0.5 * as_float(t_raw <= 0.0) - 0.5 * as_float(t_raw >= 1.0))
+            wall(radius - dw, live * share, (dxw / dw, dyw / dw, zero))
+        wall(radius - (dh - z), live, (zero, zero, zero - 1.0))             # the front plexiglass (+z), its normal points at the grain: -z
+        wall(radius - (z + dh), live, (zero, zero, zero + 1.0))             # the back plexiglass (-z)
+        wall(radius - (lid - y), live, (zero, zero - 1.0, zero))            # the lid: a ceiling at the runtime height ``lid`` (far unless the page closes it)
+        # ---- the integrator: gravity (the runtime vector), the interstitial fluid, the forces above.  A pending id with a clear
+        # slot is placed at the inlet with its launch velocity; one with a blocked slot waits for the next step.  The fluid's
+        # drag (Stokes 6 pi mu r v and quadratic) is implicit, so any viscosity damps and none explodes.
         just = pending * as_float(blocked < 0.5)
         place = just + arming
-        inertia = 0.5 * mass * radius * radius
-        vxn = AbstractTensor.where(just > 0.5, vx0, vx + live * (fx / mass + grav_x - drag * vx) * DT)
-        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED,
-                                                                         vy + live * (fy / mass + grav_y - drag * vy) * DT))
-        wn = (w + live * (tq / inertia - SPIN_DRAG * w) * DT) * (1.0 - just)
+        buoy = 1.0 - fl_rho / density
+        speed_now = (vx * vx + vy * vy + vz * vz).sqrt()
+        kdrag = 4.5 * fl_mu / (density * radius * radius) + 0.176 * fl_rho / (density * radius) * speed_now
+        damp = 1.0 / (1.0 + live * kdrag * DT)
+        vxn = AbstractTensor.where(just > 0.5, vx0, (vx + live * (f_[0] / mass + grav[0] * buoy) * DT) * damp)
+        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(
+            arming > 0.5, vy * 0.0 + ARMED, (vy + live * (f_[1] / mass + grav[1] * buoy) * DT) * damp))
+        vzn = AbstractTensor.where(just > 0.5, vz0, (vz + live * (f_[2] / mass + grav[2] * buoy) * DT) * damp)
+        sdamp = (1.0 - just) / (1.0 + live * spin_drag * DT)
+        wxn = (wx + live * (q_[0] / inertia) * DT) * sdamp
+        wyn = (wy + live * (q_[1] / inertia) * DT) * sdamp
+        wzn = (wz + live * (q_[2] / inertia) * DT) * sdamp
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
+        zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * DT)
         age_next = age + DT
-        # ---- colour from the angle of the launch vector.  theta is the launch angle from the
-        # vertical (+-0.7 rad).  The hue turns four times as fast as theta so the fan spans most of
-        # the wheel: trig = atan2, rotation = the double-angle formulas applied twice to cos/sin
-        # read off the vector (no atan2).
-        cth = vy0 / speed
-        sth = vx0 / speed
+        # ---- colour from the angle of the launch vector.  theta_c is a hashed launch angle (+-0.7 rad, whatever the cone):
+        # the hue turns four times as fast as it so the fan spans most of the wheel: trig = atan2, rotation = the
+        # double-angle formulas applied twice to cos/sin (no atan2).
+        theta_c = u_theta * 0.7
+        cth = theta_c.cos()
+        sth = theta_c.sin()
         c2 = cth * cth - sth * sth
         s2 = 2.0 * cth * sth
         c = c2 * c2 - s2 * s2
         sn = 2.0 * c2 * s2
-        hue = vx0.atan2(vy0) * (4.0 / TAU) + 0.5
+        hue = sth.atan2(cth) * (4.0 / TAU) + 0.5
         root3 = 0.5773502691896258
         rot_r = (c * (2.0 / 3.0)) * 0.85 + 0.5
         rot_g = (c * (-1.0 / 3.0) + sn * root3) * 0.85 + 0.5
         rot_b = (c * (-1.0 / 3.0) - sn * root3) * 0.85 + 0.5
-        # mode 2: TIME STRATA -- hue turns ``strata`` times over the emission (a runtime uniform: the page's colour-rate
-        # option), so the settled pile is layered by the order its grains arrived (ids are emitted in order)
+        # mode 2: TIME STRATA -- hue turns ``strata`` times over the emission (a runtime uniform), so the settled pile is
+        # layered by the order its grains arrived (ids are emitted in order)
         m2 = as_float(mode > 1.5)
         hue = hue + m2 * (pid * (strata * (1.0 / float(active))) - hue)
         m = as_float(mode > 0.5) * (1.0 - m2)
@@ -523,17 +752,20 @@ def make_law(n: int, active: int | None = None):
         cg = base_g * keep + ig * use_image
         cb = base_b * keep + ib * use_image
         # ---- CONSERVATION COUNTERS and ENERGY of the state just computed.  Every id is in exactly one class:
-        # nan (not finite), parked (the zero state), outside (past a wall or under the floor) or live.
-        finite = as_float(xn.abs() < 1.0e30) * as_float(yn.abs() < 1.0e30) * as_float(vxn.abs() < 1.0e30) \
-            * as_float(vyn.abs() < 1.0e30) * as_float(wn.abs() < 1.0e30)
-        placed = finite * as_float((xn.abs() + yn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
-        outside = placed * (1.0 - (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)))
+        # nan (not finite), parked (the zero state), outside (past a wall, the plexiglass or under the floor) or live.
+        finite = as_float(xn.abs() < 1.0e30) * as_float(yn.abs() < 1.0e30) * as_float(zn.abs() < 1.0e30) \
+            * as_float(vxn.abs() < 1.0e30) * as_float(vyn.abs() < 1.0e30) * as_float(vzn.abs() < 1.0e30) \
+            * as_float(wxn.abs() < 1.0e30) * as_float(wyn.abs() < 1.0e30) * as_float(wzn.abs() < 1.0e30)
+        placed = finite * as_float((xn.abs() + yn.abs() + zn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
+        inside_box = (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) \
+            * (1.0 - as_float(zn.abs() > dh + radius))
+        outside = placed * (1.0 - inside_box)
         c_nan = 1.0 - finite
         c_parked = finite * (1.0 - placed)
         c_out = outside
         c_live = placed - outside
-        v2 = AbstractTensor.where(placed > 0.5, vxn * vxn + vyn * vyn, vxn * 0.0)
-        ke = 0.5 * mass * v2 + AbstractTensor.where(placed > 0.5, 0.5 * inertia * wn * wn, vxn * 0.0)
+        v2 = AbstractTensor.where(placed > 0.5, vxn * vxn + vyn * vyn + vzn * vzn, vxn * 0.0)
+        ke = 0.5 * mass * v2 + AbstractTensor.where(placed > 0.5, 0.5 * inertia * (wxn * wxn + wyn * wyn + wzn * wzn), vxn * 0.0)
         c_drop = dropped
         # ---- fixed-order reduction (Hillis-Steele): after the shifts 1, 2, 4 .. element 0 holds the total,
         # always as the same tree of additions, so native, wasm and WebGPU add in one order
@@ -547,7 +779,8 @@ def make_law(n: int, active: int | None = None):
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
-        return xn, yn, vxn, vyn, wn, age_next, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
+        return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, cr, cg, cb, radius, act,
+                ke, v2, c_nan, c_out, c_parked, c_live, c_drop)
 
     return fountain_step
 
@@ -558,26 +791,16 @@ def _f32(a) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).astype(np.float64)
 
 
-def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
-             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA) -> dict[str, np.ndarray]:
-    """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``),
-    its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) and the RUNTIME INPUTS
-    (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
-    geo = basin(n, aspect)
-    out = {"mode": mode, "use_image": use_image, "mix": mix}
-    out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
-    out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
-    return {k: _f32(np.float64(v)) for k, v in out.items()}
-
-
 def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0, active: int | None = None,
-                    aspect: float | None = None, strata: float = STRATA) -> dict[str, np.ndarray]:
+                    aspect: float | None = None, strata: float = STRATA, params: dict | None = None,
+                    shape: str = "box", inlet: str = "fountain") -> dict[str, np.ndarray]:
     """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
-    Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
+    Nothing else is per-id.  The chamber is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
     columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
-    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata))
+    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata,
+                            params=params, shape=shape, inlet=inlet))
     return columns
 
 
@@ -660,7 +883,7 @@ def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> d
         produced = dict(zip(OUTPUTS, outputs))
         for name in STATE:
             state[name] = produced[name + "_next"]
-        extra = {name: produced[name] for name in ("cr", "cg", "cb", "rad") + DIAGNOSTICS}
+        extra = {name: produced[name] for name in ("cr", "cg", "cb", "rad", "shown") + DIAGNOSTICS}
     return {**state, **extra}
 
 
@@ -681,7 +904,7 @@ BOARD = board_size(basin(N_FULL)["view"])
 
 
 class FountainGame(Game):
-    """Server side of the fountain: phase, mix, size, the image hand-off and
+    """Server side of the fountain: phase, mix, size, the tunables, the image hand-off and
     verification by the law's native product.  It does not stream particles:
     the main page's generic compute runtime runs the compiled law (WebGPU
     compute or the wasm product, as the compiler's verdict and the browser
@@ -689,6 +912,8 @@ class FountainGame(Game):
 
     Actions (``/api/action``): ``fountain_start`` (phase 1; optional ``mix``,
     ``mode``), ``fountain_mode``, ``fountain_speed`` (0 follows the newest frame), ``fountain_run`` (``continuous`` or ``settle``), ``fountain_size``,
+    ``fountain_param`` (``name``, ``value``: one tunable of ``PARAMS``; the live ones reach the running law at the next batch,
+    the restart ones begin a new run), ``fountain_choice`` (``name`` in ``shape``, ``inlet``, ``fluid`` and its ``value``),
     ``fountain_image`` (per-id colours as base64 bytes ``rgb``, three per id,
     or just ``count`` for sizes too large to ship), ``fountain_replay``
     (phase 2) and ``fountain_verify`` (run the law ``steps`` steps from round
@@ -705,6 +930,8 @@ class FountainGame(Game):
         self.strata = STRATA
         self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
+        self.params: dict[str, float] = {}       # the page's overrides of PARAMS (the rest are the defaults, the shares follow ``mix``)
+        self.shape, self.inlet, self.fluid = "box", "fountain", DEFAULT_FLUID
         self.phase = "fill"
         self.epoch = 1                       # bumped whenever the page must restart the fountain
         self.image: np.ndarray | None = None
@@ -721,10 +948,21 @@ class FountainGame(Game):
     def size_tag(self) -> str:
         return self.size
 
+    def resolved(self) -> dict[str, float]:
+        p = resolve_params(self.mix, self.params)
+        if "spread" not in self.params:
+            p["spread"] = inlet_default_spread(self.inlet)
+        return p
+
+    def uniforms(self, *, image: bool = False) -> dict[str, np.ndarray]:
+        return uniforms(n=self.n, mode=self.mode, use_image=1.0 if image else 0.0, mix=self.mix, aspect=self.aspect,
+                        strata=self.strata, params=self.params, shape=self.shape, inlet=self.inlet)
+
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
         cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
-                               active=self.n, aspect=self.aspect, strata=self.strata)
+                               active=self.n, aspect=self.aspect, strata=self.strata, params=self.params,
+                               shape=self.shape, inlet=self.inlet)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -737,7 +975,10 @@ class FountainGame(Game):
     def do(self, payload: dict) -> None:
         kind = str(payload.get("type"))
         if kind == "fountain_start":
-            self.mix = float(payload.get("mix", self.mix))
+            if "mix" in payload:
+                self.mix = float(payload["mix"])
+                for s in range(len(SPECIES)):                  # the poly mix is the macro that sets the four shares
+                    self.params.pop(f"wt{s}", None)
             self.mode = int(payload.get("mode", self.mode))
             # a run's basin is fixed when it starts (and kept by its replay): a screen that rotates later changes nothing
             if payload.get("aspect"):
@@ -749,6 +990,37 @@ class FountainGame(Game):
             self.strata = float(payload["strata"])
         elif kind == "fountain_speed":
             self.speed = int(payload["speed"])
+        elif kind == "fountain_param":
+            name = str(payload["name"])
+            if name not in PARAMS:
+                raise ValueError(f"fountain_param: unknown tunable {name!r}")
+            self.params[name] = min(max(float(payload["value"]), PARAMS[name][1]), PARAMS[name][2])
+            if name in ("fl_rho", "fl_mu"):
+                self.fluid = "custom"
+            if PARAMS[name][5]:
+                if payload.get("aspect"):
+                    self.aspect = float(payload["aspect"])
+                self.reset()
+        elif kind == "fountain_choice":
+            name, value = str(payload["name"]), str(payload["value"])
+            if name == "shape":
+                if value not in SHAPES:
+                    raise ValueError(f"fountain_choice: unknown shape {value!r}")
+                self.shape = value
+                self.reset()
+            elif name == "inlet":
+                if value not in INLETS:
+                    raise ValueError(f"fountain_choice: unknown inlet {value!r}")
+                self.inlet = value
+                self.params.pop("spread", None)
+                self.reset()
+            elif name == "fluid":
+                if value not in FLUIDS:
+                    raise ValueError(f"fountain_choice: unknown fluid {value!r}")
+                self.fluid = value
+                self.params["fl_rho"], self.params["fl_mu"] = FLUIDS[value]
+            else:
+                raise ValueError(f"fountain_choice: unknown choice {name!r}")
         elif kind == "fountain_run":
             run = str(payload["run"])
             if run not in ("continuous", "settle"):
@@ -795,16 +1067,27 @@ class FountainGame(Game):
         final = run_frames(self.piece, columns, steps)
         digest = hashlib.sha256(b"".join(np.ascontiguousarray(final[n], dtype=np.float32).tobytes()
                                          for n in STATE + ("cr", "cg", "cb"))).hexdigest()[:16]
-        emitted = int((columns["pid"][:active] * (EMIT_SPAN / active) <= steps * DT).sum())
+        emitted = int((columns["pid"][:active] * float(columns["emit_rate"]) <= steps * DT).sum())
         self.verified = {"steps": steps, "lane": self.piece.lane, "digest": digest,
                          "emitted": emitted, "top": float(final["y"].max())}
         return self.verified
+
+    def _control(self, name: str, kind: str = "range", **extra) -> dict[str, Any]:
+        label, lo, hi, step, default, restart, group = PARAMS[name]
+        value = self.resolved()[name]
+        spec = {"id": name, "kind": kind, "label": label, "min": lo, "max": hi, "step": step, "value": value,
+                "action": "fountain_param", "name": name, "field": "value", "group": group}
+        if restart:
+            spec["aspect"] = True
+        spec.update(extra)
+        return spec
 
     def controls_ui(self) -> list[dict[str, Any]]:
         sample = {"fit": "extent", "read": ["x", "y"], "into": ["ir", "ig", "ib"], "raster": [96, 72],
                   "post": {"action": "fountain_image", "field": "rgb", "max_ids": 65536}}
         sizes = [[tag, f"{count:,}"] for tag, (count, _pad) in SIZES.items()]
-        return [
+        p = self.resolved()
+        out: list[dict[str, Any]] = [
             {"id": "start", "kind": "button", "label": "Start", "action": "fountain_start", "aspect": True},
             {"id": "image", "kind": "file", "label": "Image", "sample": sample},
             {"id": "camera", "kind": "file", "label": "Camera", "capture": "environment", "sample": sample},
@@ -818,6 +1101,7 @@ class FountainGame(Game):
             {"id": "bounce", "kind": "button", "label": "Bounce", "local": "bounce"},
             {"id": "continue", "kind": "button", "label": "Continue", "local": "continue"},
             {"id": "tilt", "kind": "toggle", "label": "phone gravity", "local": "tilt", "value": True},
+            {"id": "orbit", "kind": "toggle", "label": "auto-rotate", "local": "orbit", "value": False},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
@@ -830,17 +1114,40 @@ class FountainGame(Game):
              "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"], [0, "max"]]},
             {"id": "verify", "kind": "button", "label": "Verify", "action": "fountain_verify"},
         ]
+        for s, (name, *_rest) in enumerate(SPECIES):                 # Grains: the species table
+            for key, label in (("r", "radius"), ("rho", "density"), ("mu", "friction"), ("e", "restitution"),
+                               ("roll", "roughness"), ("irr", "irregularity"), ("wt", "share")):
+                ctl = self._control(f"{key}{s}")
+                ctl["label"] = f"{name} {label}"
+                ctl["species"] = s
+                out.append(ctl)
+        for name in ("omega", "hertz", "coh", "spin_drag", "nozzle_speed", "rate", "k_run"):       # Physics
+            out.append(self._control(name))
+        out.append({"id": "k_run_drop", "kind": "readout", "label": "dropped contacts", "group": "Physics", "diag": "n_drop"})
+        out.append({"id": "fluid", "kind": "select", "label": "fluid", "value": self.fluid, "action": "fountain_choice",
+                    "name": "fluid", "field": "value", "group": "Fluid",
+                    "options": [[k, k] for k in FLUIDS] + ([["custom", "custom"]] if self.fluid == "custom" else [])})
+        out.extend([self._control("fl_rho"), self._control("fl_mu")])
+        out.append({"id": "shape", "kind": "select", "label": "polygon", "value": self.shape, "action": "fountain_choice",
+                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, k] for k in SHAPES]})
+        out.append({"id": "inlet", "kind": "select", "label": "inlet", "value": self.inlet, "action": "fountain_choice",
+                    "name": "inlet", "field": "value", "group": "Chamber",
+                    "options": [["fountain", "fan fountain"], ["jet", "colinear jet"], ["pour", "pour from above"], ["side", "side tube"]]})
+        out.extend([self._control("depth"), self._control("spread")])
+        for ctl in out:
+            ctl.setdefault("group", "Run")
+        return out
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect)
+        return basin(self.n, self.aspect, cell_of(self.resolved()))
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
         width, height = board_size(geo["view"])
         base = self.base_state(int(round(height)), int(round(width)))
         verified = self.verified
-        text = {"fill": "phase 1: the fountain fills the basin by contact forces; hue from the launch angle",
+        text = {"fill": "phase 1: the fountain fills the chamber by contact forces; hue from the launch angle",
                 "replay": "phase 2: the identical simulation, coloured by your image at each id's rest position"}[self.phase]
         base.update({
             "board": "free", "width": width, "height": height, "input": self.input,
@@ -854,11 +1161,10 @@ class FountainGame(Game):
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
-                "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
-                                                              use_image=1.0 if self.phase == "replay" else 0.0).items()},
-                "view": list(geo["view"]), "aspect": self.aspect,
+                "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
+                "view": list(geo["view"]), "aspect": self.aspect, "depth": self.resolved()["depth"],
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect),
+                "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved())),
             },
         })
         return base
