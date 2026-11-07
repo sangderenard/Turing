@@ -214,6 +214,16 @@
   <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
   <button id="scores-toggle">Scores</button>
   <button id="shop-toggle" title="Points you have earned, and what they buy">Shop</button>
+  <details id="marble-designer" style="position:relative"><summary>Marble designer</summary>
+    <div style="position:absolute;z-index:30;right:0;top:100%;min-width:220px;padding:10px;background:#202632;color:#fff;border:1px solid #768397;border-radius:8px;box-shadow:0 8px 22px #0008">
+      <label><input id="marble-preview" type="checkbox"> Show lit preview</label><br>
+      <label>Dyed eye <select id="marble-eye"><option value="blue">Blue</option><option value="green">Green</option><option value="amber">Amber</option></select></label><br>
+      <label>Width <input id="marble-width" type="range" min="8" max="42" value="28"></label><br>
+      <label>Curve <input id="marble-curve" type="range" min="-28" max="28" value="18"></label><br>
+      <label>Facets <select id="marble-facets"><option value="24">Fine</option><option value="40">Very fine</option><option value="12">Coarse</option></select></label><br>
+      <small>Dyed, triangulated inclusion inside a separate glass shell. Preview uses the scene lights and material database.</small>
+    </div>
+  </details>
   <label title="The pinball ring of coloured lights around the board: off removes the bulbs and their light from the scene and brings the house light back up">Arcade lights <input id="arcade" type="checkbox"></label>
   <label title="The slab and glass plate under the board; off removes them from the scene (a game may also leave them out)">Plate <input id="plate" type="checkbox"></label>
   <label title="A glass screen above the field showing the wide-angle broadcast; tilt to see the real game beneath it">Projection glass <input id="projection" type="checkbox"></label>

@@ -48,6 +48,7 @@ import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } f
 import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, curveSettled, initialCurve, clampCurveU,
          dollyParams, projectionMatrix, pickPlane } from "./world_curve.js";                                                 // [CURVE]
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
+import { catEyeMarble } from "./marble_mesh.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -1741,7 +1742,7 @@ function litMesh(faces, uvOf) {
   const pos = [], nrm = [], mat = [], uv = [];
   for (const [a, b, c, m, given] of faces) {
     const N = given || norm(cross(sub(b, a), sub(c, a)));             // (a face may carry its own normal: the 5th element)
-    for (const q of [a, b, c]) { pos.push(...q); nrm.push(...N); mat.push(m); if (uvOf) uv.push(...uvOf(q)); }
+    for (const [k, q] of [a, b, c].entries()) { pos.push(...q); nrm.push(...(Array.isArray(N[0]) ? N[k] : N)); mat.push(m); if (uvOf) uv.push(...uvOf(q)); }
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -1758,6 +1759,29 @@ function litMesh(faces, uvOf) {
   gl.bindVertexArray(null);
   (state.vaoMaterials ||= new Map()).set(vao, [...new Set(mat)]);   // which materials this mesh draws (see sceneNeedsVariant)
   return { vao, count: pos.length / 3, buffers };
+}
+const MARBLE = { mesh: null, key: "" };
+function marblePreview() {
+  if (!$('marble-preview').checked || !state.game || !state.extent) return null;
+  const eye = $('marble-eye').value;
+  const ids = { glass: state.materialIndex.marble_clear_glass,
+    eye: state.materialIndex[`marble_cat_eye_${eye}`], accent: state.materialIndex.marble_milk_glass };
+  if (Object.values(ids).some((id) => !Number.isInteger(id))) return null;
+  const options = { eyeWidth: Number($('marble-width').value) / 100,
+    eyeCurve: Number($('marble-curve').value) / 100,
+    rings: Number($('marble-facets').value), segments: Number($('marble-facets').value) * 2 };
+  const key = JSON.stringify([ids, options]);
+  if (key !== MARBLE.key) {
+    for (const mesh of Object.values(MARBLE.mesh || {})) {
+      state.vaoMaterials.delete(mesh.vao); gl.deleteVertexArray(mesh.vao);
+      for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
+    }
+    const geometry = catEyeMarble(ids, options);
+    MARBLE.mesh = { interior: litMesh(geometry.interior), glass: litMesh(geometry.glass) };
+    MARBLE.key = key;
+  }
+  const center = M.translate(extMidX(), 1.25, extMidZ());
+  return { ...MARBLE.mesh, model: M.multiply(center, M.scale(0.35, 0.35, 0.35)) };
 }
 function box(x0, y0, z0, x1, y1, z1, m) {   // outward faces
   const p = (x, y, z) => [x, y, z];
@@ -6026,6 +6050,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   if (state.glassDraws && !state.flat) for (const [m, model] of state.glassDraws) drawLit(m.vao, m.count, model, null);   // Wordle's obsidian tiles
+  if (state.marblePreview && !opts.broadcast) drawLit(state.marblePreview.glass.vao, state.marblePreview.glass.count, state.marblePreview.model, null);
   if (state.game && state.game.mobroad && !opts.broadcast) mobroad.draw(mobApi, cam, state.game, drawLit);               // [MOBROAD] the panels (glass) and their value labels
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -6083,6 +6108,8 @@ function draw(ms) {
     : glassTiles ? (state.flat ? glassTiles.map(([m, model]) => [m.vao, m.count, model, null]) : [])
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
   if (state.rackButtons && !glassTiles) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
+  state.marblePreview = state.flat ? null : marblePreview();
+  if (state.marblePreview) casters.push([state.marblePreview.interior.vao, state.marblePreview.interior.count, state.marblePreview.model, null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
