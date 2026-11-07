@@ -762,6 +762,50 @@ console.log('ok');
 """
 
 
+JS_WATCH_CASE = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {gravityAngle, spinGravity} = await import(pathToFileURL(`${dir}/compute.js`).href);
+const {caseModel, lawToWorld, rotateDirection, unrotateDirection} = await import(pathToFileURL(`${dir}/gravity.js`).href);
+const near = (a, b, tol = 1e-6) => assert.ok(Math.abs(a - b) < tol, `${a} vs ${b}`);
+const D = Math.PI / 180;
+// theta(t): spin = phase + 2 pi hz t (+ the start offset); rock = (arc/2) sin(phase)
+near(gravityAngle(0.5, 0.5, {kind: 'spin'}), Math.PI / 2);
+near(gravityAngle(0.5, 0, {kind: 'spin', phase: 90}), Math.PI / 2);
+near(gravityAngle(1, 0.25, {kind: 'rock', arc: 60}), 30 * D);                    // a quarter cycle in: the swing's peak
+near(gravityAngle(1, 0, {kind: 'rock', arc: 60, phase: 90}), 30 * D);            // started that far into the swing
+near(gravityAngle(1, 0.75, {kind: 'rock', arc: 60}), -30 * D);
+near(gravityAngle(-0.25, 1, {kind: 'spin'}), -Math.PI / 2);                      // negative = clockwise
+// the angle IS the gravity's: spinGravity = (sin theta, -cos theta)
+for (const [hz, t, m] of [[0.3, 1.7, {kind: 'spin'}], [2, 0.123, {kind: 'rock', arc: 120, phase: 40}]]) {
+  const a = gravityAngle(hz, t, m), g = spinGravity(hz, t, m);
+  near(g[0], Math.sin(a)); near(g[1], -Math.cos(a));
+}
+// gravity in the WORLD frame stays straight down the screen (law y -> -Z, so down = +Z) as the case turns by theta:
+// world gravity = (the case's model turn) applied to the case-frame gravity
+const cx = 3.0, cz = 4.5;
+for (const m of [{kind: 'spin'}, {kind: 'spin', phase: 77}, {kind: 'rock', arc: 90}, {kind: 'rock', arc: 200, phase: 33}]) {
+  for (const hz of [0.37, -1.1, 4]) {
+    for (let k = 0; k < 40; k++) {
+      const t = k * 0.0731, theta = gravityAngle(hz, t, m), model = caseModel(theta, cx, cz);
+      const law = lawToWorld(spinGravity(hz, t, m)), w = rotateDirection(model, law);
+      near(w[0], 0); near(w[1], 0); near(w[2], 1);                                // straight down the screen, full strength
+      const back = unrotateDirection(model, w);
+      near(back[0], law[0]); near(back[2], law[2]);                              // the inverse turn undoes it
+    }
+  }
+}
+// the model turns about the case centre: the centre is fixed; a point right of it, with the case turned by theta = +90 degrees
+// (gravity in the case frame pointing at +x, i.e. the case's right side is down), is carried to the bottom (+Z) of the centre
+const apply = (m, [x, y, z]) => [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]];
+const q = apply(caseModel(0.7, cx, cz), [cx, 0.25, cz]); near(q[0], cx); near(q[1], 0.25); near(q[2], cz);
+const r = apply(caseModel(Math.PI / 2, cx, cz), [cx + 1, 0, cz]); near(r[0], cx); near(r[2], cz + 1);
+const id = caseModel(0, cx, cz); for (let i = 0; i < 16; i++) near(id[i], i % 5 === 0 ? 1 : 0);
+console.log('ok');
+"""
+
+
 def _run_node(tmp_path, script: str, *modules: str) -> str:
     for name in modules:
         shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / name, tmp_path / name)
@@ -781,6 +825,17 @@ def test_the_recording_window_playback_and_continue_are_exact(tmp_path):
 @pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's gravity code")
 def test_the_phone_orientation_gives_the_screen_plane_gravity_and_the_sensor_asks_on_a_tap(tmp_path):
     assert _run_node(tmp_path, JS_GRAVITY, "gravity.js").strip() == "ok"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's case-angle code")
+def test_watch_the_case_move_turns_the_case_by_the_angle_that_keeps_world_gravity_down(tmp_path):
+    """The page's "watch the case move" view: the case angle theta(t) is the gravity's own, and the model turn of the case's
+    objects (-theta about world Y through the case centre) leaves the gravity straight down the screen in the world frame."""
+    web = ROOT / "examples" / "meowdoku" / "web"
+    for name in ("recording.js", "particle_styles.js", "noise_filter.js"):        # (compute.js imports them)
+        shutil.copyfile(web / name, tmp_path / name)
+    shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
+    assert _run_node(tmp_path, JS_WATCH_CASE, "compute.js", "gravity.js").strip() == "ok"
 
 
 JS_STYLES = """

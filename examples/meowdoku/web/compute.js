@@ -448,9 +448,12 @@ const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose 
 // the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
 // turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
 // ``motion.phase`` (degrees) offsets the cycle: a spin starts turned by it, a rock starts that far into its swing.
-export function spinGravity(hz, t, motion = { kind: "spin" }) {
+export function gravityAngle(hz, t, motion = { kind: "spin" }) {
   const phase = 2 * Math.PI * hz * t + (Math.PI / 180) * (Number(motion.phase) || 0);
-  const a = motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;
+  return motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;     // theta(t) of the case: spin = phase, rock = (arc/2) sin(phase)
+}
+export function spinGravity(hz, t, motion = { kind: "spin" }) {
+  const a = gravityAngle(hz, t, motion);
   return [Math.sin(a), -Math.cos(a)];
 }
 const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)

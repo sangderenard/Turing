@@ -5,11 +5,11 @@
 // animates the difference between states; it decides nothing.
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
-import { ComputeRuntime, PointCloud } from "./compute.js";
+import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
-import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
+import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
@@ -328,7 +328,7 @@ function renderBroadcast(now, casters) {
   const view = M.lookAt(eye, target, [0, 0, -1]), proj = M.perspective(B.fov, 1, 0.1, 300);
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo); gl.viewport(0, 0, n, n);
   gl.clearColor(...sceneBackground(), 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
-  litPass({ view, proj, viewProj: M.multiply(proj, view), eye }, now, casters, { plate: false });
+  litPass({ view, proj, viewProj: M.multiply(proj, view), eye }, now, casters, { plate: false, broadcast: true });
   // warp it into the glass's colour layer
   gl.bindFramebuffer(gl.FRAMEBUFFER, B.warp);
   gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, state.colourStack, 0, BROADCAST_LAYER);
@@ -436,6 +436,199 @@ function arrayTexture(unit, rgba) {
   gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, 1, 1, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([...rgba, ...rgba]));
   return tex;
 }
+// The emit stack (uEmitUv, unit 4): layers 0 and 1 are the shader's default pixel everywhere (what the one-pixel stack held, so
+// nothing that reads them changes); layer SLIDE_LAYER holds the backlit slide's luminance (bakeSlide).  The shader's emission is
+// emission * (A * gain) * G, so G is the transparency's transmittance and A stays 1.
+const EMIT_SIZE = 256, EMIT_DEFAULT = [0, 255, 128, 255];
+function emitStack(unit) {
+  const px = new Uint8Array(EMIT_SIZE * EMIT_SIZE * 4 * STACK_LAYERS);
+  for (let i = 0; i < px.length; i += 4) px.set(EMIT_DEFAULT, i);
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, EMIT_SIZE, EMIT_SIZE, STACK_LAYERS, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  state.emitStack = tex;
+  return tex;
+}
+// THE BACKLIT SLIDE (render only): an image shown on the glowing plate like the backlit art in a restaurant window -- a slide, positive or
+// negative, on the backlight.  It rides the plate material's own texture layers: the image is the colour UV layer SLIDE_LAYER (the
+// plate's albedo, and through its translucence term the coloured light that passes), and its luminance is the emit layer SLIDE_LAYER
+// (the plate's emission, so dark parts of the slide pass little of the backlight).  The plate mesh carries UVs over the whole plate, and
+// the image is aspect-fit inside them here (letterbox = transparent / fully lit).  Negative = 1 - colour, baked into the layers.
+const slide = { image: null, name: "", negative: false, bright: 1.0, stamp: 0, baked: "" };
+try { const saved = JSON.parse(localStorage.getItem("meowdoku.slide") || "{}"); slide.negative = !!saved.negative; if (Number.isFinite(saved.bright)) slide.bright = Math.max(0.2, Math.min(3, saved.bright)); } catch { /* storage may be blocked */ }
+function saveSlide() { try { localStorage.setItem("meowdoku.slide", JSON.stringify({ negative: slide.negative, bright: slide.bright })); } catch { /* storage may be blocked */ } }
+// the layer the slide's pixels are: the image fit (aspect) into the plate's [0,1]^2 UV square, which the plate maps non-uniformly
+function slidePixels(n) {
+  const P = state.plate, img = slide.image, fit = Math.min(P.w / img.width, P.d / img.height);
+  const fw = img.width * fit / P.w, fh = img.height * fit / P.d;
+  const c = document.createElement("canvas"); c.width = c.height = n;
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.imageSmoothingQuality = "high"; x.drawImage(img, (1 - fw) / 2 * n, (1 - fh) / 2 * n, fw * n, fh * n);
+  const d = x.getImageData(0, 0, n, n), a = d.data;
+  if (slide.negative) for (let i = 0; i < a.length; i += 4) if (a[i + 3]) { a[i] = 255 - a[i]; a[i + 1] = 255 - a[i + 1]; a[i + 2] = 255 - a[i + 2]; }
+  return a;
+}
+function bakeSlide() {
+  const P = state.plate;
+  if (!gl || !slide.image || !P || !state.colourStack || !state.emitStack) return;
+  const key = [slide.stamp, slide.negative, P.x0, P.z0, P.w, P.d].join("|");
+  if (slide.baked === key) return;
+  slide.baked = key;
+  const colour = slidePixels(STACK_SIZE), small = slidePixels(EMIT_SIZE), emit = new Uint8Array(EMIT_SIZE * EMIT_SIZE * 4);
+  for (let i = 0; i < small.length; i += 4) {
+    const a = small[i + 3] / 255, lum = 0.2126 * small[i] + 0.7152 * small[i + 1] + 0.0722 * small[i + 2];
+    emit[i] = 0; emit[i + 1] = a * lum + (1 - a) * 255; emit[i + 2] = 128; emit[i + 3] = 255;     // outside the slide the plate is clear: fully lit
+  }
+  const unit = gl.getParameter(gl.ACTIVE_TEXTURE);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.colourStack);
+  gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, SLIDE_LAYER, STACK_SIZE, STACK_SIZE, 1, gl.RGBA, gl.UNSIGNED_BYTE, colour);
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.emitStack);
+  gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, SLIDE_LAYER, EMIT_SIZE, EMIT_SIZE, 1, gl.RGBA, gl.UNSIGNED_BYTE, emit);
+  gl.activeTexture(unit);
+}
+// the plate material's slide finish (uploadMaterials): the layers, and the backlight's strength = the brightness
+function slideFinish() {
+  return { emission: [0.10, 0.10, 0.104].map((v) => v * slide.bright), colorLayer: SLIDE_LAYER, colorBlend: 1.0, emitLayer: SLIDE_LAYER,
+           profile: 2, thicknessMm: 8.0 * slide.bright, translucence: 1.0, transmission: 0.0, opacity: 1.0, roughness: 0.9, specular: 0.0 };
+}
+const slideOnPlate = () => !!slide.image && backdrop.mode === "backlit";
+function setSlide(canvas, name = "") {
+  slide.image = canvas; slide.name = name; slide.stamp++;
+  bakeSlide();
+  if (isFountainGame(state.game)) { uploadMaterials(state.game); rebuildBoards(state.game); }
+}
+async function loadSlide(file) {                          // the same decode as the fountain's own image input (compute.pickImage)
+  if (!file) return;
+  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const k = Math.min(1, STACK_SIZE / Math.max(bitmap.width, bitmap.height));
+  const c = document.createElement("canvas"); c.width = Math.max(1, Math.round(bitmap.width * k)); c.height = Math.max(1, Math.round(bitmap.height * k));
+  c.getContext("2d").drawImage(bitmap, 0, 0, c.width, c.height);
+  if (bitmap.close) bitmap.close();
+  setSlide(c, file.name);
+}
+// THE POLYGON HOUSING (3-D fountain, render only): the law's chamber outline -- a polyline of up to 8 vertices in the uniforms px0..px7 /
+// py0..py7 (fountain3d.shape_vertices: box, funnel, hexagon, ramp) extruded through the slab (z = -dh .. +dh) -- as scene glass: one wall quad per
+// segment plus the front and back panes, in the transmission-capable "housing@glass" material.  It is mapped with the grains' own law -> world
+// map (PointCloud uMap: law x -> +X, law y -> -Z, z -> height), so it sits where the law's walls are, and it is in the case's frame (turns with
+// "watch the case move").  Rebuilt when the outline, the depth, the view or the board changes.  Triangles: 12 per segment + 4 (at most 88).
+function housingFaces(g) {
+  const c = g && g.compute, u = c && c.uniforms, m = state.materialIndex["housing@glass"];
+  if (!u || u.px0 === undefined || !c.view || m == null) return null;
+  const [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0)), mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+  const y = TILE.height + 0.03, dh = u.dh;
+  const wp = (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+  const pts = [];
+  for (let i = 0; i < 8; i++) {
+    const q = [u[`px${i}`], Math.min(u[`py${i}`], y1)], last = pts[pts.length - 1];       // (the walls end at the view's top edge)
+    if (!last || Math.hypot(q[0] - last[0], q[1] - last[1]) > 1e-6) pts.push(q);           // (unused vertices repeat the last one)
+  }
+  // each wall is a THICK band (a prism of width t about the polyline segment, extended by half a width past both ends, so neighbours overlap at
+  // the corners with no gap): t = the law's wall thickness uniform (wall_t) when the state sends one, else three grain diameters
+  const rmax = Math.max(...[0, 1, 2, 3].map((i) => u[`r${i}`] || 0)), t = u.wall_t > 0 ? u.wall_t : 6 * rmax, hw = t / 2;
+  const faces = [];
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [ax, ay] = pts[i], [bx, by] = pts[i + 1], len = Math.hypot(bx - ax, by - ay), dx = (bx - ax) / len, dy = (by - ay) / len, nx = -dy, ny = dx;
+    const quad4 = [[ax - dx * hw + nx * hw, ay - dy * hw + ny * hw], [bx + dx * hw + nx * hw, by + dy * hw + ny * hw],
+                   [bx + dx * hw - nx * hw, by + dy * hw - ny * hw], [ax - dx * hw - nx * hw, ay - dy * hw - ny * hw]];
+    for (let k = 0; k < 4; k++) {                                   // the four sides, each through the depth
+      const [p, q] = [quad4[k], quad4[(k + 1) % 4]];
+      const a = wp(p[0], p[1], -dh), b = wp(q[0], q[1], -dh), c = wp(q[0], q[1], dh), d = wp(p[0], p[1], dh);
+      faces.push([a, b, c, m], [a, c, d, m]);
+    }
+    for (const z of [-dh, dh]) {                                    // the end caps (the band's front and back faces)
+      const [a, b, c, d] = quad4.map((q) => wp(q[0], q[1], z));
+      faces.push([a, b, c, m], [a, c, d, m]);
+    }
+  }
+  const lo = Math.min(...pts.map((q) => q[0])), hi = Math.max(...pts.map((q) => q[0])), bottom = Math.min(...pts.map((q) => q[1])), top = Math.max(...pts.map((q) => q[1]));
+  for (const z of [-dh, dh]) {
+    const a = wp(lo, bottom, z), b = wp(hi, bottom, z), d = wp(hi, top, z), e = wp(lo, top, z);
+    faces.push([a, b, d, m], [a, d, e, m]);
+  }
+  return faces;
+}
+function updateHousing() {
+  const g = state.game, c = g && g.compute;
+  const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion]) : "";
+  if (state.housing && state.housing.key === key) return;
+  if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
+  const faces = key ? housingFaces(g) : null;
+  state.housing = { key, mesh: faces ? litMesh(faces) : null, triangles: faces ? faces.length : 0 };
+}
+// STATUS TEXT ON THE PLATE (render only, fountain): game.status and the compute status line, drawn into a 2D canvas texture and shown on
+// a thin alpha-blended quad just above the plate (2 triangles), drawn after the plate and before the grains and the shaders, so they draw
+// over it; the page's layout does not change (the DOM #status is hidden while it is on).  The texture is re-rendered only when the text
+// (or the backdrop, which picks the ink: light with a dark shadow on the dark floor, dark with a light shadow on the backlit plate) changes.
+// It is in the case's frame like the plate, so "watch the case move" turns it too.  (The shader's alpha is per material, not per texel, so
+// this quad has its own two-line program.)
+const STATUS_W = 1024, STATUS_H = 256;
+const statusPlate = { on: true, text: null, key: "", canvas: null, tex: null, prog: null, vao: null, buffers: [], quadKey: "", loc: null };
+try { const saved = localStorage.getItem("meowdoku.statusplate"); if (saved != null) statusPlate.on = saved === "1"; } catch { /* storage may be blocked */ }
+function statusPlateWanted() { return statusPlate.on && isFountainGame(state.game) && !state.flat && !!state.extent; }
+function renderStatusTexture(text, dark) {
+  const c = statusPlate.canvas ||= Object.assign(document.createElement("canvas"), { width: STATUS_W, height: STATUS_H });
+  const x = c.getContext("2d");
+  x.clearRect(0, 0, STATUS_W, STATUS_H);
+  x.font = "22px system-ui, sans-serif"; x.textBaseline = "top";
+  const lines = [];
+  for (const para of String(text).split("\n")) {
+    let line = "";
+    for (const word of para.split(" ")) {
+      const next = line ? line + " " + word : word;
+      if (x.measureText(next).width > STATUS_W - 48 && line) { lines.push(line); line = word; } else line = next;
+    }
+    lines.push(line);
+  }
+  x.shadowColor = dark ? "rgba(255,255,255,0.75)" : "rgba(0,0,0,0.85)"; x.shadowBlur = 6; x.fillStyle = dark ? "#15171c" : "#eef1f6";
+  lines.slice(0, 9).forEach((l, i) => x.fillText(l, 24, 14 + i * 27));
+}
+function drawStatusPlate(cam, model) {
+  if (!statusPlateWanted()) return;
+  const dark = backdrop.mode === "backlit", text = status.textContent || "";
+  const key = text + "|" + dark;
+  if (!statusPlate.prog) {
+    const vs = "#version 300 es\nlayout(location=0) in vec3 aPos; layout(location=3) in vec2 aUv; uniform mat4 uMVP; out vec2 vUv; void main(){ vUv = aUv; gl_Position = uMVP * vec4(aPos, 1.0); }";
+    const fs = "#version 300 es\nprecision mediump float; uniform sampler2D uTex; in vec2 vUv; out vec4 o; void main(){ o = texture(uTex, vUv); }";
+    statusPlate.prog = link(compile(gl.VERTEX_SHADER, vs), compile(gl.FRAGMENT_SHADER, fs));
+    statusPlate.loc = { mvp: gl.getUniformLocation(statusPlate.prog, "uMVP"), tex: gl.getUniformLocation(statusPlate.prog, "uTex") };
+    statusPlate.tex = gl.createTexture();
+  }
+  const unit = gl.getParameter(gl.ACTIVE_TEXTURE);
+  gl.activeTexture(gl.TEXTURE12); gl.bindTexture(gl.TEXTURE_2D, statusPlate.tex);
+  if (statusPlate.key !== key) {
+    statusPlate.key = key; renderStatusTexture(text, dark);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, statusPlate.canvas);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  // the quad: the board's far edge, as wide as the board, text-aspect deep, just above the floor slab (or the plate)
+  const w = state.extent.width, z0 = state.extent.z0 || 0, y = backdropNoFloor() ? 0.012 : TILE.height + 0.012, qk = [w, z0, y].join("|");
+  if (statusPlate.quadKey !== qk) {
+    for (const b of statusPlate.buffers) gl.deleteBuffer(b);
+    if (statusPlate.vao) gl.deleteVertexArray(statusPlate.vao);
+    const d = w * STATUS_H / STATUS_W, x0 = 0, x1 = w, zA = z0, zB = z0 + d;
+    const pos = new Float32Array([x0, y, zA, x0, y, zB, x1, y, zB, x0, y, zA, x1, y, zB, x1, y, zA]);
+    const uv = new Float32Array([0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0]);
+    statusPlate.vao = gl.createVertexArray(); gl.bindVertexArray(statusPlate.vao); statusPlate.buffers = [];
+    for (const [data, loc, size] of [[pos, 0, 3], [uv, 3, 2]]) {
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0); statusPlate.buffers.push(b);
+    }
+    statusPlate.quadKey = qk;
+  }
+  gl.useProgram(statusPlate.prog);
+  gl.uniformMatrix4fv(statusPlate.loc.mvp, false, M.multiply(cam.viewProj, model || M.identity()));
+  gl.uniform1i(statusPlate.loc.tex, 12);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.CULL_FACE);
+  gl.bindVertexArray(statusPlate.vao); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.bindVertexArray(null);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.activeTexture(unit);
+}
 // ---------------------------------------------------------------- scrolling terrain
 // A procedural height map (tileable fractal value noise), shown through the
 // Phong shader's colour texture stack: albedo by height (water, sand, grass,
@@ -501,9 +694,9 @@ function depthTexture(unit, exported) {
   for (let i = 0; i < raw.length; i++) rgba[i] = raw.charCodeAt(i);
   return uploadTerrainTexture(unit, n, rgba);
 }
-// The colour stack holds two layers of STACK_SIZE: 0 the terrain (upsampled
-// once here), 1 the projection glass's broadcast (rendered every frame).
-const STACK_SIZE = 1024, BROADCAST_LAYER = 1;
+// The colour stack holds three layers of STACK_SIZE: 0 the terrain (upsampled
+// once here), 1 the projection glass's broadcast (rendered every frame), 2 the backlit slide image.
+const STACK_SIZE = 1024, BROADCAST_LAYER = 1, SLIDE_LAYER = 2, STACK_LAYERS = 3;   // (layer 2: the backlit slide image, see bakeSlide)
 function upsample(rgba, n, size) {
   if (n === size) return rgba;
   const out = new Uint8Array(size * size * 4), s = n / size;
@@ -519,11 +712,11 @@ function upsample(rgba, n, size) {
 }
 function uploadTerrainTexture(unit, n, rgba) {
   if (unit === 5) {
-    const layers = new Uint8Array(STACK_SIZE * STACK_SIZE * 4 * 2);
+    const layers = new Uint8Array(STACK_SIZE * STACK_SIZE * 4 * STACK_LAYERS);
     layers.set(upsample(rgba, n, STACK_SIZE), 0);
     const tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
-    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, STACK_SIZE, STACK_SIZE, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, layers);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, STACK_SIZE, STACK_SIZE, STACK_LAYERS, 0, gl.RGBA, gl.UNSIGNED_BYTE, layers);
     gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1196,11 +1389,12 @@ function rebuildRoundedMeshes() {
 
 // Lit geometry with a per-vertex material id: buttons, glass, anything
 // built on the page.  ``faces`` is a list of [a, b, c, materialIndex].
-function litMesh(faces) {
-  const pos = [], nrm = [], mat = [];
-  for (const [a, b, c, m] of faces) {
-    const N = norm(cross(sub(b, a), sub(c, a)));
-    for (const q of [a, b, c]) { pos.push(...q); nrm.push(...N); mat.push(m); }
+// ``uvOf`` (optional): a point -> [u, v], giving the mesh a UV attribute (location 3) for the texture layers.
+function litMesh(faces, uvOf) {
+  const pos = [], nrm = [], mat = [], uv = [];
+  for (const [a, b, c, m, given] of faces) {
+    const N = given || norm(cross(sub(b, a), sub(c, a)));             // (a face may carry its own normal: the 5th element)
+    for (const q of [a, b, c]) { pos.push(...q); nrm.push(...N); mat.push(m); if (uvOf) uv.push(...uvOf(q)); }
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -1209,8 +1403,13 @@ function litMesh(faces) {
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
   const mb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, mb); gl.bufferData(gl.ARRAY_BUFFER, new Int32Array(mat), gl.STATIC_DRAW);
   gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.INT, 0, 0);
+  const buffers = [pb, nb, mb];
+  if (uvOf) {
+    const ub = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ub); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uv), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0); buffers.push(ub);
+  }
   gl.bindVertexArray(null);
-  return { vao, count: pos.length / 3, buffers: [pb, nb, mb] };
+  return { vao, count: pos.length / 3, buffers };
 }
 function box(x0, y0, z0, x1, y1, z1, m) {   // outward faces
   const p = (x, y, z) => [x, y, z];
@@ -1334,7 +1533,7 @@ function uploadMaterials(game) {
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
       // the backlight (backdrop "backlit"): a white diffusing plate glowing from within (the lights under it, see litPass,
       // are what light the grains: an emissive surface glows but lights nothing)
-      : backlit ? { roughness: 0.5, transmission: 0.6, opacity: 0.88, ior: 1.5, emission: [0.55, 0.55, 0.57] }
+      : backlit ? { roughness: 0.5, transmission: 0.6, opacity: 0.88, ior: 1.5, emission: [0.55, 0.55, 0.57], ...(slide.image ? slideFinish() : {}) }
       : isFountainGame(game) ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
@@ -1393,6 +1592,8 @@ function uploadMaterials(game) {
   // thin-film coat), TEXSTACK (profile: 1 forward emission cone, 2 SSS 4x translucence, 3 frosted scatter; translucence gain;
   // thickness scale / bias in mm over a depth-stack layer; remit gain / attack / decay) and, for the ember, the ThermalChunk.
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
+  // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
+  records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -1411,6 +1612,7 @@ function uploadMaterials(game) {
         const emission = extra.emission || [0, 0, 0];
         record[8] = emission[0]; record[9] = emission[1]; record[10] = emission[2];
       }
+      if (tname === "texstack" && extra.emitLayer != null) record[0] = extra.emitLayer;              // texstack 0 = the emit layer (uEmitUv)
       if (tname === "texstack" && extra.colorLayer != null) {
         record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
       }
@@ -1525,6 +1727,9 @@ function rebuildBoards(game) {
   state.extent = { width, depth: game.board === "free" ? game.height : depth, z0: game.roster ? -TOP.height : 0,
                    x0: game.characters ? CHAR.left : 0 };         // (the tile set stands left of the board)
   const m = GLASS.margin, t = GLASS.thickness, gm = state.materialIndex.glass;
+  // the plate's UVs span the whole plate (u along x, v along z, v = 0 at the far edge): the slide image is fit inside them (bakeSlide)
+  const z0p = state.extent.z0 - m, P = state.plate = { x0: -m, z0: z0p, w: width + 2 * m, d: state.extent.depth + m - z0p };
+  const plateUv = (q) => [(q[0] - P.x0) / P.w, (q[2] - P.z0) / P.d];
   if (game.scene && game.scene.terrain === true && !state.flat) {
     // The plate lies on the planet's curve: a fine grid of glass (it never
     // scrolls, so the curve is baked once).
@@ -1534,10 +1739,16 @@ function rebuildBoards(game) {
       const xa = Math.min(x + step, x1), za = Math.min(z + step, z1);
       faces.push([at(x, z), at(x, za), at(xa, za), gm], [at(x, z), at(xa, za), at(xa, z), gm]);
     }
-    state.glass = litMesh(faces);
+    state.glass = litMesh(faces, plateUv);
   } else {
-    state.glass = litMesh(box(-m, -t, state.extent.z0 - m, width + m, 0.0, state.extent.depth + m, gm));
+    const faces = box(-m, -t, state.extent.z0 - m, width + m, 0.0, state.extent.depth + m, gm);
+    // With a slide on the plate the top face is wound the way the shader treats as the FRONT (as the terrain quad is: a clockwise
+    // triangle from above) with its normal given up: the albedo path -- and so the colour layer -- is the front face's; the back face
+    // paints the material's flat inner colour.  (Without a slide the plate is exactly as it was.)
+    if (slideOnPlate()) for (let i = 0; i < 2; i++) { const [a, b, c, mm] = faces[i]; faces[i] = [a, c, b, mm, [0, 1, 0]]; }
+    state.glass = litMesh(faces, plateUv);
   }
+  bakeSlide();
 }
 
 // ---------------------------------------------------------------- camera and light
@@ -4260,7 +4471,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4272,6 +4483,22 @@ function localControl(s, value) {
     camView.auto = !!value;
     // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
+  } else if (s.local === "watchcase") {
+    watchCase.on = !!value;
+    try { localStorage.setItem("meowdoku.watchcase", watchCase.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+  } else if (s.local === "statusplate") {
+    statusPlate.on = !!value;
+    try { localStorage.setItem("meowdoku.statusplate", statusPlate.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+  } else if (s.local === "slide_image") {
+    loadSlide(value).catch((e) => console.warn("[meowdoku] the slide image could not be read:", e));
+  } else if (s.local === "slide_clear") {
+    slide.image = null; slide.name = ""; slide.baked = "";
+    if (isFountainGame(state.game)) { uploadMaterials(state.game); rebuildBoards(state.game); }
+  } else if (s.local === "slide_negative") {
+    slide.negative = !!value; saveSlide(); bakeSlide();
+  } else if (s.local === "slide_bright") {
+    slide.bright = Math.max(0.2, Math.min(3, Number(value))); saveSlide();
+    if (slide.image && isFountainGame(state.game)) uploadMaterials(state.game);
   } else if (s.local === "gscale") {
     gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
     try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
@@ -4314,7 +4541,7 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
   } else if (s.local === "backdrop") {
     backdrop.mode = value === "clear" || value === "backlit" ? value : "floor";
-    if (isFountainGame(state.game)) uploadMaterials(state.game);   // the plate's glow is its material's emission
+    if (isFountainGame(state.game)) { uploadMaterials(state.game); rebuildBoards(state.game); }   // the plate's glow is its material's emission
     try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("pcolor_")) {
     pcolor[s.local.slice(7)] = s.local === "pcolor_source" && !COLOR_SOURCES.some(([id]) => id === value) ? DEFAULT_COLOR.source
@@ -4375,6 +4602,19 @@ function refreshLocalControls() {
       el.title = picked.reason || "where the grains' colour comes from: the simulation (per grain), one solid colour, or a declared scene material (the material style takes the whole material); render only";
     } else if (s.local === "pcolor_palette") {
       el.title = "a palette the size ramp, the species colours and the simulation's own hues are mapped through (sea, ember, meadow); native leaves them as they are";
+    } else if (s.local.startsWith("slide_")) {
+      const on = backdrop.mode === "backlit", input = el.querySelector("input");
+      if (input) input.disabled = !on;
+      if (el.tagName === "BUTTON") el.disabled = !on || !slide.image;
+      el.classList.toggle("inactive", !on);
+      el.title = on ? "an image shown on the glowing plate like a backlit slide (positive, or negative = 1 - colour); brightness is the backlight's strength"
+                    : 'active when the backdrop is "backlit"';
+    } else if (s.local === "statusplate") {
+      el.querySelector("input").checked = statusPlate.on;
+      el.title = "the status and compute lines are drawn into a texture on the plate (behind the grains, layout unchanged) instead of the page's text; dark ink on the backlit plate, light on the dark floor";
+    } else if (s.local === "watchcase") {
+      el.querySelector("input").checked = watchCase.on;
+      el.title = "off: the camera rides with the case (the case looks still, gravity turns); on: the camera stays in the world and the case turns by the same angle as the gravity (floor tiles, plate and grains; the sky and the arcade ring stay)";
     } else if (s.local === "backdrop") {
       el.title = "floor: the dark slab and glass plate under the fountain (contrast); backlit: the same plate glowing a mild white from within; clear: neither, so the sky, background and lights show through and glass has something to reflect";
     } else if (s.local === "pcolor_solid") {
@@ -4481,6 +4721,8 @@ function saveSpinMotion() {
   try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
 }
 const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
+const STATUSPLATE_SPEC = { id: "statusplate", kind: "toggle", label: "status text on the plate", local: "statusplate" };
+const WATCH_SPEC = { id: "watchcase", kind: "toggle", label: "watch the case move", local: "watchcase" };
 // GRAVITY SCALE: one slider for every gravity source; 0 at the left end is weightless, then log from 0.01 g to 10 g
 const GSCALE_SPEC = { id: "gscale", kind: "range", label: "gravity", min: 0, max: 1, step: 0.001, local: "gscale" };
 const GSCALE_LOG = [-2, 1], GSCALE_NOTCH = 0.01;
@@ -4545,6 +4787,11 @@ const COLOR_SPECS = [
   { id: "pcolor_source", kind: "select", label: "colour", local: "pcolor_source", value: "simulation", options: COLOR_SOURCES },
   { id: "pcolor_palette", kind: "select", label: "palette", local: "pcolor_palette", value: "native", options: PALETTE_IDS.map((p) => [p, p]) },
   { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["backlit", "backlit (glowing plate)"], ["clear", "clear (scene shows)"]] },
+  // the backlit slide (backdrop = backlit): an image on the glowing plate, positive or negative, through the plate material's texture layers
+  { id: "slide_image", kind: "file", label: "slide image", local: "slide_image" },
+  { id: "slide_clear", kind: "button", label: "clear slide", local: "slide_clear" },
+  { id: "slide_negative", kind: "toggle", label: "slide negative", local: "slide_negative" },
+  { id: "slide_bright", kind: "range", label: "slide brightness", min: 0.2, max: 3, step: 0.05, local: "slide_bright" },
   { id: "pcolor_solid", kind: "color", label: "solid", local: "pcolor_solid", value: DEFAULT_COLOR.solid },
   { id: "pcolor_material", kind: "select", label: "material", local: "pcolor_material", value: "", options: [] },
 ];
@@ -4553,7 +4800,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, CAMGRAV_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -4603,7 +4850,7 @@ function renderGameControls(game) {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
         if (s.capture) input.setAttribute("capture", s.capture);
-        input.onchange = async () => { const f = input.files[0]; input.value = ""; await compute.pickImage(f, s.sample); };
+        input.onchange = async () => { const f = input.files[0]; input.value = ""; if (s.local) localControl(s, f); else await compute.pickImage(f, s.sample); };
         el.append(input);
       } else {
         el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
@@ -4740,10 +4987,19 @@ function pointsFrame(cam, now) {
 function drawCloud(cam, data, g, rec, style) {
   const y = TILE.height + 0.03;
   const pick = colorPick();
-  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
+  // watch the case move: the grains are in the case's frame, so the case's model turn goes into viewProj and the view (every style reads
+  // one of them); the sun's direction (world) is un-turned for the view-space lighting, and the key light's shadow matrix takes the model
+  const model = state.caseModel;
+  const viewProj = model ? M.multiply(cam.viewProj, model) : cam.viewProj, view = model ? M.multiply(cam.view, model) : cam.view;
+  let lighting = style === DEFAULT_STYLE ? null : particleLighting(g, y), scene = state.flat ? null : particleScene(pick);
+  if (model) {
+    if (lighting && lighting.dir) lighting = { ...lighting, dir: unrotateDirection(model, lighting.dir) };
+    if (scene) scene = { ...scene, shadow: M.multiply(light.viewProj, model) };
+  }
+  cloud.draw(data, { viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
                      y, stride: rec.display_stride, background: sceneBackground(), tint: pick.tint, colorMode: pick.mode,
-                     grain: pick.grain, scene: state.flat ? null : particleScene(pick), heat: heatFx,
-                     style, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: style === DEFAULT_STYLE ? null : particleLighting(g, y) });
+                     grain: pick.grain, scene, heat: heatFx,
+                     style, noise: noiseFx.on ? noiseFx : null, camera: { view, proj: cam.proj }, lighting });
 }
 // Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, rgba8, meta], 16 bytes), spread over the live
 // view window at a constant area coverage, drawn `frames` times through the same call the scene makes; returns ms per frame
@@ -4884,7 +5140,9 @@ function litPass(cam, now, casters, opts = {}) {
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, M.identity(), null, plate ? PLATE_GROUP : 0);
+  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, state.caseModel || M.identity(), null, plate ? PLATE_GROUP : 0);
+  if (!opts.broadcast && statusPlateWanted()) { drawStatusPlate(cam, state.caseModel); gl.useProgram(P); }
+  if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -4899,6 +5157,26 @@ function litPass(cam, now, casters, opts = {}) {
   gl.depthMask(true); gl.disable(gl.BLEND);
 }
 
+// WATCH THE CASE MOVE (page toggle, default off = the camera rides with the case, as it always has).  On: the fountain's own objects
+// (floor tiles, glass plate, grains) are drawn turned about the case centre by the case's angle, in the board plane; the camera and the
+// rest of the world (sky, sun, arcade ring) stay.  theta(t) is the angle the gravity uses (compute.js gravityAngle), at the SIMULATED
+// time of the displayed frame (frame x snapEvery x dt), not the wall clock.  (meowdokuDebug.caseTime overrides t, in seconds.)
+const watchCase = { on: false };
+try { watchCase.on = localStorage.getItem("meowdoku.watchcase") === "1"; } catch { /* storage may be blocked */ }
+function caseAngleNow() {
+  if (!compute.spin || cameraGravity) return 0;                    // (camera-down gravity turns nothing: the case is still)
+  const forced = window.meowdokuDebug.caseTime;
+  const t = forced != null ? Number(forced) : compute.ready && compute.tape && compute.manifest && compute.shown != null ? compute.shown * compute.snap * compute.manifest.law.dt : 0;
+  return gravityAngle(compute.spin, t, compute.spinMotion);
+}
+function caseModelNow() {
+  if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
+  return caseModel(caseAngleNow(), state.extent.width / 2, extMidZ());
+}
+window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
+window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;
+window.meowdokuDebug.drawFrame = (ms) => { const keep = window.requestAnimationFrame; window.requestAnimationFrame = () => 0; try { draw(ms); } finally { window.requestAnimationFrame = keep; } };   // one frame, no rAF (a hidden pane)
+
 function draw(ms) {
   const now = ms / 1000; stepCamView(now - (state.time || now)); state.time = now;
   const w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
@@ -4909,8 +5187,11 @@ function draw(ms) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
+  state.caseModel = caseModelNow();
+  updateHousing();
+  status.style.visibility = statusPlateWanted() ? "hidden" : "";       // the status text is on the plate instead (layout unchanged)
   const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropNoFloor()) ? []
-    : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
+    : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
@@ -5824,7 +6105,7 @@ function fillPickers() {
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
   state.shadowMap = buildShadowMap(); state.bulb = buildSphere(); state.meshes.__sphere = uploadMesh(sphereMesh());
-  arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5, assets.terrain);
+  emitStack(4); terrainTexture(5, assets.terrain);
   // The Phong shader's depth stack (uDepthUv, unit 6): layer 0 is the terrain's
   // height map (exported in the shader's channel layout); no export, the 1x1 default.
   if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else defaultDepthStack(6);

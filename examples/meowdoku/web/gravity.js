@@ -126,3 +126,19 @@ export class GravitySensor {
   }
   get enabled() { return this.wanted; }
 }
+
+// WATCH THE CASE MOVE (render only).  The law runs in the case's frame: the case's angle theta(t) turns the gravity there to
+// g = (sin theta, -cos theta) (compute.js spinGravity).  Seen from the world, the case has turned by -theta in the law's plane
+// (so that R(-theta) g = straight down).  The board lies in world XZ with law x -> +X and law y -> -Z, so a turn of phi in the law's
+// plane is a turn of phi about world +Y (the rotateY convention: X' = cX + sZ, Z' = -sX + cZ).  This is the model matrix
+// (column-major) of the case's objects: translate(c) * rotateY(-theta) * translate(-c), c = the case centre (cx, cz).
+export function caseModel(theta, cx, cz) {
+  const a = -theta, c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c, 0, -s, 0,  0, 1, 0, 0,  s, 0, c, 0,  cx - c * cx - s * cz, 0, cz + s * cx - c * cz, 1]);
+}
+// a law-plane vector (x right, y up) as a world direction: law x -> +X, law y -> -Z
+export function lawToWorld([x, y]) { return [x, 0, -y]; }
+// the model's rotation applied to a direction
+export function rotateDirection(m, [x, y, z]) { return [m[0] * x + m[4] * y + m[8] * z, m[1] * x + m[5] * y + m[9] * z, m[2] * x + m[6] * y + m[10] * z]; }
+// the inverse turn (the transpose) applied to a world direction: the sun, as the case's own frame sees it
+export function unrotateDirection(m, [x, y, z]) { return [m[0] * x + m[1] * y + m[2] * z, m[4] * x + m[5] * y + m[6] * z, m[8] * x + m[9] * y + m[10] * z]; }
