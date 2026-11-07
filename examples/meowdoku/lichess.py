@@ -16,7 +16,7 @@ when idle challenges an online bot now and then.  Finished games can
 feed the self-play learner.  The page's ``lichess`` game shows the live
 board, opponent, clocks and result.
 
-    python examples/meowdoku/lichess.py --status          # who am I, am I a bot
+    python examples/meowdoku/lichess.py --status          # read-only account status
     python examples/meowdoku/lichess.py --challenge maia1 # one game against a bot
 """
 from __future__ import annotations
@@ -362,15 +362,17 @@ def main(argv: list[str] | None = None) -> int:
     if not access:
         print("no token: set MEOWDOKU_LICHESS_TOKEN or write build/meowdoku/lichess_token.txt", flush=True)
         return 1
+    if args.status:
+        # connect() enrolls non-bot accounts irreversibly; status only reads.
+        me = Api(access).get("/api/account")
+        print(json.dumps({k: me.get(k) for k in ("id", "username", "title", "perfs")}, indent=2))
+        return 0
     player = None
     if not args.random:
         from meowdoku.chess_net import SelfPlay
         player = SelfPlay()
     client = LichessBot(access, player=player)
-    me = client.connect()
-    if args.status:
-        print(json.dumps({k: me.get(k) for k in ("id", "username", "title", "perfs")}, indent=2))
-        return 0
+    client.connect()
     client.start()
     if args.challenge:
         client.api.post(f"/api/challenge/{args.challenge}", {"rated": "false", "clock.limit": "300", "clock.increment": "3", "variant": "standard"})
