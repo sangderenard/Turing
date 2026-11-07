@@ -55,6 +55,21 @@ for(const kind of kinds) {
 const bulk=(mesh)=>marbleMass(mesh,{radiusM:0.01,densityByRole:{shell:2500}});
 const rounded=diceSolid('d6',{shellMaterial:1,markMaterial:2,bevelRadius:0.05});
 const sharp=diceSolid('d6',{shellMaterial:1,markMaterial:2,bevelRadius:0});
+const h=1/Math.sqrt(3),r=0.05;
+let edgeSamples=0;
+for(const triangle of rounded.glass) for(const p of triangle.slice(0,3)) {
+  if(p[0]>h-r+1e-5&&p[1]>h-r+1e-5&&Math.abs(p[2])<h-r-0.02) {
+    assert(Math.abs(Math.hypot(p[0]-(h-r),p[1]-(h-r))-r)<1e-7,
+      'beveled cube edge must be a circular radius-r cross-section');
+    edgeSamples++;
+  }
+}
+assert(edgeSamples>100,'edge fillet must have resolved samples');
+let cap=rounded.glass[0][0];
+for(const triangle of rounded.glass) for(const p of triangle.slice(0,3))
+  if(p[0]+p[1]+p[2]>cap[0]+cap[1]+cap[2]) cap=p;
+assert(Math.abs(Math.hypot(...cap.map(x=>x-(h-r)))-r)<1e-7,
+  'beveled cube corner must be a radius-r spherical cap');
 for(const face of sharp.faceInfo) assert(sharp.glass.slice(face.start,face.start+face.count)
   .filter(triangle=>triangle[3]===2).length>=100,'face glyph must have adequate marked triangles');
 assert(bulk(rounded).massKg<bulk(sharp).massKg,'bevel must remove real volume');
@@ -66,6 +81,14 @@ const raisedUncompensated=diceSolid('d6',{shellMaterial:1,markMaterial:2,marking
   reliefDepth:0.025,bevelRadius:0.05,faceRelief:0.01,compensateRaised:false});
 assert(bulk(raised).massKg<bulk(raisedUncompensated).massKg,
   'raised glyph compensation must inset substrate and alter mass');
+let raisedEdgeSamples=0;
+for(const triangle of raised.glass) for(const p of triangle.slice(0,3))
+  if(p[0]>h-r+1e-5&&p[1]>h-r+1e-5&&Math.abs(p[2])<h-r-0.02) {
+    assert(Math.abs(Math.hypot(p[0]-(h-r),p[1]-(h-r))-r)<1e-7,
+      'face relief must leave the circular edge fillet intact');
+    raisedEdgeSamples++;
+  }
+assert(raisedEdgeSamples>100);
 const support=diceSolid('d6',{shellMaterial:1,markMaterial:2}).faceInfo.map(face=>{
   const p=sharp.glass[face.start][0];return face.normal.reduce((s,x,i)=>s+x*p[i],0);
 });
