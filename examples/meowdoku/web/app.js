@@ -1565,7 +1565,7 @@ function uploadMesh(mesh) {
 
 // Client-side corner rounding of the extruded glyph meshes: weld, crease-angle smooth
 // normals, Taubin smoothing of crease vertices only.  Server meshes stay flat.
-const roundParams = { iters: 4, creaseDeg: 90 };      // defaults: fully rounded and creased
+const roundParams = { iters: 0, creaseDeg: 0 };       // site defaults: no rounding, no crease
 function roundMesh(mesh, iters, creaseDeg) {
   const P0 = mesh.positions, T = P0.length / 9, N0 = mesh.normals;
   if (!T || (P0.length % 9)) return mesh;
@@ -1719,7 +1719,7 @@ Object.assign(state, {
   pieces: new Map(),                // id -> live piece
   buttons: null, rackButtons: null, glass: null,
   materialIndex: {},                // palette name (and name@hint / name@sel) -> material id
-  saturation: 2.0, tiltDeg: 90, time: 0,              // default: fully saturated
+  saturation: 2.0, tiltDeg: 84, time: 0,              // default: fully saturated; the camera backed off straight-down by 6 degrees (a hint of a vanishing point)
   debug: { shadows: true, exposure: 0.42 },
 });
 const TILE = { height: 0.16, inset: 0.11, gap: 0.03 };
