@@ -97,13 +97,19 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   const determinant = (a) => a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
     -a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
     +a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]);
-  const valid=!approximateCoating&&Number.isFinite(mass)&&mass>0&&center.every(Number.isFinite)&&
+  const unresolvedMark=mesh.contactModel==='polyhedron' && mesh.parameters.markingMode!=='flat' &&
+    densityByRole.mark!==undefined && densityByRole.mark!==glassDensity;
+  const massExact=!approximateCoating&&!unresolvedMark&&
+    Number.isFinite(mass)&&mass>0&&center.every(Number.isFinite)&&
     inertia.flat().every(Number.isFinite)&&inertia[0][0]>0&&
     inertia[0][0]*inertia[1][1]-inertia[0][1]**2>0&&determinant(inertia)>0&&
     components.every((c)=>c.volumeM3>=0&&c.massKg>=0)&&
     mesh.interior.every((face)=>face.slice(0,3).every((p)=>Math.hypot(...p)<1));
+  const valid=massExact&&mesh.contactModel!=='polyhedron';
   return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,
     principalMoments:principalMoments(inertia),
-    validForRoll:valid,mechanicsNote:approximateCoating?"Enamel thin film uses an area estimate; rolling waits for closed coating geometry":
+    massExact,validForRoll:valid,mechanicsNote:unresolvedMark?"Relief uses body substrate; distinct marking bulk density is unresolved":
+      mesh.contactModel==='polyhedron'?"Closed die mass and moments calculated for body substrate; rolling needs shape-aware contact dynamics":
+      approximateCoating?"Enamel thin film uses an area estimate; rolling waits for closed coating geometry":
       valid?"Closed disjoint volumes integrated":"Final mesh has unresolved mechanical properties"};
 }

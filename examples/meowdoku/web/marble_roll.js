@@ -51,6 +51,7 @@ export function rollingStep(state,properties,forceN,dt,radiusM) {
   const columns=zero.map((_,i)=>{const basis=zero.slice();basis[i]=1;return sub(equations(basis),bias);});
   const matrix=zero.map((_,row)=>columns.map((col)=>col[row]));
   const q=solve(matrix,scale(bias,-1)),alpha=q.slice(2,5);
+  if(q[7]<=0) throw new RangeError("marble lost contact with the floor");
   const nextOmega=add(omega,scale(alpha,dt));
   const delta=unitQuat([1,...scale(nextOmega,dt/2)]);
   const orientation=unitQuat(quatMultiply(delta,state.orientation));
