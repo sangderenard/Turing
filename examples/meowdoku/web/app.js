@@ -4003,7 +4003,7 @@ function clearLayoutTurn() {
   layoutLock.turn = null;
 }
 function applyLayoutLock() {
-  const want = !!(state.game && state.game.compute && gravitySensor.enabled);
+  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin);
   if (!want) {
     if (layoutLock.angle != null) {
       layoutLock.angle = null; gravitySensor.lockedAngle = null; clearLayoutTurn();
@@ -4046,7 +4046,7 @@ window.meowdokuDebug.noiseFx = noiseFx;
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
   return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold }[s.local] ?? s.value;
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: caseSpin }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4054,6 +4054,10 @@ function localControl(s, value) {
     gravitySensor.enabled = !!value;
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
+  } else if (s.local === "spin") {
+    caseSpin = Math.abs(Number(value)) < 1e-6 ? 0 : Number(value);
+    compute.setSpin(caseSpin);
+    try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
     particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
     try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
@@ -4069,11 +4073,16 @@ function refreshLocalControls() {
   const box = $("gamectl"), g = state.game;
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
-  for (const s of g.controls_ui) {
+  for (const s of pageSpecs(g.controls_ui)) {
     if (!s.local) continue;
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
-    if (s.local === "tilt") {
+    if (s.local === "spin") {
+      const input = el.querySelector("input");
+      if (document.activeElement !== input) input.value = String(caseSpin);
+      el.title = caseSpin ? `gravity turns ${Math.abs(caseSpin)} rev/s ${caseSpin > 0 ? "counterclockwise" : "clockwise"} (overrides the phone)` : "0: the case stands still";
+      el.querySelector("span").textContent = `case spin ${caseSpin ? caseSpin.toFixed(2) + " Hz" : "off"} `;
+    } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
     } else if (s.local === "particle_style") {
@@ -4097,8 +4106,20 @@ function refreshLocalControls() {
     }
   }
 }
+// Page-side controls the server's list leaves room for: next to the phone gravity switch, a spinning case (gravity
+// turning at a set rate, a runtime input of the law like the tilt, so no rebuild).  Declared here until the fountain's
+// controls next change server-side (an edit there re-keys the compiled products).
+const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin (Hz)", min: -1, max: 1, step: 0.05, local: "spin" };
+function pageSpecs(specs) {
+  if (!specs || specs.some((s) => s.id === SPIN_SPEC.id)) return specs;
+  const at = specs.findIndex((s) => s.local === "tilt");
+  return at < 0 ? specs : [...specs.slice(0, at + 1), SPIN_SPEC, ...specs.slice(at + 1)];
+}
+let caseSpin = 0;
+try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
+compute.setSpin(caseSpin);
 function renderGameControls(game) {
-  const box = $("gamectl"), specs = game && game.controls_ui;
+  const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;
   if (!specs) { if (box.childElementCount) box.replaceChildren(); delete box.dataset.key; return; }
   const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;

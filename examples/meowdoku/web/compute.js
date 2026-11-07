@@ -436,6 +436,13 @@ export class SettleDetector {
 
 // ------------------------------------------------------------------ runtime
 const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
+// the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
+// turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
+export function spinGravity(hz, t) {
+  const a = 2 * Math.PI * hz * t;
+  return [Math.sin(a), -Math.cos(a)];
+}
+const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)
 const TARGET_MS = { gpu: 8, wasm: 6 };  // what one batch should take: short enough to keep the display and the page responsive
 const LEAD_FRAMES = 8;                  // the pump rests when the buffer holds this many snapshots the display has not reached
 const DIAG_MS = 400;                    // continuous runs read the law's diagnostics this often (settle reads every sample)
@@ -554,9 +561,10 @@ export class ComputeRuntime {
   #inputsNow() {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
-    if (this.gravity) {
+    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt) : this.gravity;
+    if (g) {
       const G = this.manifest.law.gravity;
-      out.grav_x = this.gravity[0] * G; out.grav_y = this.gravity[1] * G;
+      out.grav_x = g[0] * G; out.grav_y = g[1] * G;
       Object.assign(out, this.spec.tilt || {});
     }
     for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
@@ -573,6 +581,16 @@ export class ComputeRuntime {
   }
 
   // The phone's gravity (or the off switch: null).  Fractions of g in the screen's plane; takes effect at the next batch.
+  // A SPINNING CASE: gravity turns at ``hz`` revolutions per SIMULATED second (negative = clockwise), as if the box rotated
+  // at a prescribed speed; 0 or null stops it.  The angle follows the law's own step count (not the wall clock), so a
+  // free-running or replayed run turns the same way, and it overrides the phone's gravity while it runs.
+  setSpin(hz) {
+    const next = hz ? Number(hz) : null;
+    if (next === this.spin) return;
+    this.spin = next;
+    this.#kick();
+  }
+
   setGravity(gx, gy) {
     const next = gx == null ? null : [gx, gy], old = this.gravity;
     if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1]) < 0.004) return;
@@ -702,6 +720,8 @@ export class ComputeRuntime {
     m = Math.max(1, Math.min(m, p.maxFrames));
     if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
     if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
+    // the inputs change only between batches: a spinning case keeps each batch to SPIN_TURN of a revolution
+    if (this.spin) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (Math.abs(this.spin) * this.manifest.law.dt * snap))));
     return m;
   }
 
