@@ -310,7 +310,7 @@ def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, 
     cols = int(math.ceil(width / cell))
     rows = int(math.ceil((nozzle_y + 0.1) / cell))
     return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
-            "cols": cols, "rows": rows, "cells": cols * rows,
+            "cols": cols, "rows": rows, "cells": cols * rows, "cell": cell,
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
 
 
@@ -331,23 +331,39 @@ def board_size(view) -> tuple[float, float]:
 
 
 def shape_vertices(shape: str, geo: dict[str, float]) -> list[tuple[float, float]]:
-    """The basin outline as a polyline (at most ``NV`` vertices; the law pads it by repeating the last).  All inside
-    ``|x| <= half`` and ``y >= 0``.  ``box`` is the old basin: a floor and two side walls, open top.  A polyline end
-    carries half a wall's weight; repeat the first vertex to close a polygon."""
+    """The basin outline as a polyline (at most ``NV`` vertices; the law pads it by repeating the last), the chamber on its
+    LEFT as it runs (counterclockwise).  ``box`` is the old basin: a floor and two side walls, open top, tall (it keeps the
+    splash).  Every other shape is a CLOSED polygon (its first vertex repeated, so its top is its own ceiling) INSCRIBED in the
+    visible sim window in BOTH axes, centred: |x| <= the window's half-width less a margin of three grain diameters, from the
+    floor (y = 0) to the window's top less that margin, as large as fits.  ``hexagon``; ``funnel`` a vessel with a V bottom
+    that narrows to its throat; ``ramp`` a vessel with a sloping floor."""
     h, ny = geo["half"], geo["nozzle_y"]
-    top = ny + 2.5
     if shape == "box":
+        top = ny + 2.5
         return [(-h, top), (-h, 0.0), (h, 0.0), (h, top)]
+    margin = 3.0 * geo.get("cell", CELL)
+    w = 0.5 * (geo["view"][1] - geo["view"][0]) - margin          # the window is centred on x = 0
+    top = geo["view"][3] - margin
+    mid = 0.5 * top
     if shape == "funnel":
-        return [(-h, top), (-h, 0.55 * ny), (-0.25 * h, 0.0), (0.25 * h, 0.0), (h, 0.55 * ny), (h, top)]
+        return [(-w, top), (-w, 0.55 * top), (-0.2 * w, 0.0), (0.2 * w, 0.0), (w, 0.55 * top), (w, top), (-w, top)]
     if shape == "hexagon":
-        return [(-h, top), (-h, 0.3 * ny), (-0.55 * h, 0.0), (0.55 * h, 0.0), (h, 0.3 * ny), (h, top)]
+        return [(-w, mid), (-0.5 * w, 0.0), (0.5 * w, 0.0), (w, mid), (0.5 * w, top), (-0.5 * w, top), (-w, mid)]
     if shape == "ramp":
-        return [(-h, top), (-h, 0.35 * ny), (h, 0.0), (h, top)]
+        return [(-w, top), (-w, 0.3 * top), (w, 0.0), (w, top), (-w, top)]
     raise ValueError(f"unknown chamber shape {shape!r}")
 
 
-def inlet_spec(inlet: str, geo: dict[str, float], p: dict[str, float]) -> dict[str, float]:
+def chord(verts: list[tuple[float, float]], y: float) -> tuple[float, float]:
+    """The x extent of the chamber at height ``y``: the leftmost and rightmost crossings of the outline."""
+    xs = []
+    for (ax, ay), (bx, by) in zip(verts[:-1], verts[1:]):
+        if (ay - y) * (by - y) <= 0.0 and ay != by:
+            xs.append(ax + (bx - ax) * (y - ay) / (by - ay))
+    return (min(xs), max(xs)) if xs else (-1.0e9, 1.0e9)
+
+
+def inlet_spec(inlet: str, geo: dict[str, float], p: dict[str, float], verts: list[tuple[float, float]] | None = None) -> dict[str, float]:
     """The inlet (a tube: position, direction, cross-section) for a preset, as the law's uniforms.  ``fountain`` is the old
     bar with a fan; the others are colinear tubes (``spread`` 0 unless the page raised it)."""
     h, ny = geo["half"], geo["nozzle_y"]
@@ -361,6 +377,16 @@ def inlet_spec(inlet: str, geo: dict[str, float], p: dict[str, float]) -> dict[s
         pos, d, half_w = (-h + 0.06, 0.55 * ny, 0.0), (1.0, 0.25, 0.0), 0.04
     else:
         raise ValueError(f"unknown inlet {inlet!r}")
+    if verts is not None:
+        # INSIDE the shape: the source's centre goes to within the chamber's chord at its height (and below the top), and the
+        # bar is narrowed to 80% of the chord's half-width there
+        margin = 3.0 * geo.get("cell", CELL)
+        top = max(v[1] for v in verts) - margin
+        y = min(pos[1], top)
+        xl, xr = chord(verts, y)
+        cx = min(max(pos[0], xl + margin), xr - margin) if xr - xl > 2 * margin else 0.5 * (xl + xr)
+        half_w = min(half_w, 0.8 * 0.5 * (xr - xl))
+        pos = (cx, y, pos[2])
     norm = math.sqrt(sum(c * c for c in d))
     d = tuple(c / norm for c in d)
     ref = (0.0, 0.0, 1.0) if abs(d[2]) <= 0.9 else (1.0, 0.0, 0.0)          # e1 = d x ref, e2 = d x e1
@@ -391,12 +417,12 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     geo = basin(n, aspect, cell)
     out: dict[str, float] = {"mode": mode, "use_image": use_image}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
-    out.update(inlet_spec(inlet, geo, p))
+    verts = shape_vertices(shape, geo)
+    out.update(inlet_spec(inlet, geo, p, None if shape == "box" else verts))
     rmax = rmax_of(p)
     dh = 0.5 * p["depth"]
     out.update({"cell": cell, "dh": dh, "bar_z": max(0.0, dh - 1.1 * rmax), "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
                 "spread": p["spread"], "nozzle_speed": p["nozzle_speed"], "emit_rate": EMIT_SPAN / float(n) / p["rate"]})
-    verts = shape_vertices(shape, geo)
     if len(verts) > NV:
         raise ValueError(f"a chamber outline has at most {NV} vertices")
     verts = verts + [verts[-1]] * (NV - len(verts))
