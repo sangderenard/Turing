@@ -73,6 +73,21 @@ function inText(x,y,label) {
 function numberFaces(faces,kind) {
   if(kind==='d4') return faces.map((face)=>({face,number:null}));
   const count=faces.length, first=kind==='d10'?0:1, numbers=new Array(count);
+  if(kind==='d10') {
+    // The five faces meeting the upper pole carry the even values in order;
+    // the lower ring carries odd values and each antipodal pair sums to nine.
+    const upper=faces.map((f,i)=>i).filter(i=>faces[i].normal[1]>0)
+      .sort((a,b)=>Math.atan2(faces[a].normal[2],faces[a].normal[0])-
+                   Math.atan2(faces[b].normal[2],faces[b].normal[0]));
+    if(upper.length!==5) throw new Error('d10 must have five upper faces');
+    for(let k=0;k<5;k++) {
+      const a=upper[k];numbers[a]=2*k;
+      const opposite=faces.findIndex((f,i)=>i!==a&&dot(f.normal,faces[a].normal)<-0.999);
+      if(opposite<0) throw new Error('d10 antipodal face missing');
+      numbers[opposite]=9-2*k;
+    }
+    return faces.map((face,i)=>({face,number:numbers[i]}));
+  }
   const order=faces.map((f,i)=>i).sort((a,b)=>{
     const A=faces[a].normal,B=faces[b].normal;
     return B[1]-A[1]||B[2]-A[2]||B[0]-A[0];

@@ -40,6 +40,10 @@ for(const kind of kinds) {
       assert(opposite,`${kind}: missing opposite`);
       assert.equal(face.number+opposite.number,kind==='d10'?9:count+1);
     }
+    if(kind==='d10') {
+      assert.deepEqual(infos.filter(x=>x.normal[1]>0).map(x=>x.number).sort((a,b)=>a-b),[0,2,4,6,8]);
+      assert.deepEqual(infos.filter(x=>x.normal[1]<0).map(x=>x.number).sort((a,b)=>a-b),[1,3,5,7,9]);
+    }
   }
   console.log(`${kind}: closed mesh, face numbering, marking material and relief mass passed`);
 }
