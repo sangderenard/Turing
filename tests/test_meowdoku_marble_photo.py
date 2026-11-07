@@ -63,11 +63,12 @@ def photo_payload(tmp_path):
 
 def test_mrp1_matches_saved_geometry_and_pbr(photo_payload):
     store, digest, vertices, normals, ids = photo_payload
-    wire = _wire(digest, vertices, normals, ids, camera={"resolution": 256})
+    wire = _wire(digest, vertices, normals, ids, camera={"resolution": 256}, transport="fixed:3")
     decoded_vertices, decoded_ids, pbr, config, seconds = photos.decode_upload(wire, store)
     np.testing.assert_array_equal(decoded_vertices, vertices)
     np.testing.assert_array_equal(decoded_ids, ids)
     assert pbr.shape == (2, 16) and config["scale_m"] == .025 and seconds == 30
+    assert config["transport"] == "fixed:3"
     altered = bytearray(wire)
     altered[-4] = 0  # change the second face's material ID
     with pytest.raises(photos.PhotoError, match="differ from the saved"):
@@ -138,6 +139,13 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         status, body = request("GET", f"/api/marble_photo/image?digest={digest}&name=preview-000120.png")
         assert status == 200 and body.startswith(b"\x89PNG")
         assert request("GET", f"/api/marble_photo/image?digest={digest}&name=../payload.npz")[0] == 400
+        (directory / "exposure-000120.npz").write_bytes(b"linear-rgb-hdr")
+        (directory / "status.json").write_text(json.dumps({
+            "digest": digest, "state": "complete", "image": "preview-000120.png",
+            "hdr": "exposure-000120.npz"}))
+        status, body = request("GET", f"/api/marble_photo/hdr?digest={digest}&name=exposure-000120.npz")
+        assert status == 200 and body == b"linear-rgb-hdr"
+        assert request("GET", f"/api/marble_photo/hdr?digest={digest}&name=../payload.npz")[0] == 400
         status, body = request("POST", "/api/marble_photo/cancel", json.dumps({"digest": digest}).encode(),
                                "application/json")
         assert status == 200 and json.loads(body)["state"] == "canceled"

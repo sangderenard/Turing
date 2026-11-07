@@ -9,6 +9,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   const config = {
     object_digest: objectDigest,
     exposure_seconds: options.seconds ?? 600,
+    transport: options.transport ?? "fixed:3",
     scale_m: 0.025,
     object_center_m: [0, 0, 0.18],
     camera: {
@@ -56,6 +57,7 @@ export function createMarblePhoto(doc = document) {
     const digest = state.jobDigest;
     state.jobDigest = null; state.generation++; stopPolling(); setButtons();
     if (digest) {
+      $("photo-hdr").hidden = true;
       await fetch("/api/marble_photo/cancel", { method: "POST",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) });
       status("Exposure canceled. The Phong preview remains interactive.");
@@ -68,6 +70,7 @@ export function createMarblePhoto(doc = document) {
     state.jobDigest = null; state.generation++; stopPolling(); setButtons();
     if (digest) fetch("/api/marble_photo/cancel", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) }).catch(() => {});
+    $("photo-hdr").hidden = true;
     if (!$("photo-panel").hidden) $("photo-caption").textContent = "Photo of the previous saved design";
     status("Design changed. Save it again before exposing another photo.");
   };
@@ -94,6 +97,12 @@ export function createMarblePhoto(doc = document) {
         $("photo-image").src = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(value.image)}`;
         $("photo-caption").textContent = `${value.transport || "Fixed-line"} · ${Math.round(value.elapsed_seconds || 0)} s exposure`;
       }
+      if (value.hdr) {
+        const link = $("photo-hdr");
+        link.href = `/api/marble_photo/hdr?digest=${digest}&name=${encodeURIComponent(value.hdr)}`;
+        link.download = value.hdr;
+        link.hidden = false;
+      }
       status(value.state === "complete" ? `Photo complete · ${Math.round(value.elapsed_seconds || 0)} s exposure` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
@@ -111,7 +120,9 @@ export function createMarblePhoto(doc = document) {
     if (state.jobDigest) await cancel();
     const body = packMarblePhoto(geometry, state.objectDigest, {
       resolution: +$("photo-resolution").value, seconds: +$("photo-seconds").value,
+      transport: $("photo-transport").value,
     });
+    $("photo-hdr").hidden = true;
     status(`Uploading ${geometry.triangleCount.toLocaleString()} saved triangles…`);
     const response = await fetch("/api/marble_photo", { method: "POST",
       headers: { "Content-Type": "application/octet-stream" }, body });

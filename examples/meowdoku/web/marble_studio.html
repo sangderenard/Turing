@@ -25,7 +25,7 @@
   @media(max-width:850px) { main { grid-template-columns:1fr; } .stage { min-height:58vh; height:58vh; } aside { max-height:none; border-left:0; border-top:1px solid #32465c; } }
 </style></head><body>
 <header><strong>Meowdoku · Marble studio</strong><a href="/">Games</a><span id="message" role="status"></span></header>
-<main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div><figure class="photo-panel" id="photo-panel" hidden><img id="photo-image" alt="Progressive thin-lens photograph of the saved marble"><figcaption id="photo-caption">Preparing photo…</figcaption></figure></div>
+  <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div><figure class="photo-panel" id="photo-panel" hidden><img id="photo-image" alt="Progressive thin-lens photograph of the saved marble"><figcaption id="photo-caption">Preparing photo…</figcaption><a id="photo-hdr" hidden download>Download linear HDR exposure</a></figure></div>
 <aside><h1>Design a marble or die</h1><p>Turn closed solids and dyed inclusions under the exported Pluck material tables and Phong shader.</p>
   <h2>Saved objects</h2><div class="grid">
     <label class="wide">Object name<input id="object-name" type="text" maxlength="80" value="My marble"></label>
@@ -35,11 +35,12 @@
     <output id="object-status" class="wide" role="status">Saved designs are shared with the particle simulator.</output>
   </div>
   <h2>Thin-lens photograph</h2><div class="grid" id="photo-controls">
-    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256" selected>256 × 256</option><option value="512">512 × 512</option></select></label>
+    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option></select></label>
+    <label>Light transport<select id="photo-transport"><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
     <label>Exposure<select id="photo-seconds"><option value="30">30 seconds</option><option value="180">3 minutes</option><option value="600" selected>10 minutes</option></select></label>
     <button id="photo-start">Expose saved object</button><button id="photo-cancel" disabled>Cancel exposure</button>
-    <output id="photo-status" class="wide" role="status">Save or load a design, then expose a progressive black-and-white photo on the GPU for up to 10 minutes.</output>
-    <p class="wide">The Phong preview stays interactive. The separate photo uses the Spectral thin-lens tracer and the saved mesh and materials; changing the design requires a new save.</p>
+    <output id="photo-status" class="wide" role="status">Save or load a design, then expose a progressive RGB thin-lens photo on the GPU for up to 10 minutes.</output>
+    <p class="wide">The Phong preview stays interactive. The separate photo uses the Spectral thin-lens tracer and the saved mesh and materials, preserving a linear HDR exposure; changing the design requires a new save.</p>
   </div>
   <h2>Shape</h2><div class="grid">
     <label>Base solid<select id="base-shape"><option value="marble">Spherical marble</option><option value="d4">D4 tetrahedron</option><option value="d6">D6 cube</option><option value="d8">D8 octahedron</option><option value="d10">D10 trapezohedron</option><option value="d12">D12 dodecahedron</option><option value="d20">D20 icosahedron</option></select></label>

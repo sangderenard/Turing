@@ -29,6 +29,7 @@ MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 MAX_TRIANGLES = 500_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE = re.compile(r"^preview-[0-9]{6}\.png$")
+_HDR = re.compile(r"^exposure-[0-9]{6}\.npz$")
 
 
 class PhotoError(ValueError):
@@ -63,6 +64,9 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
     if value.get("object_digest") != saved["digest"]:
         raise PhotoError("photo request does not name the saved object")
     seconds = _number(value.get("exposure_seconds", 180), 1, 600, "exposure_seconds")
+    transport = str(value.get("transport", "fixed:1"))
+    if transport not in ("fixed:1", "fixed:3"):
+        raise PhotoError("transport must be fixed:1 or fixed:3")
     camera_in = value.get("camera", {})
     checker_in = value.get("checker", {})
     if not isinstance(camera_in, dict) or not isinstance(checker_in, dict):
@@ -105,6 +109,7 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
         "object_digest": saved["digest"],
         "geometry_sha256": saved["geometry_sha256"],
         "exposure_seconds": seconds,
+        "transport": transport,
         "scale_m": scale,
         "object_center_m": _finite_vectors(value.get("object_center_m", [0, 0, .18]), 3, "object_center_m"),
         "camera": camera, "checker": checker, "lights": lights,
@@ -261,6 +266,18 @@ class PhotoJobs:
                 return (self.directory / digest / name).read_bytes()
             except OSError:
                 raise PhotoError("photo frame is unavailable", 404) from None
+
+    def hdr(self, digest: str, name: str) -> bytes:
+        if not _DIGEST.fullmatch(digest) or not _HDR.fullmatch(name):
+            raise PhotoError("invalid HDR exposure path", 400)
+        with self.lock:
+            status = self._status_locked(digest)
+            if status.get("hdr") != name:
+                raise PhotoError("HDR exposure is unavailable", 404)
+            try:
+                return (self.directory / digest / name).read_bytes()
+            except OSError:
+                raise PhotoError("HDR exposure is unavailable", 404) from None
 
     def cancel(self, digest: str) -> dict:
         if not _DIGEST.fullmatch(digest):
