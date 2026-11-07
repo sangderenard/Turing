@@ -6,7 +6,8 @@ const kinds=['d4','d6','d8','d10','d12','d20'];
 for(const kind of kinds) {
   const count=+kind.slice(1), meshes={};
   for(const mode of ['flat','raised','recessed']) {
-    const mesh=diceSolid(kind,{shellMaterial:1,markMaterial:2,markingMode:mode});
+    const mesh=diceSolid(kind,{shellMaterial:1,markMaterial:2,markingMode:mode,
+      compensateRaised:false});
     meshes[mode]=mesh;
     assert.equal(mesh.faceInfo.length,count);
     assert.equal(mesh.glass.length,mesh.triangleCount);
@@ -49,4 +50,43 @@ for(const kind of kinds) {
     }
   }
   console.log(`${kind}: closed mesh, face numbering, marking material and relief mass passed`);
+}
+
+const bulk=(mesh)=>marbleMass(mesh,{radiusM:0.01,densityByRole:{shell:2500}});
+const rounded=diceSolid('d6',{shellMaterial:1,markMaterial:2,bevelRadius:0.05});
+const sharp=diceSolid('d6',{shellMaterial:1,markMaterial:2,bevelRadius:0});
+for(const face of sharp.faceInfo) assert(sharp.glass.slice(face.start,face.start+face.count)
+  .filter(triangle=>triangle[3]===2).length>=100,'face glyph must have adequate marked triangles');
+assert(bulk(rounded).massKg<bulk(sharp).massKg,'bevel must remove real volume');
+const recessedFace=diceSolid('d6',{shellMaterial:1,markMaterial:2,faceRelief:0.015});
+assert(bulk(recessedFace).massKg<bulk(sharp).massKg,'face relief must remove real volume');
+const raised=diceSolid('d6',{shellMaterial:1,markMaterial:2,markingMode:'raised',
+  reliefDepth:0.025,bevelRadius:0.05,faceRelief:0.01,compensateRaised:true});
+const raisedUncompensated=diceSolid('d6',{shellMaterial:1,markMaterial:2,markingMode:'raised',
+  reliefDepth:0.025,bevelRadius:0.05,faceRelief:0.01,compensateRaised:false});
+assert(bulk(raised).massKg<bulk(raisedUncompensated).massKg,
+  'raised glyph compensation must inset substrate and alter mass');
+const support=diceSolid('d6',{shellMaterial:1,markMaterial:2}).faceInfo.map(face=>{
+  const p=sharp.glass[face.start][0];return face.normal.reduce((s,x,i)=>s+x*p[i],0);
+});
+for(const face of raised.faceInfo) {
+  const max=Math.max(...raised.glass.slice(face.start,face.start+face.count)
+    .flatMap(tri=>tri.slice(0,3).map(p=>face.normal.reduce((s,x,i)=>s+x*p[i],0))));
+  assert(max<=support[face.faceIndex]+1e-8,'compensated mark must not protrude past support plane');
+}
+assert(bulk(raised).inertiaKgM2.every((row,i)=>row[i]>0));
+console.log('bevel, face relief and raised support compensation alter closed-mesh mechanics');
+
+for(const kind of kinds) {
+  const mesh=diceSolid(kind,{shellMaterial:1,markMaterial:2,markingMode:'raised',
+    reliefDepth:0.025,bevelRadius:0.05,faceRelief:0.01,compensateRaised:true,subdivisions:24});
+  const heights=mesh.faceInfo.map(face=>{
+    let max=-Infinity;
+    for(const triangle of mesh.glass) for(const p of triangle.slice(0,3))
+      max=Math.max(max,face.normal.reduce((s,x,i)=>s+x*p[i],0));
+    return max;
+  });
+  assert(Math.max(...heights)-Math.min(...heights)<1e-6,`${kind}: unequal face support heights`);
+  assert(bulk(mesh).massKg>0&&bulk(mesh).inertiaKgM2.every((row,i)=>row[i]>0));
+  console.log(`${kind}: equal compensated support height, spread ${Math.max(...heights)-Math.min(...heights)}`);
 }
