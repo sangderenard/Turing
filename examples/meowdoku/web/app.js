@@ -4046,7 +4046,7 @@ window.meowdokuDebug.noiseFx = noiseFx;
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
   return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: caseSpin }[s.local] ?? s.value;
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin) }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4055,7 +4055,7 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.tilt", value ? "1" : "0"); } catch { /* storage may be blocked */ }
     if (value) gravitySensor.grant();
   } else if (s.local === "spin") {
-    caseSpin = Math.abs(Number(value)) < 1e-6 ? 0 : Number(value);
+    caseSpin = spinFromSlider(value);
     compute.setSpin(caseSpin);
     try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
@@ -4079,9 +4079,10 @@ function refreshLocalControls() {
     if (!el) continue;
     if (s.local === "spin") {
       const input = el.querySelector("input");
-      if (document.activeElement !== input) input.value = String(caseSpin);
-      el.title = caseSpin ? `gravity turns ${Math.abs(caseSpin)} rev/s ${caseSpin > 0 ? "counterclockwise" : "clockwise"} (overrides the phone)` : "0: the case stands still";
-      el.querySelector("span").textContent = `case spin ${caseSpin ? caseSpin.toFixed(2) + " Hz" : "off"} `;
+      if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
+      el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, centre = off`
+                          : "centre = off; log scale out to 2 Hz either way, down to 1 turn in 2.8 h";
+      el.querySelector("span").textContent = `case spin ${spinText(caseSpin)} `;
     } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
@@ -4109,7 +4110,27 @@ function refreshLocalControls() {
 // Page-side controls the server's list leaves room for: next to the phone gravity switch, a spinning case (gravity
 // turning at a set rate, a runtime input of the law like the tilt, so no rebuild).  Declared here until the fountain's
 // controls next change server-side (an edit there re-keys the compiled products).
-const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin (Hz)", min: -1, max: 1, step: 0.05, local: "spin" };
+// The slider is LOGARITHMIC in the rate (grain-size studies want the near-DC end): position s in [-1, 1] -> sign(s) x
+// 10^(SPIN_LOG[0] + |s| (SPIN_LOG[1] - SPIN_LOG[0])) Hz, from 1e-4 Hz (one turn in ~2.8 h) to 2 Hz; the centre notch is off.
+const SPIN_LOG = [-4, Math.log10(2)], SPIN_NOTCH = 0.01;
+const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin", min: -1, max: 1, step: 0.002, local: "spin" };
+function spinFromSlider(s) {
+  s = Number(s);
+  if (Math.abs(s) < SPIN_NOTCH) return 0;
+  const u = (Math.abs(s) - SPIN_NOTCH) / (1 - SPIN_NOTCH);
+  return Math.sign(s) * 10 ** (SPIN_LOG[0] + u * (SPIN_LOG[1] - SPIN_LOG[0]));
+}
+function sliderFromSpin(hz) {
+  if (!hz) return 0;
+  const u = (Math.log10(Math.abs(hz)) - SPIN_LOG[0]) / (SPIN_LOG[1] - SPIN_LOG[0]);
+  return Math.sign(hz) * (SPIN_NOTCH + Math.max(0, Math.min(1, u)) * (1 - SPIN_NOTCH));
+}
+function spinText(hz) {
+  if (!hz) return "off";
+  const a = Math.abs(hz), period = 1 / a;
+  const per = period < 120 ? `${period.toPrecision(3)} s` : period < 7200 ? `${(period / 60).toPrecision(3)} min` : `${(period / 3600).toPrecision(3)} h`;
+  return `${hz < 0 ? "-" : ""}${a.toPrecision(2)} Hz (1 turn / ${per})`;
+}
 function pageSpecs(specs) {
   if (!specs || specs.some((s) => s.id === SPIN_SPEC.id)) return specs;
   const at = specs.findIndex((s) => s.local === "tilt");
