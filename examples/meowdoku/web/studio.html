@@ -70,7 +70,7 @@
         <div class="row" style="margin-top:14px">
           <button id="record" class="on">Record</button><button id="abort" disabled>Abort</button><button id="reset">Defaults</button>
         </div>
-        <p class="hint">Recording runs the game&rsquo;s own fountain in the preview (as fast as this device allows). For large simulations it keeps only sampled visual frames, with no physics replay; the saved animation keeps at most 1,024 grains and 1 MiB of raw positions. A save enters the library and needs owner activation before players see it.</p>
+        <p class="hint">Recording runs the game&rsquo;s own fountain in the preview. Each flip moves the case and its grains about the case normal; the law applies the corresponding turn forces. The spring contact limit can lengthen the requested flip. For large simulations, only sampled visual frames are kept; the saved animation holds at most 1,024 grains and 1 MiB of raw positions. A save needs owner activation before players see it.</p>
       </div>
       <div>
         <div class="pane"><div class="idle" id="idle">The live preview of the simulation appears here while recording.</div><iframe id="live" title="recording preview" hidden></iframe></div>

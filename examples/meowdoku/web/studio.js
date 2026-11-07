@@ -66,6 +66,7 @@ const CONTROLS = [
   { k: "settle", label: "settle threshold (x law KE/id)", type: "range", min: 1, max: 400, step: 1 },
   { k: "turns", label: "turns (even)", type: "range", min: 2, max: 12, step: 2 },
   { k: "flipSeconds", label: "flip speed (turn takes s)", type: "range", min: 0.1, max: 2, step: 0.05 },
+  { k: "flipDirection", label: "flip axis / direction", type: "select", options: [[1, "case normal / one way"], [-1, "case normal / reverse"]] },
   { k: "speed", label: "sim speed", type: "select", options: [[0, "max"], [1, "1x"], [2, "2x"], [4, "4x"]] },
   ["Budget"],
   { k: "fit", label: "tighten automatically to fit ~900 KB", type: "check" },
@@ -158,7 +159,7 @@ window.addEventListener("message", (e) => {
     $("bar").value = 100;
     const s = m.stored || {};
     recMsg(s.duplicate ? "already in the library (same animation)" : `saved to the library${s.active ? " and active (the first one)" : " (not active)"}`, "ok");
-    stats([["simulated ids", Number(m.sim_n).toLocaleString()], ["capture", m.visual_only ? "visual only (no physics replay)" : "state memory"], ["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
+    stats([["simulated ids", Number(m.sim_n).toLocaleString()], ["capture", m.visual_only ? "visual only (no physics replay)" : "state memory"], ["flip", `${Number(m.effective_flip_seconds).toFixed(2)} simulated s (requested ${Number(S.recParams.flipSeconds).toFixed(2)} s)`], ["raw stream", kb(m.raw)], ["octet codec", `${kb(s.bytes)}  (${(100 * s.bytes / m.raw).toFixed(1)}% of raw)`], ["frames x grains", `${s.frames} x ${s.grains} at ${s.fps} fps`],
            ["tried", (m.tried || []).map((t) => `${t.fps}fps/${t.grains}g/${t.bits}b=${kb(t.raw)}`).join("; ")], ...(m.capped ? [["ended by", "the duration cap"]] : [])]);
     stopLive(false);
     loadLibrary().then(() => { if (s.digest) { S.playing = s.digest; paintCards(); showScreen(); } });

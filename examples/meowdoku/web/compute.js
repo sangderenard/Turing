@@ -52,9 +52,10 @@
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
-import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms } from "./particle_styles.js";
+import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms, decodeMeta } from "./particle_styles.js";
 import { NoiseFilter } from "./noise_filter.js";
 import { mobroadInputs, mobroadTarget, mobroadPather } from "./mobroad.js";               // [MOBROAD]
+import { caseFlipAt, caseFlipSteps } from "./case_motion.js";
 const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
@@ -691,9 +692,10 @@ export class ComputeRuntime {
       for (const name of Object.keys(aim)) if (mine.has(name)) out[name] = aim[name];   // the player's place (the pather's target) and the pather's weights (hand-set / trained)
     }
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
+    const flip = this.caseMotionAt(this.steps);
     if (this.runtimeInputs.has("case_omega")) {          // the case's own turn, from the same motion (one mechanism): 0 when it stands still
       const [om, dom] = this.spin ? spinOmega(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : [0, 0];
-      out.case_omega = om; out.case_domega = dom;
+      out.case_omega = om + flip.omega; out.case_domega = dom + flip.domega;
     }
     if (g) {
       const G = this.manifest.law.gravity;
@@ -702,7 +704,7 @@ export class ComputeRuntime {
     }
     // THE CASE'S STANDING ANGLE (the page's "case angle" / "turn over"): the case is held turned by caseTilt radians, so gravity in its
     // frame is turned the same way (R(a): the convention of spinGravity, whose angle adds to this one)
-    const a = this.caseTilt || 0;
+    const a = flip.angle;
     if (a && "grav_x" in out && "grav_y" in out) {
       const c = Math.cos(a), s = Math.sin(a), gx = out.grav_x, gy = out.grav_y;
       out.grav_x = gx * c - gy * s; out.grav_y = gx * s + gy * c;
@@ -736,9 +738,48 @@ export class ComputeRuntime {
 
   setCaseTilt(radians) {
     const next = Number(radians) || 0;
-    if (next === (this.caseTilt || 0)) return;
+    if (next === (this.caseTilt || 0) && !(this.caseFlips || []).length) return;
     this.caseTilt = next;
+    this.caseFlips = [];
     this.#kick();
+  }
+
+  caseMotionAt(step) {
+    const flips = this.caseFlips || [];
+    let motion = { angle: this.caseTilt || 0, omega: 0, domega: 0 };
+    for (const flip of flips) if (step >= flip.startStep) motion = caseFlipAt(flip, step); else break;
+    return motion;
+  }
+  caseAngleAt(step) {
+    const held = this.caseMotionAt(step).angle;
+    return held + (this.spin && this.manifest ? gravityAngle(this.spin, step * this.manifest.law.dt, this.spinMotion) : 0);
+  }
+  // Prescribed finite case turn about the only axis the existing 2-D/flat-slab law represents: normal to its x-y plane.
+  // The law limits angular terms by spring contact capacity per grain.  Choose a duration that stays below even the
+  // smallest currently live grain's cap; report the actual duration to the caller.
+  startCaseFlip(seconds = 0.4, direction = 1) {
+    if (!this.ready || !this.tape || !this.manifest || !this.runtimeInputs.has("case_omega")) return null;
+    const data = this.tape.get(this.tape.hi);
+    if (!data) return null;
+    let radius = Infinity;
+    for (let i = 0; i < this.rec.n; i++) {
+      const r = decodeMeta(data[5 * i + 4]).radius;
+      if (r > 0) radius = Math.min(radius, r);
+    }
+    if (!Number.isFinite(radius)) return null;
+    const u = { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs }, cell = u.cell ?? 0.028 * u.cell_scale;
+    const reach = Math.hypot(u.half, 0.5 * u.rows * cell) + 1e-6;
+    const w = 2 * Math.PI * Math.abs(this.spin || 0), rock = this.spinMotion && this.spinMotion.kind === "rock";
+    const amp = rock ? Math.PI * this.spinMotion.arc / 360 : 1;
+    const maxOmega = 0.98 * u.omega * Math.sqrt(0.5 * radius / reach) - amp * w;
+    const maxDomega = 0.98 * u.omega * u.omega * 0.5 * radius / reach - (rock ? amp * w * w : 0);
+    if (!(maxOmega > 0 && maxDomega > 0)) return null;
+    const delta = (direction < 0 ? -1 : 1) * Math.PI, dt = this.manifest.law.dt;
+    const steps = caseFlipSteps(delta, Math.max(0.1, Number(seconds) || 0.4), dt, maxOmega, maxDomega);
+    const flip = { from: this.caseMotionAt(this.steps).angle, delta, startStep: this.steps, steps, dt };
+    (this.caseFlips ||= []).push(flip);
+    this.#kick();
+    return { requestedSeconds: seconds, seconds: steps * dt, maxOmega, maxDomega, axis: "case-normal" };
   }
 
   // The hinged body's (waterwheel) machine-sim coupling: the coupling writes its transmitted torque here (an absolute runtime input of the law,
@@ -786,9 +827,9 @@ export class ComputeRuntime {
   // straight down, one swing out and back per cycle) -- a scripted rocker until the teeter-totter case is a law body.
   setSpin(hz, motion = this.spinMotion || { kind: "spin", arc: 60 }) {
     const next = hz ? Number(hz) : null;
-    this.spinMotion = { kind: motion.kind === "rock" ? "rock" : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)),
+    this.spinMotion = { kind: ["rock", "flip"].includes(motion.kind) ? motion.kind : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)),
                         phase: Number(motion.phase) || 0 };
-    this.spin = next;
+    this.spin = this.spinMotion.kind === "flip" ? null : next;
     this.#kick();
   }
 
@@ -800,6 +841,8 @@ export class ComputeRuntime {
   }
 
   #reset(phase2Rest) {
+    this.caseTilt = this.caseMotionAt(this.steps).angle;
+    this.caseFlips = [];
     this.token++; this.arrived.clear();
     this.#release(this.tape.clear());
     this.lawInputs = this.#inputsNow();
@@ -930,6 +973,7 @@ export class ComputeRuntime {
       const rate = Math.abs(this.spin) * (this.spinMotion && this.spinMotion.kind === "rock" ? Math.PI * this.spinMotion.arc / 360 : 1);
       if (rate > 0) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (rate * this.manifest.law.dt * snap))));
     }
+    if ((this.caseFlips || []).some((f) => this.steps >= f.startStep && this.steps < f.startStep + f.steps)) m = 1;
     return m;
   }
 
