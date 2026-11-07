@@ -51,7 +51,7 @@
 // so on screen; if a device is not bit-identical it records phase 2's own
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
-import { Recording, Playback } from "./recording.js";
+import { Recording, Playback, recordedAngle } from "./recording.js";
 import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms, decodeMeta } from "./particle_styles.js";
 import { NoiseFilter } from "./noise_filter.js";
 import { mobroadInputs, mobroadTarget, mobroadPather } from "./mobroad.js";               // [MOBROAD]
@@ -836,6 +836,13 @@ export class ComputeRuntime {
     this.#kick();
   }
   get bodySpeed() { return this.diag ? this.diag.body_om ?? null : null; }
+  // The wheel is rendered at the playback cursor, so its angle must come from
+  // the law snapshot displayed there rather than the latest status diagnostic.
+  bodyAngle() {
+    const name = this.spec?.body?.angle || "body_th";
+    return (this.shown == null ? null : recordedAngle(this.tape, this.play.pos, name))
+      ?? this.diag?.[name] ?? 0;
+  }
 
   // PURRLINE SAND: the purrline game's state (``purrline`` of the game state, its falling list already at this instant), written to the law's
   // solids each batch -- ONE WAY: nothing the sand does reaches the game.  null stops it (the solids are then written empty).
@@ -1028,7 +1035,7 @@ export class ComputeRuntime {
     this.#applyInputs(false);
     for (let j = 0; j < m; j++) {
       const at = base + (j + 1) * snap;
-      if (settle ? at % set.sample === 0 : (j === m - 1 && now - this.diagAt > DIAG_MS)) diagAt.push(j);
+      if (this.spec.body?.angle || (settle ? at % set.sample === 0 : (j === m - 1 && now - this.diagAt > DIAG_MS))) diagAt.push(j);
       if (this.recordOn && at % keyEvery === 0) keyAt.push(j);
     }
     if (diagAt.length && !settle) this.diagAt = now;
@@ -1052,7 +1059,7 @@ export class ComputeRuntime {
       for (let j = 0; j < count; j++) {
         const k = k0 + j, step = k * snap;
         if (this.onSnapshot) this.onSnapshot(k, r.frames[j]);
-        this.#release(this.tape.push(k, r.frames[j]));
+        this.#release(this.tape.push(k, r.frames[j], r.diags[j]));
         if (r.keys[j]) this.#release({ keys: this.tape.addKey(step, r.keys[j].payload, r.keys[j].bytes) });
         if (r.diags[j]) this.#takeDiag(step, r.diags[j]);
       }
@@ -1064,7 +1071,7 @@ export class ComputeRuntime {
   // the law's diagnostics after `step` steps; in settle mode they feed the settle rule (which stops the run)
   #takeDiag(step, d) {
     this.diag = { step, ...d };
-    if (!this.settleMode) return;
+    if (!this.settleMode || step % this.manifest.settle.sample !== 0) return;
     const found = this.detector.push(step, d);
     if (found !== null && this.settleStep === null) this.settleStep = found;
     if (step >= Math.ceil(this.manifest.settle.max_seconds / this.manifest.law.dt - 1e-9) && this.settleStep === null) this.settleStep = step;

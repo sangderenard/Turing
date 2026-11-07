@@ -21,7 +21,7 @@ export class Recording {
 
   clear() {
     const old = this.frames ? this.frames.slice(this.head).filter(Boolean) : [];
-    this.frames = []; this.head = 0; this.lo = 1; this.hi = 0;          // an empty window: lo > hi
+    this.frames = []; this.meta = []; this.head = 0; this.lo = 1; this.hi = 0;          // an empty window: lo > hi
     const keys = this.keys || [];
     this.keys = []; this.inputs = [];
     return { frames: old, keys };
@@ -33,15 +33,16 @@ export class Recording {
   stepOf(frame) { return frame * this.snapEvery; }
   frameOf(step) { return Math.floor(step / this.snapEvery); }
   get(k) { return k < this.lo || k > this.hi ? null : this.frames[this.head + k - this.lo]; }
+  getMeta(k) { return k < this.lo || k > this.hi ? null : this.meta[this.head + k - this.lo]; }
 
   // Append frame `k` (must be hi + 1).  Returns the frames and keyframes that fell out of the window, to be recycled.
-  push(k, data) {
+  push(k, data, meta = null) {
     if (k !== this.hi + 1) throw new Error(`recording: frame ${k} is not next after ${this.hi}`);
     if (this.hi < this.lo) this.lo = k;
-    this.frames.push(data); this.hi = k;
+    this.frames.push(data); this.meta.push(meta); this.hi = k;
     const out = { frames: [], keys: [] };
-    while (this.length > this.capFrames) { out.frames.push(this.frames[this.head]); this.frames[this.head++] = undefined; this.lo++; }
-    if (this.head > 1024 && this.head * 2 > this.frames.length) { this.frames = this.frames.slice(this.head); this.head = 0; }
+    while (this.length > this.capFrames) { out.frames.push(this.frames[this.head]); this.frames[this.head] = undefined; this.meta[this.head++] = undefined; this.lo++; }
+    if (this.head > 1024 && this.head * 2 > this.frames.length) { this.frames = this.frames.slice(this.head); this.meta = this.meta.slice(this.head); this.head = 0; }
     out.keys = this.#prune();
     return out;
   }
@@ -49,7 +50,7 @@ export class Recording {
   // Drop everything after frame `f` (the run is about to branch from it).
   truncateAfter(f) {
     const out = { frames: [], keys: [] };
-    while (this.hi > f && this.hi >= this.lo) { out.frames.push(this.frames.pop()); this.hi--; }
+    while (this.hi > f && this.hi >= this.lo) { out.frames.push(this.frames.pop()); this.meta.pop(); this.hi--; }
     const step = this.stepOf(f);
     out.keys = this.keys.filter((k) => k.step > step);
     this.keys = this.keys.filter((k) => k.step <= step);
@@ -116,6 +117,18 @@ export class Recording {
     ops.push({ steps: target - at });
     return { key, start, target, initial: this.inputsAt(start), ops: ops.filter((o) => o.set || o.steps > 0) };
   }
+}
+
+// Interpolate a scalar angle carried by adjacent snapshots at the playback cursor.
+// The law may wrap its angle at +/-pi; interpolate along the short arc.
+export function recordedAngle(rec, pos, name) {
+  const frame = Math.floor(pos);
+  const first = rec.getMeta(frame)?.[name];
+  if (!Number.isFinite(first)) return null;
+  const second = rec.getMeta(frame + 1)?.[name];
+  if (!Number.isFinite(second)) return first;
+  const delta = Math.atan2(Math.sin(second - first), Math.cos(second - first));
+  return first + delta * (pos - frame);
 }
 
 // The display cursor.  `mode`: "live" follows the newest frame at the pace the caller gives; "replay" plays the window
