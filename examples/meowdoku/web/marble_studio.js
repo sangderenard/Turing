@@ -6,12 +6,14 @@ import { ComputeRuntime } from "./compute.js";
 import { caseModel } from "./gravity.js";
 import { marblePreviewSpec, livePreviewParticle, previewLawToScene } from "./marble_sim_preview.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
+import { createMarblePhoto } from "./marble_photo.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
   verifySavedMarbleObject } from "./marble_object.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
+const photo = createMarblePhoto();
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
 if (!gl) message.textContent = "WebGL 2 is required for this studio";
 
@@ -191,6 +193,7 @@ async function saveObject() {
   const result=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(result.error||`save HTTP ${response.status}`);
   await refreshObjects(result.digest);
+  photo.saved(result.digest);
   objectStatus(`${result.duplicate?"Already saved":"Saved"} ${value.name} · ${result.digest.slice(0,12)} · available to particle simulator`);
 }
 async function loadObject() {
@@ -219,6 +222,7 @@ async function loadObject() {
   rebuild();syncMaterial();
   for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth","die-inclusion-size"])
     $(field).dispatchEvent(new Event("input"));
+  photo.saved(digest);
   objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
 }
 function objectLibraryControls() {
@@ -318,6 +322,7 @@ function syncMaterial() {
   }
 }
 function rebuild() {
+  photo.stale();
   dispose(interior);
   const design=readDesign(document,seed);
   const geometry=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
@@ -331,6 +336,16 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
+  const skipPhotoInvalidation=new Set(["object-name","saved-object","layer","preview-engine","preview-motion",
+    "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
+  const designChanged=(event)=>{
+    if(!event.target.closest("#photo-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
+  };
+  for(const eventName of ["input","change"]) $("view").closest("main").querySelector("aside")
+    .addEventListener(eventName,designChanged,true);
+  for(const id of ["reroll","reset-material"]) $(id).addEventListener("click",()=>photo.stale(),true);
+  $("photo-start").addEventListener("click",()=>photo.start(lastGeometry)
+    .catch((error)=>photo.status(error.message||String(error))));
   const diceCost=()=>{const kind=$("base-shape").value,
     factor={d4:12,d6:24,d8:24,d10:40,d12:60,d20:60}[kind]||0;
     $("dice-detail-cost").value=kind==="marble"?"Die detail applies to polyhedra":
