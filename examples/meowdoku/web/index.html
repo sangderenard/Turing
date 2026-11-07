@@ -174,6 +174,7 @@
 
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
+  <button id="settings-reset" type="button" title="Clear saved site settings and reload with defaults; keep player identity and diagnostic log">Reset settings</button>
   <label class="chessmove-only" for="move-input">Move</label>
   <input id="move-input" class="chessmove-only" type="text" placeholder="e2e4" autocomplete="off" spellcheck="false" size="7" aria-label="Chess move in UCI, like e2e4">
   <button id="move-submit" class="chessmove-only">Submit move</button>
@@ -287,6 +288,8 @@
 </script>
 <script type="module" src="loading_panel.js"></script>   <!-- [LOADING] first: its fetch wrapper counts the page's downloads -->
 <script type="module" src="lifecycle.js"></script>
+<script type="module" src="local_log.js"></script>
+<script type="module" src="settings_reset.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
