@@ -9,6 +9,11 @@ deploy to 8766 as soon as work lands.
 - No fountain lane waits on the large native: law tests and parity run on the 256-id native piece only, render-only work never compiles the law, and the 4k native/wasm fallbacks build only in the background (the server builds WebGPU first, then the fallbacks).
 - A dynamic-N law (sort stages, search and candidate walk as real loops, n as a runtime uniform) is being measured by the 3D job: if it compiles in minutes, it becomes the parity reference at any size.
 
+## Render priority (the user, 2026-11-06)
+
+1. Colour modes: grain size, species breakdown; palettes (sea first); "stained glass" grains through the scene's Phong + glass pass; no opaque black backdrop behind the fountain.
+2. Then the heat-map curve management, then the emoji style (image atlas + instanced meshes).
+
 ## In flight (workers)
 
 - **Fountain stage A follow-ups** (stage A landed in ee0883d7):
