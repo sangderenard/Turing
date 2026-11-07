@@ -234,14 +234,14 @@ UNIFORMS = (("mode", "use_image", "half", "nozzle_y", "bar_half", "cols", "rows"
              "spread", "nozzle_speed", "emit_rate")
             + POLYGON_UNIFORMS
             + ("grav_x", "grav_y", "grav_z", "lid", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "fl_rho", "fl_mu", "lognormal", "bi_ratio", "bi_frac",
-               "wt0", "wt1", "wt2", "wt3")
+               "wt0", "wt1", "wt2", "wt3", "case_omega", "case_domega", "pivot_x", "pivot_y")
             + _SPECIES_UNIFORMS)
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid`` and
 #: ``rows`` (a ceiling and the grid's height, which the page closes while a sensor drives gravity), and the live tunables.  The
 #: server sends their defaults; the page's runtime owns them after that and LOGS each change with its step, so a re-run
 #: (Continue) reproduces it exactly.
 LIVE_PARAMS = tuple(k for k, v in PARAMS.items() if not v[5])
-RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
+RUNTIME_INPUTS = ("grav_x", "grav_y", "grav_z", "lid", "rows", "strata", "case_omega", "case_domega", "omega", "hertz", "coh", "spin_drag", "temp", "k_run",
                   "nozzle_speed", "fl_rho", "fl_mu") \
     + tuple(f"{k}{s}" for k in ("rho", "mu", "zeta", "roll") for s in range(len(SPECIES)))
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -403,6 +403,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "grav_z": gravity[2], "lid": lid, "strata": strata,
+                "case_omega": 0.0, "case_domega": 0.0, "pivot_x": 0.0, "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3]),
                 "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"], "spin_drag": p["spin_drag"], "temp": p["temp"],
                 "lognormal": 1.0 if p["lognormal"] > 0.5 else 0.0, "bi_ratio": p["bi_ratio"], "bi_frac": p["bi_frac"],
                 "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
@@ -750,25 +751,28 @@ def make_law(n: int, active: int | None = None):
             for k in range(3):
                 f_[k] = f_[k] + force[k]
                 q_[k] = q_[k] + torque[k]
+        # THICK, SIDED, OVERLAPPING walls.  Each segment is a half-space bounded by its line, whose normal is the segment's LEFT
+        # normal (the polyline runs with the chamber on its left): a grain on the wrong side of the line, however deep, is
+        # pushed back toward the chamber by the same contact law (never a clamp or a teleport).  The overlap is bounded by a
+        # THICKNESS of 6 radii (the penetration depth the spring feels saturates there: a bounded, stable force) and the
+        # segment extends past each end by ``ext`` (a third of the half-width), its weight tapering linearly to 0 over that
+        # margin, so neighbouring walls overlap at every vertex: a grain that outruns a corner is still met by one of the walls
+        # and there is no half-weight seam.  A grain inside the chamber near a concave corner meets both walls, as it does
+        # against a floor and a side wall.
+        ext = 0.3 * half + 1.0e-6
         for k in range(NV - 1):
             ax, ay, bx, by = a[f"px{k}"], a[f"py{k}"], a[f"px{k + 1}"], a[f"py{k + 1}"]
             ex, ey = bx - ax, by - ay
             len2 = ex * ex + ey * ey
-            t_raw = ((x - ax) * ex + (y - ay) * ey) / (len2 + 1.0e-12)
-            t_c = t_raw.clamp(0.0, 1.0)
-            dxw = x - (ax + t_c * ex)
-            dyw = y - (ay + t_c * ey)
-            dw = (dxw * dxw + dyw * dyw + 1.0e-12).sqrt()
-            # SIDED: where the grain's projection falls on the segment the wall is the segment's line and its normal the
-            # segment's LEFT normal (the polyline runs with the chamber on its left), so a grain that tunnels past the line is
-            # pushed back, not further out; beyond an end the wall is the vertex, and its normal points from it.
-            inv_len = 1.0 / (len2 + 1.0e-12).sqrt()
+            seg_len = (len2 + 1.0e-12).sqrt()
+            inv_len = 1.0 / seg_len
             nlx, nly = -ey * inv_len, ex * inv_len
             side_s = (x - ax) * nlx + (y - ay) * nly
-            on_seg = as_float(t_raw >= 0.0) * as_float(t_raw <= 1.0)
-            share = as_float(len2 > 1.0e-8) * (1.0 - 0.5 * as_float(t_raw < 0.0) - 0.5 * as_float(t_raw > 1.0))
-            wall(on_seg * (radius - side_s) + (1.0 - on_seg) * (radius - dw), live * share,
-                 (on_seg * nlx + (1.0 - on_seg) * dxw / dw, on_seg * nly + (1.0 - on_seg) * dyw / dw, zero))
+            along = ((x - ax) * ex + (y - ay) * ey) * inv_len                 # distance along the segment from its start
+            w_start = ((along + ext) * (1.0 / ext)).clamp(0.0, 1.0)
+            w_end = ((seg_len + ext - along) * (1.0 / ext)).clamp(0.0, 1.0)
+            share = as_float(len2 > 1.0e-8) * w_start * w_end
+            wall(_cap(radius - side_s, 6.0 * radius), live * share, (zero + nlx, zero + nly, zero))
         wall(radius - (dh - z), live, (zero, zero, zero - 1.0))             # the front plexiglass (+z), its normal points at the grain: -z
         wall(radius - (z + dh), live, (zero, zero, zero + 1.0))             # the back plexiglass (-z)
         wall(radius - (lid - y), live, (zero, zero - 1.0, zero))            # the lid: a ceiling at the runtime height ``lid`` (far unless the page closes it)
@@ -793,14 +797,36 @@ def make_law(n: int, active: int | None = None):
         for k in range(3):
             f_[k] = f_[k] + f_amp * _noise(pid, step_now, k)
             q_[k] = q_[k] + q_amp * _noise(pid, step_now, 3 + k)
-        vxn = AbstractTensor.where(just > 0.5, vx0, (vx + live * (f_[0] / mass + grav[0] * buoy) * DT) * damp)
-        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(
-            arming > 0.5, vy * 0.0 + ARMED, (vy + live * (f_[1] / mass + grav[1] * buoy) * DT) * damp))
+        # the CASE FRAME (the walls are static here; the case turns about the z axis through (pivot_x, pivot_y) at ``case_omega``
+        # rad/s, counterclockwise positive, with ``case_domega``): besides the rotated gravity a grain feels the centrifugal
+        # w^2 (r - p) and Euler -dw x (r - p) accelerations, and its velocity turns by -2 w DT (Coriolis, an exact rotation, so any
+        # rate is stable); its own z-spin gains -dw/dt.  The defaults (0) add exact zeros.
+        # The turning case is capped at what the walls can hold: the centrifugal load of a grain at the far wall (w^2 R) must be
+        # met by the contact spring (omega^2 x penetration), so w is limited to omega sqrt(0.5 r / R) for the grain's radius r and
+        # the chamber's reach R (its half-diagonal), and the angular acceleration to omega^2 0.5 r / R (the Euler load).  Past
+        # that the spring would let a grain through by its own explicit step; the page's rate is honoured up to the cap.
+        half_height = 0.5 * rows * cell
+        reach = (half * half + half_height * half_height).sqrt() + 1.0e-6
+        w_cap = omega * (0.5 * radius * (1.0 / reach)).sqrt()
+        a_cap = omega * omega * 0.5 * radius * (1.0 / reach)
+        case_omega = -_cap(-_cap(a["case_omega"], w_cap), w_cap)
+        case_domega = -_cap(-_cap(a["case_domega"], a_cap), a_cap)
+        rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
+        fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
+        fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
+        vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x) * DT) * damp
+        vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y) * DT) * damp
+        turn = (case_omega * DT) * -2.0
+        c_turn, s_turn = turn.cos(), turn.sin()
+        vx_c = AbstractTensor.where(live > 0.5, vx_a * c_turn - vy_a * s_turn, vx_a)
+        vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
+        vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
+        vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
         vzn = AbstractTensor.where(just > 0.5, vz0, (vz + live * (f_[2] / mass + grav[2] * buoy) * DT) * damp)
         sdamp = (1.0 - just) / (1.0 + live * gamma_r * DT)
         wxn = (wx + live * (q_[0] / inertia) * DT) * sdamp
         wyn = (wy + live * (q_[1] / inertia) * DT) * sdamp
-        wzn = (wz + live * (q_[2] / inertia) * DT) * sdamp
+        wzn = (wz + live * (q_[2] / inertia - case_domega) * DT) * sdamp
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * DT)

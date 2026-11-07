@@ -1111,3 +1111,48 @@ def test_size_distributions_lognormal_and_bidisperse_are_hashed_per_id_and_off_b
     assert abs(float(large.mean()) - 0.3) < 0.08 and (large | small).all()                         # two sizes only
     assert float(np.max(bi[large] / base[large])) == pytest.approx(2.0 ** 0.5, rel=1e-6) and float(np.max(base[small] / bi[small])) == pytest.approx(2.0 ** 0.5, rel=1e-6)
     assert float(F.uniforms(n=n, params={"bi_ratio": 2.0})["cell"]) == pytest.approx(F.CELL * 2.0 ** 0.5, rel=1e-6)      # the grid fits the largest
+
+
+def _turning_case(piece, omega, steps, domega=0.0, at=(0.08, 0.3)):
+    """One grain at rest in the case frame, gravity and fluid off, the case turning about (0, 0.3)."""
+    n = F.N_SMALL
+    cols = F.initial_columns(n, mix=0.0, params={"fl_mu": 0.0, "fl_rho": 0.0})
+    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(0.0), case_omega=np.float64(omega),
+                case_domega=np.float64(domega), pivot_x=np.float64(0.0), pivot_y=np.float64(0.3), age=np.full(n, -1.0e9))
+    cols["age"][0] = 1.0e3
+    cols["x"][0], cols["y"][0] = at
+    return F.run_frames(piece, cols, steps)
+
+
+def _rotating_frame_reference(r0, omega, domega, steps):
+    """RK4 of  v' = -2 w x v + w^2 r - dw x r  (r from the pivot) with small substeps."""
+    r, v = np.array(r0, float), np.zeros(2)
+
+    def acc(r, v):
+        return np.array([2 * omega * v[1] + omega * omega * r[0] + domega * r[1], -2 * omega * v[0] + omega * omega * r[1] - domega * r[0]])
+    h = F.DT / 20.0
+    for _ in range(steps * 20):
+        k1r, k1v = v, acc(r, v)
+        k2r, k2v = v + 0.5 * h * k1v, acc(r + 0.5 * h * k1r, v + 0.5 * h * k1v)
+        k3r, k3v = v + 0.5 * h * k2v, acc(r + 0.5 * h * k2r, v + 0.5 * h * k2v)
+        k4r, k4v = v + h * k3v, acc(r + h * k3r, v + h * k3v)
+        r, v = r + h / 6 * (k1r + 2 * k2r + 2 * k3r + k4r), v + h / 6 * (k1v + 2 * k2v + 2 * k3v + k4v)
+    return r
+
+
+def test_a_turning_case_drags_its_contents_in_3d_too(native_piece):
+    """The same case-frame law in the slab: outward, bent sideways, matching the rotating-frame equation; still at omega = 0."""
+    piece, _columns = native_piece
+    assert {"case_omega", "case_domega"} <= set(F.RUNTIME_INPUTS) and {"pivot_x", "pivot_y"} <= set(F.UNIFORMS)
+    still = _turning_case(piece, 0.0, 120)
+    assert float(still["x"][0]) == 0.08 and float(still["y"][0]) == 0.3 and float(still["vx"][0]) == 0.0
+    steps, omega = 120, 3.0
+    out = _turning_case(piece, omega, steps)
+    rel = np.array([float(out["x"][0]), float(out["y"][0]) - 0.3])
+    ref = _rotating_frame_reference((0.08, 0.0), omega, 0.0, steps)
+    assert rel[0] > 0.1 and rel[1] < -1e-3
+    assert np.hypot(*(rel - ref)) < 0.03 * np.hypot(*(ref - np.array([0.08, 0.0]))) + 1e-4, (rel, ref)
+    eul = _turning_case(piece, 0.0, steps, domega=4.0)
+    ref_e = _rotating_frame_reference((0.08, 0.0), 0.0, 4.0, steps)
+    assert np.hypot(float(eul["x"][0]) - ref_e[0], float(eul["y"][0]) - 0.3 - ref_e[1]) < 0.03 * np.hypot(*(ref_e - np.array([0.08, 0.0]))) + 1e-4
+    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0

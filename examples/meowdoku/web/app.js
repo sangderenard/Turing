@@ -4990,6 +4990,19 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
+  if (g.game === "fountain3d") drawChamberOutline(cam, g, rec);
+}
+// The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
+// at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
+function drawChamberOutline(cam, g, rec) {
+  const u = g.compute.uniforms || {}, pts = [];
+  for (let k = 0; k < 8; k++) {
+    const p = [u[`px${k}`], u[`py${k}`]];
+    if (!(p[0] !== undefined && p[1] !== undefined)) break;
+    const last = pts[pts.length - 1];
+    if (!last || last[0] !== p[0] || last[1] !== p[1]) pts.push(p);
+  }
+  cloud.drawOutline(pts, u.dh || 0, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 });
 }
 function drawCloud(cam, data, g, rec, style) {
   const y = TILE.height + 0.03;
@@ -5014,7 +5027,7 @@ window.meowdokuDebug.frame = (ms = performance.now()) => {
   const raf = window.requestAnimationFrame; window.requestAnimationFrame = () => 0;
   try { draw(ms); } finally { window.requestAnimationFrame = raf; }
 };
-// Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, rgba8, meta], 16 bytes), spread over the live
+// Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, z, rgba8, meta], 20 bytes), spread over the live
 // view window at a constant area coverage, drawn `frames` times through the same call the scene makes; returns ms per frame
 // (wall time around gl.finish), with the scene's own lights as set by the last lit pass.
 window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) => {
@@ -5022,14 +5035,14 @@ window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) =>
   if (!g || !rec || !cloud) return null;
   const [x0, x1, y0, y1] = g.compute.view || rec.geometry.view, w = x1 - x0, h = y1 - y0;
   const radius = Math.sqrt(coverage * w * h / (n * Math.PI));
-  const data = new Float32Array(n * 4), bits = new Uint32Array(data.buffer);
+  const data = new Float32Array(n * 5), bits = new Uint32Array(data.buffer);       // [x, y, z, rgba8, meta]
   let seed = 12345;
   const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
   for (let i = 0; i < n; i++) {
     const s = i % 4, r = radius * (0.8 + 0.1 * s);
-    data[4 * i] = x0 + rnd() * w; data[4 * i + 1] = y0 + rnd() * h;
-    bits[4 * i + 2] = (255 << 24) | (Math.floor(rnd() * 256) << 16) | (Math.floor(rnd() * 256) << 8) | Math.floor(rnd() * 256);
-    data[4 * i + 3] = (i % 7 ? 200 : 100) + r * 1000;
+    data[5 * i] = x0 + rnd() * w; data[5 * i + 1] = y0 + rnd() * h; data[5 * i + 2] = 0;
+    bits[5 * i + 3] = (255 << 24) | (Math.floor(rnd() * 256) << 16) | (Math.floor(rnd() * 256) << 8) | Math.floor(rnd() * 256);
+    data[5 * i + 4] = (i % 7 ? 200 : 100) + r * 1000;
   }
   const cam = camera();
   const run = () => { gl.clear(gl.DEPTH_BUFFER_BIT); drawCloud(cam, data, g, rec, style); };
