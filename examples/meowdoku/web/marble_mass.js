@@ -30,13 +30,15 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   const glassDensity=densityByRole.shell;
   if (!(glassDensity>0)) throw new RangeError("positive shell density required");
   add(total,outer,glassDensity);
-  components.push({name:"shell before displacement",volumeM3:outer.volume*radiusM**3,massKg:outer.volume*radiusM**3*glassDensity});
+  components.push({name:"shell",volumeM3:outer.volume*radiusM**3,massKg:outer.volume*radiusM**3*glassDensity});
   for (const part of [...mesh.ribbons.map((x)=>({...x,name:"ribbon"})),
     ...mesh.tubes.map((x)=>({...x,name:"tube"})),...mesh.confetti.map((x)=>({...x,name:"confetti"}))]) {
     const integral=integrate(mesh.interior.slice(part.start,part.start+part.count));
     const density=densityByRole[part.densityRole];
     if (!(density>0)) throw new RangeError("positive inclusion density required");
     add(total,integral,density-glassDensity);
+    components[0].volumeM3-=integral.volume*radiusM**3;
+    components[0].massKg-=integral.volume*radiusM**3*glassDensity;
     components.push({name:part.name,material:part.material,volumeM3:integral.volume*radiusM**3,massKg:integral.volume*radiusM**3*density});
   }
   if (enamelThicknessM>0 && enamelMaterial!==undefined) {
@@ -62,5 +64,16 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
     inertia[i][j]=radiusM**5*((i===j?trace:0)-total.second[i][j])
       -mass*((i===j?dot(center,center):0)-center[i]*center[j]);
   }
-  return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,nominalOverlap:true};
+  // The generator bounds ribbon cross-sections by their lane spacing, packs
+  // confetti by disjoint enclosing spheres, confines hybrid dye to an inner
+  // radial zone, and separates ring radii and spiral turns. Thus component
+  // volume subtraction resolves the generated designs without a mesh union.
+  const determinant = (a) => a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
+    -a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
+    +a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]);
+  const valid=Number.isFinite(mass)&&mass>0&&center.every(Number.isFinite)&&
+    inertia.flat().every(Number.isFinite)&&inertia[0][0]>0&&
+    inertia[0][0]*inertia[1][1]-inertia[0][1]**2>0&&determinant(inertia)>0&&
+    components.every((c)=>c.volumeM3>=0&&c.massKg>=0);
+  return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,validForRoll:valid};
 }

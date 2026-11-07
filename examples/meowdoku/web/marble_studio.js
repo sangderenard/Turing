@@ -2,6 +2,7 @@
 // tables used by the game. All edits are local to this preview.
 import { catEyeMarble } from "./marble_mesh.js";
 import { marbleMass } from "./marble_mass.js";
+import { rollingStep, rotationMatrix } from "./marble_roll.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
@@ -29,6 +30,12 @@ function multiply(a, b) {
 const translate = (z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,z,1]);
 const rotateY = (a) => new Float32Array([Math.cos(a),0,-Math.sin(a),0, 0,1,0,0, Math.sin(a),0,Math.cos(a),0, 0,0,0,1]);
 const rotateX = (a) => new Float32Array([1,0,0,0, 0,Math.cos(a),Math.sin(a),0, 0,-Math.sin(a),Math.cos(a),0, 0,0,0,1]);
+function rotateQuaternion(q) {
+  const r=rotationMatrix(q);
+  return new Float32Array([r[0][0],r[1][0],r[2][0],0,r[0][1],r[1][1],r[2][1],0,
+    r[0][2],r[1][2],r[2][2],0,0,0,0,1]);
+}
+const translate3=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
 function perspective(aspect) {
   const f = 1 / Math.tan(Math.PI / 7), near = 0.1, far = 30;
   return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0]);
@@ -83,8 +90,10 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
-let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45;
+let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
+  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45;
 let opaqueSaved = null;
+const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
   ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material"}[layer]).value];
 const slot = (table, id, offset) => id * tables[table].table.floats_per_record + offset;
@@ -116,14 +125,29 @@ function reportMass(geometry) {
     accent:+$("accent-density").value,confetti:+$("confetti-density").value,enamel:+$("enamel-density").value};
   const result=marbleMass(geometry,{radiusM:+$("radius-mm").value/1000,densityByRole,
     enamelMaterial:coatedId,enamelThicknessM:read("enamel",coatedId,0)*1e-9});
-  const diag=[0,1,2].map((k)=>result.inertiaKgM2[k][k].toExponential(3)).join(", ");
-  $("mass-report").textContent=`Nominal mass ${result.massKg.toFixed(6)} kg · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm · principal-axis tensor diagonal (${diag}) kg·m² · ${result.components.length-1} inclusions`;
+  rollProps=result; resetRoll();
+  const tensor=result.inertiaKgM2.map((row)=>row.map((x)=>x.toExponential(3)).join("  ")).join("\n");
+  const grouped=new Map();
+  for(const c of result.components) {const g=grouped.get(c.name)||{count:0,massKg:0,volumeM3:0};
+    g.count++;g.massKg+=c.massKg;g.volumeM3+=c.volumeM3;grouped.set(c.name,g);}
+  const components=[...grouped].map(([name,c])=>`${name} ×${c.count}: ${(c.massKg*1000).toFixed(3)} g / ${(c.volumeM3*1e9).toFixed(2)} mm³`).join("\n");
+  $("mass-report").style.whiteSpace="pre-line";
+  $("mass-report").textContent=`${result.validForRoll?"Calculated":"Unresolved"} mass ${(result.massKg*1000).toFixed(3)} g · center (${result.centerM.map((x)=>(x*1000).toFixed(2)).join(", ")}) mm\nInertia tensor (kg·m²):\n${tensor}\n${components}`;
+  $("roll-status").textContent=result.validForRoll?"Locked · release to roll on the calculated inertia tensor":"Roll unavailable: invalid mass or inertia";
 }
 function checkerboard() {
-  const faces=[], dark=ids.stone_onyx, light=ids.ceramic_porcelain;
+  const faces=[], pattern=$("scene-pattern").value;
+  const material=(a,b)=>pattern==="checker" ? ((a+b)&1?ids.stone_onyx:ids.ceramic_porcelain)
+    : pattern==="porcelain" ? ((a+b)&1?ids.ceramic_porcelain:ids.stone_jade)
+      : (a%3===0?ids.metal_brass:ids.metal_steel);
   for (let x=-4;x<4;x++) for (let y=-4;y<4;y++) {
-    const z=-1.8, a=[x,y,z],b=[x+1,y,z],c=[x+1,y+1,z],d=[x,y+1,z];
-    const n=[0,0,1], id=(x+y)&1 ? dark : light;
+    const z=-2.1, a=[x,y,z],b=[x+1,y,z],c=[x+1,y+1,z],d=[x,y+1,z];
+    const n=[0,0,1], id=material(x,y);
+    faces.push([a,b,c,id,[n,n,n]],[a,c,d,id,[n,n,n]]);
+  }
+  for (let x=-4;x<4;x++) for (let z=-4;z<4;z++) {
+    const y=-1.02,a=[x,y,z],b=[x,y,z+1],c=[x+1,y,z+1],d=[x+1,y,z];
+    const n=[0,1,0],id=material(x,z);
     faces.push([a,b,c,id,[n,n,n]],[a,c,d,id,[n,n,n]]);
   }
   return mesh(faces);
@@ -166,9 +190,15 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
+  $("reset-roll").addEventListener("click",resetRoll);
+  $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
+  $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
   for (const name of dimensions) $(name).addEventListener("input", rebuild);
-  for (const name of ["eye","accent","confetti-material","kind"]) $(name).addEventListener("change", () => { rebuild(); syncMaterial(); });
-  $("shell").addEventListener("change", () => { copyCoating(); rebuild(); syncMaterial(); });
+  for (const name of ["eye","accent","confetti-material"]) $(name).addEventListener("change", () => { rebuild(); syncMaterial(); });
+  const syncKind=()=>{const hybrid=$("kind").value==="hybrid";
+    for(const name of ["orientation-yaw","orientation-pitch","orientation-roll"]) {if(hybrid) $(name).value=0;$(name).disabled=hybrid;$(name+"-out").value=$(name).value;}};
+  $("kind").addEventListener("change", () => {syncKind();rebuild();syncMaterial();});
+  $("shell").addEventListener("change", () => {$("opaque").checked=false;opaqueSaved=null;copyCoating(); rebuild(); syncMaterial(); });
   for(const field of ["radius-mm","shell-density","eye-density","accent-density","confetti-density","enamel-density"])
     $(field).addEventListener("input",()=>{ if(lastGeometry) reportMass(lastGeometry); });
   for(const field of ["paint-a-color","paint-b-color"]) $(field).addEventListener("input",()=>{copyPaint();syncMaterial();});
@@ -180,7 +210,7 @@ function controls() {
     if(preset==="spiral" || preset==="rings") {$("kind").value=preset;$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;}
     if(preset==="bare") {$("kind").value="clear";$("coverage").value=0;$("band-count").value=0;}
     if(preset==="porcelain") {$("kind").value="clear";$("shell").value="ceramic_porcelain";$("coverage").value=0;$("band-count").value=7;$("band-width").value=24;}
-    copyCoating();rebuild();syncMaterial();
+    syncKind();copyCoating();rebuild();syncMaterial();
   });
   $("coverage").addEventListener("input", () => { if (+$("coverage").value > 0 && !read("enamel",coatedId,0)) write("enamel",coatedId,0,300); syncMaterial(); });
   $("opaque").addEventListener("change", () => {
@@ -198,6 +228,7 @@ function controls() {
   $("reroll").addEventListener("click", () => { seed = (Math.random() * 0x7fffffff) | 0; rebuild(); });
   $("reset-material").addEventListener("click", () => { const id = selected();
     if (id === coatedId) { copyCoating(); syncMaterial(); return; }
+    if (id === paintAId || id === paintBId) { copyPaint(); syncMaterial(); return; }
     for (const table of Object.values(tables)) { const f = table.table.floats_per_record, start = id*f;
       table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncMaterial(); });
   for (const [name,[table,offset,scale]] of Object.entries(properties)) $(name).addEventListener("input", () => {
@@ -214,12 +245,22 @@ function controls() {
   for (const type of ["pointerup","pointercancel"]) canvas.addEventListener(type, () => { last=null; });
   canvas.addEventListener("wheel", (event) => { event.preventDefault(); distance=Math.max(2.3,Math.min(7,distance*Math.exp(event.deltaY*0.001))); }, { passive:false });
 }
-function frame() {
+function frame(now=0) {
+  const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
+  if(dt>0 && rollState && rollProps?.validForRoll && !$("inertia-lock").checked) {
+    try {rollState=rollingStep(rollState,rollProps,[+$("roll-force-x").value/1000,0,+$("roll-force-z").value/1000],
+      dt,+$("radius-mm").value/1000);
+      $("roll-status").textContent=`Rolling · angular speed ${Math.hypot(...rollState.angularVelocity).toFixed(2)} rad/s · contact force ${Math.hypot(...rollState.contactForce).toFixed(3)} N`;
+    } catch(error) {$("inertia-lock").checked=true;$("roll-status").textContent=`Roll unavailable: ${error.message}`;}
+  }
   const w=Math.max(1,Math.round(canvas.clientWidth*devicePixelRatio)), h=Math.max(1,Math.round(canvas.clientHeight*devicePixelRatio));
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
   gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
-    const mv=multiply(translate(-distance),multiply(rotateX(pitch),rotateY(yaw)));
+    const view=multiply(translate(-distance),multiply(rotateX(pitch),rotateY(yaw)));
+    const radius=+$("radius-mm").value/1000;
+    const object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
+    const mv=multiply(view,object);
     gl.useProgram(P);
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
       gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
@@ -241,7 +282,7 @@ function frame() {
     gl.vertexAttribI4i(4,0,0,0,0); gl.vertexAttribI4i(5,1,0,0,0); gl.vertexAttrib3f(6,0,0,0); gl.vertexAttrib2f(3,0,0);
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
     if ($("checker").checked && checkerMesh) {
-      setTransform(translate(-distance)); gl.bindVertexArray(checkerMesh.vao);
+      setTransform(view); gl.bindVertexArray(checkerMesh.vao);
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
     gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);

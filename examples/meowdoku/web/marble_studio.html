@@ -52,7 +52,8 @@
   <h2>Outer shell</h2><div class="grid">
     <label class="wide"><input id="opaque" type="checkbox"> Opaque outer material (transmission 0, opacity 1)</label>
     <label>Enamel shell coverage <output id="coverage-out"></output><input id="coverage" type="range" min="0" max="100" value="0"></label>
-    <label><input id="checker" type="checkbox" checked> Lit checkerboard scene</label>
+    <label><input id="checker" type="checkbox" checked> Lit floor and wall</label>
+    <label>Scene pattern<select id="scene-pattern"><option value="checker">Classic checkerboard</option><option value="porcelain">Porcelain tiles</option><option value="metal">Metal bands</option></select></label>
     <label>Exterior color bands <output id="band-count-out"></output><input id="band-count" type="range" min="0" max="12" value="0"></label>
     <label>Band width <output id="band-width-out"></output><input id="band-width" type="range" min="2" max="48" value="18"></label>
     <label>Band swirl <output id="band-curve-out"></output><input id="band-curve" type="range" min="-400" max="400" value="120"></label>
@@ -67,6 +68,11 @@
     <label>Confetti density (kg/m³)<input id="confetti-density" type="number" min="1" max="30000" step="10" value="7800"></label>
     <label>Enamel density (kg/m³)<input id="enamel-density" type="number" min="1" max="30000" step="10" value="3000"></label>
     <output id="mass-report" class="wide"></output>
+    <label class="wide"><input id="inertia-lock" type="checkbox" checked> Lock inertia preview</label>
+    <label>Roll force X (mN)<input id="roll-force-x" type="range" min="-100" max="100" value="3"></label>
+    <label>Roll force Z (mN)<input id="roll-force-z" type="range" min="-100" max="100" value="0"></label>
+    <button id="reset-roll" class="wide">Reset roll</button>
+    <output id="roll-status" class="wide">Locked</output>
     <p class="wide">Volume integrals use each closed triangle component. The shell volume subtracts inclusions; intersecting inclusions are not unioned. Enamel is a thin coating using the shader thickness in nm. Results are nominal where components overlap.</p>
   </div>
   <h2>Material</h2><div class="grid">
