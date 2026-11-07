@@ -5,6 +5,23 @@
 // animates the difference between states; it decides nothing.
 
 import "./access.js";   // [ACCESS] window.meowdokuAccess: the tier (server-enforced); development options below are shown by it
+// FOUNTAIN DIAGNOSTICS to the server log (owner devices only: LAN/dev tier): every 5 s while a fountain game runs, the law's live inputs
+// (gravity, case rates/tilt), the gravity source and the readback's speed/escape counts -- so a fault seen on a phone is visible in the log.
+setInterval(() => {
+  try {
+    const A = window.meowdokuAccess || {}, g = state.game;
+    if (!(A.edit || A.dev) || !g || !/fountain|mobroad|tipjar/.test(g.game) || !compute.diag) return;
+    if ((window.__fdiagSent = (window.__fdiagSent || 0) + 1) > 240) return;
+    const L = compute.lawInputs || {}, d = compute.diag, pick = (o, ks) => Object.fromEntries(ks.filter((k) => k in o).map((k) => [k, typeof o[k] === "number" ? +o[k].toPrecision(4) : o[k]]));
+    const msg = JSON.stringify({ game: g.game, chamber: g.compute && g.compute.chamber, manifest: compute.manifestName, n: compute.rec && compute.rec.n,
+      inputs: pick(L, ["grav_x", "grav_y", "grav_z", "case_omega", "case_domega", "pivot_x", "pivot_y", "tilt", "lid"]),
+      caseTilt: compute.caseTilt || 0, spin: compute.spin || 0, cameraGravity: typeof cameraGravity !== "undefined" ? !!cameraGravity : null,
+      phone: gravitySensor && gravitySensor.state, locked: gravitySensor && gravitySensor.lockedAngle,
+      diag: pick(d, ["step", "n_live", "n_out", "n_nan", "n_drop", "vmax2", "ke"]) });
+    const body = JSON.stringify({ kind: "fountain-diag", msg, where: location.pathname, ua: navigator.userAgent.slice(0, 60) });
+    navigator.sendBeacon ? navigator.sendBeacon("/api/clientlog", new Blob([body], { type: "application/json" })) : fetch("/api/clientlog", { method: "POST", body, keepalive: true });
+  } catch (_) { /* diagnostics never break the page */ }
+}, 5000);
 // [ACCESS] local (LAN) and dev visitors get the Studio link in the bar, with the tier named in its title
 { const link = document.getElementById("studio-link"), A = window.meowdokuAccess || {};
   if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; } }
