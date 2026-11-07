@@ -400,6 +400,7 @@ def make_handler(sessions: Sessions):
                     message = read_frame(self.rfile)
                     if message is None or message[0] == 0x8:
                         break
+                    received = time.perf_counter()
                     opcode, payload = message
                     if opcode == 0x9:
                         self.wfile.write(frame(0xA, payload)); continue
@@ -415,7 +416,9 @@ def make_handler(sessions: Sessions):
                             idle_trainer.touch()          # a realtime tick: play is on
                             game.control(request)
                             game.tick()
-                            binary, meta = encoder.encode(game, table.state())
+                            echo = request.get("ct")
+                            binary, meta = encoder.encode(game, table.state(), echo=echo if isinstance(echo, (int, float)) else None,
+                                                          received=received)
                         if meta is not None:
                             self.wfile.write(frame(0x1, json.dumps({"meta": meta}).encode("utf-8")))
                         self.wfile.write(frame(0x2, binary))

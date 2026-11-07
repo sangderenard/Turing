@@ -9,6 +9,7 @@ import { ComputeRuntime, PointCloud } from "./compute.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
+import { LawClock } from "./pilot_clock.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -2644,15 +2645,29 @@ function stepShip(ship, input, seconds, motion) {
 // its start (you.intervals), and the page applies it over exactly its span of
 // law time, on the same compiled laws.  Only its own flying is sent.
 const predicting = (game) => !!(pred.program && game && game.input === "realtime" && game.predict);
-const piloting = (game) => !!(game && game.autopilot && game.you && game.you.pilot);
+// Who flies is the SNAPSHOT's word (its pilot flag rides with the very state it describes); the status frame that says
+// ``autopilot`` comes up to a quarter second later, and a page that waited for it flew the first stretch of a hand-over
+// on its own controls while the server's pilot flew the ship.
+const piloting = (game) => !!(game && game.you && (game.you.piloted !== undefined ? game.you.piloted : game.autopilot && game.you.pilot));
 const pilotLine = new PilotTimeline();           // the pilot's intervals, keyed to law time
+// THE LAW CLOCK (pilot_clock.js): the page's law time, locked to the server's by the timing exchange each tick carries.
+// The pilot's ship is shown at law time lawClock.lawAt(now): it runs at the wall's rate and is moved by no single reply.
+const lawClock = new LawClock();
 const pilotRest = intervalControls([0, 0, 0, 0, 0]);
 // The predicted pilot ship is always the server's state at the last snapshot (pilotBase, at law time pilotBaseT)
 // carried to the law time now (pilotAt) through the timeline, in steps that end where the server's do: its tick
 // windows (the spacing of the snapshots' law clocks, pilotWindow).  The laws are discretised, so the same steps
 // give the same ship; a finer step of the page's own would be a (small, growing) disagreement.
 let pilotBase = null, pilotBaseT = 0, pilotAt = null, pilotSeen = -Infinity, pilotWindow = 1 / 40;
+let pilotFlying = false, pilotLead = 0;           // (pilotLead: law seconds the picture is ahead of the locked clock, running out)
+const PILOT_LEAD_RATE = 0.25;
 window.meowdokuDebug.pilotLine = pilotLine;
+window.meowdokuDebug.lawClock = lawClock;
+// How far past the snapshot's law time the pilot's controls are KNOWN: every decision taken by then is in the timeline
+// and takes effect motion.pilot.predelay later, so the controls in effect are certain up to clock + predelay and a
+// guess beyond it (the next decision is not taken yet).  The ship is never shown past it: that would be a held-over
+// control the pilot is about to change, corrected at the next reply.
+const pilotHorizon = (game) => Math.max(0.05, Number(game.predict && game.predict.pilot ? game.predict.pilot.predelay : 0.2));
 function reconcile(game) {
   if (!predicting(game) || !game.you || !game.you.alive) { pred.ship = null; return; }
   pred.lane = game.predict.lane;
@@ -2667,14 +2682,31 @@ function reconcile(game) {
   if (piloting(game)) {
     // the pilot's ship: the server's state at the snapshot's LAW time, carried
     // on to now by the intervals in effect over each span of law time
+    //
+    // HAND-OVER FROM A PERSON.  The person's ship stands at the law time its own intervals reach (the server's state at
+    // the last landed interval plus the intervals not yet landed: the page's clock, measured in durations), the pilot's
+    // at the law time of the locked clock (the server's wall): two bookkeepings of the same instant that part by
+    // however far the durations drifted from the wall.  The pilot's picture starts where the person's ship stood in law
+    // time and the difference runs out at PILOT_LEAD_RATE of a second per second -- a time warp, not a jump.
+    if (!pilotFlying && lawClock.ready() && Number.isFinite(game.you.clock)) {
+      lawClock.takeNewest();
+      const unlanded = [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])].reduce((sum, interval) => sum + interval.dur, 0);
+      const lead = game.you.clock + unlanded - lawClock.lawAt(performance.now() / 1000);
+      pilotLead = Math.abs(lead) < 0.25 ? lead : 0;
+    }
+    pilotFlying = true;
     pred.sent = []; pred.closed = []; pred.open = null;
     if (game.you.clock < pilotSeen - 1) { pilotLine.clear(); pilotSeen = -Infinity; }   // the law clock went back: a new game
     if (game.you.clock > pilotSeen && pilotSeen > -Infinity) pilotWindow = Math.min(STEP_CAP_S, Math.max(1e-3, game.you.clock - pilotSeen));
     pilotSeen = game.you.clock;
     pilotLine.accept(game.you.intervals, game.you.clock);
-    // unwinding the latency: the snapshot's age since it arrived plus the
-    // half round trip it took to come (the server stepped it that long ago)
-    const age = Math.min(0.3, Math.max(0, performance.now() / 1000 - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0)));
+    // The law time to show: the locked clock's (the snapshot's state stands for law time ``clock``; the picture is the
+    // ship at the law time of now).  Without a lock (no socket) the snapshot's age and the half round trip stand in.
+    const nowS = performance.now() / 1000;
+    const shown = lawClock.ready() ? lawClock.lawAt(nowS) + pilotLead - game.you.clock
+      : Math.max(0, nowS - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0));
+    const age = Math.min(pilotHorizon(game), Math.max(0, shown));
+    if (timing.on) { timing.note = timingProbe(game, age); timing.note.shown = shown; }
     pilotBase = { ...game.you }; pilotBaseT = game.you.clock;
     pilotAt = pilotBaseT + age;
     pilotLine.integrate(stepShip, ship, pilotBaseT, pilotAt, game.predict, pilotRest, pilotWindow);
@@ -2712,7 +2744,48 @@ function reconcile(game) {
     if (Math.hypot(...pred.offset) > SYNC_SNAP) pred.offset = [0, 0];
     syncFaithfulness(Math.hypot(before[0] - ship.x, before[1] - ship.y));
   }
+  if (timing.on) timingRecord(game, ship, before, error, tolerance);
+  if (!piloting(game)) { pilotFlying = false; pilotLead = 0; }
   pred.ship = ship;
+}
+// READ-ONLY TIMING TRACE (meowdokuDebug.timing): off unless a test turns it on.  It records, per snapshot, the clock
+// the page assumed against the one the server's state carries, the page's last prediction against the new state, and
+// which side drives -- it changes nothing the page does.
+const timing = { on: false, rows: [], frames: [], note: null };
+window.meowdokuDebug.timing = timing;
+function timingProbe(game, age) {
+  // the model error: the previous base carried to this snapshot's law time through the timeline, in this snapshot's window
+  // the ship the page would show at this very instant by the base it holds (the drawn one is up to a frame old): what
+  // this reply corrects is measured against THAT, at one law time
+  let beforeNow = null;
+  if (pilotBase && lawClock.ready()) {
+    beforeNow = { ...pilotBase };
+    pilotLine.integrate(stepShip, beforeNow, pilotBaseT, Math.min(Math.max(lawClock.lawAt(performance.now() / 1000) + pilotLead, pilotBaseT), pilotBaseT + pilotHorizon(game)), game.predict, pilotRest, pilotWindow);
+  }
+  const note = { beforeNow, age, rtt: sock.rtt || 0, clockAssumed: pilotBase ? pilotAt : null, clock: game.you.clock,
+                 clockErr: pilotBase ? pilotAt - (game.you.clock + age) : null, lock: lawClock.offset, lockDelay: lawClock.last && lawClock.last.delay,
+                 snaps: lawClock.snaps };
+  if (pilotBase && game.you.clock > pilotBaseT) {
+    const R = game.predict.sphere ? game.predict.sphere.radius : 1;
+    const probe = { ...pilotBase };
+    pilotLine.integrate(stepShip, probe, pilotBaseT, game.you.clock, game.predict, pilotRest, game.you.clock - pilotBaseT);
+    const d = (a, b) => (a.ux != null ? R * Math.hypot(a.ux - b.ux, a.uy - b.uy, a.uz - b.uz) : Math.hypot(a.x - b.x, a.y - b.y));
+    note.modelErr = d(probe, game.you);
+    note.calls = sock.meta && sock.meta.clock ? sock.meta.clock.law_calls : null; note.tickS = sock.meta && sock.meta.clock ? sock.meta.clock.tick_s : null;
+    note.window = game.you.clock - pilotBaseT;
+  }
+  return note;
+}
+function timingRecord(game, ship, before, error, tolerance) {
+  const R = game.predict.sphere ? game.predict.sphere.radius : 1, old = pred.ship;
+  const pos = (a, b) => (a && b ? (a.ux != null ? R * Math.hypot(a.ux - b.ux, a.uy - b.uy, a.uz - b.uz) : Math.hypot(a.x - b.x, a.y - b.y)) : null);
+  const driver = piloting(game) ? "pilot" : "player";
+  const now = driver === "pilot" && timing.note ? timing.note.beforeNow : null;
+  timing.rows.push({ corrNow: now ? pos(now, ship) : null, t: performance.now() / 1000, at: game.you.at, driver, ack: game.ack, clock: game.you.clock,
+    corr: pos(old, ship), dz: old ? Math.abs((old.z || 0) - (ship.z || 0)) : null, dyaw: old ? Math.abs((old.yaw || 0) - (ship.yaw || 0)) : null,
+    error, tolerance, spd: ship.spd, offset: Math.hypot(...pred.offset), authority: game.authority ? { ...game.authority } : null,
+    ...(driver === "pilot" ? timing.note : {}) });
+  if (timing.rows.length > 20000) timing.rows.splice(0, 5000);
 }
 // The predictor runs on its own clock, PREDICT_HZ, unbound from the display's
 // refresh: controls are sampled, input intervals closed and the ship stepped
@@ -2725,9 +2798,16 @@ function predictFrame(now) {
   const frame = pred.at == null ? 0 : Math.min(0.1, Math.max(0, now - pred.at));
   pred.at = now;
   if (!predicting(game)) return;
+  if (timing.on && pred.ship) {
+    const f = pred.ship;
+    timing.frames.push({ t: now, driver: piloting(game) ? "pilot" : "player", ux: f.ux, uy: f.uy, uz: f.uz, x: f.x, y: f.y, yaw: f.yaw, z: f.z,
+                         ox: pred.offset[0], oy: pred.offset[1], at: pilotAt });
+    if (timing.frames.length > 60000) timing.frames.splice(0, 10000);
+  }
   if (piloting(game)) {                          // the demo pilot flies: predict with its controls, send nothing
     if (pred.ship && pilotBase) {
-      pilotAt = Math.min(pilotAt + frame, pilotBaseT + 0.5);
+      pilotLead -= Math.sign(pilotLead) * Math.min(Math.abs(pilotLead), PILOT_LEAD_RATE * frame);
+      pilotAt = lawClock.ready() ? Math.min(Math.max(lawClock.lawAt(now) + pilotLead, pilotBaseT), pilotBaseT + pilotHorizon(game)) : Math.min(pilotAt + frame, pilotBaseT + pilotHorizon(game));
       const ahead = { ...pilotBase };
       pilotLine.integrate(stepShip, ahead, pilotBaseT, pilotAt, game.predict, pilotRest, pilotWindow);
       Object.assign(pred.ship, ahead);
@@ -2863,6 +2943,8 @@ const STEP_CAP_S = 1 / 30;            // the longest law step the server takes (
 // rounds, the moment the last landed interval closed.
 function worldStamp(game, now) {
   let stamp = now;
+  // the pilot's world is shown at the locked law time: a snapshot stands for the page instant of its law clock
+  if (piloting(game) && lawClock.ready() && Number.isFinite(game.you.clock)) return (state.lastStamp = Math.min(lawClock.pageAt(game.you.clock), now));
   if (predicting(game) && game.ack != null) {
     const landed = pred.sent.find((interval) => interval.seq === game.ack);
     stamp = landed ? landed.closedAt : (state.lastStamp ?? now);
@@ -2893,7 +2975,14 @@ function ensureSocket() {
       const message = JSON.parse(event.data);
       if (message.meta) {
         if (!live || (message.meta.game && message.meta.game !== current.game)) return;
-        sock.meta = { ...(sock.meta || {}), ...message.meta }; applyState({ ...sock.meta });
+        // The meta frame is the status; the SHIP is the binary snapshot's alone (its law clock, ack and pilot intervals ride
+        // there).  A meta that put its own copy of ``you`` on the state, and reconciled the ship from it, rebased the pilot's
+        // ship on a state without a clock, at a stale age, up to four times a second.
+        sock.meta = { ...(sock.meta || {}), ...message.meta };
+        const held = state.game && state.game.game === sock.meta.game ? state.game : null;
+        // (the meta frames carry only what changed: merged onto the state the page holds, so one the page was not yet
+        // listening for cannot leave it without a palette)
+        applyState({ ...(held || {}), ...sock.meta, ...(held && held.you ? { you: held.you } : {}) }, { meta: true });
       }
       if (message.error) {
         sock.outstanding = Math.max(0, sock.outstanding - 1);
@@ -2948,6 +3037,8 @@ function applySnapshot(view) {
   const { flags, ack, you } = frame;
   sync.hint = frame.hint;
   you.at = performance.now() / 1000;
+  if (flags & FLAG_CLEAR) lawClock.offset = null;          // a new game's law clock starts over (the wall offset is kept)
+  lawClock.sample({ ct: you.echo, ca: you.at, recv: you.recv, sent: you.sent, lawWall: you.lawWall, clock: you.clock });
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
   noteShield(frameGame, now);
@@ -2992,7 +3083,7 @@ function applySnapshot(view) {
 
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
-  let payload = { type: "tick", ...controls() };
+  let payload = { type: "tick", ...controls(), ct: performance.now() / 1000 };
   if (predicting(game) && !piloting(game)) {
     if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
     const at = performance.now() / 1000;
@@ -3050,7 +3141,7 @@ function sendTick(game) {
 // -- and any change of input is a check-in at once, so a press is never
 // held back by a relaxed clock.  Unpredicted pages keep the fastest clock.
 const SYNC = { fastest: 0.03, longest: 0.25, faithful: 0.01, drift: 0.04, grow: 1.2 };
-const sync = { interval: SYNC.fastest, hint: SYNC.longest, next: 0, streak: 0 };
+const sync = { interval: SYNC.fastest, hint: SYNC.longest, sentAt: -Infinity, streak: 0 };
 window.meowdokuDebug.sync = sync;
 function syncFaithfulness(correction) {
   if (correction > SYNC.drift) { sync.interval = SYNC.fastest; sync.streak = 0; return; }
@@ -3063,10 +3154,15 @@ setInterval(() => {
   // Holding fire is activity: the server must hear of it at once to spawn the
   // real shots the page is already showing.
   const firing = predicting(game) && controls().fire > 0;
-  const allowed = predicting(game) && !firing ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest;
+  // A page that watches the pilot checks in once per decision (motion.pilot.interval): a reply is then never older than the
+  // pilot's information reaches (the pilot's controls are known predelay ahead of the law time it answers for).
+  const cadence = piloting(game) && game.predict.pilot ? Math.max(SYNC.fastest, Number(game.predict.pilot.interval)) : Infinity;
+  const allowed = Math.min(cadence, predicting(game) && !firing ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest);
   const inputChanged = pred.closed.length > 0;               // a press, release or steer since the last check-in
-  if (now < sync.next && !inputChanged) return;
-  sync.next = now + allowed;
+  // (the wait is measured from the last check-in, so a delay that shortens -- the pilot has just taken the ship -- is
+  // honoured at once rather than after the longer one set at the last send)
+  if (now - sync.sentAt < allowed && !inputChanged) return;
+  sync.sentAt = now;
   sendTick(game);
 }, 5);
 
@@ -3711,7 +3807,7 @@ function syncWobbleUi() {
   $("wobble-gpu-label").title = wob.gpuState === "failed" ? "WebGPU failed; using the CPU" : "Run the cage update as a WebGPU compute shader (results are read back one or two frames late)";
 }
 
-function applyState(game) {
+function applyState(game, { meta = false } = {}) {
   // While the real-time socket is open it owns the entities; a state that
   // arrives by HTTP (reset, layout, the socket's own meta) leaves them alone.
   if (game.input === "realtime" && sock.open) delete game.entities;
@@ -3757,7 +3853,8 @@ function applyState(game) {
   }
   if (game.rack) for (const p of game.rack.pieces) place(p, true);
   syncWalk(game);
-  if (game.input === "realtime") reconcile(game); else pred.ship = null;
+  if (game.input !== "realtime") pred.ship = null;
+  else if (!meta) reconcile(game);               // (a socket's meta frame leaves the ship to the snapshot that carries its clock)
   for (const [key, live] of state.pieces) if (!seen.has(key) && live.removing == null && (game.entities || !live.entity)) live.removing = now;
   const best = (game.record && game.record.best ? ` · ${game.player}'s best ${game.record.best.score}` : "") + awardText(game);
   renderModes(game);

@@ -163,7 +163,12 @@ def frame(opcode: int, payload: bytes) -> bytes:
 #:  11 = the header's pilot controls are followed by the tracking cannon:
 #:       f32 lock (the locked lane; 0 none), mount_yaw, mount_vyaw,
 #:       mount_pitch, mount_vpitch (the gun mount's offsets from the nose).
-PROTOCOL = 12
+#:  13 = frame flags bit3 (the pilot flies the ship); the header's law clock is
+#:       followed by the timing exchange: f64 law_wall (the server wall instant the
+#:       state stands for), f64 echo (the page's send time of the tick this
+#:       answers; NaN if it sent none), f64 recv (the server's wall at its receipt),
+#:       f64 sent (its wall as the reply was cut).
+PROTOCOL = 13
 
 def _pack_body(body: dict[str, Any]) -> bytes:
     """A body's flight state: u8 flight, f32 u (3), h (3), spd, turn."""
@@ -241,8 +246,10 @@ class SnapshotEncoder:
         y = patch["cy"] - np.asarray(Y.numpy(), dtype=np.float64)
         return {lane: (float(x[i]), float(y[i]), float(z_n[i])) for i, lane in enumerate(lanes)}
 
-    def encode(self, game, state: dict[str, Any]) -> tuple[bytes, dict[str, Any] | None]:
-        """(binary delta, meta or None) for ``state`` (the game's full state)."""
+    def encode(self, game, state: dict[str, Any], *, echo: float | None = None,
+               received: float | None = None) -> tuple[bytes, dict[str, Any] | None]:
+        """(binary delta, meta or None) for ``state`` (the game's full state).  ``echo``: the page's send
+        time of the tick this answers; ``received``: the server's wall (``perf_counter``) when it arrived."""
         clock = float(state.get("world_clock") or 0.0)
         epoch = getattr(game, "epoch", 0)
         clear = game is not self.game or epoch != self.epoch
@@ -314,7 +321,7 @@ class SnapshotEncoder:
         self.sim, self.sim_clock = sim, clock
 
         ack = state.get("ack")
-        parts = [struct.pack("<BBi4fBfffffffffffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0), -1 if ack is None else int(ack),
+        parts = [struct.pack("<BBi4fBfffffffffffffffffffffffffffffffffff", PROTOCOL, (1 if keyframe else 0) | (2 if clear else 0) | (4 if carrying else 0) | (8 if state.get("piloted") else 0), -1 if ack is None else int(ack),
                              float(you.get("x", 0.0)), float(you.get("y", 0.0)), float(you.get("vx", 0.0)),
                              float(you.get("vy", 0.0)), 1 if you.get("alive") else 0, float(you.get("shield", 0.0)),
                              float(state.get("sync_hint") or 0.03),
@@ -333,7 +340,10 @@ class SnapshotEncoder:
         if intervals and intervals[-1]["seq"] < self.pilot_sent:
             self.pilot_sent = 0                        # the law's counter began again
         intervals = [r for r in intervals if keyframe or r["seq"] > self.pilot_sent]
-        parts.append(struct.pack("<dB", clock, len(intervals)))
+        stamped = time.perf_counter()
+        parts.append(struct.pack("<d4dB", clock, float(state.get("law_wall") or 0.0),
+                                 float("nan") if echo is None else float(echo),
+                                 float("nan") if received is None else float(received), stamped, len(intervals)))
         for r in intervals:
             parts.append(struct.pack("<Idf5f", int(r["seq"]), float(r["start"]), float(r["length"]), *(float(v) for v in r["controls"])))
             self.pilot_sent = max(self.pilot_sent, int(r["seq"]))
@@ -371,7 +381,8 @@ class SnapshotEncoder:
             # Only what changed since the last meta (the page merges it into
             # the state it holds); everything on a clear.
             self.meta_at = now
-            full = {key: value for key, value in state.items() if key != "entities"}
+            # (the ship rides the binary snapshot alone: its law clock, ack and pilot intervals are there)
+            full = {key: value for key, value in state.items() if key not in ("entities", "you", "ack")}
             meta = full if clear else {key: value for key, value in full.items()
                                        if self.meta_sent.get(key) != value}
             meta["game"] = full.get("game")

@@ -690,13 +690,23 @@ def live_params(name: str) -> dict[str, np.ndarray] | None:
     return _PILOT_WEIGHTS.get(name)
 
 
+_PILOTS: dict[tuple[str, int], Pilot] = {}
+
+
 def pilot_for(game) -> Pilot:
+    """The game's pilot.  A ``Pilot`` is its compiled forward over the live weights dict (it reads the dict on every
+    call and follows ``WEIGHT_VERSION``), so one serves every hand-over to the same weights: building it afresh at
+    each hand-over cost the game the better part of a second of ticks (the hand-over stalled the law, and the page
+    saw the ship jump)."""
     name = game.game
     params = live_params(name)
     if params is None:
         raise ValueError(f"no trained autopilot for {name} fitting its current observation "
                          f"{GAME_WIDTHS[name]}: train it ({weights_path(name)})")
-    return Pilot(name, params)
+    key = (name, id(params))
+    if key not in _PILOTS:
+        _PILOTS[key] = Pilot(name, params)
+    return _PILOTS[key]
 
 
 def available(name: str) -> bool:
