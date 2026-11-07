@@ -17,6 +17,7 @@ deploy to 8766 as soon as work lands.
 ## In flight (workers)
 
 - **Fountain stage A follow-ups** (stage A landed in ee0883d7):
+  - the "rightward blast": the user's hypothesis is an honest pressure wave from the naive initial deposit (no pipes or nozzles yet), rather than the drop bias. Being checked by the 3D job on the 256 piece: drops during the blast, the momentum asymmetry over time, and a mirrored emission order (does the asymmetry flip?);
   - dropped contacts (`n_drop`) are not 0 while grains emit and in dense piles at 4k, and reach 1.2e6 per step at 64k; the row-run walk drops the right-hand cells first (a bias); needs a complete or order-free neighbour selection (stage B) and contact stiffness scaled with pile depth;
   - the 64k pile never settles (E stays near 5e-2 at the 40 s cap), probably the same cause;
   - single grains still exceed their own ballistic ceiling through exchange between species of different mass (total energy holds to 1.7%);
