@@ -7,6 +7,7 @@
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
 import { STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability } from "./particle_styles.js";
+import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
@@ -4003,7 +4004,7 @@ function clearLayoutTurn() {
   layoutLock.turn = null;
 }
 function applyLayoutLock() {
-  const want = !!(state.game && state.game.compute && gravitySensor.enabled);
+  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin);
   if (!want) {
     if (layoutLock.angle != null) {
       layoutLock.angle = null; gravitySensor.lockedAngle = null; clearLayoutTurn();
@@ -4037,6 +4038,17 @@ let particleStyle = DEFAULT_STYLE;
 try { const saved = localStorage.getItem("meowdoku.pstyle"); if (STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
 window.meowdokuDebug.setParticleStyle = (id) => { particleStyle = id; refreshLocalControls(); };
 Object.defineProperty(window.meowdokuDebug, "cloud", { get: () => cloud });
+// The spectral noise filter (noise_filter.js) layered over the look: also the page's own, render only, remembered in the browser.
+const noiseFx = { ...NOISE_DEFAULTS };
+try { Object.assign(noiseFx, JSON.parse(localStorage.getItem("meowdoku.noisefx") || "{}")); } catch { /* storage may be blocked or hold junk */ }
+noiseFx.on = !!noiseFx.on; if (!NOISE_MODES.some(([id]) => id === noiseFx.mode)) noiseFx.mode = NOISE_DEFAULTS.mode;
+for (const key of ["strength", "threshold"]) if (!Number.isFinite(noiseFx[key])) noiseFx[key] = NOISE_DEFAULTS[key];
+window.meowdokuDebug.noiseFx = noiseFx;
+// the value a local control shows (the server's spec value is only the default)
+function localValue(s) {
+  return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: caseSpin, orbit: !!camView.auto }[s.local] ?? s.value;
+}
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
   if (s.local === "tilt") {
@@ -4047,9 +4059,17 @@ function localControl(s, value) {
     camView.auto = !!value;
     // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
+  } else if (s.local === "spin") {
+    caseSpin = Math.abs(Number(value)) < 1e-6 ? 0 : Number(value);
+    compute.setSpin(caseSpin);
+    try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
     particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
     try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  } else if (s.local.startsWith("noise_")) {
+    const key = s.local.slice(6);
+    noiseFx[key] = key === "on" ? !!value : key === "mode" ? (NOISE_MODES.some(([id]) => id === value) ? value : NOISE_DEFAULTS.mode) : Number(value);
+    try { localStorage.setItem("meowdoku.noisefx", JSON.stringify(noiseFx)); } catch { /* storage may be blocked */ }
   } else compute.control(s.local);
   refreshLocalControls();
 }
@@ -4068,7 +4088,12 @@ function refreshLocalControls() {
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
     if (s.local === "orbit") { el.querySelector("input").checked = !!camView.auto; continue; }
-    if (s.local === "tilt") {
+    if (s.local === "spin") {
+      const input = el.querySelector("input");
+      if (document.activeElement !== input) input.value = String(caseSpin);
+      el.title = caseSpin ? `gravity turns ${Math.abs(caseSpin)} rev/s ${caseSpin > 0 ? "counterclockwise" : "clockwise"} (overrides the phone)` : "0: the case stands still";
+      el.querySelector("span").textContent = `case spin ${caseSpin ? caseSpin.toFixed(2) + " Hz" : "off"} `;
+    } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
     } else if (s.local === "particle_style") {
@@ -4080,6 +4105,12 @@ function refreshLocalControls() {
       }
       select.value = particleStyle;
       el.title = (cloud && cloud.styles.fallback) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+    } else if (s.local.startsWith("noise_")) {
+      // without float render targets the filter is off, and the title says why
+      const caps = capabilitiesOf(gl), choice = chooseNoise(true, caps, cloud && cloud.noise.broken);
+      el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
+      const input = el.querySelector("input, select");
+      if (input) input.disabled = !choice.on;
     } else {
       el.disabled = !st.ready || (s.local === "continue" ? st.mode === "live" : s.local === "rebirth" ? false : st.frames === 0);
       el.classList.toggle("on", s.local === st.mode);
@@ -4089,8 +4120,11 @@ function refreshLocalControls() {
 // a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off, then log-spaced from spec.log_min to spec.max
 function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? 0 : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
 function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
+let caseSpin = 0;
+try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
+compute.setSpin(caseSpin);
 function renderGameControls(game) {
-  const box = $("gamectl"), specs = game && game.controls_ui;
+  const box = $("gamectl"), specs = (game && game.controls_ui);
   if (!box) return;
   if (!specs) { if (box.childElementCount) box.replaceChildren(); delete box.dataset.key; return; }
   const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;
@@ -4154,9 +4188,9 @@ function renderGameControls(game) {
         if (verdict && !verdict.ok) input.title = verdict.reason;
       }
     }
-    if (input && s.kind === "toggle") input.checked = s.local === "orbit" ? !!camView.auto : s.local ? gravitySensor.enabled : !!s.value;
+    if (input && s.kind === "toggle") input.checked = s.local ? !!localValue(s) : !!s.value;
     else if (input && document.activeElement !== input) {
-      input.value = String(s.local === "particle_style" ? particleStyle : s.kind === "range" ? toSlider(s, s.value) : s.value);
+      input.value = String(s.local ? localValue(s) : s.kind === "range" ? toSlider(s, s.value) : s.value);
       const val = el.querySelector("output.gctl-val"); if (val) val.textContent = Number(s.value).toPrecision(3);
     }
   }
@@ -4181,7 +4215,7 @@ function pointsFrame(cam, now) {
   const y = TILE.height + 0.03;
   cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
                      y, stride: rec.display_stride, background: sceneBackground(),
-                     style: particleStyle, camera: { view: cam.view, proj: cam.proj }, lighting: particleStyle === DEFAULT_STYLE ? null : particleLighting(g, y) });
+                     style: particleStyle, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: particleStyle === DEFAULT_STYLE ? null : particleLighting(g, y) });
 }
 
 // ---------------------------------------------------------------- draw

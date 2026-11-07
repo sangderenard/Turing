@@ -183,6 +183,7 @@ def test_the_pages_image_sampling_equals_pythons_sample_raster(tmp_path):
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "noise_filter.js", tmp_path / "noise_filter.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SAMPLE)
     done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
@@ -529,6 +530,7 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "noise_filter.js", tmp_path / "noise_filter.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SETTLE)
     for series in (diag, quiet):
@@ -834,6 +836,77 @@ def test_the_particle_styles_registry_picks_a_style_the_device_can_run_and_match
     look = ids["pstyle"]
     assert look["kind"] == "select" and look["local"] == "particle_style" and look["value"] == "points"
     assert look["options"] == listed
+
+
+JS_NOISE = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const N = await import(pathToFileURL(`${dir}/noise_filter.js`).href);
+const near = (a, b, tol = 0.02) => assert.ok(Math.abs(a - b) <= tol, `${a} vs ${b}`);
+// variance ladders (fine -> coarse) of known spectra: band energy v_k = s * 2^(k (beta - 2))
+const raw = (beta, s = 0.01) => Array.from({length: N.GAPS}, (_, k) => s * 2 ** (k * (beta - 2)));
+const ladder = raw;
+for (const beta of [0, 0.5, 1, 1.5, 2]) near(N.fitBeta(ladder(beta)), beta);
+near(N.fitBeta(ladder(3)), 3); near(N.fitBeta(ladder(4)), 4, 1e-3);                 // an edge reads 3, a ramp 4 (clamped)
+assert.equal(N.fitBeta(ladder(5)), 4); assert.equal(N.fitBeta(ladder(-3)), -1);       // clamped both ways
+near(N.fitBeta(ladder(1, 1e-3)), 1);                                                     // scale-free in the amplitude
+// a lone band: all the variance at the finest scale reads as white or steeper, at the coarsest as steep; neither is NaN
+const lone = (k) => [0, 0, 0, 0, 0].map((_, i) => (i === k ? 0.01 : 0));
+assert.ok(N.fitBeta(lone(0)) < N.WHITE_PINK); assert.ok(N.fitBeta(lone(4)) > N.PINK_BROWN);
+// the noise share: speckle high, coarse structure low
+near(N.noiseShare(raw(0)), 0.984, 0.002); near(N.noiseShare(raw(1)), 0.903, 0.002); near(N.noiseShare(raw(2)), 0.6, 0.002);
+near(N.noiseShare(raw(3)), 0.226, 0.002); near(N.noiseShare(raw(4)), 0.062, 0.002);
+assert.equal(N.noiseShare([0, 0, 0, 0, 0]), 0);
+// the classes
+const c = (v, lum = 0.2) => N.classify(v, lum).cls;
+assert.equal(c(ladder(0)), 'white'); assert.equal(c(ladder(0), 0.95), 'grey');
+assert.equal(c(ladder(1)), 'pink'); assert.equal(c(ladder(1), 0.95), 'pink');            // grey is a white-noise subclass
+assert.equal(c(ladder(2)), 'brown'); assert.equal(c(ladder(3)), 'brown');
+assert.equal(c(ladder(0, 1e-6)), 'solid'); assert.equal(c([0, 0, 0, 0, 0]), 'solid');
+// the boundaries sit where the constants say
+assert.equal(c(ladder(N.WHITE_PINK - 0.05)), 'white'); assert.equal(c(ladder(N.WHITE_PINK + 0.05)), 'pink');
+assert.equal(c(ladder(N.PINK_BROWN - 0.05)), 'pink'); assert.equal(c(ladder(N.PINK_BROWN + 0.05)), 'brown');
+// noise vs structure: white speckle is replaced, an edge or a strata ramp is kept, at the default threshold
+assert.equal(N.classify(ladder(0), 0.2).noise, true); assert.equal(N.classify(ladder(3), 0.2).noise, false); assert.equal(N.classify(ladder(4), 0.2).noise, false);
+assert.ok(N.noiseWeight(0.98, 0.5) > 0.99 && N.noiseWeight(0.23, 0.5) < 0.01);
+assert.ok(N.noiseWeight(0.6, 0.3) > N.noiseWeight(0.6, 0.7));                              // a higher threshold keeps more
+assert.ok(N.solidWeight(0) === 0 && N.solidWeight(1) === 1);
+// the palette: the fixed colour at beta 0 / 1 / 2, mixed between, grey replacing white as the luminance share rises
+const eq = (a, b) => a.forEach((x, i) => near(x, b[i], 1e-9));
+eq(N.paletteFor(0, 0), N.PALETTE.white); eq(N.paletteFor(0, 1), N.PALETTE.grey); eq(N.paletteFor(1, 0.3), N.PALETTE.pink); eq(N.paletteFor(2, 0.3), N.PALETTE.brown);
+eq(N.paletteFor(-1, 0), N.PALETTE.white); eq(N.paletteFor(4, 0), N.PALETTE.brown);
+eq(N.paletteFor(1.5, 0), N.PALETTE.pink.map((x, i) => (x + N.PALETTE.brown[i]) / 2));
+// replacement: mean mode blends only noise; spectral mode also tints solid regions with the solid colour
+const mean = {mode: 'mean', strength: 0.8, threshold: 0.5}, spec = {mode: 'spectral', strength: 0.8, threshold: 0.5};
+near(N.replacement(ladder(0), 0.2, mean).alpha, 0.8); assert.equal(N.replacement(ladder(0), 0.2, mean).rgb, null);
+near(N.replacement(ladder(3), 0.2, mean).alpha, 0); near(N.replacement(ladder(0, 1e-7), 0.2, mean).alpha, 0);
+near(N.replacement(ladder(3), 0.2, spec).alpha, 0);
+near(N.replacement(ladder(0, 1e-7), 0.2, spec).alpha, 0.8); eq(N.replacement(ladder(0, 1e-7), 0.2, spec).rgb, N.PALETTE.solid);
+N.replacement(ladder(1), 0.2, spec).rgb.forEach((x, i) => near(x, N.PALETTE.pink[i], 0.01));
+// availability: off with a reason without float or half-float render targets
+const full = {floatRender: 'float', maxPointSize: 256}, half = {floatRender: 'half', maxPointSize: 256}, none = {floatRender: null, maxPointSize: 256};
+assert.deepEqual(N.chooseNoise(false, none), {on: false, reason: ''});
+assert.equal(N.chooseNoise(true, full).on, true); assert.equal(N.chooseNoise(true, half).on, true); assert.match(N.chooseNoise(true, half).reason, /half/);
+assert.equal(N.chooseNoise(true, none).on, false); assert.match(N.chooseNoise(true, none).reason, /float/);
+assert.equal(N.chooseNoise(true, null).on, false);
+assert.equal(N.chooseNoise(true, full, 'incomplete target').on, false); assert.match(N.chooseNoise(true, full, 'incomplete target').reason, /incomplete target/);
+console.log(JSON.stringify(N.NOISE_MODES));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's noise filter logic")
+def test_the_noise_filters_slope_fit_and_classes_read_synthetic_variance_ladders_and_match_the_server(tmp_path):
+    """Render-only spectral noise filter (web/noise_filter.js): the log-variance slope fit reads white 0 / pink 1 / brown 2
+    from band-energy ladders (edge 3, ramp 4), the classes and palette, the speckle-vs-structure weight, the fallback
+    without float render targets -- and the server's controls declare the page's local noise controls and modes."""
+    import json
+    listed = json.loads(_run_node(tmp_path, JS_NOISE, "noise_filter.js", "particle_styles.js").strip().splitlines()[-1])
+    ids = {item["id"]: item for item in F.FountainGame(size="small").state()["controls_ui"]}
+    assert ids["nf"]["kind"] == "toggle" and ids["nf"]["local"] == "noise_on" and ids["nf"]["value"] is False
+    assert ids["nfmode"]["local"] == "noise_mode" and ids["nfmode"]["options"] == listed and ids["nfmode"]["value"] == "mean"
+    for key, local in (("nfstrength", "noise_strength"), ("nfthr", "noise_threshold")):
+        assert ids[key]["kind"] == "range" and ids[key]["local"] == local and ids[key]["min"] < ids[key]["value"] < ids[key]["max"]
 
 
 # ------------------------------------------------------------- 3-D chamber, tunables, fluids, polygon, inlet

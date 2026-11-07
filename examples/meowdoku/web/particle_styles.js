@@ -119,7 +119,7 @@ void main() {
   float t = 2.0 * sqrt(1.0 - r2) * vRw * min(1.0, vArea / (3.14159265 * vREff * vREff) + 0.35) * uThickGain;
   FragColor = vec4(vColor.rgb * t, t);
 }`;
-const QUAD_VS = `#version 300 es
+export const QUAD_VS = `#version 300 es
 void main() { vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)); gl_Position = vec4(c * 2.0 - 1.0, 0.0, 1.0); }`;
 const BLUR_FS = `#version 300 es
 precision highp float; precision highp int;
@@ -231,7 +231,7 @@ void main() {
   FragColor = vec4(vColor.rgb * g * 0.16 * k + mix(vColor.rgb, vec3(1.0), 0.5) * pow(g, 6.0) * 0.3 * k, 1.0);   // a soft halo and a hot core
 }`;
 // a quad over the board's plane (the board's rectangle, plus a margin), like compute.js's RESOLVE_VS
-const PLANE_VS = `#version 300 es
+export const PLANE_VS = `#version 300 es
 uniform mat4 uViewProj; uniform vec3 uBoard; uniform float uMargin; out vec2 vUV;
 void main() {
   vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
@@ -299,7 +299,7 @@ class Unavailable extends Error {}
 
 // Save a texture unit's 2D binding before using it, put it back after: the scene's passes share the units (a float texture
 // left on unit 0 made the pbr material table read garbage and the sun and the bulbs rendered black).
-class UnitGuard {
+export class UnitGuard {
   constructor(gl) { this.gl = gl; this.active = gl.getParameter(gl.ACTIVE_TEXTURE); this.saved = new Map(); }
   bind(unit, tex) {
     const gl = this.gl;

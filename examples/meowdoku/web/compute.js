@@ -53,6 +53,7 @@
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
 import { ParticleStyles } from "./particle_styles.js";
+import { NoiseFilter } from "./noise_filter.js";
 
 async function json(url) {
   const response = await fetch(url);
@@ -439,6 +440,13 @@ export class SettleDetector {
 
 // ------------------------------------------------------------------ runtime
 const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
+// the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
+// turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
+export function spinGravity(hz, t) {
+  const a = 2 * Math.PI * hz * t;
+  return [Math.sin(a), -Math.cos(a)];
+}
+const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)
 const TARGET_MS = { gpu: 8, wasm: 6 };  // what one batch should take: short enough to keep the display and the page responsive
 const LEAD_FRAMES = 8;                  // the pump rests when the buffer holds this many snapshots the display has not reached
 const DIAG_MS = 400;                    // continuous runs read the law's diagnostics this often (settle reads every sample)
@@ -557,9 +565,10 @@ export class ComputeRuntime {
   #inputsNow() {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
-    if (this.gravity) {
+    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt) : this.gravity;
+    if (g) {
       const G = this.manifest.law.gravity;
-      out.grav_x = this.gravity[0] * G; out.grav_y = this.gravity[1] * G; out.grav_z = this.gravity[2] * G;
+      out.grav_x = g[0] * G; out.grav_y = g[1] * G; out.grav_z = (g[2] || 0) * G;   // a spinning case turns in the screen's plane (no z)
       Object.assign(out, this.spec.tilt || {});
     }
     for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
@@ -576,6 +585,16 @@ export class ComputeRuntime {
   }
 
   // The phone's gravity (or the off switch: null).  Fractions of g in the screen's plane; takes effect at the next batch.
+  // A SPINNING CASE: gravity turns at ``hz`` revolutions per SIMULATED second (negative = clockwise), as if the box rotated
+  // at a prescribed speed; 0 or null stops it.  The angle follows the law's own step count (not the wall clock), so a
+  // free-running or replayed run turns the same way, and it overrides the phone's gravity while it runs.
+  setSpin(hz) {
+    const next = hz ? Number(hz) : null;
+    if (next === this.spin) return;
+    this.spin = next;
+    this.#kick();
+  }
+
   setGravity(gx, gy, gz = 0) {
     const next = gx == null ? null : [gx, gy, gz], old = this.gravity;
     if (next && old && Math.hypot(next[0] - old[0], next[1] - old[1], next[2] - old[2]) < 0.004) return;
@@ -705,6 +724,8 @@ export class ComputeRuntime {
     m = Math.max(1, Math.min(m, p.maxFrames));
     if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
     if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
+    // the inputs change only between batches: a spinning case keeps each batch to SPIN_TURN of a revolution
+    if (this.spin) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (Math.abs(this.spin) * this.manifest.law.dt * snap))));
     return m;
   }
 
@@ -936,6 +957,7 @@ export class PointCloud {
   constructor(gl, link, compile) {
     this.gl = gl;
     this.styles = new ParticleStyles(gl, link, compile);       // the selectable looks (particle_styles.js); `style` of draw picks one
+    this.noise = new NoiseFilter(gl, link, compile);            // the render-only spectral noise filter layered over any look (noise_filter.js); `noise` of draw
     this.program = link(compile(gl.VERTEX_SHADER, POINT_VS), compile(gl.FRAGMENT_SHADER, POINT_FS));
     this.resolve = link(compile(gl.VERTEX_SHADER, RESOLVE_VS), compile(gl.FRAGMENT_SHADER, RESOLVE_FS));
     this.vao = gl.createVertexArray(); gl.bindVertexArray(this.vao);
@@ -971,7 +993,12 @@ export class PointCloud {
 
   // data: packed points ([x, y, z, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
-  draw(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
+  draw(data, opts) {
+    this.#drawField(data, opts);
+    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y }, opts.noise);
+    else this.noise.fallback = "";
+  }
+  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
