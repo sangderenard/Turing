@@ -1,0 +1,18 @@
+# Saved Studio objects in the particle law
+
+The current Fountain/Marble Madness law accepts a **sphere approximation** of a saved marble or die. The displayed object can use its complete generated triangle mesh and material records; those triangles do not define contacts or inertia in the compiled law. This distinction must remain visible in the selector.
+
+## Fields the current law accepts
+
+The species parameters in `fountain3d.py::_params` are radius `r0..r3` (0.005–0.020 board units), relative density `rho0..rho3` (0.2–5), sliding friction `mu0..mu3` (0–1), restitution `e0..e3` (0.02–0.95), rolling roughness `roll0..roll3` (0–0.3), and radius irregularity `irr0..irr3` (0–0.3). `fountain_game.py::FountainGame.do` handles these through `fountain_param`; radius and irregularity reset the run, and the other four reach the running law at a batch boundary. The stored Studio properties should pass their named coefficients directly, after range validation. A selection must not silently clamp values as `FountainGame.do` ordinarily does.
+
+The particle render packet has position, color, live flag, and current radius. The `particle_styles.js` instancing extension scales an actual mesh by that radius. It has no orientation or angular velocity column. A die's visible pose therefore cannot follow its simulated spin today.
+
+## Values that require an engine extension
+
+* **Mass and SI density.** `fountain3d.py::current` uses `rho * (4/3)πr³`. The law's `rho` is relative simulation density; its SI kg/m³ reference and board-unit-to-metre scale are not defined. A saved object's computed kg, kg/m³, center of mass, or mass distribution cannot be mapped to `rho0` without explicit calibration. Keep the physical values in the saved design and show `rho0` separately if exposed.
+* **Full moment of inertia.** `fountain3d.py` sets `inertia = 0.4 * mass * radius * radius` and uses that one scalar for all angular axes. The saved moment tensor and principal moments are not inputs. A future law needs orientation, tensor in body coordinates, and world-frame inverse inertia in the torque update.
+* **Contacts from actual geometry.** Pair overlap is `radius + rj - dist`; wall contact likewise uses the radius. Beveled dice, raised/relieved numbers, and decorated shells therefore collide as spheres. A future geometry-contact law should reuse the saved, verified mesh or a derived convex/SDF representation from the same generator, with broad phase bounds and narrow phase support/contact points. It must use the existing symbolic contact and friction law for response rather than a parallel solver.
+* **Crystal interaction.** To model faceted crystal contact, derive contact normals, penetration, and lever arms from the modeled faces/edges and apply the contact force/torque through the existing law. Validate face landing fairness against bevel radius, face relief, and raised numbering, and compare angular energy and settling with the current sphere baseline.
+
+The playable Marble Madness game already subclasses `FountainGame` and uses one active particle in the compiled 4k SDF DEM law. Its limitation is the same sphere contact/inertia law, not a separate game solver.
