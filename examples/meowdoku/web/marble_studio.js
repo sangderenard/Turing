@@ -2,6 +2,7 @@
 // tables used by the game. All edits are local to this preview.
 import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
+import { previewMotionAngle } from "./marble_preview_motion.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
   verifySavedMarbleObject } from "./marble_object.js";
@@ -32,6 +33,7 @@ function multiply(a, b) {
 const translate = (z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,z,1]);
 const rotateY = (a) => new Float32Array([Math.cos(a),0,-Math.sin(a),0, 0,1,0,0, Math.sin(a),0,Math.cos(a),0, 0,0,0,1]);
 const rotateX = (a) => new Float32Array([1,0,0,0, 0,Math.cos(a),Math.sin(a),0, 0,-Math.sin(a),Math.cos(a),0, 0,0,0,1]);
+const rotateZ = (a) => new Float32Array([Math.cos(a),Math.sin(a),0,0, -Math.sin(a),Math.cos(a),0,0, 0,0,1,0, 0,0,0,1]);
 function rotateQuaternion(q) {
   const r=rotationMatrix(q);
   return new Float32Array([r[0][0],r[1][0],r[2][0],0,r[0][1],r[1][1],r[2][1],0,
@@ -316,6 +318,16 @@ function controls() {
     $("spot-hardness-out").value=`${$("spot-hardness").value}%`;});
   setInnerFromHardness();
   $("reset-roll").addEventListener("click",resetRoll);
+  const syncPreviewMotion=()=>{
+    const motion=$("preview-motion").value;
+    $("preview-arc").disabled=motion!=="rock";
+    $("preview-hz-out").value=`${(+$("preview-hz").value).toFixed(2)} Hz`;
+    $("preview-phase-out").value=`${$("preview-phase").value}°`;
+    $("preview-arc-out").value=`${$("preview-arc").value}°`;
+  };
+  for(const name of ["preview-motion","preview-hz","preview-phase","preview-arc"])
+    $(name).addEventListener("input",syncPreviewMotion);
+  syncPreviewMotion();
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
   for (const name of dimensions) $(name).addEventListener("input", rebuild);
@@ -390,7 +402,10 @@ function frame(now=0) {
     const view=multiply(translate(-distance),multiply(rotateX(pitch),rotateY(yaw)));
     const radius=+$("radius-mm").value/1000;
     const object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
-    const mv=multiply(view,object);
+    const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
+    const axis=$("preview-axis").value;
+    const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
+    const mv=multiply(view,multiply(object,preview));
     gl.useProgram(P);
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
       gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
