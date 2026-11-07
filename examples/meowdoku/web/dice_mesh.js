@@ -302,7 +302,7 @@ export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,marking
  */
 export function fitInclusionsInsideDie(die,inclusions,{gap=0.012,scale=1}={}) {
   if(!die||die.contactModel!=='polyhedron'||!(die.safeInteriorRadius>0)||
-    !Array.isArray(inclusions?.interior)||!(gap>=0&&gap<die.safeInteriorRadius)||
+    !Array.isArray(inclusions?.interior)||!(gap>0&&gap<die.safeInteriorRadius)||
     !(scale>=0&&scale<=1)) throw new RangeError('invalid die inclusion fit');
   const source=inclusions.interior;
   const maxRadius=source.reduce((largest,face)=>Math.max(largest,
