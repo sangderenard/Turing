@@ -142,10 +142,13 @@ SWELL_MAX_RATIO = 4.0
 FULL_COORDINATION = 6.0                # contacts of a grain with no open surface (a hex pack); exposure = 1 - contacts / this
 SOLVENTS = {"air": 0.0, "water": 1.0, "glycerine": 0.5}
 SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax")
+NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
+SHAPES = ("box", "funnel", "hexagon", "ramp")       # box: the old basin (the three planes); the others add the polygon walls
+POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
 STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
 UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata",   # the run, its basin, the RUNTIME INPUTS, then the colour rate
-            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
+            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + POLYGON_UNIFORMS + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
@@ -221,8 +224,37 @@ def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, 
     cols = int(math.ceil(width / cell))
     rows = int(math.ceil((nozzle_y + 0.1) / cell))
     return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
-            "cols": cols, "rows": rows, "cells": cols * rows,
+            "cols": cols, "rows": rows, "cells": cols * rows, "cell": cell,
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
+
+
+def shape_vertices(shape: str, geo: dict[str, float]) -> list[tuple[float, float]]:
+    """The basin outline as a polyline (at most ``NV`` vertices; the law pads it by repeating the last), the chamber on its
+    LEFT as it runs (counterclockwise).  (The box needs none: it is the three planes.)  Every non-box shape is a CLOSED polygon (its first vertex repeated, so its top is its own ceiling) INSCRIBED in the
+    visible sim window in BOTH axes, centred: |x| <= the window's half-width less a margin of three grain diameters, from the
+    floor (y = 0) to the window's top less that margin, as large as fits.  ``hexagon``; ``funnel`` a vessel with a V bottom
+    that narrows to its throat; ``ramp`` a vessel with a sloping floor.  (The same shapes as the 3-D fountain's; the planes of the
+    old basin stay, outside them.)"""
+    margin = 3.0 * geo.get("cell", CELL)
+    w = 0.5 * (geo["view"][1] - geo["view"][0]) - margin          # the window is centred on x = 0
+    top = geo["view"][3] - margin
+    mid = 0.5 * top
+    if shape == "funnel":
+        return [(-w, top), (-w, 0.55 * top), (-0.2 * w, 0.0), (0.2 * w, 0.0), (w, 0.55 * top), (w, top), (-w, top)]
+    if shape == "hexagon":
+        return [(-w, mid), (-0.5 * w, 0.0), (0.5 * w, 0.0), (w, mid), (0.5 * w, top), (-0.5 * w, top), (-w, mid)]
+    if shape == "ramp":
+        return [(-w, top), (-w, 0.3 * top), (w, 0.0), (w, top), (-w, top)]
+    raise ValueError(f"unknown chamber shape {shape!r}")
+
+
+def chord(verts: list[tuple[float, float]], y: float) -> tuple[float, float]:
+    """The x extent of the chamber at height ``y``: the leftmost and rightmost crossings of the outline."""
+    xs = []
+    for (ax, ay), (bx, by) in zip(verts[:-1], verts[1:]):
+        if (ay - y) * (by - y) <= 0.0 and ay != by:
+            xs.append(ax + (bx - ax) * (y - ay) / (by - ay))
+    return (min(xs), max(xs)) if xs else (-1.0e9, 1.0e9)
 
 
 def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
@@ -533,6 +565,31 @@ def make_law(n: int, active: int | None = None):
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
+        # the POLYGON walls (a shape other than the box): THICK, SIDED, OVERLAPPING half-spaces, the same contact law.  Each
+        # segment's normal is its LEFT normal (the chamber on the left as the polyline runs), so a grain on the wrong side of a
+        # line is pushed back, never out; the penetration the spring feels saturates at 6 radii (a bounded force); the segment
+        # extends 0.3 x half past each end with its weight tapering to 0, so neighbouring walls overlap at every vertex.  The
+        # default (all vertices 0) has zero-length segments: weight 0, exact zeros.
+        ext = 0.3 * half + 1.0e-6
+        for k in range(NV - 1):
+            ax, ay, bx, by = a[f"px{k}"], a[f"py{k}"], a[f"px{k + 1}"], a[f"py{k + 1}"]
+            ex, ey = bx - ax, by - ay
+            len2 = ex * ex + ey * ey
+            seg_len = (len2 + 1.0e-12).sqrt()
+            inv_len = 1.0 / seg_len
+            nlx, nly = -ey * inv_len, ex * inv_len
+            side_s = (x - ax) * nlx + (y - ay) * nly
+            along = ((x - ax) * ex + (y - ay) * ey) * inv_len
+            w_start = ((along + ext) * (1.0 / ext)).clamp(0.0, 1.0)
+            w_end = ((seg_len + ext - along) * (1.0 / ext)).clamp(0.0, 1.0)
+            share = as_float(len2 > 1.0e-8) * w_start * w_end
+            seg_delta = _cap(radius - side_s, 6.0 * radius).clamp(0.0, 1.0e9) * live * share
+            gx, gy, gt = _contact(seg_delta, y * 0.0 + nlx, y * 0.0 + nly, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
+            touch = as_float(seg_delta > 0.0)
+            ncont = ncont + touch
+            fx = fx + gx * touch
+            fy = fy + gy * touch
+            tq = tq - radius * gt * touch
         # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
         # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
         just = pending * as_float(blocked < 0.5)
@@ -675,7 +732,7 @@ def cell_needed(p: dict[str, float]) -> float:
 
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
              gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA,
-             params: dict | None = None) -> dict[str, np.ndarray]:
+             params: dict | None = None, shape: str = "box") -> dict[str, np.ndarray]:
     """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``),
     its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) and the RUNTIME INPUTS
     (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
@@ -687,6 +744,18 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
     out.update({"cell_scale": cell / CELL, "solvent": p["solvent"], "case_omega": 0.0, "case_domega": 0.0,
                 "pivot_x": 0.5 * (geo["view"][0] + geo["view"][1]), "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3])})
+    if shape == "box":
+        verts = [(0.0, 0.0)] * NV                                                # no polygon: zero-length segments, exact zeros
+    else:
+        verts = shape_vertices(shape, geo)
+        if len(verts) > NV:
+            raise ValueError(f"a chamber outline has at most {NV} vertices")
+        # the inlet bar INSIDE the shape: its half-width at most 80% of the chord at the nozzle's height
+        xl, xr = chord(verts, geo["nozzle_y"])
+        out["bar_half"] = min(geo["bar_half"], 0.8 * 0.5 * (xr - xl))
+        verts = verts + [verts[-1]] * (NV - len(verts))
+    out.update({f"px{k}": verts[k][0] for k in range(NV)})
+    out.update({f"py{k}": verts[k][1] for k in range(NV)})
     for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):                 # multiples of the defaults: exactly 1.0 when untouched
         out.update({f"rscale{s}": p[f"r{s}"] / r, f"fscale{s}": p[f"mu{s}"] / mu if mu else 1.0, f"dscale{s}": p[f"rho{s}"] / rho,
                     f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
@@ -694,13 +763,14 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
 
 
 def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0, active: int | None = None,
-                    aspect: float | None = None, strata: float = STRATA, params: dict | None = None) -> dict[str, np.ndarray]:
+                    aspect: float | None = None, strata: float = STRATA, params: dict | None = None,
+                    shape: str = "box") -> dict[str, np.ndarray]:
     """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
     Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
     columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
-    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata, params=params))
+    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata, params=params, shape=shape))
     return columns
 
 
@@ -827,6 +897,7 @@ class FountainGame(Game):
         self.mix, self.mode, self.speed = 0.5, 2, 1
         self.strata = STRATA
         self.params: dict[str, float] = {}       # the page's species-table overrides (see ``species_params``)
+        self.shape = "box"                       # the chamber outline (SHAPES); part of the recorded run
         self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
@@ -848,7 +919,7 @@ class FountainGame(Game):
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
         cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
-                               active=self.n, aspect=self.aspect, strata=self.strata, params=self.params)
+                               active=self.n, aspect=self.aspect, strata=self.strata, params=self.params, shape=self.shape)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -883,9 +954,13 @@ class FountainGame(Game):
                 self.reset()
         elif kind == "fountain_choice":
             name, value = str(payload["name"]), str(payload["value"])
-            if name != "solvent" or value not in SOLVENTS:
+            if name == "shape" and value in SHAPES:
+                self.shape = value
+                self.reset()
+            elif name == "solvent" and value in SOLVENTS:
+                self.params["solvent"] = SOLVENTS[value]
+            else:
                 raise ValueError(f"fountain_choice: unknown choice {name!r} = {value!r}")
-            self.params["solvent"] = SOLVENTS[value]
         elif kind == "fountain_speed":
             self.speed = int(payload["speed"])
         elif kind == "fountain_run":
@@ -962,6 +1037,8 @@ class FountainGame(Game):
             out.append(ctl("e", "restitution", RESTITUTION_RANGE[0], RESTITUTION_RANGE[1], 0.01))
             out.append(ctl("swell", "swell rate (orbeez, 1/s)", 0.0, SWELL_RATE_MAX, 0.01))
             out.append(ctl("swmax", "max swell (x radius)", 1.0, SWELL_MAX_RATIO, 0.1))
+        out.append({"id": "shape", "kind": "select", "label": "chamber shape", "value": self.shape, "action": "fountain_choice",
+                    "name": "shape", "field": "value", "group": "Chamber", "options": [[k, k] for k in SHAPES]})
         out.append({"id": "solvent", "kind": "select", "label": "solvent", "value": self.solvent_name(), "action": "fountain_choice",
                     "name": "solvent", "field": "value", "group": "Grains",
                     "options": [[k, k] for k in SOLVENTS] + ([["custom", "custom"]] if self.solvent_name() == "custom" else [])})
@@ -1031,7 +1108,7 @@ class FountainGame(Game):
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
-                                                              use_image=1.0 if self.phase == "replay" else 0.0, params=self.params).items()},
+                                                              use_image=1.0 if self.phase == "replay" else 0.0, params=self.params, shape=self.shape).items()},
                 "view": list(geo["view"]), "aspect": self.aspect,
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
                 "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params))),
