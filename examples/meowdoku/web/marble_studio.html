@@ -73,7 +73,7 @@
     <label>Roll force Z (mN)<input id="roll-force-z" type="range" min="-100" max="100" value="0"></label>
     <button id="reset-roll" class="wide">Reset roll</button>
     <output id="roll-status" class="wide">Locked</output>
-    <p class="wide">Volume integrals use each closed triangle component. The shell volume subtracts inclusions; intersecting inclusions are not unioned. Enamel is a thin coating using the shader thickness in nm. Results are nominal where components overlap.</p>
+    <p class="wide">Closed triangle volume integrals provide the first and second mass moments, center of mass, and moment of inertia tensor. Separate inclusions are placed without overlap and displace shell material. Enamel uses a thin-film area estimate; rolling stays locked when that estimate is present.</p>
   </div>
   <h2>Material</h2><div class="grid">
     <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>

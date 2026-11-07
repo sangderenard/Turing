@@ -3,6 +3,30 @@
 const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const dot = (a,b) => a.reduce((sum,x,i)=>sum+x*b[i],0);
 const zero = () => [[0,0,0],[0,0,0],[0,0,0]];
+export function principalMoments(tensor) {
+  const a=tensor.map((row)=>row.slice()),vectors=[[1,0,0],[0,1,0],[0,0,1]];
+  for(let iteration=0;iteration<40;iteration++) {
+    let p=0,q=1;
+    for(const [i,j] of [[0,1],[0,2],[1,2]]) if(Math.abs(a[i][j])>Math.abs(a[p][q])) [p,q]=[i,j];
+    if(Math.abs(a[p][q])<1e-18)break;
+    const angle=0.5*Math.atan2(2*a[p][q],a[q][q]-a[p][p]),c=Math.cos(angle),s=Math.sin(angle);
+    const app=a[p][p],aqq=a[q][q],apq=a[p][q];
+    a[p][p]=c*c*app-2*s*c*apq+s*s*aqq;
+    a[q][q]=s*s*app+2*s*c*apq+c*c*aqq;
+    a[p][q]=a[q][p]=0;
+    for(let k=0;k<3;k++) if(k!==p&&k!==q) {
+      const kp=a[k][p],kq=a[k][q];
+      a[k][p]=a[p][k]=c*kp-s*kq;
+      a[k][q]=a[q][k]=s*kp+c*kq;
+    }
+    for(let k=0;k<3;k++) {
+      const vp=vectors[k][p],vq=vectors[k][q];
+      vectors[k][p]=c*vp-s*vq;vectors[k][q]=s*vp+c*vq;
+    }
+  }
+  return [0,1,2].map((i)=>({momentKgM2:a[i][i],axis:[vectors[0][i],vectors[1][i],vectors[2][i]]}))
+    .sort((x,y)=>x.momentKgM2-y.momentKgM2);
+}
 function integrate(faces) {
   let volume=0; const first=[0,0,0], second=zero();
   for (const [a,b,c] of faces) {
@@ -79,6 +103,7 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
     components.every((c)=>c.volumeM3>=0&&c.massKg>=0)&&
     mesh.interior.every((face)=>face.slice(0,3).every((p)=>Math.hypot(...p)<1));
   return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,
+    principalMoments:principalMoments(inertia),
     validForRoll:valid,mechanicsNote:approximateCoating?"Enamel thin film uses an area estimate; rolling waits for closed coating geometry":
       valid?"Closed disjoint volumes integrated":"Final mesh has unresolved mechanical properties"};
 }
