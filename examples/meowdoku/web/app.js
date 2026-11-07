@@ -4727,6 +4727,7 @@ function applyState(game, { meta = false } = {}) {
   compute.sync(game.compute || null);
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
+  mobroad.state = state;
   renderHotbars(game);
   showPads(game);
   renderInventory(game);
@@ -6354,6 +6355,7 @@ function keyControl(key) {
 }
 window.addEventListener("keyup", (e) => { const k = keyControl(e.key); if (k) held.delete(k); });
 window.addEventListener("blur", () => held.clear());
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && mobroad.armed) { mobroad.armed = false; mobroad.cursor = null; } });   // [MOBROAD] put the ghost away
 function hit(clientX, clientY) {
   // the pointer's hit on the plane of the button tops: a board cell, a rack cell, or nothing
   const game = state.game; if (!game) return null;
@@ -6384,7 +6386,13 @@ canvas.addEventListener("pointerdown", (e) => {
   if (state.game && state.game.input === "realtime") {
     const tile = state.game.characters ? hit(e.clientX, e.clientY) : null;
     if (tile && tile.kind === "character") {                  // a character tile: choose it (kept in the profile)
+      if (state.game.mobroad) mobroad.press(state.game, tile.character);        // [MOBROAD] the cube arms a tower ghost (the same choice path)
       if (state.game.characters.chosen !== tile.character) act({ type: "settings", values: { avatar: tile.character } }).catch(() => {});
+      return;
+    }
+    if (state.game.mobroad && mobroad.armed) {                // [MOBROAD] a click on the field drops the armed tower (the server decides validity and cost)
+      const at = boardPlane(e.clientX, e.clientY);
+      if (at) act({ type: "place", x: at.x, y: at.z }).catch(() => {});
       return;
     }
     if (isWalker()) { tap = { x: e.clientX, y: e.clientY, t: performance.now() }; return; }       // a walker is not steered by a held finger
@@ -6402,7 +6410,10 @@ canvas.addEventListener("pointermove", async (e) => {
     if (at) light.pointer = at;   // the board point the lamp flies above
     return;
   }
-  if (game.input === "realtime") { if (steer) steer = boardPlane(e.clientX, e.clientY) || steer; return; }
+  if (game.input === "realtime") {
+    if (game.mobroad && mobroad.armed) { const at = boardPlane(e.clientX, e.clientY); if (at) mobroad.cursor = at; }       // [MOBROAD] the ghost follows the pointer
+    if (steer) steer = boardPlane(e.clientX, e.clientY) || steer; return;
+  }
   if (!press) return;
   if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) press.moved = true;
   // meowdoku: a swipe paints X marks on every cell it crosses

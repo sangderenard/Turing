@@ -36,14 +36,17 @@ export function mobroadPather(w) {
   return out;
 }
 
-const KIND_MATERIAL = { split: "sapphire@glass", damage: "jade@glass", rate: "ruby@glass", shooters: "opal@glass" };
-const KIND_LABEL = { split: "SPLIT", damage: "DAMAGE", rate: "FIRE RATE", shooters: "SHOOTERS" };
-const KIND_COLOR = { split: "#7fb2ff", damage: "#7fe3a0", rate: "#ff7f8e", shooters: "#d8e6ff" };
+const KIND_MATERIAL = { split: "sapphire@glass", damage: "jade@glass", rate: "ruby@glass", shooters: "opal@glass", weapon: "ruby@glass", unit: "opal@glass" };
+const KIND_LABEL = { split: "SPLIT", damage: "DAMAGE", rate: "FIRE RATE", shooters: "SHOOTERS", weapon: "WEAPON", unit: "UNITS" };
+const KIND_COLOR = { split: "#7fb2ff", damage: "#7fe3a0", rate: "#ff7f8e", shooters: "#d8e6ff", weapon: "#ffb36b", unit: "#ffe27a" };
+const UNIT_PER = 4;                                            // mobroad.py UNIT_PER: a gate grants floor(value / 4) units when it crosses the player
 const PANEL_H = 1.1;
 
 // the panel's text: a pass-through panel shows the multiplier it gives (``x2.50``), a completion panel its progress to the target
 export function panelText(p) {
   if (!p.alive) return ["SPENT", KIND_LABEL[p.kind]];
+  if (p.kind === "unit") { const u = Math.floor(p.value / UNIT_PER); return [`${u >= 0 ? "+" : ""}${u}`, "UNITS (cross me)"]; }
+  if (p.kind === "weapon") return [`${Math.max(0, p.target - p.value).toFixed(0)} hit${p.target - p.value > 1 ? "s" : ""}`, `WEAPON x${p.amount.toFixed(1)}`];
   if (p.kind === "rate" || p.kind === "shooters") return [`${p.value.toFixed(1)} / ${p.target.toFixed(1)}`, `${KIND_LABEL[p.kind]} x${p.amount.toFixed(0)}`];
   return [`x${p.value.toFixed(2)}`, KIND_LABEL[p.kind]];
 }
@@ -59,6 +62,22 @@ export class MobroadPage {
     let kind = null;
     try { kind = new URLSearchParams(location.search).get("pather") || localStorage.getItem("mobroad.pather"); } catch (e) { /* no storage: the default */ }
     this.patherKind = kind === "hand" ? "hand" : "trained";             // which weights the law walks the mob with
+    this.cursor = null; this.armed = false; this.ghostMesh = null; this.ghostKey = "";   // the tower ghost: the pointer's board place, whether a cube is pressed
+  }
+
+  // THE SIDE MENU'S CUBE (the character tile set, here the TOWER kinds): a press arms the ghost (a second press of the chosen kind puts it away)
+  press(game, character) {
+    const chosen = game.characters && game.characters.chosen;
+    this.armed = !(this.armed && chosen === character);
+  }
+
+  // a coarse validity for the ghost's tint (the server's grid of the road + the towers already placed); the SERVER decides at the drop
+  valid(game, state, x, y) {
+    const t = game.mobroad && game.mobroad.towers; if (!t || !x && x !== 0) return false;
+    const g = t.grid, c = Math.floor(x / g.step), r = Math.floor(y / g.step);
+    if (c < 0 || r < 0 || c >= g.cols || r >= g.rows || g.ok[r * g.cols + c] !== "1") return false;
+    for (const piece of state.pieces.values()) if (piece.entity && String(piece.color || "").startsWith("tower") && piece.removing == null && Math.hypot(piece.sx - x, piece.sz - y) < 2 * t.radius) return false;
+    return true;
   }
 
   // THE PLAYER (the pather's target), board units: the server's player piece (lane 0), else where it starts
@@ -113,6 +132,20 @@ export class MobroadPage {
     this.root = root; this.hud = hud; this.toggle = toggle; this.#label();
   }
 
+  // THE GHOST: a glass placeable at the pointer while a cube is armed, green where a tower may stand, red where not
+  #drawGhost(api, game, drawLit, floor) {
+    const want = this.armed && this.cursor && game.mobroad.towers;
+    if (!want) return;
+    const ok = this.valid(game, this.state, this.cursor.x, this.cursor.z), idx = api.materialIndex(), r = game.mobroad.towers.radius;
+    const key = `${ok}|${this.cursor.x.toFixed(2)}|${this.cursor.z.toFixed(2)}`;
+    if (key !== this.ghostKey) {
+      if (this.ghostMesh) api.disposeMesh(this.ghostMesh);
+      this.ghostMesh = api.litMesh(api.box(this.cursor.x - r, floor, this.cursor.z - r, this.cursor.x + r, floor + 0.9, this.cursor.z + r, idx[ok ? "jade@glass" : "ruby@glass"] ?? idx["housing@glass"]));
+      this.ghostKey = key;
+    }
+    drawLit(this.ghostMesh.vao, this.ghostMesh.count, api.model(), null);
+  }
+
   #label() { if (this.toggle) this.toggle.textContent = `pather: ${this.patherKind}`; }
 
   // called with every state; hides the overlay for any other game
@@ -129,13 +162,14 @@ export class MobroadPage {
     if (!game || !game.mobroad) return;
     this.#ensureDom();
     const panels = game.mobroad.panels, idx = api.materialIndex(), floor = api.floorY();
-    const key = JSON.stringify([panels.map((p) => [p.id, p.kind, p.alive, p.x, p.y, p.hw]), idx["sapphire@glass"] ?? -1, game.width, game.height]);
+    const key = JSON.stringify([panels.map((p) => [p.id, p.kind, p.alive, p.x, Math.round(p.y * 4) / 4, p.hw]), idx["sapphire@glass"] ?? -1, game.width, game.height]);
     if (key !== this.key) {
       for (const m of this.meshes) api.disposeMesh(m);
       this.meshes = panels.filter((p) => p.alive).map((p) => api.litMesh(api.box(p.x - p.hw, floor, p.y - p.thick, p.x + p.hw, floor + PANEL_H, p.y + p.thick, idx[KIND_MATERIAL[p.kind]] ?? idx["housing@glass"])));
       this.key = key;
     }
     for (const m of this.meshes) drawLit(m.vao, m.count, api.model(), null);
+    this.#drawGhost(api, game, drawLit, floor);
     const rect = api.canvas.getBoundingClientRect();
     const top = project(cam.viewProj, game.width / 2, floor, 0, rect.width, rect.height);           // the status overlay rides the road's top edge
     if (top) { this.hud.style.left = `${rect.left + top[0]}px`; this.hud.style.top = `${Math.max(rect.top + 6, rect.top + top[1] - 6)}px`; }
