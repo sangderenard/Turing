@@ -1156,3 +1156,21 @@ def test_a_turning_case_drags_its_contents_in_3d_too(native_piece):
     ref_e = _rotating_frame_reference((0.08, 0.0), 0.0, 4.0, steps)
     assert np.hypot(float(eul["x"][0]) - ref_e[0], float(eul["y"][0]) - 0.3 - ref_e[1]) < 0.03 * np.hypot(*(ref_e - np.array([0.08, 0.0]))) + 1e-4
     assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
+
+
+def test_every_shape_is_inscribed_in_the_visible_window_closed_when_a_polygon_and_the_inlet_is_inside():
+    for n in (256, 4096):
+        geo = F.basin(n)
+        x0, x1, y0, y1 = geo["view"]
+        box = F.shape_vertices("box", geo)
+        assert box == [(-geo["half"], geo["nozzle_y"] + 2.5), (-geo["half"], 0.0), (geo["half"], 0.0), (geo["half"], geo["nozzle_y"] + 2.5)]    # the old basin
+        for shape in ("funnel", "hexagon", "ramp"):
+            verts = F.shape_vertices(shape, geo)
+            xs, ys = [v[0] for v in verts], [v[1] for v in verts]
+            assert min(xs) >= x0 + 2.0 * geo["cell"] and max(xs) <= x1 - 2.0 * geo["cell"] and min(ys) >= 0.0 and max(ys) <= y1 - 2.0 * geo["cell"], shape      # inside the window, both axes, with a margin
+            assert max(xs) == pytest.approx(-min(xs)) and max(xs) > x1 - 4.0 * geo["cell"] and max(ys) > 0.9 * (y1 - 3.0 * geo["cell"]) - 1e-9           # centred, as large as fits
+            assert verts[0] == verts[-1] and len(verts) <= F.NV                                                        # every non-box shape is closed: its own ceiling
+            u = F.uniforms(n=n, shape=shape)
+            xl, xr = F.chord(verts, float(u["nozzle_y"]))
+            assert xl < float(u["nozzle_x"]) - float(u["bar_half"]) and float(u["nozzle_x"]) + float(u["bar_half"]) < xr    # the inlet bar is inside the chord
+            assert float(u["nozzle_y"]) < max(ys)
