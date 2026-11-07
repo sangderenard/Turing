@@ -30,6 +30,8 @@ const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
 if (!gl) throw new Error("WebGL 2 is required");
 const $ = (id) => document.getElementById(id);
 const status = $("status");
+// [LOADING] the loading panel (loading_panel.js): gates a game on its server-built products; inert if the script did not load
+const loading = window.meowdokuLoading || { gate: async () => {}, whenReady: async () => {}, release() {}, initializing() {}, done() {} };
 
 // ---------------------------------------------------------------- matrices
 const M = {
@@ -6145,7 +6147,7 @@ function chessClockTick() {
 setInterval(chessClockTick, 100);
 const newGame = (payload) => {
   if (payload.game === "meowdoku" && $("palette").value) payload = { ...payload, palette: $("palette").value };
-  const step = chain.then(async () => { console.log("[meow] new", JSON.stringify(payload)); applyState(await api("/api/new", payload)); }).catch((e) => console.warn(e));
+  const step = chain.then(async () => { await loading.gate(payload.game, { predictor: state.predictorsLoaded }); /* [LOADING] */ console.log("[meow] new", JSON.stringify(payload)); applyState(await api("/api/new", payload)); }).catch((e) => console.warn(e));
   chain = step;
   return step;
 };
@@ -6933,6 +6935,7 @@ async function lifecycleResume() {
     fetch("/api/catalog").then((r) => r.json()),
   ]);
   state.assets = assets; state.catalog = catalog;
+  loading.initializing("GPU programs");                                                                             // [LOADING]
   // The scene's Phong program, extended for instancing (particle_styles.js extendForInstancing: the original main runs first,
   // unchanged; only the material particle style turns instancing on).  If the extension cannot be made or linked, the program
   // is the original and the material style says why it is not drawn.
@@ -6970,6 +6973,7 @@ async function lifecycleResume() {
                   uEmitUv: 4, uColorUv: 5, uDepthUv: 6, uRemitUv: 7, uFieldVolume: 8, uShadowMaps: 9, turing_ssbo_thermal_k: 10 };
   for (const [name, mesh] of Object.entries(assets.meshes)) state.meshes[name] = uploadMesh(roundMesh(mesh, roundParams.iters, roundParams.creaseDeg));
   // (the exported "mouse" mesh is not drawn: X marks are notes, not mice)
+  state.predictorsLoaded = loading.whenReady(["predictor"]).then(async () => {                                      // [LOADING] after the server built them
   try {
     pred.program = await TuringWasmProgram.load("motion.wasm", "motion.abi.json");
     // the engine's other laws the page runs (entity_motion.PREDICTORS)
@@ -7001,9 +7005,11 @@ async function lifecycleResume() {
     pred.walkDrive = await TuringWasmProgram.load("walkdrive.wasm", "walkdrive.abi.json");
     pred.walkRoute = await TuringWasmProgram.load("walkroute.wasm", "walkroute.abi.json");
   } catch (error) { console.warn("[meow] ship predictor unavailable; playing unpredicted", error); }
+  });                                                                                                               // [LOADING]
   // The autopilot policy network (policy_wasm.py): the MLP forward as a wasm
   // core with the live weights fed as its inputs.  Inspection only -- nothing
   // pilots with it.  window.meowdokuDebug.policy.evaluate(features) -> action[].
+  loading.whenReady(["policy"]).then(async () => {                                                                // [LOADING]
   try {
     const program = await TuringWasmProgram.load("policy.wasm", "policy.abi.json");
     const weights = await fetch("policy.weights.json").then((response) => response.json());
@@ -7016,6 +7022,7 @@ async function lifecycleResume() {
       },
     };
   } catch (error) { console.warn("[meow] autopilot policy unavailable", error); }
+  });                                                                                                               // [LOADING]
   // The traced graph products (graph_wasm.py): the bullet-hell law and the token
   // pilot as buffer-table wasm (TuringGraphProgram).  Inspection only -- the page
   // neither predicts nor pilots with them yet.
@@ -7025,6 +7032,7 @@ async function lifecycleResume() {
   // and a phone can take long (or fail) to compile and grow it -- awaiting it
   // here held the game pickers empty until it finished.
   (async () => {
+  await loading.whenReady(["graph"]);                                                                               // [LOADING]
   try {
     const law = await TuringGraphProgram.load("law.wasm", "law.abi.json");
     window.meowdokuDebug.lawWasm = {
@@ -7064,4 +7072,6 @@ async function lifecycleResume() {
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
-})().catch((error) => { status.textContent = String(error); console.error(error); });
+  chain.then(() => { loading.done(); loading.release("boot"); });                                                    // [LOADING] the first game is drawn
+  if (/[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
+})().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });
