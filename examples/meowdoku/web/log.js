@@ -1,7 +1,8 @@
 // [LOG] The log page: the server's text ring (/api/log) drawn as GLYPH MESHES in a small instanced scene -- the exported letter/digit
 // token meshes of assets.json (the ones the main page's Phong scene draws), lit by a Phong light.  Only the lines in view, and only the
 // characters on them, become instances; the text itself lives in plain JS strings.
-import { SOURCES, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms } from "./log_view.js";
+import { SOURCES, visibleRange, clampScroll, tailScroll, atTail, glyphFor, lineText, matches, searchTerms, groupKeys } from "./log_view.js";
+import { resetSettings, settingsKeys } from "./settings_reset.js";
 
 const $ = (id) => document.getElementById(id);
 const COLORS = { "client-error": [1.0, 0.48, 0.38], "fountain-diag": [0.42, 0.85, 1.0], "server": [0.62, 0.95, 0.55] };
@@ -199,6 +200,24 @@ $("local-clear").onclick = () => { localStorage.removeItem("meowdoku.locallog");
 window.addEventListener("storage", (ev) => { if (ev.key === "meowdoku.locallog") drawLocal(); });
 setInterval(drawLocal, POLL_MS);
 drawLocal();
+
+function showReset() {
+  const groups = groupKeys(settingsKeys());
+  const body = $("resetbody"); body.replaceChildren();
+  for (const [group, keys] of Object.entries(groups)) {
+    const h = document.createElement("h3"); h.textContent = `${group} (${keys.length})`; body.appendChild(h);
+    const p = document.createElement("p"); p.textContent = keys.join(" · "); body.appendChild(p);
+  }
+  if (!Object.keys(groups).length) body.textContent = "No saved settings to reset.";
+  $("reset").classList.add("open");
+}
+$("openreset").onclick = showReset;
+$("closereset").onclick = () => $("reset").classList.remove("open");
+$("resetsettings").onclick = () => {
+  const count = resetSettings();
+  $("resetstatus").textContent = `${count} settings cleared. Opening the game with defaults.`;
+  location.href = "index.html";
+};
 
 // ---------------------------------------------------------------- boot
 (async () => {

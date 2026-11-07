@@ -22,11 +22,16 @@
   .note { height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8b93a3; font-size: 12px; padding: 0 8px; }
   #local-lines { flex: 1; margin: 0; padding: 8px; overflow: auto; white-space: pre; font: 12px/1.45 ui-monospace, Consolas, monospace; color: #d8dde6; }
   .msg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #e88; font-size: 15px; display: none; text-align: center; }
+  #reset { position: fixed; inset: 0; background: rgba(8,10,14,.96); overflow: auto; padding: 14px; display: none; }
+  #reset.open { display: block; }
+  #reset table { border-collapse: collapse; margin: 6px 0 14px; } #reset td { border-bottom: 1px solid var(--line); padding: 3px 10px 3px 0; vertical-align: top; }
+  #reset code { color: #9bd; font-size: 12px; } #reset .danger { border-color: #a55; }
   @media (max-width: 760px) { #panes { flex-direction: column; } .pane { border-right: 0; border-bottom: 1px solid var(--line); } }
 </style>
 </head>
 <body>
-<div id="top"><strong>Log</strong><span style="color:#8b93a3">server window (the ring behind /api/log) and local window (this browser)</span></div>
+<div id="top"><strong>Log</strong><span style="color:#8b93a3">server window (the ring behind /api/log) and local window (this browser)</span>
+  <button id="openreset">Reset to defaults...</button></div>
 <div id="panes">
   <section class="pane" aria-label="server log"><div class="bar" id="bar"><strong>Server</strong><span id="srcs"></span>
     <input id="q" type="search" placeholder="search server" size="16" autocomplete="off">
@@ -39,6 +44,9 @@
     <button id="local-copy">Copy</button><button id="local-clear">Clear client log</button><span id="local-stats"></span></div>
     <pre id="local-lines" aria-live="polite"></pre></section>
 </div>
+<div id="reset"><button id="closereset">Close</button><h2>Reset site settings</h2>
+  <p>Clears this browser's saved display and game settings. Your player identity, session copy, and client log stay available.</p>
+  <div id="resetbody"></div><button id="resetsettings" class="danger">Reset settings and open game</button><p id="resetstatus" role="status"></p></div>
 <script type="module" src="log.js"></script>
 </body>
 </html>

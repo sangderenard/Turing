@@ -8,7 +8,8 @@ Writes ``build/meowdoku/web/``:
   Phong shader as Turing's ``glsl_project_ir`` compiled it for WebGL 2
   (copied from spectral-analyzer's generated shaders);
 - ``assets.json``: the three tile models (the glyph extrusions, flattened
-  positions and face normals, material index per role) and the material
+  positions and face normals, material index per role), the named material
+  catalogue, and the material
   storage tables (``pbr``, ``phong``, ``enamel``, ``texstack``) exactly as
   ``material_db.MaterialDatabase.build_tensors`` lays them out, which the
   compiled shader reads back through ``turing_ssbo_load_*``;
@@ -36,6 +37,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
 from meowdoku import tiles, tree  # noqa: E402
 from meowdoku.phong_tiles import PHONG_MATERIALS, LIGHTS, _spectral, glyph_mesh  # noqa: E402
+from meowdoku.material_catalog import MATERIAL_CATALOG  # noqa: E402
 from meowdoku.phong_tiles import token_mesh as _token_mesh  # noqa: E402
 from meowdoku.puzzle import generate_batch  # noqa: E402
 from meowdoku.tiles import SPECTRAL_ROOT  # noqa: E402
@@ -216,6 +218,7 @@ def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
     material_index = {role: db.register(f"meowdoku_{role}", PHONG_MATERIALS[role]) for role in PHONG_MATERIALS}
+    material_index.update({name: db.register(name, material) for name, material in MATERIAL_CATALOG.items()})
     tensors = db.build_tensors()
     tables = {
         "pbr": tensors["pbr"], "phong": tensors["phong_compat"],
@@ -370,6 +373,7 @@ def export_assets(out: Path) -> dict:
             print(f"[export] emoji mesh {kind['name']} skipped: {error}", flush=True)
     assets = {
         "meshes": meshes,
+        "material_index": material_index,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
                              "data": np.asarray(table, np.float32).reshape(-1).tolist()}
                       for name, table in tables.items()},
@@ -515,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
-    for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js"):
+    for name in ("index.html", "app.js", "marble_mesh.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
