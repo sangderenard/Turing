@@ -25,8 +25,8 @@
 <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · separate dyed and glass triangle surfaces</div></div>
 <aside><h1>Design a cat's-eye</h1><p>Turn a real glass shell around a dyed inclusion. Every surface uses the exported Pluck material tables and Phong shader.</p>
   <h2>Shape</h2><div class="grid">
-    <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="clear">Clear shell</option></select></label>
-    <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
+    <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="clear">No inner decoration</option></select></label>
+    <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
     <label>Outer material<select id="shell"></select></label>
     <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
     <label>Accent material<select id="accent"><option value="marble_milk_glass">Milk glass</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
@@ -41,6 +41,12 @@
     <label>Tip taper <output id="tip-out"></output><input id="tip" type="range" min="60" max="300" value="135"></label>
     <label>Ribbon flare <output id="flare-out"></output><input id="flare" type="range" min="0" max="60" value="18"></label>
     <label>Ribbon phase offset <output id="phase-out"></output><input id="phase" type="range" min="0" max="360" value="0"></label>
+    <label>Inclusion yaw <output id="orientation-yaw-out"></output><input id="orientation-yaw" type="range" min="-180" max="180" value="0"></label>
+    <label>Inclusion pitch <output id="orientation-pitch-out"></output><input id="orientation-pitch" type="range" min="-180" max="180" value="0"></label>
+    <label>Inclusion roll <output id="orientation-roll-out"></output><input id="orientation-roll" type="range" min="-180" max="180" value="0"></label>
+    <label>Tube count <output id="tube-count-out"></output><input id="tube-count" type="range" min="1" max="3" value="2"></label>
+    <label>Tube radius <output id="tube-radius-out"></output><input id="tube-radius" type="range" min="8" max="50" value="24"></label>
+    <label>Spiral turns <output id="tube-turns-out"></output><input id="tube-turns" type="range" min="100" max="400" value="220"></label>
     <button id="reroll" class="wide">Reroll dyed shape</button>
   </div>
   <h2>Outer shell</h2><div class="grid">

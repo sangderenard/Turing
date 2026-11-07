@@ -42,6 +42,14 @@ assert(detail.ribbons.length === 5, "high detail mesh keeps separate ribbons");
 const phase = catEyeMarble({glass:11,eye:12,accent:13},{ribbonPhase:Math.PI/2});
 assert(JSON.stringify(phase.interior[100][0]) !== JSON.stringify(mesh.interior[100][0]), "phase rotates ribbon geometry");
 assert(JSON.stringify(phase.glass[100][0]) === JSON.stringify(mesh.glass[100][0]), "phase leaves bare shell geometry unchanged");
+const direction=(face)=>face[1].map((x,k)=>x-face[0][k]);
+assert(direction(phase.interior[100]).every((x,k)=>Math.abs(x-direction(mesh.interior[100])[k])<1e-9),
+  "placement phase leaves ribbon local orientation unchanged");
+const oriented=catEyeMarble({glass:11,eye:12,accent:13},{orientationYaw:0.2,orientationPitch:0.15,orientationRoll:-0.1});
+assert(direction(oriented.interior[100]).some((x,k)=>Math.abs(x-direction(mesh.interior[100])[k])>1e-4),
+  "orthogonal orientation controls rotate actual inclusion triangles");
+assert(oriented.glass.every((f,i)=>JSON.stringify(f[0])===JSON.stringify(mesh.glass[i][0])),
+  "inclusion orientation leaves shell unchanged");
 const decorated = catEyeMarble({glass:11,eye:12,accent:13,enamel:14,confetti:15,paintA:16,paintB:17},
   {kind:"hybrid",confettiCount:100,enamelCoverage:0.3,paintBandCount:7,seed:42});
 assert(decorated.confetti.length === 100 && decorated.ribbons.length === 3, "hybrid has discrete confetti and ribbons");
@@ -58,4 +66,19 @@ const analyticInertia=0.4*analyticMass*0.01**2;
 assert(Math.abs(clearMass.inertiaKgM2[0][0]/analyticInertia-1)<0.02,"tetrahedral rotational inertia approaches analytic sphere");
 const hybridMass=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enamelMaterial:14,enamelThicknessM:300e-9});
 assert(hybridMass.massKg>clearMass.massKg && hybridMass.components.length===decorated.ribbons.length+decorated.confetti.length+2,"inclusions and coating contribute mass");
+for(const kind of ["spiral","rings"]) {
+  const design=catEyeMarble({glass:11,eye:12,accent:13},{kind,tubeCount:2});
+  assert(design.tubes.length===2 && design.interior.length>1000,`${kind} consists of triangulated tubes`);
+  for(const tube of design.tubes) {
+    const faces=design.interior.slice(tube.start,tube.start+tube.count);
+    assert(volume(faces)>0,`${kind} tube encloses positive volume`);
+    assert(faces.every((face)=>face.slice(0,3).every((p)=>Math.hypot(...p)<0.96)),`${kind} tube stays within shell`);
+  }
+  const properties=marbleMass(design,{radiusM:0.01,densityByRole:densities});
+  assert(properties.components.length===3 && properties.massKg>0,`${kind} tubes contribute to mass`);
+}
+const confettiOnly=catEyeMarble({glass:11,eye:12,accent:13,confetti:15},{kind:"confetti",confettiCount:500,seed:19});
+assert(confettiOnly.confetti.length===500,"uniform fill packs 500 closed chips");
+assert(confettiOnly.confetti.every((a,i)=>confettiOnly.confetti.slice(i+1).every((b)=>
+  Math.hypot(...a.center.map((x,k)=>x-b.center[k]))>0.027)),"confetti chip centers remain separated");
 console.log(`PASS cat's-eye marble: ${mesh.interior.length} inclusion and ${mesh.glass.length} shell triangles`);
