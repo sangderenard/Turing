@@ -492,8 +492,11 @@ def prepare_fountain(web_dir: Path) -> None:
             routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
             print(f"[meowdoku] fountain WebGPU products ready ({routes}; {time.perf_counter() - started:.1f}s); "
                   f"CPU fallbacks follow in the background", flush=True)
-        fountain_build.build(web_dir, on_gpu_ready=gpu_ready)
-        print(f"[meowdoku] fountain CPU fallbacks ready ({time.perf_counter() - started:.1f}s)", flush=True)
+        # MEOWDOKU_FOUNTAIN_WASM=0 skips the CPU (wasm) fallbacks entirely: WebGPU products only (a rushed deploy)
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        fountain_build.build(web_dir, wasm=wasm, on_gpu_ready=gpu_ready)
+        print(f"[meowdoku] fountain CPU fallbacks {'ready' if wasm else 'skipped (MEOWDOKU_FOUNTAIN_WASM=0)'} "
+              f"({time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
