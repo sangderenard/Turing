@@ -43,6 +43,11 @@ PHYSICS
 * GRAVITY is a vector, a RUNTIME INPUT (``grav_x``, ``grav_y``, default ``(0, -G)``), as are the basin's numbers: a phone's
   tilt turns it moment by moment with no rebuild.  ``lid`` (a ceiling at that height, off by default) keeps grains in the
   basin when gravity points up.  The inputs enter the law as plain additions, so the default is bit for bit the old law.
+* The 3-D law's TUNABLES, implemented as it implements them (uniforms; hashed noise and hashed sizes, no per-id column; every one
+  exactly neutral at its default): contact stiffness ``omega`` and the Hertz blend, cohesion, spin drag, a Langevin THERMOSTAT ``temp``
+  (hashed deterministic noise; the measured T = ke / (1.5 n_live)), nozzle speed and rate, the neighbour cap ``k_run`` (with the
+  ``n_drop`` readout), the per-species rolling roughness and size irregularity, and the lognormal / bidisperse size distributions.
+  ONE FLUID (``fl_rho``, ``fl_mu``; ``FLUIDS``: air / water / glycerine / custom) drives the drag, the buoyancy AND the orbeez uptake.
 * DIAGNOSTICS: the law reduces, by a fixed tree of additions, the kinetic +
   rotational energy, the largest speed, and the number of ids that are not
   finite / outside the walls / parked / live, plus the contacts the neighbour
@@ -57,7 +62,7 @@ pairs are unique, so the order is unique and nothing about thread scheduling
 can change it).  ``P`` is the id count rounded up to a power of two; the
 extra ids are parked forever.  Each of the three rows of the 3x3 block is a
 run of the sorted cells found by two binary searches (gathers); the contact
-loop walks the first ``K_RUN`` of each run.  No atomics and no scatter.
+loop walks the first ``k_run`` (at most ``K_RUN_MAX``) of each run.  No atomics and no scatter.
 
 COLOUR
 ------
@@ -94,10 +99,16 @@ EMIT_SPAN = 6.0                        # seconds over which ids are emitted
 SETTLE = {"sample": 30, "hold_samples": 12, "relative": 0.01, "ke_per_id": 1.0e-7, "speed": 0.25, "max_seconds": 40.0}
 DT = 1.0 / 360.0
 G = 1.0
-OMEGA = 150.0                          # contact stiffness: kn = m * OMEGA^2 (OMEGA * DT stays well under 1: a grain feels several contacts)
+OMEGA = 150.0                          # default contact stiffness: kn = m_eff * omega^2 (omega * DT stays well under 1: a grain feels several contacts)
+OMEGA_MAX = 200.0                      # the CFL bound at one contact blend: omega * DT * sqrt(contacts) stays under 2
 ZETA = 0.7                             # normal damping ratio
 VREF = 0.02                            # tangential slip speed over which friction saturates
-SPIN_DRAG = 3.0                        # 1/s
+WREF = 2.0                             # relative spin (rad/s) over which rolling resistance saturates
+SPIN_DRAG = 3.0                        # default spin drag, 1/s
+TEMP_MAX = 3.0e-4                      # the hottest kT the page offers (a disk of mass 2.5e-4 then moves at ~1.5 rms; the slider is logarithmic)
+TEMP_MIN_LOG = 1.0e-8                  # the coldest non-zero kT on the page's logarithmic slider
+HERTZ_REF = 0.04                       # the overlap (in mean radii) at which the Hertz and linear springs agree
+COH_RANGE = 0.1                        # adhesion acts to this gap (in mean radii)
 STRATA = 1.0                           # default hue cycles over the emission in mode 2 (time strata); a runtime uniform ``strata``
 #: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
 STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
@@ -106,7 +117,8 @@ PARTICLE_STYLES = (("points", "points"), ("liquid", "liquid"), ("sand", "sand"),
                    ("stamp", "stamp (memory)"))
 # the page's noise-filter replacement modes (web/noise_filter.js NOISE_MODES -- a test holds the two lists equal)
 NOISE_MODES = (("mean", "mean colour"), ("spectral", "spectral class"))
-K_RUN = 24                             # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one)
+K_RUN_MAX = 24                         # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one): the compile-time maximum of the runtime uniform ``k_run``
+K_RUN = 24                             # its default
 ARMED = -1.0e9                         # the vy of an id waiting at its nozzle slot (see ``fountain_step``)
 EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
 #: The share of a contact's slip that ONE step's friction may remove.  Coulomb friction is regularised with a tanh whose slope
@@ -132,7 +144,7 @@ CELL = 2.0 * max(s[1] for s in SPECIES)
 #: default is the old law bit for bit: radius ``rscale``, friction ``fscale``, density ``dscale``, damping ratio ``zscale``
 #: (restitution), and the ORBEEZ pair ``swell`` (growth rate, fraction of the initial radius per second, 0 = does not swell)
 #: and ``swmax`` (largest radius, as a multiple of the initial one).  ``cell_scale`` multiplies CELL (the grid cell, 2 x the
-#: largest radius a grain can reach), ``solvent`` in [0, 1] is the fluid present for swelling (air 0, water 1).
+#: largest radius a grain can reach).  The FLUID (``fl_rho``, ``fl_mu``) drives the drag, the buoyancy AND the swelling (``FLUIDS``).
 RSCALE_RANGE = (0.1, 10.0)             # radius: 0.1x to 10x each species' default (log scale on the page)
 MU_RANGE = (0.0, 2.0)                  # sliding friction: frictionless to very sticky
 RESTITUTION_RANGE = (0.02, 0.95)
@@ -140,8 +152,17 @@ DENSITY_RANGE = (0.2, 5.0)
 SWELL_RATE_MAX = 0.5                   # 1/s
 SWELL_MAX_RATIO = 4.0
 FULL_COORDINATION = 6.0                # contacts of a grain with no open surface (a hex pack); exposure = 1 - contacts / this
-SOLVENTS = {"air": 0.0, "water": 1.0, "glycerine": 0.5}
-SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax")
+#: Interstitial fluids: name -> (density relative to a grain of density 1, viscosity in the sim's units) -- the 3-D law's table.  Sim
+#: units: grain density 1, g = 1, grain radius ~0.01 (Stokes damping rate of a grain = 4.5 mu / (rho r^2): water 1.4 /s, glycerine 11 /s).
+#: AIR is (0, 0) here, not the 3-D law's (0.0005, 3e-6): the 2-D species' own linear drag (``SPECIES``, 0.04-0.25 /s) already IS the
+#: air, so "air" adds nothing and the default is the old law bit for bit; water and glycerine add the fluid's drag and buoyancy on top.
+#: The SAME fluid sets the ORBEEZ uptake (the law's ``solvent``): a liquid soaks a swelling grain (WET_RHO), a viscous one more slowly (WET_MU).
+FLUIDS = {"air": (0.0, 0.0), "water": (0.38, 2.5e-5), "glycerine": (0.48, 2.0e-4)}
+DEFAULT_FLUID = "air"
+WET_RHO = 0.38                         # a fluid at least this dense (water) fills a swelling grain's pores entirely; a thinner one proportionally less (air 0)
+WET_MU = 1.0e-4                        # up to this viscosity the uptake is not rate-limited; above it the uptake falls as WET_MU / mu (glycerine: 1/2)
+SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax", "roll", "irr")
+DOF = 3                                # a disk's degrees of freedom (x, y, spin), kT / 2 each: the measured temperature's divisor (the 3-D sphere has 6)
 NV = 8                                 # polygon vertices (uniforms px0..px7, py0..py7)
 SHAPES = ("box", "funnel", "hexagon", "ramp")       # box: the old basin (the three planes); the others add the polygon walls
 POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
@@ -172,14 +193,16 @@ SDF_UNIFORMS = ("sdf_on",) + tuple(f"q{k}{f}" for k in range(SDF_SLOTS) for f in
 STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
 UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata",   # the run, its basin, the RUNTIME INPUTS, then the colour rate
-            "cell_scale", "solvent", "case_omega", "case_domega", "pivot_x", "pivot_y") + POLYGON_UNIFORMS + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4)) + SDF_UNIFORMS
+            "cell_scale", "fl_rho", "fl_mu", "omega", "hertz", "coh", "spin_drag", "temp", "k_run", "nozzle_speed", "emit_scale",
+            "lognormal", "bi_ratio", "bi_frac", "case_omega", "case_domega", "pivot_x", "pivot_y") + POLYGON_UNIFORMS + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4)) + SDF_UNIFORMS
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
 #: the lid still meet each other.  The server sends their defaults (and the closed values as ``tilt_inputs``); the page's
 #: runtime owns them after that.
-RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "solvent", "case_omega", "case_domega") + tuple(
-    f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax") for s in range(4))      # the radius (and so the grid) is fixed when a run starts
+RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "fl_rho", "fl_mu", "omega", "hertz", "coh", "spin_drag", "temp", "k_run", "nozzle_speed",
+                  "case_omega", "case_domega") + tuple(
+    f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax", "roll") for s in range(4))      # the radius, its spread and the emission rate (so the grid) are fixed when a run starts
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -345,6 +368,35 @@ def _mix(pid, a, c):
     return (r1 + r2 * (1.0 / _PRIME)) * (1.0 / _PRIME)
 
 
+def _lin_t(pid, a):
+    """``pid * a mod 4093`` for a pid up to 2**24 and a RUNTIME multiplier ``a`` < 4093 (4096 = 3 mod 4093)."""
+    hi = (pid * (1.0 / 4096.0)).floor()
+    lo = pid - hi * 4096.0
+    return _mod(_mod(lo * a, _PRIME) + _mod(hi * _mod(a * 3.0, _PRIME), _PRIME), _PRIME)
+
+
+def _mix_t(pid, a, c):
+    """``_mix`` with a runtime multiplier ``a`` and offset ``c`` (exact in f32 and f64 like ``_mix``)."""
+    r1 = _mod(_lin_t(pid, a) + c, _PRIME)
+    r1 = _mod(r1 * r1 + 3.0 * r1 + 11.0, _PRIME)
+    r2 = _mod(_lin_t(pid, a + 6.0) + 2.0 * c + 1.0, _PRIME)
+    r2 = _mod(r2 * r2 + 5.0 * r2 + 13.0, _PRIME)
+    return (r1 + r2 * (1.0 / _PRIME)) * (1.0 / _PRIME)
+
+
+def _noise(pid, step, comp):
+    """A zero-mean, unit-variance random number that is a PURE FUNCTION of (id, step, component): the sum of two hashed
+    uniforms (triangular, variance 1/6, scaled).  No generator state: a replay from any step repeats it bit for bit.  ``step``
+    is a whole number below 2**24 (the run's step count), ``comp`` a Python integer.  (The 3-D law's, verbatim.)"""
+    hi = (step * (1.0 / 4093.0)).floor()
+    lo = step - hi * 4093.0
+    a1 = 1.0 + 2.0 * _mod(hi * 7.0 + comp * 131.0 + 17.0, 1999.0)
+    c1 = _mod(lo * 31.0 + comp * 977.0 + 5.0, _PRIME)
+    a2 = 1.0 + 2.0 * _mod(hi * 11.0 + comp * 173.0 + 29.0, 1999.0)
+    c2 = _mod(lo * 37.0 + comp * 811.0 + 3.0, _PRIME)
+    return (_mix_t(pid, a1, c1) + _mix_t(pid, a2, c2) - 1.0) * 2.449489742783178
+
+
 # ------------------------------------------------------------------ the law
 def _ramp(h, offset):
     """One channel of the HSV ramp at hue ``h`` in [0, 1] (full saturation, value)."""
@@ -353,14 +405,26 @@ def _ramp(h, offset):
     return ((f * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0)
 
 
-def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu, zeta=ZETA):
-    """Force and torque on the particle from one contact (``delta`` > 0 overlap,
-    ``n`` the unit normal pointing at THIS particle, ``vr`` its velocity relative
-    to the other body, ``spin_slip`` the spin part of the contact slip).  Returns
-    (fx, fy, tangential force); torque = -radius * the third value."""
+def _contact(delta, weight, gap, nx, ny, vrx, vry, spin_slip, wrel, kn, m_eff, mu, zeta, roll, reff, rbar, hertz, coh):
+    """Force and torque on the particle from one contact (the 3-D law's contact, in the plane).  ``delta`` > 0 is the overlap
+    (already weighted: 0 for a contact that does not exist), ``weight`` the contact's weight (0 or 1 for a pair; a wall's share),
+    ``gap`` the UNWEIGHTED overlap (< 0 apart: the adhesion reaches to ``COH_RANGE`` mean radii), ``n`` the unit normal pointing at
+    THIS particle, ``vr`` its velocity relative to the other body, ``spin_slip`` the spin part of the contact slip, ``wrel`` the
+    relative spin w_i - w_j, ``reff`` the effective radius of the rolling contact, ``rbar`` the mean radius.  Returns
+    (fx, fy, tangential force, rolling torque); the friction torque = -radius * the third value.
+
+    Normal: a spring blended from linear to Hertz by ``hertz`` (the Hertz force equals the linear one at HERTZ_REF mean radii of
+    overlap; past 4x that the blend stays linear), a dashpot of damping ratio ``zeta``, minus an adhesion of ``coh`` weights of the
+    pair within COH_RANGE (acts apart as well as touching).  Tangential: Coulomb friction limited to a share of the slip per step.
+    Rolling: a constant torque against the relative spin, limited the same way (a disk's 1/2 m r^2)."""
     vn = vrx * nx + vry * ny
     cn = 2.0 * zeta * (kn * m_eff).sqrt()
-    fn = (kn * delta - cn * vn).clamp(0.0, 1.0e9)
+    over = delta.clamp(0.0, 1.0e9)
+    xr = (over * (1.0 / (HERTZ_REF * rbar + 1.0e-12))).clamp(0.0, 4.0)
+    elastic = kn * over * ((1.0 - hertz) + hertz * xr.sqrt())
+    rep = (elastic - cn * vn).clamp(0.0, 1.0e9) * as_float(delta > 0.0)
+    near = as_float(gap > -COH_RANGE * rbar)
+    fn = rep - coh * (m_eff * G) * near * weight
     tx, ty = -ny, nx
     vt = vrx * tx + vry * ty - spin_slip
     # tanh of the slip speed over VREF.  An emitted grain meets the plume at ~1.5 m/s, so the argument
@@ -368,10 +432,17 @@ def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu, zeta=ZETA):
     # |x| ~ 44 in f32, and one NaN force removes the grain and every grain it touches.  tanh(20) is 1
     # to 1e-17, so clamping the argument changes no f64 result and keeps every f32 lane finite.
     tanh = (vt * (1.0 / VREF)).clamp(-20.0, 20.0).tanh()
-    coulomb = mu * fn * tanh.abs()
+    coulomb = mu * rep * tanh.abs()
     stick = (FRICTION_SHARE / (3.0 * DT)) * m_eff * vt.abs()          # the most that removes FRICTION_SHARE of the slip in one step
     ft = -(coulomb - (coulomb - stick).clamp(0.0, 1.0e30)) * (vt / (vt.abs() + 1.0e-30))
-    return fn * nx + ft * tx, fn * ny + ft * ty, ft
+    # rolling resistance: against the relative spin, at most ``roll`` x the repulsion x the effective radius, and no more than removes
+    # FRICTION_SHARE of the relative spin in one step (in the contact's spin mass 1/2 m_eff rbar^2).  roll = 0: exact zeros.
+    wtn = (wrel * wrel + 1.0e-20).sqrt()
+    tanh_r = (wtn * (1.0 / WREF)).clamp(0.0, 20.0).tanh()
+    r_max = roll * rep * reff * tanh_r
+    r_stick = (FRICTION_SHARE / DT) * (0.5 * m_eff * rbar * rbar) * wtn
+    r_mag = r_max - (r_max - r_stick).clamp(0.0, 1.0e30)
+    return fn * nx + ft * tx, fn * ny + ft * ty, ft, -(r_mag / wtn) * wrel
 
 
 def _cap(v, hi):
@@ -537,7 +608,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
     active = int(n if active is None else active)
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
-    emit_rate = EMIT_SPAN / float(active)
+    emit_period = EMIT_SPAN / float(active)           # at nozzle rate 1; the runtime uniform ``emit_scale`` (1 / rate) stretches it
     scan_shifts = reduction_shifts(n)
 
     def fountain_step(*args):
@@ -547,7 +618,15 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
             a[k] for k in ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata"))
-        solvent = a["solvent"]
+        # the tunables the 3-D law has, implemented as it implements them (hashed noise, hashed sizes, no per-id column): all are
+        # uniforms, and at their neutral values (hertz = coh = temp = fl_rho = fl_mu = roll = irr = 0, lognormal = 0, bi_ratio = 1,
+        # nozzle_speed = emit_scale = 1, omega = 150, spin_drag = 3, k_run = 24) every term below is an exact 1 or 0: the old law bit for bit
+        omega, hertz, coh, spin_drag, temp = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "temp"))
+        fl_rho, fl_mu, k_run, nozzle_speed = (a[k] for k in ("fl_rho", "fl_mu", "k_run", "nozzle_speed"))
+        lognormal, bi_ratio, bi_frac = a["lognormal"], a["bi_ratio"], a["bi_frac"]
+        # the ORBEEZ solvent IS the fluid: the uptake is the fraction of a swelling grain's pores the fluid fills (its density over
+        # WET_RHO, 1 at most: air 0, water 1) times the rate limit of its viscosity (1 up to WET_MU, then WET_MU / mu: glycerine 1/2)
+        solvent = (fl_rho * (1.0 / WET_RHO)).clamp(0.0, 1.0) * (WET_MU / (fl_mu + 1.0e-12)).clamp(0.0, 1.0)
         # the CASE FRAME: the walls are static in the frame the law runs in, and the case turns at ``case_omega`` (rad/s, about
         # the pivot, counterclockwise positive) with angular acceleration ``case_domega``.  A grain feels, besides gravity
         # (which the page rotates), the fictitious accelerations  -2 w x v  (Coriolis: applied as an exact rotation of the
@@ -556,6 +635,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         case_omega, case_domega = a["case_omega"], a["case_domega"]
         cell = CELL * a["cell_scale"]
         cells = cols * rows
+        emit_rate = emit_period * a["emit_scale"]
 
         def tab(name):
             return [a[f"{name}{s}"] for s in range(4)]
@@ -636,13 +716,13 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 ends.append(lo)
             runs.append((ends[0], ends[1], ok))
             # candidates beyond the walk's reach are DROPPED contacts: counted (the law's dropped output), never silent
-            dropped = dropped + (ends[1] - ends[0] - float(K_RUN)).clamp(0.0, 1.0e9) * ok * searching
+            dropped = dropped + (ends[1] - ends[0] - k_run).clamp(0.0, 1.0e9) * ok * searching
         t_emit = AbstractTensor.where(pid < float(active), pid * emit_rate, pid * 0.0 + 1.0e9)
         # ---- the rest of what this id is, derived again HERE (not before the sort: a value that crosses
         # the sort's dispatches would hold an arena slot for all of them)
         x0, y0 = _nozzle(pid, bar_half, nozzle_y)
         theta = (_mix(pid, 1759.0, 17.0) * 2.0 - 1.0) * 0.7
-        speed = 0.9 + _mix(pid, 2203.0, 29.0) * 0.7
+        speed = (0.9 + _mix(pid, 2203.0, 29.0) * 0.7) * nozzle_speed
         vx0 = speed * theta.sin()
         vy0 = speed * theta.cos()
         u = _mix(pid, 1237.0, 5.0)
@@ -655,7 +735,20 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         # the species table: the default (compile-time) value times the runtime multiple (exactly 1 by default)
         radius0 = (SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * is1 + (SPECIES[2][1] - SPECIES[0][1]) * is2
                    + (SPECIES[3][1] - SPECIES[0][1]) * is3) * pick4(tab("rscale"), is1, is2, is3)
-        density = (SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * is1 + (SPECIES[2][2] - SPECIES[0][2]) * is2
+        # the SIZE DISTRIBUTION, a hash of the id (the 3-D law's, verbatim): the species' mean radius times a spread factor (uniform:
+        # 1 + irr u, u in [-1, 1); lognormal: exp(irr z - irr^2 / 2), z a unit normal clamped at 3 sigma, so the mean stays 1) times the
+        # bidisperse mode's factor (a ``bi_frac`` share of the grains are sqrt(bi_ratio) larger, the rest as much smaller; ratio 1 is
+        # exactly 1).  Each is an exact 1.0 when off.  A grain's radius is fixed at its placement (``rs``), so the neighbours read it from the state.
+        size_u = _mix(pid, 2999.0, 61.0)
+        size_z = ((size_u + _mix(pid, 3511.0, 43.0) - 1.0) * 2.449489742783178).clamp(-3.0, 3.0)
+        spread = pick4(tab("irr"), is1, is2, is3)
+        size_f = (1.0 - lognormal) * (1.0 + spread * (size_u * 2.0 - 1.0)) + lognormal * (spread * size_z - 0.5 * spread * spread).exp()
+        big = as_float(_mix(pid, 3733.0, 71.0) < bi_frac)
+        bi_sq = bi_ratio.sqrt()
+        bi_f = 1.0 + big * (bi_sq - 1.0) + (1.0 - big) * (1.0 / bi_sq - 1.0)
+        radius0 = radius0 * size_f * bi_f
+        roll = pick4(tab("roll"), is1, is2, is3)
+        density =(SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * is1 + (SPECIES[2][2] - SPECIES[0][2]) * is2
                    + (SPECIES[3][2] - SPECIES[0][2]) * is3) * pick4(tab("dscale"), is1, is2, is3)
         mu = (SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * is1 + (SPECIES[2][3] - SPECIES[0][3]) * is2
               + (SPECIES[3][3] - SPECIES[0][3]) * is3) * pick4(tab("fscale"), is1, is2, is3)
@@ -680,13 +773,13 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             muj = (SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * j1 + (SPECIES[2][3] - SPECIES[0][3]) * j2
                    + (SPECIES[3][3] - SPECIES[0][3]) * j3) * pick4(tab("fscale"), j1, j2, j3)
             rsj = rs.index_select(0, j)
-            rj = AbstractTensor.where(rsj > 0.0, rsj, rj0)           # the neighbour's current radius
-            return rj, dj * math.pi * rj * rj, muj, pick4(tab("zscale"), j1, j2, j3)
+            rj = AbstractTensor.where(rsj > 0.0, rsj, rj0)           # the neighbour's current radius (every gridded id is placed: rs > 0)
+            return rj, dj * math.pi * rj * rj, muj, pick4(tab("zscale"), j1, j2, j3), pick4(tab("roll"), j1, j2, j3)
 
         for lo, hi, ok in runs:
-            for slot in range(K_RUN):
+            for slot in range(K_RUN_MAX):
                 idx = lo + float(slot)
-                valid = as_float(idx < hi) * ok * searching
+                valid = as_float(idx < hi) * ok * searching * as_float(k_run > float(slot) + 0.5)
                 j = ki.index_select(0, idx.clamp(0.0, top))
                 valid = valid * as_float((j - pid).abs() > 0.5)
                 armed_j = as_float(vy.index_select(0, j) < ARMED * 0.5)         # an armed neighbour is a slot, not a body
@@ -695,7 +788,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 vxj = vx.index_select(0, j)
                 vyj = vy.index_select(0, j)
                 wj = w.index_select(0, j)
-                rj, mj, muj, zscj = neighbour_props(j)
+                rj, mj, muj, zscj, rollj = neighbour_props(j)
                 # coincident centres (two ids at one point) have no contact normal; they are pushed apart
                 # along a direction fixed by the ids (antisymmetric, so equal and opposite) instead of
                 # dividing a zero separation
@@ -704,7 +797,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 dx = x - xj + same * side * 1.0e-4
                 dyy = y - yj
                 dist = (dx * dx + dyy * dyy + 1.0e-12).sqrt()
-                delta = (radius + rj - dist) * valid * (1.0 - armed_j)
+                weight = valid * (1.0 - armed_j)
+                gap = radius + rj - dist
+                delta = gap * valid * (1.0 - armed_j)
                 touch = as_float(delta > 0.0)
                 # an armed id is emitted only into a CLEAR slot: no live neighbour, at the position it moves to this
                 # step, within the contact distance (plus EMIT_MARGIN): the grain is placed overlapping nothing
@@ -718,44 +813,39 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 nx = dx / dist
                 ny = dyy / dist
                 m_eff = mass * mj / (mass + mj)
-                kn = OMEGA * OMEGA * m_eff
-                gx, gy, gt = _contact(delta, nx, ny, vx - vxj, vy - vyj, radius * w + rj * wj, kn, m_eff,
-                                      (mu * muj).sqrt(), ZETA * (zsc * zscj).sqrt())
+                kn = omega * omega * m_eff
+                gx, gy, gt, gr = _contact(delta, weight, gap, nx, ny, vx - vxj, vy - vyj, radius * w + rj * wj, w - wj, kn, m_eff,
+                                          (mu * muj).sqrt(), ZETA * (zsc * zscj).sqrt(), (roll * rollj).sqrt(),
+                                          radius * rj / (radius + rj), 0.5 * (radius + rj), hertz, coh)
                 ncont = ncont + touch
-                fx = fx + gx * touch
-                fy = fy + gy * touch
-                tq = tq - radius * gt * touch
+                fx = fx + gx          # a contact that does not exist writes an exact zero (its repulsion is masked); adhesion acts apart too
+                fy = fy + gy
+                tq = tq - radius * gt * touch + gr
         # ---- walls and floor: the same contact against a body of infinite mass
-        kw = OMEGA * OMEGA * mass
-        floor_delta = (radius - (y - FLOOR_Y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(floor_delta, y * 0.0, y * 0.0 + 1.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-        touch = as_float(floor_delta > 0.0)
-        ncont = ncont + touch
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        left_delta = (radius - (x + half)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(left_delta, y * 0.0 + 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-        touch = as_float(left_delta > 0.0)
-        ncont = ncont + touch
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
-        right_delta = (radius - (half - x)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(right_delta, y * 0.0 - 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-        touch = as_float(right_delta > 0.0)
-        ncont = ncont + touch
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
+        kw = omega * omega * mass
+        walls = [fx, fy, tq, ncont]
+
+        def wall(delta, weight, gap, nx_, ny_):
+            """The contact of this grain with a wall (a body of infinite mass at rest; the grain's own radius is the mean and effective
+            radius), accumulated into ``fx, fy, tq, ncont``: the repulsion exists only where the grain overlaps (``delta`` > 0), the
+            adhesion (``coh``) also within COH_RANGE of it."""
+            gx_, gy_, gt_, gr_ = _contact(delta, weight, gap, nx_, ny_, vx, vy, radius * w, w, kw, mass, mu, ZETA * zsc, roll,
+                                          radius, radius, hertz, coh)
+            touch_ = as_float(delta > 0.0)
+            walls[3] = walls[3] + touch_
+            walls[0] = walls[0] + gx_
+            walls[1] = walls[1] + gy_
+            walls[2] = walls[2] - radius * gt_ * touch_ + gr_
+
+        gap = radius - (y - FLOOR_Y)
+        wall(gap.clamp(0.0, 1.0e9) * live, live, gap, y * 0.0, y * 0.0 + 1.0)
+        gap = radius - (x + half)
+        wall(gap.clamp(0.0, 1.0e9) * live, live, gap, y * 0.0 + 1.0, y * 0.0)
+        gap = radius - (half - x)
+        wall(gap.clamp(0.0, 1.0e9) * live, live, gap, y * 0.0 - 1.0, y * 0.0)
         # the lid: the same contact against a ceiling at the runtime height ``lid`` (a body of infinite mass; far away unless the page closes it)
-        lid_delta = (radius - (lid - y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(lid_delta, y * 0.0, y * 0.0 - 1.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-        touch = as_float(lid_delta > 0.0)
-        ncont = ncont + touch
-        fx = fx + gx * touch
-        fy = fy + gy * touch
-        tq = tq - radius * gt * touch
+        gap = radius - (lid - y)
+        wall(gap.clamp(0.0, 1.0e9) * live, live, gap, y * 0.0, y * 0.0 - 1.0)
         # the POLYGON walls (a shape other than the box): THICK, SIDED, OVERLAPPING half-spaces, the same contact law.  Each
         # segment's normal is its LEFT normal (the chamber on the left as the polyline runs), so a grain on the wrong side of a
         # line is pushed back, never out; the penetration the spring feels saturates at 6 radii (a bounded force); the segment
@@ -774,56 +864,67 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             w_start = ((along + ext) * (1.0 / ext)).clamp(0.0, 1.0)
             w_end = ((seg_len + ext - along) * (1.0 / ext)).clamp(0.0, 1.0)
             share = as_float(len2 > 1.0e-8) * w_start * w_end
-            seg_delta = _cap(radius - side_s, 6.0 * radius).clamp(0.0, 1.0e9) * live * share
-            gx, gy, gt = _contact(seg_delta, y * 0.0 + nlx, y * 0.0 + nly, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-            touch = as_float(seg_delta > 0.0)
-            ncont = ncont + touch
-            fx = fx + gx * touch
-            fy = fy + gy * touch
-            tq = tq - radius * gt * touch
+            gap = _cap(radius - side_s, 6.0 * radius)
+            wall(gap.clamp(0.0, 1.0e9) * live * share, live * share, gap, y * 0.0 + nlx, y * 0.0 + nly)
         # the SDF walls (``sdf_on`` = 1): the SAME thick sided saturating contact against the composed analytic chamber SDF.  Contact when
         # d < radius, the penetration (radius - d) saturating at 6 radii, the force along the SDF's analytic gradient (into the fluid): a
         # grain on the wrong side of a wall is pushed back by a bounded force, never clamped or moved.  sdf_on = 0: exact zeros.
         sdf_on = a["sdf_on"]
         if sdf:
             d_sdf, sdf_nx, sdf_ny = sdf_field(x, y, lambda k, field: a[f"q{k}{field}"])
-            sdf_delta = _cap(radius - d_sdf, 6.0 * radius).clamp(0.0, 1.0e9) * live * sdf_on
-            gx, gy, gt = _contact(sdf_delta, sdf_nx, sdf_ny, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
-            touch = as_float(sdf_delta > 0.0)
-            ncont = ncont + touch
-            fx = fx + gx * touch
-            fy = fy + gy * touch
-            tq = tq - radius * gt * touch
+            gap = _cap(radius - d_sdf, 6.0 * radius)
+            wall(gap.clamp(0.0, 1.0e9) * live * sdf_on, live * sdf_on, gap, sdf_nx, sdf_ny)
             sdf_gone = live * sdf_on * as_float(d_sdf < -radius)       # the grain centre is more than a radius on the wrong side
         else:
             sdf_gone = x * 0.0
+        fx, fy, tq, ncont = walls
         # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
-        # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.
+        # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.  The FLUID's drag (Stokes 6 pi mu r v and
+        # quadratic, as the 3-D law) is implicit, so any viscosity damps and none explodes, and it buoys the grain (gravity x (1 - fluid / grain
+        # density)); the species' own linear ``drag`` (the air) stays explicit as it was.
         just = pending * as_float(blocked < 0.5)
         place = just + arming
         inertia = 0.5 * mass * radius * radius
+        buoy = 1.0 - fl_rho / density
+        speed_now = (vx * vx + vy * vy).sqrt()
+        kdrag = 4.5 * fl_mu / (density * radius * radius) + 0.176 * fl_rho / (density * radius) * speed_now
+        damp = 1.0 / (1.0 + live * kdrag * DT)
+        # THERMOSTAT (Langevin), the 3-D law's: a random force per component of variance 2 gamma m kT / DT, with gamma the drag rate
+        # (the species' air plus the fluid's, just added: fluctuation-dissipation), so the grain's velocity relaxes to a Maxwell
+        # distribution of temperature kT; the factor sqrt(1 + gamma DT / 2) makes the implicit drag's stationary variance exactly kT / m.
+        # The same for the spin (its rate: the spin drag plus the fluid's rotational Stokes drag).  The noise is a pure hash of (id, step,
+        # component), so a replay repeats it; at kT = 0 every term is an exact zero.  A disk has three degrees of freedom (x, y, spin).
+        gamma_t = drag + kdrag
+        gamma_f = 10.0 * fl_mu / (density * radius * radius)
+        gamma_r = spin_drag + gamma_f
+        step_now = (age * (1.0 / DT) + 0.5).floor()
+        f_amp = (2.0 * gamma_t * mass * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * gamma_t * DT).sqrt()
+        q_amp = (2.0 * gamma_r * inertia * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * gamma_r * DT).sqrt()
+        fx = fx + f_amp * _noise(pid, step_now, 0)
+        fy = fy + f_amp * _noise(pid, step_now, 1)
+        tq = tq + q_amp * _noise(pid, step_now, 5)
         # The turning case is capped at what the walls can hold: the centrifugal load of a grain at the far wall (w^2 R) must be met
         # by the contact spring (OMEGA^2 x penetration), so w is limited to OMEGA sqrt(0.5 r / R) for the grain's radius r and the
         # chamber's reach R (its half-diagonal), and the angular acceleration to OMEGA^2 0.5 r / R (the Euler load); the planes
         # are sided, so a grain that does outrun the spring is still pushed back.
         half_height = 0.5 * rows * cell
         reach = (half * half + half_height * half_height).sqrt() + 1.0e-6
-        w_cap = OMEGA * (0.5 * radius * (1.0 / reach)).sqrt()
-        a_cap = OMEGA * OMEGA * 0.5 * radius * (1.0 / reach)
+        w_cap = omega * (0.5 * radius * (1.0 / reach)).sqrt()
+        a_cap = omega * omega * 0.5 * radius * (1.0 / reach)
         case_omega = -_cap(-_cap(case_omega, w_cap), w_cap)
         case_domega = -_cap(-_cap(case_domega, a_cap), a_cap)
         rel_x, rel_y = x - a["pivot_x"], y - a["pivot_y"]
         fict_x = case_omega * case_omega * rel_x + case_domega * rel_y
         fict_y = case_omega * case_omega * rel_y - case_domega * rel_x
-        vx_a = vx + live * (fx / mass + grav_x - drag * vx + fict_x) * DT
-        vy_a = vy + live * (fy / mass + grav_y - drag * vy + fict_y) * DT
+        vx_a = (vx + live * (fx / mass + grav_x * buoy - drag * vx + fict_x) * DT) * damp
+        vy_a = (vy + live * (fy / mass + grav_y * buoy - drag * vy + fict_y) * DT) * damp
         turn = (case_omega * DT) * -2.0                               # Coriolis: the velocity turns by -2 w DT (clockwise for w > 0)
         c_turn, s_turn = turn.cos(), turn.sin()
         vx_c = AbstractTensor.where(live > 0.5, vx_a * c_turn - vy_a * s_turn, vx_a)      # only a live grain's velocity (an armed id's vy is a sentinel)
         vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
         vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
-        wn = (w + live * (tq / inertia - SPIN_DRAG * w - case_domega) * DT) * (1.0 - just)
+        wn = (w + live * (tq / inertia - spin_drag * w - case_domega) * DT) * (1.0 - just) * (1.0 / (1.0 + live * gamma_f * DT))
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         age_next = age + DT
@@ -911,17 +1012,44 @@ def restitution_of(zeta: float) -> float:
     return math.exp(-math.pi * zeta / math.sqrt(1.0 - zeta * zeta))
 
 
+#: The tunables beyond the species table, the 3-D law's (``fountain3d.PARAMS``) with the 2-D units.  name -> (label, lo, hi, step,
+#: default, restart, group).  ``restart`` ones change what an id IS at placement (the size distribution, the emission rate): a new run;
+#: the others are RUNTIME INPUTS of the law, applied at a step boundary and logged with their step.  ``fl_rho``/``fl_mu`` are the
+#: fluid (``FLUIDS``).  A disk's mass is density x pi r^2 (~2.5e-4), 80x the 3-D sphere's, hence the hotter ``temp`` range.
+PARAMS = {
+    "omega": ("stiffness (compressibility)", 40.0, OMEGA_MAX, 5.0, OMEGA, False, "Physics"),
+    "hertz": ("Hertz blend", 0.0, 1.0, 0.05, 0.0, False, "Physics"),
+    "coh": ("cohesion", 0.0, 3.0, 0.05, 0.0, False, "Physics"),
+    "spin_drag": ("spin drag", 0.0, 20.0, 0.5, SPIN_DRAG, False, "Physics"),
+    "temp": ("temperature kT", 0.0, TEMP_MAX, 1.0e-8, 0.0, False, "Physics"),
+    "k_run": ("neighbour cap", 4.0, float(K_RUN_MAX), 1.0, float(K_RUN), False, "Physics"),
+    "nozzle_speed": ("nozzle speed", 0.3, 2.0, 0.05, 1.0, False, "Physics"),
+    "rate": ("nozzle rate", 0.25, 4.0, 0.05, 1.0, True, "Physics"),
+    "fl_rho": ("fluid density", 0.0, 1.2, 0.01, FLUIDS[DEFAULT_FLUID][0], False, "Fluid"),
+    "fl_mu": ("fluid viscosity", 0.0, 5.0e-4, 1.0e-5, FLUIDS[DEFAULT_FLUID][1], False, "Fluid"),
+    "lognormal": ("size distribution (0 uniform, 1 lognormal)", 0.0, 1.0, 1.0, 0.0, True, "Grains"),
+    "bi_ratio": ("bidisperse size ratio (large / small)", 1.0, 3.0, 0.05, 1.0, True, "Grains"),
+    "bi_frac": ("bidisperse number fraction large", 0.0, 1.0, 0.05, 0.5, True, "Grains"),
+}
+ROLL_RANGE = (0.0, 0.3)                # rolling resistance per species (roughness)
+IRR_RANGE = (0.0, 0.3)                 # size spread per species (irregularity): a uniform width, or the lognormal's sigma
+
+
 def species_params(params: dict | None = None) -> dict[str, float]:
-    """The page's species table in its own units: ``r{s}`` radius, ``mu{s}`` friction (0-2), ``rho{s}`` density, ``e{s}``
-    restitution, ``swell{s}`` rate and ``swmax{s}`` ratio, ``solvent`` -- defaults, then the overrides clamped to their ranges."""
-    p: dict[str, float] = {"solvent": 0.0}
+    """The page's tunables in their own units: the species table (``r{s}`` radius, ``mu{s}`` friction (0-2), ``rho{s}`` density,
+    ``e{s}`` restitution, ``swell{s}`` rate and ``swmax{s}`` ratio, ``roll{s}`` roughness, ``irr{s}`` irregularity) and ``PARAMS``
+    (stiffness, Hertz, cohesion, spin drag, temperature, neighbour cap, nozzle speed and rate, the fluid, the size distributions) --
+    defaults, then the overrides clamped to their ranges."""
+    p: dict[str, float] = {k: float(v[4]) for k, v in PARAMS.items()}
     for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):
-        p.update({f"r{s}": r, f"rho{s}": rho, f"mu{s}": mu, f"e{s}": restitution_of(ZETA), f"swell{s}": 0.0, f"swmax{s}": 1.0})
+        p.update({f"r{s}": r, f"rho{s}": rho, f"mu{s}": mu, f"e{s}": restitution_of(ZETA), f"swell{s}": 0.0, f"swmax{s}": 1.0,
+                  f"roll{s}": 0.0, f"irr{s}": 0.0})
     ranges = {"r": (RSCALE_RANGE[0], RSCALE_RANGE[1], True), "rho": DENSITY_RANGE + (False,), "mu": MU_RANGE + (False,),
-              "e": RESTITUTION_RANGE + (False,), "swell": (0.0, SWELL_RATE_MAX, False), "swmax": (1.0, SWELL_MAX_RATIO, False)}
+              "e": RESTITUTION_RANGE + (False,), "swell": (0.0, SWELL_RATE_MAX, False), "swmax": (1.0, SWELL_MAX_RATIO, False),
+              "roll": ROLL_RANGE + (False,), "irr": IRR_RANGE + (False,)}
     for k, v in (params or {}).items():
-        if k == "solvent":
-            p[k] = min(max(float(v), 0.0), 1.0)
+        if k in PARAMS:
+            p[k] = min(max(float(v), PARAMS[k][1]), PARAMS[k][2])
             continue
         key = k.rstrip("0123456789")
         if key in ranges and k[len(key):].isdigit() and int(k[len(key):]) < len(SPECIES):
@@ -931,10 +1059,35 @@ def species_params(params: dict | None = None) -> dict[str, float]:
     return p
 
 
+def restart_param(name: str) -> bool:
+    """Does changing tunable ``name`` begin a new run?  The radius (it sets the grid), the size distributions and the emission rate."""
+    return (PARAMS[name][5] if name in PARAMS else name.rstrip("0123456789") in ("r", "irr"))
+
+
+def size_factor_max(p: dict[str, float], s: int) -> float:
+    """The largest multiple of species ``s``'s radius any of its grains can have: its uniform width, or the lognormal's tail (the law
+    clamps the normal at 3 sigma), times the bidisperse mode's large-size factor (the 3-D law's)."""
+    spread = p[f"irr{s}"]
+    wide = math.exp(3.0 * spread) if p["lognormal"] > 0.5 else 1.0 + spread
+    return wide * math.sqrt(max(p["bi_ratio"], 1.0))
+
+
+def stiffness_of(p: dict[str, float]) -> float:
+    """The contact stiffness the law is given: the page's ``omega`` clamped to the CFL bound (Hertz stiffens the spring up to
+    1 + 2 hertz times its linear tangent, so the bound drops with it)."""
+    return min(p["omega"], OMEGA_MAX / math.sqrt(1.0 + 2.0 * p["hertz"]))
+
+
+def measured_temperature(diag) -> float:
+    """kT measured from the law's diagnostics: the kinetic + rotational energy over the live grains' THREE degrees of freedom (x, y,
+    spin; each holds kT / 2), so ``ke = 1.5 n_live kT`` (the 3-D law has six: ``ke = 3 n_live kT``)."""
+    return float(diag["ke"]) / (DOF / 2.0 * max(float(diag["n_live"]), 1.0))
+
+
 def cell_needed(p: dict[str, float]) -> float:
-    """The grid cell the species table needs: twice the largest radius any grain can reach (a swelling species grows to
-    ``swmax`` x its radius)."""
-    return 2.0 * max(p[f"r{s}"] * (p[f"swmax{s}"] if p[f"swell{s}"] > 0.0 else 1.0) for s in range(len(SPECIES)))
+    """The grid cell the species table needs: twice the largest radius any grain can reach (its size spread and bidisperse mode, and a
+    swelling species grows to ``swmax`` x its radius)."""
+    return 2.0 * max(p[f"r{s}"] * size_factor_max(p, s) * (p[f"swmax{s}"] if p[f"swell{s}"] > 0.0 else 1.0) for s in range(len(SPECIES)))
 
 
 def _slot(kind: str, role: str, cx: float, cy: float, rot: float, *p: float) -> dict[str, float]:
@@ -1166,7 +1319,11 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
-    out.update({"cell_scale": cell / CELL, "solvent": p["solvent"], "case_omega": 0.0, "case_domega": 0.0,
+    out.update({"fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"], "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"],
+                "spin_drag": p["spin_drag"], "temp": p["temp"], "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
+                "nozzle_speed": p["nozzle_speed"], "emit_scale": 1.0 / p["rate"], "lognormal": 1.0 if p["lognormal"] > 0.5 else 0.0,
+                "bi_ratio": p["bi_ratio"], "bi_frac": p["bi_frac"]})
+    out.update({"cell_scale": cell / CELL, "case_omega": 0.0, "case_domega": 0.0,
                 "pivot_x": 0.5 * (geo["view"][0] + geo["view"][1]), "pivot_y": 0.5 * (geo["view"][2] + geo["view"][3])})
     slots: list[dict[str, float]] = []
     spec = None
@@ -1199,7 +1356,8 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
         out["bar_half"] = fit_inlet(out, cell)                                   # the inlet is inside the fluid
     for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):                 # multiples of the defaults: exactly 1.0 when untouched
         out.update({f"rscale{s}": p[f"r{s}"] / r, f"fscale{s}": p[f"mu{s}"] / mu if mu else 1.0, f"dscale{s}": p[f"rho{s}"] / rho,
-                    f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
+                    f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"],
+                    f"roll{s}": p[f"roll{s}"], f"irr{s}": p[f"irr{s}"]})
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
@@ -1339,6 +1497,7 @@ class FountainGame(Game):
         self.strata = STRATA
         self.params: dict[str, float] = {}       # the page's species-table overrides (see ``species_params``)
         self.shape = "box"                       # the chamber outline (SHAPES); part of the recorded run
+        self.fluid = DEFAULT_FLUID               # the fluid's name ("custom" once its density or viscosity is set by hand)
         self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
@@ -1389,7 +1548,9 @@ class FountainGame(Game):
             if name not in known:
                 raise ValueError(f"fountain_param: unknown tunable {name!r}")
             self.params[name] = species_params({name: payload["value"]})[name]
-            if name.rstrip("0123456789") == "r":          # the radius sets the grid: a new run (the others are runtime inputs)
+            if name in ("fl_rho", "fl_mu"):
+                self.fluid = "custom"
+            if restart_param(name):          # the radius sets the grid, the size distributions and the rate what an id is: a new run (the others are runtime inputs)
                 if payload.get("aspect"):
                     self.aspect = float(payload["aspect"])
                 self.reset()
@@ -1398,8 +1559,9 @@ class FountainGame(Game):
             if name == "shape" and value in dict(CHAMBER_CHOICES):
                 self.shape = value
                 self.reset()
-            elif name == "solvent" and value in SOLVENTS:
-                self.params["solvent"] = SOLVENTS[value]
+            elif name == "fluid" and value in FLUIDS:
+                self.fluid = value
+                self.params["fl_rho"], self.params["fl_mu"] = FLUIDS[value]
             else:
                 raise ValueError(f"fountain_choice: unknown choice {name!r} = {value!r}")
         elif kind == "fountain_speed":
@@ -1450,14 +1612,20 @@ class FountainGame(Game):
         final = run_frames(self.piece, columns, steps)
         digest = hashlib.sha256(b"".join(np.ascontiguousarray(final[n], dtype=np.float32).tobytes()
                                          for n in STATE + ("cr", "cg", "cb"))).hexdigest()[:16]
-        emitted = int((columns["pid"][:active] * (EMIT_SPAN / active) <= steps * DT).sum())
+        emitted = int((columns["pid"][:active] * (EMIT_SPAN / active) * float(columns["emit_scale"]) <= steps * DT).sum())
         self.verified = {"steps": steps, "lane": self.piece.lane, "digest": digest,
                          "emitted": emitted, "top": float(final["y"].max())}
         return self.verified
 
-    def solvent_name(self) -> str:
-        v = species_params(self.params)["solvent"]
-        return next((k for k, x in SOLVENTS.items() if abs(x - v) < 1e-9), "custom")
+    def _control(self, name: str, kind: str = "range", **extra) -> dict[str, Any]:
+        """One tunable of ``PARAMS`` as a page control (``fountain_param``), in its group; a restart one carries ``aspect``."""
+        label, lo, hi, step, _default, restart, group = PARAMS[name]
+        spec = {"id": name, "kind": kind, "label": label, "min": lo, "max": hi, "step": step, "value": species_params(self.params)[name],
+                "action": "fountain_param", "name": name, "field": "value", "group": group}
+        if restart:
+            spec["aspect"] = True
+        spec.update(extra)
+        return spec
 
     def _species_controls(self) -> list[dict[str, Any]]:
         """The species table as page controls: grouped, every one a ``fountain_param`` range.  The radius is a log slider
@@ -1478,11 +1646,23 @@ class FountainGame(Game):
             out.append(ctl("e", "restitution", RESTITUTION_RANGE[0], RESTITUTION_RANGE[1], 0.01))
             out.append(ctl("swell", "swell rate (orbeez, 1/s)", 0.0, SWELL_RATE_MAX, 0.01))
             out.append(ctl("swmax", "max swell (x radius)", 1.0, SWELL_MAX_RATIO, 0.1))
+            out.append(ctl("roll", "roughness", ROLL_RANGE[0], ROLL_RANGE[1], 0.01))
+            out.append(ctl("irr", "irregularity", IRR_RANGE[0], IRR_RANGE[1], 0.01, {"aspect": True}))     # a restart: it sets the radius an id has
+        out.append({"id": "lognormal", "kind": "select", "label": "size distribution", "value": int(p["lognormal"] > 0.5),
+                    "action": "fountain_param", "name": "lognormal", "field": "value", "group": "Grains", "aspect": True,
+                    "options": [[0, "uniform width"], [1, "lognormal sigma"]]})
+        for name in ("bi_ratio", "bi_frac"):                       # Grains: the optional two-size (bidisperse) mode
+            out.append(self._control(name))
+        for name in ("omega", "hertz", "coh", "spin_drag", "temp", "nozzle_speed", "rate", "k_run"):       # Physics
+            # the temperature is a logarithmic slider (0 = off, then kT from TEMP_MIN_LOG to TEMP_MAX)
+            out.append(self._control(name, scale="log", log_min=TEMP_MIN_LOG) if name == "temp" else self._control(name))
+        out.append({"id": "k_run_drop", "kind": "readout", "label": "dropped contacts", "group": "Physics", "diag": "n_drop"})
+        out.append({"id": "fluid", "kind": "select", "label": "fluid", "value": self.fluid, "action": "fountain_choice",
+                    "name": "fluid", "field": "value", "group": "Fluid",
+                    "options": [[k, k] for k in FLUIDS] + ([["custom", "custom"]] if self.fluid == "custom" else [])})
+        out.extend([self._control("fl_rho"), self._control("fl_mu")])
         out.append({"id": "shape", "kind": "select", "label": "chamber shape", "value": self.shape, "action": "fountain_choice",
                     "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES]})
-        out.append({"id": "solvent", "kind": "select", "label": "solvent", "value": self.solvent_name(), "action": "fountain_choice",
-                    "name": "solvent", "field": "value", "group": "Grains",
-                    "options": [[k, k] for k in SOLVENTS] + ([["custom", "custom"]] if self.solvent_name() == "custom" else [])})
         return out
 
     def controls_ui(self) -> list[dict[str, Any]]:

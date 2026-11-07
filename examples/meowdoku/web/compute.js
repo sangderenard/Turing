@@ -177,7 +177,8 @@ ${commit}
     const at = (s) => `lane${Math.floor(s / spb)}[${(s % spb) * pad}u + i]`;
     const packCode = PACK_WGSL.replace("__LANES__", lanes("read_write")).replace("__PTSB__", String(B))
       .replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride))
-      .replaceAll("__LIVE__", Array.isArray(p.live) ? `${at(slot(p.live[0]))} >= f32(i) * ${rec.emit_rate.toPrecision(9)}f` : `${at(oslot(p.live))} > 0.5`)   // 2-D product: emitted by age; 3-D: its `shown` output
+      .replaceAll("__LIVE__", p.placed ? `(abs(${at(slot(p.placed[0]))}) + abs(${at(slot(p.placed[1]))})) >= 1.0e-30`   // 2-D product: placed (not the parked zero state), whatever the nozzle rate
+        : Array.isArray(p.live) ? `${at(slot(p.live[0]))} >= f32(i) * ${rec.emit_rate.toPrecision(9)}f` : `${at(oslot(p.live))} > 0.5`)   // else emitted by age; 3-D: its `shown` output
       .replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y))).replaceAll("__Z__", p.z === undefined ? "0.0" : at(slot(p.z)))       // a 2-D product has no z: 0
       .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy))).replaceAll("__VZ__", p.vz === undefined ? "0.0" : at(slot(p.vz)))
       .replaceAll("__R__", at(oslot(p.rgb[0]))).replaceAll("__G__", at(oslot(p.rgb[1]))).replaceAll("__RAD__", at(oslot(p.radius)))
@@ -404,13 +405,14 @@ class WasmProduct {
     const p = this.manifest.points, I = this.inputs, O = this.nexts, u = new Uint32Array(f.buffer, f.byteOffset, f.length);
     const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], rate = this.rec.emit_rate;
     const z = p.z === undefined ? null : I[p.z], vz = p.vz === undefined ? null : I[p.vz];
-    const age = Array.isArray(p.live) ? I[p.live[0]] : null, shown = age ? null : O[p.live];
+    const age = Array.isArray(p.live) && !p.placed ? I[p.live[0]] : null, shown = Array.isArray(p.live) ? null : O[p.live];
+    const px = p.placed ? I[p.placed[0]] : null, py = p.placed ? I[p.placed[1]] : null;
     const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]], rad = O[p.radius], rest2 = p.rest_speed * p.rest_speed;
     const byte = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
     for (let i = 0; i < this.pad; i++) {
       f[5 * i] = x[i]; f[5 * i + 1] = y[i]; f[5 * i + 2] = z ? z[i] : 0;
       u[5 * i + 3] = (255 << 24) | (byte(b[i]) << 16) | (byte(g[i]) << 8) | byte(r[i]);
-      const on = age ? age[i] >= i * rate : shown[i] > 0.5, v2 = vx[i] * vx[i] + vy[i] * vy[i] + (vz ? vz[i] * vz[i] : 0);
+      const on = px ? Math.abs(px[i]) + Math.abs(py[i]) >= 1e-30 : age ? age[i] >= i * rate : shown[i] > 0.5, v2 = vx[i] * vx[i] + vy[i] * vy[i] + (vz ? vz[i] * vz[i] : 0);
       f[5 * i + 4] = on ? (v2 < rest2 ? 200 : 100) + rad[i] * 1000 : 0;
     }
     return f;
@@ -904,7 +906,7 @@ export class ComputeRuntime {
     if (!d) return "";
     const n = this.rec.pad, total = d.n_nan + d.n_out + d.n_parked + d.n_live;
     const bad = [d.n_nan ? `${d.n_nan} NaN` : "", d.n_out ? `${d.n_out} outside` : "", d.n_drop ? `${d.n_drop} contacts dropped` : "", total !== n ? `COUNT ${total}/${n}` : ""].filter(Boolean);
-    const kT = d.ke / (3 * Math.max(d.n_live, 1)), set = this.lawInputs.temp ?? this.spec.uniforms.temp ?? 0;       // ke = 3 n kT: six degrees of freedom of kT/2 each
+    const kT = d.ke / (((this.manifest.law.dof || 6) / 2) * Math.max(d.n_live, 1)), set = this.lawInputs.temp ?? this.spec.uniforms.temp ?? 0;       // ke = dof/2 n kT: kT/2 per degree of freedom (3-D: six; the 2-D disk: x, y, spin)
     return ` | E ${d.ke.toExponential(2)} T ${kT.toExponential(2)} (set ${set.toExponential(1)}) v ${Math.sqrt(d.vmax2).toFixed(2)} live ${d.n_live.toLocaleString()}/${this.rec.n.toLocaleString()}${bad.length ? " | " + bad.join(", ") : ""}`;
   }
 
