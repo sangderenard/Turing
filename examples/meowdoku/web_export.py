@@ -406,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
     for name in ("index.html", "app.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "compute.js", "recording.js", "gravity.js",
-                 "particle_styles.js", "noise_filter.js"):
+                 "particle_styles.js", "noise_filter.js", "share.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     print("[export] assets:", {role: mesh["triangles"] for role, mesh in assets["meshes"].items()},

@@ -57,6 +57,7 @@ from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402 
 from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
+from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PROFILES = ROOT / "build" / "meowdoku" / "profiles.json"
@@ -303,6 +304,9 @@ class Sessions:
         self.profiles = profiles
         self.lock = threading.Lock()
         self.tables: dict[str, list] = {}       # token -> [Table, last_seen]
+        self.shares = share_mod.ShareStore(web_dir.parent / "shares")     # build/meowdoku/shares (gitignored with build/)
+        self.spectate = share_mod.Spectate()                              # owner session -> its view-only live share
+        self.share_hits: dict[str, list] = {}                             # client address -> recent share POST times
         boards = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.board_count = len(boards["boards"])
 
@@ -311,6 +315,7 @@ class Sessions:
         with self.lock:
             for key in [k for k, (_, seen) in self.tables.items() if now - seen > SESSION_IDLE_SECONDS]:
                 del self.tables[key]
+                self.spectate.drop_owner(key)       # a session that ended takes its viewer token with it
             fresh = token not in self.tables
             if fresh:
                 token = secrets.token_urlsafe(24)
@@ -351,6 +356,7 @@ def make_handler(sessions: Sessions):
             from http.cookies import SimpleCookie
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token, table, fresh = sessions.get(jar[COOKIE].value if COOKIE in jar else None)
+            self._token = token
             self._set_cookie = [f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"] if fresh else []
             # The player: the browser's long-lived token names its profile; a
             # browser without one gets a token and a generated name.
@@ -389,6 +395,8 @@ def make_handler(sessions: Sessions):
             Each text frame is one tick's input; each answer is a binary
             snapshot delta, preceded by a ``meta`` text frame when one is due."""
             key = self.headers.get("Sec-WebSocket-Key")
+            if self._is_viewer() or "viewer=" in self.path:
+                return self._refuse_viewer()
             if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
                 return self._json({"error": "expected a WebSocket upgrade"}, HTTPStatus.BAD_REQUEST)
             table = self._table()
@@ -433,7 +441,69 @@ def make_handler(sessions: Sessions):
             finally:
                 self.close_connection = True
 
+        # ---- share links and the view-only stream (share.py).  A request that presents the viewer header is a viewer's:
+        # it may read the catalog, the static page and /api/spectate/watch, and nothing else.
+        def _is_viewer(self) -> bool:
+            return self.headers.get(share_mod.VIEWER_HEADER) is not None
+
+        def _refuse_viewer(self) -> None:
+            self._set_cookie = []
+            self._json({"error": "this is a view-only link: it cannot send inputs or controls"}, HTTPStatus.FORBIDDEN)
+
+        def _share_error(self, error) -> None:
+            self._set_cookie = []
+            self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+
+        def _watch(self) -> None:
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(self.path).query)
+            token = self.headers.get(share_mod.VIEWER_HEADER) or ""
+            vid, rev, lrev = (query.get(k, [None])[0] for k in ("vid", "rev", "lrev"))
+
+            def owner_state():
+                owner = sessions.spectate.by_token[token].owner
+                table = sessions.tables[owner][0]
+                with table.lock:
+                    return share_mod.public_state(table.state())
+            try:
+                payload = sessions.spectate.watch(token, vid, rev, owner_state, owner_alive=lambda o: o in sessions.tables,
+                                                  have_live=int(lrev) if lrev and lrev.lstrip("-").isdigit() else None)
+            except KeyError:
+                return self._share_error(share_mod.ShareError("the shared session has ended", 410))
+            except share_mod.ShareError as error:
+                return self._share_error(error)
+            stats = sessions.spectate.viewer_stats(token, payload["vid"])
+            if stats:
+                payload["stats"] = stats                    # this viewer's bytes so far, per second (before this reply)
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            sessions.spectate.account(token, payload["vid"], len(body) + 180)     # + the response headers
+            self._set_cookie = []
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _share_rate_ok(self) -> bool:
+            now, hits = time.time(), sessions.share_hits.setdefault(self.client_address[0], [])
+            hits[:] = [t for t in hits if now - t < 60]
+            if len(hits) >= 60:
+                return False
+            hits.append(now)
+            return True
+
         def do_GET(self):  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            if path == "/api/spectate/watch":
+                return self._watch()
+            if path.startswith("/api/share/"):
+                try:
+                    return self._json(sessions.shares.get(path[len("/api/share/"):]))
+                except share_mod.ShareError as error:
+                    return self._share_error(error)
+            if self._is_viewer() and (path.startswith("/ws") or (path.startswith("/api/") and not path.startswith("/api/catalog"))):
+                return self._refuse_viewer()
             if self.path.startswith("/ws"):
                 return self._socket()
             if self.path.startswith("/api/state"):
@@ -450,7 +520,34 @@ def make_handler(sessions: Sessions):
             return super().do_GET()
 
         def do_POST(self):  # noqa: N802
+            if self._is_viewer():
+                return self._refuse_viewer()                  # every POST (new, action, profile, share, spectate) is an owner's
             length = int(self.headers.get("Content-Length") or 0)
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/api/share") or path.startswith("/api/spectate"):
+                if length > 2 * share_mod.SHARE_MAX_BYTES:
+                    return self._share_error(share_mod.ShareError("too large", 413))
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                    if path == "/api/share":
+                        if not self._share_rate_ok():
+                            raise share_mod.ShareError("too many shares from this address", 429)
+                        return self._json({"id": sessions.shares.put(body.get("view"))})
+                    self._table()                                # the owner's cookie session names the owner
+                    if path == "/api/spectate":
+                        op = body.get("op")
+                        if op == "start":
+                            sessions.spectate.start(self._token)
+                        elif op == "stop":
+                            sessions.spectate.stop(self._token)
+                        elif op != "status":
+                            raise share_mod.ShareError("unknown op")
+                        return self._json(sessions.spectate.status(self._token))
+                    if path == "/api/spectate/live":
+                        return self._json({"rev": sessions.spectate.push_live(self._token, body.get("live"))})
+                except (ValueError, TypeError) as error:
+                    return self._share_error(error)
+                return self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
             payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
             table = self._table()
             try:

@@ -13,6 +13,7 @@ import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirecti
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
+import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -5004,6 +5005,11 @@ compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
 // a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off (or log_min with log_floor), then log-spaced from spec.log_min to spec.max
 function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? (s.log_floor ? s.log_min : 0) : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
 function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
+// SHARE: the action a server-side control sends for `value` (built in this one place: the controls and a shared link both use it).
+function serverControlPayload(s, value) {
+  if (s.kind === "toggle") return { type: s.action, [s.field]: value };
+  return { type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) };
+}
 function renderGameControls(game) {
   const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;
@@ -5017,7 +5023,7 @@ function renderGameControls(game) {
       if (s.kind === "button") { el = document.createElement("button"); el.textContent = s.label; el.onclick = () => (s.local ? localControl(s) : act({ type: s.action, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) })); }
       else if (s.kind === "toggle") {
         el = document.createElement("label"); const input = document.createElement("input"); input.type = "checkbox";
-        input.onchange = () => (s.local ? localControl(s, input.checked) : act({ type: s.action, [s.field]: input.checked }));
+        input.onchange = () => (s.local ? localControl(s, input.checked) : act(serverControlPayload(s, input.checked)));
         el.append(input, " " + s.label);
       }
       else if (s.kind === "color") {
@@ -5039,7 +5045,7 @@ function renderGameControls(game) {
         if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
         else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => (s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }));
+        input.onchange = () => (s.local ? localControl(s, input.value) : act(serverControlPayload(s, s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value)));
         if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
         else el.append(input);
       }
@@ -6429,7 +6435,16 @@ function fillPickers() {
   } catch (error) { console.warn("[meow] pilot wasm unavailable", error); }
   })();
   fillPickers();
-  if (rememberedName()) await setPlayer(rememberedName());
+  if (rememberedName() && !share.share.viewOnly) await setPlayer(rememberedName());
   requestAnimationFrame(draw);
-  $("new").click();
+  // SHARE hooks (share.js): what a shared view reads and writes on this page
+  share.attach({
+    getGame: () => state.game, catalog: () => state.catalog, pageSpecs, localValue, localControl, serverPayload: serverControlPayload, api, applyState,
+    aspect: () => canvas.clientWidth / Math.max(1, canvas.clientHeight),
+    selectGame: (g) => { const sel = $("game"); if ([...sel.options].some((o) => o.value === g)) sel.value = g; document.body.dataset.game = g; },
+    camera: { get: () => ({ ...camView.goal, auto: !!camView.auto }), set: (c) => { const { auto, ...pose } = c; Object.assign(camView.goal, pose); Object.assign(camView.cur, pose); camView.auto = !!auto; } },
+    runtime: { get: () => ({ gravity: compute.gravity ? Array.from(compute.gravity) : null }),
+               set: (r) => compute.setGravity(...(r.gravity || [null])) },
+  });
+  if (!(await share.bootGame())) $("new").click();
 })().catch((error) => { status.textContent = String(error); console.error(error); });
