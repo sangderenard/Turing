@@ -6338,6 +6338,21 @@ function fillPickers() {
   };
 }
 
+// LIFECYCLE (lifecycle.js): after a server restart the page reloads once, flagged; that boot adopts the session the server holds (restored
+// from its file, or re-seeded from the page's copy) instead of starting a new game.
+async function lifecycleResume() {
+  try {
+    if (sessionStorage.getItem("meowdoku.resume") !== "1") return false;
+    sessionStorage.removeItem("meowdoku.resume");
+    const held = await (await fetch("/api/state", { cache: "no-store" })).json();
+    if (!held || !held.game) return false;
+    const sel = $("game"); if ([...sel.options].some((o) => o.value === held.game)) sel.value = held.game;
+    if (held.game === "meowdoku" && [...$("board").options].some((o) => o.value === held.id)) $("board").value = held.id;
+    applyState(held);
+    return true;
+  } catch (error) { console.warn("[meow] resume failed", error); return false; }
+}
+
 // ---------------------------------------------------------------- boot
 (async () => {
   const [vert, frag, assets, catalog] = await Promise.all([
@@ -6477,5 +6492,5 @@ function fillPickers() {
     runtime: { get: () => ({ gravity: compute.gravity ? Array.from(compute.gravity) : null }),
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
-  if (!(await share.bootGame())) $("new").click();
+  if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
 })().catch((error) => { status.textContent = String(error); console.error(error); });
