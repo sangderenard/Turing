@@ -155,40 +155,71 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
         "source_digest": digest(tag),
     }
-    if pad <= WASM_MAX and wasm:
-        wasm_abi = graph_wasm._compile(
-            f"fountain_{tag}", shapes_for(pad),
-            lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
-            F.OUTPUTS, WASM_CONTRACT, web_dir,
-            {"argument_names": list(F.ARGUMENTS), "count": pad})
-        record.update({"wasm": f"fountain_{tag}.wasm", "wasm_abi": f"fountain_{tag}.abi.json",
-                       "wasm_buffers": len(wasm_abi["order"])})
     record["build_seconds"] = round(time.perf_counter() - started, 1)
+    if pad <= WASM_MAX and wasm:
+        build_fallback(tag, web_dir, record)
     return record
 
 
-def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True) -> dict:
-    """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept."""
-    from src.compiler.deployment_classification import WebGPUComputeCostModel
+def build_fallback(tag: str, web_dir: Path, record: dict) -> dict:
+    """The CPU fallback of one size (the wasm product, for a browser without WebGPU), added to its ``record``.  It is the
+    slow part of a build (the size-specialised law lowered whole: minutes, ~30 at 4k), so ``build`` makes it AFTER every
+    WebGPU product is written."""
+    from meowdoku import graph_wasm
+    active, pad = SIZES[tag]
+    started = time.perf_counter()
+    wasm_abi = graph_wasm._compile(
+        f"fountain_{tag}", shapes_for(pad),
+        lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
+        F.OUTPUTS, WASM_CONTRACT, web_dir,
+        {"argument_names": list(F.ARGUMENTS), "count": pad})
+    record.update({"wasm": f"fountain_{tag}.wasm", "wasm_abi": f"fountain_{tag}.abi.json",
+                   "wasm_buffers": len(wasm_abi["order"]), "wasm_seconds": round(time.perf_counter() - started, 1)})
+    return record
+
+
+def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True, on_gpu_ready=None) -> dict:
+    """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept.
+
+    Two passes: first every size's WebGPU product (seconds each), then the manifest is written and ``on_gpu_ready``
+    called -- the page can run -- and only then the slow CPU fallbacks (``build_fallback``), the manifest rewritten as
+    each one lands."""
     web_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = web_dir / "fountain.manifest.json"
     old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     records = {}
     for tag in sizes:
         previous = (old.get("sizes") or {}).get(tag)
-        files = [web_dir / f"fountain_{tag}.wgsl"]
-        if SIZES[tag][1] <= WASM_MAX and wasm:
-            files += [web_dir / f"fountain_{tag}.wasm", web_dir / f"fountain_{tag}.abi.json"]
-        if previous and previous.get("source_digest") == digest(tag) and all(p.exists() for p in files):
+        if previous and previous.get("source_digest") == digest(tag) and (web_dir / f"fountain_{tag}.wgsl").exists():
+            if previous.get("wasm") and not all((web_dir / previous[k]).exists() for k in ("wasm", "wasm_abi")):
+                previous = {k: v for k, v in previous.items() if not k.startswith("wasm")}
             records[tag] = previous
             continue
-        records[tag] = build_size(tag, web_dir, wasm)
+        records[tag] = build_size(tag, web_dir, wasm=False)
         r = records[tag]
         print(f"[fountain] {tag}: {r['n']} ids (sort {r['pad']}) -> {r['route']} (predicted {r['verdict']['speedup']:.2f}x, "
               f"{r['wgsl_abi']['dispatches']} dispatches, {r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)
+    manifest = _manifest(records)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    if on_gpu_ready is not None:
+        on_gpu_ready(manifest)
+    if wasm:
+        for tag in sizes:
+            r = records[tag]
+            if SIZES[tag][1] > WASM_MAX or r.get("wasm"):
+                continue
+            build_fallback(tag, web_dir, r)
+            print(f"[fountain] {tag}: CPU fallback (wasm) built in {r['wasm_seconds']}s", flush=True)
+            manifest = _manifest(records)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _manifest(records: dict) -> dict:
+    from src.compiler.deployment_classification import WebGPUComputeCostModel
     model = WebGPUComputeCostModel()
     geo = F.basin(F.N_FULL)
-    manifest = {
+    return {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
                 "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
@@ -200,8 +231,6 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
         "species": [list(item) for item in F.SPECIES],
         "settle": F.SETTLE,
     }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:

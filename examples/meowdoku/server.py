@@ -488,9 +488,12 @@ def prepare_fountain(web_dir: Path) -> None:
     from meowdoku import fountain_build
     try:
         started = time.perf_counter()
-        manifest = fountain_build.build(web_dir)
-        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
-        print(f"[meowdoku] fountain products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        def gpu_ready(manifest):
+            routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+            print(f"[meowdoku] fountain WebGPU products ready ({routes}; {time.perf_counter() - started:.1f}s); "
+                  f"CPU fallbacks follow in the background", flush=True)
+        fountain_build.build(web_dir, on_gpu_ready=gpu_ready)
+        print(f"[meowdoku] fountain CPU fallbacks ready ({time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
