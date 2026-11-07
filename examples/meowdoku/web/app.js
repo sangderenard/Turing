@@ -28,7 +28,7 @@ setInterval(() => {
   if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; }
   const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = ""; }     // [LOG] the log page link, same visitors
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
-import { ComputeRuntime, PointCloud } from "./compute.js";
+import { ComputeRuntime, PointCloud, SettleDetector } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
 import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles.js";
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
@@ -584,7 +584,10 @@ function housingFaces(g) {
     const m16 = (s) => { const bin = atob(s), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
     const q = m16(c.chamber_mesh.v), t = m16(c.chamber_mesh.t), b = c.chamber_mesh.bounds, faces = [];
     const law = (i) => [b[0] + q[3 * i] / 65535 * (b[1] - b[0]), b[2] + q[3 * i + 1] / 65535 * (b[3] - b[2]), b[4] + q[3 * i + 2] / 65535 * (b[5] - b[4])];
-    const emit = (a, b, d) => faces.push([wp(...a), wp(...b), wp(...d), wallMaterial(a, b, d)]);
+    const toyFloor = c.manifest === "fountain3d_toy.manifest.json" && state.materialIndex.housing_toy_floor != null;
+    const materialFor = (a, b, d) => toyFloor && [a, b, d].every((p) => Math.abs(p[1]) < 1e-6)
+      ? state.materialIndex.housing_toy_floor : wallMaterial(a, b, d);
+    const emit = (a, b, d) => faces.push([wp(...a), wp(...b), wp(...d), materialFor(a, b, d)]);
     const mid = (a, b) => a.map((v, i) => (v + b[i]) * 0.5);
     for (let i = 0; i < c.chamber_mesh.nt; i++) {
       const a = law(t[3 * i]), b = law(t[3 * i + 1]), d = law(t[3 * i + 2]);
@@ -2125,6 +2128,7 @@ function uploadMaterials(game) {
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
+  records.push(["housing_toy_floor", [0.42, 0.56, 0.62], { roughness: 0.28, metallic: 0.22, specular: 0.72, shininess: 72 }]);
   records.push(["housing_checker_light", [0.88, 0.84, 0.76], { roughness: 0.34, specular: 0.48, shininess: 48 }]);
   records.push(["housing_checker_dark", [0.035, 0.045, 0.07], { roughness: 0.28, specular: 0.60, shininess: 64 }]);
   records.push(["outline@glass", [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22, 0.42, 0.62] }]);   // the 2-D chamber's glowing glass ribbons
@@ -5266,7 +5270,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), casetilt: caseTiltDeg, panes: panes.mode, spinphase: spinMotion.phase || 0, worldcurve: curveView.u }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), casetilt: caseTiltDeg, autoflip: autoFlip.on, panes: panes.mode, spinphase: spinMotion.phase || 0, worldcurve: curveView.u }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -5325,14 +5329,10 @@ function localControl(s, value) {
   } else if (s.local === "casetilt") {
     caseTiltDeg = Number(value) || 0; applyCaseTilt();
   } else if (s.local === "turnover") {
-    if (cameraGravity) return;
-    const requested = spinMotion.kind === "flip" && caseSpin ? 1 / (2 * Math.abs(caseSpin)) : 0.4;
-    const flip = compute.startCaseFlip(requested, spinReverse ? -1 : 1);
-    if (flip) {
-      caseTiltDeg = (caseTiltDeg + (spinReverse ? -180 : 180) + 360) % 360;
-      try { localStorage.setItem("meowdoku.casetilt", String(caseTiltDeg)); } catch { /* storage may be blocked */ }
-      compute.note = `case flip ${flip.seconds.toFixed(2)} s (requested ${requested.toFixed(2)} s; spring contact cap)`;
-    }
+    flipCase();
+  } else if (s.local === "autoflip") {
+    autoFlip.on = !!value; autoFlip.detector = null; autoFlip.lastStep = -1;
+    try { localStorage.setItem("meowdoku.autoflip", autoFlip.on ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "gscale") {
     gravityScale = gscaleFromSlider(value); compute.setGravityScale(gravityScale);
     try { localStorage.setItem("meowdoku.gscale", String(gravityScale)); } catch { /* storage may be blocked */ }
@@ -5501,7 +5501,10 @@ function refreshLocalControls() {
       el.querySelector("span").textContent = `case angle ${Math.round(caseTiltDeg)}\u00b0 `;
       el.title = "the case held turned by this angle: gravity turns with it (turn on 'watch the case move' to see the case turn); camera-down gravity ignores it";
     } else if (s.local === "turnover") {
-      el.disabled = cameraGravity; el.title = cameraGravity ? "turn off camera-down gravity to flip the case" : "turn the actual case 180 degrees about its normal; reverse chooses the direction; contact limits may lengthen it";
+      el.disabled = cameraGravity; el.title = cameraGravity ? "turn off camera-down gravity to flip the case" : "turn the actual case 180 degrees about its normal; Space is the keyboard shortcut; reverse chooses the direction; contact limits may lengthen it";
+    } else if (s.local === "autoflip") {
+      el.querySelector("input").checked = autoFlip.on;
+      el.title = "in a continuous fountain, turn the case when the law's kinetic energy and largest speed stay below its settle thresholds; waits for the prior turn to finish";
     } else if (s.local === "gscale") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromGscale(gravityScale));
@@ -5595,9 +5598,39 @@ const GSCALE_SPEC = { id: "gscale", kind: "range", label: "gravity", min: 0, max
 // THE CASE ANGLE: the case held turned (0-360 degrees; gravity turns with it in the case's frame), and a "turn over" button that
 // flips it by 180 (an hourglass turned over).  A spin or rock turns on top of it; camera-down gravity ignores it.
 const TILT_SPEC = { id: "casetilt", kind: "range", label: "case angle", min: 0, max: 360, step: 1, local: "casetilt" };
-const TURN_SPEC = { id: "turnover", kind: "button", label: "Flip case", local: "turnover" };
+const TURN_SPEC = { id: "turnover", kind: "button", label: "Flip case (Space)", local: "turnover" };
+const AUTOFLIP_SPEC = { id: "autoflip", kind: "toggle", label: "auto flip at low energy", local: "autoflip" };
 let caseTiltDeg = 0;
 try { caseTiltDeg = Number(localStorage.getItem("meowdoku.casetilt")) || 0; } catch { /* storage may be blocked */ }
+const autoFlip = { on: false, token: null, detector: null, lastStep: -1, readyStep: 0 };
+try { autoFlip.on = localStorage.getItem("meowdoku.autoflip") === "1"; } catch { /* storage may be blocked */ }
+function flipCase() {
+  if (cameraGravity) return null;
+  const last = (compute.caseFlips || []).at(-1);
+  if (last && compute.steps < last.startStep + last.steps) return null;
+  const requested = spinMotion.kind === "flip" && caseSpin ? 1 / (2 * Math.abs(caseSpin)) : 0.4;
+  const flip = compute.startCaseFlip(requested, spinReverse ? -1 : 1);
+  if (!flip) return null;
+  caseTiltDeg = (caseTiltDeg + (spinReverse ? -180 : 180) + 360) % 360;
+  try { localStorage.setItem("meowdoku.casetilt", String(caseTiltDeg)); } catch { /* storage may be blocked */ }
+  compute.note = `case flip ${flip.seconds.toFixed(2)} s (requested ${requested.toFixed(2)} s; spring contact cap)`;
+  autoFlip.token = compute.token;
+  autoFlip.detector = null;
+  autoFlip.readyStep = compute.steps + Math.ceil((flip.seconds + 2) / compute.manifest.law.dt);
+  return flip;
+}
+function autoFlipStep() {
+  const g = state.game, d = compute.diag;
+  if (!autoFlip.on || !g || !["fountain", "fountain3d"].includes(g.game) || cameraGravity || !compute.ready || !compute.running || compute.settleMode || !d) return;
+  if (autoFlip.token !== compute.token) {
+    autoFlip.token = compute.token; autoFlip.detector = null; autoFlip.lastStep = -1; autoFlip.readyStep = 0;
+  }
+  if (d.step <= autoFlip.lastStep) return;
+  autoFlip.lastStep = d.step;
+  if (d.step < autoFlip.readyStep) return;
+  if (!autoFlip.detector) autoFlip.detector = new SettleDetector(compute.manifest.settle, compute.rec.n, compute.rec.pad);
+  if (autoFlip.detector.push(d.step, d) !== null) flipCase();
+}
 function applyCaseTilt() {
   compute.setCaseTilt(cameraGravity ? 0 : caseTiltDeg * Math.PI / 180);
   try { localStorage.setItem("meowdoku.casetilt", String(caseTiltDeg)); } catch { /* storage may be blocked */ }
@@ -5789,7 +5822,7 @@ function pageSpecs(specs) {
   if (curved && !out.some((s) => s.id === CURVE_SPEC.id)) out = [...out, CURVE_SPEC];
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, ...(["fountain", "fountain3d"].includes(state.game?.game) ? [AUTOFLIP_SPEC] : []), CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     if (state.game && (state.game.game === "fountain3d" || state.game.game === "marble_madness")) out = [...out, PANES_SPEC, WALL_FINISH_SPEC];
     if (state.game && state.game.tipjar) out = [...out, QRWALL_SPEC, QRFRONT_SPEC];                 // [QRWALL]
     if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC, ...GHOST_SPECS];     // [GHOSTS]
@@ -6062,6 +6095,7 @@ function pointsFrame(cam, now) {
     if (g.game !== "marble_madness") compute.setGravity(gx, gy, g.game === "fountain3d" ? gz : 0);
   }
   compute.frame(now);
+  autoFlipStep();
   const data = compute.points();
   const rec = compute.rec;
   if (!data || !rec) return;
@@ -7019,6 +7053,10 @@ window.addEventListener("keydown", (e) => {
 }, true);
 window.addEventListener("keydown", async (e) => {
   const game = state.game; if (!game) return;
+  if (e.key === " " && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && ["fountain", "fountain3d"].includes(game.game)
+      && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLSelectElement) && !(e.target instanceof HTMLTextAreaElement) && !e.target.isContentEditable) {
+    e.preventDefault(); localControl(TURN_SPEC, true); return;
+  }
   if (e.target === $("entry")) return;
   if (game.input === "realtime" && bombs() && e.key.toLowerCase() === "c") { e.preventDefault(); cycleBomb(); return; }
   if (game.input === "realtime" && banking()) {
