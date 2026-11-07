@@ -4,7 +4,7 @@
 
 This checkout is `codex/meowdoku-claude-integration-20261107`, based on main `66e24497`. It combines the three layout stages with the committed log backend and page work. It has **not** been merged into main or deployed. The live 8766 process was not restarted.
 
-Later update: main now carries the log backend and the browser/server log page, and live 8766 was restarted from its recorded Python command. This branch has a separate, **unbuilt** 3-D toy product implementation below. The opening paragraph and original branch inventory remain as the integration receipt at the time they were written.
+2026-11-07 update: main now carries the log backend and browser/server log page. Live 8766 was restarted from its recorded Python command. The Studio all-size selector, visual-only capture, material catalogue, and cat-eye marble designer reached main and live 8766 separately. This branch retains the layout move and 3-D toy product; scratch WebGPU products for `small` and `4k` built successfully, with no Wasm compile. The opening paragraph and original branch inventory remain as the integration receipt at the time they were written.
 
 | Integration commit | Source | Result |
 |---|---|---|
@@ -29,7 +29,7 @@ The law and fountain product digest changes described in `LAYOUT_AUDIT.md` requi
 
 ## 3-D toy product prepared after the integration receipt
 
-The 3-D `sdf_toy` now consumes `toy_design.toy_parts`, extrudes its split ramps and dribble holes, shares the pool/peg/hourglass dimensions, and places a free hinged wheel from the same design. The `toy` builder variant combines SDF walls and body state and routes to `fountain3d_toy.manifest.json`; readiness has its own family. Host geometry, mesh, startup and routing checks passed. **No compiler product was built or deployed** under the workspace's explicit build-approval rule. The live 8766 server still serves the prior 3-D toy product. The 2-D `PEG_FILTER` flag is still false because the current size-filter configuration clogs; do not describe that filtering behavior as finished.
+The 3-D `sdf_toy` now consumes `toy_design.toy_parts`, extrudes its split ramps and dribble holes, shares the pool/peg/hourglass dimensions, and places a free hinged wheel from the same design. The `toy` builder variant combines SDF walls and body state and routes to `fountain3d_toy.manifest.json`; readiness has its own family. Host geometry, mesh, startup and routing checks passed. After approval for WebGPU, `small` and `4k` compiled into this checkout's scratch `build/meowdoku/web_toy_dev`; both are in its manifest. No Wasm product was compiled. Startup skips toy Wasm, but an actual on-demand or idle Wasm path remains to be implemented. The toy product has not been deployed to live 8766. The 2-D `PEG_FILTER` flag is still false because the current size-filter configuration clogs; do not describe that filtering behavior as finished.
 
 ## Live branches and remaining work
 
