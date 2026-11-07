@@ -197,10 +197,12 @@ function rebuild() {
 }
 function controls() {
   for(const field of ["base-shape","marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  const lightValue=(name)=>{const divisor=name==="light-strength"?10:name.startsWith("spot")?1:100;
+    return (+$(name).value/divisor).toFixed(name.startsWith("spot")?0:2);};
   for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
-    $(name).addEventListener("input",()=>{$(name+"-out").value=(+$(name).value/(name.startsWith("spot")?1:10)).toFixed(name.startsWith("spot")?0:1);});
+    $(name).addEventListener("input",()=>{$(name+"-out").value=lightValue(name);});
   for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
-    $(name+"-out").value=(+$(name).value/(name.startsWith("spot")?1:10)).toFixed(name.startsWith("spot")?0:1);
+    $(name+"-out").value=lightValue(name);
   $("reset-roll").addEventListener("click",resetRoll);
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
