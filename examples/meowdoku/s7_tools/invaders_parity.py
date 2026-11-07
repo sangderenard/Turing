@@ -22,7 +22,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples"), str(ROOT.parent / "engine_toy
 
 import numpy as np  # noqa: E402
 
-from meowdoku import entities
+from meowdoku.s1_engine import entities
 from meowdoku.s2_titles.invaders import invaders as inv  # noqa: E402
 
 

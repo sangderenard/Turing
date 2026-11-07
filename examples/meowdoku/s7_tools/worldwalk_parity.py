@@ -85,7 +85,7 @@ def run(out: str) -> None:
             for name in COLUMNS:
                 rows[name].append(np.array(game.session.column(name)[:ww.ENT + 4], dtype=np.float64))
     np.savez(out, t=np.asarray(times), **{k: np.stack(v) for k, v in rows.items()})
-    from meowdoku.entities import LAW_LANE
+    from meowdoku.s1_engine.entities import LAW_LANE
     print(f"[parity] lane {LAW_LANE}: {len(times)} samples of {len(COLUMNS)} columns -> {out}", flush=True)
 
 

@@ -158,7 +158,7 @@ def profile(variant: str, batches: list[int]) -> None:
 def cost(variant: str, batches: list[int]) -> None:
     """In-law cost of one decision: the observation plus the network, natively
     (the module's variant is the process's MEOWDOKU_PILOT_ARCH)."""
-    from meowdoku import scroller as sc
+    from meowdoku.s2_titles.scroller import scroller as sc
     from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
     from src.compiler.ssa_llvm_backend import prepare_artifact_execution
     from src.compiler.work_contract import PRESETS, scoped_work_contract
