@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 
-from meowdoku import fountain as F
+from meowdoku.s2_titles.fountain import fountain as F
 
 DT_SIM = 1.0 / 60.0
 RADIUS = F.SPECIES[0][1]

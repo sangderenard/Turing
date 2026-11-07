@@ -38,8 +38,8 @@ from pathlib import Path
 
 import numpy as np
 
-from meowdoku import fountain3d as F
-from meowdoku.fountain3d import _f32
+from meowdoku.s2_titles.fountain import fountain3d as F
+from meowdoku.s2_titles.fountain.fountain3d import _f32
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_TEXT = "MEOW"

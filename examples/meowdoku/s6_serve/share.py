@@ -164,7 +164,7 @@ class Spectate:
             raise ShareError("not a fountain keyframe")
         if len(raw) > KEY_MAX_BYTES:
             raise ShareError("the keyframe is too large", 413)
-        from meowdoku import loading_anim
+        from meowdoku.s6_serve import loading_anim
         packet = loading_anim.pack(bytes(raw))
         with self.lock:
             share = self.by_owner.get(owner)
