@@ -962,6 +962,7 @@ export class ComputeRuntime {
       this.arrived.delete(k0);
       for (let j = 0; j < count; j++) {
         const k = k0 + j, step = k * snap;
+        if (this.onSnapshot) this.onSnapshot(k, r.frames[j]);
         this.#release(this.tape.push(k, r.frames[j]));
         if (r.keys[j]) this.#release({ keys: this.tape.addKey(step, r.keys[j].payload, r.keys[j].bytes) });
         if (r.diags[j]) this.#takeDiag(step, r.diags[j]);
