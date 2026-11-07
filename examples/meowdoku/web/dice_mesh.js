@@ -7,6 +7,20 @@ const dot = (a,b) => a.reduce((s,x,i)=>s+x*b[i],0);
 const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const unit = (a) => { const r=Math.hypot(...a); return a.map(x=>x/r); };
 const mean = (points) => points[0].map((_,k)=>points.reduce((s,p)=>s+p[k],0)/points.length);
+function originToSegment(a,b) {
+  const ab=sub(b,a), length2=dot(ab,ab);
+  const t=length2>0?Math.max(0,Math.min(1,-dot(a,ab)/length2)):0;
+  return Math.hypot(...a.map((x,i)=>x+t*ab[i]));
+}
+function originToTriangle(a,b,c) {
+  const n=cross(sub(b,a),sub(c,a)), n2=dot(n,n);
+  let nearest=Math.min(originToSegment(a,b),originToSegment(b,c),originToSegment(c,a));
+  if(n2<1e-24) return nearest;
+  const p=n.map(x=>x*dot(n,a)/n2);
+  if([[a,b],[b,c],[c,a]].every(([u,v])=>dot(cross(sub(v,u),sub(p,u)),n)>=-1e-12*n2))
+    nearest=Math.min(nearest,Math.hypot(...p));
+  return nearest;
+}
 
 function hull(vertices) {
   const found=new Map(), epsilon=1e-7;
@@ -267,8 +281,39 @@ export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,marking
     faceInfo.push({faceIndex,number,normal:face.normal,vertexIds:[...face.ids],start,count:glass.length-start,
       markings:markings.map(x=>({number:x.label,anchor:x.center}))});
   }
+  // Exact closest distance from the origin to the final piecewise-triangular
+  // boundary, including bevel, face inset, and marking relief. Because the
+  // origin lies inside every supported die, this is the centered insphere
+  // radius guaranteed to fit inside its solid, even with concave face relief.
+  let safeInteriorRadius=Infinity;
+  for(const [a,b,c] of glass)
+    safeInteriorRadius=Math.min(safeInteriorRadius,originToTriangle(a,b,c));
+  if(!(safeInteriorRadius>0)) throw new Error(`${kind} has no centered interior`);
   return {glass,interior:[],ribbons:[],tubes:[],confetti:[],triangleCount:glass.length,
     faceInfo,parameters:{kind,shellMaterial,markMaterial,markingMode,reliefDepth,subdivisions,markScale,
       bevelRadius,faceRelief,compensateRaised},
-    mechanicsResolved:true,contactModel:'polyhedron'};
+    mechanicsResolved:true,contactModel:'polyhedron',safeInteriorRadius};
+}
+
+/** Keep all of an existing catEyeMarble interior inside a finished die.
+ * Scaling one whole inclusion assembly preserves every disjoint component's
+ * winding, material and triangle ranges. The die's sphere bound is conservative
+ * for non-spherical inclusions and is computed from its final triangles.
+ */
+export function fitInclusionsInsideDie(die,inclusions,{gap=0.012,scale=1}={}) {
+  if(!die||die.contactModel!=='polyhedron'||!(die.safeInteriorRadius>0)||
+    !Array.isArray(inclusions?.interior)||!(gap>=0&&gap<die.safeInteriorRadius)||
+    !(scale>=0&&scale<=1)) throw new RangeError('invalid die inclusion fit');
+  const source=inclusions.interior;
+  const maxRadius=source.reduce((largest,face)=>Math.max(largest,
+    ...face.slice(0,3).map(p=>Math.hypot(...p))),0);
+  const factor=maxRadius>0?(die.safeInteriorRadius-gap)/maxRadius*scale:1;
+  const interior=scale===0?[]:source.map(([a,b,c,id,normals])=>
+    [a.map(x=>x*factor),b.map(x=>x*factor),c.map(x=>x*factor),id,normals]);
+  const parts=(array)=>scale===0?[]:(array||[]).map(part=>({
+    ...part,...(part.center?{center:part.center.map(x=>x*factor)}:{})}));
+  return {...die,interior,ribbons:parts(inclusions.ribbons),tubes:parts(inclusions.tubes),
+    confetti:parts(inclusions.confetti),triangleCount:die.glass.length+interior.length,
+    mechanicsResolved:die.mechanicsResolved!==false&&inclusions.mechanicsResolved!==false,
+    inclusionFit:{gap,scale,factor,sourceMaxRadius:maxRadius,safeInteriorRadius:die.safeInteriorRadius}};
 }
