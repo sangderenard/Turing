@@ -112,10 +112,10 @@ const SPLAT_VS = `#version 300 es
 layout(location=0) in vec2 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
-uniform vec4 uMap; uniform vec3 uBoard; uniform float uTexel; uniform float uMax;
+uniform vec4 uMap; uniform vec3 uBoard; uniform float uTexel; uniform float uMax; uniform vec4 uTint;
 out vec3 vColor;
 void main() {
-  vColor = aColor.rgb; gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
+  vColor = uTint.w > 0.5 ? uTint.rgb : aColor.rgb; gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
   if (aMeta < 50.0) return;
   float flag = floor(aMeta / 100.0 + 0.001);
   float radius = (aMeta - flag * 100.0) * 0.001;
@@ -323,7 +323,7 @@ export class NoiseFilter {
   // the map is as wide as the grains need (~2 texels across the median grain), a power of two in [256, 2048], sticky.  `base`: the mip level of
   // the median grain (0 at the 2048 cap, up to 3 on a small cloud), where the band ladder starts: the grain is the finest scale there is.
   #size(data, board, k) {
-    const n = data.length / 5, radii = [];
+    const n = data.length / 5, radii = [];            // points are [x, y, z, rgba8, meta]
     for (let i = 0, step = Math.max(1, Math.floor(n / 256)); i < n; i += step) {
       const meta = data[i * 5 + 4];
       if (meta >= 50) radii.push((meta - Math.floor(meta / 100 + 0.001) * 100) * 0.001);
@@ -346,7 +346,7 @@ export class NoiseFilter {
     gl.bindVertexArray(ctx.vao);
     gl.useProgram(p.program);
     gl.uniform4f(p.u.uMap, map[0], map[1], map[2], 0); gl.uniform3f(p.u.uBoard, ctx.board[0], ctx.board[1], ctx.y);
-    gl.uniform1f(p.u.uTexel, tw / ctx.board[0]); gl.uniform1f(p.u.uMax, this.caps.maxPointSize);
+    gl.uniform1f(p.u.uTexel, tw / ctx.board[0]); gl.uniform1f(p.u.uMax, this.caps.maxPointSize); gl.uniform4fv(p.u.uTint, ctx.tint || [0, 0, 0, 0]);
     gl.drawArrays(gl.POINTS, 0, data.length / 5);
     gl.bindVertexArray(null);
   }

@@ -29,6 +29,7 @@ the difference between states.  Meowdoku runs the dt-system law through
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import secrets
 import sys
@@ -483,7 +484,7 @@ def prepare_predictor(web_dir: Path) -> None:
               "free-board games run unpredicted", flush=True)
 
 
-def prepare_fountain(web_dir: Path, wasm: bool = True) -> None:
+def prepare_fountain(web_dir: Path) -> None:
     """The fountain's compute product (the page's generic compute runtime loads it) (``fountain_build.build``):
     the generated WebGPU compute shader and the wasm product for each size, and
     the manifest holding the compiler's deployment verdicts.  Rebuilt only when
@@ -491,18 +492,25 @@ def prepare_fountain(web_dir: Path, wasm: bool = True) -> None:
     from meowdoku import fountain_build
     try:
         started = time.perf_counter()
-        manifest = fountain_build.build(web_dir, wasm=wasm)
-        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
-        print(f"[meowdoku] fountain products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        def gpu_ready(manifest):
+            routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+            print(f"[meowdoku] fountain WebGPU products ready ({routes}; {time.perf_counter() - started:.1f}s); "
+                  f"CPU fallbacks follow in the background", flush=True)
+        # MEOWDOKU_FOUNTAIN_WASM=0 skips the CPU (wasm) fallbacks entirely: WebGPU products only (a rushed deploy)
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
+        fountain_build.build(web_dir, wasm=wasm, on_gpu_ready=gpu_ready)
+        print(f"[meowdoku] fountain CPU fallbacks {'ready' if wasm else 'skipped (MEOWDOKU_FOUNTAIN_WASM=0)'} "
+              f"({time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
-def prepare_fountain3d(web_dir: Path, wasm: bool = True) -> None:
+def prepare_fountain3d(web_dir: Path) -> None:
     """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
     from meowdoku import fountain3d_build
     try:
         started = time.perf_counter()
+        wasm = os.environ.get("MEOWDOKU_FOUNTAIN_WASM", "1") != "0"
         manifest = fountain3d_build.build(web_dir, wasm=wasm)
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
@@ -570,8 +578,12 @@ def main(argv: list[str] | None = None) -> int:
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
-    prepare_fountain(web_dir, wasm=not args.no_wasm)
-    prepare_fountain3d(web_dir, wasm=not args.no_wasm)
+    # The fountains' products can take a long compile (the 256 / 4k native + wasm fallbacks): every other game serves
+    # meanwhile, and the fountain pages read their manifests once written.  The 2-D fountain first, then the 3-D one
+    # (its own law and products).  --no-wasm is the same switch as MEOWDOKU_FOUNTAIN_WASM=0: WebGPU products only.
+    if args.no_wasm:
+        os.environ["MEOWDOKU_FOUNTAIN_WASM"] = "0"
+    threading.Thread(target=lambda: (prepare_fountain(web_dir), prepare_fountain3d(web_dir)), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

@@ -960,8 +960,6 @@ class FountainGame(Game):
             {"id": "bounce", "kind": "button", "label": "Bounce", "local": "bounce"},
             {"id": "continue", "kind": "button", "label": "Continue", "local": "continue"},
             {"id": "tilt", "kind": "toggle", "label": "phone gravity", "local": "tilt", "value": True},
-            # a spinning case: gravity turns in the screen's plane at a set rate (a runtime input of the law, like the tilt)
-            {"id": "spin", "kind": "range", "label": "case spin (Hz)", "min": -1, "max": 1, "step": 0.05, "local": "spin", "value": 0},
             # the particle field's render look is the page's own too (web/particle_styles.js STYLES: same ids, same order); render only
             {"id": "pstyle", "kind": "select", "label": "look", "local": "particle_style", "value": "points",
              "options": [[tag, label] for tag, label in PARTICLE_STYLES]},

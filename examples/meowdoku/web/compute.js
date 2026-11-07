@@ -52,8 +52,9 @@
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
-import { ParticleStyles } from "./particle_styles.js";
+import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms } from "./particle_styles.js";
 import { NoiseFilter } from "./noise_filter.js";
+const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
   const response = await fetch(url);
@@ -446,8 +447,9 @@ export class SettleDetector {
 const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
 // the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
 // turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
-export function spinGravity(hz, t) {
-  const a = 2 * Math.PI * hz * t;
+export function spinGravity(hz, t, motion = { kind: "spin" }) {
+  const phase = 2 * Math.PI * hz * t;
+  const a = motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;
   return [Math.sin(a), -Math.cos(a)];
 }
 const SPIN_TURN = 1 / 120;              // the most a spinning case turns between input updates (3 degrees)
@@ -554,7 +556,24 @@ export class ComputeRuntime {
     let snap = Math.max(1, Math.round(1 / (60 * dt)));
     while (set.sample % snap) snap--;
     this.tape = new Recording({ snapEvery: snap, frameBytes: product.frameBytes, capBytes: this.capBytes, keyEvery: snap * Math.max(1, Math.round(1 / (dt * snap))) });
+    this.#recordCap();
     this.ready = true;
+  }
+
+  // RECORDING (readback saving) is OFF by default and switchable: off, the window holds only what the display needs (the
+  // pump's lead plus a margin) and no keyframe state copies are read back, so Replay / Bounce / Continue are unavailable
+  // (Rebirth needs nothing recorded).  On, the window grows to the memory cap and keyframes are kept again.
+  setRecording(on) {
+    this.recordOn = !!on;
+    if (!this.tape) return;
+    this.#recordCap();
+    if (!this.recordOn) this.#release({ keys: this.tape.keys.splice(0) });
+    this.onStatus();
+  }
+
+  #recordCap() {
+    const t = this.tape;
+    t.capFrames = this.recordOn ? Math.max(2, Math.floor(this.capBytes / t.frameBytes)) : LEAD_FRAMES + 4;
   }
 
   // give the recording's frames and keyframes back (frames to the product's pool, keyframes to the device)
@@ -569,7 +588,7 @@ export class ComputeRuntime {
   #inputsNow() {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
-    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt) : this.gravity;
+    const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (g) {
       const G = this.manifest.law.gravity;
       out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)
@@ -592,9 +611,11 @@ export class ComputeRuntime {
   // A SPINNING CASE: gravity turns at ``hz`` revolutions per SIMULATED second (negative = clockwise), as if the box rotated
   // at a prescribed speed; 0 or null stops it.  The angle follows the law's own step count (not the wall clock), so a
   // free-running or replayed run turns the same way, and it overrides the phone's gravity while it runs.
-  setSpin(hz) {
+  // ``motion``: "spin" (a full turn per cycle) or "rock" (gravity swings sinusoidally through ``arc`` degrees, centred on
+  // straight down, one swing out and back per cycle) -- a scripted rocker until the teeter-totter case is a law body.
+  setSpin(hz, motion = this.spinMotion || { kind: "spin", arc: 60 }) {
     const next = hz ? Number(hz) : null;
-    if (next === this.spin) return;
+    this.spinMotion = { kind: motion.kind === "rock" ? "rock" : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)) };
     this.spin = next;
     this.#kick();
   }
@@ -729,7 +750,12 @@ export class ComputeRuntime {
     if (!this.turbo) m = Math.max(1, Math.min(m, LEAD_FRAMES - Math.floor(this.lead)));
     if (this.settleMode) m = Math.max(1, Math.min((set.sample - (this.steps % set.sample)) / snap, (this.#stop() - this.steps) / snap));
     // the inputs change only between batches: a spinning case keeps each batch to SPIN_TURN of a revolution
-    if (this.spin) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (Math.abs(this.spin) * this.manifest.law.dt * snap))));
+    if (this.spin) {
+      // the fastest the gravity angle turns, in revolutions per simulated second: |hz| for a spin, pi * arc/360 * |hz| at the
+      // middle of a rock's swing
+      const rate = Math.abs(this.spin) * (this.spinMotion && this.spinMotion.kind === "rock" ? Math.PI * this.spinMotion.arc / 360 : 1);
+      if (rate > 0) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (rate * this.manifest.law.dt * snap))));
+    }
     return m;
   }
 
@@ -740,7 +766,7 @@ export class ComputeRuntime {
     for (let j = 0; j < m; j++) {
       const at = base + (j + 1) * snap;
       if (settle ? at % set.sample === 0 : (j === m - 1 && now - this.diagAt > DIAG_MS)) diagAt.push(j);
-      if (at % keyEvery === 0) keyAt.push(j);
+      if (this.recordOn && at % keyEvery === 0) keyAt.push(j);
     }
     if (diagAt.length && !settle) this.diagAt = now;
     this.steps += m * snap; this.inflight++;
@@ -839,7 +865,7 @@ export class ComputeRuntime {
 
   // what the page's controls show about the run modes
   localState() {
-    return { tilt: this.gravity !== null, mode: this.play.mode, frames: this.tape ? this.tape.length : 0, ready: this.ready };
+    return { tilt: this.gravity !== null, mode: this.play.mode, frames: this.tape ? this.tape.length : 0, ready: this.ready, recording: !!this.recordOn };
   }
 
   energyText() {
@@ -891,6 +917,7 @@ export class ComputeRuntime {
 //     footprint divides colour by coverage and composites over the scene with alpha = min(coverage, 1).  Dense regions show
 //     their true average colour; sparse ones stay faint.
 const POINT_VS = `#version 300 es
+${GRAIN_COLOR_GLSL}
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
@@ -899,7 +926,7 @@ uniform int uPass;            // 0 splat (small), 1 disc (large), 2 small direct
 uniform float uThreshold;     // the diameter (px) below which a particle is accumulated
 out vec4 vColor; out float vDiameter; out float vCover; flat out vec2 vCenter;
 void main() {
-  vColor = aColor; vDiameter = 0.0; vCover = 0.0; vCenter = vec2(0.0);
+  vColor = grainColor(aColor, aMeta); vDiameter = 0.0; vCover = 0.0; vCenter = vec2(0.0);
   gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
   if (aMeta < 50.0) return;
   float flag = floor(aMeta / 100.0 + 0.001);
@@ -972,7 +999,7 @@ export class PointCloud {
     gl.bindVertexArray(null);
     this.emptyVao = gl.createVertexArray();
     this.max = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
-    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uFocal", "uViewport", "uMax", "uStride", "uPass", "uThreshold", "u_background"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
+    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uFocal", "uViewport", "uMax", "uStride", "uPass", "uThreshold", "u_background", "uTint", "uGrain", "uLut", "uBands"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
     this.rloc = Object.fromEntries(["uViewProj", "uBoard", "uMargin", "uAccum"].map((n) => [n, gl.getUniformLocation(this.resolve, n)]));
     // a float target to accumulate into; without one, small particles fall back to alpha-blended sub-pixel dots (same area weighting)
     this.floatOk = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
@@ -999,10 +1026,10 @@ export class PointCloud {
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
   draw(data, opts) {
     this.#drawField(data, opts);
-    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y }, opts.noise);
+    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y, tint: opts.tint }, opts.noise);
     else this.noise.fallback = "";
   }
-  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
+  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera, tint, colorMode, grain, scene, heat }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
@@ -1013,7 +1040,7 @@ export class PointCloud {
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
     const n = data.length / PT_WORDS;
     // a selected style (particle_styles.js) draws the frame itself; "points", and a style this device cannot run, go on below
-    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
+    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, buffer: this.dyn, tint, colorMode, grain, scene, heat, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
                                                                  map: [(x0 + x1) / 2, (y0 + y1) / 2, k], now: performance.now() })) return;
     const setUniforms = (pass) => {
       gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
@@ -1022,6 +1049,7 @@ export class PointCloud {
       gl.uniform1f(this.loc.uFocal, focal * H / 2); gl.uniform2f(this.loc.uViewport, W, H); gl.uniform1f(this.loc.uMax, this.max);
       gl.uniform1f(this.loc.uStride, stride || 1); gl.uniform1f(this.loc.uThreshold, 1.25);
       gl.uniform3fv(this.loc.u_background, new Float32Array(background || [0.085, 0.085, 0.1]));
+      grainUniforms(gl, (n) => this.loc[n], tint, grain);
       gl.uniform1i(this.loc.uPass, pass);
     };
     gl.useProgram(this.program);

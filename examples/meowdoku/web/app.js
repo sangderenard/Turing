@@ -6,7 +6,8 @@
 
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud } from "./compute.js";
-import { STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability } from "./particle_styles.js";
+import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
+import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
 import { GravitySensor, layoutTransform, screenAngle } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
@@ -410,6 +411,24 @@ function storageTexture(table, unit) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, padded);
   return tex;
 }
+// The Phong shader's depth stack (uDepthUv: R depth, G thickness, B translucence mask, A scatter mask) holds, after the
+// terrain's layer 0, one constant layer per grain-finish thickness setting (see GRAIN_FINISHES): a finish's texstack record names
+// the layer and scales G into millimetres (thickness_scale_mm), which is the shader's thickness for its translucence term.
+const FINISH_LAYERS = [[0, 255, 255, 0], [0, 255, 255, 255]];     // layer 1: clear (thickness 1, translucence 1, no scatter); 2: frosted (scatter 1)
+const FINISH_LAYER_CLEAR = 1, FINISH_LAYER_FROST = 2;
+function withFinishLayers(n, rgba) {
+  const size = n * n * 4, out = new Uint8Array(size * (1 + FINISH_LAYERS.length));
+  out.set(rgba.subarray(0, size), 0);
+  FINISH_LAYERS.forEach((px, k) => { for (let i = 0; i < n * n; i++) out.set(px, size * (k + 1) + 4 * i); });
+  return out;
+}
+function defaultDepthStack(unit) {      // no terrain export: layer 0 flat, then the finish layers (1x1 each)
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, 1, 1, 1 + FINISH_LAYERS.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, withFinishLayers(1, new Uint8Array([0, 0, 0, 255])));
+  return tex;
+}
 function arrayTexture(unit, rgba) {
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
@@ -515,7 +534,8 @@ function uploadTerrainTexture(unit, n, rgba) {
   const tex = gl.createTexture();
   if (unit === 6) state.depthStack = { tex, n };
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
-  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  if (unit === 6) gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1 + FINISH_LAYERS.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, withFinishLayers(n, rgba));
+  else gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, n, n, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
   gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1243,6 +1263,40 @@ function meowMaterial(name, rgb) {
 }
 
 // ---------------------------------------------------------------- materials from the palette
+// The grain finishes (a family of scene materials the fountain's material / stained styles can take; see uploadMaterials).  Every
+// field below is one the shader reads from its own tables; what each does on screen is stated beside it.  [name, albedo, record].
+//   transmission is recorded in the PBR table; the shader reads opacity (alpha) for how much of the scene shows through, and
+//   the translucence / SSS / enamel terms for the light a bead carries itself.
+const PLATE_GROUP = 40;           // the backlit plate's emitter group (uLightGroupId; its own fragments skip its light)
+const EMBER_GROUP = 90;           // a grain finish whose group id indexes the ThermalChunk (uThermalEmission): a Planck blackbody
+const THERMAL_SLOTS = 128;
+const GRAIN_FINISHES = [
+  // clear glass: a high-index specular, a little translucence (thickness 6 mm x gain 1 x 0.02 of the tint added)
+  ["bead@glass", [0.92, 0.96, 1.0], { roughness: 0.02, transmission: 0.92, opacity: 0.12, ior: 1.52, specular: 1.0, shininess: 220, thicknessMm: 6, translucence: 1.0 }],
+  // frosted (profile 3): the depth layer's scatter mask 1 cuts shininess to 12 % and spec strength to 30 %, adds a diffuse halo
+  ["frost@glass", [0.92, 0.95, 1.0], { roughness: 0.55, transmission: 0.7, opacity: 0.35, ior: 1.5, specular: 0.6, shininess: 40, profile: 3,
+    thicknessMm: 3, thicknessLayer: FINISH_LAYER_FROST, translucence: 1.0 }],
+  // SSS (profile 2: translucence at 4x): jade (5 mm) and milk glass (8 mm) glow by thickness x gain x 0.08 of their own tint
+  ["jade@glass", [0.25, 0.72, 0.46], { roughness: 0.35, transmission: 0.5, opacity: 0.5, ior: 1.6, specular: 0.5, shininess: 60, profile: 2, thicknessMm: 5, translucence: 1.0 }],
+  ["milk@glass", [0.96, 0.94, 0.88], { roughness: 0.5, transmission: 0.4, opacity: 0.6, ior: 1.5, specular: 0.4, shininess: 30, profile: 2, thicknessMm: 8, translucence: 1.0 }],
+  // thin film (the ENAMEL record): iridescent fringes from the optical path 2 n d cos, a colour fringe weight of d / 800 nm (max 0.45), a
+  // coat gloss from its own index; opal 480 nm over clear glass, pearl 320 nm over an opaque SSS body (opacity 1: not glass)
+  ["opal@glass", [0.9, 0.92, 0.96], { roughness: 0.15, transmission: 0.6, opacity: 0.3, ior: 1.45, specular: 0.9, shininess: 140, thicknessMm: 3, translucence: 1.0,
+    enamel: { thicknessNm: 480, ior: 1.55, roughness: 0.1, color: [1, 1, 1] } }],
+  ["pearl", [0.93, 0.90, 0.86], { roughness: 0.25, ior: 1.62, specular: 0.7, shininess: 80, profile: 2, thicknessMm: 2, translucence: 1.0,
+    enamel: { thicknessNm: 320, ior: 1.62, roughness: 0.15, color: [1.0, 0.97, 0.95] } }],
+  // gems: a high index (Schlick F0 17 % at 2.42, 7.7 % at 1.77) and a tinting enamel coat
+  ["ruby@glass", [0.85, 0.04, 0.10], { roughness: 0.02, transmission: 0.8, opacity: 0.4, ior: 1.77, specular: 1.0, shininess: 260, thicknessMm: 6, translucence: 1.0,
+    enamel: { thicknessNm: 200, ior: 1.77, roughness: 0.05, color: [1.0, 0.35, 0.4] } }],
+  ["sapphire@glass", [0.06, 0.15, 0.90], { roughness: 0.02, transmission: 0.8, opacity: 0.4, ior: 1.77, specular: 1.0, shininess: 260, thicknessMm: 6, translucence: 1.0,
+    enamel: { thicknessNm: 200, ior: 1.77, roughness: 0.05, color: [0.4, 0.55, 1.0] } }],
+  // phosphorescence: the remit record (gain 1.2, attack 0.05, decay 4 s) -- the shader reads the gain but does not yet sample the
+  // remit layer, so what shows is the SSS body and the emission floor
+  ["glow@glass", [0.35, 0.90, 0.50], { roughness: 0.2, transmission: 0.5, opacity: 0.3, ior: 1.5, specular: 0.5, shininess: 60, emission: [0.04, 0.32, 0.14], profile: 2,
+    thicknessMm: 4, translucence: 1.0, remit: [1.2, 0.05, 4.0] }],
+  // a blackbody (the ThermalChunk: one temperature per group id, so per finish, not per grain)
+  ["ember", [0.18, 0.06, 0.04], { roughness: 0.7, ior: 1.4, specular: 0.2, shininess: 12, group: EMBER_GROUP, kelvin: 1150 }],
+];
 function uploadMaterials(game) {
   // Base tables hold the three piece materials; every palette colour of the
   // state becomes a record (X mark's template, albedo replaced), plus a
@@ -1262,15 +1316,26 @@ function uploadMaterials(game) {
       // against it and the sun leaves a soft highlight.  (It was always drawn
       // this dark, but by accident -- see pointsFrame.)  Declared here as a finish.
       const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint)
-        : (game.game === "fountain" || game.game === "fountain3d") ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
+        : isFountainGame(game) ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
   }
   records.push(["traycube", [0.86, 0.95, 1.0], { roughness: 0.04, transmission: 0.88, opacity: 0.2, ior: 1.5 }]);
+  // GRAIN FINISHES for the fountain's material / stained styles: what the Phong shader needs for visible highlights --
+  // a high declared spec strength and shininess, and a high index (Schlick F0 from the ior: 1.5 gives 4 %, a gem's 2.42
+  // gives 17 %), or a metal (F0 = albedo).  The albedo here is a default: the grain's own colour replaces it.
+  records.push(["gem", [0.85, 0.12, 0.18], { roughness: 0.02, ior: 2.42, specular: 1.0, shininess: 220 }]);
+  records.push(["gem@glass", [0.9, 0.15, 0.22], { roughness: 0.02, transmission: 0.82, opacity: 0.42, ior: 2.42, specular: 1.0, shininess: 260 }]);
+  records.push(["gloss", [0.8, 0.8, 0.8], { roughness: 0.06, ior: 1.6, specular: 0.8, shininess: 120 }]);
+  records.push(["metal", [0.9, 0.8, 0.55], { roughness: 0.12, metallic: 1.0, ior: 1.5, specular: 0.9, shininess: 90 }]);
   // (the fountain's glass slab matches its dark floor)
-  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : (game.game === "fountain" || game.game === "fountain3d") ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
+  const backlit = isFountainGame(game) && typeof backdrop !== "undefined" && backdrop.mode === "backlit";
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : backlit ? [0.92, 0.93, 0.95] : isFountainGame(game) ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
-      : (game.game === "fountain" || game.game === "fountain3d") ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
+      // the backlight (backdrop "backlit"): a white diffusing plate glowing from within (the lights under it, see litPass,
+      // are what light the grains: an emissive surface glows but lights nothing)
+      : backlit ? { roughness: 0.5, transmission: 0.6, opacity: 0.88, ior: 1.5, emission: [0.55, 0.55, 0.57] }
+      : isFountainGame(game) ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
@@ -1323,6 +1388,11 @@ function uploadMaterials(game) {
   records.push(["nav_white", [0.3, 0.3, 0.3], { emission: [1.6, 1.6, 1.5], roughness: 0.2 }]);
   records.push(["nav_strobe", [0.3, 0.3, 0.3], { emission: [2.4, 2.4, 2.5], roughness: 0.2 }]);
   records.push(["nav_off", [0.12, 0.12, 0.13], { roughness: 0.3 }]);
+  // GRAIN FINISHES (appended after every other record: nothing above moves).  Each one is the shader's own material tables,
+  // nothing else: PBR (ior, roughness, metallic, transmission, opacity, emission), Phong (spec strength, shininess), ENAMEL (a
+  // thin-film coat), TEXSTACK (profile: 1 forward emission cone, 2 SSS 4x translucence, 3 frosted scatter; translucence gain;
+  // thickness scale / bias in mm over a depth-stack layer; remit gain / attack / decay) and, for the ember, the ThermalChunk.
+  for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -1336,13 +1406,24 @@ function uploadMaterials(game) {
       const record = template.slice();
       if (tname === "pbr") {
         record[0] = rgb[0]; record[1] = rgb[1]; record[2] = rgb[2];
-        record[3] = extra.roughness ?? 0.72; record[4] = 0.0; record[5] = extra.transmission ?? 0.0;
+        record[3] = extra.roughness ?? 0.72; record[4] = extra.metallic ?? 0.0; record[5] = extra.transmission ?? 0.0;
         record[6] = extra.ior ?? 1.5; record[7] = extra.opacity ?? 1.0;
         const emission = extra.emission || [0, 0, 0];
         record[8] = emission[0]; record[9] = emission[1]; record[10] = emission[2];
       }
       if (tname === "texstack" && extra.colorLayer != null) {
         record[1] = extra.colorLayer; record[9] = extra.colorBlend ?? 1.0;
+      }
+      if (tname === "texstack" && extra.profile != null) record[11] = extra.profile;                // model_flags: the profile
+      if (tname === "texstack" && extra.translucence != null) record[15] = extra.translucence;      // translucence_gain
+      if (tname === "texstack" && extra.thicknessMm != null) {        // thickness = (the layer's G = 1) * scale + bias, in mm
+        record[2] = extra.thicknessLayer ?? FINISH_LAYER_CLEAR; record[5] = extra.thicknessMm; record[7] = 0.0;
+      }
+      if (tname === "texstack" && extra.remit) { record[12] = extra.remit[0]; record[13] = extra.remit[1]; record[14] = extra.remit[2]; }   // gain / attack / decay
+      if (tname === "enamel" && extra.enamel) {                       // a thin-film coat: thickness nm (0 = none), real / imaginary index, roughness, colour
+        const e = extra.enamel;
+        record[0] = e.thicknessNm; record[1] = e.ior; record[2] = e.iorImag ?? 0.0; record[3] = e.roughness ?? 0.1;
+        record[4] = e.color[0]; record[5] = e.color[1]; record[6] = e.color[2];
       }
       if (tname === "texstack" && extra.depthLayer != null) {
         // texstack 2 = depth layer, 4 = depth scale (mm), 6 = depth bias (mm);
@@ -1351,7 +1432,10 @@ function uploadMaterials(game) {
         record[5] = extra.depthScaleMm ?? 0.0; record[7] = 0.0;
       }
       if (tname === "phong") {
-        record[1] = extra.transmission ? 0.5 : Math.min(record[1], 0.10);
+        record[1] = extra.specular ?? (extra.transmission ? 0.5 : Math.min(record[1], 0.10));
+        // phong [1] spec strength, [2] shininess: a material may declare them (the grain gems); the rest keep the
+        // template's, the spec strength capped as before
+        if (extra.shininess != null) record[2] = extra.shininess;
         // The extruded meshes' walls are wound inward (measured: wall signed volume is
         // negative, stored normals follow the winding), so seen from outside they are
         // BACK faces, and the shader paints back faces with the phong record's "inner"
@@ -1359,6 +1443,7 @@ function uploadMaterials(game) {
         // (0.055, 0.055, 0.066): every wall of every piece rendered near-black.  The
         // material is the palette colour on both sides, so inner = albedo.
         record[4] = rgb[0]; record[5] = rgb[1]; record[6] = rgb[2];
+        if (extra.ambient != null) record[0] = extra.ambient;         // (the shader clamps it to 0.12)
       }
       data.push(...record);
       state.materialIndex[name] = base.pbr.records + k;
@@ -1367,6 +1452,13 @@ function uploadMaterials(game) {
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
   state.materialsVersion = (state.materialsVersion || 0) + 1;
+  state.pbrTable = tables.pbr;
+  state.tables = tables;
+  // a finish with a group id and a temperature: the ThermalChunk holds the kelvins by group id (the shader's uThermalEmission reads it)
+  state.materialGroups = {};
+  const thermal = new Float32Array(THERMAL_SLOTS);
+  for (const [name, , extra] of records) if (extra.group != null) { state.materialGroups[name] = { group: extra.group, kelvin: extra.kelvin || 0 }; thermal[extra.group] = extra.kelvin || 0; }
+  storageTexture({ data: thermal }, 10);
   storageTexture(tables.pbr, 0); storageTexture(tables.phong, 1); storageTexture(tables.enamel, 2); storageTexture(tables.texstack, 3);
 }
 
@@ -1443,6 +1535,7 @@ function rebuildBoards(game) {
 // SCENE-CAMERA GESTURES: a view offset (yaw, pitch, log-zoom, pan on the ground)
 // that composes on top of whatever camera the game is in (board, flat, follow);
 // the gesture layer further down moves the goal, stepCamView eases `cur` toward it.
+const isFountainGame = (g) => !!g && (g.game === "fountain" || g.game === "fountain3d");     // the 2-D and the 3-D fountain are one page
 const camView = {
   key: null, lastR: 1, active: 0,
   auto: false,                    // AUTO-ROTATE: a slow orbit (the yaw goal turns at AUTO_ROTATE rad/s) while no finger is on the view
@@ -2111,7 +2204,7 @@ function arcadeBulbs() {
   }
   return bulbs;
 }
-// The ring driven from a compute game's packed points ([x, y, z, rgba8, meta] per
+// The ring driven from a compute game's packed points ([x, y, rgba8, meta] per
 // displayed id; meta/100: 0 not launched, 1 in flight, 2 at rest), once per
 // frame, from what the simulation already gives the page -- no readback of its
 // own.  Three signals, all through the one arcadeBulb mechanism:
@@ -2246,8 +2339,11 @@ const LAMP = { omega: 1.6 };
 // time of day -- its bearing goes once round the board per day, it stands
 // highest at noon, low and warm at dawn and dusk, and at night it is a dim
 // blue moon on the far side.
+// ?hour=13.5 in the URL (or meowdokuDebug.sunHour) holds the sun at that time of day: the live clock otherwise
+const SUN_HOUR = (() => { try { const h = new URLSearchParams(location.search).get("hour"); return h == null ? null : Number(h); } catch { return null; } })();
 function sunState() {
-  const d = new Date(), hours = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+  const d = new Date(), pinned = window.meowdokuDebug && window.meowdokuDebug.sunHour != null ? window.meowdokuDebug.sunHour : SUN_HOUR;
+  const hours = pinned != null && isFinite(pinned) ? ((pinned % 24) + 24) % 24 : d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
   const day = Math.sin((hours - 6) / 24 * 2 * Math.PI);          // +1 noon, 0 dawn/dusk, -1 midnight
   const azimuth = hours / 24 * 2 * Math.PI;
   const elevation = (day >= 0 ? 15 + 55 * day : 35) * Math.PI / 180;
@@ -3983,8 +4079,13 @@ const compute = new ComputeRuntime({
 window.meowdokuDebug.compute = compute;
 // The phone's orientation is the fountain's gravity (a runtime input of the law), on by default, with an off switch.  iOS only
 // delivers the events after a permission asked for on a tap: the first tap anywhere asks.
+// CAMERA-DOWN GRAVITY (a page switch): gravity is the camera's down vector in the box's frame, so orbiting the camera is the
+// box turning under a fixed view.  Overrides the phone; a spinning / rocking case overrides it.
+let cameraGravity = false;
+const camGravNow = [0, -1];                      // the last camera-down gravity applied (fractions of g), for the control's readout
+try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
 const gravitySensor = new GravitySensor({
-  onGravity: (gx, gy, gz) => compute.setGravity(gx, gy, gz),
+  onGravity: (gx, gy, gz) => { if (!cameraGravity) compute.setGravity(gx, gy, gz); },
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
@@ -4004,7 +4105,7 @@ function clearLayoutTurn() {
   layoutLock.turn = null;
 }
 function applyLayoutLock() {
-  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin);
+  const want = !!(state.game && state.game.compute && gravitySensor.enabled && !caseSpin && !cameraGravity);
   if (!want) {
     if (layoutLock.angle != null) {
       layoutLock.angle = null; gravitySensor.lockedAngle = null; clearLayoutTurn();
@@ -4035,7 +4136,7 @@ function contentPoint(X, Y) {
 for (const type of ["resize", "orientationchange"]) addEventListener(type, () => setTimeout(applyLayoutLock, 0));
 // The particle field's render style (particle_styles.js): a page setting, render only, remembered in the browser.
 let particleStyle = DEFAULT_STYLE;
-try { const saved = localStorage.getItem("meowdoku.pstyle"); if (STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
+try { const saved = localStorage.getItem("meowdoku.pstyle"); if (ALL_STYLES.some((x) => x.id === saved)) particleStyle = saved; } catch { /* storage may be blocked */ }
 window.meowdokuDebug.setParticleStyle = (id) => { particleStyle = id; refreshLocalControls(); };
 Object.defineProperty(window.meowdokuDebug, "cloud", { get: () => cloud });
 // The spectral noise filter (noise_filter.js) layered over the look: also the page's own, render only, remembered in the browser.
@@ -4044,10 +4145,70 @@ try { Object.assign(noiseFx, JSON.parse(localStorage.getItem("meowdoku.noisefx")
 noiseFx.on = !!noiseFx.on; if (!NOISE_MODES.some(([id]) => id === noiseFx.mode)) noiseFx.mode = NOISE_DEFAULTS.mode;
 for (const key of ["strength", "threshold"]) if (!Number.isFinite(noiseFx[key])) noiseFx[key] = NOISE_DEFAULTS[key];
 window.meowdokuDebug.noiseFx = noiseFx;
+// The particle colour source (particle_styles.js resolveColorSource): the simulation's per-id colour, one solid colour, or a
+// declared scene material.  A page setting like the style: render only, remembered in the browser.
+// The heat style's manual override (particle_styles.js "heat tone mapping"): a fixed range instead of the adaptive one, and a gamma.
+const heatFx = { fixed: false, gamma: 1 };
+try { Object.assign(heatFx, JSON.parse(localStorage.getItem("meowdoku.heatfx") || "{}")); } catch { /* storage may be blocked or hold junk */ }
+heatFx.fixed = !!heatFx.fixed; if (!Number.isFinite(heatFx.gamma)) heatFx.gamma = 1;
+const pcolor = { ...DEFAULT_COLOR };
+try { Object.assign(pcolor, JSON.parse(localStorage.getItem("meowdoku.pcolor") || "{}")); } catch { /* storage may be blocked or hold junk */ }
+if (!COLOR_SOURCES.some(([id]) => id === pcolor.source)) pcolor.source = DEFAULT_COLOR.source;
+if (!PALETTE_IDS.includes(pcolor.palette)) pcolor.palette = DEFAULT_COLOR.palette;
+// The fountain's backdrop (page-side, render only): "floor" is today's dark slab and glass plate under the grains; "clear" draws
+// neither, so the scene's sky / background, lights and the glass styles' reflections show through.
+const backdrop = { mode: "floor" };
+try { const saved = localStorage.getItem("meowdoku.backdrop"); if (saved === "clear" || saved === "floor" || saved === "backlit") backdrop.mode = saved; } catch { /* storage may be blocked */ }
+const backdropClear = () => backdrop.mode === "clear" && !!isFountainGame(state.game);
+// no dark floor tiles under the fountain: "clear" (nothing) and "backlit" (only the glowing plate)
+const backdropNoFloor = () => (backdrop.mode === "clear" || backdrop.mode === "backlit") && !!isFountainGame(state.game);
+// The backlit plate is an EMITTER GROUP of the shader's light list ("all direct illumination comes from host emitters"): one light at
+// the plate's centre whose uLightIntensity is the plate's AREA (the shader's emitter radius is sqrt(area / 4 pi)), whose uLightGroupId
+// is PLATE_GROUP -- and the plate is drawn with that aGroupId, so its own fragments skip it.  (board frame)
+const BACKLIGHT_COLOUR = [0.11, 0.108, 0.105];     // linear: the plate's radiance per unit (the shader divides the area by the squared distance + radius^2)
+function backlightEmitter() {
+  if (!(backdrop.mode === "backlit" && isFountainGame(state.game) && !state.flat)) return null;
+  const w = state.extent.width, z0 = state.extent.z0 || 0, d = state.extent.depth;
+  return { at: [w / 2, -GLASS.thickness * 0.5, (z0 + d) / 2], area: w * (d - z0) };
+}
+// Debug: draw caller-made packed grains `data` ([x, y, rgba8, meta]) in `style` through the scene's own call (the measurements'
+// path: no rAF needed); the GL context; the material tables as uploaded.
+window.meowdokuDebug.drawGrains = (data, style) => { const g = state.game, rec = compute.rec; if (!g || !rec || !cloud) return null; drawCloud(camera(), data, g, rec, style); return cloud.styles.fallback || cloud.styles.note || ""; };
+window.meowdokuDebug.glx = () => gl;
+window.meowdokuDebug.glassInfo = () => cloud && cloud.styles.glassInfo;
+// the scene's light list as the last lit pass set it: [{ pos (view space), colour, intensity, group }]
+window.meowdokuDebug.lights = () => {
+  const P = state.programs.phong, n = gl.getUniform(P, gl.getUniformLocation(P, "uNumLights")), out = [];
+  for (let i = 0; i < n; i++) out.push({ pos: Array.from(gl.getUniform(P, gl.getUniformLocation(P, `uLightPos[${i}]`))), colour: Array.from(gl.getUniform(P, gl.getUniformLocation(P, `uLightColor[${i}]`))),
+    intensity: gl.getUniform(P, gl.getUniformLocation(P, `uLightIntensity[${i}]`)), group: gl.getUniform(P, gl.getUniformLocation(P, `uLightGroupId[${i}]`)) });
+  return out;
+};
+window.meowdokuDebug.tablesNow = () => ({ names: state.materialIndex, tables: Object.fromEntries(Object.entries(state.tables).map(([k, v]) => [k, { f: v.floats_per_record, n: v.records, data: Array.from(v.data) }])) });
+window.meowdokuDebug.backdrop = backdrop; window.meowdokuDebug.budget = MATERIAL_BUDGET;
+window.meowdokuDebug.pcolor = pcolor;
+// the scene's declared materials a grain may take (name@variants are the pieces' own states of one material)
+// (the generated families -- bulbs, shield steps, nav lights, bars, smoke steps -- and the pieces' @hint / @sel states are left out;
+// the @glass ones are the scene's translucent materials)
+function materialChoices() {
+  return Object.keys(state.materialIndex).filter((n) => !/^(bulb\d|shield_|nav_|bar_|smoke_|sight|reticle|beam|broadcast|terrain)/.test(n) && !/@(hint|sel)$/.test(n)).sort();
+}
+function albedoOfMaterial(name) {
+  const id = state.materialIndex[name], t = state.pbrTable;
+  if (id == null || !t) return null;
+  const f = t.floats_per_record, o = id * f;
+  return t.data.length >= o + 3 ? [t.data[o], t.data[o + 1], t.data[o + 2]] : null;
+}
+function colorPick() {
+  const names = materialChoices();
+  return resolveColorSource({ ...pcolor, material: names.includes(pcolor.material) ? pcolor.material : "" }, albedoOfMaterial,
+                            compute && compute.manifest ? compute.manifest.species : null);
+}
 // the value a local control shows (the server's spec value is only the default)
 function localValue(s) {
-  return { particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
-           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: caseSpin, orbit: !!camView.auto }[s.local] ?? s.value;
+  return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
+           particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
+           noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
+           spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4059,13 +4220,45 @@ function localControl(s, value) {
     camView.auto = !!value;
     // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
+  } else if (s.local === "spinmotion") {
+    spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
+  } else if (s.local === "spinarc") {
+    spinMotion.arc = Number(value); saveSpinMotion();
+  } else if (s.local === "autoarc") {
+    autoArc.on = !!value; autoArc.level = null; autoArc.steps = null; saveAutoArc();
+  } else if (s.local === "autoarc_species") {
+    autoArc.species = Number(value) || 0; autoArc.level = null; saveAutoArc();
+  } else if (s.local === "autoarc_target") {
+    autoArc.target = Number(value); saveAutoArc();
+  } else if (s.local === "autoarc_gain") {
+    autoArc.gain = Number(value); saveAutoArc();
+  } else if (s.local === "camgrav") {
+    cameraGravity = !!value;
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);    // camera-down wins over a spinning / rocking case while it is on
+    if (!cameraGravity) compute.setGravity(gravitySensor.last ? gravitySensor.last[0] : null, gravitySensor.last ? gravitySensor.last[1] : null);
+    try { localStorage.setItem("meowdoku.camgrav", cameraGravity ? "1" : "0"); } catch { /* storage may be blocked */ }
+  } else if (s.local === "record") {
+    recordOn = !!value;
+    compute.setRecording(recordOn);
+    try { localStorage.setItem("meowdoku.record", recordOn ? "1" : "0"); } catch { /* storage may be blocked */ }
   } else if (s.local === "spin") {
-    caseSpin = Math.abs(Number(value)) < 1e-6 ? 0 : Number(value);
-    compute.setSpin(caseSpin);
+    caseSpin = spinFromSlider(value);
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
     try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
   } else if (s.local === "particle_style") {
-    particleStyle = STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
+    particleStyle = ALL_STYLES.some((x) => x.id === value) ? value : DEFAULT_STYLE;
     try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
+  } else if (s.local.startsWith("heat_")) {
+    heatFx[s.local.slice(5)] = s.local === "heat_fixed" ? !!value : Number(value);
+    try { localStorage.setItem("meowdoku.heatfx", JSON.stringify(heatFx)); } catch { /* storage may be blocked */ }
+  } else if (s.local === "backdrop") {
+    backdrop.mode = value === "clear" || value === "backlit" ? value : "floor";
+    if (isFountainGame(state.game)) uploadMaterials(state.game);   // the plate's glow is its material's emission
+    try { localStorage.setItem("meowdoku.backdrop", backdrop.mode); } catch { /* storage may be blocked */ }
+  } else if (s.local.startsWith("pcolor_")) {
+    pcolor[s.local.slice(7)] = s.local === "pcolor_source" && !COLOR_SOURCES.some(([id]) => id === value) ? DEFAULT_COLOR.source
+      : s.local === "pcolor_palette" && !PALETTE_IDS.includes(value) ? DEFAULT_COLOR.palette : String(value);
+    try { localStorage.setItem("meowdoku.pcolor", JSON.stringify(pcolor)); } catch { /* storage may be blocked */ }
   } else if (s.local.startsWith("noise_")) {
     const key = s.local.slice(6);
     noiseFx[key] = key === "on" ? !!value : key === "mode" ? (NOISE_MODES.some(([id]) => id === value) ? value : NOISE_DEFAULTS.mode) : Number(value);
@@ -4078,7 +4271,7 @@ function refreshLocalControls() {
   const box = $("gamectl"), g = state.game;
   if (!box || !g || !g.controls_ui) return;
   const st = compute.localState();
-  for (const s of g.controls_ui) {
+  for (const s of pageSpecs(g.controls_ui)) {
     if (s.kind === "readout") {                       // a number the law reports (the dropped neighbour contacts beside the cap)
       const el = box.querySelector(`[data-ctl="${s.id}"]`), d = compute.diag;
       if (el) el.textContent = `${s.label}: ${d ? Math.round(d[s.diag]).toLocaleString() : "-"}`;
@@ -4087,12 +4280,12 @@ function refreshLocalControls() {
     if (!s.local) continue;
     const el = box.querySelector(`[data-ctl="${s.id}"]`);
     if (!el) continue;
-    if (s.local === "orbit") { el.querySelector("input").checked = !!camView.auto; continue; }
     if (s.local === "spin") {
       const input = el.querySelector("input");
-      if (document.activeElement !== input) input.value = String(caseSpin);
-      el.title = caseSpin ? `gravity turns ${Math.abs(caseSpin)} rev/s ${caseSpin > 0 ? "counterclockwise" : "clockwise"} (overrides the phone)` : "0: the case stands still";
-      el.querySelector("span").textContent = `case spin ${caseSpin ? caseSpin.toFixed(2) + " Hz" : "off"} `;
+      if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
+      el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, centre = off`
+                          : "centre = off; log scale out to 2 Hz either way, down to 1 turn in 2.8 h";
+      el.querySelector("span").textContent = `case spin ${spinText(caseSpin)} `;
     } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
       el.title = { idle: "waiting for a tap", waiting: "waiting for the first reading", on: "gravity follows the phone", off: "gravity is straight down", denied: "the browser refused motion access" }[gravitySensor.state] || "";
@@ -4103,28 +4296,194 @@ function refreshLocalControls() {
         const av = styleAvailability(option.value, caps), base = option.dataset.label || (option.dataset.label = option.textContent);
         option.disabled = !av.ok; option.textContent = av.ok ? base : `${base} (unavailable here)`; option.title = av.note;
       }
+      const drawn = cloud && cloud.styles.fallback;
+      for (const option of select.options) if (option.value === "material" && option.dataset.label) {
+        option.textContent = drawn && particleStyle === "material" && option.disabled === false ? `${option.dataset.label} (drawing sand: see tooltip)` : option.dataset.label;
+      }
       select.value = particleStyle;
-      el.title = (cloud && cloud.styles.fallback) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      const glassInfo = cloud && cloud.styles.glassInfo;     // how the glass grains were composited in the last frame (OIT, or alpha and why)
+      el.title = drawn || (glassInfo ? `${glassInfo}` : "") || (particleStyle === "heat" && cloud && cloud.styles.heatInfo) || chooseStyle(particleStyle, caps).reason || "render style of the particle field (render only)";
+      for (const option of select.options) if ((option.value === "stained" || option.value === "stained_fast") && option.dataset.label)
+        option.title = option.disabled ? option.title : (option.value === "stained_fast" ? "glass grains: plain alpha blending in draw order (fast mode)" : glassInfo || "glass grains: weighted blended OIT through the scene shader's material tables");
+    } else if (s.local === "heat_fixed" || s.local === "heat_gamma") {
+      const on = particleStyle === "heat", input = el.querySelector("input");
+      input.disabled = !on;
+      el.title = (on && cloud && cloud.styles.heatInfo) || "heat style: fixed range on/off (off = the range follows the field's 2nd..98th percentiles over about a second) and gamma";
+    } else if (s.local === "pcolor_source") {
+      const picked = colorPick();
+      el.title = picked.reason || "where the grains' colour comes from: the simulation (per grain), one solid colour, or a declared scene material (the material style takes the whole material); render only";
+    } else if (s.local === "pcolor_palette") {
+      el.title = "a palette the size ramp, the species colours and the simulation's own hues are mapped through (sea, ember, meadow); native leaves them as they are";
+    } else if (s.local === "backdrop") {
+      el.title = "floor: the dark slab and glass plate under the fountain (contrast); backlit: the same plate glowing a mild white from within; clear: neither, so the sky, background and lights show through and glass has something to reflect";
+    } else if (s.local === "pcolor_solid") {
+      el.querySelector("input").disabled = pcolor.source !== "solid";
+      el.title = "the grains' colour when the source is 'solid colour'";
+    } else if (s.local === "pcolor_material") {
+      const select = el.querySelector("select"), names = materialChoices(), have = Array.from(select.options).map((o) => o.value).join(",");
+      if (have !== names.join(",")) select.replaceChildren(...names.map((n) => Object.assign(document.createElement("option"), { value: n, textContent: n })));
+      select.value = names.includes(pcolor.material) ? pcolor.material : names[0] || "";
+      select.disabled = pcolor.source !== "material" || !names.length;
+      el.title = select.disabled ? 'active when "colour" is set to scene material: then it lists every scene material (' + names.length + ")"
+                                 : "the scene material the grains take (glass ones, @glass, go through the glass pass)";
+      el.classList.toggle("inactive", select.disabled);
+      el.title = "the scene material the grains take when the source is 'scene material': its colour, and for the material style its whole surface (roughness, metal, gloss)";
     } else if (s.local.startsWith("noise_")) {
       // without float render targets the filter is off, and the title says why
       const caps = capabilitiesOf(gl), choice = chooseNoise(true, caps, cloud && cloud.noise.broken);
       el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
       const input = el.querySelector("input, select");
       if (input) input.disabled = !choice.on;
+    } else if (s.local === "spinmotion" || s.local === "spinarc") {
+      const input = el.querySelector("input, select");
+      if (document.activeElement !== input) input.value = String(s.local === "spinmotion" ? spinMotion.kind : spinMotion.arc);
+      if (s.local === "spinarc") {
+        el.querySelector("span").textContent = `rock arc ${spinMotion.arc}° `;
+        input.disabled = spinMotion.kind !== "rock";
+        el.title = "the swing: gravity rocks +-half this angle about straight down, one swing out and back per cycle at the case spin rate";
+      } else el.title = "rotate: a full turn per cycle; rock: swing through the arc at the case spin rate";
+    } else if (s.local === "autoarc") {
+      el.querySelector("input").checked = autoArc.on;
+      const live = caseSpin && spinMotion.kind === "rock" && !cameraGravity;
+      el.lastChild.textContent = autoArc.on ? ` auto arc (level ${autoArc.level == null ? "-" : autoArc.level.toFixed(2)}, arc ${spinMotion.arc.toFixed(1)}°${live ? "" : ", idle: set case motion rock and a spin rate"})` : " auto arc";
+      el.title = "live-tunes the rock arc so the chosen species' mean height sits at the target level of the box (integral control in simulated time)";
+    } else if (s.local === "autoarc_species") {
+      const select = el.querySelector("select"), table = speciesTable(compute.manifest && compute.manifest.species);
+      const have = Array.from(select.options).map((o) => o.textContent).join(",");
+      if (have !== table.map((r) => r.name).join(",")) select.replaceChildren(...table.map((r, i) => Object.assign(document.createElement("option"), { value: String(i), textContent: r.name })));
+      select.value = String(autoArc.species); select.disabled = !autoArc.on;
+    } else if (s.local === "autoarc_target" || s.local === "autoarc_gain") {
+      const input = el.querySelector("input"); input.disabled = !autoArc.on;
+      el.querySelector("span").textContent = s.local === "autoarc_target" ? `target level ${autoArc.target.toFixed(2)} ` : `arc gain ${autoArc.gain}°/s `;
+    } else if (s.local === "camgrav") {
+      el.querySelector("input").checked = cameraGravity;
+      const mag = Math.hypot(camGravNow[0], camGravNow[1]), ang = Math.atan2(camGravNow[0], -camGravNow[1]) * 180 / Math.PI;
+      el.lastChild.textContent = cameraGravity ? ` gravity = camera down (${(100 * mag).toFixed(0)}% g, ${ang.toFixed(0)}°)` : " gravity = camera down";
+      el.title = "gravity is the camera's down: orbit or tilt the camera and the box turns under it. Full strength looking straight down at the board, less as the camera tilts toward the horizon. Overrides phone gravity and the case spin/rock while on.";
+    } else if (s.local === "record") {
+      el.querySelector("input").checked = recordOn;
+      el.title = recordOn ? "frames and keyframes are read back and kept (memory-capped window): Replay, Bounce, Continue"
+                          : "off: only the display's few frames are read back; switch on to record";
     } else {
-      el.disabled = !st.ready || (s.local === "continue" ? st.mode === "live" : s.local === "rebirth" ? false : st.frames === 0);
+      el.disabled = !st.ready || (s.local === "rebirth" ? false : !st.recording || (s.local === "continue" ? st.mode === "live" : st.frames === 0));
+      if (s.local !== "rebirth") el.title = st.recording ? "" : "switch on record (readback) to keep frames for this";
       el.classList.toggle("on", s.local === st.mode);
     }
   }
 }
-// a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off, then log-spaced from spec.log_min to spec.max
+// Page-side controls the server's list leaves room for: next to the phone gravity switch, a spinning case (gravity
+// turning at a set rate, a runtime input of the law like the tilt, so no rebuild).  Declared here until the fountain's
+// controls next change server-side (an edit there re-keys the compiled products).
+// The slider is LOGARITHMIC in the rate (grain-size studies want the near-DC end): position s in [-1, 1] -> sign(s) x
+// 10^(SPIN_LOG[0] + |s| (SPIN_LOG[1] - SPIN_LOG[0])) Hz, from 1e-4 Hz (one turn in ~2.8 h) to 2 Hz; the centre notch is off.
+const SPIN_LOG = [-4, Math.log10(2)], SPIN_NOTCH = 0.01;
+const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin", min: -1, max: 1, step: 0.002, local: "spin" };
+function spinFromSlider(s) {
+  s = Number(s);
+  if (Math.abs(s) < SPIN_NOTCH) return 0;
+  const u = (Math.abs(s) - SPIN_NOTCH) / (1 - SPIN_NOTCH);
+  return Math.sign(s) * 10 ** (SPIN_LOG[0] + u * (SPIN_LOG[1] - SPIN_LOG[0]));
+}
+function sliderFromSpin(hz) {
+  if (!hz) return 0;
+  const u = (Math.log10(Math.abs(hz)) - SPIN_LOG[0]) / (SPIN_LOG[1] - SPIN_LOG[0]);
+  return Math.sign(hz) * (SPIN_NOTCH + Math.max(0, Math.min(1, u)) * (1 - SPIN_NOTCH));
+}
+function spinText(hz) {
+  if (!hz) return "off";
+  const a = Math.abs(hz), period = 1 / a;
+  const per = period < 120 ? `${period.toPrecision(3)} s` : period < 7200 ? `${(period / 60).toPrecision(3)} min` : `${(period / 3600).toPrecision(3)} h`;
+  return `${hz < 0 ? "-" : ""}${a.toPrecision(2)} Hz (1 turn / ${per})`;
+}
+// How the case moves at the spin rate: a full rotation, or a rock through an arc (degrees, centred on straight down).
+const MOTION_SPEC = { id: "spinmotion", kind: "select", label: "case motion", local: "spinmotion", options: [["spin", "rotate"], ["rock", "rock"]] };
+const ARC_SPEC = { id: "spinarc", kind: "range", label: "rock arc", min: 0, max: 360, step: 1, local: "spinarc" };
+function saveSpinMotion() {
+  compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
+  try { localStorage.setItem("meowdoku.spinmotion", JSON.stringify(spinMotion)); } catch { /* storage may be blocked */ }
+}
+const CAMGRAV_SPEC = { id: "camgrav", kind: "toggle", label: "gravity = camera down", local: "camgrav" };
+// AUTO ARC: while the case rocks, a slow integral controller live-tunes the rock arc to hold one species' mean height at a
+// target level of the box (default the middle): high-speed rocking swings material up, and there is a fine arc that floats
+// (liquefies) the pile.  Measured from the displayed frame's own positions; the arc is a runtime input, so no rebuild.
+const AUTOARC_SPECS = [
+  { id: "autoarc", kind: "toggle", label: "auto arc", local: "autoarc" },
+  { id: "autoarc_species", kind: "select", label: "species", local: "autoarc_species", options: [] },
+  { id: "autoarc_target", kind: "range", label: "target level", min: 0.05, max: 0.95, step: 0.01, local: "autoarc_target" },
+  { id: "autoarc_gain", kind: "range", label: "arc gain", min: 5, max: 400, step: 5, local: "autoarc_gain" },
+];
+const autoArc = { on: false, species: 0, target: 0.5, gain: 60, level: null, steps: null, frame: null };
+try { Object.assign(autoArc, JSON.parse(localStorage.getItem("meowdoku.autoarc") || "{}"), { level: null, steps: null, frame: null }); } catch { /* storage may be blocked */ }
+const AUTOARC_SMOOTH_S = 0.8;                       // the level's smoothing, in simulated seconds
+function saveAutoArc() {
+  try { localStorage.setItem("meowdoku.autoarc", JSON.stringify({ on: autoArc.on, species: autoArc.species, target: autoArc.target, gain: autoArc.gain })); } catch { /* storage may be blocked */ }
+}
+// One controller step on a new displayed frame: the species' mean height over the box height (floor 0 to the lid the
+// rocking case closes, else the nozzle), smoothed in simulated time; the arc integrates (target - level) * gain deg/s.
+function autoArcStep(data) {
+  if (!autoArc.on || !compute.rec || compute.shown == null || compute.shown === autoArc.frame) return;
+  autoArc.frame = compute.shown;
+  const spec = compute.spec || {}, u = spec.uniforms || {}, tilt = spec.tilt || {};
+  const top = (spinMotion.kind === "rock" && caseSpin ? tilt.lid : null) || u.nozzle_y || 1;
+  const table = speciesTable(compute.manifest && compute.manifest.species);
+  let sum = 0, n = 0;
+  const count = pointCount(data), stride = Math.max(1, Math.floor(count / 20000));
+  for (let i = 0; i < count; i += stride) {
+    const pt = readPoint(data, i);
+    if (pt.alive && speciesOf(pt.radius, table) === autoArc.species) { sum += pt.y; n++; }
+  }
+  if (!n) return;
+  const level = Math.max(0, Math.min(1, sum / n / top));
+  const now = compute.steps * compute.manifest.law.dt, dt = autoArc.steps == null ? 0 : Math.max(0, now - autoArc.steps);
+  autoArc.steps = now;
+  autoArc.level = autoArc.level == null ? level : autoArc.level + (level - autoArc.level) * (1 - Math.exp(-dt / AUTOARC_SMOOTH_S));
+  if (!(caseSpin && spinMotion.kind === "rock" && !cameraGravity) || dt <= 0) return;      // it tunes a rocking case only
+  spinMotion.arc = Math.max(0, Math.min(360, spinMotion.arc + autoArc.gain * (autoArc.target - autoArc.level) * dt));
+  compute.setSpin(caseSpin, spinMotion);
+}
+// Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
+const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
+// The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
+// products): controls after the server's `look` select, and the material styles appended to that select's options.
+const COLOR_SPECS = [
+  { id: "heat_fixed", kind: "toggle", label: "heat fixed range", local: "heat_fixed", value: false },
+  { id: "heat_gamma", kind: "range", label: "heat gamma", min: 0.4, max: 2.5, step: 0.05, local: "heat_gamma", value: 1 },
+  { id: "pcolor_source", kind: "select", label: "colour", local: "pcolor_source", value: "simulation", options: COLOR_SOURCES },
+  { id: "pcolor_palette", kind: "select", label: "palette", local: "pcolor_palette", value: "native", options: PALETTE_IDS.map((p) => [p, p]) },
+  { id: "backdrop", kind: "select", label: "backdrop", local: "backdrop", value: "floor", options: [["floor", "floor (dark slab)"], ["backlit", "backlit (glowing plate)"], ["clear", "clear (scene shows)"]] },
+  { id: "pcolor_solid", kind: "color", label: "solid", local: "pcolor_solid", value: DEFAULT_COLOR.solid },
+  { id: "pcolor_material", kind: "select", label: "material", local: "pcolor_material", value: "", options: [] },
+];
+function pageSpecs(specs) {
+  if (!specs) return specs;
+  let out = specs;
+  if (!out.some((s) => s.id === SPIN_SPEC.id)) {
+    const tilt = out.findIndex((s) => s.local === "tilt");
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    const run = out.findIndex((s) => s.local === "rebirth");
+    if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
+  }
+  const look = out.findIndex((s) => s.local === "particle_style");
+  if (look >= 0 && !out.some((s) => s.id === COLOR_SPECS[0].id)) {
+    const extra = PAGE_STYLES.filter((p) => !out[look].options.some(([id]) => id === p.id)).map((p) => [p.id, p.label]);
+    out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
+    out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
+  }
+  return out;
+}
+let recordOn = false;
+try { recordOn = localStorage.getItem("meowdoku.record") === "1"; } catch { /* storage may be blocked */ }
+compute.setRecording(recordOn);
+let caseSpin = 0;
+let spinMotion = { kind: "spin", arc: 60 };
+try { spinMotion = { ...spinMotion, ...JSON.parse(localStorage.getItem("meowdoku.spinmotion") || "{}") }; } catch { /* storage may be blocked */ }
+try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
+compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
+// a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off (or log_min with log_floor), then log-spaced from spec.log_min to spec.max
 function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? (s.log_floor ? s.log_min : 0) : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
 function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
-let caseSpin = 0;
-try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
-compute.setSpin(caseSpin);
 function renderGameControls(game) {
-  const box = $("gamectl"), specs = (game && game.controls_ui);
+  const box = $("gamectl"), specs = pageSpecs(game && game.controls_ui);
   if (!box) return;
   if (!specs) { if (box.childElementCount) box.replaceChildren(); delete box.dataset.key; return; }
   const key = `${game.game}:${specs.map((s) => s.id).join(",")}`;
@@ -4139,21 +4498,27 @@ function renderGameControls(game) {
         input.onchange = () => (s.local ? localControl(s, input.checked) : act({ type: s.action, [s.field]: input.checked }));
         el.append(input, " " + s.label);
       }
+      else if (s.kind === "color") {
+        el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
+        const input = document.createElement("input"); input.type = "color"; input.value = s.value;
+        input.onchange = () => localControl(s, input.value);
+        el.append(input);
+      }
+      else if (s.kind === "readout") { el = document.createElement("span"); el.className = "gctl-readout"; }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
         if (s.capture) input.setAttribute("capture", s.capture);
         input.onchange = async () => { const f = input.files[0]; input.value = ""; await compute.pickImage(f, s.sample); };
         el.append(input);
-      } else if (s.kind === "readout") { el = document.createElement("span"); el.className = "gctl-readout"; }
-      else {
+      } else {
         el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
         const input = document.createElement(s.kind === "select" ? "select" : "input");
-        if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });   // 0 = off, then log-spaced from log_min to max
+        if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
         else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
-        input.onchange = () => s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options?.[0]?.[0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) });
-        if (s.kind === "range") { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
+        input.onchange = () => (s.local ? localControl(s, input.value) : act({ type: s.action, ...(s.name ? { name: s.name } : {}), [s.field]: s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value, ...(s.aspect ? { aspect: canvas.clientWidth / Math.max(1, canvas.clientHeight) } : {}) }));
+        if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
         else el.append(input);
       }
       el.dataset.ctl = s.id;
@@ -4203,20 +4568,80 @@ function particleLighting(g, y) {
   const lit = (v, floor) => floor + (1 - floor) * Math.min(1, v);
   return { dir: norm(sub(light.position, [g.width / 2, y, g.height / 2])), key: key.map((v) => lit(v, 0.3)), fill: ambientFill([0.75, 0.85, 1.0]).map((v) => lit(v, 0.34)) };
 }
+// The scene's own material path for the material particle style: the Phong program (lights and units are already set by the
+// lit pass of this frame), the material id (the chosen scene material, else the plain `glass` one: only its surface parameters,
+// the colour is the grain's), and the key light's matrix for the shadow lookups.
+function particleScene(pick) {
+  // stained glass without a chosen material takes the scene's translucent glass cube material (the tray's), else the plain glass
+  // (stained = the material-mode glass: the "bead@glass" finish through the shader's tables, composited by OIT; stained_fast = the
+  // alpha-blended look it had before, "gem@glass")
+  const name = pick.mode === "material" ? pick.material
+    : particleStyle === "stained" ? (state.materialIndex["bead@glass"] != null ? "bead@glass" : "gem@glass")
+    : particleStyle === "stained_fast" ? (state.materialIndex["gem@glass"] != null ? "gem@glass" : "traycube") : (state.materialIndex.gem != null ? "gem" : "glass");
+  const id = state.materialIndex[name];
+  const t = state.pbrTable, f = t && t.floats_per_record;
+  const opacity = id != null && t ? t.data[id * f + 7] : 1;
+  const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
+  const group = (state.materialGroups || {})[name];
+  return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj,
+           glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
+}
+// The camera's down in the law's plane: the board maps law x to world +x and law y to world -z (PointCloud's uMap), so the
+// in-plane part of the camera's down (minus its up row of the view matrix) is (d.x, -d.z) -- full strength looking
+// straight down at the board, none looking along it (the box then lies flat in the camera's frame).
+function cameraDownInLaw(view) {
+  const down = [-view[1], -view[5], -view[9]];
+  return [down[0], -down[2]];
+}
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
+  if (autoArc.on) { const shown = compute.points(); if (shown) autoArcStep(shown); }
+  if (cameraGravity) { const [gx, gy] = cameraDownInLaw(cam.view); camGravNow[0] = gx; camGravNow[1] = gy; compute.setGravity(gx, gy); }
   compute.frame(now);
   const data = compute.points();
   const rec = compute.rec;
   if (!data || !rec) return;
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
-  const y = TILE.height + 0.03;
-  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
-                     y, stride: rec.display_stride, background: sceneBackground(),
-                     style: particleStyle, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: particleStyle === DEFAULT_STYLE ? null : particleLighting(g, y) });
+  drawCloud(cam, data, g, rec, particleStyle);
 }
+function drawCloud(cam, data, g, rec, style) {
+  const y = TILE.height + 0.03;
+  const pick = colorPick();
+  cloud.draw(data, { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], focal: cam.proj[5],
+                     y, stride: rec.display_stride, background: sceneBackground(), tint: pick.tint, colorMode: pick.mode,
+                     grain: pick.grain, scene: state.flat ? null : particleScene(pick), heat: heatFx,
+                     style, noise: noiseFx.on ? noiseFx : null, camera: { view: cam.view, proj: cam.proj }, lighting: style === DEFAULT_STYLE ? null : particleLighting(g, y) });
+}
+// Benchmark (debug): `n` synthetic grains in the real packed format ([x, y, rgba8, meta], 16 bytes), spread over the live
+// view window at a constant area coverage, drawn `frames` times through the same call the scene makes; returns ms per frame
+// (wall time around gl.finish), with the scene's own lights as set by the last lit pass.
+window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) => {
+  const g = state.game, rec = compute.rec;
+  if (!g || !rec || !cloud) return null;
+  const [x0, x1, y0, y1] = g.compute.view || rec.geometry.view, w = x1 - x0, h = y1 - y0;
+  const radius = Math.sqrt(coverage * w * h / (n * Math.PI));
+  const data = new Float32Array(n * 4), bits = new Uint32Array(data.buffer);
+  let seed = 12345;
+  const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < n; i++) {
+    const s = i % 4, r = radius * (0.8 + 0.1 * s);
+    data[4 * i] = x0 + rnd() * w; data[4 * i + 1] = y0 + rnd() * h;
+    bits[4 * i + 2] = (255 << 24) | (Math.floor(rnd() * 256) << 16) | (Math.floor(rnd() * 256) << 8) | Math.floor(rnd() * 256);
+    data[4 * i + 3] = (i % 7 ? 200 : 100) + r * 1000;
+  }
+  const cam = camera();
+  const run = () => { gl.clear(gl.DEPTH_BUFFER_BIT); drawCloud(cam, data, g, rec, style); };
+  const sync = new Uint8Array(4), wait = () => { gl.finish(); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, sync); };   // (readPixels forces the queue to drain)
+  for (let i = 0; i < 3; i++) run();
+  wait();
+  const t0 = performance.now();
+  for (let i = 0; i < frames; i++) run();
+  wait();
+  const ms = (performance.now() - t0) / frames;
+  return { n, style, ms: +ms.toFixed(2), radiusPx: +(radius * (cloud.styles.heatInfo ? 1 : 1)).toFixed(5), drawn: cloud.styles.fallback || cloud.styles.note || "" };
+};
 
 // ---------------------------------------------------------------- draw
 // The lit scene from ``cam`` into whatever framebuffer is bound: the main
@@ -4262,6 +4687,8 @@ function litPass(cam, now, casters, opts = {}) {
   for (const nav of markerLights(now)) bulbLights.push({ view: M.apply(cam.view, nav.at), colour: nav.light, level: 0, intensity: nav.intensity });
   bulbLights.push(...headlights(cam));
   bulbLights.push(...intentSpot(cam, now));
+  const plate = backlightEmitter();
+  if (plate) bulbLights.push({ view: M.apply(cam.view, plate.at), colour: BACKLIGHT_COLOUR, level: 0, intensity: plate.area, group: PLATE_GROUP });
   const count = Math.min(3 + bulbLights.length, 100);
   gl.uniform1i(gl.getUniformLocation(P, "uNumLights"), count);
   gl.uniform3fv(gl.getUniformLocation(P, "uLightPos[0]"), new Float32Array([...keyView, 0.9 * span, 0.4 * span, 0.4 * span - 1.0,
@@ -4271,7 +4698,9 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
     (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
     ...bulbLights.slice(0, count - 3).map((b) => (b.intensity ?? ARCADE.lamp * b.level))]));
-  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), new Int32Array(count).fill(-1));
+  const groups = new Int32Array(count).fill(-1);               // an emitter's group id: its own surface skips its light
+  bulbLights.slice(0, count - 3).forEach((b, i) => { if (b.group != null) groups[i + 3] = b.group; });
+  gl.uniform1iv(gl.getUniformLocation(P, "uLightGroupId[0]"), groups);
   // Spot cones (Pluck's light loop): a direction and (cos inner, cos outer)
   // per light; zero direction = a point light (the key, fills, bulbs, lightning).
   const spotDir = new Float32Array(count * 3), spotCone = new Float32Array(count * 2);
@@ -4294,7 +4723,7 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform2f(gl.getUniformLocation(P, "uShadowTexelSize"), 1 / SHADOW_SIZE, 1 / SHADOW_SIZE);
   gl.uniform1f(gl.getUniformLocation(P, "uShadowBias"), 0.0015);
   const shadowLoc = gl.getUniformLocation(P, "uShadowMatrices[0]");
-  const drawLit = (vao, count, model, materialId) => {
+  const drawLit = (vao, count, model, materialId, groupId = 0) => {
     const mv = M.multiply(cam.view, model);
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMVP"), false, M.multiply(cam.proj, mv));
     gl.uniformMatrix4fv(gl.getUniformLocation(P, "uMV"), false, mv);
@@ -4303,7 +4732,7 @@ function litPass(cam, now, casters, opts = {}) {
     if (materialId != null) gl.vertexAttribI4i(2, materialId, 0, 0, 0);
     // aCullImmune = 1: the extruded meshes' walls are wound inward, so draw both sides
     // (the shader flips back-face normals).
-    gl.vertexAttribI4i(4, 0, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
+    gl.vertexAttribI4i(4, groupId, 0, 0, 0); gl.vertexAttribI4i(5, 1, 0, 0, 0); gl.vertexAttrib3f(6, 0, 0, 0); gl.vertexAttrib2f(3, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, count);
   };
   drawTerrain(now, drawLit);
@@ -4323,7 +4752,7 @@ function litPass(cam, now, casters, opts = {}) {
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  if (layerOn("glass")) drawLit(state.glass.vao, state.glass.count, M.identity(), null);
+  if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, M.identity(), null, plate ? PLATE_GROUP : 0);
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -4348,7 +4777,7 @@ function draw(ms) {
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   if (!state.game) { requestAnimationFrame(draw); return; }
   const cam = camera(); updateLight(now);
-  const casters = state.game && state.game.board === "free" && !layerOn("floor") ? []
+  const casters = state.game && state.game.board === "free" && (!layerOn("floor") || backdropNoFloor()) ? []
     : [[state.buttons.vao, state.buttons.count, M.identity(), null]];
   if (state.rackButtons) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   const removed = [];
@@ -5230,7 +5659,29 @@ function fillPickers() {
     fetch("/api/catalog").then((r) => r.json()),
   ]);
   state.assets = assets; state.catalog = catalog;
-  state.programs.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
+  // The scene's Phong program, extended for instancing (particle_styles.js extendForInstancing: the original main runs first,
+  // unchanged; only the material particle style turns instancing on).  If the extension cannot be made or linked, the program
+  // is the original and the material style says why it is not drawn.
+  state.instancing = false; state.instancingNote = "";
+  try {
+    const extended = extendForInstancing(vert, frag);
+    // ...and with the order-independent-transparency outputs (extendForOit: a second output, written only when uOit = 1; the
+    // original colour write is unchanged otherwise).  If that cannot be made or linked, glass falls back to alpha blending, and says so.
+    state.oit = false; state.oitNote = "";
+    try {
+      state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extendForOit(extended.frag)));
+      state.oit = true;
+    } catch (oitError) {
+      state.oitNote = String(oitError.message || oitError).slice(0, 200);
+      console.warn("[meowdoku] the Phong shader could not be extended for OIT:", state.oitNote);
+      state.programs.phong = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, extended.frag));
+    }
+    state.instancing = true;
+  } catch (error) {
+    state.instancingNote = String(error.message || error).slice(0, 200);
+    console.warn("[meowdoku] the Phong shader could not be extended for instancing:", state.instancingNote);
+    state.programs.phong = link(compile(gl.VERTEX_SHADER, vert), compile(gl.FRAGMENT_SHADER, frag));
+  }
   state.programs.flat = link(compile(gl.VERTEX_SHADER, FLAT_VS), compile(gl.FRAGMENT_SHADER, FLAT_FS));
   state.programs.cel = link(compile(gl.VERTEX_SHADER, CEL_VS), compile(gl.FRAGMENT_SHADER, CEL_FS));
   state.programs.depth = link(compile(gl.VERTEX_SHADER, DEPTH_VS), compile(gl.FRAGMENT_SHADER, DEPTH_FS));
@@ -5238,7 +5689,7 @@ function fillPickers() {
   arrayTexture(4, [0, 255, 128, 255]); terrainTexture(5, assets.terrain);
   // The Phong shader's depth stack (uDepthUv, unit 6): layer 0 is the terrain's
   // height map (exported in the shader's channel layout); no export, the 1x1 default.
-  if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else arrayTexture(6, [0, 0, 0, 255]);
+  if (assets.terrain && assets.terrain.depth) depthTexture(6, assets.terrain.depth); else defaultDepthStack(6);
   arrayTexture(7, [0, 0, 0, 0]);
   volumeTexture(8); storageTexture({ data: [0.0] }, 10);
   state.units = { turing_ssbo_pbr: 0, turing_ssbo_phong: 1, turing_ssbo_enamel: 2, turing_ssbo_texstack: 3,

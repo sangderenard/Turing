@@ -4,9 +4,28 @@ The single list of user-requested items still open. Update it as items land.
 Rules: the server and page run the same law text; fix generators, not output;
 deploy to 8766 as soon as work lands.
 
+## Fountain lane rules
+
+- No fountain lane waits on the large native: law tests and parity run on the 256-id native piece only, render-only work never compiles the law, and the 4k native/wasm fallbacks build only in the background (the server builds WebGPU first, then the fallbacks).
+- A dynamic-N law (sort stages, search and candidate walk as real loops, n as a runtime uniform) is being measured by the 3D job: if it compiles in minutes, it becomes the parity reference at any size.
+
+## Next big fountain work, right after the 3D change lands (the user, 2026-11-06)
+
+**Confinement shapes, rigid-body actors and boundary regions, paired with the detailed grain size and shape settings:**
+- confinement as shapes: polygon chambers and inner obstacles as boundary regions (the 3D job brings a static polygon outline; this makes them first-class);
+- rigid-body actors: shapes that are fixed, kinematic (driven: a prescribed rotation or motion) or dynamic (free or pinned, moved by the grains' forces), with two-way contact forces, through the engine_toy machine-sim coupling/torque path (the same path as the waterwheel and the teeter-totter);
+- the first target is a ROTATING POLYGON container or drum that sorts grains (size and shape segregation: the rotating-drum / Brazil-nut effects), so it needs the detailed per-species size distribution, roughness and shape irregularity at the same time;
+- the fixed shapes can later use the baked distance-field colliders (prebake item).
+
+## Render priority (the user, 2026-11-06)
+
+1. Colour modes: grain size, species breakdown; palettes (sea first); "stained glass" grains through the scene's Phong + glass pass; no opaque black backdrop behind the fountain.
+2. Then the heat-map curve management, then the emoji style (image atlas + instanced meshes).
+
 ## In flight (workers)
 
 - **Fountain stage A follow-ups** (stage A landed in ee0883d7):
+  - the "rightward blast": the user's hypothesis is an honest pressure wave from the naive initial deposit (no pipes or nozzles yet), rather than the drop bias. Being checked by the 3D job on the 256 piece: drops during the blast, the momentum asymmetry over time, and a mirrored emission order (does the asymmetry flip?);
   - dropped contacts (`n_drop`) are not 0 while grains emit and in dense piles at 4k, and reach 1.2e6 per step at 64k; the row-run walk drops the right-hand cells first (a bias); needs a complete or order-free neighbour selection (stage B) and contact stiffness scaled with pile depth;
   - the 64k pile never settles (E stays near 5e-2 at the 40 s cap), probably the same cause;
   - single grains still exceed their own ballistic ceiling through exchange between species of different mass (total energy holds to 1.7%);
@@ -46,9 +65,16 @@ deploy to 8766 as soon as work lands.
    - inside, the glyph or glyph string is built from the run's N particles filling each glyph's ENCLOSED solid volume (not its surface). The glyph meshes are extrusions of an outline (token_mesh in web_export: outline with holes, depth_ratio), so "inside" is exact and cheap: an even-odd point-in-outline test (holes count) and |z| < depth/2, from the same outline data the exported mesh used (emoji keep only their largest component). Grain size from N·(4/3)πr³ = φ·V (φ ≈ 0.64 random, or ≈ 0.74 on a lattice for a crystalline start); with a species mix, scale the drawn radii to fit;
    - the simulation starts from that state at rest, then evolves (gravity, tilt, temperature and the rest apply as usual);
    - the starting state is part of the replay (same text, same N, same result).
+4c. **Teeter-totter case (after 3D, with glyph start):**
+   - the whole chamber sits on a fulcrum: one rotational degree of freedom, a pivot under (or beside) the case;
+   - the grains' own mass drives it: the contact forces the grains put on the walls (plus gravity on the case itself) give the torque about the pivot, and the case angle is integrated from that over time, like the desk-toy wave rockers;
+   - options: case mass and inertia, pivot position, pivot friction or damping, an optional restoring spring, start tilt;
+   - the case angle is law state (exact replay). In the case frame the law sees gravity rotated by the angle, plus the frame's inertial terms (Euler and centrifugal), which is the honest version of the case spin, which only rotates gravity;
+   - the pivot is the first rigid-body coupling, so build it on the engine_toy machine-sim coupling/torque path that the rigid emoji objects and the waterwheel will use, not as a one-off.
 5. **Page controls** (landed): Grains (per species radius, density, friction, restitution, roughness, irregularity, share), Physics (stiffness, Hertz blend, cohesion, spin drag, nozzle speed and rate, neighbour cap with the dropped-contact readout), Fluid (air / water / glycerine presets plus density and viscosity), Chamber (depth, polygon, inlet, spread); all server-declared `controls_ui` (`fountain_param`, `fountain_choice`); the live ones are runtime inputs of the law, logged by the recording, the restart ones begin a new run.
 6. **Fluids, crystals and temperature** (landed): temperature `temp` (kT) is a Langevin thermostat tied to the fluid drag (variance 2 gamma m kT / DT per component, noise a hash of id, step and component; 0 = off exactly), log slider in Physics, measured T = ke / (3 n_live) in the status line; buoyancy plus implicit Stokes and quadratic drag; stiffness `omega` (clamped to the CFL bound) and a Hertz blend; cohesion. **Open:** a measured crystal (a near-monodisperse stiff pile reaching a hexagonal packing) has not been demonstrated.
 7. **Grain species** (landed): four species, each with radius, density, friction, restitution, rolling roughness and per-id size jitter (irregularity), and mix shares; the poly-mix slider is the macro that sets the shares.
+2D: the same tunables landed in the 2D law (`fountain.py`, unchanged in dimension): species radius 0.1x-10x (log; restart), friction 0-2, restitution, density, grid cell as a runtime uniform; ORBEEZ species (swell rate, max ratio; the radius is state `rs`; growth ~ exposed surface x solvent; air does not swell). The 3D law is its own module and products (`fountain3d.py`, `fountain3d_build.py`, game "fountain3d"); the 2D one is the page's `fountain`.
 8. **Pipe and laminar flow:**
    - large grains at a reasonable population fill the area;
    - set by spawn flow rate, or by spawning inside an enclosed vessel that empties through a tube.
@@ -76,7 +102,11 @@ deploy to 8766 as soon as work lands.
   - **attraction:** short-range cohesion (liquid-bridge / van der Waals style; the 3D job adds a basic cohesion uniform) and phase behaviour, e.g. a wet clump, a dry flow, a crystal;
   - **dipoles:** each grain carries a moment (a per-id orientation vector) with an orientation-dependent pair force and torque (magnetic/electric), so chains and needles form;
   - **aggregates:** grains bonded at rest fuse into a cluster that moves as one rigid body (fewer degrees of freedom, so the sim calms down and gets cheaper), and break apart when bond stress exceeds a strength; the same rigid-body machinery as the emoji objects;
-  - the bonds and their breakage are law state, deterministic, and replay bit-identically.
+  - the bonds and their breakage are law state, deterministic, and replay bit-identically;
+  - **lattice-sensitive crystal shading** (grouped here by the user):
+    - the law exports per-grain bond-orientational order ψ6 = mean of e^{6iθ} over neighbours, in the existing neighbour walk: crystallinity |ψ6| and lattice angle arg(ψ6)/6;
+    - the scene Phong shader blends crystalline grains into a gem material: facet normals rotated by the lattice angle, so whole domains glint together; rainbow (dispersion-like) glints from the lattice-to-light/view angle; ruby, sapphire, emerald and opal presets and faceted "gem pebbles";
+    - cheap: a few multiply-adds per contact plus a dot product and a hue ramp per fragment.
 - **Late-stage colour from per-id data** (fountain):
   - the law hands the render per-id attributes instead of a baked rgba8: species, grain size, smoothness/roughness, irregularity, speed, age/emission order, contact count, temperature;
   - a late-stage shader composes colour from them through maps (ramps, palettes) and simple blend recipes (e.g. hue = species, value = size, saturation = speed, or a weighted mix of any channels), quick to switch, chosen for dramatic informational and aesthetic effect;

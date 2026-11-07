@@ -233,8 +233,6 @@ class FountainGame(Game):
              "options": [[tag, label] for tag, label in NOISE_MODES]},
             {"id": "nfstrength", "kind": "range", "label": "strength", "min": 0, "max": 1, "step": 0.05, "local": "noise_strength", "value": 0.85},
             {"id": "nfthr", "kind": "range", "label": "threshold", "min": 0.2, "max": 0.9, "step": 0.05, "local": "noise_threshold", "value": 0.5},
-            # a spinning case: gravity turns in the screen's plane at a set rate (a runtime input of the law, like the tilt)
-            {"id": "spin", "kind": "range", "label": "case spin (Hz)", "min": -1, "max": 1, "step": 0.05, "local": "spin", "value": 0},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",
