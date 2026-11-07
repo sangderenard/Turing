@@ -52,6 +52,7 @@ from meowdoku.tilequest import TileQuest  # noqa: E402
 from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.worldwalk import WorldWalk  # noqa: E402
 from meowdoku.fountain import FountainGame  # noqa: E402
+from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402  (the 3-D fountain: its own law, products and page controls)
 from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
@@ -81,7 +82,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "purrline"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "purrline"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -139,6 +140,8 @@ class Table:
             self.game = WorldWalk(aspect=float(payload.get("aspect") or 0.0))
         elif kind == "fountain":
             self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
+        elif kind == "fountain3d":
+            self.game = Fountain3DGame(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "purrline":
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:
@@ -495,6 +498,18 @@ def prepare_fountain(web_dir: Path) -> None:
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
+def prepare_fountain3d(web_dir: Path) -> None:
+    """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
+    from meowdoku import fountain3d_build
+    try:
+        started = time.perf_counter()
+        manifest = fountain3d_build.build(web_dir)
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+    except Exception as error:  # the page reports the missing manifest
+        print(f"[meowdoku] fountain3d products NOT built ({type(error).__name__}: {error})", flush=True)
+
+
 def prepare_policy(web_dir: Path) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
@@ -554,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
     prepare_fountain(web_dir)
+    prepare_fountain3d(web_dir)
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

@@ -1,8 +1,5 @@
-"""The fountain: a 3-D (slab chamber) DEM granular law, a compiler-chosen and compiler-generated compute program,
-no per-id tables, runtime tunables, and deterministic image verification.
-
-The state is 3-D (x y z, v, a spin vector): the DEFAULT chamber is a thin slab (about one grain diameter deep), whose pile is
-the 2-D one of before (no bit identity with that law is required: the layout changed)."""
+"""The fountain: a DEM granular law, a compiler-chosen and compiler-generated compute program,
+no per-id tables, and deterministic image verification."""
 
 from __future__ import annotations
 
@@ -61,11 +58,10 @@ def test_the_pile_forms_and_settles_by_contact_forces(native_piece):
     geo = F.basin(F.N_SMALL)
     assert not np.isnan(final["x"]).any()
     assert np.all(np.abs(final["x"]) <= geo["half"] + 1e-3) and float(final["y"].min()) > -1e-3
-    assert float(np.sqrt(final["vx"] ** 2 + final["vy"] ** 2 + final["vz"] ** 2).max()) < 0.2          # at rest
-    assert float(np.abs(final["z"]).max()) <= float(columns["dh"])                                   # inside the plexiglass
+    assert float(np.hypot(final["vx"], final["vy"]).max()) < 0.2          # at rest
     top = float(np.percentile(final["y"], 99))
     fraction = float((np.pi * final["rad"] ** 2).sum() / (geo["width"] * top))
-    assert 0.55 < fraction < 0.95                  # the thin slab's pile is the 2-D pile: a single layer of disks' areal fraction
+    assert 0.55 < fraction < 0.95
     x, y, r = final["x"], final["y"], final["rad"]
     gap = np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :]) - (r[:, None] + r[None, :])
     np.fill_diagonal(gap, 1.0)
@@ -88,7 +84,7 @@ def test_the_replay_is_bit_identical_and_the_settled_pile_shows_the_image(native
     phase2.update(F.uniforms(n=256, mode=0, use_image=1.0, mix=0.5))
     phase2["ir"], phase2["ig"], phase2["ib"] = samples[:, 0], samples[:, 1], samples[:, 2]
     final = F.run_frames(piece, phase2, steps)
-    assert all(np.array_equal(final[k], phase1[k]) for k in ("x", "y", "z"))
+    assert np.array_equal(final["x"], phase1["x"]) and np.array_equal(final["y"], phase1["y"])
     assert np.array_equal(final["cr"], samples[:, 0]) and np.array_equal(final["cg"], samples[:, 1])
     assert np.array_equal(final["cb"], samples[:, 2])
 
@@ -120,11 +116,10 @@ def test_the_compiler_chooses_per_size_and_the_program_carries_no_per_id_data():
     assert "lane0[" in compiled.source and "f32(i)" in compiled.source
     # bytes per id (rematerialised sort temporaries hold no slot): the pile state and colours, plus the seven reduced
     # diagnostics, each carried through the reduction's stages in two buffers
-    assert compiled.arena_elements * 4 / pad < 205
+    assert compiled.arena_elements * 4 / pad < 170
     # the arena is split across bindings of at most 256 MiB, none of the single-buffer limit's business
-    assert compiled.bindings > 1 and compiled.bindings + 1 <= 8       # the binding COUNT budget holds (7 stacked lanes + the head)
+    assert compiled.bindings > 1 and compiled.slots_per_binding * pad * 4 <= 256 * 1024 * 1024
     assert compiled.bindings == -(-compiled.slots // compiled.slots_per_binding)
-    assert compiled.slots_per_binding * pad * 4 <= 300 * 1024 * 1024    # 49 slots at 10M: 7 per lane, 280 MB
 
 
 def test_the_wgsl_program_is_generated_from_the_authored_law():
@@ -256,18 +251,14 @@ def test_slip_friction_stays_finite_for_any_slip_speed_and_coincident_ids_separa
     exp(2x) overflows f32 (NaN) past ~44: the argument is clamped.  Two ids at one point are pushed
     apart along an id-fixed direction instead of dividing a zero separation."""
     t = AbstractTensor.get_tensor([0.0, 5.0, -5.0])
-    zero, one = t * 0.0, t * 0.0 + 1.0
-    # a contact with the normal along y and a slip of t along x: the friction force is -mu * fn along x once saturated
-    force, torque = F._contact(t * 0.0 + 0.01, one, (zero, one, zero), (t, zero, zero), (zero, zero, zero), (zero, zero, zero),
-                               one, one, zero + 0.3, zero + 0.7, zero, zero + 0.01, zero + 0.005, zero + 0.01, zero, zero)
-    fx, fy = np.asarray(force[0]), np.asarray(force[1])
-    assert all(np.isfinite(np.asarray(v)).all() for v in (*force, *torque))
-    assert abs(float(fx[1]) + 0.3 * float(fy[1])) < 1e-6      # saturated: |ft| = mu * fn
+    fx, fy, ft = F._contact(t + 0.01, t * 0.0, t * 0.0 + 1.0, t, t, t * 0.0, t * 0.0 + 1.0, t * 0.0 + 1.0, t * 0.0 + 0.3)
+    assert np.isfinite(np.asarray(ft)).all()
+    assert abs(float(np.asarray(ft)[1]) + 0.3 * float(np.asarray(fy)[1])) < 1e-6      # saturated: |ft| = mu * fn
     columns = F.initial_columns(256, mix=1.0)
     columns["age"][2:4] = 1.0
     columns["x"][2:4], columns["y"][2:4] = 0.05, 0.5
     out = _one_step(columns)
-    assert np.isfinite(out["vx"]).all() and np.isfinite(out["vy"]).all() and np.isfinite(out["vz"]).all()
+    assert np.isfinite(out["vx"]).all() and np.isfinite(out["vy"]).all()
     assert out["vx"][2] * out["vx"][3] < 0                                            # equal and opposite, by id
 
 
@@ -318,22 +309,18 @@ def emission_run(native_piece):
     return {"state": state, "diag": diag, "kept": kept, "rad": extra["rad"], "steps": steps, "columns": columns}
 
 
-def _mass(rad):
-    species = {round(s[1], 6): s for s in F.SPECIES}
-    return np.array([species[round(float(r), 6)][2] * 4.0 / 3.0 * np.pi * r ** 3 for r in rad])
-
-
-def _system_energy(x, y, z, vx, vy, vz, w2, rad, live):
+def _system_energy(x, y, vx, vy, w, rad, live):
     """Kinetic + rotational + gravitational + the contacts' elastic energy of the live grains (the springs' ``kn delta^2 / 2``)."""
-    mass = _mass(rad)
+    species = {round(s[1], 6): s for s in F.SPECIES}
+    mass = np.array([species[round(float(r), 6)][2] * np.pi * r * r for r in rad])
     idx = np.where(live)[0]
-    m, r, px, py, pz = mass[idx], rad[idx], x[idx], y[idx], z[idx]
-    total = float((0.5 * m * (vx[idx] ** 2 + vy[idx] ** 2 + vz[idx] ** 2) + 0.2 * m * r * r * w2[idx] + m * F.G * py).sum())
-    d = np.sqrt((px[:, None] - px[None, :]) ** 2 + (py[:, None] - py[None, :]) ** 2 + (pz[:, None] - pz[None, :]) ** 2)
+    m, r, px, py = mass[idx], rad[idx], x[idx], y[idx]
+    total = float((0.5 * m * (vx[idx] ** 2 + vy[idx] ** 2) + 0.25 * m * r * r * w[idx] ** 2 + m * F.G * py).sum())
+    d = np.hypot(px[:, None] - px[None, :], py[:, None] - py[None, :])
     delta = np.clip(r[:, None] + r[None, :] - d, 0.0, None)
     np.fill_diagonal(delta, 0.0)
     meff = m[:, None] * m[None, :] / (m[:, None] + m[None, :])
-    total += float(0.25 * (F.OMEGA ** 2 * meff * delta ** 2).sum())                    # each pair once (linear spring: hertz = 0)
+    total += float(0.25 * (F.OMEGA ** 2 * meff * delta ** 2).sum())                    # each pair once
     for gap in (r - py, r - (px + emission_half), r - (emission_half - px)):
         total += float((0.5 * F.OMEGA ** 2 * m * np.clip(gap, 0.0, None) ** 2).sum())
     return total
@@ -348,8 +335,7 @@ def test_an_emitted_grain_never_spawns_inside_another_and_the_system_gains_no_en
     exceeds what the emissions have put in (each grain's launch energy): collisions and drag only take energy out.  So
     no height or speed is beyond what the launches allow."""
     run, n = emission_run, F.N_SMALL
-    x, y, z, vx, vy, vz, wx, wy, wz = (np.array(run["kept"][k]) for k in ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz"))      # (steps, n)
-    w2 = wx ** 2 + wy ** 2 + wz ** 2
+    x, y, vx, vy, w = (np.array(run["kept"][k]) for k in ("x", "y", "vx", "vy", "w"))      # (steps, n)
     rad = run["rad"]
     live = ((np.abs(x) + np.abs(y)) >= 1e-30) & (vy > F.ARMED * 0.5)               # launched: not parked, not armed at the slot
     placed_at = np.where(live.any(axis=0), live.argmax(axis=0), -1)
@@ -359,16 +345,17 @@ def test_an_emitted_grain_never_spawns_inside_another_and_the_system_gains_no_en
         k = placed_at[j]
         others = np.where(live[k])[0]
         others = others[others != j]
-        gap = np.sqrt((x[k, others] - x[k, j]) ** 2 + (y[k, others] - y[k, j]) ** 2 + (z[k, others] - z[k, j]) ** 2) - (rad[others] + rad[j])
+        gap = np.hypot(x[k, others] - x[k, j], y[k, others] - y[k, j]) - (rad[others] + rad[j])
         deepest = max(deepest, float(-gap.min()) if gap.size else 0.0)
     assert deepest <= 3e-3, deepest                       # placed overlapping nothing (4k, measured: 2 of 4096 spawns by <= 1.8 mm; the baseline: half of them, up to 25 mm)
-    mass = _mass(rad)
-    launch = 0.5 * mass * (vx[placed_at, np.arange(n)] ** 2 + vy[placed_at, np.arange(n)] ** 2 + vz[placed_at, np.arange(n)] ** 2) \
+    species = {round(s[1], 6): s for s in F.SPECIES}
+    mass = np.array([species[round(float(r), 6)][2] * np.pi * r * r for r in rad])
+    launch = 0.5 * mass * (vx[placed_at, np.arange(n)] ** 2 + vy[placed_at, np.arange(n)] ** 2) \
         + mass * F.G * y[placed_at, np.arange(n)]
     worst = -np.inf
     for k in range(0, run["steps"], 30):
         e_in = float(launch[placed_at <= k].sum())
-        worst = max(worst, _system_energy(x[k], y[k], z[k], vx[k], vy[k], vz[k], w2[k], rad, live[k]) - e_in)
+        worst = max(worst, _system_energy(x[k], y[k], vx[k], vy[k], w[k], rad, live[k]) - e_in)
     assert worst < 0.03 * float(launch.sum()), worst      # semi-implicit Euler's own drift, ~1% (4k, measured)
     ceiling = (y[placed_at, np.arange(n)] + vy[placed_at, np.arange(n)] ** 2 / (2.0 * F.G)).max()
     assert float(np.where(live, y, -np.inf).max()) <= 1.06 * ceiling           # the highest grain is within 6% of the highest launch ceiling (measured: 4% at 256, 2% at 4k; before: 42% over)
@@ -377,10 +364,8 @@ def test_an_emitted_grain_never_spawns_inside_another_and_the_system_gains_no_en
 def test_an_id_waits_for_a_clear_nozzle_slot_and_goes_the_step_it_clears(native_piece):
     piece, columns = native_piece
     n = F.N_SMALL
-    u = {k: float(v) for k, v in columns.items() if k in F.UNIFORMS}
-    slot = [float(np.asarray(v)[0]) for v in F._nozzle(
-        AbstractTensor.get_tensor(np.zeros(1)), (u["nozzle_x"], u["nozzle_y"], u["nozzle_z"]), (u["e1x"], u["e1y"], u["e1z"]),
-        (u["e2x"], u["e2y"], u["e2z"]), (u["in_dx"], u["in_dy"], u["in_dz"]), u["bar_half"], u["bar_z"])]
+    geo = F.basin(n)
+    slot = [float(np.asarray(v)[0]) for v in F._nozzle(AbstractTensor.get_tensor(np.zeros(1)), geo["bar_half"], geo["nozzle_y"])]
 
     def after(state, steps=1):
         out = F.run_frames(piece, {**columns, **state}, steps)
@@ -388,7 +373,6 @@ def test_an_id_waits_for_a_clear_nozzle_slot_and_goes_the_step_it_clears(native_
 
     armed = after({k: np.array(columns[k]) for k in F.STATE})
     assert armed["vy"][0] == F.ARMED and abs(armed["x"][0] - slot[0]) < 1e-6 and abs(armed["y"][0] - slot[1]) < 1e-6   # due: armed AT its slot
-    assert abs(armed["z"][0] - slot[2]) < 1e-6
     blocked = dict(armed)
     for k in ("age", "x", "y"):
         blocked[k] = armed[k].copy()
@@ -418,28 +402,29 @@ def test_the_reduction_is_the_sum_of_the_columns(emission_run):
     """Element 0 of the reduced diagnostics is the sum (the max) of the per-id values, computed here from the state."""
     run = emission_run
     last = run["steps"] - 1
-    vx, vy, vz, wx, wy, wz = (run["kept"][k][last] for k in ("vx", "vy", "vz", "wx", "wy", "wz"))
+    x, y, vx, vy, w = (run["kept"][k][last] for k in ("x", "y", "vx", "vy", "w"))
     rad = run["rad"]
-    mass = _mass(rad)
-    ke = float((0.5 * mass * (vx ** 2 + vy ** 2 + vz ** 2) + 0.5 * (0.4 * mass * rad ** 2) * (wx ** 2 + wy ** 2 + wz ** 2)).sum())
-    assert abs(run["diag"]["ke"][last] - ke) < 1e-9 * max(ke, 1e-12)
-    assert abs(run["diag"]["vmax2"][last] - float((vx ** 2 + vy ** 2 + vz ** 2).max())) < 1e-12
+    species = {round(s[1], 6): s for s in F.SPECIES}
+    mass = np.array([species[round(float(r), 6)][2] * np.pi * r * r for r in rad])
+    ke = float((0.5 * mass * (vx ** 2 + vy ** 2) + 0.5 * (0.5 * mass * rad ** 2) * w ** 2).sum())
+    assert abs(run["diag"]["ke"][last] - ke) < 1e-9 * max(ke, 1.0)
+    assert abs(run["diag"]["vmax2"][last] - float((vx ** 2 + vy ** 2).max())) < 1e-12
 
 
 def test_a_mirrored_post_emission_state_evolves_mirrored(emission_run, native_piece):
-    """x -> -x, vx -> -vx, spin (a pseudovector: wy, wz flip) with the same ids: the evolution is the mirror image within float noise.  A
+    """x -> -x, vx -> -vx, spin -> -spin with the same ids: the evolution is the mirror image within float noise.  A
     neighbour walk that drops contacts on one side (the right-hand cells of a row run) would break it."""
     piece, columns = native_piece
     run = emission_run
     state = {k: np.array(run["kept"][k][-1]) for k in F.STATE}
     mirrored = dict(state)
-    mirrored["x"], mirrored["vx"], mirrored["wy"], mirrored["wz"] = -state["x"], -state["vx"], -state["wy"], -state["wz"]
+    mirrored["x"], mirrored["vx"], mirrored["w"] = -state["x"], -state["vx"], -state["w"]
     steps = 80
     a, da, _, _ = _series(piece, {**columns, **state}, steps)
     b, db, _, _ = _series(piece, {**columns, **mirrored}, steps)
     assert da["n_drop"].max() == 0 and db["n_drop"].max() == 0
     assert float(np.abs(a["x"] + b["x"]).max()) < 1e-9 and float(np.abs(a["y"] - b["y"]).max()) < 1e-9
-    assert float(np.abs(a["vx"] + b["vx"]).max()) < 1e-8 and float(np.abs(a["wz"] + b["wz"]).max()) < 1e-8
+    assert float(np.abs(a["vx"] + b["vx"]).max()) < 1e-8 and float(np.abs(a["w"] + b["w"]).max()) < 1e-8
 
 
 def test_the_settle_step_comes_from_the_energy_and_differs_with_size_and_mix(native_piece):
@@ -544,6 +529,11 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
 
 
 # ---------------------------------------------------------- run modes: gravity, recording, playback
+#: sha256 of the float64 bytes of STATE + (cr, cg, cb) after 700 steps of the 256-id law at mix 0.5, as the law ran BEFORE gravity
+#: became a runtime vector (``G`` baked into ``vy``).  The default inputs must reproduce it bit for bit.
+PRE_GRAVITY_DIGEST_700 = "576e50eb1463aa61fa3727fae820dadd018e01f587c0e54a46a70de49692643f"
+
+
 def _digest(final) -> str:
     import hashlib
     return hashlib.sha256(b"".join(np.ascontiguousarray(final[k], dtype=np.float64).tobytes() for k in F.STATE + ("cr", "cg", "cb"))).hexdigest()
@@ -551,11 +541,10 @@ def _digest(final) -> str:
 
 def test_gravity_is_a_runtime_input_the_default_is_the_old_law_and_a_tilt_changes_it_without_a_rebuild(native_piece):
     piece, columns = native_piece
-    assert {"grav_x", "grav_y", "grav_z", "lid", "rows"} <= set(F.RUNTIME_INPUTS) and set(F.RUNTIME_INPUTS) <= set(F.UNIFORMS)
-    assert float(columns["grav_x"]) == 0.0 and float(columns["grav_y"]) == -F.G and float(columns["grav_z"]) == 0.0
-    assert float(columns["lid"]) == F.LID_OFF
+    assert F.RUNTIME_INPUTS == ("grav_x", "grav_y", "lid", "rows") and set(F.RUNTIME_INPUTS) <= set(F.UNIFORMS)
+    assert float(columns["grav_x"]) == 0.0 and float(columns["grav_y"]) == -F.G and float(columns["lid"]) == F.LID_OFF
     default = F.run_frames(piece, columns, 700)
-    assert F.run_frames(piece, columns, 700)["x"].tolist() == default["x"].tolist()          # deterministic
+    assert _digest(default) == PRE_GRAVITY_DIGEST_700                     # the default is bit for bit the law before the change
     tilted = dict(columns, grav_x=np.float64(0.5), grav_y=np.float64(-0.8660254))
     other = F.run_frames(piece, tilted, 700)                              # the same compiled piece: only the uniform changed
     assert _digest(other) != _digest(default)
@@ -607,7 +596,6 @@ def test_the_server_declares_the_run_modes_and_the_tilt_inputs():
     tilt = state["compute"]["tilt"]                                          # what the page writes while the sensor drives gravity
     geo = F.basin(256)
     assert tilt["lid"] > geo["nozzle_y"] + 1.35 and tilt["rows"] * F.CELL >= tilt["lid"]
-    assert ids["orbit"]["kind"] == "toggle" and ids["orbit"]["local"] == "orbit" and ids["orbit"]["value"] is False
     before = state["compute"]["epoch"]
     game.do({"type": "fountain_run", "run": "settle"})
     assert game.state()["compute"]["run"] == "settle" and game.state()["compute"]["epoch"] == before + 1
@@ -719,15 +707,13 @@ JS_GRAVITY = """
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const [dir] = process.argv.slice(2);
-const {gravityInScreen, gravityVector, gravityFromAcceleration, GravitySensor, layoutTransform} = await import(pathToFileURL(`${dir}/gravity.js`).href);
+const {gravityInScreen, gravityFromAcceleration, GravitySensor, layoutTransform} = await import(pathToFileURL(`${dir}/gravity.js`).href);
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} vs ${b}`);
 let g = gravityInScreen(90, 0, 0); near(g[0], 0); near(g[1], -1);              // held upright: straight down the screen
 g = gravityInScreen(0, 0, 0); near(g[0], 0); near(g[1], 0);                     // lying flat: no pull in the screen's plane
 g = gravityInScreen(60, 0, 0); near(g[0], 0); near(g[1], -Math.sin(Math.PI / 3));      // tipped back 30 degrees
 g = gravityInScreen(0, 30, 0); near(g[0], 0.5); near(g[1], 0);                  // flat, right edge down
 g = gravityInScreen(0, -90, 90); near(g[0], 0); near(g[1], -1);                 // landscape (screen angle 90): still down the screen
-g = gravityVector(0, 0, 0); near(g[0], 0); near(g[1], 0); near(g[2], -1);           // lying flat face up: the pull is INTO the slab (against the back wall)
-g = gravityVector(90, 0, 0); near(g[1], -1); near(g[2], 0);
 g = gravityFromAcceleration(0, 9.81, 0, 0, true); near(g[0], 0); near(g[1], -1);    // Android upright reads +y; gravity is the other way
 g = gravityFromAcceleration(0, -9.81, 0, 0, false); near(g[0], 0); near(g[1], -1); // iOS reads the opposite
 
@@ -736,7 +722,7 @@ const listeners = {}, calls = [];
 const win = {DeviceOrientationEvent: {requestPermission: async () => 'granted'}, screen: {orientation: {angle: 0}},
              addEventListener: (type, fn) => { listeners[type] = fn; }};
 const states = [];
-const sensor = new GravitySensor({win, onGravity: (x, y, z) => calls.push([x, y]), onState: (s) => states.push(s)});
+const sensor = new GravitySensor({win, onGravity: (x, y) => calls.push([x, y]), onState: (s) => states.push(s)});
 sensor.start();
 assert.deepEqual(Object.keys(listeners), []);                                   // iOS: no events before a gesture
 await sensor.grant();
@@ -838,6 +824,109 @@ def test_the_particle_styles_registry_picks_a_style_the_device_can_run_and_match
     assert look["options"] == listed
 
 
+JS_RENDER = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const P = await import(pathToFileURL(`${dir}/particle_styles.js`).href);
+const full = {floatRender: 'float', maxPointSize: 256};
+// ---- colour source
+const albedo = (n) => ({glass: [0.2, 0.4, 0.8]})[n] || null;
+assert.equal(P.resolveColorSource({source: 'simulation'}).tint[3], 0);
+assert.equal(P.resolveColorSource({source: 'nonsense'}).mode, 'simulation');
+const solid = P.resolveColorSource({source: 'solid', solid: '#ff8000'});
+assert.deepEqual(solid.tint.map((v) => Math.round(v * 255)), [255, 128, 0, 255]); assert.equal(solid.mode, 'solid');
+assert.equal(P.resolveColorSource({source: 'solid', solid: 'zz'}).mode, 'simulation');
+assert.match(P.resolveColorSource({source: 'solid', solid: 'zz'}).reason, /not a colour/);
+const mat = P.resolveColorSource({source: 'material', material: 'glass'}, albedo);
+assert.equal(mat.mode, 'material'); assert.equal(mat.material, 'glass'); assert.equal(mat.tint[3], 1);
+assert.ok(mat.tint[2] > mat.tint[0]);
+assert.equal(P.resolveColorSource({source: 'material', material: 'nope'}, albedo).mode, 'simulation');
+assert.match(P.resolveColorSource({source: 'material', material: ''}, albedo).reason, /no material chosen/);
+// size and species, through palettes
+const size = P.resolveColorSource({source: 'size', palette: 'sea'});
+assert.equal(size.grain.mode, 2); assert.equal(size.tint[3], 0); assert.equal(size.grain.lut.length, 48);
+assert.ok(size.grain.lut[2] > size.grain.lut[0]);
+const sea = P.paletteLut('sea'); assert.ok(sea[45] > 0.8 && sea[46] > 0.8 && sea[47] > 0.8);
+assert.deepEqual(Array.from(P.paletteLut('native')).slice(0, 3), Array.from(P.paletteLut('nonsense')).slice(0, 3));
+const species = P.resolveColorSource({source: 'species', palette: 'ember'}, undefined, [['a', 0.009], ['b', 0.0105], ['c', 0.012], ['d', 0.014]]);
+assert.equal(species.grain.mode, 3); assert.equal(species.species.length, 4);
+assert.equal(P.resolveColorSource({source: 'simulation', palette: 'sea'}).grain.mode, 4);
+assert.equal(P.resolveColorSource({source: 'simulation', palette: 'native'}).grain.mode, 0);
+// species from the radius: the nearest of the manifest's radii, one function
+const table = P.speciesTable([['pearl', 0.014], ['grain', 0.009], ['bead', 0.0105], ['dust', 0.012]]);
+assert.deepEqual(table.map((t) => t.name), ['grain', 'bead', 'dust', 'pearl']);
+for (const [r, want] of [[0.0085, 0], [0.009, 0], [0.0101, 1], [0.0108, 1], [0.0119, 2], [0.0131, 3], [0.02, 3]]) assert.equal(P.speciesOf(r, table), want, `radius ${r}`);
+const bands = P.speciesBands(table); assert.ok(Math.abs(bands[0] - 0.00975) < 1e-6); assert.equal(bands[3], 1e9);
+// ---- packing is read in one place
+const data = new Float32Array([0.5, 0.25, 0, 109, 1, 2, 0, 214, 0, 0, 0, 0]);
+assert.equal(P.pointCount(data), 3);
+const p0 = P.readPoint(data, 0); assert.ok(p0.alive && p0.moving && Math.abs(p0.radius - 0.009) < 1e-6);
+const p1 = P.readPoint(data, 1); assert.ok(!p1.moving && Math.abs(p1.radius - 0.014) < 1e-6);
+assert.ok(!P.readPoint(data, 2).alive);
+// ---- LOD and the fallback to sand
+const plan = (count, radiusPx) => P.materialPlan({count, radiusPx});
+assert.equal(plan(4000, 12).tris, 320); assert.equal(plan(4000, 3).tris, 80); assert.equal(plan(4000, 1).tris, 20);   // detailAtPx [1.5, 4]
+assert.equal(plan(60000, 12).tris, 20);
+assert.equal(plan(20000, 12).tris, 80); assert.equal(plan(5000, 12).tris, 320);
+assert.equal(plan(P.MATERIAL_BUDGET.maxInstances, 4).ok, true); assert.equal(plan(P.MATERIAL_BUDGET.maxInstances + 1, 4).ok, false);
+assert.match(plan(1e6, 4).reason, /frame rate/); assert.match(plan(4000, 0.1).reason, /too small/);
+assert.equal(P.materialPlan({ready: false}).ok, false);
+let c = P.chooseStyle('material', full, {}, {ready: true, count: 4000, radiusPx: 3});
+assert.equal(c.style, 'material'); assert.equal(c.lod, 1);
+c = P.chooseStyle('material', full, {}, {ready: true, count: 1e6, radiusPx: 5});
+assert.equal(c.style, 'sand'); assert.equal(c.requested, 'material'); assert.match(c.reason, /showing sand/);
+c = P.chooseStyle('material', full, {}, {ready: false, count: 4000, radiusPx: 5}); assert.equal(c.style, 'sand');
+c = P.chooseStyle('stained', full, {}, {ready: true, count: 100000, radiusPx: 5}); assert.equal(c.style, 'sand');
+assert.equal(P.chooseStyle('material', full, {}, {ready: true, count: 100000, radiusPx: 5}).style, 'material');
+assert.equal(P.chooseStyle('material', full, {material: 'link failed'}).style, 'sand');
+assert.equal(P.chooseStyle('material', {floatRender: null, maxPointSize: 1}, {}, {ready: true, count: 10, radiusPx: 5}).style, 'material');
+assert.equal(P.chooseStyle('material', null).style, 'points');
+// ---- icospheres
+for (const [lvl, tris, verts] of [[0, 20, 12], [1, 80, 42], [2, 320, 162]]) {
+  const m = P.icosphere(lvl); assert.equal(m.triangles, tris); assert.equal(m.positions.length / 3, verts); assert.equal(m.indices.length, tris * 3);
+  for (let i = 0; i < verts; i++) assert.ok(Math.abs(Math.hypot(m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2]) - 1) < 1e-5);
+  let vol = 0;
+  for (let t = 0; t < tris; t++) { const [a, b, d] = [0, 1, 2].map((k) => m.indices[3 * t + k] * 3); const A = m.positions.slice(a, a + 3), B = m.positions.slice(b, b + 3), D = m.positions.slice(d, d + 3);
+    vol += (A[0] * (B[1] * D[2] - B[2] * D[1]) - A[1] * (B[0] * D[2] - B[2] * D[0]) + A[2] * (B[0] * D[1] - B[1] * D[0])) / 6; }
+  assert.ok(vol > 0);
+}
+// ---- the scene shader's instancing extension keeps the original code and adds the instance path
+const vert = '#version 300 es\\nlayout(location = 0) in vec3 aPos;\\nlayout(location = 1) in vec3 aNorm;\\nuniform mat4 uMVP;\\nuniform mat4 uMV;\\nout vec3 vNormV;\\nout vec3 vPosV;\\nout vec3 vPosObj;\\nvoid main() {\\n  gl_Position = uMVP * vec4(aPos, 1.0);\\n}\\n';
+const frag = '#version 300 es\\nvoid main() {\\n    int id = 0;\\n    vec3  albedo   = mat_albedo   (id);\\n    vec3  inner    = ph_inner    (id);\\n    FragColor = vec4(albedo, 1.0);\\n}\\n';
+const ext = P.extendForInstancing(vert, frag);
+assert.ok(ext.vert.includes('void main_scene() {') && ext.vert.includes('uInstanced') && ext.vert.includes('aInstPos') && ext.vert.includes('grainColor'));
+assert.ok(ext.vert.includes('gl_Position = uMVP * vec4(aPos, 1.0);'));
+assert.ok(ext.frag.includes('if (vInstUse > 0.5) albedo = vInstColor;') && ext.frag.includes('if (vInstUse > 0.5) inner = vInstColor;'));
+assert.ok(ext.frag.indexOf('flat in float vInstUse') < ext.frag.indexOf('void main()'));
+assert.throws(() => P.extendForInstancing(vert, frag.replace('mat_albedo', 'other')), /albedo/);
+assert.throws(() => P.extendForInstancing(vert.replace('uMV;', 'uMX;'), frag), /uMV/);
+// ---- heat tone mapping
+const hist = new Float64Array(P.HEAT_HIST_BINS); hist.fill(1);
+const t = P.heatTarget(hist); assert.ok(t[0] < t[1]); assert.ok(Math.abs(t[0] - 0.02 * P.HEAT_X_MAX) < 0.05 && Math.abs(t[1] - 0.98 * P.HEAT_X_MAX) < 0.05);
+assert.equal(P.heatTarget(new Float64Array(P.HEAT_HIST_BINS)), null);
+const flat = new Float64Array(P.HEAT_HIST_BINS); flat[100] = 500; assert.ok(P.heatTarget(flat)[1] - P.heatTarget(flat)[0] >= P.HEAT_MIN_SPAN - 1e-9);
+let r = P.adaptRange(null, [1, 3], 0.1); assert.deepEqual(r, [1, 3]);
+for (let i = 0; i < 10; i++) r = P.adaptRange(r, [2, 6], 0.1);
+assert.ok(Math.abs(r[0] - (1 + (1 - Math.exp(-1)))) < 1e-9);
+assert.equal(P.adaptRange([1, 2], null, 1)[0], 1);
+assert.equal(P.heatMap(0, [0.5, 3]), 0); assert.equal(P.heatMap(1e6, [0.5, 3]), 1);
+const range = [P.quantityToX(0.05), P.quantityToX(2)];
+assert.ok(P.heatMap(0.2, range) > 0 && P.heatMap(1.0, range) < 1);
+assert.ok(Math.abs(P.xToQuantity(P.quantityToX(1.7)) - 1.7) < 1e-9);
+assert.ok(P.heatMap(0.5, range, 2) < P.heatMap(0.5, range, 1));
+console.log('ok');
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's render styles")
+def test_the_material_style_colour_sources_lod_fallback_and_heat_curve_are_exact(tmp_path):
+    """Render-only pure parts (web/particle_styles.js): the colour source (simulation / solid / material / size / species,
+    through palettes), the species-from-radius function, the packing reads, the material style's LOD and its fallback to sand
+    by count and size, the icospheres, the scene shader's instancing extension, and the heat style's adaptive tone map."""
+    assert _run_node(tmp_path, JS_RENDER, "particle_styles.js").strip().splitlines()[-1] == "ok"
+
+
 JS_NOISE = """
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
@@ -907,218 +996,3 @@ def test_the_noise_filters_slope_fit_and_classes_read_synthetic_variance_ladders
     assert ids["nfmode"]["local"] == "noise_mode" and ids["nfmode"]["options"] == listed and ids["nfmode"]["value"] == "mean"
     for key, local in (("nfstrength", "noise_strength"), ("nfthr", "noise_threshold")):
         assert ids[key]["kind"] == "range" and ids[key]["local"] == local and ids[key]["min"] < ids[key]["value"] < ids[key]["max"]
-
-
-# ------------------------------------------------------------- 3-D chamber, tunables, fluids, polygon, inlet
-def _step_count(piece, cols, steps):
-    return F.run_frames(piece, cols, steps)
-
-
-def _live(f):
-    return (np.abs(f["x"]) + np.abs(f["y"]) + np.abs(f["z"])) > 0
-
-
-def test_the_default_chamber_is_a_thin_slab_and_its_pile_stays_flat(native_piece):
-    """Depth is a runtime uniform; the default is about one grain diameter deep, so z never moves (a 2-D pile of spheres)."""
-    piece, columns = native_piece
-    assert F.CELL <= 2.0 * float(columns["dh"]) <= F.DEPTH_DEFAULT + 1e-9 and float(columns["bar_z"]) == 0.0
-    out = F.run_frames(piece, columns, 2500)
-    assert float(np.abs(out["z"]).max()) < 1e-9 and float(np.abs(out["vz"]).max()) < 1e-9
-    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
-
-
-def test_a_deeper_slab_uses_its_depth_and_the_plexiglass_holds_it(native_piece):
-    piece, _columns = native_piece
-    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": F.DEPTH_MAX})
-    assert float(cols["bar_z"]) > 0.0
-    out = F.run_frames(piece, cols, 2500)
-    live = _live(out)
-    dh = float(cols["dh"])
-    assert float(np.abs(out["z"][live]).max()) > 0.2 * dh and float(np.abs(out["z"][live]).max()) <= dh + 1e-6
-    assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0 and float(out["n_drop"][0]) == 0
-
-
-def test_a_phone_lying_flat_pulls_the_grains_into_the_slab_against_the_back_wall(native_piece):
-    piece, _columns = native_piece
-    cols = F.initial_columns(F.N_SMALL, mix=0.5, params={"depth": F.DEPTH_MAX})
-    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(-F.G))
-    out = F.run_frames(piece, cols, 3000)
-    live = _live(out)
-    dh = float(cols["dh"])
-    assert float(out["z"][live].mean()) < -0.5 * dh                       # lying against the back wall (-z)
-    assert float(np.abs(out["z"][live]).max()) <= dh + 1e-6
-
-
-def test_the_polygon_outline_confines_the_pile(native_piece):
-    piece, _columns = native_piece
-    for shape in ("funnel", "hexagon", "ramp"):
-        cols = F.initial_columns(F.N_SMALL, mix=0.5, shape=shape)
-        geo = F.basin(F.N_SMALL)
-        verts = F.shape_vertices(shape, geo)
-        out = F.run_frames(piece, cols, 2500)
-        live = _live(out)
-        assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0, shape
-        assert float(out["y"][live].min()) > -1e-3 and float(np.abs(out["x"][live]).max()) <= geo["half"] + 1e-3
-    funnel = F.run_frames(piece, F.initial_columns(F.N_SMALL, mix=0.5, shape="funnel"), 3000)
-    box = F.run_frames(piece, F.initial_columns(F.N_SMALL, mix=0.5), 3000)
-    # the funnel narrows to the bottom: its lowest grains sit in a narrower span than the box's
-    low = lambda f: float(np.ptp(f["x"][_live(f) & (f["y"] < 0.05)]))
-    assert low(funnel) < low(box)
-
-
-def test_the_inlet_is_a_tube_with_a_runtime_direction_and_position(native_piece):
-    piece, _columns = native_piece
-    spec = F.inlet_spec("side", F.basin(F.N_SMALL), F.resolve_params())
-    d = np.array([spec["in_dx"], spec["in_dy"], spec["in_dz"]])
-    e1 = np.array([spec["e1x"], spec["e1y"], spec["e1z"]])
-    e2 = np.array([spec["e2x"], spec["e2y"], spec["e2z"]])
-    assert abs(np.linalg.norm(d) - 1) < 1e-9 and abs(d @ e1) < 1e-9 and abs(d @ e2) < 1e-9 and abs(e1 @ e2) < 1e-9
-    cols = F.initial_columns(F.N_SMALL, mix=0.5, inlet="jet")                       # a colinear stream straight up
-    assert float(cols["spread"]) == 0.0
-    out = _series(piece, cols, 120, keep=("x", "vx", "vy", "vz"))
-    kept = out[2]
-    vx, vy = np.array(kept["vx"]), np.array(kept["vy"])
-    shot = vy[-1] > 0.5
-    assert shot.any() and float(np.abs(vx[-1][shot]).max()) < 0.3 and float(np.abs(np.array(kept["vz"])[-1][shot]).max()) < 1e-6   # colinear (a fan reaches +-1)
-
-
-def test_the_fluid_buoyancy_and_viscosity_slow_a_settling_grain(native_piece):
-    piece, columns = native_piece
-    base = dict(columns, mode=np.float64(2.0))
-    speeds = {}
-    for name, (rho, mu) in F.FLUIDS.items():
-        cols = dict(base, fl_rho=np.float64(rho), fl_mu=np.float64(mu))
-        # one free grain dropped high in the open (no neighbours): its speed after a second of fall
-        cols = {k: (np.array(v) if np.ndim(v) else v) for k, v in cols.items()}
-        for k in ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz"):
-            cols[k] = np.zeros(F.N_SMALL)
-        cols["age"] = np.full(F.N_SMALL, 1.0e3)
-        cols["x"][0], cols["y"][0] = 0.0, 1.0
-        out = F.run_frames(piece, cols, 360)
-        speeds[name] = float(-out["vy"][0])
-    assert speeds["air"] > speeds["water"] > speeds["glycerine"] > 0.0           # denser, more viscous: slower
-    assert speeds["air"] > 0.8 * F.G and speeds["glycerine"] < 0.2                # air: ~free fall; glycerine: near terminal speed
-
-
-def test_stiffness_is_clamped_to_the_stability_bound_and_the_neighbour_cap_counts_what_it_drops(native_piece):
-    piece, columns = native_piece
-    for hertz in (0.0, 1.0):
-        u = F.uniforms(n=256, params={"omega": 1.0e4, "hertz": hertz})
-        assert float(u["omega"]) <= F.OMEGA_MAX / (1.0 + 2.0 * hertz) ** 0.5 + 1e-3
-        assert float(u["omega"]) * F.DT * (1.0 + 2.0 * hertz) ** 0.5 < 0.6
-    stiff = F.initial_columns(F.N_SMALL, mix=0.0, params={"omega": 1.0e4, "hertz": 1.0, "coh": 1.0, "fl_mu": 5.0e-4})
-    out = F.run_frames(piece, stiff, 3000)
-    assert np.isfinite(out["x"]).all() and float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
-    capped = F.run_frames(piece, F.initial_columns(F.N_SMALL, mix=0.5, params={"k_run": 4}), 2500)
-    assert float(capped["n_drop"][0]) > 0                                         # a small cap says so
-    assert float(F.run_frames(piece, columns, 2500)["n_drop"][0]) == 0            # the default cap drops nothing
-
-
-def test_species_roughness_irregularity_and_restitution_are_runtime_tunables():
-    u = F.uniforms(n=256, params={"irr0": 0.2, "roll0": 0.1, "e0": 0.9, "r0": 0.012})
-    assert float(u["irr0"]) == pytest.approx(0.2, abs=1e-6) and float(u["roll0"]) == pytest.approx(0.1, abs=1e-6)
-    assert float(u["zeta0"]) == pytest.approx(F.zeta_of(0.9), abs=1e-6) and F.restitution_of(F.zeta_of(0.9)) == pytest.approx(0.9)
-    assert F.restitution_of(F.ZETA) == pytest.approx(F.PARAMS["e0"][4]) and float(F.uniforms(n=256)["zeta0"]) == pytest.approx(F.ZETA, abs=1e-6)
-    assert float(u["cell"]) == pytest.approx(2.0 * 0.012 * 1.2, abs=1e-6)       # 2 * max(radius * (1 + irr)): the widened grain species is now the largest
-    assert float(F.uniforms(n=256)["cell"]) == pytest.approx(F.CELL, abs=1e-6)
-    cols = F.initial_columns(256, mix=0.0, params={"irr0": 0.2})
-    out = F.run_frames(F.make_piece(256), cols, 1)
-    base = F.run_frames(F.make_piece(256), F.initial_columns(256, mix=0.0), 1)
-    assert len(np.unique(np.round(out["rad"], 7))) > len(np.unique(np.round(base["rad"], 7)))          # one species, many sizes
-    assert float(out["rad"].min()) >= 0.0090 * 0.8 - 1e-9
-
-
-def test_the_server_declares_the_grouped_tunables_and_live_ones_do_not_restart_the_run():
-    game = F.FountainGame(size="small")
-    ids = {c["id"]: c for c in game.state()["controls_ui"]}
-    assert {c["group"] for c in ids.values()} >= {"Run", "Grains", "Physics", "Fluid", "Chamber"}
-    for key in ("r0", "rho1", "mu2", "e3", "roll0", "irr1", "wt2", "omega", "hertz", "coh", "spin_drag", "k_run", "nozzle_speed",
-                "rate", "fl_rho", "fl_mu", "depth", "spread"):
-        assert ids[key]["kind"] == "range" and ids[key]["action"] == "fountain_param" and ids[key]["name"] == key
-    assert ids["fluid"]["kind"] == "select" and [o[0] for o in ids["fluid"]["options"]][:3] == ["air", "water", "glycerine"]
-    assert ids["shape"]["kind"] == "select" and ids["inlet"]["kind"] == "select" and ids["k_run_drop"]["kind"] == "readout"
-    before = game.state()["compute"]["epoch"]
-    game.do({"type": "fountain_param", "name": "coh", "value": 1.5})              # live: the same run, new uniform
-    state = game.state()["compute"]
-    assert state["epoch"] == before and state["uniforms"]["coh"] == 1.5 and "coh" in F.RUNTIME_INPUTS
-    game.do({"type": "fountain_param", "name": "omega", "value": 1.0e5})          # clamped to its range, and to the CFL bound in the law's input
-    assert game.state()["compute"]["uniforms"]["omega"] <= F.OMEGA_MAX
-    game.do({"type": "fountain_choice", "name": "fluid", "value": "glycerine"})
-    u = game.state()["compute"]["uniforms"]
-    assert u["fl_rho"] == pytest.approx(F.FLUIDS["glycerine"][0], rel=1e-6) and u["fl_mu"] == pytest.approx(F.FLUIDS["glycerine"][1], rel=1e-6)
-    assert game.state()["compute"]["epoch"] == before
-    game.do({"type": "fountain_param", "name": "depth", "value": 0.05})           # a restart class: a new run
-    assert game.state()["compute"]["epoch"] == before + 1 and game.state()["compute"]["uniforms"]["dh"] == pytest.approx(0.025, rel=1e-6)
-    game.do({"type": "fountain_choice", "name": "shape", "value": "funnel"})
-    assert game.state()["compute"]["epoch"] == before + 2
-    game.do({"type": "fountain_choice", "name": "inlet", "value": "pour"})
-    assert game.state()["compute"]["uniforms"]["in_dy"] == -1.0 and game.state()["compute"]["uniforms"]["spread"] == 0.0
-    for bad in ({"type": "fountain_param", "name": "nope", "value": 1}, {"type": "fountain_choice", "name": "shape", "value": "torus"}):
-        with pytest.raises(ValueError):
-            game.do(bad)
-    game.do({"type": "fountain_start", "mix": 1.0})                               # the poly mix is the macro that sets the shares
-    assert game.state()["compute"]["uniforms"]["wt2"] == pytest.approx(F.POLY_WEIGHT[2], rel=1e-6)
-
-
-def _dust(piece_cols, fluid, temp, steps, *, mix=0.0):
-    """256 grains spread out so none touch (a lattice), at rest, gravity off, in a fluid at kT = ``temp``."""
-    rho, mu = F.FLUIDS[fluid]
-    cols = F.initial_columns(F.N_SMALL, mix=mix, params={"fl_rho": rho, "fl_mu": 5.0e-4, "temp": temp, "depth": F.DEPTH_MAX})
-    cols.update(grav_x=np.float64(0.0), grav_y=np.float64(0.0), grav_z=np.float64(0.0))
-    ix, iy = np.meshgrid(np.arange(16), np.arange(16))
-    cols["x"] = (ix.ravel() - 7.5) * 0.026
-    cols["y"] = 0.15 + iy.ravel() * 0.04
-    cols["age"] = np.full(F.N_SMALL, 1.0e3)
-    return cols
-
-
-def test_temperature_is_a_langevin_thermostat_whose_measured_kT_settles_near_the_set_one(native_piece):
-    """Gravity off, small grains in glycerine (a strong drag, so a short relaxation), the measured kT = ke / (3 n_live)
-    settles near the set kT; at kT = 0 nothing moves and the run is bit-identical to itself (the noise terms are exact zeros)."""
-    piece, columns = native_piece
-    assert "temp" in F.UNIFORMS and "temp" in F.RUNTIME_INPUTS and float(columns["temp"]) == 0.0
-    cold = F.run_frames(piece, _dust(columns, "glycerine", 0.0, 0), 400)
-    again = F.run_frames(piece, _dust(columns, "glycerine", 0.0, 0), 400)
-    assert all(np.array_equal(cold[k], again[k]) for k in F.STATE)
-    assert float(np.abs(cold["vx"]).max()) == 0.0 and float(np.abs(cold["wz"]).max()) == 0.0            # kT = 0: exactly still
-    kT = 1.0e-9
-    cols = _dust(columns, "glycerine", kT, 0)
-    series = _series(piece, cols, 1800)[1]
-    measured = series["ke"] / (3.0 * series["n_live"])
-    hot = float(measured[600:].mean())                                      # after many relaxation times (gamma >= 12 /s, a few steps apiece)
-    assert 0.9 * kT < hot < 1.1 * kT, (hot, kT)
-    assert series["n_nan"].max() == 0 and series["n_out"].max() == 0
-    replay = _series(piece, cols, 600)[1]                                   # the noise is a hash of (id, step, component): a replay repeats it
-    assert np.array_equal(replay["ke"], series["ke"][:600])
-    assert F.measured_temperature({"ke": series["ke"][-1], "n_live": series["n_live"][-1]}) == pytest.approx(float(measured[-1]))
-
-
-def test_the_server_declares_temperature_on_a_log_slider_in_the_physics_group():
-    ids = {c["id"]: c for c in F.FountainGame(size="small").state()["controls_ui"]}
-    assert ids["temp"]["group"] == "Physics" and ids["temp"]["scale"] == "log" and ids["temp"]["min"] == 0.0 and ids["temp"]["log_min"] > 0
-    game = F.FountainGame(size="small")
-    before = game.state()["compute"]["epoch"]
-    game.do({"type": "fountain_param", "name": "temp", "value": 2.0e-7})
-    assert game.state()["compute"]["uniforms"]["temp"] == pytest.approx(2.0e-7, rel=1e-6) and game.state()["compute"]["epoch"] == before
-
-
-def test_size_distributions_lognormal_and_bidisperse_are_hashed_per_id_and_off_by_default():
-    n = F.N_SMALL
-
-    def radii(**params):
-        return F.run_frames(F.make_piece(n), F.initial_columns(n, mix=0.0, params=params), 1)["rad"]
-
-    base = radii()
-    assert len(np.unique(np.round(base, 7))) == 2                                   # grain and bead: no spread, ratio 1
-    assert F.uniforms(n=n)["bi_ratio"] == 1.0 and F.uniforms(n=n)["lognormal"] == 0.0
-    uni = radii(irr0=0.2, irr1=0.2)
-    assert len(np.unique(np.round(uni, 7))) > 20 and float(uni.min()) >= 0.0090 * 0.8 - 1e-9 and float(uni.max()) <= 0.0105 * 1.2 + 1e-9
-    logn = radii(irr0=0.2, irr1=0.2, lognormal=1.0)
-    assert len(np.unique(np.round(logn, 7))) > 20 and float(logn.max()) <= 0.0105 * np.exp(0.6) + 1e-9
-    assert not np.array_equal(uni, logn) and np.array_equal(logn, radii(irr0=0.2, irr1=0.2, lognormal=1.0))     # a hash: repeatable
-    assert abs(float(np.mean(np.log(logn / np.where(logn > 0, base, 1.0)))) + 0.02) < 0.03       # lognormal: log-radius has mean -sigma^2/2
-    bi = radii(bi_ratio=2.0, bi_frac=0.3)
-    large, small = bi > base * 1.2, bi < base / 1.2
-    assert abs(float(large.mean()) - 0.3) < 0.08 and (large | small).all()                         # two sizes only
-    assert float(np.max(bi[large] / base[large])) == pytest.approx(2.0 ** 0.5, rel=1e-6) and float(np.max(base[small] / bi[small])) == pytest.approx(2.0 ** 0.5, rel=1e-6)
-    assert float(F.uniforms(n=n, params={"bi_ratio": 2.0})["cell"]) == pytest.approx(F.CELL * 2.0 ** 0.5, rel=1e-6)      # the grid fits the largest

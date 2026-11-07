@@ -43,7 +43,7 @@ for _path in (str(ROOT), str(ROOT / "examples")):
 
 from meowdoku import fountain as F  # noqa: E402
 
-SCHEMA = "turing.fountain-products.v4"
+SCHEMA = "turing.fountain-products.v3"
 SIZES = dict(F.SIZES)                    # tag -> (active ids, sort length)
 WASM_MAX = 4096                          # sizes up to this also get a wasm product
 WGSL_CONTRACT = "fast"                   # float64 storage -> f32 through a declared backend identity
@@ -51,10 +51,19 @@ WASM_CONTRACT = "develop"
 DISPLAY_MAX = 262144                     # the most points the page draws: the display samples every k-th id
 
 
+_SOURCES: str | None = None
+
+
 def _sources() -> str:
-    from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
-    return "\0".join(inspect.getsource(m) for m in (F, sys.modules[__name__], ssa_webgpu_backend,
-                                                     deployment_classification, llvm_training_runtime))
+    """The source text the products are keyed by, read ONCE per process and kept.  inspect.getsource re-reads the files
+    from disk, so a file edited while a long build ran stamped the build's later sizes with the digest of code it never
+    compiled (2026-11-06: small and 4k keyed to one fountain.py, 16k+ to the next; the next start rebuilt both fallbacks)."""
+    global _SOURCES
+    if _SOURCES is None:
+        from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
+        _SOURCES = "\0".join(inspect.getsource(m) for m in (F, sys.modules[__name__], ssa_webgpu_backend,
+                                                            deployment_classification, llvm_training_runtime))
+    return _SOURCES
 
 
 def digest(tag: str) -> str:
@@ -140,59 +149,88 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
             "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
         },
         "memory": {"arena_bytes": compiled.arena_elements * 4, "bytes_per_id": compiled.arena_elements * 4 / pad,
-                   "display_ids": -(-pad // stride), "display_bytes": 3 * 20 * -(-pad // stride)},
-        "display_stride": stride,
+                   "display_ids": -(-pad // stride), "display_bytes": 3 * 16 * -(-pad // stride)},
+        "display_stride": stride, "emit_rate": F.EMIT_SPAN / active,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
         "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
         "source_digest": digest(tag),
     }
-    if pad <= WASM_MAX and wasm:
-        wasm_abi = graph_wasm._compile(
-            f"fountain_{tag}", shapes_for(pad),
-            lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
-            F.OUTPUTS, WASM_CONTRACT, web_dir,
-            {"argument_names": list(F.ARGUMENTS), "count": pad})
-        record.update({"wasm": f"fountain_{tag}.wasm", "wasm_abi": f"fountain_{tag}.abi.json",
-                       "wasm_buffers": len(wasm_abi["order"])})
     record["build_seconds"] = round(time.perf_counter() - started, 1)
+    if pad <= WASM_MAX and wasm:
+        build_fallback(tag, web_dir, record)
     return record
 
 
-def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True) -> dict:
-    """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept."""
-    from src.compiler.deployment_classification import WebGPUComputeCostModel
+def build_fallback(tag: str, web_dir: Path, record: dict) -> dict:
+    """The CPU fallback of one size (the wasm product, for a browser without WebGPU), added to its ``record``.  It is the
+    slow part of a build (the size-specialised law lowered whole: minutes, ~30 at 4k), so ``build`` makes it AFTER every
+    WebGPU product is written."""
+    from meowdoku import graph_wasm
+    active, pad = SIZES[tag]
+    started = time.perf_counter()
+    wasm_abi = graph_wasm._compile(
+        f"fountain_{tag}", shapes_for(pad),
+        lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
+        F.OUTPUTS, WASM_CONTRACT, web_dir,
+        {"argument_names": list(F.ARGUMENTS), "count": pad})
+    record.update({"wasm": f"fountain_{tag}.wasm", "wasm_abi": f"fountain_{tag}.abi.json",
+                   "wasm_buffers": len(wasm_abi["order"]), "wasm_seconds": round(time.perf_counter() - started, 1)})
+    return record
+
+
+def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = True, on_gpu_ready=None) -> dict:
+    """Write the page products; returns the manifest.  Sizes whose source digest is unchanged are kept.
+
+    Two passes: first every size's WebGPU product (seconds each), then the manifest is written and ``on_gpu_ready``
+    called -- the page can run -- and only then the slow CPU fallbacks (``build_fallback``), the manifest rewritten as
+    each one lands."""
     web_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = web_dir / "fountain.manifest.json"
     old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     records = {}
     for tag in sizes:
         previous = (old.get("sizes") or {}).get(tag)
-        files = [web_dir / f"fountain_{tag}.wgsl"]
-        if SIZES[tag][1] <= WASM_MAX and wasm:
-            files += [web_dir / f"fountain_{tag}.wasm", web_dir / f"fountain_{tag}.abi.json"]
-        if previous and previous.get("source_digest") == digest(tag) and all(p.exists() for p in files):
+        if previous and previous.get("source_digest") == digest(tag) and (web_dir / f"fountain_{tag}.wgsl").exists():
+            if previous.get("wasm") and not all((web_dir / previous[k]).exists() for k in ("wasm", "wasm_abi")):
+                previous = {k: v for k, v in previous.items() if not k.startswith("wasm")}
             records[tag] = previous
             continue
-        records[tag] = build_size(tag, web_dir, wasm)
+        records[tag] = build_size(tag, web_dir, wasm=False)
         r = records[tag]
         print(f"[fountain] {tag}: {r['n']} ids (sort {r['pad']}) -> {r['route']} (predicted {r['verdict']['speedup']:.2f}x, "
               f"{r['wgsl_abi']['dispatches']} dispatches, {r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)
+    manifest = _manifest(records)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    if on_gpu_ready is not None:
+        on_gpu_ready(manifest)
+    if wasm:
+        for tag in sizes:
+            r = records[tag]
+            if SIZES[tag][1] > WASM_MAX or r.get("wasm"):
+                continue
+            build_fallback(tag, web_dir, r)
+            print(f"[fountain] {tag}: CPU fallback (wasm) built in {r['wasm_seconds']}s", flush=True)
+            manifest = _manifest(records)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _manifest(records: dict) -> dict:
+    from src.compiler.deployment_classification import WebGPUComputeCostModel
     model = WebGPUComputeCostModel()
     geo = F.basin(F.N_FULL)
-    manifest = {
+    return {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
         "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
                 "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
-                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G, "k_run_max": F.K_RUN_MAX, "depth_max": F.DEPTH_MAX},
+                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G},
         "emit_span": F.EMIT_SPAN, "initial": {},
-        "points": {"x": "x", "y": "y", "z": "z", "vx": "vx", "vy": "vy", "vz": "vz", "rgb": ["cr", "cg", "cb"], "live": "shown",
-                   "radius": "rad", "rest_speed": 0.15, "bytes": 20},
+        "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"],
+                   "radius": "rad", "rest_speed": 0.15},
         "reference_view": list(geo["view"]),
-        "species": [list(item) for item in F.SPECIES], "fluids": {k: list(v) for k, v in F.FLUIDS.items()},
+        "species": [list(item) for item in F.SPECIES],
         "settle": F.SETTLE,
     }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:

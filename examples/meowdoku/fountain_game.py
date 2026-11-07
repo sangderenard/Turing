@@ -1,9 +1,9 @@
-"""The fountain's server side: the game (phase, mix, size, the tunables, the image hand-off, verification) and the page's
+"""The 3-D fountain's server side (``fountain3d``; the 2-D fountain is ``fountain.py`` and stays as it was): the game (phase, mix, size, the tunables, the image hand-off, verification) and the page's
 controls (``controls_ui``).
 
-Kept apart from ``fountain.py`` on purpose: the compiled products (``fountain_build``'s digest, ``LawPiece``) hash the law
-module, so an edit to the page's controls here never forces the long rebuild.  ``fountain.FountainGame`` and the option
-lists below are still reachable through ``meowdoku.fountain`` (its module ``__getattr__``).
+Kept apart from ``fountain3d.py`` on purpose: the compiled products (``fountain_build``'s digest, ``LawPiece``) hash the law
+module, so an edit to the page's controls here never forces the long rebuild.  ``fountain3d.FountainGame`` and the option
+lists below are still reachable through ``meowdoku.fountain3d`` (its module ``__getattr__``).
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from typing import Any
 
 import numpy as np
 
-from meowdoku.fountain import *  # noqa: F401,F403  (the law, its constants and the host helpers)
-from meowdoku.fountain import _f32  # noqa: F401
+from meowdoku.fountain3d import *  # noqa: F401,F403  (the law, its constants and the host helpers)
+from meowdoku.fountain3d import _f32  # noqa: F401
 from meowdoku.games import Game
 
 #: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
@@ -41,9 +41,9 @@ class FountainGame(Game):
     (phase 2) and ``fountain_verify`` (run the law ``steps`` steps from round
     zero natively, small sizes only, and report a digest)."""
 
-    game = "fountain"
+    game = "fountain3d"
     input = "compute"
-    title = "Fountain"
+    title = "Fountain 3D"
 
     def __init__(self, board_id: str = "", *, size: str = DEFAULT_SIZE, aspect: float | None = None):
         super().__init__(board_id)
@@ -299,7 +299,7 @@ class FountainGame(Game):
             "controls_ui": self.controls_ui(),
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
-                "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
+                "manifest": "fountain3d.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in self.uniforms(image=self.phase == "replay").items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "depth": self.resolved()["depth"],
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,

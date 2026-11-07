@@ -1262,15 +1262,15 @@ function uploadMaterials(game) {
       // against it and the sun leaves a soft highlight.  (It was always drawn
       // this dark, but by accident -- see pointsFrame.)  Declared here as a finish.
       const [albedo, finish] = game.game === "meowdoku" ? meowMaterial(role, tint)
-        : game.game === "fountain" ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
+        : (game.game === "fountain" || game.game === "fountain3d") ? [tint.map((v) => 0.08 * v), { roughness: 0.3 }] : [tint, {}];
       records.push([role, albedo, { ...finish, ...(emission ? { emission } : {}) }]);
     }
   }
   records.push(["traycube", [0.86, 0.95, 1.0], { roughness: 0.04, transmission: 0.88, opacity: 0.2, ior: 1.5 }]);
   // (the fountain's glass slab matches its dark floor)
-  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : game.game === "fountain" ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
+  records.push(["glass", game.game === "meowdoku" ? [0.26, 0.46, 0.49] : (game.game === "fountain" || game.game === "fountain3d") ? [0.012, 0.012, 0.016] : [0.80, 0.90, 1.0],
     game.game === "meowdoku" ? { roughness: 0.84, transmission: 0.0, opacity: 1.0, ior: 1.3 }
-      : game.game === "fountain" ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
+      : (game.game === "fountain" || game.game === "fountain3d") ? { roughness: 0.3, transmission: 0.0, opacity: 1.0, ior: 1.5 }
       : { roughness: 0.04, transmission: 0.85, opacity: 0.28, ior: 1.5 }]);
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.

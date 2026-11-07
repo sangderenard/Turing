@@ -96,7 +96,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) gr
   let j = g.x + g.y * grid.x * 64u;
   if (j >= __NDISP__u) { return; }
   let i = j * __STRIDE__u;
-  let live = __SHOWN__ > 0.5;
+  let live = __LIVE__;
   let vx = __VX__;
   let vy = __VY__;
   let vz = __VZ__;
@@ -176,8 +176,9 @@ ${commit}
     const at = (s) => `lane${Math.floor(s / spb)}[${(s % spb) * pad}u + i]`;
     const packCode = PACK_WGSL.replace("__LANES__", lanes("read_write")).replace("__PTSB__", String(B))
       .replaceAll("__NDISP__", String(ndisp)).replaceAll("__STRIDE__", String(stride))
-      .replaceAll("__SHOWN__", at(oslot(p.live))).replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y))).replaceAll("__Z__", at(slot(p.z)))
-      .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy))).replaceAll("__VZ__", at(slot(p.vz)))
+      .replaceAll("__LIVE__", Array.isArray(p.live) ? `${at(slot(p.live[0]))} >= f32(i) * ${rec.emit_rate.toPrecision(9)}f` : `${at(oslot(p.live))} > 0.5`)   // 2-D product: emitted by age; 3-D: its `shown` output
+      .replaceAll("__X__", at(slot(p.x))).replaceAll("__Y__", at(slot(p.y))).replaceAll("__Z__", p.z === undefined ? "0.0" : at(slot(p.z)))       // a 2-D product has no z: 0
+      .replaceAll("__VX__", at(slot(p.vx))).replaceAll("__VY__", at(slot(p.vy))).replaceAll("__VZ__", p.vz === undefined ? "0.0" : at(slot(p.vz)))
       .replaceAll("__R__", at(oslot(p.rgb[0]))).replaceAll("__G__", at(oslot(p.rgb[1]))).replaceAll("__RAD__", at(oslot(p.radius)))
       .replaceAll("__B__", at(oslot(p.rgb[2]))).replaceAll("__REST2__", (p.rest_speed * p.rest_speed).toFixed(8));
     const pack = this.device.createShaderModule({ code: packCode });
@@ -221,7 +222,7 @@ ${commit}
     this.setColours(named);
   }
 
-  setUniform(name, value) { this.device.queue.writeBuffer(this.head, this.abi.uniform_index[name] * 4, new Float32Array([value])); }
+  setUniform(name, value) { const k = this.abi.uniform_index[name]; if (k !== undefined) this.device.queue.writeBuffer(this.head, k * 4, new Float32Array([value])); }   // a name this product has no uniform for (grav_z on the 2-D one) is ignored
 
   setColours(named) {
     for (const [name, values] of Object.entries(named)) {
@@ -368,10 +369,10 @@ class WasmProduct {
     for (const view of Object.values(this.inputs)) if (view.length > 1) view.fill(0);
     for (let i = 0; i < this.pad; i++) this.inputs.pid[i] = i;
     for (const [name, values] of Object.entries(named)) if (this.inputs[name] && this.inputs[name].length >= values.length) this.inputs[name].set(values);
-    for (const [name, value] of Object.entries(uniforms)) this.inputs[name][0] = value;
+    for (const [name, value] of Object.entries(uniforms)) if (this.inputs[name]) this.inputs[name][0] = value;
   }
 
-  setUniform(name, value) { this.inputs[name][0] = value; }
+  setUniform(name, value) { if (this.inputs[name]) this.inputs[name][0] = value; }
   setColours(named) { for (const [name, values] of Object.entries(named)) this.inputs[name].set(values); }
 
   step(count) {
@@ -400,13 +401,16 @@ class WasmProduct {
 
   #pack(f) {
     const p = this.manifest.points, I = this.inputs, O = this.nexts, u = new Uint32Array(f.buffer, f.byteOffset, f.length);
-    const x = I[p.x], y = I[p.y], z = I[p.z], vx = I[p.vx], vy = I[p.vy], vz = I[p.vz], shown = O[p.live];
+    const x = I[p.x], y = I[p.y], vx = I[p.vx], vy = I[p.vy], rate = this.rec.emit_rate;
+    const z = p.z === undefined ? null : I[p.z], vz = p.vz === undefined ? null : I[p.vz];
+    const age = Array.isArray(p.live) ? I[p.live[0]] : null, shown = age ? null : O[p.live];
     const r = O[p.rgb[0]], g = O[p.rgb[1]], b = O[p.rgb[2]], rad = O[p.radius], rest2 = p.rest_speed * p.rest_speed;
     const byte = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
     for (let i = 0; i < this.pad; i++) {
-      f[5 * i] = x[i]; f[5 * i + 1] = y[i]; f[5 * i + 2] = z[i];
+      f[5 * i] = x[i]; f[5 * i + 1] = y[i]; f[5 * i + 2] = z ? z[i] : 0;
       u[5 * i + 3] = (255 << 24) | (byte(b[i]) << 16) | (byte(g[i]) << 8) | byte(r[i]);
-      f[5 * i + 4] = shown[i] > 0.5 ? ((vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]) < rest2 ? 200 : 100) + rad[i] * 1000 : 0;
+      const on = age ? age[i] >= i * rate : shown[i] > 0.5, v2 = vx[i] * vx[i] + vy[i] * vy[i] + (vz ? vz[i] * vz[i] : 0);
+      f[5 * i + 4] = on ? (v2 < rest2 ? 200 : 100) + rad[i] * 1000 : 0;
     }
     return f;
   }
@@ -568,7 +572,7 @@ export class ComputeRuntime {
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt) : this.gravity;
     if (g) {
       const G = this.manifest.law.gravity;
-      out.grav_x = g[0] * G; out.grav_y = g[1] * G; out.grav_z = (g[2] || 0) * G;   // a spinning case turns in the screen's plane (no z)
+      out.grav_x = g[0] * G; out.grav_y = g[1] * G; if (this.runtimeInputs.has("grav_z")) out.grav_z = (g[2] || 0) * G;   // the 3-D law only; a spinning case turns in the screen's plane (no z)
       Object.assign(out, this.spec.tilt || {});
     }
     for (const name of Object.keys(out)) out[name] = Math.fround(out[name]);
