@@ -1451,6 +1451,15 @@ function uploadMaterials(game) {
     });
     tables[tname] = { floats_per_record: f, records: table.records + records.length, data };
   }
+  {   // which materials read the transmission variant's fields (see phongVariant)
+    const pf = tables.pbr.floats_per_record, tf = tables.texstack.floats_per_record, rows = tables.pbr.records;
+    state.variantNeeds = new Uint8Array(rows);
+    for (let r = 0; r < rows; r++) {
+      const p = tables.pbr.data, t = tables.texstack.data;
+      const thick = t[r * tf + 2] >= 0 && (t[r * tf + 5] + t[r * tf + 7]) > 0;
+      state.variantNeeds[r] = p[r * pf + 5] > 0 || t[r * tf + 12] > 0 || (thick && t[r * tf + 15] > 0) ? 1 : 0;
+    }
+  }
   state.materialsVersion = (state.materialsVersion || 0) + 1;
   state.pbrTable = tables.pbr;
   state.tables = tables;
@@ -4251,7 +4260,7 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, spinarc: spinMotion.arc }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, spinarc: spinMotion.arc, spinrev: spinReverse, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
@@ -4263,6 +4272,12 @@ function localControl(s, value) {
     camView.auto = !!value;
     // a slab is seen edge-on from straight above: tip the view a little so the orbit shows its depth
     if (value && Math.abs(camView.goal.pitch) < 0.1) camView.goal.pitch = -0.7;
+  } else if (s.local === "spinrev") {
+    spinReverse = !!value; caseSpin = Math.abs(caseSpin) * (spinReverse ? -1 : 1);
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
+    try { localStorage.setItem("meowdoku.spin", String(caseSpin)); } catch { /* storage may be blocked */ }
+  } else if (s.local === "spinphase") {
+    spinMotion.phase = Number(value); saveSpinMotion();
   } else if (s.local === "spinmotion") {
     spinMotion.kind = value === "rock" ? "rock" : "spin"; saveSpinMotion();
   } else if (s.local === "spinarc") {
@@ -4326,8 +4341,8 @@ function refreshLocalControls() {
     if (s.local === "spin") {
       const input = el.querySelector("input");
       if (document.activeElement !== input) input.value = String(sliderFromSpin(caseSpin));
-      el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, centre = off`
-                          : "centre = off; log scale out to 30 Hz either way (the Nyquist rate of the 60 Hz input updates), down to 1 turn in 2.8 h";
+      el.title = caseSpin ? `gravity turns ${spinText(caseSpin)} ${caseSpin > 0 ? "counterclockwise" : "clockwise"} in simulated time (overrides the phone); log scale, left end = off`
+                          : "left end = off; log scale from 1 turn in 2.8 h up to 30 Hz (the Nyquist rate of the 60 Hz input updates); the reverse switch sets the direction";
       el.querySelector("span").textContent = `case spin ${spinText(caseSpin)} `;
     } else if (s.local === "tilt") {
       el.querySelector("input").checked = gravitySensor.enabled;
@@ -4377,6 +4392,14 @@ function refreshLocalControls() {
       el.title = (noiseFx.on && cloud && cloud.noise.fallback) || choice.reason || "spectral noise filter over the look: speckle becomes a solid colour (render only)";
       const input = el.querySelector("input, select");
       if (input) input.disabled = !choice.on;
+    } else if (s.local === "spinrev") {
+      el.querySelector("input").checked = spinReverse;
+      el.title = "the case turns clockwise when on (counterclockwise when off)";
+    } else if (s.local === "spinphase") {
+      const input = el.querySelector("input");
+      if (document.activeElement !== input) input.value = String(spinMotion.phase || 0);
+      el.querySelector("span").textContent = `phase ${Math.round(spinMotion.phase || 0)}\u00b0 `;
+      el.title = "where the cycle starts: a spin starts turned by this angle, a rock starts this far into its swing";
     } else if (s.local === "spinmotion" || s.local === "spinarc") {
       const input = el.querySelector("input, select");
       if (document.activeElement !== input) input.value = String(s.local === "spinmotion" ? spinMotion.kind : spinMotion.arc);
@@ -4420,17 +4443,21 @@ function refreshLocalControls() {
 // The slider is LOGARITHMIC in the rate (grain-size studies want the near-DC end): position s in [-1, 1] -> sign(s) x
 // 10^(SPIN_LOG[0] + |s| (SPIN_LOG[1] - SPIN_LOG[0])) Hz, from 1e-4 Hz (one turn in ~2.8 h) to 30 Hz; the centre notch is off.
 const SPIN_LOG = [-4, Math.log10(30)], SPIN_NOTCH = 0.01;      // 30 Hz: the Nyquist rate of the 60 Hz input updates
-const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin", min: -1, max: 1, step: 0.002, local: "spin" };
+const SPIN_SPEC = { id: "spin", kind: "range", label: "case spin", min: 0, max: 1, step: 0.001, local: "spin" };
+const REVERSE_SPEC = { id: "spinrev", kind: "toggle", label: "reverse", local: "spinrev" };
+const PHASE_SPEC = { id: "spinphase", kind: "range", label: "phase", min: 0, max: 360, step: 1, local: "spinphase" };
+// one-sided: the slider is the rate's size (0 at the left end = off, then log from 1e-4 Hz to 30 Hz); the reverse switch
+// is its direction
 function spinFromSlider(s) {
-  s = Number(s);
-  if (Math.abs(s) < SPIN_NOTCH) return 0;
-  const u = (Math.abs(s) - SPIN_NOTCH) / (1 - SPIN_NOTCH);
-  return Math.sign(s) * 10 ** (SPIN_LOG[0] + u * (SPIN_LOG[1] - SPIN_LOG[0]));
+  s = Math.abs(Number(s));
+  if (s < SPIN_NOTCH) return 0;
+  const u = (s - SPIN_NOTCH) / (1 - SPIN_NOTCH);
+  return (spinReverse ? -1 : 1) * 10 ** (SPIN_LOG[0] + u * (SPIN_LOG[1] - SPIN_LOG[0]));
 }
 function sliderFromSpin(hz) {
   if (!hz) return 0;
   const u = (Math.log10(Math.abs(hz)) - SPIN_LOG[0]) / (SPIN_LOG[1] - SPIN_LOG[0]);
-  return Math.sign(hz) * (SPIN_NOTCH + Math.max(0, Math.min(1, u)) * (1 - SPIN_NOTCH));
+  return SPIN_NOTCH + Math.max(0, Math.min(1, u)) * (1 - SPIN_NOTCH);
 }
 function spinText(hz) {
   if (!hz) return "off";
@@ -4502,7 +4529,7 @@ function pageSpecs(specs) {
   let out = specs;
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
-    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
+    if (tilt >= 0) out = [...out.slice(0, tilt + 1), CAMGRAV_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
   }
@@ -4517,10 +4544,10 @@ function pageSpecs(specs) {
 let recordOn = false;
 try { recordOn = localStorage.getItem("meowdoku.record") === "1"; } catch { /* storage may be blocked */ }
 compute.setRecording(recordOn);
-let caseSpin = 0;
+let caseSpin = 0, spinReverse = false;
 let spinMotion = { kind: "spin", arc: 60 };
 try { spinMotion = { ...spinMotion, ...JSON.parse(localStorage.getItem("meowdoku.spinmotion") || "{}") }; } catch { /* storage may be blocked */ }
-try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }
+try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; spinReverse = caseSpin < 0; } catch { /* storage may be blocked */ }
 compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
 // a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off (or log_min with log_floor), then log-spaced from spec.log_min to spec.max
 function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? (s.log_floor ? s.log_min : 0) : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
@@ -4626,8 +4653,45 @@ function particleScene(pick) {
   const opacity = id != null && t ? t.data[id * f + 7] : 1;
   const glass = particleStyle === "stained" || particleStyle === "stained_fast" || (id != null && isGlass(opacity));
   const group = (state.materialGroups || {})[name];
-  return { program: state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj,
+  return { program: state.activePhong || state.programs.phong, instancing: state.instancing, materialId: id == null ? 0 : id, shadow: light.viewProj,
            glass, oit: !!state.oit, oitNote: state.oitNote, group: group ? group.group : 0, thermal: !!group && group.kelvin > 0 };
+}
+// THE TRANSMISSION VARIANT (Pluck's PLUCK_TRANSMISSION define): the same Phong source with light through transmissive bodies,
+// back-lit translucence and steady-state remit switched on, compiled as a second program on first need.  The base program is
+// the original, so a scene whose drawn materials set none of those fields costs exactly what it did.  A material "needs" the
+// variant when its PBR transmission, its remit gain, or its translucence gain (with a thickness) is above zero (state.variantNeeds,
+// by material id, from uploadMaterials).  Debug: meowdokuDebug.transmission = "auto" | "off" | "on".
+function phongVariant() {
+  if (state.programs.phongT !== undefined) return state.programs.phongT;
+  state.programs.phongT = null;
+  const src = state.shaderSources; if (!src) return null;
+  const define = (text) => text.replace(/^(#version[^\n]*\n)/, "$1#define PLUCK_TRANSMISSION 1\n");
+  try {
+    const extended = extendForInstancing(src.vert, define(src.frag));
+    state.programs.phongT = link(compile(gl.VERTEX_SHADER, extended.vert), compile(gl.FRAGMENT_SHADER, state.oit ? extendForOit(extended.frag) : extended.frag));
+  } catch (error) {
+    state.variantNote = String(error.message || error).slice(0, 300);
+    console.warn("[meowdoku] the transmission variant could not be built:", state.variantNote);
+  }
+  return state.programs.phongT;
+}
+function sceneNeedsVariant(casters, pick) {
+  const mode = state.debug.transmission || "auto";
+  if (mode === "off") return false;
+  if (mode === "on") return true;
+  const needs = state.variantNeeds, index = state.materialIndex; if (!needs) return false;
+  const has = (name) => { const id = index[name]; return id != null && needs[id] === 1; };
+  if (backlightEmitter()) return true;
+  if (state.glass && has("glass")) return true;
+  for (const piece of state.glassPieces || []) if (has(`${piece.color}@glass`)) return true;
+  for (const c of casters) if (c[3] && c[3].color && has(c[3].color)) return true;
+  if (pick) {
+    const name = pick.mode === "material" ? pick.material
+      : particleStyle === "stained" ? (index["bead@glass"] != null ? "bead@glass" : "gem@glass")
+      : particleStyle === "stained_fast" ? "gem@glass" : null;
+    if (name && has(name)) return true;
+  }
+  return false;
 }
 // The camera's down in the law's plane: the board maps law x to world +x and law y to world -z (PointCloud's uMap), so the
 // in-plane part of the camera's down (minus its up row of the view matrix) is (d.x, -d.z) -- full strength looking
@@ -4692,7 +4756,8 @@ window.meowdokuDebug.benchParticles = (n, style, frames = 20, coverage = 0.3) =>
 // glass itself -- never into its own broadcast).
 function litPass(cam, now, casters, opts = {}) {
   // pass 2: the lit scene
-  const P = state.programs.phong; gl.useProgram(P);
+  const P = (sceneNeedsVariant(casters, state.game && state.game.game === "fountain" ? colorPick() : null) && phongVariant()) || state.programs.phong;
+  state.activePhong = P; gl.useProgram(P);
   const span = Math.max(state.extent.width, extLength());
   const keyView = M.apply(cam.view, light.position);
   const sun = sunState(), boardCentre = [state.extent.width / 2, 0, extMidZ()];
@@ -5711,7 +5776,7 @@ function fillPickers() {
   // The scene's Phong program, extended for instancing (particle_styles.js extendForInstancing: the original main runs first,
   // unchanged; only the material particle style turns instancing on).  If the extension cannot be made or linked, the program
   // is the original and the material style says why it is not drawn.
-  state.instancing = false; state.instancingNote = "";
+  state.instancing = false; state.instancingNote = ""; state.shaderSources = { vert, frag };
   try {
     const extended = extendForInstancing(vert, frag);
     // ...and with the order-independent-transparency outputs (extendForOit: a second output, written only when uOit = 1; the

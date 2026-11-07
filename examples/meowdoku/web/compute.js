@@ -447,8 +447,9 @@ export class SettleDetector {
 const MAX_IN_FLIGHT = 2;               // batches submitted to the device whose snapshots have not come back (the queue never runs away)
 // the gravity of a case spinning at ``hz`` revolutions per second, ``t`` simulated seconds in: straight down at t = 0,
 // turning counterclockwise for hz > 0 (fractions of g in the screen's plane)
+// ``motion.phase`` (degrees) offsets the cycle: a spin starts turned by it, a rock starts that far into its swing.
 export function spinGravity(hz, t, motion = { kind: "spin" }) {
-  const phase = 2 * Math.PI * hz * t;
+  const phase = 2 * Math.PI * hz * t + (Math.PI / 180) * (Number(motion.phase) || 0);
   const a = motion.kind === "rock" ? (Math.PI / 180) * (motion.arc / 2) * Math.sin(phase) : phase;
   return [Math.sin(a), -Math.cos(a)];
 }
@@ -615,7 +616,8 @@ export class ComputeRuntime {
   // straight down, one swing out and back per cycle) -- a scripted rocker until the teeter-totter case is a law body.
   setSpin(hz, motion = this.spinMotion || { kind: "spin", arc: 60 }) {
     const next = hz ? Number(hz) : null;
-    this.spinMotion = { kind: motion.kind === "rock" ? "rock" : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)) };
+    this.spinMotion = { kind: motion.kind === "rock" ? "rock" : "spin", arc: Math.max(0, Math.min(360, Number(motion.arc) || 0)),
+                        phase: Number(motion.phase) || 0 };
     this.spin = next;
     this.#kick();
   }
