@@ -634,5 +634,24 @@ def build_mobroad(web_dir: Path, sizes: tuple[str, ...] = MOBROAD_SIZES, wasm: b
             manifest_path.write_text(json.dumps(mobroad_manifest(records)), encoding="utf-8")
     return manifest
 # </mobroad>
+# <toy>
+# ------------------------------------------------------------------------------------------------------------------------
+# THE TOY'S PRESET is host-side data (``fountain.py``'s ``# <toy>`` region, ``toy_design.py``): it is not part of what a product is compiled from, so EVERY
+# digest (the default, wheel, purrline and mobroad ones) leaves the ``# <toy>`` regions out.  The helper below re-binds ``_module_sources`` (the last
+# definition wins) and the two patterns; with them a toy edit rebuilds nothing, and the text each digest hashes is the text it was.
+_MARKED_TOY = _re.compile(r"^[ \t]*# <toy>\n.*?^[ \t]*# </toy>\n", _re.S | _re.M)
+_MARKED = _re.compile(r"^[ \t]*# <(?:purrline|mobroad|toy)>\n.*?^[ \t]*# </(?:purrline|mobroad|toy)>\n", _re.S | _re.M)
+_MARKED_MOB = _re.compile(r"^[ \t]*# <(?:mobroad|toy)>\n.*?^[ \t]*# </(?:mobroad|toy)>\n", _re.S | _re.M)
+
+
+def _module_sources(strip: bool, drop=None) -> str:
+    """As the mobroad region's: ``strip`` leaves out all the variants' regions, ``drop`` a given pattern's, else whole -- and the toy regions always."""
+    from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
+    texts = [_MARKED_TOY.sub("", inspect.getsource(m)) for m in (F, sys.modules[__name__])]
+    pattern = drop if drop is not None else (_MARKED if strip else None)
+    if pattern is not None:
+        texts = [pattern.sub("", t) for t in texts]
+    return "\0".join(texts + [inspect.getsource(m) for m in (ssa_webgpu_backend, deployment_classification, llvm_training_runtime)])
+# </toy>
 if __name__ == "__main__":
     raise SystemExit(main())
