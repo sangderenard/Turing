@@ -68,6 +68,11 @@ deploy to 8766 as soon as work lands.
   - **baked colliders:** fixed solids become a distance/occupancy field texture, so grains and bodies query a texture instead of per-object contacts (fixed fountain objects, level tiles, chamber walls);
   - **animation capture:** deterministic animations (Meowdoku piece placement, cat pops, tray and roster effects) are recorded once per (event, parameters) into flipbooks or atlases and replayed, so Meowdoku can run as 100% captured animation;
   - the bake runs through the existing deployment/compile path and is keyed like other cached products (the declared inputs digest), never hand-edited.
+- **Self-attraction, dipoles and aggregates in the fountain** (for dynamic richness, and to calm the sim):
+  - **attraction:** short-range cohesion (liquid-bridge / van der Waals style; the 3D job adds a basic cohesion uniform) and phase behaviour, e.g. a wet clump, a dry flow, a crystal;
+  - **dipoles:** each grain carries a moment (a per-id orientation vector) with an orientation-dependent pair force and torque (magnetic/electric), so chains and needles form;
+  - **aggregates:** grains bonded at rest fuse into a cluster that moves as one rigid body (fewer degrees of freedom, so the sim calms down and gets cheaper), and break apart when bond stress exceeds a strength; the same rigid-body machinery as the emoji objects;
+  - the bonds and their breakage are law state, deterministic, and replay bit-identically.
 - **Fountain regions inside platform games:** a granular material that spills through a course (platformer, side scroller, delve). The same fountain law runs as a region of the level, and its grains interact with the level's tiles and the player.
 
 ## Other open items
