@@ -73,13 +73,15 @@ def put(game: pl.Purrline, rows: list[list[int]], spec: dict[tuple[int, int], in
     st.counter[:] = st.counter[0] + 100.0
     st.moves[:] = float(pl.MOVES_PER_LEVEL)
     st.over[:] = 0.0
+    st.retry[:] = 0.0
     if idle:
         settle(game)
 
 
 def busy(game: pl.Purrline) -> bool:
     s = game.session
-    return bool(np.abs(s.column("ox")).max() > 1e-9 or np.abs(s.column("oy")).max() > 1e-9 or s.column("wait")[0] > 1e-9)
+    return bool(np.abs(s.column("ox")).max() > 1e-9 or np.abs(s.column("oy")).max() > 1e-9 or s.column("wait")[0] > 1e-9
+                or s.column("sky_on").max() > 0.5)
 
 
 def settle(game: pl.Purrline, limit: int = 2000) -> int:

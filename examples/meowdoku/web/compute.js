@@ -610,6 +610,7 @@ export class ComputeRuntime {
   #inputsNow() {
     const out = {};
     for (const name of this.runtimeInputs) if (name in this.spec.uniforms) out[name] = this.spec.uniforms[name];
+    if (this.bodyTau != null && this.runtimeInputs.has("body_tau")) out.body_tau = this.bodyTau;   // the hinged body's coupling torque (setBodyTorque)
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (this.runtimeInputs.has("case_omega")) {          // the case's own turn, from the same motion (one mechanism): 0 when it stands still
       const [om, dom] = this.spin ? spinOmega(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : [0, 0];
@@ -640,6 +641,16 @@ export class ComputeRuntime {
     this.caseTilt = next;
     this.#kick();
   }
+
+  // The hinged body's (waterwheel) machine-sim coupling: the coupling writes its transmitted torque here (an absolute runtime input of the law,
+  // logged with its step like the others) and reads the wheel's speed back from the law's diagnostics.
+  setBodyTorque(nm) {
+    const next = Number(nm) || 0;
+    if (next === (this.bodyTau ?? 0)) return;
+    this.bodyTau = next;
+    this.#kick();
+  }
+  get bodySpeed() { return this.diag ? this.diag.body_om ?? null : null; }
 
   setGravityScale(k) {
     const next = Math.max(0, Number(k));

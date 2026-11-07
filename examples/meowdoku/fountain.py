@@ -177,7 +177,8 @@ CHAMBER_CHOICES = (("box", "box (open basin)"), ("funnel", "funnel"), ("hexagon"
                    ("ngon6", "hexagon, regular (fast, polyline)"), ("ngon7", "heptagon (fast, polyline)"),
                    ("sdf_circle", "sphere / circle (SDF)"), ("sdf_square", "cube / square (SDF)"), ("sdf_triangle", "tetrahedron / triangle (SDF)"),
                    ("sdf_annulus", "toroidal shell / annulus (SDF)"), ("sdf_hourglass", "hourglass (SDF)"),
-                   ("sdf_toy", "oil & glycerine toy: ramps, hourglass, pegs (SDF)"))
+                   ("sdf_toy", "oil & glycerine toy: ramps, hourglass, pegs (SDF)"),
+                   ("waterwheel", "waterwheel: a nozzle falls on a hinged paddle wheel (box)"))
 #: ANALYTIC SDF CHAMBERS (runtime uniforms, no recompile when the chamber changes).  ``SDF_SLOTS`` primitive slots, each ``q<k><field>``:
 #: ``kind`` (0 unused), ``role`` (0 FLUID: the chamber's inside; 1 SOLID: an obstacle inside it), the centre ``cx cy``, the rotation ``rot``
 #: and the parameters ``p0..p5`` (see ``sdf_field``).  ``sdf_on`` (0 / 1) picks the SDF walls; 0 is the polyline walls and the old law bit for bit.
@@ -205,13 +206,24 @@ RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "fl_rho", "fl_mu", "omega",
     f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax", "roll") for s in range(4))      # the radius, its spread and the emission rate (so the grid) are fixed when a run starts
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
+#: The HINGED BODY (the waterwheel): present only in the BODY VARIANT of the law (``make_law(.., body=True)``), whose argument list adds the
+#: two replicated state columns ``bth`` (angle, counterclockwise) and ``bom`` (angular velocity) and the uniforms below; the default law
+#: has none of it (its signature, products and the 10M size are unchanged).  See the module's WATERWHEEL section.
+BODY_STATE = ("bth", "bom")
+BODY_UNIFORMS = ("body_x", "body_y", "body_rh", "body_pl", "body_ht", "body_np", "body_i", "body_gam", "body_alpha", "body_tau")
+BODY_RUNTIME_INPUTS = ("body_i", "body_gam", "body_alpha", "body_tau")
+BODY_DIAGNOSTICS = ("body_th", "body_om", "body_tq")
+BODY_SHAPES = ("waterwheel",)
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
 #: ``ke``..``n_drop`` are the law's DIAGNOSTICS: reduced by a fixed-order tree, so element 0 holds the total over all ids
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
 #: walls, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
 DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
 OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "rs_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
+BODY_OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "rs_next", "bth_next", "bom_next", "cr", "cg", "cb",
+                "rad") + DIAGNOSTICS + BODY_DIAGNOSTICS
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
+BODY_ARGUMENTS = STATE + BODY_STATE + CONSTANTS + UNIFORMS + BODY_UNIFORMS
 
 TAU = 2.0 * math.pi
 
@@ -327,11 +339,11 @@ def chord(verts: list[tuple[float, float]], y: float) -> tuple[float, float]:
     return (min(xs), max(xs)) if xs else (-1.0e9, 1.0e9)
 
 
-def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL, shape: str = "box") -> dict[str, float]:
     """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
     jet's reach and a grid tall enough to cover everything under it."""
-    geo = basin(n, aspect, cell)
-    lid = geo["nozzle_y"] + LID_ABOVE
+    geo = chamber_basin(shape, n, aspect, cell)
+    lid = max(geo["nozzle_y"] + LID_ABOVE, geo.get("top", 0.0) + cell)             # (a designed SDF chamber may be taller than the jet's reach)
     return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
 
 
@@ -604,7 +616,7 @@ def sdf_field(x, y, q):
     return AbstractTensor.where(pick, d_s, d_f), AbstractTensor.where(pick, s_nx, f_nx), AbstractTensor.where(pick, s_ny, f_ny)
 
 
-def make_law(n: int, active: int | None = None, sdf: bool = True):
+def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = False):
     """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
     The basin (``half``, ``nozzle_y``, ``bar_half``, ``cols``, ``rows``) is a runtime uniform: see ``basin``."""
     active = int(n if active is None else active)
@@ -615,7 +627,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
 
     def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
-        a = dict(zip(ARGUMENTS, args))
+        a = dict(zip(BODY_ARGUMENTS if body else ARGUMENTS, args))
         x, y, vx, vy, w, age, rs = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
@@ -827,17 +839,19 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         kw = omega * omega * mass
         walls = [fx, fy, tq, ncont]
 
-        def wall(delta, weight, gap, nx_, ny_):
+        def wall(delta, weight, gap, nx_, ny_, vrx_=None, vry_=None, wrel_=None):
             """The contact of this grain with a wall (a body of infinite mass at rest; the grain's own radius is the mean and effective
             radius), accumulated into ``fx, fy, tq, ncont``: the repulsion exists only where the grain overlaps (``delta`` > 0), the
             adhesion (``coh``) also within COH_RANGE of it."""
-            gx_, gy_, gt_, gr_ = _contact(delta, weight, gap, nx_, ny_, vx, vy, radius * w, w, kw, mass, mu, ZETA * zsc, roll,
+            gx_, gy_, gt_, gr_ = _contact(delta, weight, gap, nx_, ny_, vx if vrx_ is None else vrx_, vy if vry_ is None else vry_,
+                                          radius * w, w if wrel_ is None else wrel_, kw, mass, mu, ZETA * zsc, roll,
                                           radius, radius, hertz, coh)
             touch_ = as_float(delta > 0.0)
             walls[3] = walls[3] + touch_
             walls[0] = walls[0] + gx_
             walls[1] = walls[1] + gy_
             walls[2] = walls[2] - radius * gt_ * touch_ + gr_
+            return gx_, gy_, gr_, touch_
 
         gap = radius - (y - FLOOR_Y)
         wall(gap.clamp(0.0, 1.0e9) * live, live, gap, y * 0.0, y * 0.0 + 1.0)
@@ -879,6 +893,35 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             sdf_gone = live * sdf_on * as_float(d_sdf < -radius)       # the grain centre is more than a radius on the wrong side
         else:
             sdf_gone = x * 0.0
+        tb = x * 0.0
+        if body:
+            # ---- the HINGED BODY (waterwheel): a hub circle and ``body_np`` capsule paddles in the body frame (hinge ``body_x, body_y``,
+            # angle ``bth``).  The N paddles are ONE evaluation: the grain's angle in the body frame picks the nearest paddle axis
+            # (``round(phi N / 2 pi)``) and the capsule is evaluated in that paddle's frame; its analytic gradient is rotated back.  The
+            # contact is the wall contact (the same ``_contact``) against a surface moving at ``omega x r`` (spin relative to ``bom``);
+            # the body takes the equal and opposite force at the contact point ``centre - n radius`` (the point this grain's own friction
+            # torque arm uses, so angular momentum is conserved pair by pair) and the reaction of the rolling couple.
+            bth, bom = a["bth"], a["bom"]
+            bnp = _max(a["body_np"], a["body_np"] * 0.0 + 1.0)
+            dxb, dyb = x - a["body_x"], y - a["body_y"]
+            rr = (dxb * dxb + dyb * dyb + 1.0e-12).sqrt()
+            d_hub = rr - a["body_rh"]
+            cb0, sb0 = bth.cos(), bth.sin()
+            phi = (cb0 * dyb - sb0 * dxb).atan2(cb0 * dxb + sb0 * dyb + 1.0e-9)
+            sector = (phi * (bnp * (1.0 / TAU)) + 0.5).floor()
+            alpha = bth + sector * (TAU * (1.0 / bnp))
+            ca, sa = alpha.cos(), alpha.sin()
+            px_, py_ = ca * dxb + sa * dyb, ca * dyb - sa * dxb
+            half_p = 0.5 * a["body_pl"]
+            d_pad, pgx, pgy = _sdf_box(px_ - half_p, py_, half_p, a["body_ht"], a["body_ht"])
+            near_pad = d_pad < d_hub
+            d_b = AbstractTensor.where(near_pad, d_pad, d_hub)
+            nbx = AbstractTensor.where(near_pad, ca * pgx - sa * pgy, dxb / rr)
+            nby = AbstractTensor.where(near_pad, sa * pgx + ca * pgy, dyb / rr)
+            gap_b = _cap(radius - d_b, 6.0 * radius)
+            gbx, gby, grb, _touch = wall(gap_b.clamp(0.0, 1.0e9) * live, live, gap_b, nbx, nby, vx + bom * dyb, vy - bom * dxb, w - bom)
+            arm_x, arm_y = dxb - nbx * radius, dyb - nby * radius
+            tb = ((arm_y * gbx - arm_x * gby) - grb) * live
         fx, fy, tq, ncont = walls
         # ---- the integrator: gravity (the runtime vector ``grav_x, grav_y``), drag, the forces above.  A pending id with a clear slot is placed at the
         # nozzle with its launch velocity; one with a blocked slot waits, parked, for the next step.  The FLUID's drag (Stokes 6 pi mu r v and
@@ -987,12 +1030,28 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             gate = as_float(pid + float(shift) < float(n))
             partner = (pid + float(shift)).clamp(0.0, top_i)
             ke = ke + ke.index_select(0, partner) * gate
+            if body:
+                tb = tb + tb.index_select(0, partner) * gate
             c_nan = c_nan + c_nan.index_select(0, partner) * gate
             c_parked = c_parked + c_parked.index_select(0, partner) * gate
             c_out = c_out + c_out.index_select(0, partner) * gate
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
+        if body:
+            # ---- the BODY's step, in engine_toy's order (DrivetrainSolver): the applied torques first (the grains' reaction, from the
+            # reduction's element 0; ``body_tau``, an absolute torque a machine-sim coupling writes; ``body_alpha`` x I, the motor as an
+            # acceleration), ``omega += torque / I dt``; then the hinge, a ``rotational-bearing`` edge to the frame (omega = 0), solved
+            # as ``rotational_friction.friction_impulse`` does: the viscous drag ``gam I |omega|`` capped at sticking (it never reverses omega).
+            inertia_b = a["body_i"]
+            tau_c = tb.index_select(0, pid * 0.0)
+            om1 = a["bom"] + (tau_c + a["body_tau"] + a["body_alpha"] * inertia_b) * (1.0 / inertia_b) * DT
+            mag = _min(a["body_gam"] * inertia_b * om1.abs() * DT, om1.abs() * inertia_b)
+            om2 = om1 - _sgn(om1) * mag * (1.0 / inertia_b)
+            th1 = a["bth"] + om2 * DT
+            th2 = th1 - TAU * (th1 * (1.0 / TAU) + 0.5).floor()
+            return (xn, yn, vxn, vyn, wn, age_next, rsn, th2, om2, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop,
+                    th2, om2, tau_c)
         return xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
 
     return fountain_step
@@ -1032,7 +1091,18 @@ PARAMS = {
     "lognormal": ("size distribution (0 uniform, 1 lognormal)", 0.0, 1.0, 1.0, 0.0, True, "Grains"),
     "bi_ratio": ("bidisperse size ratio (large / small)", 1.0, 3.0, 0.05, 1.0, True, "Grains"),
     "bi_frac": ("bidisperse number fraction large", 0.0, 1.0, 0.05, 0.5, True, "Grains"),
+    # the hinged wheel (shape "waterwheel" only): paddles and radius are what the body IS (a new run); inertia, damping and the motor are runtime inputs
+    "wheel_n": ("wheel paddles", 2.0, 16.0, 1.0, 8.0, True, "Wheel"),
+    "wheel_r": ("wheel radius (x)", 0.5, 2.0, 0.05, 1.0, True, "Wheel"),
+    "wheel_i": ("wheel inertia (x)", 0.1, 10.0, 0.1, 1.0, False, "Wheel"),
+    "wheel_gam": ("hinge damping rate (1/s)", 0.0, 20.0, 0.1, 1.0, False, "Wheel"),
+    "wheel_alpha": ("motor (rad/s^2, 0 = free)", -50.0, 50.0, 0.5, 0.0, False, "Wheel"),
 }
+WHEEL_RADIUS = 0.30                    # the wheel's outer reach at the reference basin (x the basin scale s)
+WHEEL_HUB = 0.2                        # hub radius / reach
+WHEEL_PADDLE_HALF = 0.012              # paddle half thickness (about one grain radius: it does not scale with the basin)
+WHEEL_AREAL_DENSITY = 3.0              # wheel material, x the grain's density (mass per area): sets the reference inertia
+WHEEL_NOZZLE_BAR = 0.04                # the inlet's half width at the reference basin (x s): a stream, not a curtain
 ROLL_RANGE = (0.0, 0.3)                # rolling resistance per species (roughness)
 IRR_RANGE = (0.0, 0.3)                 # size spread per species (irregularity): a uniform width, or the lognormal's sigma
 
@@ -1106,54 +1176,79 @@ def _capsule_ramp(high: tuple[float, float], low: tuple[float, float], rad: floa
 
 
 def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
-    """An SDF chamber as slots (pure data), inscribed in the visible window with the 3-cell margin (|x| <= w, 0 <= y <= top), and where
-    its inlet goes (``nozzle_y``; ``None``: the basin's own height) -- the inlet is checked to be inside the fluid by ``uniforms``."""
+    """An SDF chamber as slots (pure data) at its DESIGNED proportions: the width is the basin's (``|x| <= w``, the window's half width
+    less the 3-cell margin), the HEIGHT is whatever the design needs (``top``), built from ``w`` (which goes as sqrt(ids)) and the grain
+    size (``cell``): a circle's diameter, a funnel's slope, the toy's peg rows, throat and ramps.  ``chamber_basin`` makes the view
+    follow it.  Also where its inlet goes (``nozzle_y``) -- the inlet is checked to be inside the fluid by ``uniforms``."""
     c = geo.get("cell", CELL)
     w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
-    top = geo["view"][3] - 3.0 * c
     slots: list[dict[str, float]] = []
     nozzle_y = None
     if shape == "sdf_circle":
-        slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, min(w, 0.5 * top)))
+        top = 2.0 * w
+        slots.append(_slot("circle", "fluid", 0.0, 0.5 * top, 0.0, w))
         nozzle_y = 0.5 * top
     elif shape == "sdf_square":
-        half = min(w, 0.5 * top)
-        slots.append(_slot("box", "fluid", 0.0, 0.5 * top, 0.0, half, half, 2.0 * c))
-        nozzle_y = 0.5 * top
+        top = 2.0 * w
+        slots.append(_slot("box", "fluid", 0.0, w, 0.0, w, w, 2.0 * c))
+        nozzle_y = w
     elif shape == "sdf_triangle":
-        r, cy = ngon_fit(3, w, top)
+        ang = [-0.5 * math.pi - math.pi / 3 + TAU * i / 3 for i in range(3)]
+        ys = [math.sin(t) for t in ang]
+        r = 2.0 * w / (max(math.cos(t) for t in ang) - min(math.cos(t) for t in ang))
+        cy = -r * min(ys)
+        top = r * (max(ys) - min(ys))
         slots.append(_slot("ngon", "fluid", 0.0, cy, -0.5 * math.pi, r, 3.0))
         nozzle_y = cy
     elif shape == "sdf_annulus":
-        big = min(w, 0.5 * top)
+        big = w
+        top = 2.0 * big
         band = min(max(0.25 * big, 4.0 * c), 0.4 * big)                          # the ring's half thickness (a tiny window keeps a ring wide enough to pour into)
-        slots.append(_slot("annulus", "fluid", 0.0, 0.5 * top, 0.0, big - band, band))
-        nozzle_y = 0.5 * top + big - band
+        slots.append(_slot("annulus", "fluid", 0.0, big, 0.0, big - band, band))
+        nozzle_y = big + big - band
     elif shape == "sdf_hourglass":
+        top = 2.7 * w
         slots.append(_slot("hourglass", "fluid", 0.0, 0.5 * top, 0.0, w, max(0.1 * w, 3.5 * c), 0.5 * top, 0.0))
         nozzle_y = 0.75 * top
     elif shape == "sdf_toy":
         # ONE hourglass-profile vessel (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall, the floor y = 0 under
-        # it); three capsule ramps (left-down, right-down, left-down) in the upper section; a staggered peg field under the throat
+        # it); three capsule ramps (left-down, right-down, left-down) in the upper section; a staggered peg field under the throat.  Built
+        # bottom up from what each part needs, so the height is the sum, not a fraction of a window: six peg rows (pitch 4.6 grain
+        # diameters) and a 3-cell clearance under the funnel; the funnel (slope 1.7); the ramps (a drop of tan 0.42 across the vessel,
+        # each stepped 0.25 w below the last, 6 cells of clearance above the funnel); the inlet 0.12 above the highest ramp.
         rr = 0.9 * c
-        yc, delta = 0.44 * top, 0.20 * top
         throat = max(0.09 * w, 3.5 * c)
-        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, (w - throat) / delta))
-        tan, y0, step = 0.42, top - 0.10 * top, 0.097 * top
+        slope, tan, step = 1.7, 0.42, 0.25 * w
+        delta = (w - throat) / slope
+        px = py = 4.6 * c
+        y_lo, peg_rows = 4.0 * c, 6
+        pegs_top = y_lo + (peg_rows - 1) * py + 0.9 * c
+        yc = pegs_top + 3.0 * c + delta
         edge = w + 1.5 * rr
+        y0 = yc + delta + 6.0 * c + tan * (edge + 0.1 * w) + 2.0 * step
+        nozzle_y = y0 + 0.12
+        top = nozzle_y + 0.12
+        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, slope))
         for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
             sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
             high = (sign * edge, y0 - i * step)
             slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
-        px = py = 4.6 * c
-        y_lo, y_hi = 0.05 * top, yc - delta - 0.03 * top
-        rows = max(1, int((y_hi - y_lo) // py) + 1)
         cols = 2 * int(w // px) + 1
-        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
-        nozzle_y = top - 0.12
+        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (peg_rows - 1) * py, 0.0, px, py, 0.9 * c, cols, peg_rows, 1.0))
     else:
         raise ValueError(f"unknown SDF chamber {shape!r}")
     return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": (0.25 if shape == "sdf_toy" else 0.4) * w}
+
+
+def chamber_basin(shape: str, n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+    """``basin`` for a chamber shape: the polygon presets and the box are the basin as it always was; an SDF preset keeps its designed
+    proportions, so the VIEW (its top: the chamber's top and the 3-cell margin), the grid's rows and the inlet follow the chamber."""
+    geo = basin(n, aspect, cell)
+    if shape not in SDF_SHAPES:
+        return geo
+    spec = sdf_preset(shape, geo)
+    view = (geo["view"][0], geo["view"][1], geo["view"][2], spec["top"] + 3.0 * cell)
+    return {**geo, "view": view, "nozzle_y": spec["nozzle_y"], "rows": max(geo["rows"], math.ceil(spec["top"] / cell) + 1), "top": spec["top"]}
 
 
 def slot_uniforms(slots: list[dict[str, float]]) -> dict[str, float]:
@@ -1285,7 +1380,7 @@ def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dic
     key = (shape, int(n), aspect, round(cell, 9))
     if key in _OUTLINES:
         return _OUTLINES[key]
-    geo = basin(n, aspect, cell)
+    geo = chamber_basin(shape, n, aspect, cell)
     if shape in SDF_SHAPES:
         u = uniforms(n=n, aspect=aspect, params=params, shape=shape)
         x0, x1, y0, y1 = geo["view"]
@@ -1297,7 +1392,7 @@ def chamber_outline(shape: str, n: int, aspect: float | None = None, params: dic
         d = np.clip(d, -1.0, 1.0)
         lines = [[[float(round(px, 5)), float(round(py, 5))] for px, py in simplify(line, OUTLINE_TOL)]
                  for line in zero_contours(d, float(xs[0]), float(ys[0]), h)]
-    elif shape == "box":
+    elif shape == "box" or shape in BODY_SHAPES:
         lines = []
     else:
         lines = [[[float(vx), float(vy)] for vx, vy in shape_vertices(shape, geo)]]
@@ -1309,6 +1404,20 @@ OUTLINE_STEP = 1.0 / 3.0                 # the outline's sampling step, in grid 
 OUTLINE_TOL = 5.0e-4                     # the outline's simplification tolerance (scene units; a pixel is ~2e-3)
 
 
+def wheel_geometry(geo: dict[str, float], p: dict[str, float]) -> dict[str, float]:
+    """The wheel's uniforms for a basin: the hinge left of the stream (so the stream, falling at x ~ 0, strikes the right half and turns
+    the wheel clockwise), reach, hub, paddles, and the reference inertia of its material (paddles as rods about the hinge, a hub disc)."""
+    s = geo["scale"]
+    reach = WHEEL_RADIUS * s * p["wheel_r"]
+    hub = WHEEL_HUB * reach
+    count = round(p["wheel_n"])
+    ht = WHEEL_PADDLE_HALF
+    m_paddle = WHEEL_AREAL_DENSITY * 2.0 * ht * reach
+    i_ref = count * m_paddle * reach * reach / 3.0 + 0.5 * math.pi * WHEEL_AREAL_DENSITY * hub ** 4
+    return {"body_x": -0.5 * reach, "body_y": 0.45 * s + 0.2 * reach, "body_rh": hub, "body_pl": reach, "body_ht": ht, "body_np": float(count),
+            "body_i": i_ref * p["wheel_i"], "body_gam": p["wheel_gam"], "body_alpha": p["wheel_alpha"], "body_tau": 0.0}
+
+
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
              gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA,
              params: dict | None = None, shape: str = "box") -> dict[str, np.ndarray]:
@@ -1317,9 +1426,12 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
     p = species_params(params)
     cell = cell_needed(p)
-    geo = basin(n, aspect, cell)
+    geo = chamber_basin(shape, n, aspect, cell)
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
+    wheel = shape in BODY_SHAPES
+    if wheel:
+        out["bar_half"] = WHEEL_NOZZLE_BAR * geo["scale"]
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
     out.update({"fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"], "omega": stiffness_of(p), "hertz": p["hertz"], "coh": p["coh"],
                 "spin_drag": p["spin_drag"], "temp": p["temp"], "k_run": min(max(round(p["k_run"]), 1), K_RUN_MAX),
@@ -1336,7 +1448,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
         if spec["nozzle_y"] is not None:
             out["nozzle_y"] = spec["nozzle_y"]
         out["rows"] = max(out["rows"], math.ceil(spec["top"] / cell) + 1)         # the grid covers the whole chamber
-    elif shape == "box":
+    elif shape == "box" or shape in BODY_SHAPES:
         verts = [(0.0, 0.0)] * NV                                                # no polygon: zero-length segments, exact zeros
     else:
         verts = shape_vertices(shape, geo)
@@ -1353,6 +1465,8 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     out.update({f"px{k}": verts[k][0] for k in range(NV)})
     out.update({f"py{k}": verts[k][1] for k in range(NV)})
     out.update(slot_uniforms(slots))
+    if wheel:
+        out.update(wheel_geometry(geo, p))
     if slots:
         out["bar_half"] = min(geo["bar_half"], spec["bar"])
         out["bar_half"] = fit_inlet(out, cell)                                   # the inlet is inside the fluid
@@ -1369,7 +1483,7 @@ def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float
     """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
     Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
-    columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
+    columns = {name: zeros.copy() for name in STATE + (BODY_STATE if shape in BODY_SHAPES else ()) + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
     columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata, params=params, shape=shape))
     return columns
@@ -1436,23 +1550,29 @@ class FountainPiece(LawPiece):
         self.entry = f"fountain_step_{int(batch)}_{int(active or batch)}"
 
 
-def make_piece(n: int, active: int | None = None) -> FountainPiece:
-    """A ``FountainPiece`` whose law is ``make_law(n, active)``."""
+def make_piece(n: int, active: int | None = None, body: bool = False) -> FountainPiece:
+    """A ``FountainPiece`` whose law is ``make_law(n, active)`` (``body``: the hinged-body variant, with its own argument list)."""
     class Sized(FountainPiece):
-        law = staticmethod(make_law(n, active))
-    return Sized(n, active)
+        law = staticmethod(make_law(n, active, body=body))
+        argument_names = BODY_ARGUMENTS if body else ARGUMENTS
+        output_names = BODY_OUTPUTS if body else OUTPUTS
+    piece = Sized(n, active)
+    if body:
+        piece.entry += "_body"
+    return piece
 
 
 def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> dict[str, np.ndarray]:
     """Advance ``steps`` fixed steps through ``piece`` (its compiled product
     when compiled, otherwise the AbstractTensor law); returns the final state,
     the colour columns and ``rad``."""
-    state = {name: np.array(columns[name], dtype=np.float64) for name in STATE}
+    names = STATE + (BODY_STATE if "bth" in columns else ())
+    state = {name: np.array(columns[name], dtype=np.float64) for name in names}
     extra = {}
     for _ in range(int(steps)):
-        outputs = piece(*[state[n] if n in state else columns[n] for n in ARGUMENTS])
-        produced = dict(zip(OUTPUTS, outputs))
-        for name in STATE:
+        outputs = piece(*[state[n] if n in state else columns[n] for n in piece.argument_names])
+        produced = dict(zip(piece.output_names, outputs))
+        for name in names:
             state[name] = produced[name + "_next"]
         extra = {name: produced[name] for name in ("cr", "cg", "cb", "rad") + DIAGNOSTICS}
     return {**state, **extra}
@@ -1609,7 +1729,7 @@ class FountainGame(Game):
             raise ValueError("fountain_verify: the native lane is built for sizes up to 4096 ids")
         columns = self.columns(image=image)
         if self.piece is None:
-            self.piece = make_piece(pad, active)
+            self.piece = make_piece(pad, active, body=self.shape in BODY_SHAPES)
             self.piece.compile(columns)
         final = run_frames(self.piece, columns, steps)
         digest = hashlib.sha256(b"".join(np.ascontiguousarray(final[n], dtype=np.float32).tobytes()
@@ -1665,6 +1785,9 @@ class FountainGame(Game):
         out.extend([self._control("fl_rho"), self._control("fl_mu")])
         out.append({"id": "shape", "kind": "select", "label": "chamber shape", "value": self.shape, "action": "fountain_choice",
                     "name": "shape", "field": "value", "group": "Chamber", "options": [[k, label] for k, label in CHAMBER_CHOICES]})
+        if self.shape in BODY_SHAPES:                            # the hinged wheel: paddles / radius (a new run), inertia, damping, the motor
+            out.extend(self._control(name) for name in ("wheel_n", "wheel_r", "wheel_i", "wheel_gam", "wheel_alpha"))
+            out.append({"id": "wheel_om", "kind": "readout", "label": "wheel speed (rad/s)", "group": "Wheel", "diag": "body_om"})
         return out
 
     def controls_ui(self) -> list[dict[str, Any]]:
@@ -1709,7 +1832,7 @@ class FountainGame(Game):
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect, cell_needed(species_params(self.params)))
+        return chamber_basin(self.shape, self.n, self.aspect, cell_needed(species_params(self.params)))
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
@@ -1729,15 +1852,25 @@ class FountainGame(Game):
             "controls_ui": self.controls_ui(),
             "camera_gestures": {"orbit": "one", "zoom": True, "pan": True, "tilt": True},   # camera-first: the page's scene-camera layer
             "compute": {
-                "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
+                "manifest": "fountain_wheel.manifest.json" if self.shape in BODY_SHAPES else "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
                                                               use_image=1.0 if self.phase == "replay" else 0.0, params=self.params, shape=self.shape).items()},
                 "view": list(geo["view"]), "aspect": self.aspect, "chamber_outline": chamber_outline(self.shape, self.n, self.aspect, self.params),
-                "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params))),
+                "body": self.body_spec(), "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
+                "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params)), self.shape),
             },
         })
         return base
+
+    def body_spec(self) -> dict[str, Any] | None:
+        """The hinged body for the page to draw (its SDF outline at the angle the law reports in ``diag.body_th``) and to couple
+        (``body_tau`` is the runtime input a machine-sim coupling writes; ``body_om`` is read back from the diagnostics)."""
+        if self.shape not in BODY_SHAPES:
+            return None
+        u = uniforms(n=self.n, aspect=self.aspect, params=self.params, shape=self.shape)
+        return {"hinge": [float(u["body_x"]), float(u["body_y"])], "hub": float(u["body_rh"]), "reach": float(u["body_pl"]),
+                "half_thickness": float(u["body_ht"]), "paddles": int(round(float(u["body_np"]))), "angle": "body_th",
+                "speed": "body_om", "torque_input": "body_tau"}
 
     def result(self):
         return None

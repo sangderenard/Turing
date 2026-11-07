@@ -607,8 +607,97 @@ function paneOutside(ring, lo, hi, bottom, top) {
 // the panes option (page-side, the 3-D fountain): what fills the panes beyond the angled walls
 const panes = { mode: "trim" };
 try { const saved = localStorage.getItem("meowdoku.panes"); if (["trim", "frame", "matte"].includes(saved)) panes.mode = saved; } catch { /* storage may be blocked */ }
+// THE 2-D CHAMBER AS GLOWING GLASS RIBBONS: each outline polyline (the server's chamber_outline -- the polygon's vertices or the SDF
+// chamber's zero contour -- else the px/py polyline) becomes a low glass bar along the wall, in the emissive "outline@glass"
+// material, through the scene's own material path; drawn with the case's model (state.caseModel) like the 3-D housing, so it turns
+// with the case.  Each segment is a band one wall-thickness wide (wall_t, else three grain diameters), extended half a width past
+// its ends so corners overlap, standing RIBBON_H (law units) off the plate.
+const RIBBON_H = 0.035;
+// the law -> world map of a 2-D fountain state (PointCloud's uMap: law x -> +X, law y -> -Z)
+function lawToWorld(g) {
+  const c = g.compute, [x0, x1, y0, y1] = c.view, W = g.width, H = g.height, k = Math.min(W / (x1 - x0), H / (y1 - y0));
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2, y = TILE.height + 0.03;
+  return (lx, ly, lz) => [W / 2 + (lx - mx) * k, y + lz * k, H / 2 - (ly - my) * k];
+}
+// the chamber's walls as polylines: the server's outline, else the px/py polyline, else (the box: its walls are planes, its polygon
+// uniforms are zero) the basin's floor and two side walls up to the view's top
+function chamberLines(g) {
+  const c = g.compute, u = c.uniforms, y1 = c.view[3];
+  if (c.chamber_outline && c.chamber_outline.length) return c.chamber_outline;
+  const pts = [];
+  for (let i = 0; i < 8; i++) {
+    if (u[`px${i}`] === undefined) break;
+    const q = [u[`px${i}`], Math.min(u[`py${i}`], y1)], last = pts[pts.length - 1];
+    if (!last || Math.hypot(q[0] - last[0], q[1] - last[1]) > 1e-6) pts.push(q);
+  }
+  if (pts.length > 1) return [pts];
+  const h = u.half;
+  return h > 0 ? [[[-h, y1], [-h, 0], [h, 0], [h, y1]]] : [];
+}
+// the waterwheel (state.compute.body) at angle 0 as polylines: the hub and each paddle (a capsule outline), as drawBody drew them
+function bodyLines(b) {
+  const [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
+  const lines = [Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0))];
+  for (let k = 0; k < b.paddles; k++) {
+    const a = 2 * Math.PI * k / b.paddles, t = b.half_thickness, l = b.reach, cap = [];
+    for (let j = 0; j <= 6; j++) cap.push([hx + l * Math.cos(a) + t * Math.cos(a + Math.PI / 2 - Math.PI * j / 6), hy + l * Math.sin(a) + t * Math.sin(a + Math.PI / 2 - Math.PI * j / 6)]);
+    lines.push([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)]);
+  }
+  return lines;
+}
+function ribbonFaces(g, linesIn, hwIn) {
+  const c = g && g.compute, u = c && c.uniforms, m = state.materialIndex["outline@glass"];
+  if (!u || !c.view || m == null) return null;
+  const wp = lawToWorld(g);
+  const lines = linesIn || chamberLines(g);
+  const rmax = Math.max(...[0, 1, 2, 3].map((i) => (u[`r${i}`] || 0) * (u[`rscale${i}`] || 1)), 0.009);
+  const hw = hwIn || (u.wall_t > 0 ? u.wall_t : 6 * rmax) / 2, faces = [];
+  for (const line of lines) for (let i = 0; i + 1 < line.length; i++) {
+    const [ax, ay] = line[i], [bx, by] = line[i + 1], len = Math.hypot(bx - ax, by - ay);
+    if (len < 1e-9) continue;
+    const dx = (bx - ax) / len, dy = (by - ay) / len, nx = -dy, ny = dx;
+    const quad = [[ax - dx * hw + nx * hw, ay - dy * hw + ny * hw], [bx + dx * hw + nx * hw, by + dy * hw + ny * hw],
+                  [bx + dx * hw - nx * hw, by + dy * hw - ny * hw], [ax - dx * hw - nx * hw, ay - dy * hw - ny * hw]];
+    for (let s = 0; s < 4; s++) {                                    // the bar's four sides
+      const p0 = quad[s], p1 = quad[(s + 1) % 4];
+      const a = wp(p0[0], p0[1], 0), b2 = wp(p1[0], p1[1], 0), c2 = wp(p1[0], p1[1], RIBBON_H), d = wp(p0[0], p0[1], RIBBON_H);
+      faces.push([a, b2, c2, m], [a, c2, d, m]);
+    }
+    const [a, b2, c2, d] = quad.map((q) => wp(q[0], q[1], RIBBON_H));  // its top
+    faces.push([a, b2, c2, m], [a, c2, d, m]);
+  }
+  return faces.length ? faces : null;
+}
+// THE WATERWHEEL AS GLASS RIBBONS: built once at angle 0 (rebuilt when its shape changes); drawn each frame turned by the law's angle
+// about its hinge (bodyModel), inside the case's model like the chamber
+function updateBodyMesh(g) {
+  const b = g.compute.body;
+  const key = b ? JSON.stringify([b.hinge, b.hub, b.paddles, b.reach, b.half_thickness, g.compute.view, g.width, g.height, state.materialsVersion]) : "";
+  if (state.bodyMesh && state.bodyMesh.key === key) return;
+  if (state.bodyMesh && state.bodyMesh.mesh) disposeMesh(state.bodyMesh.mesh);
+  const faces = b ? ribbonFaces(g, bodyLines(b), Math.max(0.004, 0.6 * b.half_thickness)) : null;
+  state.bodyMesh = { key, mesh: faces ? litMesh(faces) : null, hinge: b ? lawToWorld(g)(b.hinge[0], b.hinge[1], 0) : null };
+}
+function bodyModel(g) {
+  const b = g && g.compute && g.compute.body, bm = state.bodyMesh;
+  if (!b || !bm || !bm.mesh) return null;
+  const th = (compute.diag && compute.diag[b.angle]) || 0, h = bm.hinge;
+  // a law-plane turn by +th (x toward y) is a world turn about +Y by +th (law y is world -z)
+  const turn = M.multiply(M.translate(h[0], 0, h[2]), M.multiply(M.rotateY(th), M.translate(-h[0], 0, -h[2])));
+  return state.caseModel ? M.multiply(state.caseModel, turn) : turn;
+}
 function updateHousing() {
   const g = state.game, c = g && g.compute;
+  if (g && g.game === "fountain" && c && !state.flat) {
+    const key = JSON.stringify(["2d", c.chamber_outline || 0, c.uniforms && [c.uniforms.px0, c.uniforms.py0, c.uniforms.px1, c.uniforms.py1, c.uniforms.wall_t], c.view, g.width, g.height, state.materialsVersion]);
+    if (state.housing && state.housing.key === key) return;
+    if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
+    const faces = ribbonFaces(g);
+    state.housing = { key, mesh: faces ? litMesh(faces) : null, triangles: faces ? faces.length : 0 };
+    updateBodyMesh(g);
+    return;
+  }
+  if (state.bodyMesh) { disposeMesh(state.bodyMesh.mesh); state.bodyMesh = null; }
   const key = g && g.game === "fountain3d" && c ? JSON.stringify([c.uniforms, c.view, g.width, g.height, state.materialsVersion, panes.mode, c.chamber_mesh ? [c.chamber_mesh.nv, c.chamber_mesh.v.slice(0, 48)] : 0]) : "";
   if (state.housing && state.housing.key === key) return;
   if (state.housing && state.housing.mesh) disposeMesh(state.housing.mesh);
@@ -1652,6 +1741,7 @@ function uploadMaterials(game) {
   for (const [name, albedo, extra] of GRAIN_FINISHES) records.push([name, albedo, extra]);
   // the 3-D fountain's polygon housing: clear glass walls and panes (see housingFaces)
   records.push(["housing@glass", [0.82, 0.92, 1.0], { roughness: 0.05, transmission: 0.7, opacity: 0.3, ior: 1.5, specular: 0.8, shininess: 80 }]);
+  records.push(["outline@glass", [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22, 0.42, 0.62] }]);   // the 2-D chamber's glowing glass ribbons
   records.push(["housing_matte", [0.10, 0.10, 0.11], { roughness: 0.95, specular: 0.02 }]);   // the panes' matte fill (panes "matte")
   const tables = {};
   state.materialIndex = {};
@@ -5080,17 +5170,28 @@ function pointsFrame(cam, now) {
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
   drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d" || g.game === "fountain") drawChamberOutline(cam, g, rec);
+  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat)) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
+// The 2-D fountain's hinged body (the waterwheel): its SDF outline (hub circle, capsule paddles) at the angle the law reports (diagnostic body_th).
+function drawBody(b, frame) {
+  if (!b) return;
+  const th = (compute.diag && compute.diag[b.angle]) || 0, [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
+  cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), 0, frame);
+  for (let k = 0; k < b.paddles; k++) {
+    const a = th + 2 * Math.PI * k / b.paddles, t = b.half_thickness, l = b.reach, cap = [];
+    for (let j = 0; j <= 6; j++) cap.push([hx + l * Math.cos(a) + t * Math.cos(a + Math.PI / 2 - Math.PI * j / 6), hy + l * Math.sin(a) + t * Math.sin(a + Math.PI / 2 - Math.PI * j / 6)]);
+    cloud.drawOutline([pt(a, 0, t), ...cap, pt(a, 0, -t), pt(a, 0, t)], 0, frame);
+  }
+}
 function drawChamberOutline(cam, g, rec) {
   const u = g.compute.uniforms || {}, pts = [], frame = { viewProj: cam.viewProj, view: g.compute.view || rec.geometry.view, board: [g.width, g.height], y: TILE.height + 0.03 };
   // the 2-D fountain's server sends its chamber as polylines (g.compute.chamber_outline: the polyline chambers' vertices, the SDF chambers'
   // zero contour), drawn flat (dh = 0); the 3-D fountain's is its px/py uniforms, extruded through the slab
   if (g.compute.chamber_mesh) return;                         // an SDF chamber's walls are the glass mesh (housingFaces)
   const lines = g.compute.chamber_outline;
-  if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); return; }
+  if (lines) { for (const line of lines) cloud.drawOutline(line, 0, frame); drawBody(g.compute.body, frame); return; }
   for (let k = 0; k < 8; k++) {
     const p = [u[`px${k}`], u[`py${k}`]];
     if (!(p[0] !== undefined && p[1] !== undefined)) break;
@@ -5265,7 +5366,8 @@ function litPass(cam, now, casters, opts = {}) {
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, state.caseModel || M.identity(), null, plate ? PLATE_GROUP : 0);
   if (!opts.broadcast && statusPlateWanted()) { drawStatusPlate(cam, state.caseModel); gl.useProgram(P); }
-  if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);   // the 3-D fountain's polygon housing
+  if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);
+  if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) { const bmodel = bodyModel(state.game); if (bmodel) drawLit(state.bodyMesh.mesh.vao, state.bodyMesh.mesh.count, bmodel, null); }   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {

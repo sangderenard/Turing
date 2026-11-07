@@ -1294,9 +1294,10 @@ def test_the_regular_ngons_are_equilateral_closed_and_inscribed_and_the_sdf_pres
             d = F.chamber_distance(u, np.array([0.0]), np.array([float(u["nozzle_y"])]))[0][0]
             if not (shape == "sdf_annulus" and n == 256):                                # (a ring in the tiny window is too narrow for a bar)
                 assert d > geo["cell"], (shape, n)
-            for line in F.chamber_outline(shape, n):                                     # the outline lies inside the window
+            cx0, cx1, cy0, cy1 = F.chamber_basin(shape, n)["view"]                       # the view follows the designed chamber
+            for line in F.chamber_outline(shape, n):                                     # the outline lies inside it
                 a = np.asarray(line)
-                assert a[:, 0].min() >= x0 and a[:, 0].max() <= x1 and a[:, 1].min() >= y_bottom and a[:, 1].max() <= y1
+                assert a[:, 0].min() >= cx0 and a[:, 0].max() <= cx1 and a[:, 1].min() >= cy0 and a[:, 1].max() <= cy1
     assert float(F.uniforms(n=256)["sdf_on"]) == 0.0 and F.chamber_outline("box", 256) == []
 
 
@@ -1310,7 +1311,8 @@ def test_the_sdf_normal_is_the_analytic_gradient_and_walls_face_into_the_fluid()
     gy = (F.chamber_distance(u, xs, ys + e)[0] - F.chamber_distance(u, xs, ys - e)[0]) / (2 * e)
     smooth = (np.abs(d) < 0.3) & (np.abs(d) > 0.01) & (np.abs(np.hypot(gx, gy) - 1.0) < 0.05)
     assert smooth.sum() > 20
-    assert np.abs(nx[smooth] - gx[smooth]).max() < 3e-2 and np.abs(ny[smooth] - gy[smooth]).max() < 3e-2
+    err = np.maximum(np.abs(nx - gx), np.abs(ny - gy))[smooth]
+    assert np.quantile(err, 0.99) < 3e-2 and err.max() < 0.1          # (a sample straddling a switch of the nearest feature differs by a few percent)
     assert np.allclose(np.hypot(nx, ny), 1.0, atol=1e-3)
 
 
@@ -1320,7 +1322,7 @@ def test_an_sdf_grain_thrown_at_the_wall_stays_inside():
     u = {k: float(cols[k]) for k in F.UNIFORMS}
     law = F.make_law(n, active)
     cols["age"][:] = 1.0e3
-    cols["x"][:], cols["y"][:] = [0.7, -0.7, 0.0, 0.3], [1.28, 1.3, 0.5, 2.0]
+    cols["x"][:], cols["y"][:] = [0.7, -0.7, 0.0, 0.3], [0.95, 0.97, 0.5, 1.7]        # (the circle sits on the floor now: centre (0, R))
     cols["vx"][:], cols["vy"][:] = [12.0, -9.0, 0.0, 6.0], [0.0, 3.0, -12.0, 8.0]
     state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE}
     worst = 0.0
@@ -1389,7 +1391,7 @@ def _contact_rich_digest(mod, piece, shape) -> str:
 PRE_TUNABLES_DIGESTS = {
     "box": "aaaf79a4f6f13b4b66555b012fc8af23d084d6465cc175b8c1e384d85e8dee61",
     "funnel": "d5aa47283e4ea2fb2b4f6e08e68b15c887c82cfabfbcb4e94c0ebbaf918b4972",
-    "sdf_toy": "eb448f7acb94723ba4b60001f39b0525ee3888a591c48563766e7a00fcb43193",
+    "sdf_toy": "fbaf1f467c01b19f32d4ceb062305d379090072e35a3d6d379d62b6f3497071a",   # refreshed 2026-11-07: the SDF where() f32 fix, then the designed-height toy (box and funnel are untouched)
 }
 
 
@@ -1598,3 +1600,145 @@ def test_the_game_declares_the_grouped_controls_the_fluid_choice_and_the_tempera
     with pytest.raises(ValueError):
         game.do({"type": "fountain_choice", "name": "solvent", "value": "water"})
     assert F.measured_temperature({"ke": 3.0, "n_live": 2.0}) == pytest.approx(1.0) and B._manifest({})["law"]["dof"] == F.DOF == 3
+
+
+# ------------------------------------------------------------- the hinged waterwheel (body variant of the 2-D law)
+class _EagerBody:
+    """The body variant of the law as plain AbstractTensor ops: columns in, outputs out."""
+
+    def __init__(self, n, active=None):
+        self.law, self.batch = F.make_law(n, active, body=True), n
+
+    def __call__(self, *columns):
+        tensors = [AbstractTensor.get_tensor(np.asarray(c, dtype=np.float64)) for c in columns]
+        return tuple(np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (self.batch,)).copy() for v in self.law(*tensors))
+
+
+def _wheel_world(n=64, **uniform_overrides):
+    """A wheel world of ``n`` ids, all parked (never emitted), the wheel at rest: (law, columns)."""
+    cols = F.initial_columns(n, mix=0.0, shape="waterwheel")
+    cols["age"][:] = -1.0e9
+    for k, v in uniform_overrides.items():
+        cols[k] = np.float64(v)
+    return _EagerBody(n), cols
+
+
+def _wheel_place(cols, grains):
+    """Place grains {id: (x, y, vx, vy)} live (rs = their species radius is learnt by the law on step one)."""
+    for i, (x, y, vx, vy) in grains.items():
+        cols["age"][i], cols["x"][i], cols["y"][i], cols["vx"][i], cols["vy"][i] = 1.0e3, x, y, vx, vy
+
+
+def _wheel_steps(law, cols, steps, each=None):
+    """Step ``steps`` times; returns the state dict and the per-step (body_th, body_om, body_tq).  ``each(step, cols, out)`` may write runtime inputs."""
+    names = F.STATE + F.BODY_STATE
+    state = {k: np.array(cols[k], dtype=np.float64) for k in names}
+    series = []
+    out = {}
+    for step in range(steps):
+        out = dict(zip(F.BODY_OUTPUTS, law(*[state[k] if k in state else cols[k] for k in F.BODY_ARGUMENTS])))
+        state = {k: out[k + "_next"] for k in names}
+        series.append((float(out["body_th"][0]), float(out["body_om"][0]), float(out["body_tq"][0])))
+        if each is not None:
+            each(step, cols, out)
+    return state, np.array(series), out
+
+
+def test_the_default_law_has_no_body_columns_and_the_wheel_variant_adds_exactly_them():
+    assert F.BODY_ARGUMENTS == F.STATE + F.BODY_STATE + F.CONSTANTS + F.UNIFORMS + F.BODY_UNIFORMS
+    assert not set(F.BODY_STATE + F.BODY_UNIFORMS) & set(F.ARGUMENTS) and len(F.ARGUMENTS) == len(set(F.ARGUMENTS))
+    assert "bth" not in F.initial_columns(16) and "bth" in F.initial_columns(16, shape="waterwheel")
+    assert F.chamber_outline("waterwheel", 256) == []
+
+
+def test_the_waterwheel_spins_the_way_the_stream_hits_it():
+    for side, sign in ((+1.0, -1.0), (-1.0, +1.0)):                     # a stream on the right half turns it clockwise, on the left counterclockwise
+        law, cols = _wheel_world(64)
+        bx, by, reach = float(cols["body_x"]), float(cols["body_y"]), float(cols["body_pl"])
+        # a column of grains falling onto the paddles on one side of the hinge
+        _wheel_place(cols, {i: (bx + side * (0.45 * reach + 0.012 * (i % 2)), by + reach + 0.03 + 0.03 * i, 0.0, -1.5) for i in range(12)})
+        _state, series, _out = _wheel_steps(law, cols, 110)
+        assert sign * series[-1, 1] > 0.05, (side, series[-1])
+        assert np.isfinite(series).all()
+
+
+def test_a_grain_hitting_a_paddle_changes_the_wheel_by_impulse_times_arm_over_inertia():
+    law, cols = _wheel_world(64, grav_x=0.0, grav_y=0.0, body_gam=0.0, half=1.0)
+    bx, by, reach, inertia = (float(cols[k]) for k in ("body_x", "body_y", "body_pl", "body_i"))
+    _wheel_place(cols, {0: (bx + 0.6 * reach, by + 0.05, 0.0, -2.0)})
+    state = {k: np.array(cols[k], dtype=np.float64) for k in F.STATE + F.BODY_STATE}
+
+    def angular_momentum(st, rad):
+        mass = [s[2] for s in F.SPECIES if abs(s[1] - rad) < 1.0e-9][0] * np.pi * rad * rad
+        return (mass * ((st["x"][0] - bx) * st["vy"][0] - (st["y"][0] - by) * st["vx"][0]) + 0.5 * mass * rad * rad * st["w"][0])
+    first = dict(zip(F.BODY_OUTPUTS, law(*[state[k] if k in state else cols[k] for k in F.BODY_ARGUMENTS])))
+    rad = float(first["rad"][0])
+    before = angular_momentum(state, rad)
+    final, series, _ = _wheel_steps(law, cols, 30)           # the hit is over by step 10; the grain is then clear of the wheel
+    after = angular_momentum(final, rad)
+    delta_wheel = inertia * final["bom"][0]
+    assert abs(delta_wheel) > 0.2 * abs(before)                                 # the paddle did take it
+    assert abs(delta_wheel + (after - before)) < 0.06 * abs(before), (delta_wheel, after - before)     # the pair's angular momentum is conserved (to the air drag)
+
+
+def test_a_motor_torque_drives_the_wheel_against_the_hinge_damping_to_alpha_over_gamma():
+    law, cols = _wheel_world(16, body_alpha=40.0, body_gam=20.0)
+    _s, series, _ = _wheel_steps(law, cols, 320)
+    # the semi-implicit fixed point (applied torque first, then the hinge impulse, as engine_toy orders them): alpha (1 - gam DT) / gam,
+    # which is alpha / gam to O(gam DT)
+    assert abs(series[-1, 1] - 40.0 * (1.0 - 20.0 * F.DT) / 20.0) < 1.0e-6 and abs(series[-1, 1] - 2.0) < 1.1 * 20.0 * F.DT * 2.0
+    assert abs(series[-1, 1] - series[-2, 1]) < 1.0e-6
+    law, cols = _wheel_world(16, body_alpha=0.0, body_gam=20.0)                 # free: it stays at rest
+    assert np.all(_wheel_steps(law, cols, 20)[1][:, 1] == 0.0)
+
+
+def test_the_wheel_is_driven_through_an_engine_toy_coupling_written_each_batch():
+    """The page's path: a machine-sim coupling (a fluid coupling from a shaft at 3 rad/s) writes ``body_tau`` each batch of 10 steps from the
+    wheel speed it reads back; the wheel settles where the coupling's torque equals the hinge damping."""
+    from couplings import Coupling
+    law, cols = _wheel_world(16, body_gam=5.0)
+    coupling, drive, batch = Coupling(kind="fluid-coupling", diameter_m=0.14), 3.0, 10
+
+    def write(step, cols, out):
+        if (step + 1) % batch == 0:
+            cols["body_tau"] = np.float64(coupling.step(batch * F.DT, drive, float(out["body_om"][0]), 0.0))
+    _s, series, _ = _wheel_steps(law, cols, 600, each=write)
+    c, omega = float(cols["body_gam"]) * float(cols["body_i"]), series[-1, 1]
+    expected = max((o for o in np.linspace(0.0, drive, 30001) if Coupling(kind="fluid-coupling", diameter_m=0.14).step(1.0, drive, o, 0.0) >= c * o), default=0.0)
+    assert 0.2 < omega < drive and abs(omega - expected) < 0.05 * expected, (omega, expected)
+
+
+def test_the_wheel_replay_is_bit_identical_and_split_runs_agree():
+    law, cols = _wheel_world(64)
+    bx, by, reach = float(cols["body_x"]), float(cols["body_y"]), float(cols["body_pl"])
+    _wheel_place(cols, {i: (bx + 0.4 * reach, by + reach + 0.03 + 0.03 * i, 0.0, -1.5) for i in range(8)})
+    one = _wheel_steps(law, cols, 60)
+    two = _wheel_steps(law, cols, 60)
+    assert all(np.array_equal(one[0][k], two[0][k]) for k in one[0]) and np.array_equal(one[1], two[1])
+    # every id carries the same copy of the body state
+    assert np.all(one[0]["bth"] == one[0]["bth"][0]) and np.all(one[0]["bom"] == one[0]["bom"][0])
+
+
+def test_the_sdf_presets_keep_their_designed_height_and_the_view_follows_the_chamber():
+    for n in (256, 4096, 65536):
+        base = F.basin(n)
+        heights = {}
+        for shape in F.SDF_SHAPES:
+            geo = F.chamber_basin(shape, n)
+            u = F.uniforms(n=n, shape=shape)
+            assert geo["view"][:3] == base["view"][:3] and geo["view"][3] > 0.0               # only the top follows
+            lines = F.chamber_outline(shape, n)
+            top = max(max(pt[1] for pt in line) for line in lines)
+            assert geo["view"][3] - 3.5 * geo["cell"] <= top <= geo["view"][3]          # the view is the chamber plus the margin
+            assert float(u["rows"]) * geo["cell"] >= top and float(u["pivot_y"]) == pytest.approx(0.5 * (geo["view"][2] + geo["view"][3]), rel=1e-6)
+            assert F.board_size(geo["view"])[0] > 0.0
+            heights[shape] = top
+            d = F.chamber_distance(u, np.array([0.0]), np.array([float(u["nozzle_y"])]))[0][0]
+            if not (shape == "sdf_annulus" and n == 256):
+                assert d > geo["cell"], (shape, n)
+    # defaults: the box and the polygons are the basin as it was
+    for shape in ("box", "funnel", "hexagon", "ramp", "ngon5", "waterwheel"):
+        assert F.chamber_basin(shape, 4096) == F.basin(4096)
+    # the toy at 4k: peg rows, throat, funnel and the three ramps stack to the height the parts need, not a window fraction
+    toy = F.sdf_preset("sdf_toy", F.basin(4096))
+    assert toy["top"] > 2.8 and F.tilt_inputs(4096, None, F.CELL, "sdf_toy")["lid"] >= toy["top"]
