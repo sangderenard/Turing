@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "examples"))
 
 from meowdoku import fountain as F  # noqa: E402
 from meowdoku import fountain_build as B  # noqa: E402
+from meowdoku import toy_design as TD  # noqa: E402
 from src.common.tensors import AbstractTensor  # noqa: E402
 
 REST_STEPS = int(14.0 / F.DT)               # sim time by which a 256-id pile is at rest
@@ -1753,7 +1754,7 @@ def test_the_toy_has_a_generous_open_pool_under_the_peg_field_and_grew_taller_to
         c, w = geo["cell"], spec["half"]
         pegs = next(s for s in spec["slots"] if s["kind"] == F.SDF_KINDS["pegs"])
         lowest_peg_bottom = pegs["cy"] - 0.5 * (pegs["p4"] - 1.0) * pegs["p1"] - pegs["p2"]
-        assert lowest_peg_bottom == pytest.approx(spec["pool"], abs=1e-9) and spec["pool"] >= max(F.TOY_POOL_W * w, F.TOY_POOL_MIN_CELLS * c) - 1e-12
+        assert lowest_peg_bottom == pytest.approx(spec["pool"], abs=1e-9) and spec["pool"] >= max(TD.POOL_W * w, TD.POOL_MIN_CELLS * c) - 1e-12
         u = {k: float(v) for k, v in F.uniforms(n=n, shape="sdf_toy").items()}
         xs = np.linspace(-w, w, 801)
         for y in (0.15 * spec["pool"], 0.5 * spec["pool"], 0.9 * spec["pool"]):
@@ -1769,6 +1770,99 @@ def test_a_toy_edit_rekeys_no_product_the_digests_leave_the_toy_region_out():
     for text in (B._sources(), B._module_sources(False, B._MARKED_MOB), B._module_sources(False)):
         assert "# <toy>" not in text and "TOY_POOL_W" not in text
     assert len({B.digest("4k"), B.digest("4k", True), B.purrline_digest("4k"), B.mobroad_digest("4k")}) == 4
+
+
+# ------------------------------------------------- the toy: a free wheel under a short last ramp, arms open at the case sides
+# (the toy's one description is ``toy_design.py``; its preset lives in the ``# <toy>`` regions, which no product digest hashes)
+class _ToyWorld:
+    """Grains of the toy at the 4096-id design, placed by hand (every id parked until placed), stepped in the eager lane with the HINGED-BODY law
+    (the toy runs on the wheel product)."""
+
+    def __init__(self, n, mix=0.0, params=None, **uniform_overrides):
+        self.n = n
+        self.cols = F.initial_columns(n, mix=mix, shape="sdf_toy", active=4096, params=params)
+        for k, v in uniform_overrides.items():
+            self.cols[k] = np.float64(v)
+        self.design = F.sdf_preset("sdf_toy", F.chamber_basin("sdf_toy", 4096))["design"]
+        self.law = F.make_law(n, 4096, body=True)
+        self.cols["age"][:] = 1.0e3
+        self.state = {k: np.array(self.cols[k], dtype=np.float64) for k in F.STATE + F.BODY_STATE}
+        self.rad = self.step()["rad"].copy()
+        self.state["rs"][:] = self.rad
+
+    def step(self):
+        tensors = [AbstractTensor.get_tensor(np.asarray(self.state[k] if k in self.state else self.cols[k], dtype=np.float64)) for k in F.BODY_ARGUMENTS]
+        out = dict(zip(F.BODY_OUTPUTS, (np.broadcast_to(np.asarray(v.numpy(), dtype=np.float64), (self.n,)).copy() for v in self.law(*tensors))))
+        self.last = out
+        return out
+
+    def run(self, steps):
+        for _ in range(steps):
+            out = self.step()
+            self.state = {k: out[k + "_next"] for k in F.STATE + F.BODY_STATE}
+        return self.last
+
+    def on_ramp(self, k, s, speed, underside=False):
+        """Place the grains on ramp ``k`` at the fractions ``s`` of its length from the HIGH end (on top, or under it), moving ``speed`` down the ramp."""
+        r = self.design["ramps"][k]
+        (hx, hy), (lx, ly) = r["high"], r["low"]
+        length = math.hypot(lx - hx, ly - hy)
+        ax, ay = (lx - hx) / length, (ly - hy) / length
+        nx, ny = -ay, ax
+        if ny < 0:
+            nx, ny = -nx, -ny                                                # the ramp's up-facing normal
+        side = -1.0 if underside else 1.0
+        for i, f in enumerate(s):
+            self.state["x"][i] = hx + ax * length * f + side * nx * (r["r"] + self.rad[i] + 0.002)
+            self.state["y"][i] = hy + ay * length * f + side * ny * (r["r"] + self.rad[i] + 0.002)
+            self.state["vx"][i], self.state["vy"][i] = ax * speed, ay * speed
+        return (hx, hy), (ax, ay)
+
+
+def test_the_ramps_are_open_at_the_case_sides_the_last_is_short_and_ends_over_a_free_wheel():
+    spec = F.sdf_preset("sdf_toy", F.chamber_basin("sdf_toy", 4096))
+    d = spec["design"]
+    u = {k: float(v) for k, v in F.uniforms(n=4096, shape="sdf_toy").items()}
+    for r in d["ramps"]:                                                      # each ramp's high end stands >= 3 grain cells off the wall, and that span is free fluid
+        hx, hy = r["high"]
+        assert d["w"] - abs(hx) - r["r"] >= 3.0 * d["c"] - 1e-9
+        xs = np.sign(hx) * np.linspace(abs(hx) + r["r"] + 0.005, d["w"] - 0.005, 40)
+        assert (F.chamber_distance(u, xs, np.full_like(xs, hy))[0] > 0.0).all()
+    length = [math.hypot(r["high"][0] - r["low"][0], r["high"][1] - r["low"][1]) for r in d["ramps"]]
+    assert length[2] < 0.7 * min(length[0], length[1])                        # the last diagonal is short
+    wh, last = d["wheel"], d["ramps"][2]
+    assert wh["y"] + wh["reach"] < last["low"][1] - last["r"] and abs(wh["x"] - last["low"][0]) < 0.35 * d["w"]       # the wheel hangs under its low end
+    assert wh["y"] - wh["reach"] > d["yc"]                                    # ... over the funnel, so the hourglass empties beneath it
+    uu = F.uniforms(n=4096, shape="sdf_toy")
+    assert float(uu["body_x"]) == pytest.approx(wh["x"], abs=1e-6) and float(uu["body_alpha"]) == 0.0 and float(uu["body_np"]) == 8.0    # free: no motor
+    assert F.chamber_distance(u, np.array([wh["x"]]), np.array([wh["y"]]))[0][0] > 0.0
+    assert "sdf_toy" in F.BODY_SHAPES and "bth" in F.initial_columns(16, shape="sdf_toy")
+    game = F.FountainGame(size="4k")
+    game.do({"type": "fountain_choice", "name": "shape", "value": "sdf_toy"})
+    st = game.state()["compute"]
+    assert st["manifest"] == "fountain_wheel.manifest.json" and st["body"]["paddles"] == 8 and st["body"]["hinge"][1] == pytest.approx(wh["y"], abs=1e-5)
+
+
+def test_the_stream_off_the_last_ramp_turns_the_free_wheel():
+    """Eager lane, the body law: ten grains leave the last ramp at the speed the cascade gives them; the wheel (no motor) is turned by the stream."""
+    world = _ToyWorld(10)
+    world.on_ramp(2, np.linspace(0.6, 0.97, 10), 0.7)
+    last = world.run(230)
+    assert abs(float(last["body_om"][0])) > 0.1 and abs(float(last["body_th"][0])) > 0.01, (last["body_om"][0], last["body_th"][0])      # turning, from rest (the stream lands left of the hinge: counterclockwise)
+    assert float(last["n_out"][0]) == 0 and float(last["n_nan"][0]) == 0
+
+
+def test_turned_over_the_flow_follows_the_ramps_through_the_open_ends_and_nothing_escapes():
+    """Gravity up (the toy turned over; the page closes the lid): grains on the UNDERSIDE of the last ramp slide to its high end and leave through the
+    open gap at the case wall (they would be dammed at a sealed end); n_out = 0."""
+    world = _ToyWorld(10, grav_y=+1.0, lid=F.sdf_preset("sdf_toy", F.chamber_basin("sdf_toy", 4096))["top"] + 0.05)
+    (hx, hy), (ax, ay) = world.on_ramp(2, np.linspace(0.08, 0.4, 10), -0.4, underside=True)       # moving up the ramp, toward its high end
+    along0 = float(((world.state["x"] - hx) * ax + (world.state["y"] - hy) * ay).mean())
+    last = world.run(200)
+    along = ((world.state["x"] - hx) * ax + (world.state["y"] - hy) * ay)
+    assert float(along.mean()) < along0 - 0.1                                  # they travelled up the ramp ...
+    assert int((world.state["x"] > hx + world.design["ramps"][2]["r"]).sum()) >= 8      # ... and out through the open end (past the capsule's end, toward the wall)
+    assert float(last["n_out"][0]) == 0 and float(last["n_nan"][0]) == 0
 
 
 def test_the_toy_internal_parts_obstruct_and_guide_grains_and_nothing_leaves_the_chamber():
