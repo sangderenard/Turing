@@ -51,6 +51,7 @@ for (const [game, controls] of Object.entries(served)) {
   // serialize -> encode -> decode -> parse round-trips, and every shared spec is in it (no hand-kept list)
   const out = S.serializeSpecs(withServer, (s) => store[s.id]);
   assert.equal(Object.keys(out.l).length, locals.length);
+  assert.ok(out.l.wheelblur === true, `${game}: the wheel blur toggle is in a share link`);
   assert.equal(Object.keys(out.c).length, servers.length);
   const view = { v: 1, g: game, ...out, ls: { "meowdoku.pstyle": "heat", "meowdoku.noisefx": '{"on":true,"strength":0.5}' }, cam: { yaw: 1.2, pitch: -0.4, lz: 0.5, px: 0, pz: 2, auto: true }, rt: { gravity: [0, -1, 0] } };
   const enc = await S.encodeView(view);
