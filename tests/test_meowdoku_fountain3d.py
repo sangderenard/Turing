@@ -1344,3 +1344,45 @@ def test_the_server_offers_the_sdf_chambers_and_builds_each_to_the_depth_its_sol
     assert game.state()["compute"]["depth"] == pytest.approx(0.4, abs=1e-6)
     game.do({"type": "fountain_choice", "name": "shape", "value": "funnel"})                  # back to a polygon: the polygons' default depth
     assert game.state()["compute"]["depth"] == pytest.approx(F.DEPTH_DEFAULT, abs=1e-6) and game.state()["compute"]["chamber_mesh"] is None
+
+
+def _throw_at_walls(shape, n=24, steps=60, speed=2.5, where=None, seed=0):
+    """Grains placed in the fluid 0.06 - 0.30 from a wall and thrown at it at ``speed`` (fan-jet speeds are ~1.6) for ``steps`` steps (eager NumPy lane);
+    returns (the largest n_out over the steps, the worst distance a grain centre went beyond a wall, the grain radius)."""
+    rng = np.random.default_rng(seed)
+    uf = {k: float(v) for k, v in F.uniforms(n=4096, shape=shape).items()}
+    _c, w, top = F.window_fit(F.basin(4096))
+    pts = []
+    while len(pts) < n:
+        p = np.array([rng.uniform(-w, w), rng.uniform(0.0, top), rng.uniform(-uf["dh"] + 0.02, uf["dh"] - 0.02)])
+        d, nx, ny, nz = (float(v[0]) for v in F.chamber_distance(uf, [p[0]], [p[1]], [p[2]]))
+        if 0.06 < d < 0.30 and (where is None or where(p, uf)):
+            pts.append((p, -np.array([nx, ny, nz]) * speed + rng.normal(size=3) * 0.3))
+    cols = {k: np.zeros(n) for k in F.STATE + ("ir", "ig", "ib")}
+    cols["pid"] = np.arange(n, dtype=np.float64)
+    cols.update(uf)
+    for i, (p, v) in enumerate(pts):
+        cols["x"][i], cols["y"][i], cols["z"][i] = p
+        cols["vx"][i], cols["vy"][i], cols["vz"][i] = v
+    cols["age"] = np.full(n, 100.0)
+    law = F.make_law(n, n)
+    worst, out = 0.0, 0.0
+    for _ in range(steps):
+        cols, got = _eager_step(law, cols, n)
+        d = F.chamber_distance(uf, cols["x"], cols["y"], cols["z"])[0]
+        worst, out = max(worst, float((-d).max())), max(out, float(got["n_out"][0]))
+    return out, worst, float(got["rad"].mean())
+
+
+def test_grains_thrown_at_the_pegs_the_ramps_and_the_torus_inner_wall_do_not_escape():
+    """Thrown at the walls faster than the fan jet fires (eager lane; the 64-id, 150-step run over every chamber is in the commit's report):
+    none leaves (n_out = 0), and no grain centre goes more than a radius beyond a wall."""
+    top = F.window_fit(F.basin(4096))[2]
+    out, worst, rad = _throw_at_walls("sdf_toy", where=lambda p, u: 0.05 * top <= p[1] <= 0.30 * top, seed=1)          # the peg field's band
+    assert out == 0.0 and worst < rad
+    out, worst, rad = _throw_at_walls("sdf_toy", where=lambda p, u: p[1] > 0.7 * top, seed=2)                         # the ramps' band
+    assert out == 0.0 and worst < rad
+    u = F.uniforms(n=4096, shape="sdf_torus")
+    big, cy = float(u["q8p0"]), float(u["q8cy"])
+    out, worst, rad = _throw_at_walls("sdf_torus", where=lambda p, uf: np.hypot(p[0], p[1] - cy) < big - 0.02, seed=3)  # the inner half of the tube: at the INNER wall
+    assert out == 0.0 and worst < rad
