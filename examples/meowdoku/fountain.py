@@ -2381,41 +2381,55 @@ def mobroad_spec(size: str = "4k") -> dict[str, Any]:
 # </mobroad>
 # <toy>
 # ------------------------------------------------------------------------------------------------------------------------
-# THE OIL & GLYCERINE TOY's PRESET is host-side data (slots), so it lives between ``# <toy>`` markers, which ``fountain_build`` leaves out of EVERY product's
-# source digest (the default, wheel, purrline and mobroad ones): editing the toy rebuilds no product.  The ``sdf_toy`` branch of ``sdf_preset`` above is dead
+# THE OIL & GLYCERINE TOY (examples/meowdoku/toy_design.py is its one description, shared with the 3-D fountain): its PRESET is host-side data (slots
+# and the wheel's place), so everything of it lives between ``# <toy>`` markers, which ``fountain_build`` leaves out of EVERY product's source digest
+# (the default, wheel, purrline and mobroad ones): editing the toy rebuilds no product.  The toy runs on the WHEEL product (the hinged-body law: it
+# has the SDF walls and the body), its wheel placed by the preset; the block of ``sdf_preset`` above that still holds the earlier toy is dead
 # (this definition replaces it) and stays only so that the law's digests are the digests they were.
-TOY_POOL_W = 0.35                       # the collection pool under the peg field: its depth, in half widths of the vessel ...
-TOY_POOL_MIN_CELLS = 8.0                # ... and at least this many grain cells
+from meowdoku import toy_design as _toy_design  # noqa: E402
+
+BODY_SHAPES = BODY_SHAPES + ("sdf_toy",)
+CHAMBER_CHOICES = tuple((k, "oil & glycerine toy: ramps, pegs, pool, hourglass, wheel (SDF)" if k == "sdf_toy" else label) for k, label in CHAMBER_CHOICES)
 _sdf_preset_toy_base = sdf_preset
+_chamber_basin_toy_base = chamber_basin
+_wheel_geometry_toy_base = wheel_geometry
+
+
+def toy_design(geo: dict[str, float]) -> dict[str, Any]:
+    """The toy's parts (``toy_design.toy_parts``) for the basin ``geo``: the half width is the window's less the 3-cell margin, the grain cell is the
+    basin's, and the filter sits between the species' diameters."""
+    c = geo.get("cell", CELL)
+    return _toy_design.toy_parts(0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c, c, [s[1] for s in SPECIES])
 
 
 def sdf_preset(shape: str, geo: dict[str, float]) -> dict[str, Any]:
-    """``sdf_preset`` with the toy's COLLECTION POOL: an open basin ``TOY_POOL_W`` half widths deep (at least ``TOY_POOL_MIN_CELLS`` cells) between the
-    floor and the lowest peg row, where what passes the pegs gathers.  Everything else of the toy is as it was (the vessel, the funnel, the peg rows and
-    pitch, the three ramps); built bottom up, so the toy grows TALLER by what the pool adds."""
+    """``sdf_preset`` with the toy rebuilt from its shared description: ONE hourglass vessel; under its throat the staggered peg field (the filter:
+    the gap between pegs is between the species' diameters) over an open collection pool; three capsule ramps whose high ends stand off the case
+    walls (an open gap, so a turned-over toy pours along the same cascade), the last one short and ending over the free wheel (``wheel``)."""
     if shape != "sdf_toy":
         return _sdf_preset_toy_base(shape, geo)
-    c = geo.get("cell", CELL)
-    w = 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c
-    rr = 0.9 * c
-    throat = max(0.09 * w, 3.5 * c)
-    slope, tan, step = 1.7, 0.42, 0.25 * w
-    delta = (w - throat) / slope
-    px = py = 4.6 * c
-    pool = max(TOY_POOL_W * w, TOY_POOL_MIN_CELLS * c)
-    y_lo, peg_rows = pool + 0.9 * c, 6                                                   # the lowest peg row's centre: the pool is the open space under it
-    pegs_top = y_lo + (peg_rows - 1) * py + 0.9 * c
-    yc = pegs_top + 3.0 * c + delta
-    edge = w + 1.5 * rr
-    y0 = yc + delta + 6.0 * c + tan * (edge + 0.1 * w) + 2.0 * step
-    nozzle_y = y0 + 0.12
-    top = nozzle_y + 0.12
-    slots = [_slot("hourglass", "fluid", 0.0, yc, 0.0, w, throat, top - yc, slope)]
-    for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
-        sign = 1.0 if i % 2 == 0 else -1.0                                               # +: high end at the right wall (the ramp runs left-down)
-        high = (sign * edge, y0 - i * step)
-        slots.append(_capsule_ramp(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr))
-    cols = 2 * int(w // px) + 1
-    slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (peg_rows - 1) * py, 0.0, px, py, 0.9 * c, cols, peg_rows, 1.0))
-    return {"slots": slots, "nozzle_y": nozzle_y, "top": top, "half": w, "bar": 0.25 * w, "pool": pool}
+    d = toy_design(geo)
+    pg = d["pegs"]
+    slots = [_slot("hourglass", "fluid", 0.0, d["yc"], 0.0, d["w"], d["throat"], d["top"] - d["yc"], d["slope"])]
+    slots += [_capsule_ramp(r["high"], r["low"], r["r"]) for r in d["ramps"]]
+    slots.append(_slot("pegs", "solid", pg["cx"], pg["cy"], 0.0, pg["px"], pg["py"], pg["r"], pg["cols"], pg["rows"], 1.0))
+    return {"slots": slots, "nozzle_y": d["nozzle_y"], "top": d["top"], "half": d["w"], "bar": 0.25 * d["w"], "pool": d["pool"], "wheel": d["wheel"], "design": d}
+
+
+def chamber_basin(shape: str, n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+    """``chamber_basin``; the toy's also carries its wheel's place (``wheel_geometry`` reads it)."""
+    geo = _chamber_basin_toy_base(shape, n, aspect, cell)
+    if shape == "sdf_toy":
+        geo = {**geo, "wheel": sdf_preset(shape, basin(n, aspect, cell))["wheel"]}
+    return geo
+
+
+def wheel_geometry(geo: dict[str, float], p: dict[str, float]) -> dict[str, float]:
+    """``wheel_geometry``; the toy's wheel is placed by the preset (hinge, reach), its inertia from the same material formula."""
+    wh = geo.get("wheel")
+    if wh is None:
+        return _wheel_geometry_toy_base(geo, p)
+    out = _wheel_geometry_toy_base({**geo, "scale": wh["reach"] / WHEEL_RADIUS}, p)
+    out.update({"body_x": wh["x"], "body_y": wh["y"]})
+    return out
 # </toy>
