@@ -250,6 +250,10 @@ class Table:
                 self.profiles.save_settings(self.player, payload["values"])
             if hasattr(self.game, "set_hero") and isinstance(payload.get("values"), dict) and "avatar" in payload["values"]:
                 self.game.set_hero(payload["values"]["avatar"])
+        elif kind == "place":                                        # [MOBROAD] a tower dropped on the field: the game decides validity and cost
+            if not hasattr(self.game, "place"):
+                raise ValueError("this game has no placeables")
+            self.game.place(payload)
         elif kind == "palette":
             self.game.set_palette(str(payload.get("name", "")))
         elif kind == "mode":
