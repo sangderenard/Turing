@@ -5,6 +5,9 @@
 // animates the difference between states; it decides nothing.
 
 import "./access.js";   // [ACCESS] window.meowdokuAccess: the tier (server-enforced); development options below are shown by it
+// [ACCESS] local (LAN) and dev visitors get the Studio link in the bar, with the tier named in its title
+{ const link = document.getElementById("studio-link"), A = window.meowdokuAccess || {};
+  if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; } }
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
