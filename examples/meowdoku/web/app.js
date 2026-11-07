@@ -1888,7 +1888,19 @@ async function selectSavedParticle(digest) {
 }
 const MARBLE = { mesh: null, key: "" };
 function marblePreview() {
-  if (!$('marble-preview').checked || !state.game || !state.extent) return null;
+  if (!state.game || !state.extent || (state.game.game !== "marble_madness" && !$('marble-preview').checked)) return null;
+  if (state.game.game === "marble_madness" && savedParticle.mesh) {
+    const data = compute.points();
+    if (!data) return null;
+    const point = readPoint(data, 0);
+    if (!point.alive) return null;
+    const c = state.game.compute, [x0, x1, y0, y1] = c.view;
+    const scale = Math.min(state.game.width / (x1 - x0), state.game.height / (y1 - y0));
+    const at = lawToWorld(state.game)(point.x, point.y, point.z), mesh = savedParticle.mesh;
+    const r = point.radius * scale * mesh.scale;
+    return { interior: mesh.opaque, glass: mesh.glass,
+      model: M.multiply(M.multiply(M.translate(...at), M.scale(r, r, r)), M.translate(...mesh.center.map((v) => -v))) };
+  }
   const eye = $('marble-eye').value;
   const ids = { glass: state.materialIndex.marble_clear_glass,
     eye: state.materialIndex[`marble_cat_eye_${eye}`], accent: state.materialIndex.marble_milk_glass };
@@ -1905,6 +1917,17 @@ function marblePreview() {
     const geometry = catEyeMarble(ids, options);
     MARBLE.mesh = { interior: litMesh(geometry.interior), glass: litMesh(geometry.glass) };
     MARBLE.key = key;
+  }
+  if (state.game.game === "marble_madness") {
+    const data = compute.points();
+    if (!data) return null;
+    const point = readPoint(data, 0);
+    if (!point.alive) return null;
+    const c = state.game.compute, [x0, x1, y0, y1] = c.view;
+    const scale = Math.min(state.game.width / (x1 - x0), state.game.height / (y1 - y0));
+    const at = lawToWorld(state.game)(point.x, point.y, point.z);
+    const r = point.radius * scale;
+    return { ...MARBLE.mesh, model: M.multiply(M.translate(...at), M.scale(r, r, r)) };
   }
   const center = M.translate(extMidX(), 1.25, extMidZ());
   return { ...MARBLE.mesh, model: M.multiply(center, M.scale(0.35, 0.35, 0.35)) };
@@ -2324,7 +2347,7 @@ function rebuildBoards(game) {
 // SCENE-CAMERA GESTURES: a view offset (yaw, pitch, log-zoom, pan on the ground)
 // that composes on top of whatever camera the game is in (board, flat, follow);
 // the gesture layer further down moves the goal, stepCamView eases `cur` toward it.
-const isFountainGame = (g) => !!g && (g.game === "fountain" || g.game === "fountain3d");     // the 2-D and the 3-D fountain are one page
+const isFountainGame = (g) => !!g && (g.game === "fountain" || g.game === "fountain3d" || g.game === "marble_madness");
 const camView = {
   key: null, lastR: 1, active: 0,
   auto: false,                    // AUTO-ROTATE: a slow orbit (the yaw goal turns at AUTO_ROTATE rad/s) while no finger is on the view
@@ -4902,6 +4925,10 @@ function applyState(game, { meta = false } = {}) {
   const now = state.time, previous = state.game;
   state.game = game;
   document.body.dataset.game = game.game;
+  $('marble-pad').style.display = game.game === "marble_madness" ? "flex" : "none";
+  if (game.game !== "marble_madness") marbleKeys.clear();
+  if (game.game === "marble_madness" && (!previous || !previous.compute || previous.compute.epoch !== game.compute.epoch)) MARBLE.finishSent = false;
+  if (game.game === "marble_madness") { state.flat = false; $('flat').textContent = "Flat (V)"; }
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
     pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1; pred.shots = [];
@@ -4952,6 +4979,7 @@ function applyState(game, { meta = false } = {}) {
   chessClockSync(game);
   if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
+  if (game.game === "marble_madness") { compute.setSpin(0); compute.setGravity(0, -0.75, 0); }
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   mobroad.state = state;
@@ -5072,6 +5100,26 @@ const compute = new ComputeRuntime({
   onSupport: () => { if (state.game) renderGameControls(state.game); },
 });
 window.meowdokuDebug.compute = compute;
+const marbleKeys = new Set();
+const marbleKey = (key) => ({ ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right",
+  ArrowUp: "up", w: "up", W: "up", ArrowDown: "down", s: "down", S: "down" })[key];
+for (const type of ["keydown", "keyup"]) window.addEventListener(type, (event) => {
+  if (!state.game || state.game.game !== "marble_madness" || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+  const key = marbleKey(event.key); if (!key) return;
+  event.preventDefault();
+  if (type === "keydown") marbleKeys.add(key); else marbleKeys.delete(key);
+});
+window.addEventListener("blur", () => marbleKeys.clear());
+for (const button of document.querySelectorAll("#marble-pad [data-marble-key]")) {
+  const key = button.dataset.marbleKey;
+  button.addEventListener("pointerdown", (event) => { button.setPointerCapture(event.pointerId); marbleKeys.add(key); event.preventDefault(); });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) button.addEventListener(type, () => marbleKeys.delete(key));
+}
+function marbleGravity() {
+  const x = (marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0);
+  const y = marbleKeys.has("up") ? -0.35 : marbleKeys.has("down") ? -1.15 : -0.75;
+  compute.setGravity(0.68 * x, y, 0);
+}
 // TIP JAR (tipjar.js): the panel, the grain picker and the state poll of the tip jar game (a game state that carries `tipjar`); inert otherwise.
 const tipjar = initTipJar({
   canvas, getState: () => state.game, getCompute: () => compute, applyState: (g) => applyState(g),
@@ -5087,7 +5135,7 @@ const camGravNow = [0, -1];                      // the last camera-down gravity
 try { cameraGravity = localStorage.getItem("meowdoku.camgrav") === "1"; } catch { /* storage may be blocked */ }
 if (new URLSearchParams(location.search).get("studio") === "1") cameraGravity = false;
 const gravitySensor = new GravitySensor({
-  onGravity: (gx, gy, gz) => { if (!cameraGravity) compute.setGravity(gx, gy, gz); },
+  onGravity: (gx, gy, gz) => { if (!cameraGravity && state.game && state.game.game !== "marble_madness") compute.setGravity(gx, gy, gz); },
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
@@ -6001,6 +6049,7 @@ function sandFeed(g) {
 function pointsFrame(cam, now) {
   const g = state.game;
   if (!g || !g.compute) { ARCADE.activity = null; return; }
+  if (g.game === "marble_madness" && !g.won) marbleGravity();
   if (g.purrline) sandFeed(g);                                  // purrline sand: the game's solids into the law's inputs (one way)
   if (g.mobroad) {                                                // [MOBROAD] the bullets into the law's kill segments, the player's place and the pather's weights (one way)
     compute.setMobroad(mobroad.collect(state, gnow(now), g));
@@ -6010,17 +6059,25 @@ function pointsFrame(cam, now) {
   if (cameraGravity) {
     const [gx, gy, gz] = cameraDownInLaw(cam.view);
     camGravNow[0] = gx; camGravNow[1] = gy;
-    compute.setGravity(gx, gy, g.game === "fountain3d" ? gz : 0);     // the 3-D law takes the whole vector: turning the camera over turns gravity over
+    if (g.game !== "marble_madness") compute.setGravity(gx, gy, g.game === "fountain3d" ? gz : 0);
   }
   compute.frame(now);
   const data = compute.points();
   const rec = compute.rec;
   if (!data || !rec) return;
+  if (g.game === "marble_madness" && !g.won && !MARBLE.finishSent && compute.shown != null) {
+    const point = readPoint(data, 0), goal = g.marble.goal;
+    if (point.alive && Math.abs(point.x - goal.x) <= goal.half_width && point.y >= 0 && point.y <= goal.ceiling) {
+      MARBLE.finishSent = true;
+      act({ type: "marble_finish", x: point.x, y: point.y, z: point.z,
+        seconds: compute.shown * compute.snap * compute.manifest.law.dt });
+    }
+  }
   if (!cloud) cloud = new PointCloud(gl, link, compile);
   if (!state.flat && layerOn("arcade")) arcadeActivity(data, rec, g, now); else ARCADE.activity = null;
-  ghostsDraw(cam, data, g, rec);                                // [GHOSTS] the replay layers, behind / under the live run
-  drawCloud(cam, data, g, rec, particleStyle);
-  if (g.game === "fountain3d" || (g.game === "fountain" && state.flat) || g.compute.purrline || g.compute.mobroad) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
+  if (g.game !== "marble_madness") ghostsDraw(cam, data, g, rec);  // the course shows only its one live marble
+  if (g.game !== "marble_madness") drawCloud(cam, data, g, rec, particleStyle);
+  if (g.game === "fountain3d" || g.game === "marble_madness" || (g.game === "fountain" && state.flat) || g.compute.purrline || g.compute.mobroad) drawChamberOutline(cam, g, rec);   // (the 2-D chamber is glass ribbons in the scene pass)
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
@@ -6205,6 +6262,10 @@ function litPass(cam, now, casters, opts = {}) {
   // materials (a bulb's level picks its brightness step).
   if (!state.flat) {
     const orb = state.meshes.__sphere;
+    if (state.game && state.game.game === "marble_madness") {
+      const goal = state.game.marble.goal, at = lawToWorld(state.game)(goal.x, goal.y, 0);
+      drawLit(orb.vao, orb.count, M.multiply(M.translate(...at), M.scale(0.12, 0.12, 0.12)), state.materialIndex.nav_green);
+    }
     drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
     bulbs.forEach((p, i) => {
       const { level, ci } = bulbStates[i];
@@ -6223,7 +6284,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   if (state.glassDraws && !state.flat) for (const [m, model] of state.glassDraws) drawLit(m.vao, m.count, model, null);   // Wordle's obsidian tiles
-  if (state.marblePreview && !opts.broadcast) drawLit(state.marblePreview.glass.vao, state.marblePreview.glass.count, state.marblePreview.model, null);
+  if (state.marblePreview?.glass && !opts.broadcast) drawLit(state.marblePreview.glass.vao, state.marblePreview.glass.count, state.marblePreview.model, null);
   if (state.game && state.game.mobroad && !opts.broadcast) mobroad.draw(mobApi, cam, state.game, drawLit);               // [MOBROAD] the panels (glass) and their value labels
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -6281,7 +6342,7 @@ function draw(ms) {
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
   if (state.rackButtons && !glassTiles) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
   state.marblePreview = state.flat ? null : marblePreview();
-  if (state.marblePreview) casters.push([state.marblePreview.interior.vao, state.marblePreview.interior.count, state.marblePreview.model, null]);
+  if (state.marblePreview?.interior) casters.push([state.marblePreview.interior.vao, state.marblePreview.interior.count, state.marblePreview.model, null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }
@@ -6808,7 +6869,7 @@ const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: t
                                   space_invaders: ZOOM_ONLY, boardwalk: ZOOM_ONLY, delve: ZOOM_ONLY };
 // The view a game opens in and returns to on a reset: the 3-D fountain is a BOX nine grains deep, which straight down would hide (the depth is
 // the height axis), so it opens as a slight 3/4 view (yaw about the vertical, the eye tipped toward the front glass).
-const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 }, mobroad: { yaw: 0, pitch: 0 } };
+const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 }, marble_madness: { yaw: 0.35, pitch: -0.55 }, mobroad: { yaw: 0, pitch: 0 } };
 const CAMERA_TOP_DOWN = new Set(["mobroad"]);       // [MOBROAD] the TOP VIEW preset: the mob walks on the ground plane seen from straight above (gravity is orthogonal to the scene)
 const cameraViewDefault = (key, k) => (CAMERA_VIEW_DEFAULTS[key] || {})[k] || 0;
 function cameraGestures() {
@@ -7106,7 +7167,7 @@ $("sky-locate").onclick = () => {      // opt-in only: nothing asks for the loca
     $("sky-locate").textContent = "Located";
   }, () => { $("sky-locate").textContent = "Location denied"; });
 };
-function toggleFlat() { state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
+function toggleFlat() { if (state.game && state.game.game === "marble_madness") return; state.flat = !state.flat; $("flat").textContent = state.flat ? "Flat: on (V)" : "Flat (V)"; }
 $("flat").onclick = toggleFlat;
 $("wobble").onchange = (e) => { wob.on = e.target.checked; wob.lastNow = null; };
 $("wobble-k").oninput = (e) => { wob.freq = Number(e.target.value); };

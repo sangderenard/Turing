@@ -60,7 +60,8 @@ def _sources() -> str:
 # TWO PRODUCTS per size: "sdf" (the law with the SDF chamber walls) and "flat" (``make_law(..., sdf=False)``: the SDF compiled out,
 # for the box and the polygon chambers).  With sdf_on = 0 the two are the same law bit for bit, but the sdf product's shader still
 # evaluates the SDF every step (~21% of a 64k step), so the page runs the flat one whenever the chamber is not an SDF.
-VARIANTS = {"sdf": ("fountain3d", True), "flat": ("fountain3d_flat", False), "wheel": ("fountain3d_wheel", False)}
+VARIANTS = {"sdf": ("fountain3d", True), "flat": ("fountain3d_flat", False), "wheel": ("fountain3d_wheel", False),
+            "toy": ("fountain3d_toy", True)}
 # the third, "wheel", is the hinged-body (waterwheel) law: the flat law plus the body's two state columns and uniforms (``make_law(.., body=True)``),
 # with its own argument list and manifest; the 10M size is not offered for it (+4 arena slots)
 WHEEL_SIZES = tuple(tag for tag in SIZES if SIZES[tag][0] < 10_000_000)
@@ -68,7 +69,7 @@ WHEEL_SIZES = tuple(tag for tag in SIZES if SIZES[tag][0] < 10_000_000)
 
 def layout(variant: str) -> dict:
     """The law's names for a variant: the default law's, or the hinged-body variant's."""
-    if variant != "wheel":
+    if variant not in ("wheel", "toy"):
         return {"arguments": F.ARGUMENTS, "state": F.STATE, "outputs": F.OUTPUTS, "diagnostics": F.DIAGNOSTICS, "uniforms": F.UNIFORMS,
                 "runtime_inputs": F.RUNTIME_INPUTS}
     return {"arguments": F.BODY_ARGUMENTS, "state": F.STATE + F.BODY_STATE, "outputs": F.BODY_OUTPUTS, "diagnostics": F.DIAGNOSTICS + F.BODY_DIAGNOSTICS,
@@ -88,7 +89,7 @@ def trace(pad: int, active: int, contract: str, sdf: bool = True, variant: str =
     """The law traced at ``pad`` ids: (program, output values, bindings)."""
     from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
     from src.compiler.work_contract import PRESETS, scoped_work_contract
-    law = F.make_law(pad, active, sdf=sdf, body=variant == "wheel")
+    law = F.make_law(pad, active, sdf=sdf, body=variant in ("wheel", "toy"))
     names = layout(variant)["arguments"]
     with scoped_work_contract(PRESETS[contract]):
         program = SSATensorProgram("fountain_step")
@@ -167,13 +168,13 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True, variant: str = "sdf")
                    "display_ids": -(-pad // stride), "display_bytes": 3 * 20 * -(-pad // stride)},
         "display_stride": stride,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
-        "uniforms": {k: float(v) for k, v in F.uniforms(n=active, shape="waterwheel" if variant == "wheel" else "box").items()},
+        "uniforms": {k: float(v) for k, v in F.uniforms(n=active, shape="sdf_toy" if variant == "toy" else "waterwheel" if variant == "wheel" else "box").items()},
         "source_digest": digest(tag, variant),
     }
     if pad <= WASM_MAX and wasm:
         wasm_abi = graph_wasm._compile(
             f"{prefix}_{tag}", shapes_for(pad, variant),
-            lambda b: F.make_law(pad, active, sdf=sdf, body=variant == "wheel")(*(b[name] for name in lay["arguments"])),
+            lambda b: F.make_law(pad, active, sdf=sdf, body=variant in ("wheel", "toy"))(*(b[name] for name in lay["arguments"])),
             lay["outputs"], WASM_CONTRACT, web_dir,
             {"argument_names": list(lay["arguments"]), "count": pad})
         record.update({"wasm": f"{prefix}_{tag}.wasm", "wasm_abi": f"{prefix}_{tag}.abi.json",

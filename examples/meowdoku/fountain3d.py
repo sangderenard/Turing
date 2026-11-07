@@ -78,6 +78,7 @@ import math
 from typing import Any
 
 import numpy as np
+from meowdoku import toy_design as _toy_design
 
 from meowdoku.entities import LawPiece, as_float
 from src.common.tensors import AbstractTensor
@@ -269,7 +270,7 @@ SDF_KINDS = {"box": 1, "sphere": 2, "capsule": 3, "torus": 4, "tetra": 5, "hourg
 SDF_FAR = 1.0e9
 #: TYPED slots: the kind of each slot is fixed at compile time (3 boxes, 2 spheres, 3 capsules, a torus, a tetrahedron, a revolved hourglass,
 #: a peg field), so a slot evaluates only its own SDF; ``kind`` is just its used flag and a preset fills the slots it needs.
-SDF_LAYOUT = ("box", "box", "box", "sphere", "sphere", "capsule", "capsule", "capsule", "torus", "tetra", "hourglass", "pegs")
+SDF_LAYOUT = ("box", "box", "box", "box", "sphere", "capsule", "capsule", "capsule", "torus", "tetra", "hourglass", "pegs")
 assert len(SDF_LAYOUT) == SDF_SLOTS
 SDF_UNIFORMS = ("sdf_on",) + tuple(f"q{k}{f}" for k in range(SDF_SLOTS) for f in SDF_FIELDS)
 SDF_SHAPES = ("sdf_sphere", "sdf_cube", "sdf_tetra", "sdf_torus", "sdf_hourglass", "sdf_toy")
@@ -310,7 +311,7 @@ BODY_STATE = ("bth", "bom")
 BODY_UNIFORMS = ("body_x", "body_y", "body_rh", "body_pl", "body_ht", "body_np", "body_i", "body_gam", "body_alpha", "body_tau")
 BODY_RUNTIME_INPUTS = ("body_i", "body_gam", "body_alpha", "body_tau")
 BODY_DIAGNOSTICS = ("body_th", "body_om", "body_tq")
-BODY_SHAPES = ("waterwheel",)
+BODY_SHAPES = ("waterwheel", "sdf_toy")
 BODY_ARGUMENTS = STATE + BODY_STATE + CONSTANTS + UNIFORMS + BODY_UNIFORMS
 BODY_OUTPUTS = tuple(f"{s}_next" for s in STATE + BODY_STATE) + ("cr", "cg", "cb", "rad", "shown") + DIAGNOSTICS + BODY_DIAGNOSTICS
 WHEEL_RADIUS = 0.30                    # the wheel's outer reach at the reference basin (x the basin scale s)
@@ -513,17 +514,13 @@ Z_MARGIN_CELLS = 1.5                                                          # 
 
 
 HOURGLASS_ASPECT = 2.6                 # the hourglass is 2.6 half-widths tall
-TOY_ASPECT_W, TOY_ASPECT_C = 4.15, 17.5   # the toy's height, in half-widths and in cells: a full phone screen (~2.1 heights per width; see ``sdf_design``)
-TOY_PARTS_W = 2.24                     # the height its parts need (half-widths, plus TOY_ASPECT_C cells): the rest is open fall under the ramps
-TOY_PEG_ROWS = 5                       # the toy's peg field has at least this many rows (they fill 0.22 of the height, 4.6 cells apart)
 
 
 def sdf_design(shape: str, s: float, c: float) -> tuple[float, float, float]:
     """``(cell, w, top)``: the DESIGNED bounding box of an SDF chamber, |x| <= w and 0 <= y <= top, for the id scale ``s`` (sqrt(n / N_BASE)) and the
     grain cell ``c``.  The half-width is the reference window's (the same at any screen aspect); the height is the solid's own: a sphere, cube and
     torus are as tall as wide, the tetrahedron stands at its natural 4/3 circumradius, the hourglass is ``HOURGLASS_ASPECT`` half-widths and the toy is as
-    tall as its parts need -- the lowest ramp's low end (``TOY_ASPECT_W`` half-widths + ``TOY_ASPECT_C`` cells up from the floor) clears the throat above
-    the peg field, which has ``TOY_PEG_ROWS`` rows of pegs 4.6 cells apart -- so a smaller or coarser chamber grows TALLER relative to its width."""
+    tall as the shared ``toy_design.toy_parts`` geometry needs."""
     w = max(VIEW_SIDE * s - 3.0 * c, 4.0 * c)
     if shape in ("sdf_sphere", "sdf_cube", "sdf_torus"):
         return c, w, 2.0 * w
@@ -532,14 +529,9 @@ def sdf_design(shape: str, s: float, c: float) -> tuple[float, float, float]:
     if shape == "sdf_hourglass":
         return c, w, max(HOURGLASS_ASPECT * w, 30.0 * c)
     if shape == "sdf_toy":
-        return c, w, max(TOY_ASPECT_W * w + TOY_ASPECT_C * c, _toy_parts(w, c))
+        w = max(w, 6.0 * c)
+        return c, w, _toy_design.toy_parts(w, c, [species[1] for species in SPECIES])["top"]
     raise ValueError(f"unknown SDF chamber {shape!r}")
-
-
-def _toy_parts(w: float, c: float) -> float:
-    """The height the toy's PARTS need (the lower bulb with its peg field, the funnel and throat, the ramps); ``sdf_design`` makes the toy taller,
-    and the extra is open height between the ramps and the funnel."""
-    return max(TOY_PARTS_W * w + TOY_ASPECT_C * c, (TOY_PEG_ROWS - 1) * 4.6 * c / 0.22)
 
 
 def window_fit(shape: str, geo: dict[str, float]) -> tuple[float, float, float]:
@@ -601,32 +593,23 @@ def sdf_preset(shape: str, geo: dict[str, float], dh: float) -> dict[str, Any]:
         slots.append(_slot("hourglass", "fluid", 0.0, 0.5 * top, 0.0, 0.0, top_w, min(max(0.1 * top_w, 3.5 * c), 0.5 * top_w), 0.5 * top, 0.0, 0.0))
         nozzle_y = 0.75 * top
     elif shape == "sdf_toy":
-        # ONE hourglass-profile vessel EXTRUDED through the depth (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall);
-        # three ramps (capsule slots stretched across z: left-down, right-down, left-down) in the upper section; a staggered field of peg
-        # cylinders (one slot, domain repetition) under the throat, each peg spanning the depth
-        # The parts are laid out in the height they need (h0, ``_toy_parts``); the toy is taller (a phone screen), and the extra is open height
-        # UNDER THE RAMPS, above the funnel: the hourglass spans 0 .. h0 (throat at h0 / 2), a FLUID box of the same width (union: max of
-        # inside distances) carries the vertical walls on up from inside its upper bulb to the top, and the ramps hang from the top.
-        rr = 0.9 * c
-        h0 = min(_toy_parts(w, c), top)
-        yc, delta = 0.5 * h0, 0.20 * h0                                              # the lower bulb rests on the window floor
-        throat = max(0.055 * w, 2.5 * c)
-        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, 0.0, w, throat, yc, (w - throat) / delta, 1.0))
-        if top > h0 + 1.0e-9:
-            y_box = yc + delta + 0.5 * (h0 - yc - delta)                             # inside the upper bulb's vertical walls: the seam is a straight wall
-            slots.append(_slot("box", "fluid", 0.0, 0.5 * (y_box + top), 0.0, 0.0, w, 0.5 * (top - y_box), dh + 2.0 * c, 0.0))
-        tan, y0, step = 0.42, top - 0.10 * h0, 0.097 * h0
-        edge = w + 1.5 * rr
-        for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
-            sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
-            high = (sign * edge, y0 - i * step)
-            slots.append(_ramp_slot(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr, dh + 2.0 * c))
-        px = py = 4.6 * c
-        y_lo, y_hi = 0.05 * h0, yc - delta - 0.03 * h0
-        rows = max(1, int((y_hi - y_lo) // py) + 1)
-        cols = 2 * int(w // px) + 1
-        slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
-        nozzle_y = top - 0.12
+        d = _toy_design.toy_parts(w, c, [species[1] for species in SPECIES])
+        pg = d["pegs"]
+        slots.append(_slot("hourglass", "fluid", 0.0, d["yc"], 0.0, 0.0, w, d["throat"], d["yc"], d["slope"], 1.0))
+        join = d["yc"] + d["delta"]
+        slots.append(_slot("box", "fluid", 0.0, 0.5 * (join + d["top"]), 0.0, 0.0,
+                           w, 0.5 * (d["top"] - join), dh + 2.0 * c, 0.0))
+        for ramp in d["ramps"]:
+            for kind, a, b in ramp["pieces"]:
+                if kind == "capsule":
+                    slots.append(_ramp_slot(a, b, ramp["r"], dh + 2.0 * c))
+                else:
+                    slots.append(_slot("box", "solid", 0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.0,
+                                       math.atan2(b[1] - a[1], b[0] - a[0]),
+                                       0.5 * math.hypot(b[0] - a[0], b[1] - a[1]) + ramp["r"], ramp["r"], dh + 2.0 * c, ramp["r"]))
+        slots.append(_slot("pegs", "solid", pg["cx"], pg["cy"], 0.0, 0.0,
+                           pg["px"], pg["py"], pg["r"], pg["cols"], pg["rows"], 1.0))
+        nozzle_y = d["nozzle_y"]
         bar = 0.25 * w
     else:
         raise ValueError(f"unknown SDF chamber {shape!r}")
@@ -764,7 +747,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
                     f"zeta{s}": zeta_of(p[f"e{s}"]), f"roll{s}": p[f"roll{s}"], f"irr{s}": p[f"irr{s}"],
                     f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
     if wheel:
-        out.update(wheel_geometry(geo, p, dh))
+        out.update(wheel_geometry({**geo, "shape": shape}, p, dh))
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
@@ -773,13 +756,18 @@ def wheel_geometry(geo: dict[str, float], p: dict[str, float], dh: float) -> dic
     turns the wheel clockwise), reach, hub, paddles, and the reference inertia of its material about the hinge axis (paddles as rods, a hub disc,
     both extruded through the depth ``2 dh`` at ``WHEEL_DENSITY``)."""
     s = geo["scale"]
+    if geo.get("shape") == "sdf_toy":
+        d = _toy_design.toy_parts(window_fit("sdf_toy", geo)[1], geo.get("cell", CELL), [species[1] for species in SPECIES])
+        s = d["wheel"]["reach"] / WHEEL_RADIUS
     reach = WHEEL_RADIUS * s * p["wheel_r"]
     hub = WHEEL_HUB * reach
     count = round(p["wheel_n"])
     ht = WHEEL_PADDLE_HALF
     m_paddle = WHEEL_DENSITY * 2.0 * dh * 2.0 * ht * reach
     i_ref = count * m_paddle * reach * reach / 3.0 + 0.5 * math.pi * WHEEL_DENSITY * 2.0 * dh * hub ** 4
-    return {"body_x": -0.5 * reach, "body_y": 0.45 * s + 0.2 * reach, "body_rh": hub, "body_pl": reach, "body_ht": ht, "body_np": float(count),
+    return {"body_x": d["wheel"]["x"] if geo.get("shape") == "sdf_toy" else -0.5 * reach,
+            "body_y": d["wheel"]["y"] if geo.get("shape") == "sdf_toy" else 0.45 * s + 0.2 * reach,
+            "body_rh": hub, "body_pl": reach, "body_ht": ht, "body_np": float(count),
             "body_i": i_ref * p["wheel_i"], "body_gam": p["wheel_gam"], "body_alpha": p["wheel_alpha"], "body_tau": 0.0}
 
 
