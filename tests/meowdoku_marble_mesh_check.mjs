@@ -2,6 +2,9 @@ import { catEyeMarble } from "../examples/meowdoku/web/marble_mesh.js";
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const mesh = catEyeMarble({ glass: 11, eye: 12, accent: 13 });
+const reroll = catEyeMarble({ glass: 11, eye: 12, accent: 13 }, { seed: 31415 });
+assert(JSON.stringify(mesh.interior[100][0]) !== JSON.stringify(reroll.interior[100][0]), "reroll changes dyed geometry");
+assert(JSON.stringify(mesh.glass[100][0]) === JSON.stringify(reroll.glass[100][0]), "reroll retains the glass shell");
 assert(mesh.interior.length > 1000 && mesh.glass.length > 1000, "both surfaces are triangulated");
 assert(mesh.triangleCount === mesh.interior.length + mesh.glass.length, "triangle count");
 assert(new Set(mesh.interior.map((f) => f[3])).size === 2, "dyed and accent triangles");
