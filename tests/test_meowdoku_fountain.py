@@ -1170,3 +1170,47 @@ def test_a_turning_case_drags_its_contents_with_gravity_off(native_piece):
     assert np.hypot(float(eul["x"][i]) - ref_e[0], float(eul["y"][i]) - 0.3 - ref_e[1]) < 0.03 * np.hypot(*(ref_e - np.array([0.08, 0.0]))) + 1e-4
     for out in (turned, spun, eul):
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
+
+
+# ------------------------------------------------------------- polygon chambers (the shapes of the 3-D fountain, in 2D)
+def test_the_2d_shapes_are_closed_polygons_inscribed_in_the_window_and_the_box_adds_nothing():
+    for n in (256, 4096):
+        geo = F.basin(n)
+        x0, x1, y0, y1 = geo["view"]
+        zero = F.uniforms(n=n)
+        assert all(float(zero[f"{c}{k}"]) == 0.0 for c in ("px", "py") for k in range(F.NV))         # the box: zero-length segments, exact zeros
+        for shape in ("funnel", "hexagon", "ramp"):
+            verts = F.shape_vertices(shape, geo)
+            xs, ys = [v[0] for v in verts], [v[1] for v in verts]
+            assert min(xs) >= x0 + 2.0 * geo["cell"] and max(xs) <= x1 - 2.0 * geo["cell"] and min(ys) >= 0.0 and max(ys) <= y1 - 2.0 * geo["cell"], shape
+            assert verts[0] == verts[-1] and len(verts) <= F.NV and max(xs) == pytest.approx(-min(xs))
+            u = F.uniforms(n=n, shape=shape)
+            xl, xr = F.chord(verts, float(u["nozzle_y"]))
+            assert xl < -float(u["bar_half"]) and float(u["bar_half"]) < xr                           # the inlet bar is inside the chord
+    game = F.FountainGame(size="small")
+    before = game.state()["compute"]["epoch"]
+    game.do({"type": "fountain_choice", "name": "shape", "value": "hexagon"})
+    state = game.state()["compute"]
+    assert state["epoch"] == before + 1 and state["uniforms"]["py3"] > 0.0
+    ids = {c["id"]: c for c in game.state()["controls_ui"]}
+    assert ids["shape"]["kind"] == "select" and [o[0] for o in ids["shape"]["options"]] == list(F.SHAPES)
+
+
+def test_a_violent_grain_stays_inside_every_polygon_chamber(native_piece):
+    """Grains thrown at the walls and corners at 6-12 m/s end inside the chamber (the walls are thick, sided half-spaces through
+    the same contact law; a grain on the wrong side is pushed back, never out)."""
+    piece, _columns = native_piece
+    n = F.N_SMALL
+    throws = {"funnel": [((-0.10, 0.12), (-3.0, -8.0)), ((0.12, 0.30), (6.0, -6.0))], "hexagon": [((-0.12, 0.10), (-6.0, -6.0)), ((0.1, 0.05), (5.0, -9.0))],
+              "ramp": [((0.12, 0.05), (9.0, -4.0)), ((-0.12, 0.2), (-9.0, 0.0))]}
+    for shape, grains in throws.items():
+        cols = F.initial_columns(n, mix=0.0, shape=shape)
+        cols.update(age=np.full(n, -1.0e9))
+        for i, ((px, py), (vx, vy)) in enumerate(grains):
+            cols["age"][i], cols["x"][i], cols["y"][i], cols["vx"][i], cols["vy"][i] = 1.0e3, px, py, vx, vy
+        out = F.run_frames(piece, cols, 400)
+        verts = F.shape_vertices(shape, F.basin(n))
+        for i in range(len(grains)):
+            xl, xr = F.chord(verts, float(out["y"][i]))
+            assert xl - 0.01 <= float(out["x"][i]) <= xr + 0.01 and 0.0 <= float(out["y"][i]) <= verts[0][1] + 0.01, (shape, i)
+        assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0, shape
