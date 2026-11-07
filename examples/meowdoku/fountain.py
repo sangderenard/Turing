@@ -104,6 +104,8 @@ STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
 # the page's render looks for the particle field (web/particle_styles.js STYLES -- a test holds the two lists equal)
 PARTICLE_STYLES = (("points", "points"), ("liquid", "liquid"), ("sand", "sand"), ("glow", "glow"), ("heat", "heat"),
                    ("stamp", "stamp (memory)"))
+# the page's noise-filter replacement modes (web/noise_filter.js NOISE_MODES -- a test holds the two lists equal)
+NOISE_MODES = (("mean", "mean colour"), ("spectral", "spectral class"))
 K_RUN = 24                             # candidates walked per row run (a hex pack of the smallest grains is ~9; 24 covers a 2.5x compressed one)
 ARMED = -1.0e9                         # the vy of an id waiting at its nozzle slot (see ``fountain_step``)
 EMIT_MARGIN = 1.0e-3                   # an id is emitted only where no live grain, at its NEXT-step position, is within contact distance + this
@@ -824,6 +826,12 @@ class FountainGame(Game):
             # the particle field's render look is the page's own too (web/particle_styles.js STYLES: same ids, same order); render only
             {"id": "pstyle", "kind": "select", "label": "look", "local": "particle_style", "value": "points",
              "options": [[tag, label] for tag, label in PARTICLE_STYLES]},
+            # the spectral noise filter over the look (web/noise_filter.js): speckle becomes a solid colour; also the page's own, render only
+            {"id": "nf", "kind": "toggle", "label": "noise filter", "local": "noise_on", "value": False},
+            {"id": "nfmode", "kind": "select", "label": "replace with", "local": "noise_mode", "value": "mean",
+             "options": [[tag, label] for tag, label in NOISE_MODES]},
+            {"id": "nfstrength", "kind": "range", "label": "strength", "min": 0, "max": 1, "step": 0.05, "local": "noise_strength", "value": 0.85},
+            {"id": "nfthr", "kind": "range", "label": "threshold", "min": 0.2, "max": 0.9, "step": 0.05, "local": "noise_threshold", "value": 0.5},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",

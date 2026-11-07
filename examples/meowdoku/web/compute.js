@@ -53,6 +53,7 @@
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
 import { ParticleStyles } from "./particle_styles.js";
+import { NoiseFilter } from "./noise_filter.js";
 
 async function json(url) {
   const response = await fetch(url);
@@ -931,6 +932,7 @@ export class PointCloud {
   constructor(gl, link, compile) {
     this.gl = gl;
     this.styles = new ParticleStyles(gl, link, compile);       // the selectable looks (particle_styles.js); `style` of draw picks one
+    this.noise = new NoiseFilter(gl, link, compile);            // the render-only spectral noise filter layered over any look (noise_filter.js); `noise` of draw
     this.program = link(compile(gl.VERTEX_SHADER, POINT_VS), compile(gl.FRAGMENT_SHADER, POINT_FS));
     this.resolve = link(compile(gl.VERTEX_SHADER, RESOLVE_VS), compile(gl.FRAGMENT_SHADER, RESOLVE_FS));
     this.vao = gl.createVertexArray(); gl.bindVertexArray(this.vao);
@@ -966,7 +968,12 @@ export class PointCloud {
 
   // data: packed points ([x, y, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
-  draw(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
+  draw(data, opts) {
+    this.#drawField(data, opts);
+    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y }, opts.noise);
+    else this.noise.fallback = "";
+  }
+  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
