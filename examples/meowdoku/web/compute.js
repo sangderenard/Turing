@@ -434,6 +434,25 @@ class WasmProduct {
 // absolute floor (per id) and a fraction of its peak, with the largest speed under a limit, for `hold_samples` samples in
 // a row.  The step of the sample that completes the hold is S; phase 2 stops at exactly S.  `fountain.SettleDetector`
 // is the same rule in Python (held against this one by tests/test_meowdoku_fountain.py).
+// The glyph start's placed grains (game.compute.start, glyph_start.GlyphStart.payload): x y z (and rs for a swelling species) as 16-bit fixed
+// point over `bounds`, decoded to float32 columns of the product's length.  They are fed beside the image colours (reset({named})): the
+// run starts from these positions at rest.  Python's glyph_start.decode_payload is this formula.
+export function decodeStart(start, pad) {
+  const bytes = (text) => { const bin = atob(text), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
+  const q = bytes(start.xyz), b = start.bounds, out = {};
+  ["x", "y", "z"].forEach((name, c) => {
+    const column = new Float32Array(pad), lo = b[2 * c], span = b[2 * c + 1] - lo;
+    for (let i = 0; i < start.n; i++) column[i] = lo + q[3 * i + c] / 65535 * span;
+    out[name] = column;
+  });
+  if (start.rs) {
+    const r = bytes(start.rs), column = new Float32Array(pad);
+    for (let i = 0; i < start.n; i++) column[i] = r[i] / 65535 * start.rmax;
+    out.rs = column;
+  }
+  return out;
+}
+
 export class SettleDetector {
   constructor(p, active, pad) { this.p = p; this.active = active; this.pad = pad; this.peak = 0; this.quiet = 0; }
   push(step, d) {
@@ -480,7 +499,7 @@ export class ComputeRuntime {
     this.onStatus = onStatus; this.onSamples = onSamples; this.onSupport = onSupport || (() => {});
     this.spec = null; this.manifest = null; this.product = null; this.productKey = null;
     this.epoch = null; this.uniforms = {}; this.support = null;
-    this.named = {}; this.raster = null; this.sampleSpec = null; this.rest = null; this.verdict = null;
+    this.named = {}; this.start = null; this.raster = null; this.sampleSpec = null; this.rest = null; this.verdict = null;
     this.restPending = false; this.stepMs = 0; this.recovering = false;
     this.steps = 0; this.running = false; this.last = 0; this.fps = 0; this.frames = 0; this.fpsAt = 0;
     this.route = ""; this.why = ""; this.warn = false; this.queue = Promise.resolve(); this.error = null;
@@ -539,6 +558,7 @@ export class ComputeRuntime {
     }
     if (spec.epoch !== this.epoch) {
       this.epoch = spec.epoch; this.uniforms = { ...spec.uniforms };
+      this.start = spec.start ? decodeStart(spec.start, this.rec.pad) : null;       // a glyph start: the placed grains
       this.#reset();
     } else {
       // the runtime inputs belong to the page from the first reset on: the server's numbers for them are only defaults
@@ -693,7 +713,7 @@ export class ComputeRuntime {
     this.token++; this.arrived.clear();
     this.#release(this.tape.clear());
     this.lawInputs = this.#inputsNow();
-    this.product.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs } });
+    this.product.reset({ named: { ...this.named, ...this.start }, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...this.lawInputs } });
     this.steps = 0; this.running = true; this.last = performance.now() / 1000; this.resimming = false;
     this.restPending = true; this.lastDone = 0; this.diagAt = 0;
     this.tape.setInputs(0, this.lawInputs);
@@ -908,7 +928,7 @@ export class ComputeRuntime {
     if (f < tape.hi) {
       const plan = tape.plan(f);
       if (plan.key) p.restore(plan.key.snap);
-      else p.reset({ named: this.named, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...(plan.initial || {}) } });
+      else p.reset({ named: { ...this.named, ...this.start }, uniforms: { ...this.rec.uniforms, ...this.uniforms, ...(plan.initial || {}) } });
       for (const [name, value] of Object.entries(plan.initial || {})) p.setUniform(name, value);
       for (const op of plan.ops) {
         if (op.set) for (const [name, value] of Object.entries(op.set)) p.setUniform(name, value);

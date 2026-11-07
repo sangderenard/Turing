@@ -5045,6 +5045,13 @@ function renderGameControls(game) {
         el.append(input);
       }
       else if (s.kind === "readout") { el = document.createElement("span"); el.className = "gctl-readout"; }
+      else if (s.kind === "text") {                     // a free text the server validates (the glyph start's string): sent when committed, which restarts the run
+        el = document.createElement("label"); const tag = document.createElement("span"); tag.textContent = s.label + " "; el.append(tag);
+        const input = document.createElement("input"); input.type = "text"; input.spellcheck = false; input.autocomplete = "off";
+        if (s.maxlength) input.maxLength = s.maxlength;
+        input.onchange = () => act({ type: s.action, [s.field]: input.value });
+        el.append(input);
+      }
       else if (s.kind === "file") {
         el = document.createElement("label"); el.className = "gctl-file"; el.append(s.label);
         const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.hidden = true;
