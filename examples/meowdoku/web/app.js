@@ -16,6 +16,8 @@ import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES }
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
 import * as rl from "./replay_layers.js";                                                          // [GHOSTS] replay layers (pure logic)
+import { qrMatrix } from "./tipjar.js";                                                                 // [QRWALL] (the wall is the QR of the jar's URI)
+import { qrWallLayout, qrWallFaces, wallPlacement, headOnView, OBSIDIAN, FROST } from "./qr_wall.js";   // [QRWALL] pure layout, cube geometry, head-on camera
 import { initTipJar } from "./tipjar.js";                                                              // the tip jar's panel and grain picker
 import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
 import * as wl from "./wordle_layout.js";                                                             // Wordle: the rack, entry bar and give-up tile layout (pure)
@@ -811,6 +813,45 @@ function drawBodyBlur(b, frame, dh = 0) {
     }
   }
   wheelBlur.drew = rg.disc >= 1 ? "disc" : rg.disc > 0 ? "smear+disc" : "smear"; wheelBlur.copies = n;
+}
+// [QRWALL] THE TIP JAR'S QR WALL: the cubes of qr_wall.js (one mesh, per-vertex material: obsidian / frosted glass) behind the jar's back pane, built
+// once per URI (and when the chamber, the board or the materials change; never per frame), drawn with the housing in the case's frame.  Toggle
+// "QR wall" (a page spec: share links carry it); "QR head-on view" turns the camera to face it straight on and fill the view.
+const qrWall = { on: true, key: "", mesh: null, wall: null, cubes: 0 };
+try { const saved = localStorage.getItem("meowdoku.qrwall"); if (saved != null) qrWall.on = saved === "1"; } catch { /* storage may be blocked */ }
+const QRWALL_SPEC = { id: "qrwall", kind: "toggle", label: "QR wall", local: "qrwall" };
+const QRFRONT_SPEC = { id: "qrfront", kind: "button", label: "QR head-on view", local: "qrfront" };
+function updateQrWall() {
+  const g = state.game, c = g && g.compute, t = g && g.tipjar, uri = t && t.uri;
+  const bounds = c && c.chamber_mesh && c.chamber_mesh.bounds;
+  const key = qrWall.on && uri && bounds && g.game === "fountain3d" && state.materialIndex[OBSIDIAN] != null
+    ? JSON.stringify([uri, bounds, c.view, g.width, g.height, state.materialsVersion]) : "";
+  if (qrWall.key === key) return;
+  if (qrWall.mesh) disposeMesh(qrWall.mesh);
+  qrWall.key = key; qrWall.mesh = null; qrWall.wall = null;
+  if (!key) return;
+  try {
+    const layout = qrWallLayout(qrMatrix(uri)), map = lawToWorld(g), k = map(1, 0, 0)[0] - map(0, 0, 0)[0];
+    const wall = wallPlacement(bounds, map, k);
+    qrWall.wall = wall; qrWall.cubes = layout.counts.cubes;
+    qrWall.mesh = litMesh(qrWallFaces(layout, wall, { [OBSIDIAN]: state.materialIndex[OBSIDIAN], [FROST]: state.materialIndex[FROST] }));
+  } catch (e) { console.warn("[meowdoku] the QR wall could not be built:", e.message || e); }
+}
+// the camera goal that faces the wall head-on and fills the part of the view the page's panel leaves free
+function qrHeadOnGoal() {
+  const wall = qrWall.wall, ext = state.extent;
+  if (!wall || !ext) return null;
+  const r = canvas.getBoundingClientRect(), panel = document.getElementById("tipjar"), pr = panel && panel.style.display !== "none" ? panel.getBoundingClientRect() : null;
+  const wide = pr && pr.width > 0.6 * r.width;                     // a phone: the panel is a strip along the bottom
+  const reserve = pr && pr.width > 0 ? (wide ? { right: 0, bottom: Math.max(0, r.bottom - pr.top) } : { right: Math.max(0, r.right - pr.left), bottom: 0 }) : { right: 0, bottom: 0 };
+  return headOnView(wall, { dist0: camView.lastR / Math.exp(camView.cur.lz), targetY: 0, centre: [extMidX(ext) + (ext.x0 || 0) / 2, extMidZ(ext)], tanHalf: Math.tan(0.31), w: r.width, h: r.height }, reserve);
+}
+function qrHeadOn() {
+  const goal = qrHeadOnGoal(); if (!goal) return false;
+  const was = camView.goal;
+  if (Math.abs(was.pitch) < 1e-3 && Math.abs(was.yaw) < 1e-3 && Math.abs(was.lz - goal.lz) < 0.02) { resetCameraView(); return true; }    // pressed again: back to the usual view
+  Object.assign(camView.goal, goal); for (const k of CV_KEYS) camView.vel[k] = 0;
+  return true;
 }
 function updateHousing() {
   const g = state.game, c = g && g.compute;
@@ -1896,6 +1937,11 @@ function uploadMaterials(game) {
     records.push([`outline@glass~${k}`, [0.78, 0.92, 1.0], { roughness: 0.04, transmission: 0.55, opacity: 0.55 * f, ior: 1.5, specular: 0.9, shininess: 120, emission: [0.22 * f, 0.42 * f, 0.62 * f] }]);
   }
   records.push(["housing_matte", [0.10, 0.10, 0.11], { roughness: 0.95, specular: 0.02 }]);   // the panes' matte fill (panes "matte")
+  // [QRWALL] the tip jar's QR wall: OBSIDIAN cubes (the dark modules; Wordle's volcanic glass: near black, glossy, a little transmission) and
+  // FROSTED glass cubes (the light modules and the quiet zone; profile 3 = the depth layer's scatter, bright and translucent, with an emission
+  // so a dim sun leaves them light).  Appended last: nothing above moves.
+  records.push([OBSIDIAN, [0.022, 0.022, 0.028], { roughness: 0.06, transmission: 0.2, opacity: 0.96, ior: 1.5, specular: 0.8, shininess: 140 }]);
+  records.push([FROST, [0.97, 0.98, 1.0], { roughness: 0.75, transmission: 0.3, opacity: 0.9, ior: 1.5, specular: 0.25, shininess: 20, profile: 3, thicknessMm: 3, thicknessLayer: FINISH_LAYER_FROST, translucence: 1.0, emission: [0.40, 0.41, 0.43] }]);
   const tables = {};
   state.materialIndex = {};
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
@@ -4982,6 +5028,7 @@ function colorPick() {
 function localValue(s) {
   if (s.local && s.local.startsWith("ghosts")) return rl.settingValue(ghostSettings, s.local) ?? s.value;     // [GHOSTS]
   if (s.local === "wheelblur") return wheelBlur.on;
+  if (s.local === "qrwall") return qrWall.on;                                      // [QRWALL]
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
@@ -4995,6 +5042,12 @@ function localControl(s, value) {
     try { localStorage.setItem("meowdoku.wheelblur", wheelBlur.on ? "1" : "0"); } catch { /* storage may be blocked */ }
     return;
   }
+  if (s.local === "qrwall") {                                                      // [QRWALL]
+    qrWall.on = !!value;
+    try { localStorage.setItem("meowdoku.qrwall", qrWall.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+    return;
+  }
+  if (s.local === "qrfront") { qrHeadOn(); return; }                               // [QRWALL]
   if (s.local === "worldcurve") {
     setWorldCurve(Number(value));                                                  // [CURVE]
     return;
@@ -5475,6 +5528,7 @@ function pageSpecs(specs) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
     if (state.game && state.game.game === "fountain3d") out = [...out, PANES_SPEC];
+    if (state.game && state.game.tipjar) out = [...out, QRWALL_SPEC, QRFRONT_SPEC];                 // [QRWALL]
     if (state.game && (state.game.game === "fountain" || state.game.game === "fountain3d")) out = [...out, WHEELBLUR_SPEC, ...GHOST_SPECS];     // [GHOSTS]
     const run = out.findIndex((s) => s.local === "rebirth");
     if (run >= 0) out = [...out.slice(0, run), RECORD_SPEC, ...out.slice(run)];
@@ -5935,6 +5989,7 @@ function litPass(cam, now, casters, opts = {}) {
   drawCockpit(cam, drawLit);
   // the glass plate under everything: blended, no depth write
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  if (!opts.broadcast && qrWall.mesh) drawLit(qrWall.mesh.vao, qrWall.mesh.count, state.caseModel || M.identity(), null);   // [QRWALL] the farthest glass: behind the jar's back pane
   if (layerOn("glass") && !backdropClear()) drawLit(state.glass.vao, state.glass.count, state.caseModel || M.identity(), null, plate ? PLATE_GROUP : 0);
   if (!opts.broadcast && statusPlateWanted()) { drawStatusPlate(cam, state.caseModel); gl.useProgram(P); }
   if (!opts.broadcast && state.housing && state.housing.mesh) drawLit(state.housing.mesh.vao, state.housing.mesh.count, state.caseModel || M.identity(), null);
@@ -5975,6 +6030,7 @@ function caseModelNow() {
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
 window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;
+window.meowdokuDebug.qrwall = { state: qrWall, headOn: qrHeadOn, goal: qrHeadOnGoal, project: (p) => M.apply(camera().viewProj, p) };   // [QRWALL] (debug: the page check frames its oblique views with project)
 window.meowdokuDebug.drawFrame = (ms) => { const keep = window.requestAnimationFrame; window.requestAnimationFrame = () => 0; try { draw(ms); } finally { window.requestAnimationFrame = keep; } };   // one frame, no rAF (a hidden pane)
 
 function draw(ms) {
@@ -5989,6 +6045,7 @@ function draw(ms) {
   const cam = camera(); updateLight(now);
   state.caseModel = caseModelNow();
   updateHousing();
+  updateQrWall();                                                                   // [QRWALL]
   wheelBlurFrame(state.game, cam);
   status.style.visibility = statusPlateWanted() ? "hidden" : "";       // the status text is on the plate instead (layout unchanged)
   const glassTiles = state.glassDraws = wordleTileDraws(now);                       // Wordle's tiles are translucent obsidian: drawn blended after the plate, not as casters
@@ -6510,7 +6567,7 @@ function cameraGestures() {
   const ext = state.extent || { width: 6, depth: 6 }, lim = d.limits || {};
   return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false, tilt: d.tilt !== false,
            target: Array.isArray(d.target) ? d.target : null,
-           zoomLim: g.zoom ? [-Math.log(zoomLimits(g).max), -Math.log(zoomLimits(g).min)] : (lim.zoom || [0.3, 3]).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],
+           zoomLim: g.zoom ? [-Math.log(zoomLimits(g).max), -Math.log(zoomLimits(g).min)] : (lim.zoom || (g.tipjar ? [0.1, 3] : [0.3, 3])).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],     // [QRWALL] (the tip jar zooms in further: a tall jar's wall is small on its board)
            panLim: lim.pan != null ? lim.pan : Math.max(ext.width, extLength(ext)) };
 }
 const CV_KEYS = ["yaw", "pitch", "lz", "px", "pz"];

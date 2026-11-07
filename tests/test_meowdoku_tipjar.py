@@ -289,3 +289,15 @@ def test_the_game_state_carries_the_demo_panel_and_no_address():
 def test_qr_code_helpers_in_node():
     done = subprocess.run(["node", str(ROOT / "tests" / "meowdoku_tipjar_check.mjs")], capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_qr_wall_layout_in_node():
+    """[QRWALL] the module -> cube layout, material assignment, cube geometry and the head-on camera (web/qr_wall.js)."""
+    done = subprocess.run(["node", str(ROOT / "tests" / "meowdoku_qrwall_check.mjs")], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_qr_wall_is_exported_with_the_page():
+    """[QRWALL] web_export copies qr_wall.js beside the page (app.js imports it)."""
+    assert '"qr_wall.js"' in (ROOT / "examples" / "meowdoku" / "web_export.py").read_text(encoding="utf-8")

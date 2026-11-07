@@ -15,6 +15,11 @@ const m = qrMatrix("bitcoin:bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
 eq(m.length, 29, "a 50-byte payload is version 3");
 for (let i = 8; i < 21; i++) { eq(m[6][i], i % 2 === 0, "timing row " + i); eq(m[i][6], i % 2 === 0, "timing col " + i); }
 for (const [x, y] of [[0, 0], [22, 0], [0, 22]]) { eq(m[y + 3][x + 3], true, "finder centre"); eq(m[y + 1][x + 1], false, "finder ring"); eq(m[y][x], true, "finder corner"); }
+// [QRWALL] every finder is the full 7 x 7 ring (the timing lines are drawn UNDER the finders; they once cut a gap in each finder's edge and no scanner could read the code),
+// with its light separator
+const finder = ["#######", "#.....#", "#.###.#", "#.###.#", "#.###.#", "#.....#", "#######"];
+for (const [fx, fy] of [[0, 0], [22, 0], [0, 22]]) for (let dy = 0; dy < 7; dy++) eq(m[fy + dy].slice(fx, fx + 7).map((v) => (v ? "#" : ".")).join(""), finder[dy], `finder row ${dy} at ${fx},${fy}`);
+for (let i = 0; i < 8; i++) { eq(m[7][i], false, "separator below the top-left finder"); eq(m[i][7], false, "separator right of the top-left finder"); }
 eq(m[29 - 8][8], true, "dark module");
 eq(m[22][22], true, "alignment centre");
 eq(qrMatrix("a").length, 21, "version 1");
