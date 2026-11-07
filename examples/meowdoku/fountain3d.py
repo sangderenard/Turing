@@ -9,7 +9,7 @@ inlet, its launch velocity, its species and so radius, mass and friction -- is
 DERIVED IN THE LAW from the id itself by an integer hash done in exact float
 arithmetic (every intermediate is a whole number below 2**24, so f64 and f32
 agree to the bit and native, wasm and WGSL cannot disagree).  The only per-id
-columns are the state (x y z vx vy vz wx wy wz age), the iota ``pid`` (which
+columns are the state (x y z vx vy vz wx wy wz age rs), the iota ``pid`` (which
 the generated shader reads from its own invocation index, never from memory)
 and the image colours ``ir ig ib``.
 
@@ -36,6 +36,8 @@ PHYSICS
 * An INTERSTITIAL FLUID of density ``fl_rho`` and viscosity ``fl_mu`` acts on every grain: buoyancy (gravity times
   1 - fl_rho / rho), Stokes drag (6 pi mu r v) and quadratic drag, integrated IMPLICITLY so a stiff setting damps and
   never explodes.  Air, water and glycerine are presets of the page.
+* ORBEEZ: a species with ``swell`` > 0 swells in the fluid (the 2-D law's model; see ``FULL_COORDINATION``).  Its CURRENT radius is the state
+  column ``rs``; the mass follows it (r^3), and the grid cell is sized for the largest radius a grain can reach (``cell_of``, swmax-aware).
 * TEMPERATURE: a Langevin thermostat.  ``temp`` (kT, a runtime uniform; 0 = off, exactly) adds to every live grain a
   random force and torque whose variance follows from the drag it feels (fluctuation-dissipation: 2 gamma m kT / DT), so
   small, light grains in a viscous fluid jitter most, like dust in water.  The noise is a hash of (id, step, component).
@@ -141,6 +143,19 @@ CELL = 2.0 * max(s[1] for s in SPECIES)  # the reference grid cell; the running 
 FLUIDS = {"air": (0.0005, 3.0e-6), "water": (0.38, 2.5e-5), "glycerine": (0.48, 2.0e-4)}
 DEFAULT_FLUID = "air"
 
+#: ORBEEZ (grains that swell with hydration), the 2-D law's model (``fountain.py``) in 3-D.  Per species ``swell`` (growth rate, a fraction of
+#: the initial radius per second; 0 = does not swell) and ``swmax`` (largest radius, a multiple of the initial one).  A grain's radius grows at
+#: ``swell x r0 x exposure x solvent``: ``exposure`` = 1 - contacts / ``FULL_COORDINATION`` (the grains and walls it touches close its surface)
+#: and ``solvent`` is the FLUID's (``fl_rho`` above air's over ``WET_RHO``, times ``WET_MU`` over ``fl_mu``, each clamped to 1: air 0, water 1, glycerine 1/2).
+#: The 3-D normaliser is 12 (a sphere's kissing number: the contacts of a grain in a close packing, so 12 contacts close it entirely; the
+#: 2-D law's 6 is the disk's).  The mass follows the volume (density constant: mass ~ r^3).
+SWELL_RATE_MAX = 0.5                   # 1/s
+SWELL_MAX_RATIO = 4.0
+FULL_COORDINATION = 12.0
+DRY_RHO = FLUIDS["air"][0]                 # the 3-D air has a density (the 2-D one has none): the uptake counts the fluid's density ABOVE it, so air soaks nothing, exactly
+WET_RHO = 0.38                         # a fluid at least this dense (water) fills a swelling grain's pores entirely; a thinner one proportionally less (air 0)
+WET_MU = 1.0e-4                        # up to this viscosity the uptake is not rate-limited; above it the uptake falls as WET_MU / mu (glycerine: 1/2)
+
 SHAPES = ("box", "funnel", "hexagon", "ramp")
 INLETS = ("fountain", "jet", "pour", "side")
 
@@ -167,6 +182,9 @@ def _params() -> dict[str, tuple]:
         out[f"e{s}"] = (f"{name} restitution", 0.02, 0.95, 0.01, restitution_of(ZETA), False, "Grains")
         out[f"roll{s}"] = (f"{name} roughness", 0.0, 0.3, 0.01, roll, False, "Grains")
         out[f"irr{s}"] = (f"{name} irregularity", 0.0, 0.3, 0.01, irr, True, "Grains")
+        # swell / swmax size the GRID (the largest radius a grain can reach), which is fixed when a run starts: a new run
+        out[f"swell{s}"] = (f"{name} swell rate (orbeez, 1/s)", 0.0, SWELL_RATE_MAX, 0.01, 0.0, True, "Grains")
+        out[f"swmax{s}"] = (f"{name} max swell (x radius)", 1.0, SWELL_MAX_RATIO, 0.1, 1.0, True, "Grains")
         out[f"wt{s}"] = (f"{name} share", 0.0, 1.0, 0.05, MONO_WEIGHT[s], True, "Grains")
     out.update({
         "omega": ("stiffness (compressibility)", 40.0, OMEGA_MAX, 5.0, OMEGA, False, "Physics"),
@@ -213,13 +231,15 @@ def size_factor_max(p: dict[str, float], s: int) -> float:
     return wide * math.sqrt(max(p["bi_ratio"], 1.0))
 
 
-def rmax_of(p: dict[str, float]) -> float:
-    return max(p[f"r{s}"] * size_factor_max(p, s) for s in range(len(SPECIES)))
+def rmax_of(p: dict[str, float], swollen: bool = False) -> float:
+    """The largest radius any grain has when it is placed; with ``swollen``, the largest it can REACH (a swelling species grows to ``swmax`` x)."""
+    return max(p[f"r{s}"] * size_factor_max(p, s) * (p[f"swmax{s}"] if swollen and p[f"swell{s}"] > 0.0 else 1.0) for s in range(len(SPECIES)))
 
 
 def cell_of(p: dict[str, float]) -> float:
-    """The grid cell: the largest diameter any grain can have (species radius with its size spread and bidisperse mode)."""
-    return 2.0 * rmax_of(p)
+    """The grid cell: the largest diameter any grain can reach (species radius with its size spread and bidisperse mode, and a swelling
+    species' growth to ``swmax`` x)."""
+    return 2.0 * rmax_of(p, True)
 
 
 def stiffness_of(p: dict[str, float]) -> float:
@@ -228,9 +248,9 @@ def stiffness_of(p: dict[str, float]) -> float:
     return min(p["omega"], OMEGA_MAX / math.sqrt(1.0 + 2.0 * p["hertz"]))
 
 
-STATE = ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz", "age")
+STATE = ("x", "y", "z", "vx", "vy", "vz", "wx", "wy", "wz", "age", "rs")          # rs: the grain's CURRENT radius (0 until placed; it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
-_SPECIES_UNIFORMS = tuple(f"{k}{s}" for k in ("r", "rho", "mu", "zeta", "roll", "irr") for s in range(len(SPECIES)))
+_SPECIES_UNIFORMS = tuple(f"{k}{s}" for k in ("r", "rho", "mu", "zeta", "roll", "irr", "swell", "swmax") for s in range(len(SPECIES)))
 POLYGON_UNIFORMS = tuple(f"{c}{k}" for c in ("px", "py") for k in range(NV))
 #: ANALYTIC SDF CHAMBERS (true 3-D solids; runtime uniforms, no recompile when the chamber changes).  ``SDF_SLOTS`` primitive slots, each
 #: ``q<k><field>``: ``kind`` (0 unused), ``role`` (0 FLUID: the chamber's inside; 1 SOLID: an obstacle inside it), the centre ``cx cy cz``, the
@@ -321,11 +341,21 @@ def fit_scale(s: float, aspect: float) -> float:
     return (b + math.sqrt(b * b + 4.0 * w * 0.6 * a * s)) / (2.0 * w)
 
 
-def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+def basin(n: int, aspect: float | None = None, cell: float = CELL, shape: str | None = None) -> dict[str, float]:
     """Geometry for ``n`` active ids: basin and nozzle scale with sqrt(n / N_BASE).  ``aspect`` (the screen's
     width / height, clamped) stretches it to fill that screen at the same pile area; ``None`` is the reference basin.
-    ``cell`` is the grid cell (``cell_of``).  Every number the law needs is a RUNTIME uniform (see ``uniforms``)."""
+    ``cell`` is the grid cell (``cell_of``).  Every number the law needs is a RUNTIME uniform (see ``uniforms``).
+    An SDF ``shape`` is not stretched to the screen: its solid keeps its DESIGNED proportions (``sdf_design``: scaled by the id count and the grain
+    size) and the view, grid and lid follow the solid's bounding box plus a margin of three cells."""
     s = math.sqrt(n / N_BASE)
+    if shape in SDF_SHAPES:
+        c, w, top = sdf_design(shape, s, cell)
+        half = w + 2.0 * c
+        cols = int(math.ceil(2.0 * half / cell))
+        rows = int(math.ceil((top + 0.1) / cell))
+        return {"scale": s, "stretch": 1.0, "width": 2.0 * half, "half": half, "nozzle_y": top, "bar_half": 0.8 * s, "cols": cols, "rows": rows,
+                "cells": cols * rows, "cell": cell, "view": (-(w + 3.0 * c), w + 3.0 * c, -VIEW_BOTTOM * s, top + 3.0 * c),
+                "sdf_w": w, "sdf_top": top}
     k = 1.0 if not aspect else fit_scale(s, aspect)
     width = WIDTH_BASE * s * k
     nozzle_y = 0.6 * s / k + 0.7
@@ -336,18 +366,18 @@ def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, 
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
 
 
-def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
+def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL, shape: str | None = None) -> dict[str, float]:
     """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
     jet's reach and a grid tall enough to cover everything under it."""
-    geo = basin(n, aspect, cell)
+    geo = basin(n, aspect, cell, shape)
     lid = geo["nozzle_y"] + LID_ABOVE
     return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
 
 
-def depth_cap(n: int, cell: float = CELL, aspect: float | None = None) -> float:
+def depth_cap(n: int, cell: float = CELL, aspect: float | None = None, shape: str | None = None) -> float:
     """The deepest box that ``n`` ids can have: the cell index (cols x rows x lays) is a float32 whole number, so it must stay under
     ``KEY_MAX`` (< 2**24).  The cap is whole cells of ``cell`` (every size below 10M clears the default depth; 10M is capped lower)."""
-    geo = basin(n, aspect, cell)
+    geo = basin(n, aspect, cell, shape)
     lays = KEY_MAX // (geo["cols"] * (geo["rows"] + ROWS_MARGIN))
     return max(1, lays) * cell
 
@@ -457,10 +487,32 @@ TET_HALF_Z = 0.5 * (TET_Z_HI + TET_Z_LO)
 Z_MARGIN_CELLS = 1.5                                                          # a solid keeps this many cells from the front and back glass
 
 
-def window_fit(geo: dict[str, float]) -> tuple[float, float, float]:
-    """(cell, w, top): the window the SDF solids are inscribed in, |x| <= w, 0 <= y <= top, a margin of three cells inside the view."""
-    c = geo.get("cell", CELL)
-    return c, 0.5 * (geo["view"][1] - geo["view"][0]) - 3.0 * c, geo["view"][3] - 3.0 * c
+HOURGLASS_ASPECT = 2.6                 # the hourglass is 2.6 half-widths tall
+TOY_ASPECT_W, TOY_ASPECT_C = 2.24, 17.5   # the toy's height, in half-widths and in cells: the lowest ramp's low end clears the throat (see ``sdf_design``)
+TOY_PEG_ROWS = 5                       # the toy's peg field has at least this many rows (they fill 0.22 of the height, 4.6 cells apart)
+
+
+def sdf_design(shape: str, s: float, c: float) -> tuple[float, float, float]:
+    """``(cell, w, top)``: the DESIGNED bounding box of an SDF chamber, |x| <= w and 0 <= y <= top, for the id scale ``s`` (sqrt(n / N_BASE)) and the
+    grain cell ``c``.  The half-width is the reference window's (the same at any screen aspect); the height is the solid's own: a sphere, cube and
+    torus are as tall as wide, the tetrahedron stands at its natural 4/3 circumradius, the hourglass is ``HOURGLASS_ASPECT`` half-widths and the toy is as
+    tall as its parts need -- the lowest ramp's low end (``TOY_ASPECT_W`` half-widths + ``TOY_ASPECT_C`` cells up from the floor) clears the throat above
+    the peg field, which has ``TOY_PEG_ROWS`` rows of pegs 4.6 cells apart -- so a smaller or coarser chamber grows TALLER relative to its width."""
+    w = max(VIEW_SIDE * s - 3.0 * c, 4.0 * c)
+    if shape in ("sdf_sphere", "sdf_cube", "sdf_torus"):
+        return c, w, 2.0 * w
+    if shape == "sdf_tetra":
+        return c, w, (4.0 / 3.0) * w / TET_X
+    if shape == "sdf_hourglass":
+        return c, w, max(HOURGLASS_ASPECT * w, 30.0 * c)
+    if shape == "sdf_toy":
+        return c, w, max(TOY_ASPECT_W * w + TOY_ASPECT_C * c, (TOY_PEG_ROWS - 1) * 4.6 * c / 0.22)
+    raise ValueError(f"unknown SDF chamber {shape!r}")
+
+
+def window_fit(shape: str, geo: dict[str, float]) -> tuple[float, float, float]:
+    """(cell, w, top): the designed bounding box of the SDF solid (``sdf_design``) for the basin ``geo``'s id scale and cell."""
+    return sdf_design(shape, geo["scale"], geo.get("cell", CELL))
 
 
 def _torus_fit(big: float, c: float, dm: float) -> float:
@@ -469,9 +521,9 @@ def _torus_fit(big: float, c: float, dm: float) -> float:
 
 
 def sdf_default_depth(shape: str, geo: dict[str, float]) -> float:
-    """The depth an SDF chamber is built for when the page has not set one: the z extent of the solid inscribed in the WINDOW, plus the margin
+    """The depth an SDF chamber is built for when the page has not set one: the z extent of the designed solid (``sdf_design``), plus the margin
     to the glass (a sphere needs a ball's depth; the toy keeps the old default, its parts all run through the depth)."""
-    c, w, top = window_fit(geo)
+    c, w, top = window_fit(shape, geo)
     if shape == "sdf_toy":
         return DEPTH_DEFAULT
     if shape in ("sdf_sphere", "sdf_cube"):
@@ -488,10 +540,10 @@ def sdf_default_depth(shape: str, geo: dict[str, float]) -> float:
 
 
 def sdf_preset(shape: str, geo: dict[str, float], dh: float) -> dict[str, Any]:
-    """An SDF chamber as slots (pure data): the solid INSCRIBED in the visible window (|x| <= w, 0 <= y <= top, a margin of three cells) AND in
+    """An SDF chamber as slots (pure data): the solid in its DESIGNED box (``sdf_design``: |x| <= w, 0 <= y <= top; the view follows it) AND in
     the depth (|z| <= dh less ``Z_MARGIN_CELLS`` cells), as large as fits; and where its inlet goes (``nozzle_y``) -- the inlet is then fitted
     inside the fluid by ``fit_inlet``.  Revolved and standing solids are centred in z; the toy's parts all run through the depth."""
-    c, w, top = window_fit(geo)
+    c, w, top = window_fit(shape, geo)
     dm = max(dh - Z_MARGIN_CELLS * c, 0.5 * c)
     slots: list[dict[str, float]] = []
     bar = 0.4 * w
@@ -598,7 +650,7 @@ def chamber_depth(n: int, aspect: float | None, shape: str, p: dict[str, float],
     depth = p["depth"]
     if shape in SDF_SHAPES and "depth" not in (params or {}):
         depth = min(max(sdf_default_depth(shape, geo), PARAMS["depth"][1]), PARAMS["depth"][2])
-    return min(depth, depth_cap(n, geo["cell"], aspect))
+    return min(depth, depth_cap(n, geo["cell"], aspect, shape))
 
 
 _SDF_SETUPS: dict[tuple, tuple[dict[str, float], list[dict[str, float]]]] = {}
@@ -635,7 +687,7 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
     if "spread" not in (params or {}):
         p["spread"] = inlet_default_spread(inlet)
     cell = cell_of(p)
-    geo = basin(n, aspect, cell)
+    geo = basin(n, aspect, cell, shape)
     out: dict[str, float] = {"mode": mode, "use_image": use_image}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     sdf = shape in SDF_SHAPES
@@ -665,7 +717,8 @@ def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5,
                 "fl_rho": p["fl_rho"], "fl_mu": p["fl_mu"]})
     for s in range(len(SPECIES)):
         out.update({f"wt{s}": p[f"wt{s}"], f"r{s}": p[f"r{s}"], f"rho{s}": p[f"rho{s}"], f"mu{s}": p[f"mu{s}"],
-                    f"zeta{s}": zeta_of(p[f"e{s}"]), f"roll{s}": p[f"roll{s}"], f"irr{s}": p[f"irr{s}"]})
+                    f"zeta{s}": zeta_of(p[f"e{s}"]), f"roll{s}": p[f"roll{s}"], f"irr{s}": p[f"irr{s}"],
+                    f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
@@ -992,7 +1045,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
     def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
         a = dict(zip(ARGUMENTS, args))
-        x, y, z, vx, vy, vz, wx, wy, wz, age = (a[k] for k in STATE)
+        x, y, z, vx, vy, vz, wx, wy, wz, age, rs = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         half, nozzle_y, bar_half, cols, rows, lays, cell, dh, bar_z = (a[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows", "lays", "cell", "dh", "bar_z"))
         emit_rate, k_run, spread, nozzle_speed = a["emit_rate"], a["k_run"], a["spread"], a["nozzle_speed"]
@@ -1000,6 +1053,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         lid, strata, mode, use_image = a["lid"], a["strata"], a["mode"], a["use_image"]
         omega, hertz, coh, spin_drag, fl_rho, fl_mu, temp = (a[k] for k in ("omega", "hertz", "coh", "spin_drag", "fl_rho", "fl_mu", "temp"))
         lognormal, bi_ratio, bi_frac = a["lognormal"], a["bi_ratio"], a["bi_frac"]
+        # the ORBEEZ solvent IS the fluid: the uptake is the fraction of a swelling grain's pores the fluid fills (its density over WET_RHO,
+        # 1 at most: air 0, water 1) times the rate limit of its viscosity (1 up to WET_MU, then WET_MU / mu: glycerine 1/2)
+        solvent = ((fl_rho - DRY_RHO) * (1.0 / (WET_RHO - DRY_RHO))).clamp(0.0, 1.0) * (WET_MU / (fl_mu + 1.0e-12)).clamp(0.0, 1.0)
         centre = (a["nozzle_x"], nozzle_y, a["nozzle_z"])
         d_in = (a["in_dx"], a["in_dy"], a["in_dz"])
         e1 = (a["e1x"], a["e1y"], a["e1z"])
@@ -1039,6 +1095,15 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             rho = pick(table("rho"), m1, m2, m3)
             return (rr, rho, rho * ((4.0 / 3.0) * math.pi) * rr * rr * rr, pick(table("mu"), m1, m2, m3),
                     pick(table("zeta"), m1, m2, m3), pick(table("roll"), m1, m2, m3))
+
+        def current(ident, sp):
+            """``species`` of an id with its CURRENT radius (the state ``rs``; the species radius until the id is placed) and the mass that
+            follows it (density x 4/3 pi r^3): (radius, density, mass, friction, damping ratio, rolling, species radius).  With no swelling
+            ``rs`` is the species radius, and every value is the unswollen law's, bit for bit."""
+            r0_, rho_, _m0, mu_, zeta_, roll_ = sp
+            rs_ = rs.index_select(0, ident) if ident is not pid else rs
+            rc = AbstractTensor.where(rs_ > 0.0, rs_, r0_)
+            return rc, rho_, rho_ * ((4.0 / 3.0) * math.pi) * rc * rc * rc, mu_, zeta_, roll_, r0_
 
         def frame(search):
             """emit time and the state of each id, from the id and its state.  Evaluated again after the sort
@@ -1089,7 +1154,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         zero = x * 0.0
         f_ = [zero, zero, zero]
         q_ = [zero, zero, zero]
-        blk = [zero, zero]                  # [blocked, dropped] (updated by the walk)
+        blk = [zero, zero, zero]            # [blocked, dropped, contacts] (updated by the walk and the walls); the contacts close an orbeez's surface
         top = float(n - 1)
         own = []                            # what this id is (its species values), derived at the FIRST walk: after the first search
         # reads the sorted cells, so no value is derived in the sort's last dispatch and carried into the next (it would hold a slot)
@@ -1097,8 +1162,8 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         def walk(lo, hi, ok):
             """The particle-particle contacts of one run: forces from the neighbours' state."""
             if not own:
-                own.append(species(pid))
-            radius, density, mass, mu, zeta, roll = own[0]
+                own.append(current(pid, species(pid)))
+            radius, density, mass, mu, zeta, roll, _r0 = own[0]
             # candidates beyond the walk's reach (``k_run``) are DROPPED contacts: counted (the law's dropped output), never silent
             blk[1] = blk[1] + (hi - lo - k_run).clamp(0.0, 1.0e9) * ok * searching
             for slot in range(K_RUN_MAX):
@@ -1114,7 +1179,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 vxj = vx.index_select(0, j)
                 vzj = vz.index_select(0, j)
                 wj = (wx.index_select(0, j), wy.index_select(0, j), wz.index_select(0, j))
-                rj, _dj, mj, muj, zetaj, rollj = species(j)
+                rj, _dj, mj, muj, zetaj, rollj, _rj0 = current(j, species(j))
                 # coincident centres (two ids at one point) have no contact normal; they are pushed apart
                 # along a direction fixed by the ids (antisymmetric, so equal and opposite) instead of
                 # dividing a zero separation
@@ -1144,6 +1209,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                 force, torque = _contact(radius + rj - dist, valid * (1.0 - armed_j), nrm, vr, spin_slip, wrel, kn, m_eff,
                                          (mu * muj).sqrt(), (zeta * zetaj).sqrt(), (roll * rollj).sqrt(), radius,
                                          radius * rj / (radius + rj), 0.5 * (radius + rj), hertz, coh)
+                blk[2] = blk[2] + as_float(radius + rj - dist > 0.0) * valid * (1.0 - armed_j)         # a real contact closes the surface
                 for k in range(3):
                     f_[k] = f_[k] + force[k]
                     q_[k] = q_[k] + torque[k]
@@ -1172,8 +1238,8 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
                         hi = AbstractTensor.where(run_live * (1.0 - below) > 0.5, mid, hi)
                     ends.append(lo)
                 walk(ends[0], ends[1], ok)
-        blocked, dropped = blk
-        radius, density, mass, mu, zeta, roll = own[0]
+        blocked, dropped, _contacts = blk
+        radius, density, mass, mu, zeta, roll, radius0 = own[0]
         inertia = 0.4 * mass * radius * radius
         w_self = (wx, wy, wz)
 
@@ -1185,6 +1251,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         def wall(dl, valid, n_vec):
             force, torque = _contact(dl, valid, n_vec, (vx, vy, vz), _cross((radius * wx, radius * wy, radius * wz), n_vec),
                                      w_self, kw, mass, mu, zeta, roll, radius, radius, radius, hertz, coh)
+            blk[2] = blk[2] + as_float(dl.clamp(0.0, 1.0e9) * valid > 0.0)               # a wall touching the grain closes its surface too
             for k in range(3):
                 f_[k] = f_[k] + force[k]
                 q_[k] = q_[k] + torque[k]
@@ -1288,6 +1355,17 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * DT)
         age_next = age + DT
+        # ---- ORBEEZ: a swelling species takes up solvent through its OPEN surface.  A grain's surface is closed by what it touches (the
+        # grains and walls in contact, ``FULL_COORDINATION`` closing it entirely), so its radius grows at ``swell`` x its initial radius per
+        # second times the exposed fraction times the solvent present (the fluid's: 0 in air), up to ``swmax`` x the initial radius.  The
+        # mass follows the volume (density constant), through ``current``.  A pure function of the state: deterministic.  With swell = 0
+        # (the default) every term is an exact zero and the radius is the species radius, bit for bit.
+        g1, g2, g3 = masks(_mix(pid, 1237.0, 5.0))
+        swell = pick(table("swell"), g1, g2, g3)
+        swmax = pick(table("swmax"), g1, g2, g3)
+        exposure = (1.0 - blk[2] * (1.0 / FULL_COORDINATION)).clamp(0.0, 1.0)
+        grown = _cap(rs + live * (swell * radius0 * exposure * solvent) * DT, radius0 * swmax)
+        rs_next = AbstractTensor.where(place > 0.5, radius0, grown)
         # ---- colour from the angle of the launch vector.  theta_c is a hashed launch angle (+-0.7 rad, whatever the cone):
         # the hue turns four times as fast as it so the fan spans most of the wheel: trig = atan2, rotation = the
         # double-angle formulas applied twice to cos/sin (no atan2).
@@ -1346,7 +1424,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True):
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
-        return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, cr, cg, cb, radius, act,
+        return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, rs_next, cr, cg, cb, radius, act,
                 ke, v2, c_nan, c_out, c_parked, c_live, c_drop)
 
     return fountain_step
@@ -1470,12 +1548,13 @@ N_SMALL = SIZES["small"][0]
 BOARD = board_size(basin(N_FULL)["view"])
 
 
-#: The compiler's arena for this law (``fountain3d_build``: 13 feeds + 22 outputs + the reduction's 14 = 49 slots, 196 B/id; a test holds it equal to the
+#: The compiler's arena for this law (``fountain3d_build``: 14 feeds + 23 outputs + the reduction's 14 = 51 slots, 204 B/id; a test holds it equal to the
 #: generated program's), stacked into at most 7 lane bindings beside the uniform head.  The z grid adds no per-id column: the cell index is rebuilt
-#: from the state, so the volume costs what the slab did.  A binding is ``ceil(49 / 7) = 7`` slots of ``n`` floats at the sizes where the 256 MiB split
-#: does not apply: 10M ids need 280 MB per binding, over the 240 MB ``maxStorageBufferBindingSize`` class limit (the runtime refuses a device that
-#: cannot hold it, with the reason on screen).
-ARENA_SLOTS = 49
+#: from the state, so the volume costs what the slab did; the orbeez radius ``rs`` is the one state column added since (2 slots: its feed and its
+#: output, 49 -> 51).  A binding is ``ceil(51 / 7) = 8`` slots of ``n`` floats at the sizes where the class-limit split does not apply: 10M ids need
+#: 320 MB per binding (280 MB before ``rs``), over the 240 MB ``maxStorageBufferBindingSize`` class limit (the runtime refuses a device that
+#: cannot hold it, with the reason on screen; the size control says what 10M needs).  Seven lanes cannot absorb the slot (7 x 7 = 49).
+ARENA_SLOTS = 51
 STORAGE_LANES = 7
 BINDING_CLASS_LIMIT = 240e6
 BINDING_SPLIT_BYTES = int(BINDING_CLASS_LIMIT)               # the generator splits a binding at the class limit (not 256 MiB)

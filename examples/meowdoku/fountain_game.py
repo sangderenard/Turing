@@ -76,7 +76,7 @@ class FountainGame(Game):
         if "spread" not in self.params:
             p["spread"] = inlet_default_spread(self.inlet)
         if self.shape in SDF_SHAPES and "depth" not in self.params:        # an SDF chamber is built to the depth its solid needs, until the page sets one
-            p["depth"] = chamber_depth(self.n, self.aspect, self.shape, p, self.params, basin(self.n, self.aspect, cell_of(p)))
+            p["depth"] = chamber_depth(self.n, self.aspect, self.shape, p, self.params, basin(self.n, self.aspect, cell_of(p), self.shape))
         return p
 
     def uniforms(self, *, image: bool = False) -> dict[str, np.ndarray]:
@@ -202,7 +202,7 @@ class FountainGame(Game):
     def _control(self, name: str, kind: str = "range", **extra) -> dict[str, Any]:
         label, lo, hi, step, default, restart, group = PARAMS[name]
         if name == "depth":                      # the deepest box this size's grid can index (a float32 cell index: 10M ids cap lower)
-            hi = min(hi, depth_cap(self.n, cell_of(self.resolved()), self.aspect))
+            hi = min(hi, depth_cap(self.n, cell_of(self.resolved()), self.aspect, self.shape))
         value = self.resolved()[name]
         spec = {"id": name, "kind": kind, "label": label, "min": lo, "max": hi, "step": step, "value": value,
                 "action": "fountain_param", "name": name, "field": "value", "group": group}
@@ -256,6 +256,7 @@ class FountainGame(Game):
         ]
         for s, (name, *_rest) in enumerate(SPECIES):                 # Grains: the species table
             for key, label in (("r", "radius"), ("rho", "density"), ("mu", "friction"), ("e", "restitution"),
+                               ("swell", "swell rate (orbeez, 1/s)"), ("swmax", "max swell (x radius)"),
                                ("roll", "roughness"), ("irr", "irregularity"), ("wt", "share")):
                 ctl = self._control(f"{key}{s}")
                 ctl["label"] = f"{name} {label}"
@@ -286,7 +287,7 @@ class FountainGame(Game):
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect, cell_of(self.resolved()))
+        return basin(self.n, self.aspect, cell_of(self.resolved()), self.shape)
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
@@ -313,7 +314,7 @@ class FountainGame(Game):
                 "view": list(geo["view"]), "aspect": self.aspect, "depth": 2.0 * float(self.uniforms()["dh"]),
                 "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved())),
+                "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved()), self.shape),
             },
         })
         return base
@@ -426,7 +427,7 @@ def chamber_mesh(shape: str, n: int, aspect: float | None = None, params: dict |
     if key in _MESHES:
         return _MESHES[key]
     u = {k: float(v) for k, v in uniforms(n=n, aspect=aspect, params=params, shape=shape).items()}
-    geo = basin(n, aspect, cell)
+    geo = basin(n, aspect, cell, shape)
     x0, x1, y0, y1 = geo["view"]
     dh = u["dh"]
     if _planar(u):
