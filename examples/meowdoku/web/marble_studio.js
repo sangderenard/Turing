@@ -45,6 +45,7 @@ function rotateQuaternion(q) {
     r[0][2],r[1][2],r[2][2],0,0,0,0,1]);
 }
 const translate3=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
+const transformPoint=(m,[x,y,z])=>[m[0]*x+m[4]*y+m[8]*z+m[12],m[1]*x+m[5]*y+m[9]*z+m[13],m[2]*x+m[6]*y+m[10]*z+m[14]];
 const scale3=(s)=>new Float32Array([s,0,0,0,0,s,0,0,0,0,s,0,0,0,0,1]);
 function perspective(aspect) {
   const f = 1 / Math.tan(Math.PI / 7), near = 0.1, far = 30;
@@ -336,7 +337,7 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
-  const skipPhotoInvalidation=new Set(["object-name","saved-object","layer","preview-engine","preview-motion",
+  const skipPhotoInvalidation=new Set(["object-name","saved-object","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
     if(!event.target.closest("#photo-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
@@ -398,6 +399,7 @@ function controls() {
   $("reset-roll").addEventListener("click",resetRoll);
   const syncPreviewMotion=()=>{
     const motion=$("preview-motion").value;
+    $("preview-camera").disabled=$("preview-engine").value!=="particle";
     $("preview-arc").disabled=motion!=="rock";
     $("preview-hz-out").value=`${(+$("preview-hz").value).toFixed(2)} Hz`;
     $("preview-phase-out").value=`${$("preview-phase").value}°`;
@@ -409,11 +411,17 @@ function controls() {
   for(const name of ["preview-motion","preview-axis","preview-hz","preview-phase","preview-arc"])
     $(name).addEventListener("input",syncPreviewMotion);
   $("preview-engine").addEventListener("change",()=>{
+    $("preview-camera").disabled=$("preview-engine").value!=="particle";
     if($("preview-engine").value==="particle") {
       sim.status="Loading compiled particle and native containing case…";simStatus();
       startSim().catch((error)=>{sim.status=`Particle simulation unavailable: ${error.message||error}`;simStatus();});
     } else {sim.runtime?.sync(null);sim.status="Visual preview (cheap): object motion only";simStatus();}
   });
+  $("preview-camera").addEventListener("change",()=>{
+    $("preview-camera").title=$("preview-camera").value==="marble"?
+      "Follows the simulated particle position; the packed frame has no spin orientation":"Shows the whole containing case";
+  });
+  $("preview-camera").dispatchEvent(new Event("change"));
   for(const id of ["sim-radius","sim-rho","sim-mu","sim-e","sim-roll","sim-irr"])
     $(id).addEventListener("change",()=>{if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});});
   syncPreviewMotion();
@@ -498,19 +506,25 @@ function frame(now=0) {
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
   gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
-    const view=multiply(translate(simOn? -Math.max(distance,7): -distance),multiply(rotateX(pitch),rotateY(yaw)));
+    const follow=simOn&&$("preview-camera").value==="marble";
+    const cameraDistance=simOn&&!follow?Math.max(distance,7):distance;
+    const baseView=multiply(translate(-cameraDistance),multiply(rotateX(pitch),rotateY(yaw)));
     const radius=+$("radius-mm").value/1000;
     let object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
     const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
     const axis=$("preview-axis").value;
     const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
-    let caseM=identity(),haveParticle=true;
+    let caseM=identity(),haveParticle=true,particleWorld=null;
     if(simOn) {
       const runtime=sim.runtime,pt=livePreviewParticle(runtime?.points());
       haveParticle=!!(runtime?.ready&&pt&&sim.map);
       if(runtime?.ready&&runtime.shown!=null) caseM=caseModel(runtime.caseAngleAt(runtime.shown*runtime.snap),0,0,runtime.caseAxis||axis,0);
-      if(haveParticle) {const p=sim.map.point([pt.x,pt.y,pt.z]);object=multiply(caseM,multiply(translate3(...p),scale3(pt.radius*sim.map.scale)));}
+      if(haveParticle) {const p=sim.map.point([pt.x,pt.y,pt.z]);particleWorld=transformPoint(caseM,p);
+        object=multiply(caseM,multiply(translate3(...p),scale3(pt.radius*sim.map.scale)));}
     }
+    // The law position is in the case frame. Apply the same physical case
+    // transform as the containing mesh before anchoring the camera to it.
+    const view=follow&&particleWorld?multiply(baseView,translate3(...particleWorld.map((v)=>-v))):baseView;
     const mv=multiply(view,simOn?object:multiply(object,preview));
     gl.useProgram(P);
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
