@@ -58,6 +58,7 @@ from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.profiles import Profiles  # noqa: E402
 from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_frame  # noqa: E402
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
+from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PROFILES = ROOT / "build" / "meowdoku" / "profiles.json"
@@ -148,6 +149,7 @@ class Table:
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:
             raise ValueError(f"unknown game {kind!r}")
+        self.new_payload = dict(payload)        # LIFECYCLE: what rebuilds this game after a restart (lifecycle.dump_table)
         self.apply_hero()
         return self.state()
 
@@ -309,6 +311,7 @@ class Sessions:
         self.share_hits: dict[str, list] = {}                             # client address -> recent share POST times
         boards = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.board_count = len(boards["boards"])
+        self.lifecycle = None                   # LIFECYCLE: set by main(); restores a saved session for a cookie that has a file
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -317,6 +320,11 @@ class Sessions:
                 del self.tables[key]
                 self.spectate.drop_owner(key)       # a session that ended takes its viewer token with it
             fresh = token not in self.tables
+            if fresh and token and self.lifecycle is not None:       # LIFECYCLE: a cookie with a saved session gets it back
+                restored = self.lifecycle.restore_for(token)
+                if restored is not None:
+                    self.tables[token] = [restored, now]
+                    fresh = False
             if fresh:
                 token = secrets.token_urlsafe(24)
                 self.tables[token] = [Table(self.web_dir, self.profiles), now]
@@ -349,7 +357,7 @@ def make_handler(sessions: Sessions):
 
         def log_message(self, format, *args):  # noqa: A002 - quiet static and polling logs
             line = str(args[0]) if args else ""
-            if "/api/" in line and "/api/action" not in line and "/api/state" not in line:
+            if "/api/" in line and "/api/action" not in line and "/api/state" not in line and "/api/lifecycle?" not in line:   # LIFECYCLE: the poll is quiet
                 sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
         def _table(self) -> Table:
@@ -498,6 +506,8 @@ def make_handler(sessions: Sessions):
 
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
+                return self._lifecycle_get()
             if path == "/api/spectate/watch":
                 return self._watch()
             if path.startswith("/api/share/"):
@@ -522,7 +532,48 @@ def make_handler(sessions: Sessions):
                     return self._json(table.profile())
             return super().do_GET()
 
+        # ---- LIFECYCLE (lifecycle.py): the announcement every page reads, the page's copy re-seeding a session, and the admin trigger.
+        def _lifecycle_get(self) -> None:
+            from http.cookies import SimpleCookie
+            from urllib.parse import parse_qs, urlparse
+            lc = sessions.lifecycle
+            self._set_cookie = []
+            out = lc.status()
+            query = parse_qs(urlparse(self.path).query)
+            if query.get("snap") and not self._is_viewer():
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                out.update(lc.snapshot_for(jar[COOKIE].value if COOKIE in jar else None, (query.get("have") or [None])[0]))
+            self._json(out)
+
+        def _lifecycle_post(self, path: str, length: int) -> None:
+            lc = sessions.lifecycle
+            if path == "/api/admin/lifecycle":
+                forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
+                ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
+                                                                self.headers.get("X-Meowdoku-Admin"), lc.token)
+                if not ok:
+                    self.close_connection = True
+                    return self._json({"error": why}, status)
+                try:
+                    return self._json(lc.request_json(json.loads(self.rfile.read(length) or b"{}")))
+                except (ValueError, TypeError) as error:
+                    return self._json({"error": str(error)}, getattr(error, "status", 400))
+            if length > 2 * lifecycle_mod.DUMP_MAX_BYTES:
+                self.close_connection = True
+                return self._json({"error": "this session copy is too large"}, 413)
+            try:
+                dump = json.loads(self.rfile.read(length) or b"{}").get("dump")
+                table = self._table()
+                lifecycle_mod.restore_table(table, dump)
+                with table.lock:
+                    return self._json(table.state())
+            except (ValueError, TypeError, AttributeError) as error:
+                return self._json({"error": f"{type(error).__name__}: {error}"}, getattr(error, "status", 400))
+
         def do_POST(self):  # noqa: N802
+            path0 = self.path.split("?", 1)[0]
+            if path0 in ("/api/admin/lifecycle", "/api/lifecycle/restore") and not self._is_viewer():
+                return self._lifecycle_post(path0, int(self.headers.get("Content-Length") or 0))
             if self._is_viewer():
                 return self._refuse_viewer()                  # every POST (new, action, profile, share, spectate) is an owner's
             length = int(self.headers.get("Content-Length") or 0)
@@ -725,6 +776,10 @@ def main(argv: list[str] | None = None) -> int:
         idle_trainer.start_default()                    # studies recorded play whenever the server is idle
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
+    lc = lifecycle_mod.Lifecycle(sessions, web_dir.parent, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
+    lc.server, sessions.lifecycle = server, lc
+    lifecycle_mod.record_launch(lc.paths, args.port, args.bind, web_dir)
+    threading.Thread(target=lc.run, name="lifecycle", daemon=True).start()
     scheme = "http"
     if args.tls_cert:
         import ssl
@@ -740,7 +795,12 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
-    return 0
+    finally:
+        lc.stopping = True
+        if not lc.exit_code:
+            lc.save_all()                                   # LIFECYCLE: a Ctrl-C keeps the sessions too
+        server.server_close()
+    return lc.exit_code
 
 
 if __name__ == "__main__":
