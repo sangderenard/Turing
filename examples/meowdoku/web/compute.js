@@ -52,8 +52,9 @@
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
-import { ParticleStyles } from "./particle_styles.js";
+import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms } from "./particle_styles.js";
 import { NoiseFilter } from "./noise_filter.js";
+const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
   const response = await fetch(url);
@@ -907,6 +908,7 @@ export class ComputeRuntime {
 //     footprint divides colour by coverage and composites over the scene with alpha = min(coverage, 1).  Dense regions show
 //     their true average colour; sparse ones stay faint.
 const POINT_VS = `#version 300 es
+${GRAIN_COLOR_GLSL}
 layout(location=0) in vec2 aPos;
 layout(location=1) in vec4 aColor;
 layout(location=2) in float aMeta;
@@ -915,7 +917,7 @@ uniform int uPass;            // 0 splat (small), 1 disc (large), 2 small direct
 uniform float uThreshold;     // the diameter (px) below which a particle is accumulated
 out vec4 vColor; out float vDiameter; out float vCover; flat out vec2 vCenter;
 void main() {
-  vColor = aColor; vDiameter = 0.0; vCover = 0.0; vCenter = vec2(0.0);
+  vColor = grainColor(aColor, aMeta); vDiameter = 0.0; vCover = 0.0; vCenter = vec2(0.0);
   gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0;
   if (aMeta < 50.0) return;
   float flag = floor(aMeta / 100.0 + 0.001);
@@ -988,7 +990,7 @@ export class PointCloud {
     gl.bindVertexArray(null);
     this.emptyVao = gl.createVertexArray();
     this.max = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
-    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uFocal", "uViewport", "uMax", "uStride", "uPass", "uThreshold", "u_background"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
+    this.loc = Object.fromEntries(["uViewProj", "uMap", "uBoard", "uFocal", "uViewport", "uMax", "uStride", "uPass", "uThreshold", "u_background", "uTint", "uGrain", "uLut", "uBands"].map((n) => [n, gl.getUniformLocation(this.program, n)]));
     this.rloc = Object.fromEntries(["uViewProj", "uBoard", "uMargin", "uAccum"].map((n) => [n, gl.getUniformLocation(this.resolve, n)]));
     // a float target to accumulate into; without one, small particles fall back to alpha-blended sub-pixel dots (same area weighting)
     this.floatOk = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
@@ -1015,10 +1017,10 @@ export class PointCloud {
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
   draw(data, opts) {
     this.#drawField(data, opts);
-    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y }, opts.noise);
+    if (opts.noise && data) this.noise.apply(data, { vao: this.vao, viewProj: opts.viewProj, view: opts.view, board: opts.board, y: opts.y, tint: opts.tint }, opts.noise);
     else this.noise.fallback = "";
   }
-  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
+  #drawField(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera, tint, colorMode, grain, scene, heat }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
@@ -1029,7 +1031,7 @@ export class PointCloud {
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
     const n = data.length / 4;
     // a selected style (particle_styles.js) draws the frame itself; "points", and a style this device cannot run, go on below
-    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
+    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, buffer: this.dyn, tint, colorMode, grain, scene, heat, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
                                                                  map: [(x0 + x1) / 2, (y0 + y1) / 2, k], now: performance.now() })) return;
     const setUniforms = (pass) => {
       gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
@@ -1038,6 +1040,7 @@ export class PointCloud {
       gl.uniform1f(this.loc.uFocal, focal * H / 2); gl.uniform2f(this.loc.uViewport, W, H); gl.uniform1f(this.loc.uMax, this.max);
       gl.uniform1f(this.loc.uStride, stride || 1); gl.uniform1f(this.loc.uThreshold, 1.25);
       gl.uniform3fv(this.loc.u_background, new Float32Array(background || [0.085, 0.085, 0.1]));
+      grainUniforms(gl, (n) => this.loc[n], tint, grain);
       gl.uniform1i(this.loc.uPass, pass);
     };
     gl.useProgram(this.program);
