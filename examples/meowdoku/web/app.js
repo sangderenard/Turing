@@ -51,6 +51,7 @@ import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, 
          dollyParams, projectionMatrix, pickPlane } from "./world_curve.js";                                                 // [CURVE]
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
 import { catEyeMarble } from "./marble_mesh.js";
+import { marbleGravityVector } from "./marble_controls.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -4983,7 +4984,7 @@ function applyState(game, { meta = false } = {}) {
   chessClockSync(game);
   if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
-  if (game.game === "marble_madness") { compute.setSpin(0); compute.setGravity(0, -0.75, 0); }
+  if (game.game === "marble_madness") { compute.setSpin(0); compute.setCaseTilt(0); compute.setGravity(0, -1, 0); }
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   mobroad.state = state;
@@ -5114,15 +5115,27 @@ for (const type of ["keydown", "keyup"]) window.addEventListener(type, (event) =
   if (type === "keydown") marbleKeys.add(key); else marbleKeys.delete(key);
 });
 window.addEventListener("blur", () => marbleKeys.clear());
-for (const button of document.querySelectorAll("#marble-pad [data-marble-key]")) {
-  const key = button.dataset.marbleKey;
-  button.addEventListener("pointerdown", (event) => { button.setPointerCapture(event.pointerId); marbleKeys.add(key); event.preventDefault(); });
-  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) button.addEventListener(type, () => marbleKeys.delete(key));
+const marbleSticks = { x: $("marble-stick-x"), z: $("marble-stick-z") };
+let marblePhoneTilt = false;
+try { marblePhoneTilt = localStorage.getItem("meowdoku.marble.phoneTilt") === "1"; } catch { /* storage may be blocked */ }
+$("marble-phone-tilt").checked = marblePhoneTilt;
+$("marble-phone-tilt").addEventListener("change", (event) => {
+  marblePhoneTilt = event.target.checked;
+  try { localStorage.setItem("meowdoku.marble.phoneTilt", marblePhoneTilt ? "1" : "0"); } catch { /* storage may be blocked */ }
+  if (marblePhoneTilt) { gravitySensor.enabled = true; gravitySensor.grant(); }
+});
+for (const stick of Object.values(marbleSticks)) {
+  const release = () => { stick.value = "0"; };
+  stick.addEventListener("pointerup", release);
+  stick.addEventListener("pointercancel", release);
+  stick.addEventListener("lostpointercapture", release);
 }
 function marbleGravity() {
-  const x = (marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0);
-  const y = marbleKeys.has("up") ? -0.35 : marbleKeys.has("down") ? -1.15 : -0.75;
-  compute.setGravity(0.68 * x, y, 0);
+  const x = ((marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0)) * 0.7 + Number(marbleSticks.x.value) / 100;
+  const z = ((marbleKeys.has("down") ? 1 : 0) - (marbleKeys.has("up") ? 1 : 0)) * 0.7 + Number(marbleSticks.z.value) / 100;
+  const manual = x !== 0 || z !== 0;
+  const phone = marblePhoneTilt && !manual && gravitySensor.enabled ? gravitySensor.last : null;
+  compute.setGravity(...marbleGravityVector(x, z, phone));
 }
 // TIP JAR (tipjar.js): the panel, the grain picker and the state poll of the tip jar game (a game state that carries `tipjar`); inert otherwise.
 const tipjar = initTipJar({
@@ -5143,6 +5156,7 @@ const gravitySensor = new GravitySensor({
   onState: () => refreshLocalControls(),
 });
 try { gravitySensor.wanted = localStorage.getItem("meowdoku.tilt") !== "0"; } catch { /* storage may be blocked */ }
+if (marblePhoneTilt) gravitySensor.wanted = true;
 if (new URLSearchParams(location.search).get("studio") === "1") gravitySensor.wanted = false;
 gravitySensor.start();
 const firstTap = () => { for (const type of ["click", "touchend"]) removeEventListener(type, firstTap, true); gravitySensor.grant(); };
