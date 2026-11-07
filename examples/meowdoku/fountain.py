@@ -100,6 +100,9 @@ COH_RANGE = 0.1                        # adhesion acts to this gap (in mean radi
 STRATA = 1.0                           # default hue cycles over the emission in mode 2 (time strata); a runtime uniform ``strata``
 #: The time-strata rates the page offers (hue cycles over one emission): slower keeps wider bands of one colour in place.
 STRATA_CHOICES = (0.5, 1.0, 2.0, 4.0, 8.0)
+# the page's render looks for the particle field (web/particle_styles.js STYLES -- a test holds the two lists equal)
+PARTICLE_STYLES = (("points", "points"), ("liquid", "liquid"), ("sand", "sand"), ("glow", "glow"), ("heat", "heat"),
+                   ("stamp", "stamp (memory)"))
 K_RUN_MAX = 32                         # candidates walked per row run: the compile-time maximum of the runtime uniform ``k_run``
 K_RUN = 24                             # its default (a hex pack of the smallest grains in a thin slab is ~9-15 per run)
 ARMED = -1.0e9                         # the vy of an id waiting at its inlet slot (see ``fountain_step``)
@@ -1102,6 +1105,9 @@ class FountainGame(Game):
             {"id": "continue", "kind": "button", "label": "Continue", "local": "continue"},
             {"id": "tilt", "kind": "toggle", "label": "phone gravity", "local": "tilt", "value": True},
             {"id": "orbit", "kind": "toggle", "label": "auto-rotate", "local": "orbit", "value": False},
+            # the particle field's render look is the page's own too (web/particle_styles.js STYLES: same ids, same order); render only
+            {"id": "pstyle", "kind": "select", "label": "look", "local": "particle_style", "value": "points",
+             "options": [[tag, label] for tag, label in PARTICLE_STYLES]},
             {"id": "mix", "kind": "range", "label": "poly mix", "min": 0, "max": 1, "step": 0.05,
              "value": self.mix, "action": "fountain_start", "field": "mix", "aspect": True},
             {"id": "mode", "kind": "select", "label": "colour", "value": self.mode, "action": "fountain_mode",

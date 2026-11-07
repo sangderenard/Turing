@@ -481,7 +481,11 @@ class EntityGame(Game):
     input = "realtime"
     width = 15.0
     height = 13.0
-    max_frame = 0.25          # longer gaps (a hidden tab) are dropped, shorter ones landed whole
+    #: The longest wall gap one tick lands whole; a longer one (a hidden tab) is dropped.  It must clear the longest
+    #: check-in the page may relax to (``SYNC_MAX``) with room for the network's jitter: a cap AT the relaxed
+    #: cadence cut the law's time short on every late tick, so the law fell behind the wall it is locked to
+    #: (the timing negotiation: ``law_wall``) and the page's picture of the pilot was pulled back each time.
+    max_frame = 0.5
     CONTROLS: tuple[str, ...] = ()
     #: The player's lane and its motion law's constants: ``speed``, ``tau``,
     #: ``reach`` and, per predicted axis (``x``, and ``y`` for 2D games),
@@ -514,6 +518,13 @@ class EntityGame(Game):
         self.session = EntitySession(piece, columns, self.CONTROLS, rewind_depth=0)
         self.sync_parameters()
         self.last_tick: float | None = None
+        #: THE LAW'S PLACE ON THE SERVER'S WALL.  A tick lands the wall time since the previous tick STARTED, so the law
+        #: clock and the server's wall clock advance together; ``law_wall`` is the wall instant (``perf_counter``) the
+        #: last tick began, the law state standing for law time ``clock`` at it, and ``law_wall - clock`` (where law
+        #: time zero stands on the wall) is constant for as long as no tick was cut short by ``max_frame``; a cut
+        #: moves it later by exactly the time dropped.  The snapshot carries it, and the page locks its law time to
+        #: it (web/pilot_clock.js).
+        self.law_wall: float = time.perf_counter()
         self.ticks = 0
         self.held: dict[str, float] = {}
         self.ack = None           # the last input interval landed
@@ -529,8 +540,26 @@ class EntityGame(Game):
     #: the policy work; the page predicts the ship between decisions).
     PILOT_STEP = 1.0 / 10.0
 
+    def _catch_up(self) -> None:
+        """Land the wall time since the previous tick under the pilot, as the pilot is handed back to a person.  The
+        pilot's time is the wall's (a tick lands the wall time since the previous one began), so a hand-over between
+        two ticks would otherwise fly the whole gap since the last tick under the NEW controls: they would change a
+        gap before the moment of the hand-over, and the page, which shows the pilot's controls until it sees the
+        hand-over, would be out by that much.  (Not done when the pilot takes over: a person's time is the page's
+        measured intervals, which already cover that gap and are landed with the next tick.)"""
+        if self.session.state is None or self.last_tick is None or self.intervals:
+            return
+        now = time.perf_counter()
+        seconds = min(self.max_frame, max(0.0, now - self.last_tick))
+        self.last_tick = now
+        self.law_wall = now
+        self._land(seconds, self.held)
+
     def set_autopilot(self, on: bool) -> None:
         """Hand the controls to the trained policy (server side); the page keeps drawing."""
+        started = time.perf_counter()
+        if not on and self.autopilot:
+            self._catch_up()
         if on:
             from meowdoku.autopilot import pilot_for
             self.pilot = pilot_for(self)         # refuses when there are no trained weights
@@ -539,6 +568,7 @@ class EntityGame(Game):
                 self.PILOT_STEP = decl.step      # a declared game holds each decision for its own step
         self.autopilot = bool(on)
         self._pilot_hold = 0.0
+        print(f"[meowdoku] autopilot {'on' if on else 'off'} ({self.game}): hand-over took {time.perf_counter() - started:.3f}s", flush=True)
 
     def _tracing(self) -> bool:
         """Whether a decision made now would be recorded for learning."""
@@ -783,6 +813,8 @@ class EntityGame(Game):
     def _adopt_outcome(self) -> str:
         ship, self.reported = getattr(self, "reported", None), None
         motion, k = self.motion(), self.PLAYER_LANE
+        if self.autopilot:
+            return "unreported"       # the pilot flies the ship (a report from a page still on its own controls is stale)
         if not ship or not motion or k is None or self.session.state is None or self.ack is None:
             return "unreported"
         if int(ship.get("seq", -1)) != self.ack or self.session.column("alive")[k] <= 0.0:
@@ -810,6 +842,8 @@ class EntityGame(Game):
         return "kept"
 
     def tick(self) -> None:
+        started = time.perf_counter()
+        self.law_wall = started
         if self.intervals and self.session.state is not None:
             # Input-timed: each interval is a round with its own controls.
             for interval in self.intervals:
@@ -820,11 +854,13 @@ class EntityGame(Game):
                 self.ack = int(interval["seq"])
             self.adopt_reported()
             self.intervals = []
-            self.last_tick = time.perf_counter()
+            # (the next wall tick lands the time since THIS one began, as a wall tick does: the law's clock keeps pace
+            # with the wall through a hand-over between a player's intervals and the pilot's wall time)
+            self.last_tick = started
             self.ticks += 1
             return
-        now = time.perf_counter()
-        seconds = 0.0 if self.last_tick is None else min(self.max_frame, now - self.last_tick)
+        now = started
+        seconds = 0.0 if self.last_tick is None else min(self.max_frame, max(0.0, now - self.last_tick))
         self.last_tick = now
         if self.session.state is None:
             seconds = max(seconds, 1.0 / 60.0)      # round zero instantiates the state
@@ -868,9 +904,11 @@ class EntityGame(Game):
         st["moves"] = self.ticks
         st["over"] = self.session.state is not None and self.result() is not None
         st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
+        st["law_wall"] = float(self.law_wall)
         st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
         st["sync_hint"] = self.sync_hint()
         st["autopilot"] = self.autopilot
+        st["piloted"] = bool(self.autopilot and self.pilot is not None)     # the snapshot's pilot flag: who flies the ship
         st["controls"] = list(self.CONTROLS)           # the control names this game's law takes
         if getattr(self, "MODES", None):
             st["modes"] = {"labels": dict(self.MODES), "on": self.modes()}

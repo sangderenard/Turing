@@ -182,6 +182,7 @@ def test_the_pages_image_sampling_equals_pythons_sample_raster(tmp_path):
     (tmp_path / "job.json").write_text(json.dumps({"n": n, "w": w, "h": h}))
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SAMPLE)
     done = subprocess.run(["node", str(tmp_path / "run.mjs"), str(tmp_path)], capture_output=True, text=True)
@@ -527,6 +528,7 @@ def test_the_pages_settle_rule_equals_pythons_on_a_native_series(tmp_path, emiss
     quiet["vmax2"][len(diag["ke"]):] = 1e-6
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "compute.js", tmp_path / "compute.js")
     shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "recording.js", tmp_path / "recording.js")
+    shutil.copyfile(ROOT / "examples" / "meowdoku" / "web" / "particle_styles.js", tmp_path / "particle_styles.js")
     shutil.copyfile(ROOT / "examples" / "mobile_reference_app" / "web" / "turing-wasm-shell.js", tmp_path / "turing-wasm-shell.js")
     (tmp_path / "run.mjs").write_text(JS_SETTLE)
     for series in (diag, quiet):
@@ -715,7 +717,7 @@ JS_GRAVITY = """
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const [dir] = process.argv.slice(2);
-const {gravityInScreen, gravityVector, gravityFromAcceleration, GravitySensor} = await import(pathToFileURL(`${dir}/gravity.js`).href);
+const {gravityInScreen, gravityVector, gravityFromAcceleration, GravitySensor, layoutTransform} = await import(pathToFileURL(`${dir}/gravity.js`).href);
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} vs ${b}`);
 let g = gravityInScreen(90, 0, 0); near(g[0], 0); near(g[1], -1);              // held upright: straight down the screen
 g = gravityInScreen(0, 0, 0); near(g[0], 0); near(g[1], 0);                     // lying flat: no pull in the screen's plane
@@ -749,6 +751,24 @@ assert.equal(await denied.grant(), 'denied');
 const plain = {addEventListener: (type, fn) => { listeners['plain' + type] = fn; }, screen: {orientation: {angle: 0}}};
 const other = new GravitySensor({win: plain, onGravity: (x, y) => calls.push([x, y])});
 assert.equal(other.enabled, true); other.start(); assert.ok(listeners.plaindeviceorientation);
+// iOS: BOTH permission requests are made inside the tap.  A request issued after an await has lost the tap's activation
+// and throws (it used to fail the whole grant, so the switch had to be cycled before gravity followed the phone).
+let active = true;
+const strict = (answer) => () => { if (!active) throw new Error('NotAllowedError: no user activation'); queueMicrotask(() => { active = false; }); return Promise.resolve(answer); };
+const L2 = {};
+const ios = new GravitySensor({win: {DeviceOrientationEvent: {requestPermission: strict('granted')}, DeviceMotionEvent: {requestPermission: strict('granted')},
+                                     screen: {orientation: {angle: 0}}, addEventListener: (type, fn) => { L2[type] = fn; }}, onGravity: () => {}});
+assert.equal(await ios.grant(), 'waiting'); assert.ok(L2.deviceorientation);
+// the layout lock: a turn of the screen is undone, and gravity is read in the locked frame
+assert.equal(layoutTransform(0, 0, 390, 844), null);
+assert.equal(layoutTransform(0, 90, 390, 844), 'translate(0px, 390px) rotate(-90deg)');
+assert.equal(layoutTransform(0, 270, 390, 844), 'translate(844px, 0px) rotate(90deg)');
+assert.equal(layoutTransform(90, 0, 844, 390), 'translate(390px, 0px) rotate(90deg)');
+const held = []; const L3 = {};
+const locked = new GravitySensor({win: {screen: {orientation: {angle: 90}}, addEventListener: (type, fn) => { L3[type] = fn; }}, onGravity: (x, y) => held.push([x, y])});
+locked.lockedAngle = 0; locked.start();
+L3.deviceorientation({beta: 90, gamma: 0});            // upright in the locked (portrait) frame, whatever the screen says
+near(held[0][0], 0); near(held[0][1], -1);
 console.log('ok');
 """
 
@@ -772,6 +792,48 @@ def test_the_recording_window_playback_and_continue_are_exact(tmp_path):
 @pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's gravity code")
 def test_the_phone_orientation_gives_the_screen_plane_gravity_and_the_sensor_asks_on_a_tap(tmp_path):
     assert _run_node(tmp_path, JS_GRAVITY, "gravity.js").strip() == "ok"
+
+
+JS_STYLES = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const [dir] = process.argv.slice(2);
+const {STYLES, STYLE_IDS, DEFAULT_STYLE, chooseStyle, styleAvailability} = await import(pathToFileURL(`${dir}/particle_styles.js`).href);
+const full = {floatRender: 'float', maxPointSize: 256}, half = {floatRender: 'half', maxPointSize: 256}, none = {floatRender: null, maxPointSize: 256};
+assert.equal(DEFAULT_STYLE, 'points'); assert.equal(STYLE_IDS[0], 'points'); assert.equal(new Set(STYLE_IDS).size, STYLE_IDS.length);
+// the default and unknown names are always points; an ordinary device runs every style
+assert.deepEqual(chooseStyle('points', null), {style: 'points', requested: 'points', reason: ''});
+assert.equal(chooseStyle('no-such-style', full).style, 'points');
+for (const id of STYLE_IDS) assert.equal(chooseStyle(id, full).style, id);
+// no float render targets: the float styles fall back to points and say why; sand loses only its ambient occlusion; stamp and glow need none
+for (const id of ['liquid', 'heat']) {
+  const c = chooseStyle(id, none);
+  assert.equal(c.style, 'points'); assert.equal(c.requested, id); assert.match(c.reason, /float/);
+}
+for (const id of ['sand', 'glow', 'stamp']) assert.equal(chooseStyle(id, none).style, id);
+assert.match(chooseStyle('sand', none).reason, /ambient/);
+// half float runs them, with the precision noted
+assert.equal(chooseStyle('liquid', half).style, 'liquid'); assert.match(chooseStyle('liquid', half).reason, /half/);
+// tiny point sprites (some phones): every sprite style falls back
+assert.equal(chooseStyle('glow', {floatRender: 'float', maxPointSize: 1}).style, 'points');
+// a style that failed at run time is not retried
+assert.equal(chooseStyle('liquid', full, {liquid: 'incomplete target'}).style, 'points');
+assert.match(chooseStyle('liquid', full, {liquid: 'incomplete target'}).reason, /incomplete target/);
+assert.equal(styleAvailability('liquid', null).ok, false);
+console.log(JSON.stringify(STYLES.map((s) => [s.id, s.label])));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the page's particle style registry")
+def test_the_particle_styles_registry_picks_a_style_the_device_can_run_and_matches_the_server(tmp_path):
+    """Render-only looks (web/particle_styles.js): the registry, what a device can run, the fallback to points -- and the
+    server's `look` control declares exactly the page's styles, in the page's order."""
+    import json
+    listed = json.loads(_run_node(tmp_path, JS_STYLES, "particle_styles.js").strip().splitlines()[-1])
+    ids = {item["id"]: item for item in F.FountainGame(size="small").state()["controls_ui"]}
+    look = ids["pstyle"]
+    assert look["kind"] == "select" and look["local"] == "particle_style" and look["value"] == "points"
+    assert look["options"] == listed
 
 
 # ------------------------------------------------------------- 3-D chamber, tunables, fluids, polygon, inlet

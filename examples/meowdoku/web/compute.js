@@ -52,6 +52,7 @@
 // positions and replays again, so the image still forms.
 import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
+import { ParticleStyles } from "./particle_styles.js";
 
 async function json(url) {
   const response = await fetch(url);
@@ -933,6 +934,7 @@ void main() {
 export class PointCloud {
   constructor(gl, link, compile) {
     this.gl = gl;
+    this.styles = new ParticleStyles(gl, link, compile);       // the selectable looks (particle_styles.js); `style` of draw picks one
     this.program = link(compile(gl.VERTEX_SHADER, POINT_VS), compile(gl.FRAGMENT_SHADER, POINT_FS));
     this.resolve = link(compile(gl.VERTEX_SHADER, RESOLVE_VS), compile(gl.FRAGMENT_SHADER, RESOLVE_FS));
     this.vao = gl.createVertexArray(); gl.bindVertexArray(this.vao);
@@ -968,7 +970,7 @@ export class PointCloud {
 
   // data: packed points ([x, y, z, rgba8, meta] per displayed id); view: the size's world window; focal: the projection's
   // vertical scale (proj[5]), turned into pixels with the CURRENT viewport's height
-  draw(data, { viewProj, view, board, y, focal, stride, background }) {
+  draw(data, { viewProj, view, board, y, focal, stride, background, style, lighting, camera }) {
     const gl = this.gl;
     if (!data) return;
     const [x0, x1, y0, y1] = view, k = Math.min(board[0] / (x1 - x0), board[1] / (y1 - y0));
@@ -978,6 +980,9 @@ export class PointCloud {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dyn);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
     const n = data.length / PT_WORDS;
+    // a selected style (particle_styles.js) draws the frame itself; "points", and a style this device cannot run, go on below
+    if (style && style !== "points" && this.styles.draw(style, { data, n, vao: this.vao, viewProj, board, y, focal, stride, background, lighting, camera, W, H, vp, bound,
+                                                                 map: [(x0 + x1) / 2, (y0 + y1) / 2, k], now: performance.now() })) return;
     const setUniforms = (pass) => {
       gl.uniformMatrix4fv(this.loc.uViewProj, false, viewProj);
       gl.uniform4f(this.loc.uMap, (x0 + x1) / 2, (y0 + y1) / 2, k, 0);

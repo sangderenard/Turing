@@ -51,6 +51,22 @@ deploy to 8766 as soon as work lands.
    - every particle is handed to fragment shaders;
    - persistent textures act as memory the points stamp sprites into (per-species sprites, trails and layering over time);
    - colour covers all particles.
+  - **Landed (first cut):** a page control "look" (web/particle_styles.js, render only): points (default), liquid (screen-space fluid), sand (shaded impostors + density AO), glow, heat (density and moving share: the packed points carry no velocity), stamp (a decaying 8-bit memory under the points, in board coordinates).
+  - **Open:** per-species sprites, stamped layers and trails per id, the memory following the 3D law, a velocity channel in the packed points (heat by speed).
+
+## Later desires (the user's, recorded 2026-11-06)
+
+- **Rigid objects in the fountain**, built from the platformer's map emojis and other drawing primitives:
+  - each object is free, pinned/jointed, or fixed;
+  - two-way force interaction with the grains (contacts write forces; only the integrator integrates);
+  - coupled through engine_toy's machine sim and its torque negotiation (its couplings, the dyno pattern), so a waterwheel in the sand toy can be driven (a motor turns it) or receptive (the sand turns it, delivering torque);
+  - first study the existing coupling and collision rules: collisions are force transfer, not penalties.
+- **Prebaked rendering and physics for fixed-camera scenes** (the user, verbatim: "we need to build in way to prebake animations, anything with a fixed camera, with solid objects, we could be rendering them to texture and eliminating them from various physics tasks, like meowdoku could be 100% dynamic animation capture"):
+  - **static layer:** with a fixed camera, solid objects that don't move render once to colour + depth textures; each frame composites only the dynamic parts over them; the cache is invalidated on camera, light or time-of-day change;
+  - **baked colliders:** fixed solids become a distance/occupancy field texture, so grains and bodies query a texture instead of per-object contacts (fixed fountain objects, level tiles, chamber walls);
+  - **animation capture:** deterministic animations (Meowdoku piece placement, cat pops, tray and roster effects) are recorded once per (event, parameters) into flipbooks or atlases and replayed, so Meowdoku can run as 100% captured animation;
+  - the bake runs through the existing deployment/compile path and is keyed like other cached products (the declared inputs digest), never hand-edited.
+- **Fountain regions inside platform games:** a granular material that spills through a course (platformer, side scroller, delve). The same fountain law runs as a region of the level, and its grains interact with the level's tiles and the player.
 
 ## Other open items
 

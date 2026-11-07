@@ -17,8 +17,8 @@
   #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center; padding: 6px 10px;
          background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); z-index: 2; flex-wrap: wrap;
          /* a wrapping bar must not eat the viewport: past a third of the screen it scrolls, so the
-            canvas below it (100vh - --bar-h) always keeps at least two thirds */
-         max-height: 34vh; overflow-y: auto; box-sizing: border-box; }
+            canvas below it (var(--vh100, 100vh) - --bar-h) always keeps at least two thirds */
+         max-height: calc(var(--vh100, 100vh) * 0.34); overflow-y: auto; box-sizing: border-box; }
   #bar select, #bar button, #bar input[type=text] { background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: inherit; }
   #bar button:hover { background: var(--ctl-hover); }
   #bar label { display: inline-flex; gap: 6px; align-items: center; }
@@ -38,8 +38,8 @@
   #gamectl button.on { outline: 2px solid currentColor; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
-  canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: 100vw;
-           height: calc(100vh - var(--bar-h, 0px)); touch-action: none; }
+  canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
+           height: calc(var(--vh100, 100vh) - var(--bar-h, 0px)); touch-action: none; }
   #word { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; z-index: 2; }
   #word input { font: 22px/1 monospace; letter-spacing: 0.4em; text-transform: uppercase; width: 8.5em; text-align: center;
                 background: var(--ctl); color: var(--fg-strong); border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px 6px 12px; }
@@ -111,16 +111,16 @@
      button float over it. */
   #hud, #fs-exit { display: none; position: fixed; z-index: 3; }
   body.immersive #bar, body.immersive #help, body.immersive #scores { display: none; }
-  body.immersive canvas { top: 0; height: 100vh; }
+  body.immersive canvas { top: 0; height: var(--vh100, 100vh); }
   body.immersive #hud { display: block; left: 10px; top: 8px; right: 64px; font-size: 13px; opacity: 0.8; pointer-events: none;
                         text-shadow: 0 1px 2px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.immersive #fs-exit { display: block; right: 10px; top: 6px; background: color-mix(in srgb, var(--ctl) 75%, transparent); color: #e8e8ea;
                             border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; }
-  #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
-            max-height: 70vh; overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  #scores { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(var(--vw100, 100vw) - 20px));
+            max-height: calc(var(--vh100, 100vh) * 0.7); overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   #scores.open { display: block; }
-  #shop { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(100vw - 20px));
-          max-height: 70vh; overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+  #shop { position: fixed; right: 10px; top: calc(var(--bar-h, 0px) + 8px); z-index: 3; display: none; width: min(340px, calc(var(--vw100, 100vw) - 20px));
+          max-height: calc(var(--vh100, 100vh) * 0.7); overflow: auto; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
   #shop.open { display: block; }
   #shop h3 { margin: 4px 0 6px; font-size: 13px; opacity: 0.8; font-weight: 600; }
   #shop .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
