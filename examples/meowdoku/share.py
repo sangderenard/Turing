@@ -30,8 +30,10 @@ SHARE_MAX_FILES = 5000                       # the whole store
 VIEWER_CAP = 16                              # active viewers per shared session
 ACTIVE_SECONDS = 15.0                        # a viewer that has not polled for this long no longer counts
 SHARE_TTL_SECONDS = 12 * 3600                # a live share dies at the latest then, with or without its session
-STATE_CACHE_SECONDS = 0.25                   # the owner's state is serialised at most this often however many watch it
-LIVE_MAX_BYTES = 16 * 1024                   # the owner's pushed page-side inputs
+STATE_CACHE_SECONDS = 0.1                    # the owner's state is serialised at most this often however many watch it
+KEY_HEADER_BYTES = 50                        # [LIVEVIEW] MFK1: magic, version, stride, steps, total, count, eight f32 ranges
+KEY_MAX_BYTES = 96 * 1024                    # one fountain keyframe, raw (4096 ids x 4 columns x 2 bytes + header is 32 KB)
+LIVE_MAX_BYTES = 16 * 1024                 # the owner's pushed page-side inputs
 ID_RE = re.compile(r"^[0-9a-f]{20}$")
 # Keys the page must never put into a shared view (also dropped here, whatever arrives): credentials, identity, location.
 SECRET_KEY_RE = re.compile(r"token|secret|passw|credential|auth|cookie|session|api[_-]?key|lichess|player|geo", re.I)
@@ -102,6 +104,8 @@ class _Share:
         self.owner, self.token, self.created = owner, token, now
         self.live: dict[str, Any] = {}
         self.live_rev = 0
+        self.key_seq = 0                    # [LIVEVIEW] the owner's last fountain position keyframe (octet-codec packet) and its number
+        self.key_packet = b""
         self.viewers: dict[str, dict[str, float]] = {}      # vid -> {seen, since, bytes}
         self.state_text = ""
         self.state_rev = ""
@@ -153,6 +157,23 @@ class Spectate:
                 share.live, share.live_rev = live, share.live_rev + 1
             return share.live_rev
 
+    def push_key(self, owner: str, raw: bytes) -> int:
+        """[LIVEVIEW] The owner's fountain POSITION KEYFRAME (MFK1, web/share.js): validated, then kept as the octet-codec packet
+        the viewers are sent (the same codec the loading animation is served in)."""
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) < KEY_HEADER_BYTES or bytes(raw[:4]) != b"MFK1":
+            raise ShareError("not a fountain keyframe")
+        if len(raw) > KEY_MAX_BYTES:
+            raise ShareError("the keyframe is too large", 413)
+        from meowdoku import loading_anim
+        packet = loading_anim.pack(bytes(raw))
+        with self.lock:
+            share = self.by_owner.get(owner)
+            if share is None:
+                raise ShareError("not sharing", 409)
+            share.key_seq += 1
+            share.key_packet = packet
+            return share.key_seq
+
     def status(self, owner: str) -> dict[str, Any]:
         with self.lock:
             share = self.by_owner.get(owner)
@@ -174,7 +195,8 @@ class Spectate:
         return {"bytes": int(v["bytes"]), "seconds": round(span, 2), "bytes_per_s": round(v["bytes"] / span, 1)}
 
     def watch(self, token: str, vid: str | None, have_rev: str | None, state_fn: Callable[[], dict[str, Any]],
-              owner_alive: Callable[[str], bool] = lambda owner: True, have_live: int | None = None) -> dict[str, Any]:
+              owner_alive: Callable[[str], bool] = lambda owner: True, have_live: int | None = None,
+              want_state: bool = True, have_key: int | None = None) -> dict[str, Any]:
         """One poll.  ``state_fn`` returns the owner's table state (already free of private keys); the full state is sent
         only when its revision differs from ``have_rev``, the pushed page-side inputs only when ``have_live`` is not the current one."""
         with self.lock:
@@ -193,7 +215,7 @@ class Spectate:
                 vid = secrets.token_urlsafe(9)
                 viewer = share.viewers[vid] = {"seen": now, "since": now, "bytes": 0.0}
             viewer["seen"] = now
-            refresh = now - share.state_at > STATE_CACHE_SECONDS
+            refresh = want_state and now - share.state_at > STATE_CACHE_SECONDS      # [LIVEVIEW] want_state=False: a socket carries the game
         if refresh:                     # outside the registry lock: the owner's table lock may be held by a tick
             text = json.dumps(state_fn(), separators=(",", ":"))
             with self.lock:
@@ -205,9 +227,54 @@ class Spectate:
             out: dict[str, Any] = {"vid": vid, "live_rev": share.live_rev, "state_rev": share.state_rev, "viewers": len(share.viewers)}
             if have_live != share.live_rev:
                 out["live"] = share.live
-            if have_rev != share.state_rev:
+            if share.key_seq and have_key != share.key_seq:            # [LIVEVIEW] a newer fountain keyframe (base64 of the octet packet)
+                import base64
+                out["key_seq"], out["key"] = share.key_seq, base64.b64encode(share.key_packet).decode("ascii")
+            if want_state and have_rev != share.state_rev:
                 out["state"] = json.loads(share.state_text)
             return out
+
+    # -- [LIVEVIEW] the viewer's push socket (/ws/spectate): a viewer held open instead of polled.  It occupies the same cap
+    # and the same viewer table as a poller, is refreshed by every heartbeat, and dies with the token (revoke / expiry / owner).
+    def open_stream(self, token: str, owner_alive: Callable[[str], bool] = lambda owner: True) -> tuple[str, str]:
+        """(owner, vid) for a new viewer socket; ShareError 410 / 429 when the share is gone or full."""
+        with self.lock:
+            share = self.by_token.get(token or "")
+            now = self.clock()
+            if share is None:
+                raise ShareError("this live view is not shared (any more)", 410)
+            if now - share.created > SHARE_TTL_SECONDS or not owner_alive(share.owner):
+                self._drop(share)
+                raise ShareError("the shared session has ended", 410)
+            self._prune(share, now)
+            if len(share.viewers) >= self.cap:
+                raise ShareError(f"this live view already has {self.cap} viewers", 429)
+            vid = secrets.token_urlsafe(9)
+            share.viewers[vid] = {"seen": now, "since": now, "bytes": 0.0}
+            return share.owner, vid
+
+    def keep_stream(self, token: str, vid: str, nbytes: int = 0, owner_alive: Callable[[str], bool] = lambda owner: True) -> bool:
+        """The socket's heartbeat: False once the token was revoked or expired or its owner went (the socket must close)."""
+        with self.lock:
+            share = self.by_token.get(token or "")
+            now = self.clock()
+            if share is None:
+                return False
+            if now - share.created > SHARE_TTL_SECONDS or not owner_alive(share.owner):
+                self._drop(share)
+                return False
+            viewer = share.viewers.get(vid)
+            if viewer is None:
+                return False
+            viewer["seen"] = now
+            viewer["bytes"] += nbytes
+            return True
+
+    def close_stream(self, token: str, vid: str) -> None:
+        with self.lock:
+            share = self.by_token.get(token or "")
+            if share is not None:
+                share.viewers.pop(vid, None)
 
     def account(self, token: str, vid: str, nbytes: int) -> None:
         with self.lock:
