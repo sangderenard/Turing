@@ -483,7 +483,7 @@ def prepare_predictor(web_dir: Path) -> None:
               "free-board games run unpredicted", flush=True)
 
 
-def prepare_fountain(web_dir: Path) -> None:
+def prepare_fountain(web_dir: Path, wasm: bool = True) -> None:
     """The fountain's compute product (the page's generic compute runtime loads it) (``fountain_build.build``):
     the generated WebGPU compute shader and the wasm product for each size, and
     the manifest holding the compiler's deployment verdicts.  Rebuilt only when
@@ -491,19 +491,19 @@ def prepare_fountain(web_dir: Path) -> None:
     from meowdoku import fountain_build
     try:
         started = time.perf_counter()
-        manifest = fountain_build.build(web_dir)
+        manifest = fountain_build.build(web_dir, wasm=wasm)
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest
         print(f"[meowdoku] fountain products NOT built ({type(error).__name__}: {error})", flush=True)
 
 
-def prepare_fountain3d(web_dir: Path) -> None:
+def prepare_fountain3d(web_dir: Path, wasm: bool = True) -> None:
     """The 3-D fountain's compute product, beside the 2-D one and independent of it (``fountain3d_build.build``)."""
     from meowdoku import fountain3d_build
     try:
         started = time.perf_counter()
-        manifest = fountain3d_build.build(web_dir)
+        manifest = fountain3d_build.build(web_dir, wasm=wasm)
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
     except Exception as error:  # the page reports the missing manifest
@@ -558,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default=None,
                         help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
     parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
+    parser.add_argument("--no-wasm", action="store_true",
+                        help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -568,8 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
-    prepare_fountain(web_dir)
-    prepare_fountain3d(web_dir)
+    prepare_fountain(web_dir, wasm=not args.no_wasm)
+    prepare_fountain3d(web_dir, wasm=not args.no_wasm)
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

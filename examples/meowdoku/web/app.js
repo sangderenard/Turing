@@ -4118,7 +4118,7 @@ function refreshLocalControls() {
   }
 }
 // a logarithmic range control (spec.scale "log"): the slider runs 0..1, 0 is off, then log-spaced from spec.log_min to spec.max
-function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? 0 : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
+function fromSlider(s, p) { return s.scale === "log" ? (p <= 0 ? (s.log_floor ? s.log_min : 0) : s.log_min * Math.pow(s.max / s.log_min, p)) : p; }
 function toSlider(s, v) { return s.scale === "log" ? (v <= 0 ? 0 : Math.max(0, Math.min(1, Math.log(v / s.log_min) / Math.log(s.max / s.log_min)))) : v; }
 let caseSpin = 0;
 try { caseSpin = Number(localStorage.getItem("meowdoku.spin")) || 0; } catch { /* storage may be blocked */ }

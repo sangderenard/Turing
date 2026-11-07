@@ -128,15 +128,31 @@ MONO_WEIGHT = (0.6, 0.4, 0.0, 0.0)       # mix 0: near-monodisperse grains and b
 POLY_WEIGHT = (0.15, 0.15, 0.35, 0.35)   # mix 1: all four species, widely polydisperse
 CELL = 2.0 * max(s[1] for s in SPECIES)
 
-STATE = ("x", "y", "vx", "vy", "w", "age")
+#: The species table is a set of RUNTIME TUNABLES (uniforms, no rebuild), each a MULTIPLE of the default above so that the
+#: default is the old law bit for bit: radius ``rscale``, friction ``fscale``, density ``dscale``, damping ratio ``zscale``
+#: (restitution), and the ORBEEZ pair ``swell`` (growth rate, fraction of the initial radius per second, 0 = does not swell)
+#: and ``swmax`` (largest radius, as a multiple of the initial one).  ``cell_scale`` multiplies CELL (the grid cell, 2 x the
+#: largest radius a grain can reach), ``solvent`` in [0, 1] is the fluid present for swelling (air 0, water 1).
+RSCALE_RANGE = (0.1, 10.0)             # radius: 0.1x to 10x each species' default (log scale on the page)
+MU_RANGE = (0.0, 2.0)                  # sliding friction: frictionless to very sticky
+RESTITUTION_RANGE = (0.02, 0.95)
+DENSITY_RANGE = (0.2, 5.0)
+SWELL_RATE_MAX = 0.5                   # 1/s
+SWELL_MAX_RATIO = 4.0
+FULL_COORDINATION = 6.0                # contacts of a grain with no open surface (a hex pack); exposure = 1 - contacts / this
+SOLVENTS = {"air": 0.0, "water": 1.0, "glycerine": 0.5}
+SPECIES_TUNABLES = ("rscale", "fscale", "dscale", "zscale", "swell", "swmax")
+STATE = ("x", "y", "vx", "vy", "w", "age", "rs")          # rs: the grain's CURRENT radius (it grows for a swelling species)
 CONSTANTS = ("pid", "ir", "ig", "ib")
-UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata")   # the run, its basin, the RUNTIME INPUTS, then the colour rate
+UNIFORMS = ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata",   # the run, its basin, the RUNTIME INPUTS, then the colour rate
+            "cell_scale", "solvent") + tuple(f"{k}{s}" for k in SPECIES_TUNABLES for s in range(4))
 #: The uniforms the PAGE drives moment by moment (no rebuild, no reset): the gravity vector (the phone's tilt), ``lid``, a
 #: ceiling that is far away (``LID_OFF``) until the page, driving gravity from a sensor, closes it so a grain cannot fall
 #: out of the open top when gravity points up, and ``rows``, the grid's height, which it raises with the lid so grains under
 #: the lid still meet each other.  The server sends their defaults (and the closed values as ``tilt_inputs``); the page's
 #: runtime owns them after that.
-RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows")
+RUNTIME_INPUTS = ("grav_x", "grav_y", "lid", "rows", "solvent") + tuple(
+    f"{k}{s}" for k in ("fscale", "dscale", "zscale", "swell", "swmax") for s in range(4))      # the radius (and so the grid) is fixed when a run starts
 LID_OFF = 1.0e9
 LID_ABOVE = 1.45                       # the lid the page closes while a sensor drives gravity: this far above the nozzle (the jet's apex is ~1.34)
 IOTA = ("pid",)                        # columns the generated shader derives from its invocation index
@@ -144,7 +160,7 @@ IOTA = ("pid",)                        # columns the generated shader derives fr
 #: (kinetic + rotational energy, the largest speed squared, and the counts of the ids that are not finite, outside the
 #: walls, parked, live, plus the contacts the neighbour walk dropped).  The four classes partition the ids.
 DIAGNOSTICS = ("ke", "vmax2", "n_nan", "n_out", "n_parked", "n_live", "n_drop")
-OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
+OUTPUTS = ("x_next", "y_next", "vx_next", "vy_next", "w_next", "age_next", "rs_next", "cr", "cg", "cb", "rad") + DIAGNOSTICS
 ARGUMENTS = STATE + CONSTANTS + UNIFORMS
 
 TAU = 2.0 * math.pi
@@ -194,7 +210,7 @@ def fit_scale(s: float, aspect: float) -> float:
     return (b + math.sqrt(b * b + 4.0 * w * 0.6 * a * s)) / (2.0 * w)
 
 
-def basin(n: int, aspect: float | None = None) -> dict[str, float]:
+def basin(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
     """Geometry for ``n`` active ids: basin and nozzle scale with sqrt(n / N_BASE).  ``aspect`` (the screen's
     width / height, clamped) stretches it to fill that screen at the same pile area; ``None`` is the reference basin.
     Every number the law needs is a RUNTIME uniform (see ``uniforms``): one program serves every aspect."""
@@ -202,19 +218,19 @@ def basin(n: int, aspect: float | None = None) -> dict[str, float]:
     k = 1.0 if not aspect else fit_scale(s, aspect)
     width = WIDTH_BASE * s * k
     nozzle_y = 0.6 * s / k + 0.7
-    cols = int(math.ceil(width / CELL))
-    rows = int(math.ceil((nozzle_y + 0.1) / CELL))
+    cols = int(math.ceil(width / cell))
+    rows = int(math.ceil((nozzle_y + 0.1) / cell))
     return {"scale": s, "stretch": k, "width": width, "half": width / 2.0, "nozzle_y": nozzle_y, "bar_half": 0.8 * s * k,
             "cols": cols, "rows": rows, "cells": cols * rows,
             "view": (-VIEW_SIDE * s * k, VIEW_SIDE * s * k, -VIEW_BOTTOM * s, nozzle_y + VIEW_TOP)}
 
 
-def tilt_inputs(n: int, aspect: float | None = None) -> dict[str, float]:
+def tilt_inputs(n: int, aspect: float | None = None, cell: float = CELL) -> dict[str, float]:
     """What the page writes to the runtime inputs ``lid`` and ``rows`` while a sensor drives gravity: a ceiling above the
     jet's reach and a grid tall enough to cover everything under it."""
-    geo = basin(n, aspect)
+    geo = basin(n, aspect, cell)
     lid = geo["nozzle_y"] + LID_ABOVE
-    return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / CELL))}
+    return {"lid": float(_f32(lid)), "rows": float(math.ceil(lid / cell))}
 
 
 def board_size(view) -> tuple[float, float]:
@@ -258,13 +274,13 @@ def _ramp(h, offset):
     return ((f * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0)
 
 
-def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu):
+def _contact(delta, nx, ny, vrx, vry, spin_slip, kn, m_eff, mu, zeta=ZETA):
     """Force and torque on the particle from one contact (``delta`` > 0 overlap,
     ``n`` the unit normal pointing at THIS particle, ``vr`` its velocity relative
     to the other body, ``spin_slip`` the spin part of the contact slip).  Returns
     (fx, fy, tangential force); torque = -radius * the third value."""
     vn = vrx * nx + vry * ny
-    cn = 2.0 * ZETA * (kn * m_eff).sqrt()
+    cn = 2.0 * zeta * (kn * m_eff).sqrt()
     fn = (kn * delta - cn * vn).clamp(0.0, 1.0e9)
     tx, ty = -ny, nx
     vt = vrx * tx + vry * ty - spin_slip
@@ -301,10 +317,22 @@ def make_law(n: int, active: int | None = None):
     emit_rate = EMIT_SPAN / float(active)
     scan_shifts = reduction_shifts(n)
 
-    def fountain_step(x, y, vx, vy, w, age, pid, ir, ig, ib, mode, use_image, mix, half, nozzle_y, bar_half, cols, rows,
-                      grav_x, grav_y, lid, strata):
+    def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
+        a = dict(zip(ARGUMENTS, args))
+        x, y, vx, vy, w, age, rs = (a[k] for k in STATE)
+        pid, ir, ig, ib = (a[k] for k in CONSTANTS)
+        mode, use_image, mix, half, nozzle_y, bar_half, cols, rows, grav_x, grav_y, lid, strata = (
+            a[k] for k in ("mode", "use_image", "mix", "half", "nozzle_y", "bar_half", "cols", "rows", "grav_x", "grav_y", "lid", "strata"))
+        solvent = a["solvent"]
+        cell = CELL * a["cell_scale"]
         cells = cols * rows
+
+        def tab(name):
+            return [a[f"{name}{s}"] for s in range(4)]
+
+        def pick4(vals, m1, m2, m3):
+            return vals[0] + (vals[1] - vals[0]) * m1 + (vals[2] - vals[0]) * m2 + (vals[3] - vals[0]) * m3
 
         def frame(search):
             """emit time and the state of each id, from the id and its state.  Evaluated again after the sort
@@ -325,9 +353,9 @@ def make_law(n: int, active: int | None = None):
             arming = a * parked
             # only particles inside the grid take part (parked ones and the dilute spray above the grid's top
             # get the cell past the end: sorted last, in nobody's block)
-            ix = _cap(((x + half) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), cols - 1.0)
-            iy = _cap(((y - FLOOR_Y) * (1.0 / CELL)).floor().clamp(0.0, 1.0e9), rows - 1.0)
-            inside = as_float(y < rows * CELL + FLOOR_Y)
+            ix = _cap(((x + half) * (1.0 / cell)).floor().clamp(0.0, 1.0e9), cols - 1.0)
+            iy = _cap(((y - FLOOR_Y) * (1.0 / cell)).floor().clamp(0.0, 1.0e9), rows - 1.0)
+            inside = as_float(y < rows * cell + FLOOR_Y)
             # armed ids are sorted into the grid too (at their slots): they see each other, and live grains see them
             return t, a, arming, live, pending, ix, iy, (live + pending * float(search)) * inside, (live + pending) * inside
         t_emit, act, arming, live, pending, cx, cy, searching, gridded = frame(False)
@@ -355,6 +383,7 @@ def make_law(n: int, active: int | None = None):
         fy = fx
         tq = fx
         blocked = fx
+        ncont = fx                                            # the grains (and walls) this grain touches: its closed surface
         dropped = fx
         top = float(n - 1)
         runs = []
@@ -394,12 +423,18 @@ def make_law(n: int, active: int | None = None):
         c0, c1, c2 = w0, w0 + w1, w0 + w1 + w2
         sp = as_float(u >= c0) + as_float(u >= c1) + as_float(u >= c2)
         is1, is2, is3 = (as_float((sp - float(k)).abs() < 0.5) for k in (1, 2, 3))
-        radius = SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * is1 + (SPECIES[2][1] - SPECIES[0][1]) * is2 \
-            + (SPECIES[3][1] - SPECIES[0][1]) * is3
-        density = SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * is1 + (SPECIES[2][2] - SPECIES[0][2]) * is2 \
-            + (SPECIES[3][2] - SPECIES[0][2]) * is3
-        mu = SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * is1 + (SPECIES[2][3] - SPECIES[0][3]) * is2 \
-            + (SPECIES[3][3] - SPECIES[0][3]) * is3
+        # the species table: the default (compile-time) value times the runtime multiple (exactly 1 by default)
+        radius0 = (SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * is1 + (SPECIES[2][1] - SPECIES[0][1]) * is2
+                   + (SPECIES[3][1] - SPECIES[0][1]) * is3) * pick4(tab("rscale"), is1, is2, is3)
+        density = (SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * is1 + (SPECIES[2][2] - SPECIES[0][2]) * is2
+                   + (SPECIES[3][2] - SPECIES[0][2]) * is3) * pick4(tab("dscale"), is1, is2, is3)
+        mu = (SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * is1 + (SPECIES[2][3] - SPECIES[0][3]) * is2
+              + (SPECIES[3][3] - SPECIES[0][3]) * is3) * pick4(tab("fscale"), is1, is2, is3)
+        zsc = pick4(tab("zscale"), is1, is2, is3)
+        swell = pick4(tab("swell"), is1, is2, is3)
+        swmax = pick4(tab("swmax"), is1, is2, is3)
+        # the grain's CURRENT radius is state (it grows for a swelling species); an id not yet placed has its species radius
+        radius = AbstractTensor.where(rs > 0.0, rs, radius0)
         drag = SPECIES[0][4] + (SPECIES[1][4] - SPECIES[0][4]) * is1 + (SPECIES[2][4] - SPECIES[0][4]) * is2 \
             + (SPECIES[3][4] - SPECIES[0][4]) * is3
         mass = density * math.pi * radius * radius
@@ -409,13 +444,15 @@ def make_law(n: int, active: int | None = None):
             uj = _mix(j, 1237.0, 5.0)
             spj = as_float(uj >= c0) + as_float(uj >= c1) + as_float(uj >= c2)
             j1, j2, j3 = (as_float((spj - float(k)).abs() < 0.5) for k in (1, 2, 3))
-            rj = SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * j1 + (SPECIES[2][1] - SPECIES[0][1]) * j2 \
-                + (SPECIES[3][1] - SPECIES[0][1]) * j3
-            dj = SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * j1 + (SPECIES[2][2] - SPECIES[0][2]) * j2 \
-                + (SPECIES[3][2] - SPECIES[0][2]) * j3
-            muj = SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * j1 + (SPECIES[2][3] - SPECIES[0][3]) * j2 \
-                + (SPECIES[3][3] - SPECIES[0][3]) * j3
-            return rj, dj * math.pi * rj * rj, muj
+            rj0 = (SPECIES[0][1] + (SPECIES[1][1] - SPECIES[0][1]) * j1 + (SPECIES[2][1] - SPECIES[0][1]) * j2
+                   + (SPECIES[3][1] - SPECIES[0][1]) * j3) * pick4(tab("rscale"), j1, j2, j3)
+            dj = (SPECIES[0][2] + (SPECIES[1][2] - SPECIES[0][2]) * j1 + (SPECIES[2][2] - SPECIES[0][2]) * j2
+                  + (SPECIES[3][2] - SPECIES[0][2]) * j3) * pick4(tab("dscale"), j1, j2, j3)
+            muj = (SPECIES[0][3] + (SPECIES[1][3] - SPECIES[0][3]) * j1 + (SPECIES[2][3] - SPECIES[0][3]) * j2
+                   + (SPECIES[3][3] - SPECIES[0][3]) * j3) * pick4(tab("fscale"), j1, j2, j3)
+            rsj = rs.index_select(0, j)
+            rj = AbstractTensor.where(rsj > 0.0, rsj, rj0)           # the neighbour's current radius
+            return rj, dj * math.pi * rj * rj, muj, pick4(tab("zscale"), j1, j2, j3)
 
         for lo, hi, ok in runs:
             for slot in range(K_RUN):
@@ -429,7 +466,7 @@ def make_law(n: int, active: int | None = None):
                 vxj = vx.index_select(0, j)
                 vyj = vy.index_select(0, j)
                 wj = w.index_select(0, j)
-                rj, mj, muj = neighbour_props(j)
+                rj, mj, muj, zscj = neighbour_props(j)
                 # coincident centres (two ids at one point) have no contact normal; they are pushed apart
                 # along a direction fixed by the ids (antisymmetric, so equal and opposite) instead of
                 # dividing a zero separation
@@ -454,34 +491,39 @@ def make_law(n: int, active: int | None = None):
                 m_eff = mass * mj / (mass + mj)
                 kn = OMEGA * OMEGA * m_eff
                 gx, gy, gt = _contact(delta, nx, ny, vx - vxj, vy - vyj, radius * w + rj * wj, kn, m_eff,
-                                      (mu * muj).sqrt())
+                                      (mu * muj).sqrt(), ZETA * (zsc * zscj).sqrt())
+                ncont = ncont + touch
                 fx = fx + gx * touch
                 fy = fy + gy * touch
                 tq = tq - radius * gt * touch
         # ---- walls and floor: the same contact against a body of infinite mass
         kw = OMEGA * OMEGA * mass
         floor_delta = (radius - (y - FLOOR_Y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(floor_delta, y * 0.0, y * 0.0 + 1.0, vx, vy, radius * w, kw, mass, mu)
+        gx, gy, gt = _contact(floor_delta, y * 0.0, y * 0.0 + 1.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
         touch = as_float(floor_delta > 0.0)
+        ncont = ncont + touch
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
         left_delta = (radius - (x + half)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(left_delta, y * 0.0 + 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
+        gx, gy, gt = _contact(left_delta, y * 0.0 + 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
         touch = as_float(left_delta > 0.0)
+        ncont = ncont + touch
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
         right_delta = (radius - (half - x)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(right_delta, y * 0.0 - 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu)
+        gx, gy, gt = _contact(right_delta, y * 0.0 - 1.0, y * 0.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
         touch = as_float(right_delta > 0.0)
+        ncont = ncont + touch
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
         # the lid: the same contact against a ceiling at the runtime height ``lid`` (a body of infinite mass; far away unless the page closes it)
         lid_delta = (radius - (lid - y)).clamp(0.0, 1.0e9) * live
-        gx, gy, gt = _contact(lid_delta, y * 0.0, y * 0.0 - 1.0, vx, vy, radius * w, kw, mass, mu)
+        gx, gy, gt = _contact(lid_delta, y * 0.0, y * 0.0 - 1.0, vx, vy, radius * w, kw, mass, mu, ZETA * zsc)
         touch = as_float(lid_delta > 0.0)
+        ncont = ncont + touch
         fx = fx + gx * touch
         fy = fy + gy * touch
         tq = tq - radius * gt * touch
@@ -497,6 +539,14 @@ def make_law(n: int, active: int | None = None):
         xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
         yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
         age_next = age + DT
+        # ---- ORBEEZ: a swelling species takes up solvent through its OPEN surface.  A grain's surface is closed by what it
+        # touches (the grains and walls in contact, ``FULL_COORDINATION`` closing it entirely), so its radius grows at
+        # ``swell`` x its initial radius per second times the exposed fraction times the solvent present (0 in air), up to
+        # ``swmax`` x the initial radius.  The mass follows the area (the density stays constant).  A pure function of the
+        # state: deterministic.  With swell = 0 (the default) every term is an exact zero.
+        exposure = (1.0 - ncont * (1.0 / FULL_COORDINATION)).clamp(0.0, 1.0)
+        grown = _cap(rs + live * (swell * radius0 * exposure * solvent) * DT, radius0 * swmax)
+        rsn = AbstractTensor.where(place > 0.5, radius0, grown)
         # ---- colour from the angle of the launch vector.  theta is the launch angle from the
         # vertical (+-0.7 rad).  The hue turns four times as fast as theta so the fan spans most of
         # the wheel: trig = atan2, rotation = the double-angle formulas applied twice to cos/sin
@@ -552,7 +602,7 @@ def make_law(n: int, active: int | None = None):
             c_live = c_live + c_live.index_select(0, partner) * gate
             c_drop = c_drop + c_drop.index_select(0, partner) * gate
             v2 = v2 + (v2.index_select(0, partner) * gate - v2).clamp(0.0, 1.0e30)
-        return xn, yn, vxn, vyn, wn, age_next, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
+        return xn, yn, vxn, vyn, wn, age_next, rsn, cr, cg, cb, radius, ke, v2, c_nan, c_out, c_parked, c_live, c_drop
 
     return fountain_step
 
@@ -563,26 +613,69 @@ def _f32(a) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).astype(np.float64)
 
 
+def zeta_of(restitution: float) -> float:
+    """Damping ratio of a spring-dashpot contact that returns ``restitution`` of the approach speed."""
+    ln = math.log(min(max(float(restitution), 1.0e-4), 0.9999))
+    return -ln / math.sqrt(math.pi ** 2 + ln * ln)
+
+
+def restitution_of(zeta: float) -> float:
+    return math.exp(-math.pi * zeta / math.sqrt(1.0 - zeta * zeta))
+
+
+def species_params(params: dict | None = None) -> dict[str, float]:
+    """The page's species table in its own units: ``r{s}`` radius, ``mu{s}`` friction (0-2), ``rho{s}`` density, ``e{s}``
+    restitution, ``swell{s}`` rate and ``swmax{s}`` ratio, ``solvent`` -- defaults, then the overrides clamped to their ranges."""
+    p: dict[str, float] = {"solvent": 0.0}
+    for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):
+        p.update({f"r{s}": r, f"rho{s}": rho, f"mu{s}": mu, f"e{s}": restitution_of(ZETA), f"swell{s}": 0.0, f"swmax{s}": 1.0})
+    ranges = {"r": (RSCALE_RANGE[0], RSCALE_RANGE[1], True), "rho": DENSITY_RANGE + (False,), "mu": MU_RANGE + (False,),
+              "e": RESTITUTION_RANGE + (False,), "swell": (0.0, SWELL_RATE_MAX, False), "swmax": (1.0, SWELL_MAX_RATIO, False)}
+    for k, v in (params or {}).items():
+        if k == "solvent":
+            p[k] = min(max(float(v), 0.0), 1.0)
+            continue
+        key = k.rstrip("0123456789")
+        if key in ranges and k[len(key):].isdigit() and int(k[len(key):]) < len(SPECIES):
+            lo, hi, relative = ranges[key]
+            base = SPECIES[int(k[len(key):])][1] if relative else 1.0
+            p[k] = min(max(float(v), lo * base), hi * base)
+    return p
+
+
+def cell_needed(p: dict[str, float]) -> float:
+    """The grid cell the species table needs: twice the largest radius any grain can reach (a swelling species grows to
+    ``swmax`` x its radius)."""
+    return 2.0 * max(p[f"r{s}"] * (p[f"swmax{s}"] if p[f"swell{s}"] > 0.0 else 1.0) for s in range(len(SPECIES)))
+
+
 def uniforms(*, n: int, mode: int = 0, use_image: float = 0.0, mix: float = 0.5, aspect: float | None = None,
-             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA) -> dict[str, np.ndarray]:
+             gravity: tuple[float, float] = (0.0, -G), lid: float = LID_OFF, strata: float = STRATA,
+             params: dict | None = None) -> dict[str, np.ndarray]:
     """The law's scalar columns (shape ()) as float32-representable values: the run (``mode``, ``use_image``, ``mix``),
     its basin for ``n`` active ids at the screen ``aspect`` (``None``: the reference basin) and the RUNTIME INPUTS
     (``gravity`` vector, ``lid`` height), whose defaults are the plain downward pull of ``G`` and no ceiling."""
-    geo = basin(n, aspect)
+    p = species_params(params)
+    cell = cell_needed(p)
+    geo = basin(n, aspect, cell)
     out = {"mode": mode, "use_image": use_image, "mix": mix}
     out.update({k: geo[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows")})
     out.update({"grav_x": gravity[0], "grav_y": gravity[1], "lid": lid, "strata": strata})
+    out.update({"cell_scale": cell / CELL, "solvent": p["solvent"]})
+    for s, (_name, r, rho, mu, _drag) in enumerate(SPECIES):                 # multiples of the defaults: exactly 1.0 when untouched
+        out.update({f"rscale{s}": p[f"r{s}"] / r, f"fscale{s}": p[f"mu{s}"] / mu if mu else 1.0, f"dscale{s}": p[f"rho{s}"] / rho,
+                    f"zscale{s}": zeta_of(p[f"e{s}"]) / ZETA, f"swell{s}": p[f"swell{s}"], f"swmax{s}": p[f"swmax{s}"]})
     return {k: _f32(np.float64(v)) for k, v in out.items()}
 
 
 def initial_columns(n: int, *, mix: float = 0.5, mode: int = 0, use_image: float = 0.0, active: int | None = None,
-                    aspect: float | None = None, strata: float = STRATA) -> dict[str, np.ndarray]:
+                    aspect: float | None = None, strata: float = STRATA, params: dict | None = None) -> dict[str, np.ndarray]:
     """Round zero for ``n`` ids: the state is zero, ``pid`` is the iota and the image colours are zero.
     Nothing else is per-id.  The basin is that of ``active`` ids (default ``n``) at ``aspect``."""
     zeros = np.zeros(n)
     columns = {name: zeros.copy() for name in STATE + ("ir", "ig", "ib")}
     columns["pid"] = np.arange(n, dtype=np.float64)
-    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata))
+    columns.update(uniforms(n=int(active or n), mode=mode, use_image=use_image, mix=mix, aspect=aspect, strata=strata, params=params))
     return columns
 
 
@@ -708,6 +801,7 @@ class FountainGame(Game):
         self.size = size
         self.mix, self.mode, self.speed = 0.5, 2, 1
         self.strata = STRATA
+        self.params: dict[str, float] = {}       # the page's species-table overrides (see ``species_params``)
         self.run = "continuous"              # "continuous": never stops; "settle": stops at rest (the image replay needs it)
         self.aspect: float | None = aspect       # the screen's width / height when the run started; part of the recorded run
         self.phase = "fill"
@@ -729,7 +823,7 @@ class FountainGame(Game):
     def columns(self, *, image: bool = False) -> dict[str, np.ndarray]:
         pad = SIZES[self.size][1]
         cols = initial_columns(pad, mix=self.mix, mode=self.mode, use_image=1.0 if image else 0.0,
-                               active=self.n, aspect=self.aspect, strata=self.strata)
+                               active=self.n, aspect=self.aspect, strata=self.strata, params=self.params)
         if image and self.image is not None:
             cols["ir"][: self.n], cols["ig"][: self.n], cols["ib"][: self.n] = (
                 _f32(self.image[:, c] / 255.0) for c in range(3))
@@ -752,6 +846,21 @@ class FountainGame(Game):
             self.mode = int(payload["mode"])
         elif kind == "fountain_strata":
             self.strata = float(payload["strata"])
+        elif kind == "fountain_param":
+            name = str(payload["name"])
+            known = species_params()
+            if name not in known:
+                raise ValueError(f"fountain_param: unknown tunable {name!r}")
+            self.params[name] = species_params({name: payload["value"]})[name]
+            if name.rstrip("0123456789") == "r":          # the radius sets the grid: a new run (the others are runtime inputs)
+                if payload.get("aspect"):
+                    self.aspect = float(payload["aspect"])
+                self.reset()
+        elif kind == "fountain_choice":
+            name, value = str(payload["name"]), str(payload["value"])
+            if name != "solvent" or value not in SOLVENTS:
+                raise ValueError(f"fountain_choice: unknown choice {name!r} = {value!r}")
+            self.params["solvent"] = SOLVENTS[value]
         elif kind == "fountain_speed":
             self.speed = int(payload["speed"])
         elif kind == "fountain_run":
@@ -805,6 +914,34 @@ class FountainGame(Game):
                          "emitted": emitted, "top": float(final["y"].max())}
         return self.verified
 
+    def solvent_name(self) -> str:
+        v = species_params(self.params)["solvent"]
+        return next((k for k, x in SOLVENTS.items() if abs(x - v) < 1e-9), "custom")
+
+    def _species_controls(self) -> list[dict[str, Any]]:
+        """The species table as page controls: grouped, every one a ``fountain_param`` range.  The radius is a log slider
+        (0.1x to 10x the default; a restart, since it sets the grid), friction 0 (frictionless) to 2 (very sticky)."""
+        p = species_params(self.params)
+        out: list[dict[str, Any]] = []
+        for s, (name, r, rho, mu, _drag) in enumerate(SPECIES):
+            def ctl(key, label, lo, hi, step, extra=None):
+                spec = {"id": f"{key}{s}", "kind": "range", "label": f"{name} {label}", "min": lo, "max": hi, "step": step,
+                        "value": p[f"{key}{s}"], "action": "fountain_param", "name": f"{key}{s}", "field": "value", "group": "Grains",
+                        "species": s}
+                spec.update(extra or {})
+                return spec
+            out.append(ctl("r", "radius", r * RSCALE_RANGE[0], r * RSCALE_RANGE[1], r / 20.0,
+                           {"scale": "log", "log_min": r * RSCALE_RANGE[0], "log_floor": True, "aspect": True}))
+            out.append(ctl("rho", "density", DENSITY_RANGE[0], DENSITY_RANGE[1], 0.1))
+            out.append(ctl("mu", "friction", MU_RANGE[0], MU_RANGE[1], 0.05))
+            out.append(ctl("e", "restitution", RESTITUTION_RANGE[0], RESTITUTION_RANGE[1], 0.01))
+            out.append(ctl("swell", "swell rate (orbeez, 1/s)", 0.0, SWELL_RATE_MAX, 0.01))
+            out.append(ctl("swmax", "max swell (x radius)", 1.0, SWELL_MAX_RATIO, 0.1))
+        out.append({"id": "solvent", "kind": "select", "label": "solvent", "value": self.solvent_name(), "action": "fountain_choice",
+                    "name": "solvent", "field": "value", "group": "Grains",
+                    "options": [[k, k] for k in SOLVENTS] + ([["custom", "custom"]] if self.solvent_name() == "custom" else [])})
+        return out
+
     def controls_ui(self) -> list[dict[str, Any]]:
         sample = {"fit": "extent", "read": ["x", "y"], "into": ["ir", "ig", "ib"], "raster": [96, 72],
                   "post": {"action": "fountain_image", "field": "rgb", "max_ids": 65536}}
@@ -823,6 +960,8 @@ class FountainGame(Game):
             {"id": "bounce", "kind": "button", "label": "Bounce", "local": "bounce"},
             {"id": "continue", "kind": "button", "label": "Continue", "local": "continue"},
             {"id": "tilt", "kind": "toggle", "label": "phone gravity", "local": "tilt", "value": True},
+            # a spinning case: gravity turns in the screen's plane at a set rate (a runtime input of the law, like the tilt)
+            {"id": "spin", "kind": "range", "label": "case spin (Hz)", "min": -1, "max": 1, "step": 0.05, "local": "spin", "value": 0},
             # the particle field's render look is the page's own too (web/particle_styles.js STYLES: same ids, same order); render only
             {"id": "pstyle", "kind": "select", "label": "look", "local": "particle_style", "value": "points",
              "options": [[tag, label] for tag, label in PARTICLE_STYLES]},
@@ -843,11 +982,11 @@ class FountainGame(Game):
             {"id": "speed", "kind": "select", "label": "speed", "value": self.speed, "action": "fountain_speed",
              "field": "speed", "options": [[1, "1x"], [2, "2x"], [4, "4x"], [0, "max"]]},
             {"id": "verify", "kind": "button", "label": "Verify", "action": "fountain_verify"},
-        ]
+        ] + self._species_controls()
 
     def basin(self) -> dict[str, Any]:
         """The running basin: ``n`` ids at the aspect the run started with."""
-        return basin(self.n, self.aspect)
+        return basin(self.n, self.aspect, cell_needed(species_params(self.params)))
 
     def state(self) -> dict[str, Any]:
         geo = self.basin()
@@ -869,10 +1008,10 @@ class FountainGame(Game):
             "compute": {
                 "manifest": "fountain.manifest.json", "size": self.size, "epoch": self.epoch,
                 "uniforms": {k: float(v) for k, v in uniforms(n=self.n, mode=self.mode, mix=self.mix, aspect=self.aspect, strata=self.strata,
-                                                              use_image=1.0 if self.phase == "replay" else 0.0).items()},
+                                                              use_image=1.0 if self.phase == "replay" else 0.0, params=self.params).items()},
                 "view": list(geo["view"]), "aspect": self.aspect,
                 "speed": self.speed, "named": ["ir", "ig", "ib"], "run": self.run,
-                "tilt": tilt_inputs(self.n, self.aspect),
+                "tilt": tilt_inputs(self.n, self.aspect, cell_needed(species_params(self.params))),
             },
         })
         return base
