@@ -766,7 +766,7 @@ function updateBodyMesh(g) {
 function bodyModel(g, angle) {                                   // (angle: another turn than the law's, for a blurred copy)
   const b = g && g.compute && g.compute.body, bm = state.bodyMesh;
   if (!b || !bm || !bm.mesh) return null;
-  const th = angle ?? ((compute.diag && compute.diag[b.angle]) || 0), h = bm.hinge;
+  const th = angle ?? compute.bodyAngle(), h = bm.hinge;
   // a law-plane turn by +th (x toward y) is a world turn about +Y by +th (law y is world -z)
   const turn = M.multiply(M.translate(h[0], 0, h[2]), M.multiply(M.rotateY(th), M.translate(-h[0], 0, -h[2])));
   return state.caseModel ? M.multiply(state.caseModel, turn) : turn;
@@ -790,7 +790,7 @@ function wheelPxPerUnit(g, cam) {
 function wheelBlurFrame(g, cam) {
   const b = g && g.compute && g.compute.body;
   if (!b || !wheelBlur.on) { wheelBlur.theta = null; wheelBlur.d = 0; wheelBlur.regime = null; return; }
-  const th = (compute.diag && compute.diag[b.angle]) || 0;
+  const th = compute.bodyAngle();
   const fresh = wheelBlur.theta == null ? 0 : wrapDelta(th - wheelBlur.theta);
   wheelBlur.theta = th;
   wheelBlur.d = Math.abs(fresh) >= 0.8 * Math.abs(wheelBlur.d) ? fresh : 0.8 * wheelBlur.d;
@@ -6081,10 +6081,10 @@ function pointsFrame(cam, now) {
 }
 // The 3-D chamber's walls: the law's basin outline (uniforms px0..py7, repeated trailing vertices dropped) between the plexiglass
 // at +-dh, as a wireframe -- so the funnel / hexagon / ramp the grains are held by can be seen.
-// The 2-D fountain's hinged body (the waterwheel): its SDF outline (hub circle, capsule paddles) at the angle the law reports (diagnostic body_th).
+// The 2-D fountain's hinged body (the waterwheel): its SDF outline (hub circle, capsule paddles) at the interpolated law-snapshot angle.
 function drawBody(b, frame, dh = 0, angle = null, alpha = 1) {                       // dh: the 3-D fountain's half depth (the body is extruded through the slab); 0 = flat; angle / alpha: a blurred copy
   if (!b) return;
-  const th = angle ?? ((compute.diag && compute.diag[b.angle]) || 0), color = [0.85, 0.9, 1.0, 0.55 * alpha], [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
+  const th = angle ?? compute.bodyAngle(), color = [0.85, 0.9, 1.0, 0.55 * alpha], [hx, hy] = b.hinge, pt = (a, r, off) => [hx + r * Math.cos(a) - off * Math.sin(a), hy + r * Math.sin(a) + off * Math.cos(a)];
   cloud.drawOutline(Array.from({ length: 33 }, (_, k) => pt(2 * Math.PI * k / 32, b.hub, 0)), dh, frame, color);
   for (let k = 0; k < b.paddles; k++) {
     const a = th + 2 * Math.PI * k / b.paddles, t = b.half_thickness, l = b.reach, cap = [];
