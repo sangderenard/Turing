@@ -186,6 +186,7 @@ def test_loading_anim_serves_the_active_entry(server):
 
 def test_activate_and_delete_need_the_owner_token(server):
     port, sessions = server
+    sessions.access.decide = lambda ip, host: ("ip", "edit")          # a REMOTE owner (bare IP, edit tier): the token applies
     _, r1 = _save(port, _raw(1))
     _, r2 = _save(port, _raw(2))
     d1, d2 = r1["stored"]["digest"], r2["stored"]["digest"]
@@ -205,6 +206,7 @@ def test_activate_and_delete_need_the_owner_token(server):
 
 def test_wrong_tokens_are_rate_limited_and_the_token_is_never_sent(server):
     port, sessions = server
+    sessions.access.decide = lambda ip, host: ("ip", "edit")          # a REMOTE owner (bare IP, edit tier): the token applies
     _, r1 = _save(port, _raw(1))
     codes = [_owner(port, "delete", r1["stored"]["digest"], token="bad")[0] for _ in range(7)]
     assert codes[:5] == [401] * 5 and codes[5:] == [429, 429]
@@ -282,3 +284,14 @@ def test_the_stream_at_each_bit_depth(tmp_path):
         packed[int(bits)] = len(L.pack(raw))
     assert len({i["bytes"] for i in info.values()}) == 1                                              # the raw stream is the same size at every depth
     assert packed[10] < packed[11] < packed[12] < packed[16]                                          # fewer bits: the codec packs smaller
+
+
+def test_a_local_visitor_needs_no_token_for_the_studio(server):
+    """LAN-origin visitors (the owner's own network) activate and delete without the token; the owner asked for the studio open to creative use."""
+    port, sessions = server
+    sessions.access.decide = lambda ip, host: ("lan", "edit")
+    _, r1 = _save(port, _raw(1))
+    _, r2 = _save(port, _raw(2))
+    d2 = r2["stored"]["digest"]
+    assert _owner(port, "activate", d2, token=None)[0] == 200
+    assert _owner(port, "delete", r1["stored"]["digest"], token=None)[0] == 200

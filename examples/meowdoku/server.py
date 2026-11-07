@@ -701,8 +701,14 @@ def make_handler(sessions: Sessions):
             misses[:] = [t for t in misses if now - t < 600]
             if len(misses) >= 5:
                 return refuse("too many wrong tokens from this address", HTTPStatus.TOO_MANY_REQUESTS)
-            ok, status, why = anim_mod.owner_authorize(isinstance(self.connection, ssl.SSLSocket), self.headers.get("X-Forwarded-Proto"), direct,
-                                                       self.headers.get("X-Meowdoku-Admin"), lc.token)
+            # a LOCAL (LAN-origin) visitor is the owner's own network: no token for the studio (the owner asked for it open to creative use);
+            # remote visitors still need the token
+            self._classify()
+            if getattr(self, "_origin", None) == "lan":
+                ok, status, why = True, 200, ""
+            else:
+                ok, status, why = anim_mod.owner_authorize(isinstance(self.connection, ssl.SSLSocket), self.headers.get("X-Forwarded-Proto"), direct,
+                                                           self.headers.get("X-Meowdoku-Admin"), lc.token)
             if not ok:
                 if status == 401:
                     misses.append(now)

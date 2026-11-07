@@ -19,9 +19,9 @@ $("tokenNote").textContent = secure ? "kept for this tab only" : "owner actions 
 
 async function owner(path, digest) {
   if (!secure) throw new Error("owner actions need HTTPS");
-  const token = $("token").value;
-  if (!token) throw new Error("type the owner token first (top right)");
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Meowdoku-Admin": token }, body: JSON.stringify({ digest }) });
+  const token = $("token").value;                    // local (LAN) visitors need none; remote owners type it (top right)
+  const headers = { "Content-Type": "application/json" }; if (token) headers["X-Meowdoku-Admin"] = token;
+  const r = await fetch(path, { method: "POST", headers, body: JSON.stringify({ digest }) });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
   return body;
