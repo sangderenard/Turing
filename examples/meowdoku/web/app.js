@@ -58,6 +58,14 @@ const $ = (id) => document.getElementById(id);
 const status = $("status");
 // [LOADING] the loading panel (loading_panel.js): gates a game on its server-built products; inert if the script did not load
 const loading = window.meowdokuLoading || { gate: async () => {}, whenReady: async () => {}, release() {}, initializing() {}, done() {} };
+let bootReady = false, bootFramePresented = false;
+
+function finishBootFrame() {
+  if (!bootReady || bootFramePresented) return;
+  bootFramePresented = true;
+  // The next animation frame follows a paint of this completed game frame.
+  requestAnimationFrame(() => loading.release("boot"));
+}
 
 // ---------------------------------------------------------------- matrices
 const M = {
@@ -6099,7 +6107,7 @@ function draw(ms) {
   const clear = sceneBackground();
   gl.viewport(0, 0, w, h); gl.clearColor(...clear, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-  if (!state.game) { requestAnimationFrame(draw); return; }
+  if (!state.game) { requestAnimationFrame(drawFrame); return; }
   const cam = camera(); updateLight(now);
   state.caseModel = caseModelNow();
   updateHousing();
@@ -6126,7 +6134,7 @@ function draw(ms) {
   }
   for (const key of removed) state.pieces.delete(key);
   if (wob.on) wobFrame(casters, now); else for (const c of casters) if (c[3]) c[3].cage = null;
-  if (state.flat) { drawFlat(cam, casters); pointsFrame(cam, now); requestAnimationFrame(draw); return; }
+  if (state.flat) { drawFlat(cam, casters); pointsFrame(cam, now); finishBootFrame(); requestAnimationFrame(drawFrame); return; }
   // pass 1: depth from the key light
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.shadowMap.fbo); gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE); gl.clear(gl.DEPTH_BUFFER_BIT);
   gl.useProgram(state.programs.depth); gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2.0, 4.0);
@@ -6153,7 +6161,17 @@ function draw(ms) {
   // (the sun and the bulbs are drawn as emissive geometry in the lit pass)
   gl.bindVertexArray(null);
   if (lensK > 0) lensPresent(w, h, lensK);
-  requestAnimationFrame(draw);
+  finishBootFrame();
+  requestAnimationFrame(drawFrame);
+}
+
+function drawFrame(ms) {
+  try { draw(ms); }
+  catch (error) {
+    loading.release("boot");
+    status.textContent = String(error);
+    console.error(error);
+  }
 }
 
 // Flat view: no shadow pass, no glass, no bulb.  Each piece is drawn twice: first a
@@ -7200,7 +7218,7 @@ async function lifecycleResume() {
   })();
   fillPickers();
   if (rememberedName() && !share.share.viewOnly) await setPlayer(rememberedName());
-  requestAnimationFrame(draw);
+  requestAnimationFrame(drawFrame);
   // SHARE hooks (share.js): what a shared view reads and writes on this page
   share.attach({
     getGame: () => state.game, catalog: () => state.catalog, pageSpecs, localValue, localControl, serverPayload: serverControlPayload, api, applyState,
@@ -7214,6 +7232,6 @@ async function lifecycleResume() {
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
-  chain.then(() => { loading.done(); loading.release("boot"); });                                                    // [LOADING] the first game is drawn
+  chain.then(() => { loading.done(); if (state.game) bootReady = true; else loading.release("boot"); });             // [LOADING] a successful game frame releases boot
   if (window.meowdokuAccess.edit && /[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
 })().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });

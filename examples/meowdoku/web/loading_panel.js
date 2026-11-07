@@ -380,7 +380,11 @@ function start() {
   };
   window.meowdokuLoading = api;
   hold("boot", "boot");                                              // from the first byte until the first game is drawn
-  window.addEventListener("error", () => release("boot"), { once: true });
+  window.addEventListener("error", (event) => {
+    // An unrelated resource or extension error must not expose an unfinished
+    // game canvas.  The app's own startup/draw errors still uncover its status.
+    if (event.filename && /\/app\.js(?:$|\?)/.test(event.filename)) release("boot");
+  });
   if (S.forced) refresh();
   fetchReady().then(loadAnimation);
   // [STUDIO] a page held on a demo phase (?loading_demo=) can be steered by its same-origin parent (studio.html): the phase, the entry played
