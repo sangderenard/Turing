@@ -58,6 +58,7 @@ export function createMarblePhoto(doc = document) {
     state.jobDigest = null; state.generation++; stopPolling(); setButtons();
     if (digest) {
       $("photo-hdr").hidden = true;
+      $("photo-full").hidden = true;
       await fetch("/api/marble_photo/cancel", { method: "POST",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) });
       status("Exposure canceled. The Phong preview remains interactive.");
@@ -71,6 +72,7 @@ export function createMarblePhoto(doc = document) {
     if (digest) fetch("/api/marble_photo/cancel", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) }).catch(() => {});
     $("photo-hdr").hidden = true;
+    $("photo-full").hidden = true;
     if (!$("photo-panel").hidden) $("photo-caption").textContent = "Photo of the previous saved design";
     status("Design changed. Save it again before exposing another photo.");
   };
@@ -94,7 +96,10 @@ export function createMarblePhoto(doc = document) {
       if (state.jobDigest !== digest || generation !== state.generation) return;
       if (value.image) {
         $("photo-panel").hidden = false;
-        $("photo-image").src = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(value.image)}`;
+        const imageUrl = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(value.image)}`;
+        $("photo-image").src = imageUrl;
+        $("photo-full").href = imageUrl;
+        $("photo-full").hidden = false;
         $("photo-caption").textContent = `${value.transport || "Fixed-line"} · ${Math.round(value.elapsed_seconds || 0)} s exposure`;
       }
       if (value.hdr) {
@@ -123,6 +128,7 @@ export function createMarblePhoto(doc = document) {
       transport: $("photo-transport").value,
     });
     $("photo-hdr").hidden = true;
+    $("photo-full").hidden = true;
     status(`Uploading ${geometry.triangleCount.toLocaleString()} saved triangles…`);
     const response = await fetch("/api/marble_photo", { method: "POST",
       headers: { "Content-Type": "application/octet-stream" }, body });
