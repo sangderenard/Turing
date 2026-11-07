@@ -92,7 +92,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
-  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45;
+  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
@@ -196,7 +196,15 @@ function rebuild() {
   reportMass(geometry);
 }
 function controls() {
-  for(const field of ["base-shape","marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  $("base-shape").addEventListener("change",()=>{
+    if($("base-shape").value!=="marble"&&!dieDefaultsApplied) {
+      $("shell").value="ceramic_porcelain";$("mark-material").value="stone_onyx";
+      $("layer").value="mark";$("opaque").checked=false;opaqueSaved=null;
+      yaw=-0.65;pitch=0.42;dieDefaultsApplied=true;copyCoating();
+    }
+    rebuild();syncMaterial();
+  });
+  for(const field of ["marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
   const lightValue=(name)=>{const divisor=name==="light-strength"?10:name.startsWith("spot")?1:100;
     return (+$(name).value/divisor).toFixed(name.startsWith("spot")?0:2);};
   for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
