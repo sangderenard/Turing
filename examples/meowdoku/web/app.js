@@ -4,6 +4,7 @@
 // whatever state the Python server hands it (games.py's protocol) and
 // animates the difference between states; it decides nothing.
 
+import "./access.js";   // [ACCESS] window.meowdokuAccess: the tier (server-enforced); development options below are shown by it
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, gravityAngle } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
@@ -2994,8 +2995,8 @@ function defaultLatitude() {
   return 42;
 }
 try { const g = JSON.parse(localStorage.getItem("meowdoku_geo") || "null"); if (g && Number.isFinite(g.lat) && Number.isFinite(g.lon)) { SCENE.lat = g.lat; SCENE.lon = g.lon; SCENE.homeLat = g.lat; SCENE.homeLon = g.lon; } } catch { /* private window */ }
-try { const q = new URLSearchParams(location.search).get("clock"); if (q) SCENE.clock = q; } catch { /* no location */ }
-try { const h = new URLSearchParams(location.search).get("hour"); if (h != null && isFinite(Number(h))) SCENE.clock = hourClock(h); } catch { /* no location */ }
+try { const q = new URLSearchParams(location.search).get("clock"); if (q && window.meowdokuAccess.dev) SCENE.clock = q; } catch { /* no location */ }   // [ACCESS] dev option
+try { const h = window.meowdokuAccess.dev ? new URLSearchParams(location.search).get("hour") : null; if (h != null && isFinite(Number(h))) SCENE.clock = hourClock(h); } catch { /* no location */ }
 window.setSceneClock = (value) => { SCENE.clock = value || null; SCENE.at = -1e9; };
 // A PLACE for the sky: its latitude, longitude and time zone (the sun is where it is THERE; a fixed clock is that place's
 // local time).  "here" is the browser's own zone and the saved / rough location.
@@ -7073,5 +7074,5 @@ async function lifecycleResume() {
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
   chain.then(() => { loading.done(); loading.release("boot"); });                                                    // [LOADING] the first game is drawn
-  if (/[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
+  if (window.meowdokuAccess.edit && /[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
 })().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });

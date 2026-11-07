@@ -8,6 +8,7 @@
 // It also owns the page's readiness client: `gate(game)` holds a game until ITS products are built (the panel shows meanwhile) and
 // `whenReady(names)` waits silently for a product, using the polling pattern of lifecycle.js.  The panel never takes input.
 import { decodePacket, seam, angleOf } from "./loading_anim.js";
+import "./access.js";   // [ACCESS] sets window.meowdokuAccess (the shader tier shows this panel alone; ?loading_demo is a development option)
 
 // ------------------------------------------------------------------ pure helpers (tested in node)
 export const PHASES = {
@@ -53,7 +54,7 @@ function start() {
     data: null, fails: 0, timer: null, waiters: new Set(),
     shownAt: 0, visible: false, showTimer: null, raf: 0, gl: null, anim: null, animUrl: null, animTried: false,
     tint: PHASES.downloading.tint.slice(), phase: "downloading", t0: performance.now(),
-    forced: new URLSearchParams(location.search).get("loading_demo"),
+    forced: window.meowdokuAccess.shader ? "downloading" : window.meowdokuAccess.dev ? new URLSearchParams(location.search).get("loading_demo") : null,   // [ACCESS]
   };
   const dl = { loaded: 0, total: 0, inflight: 0 };
   const webgpu = !!navigator.gpu;
@@ -125,6 +126,7 @@ function start() {
   const dot = document.createElement("span"); dot.className = "lp-dot";
   const text = document.createElement("span");
   caption.append(dot, text); root.append(canvas, caption);
+  if (window.meowdokuAccess.shader) caption.style.display = "none";                   // [ACCESS] shader only: the animation, no words
   document.body.appendChild(root);
 
   // ---- colours: the page's own (CSS custom properties), parsed once per frame

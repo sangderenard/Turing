@@ -62,6 +62,7 @@ from meowdoku import share as share_mod  # noqa: E402  (share links and the view
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
+from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PRODUCT_WAIT_SECONDS = 90       # [LOADING] how long a request for a building product file waits before "503, retry"
@@ -325,6 +326,7 @@ class Sessions:
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
+        self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -392,6 +394,41 @@ def make_handler(sessions: Sessions):
                     self._set_cookie.append(f"{PLAYER_COOKIE}={held}; Path=/; Max-Age={PLAYER_COOKIE_SECONDS}; HttpOnly; SameSite=Lax")
                 table.player_token, table.player = held, name
             return table
+
+        # ---- [ACCESS] origin and tier, from the socket peer and the Host header only (never a forwarding header: there is no proxy)
+        def _classify(self) -> None:
+            self._origin, self._tier = sessions.access.decide(self.client_address[0], self.headers.get("Host"))
+
+        def _shader_request(self, path: str, method: str) -> bool:
+            """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
+            if method != "GET":
+                self.close_connection = True
+                self._set_cookie = []
+                self._json({"error": "shader tier"}, HTTPStatus.FORBIDDEN)
+                return True
+            if path in access_mod.SHADER_APIS:
+                return False                                   # served below (/api/ready is reduced for this tier)
+            if path.startswith("/api/") or path.startswith("/ws"):
+                self._set_cookie = []
+                self._json({"error": "shader tier"}, HTTPStatus.FORBIDDEN)
+                return True
+            if path not in access_mod.SHADER_FILES:
+                self.path = access_mod.SHADER_PAGE                # any other page address is the shader page
+            super().do_GET()
+            return True
+
+        def _whoami(self) -> None:
+            self._set_cookie = []
+            self._json({"origin": self._origin, "tier": self._tier,
+                        "dev": access_mod.at_least(self._tier, "dev"), "edit": access_mod.at_least(self._tier, "edit"),
+                        "shader": self._tier == "shader"})
+
+        def do_HEAD(self):  # noqa: N802
+            self._classify()
+            if self._tier == "shader" or self.path.startswith("/api/") or self.path.startswith("/ws"):
+                self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
+                return
+            return super().do_HEAD()
 
         def _json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
             body = json.dumps(payload).encode("utf-8")
@@ -521,6 +558,11 @@ def make_handler(sessions: Sessions):
 
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
+            self._classify()                                      # [ACCESS]
+            if self._tier == "shader" and self._shader_request(path, "GET"):
+                return
+            if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
+                return self._whoami()
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
                 return self._lifecycle_get()
             if path == "/api/ready":                              # [LOADING] per-product readiness, polled by the page (loading_panel.js)
@@ -560,8 +602,8 @@ def make_handler(sessions: Sessions):
         # ---- [LOADING] readiness and the loading animation
         def _ready(self) -> None:
             self._set_cookie = []
-            out = sessions.readiness.snapshot()
             info = sessions.anim.info()
+            out = sessions.readiness.snapshot() if self._tier != "shader" else {}      # [ACCESS] the shader tier sees only the animation
             out["loading_anim"] = ({"present": True, "url": f"/api/loading_anim?v={info['digest']}", **info} if info
                                    else {"present": False, "upload": True})
             self._json(out)
@@ -588,6 +630,8 @@ def make_handler(sessions: Sessions):
             def refuse(message, status):
                 self.close_connection = True                       # the body may be unread
                 return self._json({"error": message}, status)
+            if not access_mod.require_tier(self, "edit"):          # [ACCESS] recording the animation is an owner tool
+                return
             if self.headers.get("X-Meowdoku-Loading") != "1":
                 return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
             if length <= 0 or length > anim_mod.MAX_BYTES:
@@ -627,6 +671,8 @@ def make_handler(sessions: Sessions):
         def _lifecycle_post(self, path: str, length: int) -> None:
             lc = sessions.lifecycle
             if path == "/api/admin/lifecycle":
+                if not access_mod.require_tier(self, "edit"):      # [ACCESS] the tier is in addition to the token below
+                    return
                 forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
                 ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
                                                                 self.headers.get("X-Meowdoku-Admin"), lc.token)
@@ -651,6 +697,10 @@ def make_handler(sessions: Sessions):
 
         def do_POST(self):  # noqa: N802
             path0 = self.path.split("?", 1)[0]
+            self._classify()                                      # [ACCESS]
+            if self._tier == "shader":
+                self._shader_request(path0, "POST")
+                return
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
                 try:
@@ -694,6 +744,8 @@ def make_handler(sessions: Sessions):
                     return self._share_error(error)
                 return self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
             payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            if path.startswith("/api/action") and str(payload.get("type")) in access_mod.EDIT_ACTIONS and not access_mod.require_tier(self, "edit"):
+                return                                            # [ACCESS] process-wide controls (learner, Lichess, pilot weights)
             table = self._table()
             try:
                 with table.lock:
@@ -943,6 +995,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default=None,
                         help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
     parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
+    parser.add_argument("--access", default=None,
+                        help="access tier policy file (default <web-dir>/../access.json; see access.py)")
     parser.add_argument("--no-wasm", action="store_true",
                         help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--no-idle-train", action="store_true",
@@ -963,6 +1017,9 @@ def main(argv: list[str] | None = None) -> int:
         COOKIE = f"meowdoku_session_{args.port}"
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
+    if args.access:
+        sessions.access = access_mod.Access(Path(args.access))
+    sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
     lc = lifecycle_mod.Lifecycle(sessions, web_dir.parent, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
     lc.server, sessions.lifecycle = server, lc
