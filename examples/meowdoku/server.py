@@ -553,7 +553,9 @@ def main(argv: list[str] | None = None) -> int:
     prepare_predictor(web_dir)
     prepare_policy(web_dir)
     prepare_graph_products(web_dir)
-    prepare_fountain(web_dir)
+    # The fountain's products can take a long compile (the 256 / 4k native + wasm fallbacks): every other game serves
+    # meanwhile, and the fountain page reads the manifest once it is written.
+    threading.Thread(target=prepare_fountain, args=(web_dir,), name="fountain-build", daemon=True).start()
     global COOKIE, PLAYER_COOKIE
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"

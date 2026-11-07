@@ -51,10 +51,19 @@ WASM_CONTRACT = "develop"
 DISPLAY_MAX = 262144                     # the most points the page draws: the display samples every k-th id
 
 
+_SOURCES: str | None = None
+
+
 def _sources() -> str:
-    from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
-    return "\0".join(inspect.getsource(m) for m in (F, sys.modules[__name__], ssa_webgpu_backend,
-                                                     deployment_classification, llvm_training_runtime))
+    """The source text the products are keyed by, read ONCE per process and kept.  inspect.getsource re-reads the files
+    from disk, so a file edited while a long build ran stamped the build's later sizes with the digest of code it never
+    compiled (2026-11-06: small and 4k keyed to one fountain.py, 16k+ to the next; the next start rebuilt both fallbacks)."""
+    global _SOURCES
+    if _SOURCES is None:
+        from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
+        _SOURCES = "\0".join(inspect.getsource(m) for m in (F, sys.modules[__name__], ssa_webgpu_backend,
+                                                            deployment_classification, llvm_training_runtime))
+    return _SOURCES
 
 
 def digest(tag: str) -> str:
