@@ -56,6 +56,7 @@ deploy to 8766 as soon as work lands.
    - colour covers all particles.
   - **Landed (first cut):** a page control "look" (web/particle_styles.js, render only): points (default), liquid (screen-space fluid), sand (shaded impostors + density AO), glow, heat (density and moving share: the packed points carry no velocity), stamp (a decaying 8-bit memory under the points, in board coordinates).
   - **Open:** per-species sprites, stamped layers and trails per id, the memory following the 3D law, a velocity channel in the packed points (heat by speed).
+  - **Landed (noise filter):** web/noise_filter.js, render only, layered over any look (toggle, replace-with mean / spectral class, strength, threshold; local controls, remembered): the colour field is splat to a board texture and mip-mapped; the gaps between mip levels are band variances, the slope of their log against scale is beta (white 0, pink 1, brown 2, a step edge 3), and speckle (variance in the fine bands) is replaced by the region's coarse mean or by a fixed class colour (white, pink, brown, grey = luminance-only white, solid). Needs half-float render targets; off, with the reason in the control title, without them.
 
 ## Later desires (the user's, recorded 2026-11-06)
 
