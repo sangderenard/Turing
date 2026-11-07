@@ -48,6 +48,7 @@ import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } f
 import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, curveSettled, initialCurve, clampCurveU,
          dollyParams, projectionMatrix, pickPlane } from "./world_curve.js";                                                 // [CURVE]
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
+import { catEyeMarble } from "./marble_mesh.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -1741,7 +1742,7 @@ function litMesh(faces, uvOf) {
   const pos = [], nrm = [], mat = [], uv = [];
   for (const [a, b, c, m, given] of faces) {
     const N = given || norm(cross(sub(b, a), sub(c, a)));             // (a face may carry its own normal: the 5th element)
-    for (const q of [a, b, c]) { pos.push(...q); nrm.push(...N); mat.push(m); if (uvOf) uv.push(...uvOf(q)); }
+    for (const [k, q] of [a, b, c].entries()) { pos.push(...q); nrm.push(...(Array.isArray(N[0]) ? N[k] : N)); mat.push(m); if (uvOf) uv.push(...uvOf(q)); }
   }
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
@@ -1758,6 +1759,29 @@ function litMesh(faces, uvOf) {
   gl.bindVertexArray(null);
   (state.vaoMaterials ||= new Map()).set(vao, [...new Set(mat)]);   // which materials this mesh draws (see sceneNeedsVariant)
   return { vao, count: pos.length / 3, buffers };
+}
+const MARBLE = { mesh: null, key: "" };
+function marblePreview() {
+  if (!$('marble-preview').checked || !state.game || !state.extent) return null;
+  const eye = $('marble-eye').value;
+  const ids = { glass: state.materialIndex.marble_clear_glass,
+    eye: state.materialIndex[`marble_cat_eye_${eye}`], accent: state.materialIndex.marble_milk_glass };
+  if (Object.values(ids).some((id) => !Number.isInteger(id))) return null;
+  const options = { eyeWidth: Number($('marble-width').value) / 100,
+    eyeCurve: Number($('marble-curve').value) / 100,
+    rings: Number($('marble-facets').value), segments: Number($('marble-facets').value) * 2 };
+  const key = JSON.stringify([ids, options]);
+  if (key !== MARBLE.key) {
+    for (const mesh of Object.values(MARBLE.mesh || {})) {
+      state.vaoMaterials.delete(mesh.vao); gl.deleteVertexArray(mesh.vao);
+      for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
+    }
+    const geometry = catEyeMarble(ids, options);
+    MARBLE.mesh = { interior: litMesh(geometry.interior), glass: litMesh(geometry.glass) };
+    MARBLE.key = key;
+  }
+  const center = M.translate(extMidX(), 1.25, extMidZ());
+  return { ...MARBLE.mesh, model: M.multiply(center, M.scale(0.35, 0.35, 0.35)) };
 }
 function box(x0, y0, z0, x1, y1, z1, m) {   // outward faces
   const p = (x, y, z) => [x, y, z];
@@ -1854,7 +1878,7 @@ const GRAIN_FINISHES = [
   ["ember", [0.18, 0.06, 0.04], { roughness: 0.7, ior: 1.4, specular: 0.2, shininess: 12, group: EMBER_GROUP, kelvin: 1150 }],
 ];
 function uploadMaterials(game) {
-  // Base tables hold the three piece materials; every palette colour of the
+  // Base tables hold the three piece materials and the authored catalogue; every palette colour of the
   // state becomes a record (X mark's template, albedo replaced), plus a
   // lit "@hint" and "@sel" variant per colour and a glass record.
   const base = state.assets.materials, x = state.assets.meshes.x_mark.material;
@@ -1964,7 +1988,7 @@ function uploadMaterials(game) {
   records.push([OBSIDIAN, [0.022, 0.022, 0.028], { roughness: 0.06, transmission: 0.2, opacity: 0.96, ior: 1.5, specular: 0.8, shininess: 140 }]);
   records.push([FROST, [0.97, 0.98, 1.0], { roughness: 0.75, transmission: 0.3, opacity: 0.9, ior: 1.5, specular: 0.25, shininess: 20, profile: 3, thicknessMm: 3, thicknessLayer: FINISH_LAYER_FROST, translucence: 1.0, emission: [0.40, 0.41, 0.43] }]);
   const tables = {};
-  state.materialIndex = {};
+  state.materialIndex = { ...(state.assets.material_index || {}) };
   state.celPalette = new Float32Array(CEL_PALETTE * 3);
   {
     const f = base.pbr.floats_per_record;
@@ -2011,13 +2035,15 @@ function uploadMaterials(game) {
         // phong [1] spec strength, [2] shininess: a material may declare them (the grain gems); the rest keep the
         // template's, the spec strength capped as before
         if (extra.shininess != null) record[2] = extra.shininess;
+        if (extra.grain != null) record[3] = extra.grain;
         // The extruded meshes' walls are wound inward (measured: wall signed volume is
         // negative, stored normals follow the winding), so seen from outside they are
         // BACK faces, and the shader paints back faces with the phong record's "inner"
         // colour (floats 4..6) instead of albedo.  The X-mark template's inner is
         // (0.055, 0.055, 0.066): every wall of every piece rendered near-black.  The
         // material is the palette colour on both sides, so inner = albedo.
-        record[4] = rgb[0]; record[5] = rgb[1]; record[6] = rgb[2];
+        const inner = extra.innerColor || rgb;
+        record[4] = inner[0]; record[5] = inner[1]; record[6] = inner[2];
         if (extra.ambient != null) record[0] = extra.ambient;         // (the shader clamps it to 0.12)
       }
       data.push(...record);
@@ -6026,6 +6052,7 @@ function litPass(cam, now, casters, opts = {}) {
   if (!opts.broadcast && state.bodyMesh && state.bodyMesh.mesh) drawWheel2D(state.game, drawLit);   // the waterwheel   // the 3-D fountain's polygon housing
   if (state.trayButtons) drawLit(state.trayButtons.vao, state.trayButtons.count, M.identity(), null);   // the power-ups' glass cubes
   if (state.glassDraws && !state.flat) for (const [m, model] of state.glassDraws) drawLit(m.vao, m.count, model, null);   // Wordle's obsidian tiles
+  if (state.marblePreview && !opts.broadcast) drawLit(state.marblePreview.glass.vao, state.marblePreview.glass.count, state.marblePreview.model, null);
   if (state.game && state.game.mobroad && !opts.broadcast) mobroad.draw(mobApi, cam, state.game, drawLit);               // [MOBROAD] the panels (glass) and their value labels
   drawLightning(cam, now, drawLit);
   for (const piece of state.glassPieces || []) {
@@ -6083,6 +6110,8 @@ function draw(ms) {
     : glassTiles ? (state.flat ? glassTiles.map(([m, model]) => [m.vao, m.count, model, null]) : [])
     : [[state.buttons.vao, state.buttons.count, state.caseModel || M.identity(), null]];
   if (state.rackButtons && !glassTiles) casters.push([state.rackButtons.vao, state.rackButtons.count, M.identity(), null]);
+  state.marblePreview = state.flat ? null : marblePreview();
+  if (state.marblePreview) casters.push([state.marblePreview.interior.vao, state.marblePreview.interior.count, state.marblePreview.model, null]);
   const removed = [];
   for (const [key, piece] of state.pieces) {
     if (piece.removing != null && now - piece.removing > 0.3) { removed.push(key); continue; }

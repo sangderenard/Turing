@@ -257,6 +257,8 @@ def test_recorder_parameter_handling():
     assert (w["chamber"], w["size"], w["mix"], w["grainScale"], w["grains"], w["fps"], w["bits"], w["turns"], w["flipSeconds"], w["speed"], w["cap"], w["colour"], w["fit"]) == \
         ("sdf_hourglass", "small", 1, 0.5, 1024, 2, 12, 4, 2, 0, 10, 2, False)
     assert "junk" not in w
+    assert out["sizes"] == ["small", "4k", "16k", "64k", "256k", "1M", "4M", "10M"]
+    assert out["sizeIds"]["256k"] == 262144 and out["sizeIds"]["10M"] == 10000000
     back = out["back"]
     assert back["on"] and back["studio"] and back["params"]["chamber"] == "sdf_circle" and back["params"]["bits"] == 10 and back["params"]["mix"] == 0.25 and back["params"]["turns"] == 6
     assert "record_loading=1" in out["query"] and "studio=1" in out["query"] and "rp=" in out["query"]
@@ -265,6 +267,13 @@ def test_recorder_parameter_handling():
     assert out["tight"] == [[8, 300, 11], [8, 256, 10], [6, 200, 10]]                                 # fit never goes looser than the choice
     assert out["meta"]["mix"] == "default" and out["meta"]["capped"] is True and out["meta"]["bits"] == 12
     assert all(isinstance(v, (str, int, float, bool)) for v in out["meta"].values())                  # flat: the server keeps these
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_visual_projection_filters_existing_packed_snapshots():
+    out = json.loads(subprocess.run([NODE, str(CHECK), "visual"], check=True, capture_output=True, text=True).stdout)
+    assert out == {"frames": 10, "sampled": 32, "step": 24, "grains": 16, "raw": 722, "capped": True}
+    assert out["raw"] < L.MAX_BYTES
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")

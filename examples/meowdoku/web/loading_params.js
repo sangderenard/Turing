@@ -3,7 +3,10 @@
 // (`?record_loading=1&rp=<json>`).  A bare `?record_loading=1` is DEFAULTS, i.e. what the recorder always did.
 export const BITS = [10, 11, 12, 16];
 export const COLOUR_SOURCES = [[2, "time strata"], [0, "trig (atan2)"], [1, "rotation"]];      // fountain.py `mode` (fountain_mode)
-export const SIZES = ["small", "4k"];                                                         // the fountain sizes the compute products are built for
+// fountain.py SIZES.  The studio further restricts this list to entries present in the deployed manifest.
+export const SIZES = ["small", "4k", "16k", "64k", "256k", "1M", "4M", "10M"];
+export const SIZE_IDS = { small: 256, "4k": 4096, "16k": 16384, "64k": 65536,
+  "256k": 262144, "1M": 1048576, "4M": 4194304, "10M": 10000000 };
 export const CHAMBERS = [                                                                     // the 2-D chambers (fountain.py CHAMBER_CHOICES)
   ["sdf_hourglass", "hourglass"], ["sdf_circle", "circle"], ["sdf_square", "square"], ["sdf_triangle", "triangle"], ["sdf_annulus", "annulus"],
   ["box", "box (open basin)"], ["funnel", "funnel"], ["hexagon", "hexagon"], ["ramp", "ramp"], ["ngon5", "pentagon"], ["ngon7", "heptagon"], ["sdf_toy", "oil & glycerine toy"],
