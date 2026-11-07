@@ -2074,6 +2074,9 @@ function uploadMaterials(game) {
   // Emitters are surfaces the shader lights from within (pbr emission): the
   // sun's orb and the arcade bulbs, each bulb colour at ARCADE_LEVELS steps.
   records.push(["sun_orb", [0.2, 0.2, 0.2], { emission: [2.2, 2.0, 1.7] }]);
+  for (const [name, tint] of Object.entries(NIGHT_LAMP_COLORS))
+    records.push([`night_lamp_${name}`, tint.map((v) => 0.18 * v),
+      { roughness: 0.18, specular: 0.6, shininess: 100, emission: tint.map((v) => 4 * v) }]);
   // The vital bars: a glass tube each (clear) and its fill (glowing glass).
   // Clouds: white frosted glass (rough, partly transmissive, softly lit from within).
   // Clouds: thin white frosted glass, low over the land.
@@ -3158,6 +3161,19 @@ function arcadeBulb(i, bulbs, now) {
 // above the board under the pointer.  Its light falls off with distance, so
 // what it passes close to glows and the far side dims.
 const LAMP = { omega: 1.6 };
+const NIGHT_LAMP_COLORS = {
+  warm: [1.0, 0.76, 0.46], amber: [1.0, 0.48, 0.16],
+  neutral: [1.0, 0.96, 0.88], cool: [0.65, 0.82, 1.0],
+};
+const nightLamp = { on: true, color: "warm" };
+function nightLampLevel() {
+  // Begin the handoff at late dusk, reaching full bulb light below the horizon.
+  return nightLamp.on ? Math.max(0, Math.min(1, (4 - SCENE.elevation * 180 / Math.PI) / 8)) : 0;
+}
+function nightLampPosition(ext) {
+  const span = Math.max(ext.width, extLength(ext));
+  return [extMidX(ext) + 0.48 * span, 0.64 * span, extMidZ(ext) - 0.24 * span];
+}
 // The sun: a soft light at an angle over the board, placed by the user's local
 // time of day -- its bearing goes once round the board per day, it stands
 // highest at noon, low and warm at dawn and dusk, and at night it is a dim
@@ -3388,7 +3404,8 @@ function updateLight(now) {
   const ext = state.extent || { width: 6, depth: 6 }, span = Math.max(ext.width, extLength(ext));
   if (state.flat) light.position = [ext.width / 2, light.height * span * 0.9, extMidZ(ext)];   // co-located with the camera, straight down
   else {
-    const target = lampTarget(now, ext);
+    const sunTarget = lampTarget(now, ext), bulbTarget = nightLampPosition(ext), amount = nightLampLevel();
+    const target = sunTarget.map((v, k) => v * (1 - amount) + bulbTarget[k] * amount);
     if (!light.body) light.body = { p: target.slice(), v: [0, 0, 0], at: now };
     const body = light.body, dt = Math.min(0.05, Math.max(0, now - body.at)), w = LAMP.omega;
     body.at = now;
@@ -4443,7 +4460,8 @@ function showShop(inv) {
 // Settings ride on the profile: saved when changed, applied once on arrival.
 function currentSettings() {
   return { camMode: state.camMode || "board", pads: $("pads") ? $("pads").checked : false,
-           bombStyle: state.bombStyle || 0, wordle: { ...wordleChoice }, skyMode: SCENE.mode };
+           bombStyle: state.bombStyle || 0, wordle: { ...wordleChoice }, skyMode: SCENE.mode,
+           autoLamp: nightLamp.on, lampColor: nightLamp.color };
 }
 function saveSettings() { if (state.game) act({ type: "settings", values: currentSettings() }).catch(() => {}); }
 function applySettings(values) {
@@ -4452,6 +4470,10 @@ function applySettings(values) {
   if (Number.isInteger(values.bombStyle)) { state.bombStyle = (values.bombStyle + BOMB_STYLES.length - 1) % BOMB_STYLES.length; cycleBomb(); }
   if (values.wordle && typeof values.wordle === "object") Object.assign(wordleChoice, values.wordle);
   if (SCENE_MODES.includes(values.skyMode)) setSkyMode(values.skyMode, false);
+  if (typeof values.autoLamp === "boolean") nightLamp.on = values.autoLamp;
+  if (Object.hasOwn(NIGHT_LAMP_COLORS, values.lampColor)) nightLamp.color = values.lampColor;
+  $("auto-lamp").checked = nightLamp.on;
+  $("lamp-color").value = nightLamp.color;
 }
 function renderModes(game) {
   const box = $("modes"), modes = game && game.modes;
@@ -5269,7 +5291,7 @@ window.meowdokuDebug.pcolor = pcolor;
 // (the generated families -- bulbs, shield steps, nav lights, bars, smoke steps -- and the pieces' @hint / @sel states are left out;
 // the @glass ones are the scene's translucent materials)
 function materialChoices() {
-  return Object.keys(state.materialIndex).filter((n) => !/^(bulb\d|shield_|nav_|bar_|smoke_|sight|reticle|beam|broadcast|terrain)/.test(n) && !/@(hint|sel)$/.test(n)).sort();
+  return Object.keys(state.materialIndex).filter((n) => !/^(bulb\d|night_lamp_|shield_|nav_|bar_|smoke_|sight|reticle|beam|broadcast|terrain)/.test(n) && !/@(hint|sel)$/.test(n)).sort();
 }
 function albedoOfMaterial(name) {
   const id = state.materialIndex[name], t = state.pbrTable;
@@ -6241,6 +6263,9 @@ function litPass(cam, now, casters, opts = {}) {
     const day = Math.max(0, Math.min(1, (globe[1] + 0.12) / 0.4));
     fillColour = [0.35 + 0.4 * day, 0.42 + 0.43 * day, 0.62 + 0.38 * day].map((v) => v * (0.35 + 0.65 * day));
   } else fillColour = ambientFill(fillColour);   // no sky of its own: the shared background tints the fill
+  const lampAmount = nightLampLevel();
+  keyColour = mix(keyColour, NIGHT_LAMP_COLORS[nightLamp.color], lampAmount);
+  const keyStrength = sun.strength * (1 - lampAmount) + lampAmount;
   // The sun's intensity is set for its distance to the board's centre (soft,
   // even light); the fill light carries the arcade ring's colour and activity.
   // The house light is turned down so the arcade bulbs carry the scene: the
@@ -6271,7 +6296,7 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniform3fv(gl.getUniformLocation(P, "uLightColor[0]"), new Float32Array([...keyColour, ...fillColour, 1.0, 0.8, 0.7,
     ...bulbLights.slice(0, count - 3).flatMap((b) => b.colour)]));
   gl.uniform1fv(gl.getUniformLocation(P, "uLightIntensity[0]"), new Float32Array([
-    (state.flat ? 2.6 : 1.45 * house * sun.strength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
+    (state.flat ? 2.6 : 1.45 * house * keyStrength) * sunReach * sunReach, 0.19 * house * span * span, 0.14 * house * span * span,
     ...bulbLights.slice(0, count - 3).map((b) => (b.intensity ?? ARCADE.lamp * b.level))]));
   const groups = new Int32Array(count).fill(-1);               // an emitter's group id: its own surface skips its light
   bulbLights.slice(0, count - 3).forEach((b, i) => { if (b.group != null) groups[i + 3] = b.group; });
@@ -6322,7 +6347,11 @@ function litPass(cam, now, casters, opts = {}) {
       const goal = state.game.marble.goal, at = lawToWorld(state.game)(goal.x, goal.y, 0);
       drawLit(orb.vao, orb.count, M.multiply(M.translate(...at), M.scale(0.12, 0.12, 0.12)), state.materialIndex.nav_green);
     }
-    drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
+    if (lampAmount > 0.1 && state.meshes.bulb) {
+      const bulb = state.meshes.bulb;
+      drawLit(bulb.vao, bulb.count, M.multiply(M.translate(...light.position), M.scale(0.54, 0.54, 0.54)),
+        state.materialIndex[`night_lamp_${nightLamp.color}`]);
+    } else drawLit(orb.vao, orb.count, M.multiply(M.translate(...light.position), M.scale(0.16, 0.16, 0.16)), state.materialIndex.sun_orb);
     bulbs.forEach((p, i) => {
       const { level, ci } = bulbStates[i];
       const step = ARCADE_LEVELS.reduce((best, v, k) => (Math.abs(v - 2.4 * level) < Math.abs(ARCADE_LEVELS[best] - 2.4 * level) ? k : best), 0);
@@ -7214,6 +7243,8 @@ $("saturation").oninput = (e) => { state.saturation = Number(e.target.value) / 1
 function toggleLight() { light.follow = !light.follow; $("light").textContent = light.follow ? "Light: pointer (L)" : "Light: sun (L)"; }
 $("light").onclick = toggleLight;
 $("sky-mode").onchange = () => setSkyMode($("sky-mode").value);
+$("auto-lamp").onchange = () => { nightLamp.on = $("auto-lamp").checked; saveSettings(); };
+$("lamp-color").onchange = () => { nightLamp.color = $("lamp-color").value; saveSettings(); };
 // the sky's place and clock (restored, then applied)
 try { const pl = localStorage.getItem("meowdoku.skyplace"); if (pl) setSkyPlace(pl); const ck = localStorage.getItem("meowdoku.skyclock"); if (ck && !SCENE.clock) setSkyClock(ck); } catch { /* storage may be blocked */ }
 if ($("sky-place")) { $("sky-place").value = SCENE.place || "here"; $("sky-place").onchange = () => setSkyPlace($("sky-place").value); }
