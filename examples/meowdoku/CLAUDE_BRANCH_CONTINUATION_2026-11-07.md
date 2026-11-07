@@ -21,6 +21,7 @@ The stage 3 mover (`python tools/meowdoku_layout_move.py --stage 3 --dry`) now r
 - Log commit: `test_meowdoku_logring.py`: 5 passed; Node module syntax checks for `log.js` and `log_view.js` and `tests/meowdoku_log_view_check.mjs` passed.
 - After stage 3: compileall on the moved title/generator/export/serve packages passed; access, startup, share, logring and loading animation tests: 68 passed. `git -c core.whitespace=cr-at-eol diff --check` was clean. No compiler rebuild or live site test was run.
 - The two stale Node failures listed in `LAYOUT_AUDIT.md` are repaired in the test setup: the world-curve check now loads the real replay-layer tint table, and the emoji-style check copies `world_curve.js` and its `world_zoom.js` dependency beside the module under test. Both checks pass (2 passed); no page source was changed.
+- Main's November 5 uncommitted chess `search.py` was copied byte-for-byte into the moved `s2_titles/chess/search.py`, along with its untracked `test_meowdoku_search.py`, in this isolated branch. The three chess-search tests pass here. Main's files were not changed by this copy; compare again before landing if the owner's work advances.
 
 The law and fountain product digest changes described in `LAYOUT_AUDIT.md` require rebuild when this branch lands. Do not treat the test counts as a full product or browser gate.
 
@@ -29,11 +30,11 @@ The law and fountain product digest changes described in `LAYOUT_AUDIT.md` requi
 - `worktree-agent-abce6c236a4a86060` still has uncommitted `web/log.html`, `web/log_view.js`, and new `web/local_log.js` as of this note. Its committed backend is included here. Let that worker finish, then bring its final commit or exact files into this checkout, run the JS checks and log tests, and resolve any changes against this tree.
 - `worktree-agent-acae7257c8e4ec853` is the original layout branch. Its three stages and audit are represented here. Keep it until integration is reviewed.
 - The recent toy, QR wall, Mobroad, Wordle, loading studio, and live-view branches already reached main. The older unmerged compiler branches in `git branch --no-merged main` are separate long-running work and were not folded into a Meowdoku layout change.
-- Main has an uncommitted `examples/meowdoku/search.py` edit, which is a stage 1 moved path. Main also has unrelated compiler edits, `docs/MEOWDOKU_WEB_2026-11-05.md`, tests, hazards, and other untracked files. Preserve all of them. Resolve the `search.py` content into `s2_titles/chess/search.py` while keeping the old-path shim before merging this branch. Stage only explicit paths; do not reset or stash the owner's work indiscriminately.
+- Main has an uncommitted `examples/meowdoku/search.py` edit, which is a stage 1 moved path. Its content has been carried into this branch, but the dirty old path will still stop a merge into main. Main also has unrelated compiler edits, `docs/MEOWDOKU_WEB_2026-11-05.md`, tests, hazards, and other untracked files. Preserve all of them. Stage only explicit paths; do not reset or stash the owner's work indiscriminately.
 
 ## Next safe landing sequence
 
 1. Wait for the log worker's final commit, or coordinate a precise snapshot of its three dirty page files. Incorporate it here and verify the page module checks.
-2. Reconcile main's `search.py` work with the moved implementation in this branch. The old path must remain a shim. Check whether main has advanced and merge any new commits into this isolated branch first.
+2. Compare main's still-dirty `search.py` and test against the copies in this branch. If unchanged, arrange the main checkout's old-path edit so Git can install the shim during merge; retain the implementation under `s2_titles/chess/search.py`. Check whether main has advanced and merge any new commits into this isolated branch first.
 3. Verify the resulting diff and focused server/page tests. Then merge to main with the owner's local edits preserved. Schedule the law and fountain product rebuild in the approved digest window; follow the scratch `--web-dir` and 8766/8767 policy for any server gate.
 
