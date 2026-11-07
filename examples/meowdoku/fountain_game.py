@@ -347,7 +347,7 @@ class FountainGame(Game):
             chamber = {"manifest": "fountain3d.manifest.json", "depth": 2.0 * float(glyph.overrides["dh"]), "chamber_mesh": glyph.chamber_mesh(),
                        "start": glyph.payload(), "tilt": {"lid": 2.0 * glyph.box["hy"] + glyph.box["cell"], "rows": float(glyph.overrides["rows"])}}
         else:
-            chamber = {"manifest": ("fountain3d_wheel.manifest.json" if self.shape in BODY_SHAPES
+            chamber = {"manifest": ("fountain3d_toy.manifest.json" if self.shape == "sdf_toy" else "fountain3d_wheel.manifest.json" if self.shape in BODY_SHAPES
                                     else "fountain3d.manifest.json" if self.shape in SDF_SHAPES else "fountain3d_flat.manifest.json"),
                        "depth": 2.0 * float(self.uniforms()["dh"]), "chamber_mesh": chamber_mesh(self.shape, self.n, self.aspect, self.params),
                        "start": None, "tilt": tilt_inputs(self.n, self.aspect, cell_of(self.resolved()), self._shape())}
@@ -463,7 +463,8 @@ def _planar(u: dict[str, float]) -> bool:
     for k in range(SDF_SLOTS):
         if u[f"q{k}kind"] > 0.5:
             kind = SDF_LAYOUT[k]
-            if not (kind == "pegs" or (kind == "hourglass" and u[f"q{k}p4"] > 0.5) or (kind == "capsule" and u[f"q{k}p2"] >= u["dh"])):
+            if not (kind == "pegs" or (kind == "hourglass" and u[f"q{k}p4"] > 0.5)
+                    or (kind in ("box", "capsule") and u[f"q{k}p2"] >= u["dh"])):
                 return False
     return True
 

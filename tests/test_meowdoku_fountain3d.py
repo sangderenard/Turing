@@ -1551,11 +1551,15 @@ def test_sdf_presets_keep_their_designed_proportions_and_the_view_follows_the_ch
     c = F.CELL
     assert F.sdf_design("sdf_sphere", 1.0, c)[2] == pytest.approx(2.0 * F.sdf_design("sdf_sphere", 1.0, c)[1])      # as tall as wide
     assert F.sdf_design("sdf_hourglass", 1.0, c)[2] == pytest.approx(F.HOURGLASS_ASPECT * F.sdf_design("sdf_hourglass", 1.0, c)[1])
-    # the toy is as tall as its parts need: ramps over the throat over a peg field of >= 5 rows, whatever the grain size and id count
+    # The 2-D and 3-D toy use the same bottom-up geometry, including split ramps and the wheel.
+    from meowdoku import toy_design
     for n in (256, 4096):
         for cell in (F.CELL, 2.0 * F.CELL, 4.0 * F.CELL):
             _c, w, top = F.sdf_design("sdf_toy", math.sqrt(n / F.N_BASE), cell)
-            assert top >= F.TOY_ASPECT_W * w + F.TOY_ASPECT_C * cell - 1e-12 and 0.22 * top >= (F.TOY_PEG_ROWS - 1) * 4.6 * cell - 1e-12
+            parts = toy_design.toy_parts(w, cell, [species[1] for species in F.SPECIES])
+            assert top == pytest.approx(parts["top"])
+            assert parts["pegs"]["rows"] >= toy_design.PEG_ROWS
+            assert parts["pegs"]["top"] < parts["yc"] < parts["wheel"]["y"] < parts["ramps"][0]["high"][1] < top
     small = F.sdf_design("sdf_toy", 0.25, F.CELL)
     assert small[2] / small[1] > F.sdf_design("sdf_toy", 1.0, F.CELL)[2] / F.sdf_design("sdf_toy", 1.0, F.CELL)[1]     # a small chamber is relatively taller
     # the polygons and the box are untouched by the shape argument

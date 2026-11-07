@@ -55,6 +55,7 @@ from meowdoku.boardwalk import Boardwalk  # noqa: E402
 from meowdoku.worldwalk import WorldWalk  # noqa: E402
 from meowdoku.fountain import FountainGame  # noqa: E402
 from meowdoku.fountain_game import FountainGame as Fountain3DGame  # noqa: E402  (the 3-D fountain: its own law, products and page controls)
+from meowdoku.marble_madness import MarbleMadness  # noqa: E402
 from meowdoku.purrline import Purrline  # noqa: E402
 from meowdoku.mobroad import Mobroad  # noqa: E402  (the road-defence mob shooter: the fountain law as the mob, an entity law for the shooters)
 from meowdoku.profiles import Profiles  # noqa: E402
@@ -95,7 +96,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "tipjar", "purrline", "mobroad"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "marble_madness", "tipjar", "purrline", "mobroad"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -155,6 +156,8 @@ class Table:
             self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
         elif kind == "fountain3d":
             self.game = Fountain3DGame(aspect=float(payload.get("aspect") or 0.0) or None)
+        elif kind == "marble_madness":
+            self.game = MarbleMadness(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "tipjar":
             from meowdoku import tipjar            # the watch-only Bitcoin tip jar on the 3-D fountain (build/meowdoku/tipjar.json; else a DEMO)
             self.game = tipjar.TipJarGameClass()(aspect=float(payload.get("aspect") or 0.0) or None)
@@ -190,7 +193,7 @@ class Table:
                 self.game.control(payload)          # the held controls ride on the tick
             if hasattr(self.game, "tick"):
                 self.game.tick()
-        elif kind.startswith("fountain_") or kind.startswith("worldwalk_") or kind.startswith("delve_"):
+        elif kind.startswith("fountain_") or kind.startswith("marble_") or kind.startswith("worldwalk_") or kind.startswith("delve_"):
             if not hasattr(self.game, "do"):
                 raise ValueError("this game takes no such action")
             self.game.do(payload)
@@ -1188,6 +1191,22 @@ def prepare_fountain3d_wheel(web_dir: Path, ctx=None) -> None:
         _fail_family(ctx, "fountain3d_wheel", error)
 
 
+def prepare_fountain3d_toy(web_dir: Path, ctx=None) -> None:
+    """Build the shared oil toy's SDF chamber and free hinged wheel on WebGPU."""
+    from meowdoku import fountain3d_build
+    try:
+        started = time.perf_counter()
+        requested = os.environ.get("MEOWDOKU_TOY_SIZES", "")
+        sizes = tuple(tag.strip() for tag in requested.split(",") if tag.strip()) if requested else fountain3d_build.WHEEL_SIZES
+        manifest = fountain3d_build.build(web_dir, sizes=sizes, wasm=False, variant="toy")
+        routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
+        print(f"[meowdoku] fountain3d toy products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
+        _settle_family(ctx, "fountain3d_toy", False)
+    except Exception as error:
+        print(f"[meowdoku] fountain3d toy products NOT built ({type(error).__name__}: {error})", flush=True)
+        _fail_family(ctx, "fountain3d_toy", error)
+
+
 def prepare_policy(web_dir: Path, ctx=None) -> None:
     """The autopilot policy network as a WebAssembly core beside the engine
     laws (``policy_wasm.build_policy``): ``policy.wasm`` + ``policy.abi.json``,
@@ -1254,7 +1273,8 @@ def prepare_lanes(web_dir: Path, args) -> dict:
         "laws": [step(("predictor",), lambda c: prepare_predictor(web_dir, c)),
                  step(("policy",), lambda c: prepare_policy(web_dir, c)),
                  step(("graph",), lambda c: prepare_graph_products(web_dir, c))],
-        "fountain": [step(both("fountain"), lambda c: prepare_fountain(web_dir, c)),
+        "fountain": [step(both("fountain3d_toy"), lambda c: prepare_fountain3d_toy(web_dir, c)),
+                     step(both("fountain"), lambda c: prepare_fountain(web_dir, c)),
                      step(both("fountain_wheel"), lambda c: prepare_fountain_wheel(web_dir, c)),
                      step(both("fountain_purrline"), lambda c: prepare_fountain_purrline(web_dir, c)),
                      step(both("fountain_mobroad"), lambda c: prepare_fountain_mobroad(web_dir, c)),
