@@ -161,7 +161,7 @@ def test_a_damage_panel_scales_the_bullets_damage_and_reach_by_its_value():
 def test_a_rate_panel_completes_when_its_value_reaches_its_target_and_is_spent():
     cols = _game_columns()
     p = M.LEVEL_PANELS[1]                                              # rate: 1.0 .. 2.0, +0.1 a hit, x2 on completion
-    _setup_panel(cols, 1, pval=1.95)
+    _setup_panel(cols, 1, pval=1.96)
     _bullet(cols, M.BULLET0, p["x"], _below(p))
     _step(cols)
     k = M.PANEL0 + 1
@@ -180,13 +180,13 @@ def test_a_rate_panel_below_its_target_only_rises():
     _bullet(cols, M.BULLET0, p["x"], _below(p))
     _step(cols)
     k = M.PANEL0 + 1
-    assert cols["alive"][k] == 1.0 and cols["pval"][k] == pytest.approx(1.1) and cols["rate_mult"][0] == 1.0
+    assert cols["alive"][k] == 1.0 and cols["pval"][k] == pytest.approx(p["v0"] + p["step"]) and cols["rate_mult"][0] == 1.0
 
 
 def test_a_shooters_panel_adds_escorts_up_to_the_maximum():
     cols = _game_columns()
     p = M.LEVEL_PANELS[1]
-    _setup_panel(cols, 1, pkind=M.SHOOTERS, pval=1.95, pamount=1.0)
+    _setup_panel(cols, 1, pkind=M.SHOOTERS, pval=1.96, pamount=1.0)
     _bullet(cols, M.BULLET0, p["x"], _below(p))
     assert cols["alive"][M.ESCORT0] == 0.0
     _step(cols)
@@ -195,7 +195,7 @@ def test_a_shooters_panel_adds_escorts_up_to_the_maximum():
     assert cols["alive"][M.ESCORT0] == 1.0 and cols["alive"][M.ESCORT0 + 1] == 0.0      # the first escort stands beside the player
     assert abs(cols["x"][M.ESCORT0] - cols["x"][0]) == pytest.approx(abs(M.ESCORT_OFFSETS[0]), abs=0.05)
     cols["shooters"][:] = 5.0                                          # the cap
-    _setup_panel(cols, 3, pkind=M.SHOOTERS, pval=1.95, pamount=3.0, home_y=_below(M.LEVEL_PANELS[3]) - 0.05)
+    _setup_panel(cols, 3, pkind=M.SHOOTERS, pval=1.96, pamount=3.0, home_y=_below(M.LEVEL_PANELS[3]) - 0.05)
     _bullet(cols, M.BULLET0 + 1, M.LEVEL_PANELS[3]["x"], M.LEVEL_PANELS[3]["y"] + 0.05)
     _step(cols)
     assert cols["shooters"][0] == float(M.MAX_SHOOTERS)
@@ -274,9 +274,11 @@ def test_the_game_is_registered_in_the_catalog_and_made_by_the_table(tmp_path):
     (tmp_path / "boards.json").write_text(json.dumps({"boards": [], "levels": []}), encoding="utf-8")
     table = server.Table(tmp_path)
     assert "mobroad" in table.catalog()["games"]
-    state = table.new({"game": "mobroad", "size": "small"})
+    table.new({"game": "mobroad", "size": "small"})
+    table.game.session.advance(0.05)                                    # (the entities are the law's, from its first round)
+    state = table.state()
     assert state["game"] == "mobroad" and state["board"] == "free" and (state["width"], state["height"]) == F.MOB_BOARD
-    assert {e["mesh"] for e in state["entities"]} == {"rocket"} and len(state["mobroad"]["panels"]) == 4
+    assert {e["mesh"] for e in state["entities"]} <= {"rocket", "bolt"} and "rocket" in {e["mesh"] for e in state["entities"]} and len(state["mobroad"]["panels"]) == 4
     assert {p["kind"] for p in state["mobroad"]["panels"]} == {"split", "rate"}      # the level's two kinds
 
 
@@ -368,7 +370,7 @@ def test_a_swept_bullet_parks_the_grains_it_touches_for_good():
     hit &= xs >= -0.34 - 1e-9
     dead = state["age"] < -5.0e8
     assert dead.sum() >= 2 and out["n_dead"][0] == dead.sum() and (dead == hit).all()
-    assert (state["x"][dead] == 0).all() and (state["y"][dead] == 0).all() and (state["age"][dead] == -1.0e9).all()
+    assert (state["x"][dead] == 0).all() and (state["y"][dead] == 0).all() and np.allclose(state["age"][dead], -1.0e9, atol=1.0)       # pinned far below any emit time (the f64 lane adds a step to it)
     assert out["n_parked"][0] == dead.sum() and out["n_live"][0] == n - dead.sum() and out["n_goal"][0] == 0
     # the bullet is gone: nothing comes back, the survivors are untouched
     for k in seg:

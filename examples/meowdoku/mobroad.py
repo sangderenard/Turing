@@ -58,24 +58,24 @@ MAX_SHOOTERS = 1 + ESCORTS
 PLAYER_Y = HEIGHT - 0.9
 PLAYER_SPEED, SHIP_TAU, SHIP_REACH = 9.0, 0.05, 0.18
 MUZZLE = 0.7
-BULLET_SPEED = 10.0                   # board units / s (straight up the road)
-BULLET_LIFE = 0.65                    # s: a bullet's range is 6.5 board units, ~0.65 of the road's length in fountain units
+BULLET_SPEED = 12.0                   # board units / s (straight up the road)
+BULLET_LIFE = 0.9                     # s: a bullet's range is 10.8 board units: from the shooters up through the peg field to the funnel's mouth
 BASE_RATE = 3.0                       # shots per second per shooter at rate x1
 BOLT_SIZE = 0.26                      # the bolt's drawn size at damage 1 ...
-KILL_REACH = 0.34                     # ... and its kill reach (board units): reach = KILL_REACH * sqrt(damage), size = BOLT_SIZE * sqrt(damage)
+KILL_REACH = 0.45                     # ... and its kill reach (board units): reach = KILL_REACH * sqrt(damage), size = BOLT_SIZE * sqrt(damage)
 REACH_PER_SIZE = KILL_REACH / BOLT_SIZE
 FAN = 0.12                            # radians between the bullets a split leaves as
 MAX_COPIES = 6.0
 POINTS_KILL, POINTS_PANEL, POINTS_HIT = 10.0, 25.0, 1.0
-LOSE_AT = 25.0                        # grains past the goal line that end the run
+LOSE_AT = 40.0                        # grains past the goal line that end the run
 PANEL_THICK = 0.18
 
 #: The level's panels: kind, centre (board units), half width, start value, rise per hit, completion target, effect amount, value cap.
 LEVEL_PANELS = (
-    {"kind": SPLIT, "x": 3.4, "y": 15.4, "hw": 2.3, "v0": 2.0, "step": 0.25, "target": 0.0, "amount": 0.0, "cap": 6.0},
-    {"kind": RATE, "x": 9.1, "y": 15.4, "hw": 2.3, "v0": 1.0, "step": 0.1, "target": 2.0, "amount": 2.0, "cap": 2.0},
-    {"kind": SPLIT, "x": 6.25, "y": 13.6, "hw": 2.0, "v0": 2.0, "step": 0.25, "target": 0.0, "amount": 0.0, "cap": 6.0},
-    {"kind": RATE, "x": 9.4, "y": 12.8, "hw": 2.0, "v0": 1.0, "step": 0.1, "target": 2.0, "amount": 2.0, "cap": 2.0},
+    {"kind": SPLIT, "x": 3.4, "y": 15.4, "hw": 2.3, "v0": 2.0, "step": 0.1, "target": 0.0, "amount": 0.0, "cap": 5.0},
+    {"kind": RATE, "x": 9.1, "y": 15.4, "hw": 2.3, "v0": 1.0, "step": 0.05, "target": 2.0, "amount": 2.0, "cap": 2.0},
+    {"kind": SPLIT, "x": 6.25, "y": 13.6, "hw": 2.0, "v0": 2.0, "step": 0.1, "target": 0.0, "amount": 0.0, "cap": 5.0},
+    {"kind": RATE, "x": 9.4, "y": 12.8, "hw": 2.0, "v0": 1.0, "step": 0.05, "target": 2.0, "amount": 2.0, "cap": 2.0},
 )
 
 CONTROLS = {"move_axis": "move-axis-x", "steer_x": "pointer-board-x", "fire": "primary-action"}
@@ -151,7 +151,7 @@ def mobroad_step(lane, slot, home_x, home_y, rx, ry, pkind, pstep, ptarget, pamo
         dmg_mult = dmg_mult * where(cross & (kind == DAMAGE), pv, 1.0)
         copies = copies * where(cross & (kind == SPLIT), pv.floor().clip(1.0, MAX_COPIES), 1.0)
         new = where(pv + step * hits > cap, cap, pv + step * hits)
-        completes = pa & (kind >= RATE) & (hits > 0.0) & (new >= target)
+        completes = pa & (kind >= RATE) & (hits > 0.0) & (new >= target - 1.0e-9)
         pval_n = where(sel, new, pval_n)
         phits_n = where(sel, pick(phits) + hits, phits_n)
         flash_n = where(sel & (hits > 0.0), 1.0, flash_n)
@@ -254,6 +254,9 @@ def initial_columns(width: float = WIDTH, autofire: bool = True) -> dict[str, np
         "move_axis": np.zeros(LANES), "steer_x": np.full(LANES, -1.0), "fire": np.zeros(LANES),
     })
     return columns
+
+
+_SPECS: dict[str, dict[str, Any]] = {}
 
 
 class Mobroad(EntityGame):
@@ -367,7 +370,7 @@ class Mobroad(EntityGame):
 
     def compute_spec(self) -> dict[str, Any]:
         """The mob's compute spec (the fountain's, the road variant): the page runs the law from this and restarts it when ``epoch`` moves."""
-        spec = F.mobroad_spec(self.size)
+        spec = _SPECS.get(self.size) or _SPECS.setdefault(self.size, F.mobroad_spec(self.size))         # (built once: the outline is a marching-squares trace)
         return {"manifest": "fountain_mobroad.manifest.json", "size": self.size, "epoch": self.mob_epoch, "uniforms": spec["uniforms"], "view": spec["view"],
                 "aspect": None, "chamber_outline": spec["chamber_outline"], "body": None, "speed": 1, "named": ["ir", "ig", "ib"], "run": "continuous",
                 "tilt": spec["tilt"], "mobroad": spec["map"]}

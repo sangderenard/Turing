@@ -68,7 +68,7 @@ export class MobroadPage {
     root.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:6;font:600 13px system-ui,sans-serif;color:#fff;text-shadow:0 1px 3px #000";
     document.body.appendChild(root);
     const hud = document.createElement("div");
-    hud.style.cssText = "position:absolute;left:50%;top:44px;transform:translateX(-50%);padding:4px 12px;border-radius:12px;background:#0009;white-space:nowrap";
+    hud.style.cssText = "position:absolute;left:50%;top:150px;transform:translate(-50%,-100%);padding:3px 12px;border-radius:12px;background:#0009;white-space:nowrap";
     root.appendChild(hud);
     this.root = root; this.hud = hud;
   }
@@ -95,6 +95,8 @@ export class MobroadPage {
     }
     for (const m of this.meshes) drawLit(m.vao, m.count, api.model(), null);
     const rect = api.canvas.getBoundingClientRect();
+    const top = project(cam.viewProj, game.width / 2, floor, 0, rect.width, rect.height);           // the status overlay rides the road's top edge
+    if (top) { this.hud.style.left = `${rect.left + top[0]}px`; this.hud.style.top = `${Math.max(rect.top + 6, rect.top + top[1] - 6)}px`; }
     for (const p of panels) {
       let el = this.labels.get(p.id);
       if (!el) {

@@ -210,6 +210,14 @@ State of the walls now: the 2D law has three planes plus (non-box shapes) a poly
 
 **DONE (the 3D tunables are in the 2D law, all neutral at their defaults, one fluid for drag/buoyancy/orbeez; GPU ms/step unchanged; no new per-id column).** Was: **Ports of the 3D tunables to the 2D law:** temperature, stiffness/Hertz, cohesion, spin drag, nozzle speed and rate, k_run with its n_drop readout, fluid, size distributions, roughness/irregularity (orbeez and the polygon walls are in). Each adds uniforms and law terms to the 2D law and so re-keys the 2D products; 2D native 256 compile is ~25 minutes.
 
+## Mobroad, the road-defence mob shooter (the user, 2026-11-07) -- first playable, DONE
+
+`mobroad.py` (server game, an `EntityGame` + dt-system lane law), `web/mobroad.js` (page), `fountain.make_law_mobroad` (a `# <mobroad>` product variant, built by `fountain_build.build_mobroad`, `prepare_fountain_mobroad` in server.py), tests `tests/test_meowdoku_mobroad.py`.
+- The MOB is the 2-D fountain law (grains = mob members) on a road of SDF slots (2 pillars, a narrowing, a funnel, a peg field); gravity is the march, a fluid viscosity the pace; crowd crush = the grains' contact count (colour red, `n_crush`). The law is run by the PAGE; the server never sees a grain.
+- Bullets are the server's; the page writes them each batch into the law's 32 swept kill segments (`mobroad_inputs`, one way); a killed grain (age -1e9) or one past the goal line (age -2e9) is PARKED in the law's own state and counted (`n_dead`, `n_goal`). The page reports those counts in its ticks (`mob`); score and lives are functions of them. Bullets pierce.
+- Panels: pass-through (`split`: floor(value) bullets, fanned; `damage`: reach x sqrt(value)) and completion (`rate`: fire rate x amount; `shooters`: +escorts) kinds; every bullet crossing a panel hits it (+step); the level uses split and rate.
+- Open: no wasm product for the variant in the dev run; the mob runs ahead of the display by the pump's lead, so a bullet reaches a grain slightly early on screen; `shooters`/`damage` panels are in the law and tests but not in the level; one level; mob size 4k only; no autopilot.
+
 ## Tip jar (the user, 2026-11-07)
 
 A watch-only Bitcoin piggybank on the 3-D fountain (`tipjar.py`, `web/tipjar.js`, game `tipjar`): one grain per incoming transaction, the jar is the wallet. Config `build/meowdoku/tipjar.json` (gitignored): `{"address": "...", "xpub": "... (xpub or zpub, optional)", "show_txid": false}`; private keys and seeds are refused. Unconfigured: a DEMO from `tipjar_fixture.json`. The mempool.space poll runs once per 60 s on the server.
