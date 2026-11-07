@@ -4173,6 +4173,9 @@ function refreshLocalControls() {
       if (have !== names.join(",")) select.replaceChildren(...names.map((n) => Object.assign(document.createElement("option"), { value: n, textContent: n })));
       select.value = names.includes(pcolor.material) ? pcolor.material : names[0] || "";
       select.disabled = pcolor.source !== "material" || !names.length;
+      el.title = select.disabled ? 'active when "colour" is set to scene material: then it lists every scene material (' + names.length + ")"
+                                 : "the scene material the grains take (glass ones, @glass, go through the glass pass)";
+      el.classList.toggle("inactive", select.disabled);
       el.title = "the scene material the grains take when the source is 'scene material': its colour, and for the material style its whole surface (roughness, metal, gloss)";
     } else if (s.local.startsWith("noise_")) {
       // without float render targets the filter is off, and the title says why
