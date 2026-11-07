@@ -510,7 +510,8 @@ Z_MARGIN_CELLS = 1.5                                                          # 
 
 
 HOURGLASS_ASPECT = 2.6                 # the hourglass is 2.6 half-widths tall
-TOY_ASPECT_W, TOY_ASPECT_C = 2.24, 17.5   # the toy's height, in half-widths and in cells: the lowest ramp's low end clears the throat (see ``sdf_design``)
+TOY_ASPECT_W, TOY_ASPECT_C = 4.15, 17.5   # the toy's height, in half-widths and in cells: a full phone screen (~2.1 heights per width; see ``sdf_design``)
+TOY_PARTS_W = 2.24                     # the height its parts need (half-widths, plus TOY_ASPECT_C cells): the rest is open fall under the ramps
 TOY_PEG_ROWS = 5                       # the toy's peg field has at least this many rows (they fill 0.22 of the height, 4.6 cells apart)
 
 
@@ -528,8 +529,14 @@ def sdf_design(shape: str, s: float, c: float) -> tuple[float, float, float]:
     if shape == "sdf_hourglass":
         return c, w, max(HOURGLASS_ASPECT * w, 30.0 * c)
     if shape == "sdf_toy":
-        return c, w, max(TOY_ASPECT_W * w + TOY_ASPECT_C * c, (TOY_PEG_ROWS - 1) * 4.6 * c / 0.22)
+        return c, w, max(TOY_ASPECT_W * w + TOY_ASPECT_C * c, _toy_parts(w, c))
     raise ValueError(f"unknown SDF chamber {shape!r}")
+
+
+def _toy_parts(w: float, c: float) -> float:
+    """The height the toy's PARTS need (the lower bulb with its peg field, the funnel and throat, the ramps); ``sdf_design`` makes the toy taller,
+    and the extra is open height between the ramps and the funnel."""
+    return max(TOY_PARTS_W * w + TOY_ASPECT_C * c, (TOY_PEG_ROWS - 1) * 4.6 * c / 0.22)
 
 
 def window_fit(shape: str, geo: dict[str, float]) -> tuple[float, float, float]:
@@ -594,18 +601,25 @@ def sdf_preset(shape: str, geo: dict[str, float], dh: float) -> dict[str, Any]:
         # ONE hourglass-profile vessel EXTRUDED through the depth (a vertical wall to the funnel, a throat, a funnel back out to a vertical wall);
         # three ramps (capsule slots stretched across z: left-down, right-down, left-down) in the upper section; a staggered field of peg
         # cylinders (one slot, domain repetition) under the throat, each peg spanning the depth
+        # The parts are laid out in the height they need (h0, ``_toy_parts``); the toy is taller (a phone screen), and the extra is open height
+        # UNDER THE RAMPS, above the funnel: the hourglass spans 0 .. h0 (throat at h0 / 2), a FLUID box of the same width (union: max of
+        # inside distances) carries the vertical walls on up from inside its upper bulb to the top, and the ramps hang from the top.
         rr = 0.9 * c
-        yc, delta = 0.5 * top, 0.20 * top                                            # the vessel spans y = 0 .. top (the lower bulb rests on the window floor)
-        throat = max(0.09 * w, 3.5 * c)
-        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, 0.0, w, throat, top - yc, (w - throat) / delta, 1.0))
-        tan, y0, step = 0.42, top - 0.10 * top, 0.097 * top
+        h0 = min(_toy_parts(w, c), top)
+        yc, delta = 0.5 * h0, 0.20 * h0                                              # the lower bulb rests on the window floor
+        throat = max(0.055 * w, 2.5 * c)
+        slots.append(_slot("hourglass", "fluid", 0.0, yc, 0.0, 0.0, w, throat, yc, (w - throat) / delta, 1.0))
+        if top > h0 + 1.0e-9:
+            y_box = yc + delta + 0.5 * (h0 - yc - delta)                             # inside the upper bulb's vertical walls: the seam is a straight wall
+            slots.append(_slot("box", "fluid", 0.0, 0.5 * (y_box + top), 0.0, 0.0, w, 0.5 * (top - y_box), dh + 2.0 * c, 0.0))
+        tan, y0, step = 0.42, top - 0.10 * h0, 0.097 * h0
         edge = w + 1.5 * rr
         for i, low_x in enumerate((-0.10 * w, 0.10 * w, -0.10 * w)):
             sign = 1.0 if i % 2 == 0 else -1.0                                           # +: high end at the right wall (the ramp runs left-down)
             high = (sign * edge, y0 - i * step)
             slots.append(_ramp_slot(high, (low_x, high[1] - tan * abs(high[0] - low_x)), rr, dh + 2.0 * c))
         px = py = 4.6 * c
-        y_lo, y_hi = 0.05 * top, yc - delta - 0.03 * top
+        y_lo, y_hi = 0.05 * h0, yc - delta - 0.03 * h0
         rows = max(1, int((y_hi - y_lo) // py) + 1)
         cols = 2 * int(w // px) + 1
         slots.append(_slot("pegs", "solid", 0.0, y_lo + 0.5 * (rows - 1) * py, 0.0, 0.0, px, py, 0.9 * c, cols, rows, 1.0))
