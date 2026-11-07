@@ -605,6 +605,7 @@ class SpaceInvaders(EntityGame):
         self.epoch += 1
 
     PLAYER_LANE = 0
+    SPEED_CONTROL = ZOOM_CONTROL = True              # (no world beyond its field: the zoom only goes in)
 
     def motion(self) -> dict[str, Any]:
         return {"speed": PLAYER_SPEED, "tau": SHIP_TAU, "reach": SHIP_REACH,

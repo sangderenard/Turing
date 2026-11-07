@@ -16,6 +16,8 @@ import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalContr
 import { LawClock } from "./pilot_clock.js";
 import { WHEEL_LEVELS, wheelRegime, smearWeights, levelOf, levelAlpha, discSpin, wrapDelta, polarBlurRaster } from "./wheel_blur.js";   // the waterwheel's motion blur (pure helpers)
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
+import { GameClock, SPEED, sliderToSpeed, speedToSlider, speedLabel } from "./game_clock.js";   // [SPEED+ZOOM]
+import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } from "./world_zoom.js";                  // [SPEED+ZOOM]
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -995,7 +997,7 @@ function uploadTerrainTexture(unit, n, rgba) {
 }
 // The ground quad: positions, an up normal, and a UV buffer rewritten as it scrolls.
 function terrainMesh(width, depth) {
-  const m = 2.0, x0 = -m, x1 = width + m, z0 = -m, z1 = depth + m, y = -0.02;
+  const m = 40.0, x0 = -m, x1 = width + m, z0 = -m, z1 = depth + m, y = -0.02;       // [SPEED+ZOOM] (was 2: wide enough for the lowest zoom)
   const pos = new Float32Array([x0, y, z0, x1, y, z1, x1, y, z0, x0, y, z0, x0, y, z1, x1, y, z1]);
   const nrm = new Float32Array(18); for (let i = 0; i < 6; i++) nrm[i * 3 + 1] = 1;
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -1454,7 +1456,7 @@ function drawTerrain(now, drawLit) {
         return;
       }
     }
-    if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % relief.tile;
+    if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame * gclock.speed) % relief.tile;       // [SPEED+ZOOM]
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
     return;
   }
@@ -1462,7 +1464,7 @@ function drawTerrain(now, drawLit) {
   if (!TERRAIN.mesh || TERRAIN.mesh.key !== key) TERRAIN.mesh = terrainMesh(state.extent.width, state.extent.depth);
   const frame = TERRAIN.at == null ? 0 : Math.min(0.1, now - TERRAIN.at);
   TERRAIN.at = now;
-  if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame) % (TERRAIN.tile * 64);
+  if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame * gclock.speed) % (TERRAIN.tile * 64);       // [SPEED+ZOOM]
   const uv = new Float32Array(12);
   TERRAIN.mesh.corners.forEach(([x, z], i) => { uv[i * 2] = x / TERRAIN.tile; uv[i * 2 + 1] = (z - TERRAIN.scroll) / TERRAIN.tile; });
   gl.bindBuffer(gl.ARRAY_BUFFER, TERRAIN.mesh.uvBuffer); gl.bufferSubData(gl.ARRAY_BUFFER, 0, uv);
@@ -2045,7 +2047,8 @@ function camera() {
   const declared = cameraGestures(), V = camView.cur, az = V.yaw;
   const lean = stageOf();                                           // a stage game: the plane rises behind the board
   const centre = declared && declared.target ? declared.target : [(ext.width + x0) / 2, lean ? ext.depth * Math.tan(lean) / 2 : 0, extMidZ(ext)];
-  const target = [centre[0] + V.px, centre[1], centre[2] + V.pz];
+  const zs = zoomShift(V.lz);                                      // [SPEED+ZOOM] the zoom window slides inside the supplied world
+  const target = [centre[0] + V.px + zs[0], centre[1], centre[2] + V.pz + zs[1]];
   if (state.flat) {
     // Flat view: orthographic, looking straight down; the same framing as the lens below.
     const eye = [target[0], 60, target[2]], view = M.lookAt(eye, target, [-Math.sin(az), 0, -Math.cos(az)]);
@@ -3259,7 +3262,7 @@ function lockedBody(lane) {
     for (const p of state.pieces.values()) if (p.entity && !p.provisional && p.lane === lane && p.body && p.removing == null) { piece = p; break; }
     aimLock.piece = piece;
   }
-  return piece && { body: piece.body, until: Math.min(performance.now() / 1000, piece.tRecv + 1.0) };
+  return piece && { body: piece.body, until: Math.min(gnow(), piece.tRecv + 1.0) };
 }
 const aimTarget = cannonAimer(pred, () => state.game && state.game.predict, lockedBody);
 const shipStep = shipStepper(pred, () => view, aimTarget);
@@ -3284,6 +3287,83 @@ const pilotLine = new PilotTimeline();           // the pilot's intervals, keyed
 // THE LAW CLOCK (pilot_clock.js): the page's law time, locked to the server's by the timing exchange each tick carries.
 // The pilot's ship is shown at law time lawClock.lawAt(now): it runs at the wall's rate and is moved by no single reply.
 const lawClock = new LawClock();
+
+// [SPEED+ZOOM] THE GAME CLOCK SPEED and THE WORLD ZOOM (game_clock.js, world_zoom.js; the server's world_view.py).
+// ONE clock: ``gclock`` is the wall integrated by the speed in force (the virtual wall).  Everything that measures the
+// game's WORLD in seconds -- the predictor's frame, the open input interval, the stamps entities are carried from, the
+// timing exchange (ct/ca) -- reads it through ``gnow()``; the network, the camera's ease and the interface keep real time.
+// The speed is not the law: the server lands speed * wall and the dt controller cuts the same steps.  The zoom is the
+// scene camera (``camera()``), eased by a critically damped spring; the server widens what it sends with it.
+const gclock = new GameClock(SPEED.default, performance.now() / 1000);
+const gnow = (real = performance.now() / 1000) => gclock.at(real);
+const dials = { zoomDirty: false, sent: 1 };
+const speedKey = (g) => `meowdoku.speed.${g}`;
+function rememberedSpeed(g) { try { const v = localStorage.getItem(speedKey(g)); return v == null ? null : Number(v); } catch (_) { return null; } }
+function setGameSpeed(speed) {
+  const game = state.game; if (!game || !game.speed) return;
+  gclock.set(speed, performance.now() / 1000);
+  try { localStorage.setItem(speedKey(game.game), String(gclock.speed)); } catch (_) { /* unremembered */ }
+  syncDialUi(true);
+}
+// a new game: its remembered speed (else the server's default); a game without the control runs at 1; the zoom starts whole
+function adoptDials(game) {
+  const real = performance.now() / 1000, saved = game.speed ? rememberedSpeed(game.game) : null;
+  gclock.set(!game.speed ? 1 : Number.isFinite(saved) && saved != null ? saved : game.speed.default, real);
+  camView.goal.lz = camView.cur.lz = camView.lzv = 0; dials.zoomDirty = true;
+  syncDialUi(true);
+}
+// the zoom the server should widen for: the wider of where the spring is and where it is going
+const zoomNow = () => Math.min(Math.exp(-camView.goal.lz), Math.exp(-camView.cur.lz));
+// What the zoom can show NOW: the world the server supplies (``game.zoom.reach``) narrowed by what the page has drawn --
+// the exported relief is a fixed mesh (web_export TERRAIN_SPAN), so a terrain game cannot show past its edge; the plain
+// ground quad is drawn wide (terrainMesh margin) and limits nothing.
+function zoomLimits(g) {
+  if (!g || !g.zoom) return null;
+  const r = { ...g.zoom.reach };
+  if (!state.flat && g.scene && g.scene.terrain === true && state.assets && state.assets.terrain) {
+    const relief = reliefMesh(state.assets.terrain);
+    if (relief) {
+      const z0 = -relief.tile - 2.0, sphere = !!(g.predict && g.predict.patch), side = Math.max(0, (relief.span[0] - g.width) / 2);
+      r.left = Math.min(r.left, side); r.right = Math.min(r.right, side);
+      r.up = Math.min(r.up, sphere ? -z0 : 2.0); r.down = Math.min(r.down, Math.max(0, z0 + relief.span[1] - g.height));
+    }
+  }
+  return { min: zoomFloor(g.width, g.height, r), max: g.zoom.max, reach: r };
+}
+function zoomShift(lz) {
+  const g = state.game;
+  if (!g || !g.zoom || g.board !== "free") return [0, 0];
+  const w = g.width, h = g.height, real = state.time || performance.now() / 1000;      // (the frame's own instant: the view caches by it)
+  let reach = zoomLimits(g).reach, focus = null;
+  if (g.roomview) {       // a room-graph game's window slides inside its room: the world beyond is the room's
+    const rv = roomView(real), room = g.roomview;
+    reach = { left: rv.x, right: Math.max(0, room.w - rv.x - w), up: rv.y, down: Math.max(0, room.h - rv.y - h) };
+  }
+  const ship = pred.ship || (g.you && g.you.alive ? g.you : null);
+  if (ship && Number.isFinite(ship.x)) focus = [ship.x + (pred.ship ? pred.offset[0] : 0) - viewX(real), ship.y + (pred.ship ? pred.offset[1] : 0) - viewY(real)];
+  return windowShift(w, h, Math.min(Math.exp(-lz), ZOOM_MAX), reach, focus);
+}
+function syncDialUi(force = false) {
+  const g = state.game, speedBox = $("speed-label"), zoomBox = $("zoom-label");
+  if (!speedBox || !zoomBox) return;
+  speedBox.style.display = g && g.speed ? "" : "none"; zoomBox.style.display = g && g.zoom ? "" : "none";
+  if (g && g.speed && (force || document.activeElement !== $("speed"))) { $("speed").value = String(Math.round(speedToSlider(gclock.speed) * 1000)); $("speed-read").textContent = speedLabel(gclock.speed); }
+  if (g && g.zoom && (force || document.activeElement !== $("zoom"))) {
+    const L = zoomLimits(g), z = Math.exp(-camView.goal.lz), lo = Math.log(L.min), hi = Math.log(L.max);
+    $("zoom").value = String(Math.round(1000 * (Math.log(z) - lo) / Math.max(1e-9, hi - lo))); $("zoom-read").textContent = `${z.toFixed(2)}x`;
+    $("zoom").disabled = !(L.max > L.min + 1e-6);
+  }
+}
+setInterval(() => syncDialUi(false), 120);
+$("speed").oninput = (e) => setGameSpeed(sliderToSpeed(Number(e.target.value) / 1000));
+$("zoom").oninput = (e) => {
+  const g = state.game; if (!g || !g.zoom) return;
+  const L = zoomLimits(g), lo = Math.log(L.min), hi = Math.log(L.max), z = Math.exp(lo + (hi - lo) * Number(e.target.value) / 1000);
+  camView.goal.lz = -Math.log(z); camView.vel.lz = 0; dials.zoomDirty = true;
+};
+window.meowdokuDebug.gclock = gclock; window.meowdokuDebug.dials = dials; window.meowdokuDebug.setGameSpeed = setGameSpeed;
+window.meowdokuDebug.zoomTo = (z) => { const g = state.game; camView.goal.lz = -Math.log(clampZoom(z, g.width, g.height, zoomLimits(g).reach)); dials.zoomDirty = true; };
+window.meowdokuDebug.zoomLimits = () => zoomLimits(state.game);
 const pilotRest = intervalControls([0, 0, 0, 0, 0]);
 // The predicted pilot ship is always the server's state at the last snapshot (pilotBase, at law time pilotBaseT)
 // carried to the law time now (pilotAt) through the timeline, in steps that end where the server's do: its tick
@@ -3322,7 +3402,7 @@ function reconcile(game) {
     if (!pilotFlying && lawClock.ready() && Number.isFinite(game.you.clock)) {
       lawClock.takeNewest();
       const unlanded = [...pred.sent, ...pred.closed, ...(pred.open ? [pred.open] : [])].reduce((sum, interval) => sum + interval.dur, 0);
-      const lead = game.you.clock + unlanded - lawClock.lawAt(performance.now() / 1000);
+      const lead = game.you.clock + unlanded - lawClock.lawAt(gnow());
       pilotLead = Math.abs(lead) < 0.25 ? lead : 0;
     }
     pilotFlying = true;
@@ -3333,7 +3413,7 @@ function reconcile(game) {
     pilotLine.accept(game.you.intervals, game.you.clock);
     // The law time to show: the locked clock's (the snapshot's state stands for law time ``clock``; the picture is the
     // ship at the law time of now).  Without a lock (no socket) the snapshot's age and the half round trip stand in.
-    const nowS = performance.now() / 1000;
+    const nowS = gnow();
     const shown = lawClock.ready() ? lawClock.lawAt(nowS) + pilotLead - game.you.clock
       : Math.max(0, nowS - (game.you.at ?? 0) + 0.5 * (sock.rtt || 0));
     const age = Math.min(pilotHorizon(game), Math.max(0, shown));
@@ -3391,7 +3471,7 @@ function timingProbe(game, age) {
   let beforeNow = null;
   if (pilotBase && lawClock.ready()) {
     beforeNow = { ...pilotBase };
-    pilotLine.integrate(stepShip, beforeNow, pilotBaseT, Math.min(Math.max(lawClock.lawAt(performance.now() / 1000) + pilotLead, pilotBaseT), pilotBaseT + pilotHorizon(game)), game.predict, pilotRest, pilotWindow);
+    pilotLine.integrate(stepShip, beforeNow, pilotBaseT, Math.min(Math.max(lawClock.lawAt(gnow()) + pilotLead, pilotBaseT), pilotBaseT + pilotHorizon(game)), game.predict, pilotRest, pilotWindow);
   }
   const note = { beforeNow, age, rtt: sock.rtt || 0, clockAssumed: pilotBase ? pilotAt : null, clock: game.you.clock,
                  clockErr: pilotBase ? pilotAt - (game.you.clock + age) : null, lock: lawClock.offset, lockDelay: lawClock.last && lawClock.last.delay,
@@ -3423,7 +3503,7 @@ function timingRecord(game, ship, before, error, tolerance) {
 // at that rate whether the page draws at 30, 60 or 144 frames a second (or
 // not at all); drawing just reads the latest predicted ship.
 const PREDICT_HZ = 240;
-setInterval(() => predictFrame(performance.now() / 1000), 1000 / PREDICT_HZ);
+setInterval(() => predictFrame(gnow()), 1000 / PREDICT_HZ);       // [SPEED+ZOOM] (the game clock: the world measured in law seconds)
 function predictFrame(now) {
   const game = state.game;
   const frame = pred.at == null ? 0 : Math.min(0.1, Math.max(0, now - pred.at));
@@ -3512,7 +3592,7 @@ function predictShots(now, game, c) {
   for (const [mx, mz] of weapon.muzzles) {
     const id = `prov:${++pred.shotSeq}`;
     state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane,
-      sx: x0 + mx, sz: z0 + mz, x: x0 + mx, z: z0 + mz, vx: weapon.velocity[0], vz: weapon.velocity[1], tRecv: drawNow,
+      sx: x0 + mx, sz: z0 + mz, x: x0 + mx, z: z0 + mz, vx: weapon.velocity[0], vz: weapon.velocity[1], tRecv: gnow(drawNow),
       mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
       t0: state.time, removing: null, seed: 0, birth: null });
     pred.shots.push({ id, at: drawNow });
@@ -3557,7 +3637,7 @@ function predictVolleys(now, game, c, weapon, drawNow) {
       const flown = { ux: r.ux_next, uy: r.uy_next, uz: r.uz_next, hx: r.hx_next, hy: r.hy_next, hz: r.hz_next,
                       spd: r.speed_next, vz: r.vz_next, z: ship.z || 0 };
       state.pieces.set(id, { id, entity: true, provisional: true, lane: -1, owner: pred.lane, flown,
-        sx: 0, sz: 0, x: 0, z: 0, vx: 0, vz: 0, tRecv: drawNow,
+        sx: 0, sz: 0, x: 0, z: 0, vx: 0, vz: 0, tRecv: gnow(drawNow),
         mesh: weapon.mesh, color: weapon.color, size: weapon.size, roll: 0, spin: 0, bob: 0, lean: 0.55,
         t0: state.time, removing: null, seed: 0, birth: null });
       pred.shots.push({ id, at: drawNow, flown });
@@ -3572,7 +3652,8 @@ const STEP_CAP_S = 1 / 30;            // the longest law step the server takes (
 // the newest one applied is dropped.
 // The world time a state stands for, on the page's clock: with input-timed
 // rounds, the moment the last landed interval closed.
-function worldStamp(game, now) {
+function worldStamp(game, real) {
+  const now = gnow(real);                                   // [SPEED+ZOOM] stamps are on the game clock
   let stamp = now;
   // the pilot's world is shown at the locked law time: a snapshot stands for the page instant of its law clock
   if (piloting(game) && lawClock.ready() && Number.isFinite(game.you.clock)) return (state.lastStamp = Math.min(lawClock.pageAt(game.you.clock), now));
@@ -3609,7 +3690,9 @@ function ensureSocket() {
         // The meta frame is the status; the SHIP is the binary snapshot's alone (its law clock, ack and pilot intervals ride
         // there).  A meta that put its own copy of ``you`` on the state, and reconciled the ship from it, rebased the pilot's
         // ship on a state without a clock, at a stale age, up to four times a second.
-        sock.meta = { ...(sock.meta || {}), ...message.meta };
+        // [SPEED+ZOOM] (a meta frame of ANOTHER game starts the merge afresh: keys the new game does not have -- its speed, zoom,
+        // controls -- must not survive from the last one)
+        sock.meta = { ...(sock.meta && sock.meta.game === message.meta.game ? sock.meta : {}), ...message.meta };
         const held = state.game && state.game.game === sock.meta.game ? state.game : null;
         // (the meta frames carry only what changed: merged onto the state the page holds, so one the page was not yet
         // listening for cannot leave it without a palette)
@@ -3667,9 +3750,16 @@ function applySnapshot(view) {
   }
   const { flags, ack, you } = frame;
   sync.hint = frame.hint;
-  you.at = performance.now() / 1000;
+  you.at = gnow();                                          // [SPEED+ZOOM] (the game clock, as the exchange's ct is)
+  const lawBefore = lawClock.ready() ? lawClock.lawAt(you.at) : null;
   if (flags & FLAG_CLEAR) lawClock.offset = null;          // a new game's law clock starts over (the wall offset is kept)
-  lawClock.sample({ ct: you.echo, ca: you.at, recv: you.recv, sent: you.sent, lawWall: you.lawWall, clock: you.clock });
+  lawClock.sample({ ct: you.echo, ca: you.at, recv: you.recv, sent: you.sent, lawWall: you.lawWall, clock: you.clock, gen: you.speedGen });
+  // A change of the clock speed re-bases the law clock (the readings before it ran at another rate): the pilot's picture
+  // keeps its place and the difference runs out as a time warp (pilotLead), exactly as a hand-over from a person does.
+  if (lawClock.rebased && lawBefore != null && lawClock.ready() && !(flags & FLAG_CLEAR)) {
+    const jump = pilotLead + lawBefore - lawClock.lawAt(you.at);
+    pilotLead = Math.abs(jump) < 0.5 ? jump : 0;
+  }
   const frameGame = { ...game, ack: ack < 0 ? null : ack, you };
   state.game.you = you;
   noteShield(frameGame, now);
@@ -3697,7 +3787,7 @@ function applySnapshot(view) {
         // our own shot, confirmed: it leaves from where the provisional one is drawn and glides onto the server's path
         const at = piece.body ? carriedPatch(piece, now) : null;
         if (at) piece.birth = { dx: shown.x - at.x, dz: shown.z - at.z };
-        else { const lead = Math.max(0, now - stamp); piece.birth = { dx: shown.x - (r.x + r.vx * lead), dz: shown.z - (r.y + r.vy * lead) }; }
+        else { const lead = Math.max(0, gnow(now) - stamp); piece.birth = { dx: shown.x - (r.x + r.vx * lead), dz: shown.z - (r.y + r.vy * lead) }; }
         state.pieces.delete(adopted.id);
       }
     }
@@ -3714,10 +3804,13 @@ function applySnapshot(view) {
 
 const ticks = { inFlight: 0, sent: 0, applied: -1 };
 function sendTick(game) {
-  let payload = { type: "tick", ...controls(), ct: performance.now() / 1000 };
+  let payload = { type: "tick", ...controls(), ct: gnow() };
+  // [SPEED+ZOOM] the clock speed and the zoom ride every tick (the server clamps both and echoes the speed in the snapshot)
+  if (game.speed) payload.speed = gclock.speed;
+  if (game.zoom) { payload.zoom = zoomNow(); dials.zoomDirty = false; }
   if (predicting(game) && !piloting(game)) {
     if (pred.open && pred.open.dur > 0) { pred.closed.push(pred.open); pred.open = { controls: pred.open.controls, dur: 0 }; }
-    const at = performance.now() / 1000;
+    const at = gnow();
     pred.sent.push(...pred.closed.map((interval) => ({ ...interval, seq: ++pred.seq, closedAt: at })));
     pred.closed = [];
     if (pred.sent.length > 240) pred.sent.splice(0, pred.sent.length - 240);
@@ -3787,9 +3880,9 @@ setInterval(() => {
   const firing = predicting(game) && controls().fire > 0;
   // A page that watches the pilot checks in once per decision (motion.pilot.interval): a reply is then never older than the
   // pilot's information reaches (the pilot's controls are known predelay ahead of the law time it answers for).
-  const cadence = piloting(game) && game.predict.pilot ? Math.max(SYNC.fastest, Number(game.predict.pilot.interval)) : Infinity;
+  const cadence = piloting(game) && game.predict.pilot ? Math.max(SYNC.fastest, Number(game.predict.pilot.interval) / gclock.speed) : Infinity;       // (a decision every interval of LAW time: 1/speed as often on the wall)
   const allowed = Math.min(cadence, predicting(game) && !firing ? Math.min(sync.interval, Math.max(SYNC.fastest, sync.hint)) : SYNC.fastest);
-  const inputChanged = pred.closed.length > 0;               // a press, release or steer since the last check-in
+  const inputChanged = pred.closed.length > 0 || dials.zoomDirty;               // a press, release or steer since the last check-in
   // (the wait is measured from the last check-in, so a delay that shortens -- the pilot has just taken the ship -- is
   // honoured at once rather than after the longer one set at the last send)
   if (now - sync.sentAt < allowed && !inputChanged) return;
@@ -3812,7 +3905,7 @@ function entityModel(piece, now) {
   // at most one keyframe -- 0.5 s of world time -- old.)
   // (a spherical game's body is never extrapolated linearly: with its cores not
   // loaded it stands where the server last put it)
-  const mesh = state.meshes[piece.mesh], lead = piece.body ? 0 : Math.min(Math.max(0, now - piece.tRecv), 1.0);
+  const mesh = state.meshes[piece.mesh], lead = piece.body ? 0 : Math.min(Math.max(0, gnow(now) - piece.tRecv), 1.0);
   const own = state.game && state.game.predict && piece.lane === state.game.predict.lane && piece.mesh !== "boom" && piece.removing == null;
   if (own && drawnShip.at !== now) {             // once per frame (the shadow and lit passes both draw it)
     drawnShip.at = now;
@@ -4031,7 +4124,7 @@ function roomShip(game) {
   // the ship as drawn: the prediction sideways, the server's word vertically carried on by its velocity (a frame's worth)
   const ship = pred.ship || game.you;
   if (!ship) return null;
-  const age = pred.ship && ship.at != null ? Math.min(0.1, Math.max(0, performance.now() / 1000 - ship.at)) : 0;
+  const age = pred.ship && ship.at != null ? Math.min(0.1, Math.max(0, gnow() - ship.at)) : 0;
   // (a game that declares ``predict.vertical`` has its vertical motion stepped by the engine law already: no linear carry)
   const carry = pred.ship && game.predict && game.predict.vertical ? 0 : (ship.vy || 0) * age;
   return { x: ship.x + (pred.ship ? pred.offset[0] : 0), y: ship.y + (pred.ship ? pred.offset[1] : 0) + carry };
@@ -4081,7 +4174,7 @@ function carriedPatch(piece, now) {
   const ship = pred.ship && pred.ship.ux != null ? pred.ship : game && game.you;
   if (!pred.bodies || !cfg || !cfg.bodies || !cfg.patch || !cfg.sphere || !ship || ship.ux == null) return null;
   if (piece.carried && piece.carried.at === now) return piece.carried;
-  const b = piece.body, until = Math.min(now, piece.tRecv + 1.0);
+  const b = piece.body, until = Math.min(gnow(now), piece.tRecv + 1.0);
   pred.bodies.carry(b, until - b.at, cfg.bodies, cfg.sphere);
   b.at = Math.max(b.at, until);
   const at = pred.bodies.patch(b, ship, cfg.patch, cfg.sphere.radius);
@@ -4448,6 +4541,7 @@ function applyState(game, { meta = false } = {}) {
   if (!previous || previous.game !== game.game || previous.id !== game.id || previous.rows !== game.rows) {
     state.pieces.clear(); uploadMaterials(game);
     pred.sent = []; pred.closed = []; pred.open = null; pred.ship = null; ticks.applied = -1; pred.shots = [];
+    adoptDials(game);                                        // [SPEED+ZOOM]
     drawnShip.page = drawnShip.server = 0;
   } else if (previous.palette_name !== game.palette_name) uploadMaterials(game);
   rebuildBoards(game);
@@ -6049,7 +6143,9 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 //   double tap (orbit "one") or two-finger tap = reset the view
 //   mouse: wheel = zoom, right/middle drag = orbit, shift+drag = pan, left drag = orbit when orbit "one"
 // A game that declares nothing may be given a default here (below).
-const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: true, tilt: true } };
+const ZOOM_ONLY = { orbit: null, zoom: true, pan: false, tilt: false };       // [SPEED+ZOOM] pinch and wheel; no pan or tilt
+const CAMERA_GESTURE_DEFAULTS = { bullet_hell: { orbit: null, zoom: true, pan: true, tilt: true }, side_scroller: ZOOM_ONLY, platformer: ZOOM_ONLY,
+                                  space_invaders: ZOOM_ONLY, boardwalk: ZOOM_ONLY, delve: ZOOM_ONLY };
 // The view a game opens in and returns to on a reset: the 3-D fountain is a BOX nine grains deep, which straight down would hide (the depth is
 // the height axis), so it opens as a slight 3/4 view (yaw about the vertical, the eye tipped toward the front glass).
 const CAMERA_VIEW_DEFAULTS = { fountain3d: { yaw: 0.4, pitch: -0.55 } };
@@ -6061,7 +6157,7 @@ function cameraGestures() {
   const ext = state.extent || { width: 6, depth: 6 }, lim = d.limits || {};
   return { orbit: d.orbit || null, zoom: d.zoom !== false, pan: d.pan !== false, tilt: d.tilt !== false,
            target: Array.isArray(d.target) ? d.target : null,
-           zoomLim: (lim.zoom || [0.3, 3]).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],
+           zoomLim: g.zoom ? [-Math.log(zoomLimits(g).max), -Math.log(zoomLimits(g).min)] : (lim.zoom || [0.3, 3]).map(Math.log), elLim: lim.elevation || [0.1, Math.PI / 2],
            panLim: lim.pan != null ? lim.pan : Math.max(ext.width, extLength(ext)) };
 }
 const CV_KEYS = ["yaw", "pitch", "lz", "px", "pz"];
@@ -6078,6 +6174,7 @@ function stepCamView(dt) {
   if (key !== camView.key) { camView.key = key; for (const k of CV_KEYS) { camView.cur[k] = camView.goal[k] = cameraViewDefault(key, k); camView.vel[k] = 0; } }
   dt = Math.max(0, Math.min(0.1, dt || 0));
   const gest = cameraGestures(), G = camView.goal, C = camView.cur;
+  if (gest) clampCamGoal(gest);                                                  // [SPEED+ZOOM] (the limits move with the scene)
   if (gest && camView.auto && !camView.active) G.yaw += AUTO_ROTATE * dt;
   if (gest && !camView.active) {                                        // inertia: a released flick coasts and damps
     const decay = Math.exp(-dt * 4);
@@ -6085,7 +6182,9 @@ function stepCamView(dt) {
     clampCamGoal(gest);
   }
   const ease = 1 - Math.exp(-dt * 16);
-  for (const k of CV_KEYS) C[k] += (G[k] - C[k]) * ease;
+  for (const k of CV_KEYS) if (k !== "lz") C[k] += (G[k] - C[k]) * ease;
+  const zs = springStep(C.lz, camView.lzv || 0, G.lz, dt, ZOOM_OMEGA);       // [SPEED+ZOOM] the zoom: critically damped, no overshoot
+  C.lz = zs.x; camView.lzv = zs.v;
 }
 const gpointers = new Map();           // pointerId -> { x, y, sx, sy, t, type }
 let gsession = null;                   // { mode: "pending" | "orbit" | "pan" | "two" | "dead", ... }

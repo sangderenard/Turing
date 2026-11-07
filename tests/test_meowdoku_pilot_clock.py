@@ -2,7 +2,7 @@
 
 The pilot's ship is a function of LAW time, so the picture is smooth exactly when the law time the page shows is:
 ``web/pilot_clock.js`` reads the timing exchange every tick carries (the page's send time echoed with the server's
-receipt and send instants, ``realtime_socket`` PROTOCOL 13) the way NTP does, and ``app.js`` shows the pilot's ship at
+receipt and send instants, ``realtime_socket`` PROTOCOL 13, now 14: the same in the virtual wall) the way NTP does, and ``app.js`` shows the pilot's ship at
 the law time of the page's now.  Before, the law time of each snapshot was taken from its ARRIVAL (``clock`` plus the
 half round trip), so every reply's queueing and the server's compute time (which grows with the window it landed) moved
 the picture's law time and the ship was pulled back each time (a correction of tens of milliseconds' flight, up to a
@@ -235,7 +235,7 @@ def test_the_snapshot_carries_the_timing_exchange_and_the_pilot_flag(tmp_path):
     state["piloted"] = True
     encoder = rs.SnapshotEncoder()
     binary, meta = encoder.encode(game, state, echo=123.25, received=456.5)
-    assert binary[0] == rs.PROTOCOL == 13 and binary[1] & 8
+    assert binary[0] == rs.PROTOCOL == 14 and binary[1] & 8
     assert meta is not None and "you" not in meta and "ack" not in meta          # the ship rides the binary frame alone
     js = r"""
 import { pathToFileURL } from 'node:url';
@@ -257,6 +257,7 @@ def test_the_law_clock_follows_the_wall_through_a_hand_over_and_a_slow_tick():
     (law time zero moves later on the wall by what was dropped), and ``max_frame`` clears the longest relaxed check-in."""
     assert ent.EntityGame.max_frame >= 2.0 * ent.EntityGame.SYNC_MAX
     game = sc.BulletScroller("p")
+    game.speed = 1.0                                              # (wall time: this test is about the wall; game_speed tests the speed)
     game.control({})
     game.tick()                                                   # round zero
     seen = []

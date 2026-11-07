@@ -254,6 +254,7 @@ class Platformer(EntityGame):
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
     CHARACTERS_ON = True
+    SPEED_CONTROL = ZOOM_CONTROL = True              # (no world beyond its field: the zoom only goes in)
     #: ``stage``: every body stands on one backdrop plane leaning back by this many radians (the page's placeEntity:
     #: bricks are the scenery layer, the frog and stars a layer in front), so the frog's feet meet the brick.
     #: ``rocket: False``: no shield bubble, marker lights or headlights (a rocket's gear); ``spot``: the one cone

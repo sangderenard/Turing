@@ -1587,6 +1587,17 @@ class BulletScroller(EntityGame):
     height = HEIGHT
     CONTROLS = tuple(CONTROLS)
     PLAYER_LANE = 0
+    SPEED_CONTROL = ZOOM_CONTROL = True
+
+    def zoom_reach(self) -> dict[str, float]:
+        """Bodies are sent out to ``SEND_R_MAX`` (the streaming budget) about the player: the window may extend each
+        side of the field by what keeps its corners inside that disc."""
+        from meowdoku import world_view as wv
+        half_w, half_h = self.width / 2.0, max(PLAYER_Y, HEIGHT - PLAYER_Y)
+        # (half_w + e)^2 + (half_h + e)^2 = SEND_R_MAX^2
+        b, c = half_w + half_h, half_w ** 2 + half_h ** 2 - wv.SEND_R_MAX ** 2
+        e = max(0.0, -b + float(np.sqrt(b * b - c)))
+        return {"left": e, "right": e, "up": e, "down": e}
 
     def __init__(self, board_id: str = "", aspect: float | None = None, level: int = 1):
         self.width = field_width(aspect)
@@ -1792,8 +1803,13 @@ class BulletScroller(EntityGame):
         # floats off the edge of the drawn board).
         names_hp = self.session.column("hp")
         dark_pin = (col["slot"] == PIN_SLOT) & (names_hp <= 0.05)
-        show = (((col["alive"] > 0.0) | (col["boom"] > 0.0)) & ~dark_pin & (reach < PATCH_R)
-                & (np.abs(col["x"] - self.width / 2.0) < self.width / 2.0 + 0.6))
+        # THE VIEW WINDOW (world_view.py): the field at zoom 1, wider as the page zooms out.  Only the SENDING widens; the
+        # observations the autopilot reads (PATCH_R) never see the zoom.
+        win = self.view_window()
+        send_r = max(PATCH_R, 0.6 + float(np.hypot(max(abs(win["x0"] - self.width / 2.0), abs(win["x1"] - self.width / 2.0)),
+                                                   max(abs(win["y0"] - PLAYER_Y), abs(win["y1"] - PLAYER_Y)))))
+        show = (((col["alive"] > 0.0) | (col["boom"] > 0.0)) & ~dark_pin & (reach < send_r)
+                & (col["x"] > win["x0"] - 0.6) & (col["x"] < win["x1"] + 0.6))
         out = []
         for k in np.flatnonzero(show):
             slot, exploding = col["slot"][k], col["alive"][k] <= 0.0

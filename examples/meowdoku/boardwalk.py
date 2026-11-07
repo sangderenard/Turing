@@ -618,6 +618,7 @@ class Boardwalk(EntityGame):
     CONTROLS = tuple(CONTROLS)
     HEALTH_MAX = PLAYER_HP
     SCENE = {"floor": True, "glass": False, "arcade": False}
+    SPEED_CONTROL = ZOOM_CONTROL = True              # (the whole track is on the screen: the zoom only goes in)
 
     def __init__(self, board_id: str = "", aspect: float | None = None, seed: int | None = None):
         self.seed = int(time.time_ns() % 1000) if seed is None else int(seed)

@@ -30,10 +30,20 @@ export class LawClock {
     this.snaps = 0;             // how many times the offset was taken in one jump (a first reading counts)
     this.lastAt = null;
     this.last = null;           // the last sample, for inspection
+    // THE GAME CLOCK SPEED (game_clock.js): this clock runs in the game's virtual wall.  The speed is constant between
+    // changes, and a change is announced by the server's counter ``gen``: the readings before it were taken against a
+    // clock that ran at another rate, so the window is dropped and the first reading after it is taken whole (``rebased``
+    // says so, for the caller to absorb the jump into its time warp rather than show it).
+    this.gen = null; this.rebased = false;
   }
   clear() { this.samples = []; this.offset = null; this.theta = null; this.epoch = null; this.lastAt = null; this.last = null; }
   // ``m``: { ct, ca, recv, sent, lawWall, clock }; a reply to a tick that carried no stamp (echo NaN) has no exchange to read
   sample(m) {
+    this.rebased = false;
+    if (m.gen !== undefined && m.gen !== this.gen) {
+      if (this.gen !== null) { this.samples = []; this.offset = null; this.rebased = true; }
+      this.gen = m.gen;
+    }
     if (![m.ct, m.ca, m.recv, m.sent, m.lawWall, m.clock].every(Number.isFinite)) return false;
     const delay = (m.ca - m.ct) - (m.sent - m.recv);
     const s = { theta: ((m.recv - m.ct) + (m.sent - m.ca)) / 2, delay: Math.max(0, delay), at: m.ca };

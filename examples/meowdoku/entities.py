@@ -64,6 +64,7 @@ import math
 import numpy as np
 
 from meowdoku.games import Game
+from meowdoku import world_view as wv
 from src.common.tensors import AbstractTensor
 from meowdoku.session import ROOT  # noqa: F401  (puts the repo and examples on sys.path)
 from src.common.dt_system.dt_controller import STController, Targets  # noqa: E402
@@ -518,13 +519,21 @@ class EntityGame(Game):
         self.session = EntitySession(piece, columns, self.CONTROLS, rewind_depth=0)
         self.sync_parameters()
         self.last_tick: float | None = None
+        #: THE GAME CLOCK SPEED (world_view.py): law seconds landed per wall second.  ``virtual`` is the wall integrated by
+        #: the speed in force (one clock, shared with the page through the timing exchange); ``speed`` only changes
+        #: through ``set_speed``, which re-bases it, so the virtual wall is continuous across a change.
+        self.speed = wv.SPEED_DEFAULT if self.SPEED_CONTROL else 1.0
+        self.speed_gen = 0
+        self.view_zoom = wv.ZOOM_DEFAULT
+        self._vwall, self._vat = time.perf_counter(), time.perf_counter()
+        self._last_v: float | None = None            # the virtual wall at the previous tick's start
         #: THE LAW'S PLACE ON THE SERVER'S WALL.  A tick lands the wall time since the previous tick STARTED, so the law
         #: clock and the server's wall clock advance together; ``law_wall`` is the wall instant (``perf_counter``) the
         #: last tick began, the law state standing for law time ``clock`` at it, and ``law_wall - clock`` (where law
         #: time zero stands on the wall) is constant for as long as no tick was cut short by ``max_frame``; a cut
         #: moves it later by exactly the time dropped.  The snapshot carries it, and the page locks its law time to
         #: it (web/pilot_clock.js).
-        self.law_wall: float = time.perf_counter()
+        self.law_wall: float = self._vwall
         self.ticks = 0
         self.held: dict[str, float] = {}
         self.ack = None           # the last input interval landed
@@ -533,6 +542,44 @@ class EntityGame(Game):
         self.autopilot = False    # when set, the compiled policy (autopilot.py) supplies the controls
         self.pilot = None
         self._pilot_hold = 0.0    # seconds left on the policy's current decision
+
+    #: A scrolling game opts into the game clock speed and the world zoom (world_view.py); the others keep wall time.
+    SPEED_CONTROL = False
+    ZOOM_CONTROL = False
+
+    def zoom_reach(self) -> dict[str, float] | None:
+        """The world this game can supply beyond its field's edges (screen units), which bounds the zoom out and the
+        view window.  None: nothing beyond the field (zoom in only)."""
+        return None
+
+    def virtual(self, wall: float) -> float:
+        """The virtual wall at the server wall instant ``wall``: the wall integrated by the speed in force."""
+        return self._vwall + self.speed * (wall - self._vat)
+
+    def set_speed(self, value, wall: float | None = None) -> None:
+        if not self.SPEED_CONTROL:
+            return
+        value = wv.clamp_speed(value)
+        if value == self.speed:
+            return
+        wall = time.perf_counter() if wall is None else wall
+        self._vwall, self._vat = self.virtual(wall), wall
+        self.speed = value
+        self.speed_gen += 1
+
+    def set_zoom(self, value) -> None:
+        if self.ZOOM_CONTROL:
+            self.view_zoom = wv.clamp_zoom(value, self.width, self.height, self.zoom_reach())
+
+    def send_reach(self) -> dict[str, float] | None:
+        """The world beyond the field's edges NOW (a game whose window moves over a bigger world overrides)."""
+        return self.zoom_reach()
+
+    def view_window(self) -> dict[str, float]:
+        """The world rectangle (screen frame) the server sends bodies for: the field at zoom 1, wider as the zoom goes
+        out (zooming IN never narrows it: the page may follow the ship about the field).  The zoom was clamped when it
+        was set (to the floor the game's reach allows)."""
+        return wv.view_window(self.width, self.height, min(1.0, self.view_zoom) if self.ZOOM_CONTROL else 1.0, self.send_reach(), limit=False)
 
     #: Seconds one autopilot decision is held.  The policy's outputs are
     #: control values held over an interval -- streamed like a player's
@@ -550,10 +597,14 @@ class EntityGame(Game):
         if self.session.state is None or self.last_tick is None or self.intervals:
             return
         now = time.perf_counter()
-        seconds = min(self.max_frame, max(0.0, now - self.last_tick))
-        self.last_tick = now
-        self.law_wall = now
+        self.law_wall = self.virtual(now)
+        seconds = min(self._frame_cap(), max(0.0, self.law_wall - (self._last_v if self._last_v is not None else self.law_wall)))
+        self.last_tick, self._last_v = now, self.law_wall
         self._land(seconds, self.held)
+
+    def _frame_cap(self) -> float:
+        """The longest law time one wall tick lands (``max_frame`` wall seconds at the speed, never under it at 1x)."""
+        return self.max_frame * max(1.0, self.speed)
 
     def set_autopilot(self, on: bool) -> None:
         """Hand the controls to the trained policy (server side); the page keeps drawing."""
@@ -759,7 +810,8 @@ class EntityGame(Game):
         closing = -(dx * dvx + dy * dvy) / np.maximum(np.hypot(dx, dy), 1e-6)
         speed = np.maximum(closing, 0.25 * np.hypot(dvx, dvy) + 1e-3)
         contact = float(np.min(distance / speed))
-        return float(np.clip(0.35 * contact, self.SYNC_MIN, self.SYNC_MAX))
+        # (contact is law time; the check-in delay is wall time: the same danger takes 1/speed as long to arrive)
+        return float(np.clip(0.35 * contact / self.speed, self.SYNC_MIN, self.SYNC_MAX))
 
     def motion(self) -> dict[str, Any] | None:
         """``MOTION`` as published; a game whose walls move overrides it."""
@@ -784,6 +836,10 @@ class EntityGame(Game):
 
     def control(self, payload: dict) -> None:
         self.held = {name: float(payload[name]) for name in self.CONTROLS if name in payload}
+        if "speed" in payload:
+            self.set_speed(payload["speed"])
+        if "zoom" in payload:
+            self.set_zoom(payload["zoom"])
         self.intervals = [dict(item) for item in payload.get("inputs") or ()]
         self.reported = dict(payload["ship"]) if isinstance(payload.get("ship"), dict) else None
 
@@ -843,7 +899,7 @@ class EntityGame(Game):
 
     def tick(self) -> None:
         started = time.perf_counter()
-        self.law_wall = started
+        self.law_wall = self.virtual(started)
         if self.intervals and self.session.state is not None:
             # Input-timed: each interval is a round with its own controls.
             for interval in self.intervals:
@@ -856,12 +912,12 @@ class EntityGame(Game):
             self.intervals = []
             # (the next wall tick lands the time since THIS one began, as a wall tick does: the law's clock keeps pace
             # with the wall through a hand-over between a player's intervals and the pilot's wall time)
-            self.last_tick = started
+            self.last_tick, self._last_v = started, self.law_wall
             self.ticks += 1
             return
         now = started
-        seconds = 0.0 if self.last_tick is None else min(self.max_frame, max(0.0, now - self.last_tick))
-        self.last_tick = now
+        seconds = 0.0 if self.last_tick is None or self._last_v is None else min(self._frame_cap(), max(0.0, self.law_wall - self._last_v))
+        self.last_tick, self._last_v = now, self.law_wall
         if self.session.state is None:
             seconds = max(seconds, 1.0 / 60.0)      # round zero instantiates the state
         self._land(seconds, self.held)
@@ -870,12 +926,12 @@ class EntityGame(Game):
 
     def undo(self) -> None:
         self.session.rewind()
-        self.last_tick = None
+        self.last_tick = self._last_v = None
         self.epoch += 1
 
     def reset(self) -> None:
         self.session.reset(self.initial_columns())
-        self.last_tick = None
+        self.last_tick = self._last_v = None
         self.epoch += 1
         self.trace, self._ended = None, False          # a new episode to learn from
         self.authority = None                           # authorship counts start over
@@ -904,7 +960,11 @@ class EntityGame(Game):
         st["moves"] = self.ticks
         st["over"] = self.session.state is not None and self.result() is not None
         st["world_clock"] = float(self.session.column("clock")[0]) if self.session.state is not None else 0.0
-        st["law_wall"] = float(self.law_wall)
+        st["law_wall"] = float(self.law_wall)           # (the VIRTUAL wall: see ``virtual``)
+        if self.SPEED_CONTROL:
+            st["speed"] = wv.speed_state(self.speed, self.speed_gen)
+        if self.ZOOM_CONTROL:
+            st["zoom"] = wv.zoom_state(self.width, self.height, self.view_zoom, self.zoom_reach())
         st["score"] = float(self.session.column("score")[0]) if self.session.state is not None else 0.0
         st["sync_hint"] = self.sync_hint()
         st["autopilot"] = self.autopilot
