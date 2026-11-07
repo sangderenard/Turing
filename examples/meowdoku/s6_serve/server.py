@@ -1116,7 +1116,9 @@ def prepare_fountain3d_toy(web_dir: Path, ctx=None) -> None:
     try:
         started = time.perf_counter()
         wasm = False  # Startup builds the toy's WebGPU product only; a future fallback/idle path must request Wasm explicitly.
-        manifest = fountain3d_build.build(web_dir, sizes=fountain3d_build.WHEEL_SIZES, wasm=wasm, variant="toy")
+        requested = os.environ.get("MEOWDOKU_TOY_SIZES", "")
+        sizes = tuple(tag.strip() for tag in requested.split(",") if tag.strip()) if requested else fountain3d_build.WHEEL_SIZES
+        manifest = fountain3d_build.build(web_dir, sizes=sizes, wasm=wasm, variant="toy")
         routes = ", ".join(f"{tag}: {rec['n']} ids -> {rec['route']}" for tag, rec in manifest["sizes"].items())
         print(f"[meowdoku] fountain3d toy products ready ({routes}; {time.perf_counter() - started:.1f}s)", flush=True)
         _settle_family(ctx, "fountain3d_toy", wasm)
@@ -1191,13 +1193,13 @@ def prepare_lanes(web_dir: Path, args) -> dict:
         "laws": [step(("predictor",), lambda c: prepare_predictor(web_dir, c)),
                  step(("policy",), lambda c: prepare_policy(web_dir, c)),
                  step(("graph",), lambda c: prepare_graph_products(web_dir, c))],
-        "fountain": [step(both("fountain"), lambda c: prepare_fountain(web_dir, c)),
+        "fountain": [step(both("fountain3d_toy"), lambda c: prepare_fountain3d_toy(web_dir, c)),
+                     step(both("fountain"), lambda c: prepare_fountain(web_dir, c)),
                      step(both("fountain_wheel"), lambda c: prepare_fountain_wheel(web_dir, c)),
                      step(both("fountain_purrline"), lambda c: prepare_fountain_purrline(web_dir, c)),
                      step(both("fountain_mobroad"), lambda c: prepare_fountain_mobroad(web_dir, c)),
                      step(both("fountain3d_flat") + both("fountain3d"), lambda c: prepare_fountain3d(web_dir, c)),
-                     step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c)),
-                     step(both("fountain3d_toy"), lambda c: prepare_fountain3d_toy(web_dir, c))],
+                     step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c))],
         "autopilot": [step(("autopilot",), lambda c: prepare_autopilot(args))],
     }
 

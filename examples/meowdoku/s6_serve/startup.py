@@ -35,6 +35,7 @@ FAMILY_NAMES = tuple(name for _prefix, name in FOUNTAIN_FAMILIES)
 GAME_NEEDS = {
     "fountain": {"gpu": ["fountain"], "cpu": ["fountain_cpu"]},
     "fountain3d": {"gpu": ["fountain3d_flat"], "cpu": ["fountain3d_flat_cpu"]},
+    "marble_madness": {"gpu": ["fountain3d_toy"], "cpu": ["fountain3d_toy_cpu"]},
     "tipjar": {"gpu": ["fountain3d_flat"], "cpu": ["fountain3d_flat_cpu"]},
     "mobroad": {"gpu": ["fountain_mobroad", "predictor"], "cpu": ["fountain_mobroad_cpu", "predictor"]},
     **{game: ["predictor"] for game in ("space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest",
