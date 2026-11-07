@@ -78,7 +78,7 @@ function dispose(mesh) {
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
 
-const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","confetti-count","coverage","band-count","band-width","band-curve"];
+const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
@@ -150,9 +150,14 @@ function rebuild() {
     strandCount:+$("strands").value, ribbonThickness:+$("thickness").value/1000,
     ribbonTwist:+$("twist").value/100, ribbonTip:+$("tip").value/100,
     ribbonFlare:+$("flare").value/100, ribbonPhase:+$("phase").value*Math.PI/180,
+    orientationYaw:+$("orientation-yaw").value*Math.PI/180,
+    orientationPitch:+$("orientation-pitch").value*Math.PI/180,
+    orientationRoll:+$("orientation-roll").value*Math.PI/180,
     confettiCount:+$("confetti-count").value, enamelCoverage:+$("coverage").value/100,
     paintBandCount:+$("band-count").value,paintBandWidth:+$("band-width").value/100,
     paintBandCurve:+$("band-curve").value/100,
+    tubeCount:+$("tube-count").value,tubeRadius:+$("tube-radius").value/1000,
+    tubeTurns:+$("tube-turns").value/100,
     kind:$("kind").value, seed });
   const {interior:inside,glass:outside,triangleCount}=geometry;
   interior = mesh(inside); glass = mesh(outside); lastGeometry=geometry;
@@ -172,6 +177,7 @@ function controls() {
     if(preset==="classic") {$("kind").value="cat_eye";$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;}
     if(preset==="galaxy") {$("kind").value="confetti";$("shell").value="marble_clear_glass";$("coverage").value=55;$("band-count").value=0;$("confetti-count").value=400;}
     if(preset==="uniform") {$("kind").value="confetti";$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;$("confetti-count").value=500;}
+    if(preset==="spiral" || preset==="rings") {$("kind").value=preset;$("shell").value="marble_clear_glass";$("coverage").value=0;$("band-count").value=0;}
     if(preset==="bare") {$("kind").value="clear";$("coverage").value=0;$("band-count").value=0;}
     if(preset==="porcelain") {$("kind").value="clear";$("shell").value="ceramic_porcelain";$("coverage").value=0;$("band-count").value=7;$("band-width").value=24;}
     copyCoating();rebuild();syncMaterial();

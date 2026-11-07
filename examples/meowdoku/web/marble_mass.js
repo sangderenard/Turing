@@ -31,7 +31,8 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   if (!(glassDensity>0)) throw new RangeError("positive shell density required");
   add(total,outer,glassDensity);
   components.push({name:"shell before displacement",volumeM3:outer.volume*radiusM**3,massKg:outer.volume*radiusM**3*glassDensity});
-  for (const part of [...mesh.ribbons.map((x)=>({...x,name:"ribbon"})),...mesh.confetti.map((x)=>({...x,name:"confetti"}))]) {
+  for (const part of [...mesh.ribbons.map((x)=>({...x,name:"ribbon"})),
+    ...mesh.tubes.map((x)=>({...x,name:"tube"})),...mesh.confetti.map((x)=>({...x,name:"confetti"}))]) {
     const integral=integrate(mesh.interior.slice(part.start,part.start+part.count));
     const density=densityByRole[part.densityRole];
     if (!(density>0)) throw new RangeError("positive inclusion density required");
