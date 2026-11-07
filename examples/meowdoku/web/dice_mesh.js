@@ -114,7 +114,11 @@ function markingsFor(face,number,kind,vertices) {
 }
 function evaluateMark(point,face,marks,vertices,scale) {
   const center=mean(face.ids.map(i=>vertices[i]));
-  const n=face.normal, tangent=unit(sub(vertices[face.ids[0]],center)), bitangent=cross(n,tangent);
+  const n=face.normal;
+  // Align ordinary face labels with an actual edge. The old center-to-corner
+  // basis put cube numbers diagonally across the square face.
+  const tangent=unit(sub(vertices[face.ids[1]],vertices[face.ids[0]]));
+  const bitangent=cross(n,tangent);
   const inradius=Math.min(...face.ids.map((id,k)=>{
     const a=vertices[id],b=vertices[face.ids[(k+1)%face.ids.length]];
     return Math.abs(dot(cross(sub(b,a),sub(center,a)),n))/Math.hypot(...sub(b,a));
@@ -126,7 +130,10 @@ function evaluateMark(point,face,marks,vertices,scale) {
     // A single face-wide basis would turn two of the three values sideways.
     const up=location.corner?unit(sub(mark.center,center)):bitangent;
     const right=location.corner?cross(up,n):tangent;
-    const x=dot(offset,right)/location.height*1.5+0.5;
+    // inText already adds half of the whole word width to center each glyph.
+    // Adding another 0.5 here displaced a one-digit mark almost entirely off
+    // its face, leaving only a few jagged strokes.
+    const x=dot(offset,right)/location.height*1.5;
     const y=dot(offset,up)/location.height+0.5;
     if(inText(x,y,mark.label)) return true;
   }
@@ -145,23 +152,63 @@ function kindLocation(mark,faceCenter,inradius,scale) {
  * density until separate material-domain geometry is available.
  */
 export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,markingMode='flat',
-  reliefDepth=0.02,subdivisions=kind==='d4'?48:24,markScale=0.72}={}) {
+  reliefDepth=0.02,subdivisions=(kind==='d4'||kind==='d6')?64:48,markScale=0.72,
+  bevelRadius=0,faceRelief=0,compensateRaised=true}={}) {
   if(!Number.isInteger(shellMaterial)||shellMaterial<0||!Number.isInteger(markMaterial)||markMaterial<0)
     throw new TypeError('shell and marking material IDs are required');
   if(!['flat','raised','recessed'].includes(markingMode)||!(reliefDepth>=0&&reliefDepth<=0.08)||
-     !Number.isInteger(subdivisions)||subdivisions<12||subdivisions>64||
-     !(markScale>=0.3&&markScale<=0.9)) throw new RangeError('unsupported marking geometry');
+     !Number.isInteger(subdivisions)||subdivisions<12||subdivisions>128||
+     !(markScale>=0.3&&markScale<=0.9)||!(bevelRadius>=0&&bevelRadius<=0.16)||
+     !(faceRelief>=0&&faceRelief<=0.08)||typeof compensateRaised!=='boolean')
+    throw new RangeError('unsupported marking or face geometry');
   let vertices=verticesFor(kind), radius=Math.max(...vertices.map(v=>Math.hypot(...v)));
   vertices=vertices.map(v=>v.map(x=>x/radius));
   const facets=hull(vertices), expected={d4:4,d6:6,d8:8,d10:10,d12:12,d20:20}[kind];
   if(facets.length!==expected) throw new Error(`${kind} hull has ${facets.length} faces`);
+  const supports=facets.map(f=>dot(f.normal,vertices[f.ids[0]]));
+  const support=supports.reduce((a,b)=>a+b,0)/supports.length;
+  if(supports.some(h=>Math.abs(h-support)>1e-6)) throw new Error('dice bevel requires equal-support faces');
+  const rounded=(p)=>{
+    if(!bevelRadius) return p;
+    // The same global map is evaluated on both sides of every seam. It
+    // preserves face centers, rounds edges/corners, and keeps the mesh closed.
+    // The parameter controls the smoothing width; it is not an exact circular
+    // fillet radius on a polyhedron's unequal-angle edges.
+    const normal=[0,0,0], width=bevelRadius*1.2;
+    for(let k=0;k<facets.length;k++) {
+      const gap=Math.max(0,supports[k]-dot(facets[k].normal,p));
+      const w=Math.max(0,1-gap/width)**3;
+      for(let j=0;j<3;j++) normal[j]+=w*facets[k].normal[j];
+    }
+    const n=unit(normal);
+    return p.map((x,i)=>x*(1-bevelRadius/support)+bevelRadius*n[i]);
+  };
   const numbered=numberFaces(facets,kind), glass=[], faceInfo=[];
   for(let faceIndex=0;faceIndex<numbered.length;faceIndex++) {
     const {face,number}=numbered[faceIndex], polygon=face.ids.map(i=>vertices[i]);
+    const start=glass.length;
     const center=mean(polygon), markings=markingsFor(face,number,kind,vertices);
     const mark=(p)=>evaluateMark(p,face,markings,vertices,markScale);
-    const displace=(p)=>p.map((x,i)=>x+face.normal[i]*(markingMode==='flat'?0:
-      (markingMode==='raised'?reliefDepth:-reliefDepth)*(mark(p)?1:0)));
+    const inradius=Math.min(...polygon.map((a,k)=>{
+      const b=polygon[(k+1)%polygon.length];
+      return Math.abs(dot(cross(sub(b,a),sub(center,a)),face.normal))/Math.hypot(...sub(b,a));
+    }));
+    const edgeFade=(p)=>{
+      const d=Math.min(...polygon.map((a,k)=>{
+        const b=polygon[(k+1)%polygon.length];
+        return Math.abs(dot(cross(sub(b,a),sub(p,a)),face.normal))/Math.hypot(...sub(b,a));
+      }));
+      const t=Math.min(1,Math.max(0,d/(0.18*inradius)));
+      return t*t*(3-2*t);
+    };
+    const displace=(p)=>{
+      const fade=edgeFade(p), marked=mark(p), base=rounded(p);
+      const compensation=markingMode==='raised'&&compensateRaised?reliefDepth:0;
+      const inset=(faceRelief+compensation)*fade;
+      const glyph=(markingMode==='raised'?reliefDepth:markingMode==='recessed'?-reliefDepth:0)
+        *(marked?1:0)*fade;
+      return base.map((x,i)=>x+face.normal[i]*(glyph-inset));
+    };
     for(let side=0;side<polygon.length;side++) {
       const A=center,B=polygon[side],C=polygon[(side+1)%polygon.length];
       const point=(i,j)=>{
@@ -179,10 +226,11 @@ export function diceSolid(kind,{shellMaterial,markMaterial=shellMaterial,marking
         if(i+j<subdivisions-1) emit([i+1,j],[i+1,j+1],[i,j+1]);
       }
     }
-    faceInfo.push({faceIndex,number,normal:face.normal,vertexIds:[...face.ids],
+    faceInfo.push({faceIndex,number,normal:face.normal,vertexIds:[...face.ids],start,count:glass.length-start,
       markings:markings.map(x=>({number:x.label,anchor:x.center}))});
   }
   return {glass,interior:[],ribbons:[],tubes:[],confetti:[],triangleCount:glass.length,
-    faceInfo,parameters:{kind,shellMaterial,markMaterial,markingMode,reliefDepth,subdivisions,markScale},
+    faceInfo,parameters:{kind,shellMaterial,markMaterial,markingMode,reliefDepth,subdivisions,markScale,
+      bevelRadius,faceRelief,compensateRaised},
     mechanicsResolved:true,contactModel:'polyhedron'};
 }
