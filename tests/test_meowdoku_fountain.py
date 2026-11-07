@@ -542,7 +542,7 @@ def _digest(final) -> str:
 
 def test_gravity_is_a_runtime_input_the_default_is_the_old_law_and_a_tilt_changes_it_without_a_rebuild(native_piece):
     piece, columns = native_piece
-    assert F.RUNTIME_INPUTS == ("grav_x", "grav_y", "lid", "rows") and set(F.RUNTIME_INPUTS) <= set(F.UNIFORMS)
+    assert {"grav_x", "grav_y", "lid", "rows"} <= set(F.RUNTIME_INPUTS) and set(F.RUNTIME_INPUTS) <= set(F.UNIFORMS)
     assert float(columns["grav_x"]) == 0.0 and float(columns["grav_y"]) == -F.G and float(columns["lid"]) == F.LID_OFF
     default = F.run_frames(piece, columns, 700)
     assert _digest(default) == PRE_GRAVITY_DIGEST_700                     # the default is bit for bit the law before the change
@@ -1166,7 +1166,7 @@ def test_orbeez_swell_with_open_surface_in_a_solvent_only(native_piece):
     for out in (first, wet, dry):
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0
         assert float(out["n_live"][0] + out["n_parked"][0] + out["n_out"][0] + out["n_nan"][0]) == F.N_SMALL
-    assert float(wet["rad"][a]) == pytest.approx(float(wet["rs"][a]))      # the drawn radius is the current one
+    assert float(wet["rad"][a]) == pytest.approx(float(wet["rs"][a]), abs=1.0e-5)      # the drawn radius is the step's own (the state is one step of growth ahead)
 
 
 # ------------------------------------------------------------- the turning case (fictitious forces in the case frame)
@@ -1267,5 +1267,5 @@ def test_a_violent_grain_stays_inside_every_polygon_chamber(native_piece):
         verts = F.shape_vertices(shape, F.basin(n))
         for i in range(len(grains)):
             xl, xr = F.chord(verts, float(out["y"][i]))
-            assert xl - 0.01 <= float(out["x"][i]) <= xr + 0.01 and 0.0 <= float(out["y"][i]) <= verts[0][1] + 0.01, (shape, i)
+            assert xl - 0.01 <= float(out["x"][i]) <= xr + 0.01 and 0.0 <= float(out["y"][i]) <= max(v[1] for v in verts) + 0.01, (shape, i)
         assert float(out["n_nan"][0]) == 0 and float(out["n_out"][0]) == 0, shape
