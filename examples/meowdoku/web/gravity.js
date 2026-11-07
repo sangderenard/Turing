@@ -132,9 +132,13 @@ export class GravitySensor {
 // (so that R(-theta) g = straight down).  The board lies in world XZ with law x -> +X and law y -> -Z, so a turn of phi in the law's
 // plane is a turn of phi about world +Y (the rotateY convention: X' = cX + sZ, Z' = -sX + cZ).  This is the model matrix
 // (column-major) of the case's objects: translate(c) * rotateY(-theta) * translate(-c), c = the case centre (cx, cz).
-export function caseModel(theta, cx, cz) {
+export function caseModel(theta, cx, cz, axis = "y", cy = 0) {
   const a = -theta, c = Math.cos(a), s = Math.sin(a);
-  return new Float32Array([c, 0, -s, 0,  0, 1, 0, 0,  s, 0, c, 0,  cx - c * cx - s * cz, 0, cz + s * cx - c * cz, 1]);
+  const m = axis === "x" ? [1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0]
+    : axis === "z" ? [c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0]
+      : [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0];
+  return new Float32Array([...m, cx - m[0] * cx - m[4] * cy - m[8] * cz,
+    cy - m[1] * cx - m[5] * cy - m[9] * cz, cz - m[2] * cx - m[6] * cy - m[10] * cz, 1]);
 }
 // a law-plane vector (x right, y up) as a world direction: law x -> +X, law y -> -Z
 export function lawToWorld([x, y]) { return [x, 0, -y]; }

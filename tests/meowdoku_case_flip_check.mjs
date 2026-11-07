@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { caseFlipAt, caseFlipSteps } from "../examples/meowdoku/web/case_motion.js";
+import { caseFlipAt, caseFlipSteps, lawAxis, rotateLawVector } from "../examples/meowdoku/web/case_motion.js";
 import { caseModel } from "../examples/meowdoku/web/gravity.js";
 import { VisualTape, filterTape } from "../examples/meowdoku/web/loading_anim.js";
 
@@ -23,6 +23,22 @@ assert.ok(Math.abs(half.angle - Math.PI / 2) < 1e-12 && half.omega < 0);
 // The exact displayed angle drives the model of the case, including the flat board and its outlined wall.
 const model = caseModel(half.angle, 0, 0);
 assert.ok(Math.abs(model[0]) < 1e-6 && Math.abs(model[8] + 1) < 1e-6);
+assert.deepEqual(lawAxis("x"), [1, 0, 0]);
+assert.deepEqual(lawAxis("z"), [0, -1, 0]);
+for (const axis of ["x", "y", "z"]) {
+  const world = caseModel(Math.PI, 0, 0, axis);
+  assert.ok(world.every(Number.isFinite));
+  const g = rotateLawVector([0, -1, 0], axis, Math.PI);
+  assert.ok(Math.abs(g[1] - (axis === "z" ? -1 : 1)) < 1e-12);
+  // The rendered body and law-frame gravity are inverse turns in the same world basis.
+  const quarter = caseModel(Math.PI / 2, 0, 0, axis);
+  const [lx, ly, lz] = rotateLawVector([0, -1, 0], axis, Math.PI / 2);
+  const [wx, wy, wz] = [lx, lz, -ly];
+  const restored = [quarter[0] * wx + quarter[4] * wy + quarter[8] * wz,
+    quarter[1] * wx + quarter[5] * wy + quarter[9] * wz,
+    quarter[2] * wx + quarter[6] * wy + quarter[10] * wz];
+  assert.ok(Math.hypot(restored[0], restored[1], restored[2] - 1) < 1e-6, `${axis} case/gravity alignment`);
+}
 const tape = new VisualTape({ sourceSnap: 6, stride: 1, sourceCount: 8, maxGrains: 8 });
 for (let k = 1; k <= 12; k++) {
   const data = new Float32Array(40);

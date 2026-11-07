@@ -26,12 +26,16 @@ export async function record({ state, newGame, act, compute }) {
   const have = await (await fetch("/api/ready", { cache: "no-store" })).json();
   if (!studio && have.loading_anim && have.loading_anim.present) { log("the server already has a loading animation"); return null; }
 
-  // the existing fountain game on the chosen chamber at the chosen size
+  // The case-normal turn uses the 2-D product.  An out-of-plane axis needs the real 3-D hourglass law.
   const aspect = 1;
+  const threeD = P.flipAxis !== "y";
+  const shape3 = { sdf_circle: "sdf_sphere", sdf_square: "sdf_cube", sdf_triangle: "sdf_tetra", sdf_annulus: "sdf_torus" };
+  const shape = threeD ? (shape3[P.chamber] || P.chamber) : P.chamber;
+  if (threeD && ["ngon5", "ngon7"].includes(shape)) return fail(`${P.chamber} has no 3-D chamber; choose a 3-D shape`);
   report({ stage: "start", params: P });
-  await newGame({ game: "fountain", aspect });
+  await newGame({ game: threeD ? "fountain3d" : "fountain", aspect });
   await act({ type: "fountain_size", size: P.size, aspect });
-  await act({ type: "fountain_choice", name: "shape", value: P.chamber });
+  await act({ type: "fountain_choice", name: "shape", value: shape });
   if (P.grainScale !== 1) {                                       // grain size: every species' radius times the scale (the controls hold the defaults)
     for (const c of (state.game && state.game.controls_ui) || []) {
       if (/^r[0-3]$/.test(c.id)) await act({ type: "fountain_param", name: c.id, value: c.value * P.grainScale, aspect });
@@ -91,7 +95,7 @@ export async function record({ state, newGame, act, compute }) {
         }
         if (out.turns % 2 === 0) lastEven = compute.tape.hi;
         if (out.turns >= P.turns) { finish(compute.tape.hi, false); return; }
-        const motion = compute.startCaseFlip(P.flipSeconds, P.flipDirection);
+        const motion = compute.startCaseFlip(P.flipSeconds, P.flipDirection, P.flipAxis);
         if (!motion) throw new Error("the case has no live grains or supported turn axis yet");
         out.tilt += P.flipDirection * Math.PI; out.turns++; turnEndsAt = t + motion.seconds; calmSince = null;
         longestFlip = Math.max(longestFlip, motion.seconds);

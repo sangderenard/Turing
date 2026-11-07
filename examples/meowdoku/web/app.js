@@ -6101,7 +6101,7 @@ function caseAngleNow() {
 }
 function caseModelNow() {
   if (!watchCase.on || !isFountainGame(state.game) || !state.extent) return null;
-  return caseModel(caseAngleNow(), extMidX(), extMidZ());
+  return caseModel(caseAngleNow(), extMidX(), extMidZ(), compute.caseAxis || "y", TILE.height + 0.03);
 }
 window.meowdokuDebug.caseAngleNow = caseAngleNow; window.meowdokuDebug.caseModelNow = caseModelNow; window.meowdokuDebug.watchCase = watchCase;
 window.meowdokuDebug.wheelBlur = wheelBlur; window.meowdokuDebug.housing = () => state.housing && { triangles: state.housing.triangles }; window.meowdokuDebug.statusPlate = statusPlate; window.meowdokuDebug.slide = slide; window.meowdokuDebug.setSlide = setSlide; window.meowdokuDebug.bakeSlide = bakeSlide;

@@ -13,3 +13,15 @@ export function caseFlipSteps(delta, requestedSeconds, dt, maxOmega, maxDomega) 
     Math.sqrt((10 / Math.sqrt(3)) * Math.abs(delta) / maxDomega));
   return Math.max(1, Math.ceil(seconds / dt));
 }
+
+// The law's axes map to the scene as x -> world X, y -> world -Z, z -> world Y.
+export function lawAxis(worldAxis) {
+  return worldAxis === "x" ? [1, 0, 0] : worldAxis === "z" ? [0, -1, 0] : [0, 0, 1];
+}
+export function rotateLawVector(vector, worldAxis, angle) {
+  const a = lawAxis(worldAxis), c = Math.cos(angle), s = Math.sin(angle);
+  const dot = a[0] * vector[0] + a[1] * vector[1] + a[2] * vector[2];
+  return [vector[0] * c + (a[1] * vector[2] - a[2] * vector[1]) * s + a[0] * dot * (1 - c),
+    vector[1] * c + (a[2] * vector[0] - a[0] * vector[2]) * s + a[1] * dot * (1 - c),
+    vector[2] * c + (a[0] * vector[1] - a[1] * vector[0]) * s + a[2] * dot * (1 - c)];
+}
