@@ -66,64 +66,78 @@ def _sources() -> str:
     return _SOURCES
 
 
-def digest(tag: str) -> str:
-    return hashlib.sha256(f"{tag}:{SIZES[tag]}\0{_sources()}".encode()).hexdigest()[:16]
+def digest(tag: str, body: bool = False) -> str:
+    return hashlib.sha256(f"{tag}:{SIZES[tag]}:{'body' if body else ''}\0{_sources()}".encode()).hexdigest()[:16]
 
 
-def shapes_for(pad: int) -> dict:
-    return {name: ((pad,) if name in F.STATE + F.CONSTANTS else ()) for name in F.ARGUMENTS}
+def layout(body: bool = False) -> dict:
+    """The law's names for the default law or its hinged-body (waterwheel) variant."""
+    if not body:
+        return {"arguments": F.ARGUMENTS, "state": F.STATE, "outputs": F.OUTPUTS, "diagnostics": F.DIAGNOSTICS,
+                "uniforms": F.UNIFORMS, "runtime_inputs": F.RUNTIME_INPUTS, "prefix": "fountain"}
+    return {"arguments": F.BODY_ARGUMENTS, "state": F.STATE + F.BODY_STATE, "outputs": F.BODY_OUTPUTS,
+            "diagnostics": F.DIAGNOSTICS + F.BODY_DIAGNOSTICS, "uniforms": F.UNIFORMS + F.BODY_UNIFORMS,
+            "runtime_inputs": F.RUNTIME_INPUTS + F.BODY_RUNTIME_INPUTS, "prefix": "fountain_wheel"}
 
 
-def trace(pad: int, active: int, contract: str):
+def shapes_for(pad: int, body: bool = False) -> dict:
+    lay = layout(body)
+    return {name: ((pad,) if name in lay["state"] + F.CONSTANTS else ()) for name in lay["arguments"]}
+
+
+def trace(pad: int, active: int, contract: str, body: bool = False):
     """The law traced at ``pad`` ids: (program, output values, bindings)."""
     from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
     from src.compiler.work_contract import PRESETS, scoped_work_contract
-    law = F.make_law(pad, active)
+    law = F.make_law(pad, active, body=body)
+    names = layout(body)["arguments"]
     with scoped_work_contract(PRESETS[contract]):
         program = SSATensorProgram("fountain_step")
-        shapes = shapes_for(pad)
-        bindings = {name: SSATensorOperations.input(program, shapes[name]) for name in F.ARGUMENTS}
+        shapes = shapes_for(pad, body)
+        bindings = {name: SSATensorOperations.input(program, shapes[name]) for name in names}
         with program.activate():
-            produced = law(*(bindings[name] for name in F.ARGUMENTS))
+            produced = law(*(bindings[name] for name in names))
         outputs = [item.data.value for item in produced]
     return program, outputs, bindings
 
 
-def passes_for(tag_or_pad, active: int | None = None):
+def passes_for(tag_or_pad, active: int | None = None, body: bool = False):
     """The compiler-generated dispatch program (and the trace it came from) for a size tag,
     or for ``(pad, active)``."""
     from src.compiler import ssa_webgpu_backend as webgpu
     from src.compiler.work_contract import PRESETS, scoped_work_contract
     pad, act = SIZES[tag_or_pad][1], SIZES[tag_or_pad][0] if isinstance(tag_or_pad, str) else (int(tag_or_pad), int(active or tag_or_pad))
-    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT)
+    program, outputs, bindings = trace(pad, act, WGSL_CONTRACT, body)
     ids = {name: int(getattr(binding.data, "value").id) for name, binding in bindings.items()}
     with scoped_work_contract(PRESETS[WGSL_CONTRACT]):
         compiled = webgpu.emit_tensor_program_passes(
-            program.module, "fountain_step", outputs, count=pad, name=f"fountain_{pad}",
+            program.module, "fountain_step", outputs, count=pad, name=f"{layout(body)['prefix']}_{pad}",
             iota_args=[ids[name] for name in F.IOTA])
     return compiled, program, outputs, ids
 
 
-def verdict_for(tag_or_pad, active: int | None = None, model=None):
+def verdict_for(tag_or_pad, active: int | None = None, model=None, body: bool = False):
     """The compiler's WebGPU-compute verdict, charged for the dispatches its generated program needs."""
     from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
-    compiled, program, outputs, _ids = passes_for(tag_or_pad, active)
+    compiled, program, outputs, _ids = passes_for(tag_or_pad, active, body)
     return webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
                                  model=model or WebGPUComputeCostModel(), dispatches=compiled.dispatches)
 
 
-def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
+def build_size(tag: str, web_dir: Path, wasm: bool = True, body: bool = False) -> dict:
     from meowdoku import graph_wasm
     from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
     started = time.perf_counter()
     from src.compiler import ssa_webgpu_backend as webgpu
     active, pad = SIZES[tag]
-    compiled, program, outputs, ids = passes_for(tag)
+    lay = layout(body)
+    prefix = lay["prefix"]
+    compiled, program, outputs, ids = passes_for(tag, None, body)
     if not compiled.complete:
         raise RuntimeError("fountain shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
                                    model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
-    (web_dir / f"fountain_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    (web_dir / f"{prefix}_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
     out_ids = [int(v.id) for v in outputs]
     geo = F.basin(active)
     stride = max(1, -(-pad // DISPLAY_MAX))
@@ -131,7 +145,7 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         "tag": tag, "n": active, "pad": pad,
         "route": "webgpu-compute" if payoff.pays else "wasm",
         "verdict": payoff.as_record(),
-        "wgsl": f"fountain_{tag}.wgsl",
+        "wgsl": f"{prefix}_{tag}.wgsl",
         "wgsl_abi": {
             "count": pad, "workgroup_size": list(compiled.workgroup_size), "groups": list(compiled.groups),
             "entries": list(compiled.entries), "slots": compiled.slots, "dispatches": compiled.dispatches,
@@ -141,39 +155,40 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True) -> dict:
             # the uniform head is binding `bindings`.  Every pass (step, commit, pack) binds bindings + 1 storage buffers.
             "storage_bindings_per_pass": compiled.bindings + 1, "binding_budget": webgpu.MAX_STORAGE_BINDINGS_PER_STAGE,
             "binding_bytes": min(compiled.slots_per_binding, compiled.slots) * pad * 4,
-            "arguments": list(F.ARGUMENTS), "uniforms": list(F.UNIFORMS), "iota": list(F.IOTA),
-            "outputs": list(F.OUTPUTS),
-            "feed_slots": {name: compiled.feed_slots[ids[name]] for name in F.ARGUMENTS if ids[name] in compiled.feed_slots},
-            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in F.UNIFORMS},
-            "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(F.OUTPUTS)},
+            "arguments": list(lay["arguments"]), "uniforms": list(lay["uniforms"]), "iota": list(F.IOTA),
+            "outputs": list(lay["outputs"]),
+            "feed_slots": {name: compiled.feed_slots[ids[name]] for name in lay["arguments"] if ids[name] in compiled.feed_slots},
+            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in lay["uniforms"]},
+            "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(lay["outputs"])},
             "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
         },
         "memory": {"arena_bytes": compiled.arena_elements * 4, "bytes_per_id": compiled.arena_elements * 4 / pad,
                    "display_ids": -(-pad // stride), "display_bytes": 3 * 16 * -(-pad // stride)},
         "display_stride": stride, "emit_rate": F.EMIT_SPAN / active,
         "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
-        "uniforms": {k: float(v) for k, v in F.uniforms(n=active).items()},
-        "source_digest": digest(tag),
+        "uniforms": {k: float(v) for k, v in F.uniforms(n=active, shape="waterwheel" if body else "box").items()},
+        "source_digest": digest(tag, body),
     }
     record["build_seconds"] = round(time.perf_counter() - started, 1)
     if pad <= WASM_MAX and wasm:
-        build_fallback(tag, web_dir, record)
+        build_fallback(tag, web_dir, record, body)
     return record
 
 
-def build_fallback(tag: str, web_dir: Path, record: dict) -> dict:
+def build_fallback(tag: str, web_dir: Path, record: dict, body: bool = False) -> dict:
     """The CPU fallback of one size (the wasm product, for a browser without WebGPU), added to its ``record``.  It is the
     slow part of a build (the size-specialised law lowered whole: minutes, ~30 at 4k), so ``build`` makes it AFTER every
     WebGPU product is written."""
     from meowdoku import graph_wasm
     active, pad = SIZES[tag]
     started = time.perf_counter()
+    lay = layout(body)
     wasm_abi = graph_wasm._compile(
-        f"fountain_{tag}", shapes_for(pad),
-        lambda b: F.make_law(pad, active)(*(b[name] for name in F.ARGUMENTS)),
-        F.OUTPUTS, WASM_CONTRACT, web_dir,
-        {"argument_names": list(F.ARGUMENTS), "count": pad})
-    record.update({"wasm": f"fountain_{tag}.wasm", "wasm_abi": f"fountain_{tag}.abi.json",
+        f"{lay['prefix']}_{tag}", shapes_for(pad, body),
+        lambda b: F.make_law(pad, active, body=body)(*(b[name] for name in lay["arguments"])),
+        lay["outputs"], WASM_CONTRACT, web_dir,
+        {"argument_names": list(lay["arguments"]), "count": pad})
+    record.update({"wasm": f"{lay['prefix']}_{tag}.wasm", "wasm_abi": f"{lay['prefix']}_{tag}.abi.json",
                    "wasm_buffers": len(wasm_abi["order"]), "wasm_seconds": round(time.perf_counter() - started, 1)})
     return record
 
@@ -215,15 +230,54 @@ def build(web_dir: Path, sizes: tuple[str, ...] = tuple(SIZES), wasm: bool = Tru
     return manifest
 
 
-def _manifest(records: dict) -> dict:
+#: the sizes the hinged-body (waterwheel) law is built at: the 10M size is not offered (two more state columns = 44 slots per id)
+WHEEL_SIZES = tuple(tag for tag in SIZES if SIZES[tag][0] < 10_000_000)
+
+
+def build_wheel(web_dir: Path, sizes: tuple[str, ...] = WHEEL_SIZES, wasm: bool = True, on_gpu_ready=None) -> dict:
+    """The hinged-body (waterwheel) variant's page products, beside the default ones and independent of them:
+    ``fountain_wheel.manifest.json`` and ``fountain_wheel_<tag>.wgsl`` / ``.wasm``.  Same two passes as ``build`` (WebGPU products first,
+    then the CPU fallbacks); sizes whose source digest is unchanged are kept."""
+    web_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = web_dir / "fountain_wheel.manifest.json"
+    old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    records = {}
+    for tag in sizes:
+        previous = (old.get("sizes") or {}).get(tag)
+        if previous and previous.get("source_digest") == digest(tag, True) and (web_dir / f"fountain_wheel_{tag}.wgsl").exists():
+            if previous.get("wasm") and not all((web_dir / previous[k]).exists() for k in ("wasm", "wasm_abi")):
+                previous = {k: v for k, v in previous.items() if not k.startswith("wasm")}
+            records[tag] = previous
+            continue
+        records[tag] = build_size(tag, web_dir, wasm=False, body=True)
+        r = records[tag]
+        print(f"[fountain wheel] {tag}: {r['n']} ids -> {r['route']} ({r['wgsl_abi']['dispatches']} dispatches, "
+              f"{r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)
+    manifest = _manifest(records, True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    if on_gpu_ready is not None:
+        on_gpu_ready(manifest)
+    if wasm:
+        for tag in sizes:
+            r = records[tag]
+            if SIZES[tag][1] > WASM_MAX or r.get("wasm"):
+                continue
+            build_fallback(tag, web_dir, r, True)
+            manifest = _manifest(records, True)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _manifest(records: dict, body: bool = False) -> dict:
     from src.compiler.deployment_classification import WebGPUComputeCostModel
     model = WebGPUComputeCostModel()
     geo = F.basin(F.N_FULL)
     return {
         "schema": SCHEMA, "sizes": records, "cost_model": model.__dict__,
-        "law": {"arguments": list(F.ARGUMENTS), "state": list(F.STATE), "constants": list(F.CONSTANTS),
-                "uniforms": list(F.UNIFORMS), "outputs": list(F.OUTPUTS), "diagnostics": list(F.DIAGNOSTICS), "dt": F.DT,
-                "runtime_inputs": list(F.RUNTIME_INPUTS), "gravity": F.G, "dof": F.DOF},
+        "law": {"arguments": list(layout(body)["arguments"]), "state": list(layout(body)["state"]), "constants": list(F.CONSTANTS),
+                "uniforms": list(layout(body)["uniforms"]), "outputs": list(layout(body)["outputs"]),
+                "diagnostics": list(layout(body)["diagnostics"]), "dt": F.DT,
+                "runtime_inputs": list(layout(body)["runtime_inputs"]), "gravity": F.G, "dof": F.DOF},
         "emit_span": F.EMIT_SPAN, "initial": {},
         "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"], "placed": ["x", "y"],
                    "radius": "rad", "rest_speed": 0.15},
@@ -237,8 +291,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--web-dir", default=str(ROOT / "build" / "meowdoku" / "web"))
     parser.add_argument("--sizes", default=",".join(SIZES))
+    parser.add_argument("--wheel", action="store_true", help="build the hinged-body (waterwheel) variant instead")
+    parser.add_argument("--no-wasm", action="store_true", help="WebGPU products only (skip the slow CPU fallbacks)")
     args = parser.parse_args(argv)
-    manifest = build(Path(args.web_dir), tuple(args.sizes.split(",")))
+    sizes = tuple(args.sizes.split(","))
+    manifest = build_wheel(Path(args.web_dir), tuple(t for t in sizes if t in WHEEL_SIZES), wasm=not args.no_wasm) if args.wheel else build(Path(args.web_dir), sizes, wasm=not args.no_wasm)
     for tag, r in manifest["sizes"].items():
         print(f"  {tag:>6}: pays={r['verdict']['pays']} speedup {r['verdict']['speedup']:.2f}x  {r['memory']['arena_bytes'] / 1e6:.0f} MB arena")
     return 0
