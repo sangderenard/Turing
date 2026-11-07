@@ -20,6 +20,8 @@ deploy to 8766 as soon as work lands.
 ## Fountain physics follow-ups (the user, 2026-11-06)
 
 - **Rotating-frame forces (in progress, the 3D job's next landing):** case spin and rock only rotate gravity today, so at gravity 0 they do nothing. Fix: in the case frame add the Coriolis, centrifugal and Euler terms from runtime uniforms omega, domega and the pivot; the page writes them from the spin or rock motion.
+- **True 3D volume (queued after the rotating-frame forces):** fountain3d is a 2-layer slab today (depth 0.03 by default, 0.05 max, because the neighbour walk is planar). Next: z cells in the grid, depth up to a box, a visibly 3D default.
+- **Port the 3D tunables to 2D (then):** temperature, stiffness, cohesion, spin drag, nozzle, k_run, fluid, size distributions, roughness and irregularity; orbeez into 3D.
 - **Solvent flow (later):** a moving interstitial fluid with buoyancy and displacement (the space around grains), so real liquids and gases can be modelled; today's fluid is a still medium (drag + buoyancy only).
 - **Watch the case move (in progress, a render job):** a toggle (default off: the camera rides with the case) that rotates the fountain's objects in the world by the case angle; plus the backlit slide image on the plate (positive or negative) through the plate material's texture layers.
 
