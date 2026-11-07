@@ -57,6 +57,8 @@ function checked(options) {
       o.tubeTurns < 1 || o.tubeTurns > 4 ||
       [o.orientationYaw,o.orientationPitch,o.orientationRoll].some((v)=>!Number.isFinite(v)||Math.abs(v)>Math.PI))
     throw new RangeError("marble kind or coverage outside supported range");
+  if (o.kind === "hybrid" && (o.orientationYaw || o.orientationPitch || o.orientationRoll))
+    throw new RangeError("hybrid orientation is fixed to keep dye and confetti volumes disjoint");
   if (!(o.eyeWidth >= 0.08 && o.eyeWidth <= 0.42 && o.eyeLength >= 0.4 && o.eyeLength <= 0.85 &&
         o.eyeCurve >= -0.28 && o.eyeCurve <= 0.28))
     throw new RangeError("cat's-eye dimensions outside the glass interior");
@@ -123,14 +125,18 @@ export function catEyeMarble(materials, options = {}) {
       const t = y / o.eyeLength, centre = o.eyeCurve * (1 - t*t);
       const angle = 0.38 * lane + o.ribbonTwist * t + 0.18 * Math.sin(theta + phase);
       const ux = Math.cos(angle), uz = Math.sin(angle), vx = -uz, vz = ux;
-      const width = o.eyeWidth * (0.46 + 0.08 * Math.sin(phase + strand)) * Math.pow(s, o.ribbonTip)
+      const rawWidth = o.eyeWidth * (0.46 + 0.08 * Math.sin(phase + strand)) * Math.pow(s, o.ribbonTip)
         * (1 + o.ribbonFlare * Math.sin(2 * theta + phase) * s) * Math.min(1,3/o.strandCount);
-      const thick = o.ribbonThickness * Math.pow(s, Math.max(0.6, o.ribbonTip * 0.7));
+      const rawThick = o.ribbonThickness * Math.pow(s, Math.max(0.6, o.ribbonTip * 0.7));
+      const spread = Math.min(0.35, 0.32 * 3/o.strandCount);
+      const centerSpacing = Math.hypot(spread,Math.min(0.07,spread*0.7));
+      const cap = 0.45*(centerSpacing-0.048);
+      const fit = Math.min(1,cap/Math.hypot(rawWidth,rawThick));
+      const width=rawWidth*fit,thick=rawThick*fit;
       // A superellipse cross-section gives broad, flat-looking faces and
       // narrow rounded edges without open seams at a twist or at a tip.
       const p = Math.sign(Math.cos(phi)) * Math.sqrt(Math.abs(Math.cos(phi)));
       const q = Math.sign(Math.sin(phi)) * Math.sqrt(Math.abs(Math.sin(phi)));
-      const spread = Math.min(0.35, 0.32 * 3/o.strandCount);
       const radialX = lane * spread, radialZ = lane * Math.min(0.07, spread * 0.7);
       const offsetX = radialX * Math.cos(o.ribbonPhase) - radialZ * Math.sin(o.ribbonPhase);
       const offsetZ = radialX * Math.sin(o.ribbonPhase) + radialZ * Math.cos(o.ribbonPhase);
@@ -148,7 +154,6 @@ export function catEyeMarble(materials, options = {}) {
     };
     const start = interior.length, material = strand % 2 ? materials.accent : materials.eye;
     surface(interior, point, normal, o.rings, o.segments, material);
-    orient(interior,start,interior.length,o);
     ribbons.push({ start, count: interior.length - start, material, densityRole: strand % 2 ? "accent" : "eye" });
   }
   if (o.kind === "spiral" || o.kind === "rings") {
@@ -198,8 +203,19 @@ export function catEyeMarble(materials, options = {}) {
           }
         }
       }
-      orient(interior,start,interior.length,o);
       tubes.push({start,count:interior.length-start,material,densityRole:strand%2?"accent":"eye"});
+    }
+  }
+  // A common rigid transform preserves separation among distinct closed
+  // inclusions. In hybrid designs the ribbons are confined to an inner radial
+  // zone, leaving a clear annulus for independently packed confetti chips.
+  orient(interior,0,interior.length,o);
+  if(o.kind==="hybrid") {
+    let furthest=0;
+    for(const face of interior) for(const p of face.slice(0,3)) furthest=Math.max(furthest,Math.hypot(p[0],p[2]));
+    if(furthest>0.65) {
+      const scale=0.65/furthest;
+      for(const face of interior) for(let k=0;k<3;k++) face[k]=face[k].map((x)=>x*scale);
     }
   }
   if (o.kind === "confetti" || o.kind === "hybrid") {
@@ -217,7 +233,7 @@ export function catEyeMarble(materials, options = {}) {
       const center = [r * Math.cos(phi), y, r * Math.sin(phi)];
       const size = 0.012 + random() * 0.018, angle = TAU * random();
       if (occupied.some(({center:other,size:otherSize}) =>
-        Math.hypot(...center.map((x,i)=>x-other[i])) < size+otherSize+0.003)) continue;
+        Math.hypot(...center.map((x,i)=>x-other[i])) < 1.02*(size+otherSize)+0.003)) continue;
       occupied.push({center,size});
       const u = [Math.cos(angle), 0, Math.sin(angle)];
       const v = [-Math.sin(angle), 0, Math.cos(angle)];

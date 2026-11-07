@@ -1,5 +1,6 @@
 import { catEyeMarble } from "../examples/meowdoku/web/marble_mesh.js";
 import { marbleMass } from "../examples/meowdoku/web/marble_mass.js";
+import { rollingStep } from "../examples/meowdoku/web/marble_roll.js";
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const mesh = catEyeMarble({ glass: 11, eye: 12, accent: 13 });
@@ -66,6 +67,19 @@ const analyticInertia=0.4*analyticMass*0.01**2;
 assert(Math.abs(clearMass.inertiaKgM2[0][0]/analyticInertia-1)<0.02,"tetrahedral rotational inertia approaches analytic sphere");
 const hybridMass=marbleMass(decorated,{radiusM:0.01,densityByRole:densities,enamelMaterial:14,enamelThicknessM:300e-9});
 assert(hybridMass.massKg>clearMass.massKg && hybridMass.components.length===decorated.ribbons.length+decorated.confetti.length+2,"inclusions and coating contribute mass");
+assert(Math.abs(hybridMass.components.reduce((s,c)=>s+c.massKg,0)-hybridMass.massKg)<1e-12,
+  "component masses account for displaced shell volume exactly");
+assert(hybridMass.validForRoll,"generated hybrid has positive definite final inertia");
+const startRoll={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};
+const rolled=rollingStep(startRoll,clearMass,[0.001,0,0],0.01,0.01);
+assert(rolled.angularAcceleration[2]<0 && rolled.position[0]>0,"applied force rolls marble along floor");
+const anisotropic={...clearMass,inertiaKgM2:[[2e-7,0,0],[0,4e-7,0],[0,0,8e-7]]};
+const rollX=rollingStep(startRoll,anisotropic,[0.001,0,0],0.01,0.01);
+const rollZ=rollingStep(startRoll,anisotropic,[0,0,0.001],0.01,0.01);
+assert(Math.abs(rollX.angularAcceleration[2])<Math.abs(rollZ.angularAcceleration[0]),
+  "full anisotropic tensor changes torque response by axis");
+let gated=false;try{rollingStep(startRoll,{...clearMass,validForRoll:false},[0.001,0,0],0.01,0.01);}catch(e){gated=e instanceof RangeError;}
+assert(gated,"rolling rejects unresolved mass and inertia");
 for(const kind of ["spiral","rings"]) {
   const design=catEyeMarble({glass:11,eye:12,accent:13},{kind,tubeCount:2});
   assert(design.tubes.length===2 && design.interior.length>1000,`${kind} consists of triangulated tubes`);
