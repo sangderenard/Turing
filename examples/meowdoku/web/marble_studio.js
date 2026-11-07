@@ -3,7 +3,7 @@
 import { catEyeMarble } from "./marble_mesh.js";
 import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
-import { diceSolid } from "./dice_mesh.js";
+import { diceSolid, fitInclusionsInsideDie } from "./dice_mesh.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
@@ -91,15 +91,19 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   opacity:["pbr",7,100], ior:["pbr",6,100], ambient:["phong",0,100],
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
-let tables, ids, P, interior, glass, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
-  rollState, exteriorOpaque=false, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
+let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps,
+  rollState, lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
-function syncExteriorOpacity() {
-  exteriorOpaque=!!lastGeometry?.glass.every((face)=>{
+function repartitionExterior() {
+  if(!lastGeometry)return;
+  dispose(glass);dispose(glassOpaque);
+  const opaque=[],transparent=[];
+  for(const face of lastGeometry.glass) {
     const id=face[3], transmission=read("pbr",id,5), opacity=read("pbr",id,7);
-    return Math.min(opacity,1-0.8*transmission)>=0.999;
-  });
+    (Math.min(opacity,1-0.8*transmission)>=0.999?opaque:transparent).push(face);
+  }
+  glassOpaque=mesh(opaque);glass=mesh(transparent);
 }
 const idFor = (layer) => layer === "enamel" ? coatedId : layer === "paintA" ? paintAId : layer === "paintB" ? paintBId :
   ids[$({glass:"shell",eye:"eye",accent:"accent",confetti:"confetti-material",mark:"mark-material"}[layer]).value];
@@ -174,12 +178,8 @@ function syncMaterial() {
   }
 }
 function rebuild() {
-  dispose(interior); dispose(glass);
-  const geometry = $("base-shape").value!=="marble" ? diceSolid($("base-shape").value,{
-    shellMaterial:idFor("glass"),markMaterial:idFor("mark"),markingMode:$("marking-mode").value,
-    reliefDepth:+$("relief-depth").value/1000,markScale:+$("mark-scale").value/100,
-    subdivisions:+$("dice-detail").value,bevelRadius:+$("dice-bevel").value/1000,
-    faceRelief:+$("dice-face-relief").value/1000,compensateRaised:$("compensate-raised").checked}) : catEyeMarble({
+  dispose(interior);
+  const inclusions=catEyeMarble({
     glass: idFor("glass"), enamel: coatedId, eye: idFor("eye"), accent: idFor("accent"), confetti: idFor("confetti"),
     paintA:paintAId,paintB:paintBId }, {
     rings:96, segments:128, eyeWidth:+$("width").value/100,
@@ -196,11 +196,18 @@ function rebuild() {
     tubeCount:+$("tube-count").value,tubeRadius:+$("tube-radius").value/1000,
     tubeTurns:+$("tube-turns").value/100,
     kind:$("kind").value, seed });
+  const geometry = $("base-shape").value!=="marble" ? fitInclusionsInsideDie(diceSolid($("base-shape").value,{
+    shellMaterial:idFor("glass"),markMaterial:idFor("mark"),markingMode:$("marking-mode").value,
+    reliefDepth:+$("relief-depth").value/1000,markScale:+$("mark-scale").value/100,
+    subdivisions:+$("dice-detail").value,bevelRadius:+$("dice-bevel").value/1000,
+    faceRelief:+$("dice-face-relief").value/1000,compensateRaised:$("compensate-raised").checked}),inclusions,
+    {scale:+$("die-inclusion-size").value/100}) : inclusions;
   const {interior:inside,glass:outside,triangleCount}=geometry;
-  interior = mesh(inside); glass = mesh(outside); lastGeometry=geometry;
-  syncExteriorOpacity();
+  interior = mesh(inside); lastGeometry=geometry;
+  repartitionExterior();
   for (const name of dimensions) $(name+"-out").value = $(name).value;
-  message.textContent = `${triangleCount.toLocaleString()} triangles · pattern #${seed}`;
+  message.textContent = `${triangleCount.toLocaleString()} triangles · pattern #${seed}`+
+    (geometry.inclusionFit?` · inclusion fit ×${geometry.inclusionFit.factor.toFixed(2)}`:"");
   reportMass(geometry);
 }
 function controls() {
@@ -212,13 +219,23 @@ function controls() {
   $("base-shape").addEventListener("change",()=>{
     if($("base-shape").value!=="marble"&&!dieDefaultsApplied) {
       $("shell").value="ceramic_porcelain";$("mark-material").value="stone_onyx";
+      $("die-shell-preset").value="porcelain";
       $("layer").value="mark";$("opaque").checked=false;opaqueSaved=null;
       yaw=-0.65;pitch=0.42;dieDefaultsApplied=true;copyCoating();
     }
     diceCost();rebuild();syncMaterial();
   });
+  $("die-shell-preset").addEventListener("change",()=>{
+    const preset=$("die-shell-preset").value;
+    if(preset==="custom")return;
+    $("shell").value={porcelain:"ceramic_porcelain",clear:"marble_clear_glass",milk:"marble_milk_glass"}[preset];
+    $("mark-material").value="stone_onyx";$("opaque").checked=false;opaqueSaved=null;
+    copyCoating();rebuild();syncMaterial();
+  });
   for(const field of ["marking-mode","mark-material"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
   for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth"]) $(field).addEventListener("change",()=>{rebuild();syncMaterial();});
+  $("die-inclusion-size").addEventListener("input",()=>{$("die-inclusion-size-out").value=`${$("die-inclusion-size").value}%`;});
+  $("die-inclusion-size").addEventListener("change",()=>{rebuild();syncMaterial();});
   for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth"]) $(field).addEventListener("input",()=>{
     $(field+"-out").value=field==="dice-detail"?$(field).value:
       field==="mark-scale"?(+$(field).value/100).toFixed(2):(+$(field).value/1000).toFixed(3);
@@ -251,7 +268,7 @@ function controls() {
   const syncKind=()=>{const hybrid=$("kind").value==="hybrid";
     for(const name of ["orientation-yaw","orientation-pitch","orientation-roll"]) {if(hybrid) $(name).value=0;$(name).disabled=hybrid;$(name+"-out").value=$(name).value;}};
   $("kind").addEventListener("change", () => {syncKind();rebuild();syncMaterial();});
-  $("shell").addEventListener("change", () => {$("opaque").checked=false;opaqueSaved=null;copyCoating(); rebuild(); syncMaterial(); });
+  $("shell").addEventListener("change", () => {$("die-shell-preset").value="custom";$("opaque").checked=false;opaqueSaved=null;copyCoating(); rebuild(); syncMaterial(); });
   for(const field of ["radius-mm","shell-density","eye-density","accent-density","confetti-density","enamel-density","mark-density"])
     $(field).addEventListener("input",()=>{ if(lastGeometry) reportMass(lastGeometry); });
   for(const field of ["paint-a-color","paint-b-color"]) $(field).addEventListener("input",()=>{copyPaint();syncMaterial();});
@@ -275,22 +292,22 @@ function controls() {
       for (const [k,target] of [id,coatedId].entries()) { write("pbr",target,5,opaqueSaved[k*2]); write("pbr",target,7,opaqueSaved[k*2+1]); }
       opaqueSaved=null;
     }
-    syncExteriorOpacity();
+    repartitionExterior();
     syncMaterial();
   });
   $("layer").addEventListener("change", syncMaterial);
   $("reroll").addEventListener("click", () => { seed = (Math.random() * 0x7fffffff) | 0; rebuild(); });
   $("reset-material").addEventListener("click", () => { const id = selected();
-    if (id === coatedId) { copyCoating(); syncExteriorOpacity();syncMaterial(); return; }
-    if (id === paintAId || id === paintBId) { copyPaint(); syncExteriorOpacity();syncMaterial(); return; }
+    if (id === coatedId) { copyCoating(); repartitionExterior();syncMaterial(); return; }
+    if (id === paintAId || id === paintBId) { copyPaint(); repartitionExterior();syncMaterial(); return; }
     for (const table of Object.values(tables)) { const f = table.table.floats_per_record, start = id*f;
-      table.data.set(table.original.subarray(start,start+f),start); table.update(); } syncExteriorOpacity();syncMaterial(); });
+      table.data.set(table.original.subarray(start,start+f),start); table.update(); } repartitionExterior();syncMaterial(); });
   for (const [name,[table,offset,scale]] of Object.entries(properties)) $(name).addEventListener("input", () => {
     if ((name==="transmission" || name==="opacity") && ["glass","enamel"].includes($("layer").value)) {
       $("opaque").checked=false;opaqueSaved=null;
     }
     const value = +$(name).value; write(table,selected(),offset,value/scale);
-    if(name==="transmission"||name==="opacity") syncExteriorOpacity();
+    if(name==="transmission"||name==="opacity") repartitionExterior();
     $(name+"-out").value = (value/scale).toFixed(name === "shininess" || name === "enamel-thickness" ? 0 : 2);
     if(name==="enamel-thickness" && lastGeometry) reportMass(lastGeometry);
   });
@@ -353,8 +370,9 @@ function frame(now=0) {
     }
     gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
     gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
-    if(!exteriorOpaque) {gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);}
-    else {gl.disable(gl.BLEND);gl.depthMask(true);}
+    gl.disable(gl.BLEND);gl.depthMask(true);
+    gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);
+    gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
     gl.bindVertexArray(glass.vao); gl.drawArrays(gl.TRIANGLES,0,glass.count);
     gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
   }

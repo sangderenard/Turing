@@ -26,6 +26,7 @@
 <aside><h1>Design a marble or die</h1><p>Turn closed solids and dyed inclusions under the exported Pluck material tables and Phong shader.</p>
   <h2>Shape</h2><div class="grid">
     <label>Base solid<select id="base-shape"><option value="marble">Spherical marble</option><option value="d4">D4 tetrahedron</option><option value="d6">D6 cube</option><option value="d8">D8 octahedron</option><option value="d10">D10 trapezohedron</option><option value="d12">D12 dodecahedron</option><option value="d20">D20 icosahedron</option></select></label>
+    <label>Die shell preset<select id="die-shell-preset"><option value="porcelain">Opaque porcelain</option><option value="clear">Clear glass, dark numerals</option><option value="milk">Milk glass, dark numerals</option><option value="custom">Custom shell material</option></select></label>
     <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="clear">No inner decoration</option></select></label>
     <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
     <label>Outer material<select id="shell"></select></label>
@@ -66,10 +67,11 @@
     <label>Relief depth <output id="relief-depth-out"></output><input id="relief-depth" type="range" min="0" max="80" value="20"></label>
     <label>Numeral mesh detail <output id="dice-detail-out">48</output><input id="dice-detail" type="range" min="24" max="96" step="8" value="48"></label>
     <output id="dice-detail-cost" class="wide">Estimated D20: 138,240 triangles at detail 48</output>
+    <label>Die inclusion size <output id="die-inclusion-size-out">100%</output><input id="die-inclusion-size" type="range" min="10" max="100" value="100"></label>
     <label>Bevel radius / body radius <output id="dice-bevel-out">0.04</output><input id="dice-bevel" type="range" min="0" max="160" value="40"></label>
     <label>Face recess <output id="dice-face-relief-out">0.00</output><input id="dice-face-relief" type="range" min="0" max="80" value="0"></label>
     <label class="wide"><input id="compensate-raised" type="checkbox" checked> Keep raised marks inside face support plane</label>
-    <p class="wide">Bevel, face recess, and raised marks alter the closed die mesh and its moments of inertia. The bevel generates radius-accurate edge fillets and corner caps at sampled vertices; triangle density controls visible smoothness. Keeping mark peaks inside the rim equalizes the support profile; statistical fairness is not established.</p>
+    <p class="wide">The selected ribbons, confetti, or tubes fit inside the die and displace its body material. Choose a transparent outer material to see them. Bevel, face recess, and raised marks alter the closed die mesh and its moments of inertia. The bevel generates radius-accurate edge fillets and corner caps at sampled vertices; triangle density controls visible smoothness. Keeping mark peaks inside the rim equalizes the support profile; statistical fairness is not established.</p>
   </div>
   <h2>Physical properties</h2><div class="grid">
     <label>Marble radius (mm)<input id="radius-mm" type="number" min="1" max="100" step="0.1" value="10"></label>
