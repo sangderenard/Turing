@@ -439,6 +439,7 @@ class WasmProduct {
 // run starts from these positions at rest.  Python's glyph_start.decode_payload is this formula.
 export function decodeStart(start, pad) {
   const bytes = (text) => { const bin = atob(text), u8 = new Uint8Array(bin.length); for (let i = 0; i < u8.length; i++) u8[i] = bin.charCodeAt(i); return new Uint16Array(u8.buffer); };
+  if (start.ids) return decodeIdStart(start, pad, bytes);        // TIP JAR: a start that names the ids its rows belong to
   const q = bytes(start.xyz), b = start.bounds, out = {};
   ["x", "y", "z"].forEach((name, c) => {
     const column = new Float32Array(pad), lo = b[2 * c], span = b[2 * c + 1] - lo;
@@ -449,6 +450,21 @@ export function decodeStart(start, pad) {
     const r = bytes(start.rs), column = new Float32Array(pad);
     for (let i = 0; i < start.n; i++) column[i] = r[i] / 65535 * start.rmax;
     out.rs = column;
+  }
+  return out;
+}
+
+// TIP JAR (tipjar.py `decode_start` is this formula): the start's row k belongs to id ids[k]; x y z rs, a live `age` and the per-id colours
+// ir ig ib (bytes, rgb) are scattered to their ids.  Every other id keeps the exact zero state (parked).
+function decodeIdStart(start, pad, bytes) {
+  const n = start.n, ids = bytes(start.ids), q = bytes(start.xyz), r = bytes(start.rs), b = start.bounds, out = {};
+  const bin = atob(start.rgb), rgb = new Uint8Array(bin.length); for (let i = 0; i < rgb.length; i++) rgb[i] = bin.charCodeAt(i);
+  for (const name of ["x", "y", "z", "rs", "age", "ir", "ig", "ib"]) out[name] = new Float32Array(pad);
+  for (let k = 0; k < n; k++) {
+    const id = ids[k];
+    ["x", "y", "z"].forEach((name, c) => { out[name][id] = b[2 * c] + q[3 * k + c] / 65535 * (b[2 * c + 1] - b[2 * c]); });
+    out.rs[id] = r[k] / 65535 * start.rmax; out.age[id] = start.age;
+    out.ir[id] = rgb[3 * k] / 255; out.ig[id] = rgb[3 * k + 1] / 255; out.ib[id] = rgb[3 * k + 2] / 255;
   }
   return out;
 }

@@ -85,7 +85,7 @@ class Table:
 
     def catalog(self) -> dict:
         return {
-            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "purrline"],
+            "games": ["meowdoku", "chess", "checkers", "wordle", "chess_vs_net", "chess_arena", "lichess", "space_invaders", "bullet_hell", "platformer", "delve", "side_scroller", "tilequest", "boardwalk", "worldwalk", "fountain", "fountain3d", "tipjar", "purrline"],
             "meowdoku": {"levels": self.levels,
                          "boards": [{"id": b["id"], "level": b["level"], "type": b["type"], "n": b["n"]} for b in self.boards.values()]},
         }
@@ -145,6 +145,9 @@ class Table:
             self.game = FountainGame(aspect=float(payload.get("aspect") or 0.0) or None)       # the page runs the law; the server holds phase, seed, image
         elif kind == "fountain3d":
             self.game = Fountain3DGame(aspect=float(payload.get("aspect") or 0.0) or None)
+        elif kind == "tipjar":
+            from meowdoku import tipjar            # the watch-only Bitcoin tip jar on the 3-D fountain (build/meowdoku/tipjar.json; else a DEMO)
+            self.game = tipjar.TipJarGameClass()(aspect=float(payload.get("aspect") or 0.0) or None)
         elif kind == "purrline":
             self.game = Purrline(aspect=float(payload.get("aspect") or 0.0))
         else:
