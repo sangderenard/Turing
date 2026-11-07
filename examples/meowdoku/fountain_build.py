@@ -469,5 +469,170 @@ def build_purrline(web_dir: Path, sizes: tuple[str, ...] = PURRLINE_SIZES, wasm:
             manifest_path.write_text(json.dumps(purrline_manifest(records)), encoding="utf-8")
     return manifest
 # </purrline>
+# <mobroad>
+# ------------------------------------------------------------------------------------------------------------------------
+# THE MOBROAD VARIANT (fountain.make_law_mobroad): its own products, ``fountain_mobroad.manifest.json`` and ``fountain_mobroad_<tag>.wgsl`` (/ ``.wasm``),
+# built after the default, wheel and purrline ones and independent of them.  Everything of it is between ``# <mobroad>`` markers (here and in fountain.py).
+# The source digest of the DEFAULT and wheel products leaves BOTH variants' regions out and the purrline digest leaves this one out (the three functions
+# just below re-bind the helpers the purrline region defined), so none of those products is touched by this variant: same digests, nothing rebuilds.
+_MARKED = _re.compile(r"^[ \t]*# <(?:purrline|mobroad)>\n.*?^[ \t]*# </(?:purrline|mobroad)>\n", _re.S | _re.M)
+_MARKED_MOB = _re.compile(r"^[ \t]*# <mobroad>\n.*?^[ \t]*# </mobroad>\n", _re.S | _re.M)
+
+
+def _module_sources(strip: bool, drop=None) -> str:
+    """The sources a digest is a function of: ``strip`` leaves out BOTH variants' regions (the default / wheel products), ``drop`` a given pattern's, else whole."""
+    from src.compiler import deployment_classification, llvm_training_runtime, ssa_webgpu_backend
+    texts = [inspect.getsource(m) for m in (F, sys.modules[__name__])]
+    pattern = drop if drop is not None else (_MARKED if strip else None)
+    if pattern is not None:
+        texts = [pattern.sub("", t) for t in texts]
+    return "\0".join(texts + [inspect.getsource(m) for m in (ssa_webgpu_backend, deployment_classification, llvm_training_runtime)])
+
+
+def purrline_digest(tag: str) -> str:
+    """The purrline variant's own digest: its sources whole, the mobroad regions left out (so it is the digest it was)."""
+    return hashlib.sha256(f"{tag}:{SIZES[tag]}:purrline\0{_module_sources(False, _MARKED_MOB)}".encode()).hexdigest()[:16]
+
+
+def mobroad_digest(tag: str) -> str:
+    """The mobroad variant's own digest: its sources WHOLE."""
+    return hashlib.sha256(f"{tag}:{SIZES[tag]}:mobroad\0{_module_sources(False)}".encode()).hexdigest()[:16]
+
+
+def mobroad_layout() -> dict:
+    return {"arguments": F.MOBROAD_ARGUMENTS, "state": F.STATE, "outputs": F.MOBROAD_OUTPUTS, "diagnostics": F.DIAGNOSTICS + F.MOBROAD_DIAGNOSTICS,
+            "uniforms": F.MOBROAD_ALL_UNIFORMS, "runtime_inputs": F.MOBROAD_RUNTIME_INPUTS, "prefix": "fountain_mobroad"}
+
+
+def mobroad_shapes(pad: int) -> dict:
+    lay = mobroad_layout()
+    return {name: ((pad,) if name in lay["state"] + F.CONSTANTS else ()) for name in lay["arguments"]}
+
+
+def mobroad_passes(tag: str):
+    """The compiler-generated dispatch program of the variant at a size tag: (compiled, program, outputs, ids)."""
+    from src.common.tensors.accelerator_backends.ssa_backend import SSATensorOperations, SSATensorProgram
+    from src.compiler import ssa_webgpu_backend as webgpu
+    from src.compiler.work_contract import PRESETS, scoped_work_contract
+    active, pad = SIZES[tag]
+    law, names, shapes = F.make_law_mobroad(pad, active), mobroad_layout()["arguments"], mobroad_shapes(pad)
+    with scoped_work_contract(PRESETS[WGSL_CONTRACT]):
+        program = SSATensorProgram("fountain_step")
+        bindings = {name: SSATensorOperations.input(program, shapes[name]) for name in names}
+        with program.activate():
+            produced = law(*(bindings[name] for name in names))
+        outputs = [item.data.value for item in produced]
+        ids = {name: int(getattr(binding.data, "value").id) for name, binding in bindings.items()}
+        compiled = webgpu.emit_tensor_program_passes(program.module, "fountain_step", outputs, count=pad, name=f"fountain_mobroad_{pad}",
+                                                     iota_args=[ids[name] for name in F.IOTA])
+    return compiled, program, outputs, ids
+
+
+def build_size_mobroad(tag: str, web_dir: Path, wasm: bool = True) -> dict:
+    from src.compiler.deployment_classification import WebGPUComputeCostModel, webgpu_compute_payoff
+    from src.compiler import ssa_webgpu_backend as webgpu
+    started = time.perf_counter()
+    active, pad = SIZES[tag]
+    lay = mobroad_layout()
+    compiled, program, outputs, ids = mobroad_passes(tag)
+    if not compiled.complete:
+        raise RuntimeError("fountain mobroad shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
+    payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs, model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
+    (web_dir / f"fountain_mobroad_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    out_ids = [int(v.id) for v in outputs]
+    geo = F.mobroad_geometry(F.cell_needed(F.species_params({"fl_mu": F.MOB_MARCH["fl_mu"]})))
+    stride = max(1, -(-pad // DISPLAY_MAX))
+    record = {
+        "tag": tag, "n": active, "pad": pad, "route": "webgpu-compute" if payoff.pays else "wasm", "verdict": payoff.as_record(),
+        "wgsl": f"fountain_mobroad_{tag}.wgsl",
+        "wgsl_abi": {
+            "count": pad, "workgroup_size": list(compiled.workgroup_size), "groups": list(compiled.groups), "entries": list(compiled.entries),
+            "slots": compiled.slots, "dispatches": compiled.dispatches, "lane_base": compiled.lane_base, "arena_elements": compiled.arena_elements,
+            "bindings": compiled.bindings, "slots_per_binding": compiled.slots_per_binding,
+            "storage_bindings_per_pass": compiled.bindings + 1, "binding_budget": webgpu.MAX_STORAGE_BINDINGS_PER_STAGE,
+            "binding_bytes": min(compiled.slots_per_binding, compiled.slots) * pad * 4,
+            "arguments": list(lay["arguments"]), "uniforms": list(lay["uniforms"]), "iota": list(F.IOTA), "outputs": list(lay["outputs"]),
+            "feed_slots": {name: compiled.feed_slots[ids[name]] for name in lay["arguments"] if ids[name] in compiled.feed_slots},
+            "uniform_index": {name: compiled.uniform_index[ids[name]] for name in lay["uniforms"]},
+            "output_slots": {name: compiled.output_slots[out_ids[k]] for k, name in enumerate(lay["outputs"])},
+            "backend_identities": [d.as_record() for d in compiled.backend_identity_decisions],
+        },
+        "memory": {"arena_bytes": compiled.arena_elements * 4, "bytes_per_id": compiled.arena_elements * 4 / pad,
+                   "display_ids": -(-pad // stride), "display_bytes": 3 * 16 * -(-pad // stride)},
+        "display_stride": stride, "emit_rate": F.EMIT_SPAN / active,
+        "geometry": {k: (list(v) if isinstance(v, tuple) else v) for k, v in geo.items()},
+        "uniforms": F.mobroad_spec(tag)["uniforms"], "source_digest": mobroad_digest(tag),
+    }
+    record["build_seconds"] = round(time.perf_counter() - started, 1)
+    if pad <= WASM_MAX and wasm:
+        build_fallback_mobroad(tag, web_dir, record)
+    return record
+
+
+def build_fallback_mobroad(tag: str, web_dir: Path, record: dict) -> dict:
+    """The CPU fallback (wasm) of one size of the variant, added to its ``record``."""
+    from meowdoku import graph_wasm
+    active, pad = SIZES[tag]
+    started = time.perf_counter()
+    lay = mobroad_layout()
+    wasm_abi = graph_wasm._compile(f"fountain_mobroad_{tag}", mobroad_shapes(pad),
+                                   lambda b: F.make_law_mobroad(pad, active)(*(b[name] for name in lay["arguments"])),
+                                   lay["outputs"], WASM_CONTRACT, web_dir, {"argument_names": list(lay["arguments"]), "count": pad})
+    record.update({"wasm": f"fountain_mobroad_{tag}.wasm", "wasm_abi": f"fountain_mobroad_{tag}.abi.json", "wasm_buffers": len(wasm_abi["order"]),
+                   "wasm_seconds": round(time.perf_counter() - started, 1)})
+    return record
+
+
+#: the sizes the road is built at: the 256-id wasm demonstration and the 4k mob (a larger mob would not fit the road)
+MOBROAD_SIZES = ("small", "4k")
+
+
+def mobroad_manifest(records: dict) -> dict:
+    from src.compiler.deployment_classification import WebGPUComputeCostModel
+    lay = mobroad_layout()
+    return {
+        "schema": SCHEMA, "sizes": records, "cost_model": WebGPUComputeCostModel().__dict__,
+        "law": {"arguments": list(lay["arguments"]), "state": list(lay["state"]), "constants": list(F.CONSTANTS), "uniforms": list(lay["uniforms"]),
+                "outputs": list(lay["outputs"]), "diagnostics": list(lay["diagnostics"]), "dt": F.DT, "runtime_inputs": list(lay["runtime_inputs"]),
+                "gravity": F.G, "dof": F.DOF},
+        "emit_span": F.EMIT_SPAN, "initial": {},
+        "points": {"x": "x", "y": "y", "vx": "vx", "vy": "vy", "rgb": ["cr", "cg", "cb"], "live": ["age"], "placed": ["x", "y"], "radius": "rad", "rest_speed": 0.15},
+        "reference_view": [-F.MOB_ROAD_HALF, F.MOB_ROAD_HALF, 0.0, F.MOB_ROAD_TOP], "species": [list(item) for item in F.SPECIES], "settle": F.SETTLE,
+        "mobroad": F.mobroad_map(),
+        "presets": {"sdf_mobroad": {tag: F.mobroad_spec(tag) for tag in records}},
+    }
+
+
+def build_mobroad(web_dir: Path, sizes: tuple[str, ...] = MOBROAD_SIZES, wasm: bool = True, on_gpu_ready=None) -> dict:
+    """The mob road's page products, beside the default ones: ``fountain_mobroad.manifest.json`` and ``fountain_mobroad_<tag>.wgsl`` / ``.wasm``.  Two passes
+    like ``build`` (WebGPU products first, the CPU fallbacks after); sizes whose source digest is unchanged are kept."""
+    web_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = web_dir / "fountain_mobroad.manifest.json"
+    old = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    records = {}
+    for tag in sizes:
+        previous = (old.get("sizes") or {}).get(tag)
+        if previous and previous.get("source_digest") == mobroad_digest(tag) and (web_dir / f"fountain_mobroad_{tag}.wgsl").exists():
+            if previous.get("wasm") and not all((web_dir / previous[k]).exists() for k in ("wasm", "wasm_abi")):
+                previous = {k: v for k, v in previous.items() if not k.startswith("wasm")}
+            records[tag] = previous
+            continue
+        records[tag] = build_size_mobroad(tag, web_dir, wasm=False)
+        r = records[tag]
+        print(f"[fountain mobroad] {tag}: {r['n']} ids -> {r['route']} ({r['wgsl_abi']['dispatches']} dispatches, "
+              f"{r['memory']['bytes_per_id']:.0f} B/id), built in {r['build_seconds']}s", flush=True)
+    manifest = mobroad_manifest(records)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    if on_gpu_ready is not None:
+        on_gpu_ready(manifest)
+    if wasm:
+        for tag in sizes:
+            r = records[tag]
+            if SIZES[tag][1] > WASM_MAX or r.get("wasm"):
+                continue
+            build_fallback_mobroad(tag, web_dir, r)
+            manifest_path.write_text(json.dumps(mobroad_manifest(records)), encoding="utf-8")
+    return manifest
+# </mobroad>
 if __name__ == "__main__":
     raise SystemExit(main())

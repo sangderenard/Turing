@@ -54,6 +54,7 @@ import { TuringGraphProgram } from "./turing-wasm-shell.js";
 import { Recording, Playback } from "./recording.js";
 import { ParticleStyles, GRAIN_COLOR_GLSL, grainUniforms } from "./particle_styles.js";
 import { NoiseFilter } from "./noise_filter.js";
+import { mobroadInputs } from "./mobroad.js";               // [MOBROAD]
 const NO_TINT = new Float32Array(4);     // the colour source "simulation": no override
 
 async function json(url) {
@@ -674,6 +675,10 @@ export class ComputeRuntime {
       const mine = this.runtimeInputs, w = purrlineInputs(this.sand, this.spec.purrline.map, this.spec.purrline.boxes);
       for (const name of Object.keys(w)) if (mine.has(name)) out[name] = w[name];
     }
+    if (this.spec.mobroad) {                              // [MOBROAD] the road's bullets as the law's kill segments (setMobroad), swept from where they were last written
+      const mine = this.runtimeInputs, w = mobroadInputs(this.mob || [], this.mobPrev, this.spec.mobroad);
+      for (const name of Object.keys(w)) if (mine.has(name)) out[name] = w[name];
+    }
     const g = this.spin ? spinGravity(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : this.gravity;
     if (this.runtimeInputs.has("case_omega")) {          // the case's own turn, from the same motion (one mechanism): 0 when it stands still
       const [om, dom] = this.spin ? spinOmega(this.spin, this.steps * this.manifest.law.dt, this.spinMotion) : [0, 0];
@@ -739,6 +744,10 @@ export class ComputeRuntime {
   // solids each batch -- ONE WAY: nothing the sand does reaches the game.  null stops it (the solids are then written empty).
   setPurrline(game) { this.sand = game || null; }
 
+  // [MOBROAD] the road's bullets ([{id, x, y, kr}], board units): written to the law's kill segments each batch -- ONE WAY.  The law's own counts come
+  // back through ``diag`` (n_dead, n_goal, n_crush).
+  setMobroad(bullets) { this.mob = bullets || null; }
+
   setGravityScale(k) {
     const next = Math.max(0, Number(k));
     if (next === (this.gravityScale ?? 1)) return;
@@ -751,6 +760,7 @@ export class ComputeRuntime {
     const now = this.#inputsNow(), changed = Object.keys(now).some((n) => now[n] !== this.lawInputs[n]);
     if (!changed && !force) return;
     this.lawInputs = now;
+    if (this.spec.mobroad) this.mobPrev = new Map((this.mob || []).map((b) => [b.id, [b.x, b.y]]));   // [MOBROAD] the next segments start where these end
     for (const [name, value] of Object.entries(now)) this.product.setUniform(name, value);
     this.tape.setInputs(this.steps, now);
   }
