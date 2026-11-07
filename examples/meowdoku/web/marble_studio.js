@@ -4,7 +4,7 @@ import { marbleMass } from "./marble_mass.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
 import { ComputeRuntime } from "./compute.js";
 import { caseModel } from "./gravity.js";
-import { marblePreviewSpec, livePreviewParticle, previewLawToScene } from "./marble_sim_preview.js";
+import { marblePreviewSpec, livePreviewParticle, previewLawToScene, cameraNudgeGravity } from "./marble_sim_preview.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto } from "./marble_photo.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
@@ -107,6 +107,15 @@ let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
 const simStatus=()=>{$("preview-sim-status").textContent=sim.runtime?.error?`Particle simulation error: ${sim.runtime.error}`:sim.status;};
+const drive={direction:"neutral"};
+const DRIVE={neutral:[0,0],left:[-1,0],right:[1,0],up:[0,1],down:[0,-1]};
+function driveGravity() {
+  const [dx,up]=DRIVE[drive.direction];
+  if(sim.runtime?.ready)sim.runtime.setGravity(...cameraNudgeGravity(dx,up,yaw));
+  drive.yaw=yaw;
+  $("drive-status").textContent=drive.direction==="neutral"?"Hold an arrow to tilt the toy course":
+    `Tilting ${drive.direction} in camera view`;
+}
 function simCage(spec) {
   const packed=spec.chamber_mesh;
   if(!packed)throw new Error("compiled chamber has no containing mesh");
@@ -125,8 +134,12 @@ function simCage(spec) {
     const center=law[0].map((_,k)=>(law[0][k]+law[1][k]+law[2][k])/3);
     const checked=center[2]<b[4]+0.12*dz || center[1]>high-0.12*(high-low);
     const parity=(Math.floor(center[0]/tile)+Math.floor(center[1]/tile)+Math.floor(center[2]/tile))&1;
-    const id=checked ? (parity?ids.stone_onyx:ids.ceramic_porcelain) : ids.marble_clear_glass;
-    (checked?opaque:glass).push([a,c,d,id,[normal,normal,normal]]);
+    // The SDF toy's real contact mesh supplies the ramps, throat and pegs.
+    // Give its obstacles distinct finishes without implying per-wall friction.
+    const obstacle=Math.abs(normal[1])<0.72 && !checked;
+    const id=checked ? (parity?ids.stone_onyx:ids.ceramic_porcelain)
+      : obstacle ? (parity?ids.metal_copper:ids.metal_gold) : ids.marble_clear_glass;
+    (checked||obstacle?opaque:glass).push([a,c,d,id,[normal,normal,normal]]);
   }
   return { opaque:mesh(opaque), glass:mesh(glass) };
 }
@@ -138,22 +151,25 @@ function configureSimMotion() {
   if(kind==="rotate"||kind==="rock") {
     const result=runtime.setCasePeriodic(kind==="rotate"?"spin":"rock",hz,arc,phase,axis);
     if(!result)throw new Error(`this compiled product cannot rotate about ${axis.toUpperCase()}`);
-    sim.status=`Compiled particle · ${result.hz.toFixed(2)} Hz ${kind} about ${axis.toUpperCase()}${result.limited?" (bounded by contacts)":""} · sphere contact, fixed visual orientation`;
+    sim.status=`Compiled toy course · ${result.hz.toFixed(2)} Hz ${kind} about ${axis.toUpperCase()}${result.limited?" (bounded by contacts)":""} · physical angular mesh pose`;
   } else {
     runtime.setCasePeriodic(null);runtime.setCaseTilt(0);
     sim.nextFlipStep=runtime.steps+Math.round((phase/360)/(hz*runtime.manifest.law.dt));
-    sim.status=`Compiled particle · ${kind==="flip"?`physical Flip about ${axis.toUpperCase()}`:"case at rest"} · sphere contact, fixed visual orientation`;
+    sim.status=`Compiled toy course · ${kind==="flip"?`physical Flip about ${axis.toUpperCase()}`:"case at rest"} · physical angular mesh pose`;
   }
+  driveGravity();
   simStatus();
 }
 async function startSim() {
   if(!sim.base) {
-    const response=await fetch("/api/marble_preview_spec",{cache:"no-store"});
+    const count=Math.max(1,Math.min(16,Math.floor(+$('preview-count').value||1)));
+    $('preview-count').value=String(count);
+    const response=await fetch(`/api/marble_preview_spec?count=${count}`,{cache:"no-store"});
     if(!response.ok)throw new Error(`compiled preview spec HTTP ${response.status}`);
     sim.base=await response.json();
   }
   if(!sim.runtime) sim.runtime=new ComputeRuntime({onStatus:simStatus,onSamples:()=>{},onSupport:()=>{}});
-  sim.spec=marblePreviewSpec(sim.base,readPhysical(document),++sim.epoch);
+  sim.spec=marblePreviewSpec(sim.base,{...readPhysical(document),"sim-omega":Number($("sim-omega").value)},++sim.epoch);
   sim.runtime.setGravity(0,0,-1);
   sim.runtime.sync(sim.spec);
   await sim.runtime.queue;
@@ -162,6 +178,8 @@ async function startSim() {
   dispose(sim.cageOpaque);dispose(sim.cageGlass);
   const cage=simCage(sim.spec);sim.cageOpaque=cage.opaque;sim.cageGlass=cage.glass;
   configureSimMotion();
+  sim.status=`Compiled toy course · ${sim.spec.studio_count} identical marble${sim.spec.studio_count===1?"":"s"} · real soft-sphere contacts`;
+  simStatus();
 }
 const resetRoll=()=>{rollState={position:[0,0,0],orientation:[1,0,0,0],angularVelocity:[0,0,0]};};
 const objectStatus=(message)=>{$("object-status").textContent=message;};
@@ -412,18 +430,41 @@ function controls() {
     $(name).addEventListener("input",syncPreviewMotion);
   $("preview-engine").addEventListener("change",()=>{
     $("preview-camera").disabled=$("preview-engine").value!=="particle";
+    $("drive-pad").hidden=$("preview-engine").value!=="particle";
     if($("preview-engine").value==="particle") {
       sim.status="Loading compiled particle and native containing case…";simStatus();
       startSim().catch((error)=>{sim.status=`Particle simulation unavailable: ${error.message||error}`;simStatus();});
-    } else {sim.runtime?.sync(null);sim.status="Visual preview (cheap): object motion only";simStatus();}
+    } else {drive.direction="neutral";driveGravity();sim.runtime?.sync(null);sim.status="Visual preview (cheap): object motion only";simStatus();}
   });
   $("preview-camera").addEventListener("change",()=>{
     $("preview-camera").title=$("preview-camera").value==="marble"?
-      "Follows the simulated particle position; the packed frame has no spin orientation":"Shows the whole containing case";
+      "Follows the simulated particle position and physical angular pose":"Shows the whole containing course";
   });
+  for(const button of $("drive-pad").querySelectorAll("button[data-drive]")) {
+    const direction=button.dataset.drive;
+    button.addEventListener("pointerdown",(event)=>{
+      event.preventDefault();button.setPointerCapture(event.pointerId);
+      if($("preview-motion").value!=="off") {$("preview-motion").value="off";syncPreviewMotion();}
+      drive.direction=direction;driveGravity();
+    });
+    const release=()=>{if(drive.direction===direction){drive.direction="neutral";driveGravity();}};
+    for(const type of ["pointerup","pointercancel","lostpointercapture"])button.addEventListener(type,release);
+  }
   $("preview-camera").dispatchEvent(new Event("change"));
   for(const id of ["sim-radius","sim-rho","sim-mu","sim-e","sim-roll","sim-irr"])
     $(id).addEventListener("change",()=>{if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});});
+  $("preview-count").addEventListener("change",()=>{
+    sim.base=null;
+    if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});
+  });
+  $("sim-contact-preset").addEventListener("change",()=>{
+    if($("sim-contact-preset").value!=="custom")$("sim-omega").value=$("sim-contact-preset").value;
+    if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});
+  });
+  $("sim-omega").addEventListener("change",()=>{
+    $("sim-contact-preset").value="custom";
+    if($("preview-engine").value==="particle")startSim().catch((error)=>{sim.status=String(error.message||error);simStatus();});
+  });
   syncPreviewMotion();
   $("inertia-lock").addEventListener("change",()=>{if(!$("inertia-lock").checked && !rollProps?.validForRoll) $("inertia-lock").checked=true;});
   $("scene-pattern").addEventListener("change",()=>{dispose(checkerMesh);checkerMesh=checkerboard();});
@@ -493,12 +534,13 @@ function frame(now=0) {
   const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
   const simOn=$("preview-engine").value==="particle";
   if(simOn&&sim.runtime?.ready) {
+    if(drive.direction!=="neutral"&&drive.yaw!==yaw)driveGravity();
     sim.runtime.frame(now/1000);
     if($("preview-motion").value==="flip"&&sim.runtime.shown!=null&&sim.runtime.steps>=sim.nextFlipStep) {
       const hz=+$("preview-hz").value;
       const turn=sim.runtime.startCaseFlip(Math.min(0.7/hz,1/hz),1,$("preview-axis").value);
       if(turn) {sim.flipSeconds=turn.seconds;sim.nextFlipStep=sim.runtime.steps+Math.ceil(Math.max(turn.seconds,1/hz)/sim.runtime.manifest.law.dt);
-        sim.status=`Compiled particle · physical Flip ${turn.seconds.toFixed(2)} s about ${turn.axis.toUpperCase()} · sphere contact, fixed visual orientation`;simStatus();}
+        sim.status=`Compiled toy course · physical Flip ${turn.seconds.toFixed(2)} s about ${turn.axis.toUpperCase()} · physical angular mesh pose`;simStatus();}
     }
   }
   if(!simOn&&dt>0 && rollState && rollProps?.validForRoll && !$("inertia-lock").checked) {
@@ -519,13 +561,19 @@ function frame(now=0) {
     const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
     const axis=$("preview-axis").value;
     const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
-    let caseM=identity(),haveParticle=true,particleWorld=null;
+    let caseM=identity(),haveParticle=true,particleWorld=null,particleObjects=[];
     if(simOn) {
-      const runtime=sim.runtime,pt=livePreviewParticle(runtime?.points());
-      haveParticle=!!(runtime?.ready&&pt&&sim.map);
+      const runtime=sim.runtime,points=runtime?.points(),lead=livePreviewParticle(points);
+      haveParticle=!!(runtime?.ready&&lead&&sim.map);
       if(runtime?.ready&&runtime.shown!=null) caseM=caseModel(runtime.caseAngleAt(runtime.shown*runtime.snap),0,0,runtime.caseAxis||axis,0);
-      if(haveParticle) {const p=sim.map.point([pt.x,pt.y,pt.z]);particleWorld=transformPoint(caseM,p);
-        object=multiply(caseM,multiply(translate3(...p),scale3(pt.radius*sim.map.scale)));}
+      if(haveParticle) for(let id=0;id<(sim.spec.studio_count||1);id++) {
+        const pt=livePreviewParticle(points,id);if(!pt)continue;
+        const p=sim.map.point([pt.x,pt.y,pt.z]);
+        if(id===0)particleWorld=transformPoint(caseM,p);
+        const q=(id===0?runtime.rotation():runtime.rotationFor?.(id))?.quaternion;
+        const pose=q?multiply(rotateX(-Math.PI/2),multiply(rotateQuaternion([q[3],q[0],q[1],q[2]]),rotateX(Math.PI/2))):identity();
+        particleObjects.push(multiply(caseM,multiply(translate3(...p),multiply(pose,scale3(pt.radius*sim.map.scale)))));
+      }
     }
     // The law position is in the case frame. Apply the same physical case
     // transform as the containing mesh before anchoring the camera to it.
@@ -566,7 +614,8 @@ function frame(now=0) {
       setTransform(view); gl.bindVertexArray(checkerMesh.vao);
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
-    if(haveParticle) {
+    if(haveParticle) for(const model of simOn?particleObjects:[object]) {
+      setTransform(simOn?multiply(view,model):mv);
       gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
       gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
       gl.disable(gl.BLEND);gl.depthMask(true);

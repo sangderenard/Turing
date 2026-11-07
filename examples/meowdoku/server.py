@@ -29,6 +29,7 @@ the difference between states.  Meowdoku runs the dt-system law through
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import json
 import secrets
@@ -731,15 +732,25 @@ def make_handler(sessions: Sessions):
             if path == "/api/marble_objects":
                 return self._json({"entries": sessions.marble_objects.entries()})
             if path == "/api/marble_preview_spec":
-                # Independent one-particle run of the compiled 3-D fountain
-                # law. Opening Studio does not replace the user's game.
-                preview = Fountain3DGame(size="small")
-                preview.shape = "sdf_cube"
-                preview.fluid = "air"
-                preview.params.update({"wt0": 1.0, "wt1": 0.0, "wt2": 0.0, "wt3": 0.0,
-                                       "r0": 0.01, "irr0": 0.0, "fl_rho": 0.0, "fl_mu": 0.0})
+                # The Studio drive uses the same compiled 4k SDF toy course and
+                # contact law as Marble Madness in an independent 1–16 marble run.
+                # Opening Studio does not replace the user's game.
+                from urllib.parse import parse_qs
+                try:
+                    count = int((parse_qs(self.path.partition("?")[2]).get("count") or ["1"])[0])
+                except ValueError:
+                    return self.send_error(400, "invalid marble count")
+                if not 1 <= count <= 16:
+                    return self.send_error(400, "marble count must be 1–16")
+                preview = MarbleMadness()
                 spec = preview.state()["compute"]
-                spec["uniforms"]["emit_rate"] = 1.0e9
+                spec["uniforms"]["emit_rate"] = 0.16 if count > 1 else 1.0e9
+                # The existing start-column contract initializes age. IDs above
+                # count stay parked for this run; the product and contact law stay
+                # the same 4k compiled toy rather than pretending N is a new size.
+                ages = [0.0] * count + [-1.0e9] * (preview.n - count)
+                spec["start"] = {"age_f32": base64.b64encode(struct.pack(f"<{preview.n}f", *ages)).decode("ascii")}
+                spec["studio_count"] = count
                 return self._json(spec)
             if path.startswith("/api/marble_objects/"):
                 try:
