@@ -20,6 +20,8 @@ import * as wl from "./wordle_layout.js";                                       
 import * as share from "./share.js";     // SHARE: first, so a shared link's settings are in force before this file reads its storage
 import { GameClock, SPEED, sliderToSpeed, speedToSlider, speedLabel } from "./game_clock.js";   // [SPEED+ZOOM]
 import { springStep, windowShift, clampZoom, zoomFloor, ZOOM_MAX, ZOOM_OMEGA } from "./world_zoom.js";                  // [SPEED+ZOOM]
+import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, curveSettled, initialCurve, clampCurveU,
+         dollyParams, projectionMatrix, pickPlane } from "./world_curve.js";                                                 // [CURVE]
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
 
 const canvas = document.getElementById("gl");
@@ -1031,7 +1033,7 @@ function terrainMesh(width, depth) {
 // between two strips moved differently -- the stair-step tears and gaps.
 // Two 0.2 rows per visible strip, one 0.6 row per shadow strip; the rigid
 // tilt then leaves (L/2)^2 / 2R ~ 0.0006 units at a seam.
-const PLANET = { radius: 36.0, strip: 0.4, shadowStrip: 0.6 };
+const PLANET = { radius: 36.0, k: 1 / 36.0, strip: 0.4, shadowStrip: 0.6 };      // [CURVE] k = 1 / radius, the EASED curvature (0 = flat): world_curve.js, curveView
 // The field lies on the same sphere as the land: everything drawn over a
 // planet-terrain game drops by the curve at its own board position, so the
 // play layer stays parallel to the surface it flies over (a flat field over
@@ -1040,20 +1042,20 @@ function onPlanet() { const g = state.game; return !state.flat && !!(g && g.scen
 function planetDrop(x, z) {
   if (!onPlanet()) return 0;
   const dx = x - extMidX(), dz = z - extMidZ();
-  return (dx * dx + dz * dz) / (2 * PLANET.radius);
+  return (dx * dx + dz * dz) * PLANET.k / 2;       // [CURVE] exactly 0 when flat
 }
 function stripsOf(positions, extras, span, length = PLANET.strip) {
   // Partition a triangle soup by each triangle's centroid z into strips,
   // positions re-centred on the strip (z) and curved across the width (y).
-  const tri = positions.length / 9, strips = new Map(), cx = span[0] / 2;
+  const tri = positions.length / 9, strips = new Map(), cx = span[0] / 2;       // [CURVE] s.flatY keeps the unbaked heights so the width curve can be re-baked
   for (let k = 0; k < tri; k++) {
     const zc = (positions[k * 9 + 2] + positions[k * 9 + 5] + positions[k * 9 + 8]) / 3;
     const index = Math.floor(zc / length);
-    if (!strips.has(index)) strips.set(index, { index, pos: [], extra: extras.map(() => []) });
+    if (!strips.has(index)) strips.set(index, { index, pos: [], flatY: [], extra: extras.map(() => []) });
     const s = strips.get(index), centre = (index + 0.5) * length;
     for (let v = 0; v < 3; v++) {
       const o = k * 9 + v * 3, x = positions[o], dx = x - cx;
-      s.pos.push(x, positions[o + 1] - (dx * dx) / (2 * PLANET.radius), positions[o + 2] - centre);
+      s.pos.push(x, positions[o + 1] - (dx * dx) * PLANET.k / 2, positions[o + 2] - centre); s.flatY.push(positions[o + 1]);   // [CURVE]
     }
     extras.forEach(([data, size], e) => { for (let v = 0; v < 3; v++) for (let c = 0; c < size; c++) s.extra[e].push(data[(k * 3 + v) * size + c]); });
   }
@@ -1078,14 +1080,14 @@ function reliefMesh(exported) {
     const pos = new Float32Array(s.pos), nrm = new Float32Array(s.extra[0]), uv = new Float32Array(s.extra[1]);
     const buffers = [buffer(pos, 0, 3), buffer(nrm, 1, 3), buffer(uv, 3, 2)];
     gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre, pos, nrm, uv, buffers,
+    return { vao, count: s.pos.length / 3, centre: s.centre, pos, nrm, uv, buffers, flatY: new Float32Array(s.flatY),
              node: exported.step ? nodesOf(s, exported.step) : null };
   });
   const shadows = exported.shadow_positions ? stripsOf(exported.shadow_positions, [], exported.span, PLANET.shadowStrip).map((s) => {
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     const pos = new Float32Array(s.pos), buffers = [buffer(pos, 0, 3)];
     gl.bindVertexArray(null);
-    return { vao, count: s.pos.length / 3, centre: s.centre, pos, buffers,
+    return { vao, count: s.pos.length / 3, centre: s.centre, pos, buffers, flatY: new Float32Array(s.flatY),
              node: exported.shadow_step ? nodesOf(s, exported.shadow_step) : null };
   }) : [];
   // The relief map itself (the depth texture's R channel), through the
@@ -1117,7 +1119,7 @@ function reliefMesh(exported) {
   const surface = surfaceOf(exported.positions, exported.step, true);
   const shadowSurface = surfaceOf(exported.shadow_positions, exported.shadow_step, false);
   return (TERRAIN.relief = { strips, shadows, tile: exported.tile, span: exported.span, step: exported.step,
-                             shadowStep: exported.shadow_step, map, surface, shadowSurface });
+                             shadowStep: exported.shadow_step, map, surface, shadowSurface, bakedK: PLANET.k });
 }
 // TURNING THE LAND (a spherical game, predict.patch).  The ship never moves
 // on screen; the land is read from the same tileable relief map at a turned,
@@ -1280,7 +1282,7 @@ function sphereLand(relief, now) {
   const r0 = [h0[1] * u0[2] - h0[2] * u0[1], h0[2] * u0[0] - h0[0] * u0[2], h0[0] * u0[1] - h0[1] * u0[0]];
   const frame = LAND.frame = { u0, h0, r0, radius: sphere.radius, relief: sphere.relief, sea: sphere.sea };
   const origin = terrainOrigin(relief), x0 = origin[0], z0 = origin[2], y0 = origin[1];
-  const ext = state.extent, R = PLANET.radius, step = relief.step;
+  const ext = state.extent, K = PLANET.k, step = relief.step;       // [CURVE]
   const cols = Math.round(relief.span[0] / step) + 1, rows = Math.round(relief.span[1] / step) + 1;
   const hgt = new Float32Array(cols * rows), lonU = new Float32Array(cols * rows), latV = new Float32Array(cols * rows);
   for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
@@ -1295,10 +1297,10 @@ function sphereLand(relief, now) {
   for (let v = 0; v < S.count; v++) {
     const k = S.node[v], i = k % cols, j = (k - i) / cols;
     const bx = x0 + S.base[v * 3], bz = z0 + S.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
-    S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + hgt[k] - (dx * dx + dz * dz) / (2 * R); S.pos[v * 3 + 2] = bz;
+    S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + hgt[k] - (dx * dx + dz * dz) * K / 2; S.pos[v * 3 + 2] = bz;
     const hl = hgt[j * cols + Math.max(0, i - 1)], hr = hgt[j * cols + Math.min(cols - 1, i + 1)];
     const hu = hgt[Math.max(0, j - 1) * cols + i], hd = hgt[Math.min(rows - 1, j + 1) * cols + i];
-    const nx = -(hr - hl) / (2 * step) + dx / R, nz = -(hd - hu) / (2 * step) + dz / R, len = Math.hypot(nx, 1, nz);
+    const nx = -(hr - hl) / (2 * step) + dx * K, nz = -(hd - hu) / (2 * step) + dz * K, len = Math.hypot(nx, 1, nz);
     S.nrm[v * 3] = nx / len; S.nrm[v * 3 + 1] = 1 / len; S.nrm[v * 3 + 2] = nz / len;
     S.uv[v * 2] = lonU[k]; S.uv[v * 2 + 1] = latV[k];
   }
@@ -1315,7 +1317,7 @@ function sphereLand(relief, now) {
     for (let v = 0; v < C.count; v++) {
       const bx = x0 + C.base[v * 3], bz = z0 + C.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
       const p = patchToSphere(bx - patch.cx, patch.cy - bz, frame), [h] = sampleLand(p[0], p[1], p[2]);
-      C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + h - SHADOW_SINK - (dx * dx + dz * dz) / (2 * R); C.pos[v * 3 + 2] = bz;
+      C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + h - SHADOW_SINK - (dx * dx + dz * dz) * K / 2; C.pos[v * 3 + 2] = bz;
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, C.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, C.pos);
   }
@@ -1370,7 +1372,7 @@ function turnRelief(relief, now) {
     return { cols, rows, hgt, mu, mv };
   };
   const fine = grid(relief.step), cx = relief.span[0] / 2;
-  const ext = state.extent, R = PLANET.radius;
+  const ext = state.extent, K = PLANET.k;       // [CURVE]
   if (relief.surface) {
     // one surface: board position = origin + mesh (x, z); height = the map's,
     // less the planet's drop there (the same drop every body is drawn with)
@@ -1379,11 +1381,11 @@ function turnRelief(relief, now) {
       const k = S.node[v], i = k % fine.cols, j = (k - i) / fine.cols;
       const bx = x0 + S.base[v * 3], bz = z0 + S.base[v * 3 + 2];
       const dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
-      S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + fine.hgt[k] - (dx * dx + dz * dz) / (2 * R); S.pos[v * 3 + 2] = bz;
+      S.pos[v * 3] = bx; S.pos[v * 3 + 1] = y0 + fine.hgt[k] - (dx * dx + dz * dz) * K / 2; S.pos[v * 3 + 2] = bz;
       const hl = fine.hgt[j * fine.cols + Math.max(0, i - 1)], hr = fine.hgt[j * fine.cols + Math.min(fine.cols - 1, i + 1)];
       const hu = fine.hgt[Math.max(0, j - 1) * fine.cols + i], hd = fine.hgt[Math.min(fine.rows - 1, j + 1) * fine.cols + i];
       // slope of the land plus the slope of the planet's curve
-      const nx = -(hr - hl) / (2 * relief.step) + dx / R, nz = -(hd - hu) / (2 * relief.step) + dz / R, len = Math.hypot(nx, 1, nz);
+      const nx = -(hr - hl) / (2 * relief.step) + dx * K, nz = -(hd - hu) / (2 * relief.step) + dz * K, len = Math.hypot(nx, 1, nz);
       S.nrm[v * 3] = nx / len; S.nrm[v * 3 + 1] = 1 / len; S.nrm[v * 3 + 2] = nz / len;
       S.uv[v * 2] = fine.mu[k] / relief.tile; S.uv[v * 2 + 1] = fine.mv[k] / relief.tile;
     }
@@ -1392,7 +1394,7 @@ function turnRelief(relief, now) {
       const coarse = grid(relief.shadowStep), C = relief.shadowSurface;
       for (let v = 0; v < C.count; v++) {
         const bx = x0 + C.base[v * 3], bz = z0 + C.base[v * 3 + 2], dx = bx - ext.width / 2, dz = bz - ext.depth / 2;
-        C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + coarse.hgt[C.node[v]] - SHADOW_SINK - (dx * dx + dz * dz) / (2 * R); C.pos[v * 3 + 2] = bz;
+        C.pos[v * 3] = bx; C.pos[v * 3 + 1] = y0 + coarse.hgt[C.node[v]] - SHADOW_SINK - (dx * dx + dz * dz) * K / 2; C.pos[v * 3 + 2] = bz;
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, C.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, C.pos);
     }
@@ -1403,7 +1405,7 @@ function turnRelief(relief, now) {
     for (let v = 0; v < strip.count; v++) {
       const k = strip.node[v], i = k % fine.cols, j = (k - i) / fine.cols;
       const dx = strip.pos[v * 3] - cx;
-      strip.pos[v * 3 + 1] = fine.hgt[k] - (dx * dx) / (2 * PLANET.radius);
+      strip.pos[v * 3 + 1] = fine.hgt[k] - (dx * dx) * K / 2;
       const hl = fine.hgt[j * fine.cols + Math.max(0, i - 1)], hr = fine.hgt[j * fine.cols + Math.min(fine.cols - 1, i + 1)];
       const hu = fine.hgt[Math.max(0, j - 1) * fine.cols + i], hd = fine.hgt[Math.min(fine.rows - 1, j + 1) * fine.cols + i];
       const nx = -(hr - hl) / (2 * relief.step), nz = -(hd - hu) / (2 * relief.step), len = Math.hypot(nx, 1, nz);
@@ -1420,12 +1422,23 @@ function turnRelief(relief, now) {
         const dx = strip.pos[v * 3] - cx;
         // a hair under the fine land, so the coarse caster never cuts through
         // the surface it shades (that crossing was the rippling shadow)
-        strip.pos[v * 3 + 1] = coarse.hgt[strip.node[v]] - SHADOW_SINK - (dx * dx) / (2 * PLANET.radius);
+        strip.pos[v * 3 + 1] = coarse.hgt[strip.node[v]] - SHADOW_SINK - (dx * dx) * K / 2;
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, strip.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, strip.pos);
     }
   }
   return true;
+}
+// [CURVE] The strips' curve ACROSS the width is baked into their heights; when the eased curvature has moved since the
+// bake, re-bake from the unbaked heights (only while the curve is changing: a settled curve costs nothing).
+function rebakeWidthCurve(relief) {
+  if (relief.bakedK === PLANET.k) return;
+  relief.bakedK = PLANET.k;
+  const cx = relief.span[0] / 2, K = PLANET.k;
+  for (const group of [relief.strips, relief.shadows]) for (const strip of group) {
+    for (let v = 0; v < strip.count; v++) { const dx = strip.pos[v * 3] - cx; strip.pos[v * 3 + 1] = strip.flatY[v] - (dx * dx) * K / 2; }
+    gl.bindBuffer(gl.ARRAY_BUFFER, strip.buffers[0]); gl.bufferSubData(gl.ARRAY_BUFFER, 0, strip.pos);
+  }
 }
 function terrainOrigin(relief) {
   // Centred across the field; starting one tile above it and sliding down.
@@ -1433,7 +1446,7 @@ function terrainOrigin(relief) {
 }
 function stripModel(relief, strip) {
   const [x0, y0, z0] = terrainOrigin(relief), z = z0 + strip.centre, d = z - state.extent.depth / 2;
-  const drop = (d * d) / (2 * PLANET.radius), slope = Math.atan(d / PLANET.radius);
+  const drop = (d * d) * PLANET.k / 2, slope = Math.atan(d * PLANET.k);       // [CURVE]
   return M.multiply(M.translate(x0, y0 - drop, z), M.rotateX(slope));
 }
 // The decimated relief into the shadow map (curved the same way): peaks
@@ -1444,6 +1457,7 @@ function terrainShadowCasters() {
   if (state.flat || !game || !(game.scene && game.scene.terrain === true)) return [];
   const relief = reliefMesh(state.assets && state.assets.terrain);
   if (relief && relief.shadowSurface && game.predict && game.predict.patch) return [[relief.shadowSurface.vao, relief.shadowSurface.count, M.identity()]];
+  if (relief) rebakeWidthCurve(relief);       // [CURVE]
   return relief ? relief.shadows.map((s) => [s.vao, s.count, stripModel(relief, s)]) : [];
 }
 function drawTerrain(now, drawLit) {
@@ -1463,6 +1477,7 @@ function drawTerrain(now, drawLit) {
       }
     }
     if (!game.over) TERRAIN.scroll = (TERRAIN.scroll + TERRAIN.speed * frame * gclock.speed) % relief.tile;       // [SPEED+ZOOM]
+    rebakeWidthCurve(relief);
     for (const strip of relief.strips) drawLit(strip.vao, strip.count, stripModel(relief, strip), state.materialIndex.terrain);
     return;
   }
@@ -2112,7 +2127,7 @@ function camera() {
     const hh = halfFit * Math.exp(V.lz), hw = hh * aspect, near = 1, far = 120;
     camView.lastR = hh;
     const proj = new Float32Array([1 / hw,0,0,0, 0,1 / hh,0,0, 0,0,-2 / (far - near),0, 0,0,-(far + near) / (far - near),1]);
-    return { view, proj, viewProj: M.multiply(proj, view), eye };
+    return { view, proj, viewProj: M.multiply(proj, view), eye, pick: { eye, target, up: [-Math.sin(az), 0, -Math.cos(az)], aspect, params: { ortho: true, halfHeight: hh } } };
   }
   const RAISE = 1.12;                                              // the eye a little higher off the board
   // FIRST PERSON (the Camera control, N): the eye just ahead of the ship's
@@ -2132,11 +2147,16 @@ function camera() {
   const dist = RAISE * halfFit / Math.tan(0.31) * (1 + 0.35 * Math.cos(el)) * Math.exp(V.lz);
   camView.lastR = dist;
   const el2 = Math.max(0.05, Math.min(Math.PI / 2, el + V.pitch));    // the gesture tilt, on top of the game's own
-  const eye = [target[0] + dist * Math.cos(el2) * Math.sin(az), target[1] + dist * Math.sin(el2), target[2] + dist * Math.cos(el2) * Math.cos(az)];
+  // [CURVE] the dolly zoom: blend 0 is this perspective camera exactly, 1 the orthographic camera with the same view
+  // (world_curve.js).  The view stays the original camera's (eye at ``dist``: lighting is in this view, unchanged); the
+  // projection carries the dolly (the eye pushed back along the axis is ``eye``, which the picking and billboards use).
+  const dolly = dollyParams(dist, 0.62, curveBlend()), D = dolly.dist;
+  const eye0 = [target[0] + dist * Math.cos(el2) * Math.sin(az), target[1] + dist * Math.sin(el2), target[2] + dist * Math.cos(el2) * Math.cos(az)];
+  const eye = D === dist ? eye0 : [target[0] + D * Math.cos(el2) * Math.sin(az), target[1] + D * Math.sin(el2), target[2] + D * Math.cos(el2) * Math.cos(az)];
   const up = el2 > 1.45 ? [-Math.sin(az), 0, -Math.cos(az)] : [0, 1, 0];
-  const view = M.lookAt(eye, target, up);
-  const proj = M.perspective(0.62, aspect, 0.1, 300);
-  return { view, proj, viewProj: M.multiply(proj, view), eye, target };
+  const view = M.lookAt(eye0, target, up);
+  const proj = D === dist ? M.perspective(0.62, aspect, 0.1, 300) : new Float32Array(projectionMatrix(dolly, aspect));
+  return { view, proj, viewProj: M.multiply(proj, view), eye, target, pick: { eye, target, up, aspect, params: dolly } };
 }
 const light = { angle: 0.9, radius: 0.72, height: 0.8, follow: false, pointer: null, position: [0, 1, 0] };
 state.light = light;
@@ -2426,7 +2446,7 @@ function drawVitals(now, drawLit) {
   const SEG = 12;
   const segment = (mesh, x, y, za, zb, w) => {
     const zc = (za + zb) / 2, len = zb - za;
-    const slope = onPlanet() ? Math.atan((zc - ext.depth / 2) / PLANET.radius) : 0;
+    const slope = onPlanet() ? Math.atan((zc - ext.depth / 2) * PLANET.k) : 0;       // [CURVE]
     drawLit(mesh.vao, mesh.count, M.multiply(M.multiply(M.translate(x, y - planetDrop(x, zc), zc), M.rotateX(slope)),
       M.scale(w, w, len * 1.02)), null);
   };
@@ -3372,6 +3392,7 @@ function adoptDials(game) {
   const real = performance.now() / 1000, saved = game.speed ? rememberedSpeed(game.game) : null;
   gclock.set(!game.speed ? 1 : Number.isFinite(saved) && saved != null ? saved : game.speed.default, real);
   camView.goal.lz = camView.cur.lz = camView.lzv = 0; dials.zoomDirty = true;
+  adoptCurve(game);                                                           // [CURVE]
   syncDialUi(true);
 }
 // the zoom the server should widen for: the wider of where the spring is and where it is going
@@ -3416,13 +3437,60 @@ function syncDialUi(force = false) {
     $("zoom").disabled = !(L.max > L.min + 1e-6);
   }
 }
-setInterval(() => syncDialUi(false), 120);
+setInterval(() => { syncDialUi(false); syncCurveUi(); }, 120);       // [CURVE]
 $("speed").oninput = (e) => setGameSpeed(sliderToSpeed(Number(e.target.value) / 1000));
 $("zoom").oninput = (e) => {
   const g = state.game; if (!g || !g.zoom) return;
   const L = zoomLimits(g), lo = Math.log(L.min), hi = Math.log(L.max), z = Math.exp(lo + (hi - lo) * Number(e.target.value) / 1000);
   camView.goal.lz = -Math.log(z); camView.vel.lz = 0; dials.zoomDirty = true;
 };
+// [CURVE] THE WORLD CURVE (world_curve.js).  One control per game that has a curve: the terrain games draw the land on a small
+// planet (PLANET), and the slider sets how round -- R from very round to large, FLAT (R = infinity: planetDrop 0, nothing
+// tilted), one step farther ORTHOGRAPHIC flat (the scene camera becomes a dolly zoom whose limit is the orthographic camera).
+// Display only: the server has no curve in its law.  A TRUE sphere world (worldwalk) has a world radius that IS in the law
+// (a compiled constant: entity_motion sphere_* take it as a literal, the world graph and road plan are built for it), so its
+// control drives the DISPLAY curve and starts at the world's radius; changing the world's radius would be a law recompile.
+const curveView = { u: radiusToU(CURVE.defaultRadius), game: null, ...initialCurve(curveTarget(radiusToU(CURVE.defaultRadius))), target: curveTarget(radiusToU(CURVE.defaultRadius)) };
+const curveKey = (g) => `meowdoku.worldcurve.${g}`;
+const curvedGame = (g) => !!(g && g.scene && g.scene.terrain === true);
+const worldRadiusOf = (g) => (g && g.predict && g.predict.sphere && Number(g.predict.sphere.radius)) || null;
+function curveDefaultU(g) { return radiusToU(worldRadiusOf(g) || CURVE.defaultRadius); }          // a sphere world starts at ITS radius
+function syncCurveGlobals() { PLANET.k = curveView.k; PLANET.radius = curveView.k > 0 ? 1 / curveView.k : Infinity; }
+function setWorldCurve(u, { snap = false, remember = true } = {}) {
+  curveView.u = clampCurveU(u); curveView.target = curveTarget(curveView.u);
+  if (snap) Object.assign(curveView, initialCurve(curveView.target));
+  syncCurveGlobals();
+  const g = state.game;
+  if (remember && g) { try { localStorage.setItem(curveKey(g.game), String(curveView.u)); } catch (_) { /* unremembered */ } }
+}
+function adoptCurve(game) {
+  if (!curvedGame(game)) return;
+  let saved = null; try { const v = localStorage.getItem(curveKey(game.game)); saved = v == null ? null : Number(v); } catch (_) { /* default */ }
+  curveView.game = game.game;
+  setWorldCurve(Number.isFinite(saved) ? saved : curveDefaultU(game), { snap: true, remember: false });
+}
+function stepCurveView(dt) {
+  if (curveSettled(curveView, curveView.target)) return;
+  Object.assign(curveView, stepCurve(curveView, curveView.target, dt)); syncCurveGlobals();
+}
+// the blend the camera uses: only a game with a curve is ever orthographic
+const curveBlend = () => (curvedGame(state.game) ? curveView.s : 0);
+function worldCurveInput(input) {
+  input.oninput = () => localControl(CURVE_SPEC, Number(input.value));
+  const list = document.createElement("datalist"); list.id = "worldcurve-notches";
+  for (const [v, label] of [[0, "round"], [CURVE.uRound, "large"], [NOTCH.flat, "flat"], [NOTCH.ortho, "ortho"]]) { const o = document.createElement("option"); o.value = String(v); o.label = label; list.append(o); }
+  input.setAttribute("list", list.id); queueMicrotask(() => { if (input.parentNode) input.parentNode.append(list); });
+}
+function syncCurveUi() {
+  const box = $("gamectl"), g = state.game; if (!box || !curvedGame(g)) return;
+  const el = box.querySelector('[data-ctl="worldcurve"]'); if (!el) return;
+  const span = el.querySelector("span"), world = worldRadiusOf(g);
+  if (span) span.textContent = `world curve ${curveLabel(curveView.u)} `;
+  el.title = world ? `The land's curve: R from very round, to FLAT (no curve at all), one notch farther ORTHOGRAPHIC flat. This game is a true sphere world of radius ${world}: that radius is compiled into its law, so this changes only how the curve is DRAWN (it starts at the world's radius).`
+                   : "The land's curve: R from very round, to FLAT (no curve at all), one notch farther ORTHOGRAPHIC flat (the camera loses its perspective). Drawn only; the law does not see it.";
+  const input = el.querySelector("input"); if (input && document.activeElement !== input) input.value = String(curveView.u);
+}
+window.meowdokuDebug.curve = { view: curveView, set: (u, snap = false) => setWorldCurve(u, { snap }), planet: PLANET };
 window.meowdokuDebug.gclock = gclock; window.meowdokuDebug.dials = dials; window.meowdokuDebug.setGameSpeed = setGameSpeed;
 window.meowdokuDebug.zoomTo = (z) => { const g = state.game; camView.goal.lz = -Math.log(clampZoom(z, g.width, g.height, zoomLimits(g).reach)); dials.zoomDirty = true; };
 window.meowdokuDebug.zoomLimits = () => zoomLimits(state.game);
@@ -4912,13 +4980,17 @@ function localValue(s) {
   return { heat_fixed: heatFx.fixed, heat_gamma: heatFx.gamma, pcolor_palette: pcolor.palette, backdrop: backdrop.mode, pcolor_source: pcolor.source, pcolor_solid: pcolor.solid, pcolor_material: pcolor.material || materialChoices()[0] || "",
            particle_style: particleStyle, tilt: gravitySensor.enabled, noise_on: noiseFx.on, noise_mode: noiseFx.mode,
            noise_strength: noiseFx.strength, noise_threshold: noiseFx.threshold, spin: sliderFromSpin(caseSpin), orbit: !!camView.auto, record: recordOn, camgrav: cameraGravity, autoarc: autoArc.on, autoarc_species: autoArc.species, autoarc_target: autoArc.target, autoarc_gain: autoArc.gain,
-           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), casetilt: caseTiltDeg, panes: panes.mode, spinphase: spinMotion.phase || 0 }[s.local] ?? s.value;
+           spinmotion: spinMotion.kind, watchcase: watchCase.on, statusplate: statusPlate.on, slide_negative: slide.negative, slide_bright: slide.bright, spinarc: spinMotion.arc, spinrev: spinReverse, gscale: sliderFromGscale(gravityScale), casetilt: caseTiltDeg, panes: panes.mode, spinphase: spinMotion.phase || 0, worldcurve: curveView.u }[s.local] ?? s.value;
 }
 // A control whose spec carries ``local`` is the page's own (the compute runtime's run modes, the phone gravity switch), not a server action.
 function localControl(s, value) {
   if (s.local === "wheelblur") {
     wheelBlur.on = !!value;
     try { localStorage.setItem("meowdoku.wheelblur", wheelBlur.on ? "1" : "0"); } catch { /* storage may be blocked */ }
+    return;
+  }
+  if (s.local === "worldcurve") {
+    setWorldCurve(Number(value));                                                  // [CURVE]
     return;
   }
   if (s.local === "tilt") {
@@ -5263,6 +5335,8 @@ function autoArcStep(data) {
   compute.setSpin(caseSpin, spinMotion);
 }
 // Recording (readback saving): off by default; Replay / Bounce / Continue need it on.
+// [CURVE] the world curve control (world_curve.js): a log slider over R, then FLAT, then ORTHOGRAPHIC flat.  value = the notch of R 36.
+const CURVE_SPEC = { id: "worldcurve", kind: "range", label: "world curve", min: 0, max: 1, step: 0.005, local: "worldcurve", value: 0.311 };
 const RECORD_SPEC = { id: "record", kind: "toggle", label: "record (readback)", local: "record" };
 const PANES_SPEC = { id: "panes", kind: "select", label: "panes beyond the walls", local: "panes", options: [["trim", "trimmed"], ["frame", "frame glass"], ["matte", "matte fill"]] };
 // The particle colour source and the page-side particle style, also declared here (an edit to fountain.py re-keys the compiled
@@ -5283,8 +5357,11 @@ const COLOR_SPECS = [
   { id: "pcolor_material", kind: "select", label: "material", local: "pcolor_material", value: "", options: [] },
 ];
 function pageSpecs(specs) {
-  if (!specs) return specs;
+  // [CURVE] a game with a curve (the terrain games) has the world-curve control even when the server declares no controls
+  const curved = !!(state.game && state.game.scene && state.game.scene.terrain === true);
+  if (!specs) return curved ? [CURVE_SPEC] : specs;
   let out = specs;
+  if (curved && !out.some((s) => s.id === CURVE_SPEC.id)) out = [...out, CURVE_SPEC];
   if (!out.some((s) => s.id === SPIN_SPEC.id)) {
     const tilt = out.findIndex((s) => s.local === "tilt");
     if (tilt >= 0) out = [...out.slice(0, tilt + 1), GSCALE_SPEC, TILT_SPEC, TURN_SPEC, CAMGRAV_SPEC, WATCH_SPEC, STATUSPLATE_SPEC, SPIN_SPEC, REVERSE_SPEC, PHASE_SPEC, MOTION_SPEC, ARC_SPEC, ...AUTOARC_SPECS, ...out.slice(tilt + 1)];
@@ -5359,6 +5436,7 @@ function renderGameControls(game) {
         if (s.kind === "range" && s.scale === "log") Object.assign(input, { type: "range", min: 0, max: 1, step: 0.005 });
         else if (s.kind === "range") Object.assign(input, { type: "range", min: s.min, max: s.max, step: s.step });
         else input.innerHTML = s.options.map(([v, text]) => `<option value="${v}">${text}</option>`).join("");
+        if (s.local === "worldcurve") worldCurveInput(input);                          // [CURVE] live while dragging, with its notches
         input.onchange = () => (s.local ? localControl(s, input.value) : act(serverControlPayload(s, s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value)));
         if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
         else el.append(input);
@@ -6000,12 +6078,19 @@ setInterval(() => {
 // toward the finger and fires while down.
 const held = new Set();
 let steer = null;
+// [CURVE] the horizontal plane y under a normalised device point, [x, z] or null: the camera's own numbers (perspective, the
+// dolly in between, or orthographic: parallel rays), else the inverse of its matrix
+function pointerPlane(cam, ndc, y) {
+  if (cam.pick) return pickPlane(cam.pick, ndc, y);
+  const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
+  const t = (y - near[1]) / (far[1] - near[1]);
+  return t >= 0 ? [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])] : null;
+}
 function boardPlane(clientX, clientY) {
   const cam = camera(), rect = canvas.getBoundingClientRect();
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
-  const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
-  const t = (TILE.height - near[1]) / (far[1] - near[1]);
-  return t >= 0 ? { x: near[0] + t * (far[0] - near[0]) + viewX(performance.now() / 1000), z: near[2] + t * (far[2] - near[2]) + viewY(performance.now() / 1000) } : null;
+  const at = pointerPlane(cam, ndc, TILE.height);       // [CURVE]
+  return at ? { x: at[0] + viewX(performance.now() / 1000), z: at[1] + viewY(performance.now() / 1000) } : null;
 }
 const twoAxis = () => !!(state.game && state.game.predict && (state.game.predict.y || state.game.predict.yaw));
 const climbAxis = () => !!(state.game && state.game.controls && state.game.controls.includes("move_axis_y") && !twoAxis());
@@ -6161,10 +6246,8 @@ function hit(clientX, clientY) {
   const game = state.game; if (!game) return null;
   const cam = camera(), rect = canvas.getBoundingClientRect();
   const ndc = [((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2];
-  const inv = M.invert(cam.viewProj);
-  const near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
-  const t = (TILE.height - near[1]) / (far[1] - near[1]); if (!(t >= 0)) return null;
-  const x = near[0] + t * (far[0] - near[0]), z = near[2] + t * (far[2] - near[2]);
+  const at = pointerPlane(cam, ndc, TILE.height); if (!at) return null;       // [CURVE]
+  const x = at[0], z = at[1];
   for (const piece of game.pieces || []) {
     if (piece.character) {
       const [px, pz] = cellPosition(game, piece.cell);
@@ -6202,9 +6285,8 @@ canvas.addEventListener("pointermove", async (e) => {
   if (light.follow) {
     const cam = camera(), rect = canvas.getBoundingClientRect();
     const ndc = [((e.clientX - rect.left) / rect.width) * 2 - 1, 1 - ((e.clientY - rect.top) / rect.height) * 2];
-    const inv = M.invert(cam.viewProj), near = M.apply(inv, [ndc[0], ndc[1], -1]), far = M.apply(inv, [ndc[0], ndc[1], 1]);
-    const yPlane = light.height * Math.max(state.extent.width, extLength()) * 0.9, t = (yPlane - near[1]) / (far[1] - near[1]);
-    if (t >= 0) light.pointer = [near[0] + t * (far[0] - near[0]), near[2] + t * (far[2] - near[2])];   // the board point the lamp flies above
+    const yPlane = light.height * Math.max(state.extent.width, extLength()) * 0.9, at = pointerPlane(cam, ndc, yPlane);       // [CURVE]
+    if (at) light.pointer = at;   // the board point the lamp flies above
     return;
   }
   if (game.input === "realtime") { if (steer) steer = boardPlane(e.clientX, e.clientY) || steer; return; }
@@ -6340,6 +6422,7 @@ function stepCamView(dt) {
   for (const k of CV_KEYS) if (k !== "lz") C[k] += (G[k] - C[k]) * ease;
   const zs = springStep(C.lz, camView.lzv || 0, G.lz, dt, ZOOM_OMEGA);       // [SPEED+ZOOM] the zoom: critically damped, no overshoot
   C.lz = zs.x; camView.lzv = zs.v;
+  stepCurveView(dt);                                                          // [CURVE] the world curve's ease (curvature, dolly)
 }
 const gpointers = new Map();           // pointerId -> { x, y, sx, sy, t, type }
 let gsession = null;                   // { mode: "pending" | "orbit" | "pan" | "two" | "dead", ... }
