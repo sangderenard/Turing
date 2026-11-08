@@ -521,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
     for name in ("index.html", "app.js", "marble_controls.js", "marble_mesh.js", "dice_mesh.js", "marble_mass.js", "marble_roll.js", "marble_studio.html", "marble_studio.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_photo.js", "marble_rotation.js", "loading_candidate.js"):
+    for name in ("marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_photo.js", "marble_rotation.js", "emoji_tumble.js", "loading_candidate.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])

@@ -2,6 +2,22 @@
 // The server verifies this mesh against the saved object's geometry receipt.
 const encoder = new TextEncoder();
 const hexDigest = /^[0-9a-f]{64}$/;
+const OBJECT_CENTER = [0, 0, 0.18];
+
+// Studio's orbit is T(-distance) * Rx(pitch) * Ry(yaw). Its inverse places
+// the eye in the saved mesh's frame. The photo's focal distance is scaled by
+// the same zoom ratio. The worker's checker is an XY plane, so place it on
+// the far Z side rather than moving its center into the marble at side views.
+export function photoCameraFromStudio(yaw, pitch, distance) {
+  if (![yaw, pitch, distance].every(Number.isFinite) || distance <= 0) throw new RangeError("invalid Studio camera");
+  const d = 0.11 * distance / 3.45;
+  const direction = [-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+  return {
+    camera: { eye_m: OBJECT_CENTER.map((v, i) => v + d * direction[i]), target_m: OBJECT_CENTER,
+      fov_degrees: 18, aperture_radius_m: 0.002, focus_distance_m: d },
+    checker: { center_m: [0, 0, OBJECT_CENTER[2] - 0.12 * (direction[2] >= 0 ? 1 : -1)], width_m: 0.15, checks: 4 },
+  };
+}
 
 export function packMarblePhoto(geometry, objectDigest, options = {}) {
   if (!hexDigest.test(objectDigest)) throw new Error("save or load this design before exposing a photo");
@@ -11,13 +27,14 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
     exposure_seconds: options.seconds ?? 600,
     transport: options.transport ?? "fixed:3",
     scale_m: 0.025,
-    object_center_m: [0, 0, 0.18],
+    object_center_m: OBJECT_CENTER,
     camera: {
       resolution: options.resolution ?? 256,
       eye_m: [0, 0, 0.07], target_m: [0, 0, 0.18],
-      fov_degrees: 36, aperture_radius_m: 0.002, focus_distance_m: 0.11,
+      fov_degrees: 18, aperture_radius_m: 0.002, focus_distance_m: 0.11,
+      ...options.camera,
     },
-    checker: { center_m: [0, 0, 0.30], width_m: 0.15, checks: 4 },
+    checker: options.checker ?? { center_m: [0, 0, 0.30], width_m: 0.15, checks: 4 },
   };
   const json = encoder.encode(JSON.stringify(config));
   const n = faces.length;
@@ -44,7 +61,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   return buffer;
 }
 
-export function createMarblePhoto(doc = document) {
+export function createMarblePhoto(doc = document, currentCamera = null) {
   const $ = (id) => doc.getElementById(id);
   const state = { objectDigest: null, jobDigest: null, timer: null, generation: 0 };
   const status = (value) => { $("photo-status").textContent = value; };
@@ -126,6 +143,7 @@ export function createMarblePhoto(doc = document) {
     const body = packMarblePhoto(geometry, state.objectDigest, {
       resolution: +$("photo-resolution").value, seconds: +$("photo-seconds").value,
       transport: $("photo-transport").value,
+      ...($("photo-camera").value === "studio" ? currentCamera?.() : {}),
     });
     $("photo-hdr").hidden = true;
     $("photo-full").hidden = true;

@@ -6,14 +6,14 @@ import { ComputeRuntime } from "./compute.js";
 import { caseModel } from "./gravity.js";
 import { marblePreviewSpec, livePreviewParticle, previewLawToScene, cameraNudgeGravity } from "./marble_sim_preview.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
-import { createMarblePhoto } from "./marble_photo.js";
+import { createMarblePhoto, photoCameraFromStudio } from "./marble_photo.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
   verifySavedMarbleObject } from "./marble_object.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
-const photo = createMarblePhoto();
+const photo = createMarblePhoto(document, () => photoCameraFromStudio(yaw, pitch, distance));
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
 if (!gl) message.textContent = "WebGL 2 is required for this studio";
 
@@ -48,7 +48,7 @@ const translate3=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
 const transformPoint=(m,[x,y,z])=>[m[0]*x+m[4]*y+m[8]*z+m[12],m[1]*x+m[5]*y+m[9]*z+m[13],m[2]*x+m[6]*y+m[10]*z+m[14]];
 const scale3=(s)=>new Float32Array([s,0,0,0,0,s,0,0,0,0,s,0,0,0,0,1]);
 function perspective(aspect) {
-  const f = 1 / Math.tan(Math.PI / 7), near = 0.1, far = 30;
+  const f = 1 / Math.tan(Math.PI / 7), near = 0.01, far = 30;
   return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0]);
 }
 const loc = (p, name) => gl.getUniformLocation(p, name);
@@ -102,7 +102,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   specular:["phong",1,100], shininess:["phong",2,1],
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
-  rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.85, dieDefaultsApplied=false;
+  rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.12, dieDefaultsApplied=false;
 let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -526,7 +526,7 @@ function controls() {
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
     if ($("preview-engine").value==="particle" && $("preview-camera").value==="marble")
-      followDistance=Math.max(0.35,Math.min(4,followDistance*Math.exp(event.deltaY*0.001)));
+      followDistance=Math.max(0.06,Math.min(1.5,followDistance*Math.exp(event.deltaY*0.001)));
     else distance=Math.max(2.3,Math.min(7,distance*Math.exp(event.deltaY*0.001)));
   }, { passive:false });
 }
@@ -555,7 +555,9 @@ function frame(now=0) {
   if (P && interior) {
     const follow=simOn&&$("preview-camera").value==="marble";
     const cameraDistance=follow?followDistance:simOn?Math.max(distance,7):distance;
-    const baseView=multiply(translate(-cameraDistance),multiply(rotateX(pitch),rotateY(yaw)));
+    // The toy backplate normal maps to world +Y. Follow from that side of
+    // the course, rather than looking through its opaque side rails.
+    const baseView=multiply(translate(-cameraDistance),multiply(rotateX(pitch+(follow?Math.PI/2:0)),rotateY(yaw)));
     const radius=+$("radius-mm").value/1000;
     let object=rollState&&radius>0?multiply(translate3(rollState.position[0]/radius,0,rollState.position[2]/radius),rotateQuaternion(rollState.orientation)):identity();
     const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
