@@ -112,6 +112,22 @@ function dispose(mesh) {
   if (!mesh) return;
   gl.deleteVertexArray(mesh.vao); for (const buffer of mesh.buffers) gl.deleteBuffer(buffer);
 }
+// A flat quad facing `dir` (unit vector, the direction toward the subject),
+// as two triangles for mesh(). This is the actual visible shape of a light
+// fixture -- real geometry with a real emissive material, not a point.
+function quadFace(center, dir, halfW, halfH, materialId) {
+  let worldUp=[0,1,0];
+  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
+  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
+  const right=norm3(cross3(dir,worldUp));
+  const up=norm3(cross3(right,dir));
+  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
+  const c00=add(add(center,right,-halfW),up,-halfH), c10=add(add(center,right,halfW),up,-halfH);
+  const c11=add(add(center,right,halfW),up,halfH), c01=add(add(center,right,-halfW),up,halfH);
+  const n=[dir,dir,dir];
+  return [[c00,c10,c11,materialId,n],[c00,c11,c01,materialId,n]];
+}
 
 const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
@@ -120,6 +136,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
   rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.12, dieDefaultsApplied=false;
+let FIXTURE_MAT_BASE=0, fixtureMeshes=null;
 let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -648,9 +665,6 @@ function frame(now=0) {
       gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h),matrix)); };
     setTransform(mv);
     const key=[+$("light-x").value/100,+$("light-y").value/100,+$("light-z").value/100];
-    const spread=+$("light-spread").value/100;
-    const keyCluster=[[0,0,0],[-spread,0,0],[spread,0,0],[0,-spread,0],[0,spread,0]]
-      .map((offset)=>key.map((x,i)=>x+offset[i]));
     // Fixed photographic roles, scaled to the current camera distance so
     // they track the subject exactly the way the key does: every light
     // here is a view-space position, which is what makes it "dynamic" --
@@ -662,7 +676,7 @@ function frame(now=0) {
     const kickerL=[-cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
     const kickerR=[ cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
     const fill=[0, -cameraDistance*0.95, cameraDistance*0.30];
-    const lights=keyCluster.concat([background, kickerL, kickerR, fill]);
+    const lights=[key, background, kickerL, kickerR, fill];
     const keyStrength=+$("light-strength").value/10;
     const bgStrength=+$("light-bg-strength").value/10;
     const kickerStrength=+$("light-kicker-strength").value/10;
@@ -672,15 +686,15 @@ function frame(now=0) {
     const direction=key.map((x)=>-x/Math.max(0.001,Math.hypot(...key)));
     // Only the key is ever a spot (the photographic "narrow beam"); the
     // background, both kickers, and the fill are bare lights -- no cone.
-    const spotDirections=lights.map((_,i)=>$("spot").checked&&i<5?direction:[0,0,0]);
-    const cones=lights.map((_,i)=>i<5?[Math.cos(inner*Math.PI/180),Math.cos(outer*Math.PI/180)]:[0,0]);
+    const spotDirections=lights.map((_,i)=>$("spot").checked&&i===0?direction:[0,0,0]);
+    const cones=lights.map((_,i)=>i===0?[Math.cos(inner*Math.PI/180),Math.cos(outer*Math.PI/180)]:[0,0]);
     gl.uniform1i(loc(P,"uNumLights"),lights.length);
     gl.uniform3fv(loc(P,"uLightPos[0]"),new Float32Array(lights.flat()));
-    // Roles: 0-4 key (filtered), 5 background (neutral), 6-7 kickers (cool rim), 8 fill (neutral-soft).
-    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(lights.map((_,i)=>
-      i<5?keyFilter:i===5?[0.85,0.88,0.95]:i<8?[0.55,0.75,1.0]:[0.9,0.92,0.9]).flat()));
-    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(lights.map((_,i)=>
-      i<5?keyStrength/5:i===5?bgStrength:i<8?kickerStrength:fillStrength)));
+    // Roles: 0 key (filtered), 1 background (neutral), 2-3 kickers (cool rim), 4 fill (neutral-soft).
+    const roleColor=[keyFilter,[0.85,0.88,0.95],[0.55,0.75,1.0],[0.55,0.75,1.0],[0.9,0.92,0.9]];
+    const roleStrength=[keyStrength,bgStrength,kickerStrength,kickerStrength,fillStrength];
+    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(roleColor.flat()));
+    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(roleStrength));
     gl.uniform1iv(loc(P,"uLightGroupId[0]"),new Int32Array(lights.map(()=>-1)));
     gl.uniform3fv(loc(P,"uLightSpotDir[0]"),new Float32Array(spotDirections.flat()));
     gl.uniform2fv(loc(P,"uLightSpotCone[0]"),new Float32Array(cones.flat()));
@@ -699,6 +713,32 @@ function frame(now=0) {
       setTransform(view); gl.bindVertexArray(checkerMesh.vao);
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
+    // Real emissive light-fixture geometry: visible quads, sized and shaped
+    // per photographic role, carrying the three reserved PBR rows set up in
+    // boot(). These are what the user actually sees as "the lights" -- not
+    // an invisible point the uLightPos/uLightIntensity uniforms above still
+    // separately drive for the marble's own shading.
+    // Billboarded to face the camera (view-space +Z) rather than the
+    // subject: a panel facing the subject goes edge-on (a near-invisible
+    // sliver) whenever the camera's own view direction grazes its surface,
+    // which is routinely true for kickers/background sitting behind the
+    // subject. Facing the camera always shows the full fixture shape.
+    const camFacing=[0,0,1];
+    const keyIsHard=$("key-shape").value==="grid"||$("key-shape").value==="snoot";
+    const keyHalf=cameraDistance*(keyIsHard?0.028:0.11);
+    if (fixtureMeshes) dispose(fixtureMeshes);
+    fixtureMeshes=mesh([
+      ...quadFace(key, camFacing, keyHalf, keyHalf, FIXTURE_MAT_BASE+0),
+      ...quadFace(background, camFacing, cameraDistance*0.5, cameraDistance*0.35, FIXTURE_MAT_BASE+1),
+      ...quadFace(kickerL, camFacing, cameraDistance*0.08, cameraDistance*0.25, FIXTURE_MAT_BASE+1),
+      ...quadFace(kickerR, camFacing, cameraDistance*0.08, cameraDistance*0.25, FIXTURE_MAT_BASE+1),
+      ...quadFace(fill, camFacing, cameraDistance*0.45, cameraDistance*0.45, FIXTURE_MAT_BASE+2),
+    ]);
+    integer(P,"uEnableEmissionDirect",1);
+    setTransform(view); gl.bindVertexArray(fixtureMeshes.vao);
+    gl.drawArrays(gl.TRIANGLES,0,fixtureMeshes.count);
+    integer(P,"uEnableEmissionDirect",0);
+    setTransform(mv);
     if(haveParticle) for(const model of simOn?particleObjects:[object]) {
       setTransform(simOn?multiply(view,model):mv);
       gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
@@ -731,6 +771,24 @@ async function boot() {
     gl.useProgram(P);
     coatedId=Math.max(...Object.values(ids))+1; paintAId=coatedId+1; paintBId=coatedId+2;
     tables=Object.fromEntries(Object.entries(assets.materials).map(([name,table])=>[name,floatTexture(table,{pbr:0,phong:1,enamel:2,texstack:3}[name])]));
+    // Three reserved spare PBR rows floatTexture() already over-allocates
+    // (table.data.length + 3*floats_per_record) -- real material-table slots,
+    // not a side channel. Pure emitters: black albedo (nothing to reflect),
+    // emission holds the actual glow colour*power. Used by the light-fixture
+    // meshes drawn in frame() so "lights" are real emissive triangles, seen
+    // and shaded exactly like any other material.
+    const pbrStride=tables.pbr.table.floats_per_record;
+    FIXTURE_MAT_BASE=tables.pbr.table.data.length/pbrStride;
+    const setFixtureMaterial=(slot,rgb)=>{
+      const base=(FIXTURE_MAT_BASE+slot)*pbrStride;
+      for (let i=0;i<pbrStride;i++) tables.pbr.data[base+i]=0;
+      tables.pbr.data[base+3]=1; tables.pbr.data[base+7]=1; // roughness, opacity
+      tables.pbr.data[base+8]=rgb[0]; tables.pbr.data[base+9]=rgb[1]; tables.pbr.data[base+10]=rgb[2];
+    };
+    setFixtureMaterial(0,[1,0.9,0.78]);    // key
+    setFixtureMaterial(1,[0.55,0.75,1.0]); // background + both kickers
+    setFixtureMaterial(2,[0.9,0.92,0.9]);  // fill
+    tables.pbr.update();
     const names=Object.keys(ids).filter((name)=>Number.isInteger(ids[name])).sort();
     for (const [select,initial] of [["shell","marble_clear_glass"],["confetti-material","metal_gold"],["mark-material","metal_gold"]]) {
       for (const name of names) { const option=document.createElement("option"); option.value=name; option.textContent=name.replaceAll("_"," "); $(select).append(option); }
