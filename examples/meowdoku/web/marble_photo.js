@@ -28,6 +28,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
     exposure_seconds: options.seconds ?? 600,
     orbit_frames: options.orbitFrames ?? 1,
     transport: options.transport ?? "fixed:3",
+    gamma: options.gamma ?? 1.0,
     scale_m: 0.025,
     object_center_m: OBJECT_CENTER,
     camera: {
@@ -232,6 +233,7 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
       resolution: +$("photo-resolution").value, seconds: +$("photo-seconds").value,
       orbitFrames: +$("photo-orbit-frames").value,
       transport: $("photo-transport").value,
+      gamma: +$("photo-gamma").value / 100,
       ...($("photo-camera").value === "studio" ? currentCamera?.() : {}),
     });
     $("photo-hdr").hidden = true;
@@ -249,6 +251,9 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     setButtons(); poll(value.digest, generation);
   };
   $("photo-cancel").addEventListener("click", () => cancel().catch((error) => status(error.message || String(error))));
+  $("photo-gamma").addEventListener("input", () => {
+    $("photo-gamma-out").textContent = (+$("photo-gamma").value / 100).toFixed(2);
+  });
   $("photo-play").addEventListener("click", () => {
     if (state.playTimer) { stopPlayback(); return; }
     if (state.frames.length < 2) return;

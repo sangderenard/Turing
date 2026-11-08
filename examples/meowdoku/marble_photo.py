@@ -68,6 +68,7 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
     transport = str(value.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise PhotoError("transport must be fixed:1 or fixed:3")
+    gamma = _number(value.get("gamma", 1.0), 0.2, 5.0, "gamma")
     camera_in = value.get("camera", {})
     checker_in = value.get("checker", {})
     if not isinstance(camera_in, dict) or not isinstance(checker_in, dict):
@@ -118,6 +119,7 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
         "exposure_seconds": seconds,
         "orbit_frames": orbit_frames,
         "transport": transport,
+        "gamma": gamma,
         "scale_m": scale,
         "object_center_m": _finite_vectors(value.get("object_center_m", [0, 0, .18]), 3, "object_center_m"),
         "camera": camera, "checker": checker, "lights": lights,
