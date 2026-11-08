@@ -64,7 +64,7 @@ def _number(value: object, low: float, high: float, name: str) -> float:
 def _config(value: dict, saved: dict) -> tuple[dict, float]:
     if value.get("object_digest") != saved["digest"]:
         raise PhotoError("photo request does not name the saved object")
-    seconds = _number(value.get("exposure_seconds", 180), 1, 3600, "exposure_seconds")
+    seconds = _number(value.get("exposure_seconds", 180), 0.1, 3600, "exposure_seconds")
     transport = str(value.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise PhotoError("transport must be fixed:1 or fixed:3")

@@ -71,6 +71,10 @@ def test_mrp1_matches_saved_geometry_and_pbr(photo_payload):
     assert pbr.shape == (2, 16) and config["scale_m"] == .025 and seconds == 1800
     assert config["camera"]["resolution"] == 1024 and config["orbit_frames"] == 8
     assert config["transport"] == "fixed:3"
+    short_wire = _wire(digest, vertices, normals, ids, exposure_seconds=0.25)
+    assert photos.decode_upload(short_wire, store)[4] == 0.25
+    with pytest.raises(photos.PhotoError, match="exposure_seconds"):
+        photos.decode_upload(_wire(digest, vertices, normals, ids, exposure_seconds=0.01), store)
     altered = bytearray(wire)
     altered[-4] = 0  # change the second face's material ID
     with pytest.raises(photos.PhotoError, match="differ from the saved"):

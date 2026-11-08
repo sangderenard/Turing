@@ -212,7 +212,7 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
         link.title = `Available until ${new Date(value.animation_expires_at * 1000).toLocaleString()}`;
         link.hidden = false;
       }
-      status(value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${$("photo-seconds").value} s exposure per frame` :
+      status(value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
             value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
@@ -264,5 +264,12 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     }, 125);
   });
   setButtons();
+  const resumeDigest = new URLSearchParams(doc.defaultView?.location.search || "").get("photo");
+  if (hexDigest.test(resumeDigest || "")) {
+    state.jobDigest = state.lastDigest = resumeDigest;
+    const generation = ++state.generation;
+    setButtons();
+    poll(resumeDigest, generation);
+  }
   return { start, stale, saved, status };
 }
