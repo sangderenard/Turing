@@ -227,8 +227,12 @@ async function saveObject() {
   const result=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(result.error||`save HTTP ${response.status}`);
   await refreshObjects(result.digest);
+  if(typeof BroadcastChannel!=="undefined") {
+    const channel=new BroadcastChannel("meowdoku.marble_objects");
+    channel.postMessage({digest:result.digest});channel.close();
+  }
   photo.saved(result.digest);
-  objectStatus(`${result.duplicate?"Already saved":"Saved"} ${value.name} · ${result.digest.slice(0,12)} · available to particle simulator`);
+  objectStatus(`${result.duplicate?"Already saved":"Saved"} ${value.name} · ${result.digest.slice(0,12)} · choose it beside Look in Fountain or Fountain3D, or beside Restart in Marble Madness; the game tab refreshes its library when you return`);
 }
 async function loadObject() {
   const digest=$("saved-object").value;

@@ -1890,7 +1890,8 @@ async function refreshSavedParticleList() {
     savedParticle.entries = Array.isArray(listing) ? listing : listing.entries || [];
     delete $("gamectl").dataset.key;
     renderGameControls(state.game);
-  } catch (error) { savedParticle.note = String(error.message || error); }
+    return savedParticle.entries.length;
+  } catch (error) { savedParticle.note = String(error.message || error); status.textContent = `Saved designs unavailable: ${savedParticle.note}`; return null; }
 }
 async function selectSavedParticle(digest) {
   if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics or render selection");
@@ -1912,16 +1913,19 @@ async function selectSavedParticle(digest) {
   uploadMaterials(state.game);
   particleStyle = "designed";
   try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
-  // The current law has four species.  A selected design occupies species 0;
-  // the other shares are zero so every emitted particle uses its coefficients.
-  const updates = [...Object.entries(values), ["wt0", 1], ["wt1", 0], ["wt2", 0], ["wt3", 0]];
+  // The 3-D law can select species zero alone. The 2-D law mixes four fixed
+  // species, so give each species the saved coefficients instead.
+  const updates = state.game.game === "fountain"
+    ? [0, 1, 2, 3].flatMap((species) => Object.entries(values).map(([name, value]) =>
+        [name.replace(/0$/, String(species)), value]))
+    : [...Object.entries(values), ["wt0", 1], ["wt1", 0], ["wt2", 0], ["wt3", 0]];
   const step = chain.then(async () => {
     for (const [name, value] of updates)
       applyState(await api("/api/action", { type: "fountain_param", name, value }));
   });
   chain = step.catch((error) => console.warn("[meow] saved particle law", error));
   await step;
-  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: instanced full/medium/low meshes (${[savedParticle.mesh, savedParticle.mesh.lods.medium, savedParticle.mesh.lods.low].map((level) => Math.round(level.count / 3).toLocaleString()).join(" / ")} triangles). Sphere contact and scalar moment in current law.`;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: instanced full/medium/low meshes (${[savedParticle.mesh, savedParticle.mesh.lods.medium, savedParticle.mesh.lods.low].map((level) => Math.round(level.count / 3).toLocaleString()).join(" / ")} triangles). ${state.game.game === "fountain" ? "Disk" : "Sphere"} contact and scalar moment in current law.`;
   refreshLocalControls();
 }
 const MARBLE = { mesh: null, key: "" };
@@ -5574,7 +5578,20 @@ function localControl(s, value) {
     applyCaseVibration(); refreshLocalControls(); return;
   }
   if (s.local === "saved_particle") {
-    selectSavedParticle(value).catch((error) => { savedParticle.note = String(error.message || error); status.textContent = savedParticle.note; refreshLocalControls(); });
+    selectSavedParticle(value).catch((error) => {
+      const message = String(error.message || error);
+      savedParticle.note = message === "saved mesh recipe no longer matches its triangles"
+        ? "This saved recipe predates the current mesh. Open it in Marble Studio and save it again; the original stays in the library."
+        : message;
+      status.textContent = savedParticle.note;
+      refreshLocalControls();
+    });
+    return;
+  }
+  if (s.local === "saved_particle_refresh") {
+    refreshSavedParticleList().then((count) => {
+      if (count !== null) status.textContent = `${count} saved design${count === 1 ? "" : "s"} available. Choose one beside Look.`;
+    });
     return;
   }
   if (s.local === "wall_finish") {
@@ -5716,6 +5733,9 @@ function refreshLocalControls() {
     if (s.local === "saved_particle") {
       const select = el.querySelector("select");
       if (select) select.value = savedParticle.digest;
+      const note = el.querySelector("output");
+      if (note) note.textContent = savedParticle.note.startsWith("This saved recipe predates")
+        ? "Old mesh: open in Studio and save again" : "";
       el.title = savedParticle.note || "Select a verified Studio design. Current contacts remain spherical; full mesh and material records are rendered.";
       continue;
     }
@@ -5861,6 +5881,9 @@ function refreshLocalControls() {
       el.querySelector("input").checked = recordOn;
       el.title = recordOn ? "frames and keyframes are read back and kept (memory-capped window): Replay, Bounce, Continue"
                           : "off: only the display's few frames are read back; switch on to record";
+    } else if (s.local === "saved_particle_refresh") {
+      el.disabled = false;
+      el.title = "Read the shared Studio library again, including objects saved in another tab";
     } else {
       el.disabled = !st.ready || (s.local === "rebirth" ? false : !st.recording || (s.local === "continue" ? st.mode === "live" : st.frames === 0));
       if (s.local !== "rebirth") el.title = st.recording ? "" : "switch on record (readback) to keep frames for this";
@@ -6155,9 +6178,14 @@ function pageSpecs(specs) {
     out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
     out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
   }
-  if ((look >= 0 && state.game.game === "fountain3d" || state.game.game === "marble_madness") && !out.some((s) => s.id === "saved_particle"))
-    out = [...out, { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Grains",
-      value: savedParticle.digest, options: [["", "choose a Studio design"], ...savedParticle.entries.map((e) => [e.digest, e.name || e.digest.slice(0, 12)])] }];
+  if (isFountainGame(state.game) && !out.some((s) => s.id === "saved_particle")) {
+    const at = look >= 0 ? look + 1 : 1;
+    out = [...out.slice(0, at),
+      { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Run",
+        value: savedParticle.digest, options: [["", "choose a Studio design"], ...savedParticle.entries.map((e) => [e.digest, `${e.name || "Studio design"} · ${e.shape.toUpperCase()} · ${e.digest.slice(0, 8)}`])] },
+      { id: "saved_particle_refresh", kind: "button", label: "Refresh saved designs", local: "saved_particle_refresh", group: "Run" },
+      ...out.slice(at)];
+  }
   if (["fountain3d", "marble_madness"].includes(state.game?.game) &&
       ["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => compute.runtimeInputs.has(name)))
     out = [...out, ...VIBRATION_SPECS];
@@ -6225,6 +6253,10 @@ function renderGameControls(game) {
         input.onchange = () => (s.local ? localControl(s, input.value) : act(serverControlPayload(s, s.kind === "range" ? fromSlider(s, Number(input.value)) : typeof s.options[0][0] === "number" ? Number(input.value) : input.value)));
         if (s.kind === "range" && !s.local) { const val = document.createElement("output"); val.className = "gctl-val"; input.oninput = () => { val.textContent = Number(fromSlider(s, Number(input.value))).toPrecision(3); }; el.append(input, val); }
         else el.append(input);
+        if (s.local === "saved_particle") {
+          const note = document.createElement("output"); note.className = "saved-particle-note";
+          el.append(note);
+        }
       }
       el.dataset.ctl = s.id;
       return el;
@@ -7868,6 +7900,12 @@ async function lifecycleResume() {
   });
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
   refreshSavedParticleList();
+  window.addEventListener("focus", refreshSavedParticleList);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshSavedParticleList(); });
+  if (typeof BroadcastChannel !== "undefined") {
+    const savedObjectsChannel = new BroadcastChannel("meowdoku.marble_objects");
+    savedObjectsChannel.addEventListener("message", refreshSavedParticleList);
+  }
   chain.then(() => { loading.done(); if (state.game) bootReady = true; else loading.release("boot"); });             // [LOADING] a successful game frame releases boot
   if (window.meowdokuAccess.edit && /[?&]record_loading=1/.test(location.search)) import("./loading_record.js").then((m) => m.record({ state, newGame, act, compute, api, canvas })).catch((e) => console.warn("[loading] recorder", e));   // [LOADING] dev flag
 })().catch((error) => { loading.release("boot"); status.textContent = String(error); console.error(error); });
