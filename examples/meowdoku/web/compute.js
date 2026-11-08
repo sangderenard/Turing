@@ -1,6 +1,6 @@
 // The page's generic COMPUTE-PRODUCT runtime.
 //
-import { caseVibration } from "./case_vibration.js";
+import { caseVibration, caseNudge } from "./case_vibration.js";
 // A game declares a compute product in its state:
 //
 //   game.compute = { manifest, size, epoch, uniforms, speed, named }
@@ -620,7 +620,7 @@ export class ComputeRuntime {
     this.emojiTumble = new EmojiTumble(); this.emojiTumbleOn = false;
     this.kicked = false; this.channel = null; this.lastDone = 0; this.diagAt = 0; this.resimming = false;
     this.stepsDone = 0; this.stepsPerSec = 0;
-    this.lawInputs = {}; this.gravity = null; this.vibration = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
+    this.lawInputs = {}; this.gravity = null; this.vibration = null; this.nudge = null; this.capBytes = (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 ? 64 : 192) * 1048576;
   }
 
   get active() { return !!this.spec; }
@@ -802,6 +802,7 @@ export class ComputeRuntime {
   inheritFrom(from, { caseTiltAdd = 0 } = {}) {
     this.gravity = from.gravity ? [...from.gravity] : null; this.spin = from.spin; this.spinMotion = from.spinMotion ? { ...from.spinMotion } : this.spinMotion;
     this.vibration = from.vibration ? { ...from.vibration } : null;
+    this.nudge = from.nudge ? { ...from.nudge, direction: [...from.nudge.direction] } : null;
     this.caseTilt = (from.caseTilt || 0) + caseTiltAdd; this.gravityScale = from.gravityScale; this.bodyTau = from.bodyTau; this.named = from.named;
   }
   // [GHOSTS] the spec's uniforms with the nozzle speed scaled by 1 + rel (a runtime input; absent in a law without a nozzle)
@@ -967,10 +968,27 @@ export class ComputeRuntime {
     return this.vibration;
   }
 
+  startCaseNudge(x, y) {
+    if (!this.ready || !["case_acc_x", "case_acc_y"].every((name) => this.runtimeInputs.has(name))) return null;
+    const magnitude = Math.hypot(x, y);
+    if (!(magnitude >= 0.08)) return null;
+    if (this.nudge && (this.shown == null || this.shown * this.snap < this.nudge.endStep)) return null;
+    const duration = 0.22, startStep = this.steps;
+    this.nudge = { direction: [x / magnitude, y / magnitude], strength: Math.min(1, magnitude), startStep,
+      endStep: startStep + Math.ceil(duration / this.manifest.law.dt), duration };
+    this.#kick();
+    return this.nudge;
+  }
+
   caseDisplacementAt(step) {
     const v = this.vibration && ["case_acc_x", "case_acc_y", "case_acc_z"].every((name) => this.runtimeInputs.has(name)) ? this.vibration : null;
-    return v ? caseVibration(v.kind, v.hz, v.amplitude, v.axis, v.phase, step * (this.manifest?.law?.dt || 0))
+    const a = v ? caseVibration(v.kind, v.hz, v.amplitude, v.axis, v.phase, step * (this.manifest?.law?.dt || 0))
       : { displacement: [0, 0, 0], acceleration: [0, 0, 0] };
+    if (!this.nudge) return a;
+    const b = caseNudge(this.nudge.direction, this.nudge.strength, this.nudge.startStep, step,
+      this.manifest.law.dt, this.nudge.duration);
+    return { displacement: a.displacement.map((value, i) => value + b.displacement[i]),
+      acceleration: a.acceleration.map((value, i) => value + b.acceleration[i]) };
   }
 
   setGravity(gx, gy, gz = 0) {
@@ -982,6 +1000,7 @@ export class ComputeRuntime {
 
   #reset(phase2Rest) {
     this.caseTilt = this.caseMotionAt(this.steps).angle;
+    this.nudge = null;
     this.caseFlips = [];
     this.token++; this.arrived.clear(); this.rotations.clear(); this.emojiTumble.clear();
     this.#release(this.tape.clear());
@@ -1114,6 +1133,7 @@ export class ComputeRuntime {
       if (rate > 0) m = Math.max(1, Math.min(m, Math.floor(SPIN_TURN / (rate * this.manifest.law.dt * snap))));
     }
     if (this.vibration) m = Math.max(1, Math.min(m, Math.floor(1 / (12 * this.vibration.hz * this.manifest.law.dt * snap))));
+    if (this.nudge && this.steps < this.nudge.endStep) m = 1;
     if ((this.caseFlips || []).some((f) => this.steps >= f.startStep && this.steps < f.startStep + f.steps)) m = 1;
     return m;
   }

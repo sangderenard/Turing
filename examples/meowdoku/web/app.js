@@ -52,7 +52,7 @@ import { CURVE, NOTCH, uToCurve, radiusToU, curveLabel, curveTarget, stepCurve, 
 import { MobroadPage } from "./mobroad.js";                                                            // [MOBROAD]
 import { catEyeMarble } from "./marble_mesh.js";
 import { beginCandidate } from "./loading_candidate.js";
-import { marbleGravityVector } from "./marble_controls.js";
+import { marbleGravityVector, marbleThumbVector } from "./marble_controls.js";
 
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
@@ -5073,7 +5073,13 @@ function applyState(game, { meta = false } = {}) {
   chessClockSync(game);
   if (!game.compute) { const sand = sandSpec(game); if (sand) game.compute = sand; }       // purrline sand mode: this page hosts the fountain compute
   compute.sync(game.compute || null);
-  if (game.game === "marble_madness") { compute.setSpin(0); compute.setCaseTilt(0); compute.setGravity(0, 0, -1); }
+  if (game.game === "marble_madness") {
+    compute.setSpin(0); compute.setCaseTilt(0); compute.setGravityScale(1);
+    if (!previous || previous.game !== game.game || previous.id !== game.id || previous.compute?.epoch !== game.compute?.epoch) {
+      marbleCase.gravity = [0, 0, -1];
+      compute.setGravity(...marbleCase.gravity);
+    }
+  } else if (previous?.game === "marble_madness") compute.setGravityScale(gravityScale);
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   mobroad.state = state;
@@ -5227,7 +5233,7 @@ for (const type of ["keydown", "keyup"]) window.addEventListener(type, (event) =
   if (type === "keydown") marbleKeys.add(key); else marbleKeys.delete(key);
 });
 window.addEventListener("blur", () => marbleKeys.clear());
-const marbleSticks = { x: $("marble-stick-x"), down: $("marble-stick-down") };
+const marbleThumbs = { tilt: { x: 0, down: 0 }, nudge: { x: 0, down: 0 } };
 const marbleCase = { gravity: [0, 0, -1] };
 const marbleLight = { spot: true, mode: "lit", color: "#8bcaff", strength: 2 };
 try {
@@ -5278,15 +5284,49 @@ $("marble-phone-tilt").addEventListener("change", (event) => {
   try { localStorage.setItem("meowdoku.marble.phoneTilt", marblePhoneTilt ? "1" : "0"); } catch { /* storage may be blocked */ }
   if (marblePhoneTilt) { gravitySensor.enabled = true; gravitySensor.grant(); }
 });
-for (const stick of Object.values(marbleSticks)) {
-  const release = () => { stick.value = "0"; };
-  stick.addEventListener("pointerup", release);
-  stick.addEventListener("pointercancel", release);
-  stick.addEventListener("lostpointercapture", release);
+function bindMarbleThumb(id, outputId, onVector, onEngage = null) {
+  const pad = $(id), nub = pad.querySelector(".nub"), output = $(outputId);
+  let pointer = null, last = [0, 0];
+  const update = (event) => {
+    const rect = pad.getBoundingClientRect();
+    const [x, down] = marbleThumbVector(event.clientX, event.clientY, rect.left, rect.top, rect.width, rect.height);
+    last = [x, down];
+    const travel = Math.min(rect.width, rect.height) * 0.5 - 17;
+    nub.style.transform = `translate(${x * travel}px, ${down * travel}px)`;
+    output.textContent = onVector(x, down);
+  };
+  const release = (event) => {
+    if (pointer !== event.pointerId) return;
+    const [x, down] = last;
+    pointer = null; last = [0, 0];
+    nub.style.transform = "";
+    output.textContent = onVector(0, 0);
+    if (event.type === "pointerup" && onEngage && Math.hypot(x, down) >= 0.08) onEngage(x, down, output);
+  };
+  pad.addEventListener("pointerdown", (event) => {
+    if (pointer != null || state.game?.game !== "marble_madness") return;
+    pointer = event.pointerId; pad.setPointerCapture(pointer); update(event);
+  });
+  pad.addEventListener("pointermove", (event) => { if (pointer === event.pointerId) update(event); });
+  pad.addEventListener("pointerup", release);
+  pad.addEventListener("pointercancel", release);
+  pad.addEventListener("lostpointercapture", release);
 }
+bindMarbleThumb("marble-tilt-stick", "marble-tilt-readout", (x, down) => {
+  marbleThumbs.tilt = { x, down };
+  return Math.hypot(x, down) < 0.01 ? "neutral" : `${Math.round(x * 100)}% X · ${Math.round(down * 100)}% down`;
+});
+bindMarbleThumb("marble-nudge-stick", "marble-nudge-readout", (x, down) => {
+  marbleThumbs.nudge = { x, down };
+  return Math.hypot(x, down) < 0.01 ? "ready" : `release to nudge · ${Math.round(Math.hypot(x, down) * 100)}%`;
+}, (x, down, output) => {
+  const pulse = compute.startCaseNudge(x, -down);
+  if (pulse) output.textContent = `${Math.round(pulse.strength * 100)}% nudge`;
+  return pulse;
+});
 function marbleGravity() {
-  const x = ((marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0)) * 0.9 + Number(marbleSticks.x.value) / 100;
-  const down = ((marbleKeys.has("down") ? 1 : 0) - (marbleKeys.has("up") ? 1 : 0)) * 0.9 + Number(marbleSticks.down.value) / 100;
+  const x = ((marbleKeys.has("right") ? 1 : 0) - (marbleKeys.has("left") ? 1 : 0)) * 0.9 + marbleThumbs.tilt.x * 0.95;
+  const down = ((marbleKeys.has("down") ? 1 : 0) - (marbleKeys.has("up") ? 1 : 0)) * 0.9 + marbleThumbs.tilt.down * 0.95;
   const manual = x !== 0 || down !== 0;
   const phone = marblePhoneTilt && !manual && gravitySensor.enabled ? gravitySensor.last : null;
   marbleCase.gravity = marbleGravityVector(x, down, phone);
@@ -6574,7 +6614,7 @@ function caseAngleNow() {
 }
 function withCaseShake(model) {
   const g = state.game, view = g?.compute?.view;
-  if (!compute.vibration || compute.shown == null || !view || !["fountain3d", "marble_madness"].includes(g.game)) return model;
+  if ((!compute.vibration && !compute.nudge) || compute.shown == null || !view || !["fountain3d", "marble_madness"].includes(g.game)) return model;
   const [x0, x1, y0, y1] = view, k = Math.min(g.width / (x1 - x0), g.height / (y1 - y0));
   const [dx, dy, dz] = compute.caseDisplacementAt(compute.shown * compute.snap).displacement;
   return M.multiply(model || M.identity(), M.translate(dx * k, dz * k, -dy * k));

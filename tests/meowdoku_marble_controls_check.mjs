@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { marbleGravityVector } from '../examples/meowdoku/web/marble_controls.js';
+import { marbleGravityVector, marbleThumbVector } from '../examples/meowdoku/web/marble_controls.js';
 
 const near = (a,b) => assert.ok(Math.abs(a-b) < 1e-12, `${a} != ${b}`);
 const rest = marbleGravityVector(0,0);
@@ -16,4 +16,8 @@ near(marbleGravityVector(0,.5)[1],-.5);
 assert.ok(marbleGravityVector(.9,0)[0] > .8);
 assert.deepEqual(marbleGravityVector(0,0,[0,-9.8,0]),[0,-1,0]);
 near(marbleGravityVector(0,0,[.3,-.4,-.5])[2],-.5/Math.sqrt(.5));
+assert.deepEqual(marbleThumbVector(50,50,0,0,100,100),[0,0]);
+assert.deepEqual(marbleThumbVector(83,50,0,0,100,100),[1,0]);
+assert.deepEqual(marbleThumbVector(50,83,0,0,100,100),[0,1]);
+near(Math.hypot(...marbleThumbVector(200,200,0,0,100,100)),1);
 console.log('marble gravity axes and magnitude: ok');

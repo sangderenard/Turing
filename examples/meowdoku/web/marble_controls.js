@@ -12,3 +12,11 @@ export function marbleGravityVector(x, down, phone = null) {
   const gx = x * scale, gy = down === 0 ? 0 : -down * scale;
   return [gx, gy, -Math.sqrt(1 - gx * gx - gy * gy)];
 }
+
+export function marbleThumbVector(clientX, clientY, left, top, width, height) {
+  const radius = Math.max(1, Math.min(width, height) * 0.5 - 17);
+  const x = (clientX - left - width * 0.5) / radius;
+  const down = (clientY - top - height * 0.5) / radius;
+  const length = Math.hypot(x, down), scale = length > 1 ? 1 / length : 1;
+  return [x * scale, down * scale];
+}

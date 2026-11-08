@@ -56,6 +56,15 @@
                 background: rgba(12, 19, 31, .96) !important; box-shadow: 0 6px 28px #000b; }
   #marble-pad input[type=range] { accent-color: #f3cc7b; height: 24px; }
   #marble-pad label { white-space: nowrap; }
+  #marble-sticks { display:flex; gap:12px; justify-content:center; width:100%; }
+  .marble-stick-wrap { display:grid; justify-items:center; gap:4px; font-size:12px; }
+  .marble-stick { position:relative; width:104px; height:104px; border-radius:50%; border:2px solid #9eb8d1; background:#19283b; touch-action:none; cursor:grab; }
+  .marble-stick:focus-visible { outline:3px solid #f3cc7b; outline-offset:3px; }
+  .marble-stick::before, .marble-stick::after { content:""; position:absolute; background:#6885a3; pointer-events:none; }
+  .marble-stick::before { width:1px; height:80%; left:50%; top:10%; }
+  .marble-stick::after { height:1px; width:80%; top:50%; left:10%; }
+  .marble-stick .nub { position:absolute; left:50%; top:50%; width:30px; height:30px; margin:-15px; border-radius:50%; background:#f3cc7b; box-shadow:0 2px 8px #0008; pointer-events:none; }
+  .marble-stick-wrap output { max-width:120px; min-height:2.4em; text-align:center; color:#c5d7e9; }
   /* Wordle's entry is drawn in the scene (the entry bar); this input is only its keyboard: visually hidden, off-screen, still focusable
      (16px font so a phone does not zoom on focus) */
   #word { position: fixed; left: 0; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; display: none; }
@@ -264,8 +273,7 @@
   <label>Marble light <select id="marble-light-mode"><option value="lit">Lit</option><option value="glow">Glow only</option><option value="both">Lit + glow</option></select></label>
   <label>Glow color <input id="marble-glow-color" type="color" value="#8bcaff"></label>
   <label>Glow strength <input id="marble-glow-strength" type="range" min="0" max="8" step="0.1" value="2"></label>
-  <label style="text-align:center">Across X<br><input id="marble-stick-x" type="range" min="-95" max="95" value="0" aria-label="Across course tilt, left thumb" style="width:100px;touch-action:none"></label>
-  <label style="text-align:center">Down Y<br><input id="marble-stick-down" type="range" min="-95" max="95" value="0" aria-label="Down course tilt, right thumb" style="width:100px;touch-action:none"></label>
+  <div id="marble-sticks"><div class="marble-stick-wrap">Tilt X/Y<div class="marble-stick" id="marble-tilt-stick" role="group" tabindex="0" aria-label="Tilt course in two axes; hold and drag"><span class="nub"></span></div><output id="marble-tilt-readout">neutral</output></div><div class="marble-stick-wrap">Nudge direction/strength<div class="marble-stick" id="marble-nudge-stick" role="group" tabindex="0" aria-label="Drag to choose nudge direction and strength, then release"><span class="nub"></span></div><output id="marble-nudge-readout">ready</output></div></div>
 </div>
 <div id="word">
   <input id="entry" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="word" tabindex="-1">
