@@ -46,6 +46,28 @@ export function applyPhysical(root, physical) {
 
 export function buildMarbleObjectGeometry(design, materialIds, {detail="full"}={}) {
   const d=design,m=materialIds;
+  if(detail==="proxy"&&d["base-shape"]==="marble") {
+    // The distant particle still has two nested, lit triangle surfaces. At a
+    // pixel or two, its full ribbons and shell tessellation are subpixel.
+    const t=(1+Math.sqrt(5))/2, raw=[[-1,t,0],[1,t,0],[-1,-t,0],[1,-t,0],[0,-1,t],[0,1,t],[0,-1,-t],[0,1,-t],[t,0,-1],[t,0,1],[-t,0,-1],[-t,0,1]];
+    const verts=raw.map((v)=>{const n=Math.hypot(...v);return v.map((x)=>x/n);});
+    const indices=[[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],
+      [3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]];
+    const shell=[],core=[];
+    const add=(out,radius,material)=>{for(const ids of indices){
+      const [a,b,c]=ids.map((i)=>verts[i].map((x)=>x*radius));
+      const u=b.map((x,i)=>x-a[i]),v=c.map((x,i)=>x-a[i]);
+      const n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];
+      const outward=n.reduce((s,x,i)=>s+x*a[i],0)>0;
+      const order=outward?ids:[ids[0],ids[2],ids[1]];
+      const points=order.map((i)=>verts[i].map((x)=>x*radius));
+      out.push([...points,material,order.map((i)=>verts[i])]);
+    }};
+    add(shell,1,m.shell);
+    if(d.kind!=="clear")add(core,0.72,d.kind==="confetti"?m.confetti:m.eye);
+    return {interior:core,glass:shell,triangleCount:core.length+shell.length};
+  }
+  if(detail==="proxy")return buildMarbleObjectGeometry(d,m,{detail:"low"});
   const meshDetail={full:[96,128],medium:[24,48],low:[12,24]}[detail];
   if(!meshDetail)throw new RangeError(`unknown mesh detail ${detail}`);
   const inclusions=catEyeMarble({glass:m.shell,enamel:m.coated,eye:m.eye,accent:m.accent,
@@ -112,7 +134,7 @@ export async function verifySavedMarbleObject(snapshot) {
   const geometry=geometryFromSavedMarbleObject(snapshot),digest=await geometrySha256(geometry);
   if(digest!==snapshot.geometry_sha256)throw new Error("saved mesh recipe no longer matches its triangles");
   const lods={};
-  for(const detail of ["medium","low"]) {
+  for(const detail of ["medium","low","proxy"]) {
     const mesh=geometryFromSavedMarbleObject(snapshot,{detail});
     const expected=snapshot.design.mesh_lods?.[detail];
     if(expected && await geometrySha256(mesh)!==expected)

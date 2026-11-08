@@ -28,7 +28,7 @@ import { decompressOctets } from "./octet_codec.js";      // [LIVEVIEW] the foun
 
 export const MAX_FRAGMENT = 1800;
 export const VIEWER_HEADER = "X-Meowdoku-Viewer";
-const SECRET_KEY = /token|secret|passw|credential|auth|cookie|session|api[_-]?key|lichess|player|geo/i;
+const SECRET_KEY = /token|secret|passw|credential|auth|cookie|session|api[_-]?key|lichess|player|geo|gameConfig/i;
 const SHARED_KEY = /^meowdoku[._][A-Za-z0-9_.\-]{1,80}$/;
 const VALUE_KINDS = new Set(["range", "toggle", "select", "color"]);
 const FORBIDDEN_PROPS = new Set(["__proto__", "constructor", "prototype"]);
@@ -101,7 +101,7 @@ const finiteOr = (v, d) => (typeof v === "number" && Number.isFinite(v) ? v : d)
 
 // A decoded view -> the validated parts.  Unknown keys are ignored; every value is clamped through its spec.
 export function parseView(view, specs) {
-  const out = { g: null, b: null, c: {}, l: {}, ls: {}, cam: null, rt: null };
+  const out = { g: null, b: null, c: {}, l: {}, ls: {}, ui: {}, cam: null, rt: null };
   if (!view || typeof view !== "object" || Array.isArray(view)) return out;
   if (typeof view.g === "string" && /^[a-z0-9_]{1,40}$/.test(view.g)) out.g = view.g;
   if (typeof view.b === "string" && /^[\w\-.:]{1,80}$/.test(view.b)) out.b = view.b;
@@ -122,6 +122,17 @@ export function parseView(view, specs) {
       if (!isSharedKey(key)) continue;
       const v = cleanStored(raw);
       if (v !== undefined) out.ls[key] = v;
+    }
+  }
+  if (view.ui && typeof view.ui === "object" && !Array.isArray(view.ui)) {
+    for (const [id, raw] of Object.entries(view.ui)) {
+      const rule = TOP_UI[id];
+      if (!rule) continue;
+      if (rule === "check" && typeof raw === "boolean") out.ui[id] = raw;
+      else if (rule === "number" && typeof raw === "number" && Number.isFinite(raw) && raw >= -1000 && raw <= 1000) out.ui[id] = raw;
+      else if (rule === "color" && typeof raw === "string" && /^#[0-9a-fA-F]{6}$/.test(raw)) out.ui[id] = raw;
+      else if (Array.isArray(rule) && typeof raw === "string" && rule.includes(raw)) out.ui[id] = raw;
+      else if (rule === "clock" && typeof raw === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(raw)) out.ui[id] = raw;
     }
   }
   const cam = view.cam;
@@ -227,6 +238,38 @@ async function applyKey(host, packet) {
 
 // ---------------------------------------------------------------- the page-side module state
 const inBrowser = typeof window !== "undefined" && typeof document !== "undefined" && typeof location !== "undefined";
+const TOP_UI = {
+  "sky-mode": ["auto", "day", "night"], "sky-place": ["here", "honolulu", "los_angeles", "chicago", "new_york", "reykjavik", "london", "cairo", "mumbai", "beijing", "tokyo", "sydney", "ushuaia"],
+  "sky-clock": "clock", "auto-lamp": "check", "lamp-color": ["warm", "amber", "neutral", "cool"],
+  wobble: "check", "wobble-k": "number", "wobble-gpu": "check", tilt: "number", curve: "number", saturation: "number", round: "number", crease: "number",
+  arcade: "check", plate: "check", projection: "check", autorestart: "check", pads: "check",
+  "marble-preview": "check", "marble-eye": ["blue", "green", "amber"], "marble-width": "number", "marble-curve": "number", "marble-facets": ["12", "24", "40"],
+  "marble-phone-tilt": "check", "marble-camera-tilt": "check", "marble-follow": "check", "marble-watch-case": "check",
+  "marble-backlit": "check", "marble-spot": "check", "marble-light-mode": ["lit", "glow", "both"],
+  "marble-glow-color": "color", "marble-glow-strength": "number", light: ["sun", "pointer"], flat: "check",
+};
+function captureTopUI() {
+  const ui = {};
+  for (const [id, rule] of Object.entries(TOP_UI)) {
+    const node = document.getElementById(id); if (!node) continue;
+    ui[id] = id === "light" ? (node.textContent.includes("pointer") ? "pointer" : "sun")
+      : id === "flat" ? node.textContent.includes("on")
+      : rule === "check" ? node.checked : rule === "number" ? Number(node.value) : node.value;
+  }
+  return ui;
+}
+function applyTopUI(ui) {
+  for (const [id, value] of Object.entries(ui)) {
+    const node = document.getElementById(id); if (!node) continue;
+    if (id === "light") { if (node.textContent.includes("pointer") !== (value === "pointer")) node.click(); continue; }
+    if (id === "flat") { if (node.textContent.includes("on") !== value) node.click(); continue; }
+    if (TOP_UI[id] === "check") { if (node.checked === value) continue; node.checked = value; }
+    else { if (node.value === String(value)) continue; node.value = String(value); }
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
+const TOP_UI_DEFAULTS = inBrowser ? captureTopUI() : {};
 export const share = { mode: "owner", view: null, parsed: null, token: null, viewOnly: false, host: null, overlay: null, error: null,
   socketOpen: false, ended: false, rxAt: 0, rxBytes: 0 };      // [LIVEVIEW] the viewer's socket state
 
@@ -297,13 +340,13 @@ async function loadIncoming() {
   }
   try {
     let view = null;
-    if (h.get("s")) view = await decodeView(h.get("s"));
-    else if (h.get("share")) {
-      const r = await fetch(`/api/share/${encodeURIComponent(h.get("share"))}`);
+    if (h.get("p") || h.get("s")) view = await decodeView(h.get("p") || h.get("s"));
+    else if (h.get("play") || h.get("share")) {
+      const r = await fetch(`/api/share/${encodeURIComponent(h.get("play") || h.get("share"))}`);
       if (!r.ok) throw new Error((await r.json()).error || r.status);
       view = await r.json();
     }
-    if (view) { share.mode = "preview"; share.view = view; }
+    if (view) { share.mode = h.get("p") || h.get("play") ? "play" : "preview"; share.view = view; if (share.mode === "play") document.body.classList.add("play-link"); }
   } catch (e) { share.error = String(e.message || e); console.warn("[meowdoku] share link:", share.error); }
 }
 
@@ -324,26 +367,26 @@ async function copyText(text, box) {
   try { box.setSelectionRange(0, text.length); return document.execCommand("copy"); } catch { return false; }
 }
 
-function currentView() {
+function currentView(gameKey = null) {
   const h = share.host, game = h.getGame();
   const { c, l } = serializeSpecs(h.pageSpecs(game && game.controls_ui), h.localValue);
-  const view = { v: 1, g: game ? game.game : null, c, l, ls: serializeStorage(storageEntries), cam: h.camera.get(), rt: h.runtime.get() };
+  const view = { v: 1, g: gameKey || (game?.tipjar ? "tipjar" : game?.game || null), c, l, ls: serializeStorage(storageEntries), ui: captureTopUI(), cam: h.camera.get(), rt: h.runtime.get() };
   if (game && game.game === "meowdoku" && typeof game.id === "string") view.b = game.id;
   return view;
 }
-export function buildView() { return currentView(); }
+export function buildView(gameKey = null) { return currentView(gameKey); }
 
-async function makeLink() {
+async function makeLink(kind = "view") {
   const view = currentView(), base = location.origin + location.pathname;
   const enc = await encodeView(view);
-  if (enc.length + 3 <= MAX_FRAGMENT) return { url: `${base}#s=${enc}`, how: `in the link (${enc.length} characters; nothing is sent to the server)` };
+  if (enc.length + 3 <= MAX_FRAGMENT) return { url: `${base}#${kind === "play" ? "p" : "s"}=${enc}`, how: `in the link (${enc.length} characters; nothing is sent to the server)` };
   try {
     const r = await fetch("/api/share", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ view }) });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.status);
-    return { url: `${base}#share=${data.id}`, how: `stored on the server as ${data.id} (the view was ${enc.length} characters)` };
+    return { url: `${base}#${kind === "play" ? "play" : "share"}=${data.id}`, how: `stored on the server as ${data.id} (the view was ${enc.length} characters)` };
   } catch (e) {
-    return { url: `${base}#s=${enc}`, how: `the server would not store it (${e.message}); the link is long (${enc.length} characters)` };
+    return { url: `${base}#${kind === "play" ? "p" : "s"}=${enc}`, how: `the server would not store it (${e.message}); the link is long (${enc.length} characters)` };
   }
 }
 
@@ -354,6 +397,15 @@ async function onShare() {
   const note = el("div", { textContent: "" });
   const copy = el("button", { textContent: "Copy link", onclick: async () => { note.textContent = (await copyText(url, box)) ? "copied" : "press Ctrl/Cmd-C to copy the selected text"; } });
   showPanel(el("b", { textContent: "Share this view" }), box, el("div", { textContent: `Holds ${how}. Opening it shows this game, its controls, the page settings and the camera; the viewer's own saved settings are left alone.` }), copy, note);
+  box.focus(); box.select();
+}
+async function onShareGame() {
+  if (!share.host.getGame()) return;
+  const { url, how } = await makeLink("play");
+  const box = el("textarea", { value: url, readOnly: true, rows: 3 }); box.style.cssText = "width:100%;font:12px monospace";
+  const note = el("div", { textContent: "" });
+  const copy = el("button", { textContent: "Copy link", onclick: async () => { note.textContent = (await copyText(url, box)) ? "copied" : "press Ctrl/Cmd-C to copy the selected text"; } });
+  showPanel(el("b", { textContent: "Share game" }), box, el("div", { textContent: `Holds ${how}. Opens an independent game with this setup and a compact play interface; the visitor keeps their own player identity.` }), copy, note);
   box.focus(); box.select();
 }
 
@@ -433,8 +485,9 @@ async function resumeLive() {   // a reload of the owner's page keeps the server
 function addButtons() {
   const anchor = document.getElementById("new");
   const mk = (text, title, fn) => el("button", { textContent: text, title, onclick: fn });
-  const a = mk("Share", "a link that restores this whole view", onShare), b = mk("Share live", "a read-only link that follows this session live", onShareLive);
-  if (anchor) anchor.after(a, b); else document.body.append(a, b);
+  const a = mk("Share", "a link that restores this whole view", onShare), p = mk("Share game", "an independent game with this configuration and compact controls", onShareGame), b = mk("Share live", "a read-only link that follows this session live", onShareLive);
+  a.id = "share-view-button"; b.id = "share-live-button";
+  if (anchor) anchor.after(a, p, b); else document.body.append(a, p, b);
 }
 function banner(text, ...buttons) {
   document.getElementById("share-banner")?.remove();
@@ -454,26 +507,46 @@ function applyLocals(local) {
   for (const [id, v] of Object.entries(local)) { const s = byId.get(id); if (s) h.localControl(s, v); }
 }
 
+async function applyConfiguration(view, st) {
+  const h = share.host;
+  for (const [id, raw] of Object.entries(view.c && typeof view.c === "object" ? view.c : {})) {
+    const s = (h.pageSpecs(st.controls_ui) || []).find((x) => x.id === id && !x.local && sharable(x));
+    const want = s && s.action ? clampValue(s, raw) : undefined;
+    if (want === undefined || String(s.value) === String(want)) continue;
+    st = await h.api("/api/action", h.serverPayload(s, want));
+  }
+  h.applyState(st);
+  const full = parseView(view, h.pageSpecs(st.controls_ui));
+  applyLocals(full.l);
+  applyTopUI(full.ui);
+  if (full.cam) h.camera.set(full.cam);
+  if (full.rt && full.rt.gravity !== undefined) h.runtime.set(full.rt);
+  return st;
+}
+const profileKey = (game) => `meowdoku.gameConfig.${game}`;
+let configuredOnce = false;
+export function rememberGame(game) {
+  if (!inBrowser || share.mode !== "owner" || !/^[a-z0-9_]{1,40}$/.test(game) || !share.host?.getGame()) return;
+  try { localStorage.setItem(profileKey(game), JSON.stringify(currentView(game))); } catch { /* private storage */ }
+}
+export async function configureGame(game, st) {
+  if ((share.mode === "play" || share.mode === "preview") && share.view?.g === game)
+    return applyConfiguration(share.view, st);
+  if (share.mode !== "owner") { share.host.applyState(st); return st; }
+  let view = null;
+  try { view = JSON.parse(localStorage.getItem(profileKey(game)) || "null"); } catch { /* private storage */ }
+  if (!view || view.g !== game) { share.host.applyState(st); if (configuredOnce) applyTopUI(TOP_UI_DEFAULTS); configuredOnce = true; return st; }
+  configuredOnce = true;
+  return applyConfiguration(view, st);
+}
 async function applyPreview() {
   const h = share.host, p = parseView(share.view, []), catalog = h.catalog();
   if (!p.g || !catalog.games.includes(p.g)) return false;
   h.selectGame(p.g);
   const payload = { game: p.g, aspect: h.aspect() };
   if (p.g === "meowdoku") { if (!p.b || !catalog.meowdoku.boards.some((x) => x.id === p.b)) return false; payload.id = p.b; }
-  let st = await h.api("/api/new", payload);
-  // the server-side controls, each through the spec's own action, before the first state is shown (so no frame of defaults)
-  for (const [id, raw] of Object.entries(share.view.c && typeof share.view.c === "object" ? share.view.c : {})) {
-    const s = h.pageSpecs(st.controls_ui).find((x) => x.id === id && !x.local && sharable(x));
-    const want = s && s.action ? clampValue(s, raw) : undefined;
-    if (want === undefined || String(s.value) === String(want)) continue;
-    st = await h.api("/api/action", h.serverPayload(s, want));
-  }
-  h.applyState(st);
-  // (the specs the state adds -- the panes, the colour group -- exist only now)
-  const full = parseView(share.view, h.pageSpecs(st.controls_ui));
-  applyLocals(full.l);
-  if (full.cam) h.camera.set(full.cam);
-  if (full.rt && full.rt.gravity !== undefined) h.runtime.set(full.rt);
+  const st = await h.api("/api/new", payload);
+  await applyConfiguration(share.view, st);
   return true;
 }
 
@@ -555,9 +628,9 @@ export async function bootGame() {
   if (!share.host) return false;
   try {
     if (share.mode === "viewer") return share.first ? await applyViewer() : (document.getElementById("status").textContent = share.error || "this live view is not available", true);
-    if (share.mode === "preview") {
+    if (share.mode === "preview" || share.mode === "play") {
       const ok = await applyPreview();
-      if (ok) banner("Viewing a shared setup.",
+      if (ok) banner(share.mode === "play" ? "Playing a shared setup in your own session." : "Viewing a shared setup.",
         el("button", { textContent: "Keep these settings", onclick: () => { share.overlay.keep(); document.getElementById("share-banner")?.remove(); history.replaceState(null, "", location.pathname); } }),
         el("button", { textContent: "Close", onclick: () => document.getElementById("share-banner")?.remove() }));
       return ok;
@@ -569,7 +642,7 @@ export async function bootGame() {
 // Module start (before app.js runs its first line): decode the incoming link, and put its settings in force.
 if (inBrowser) {
   await loadIncoming();
-  if (share.mode === "preview") {
+  if (share.mode === "preview" || share.mode === "play") {
     const early = parseView(share.view, []);           // ls needs no specs
     installStorageOverlay(early.ls);
   } else if (share.mode === "viewer") {

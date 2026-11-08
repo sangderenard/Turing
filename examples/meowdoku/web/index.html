@@ -48,6 +48,21 @@
   #gamectl .gctl-val { font-variant-numeric: tabular-nums; opacity: .7; }
   #gamectl .saved-particle-note:not(:empty) { color: #ffbd80; font-size: 12px; max-width: 18rem; }
   #gamectl button.on { outline: 2px solid currentColor; }
+  #scene-settings { position: relative; }
+  #scene-settings > summary { cursor: pointer; background: var(--ctl); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; }
+  #scene-settings-body { position: absolute; z-index: 35; top: 100%; left: 0; width: min(32rem, 92vw); max-height: 65vh; overflow: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px; background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; }
+  body.play-link #scene-settings, body.play-link #marble-designer, body.play-link #marble-studio-link, body.play-link #studio-link, body.play-link #log-link,
+  body.play-link #share-view-button, body.play-link #share-live-button,
+  body.play-link #tickets-link, body.play-link #report-ticket, body.play-link #settings-reset, body.play-link #compact-capture,
+  body.play-link #bar > label:has(#game), body.play-link #bar > label:has(#arcade), body.play-link #bar > label:has(#plate), body.play-link #bar > label:has(#projection) { display: none !important; }
+  body.play-link[data-game="fountain"] #gamectl > .gctl-group,
+  body.play-link[data-game="fountain3d"] #gamectl > .gctl-group,
+  body.play-link[data-game="marble_madness"] #gamectl > .gctl-group,
+  body.play-link[data-game="fountain"] #gamectl > [data-ctl]:not([data-play-control]),
+  body.play-link[data-game="fountain3d"] #gamectl > [data-ctl]:not([data-play-control]),
+  body.play-link[data-game="marble_madness"] #gamectl > [data-ctl]:not([data-play-control]) { display: none !important; }
+  body.play-link[data-game="fountain"] #status, body.play-link[data-game="fountain3d"] #status,
+  body.play-link[data-game="marble_madness"] #status { display: none !important; }
   /* The canvas starts below the control bar (which wraps to several lines on a
      phone) so the bar never covers the board; --bar-h is kept live below. */
   canvas { display: block; position: fixed; left: 0; top: var(--bar-h, 0px); width: var(--vw100, 100vw);
@@ -181,7 +196,7 @@
   <label class="meowdoku-only">Level <select id="level"></select></label>
   <label class="meowdoku-only">Board <select id="board"></select></label>
   <button id="new">New</button>
-  <a href="marble_studio.html?v=lod-20261107" target="_blank" rel="noopener" style="color:var(--fg);background:var(--ctl);border:1px solid var(--line);border-radius:6px;padding:4px 10px;text-decoration:none" title="Design a close-up layered glass cat's-eye marble">Marble studio</a>
+  <a id="marble-studio-link" href="marble_studio.html?v=lod-20261107" target="_blank" rel="noopener" style="color:var(--fg);background:var(--ctl);border:1px solid var(--line);border-radius:6px;padding:4px 10px;text-decoration:none" title="Design a close-up layered glass cat's-eye marble">Marble studio</a>
   <a id="studio-link" href="studio.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the loading studio: record, view and pick loading animations">Studio</a>  <a id="log-link" href="log.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the server log, drawn as glyphs">Log</a>
   <button id="report-ticket" type="button" title="Send the current game state and recent browser log to the server">Report issue</button>
   <a id="tickets-link" href="tickets.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="Review diagnostic tickets">Tickets</a>
@@ -209,6 +224,7 @@
     <button id="tool-mouse" class="tool active" title="Tap marks an X: a note that no cat goes here">X marks</button>
   </span>
   <label class="meowdoku-only">Palette <select id="palette"></select></label>
+  <details id="scene-settings"><summary>Scene</summary><div id="scene-settings-body">
   <button id="light">Light: sun (L)</button>
   <label title="The page's background and night mode follow the sun at your local time; auto, or force day or night">Sky <select id="sky-mode"><option value="auto">auto</option><option value="day">day</option><option value="night">night</option></select></label>
   <label title="Where the sun is: the place sets the sun's path and its colour through the air (Rayleigh and Mie); a fixed clock is that place's local time">Place <select id="sky-place"><option value="here">here</option><option value="honolulu">Honolulu</option><option value="los_angeles">Los Angeles</option><option value="chicago">Chicago</option><option value="new_york">New York</option><option value="reykjavik">Reykjavik</option><option value="london">London</option><option value="cairo">Cairo</option><option value="mumbai">Mumbai</option><option value="beijing">Beijing</option><option value="tokyo">Tokyo</option><option value="sydney">Sydney</option><option value="ushuaia">Ushuaia</option></select></label>
@@ -228,6 +244,7 @@
   <label>Saturation <input id="saturation" type="range" min="0" max="200" value="200"></label>
   <label>Round <input id="round" type="range" min="0" max="4" value="0"></label>
   <label>Crease <input id="crease" type="range" min="0" max="90" value="0"></label>
+  </div></details>
   <label>Player <input id="player" type="text" maxlength="24" placeholder="your name" autocomplete="nickname"></label>
   <button id="scores-toggle">Scores</button>
   <button id="shop-toggle" title="Points you have earned, and what they buy">Shop</button>

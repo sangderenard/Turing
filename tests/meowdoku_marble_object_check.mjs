@@ -34,10 +34,11 @@ assert(verified.geometry.triangleCount===geometry.triangleCount,"full mesh recip
 assert(verified.mass.massKg===snapshot.derived.massKg,"mass receipt roundtrip");
 assert(verified.lods.medium.triangleCount<geometry.triangleCount,"medium LOD generated from saved recipe");
 assert(verified.lods.low.triangleCount<verified.lods.medium.triangleCount,"low LOD generated from saved recipe");
-const modeled={count:geometry.triangleCount*3,lods:{medium:{count:verified.lods.medium.triangleCount*3},low:{count:verified.lods.low.triangleCount*3}}};
+assert(verified.lods.proxy.triangleCount<verified.lods.low.triangleCount,"distant proxy retains nested triangle surfaces");
+const modeled={count:geometry.triangleCount*3,lods:{medium:{count:verified.lods.medium.triangleCount*3},low:{count:verified.lods.low.triangleCount*3},proxy:{count:verified.lods.proxy.triangleCount*3}}};
 assert(designedMeshPlan({ready:true,designedMesh:modeled,count:1}).lod==="full","one object keeps the full mesh");
 const crowded=designedMeshPlan({ready:true,designedMesh:modeled,count:4096});
-assert(crowded.ok&&crowded.lod==="low","4k objects keep an instanced mesh instead of points");
+assert(crowded.ok&&crowded.lod==="proxy","4k objects use the authored distant mesh instead of points");
 const low=geometryFromSavedMarbleObject(restored,{detail:"low"});
 assert(low.triangleCount<geometry.triangleCount,"low detail retains source design");
 assert(new Set(low.interior.map(f=>f[3])).size===new Set(geometry.interior.map(f=>f[3])).size,

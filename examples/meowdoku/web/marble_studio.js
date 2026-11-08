@@ -207,7 +207,7 @@ async function saveObject() {
     {coated:coatedId,paintA:paintAId,paintB:paintBId}));
   const geometryHash=await geometrySha256(geometry);
   design.mesh_lods={};
-  for(const detail of ["medium","low"]) {
+  for(const detail of ["medium","low","proxy"]) {
     const lod=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
       {coated:coatedId,paintA:paintAId,paintB:paintBId}),{detail});
     design.mesh_lods[detail]=await geometrySha256(lod);

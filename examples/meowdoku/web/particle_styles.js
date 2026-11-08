@@ -350,13 +350,13 @@ export function materialPlan({ ready = true, count = 0, radiusPx = 4, budget = M
   return { ok: true, lod, tris: SPHERE_TRIS[lod], note: `${count.toLocaleString("en-US")} grains as ${SPHERE_TRIS[lod]}-triangle spheres` };
 }
 
-// The triangle budget chooses an authored mesh detail level; it never replaces
-// a selected object with points because the instanced triangle count is high.
+// The triangle budget chooses an authored mesh detail level; the distant
+// proxy retains nested, lit surfaces instead of replacing the object with points.
 export function designedMeshPlan({ ready = false, designedMesh = null, count = 0 } = {}) {
   if (!ready) return { ok: false, reason: "the scene's instanced Phong shader is unavailable" };
   if (!designedMesh || !designedMesh.count) return { ok: false, reason: "select a saved marble or die first" };
   let lod = "full", mesh = designedMesh;
-  for (const detail of ["medium", "low"]) {
+  for (const detail of ["medium", "low", "proxy"]) {
     if (mesh.count / 3 * count <= MATERIAL_BUDGET.maxTriangles) break;
     if (designedMesh.lods?.[detail]) { lod = detail; mesh = designedMesh.lods[detail]; }
   }
@@ -1463,7 +1463,7 @@ export class ParticleStyles {
     gl.bindVertexArray(ctx.vao);
   }
   #designedVao(mesh, pointBuffer) {
-    const gl = this.gl, vaos = (this.designedVaos ||= new WeakMap()), held = vaos.get(mesh);
+    const gl = this.gl, L = INSTANCE_LOCATIONS, vaos = (this.designedVaos ||= new WeakMap()), held = vaos.get(mesh);
     if (held && held.mesh === mesh && held.pointBuffer === pointBuffer) return held.vao;
     if (held) gl.deleteVertexArray(held.vao);
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);

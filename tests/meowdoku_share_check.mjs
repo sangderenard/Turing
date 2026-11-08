@@ -29,7 +29,9 @@ function cut(start) {
 }
 const decls = [...src.matchAll(/^const ([A-Z_]+SPECS?) = /gm)].map((m) => cut(m.index));
 const fn = cut(src.indexOf("function pageSpecs(specs)"));
-const ctx = vm.createContext({ ...P, rl: RL, state: { game: { game: "fountain3d" } } });          // (particle_styles.js exports: COLOR_SOURCES, PALETTE_IDS, ...)
+const ctx = vm.createContext({ ...P, rl: RL, state: { game: { game: "fountain3d" } },
+  savedParticle: { digest: "", entries: [] }, compute: { runtimeInputs: new Set() },
+  isFountainGame: (g) => !!g && ["fountain", "fountain3d", "marble_madness"].includes(g.game) });
 vm.runInContext(decls.map((d) => d.replace(/^const /, "var ")).join("\n") + "\n" + fn + "\nthis.pageSpecs = pageSpecs;", ctx);
 const pageSpecs = ctx.pageSpecs;
 
@@ -54,7 +56,9 @@ for (const [game, controls] of Object.entries(served)) {
   assert.equal(Object.keys(out.l).length, locals.length);
   assert.ok(out.l.wheelblur === true, `${game}: the wheel blur toggle is in a share link`);
   assert.equal(Object.keys(out.c).length, servers.length);
-  const view = { v: 1, g: game, ...out, ls: { "meowdoku.pstyle": "heat", "meowdoku.noisefx": '{"on":true,"strength":0.5}' }, cam: { yaw: 1.2, pitch: -0.4, lz: 0.5, px: 0, pz: 2, auto: true }, rt: { gravity: [0, -1, 0] } };
+  const view = { v: 1, g: game, ...out, ls: { "meowdoku.pstyle": "heat", "meowdoku.noisefx": '{"on":true,"strength":0.5}' },
+    ui: { "marble-curve": -28, "marble-glow-color": "#12ab34", "marble-follow": false, light: "pointer" },
+    cam: { yaw: 1.2, pitch: -0.4, lz: 0.5, px: 0, pz: 2, auto: true }, rt: { gravity: [0, -1, 0] } };
   const enc = await S.encodeView(view);
   const back = await S.decodeView(enc);
   assert.deepEqual(back, view);
@@ -62,6 +66,7 @@ for (const [game, controls] of Object.entries(served)) {
   assert.deepEqual(parsed.c, out.c);
   assert.deepEqual(parsed.l, out.l);
   assert.equal(parsed.ls["meowdoku.pstyle"], "heat");
+  assert.deepEqual(parsed.ui, view.ui);
   assert.deepEqual(parsed.cam, { yaw: 1.2, pitch: -0.4, lz: 0.5, px: 0, pz: 2, auto: true });
   assert.deepEqual(parsed.rt, { gravity: [0, -1, 0] });
   console.log(`${game}: ${locals.length} local + ${servers.length} server specs round-trip; link ${enc.length} chars`);
@@ -75,13 +80,15 @@ for (const [game, controls] of Object.entries(served)) {
   (sel.local ? evil.l : evil.c)[sel.id] = "not-an-option";
   evil.c["no_such_control"] = 5; evil.l["no_such_control"] = 5;
   evil.c["__proto__"] = { polluted: true }; evil.l["constructor"] = 1;
-  evil.ls = { "meowdoku.lichess_token": "secret", "meowdoku_player": "bob", "meowdoku_geo": "{}", "other.key": "x", "meowdoku.noisefx": '{"__proto__":{"x":1},"strength":9e99,"mode":"mean"}', "meowdoku.n": "5", "meowdoku.m": 5 };
+  evil.ls = { "meowdoku.lichess_token": "secret", "meowdoku_player": "bob", "meowdoku_geo": "{}", "meowdoku.gameConfig.fountain": "{}", "other.key": "x", "meowdoku.noisefx": '{"__proto__":{"x":1},"strength":9e99,"mode":"mean"}', "meowdoku.n": "5", "meowdoku.m": 5 };
+  evil.ui = { "marble-glow-color": "javascript:alert(1)", "marble-follow": "yes", light: "moon", "marble-curve": -28 };
   const got = S.parseView(evil, withServer);
   assert.equal((ranged.local ? got.l : got.c)[ranged.id], ranged.max);
   assert.equal((sel.local ? got.l : got.c)[sel.id], undefined);
   assert.equal(got.c.no_such_control, undefined); assert.equal(got.l.no_such_control, undefined);
   assert.equal(Object.getPrototypeOf(got.c), Object.prototype); assert.equal(({}).polluted, undefined);
   assert.deepEqual(Object.keys(got.ls).sort(), ["meowdoku.n", "meowdoku.noisefx"]);
+  assert.deepEqual(got.ui, { "marble-curve": -28 });
   assert.ok(!("__proto__" in JSON.parse(got.ls["meowdoku.noisefx"]) && Object.keys(JSON.parse(got.ls["meowdoku.noisefx"])).includes("__proto__")));
   assert.equal(JSON.parse(got.ls["meowdoku.noisefx"]).strength, 1e6);
   // a local value offered as a server control (and the reverse) is dropped

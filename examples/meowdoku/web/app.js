@@ -1818,6 +1818,14 @@ function litMesh(faces, uvOf) {
 // The saved recipe is the geometry authority.  Install its full generated
 // triangles in the same material tables and Phong path as every scene mesh.
 const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, lods: null, mesh: null, note: "" };
+function clearSavedParticle() {
+  const old = savedParticle.mesh;
+  for (const level of [old, old?.lods?.medium, old?.lods?.low, old?.lods?.proxy]) for (const part of [level?.opaque, level?.glass]) if (part) {
+    state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao);
+    for (const buffer of part.buffers) gl.deleteBuffer(buffer);
+  }
+  Object.assign(savedParticle, { digest: "", snapshot: null, geometry: null, lods: null, mesh: null, note: "" });
+}
 // Marble Madness can override the exterior's light response at the material-table seam.
 // The interior keeps every material authored in Studio.
 function marbleBaseLight(tables, id) {
@@ -1834,7 +1842,7 @@ function marbleBaseLight(tables, id) {
 function installSavedParticle(tables) {
   const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
   if (!snapshot || !geometry) return;
-  const levels = { full: geometry, medium: savedParticle.lods?.medium, low: savedParticle.lods?.low };
+  const levels = { full: geometry, medium: savedParticle.lods?.medium, low: savedParticle.lods?.low, proxy: savedParticle.lods?.proxy };
   const allFaces = Object.values(levels).filter(Boolean).flatMap((level) => [...level.interior, ...level.glass]);
   const source = snapshot.materials.tables, used = [...new Set(allFaces.map((face) => face[3]))].sort((a, b) => a - b);
   const remap = new Map();
@@ -1853,7 +1861,7 @@ function installSavedParticle(tables) {
     remap.set(id, next);
   }
   const old = savedParticle.mesh;
-  const oldLevels = old ? [old, old.lods?.medium, old.lods?.low] : [];
+  const oldLevels = old ? [old, old.lods?.medium, old.lods?.low, old.lods?.proxy] : [];
   for (const level of oldLevels) for (const part of [level?.opaque, level?.glass]) if (part) {
     state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao); for (const buffer of part.buffers) gl.deleteBuffer(buffer);
   }
@@ -1879,7 +1887,7 @@ function installSavedParticle(tables) {
     return { opaque, glass, count: mapped.length * 3, center, scale: 1 / Math.max(radius, 1e-6) };
   };
   const full = uploadLevel(levels.full);
-  full.lods = { medium: uploadLevel(levels.medium), low: uploadLevel(levels.low) };
+  full.lods = { medium: uploadLevel(levels.medium), low: uploadLevel(levels.low), proxy: uploadLevel(levels.proxy) };
   savedParticle.mesh = full;
 }
 async function refreshSavedParticleList() {
@@ -1895,7 +1903,7 @@ async function refreshSavedParticleList() {
 }
 async function selectSavedParticle(digest) {
   if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics or render selection");
-  if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.lods = null; savedParticle.mesh = null; refreshLocalControls(); return; }
+  if (!digest) { clearSavedParticle(); refreshLocalControls(); return; }
   const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
   const snapshot = await response.json();
@@ -1925,7 +1933,7 @@ async function selectSavedParticle(digest) {
   });
   chain = step.catch((error) => console.warn("[meow] saved particle law", error));
   await step;
-  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: instanced full/medium/low meshes (${[savedParticle.mesh, savedParticle.mesh.lods.medium, savedParticle.mesh.lods.low].map((level) => Math.round(level.count / 3).toLocaleString()).join(" / ")} triangles). ${state.game.game === "fountain" ? "Disk" : "Sphere"} contact and scalar moment in current law.`;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: instanced full/medium/low/proxy meshes (${[savedParticle.mesh, savedParticle.mesh.lods.medium, savedParticle.mesh.lods.low, savedParticle.mesh.lods.proxy].map((level) => Math.round(level.count / 3).toLocaleString()).join(" / ")} triangles). ${state.game.game === "fountain" ? "Disk" : "Sphere"} contact and scalar moment in current law.`;
   refreshLocalControls();
 }
 const MARBLE = { mesh: null, key: "" };
@@ -1948,7 +1956,8 @@ function marbleRollModel(at, radius, center = null) {
   return model;
 }
 function marblePreview() {
-  if (!state.game || !state.extent || (state.game.game !== "marble_madness" && !$('marble-preview').checked)) return null;
+  if (!state.game || !state.extent || state.game.tipjar ||
+      (state.game.game !== "marble_madness" && (!isFountainGame(state.game) || !$('marble-preview').checked))) return null;
   if (state.game.game === "marble_madness" && savedParticle.mesh) {
     const data = compute.points();
     if (!data) return null;
@@ -6178,7 +6187,7 @@ function pageSpecs(specs) {
     out = out.map((s, i) => (i === look ? { ...s, options: [...s.options, ...extra] } : s));
     out = [...out.slice(0, look + 1), ...COLOR_SPECS, ...out.slice(look + 1)];
   }
-  if (isFountainGame(state.game) && !out.some((s) => s.id === "saved_particle")) {
+  if (isFountainGame(state.game) && !state.game.tipjar && !out.some((s) => s.id === "saved_particle")) {
     const at = look >= 0 ? look + 1 : 1;
     out = [...out.slice(0, at),
       { id: "saved_particle", kind: "select", label: "saved marble / die", local: "saved_particle", group: "Run",
@@ -6259,6 +6268,7 @@ function renderGameControls(game) {
         }
       }
       el.dataset.ctl = s.id;
+      if (["start", "run", "rebirth", "rec_replay", "bounce", "continue", "tilt", "turnover", "autoflip", "marble_restart"].includes(s.id)) el.dataset.playControl = "1";
       return el;
     });
     const top = [];
@@ -6942,14 +6952,21 @@ function chessClockTick() {
   }
 }
 setInterval(chessClockTick, 100);
+let activeGameConfig = null;
 const newGame = (payload) => {
   if (payload.game === "meowdoku" && $("palette").value) payload = { ...payload, palette: $("palette").value };
   const step = chain.then(async () => {
+    if (activeGameConfig && share.share.mode === "owner") share.rememberGame(activeGameConfig);
+    if (activeGameConfig !== payload.game) { clearSavedParticle(); particleStyle = DEFAULT_STYLE; }
     // TIP JAR: the donation panel (total, QR, address, copy) shows at once, while the jar's fountain may still be building behind the loading panel
     const early = payload.game === "tipjar" ? await api("/api/new", payload) : null;
     if (early) tipjar.update(early);
     await loading.gate(payload.game, { predictor: state.predictorsLoaded }); /* [LOADING] */
-    console.log("[meow] new", JSON.stringify(payload)); applyState(early || await api("/api/new", payload));
+    console.log("[meow] new", JSON.stringify(payload));
+    const fresh = early || await api("/api/new", payload);
+    if (share.share.mode === "viewer") applyState(fresh);
+    else await share.configureGame(payload.game, fresh);
+    activeGameConfig = payload.game;
   }).catch((e) => console.warn(e));
   chain = step;
   return step;
@@ -7898,8 +7915,8 @@ async function lifecycleResume() {
     runtime: { get: () => ({ gravity: compute.gravity ? Array.from(compute.gravity) : null }),
                set: (r) => compute.setGravity(...(r.gravity || [null])) },
   });
+  await refreshSavedParticleList();
   if (!(await share.bootGame()) && !(await lifecycleResume())) $("new").click();
-  refreshSavedParticleList();
   window.addEventListener("focus", refreshSavedParticleList);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshSavedParticleList(); });
   if (typeof BroadcastChannel !== "undefined") {
