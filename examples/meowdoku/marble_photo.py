@@ -105,11 +105,21 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
     for source in lights_in:
         if not isinstance(source, dict):
             raise PhotoError("each light must be an object")
+        shape = str(source.get("shape", "bare")).lower()
+        if shape not in ("bare", "scrim", "grid", "snoot"):
+            raise PhotoError("light.shape must be bare, scrim, grid, or snoot")
+        filter_in = source.get("filter_rgb")
+        filter_rgb = (_finite_vectors(filter_in, 3, "light.filter_rgb")
+                     if filter_in is not None else None)
+        if filter_rgb is not None and (min(filter_rgb) < 0 or max(filter_rgb) > 1):
+            raise PhotoError("light.filter_rgb components must be in [0, 1]")
         lights.append({
             "pos": _finite_vectors(source.get("pos"), 3, "light.pos"),
             "dir": _finite_vectors(source.get("dir"), 3, "light.dir"),
             "power": _number(source.get("power"), .01, 100, "light.power"),
             "label": str(source.get("label", "preview-stage"))[:80],
+            "shape": shape,
+            "filter_rgb": filter_rgb,
         })
     physical = saved["physical"]
     scale = _number(physical.get("radius-mm"), .1, 200, "saved physical radius-mm") / 1000

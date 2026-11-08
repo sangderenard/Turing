@@ -6,14 +6,31 @@ import { ComputeRuntime } from "./compute.js";
 import { caseModel } from "./gravity.js";
 import { marblePreviewSpec, livePreviewParticle, previewLawToScene, cameraNudgeGravity } from "./marble_sim_preview.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
-import { createMarblePhoto, photoCameraFromStudio } from "./marble_photo.js";
+import { createMarblePhoto, photoCameraFromStudio, photoLightsFromStudio } from "./marble_photo.js";
 import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhysical,
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256,
   verifySavedMarbleObject } from "./marble_object.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
-const photo = createMarblePhoto(document, () => photoCameraFromStudio(yaw, pitch, distance));
+// Keep the ray-traced photo's "Current Studio orbit and zoom" camera option
+// actually the same scene as the Phong preview, not just the same angle:
+// bundle the live five-role light rig (background/2 kickers/key/fill) in
+// alongside the camera pose. marble_photo.py validates power in [0.01, 100];
+// the Phong strength sliders go well past that for visual range, so clamp.
+const studioLightRig = () => ({
+  keyX: +$("light-x").value / 100, keyY: +$("light-y").value / 100, keyZ: +$("light-z").value / 100,
+  keyStrength: Math.min(100, Math.max(0.01, +$("light-strength").value / 10)),
+  keyShape: $("key-shape").value,
+  keyFilterRgb: rgb($("key-filter").value),
+  bgStrength: Math.min(100, Math.max(0.01, +$("light-bg-strength").value / 10)),
+  kickerStrength: Math.min(100, Math.max(0.01, +$("light-kicker-strength").value / 10)),
+  fillStrength: Math.min(100, Math.max(0.01, +$("light-fill-strength").value / 10)),
+});
+const photo = createMarblePhoto(document, () => ({
+  ...photoCameraFromStudio(yaw, pitch, distance),
+  ...photoLightsFromStudio(yaw, pitch, distance, studioLightRig()),
+}));
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
 if (!gl) message.textContent = "WebGL 2 is required for this studio";
 
@@ -427,12 +444,29 @@ function controls() {
     $(field).dispatchEvent(new Event("input"));
   $("compensate-raised").addEventListener("change",()=>{rebuild();syncMaterial();});
   diceCost();
-  const lightValue=(name)=>{const divisor=name==="light-strength"?10:name.startsWith("spot")?1:100;
+  const lightValue=(name)=>{const divisor=name.endsWith("strength")?10:name.startsWith("spot")?1:100;
     return (+$(name).value/divisor).toFixed(name.startsWith("spot")?0:2);};
-  for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
+  const lightFields=["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer",
+    "light-bg-strength","light-kicker-strength","light-fill-strength"];
+  for(const name of lightFields)
     $(name).addEventListener("input",()=>{$(name+"-out").value=lightValue(name);});
-  for(const name of ["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer"])
+  for(const name of lightFields)
     $(name+"-out").value=lightValue(name);
+  // Shape presets set the spot checkbox and inner/outer angle sliders to a
+  // named photographic modifier. Bare clears the cone entirely (matching
+  // the background/kicker/fill lights, which are always bare). The sliders
+  // stay fully adjustable afterward -- a preset is a starting point, not a lock.
+  const keyShapePresets={bare:{spot:false,inner:60,outer:85},
+    scrim:{spot:true,inner:55,outer:85},
+    grid:{spot:true,inner:20,outer:34},
+    snoot:{spot:true,inner:4,outer:9}};
+  $("key-shape").addEventListener("change",()=>{
+    const preset=keyShapePresets[$("key-shape").value];
+    $("spot").checked=preset.spot;
+    $("spot-inner").value=preset.inner;$("spot-outer").value=preset.outer;
+    $("spot-inner").dispatchEvent(new Event("input"));$("spot-outer").dispatchEvent(new Event("input"));
+  });
+  $("key-shape").dispatchEvent(new Event("change"));
   const setInnerFromHardness=()=>{const outer=+$("spot-outer").value,hardness=+$("spot-hardness").value/100;
     $("spot-inner").value=Math.max(5,Math.min(outer-1,Math.round(outer-(outer-5)*(1-hardness))));
     $("spot-inner-out").value=$("spot-inner").value;$("spot-hardness-out").value=`${Math.round(hardness*100)}%`;};
@@ -615,17 +649,38 @@ function frame(now=0) {
     setTransform(mv);
     const key=[+$("light-x").value/100,+$("light-y").value/100,+$("light-z").value/100];
     const spread=+$("light-spread").value/100;
-    const lights=[[0,0,0],[-spread,0,0],[spread,0,0],[0,-spread,0],[0,spread,0]]
-      .map((offset)=>key.map((x,i)=>x+offset[i])).concat([[3,1,2],[-1,-2,-3]]);
+    const keyCluster=[[0,0,0],[-spread,0,0],[spread,0,0],[0,-spread,0],[0,spread,0]]
+      .map((offset)=>key.map((x,i)=>x+offset[i]));
+    // Fixed photographic roles, scaled to the current camera distance so
+    // they track the subject exactly the way the key does: every light
+    // here is a view-space position, which is what makes it "dynamic" --
+    // it orbits with the camera with no extra transform needed.
+    // Background: behind the subject, splashes the backdrop rather than
+    // the subject's face. Kickers: behind and to each side, for rim
+    // separation. Fill: large and low, under the camera.
+    const background=[0, cameraDistance*0.20, -cameraDistance*1.65];
+    const kickerL=[-cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
+    const kickerR=[ cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
+    const fill=[0, -cameraDistance*0.95, cameraDistance*0.30];
+    const lights=keyCluster.concat([background, kickerL, kickerR, fill]);
     const keyStrength=+$("light-strength").value/10;
+    const bgStrength=+$("light-bg-strength").value/10;
+    const kickerStrength=+$("light-kicker-strength").value/10;
+    const fillStrength=+$("light-fill-strength").value/10;
+    const keyFilter=rgb($("key-filter").value);
     const inner=Math.min(+$("spot-inner").value,+$("spot-outer").value-1),outer=+$("spot-outer").value;
     const direction=key.map((x)=>-x/Math.max(0.001,Math.hypot(...key)));
+    // Only the key is ever a spot (the photographic "narrow beam"); the
+    // background, both kickers, and the fill are bare lights -- no cone.
     const spotDirections=lights.map((_,i)=>$("spot").checked&&i<5?direction:[0,0,0]);
     const cones=lights.map((_,i)=>i<5?[Math.cos(inner*Math.PI/180),Math.cos(outer*Math.PI/180)]:[0,0]);
     gl.uniform1i(loc(P,"uNumLights"),lights.length);
     gl.uniform3fv(loc(P,"uLightPos[0]"),new Float32Array(lights.flat()));
-    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(lights.map((_,i)=>i<5?[1,0.9,0.78]:i===5?[0.52,0.72,1]:[0.5,0.6,1]).flat()));
-    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(lights.map((_,i)=>i<5?keyStrength/5:i===5?10:7)));
+    // Roles: 0-4 key (filtered), 5 background (neutral), 6-7 kickers (cool rim), 8 fill (neutral-soft).
+    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(lights.map((_,i)=>
+      i<5?keyFilter:i===5?[0.85,0.88,0.95]:i<8?[0.55,0.75,1.0]:[0.9,0.92,0.9]).flat()));
+    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(lights.map((_,i)=>
+      i<5?keyStrength/5:i===5?bgStrength:i<8?kickerStrength:fillStrength)));
     gl.uniform1iv(loc(P,"uLightGroupId[0]"),new Int32Array(lights.map(()=>-1)));
     gl.uniform3fv(loc(P,"uLightSpotDir[0]"),new Float32Array(spotDirections.flat()));
     gl.uniform2fv(loc(P,"uLightSpotCone[0]"),new Float32Array(cones.flat()));

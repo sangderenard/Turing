@@ -20,6 +20,53 @@ export function photoCameraFromStudio(yaw, pitch, distance) {
   };
 }
 
+// Any Studio view-space position (not just the unit view direction above)
+// maps into the saved mesh's frame the same way: invert Rx(pitch)*Ry(yaw),
+// the same formula photoCameraFromStudio already uses for its direction
+// vector (verified identical for the (0,0,1) case), then apply the same
+// zoom-proportional scale and recenter on the marble.
+function studioPointToWorld(viewPos, yaw, pitch, distance) {
+  const scale = 0.11 / 3.45;
+  const [x, y, z] = viewPos;
+  const y1 = y * Math.cos(pitch) + z * Math.sin(pitch);
+  const z1 = -y * Math.sin(pitch) + z * Math.cos(pitch);
+  const xw = x * Math.cos(yaw) - z1 * Math.sin(yaw);
+  const zw = x * Math.sin(yaw) + z1 * Math.cos(yaw);
+  return OBJECT_CENTER.map((v, i) => v + scale * [xw, y1, zw][i]);
+}
+
+// The ray-traced photo's "Current Studio orbit and zoom" camera option only
+// matched the camera pose before this -- the lighting was still the single
+// default stage light, a different scene from what the Phong preview shows.
+// This rebuilds the exact same five-role rig (background/2 kickers/key/fill)
+// marble_studio.js's frame() renders, in world space, so selecting "studio"
+// for the photo really is the same scene, not just the same camera angle.
+export function photoLightsFromStudio(yaw, pitch, distance, rig) {
+  const aimAt = (pos) => {
+    const d = OBJECT_CENTER.map((v, i) => v - pos[i]);
+    const n = Math.max(1e-6, Math.hypot(...d));
+    return d.map((v) => v / n);
+  };
+  const toLight = (viewPos, power, label, shape, filterRgb) => {
+    const pos = studioPointToWorld(viewPos, yaw, pitch, distance);
+    return { pos, dir: aimAt(pos), power, label, shape, filter_rgb: filterRgb ?? null };
+  };
+  const key = [rig.keyX, rig.keyY, rig.keyZ];
+  const background = [0, distance * 0.20, -distance * 1.65];
+  const kickerL = [-distance * 0.95, distance * 0.30, -distance * 1.05];
+  const kickerR = [ distance * 0.95, distance * 0.30, -distance * 1.05];
+  const fill = [0, -distance * 0.95, distance * 0.30];
+  return {
+    lights: [
+      toLight(key, rig.keyStrength, "key", rig.keyShape, rig.keyFilterRgb),
+      toLight(background, rig.bgStrength, "background", "bare"),
+      toLight(kickerL, rig.kickerStrength, "kicker-left", "bare"),
+      toLight(kickerR, rig.kickerStrength, "kicker-right", "bare"),
+      toLight(fill, rig.fillStrength, "fill", "scrim"),
+    ],
+  };
+}
+
 export function packMarblePhoto(geometry, objectDigest, options = {}) {
   if (!hexDigest.test(objectDigest)) throw new Error("save or load this design before exposing a photo");
   const faces = [...geometry.interior, ...geometry.glass];
@@ -39,6 +86,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
     },
     checker: options.checker ?? { center_m: [0, 0, 0.30], width_m: 0.15, checks: 4 },
   };
+  if (options.lights) config.lights = options.lights;
   const json = encoder.encode(JSON.stringify(config));
   const n = faces.length;
   const buffer = new ArrayBuffer(16 + json.length + 76 * n);
