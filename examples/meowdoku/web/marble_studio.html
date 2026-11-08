@@ -142,6 +142,18 @@
     <p class="wide">Visual preview moves the displayed object only; it is the cheap close-up option. Particle simulation runs 1–16 copies of the current design in the same compiled toy course as Marble Madness: ramps, throat, and pegs have native wall contacts. Hold the camera-oriented D-pad to tilt its gravity direction. Marble perspective follows particle 0 while the course moves around it. Every copy shares the selected radius, density, friction, restitution, and rolling settings. Different saved designs need a verified four-species assignment; the current law still uses spherical contact and scalar moment of inertia.</p>
     <output id="preview-sim-status" class="wide">Particle simulation loads when selected. It uses the compiled sphere-contact law; modeled dice appearance does not yet supply shape contact.</output>
   </div>
+  <h2>Lighting</h2><div class="grid">
+    <label>Key strength <output id="light-strength-out"></output><input id="light-strength" type="range" min="0" max="400" value="220"></label>
+    <label>Emitter spread <output id="light-spread-out"></output><input id="light-spread" type="range" min="0" max="200" value="45"></label>
+    <label>Key X <output id="light-x-out"></output><input id="light-x" type="range" min="-500" max="500" value="-250"></label>
+    <label>Key Y <output id="light-y-out"></output><input id="light-y" type="range" min="-500" max="500" value="300"></label>
+    <label>Key Z <output id="light-z-out"></output><input id="light-z" type="range" min="-500" max="500" value="300"></label>
+    <label class="wide"><input id="spot" type="checkbox"> Aim key as a spotlight</label>
+    <label>Spot inner angle <output id="spot-inner-out"></output><input id="spot-inner" type="range" min="5" max="85" value="22"></label>
+    <label>Spot outer angle <output id="spot-outer-out"></output><input id="spot-outer" type="range" min="6" max="89" value="38"></label>
+    <label class="wide">Spot edge hardness <output id="spot-hardness-out"></output><input id="spot-hardness" type="range" min="0" max="100" value="52"></label>
+    <p class="wide">Emitter spread samples five Pluck point lights and changes the Lambertian transition and specular highlight. Spot hardness changes the shader's inner/outer cone gap. The Lambertian cosine law itself has no hardness parameter. Cast-shadow softness is unavailable in this preview.</p>
+  </div>
   <h2>Material</h2><div class="grid">
     <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="mark">Dice markings</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>
     <label>Albedo<input id="albedo" type="color"></label><label>Inner color<input id="inner" type="color"></label>
@@ -158,18 +170,6 @@
     <label>Enamel index <output id="enamel-ior-out"></output><input id="enamel-ior" type="range" min="100" max="250" value="152"></label>
     <label>Enamel color<input id="enamel-color" type="color"></label>
     <button id="reset-material" class="wide">Restore catalogue material</button>
-  </div>
-  <h2>Lighting</h2><div class="grid">
-    <label>Key strength <output id="light-strength-out"></output><input id="light-strength" type="range" min="0" max="400" value="220"></label>
-    <label>Emitter spread <output id="light-spread-out"></output><input id="light-spread" type="range" min="0" max="200" value="45"></label>
-    <label>Key X <output id="light-x-out"></output><input id="light-x" type="range" min="-500" max="500" value="-250"></label>
-    <label>Key Y <output id="light-y-out"></output><input id="light-y" type="range" min="-500" max="500" value="300"></label>
-    <label>Key Z <output id="light-z-out"></output><input id="light-z" type="range" min="-500" max="500" value="300"></label>
-    <label class="wide"><input id="spot" type="checkbox"> Aim key as a spotlight</label>
-    <label>Spot inner angle <output id="spot-inner-out"></output><input id="spot-inner" type="range" min="5" max="85" value="22"></label>
-    <label>Spot outer angle <output id="spot-outer-out"></output><input id="spot-outer" type="range" min="6" max="89" value="38"></label>
-    <label class="wide">Spot edge hardness <output id="spot-hardness-out"></output><input id="spot-hardness" type="range" min="0" max="100" value="52"></label>
-    <p class="wide">Emitter spread samples five Pluck point lights and changes the Lambertian transition and specular highlight. Spot hardness changes the shader's inner/outer cone gap. The Lambertian cosine law itself has no hardness parameter. Cast-shadow softness is unavailable in this preview.</p>
   </div>
   <p style="margin-top:14px">Save a design to keep its shape, materials and mechanical properties. Preview motion, lighting and thin-lens camera settings remain local to this page.</p>
 </aside></main><script type="module" src="marble_studio.js"></script></body></html>
