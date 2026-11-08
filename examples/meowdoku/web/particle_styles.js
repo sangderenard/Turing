@@ -599,7 +599,8 @@ export function extendForInstancing(vert, frag) {
 
 export function capabilitiesOf(gl) {
   const full = !!gl.getExtension("EXT_color_buffer_float"), half = !!gl.getExtension("EXT_color_buffer_half_float");
-  return { floatRender: full ? "float" : half ? "half" : null, maxPointSize: gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] };
+  const pointRange = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+  return { floatRender: full ? "float" : half ? "half" : null, maxPointSize: pointRange?.[1] ?? 1 };
 }
 
 // ---------------------------------------------------------------- shaders
