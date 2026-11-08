@@ -75,7 +75,10 @@ const hex = (rgb) => "#" + rgb.map((v) => Math.round(Math.max(0, Math.min(1, v))
 const rgb = (value) => [1,3,5].map((k) => parseInt(value.slice(k,k+2),16)/255);
 
 function floatTexture(table, unit) {
-  const data = new Float32Array(table.data.length + 3*table.floats_per_record), width = 256, height = Math.max(1, Math.ceil(data.length / width));
+  // 6 spare records reserved for runtime-authored materials (the Studio
+  // light fixtures: 5 distinct emissive rows + 1 shared black housing row),
+  // beyond the catalogue's own rows.
+  const data = new Float32Array(table.data.length + 6*table.floats_per_record), width = 256, height = Math.max(1, Math.ceil(data.length / width));
   data.set(table.data);
   const tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -136,7 +139,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
   rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.12, dieDefaultsApplied=false;
-let FIXTURE_MAT_BASE=0, fixtureMeshes=null;
+let FIXTURE_MAT_BASE=0, FIXTURE_HOUSING_MAT=0, fixtureMeshes=null;
 let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -461,38 +464,14 @@ function controls() {
     $(field).dispatchEvent(new Event("input"));
   $("compensate-raised").addEventListener("change",()=>{rebuild();syncMaterial();});
   diceCost();
-  const lightValue=(name)=>{const divisor=name.endsWith("strength")?10:name.startsWith("spot")?1:100;
-    return (+$(name).value/divisor).toFixed(name.startsWith("spot")?0:2);};
-  const lightFields=["light-strength","light-spread","light-x","light-y","light-z","spot-inner","spot-outer",
+  const lightValue=(name)=>{const divisor=name.endsWith("strength")?10:100;
+    return (+$(name).value/divisor).toFixed(2);};
+  const lightFields=["light-strength","light-x","light-y","light-z",
     "light-bg-strength","light-kicker-strength","light-fill-strength"];
   for(const name of lightFields)
     $(name).addEventListener("input",()=>{$(name+"-out").value=lightValue(name);});
   for(const name of lightFields)
     $(name+"-out").value=lightValue(name);
-  // Shape presets set the spot checkbox and inner/outer angle sliders to a
-  // named photographic modifier. Bare clears the cone entirely (matching
-  // the background/kicker/fill lights, which are always bare). The sliders
-  // stay fully adjustable afterward -- a preset is a starting point, not a lock.
-  const keyShapePresets={bare:{spot:false,inner:60,outer:85},
-    scrim:{spot:true,inner:55,outer:85},
-    grid:{spot:true,inner:20,outer:34},
-    snoot:{spot:true,inner:4,outer:9}};
-  $("key-shape").addEventListener("change",()=>{
-    const preset=keyShapePresets[$("key-shape").value];
-    $("spot").checked=preset.spot;
-    $("spot-inner").value=preset.inner;$("spot-outer").value=preset.outer;
-    $("spot-inner").dispatchEvent(new Event("input"));$("spot-outer").dispatchEvent(new Event("input"));
-  });
-  $("key-shape").dispatchEvent(new Event("change"));
-  const setInnerFromHardness=()=>{const outer=+$("spot-outer").value,hardness=+$("spot-hardness").value/100;
-    $("spot-inner").value=Math.max(5,Math.min(outer-1,Math.round(outer-(outer-5)*(1-hardness))));
-    $("spot-inner-out").value=$("spot-inner").value;$("spot-hardness-out").value=`${Math.round(hardness*100)}%`;};
-  $("spot-hardness").addEventListener("input",setInnerFromHardness);
-  $("spot-outer").addEventListener("input",setInnerFromHardness);
-  $("spot-inner").addEventListener("input",()=>{const outer=+$("spot-outer").value,inner=+$("spot-inner").value;
-    $("spot-hardness").value=Math.max(0,Math.min(100,Math.round(100*(1-(outer-inner)/(outer-5)))));
-    $("spot-hardness-out").value=`${$("spot-hardness").value}%`;});
-  setInnerFromHardness();
   $("reset-roll").addEventListener("click",resetRoll);
   const syncPreviewMotion=()=>{
     const motion=$("preview-motion").value;
@@ -600,13 +579,18 @@ function controls() {
   let last = null;
   canvas.addEventListener("pointerdown", (event) => { last=[event.clientX,event.clientY]; canvas.setPointerCapture(event.pointerId); });
   canvas.addEventListener("pointermove", (event) => { if (!last) return;
-    yaw += (event.clientX-last[0])*0.008; pitch = Math.max(-1.2,Math.min(1.2,pitch+(event.clientY-last[1])*0.008)); last=[event.clientX,event.clientY]; });
+    // Clamped to match pitch: the backdrop is two finite planes (a back
+    // wall, a floor), not an enclosing room. Unclamped yaw could orbit the
+    // camera past the wall and look at its unlit backface up close -- a
+    // solid-black frame that looks like a renderer bug but is just the
+    // camera standing behind a flat backdrop with nothing behind it.
+    yaw = Math.max(-1.2,Math.min(1.2,yaw+(event.clientX-last[0])*0.008)); pitch = Math.max(-1.2,Math.min(1.2,pitch+(event.clientY-last[1])*0.008)); last=[event.clientX,event.clientY]; });
   for (const type of ["pointerup","pointercancel"]) canvas.addEventListener(type, () => { last=null; });
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
     if ($("preview-engine").value==="particle" && $("preview-camera").value==="marble")
       followDistance=Math.max(0.06,Math.min(1.5,followDistance*Math.exp(event.deltaY*0.001)));
-    else distance=Math.max(2.3,Math.min(7,distance*Math.exp(event.deltaY*0.001)));
+    else distance=Math.max(1.2,Math.min(14,distance*Math.exp(event.deltaY*0.001)));
   }, { passive:false });
 }
 function frame(now=0) {
@@ -676,28 +660,23 @@ function frame(now=0) {
     const kickerL=[-cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
     const kickerR=[ cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
     const fill=[0, -cameraDistance*0.95, cameraDistance*0.30];
-    const lights=[key, background, kickerL, kickerR, fill];
     const keyStrength=+$("light-strength").value/10;
     const bgStrength=+$("light-bg-strength").value/10;
     const kickerStrength=+$("light-kicker-strength").value/10;
     const fillStrength=+$("light-fill-strength").value/10;
     const keyFilter=rgb($("key-filter").value);
-    const inner=Math.min(+$("spot-inner").value,+$("spot-outer").value-1),outer=+$("spot-outer").value;
-    const direction=key.map((x)=>-x/Math.max(0.001,Math.hypot(...key)));
-    // Only the key is ever a spot (the photographic "narrow beam"); the
-    // background, both kickers, and the fill are bare lights -- no cone.
-    const spotDirections=lights.map((_,i)=>$("spot").checked&&i===0?direction:[0,0,0]);
-    const cones=lights.map((_,i)=>i===0?[Math.cos(inner*Math.PI/180),Math.cos(outer*Math.PI/180)]:[0,0]);
-    gl.uniform1i(loc(P,"uNumLights"),lights.length);
-    gl.uniform3fv(loc(P,"uLightPos[0]"),new Float32Array(lights.flat()));
     // Roles: 0 key (filtered), 1 background (neutral), 2-3 kickers (cool rim), 4 fill (neutral-soft).
     const roleColor=[keyFilter,[0.85,0.88,0.95],[0.55,0.75,1.0],[0.55,0.75,1.0],[0.9,0.92,0.9]];
     const roleStrength=[keyStrength,bgStrength,kickerStrength,kickerStrength,fillStrength];
-    gl.uniform3fv(loc(P,"uLightColor[0]"),new Float32Array(roleColor.flat()));
-    gl.uniform1fv(loc(P,"uLightIntensity[0]"),new Float32Array(roleStrength));
-    gl.uniform1iv(loc(P,"uLightGroupId[0]"),new Int32Array(lights.map(()=>-1)));
-    gl.uniform3fv(loc(P,"uLightSpotDir[0]"),new Float32Array(spotDirections.flat()));
-    gl.uniform2fv(loc(P,"uLightSpotCone[0]"),new Float32Array(cones.flat()));
+    // No uLightPos/uLightColor/uLightIntensity array at all: a synthetic
+    // point light's Phong specular term (H=normalize(L+V)) tracks the
+    // viewer, not the light's real position -- confirmed as the actual bug
+    // behind the key highlight not lining up with the visible key fixture.
+    // The five emissive fixture meshes below are the only lights. The
+    // marble sees them exactly the way it already sees the checker
+    // backdrop: through its own transmission/reflection, which is
+    // genuinely position-correct because it IS the real geometry.
+    gl.uniform1i(loc(P,"uNumLights"),0);
     field(P,"uLightCalibration",1); field(P,"uExposure",1); field(P,"uFieldGain",0);
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
@@ -714,28 +693,54 @@ function frame(now=0) {
       gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count); setTransform(mv);
     }
     // Real emissive light-fixture geometry: visible quads, sized and shaped
-    // per photographic role, carrying the three reserved PBR rows set up in
-    // boot(). These are what the user actually sees as "the lights" -- not
-    // an invisible point the uLightPos/uLightIntensity uniforms above still
-    // separately drive for the marble's own shading.
+    // per photographic role, each with its own PBR row (not shared) so its
+    // glow brightness is genuinely linked to its own power slider below --
+    // rewritten every frame as baseColor*liveStrength, not a fixed boot-time
+    // value. A slightly larger, slightly recessed black "housing" quad sits
+    // behind each glowing panel (its own non-emissive matte material), so
+    // every fixture reads as a real light body with a visible lit face, not
+    // a bare floating rectangle. These are what the user actually sees as
+    // "the lights" -- not an invisible point the uLightPos/uLightIntensity
+    // uniforms above still separately drive for the marble's own shading.
     // Billboarded to face the camera (view-space +Z) rather than the
     // subject: a panel facing the subject goes edge-on (a near-invisible
     // sliver) whenever the camera's own view direction grazes its surface,
     // which is routinely true for kickers/background sitting behind the
     // subject. Facing the camera always shows the full fixture shape.
     const camFacing=[0,0,1];
+    {
+      const pbrStride=tables.pbr.table.floats_per_record;
+      for (let i=0;i<5;i++) {
+        const b=(FIXTURE_MAT_BASE+i)*pbrStride, c=roleColor[i], s=roleStrength[i];
+        tables.pbr.data[b+8]=c[0]*s; tables.pbr.data[b+9]=c[1]*s; tables.pbr.data[b+10]=c[2]*s;
+      }
+      tables.pbr.update();
+    }
     const keyIsHard=$("key-shape").value==="grid"||$("key-shape").value==="snoot";
-    const keyHalf=cameraDistance*(keyIsHard?0.028:0.11);
+    const fixtureRoles=[
+      {pos:key,        halfW:cameraDistance*(keyIsHard?0.028:0.11), halfH:cameraDistance*(keyIsHard?0.028:0.11), mat:FIXTURE_MAT_BASE+0},
+      {pos:background, halfW:cameraDistance*0.5,  halfH:cameraDistance*0.35, mat:FIXTURE_MAT_BASE+1},
+      {pos:kickerL,    halfW:cameraDistance*0.08, halfH:cameraDistance*0.25, mat:FIXTURE_MAT_BASE+2},
+      {pos:kickerR,    halfW:cameraDistance*0.08, halfH:cameraDistance*0.25, mat:FIXTURE_MAT_BASE+3},
+      {pos:fill,       halfW:cameraDistance*0.45, halfH:cameraDistance*0.45, mat:FIXTURE_MAT_BASE+4},
+    ];
+    const fixtureFaces=[];
+    for (const role of fixtureRoles) {
+      const housingOffset=0.18*Math.max(role.halfW,role.halfH);
+      const housingPos=role.pos.map((x,i)=>x-housingOffset*camFacing[i]);
+      fixtureFaces.push(...quadFace(housingPos, camFacing, role.halfW*1.3, role.halfH*1.3, FIXTURE_HOUSING_MAT));
+      fixtureFaces.push(...quadFace(role.pos, camFacing, role.halfW, role.halfH, role.mat));
+    }
     if (fixtureMeshes) dispose(fixtureMeshes);
-    fixtureMeshes=mesh([
-      ...quadFace(key, camFacing, keyHalf, keyHalf, FIXTURE_MAT_BASE+0),
-      ...quadFace(background, camFacing, cameraDistance*0.5, cameraDistance*0.35, FIXTURE_MAT_BASE+1),
-      ...quadFace(kickerL, camFacing, cameraDistance*0.08, cameraDistance*0.25, FIXTURE_MAT_BASE+1),
-      ...quadFace(kickerR, camFacing, cameraDistance*0.08, cameraDistance*0.25, FIXTURE_MAT_BASE+1),
-      ...quadFace(fill, camFacing, cameraDistance*0.45, cameraDistance*0.45, FIXTURE_MAT_BASE+2),
-    ]);
+    fixtureMeshes=mesh(fixtureFaces);
     integer(P,"uEnableEmissionDirect",1);
-    setTransform(view); gl.bindVertexArray(fixtureMeshes.vao);
+    // key/background/kickerL/kickerR/fill are already view-space offsets
+    // (that's what lets them orbit with the camera for free), so the quad
+    // vertices built from them are already in eye space too. Passing the
+    // real view matrix here would re-apply the camera's rotation/translation
+    // on top of coordinates that are already past that transform, scattering
+    // every fixture away from the camera the moment yaw/pitch left zero.
+    setTransform(identity()); gl.bindVertexArray(fixtureMeshes.vao);
     gl.drawArrays(gl.TRIANGLES,0,fixtureMeshes.count);
     integer(P,"uEnableEmissionDirect",0);
     setTransform(mv);
@@ -771,23 +776,30 @@ async function boot() {
     gl.useProgram(P);
     coatedId=Math.max(...Object.values(ids))+1; paintAId=coatedId+1; paintBId=coatedId+2;
     tables=Object.fromEntries(Object.entries(assets.materials).map(([name,table])=>[name,floatTexture(table,{pbr:0,phong:1,enamel:2,texstack:3}[name])]));
-    // Three reserved spare PBR rows floatTexture() already over-allocates
-    // (table.data.length + 3*floats_per_record) -- real material-table slots,
-    // not a side channel. Pure emitters: black albedo (nothing to reflect),
-    // emission holds the actual glow colour*power. Used by the light-fixture
-    // meshes drawn in frame() so "lights" are real emissive triangles, seen
-    // and shaded exactly like any other material.
+    // Six reserved spare PBR rows floatTexture() already over-allocates
+    // (table.data.length + 6*floats_per_record) -- real material-table
+    // slots, not a side channel: 5 distinct emissive rows, one per light
+    // role, plus one shared matte-black "housing" row. Pure emitters: black
+    // albedo (nothing to reflect), emission holds the glow colour; frame()
+    // rewrites each row's emission every frame as baseColor*liveStrength, so
+    // the fixture's own glow is actually linked to its power slider, not a
+    // fixed boot-time value. Housing: non-zero albedo but zero emission, a
+    // visible dark body behind each glowing panel.
     const pbrStride=tables.pbr.table.floats_per_record;
     FIXTURE_MAT_BASE=tables.pbr.table.data.length/pbrStride;
-    const setFixtureMaterial=(slot,rgb)=>{
-      const base=(FIXTURE_MAT_BASE+slot)*pbrStride;
-      for (let i=0;i<pbrStride;i++) tables.pbr.data[base+i]=0;
-      tables.pbr.data[base+3]=1; tables.pbr.data[base+7]=1; // roughness, opacity
-      tables.pbr.data[base+8]=rgb[0]; tables.pbr.data[base+9]=rgb[1]; tables.pbr.data[base+10]=rgb[2];
-    };
-    setFixtureMaterial(0,[1,0.9,0.78]);    // key
-    setFixtureMaterial(1,[0.55,0.75,1.0]); // background + both kickers
-    setFixtureMaterial(2,[0.9,0.92,0.9]);  // fill
+    FIXTURE_HOUSING_MAT=FIXTURE_MAT_BASE+5;
+    const base=(slot)=>(FIXTURE_MAT_BASE+slot)*pbrStride;
+    for (let slot=0;slot<5;slot++) {
+      const b=base(slot);
+      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
+      tables.pbr.data[b+3]=1; tables.pbr.data[b+7]=1; // roughness, opacity
+    }
+    {
+      const b=base(5);
+      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
+      tables.pbr.data[b+0]=0.03; tables.pbr.data[b+1]=0.03; tables.pbr.data[b+2]=0.035; // near-black albedo
+      tables.pbr.data[b+3]=0.8; tables.pbr.data[b+7]=1; // roughness, opacity; emission stays 0
+    }
     tables.pbr.update();
     const names=Object.keys(ids).filter((name)=>Number.isInteger(ids[name])).sort();
     for (const [select,initial] of [["shell","marble_clear_glass"],["confetti-material","metal_gold"],["mark-material","metal_gold"]]) {
