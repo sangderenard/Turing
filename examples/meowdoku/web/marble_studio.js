@@ -75,10 +75,10 @@ const hex = (rgb) => "#" + rgb.map((v) => Math.round(Math.max(0, Math.min(1, v))
 const rgb = (value) => [1,3,5].map((k) => parseInt(value.slice(k,k+2),16)/255);
 
 function floatTexture(table, unit) {
-  // 6 spare records reserved for runtime-authored materials (the Studio
-  // light fixtures: 5 distinct emissive rows + 1 shared black housing row),
-  // beyond the catalogue's own rows.
-  const data = new Float32Array(table.data.length + 6*table.floats_per_record), width = 256, height = Math.max(1, Math.ceil(data.length / width));
+  // 7 spare records reserved for runtime-authored materials (the Studio
+  // light fixtures: 5 distinct emissive rows + 1 shared black housing row +
+  // 1 bright debug-label row), beyond the catalogue's own rows.
+  const data = new Float32Array(table.data.length + 7*table.floats_per_record), width = 256, height = Math.max(1, Math.ceil(data.length / width));
   data.set(table.data);
   const tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -131,6 +131,67 @@ function quadFace(center, dir, halfW, halfH, materialId) {
   const n=[dir,dir,dir];
   return [[c00,c10,c11,materialId,n],[c00,c11,c01,materialId,n]];
 }
+// A small round disc facing `dir`, as a triangle fan. Used for the
+// background and kicker fixtures, which are small round practicals sitting
+// on the floor, not big rectangular panels.
+function circleFace(center, dir, radius, materialId, segments=12) {
+  let worldUp=[0,1,0];
+  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
+  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
+  const right=norm3(cross3(dir,worldUp));
+  const up=norm3(cross3(right,dir));
+  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
+  const n=[dir,dir,dir];
+  const faces=[];
+  for (let i=0;i<segments;i++) {
+    const a0=(i/segments)*Math.PI*2, a1=((i+1)/segments)*Math.PI*2;
+    const p0=add(add(center,right,Math.cos(a0)*radius),up,Math.sin(a0)*radius);
+    const p1=add(add(center,right,Math.cos(a1)*radius),up,Math.sin(a1)*radius);
+    faces.push([center,p0,p1,materialId,n]);
+  }
+  return faces;
+}
+// Debug-only: real extruded glyph geometry (the same digit/letter meshes
+// exported for chess/wordle tiles, assets.meshes) placed at a world
+// position, for marking fixture coordinates directly in the scene instead
+// of guessing from screenshots.
+function digitFaces(char, center, dir, scale, materialId) {
+  const g=glyphMeshes[char];
+  if (!g) return [];
+  let worldUp=[0,1,0];
+  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
+  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
+  const right=norm3(cross3(dir,worldUp));
+  const up=norm3(cross3(right,dir));
+  const pos=g.positions;
+  const faces=[];
+  for (let t=0;t<g.triangles;t++) {
+    const verts=[0,1,2].map((v)=>{
+      const o=(t*3+v)*3, lx=pos[o], ly=pos[o+1], lz=pos[o+2];
+      return center.map((c,i)=>c+right[i]*lx*scale+up[i]*ly*scale+dir[i]*lz*scale);
+    });
+    faces.push([verts[0],verts[1],verts[2],materialId,[dir,dir,dir]]);
+  }
+  return faces;
+}
+function stringFaces(text, basePos, dir, scale, materialId) {
+  let worldUp=[0,1,0];
+  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
+  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
+  const right=norm3(cross3(dir,worldUp));
+  const faces=[];
+  const spacing=scale*1.3;
+  let offset=-(text.length-1)*spacing*0.5;
+  for (const ch of text) {
+    const charCenter=basePos.map((c,i)=>c+right[i]*offset);
+    faces.push(...digitFaces(ch, charCenter, dir, scale, materialId));
+    offset+=spacing;
+  }
+  return faces;
+}
 
 const dimensions = ["width","length","curve","strands","thickness","twist","tip","flare","phase","orientation-yaw","orientation-pitch","orientation-roll","tube-count","tube-radius","tube-turns","confetti-count","coverage","band-count","band-width","band-curve"];
 const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmission:["pbr",5,100],
@@ -139,7 +200,7 @@ const properties = { roughness:["pbr",3,100], metallic:["pbr",4,100], transmissi
   "enamel-thickness":["enamel",0,1], "enamel-ior":["enamel",1,100] };
 let tables, ids, P, interior, glass, glassOpaque, checkerMesh, coatedId, paintAId, paintBId, lastGeometry, rollProps, lastMass,
   rollState, exteriorClass=new Map(), lastFrame=0, seed = 1, yaw = -0.5, pitch = 0.2, distance = 3.45, followDistance = 0.12, dieDefaultsApplied=false;
-let FIXTURE_MAT_BASE=0, FIXTURE_HOUSING_MAT=0, fixtureMeshes=null;
+let FIXTURE_MAT_BASE=0, FIXTURE_HOUSING_MAT=0, FIXTURE_LABEL_MAT=0, fixtureMeshes=null, glyphMeshes={};
 let opaqueSaved = null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -579,12 +640,7 @@ function controls() {
   let last = null;
   canvas.addEventListener("pointerdown", (event) => { last=[event.clientX,event.clientY]; canvas.setPointerCapture(event.pointerId); });
   canvas.addEventListener("pointermove", (event) => { if (!last) return;
-    // Clamped to match pitch: the backdrop is two finite planes (a back
-    // wall, a floor), not an enclosing room. Unclamped yaw could orbit the
-    // camera past the wall and look at its unlit backface up close -- a
-    // solid-black frame that looks like a renderer bug but is just the
-    // camera standing behind a flat backdrop with nothing behind it.
-    yaw = Math.max(-1.2,Math.min(1.2,yaw+(event.clientX-last[0])*0.008)); pitch = Math.max(-1.2,Math.min(1.2,pitch+(event.clientY-last[1])*0.008)); last=[event.clientX,event.clientY]; });
+    yaw += (event.clientX-last[0])*0.008; pitch += (event.clientY-last[1])*0.008; last=[event.clientX,event.clientY]; });
   for (const type of ["pointerup","pointercancel"]) canvas.addEventListener(type, () => { last=null; });
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
@@ -653,12 +709,13 @@ function frame(now=0) {
     // they track the subject exactly the way the key does: every light
     // here is a view-space position, which is what makes it "dynamic" --
     // it orbits with the camera with no extra transform needed.
-    // Background: behind the subject, splashes the backdrop rather than
-    // the subject's face. Kickers: behind and to each side, for rim
-    // separation. Fill: large and low, under the camera.
-    const background=[0, cameraDistance*0.20, -cameraDistance*1.65];
-    const kickerL=[-cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
-    const kickerR=[ cameraDistance*0.95, cameraDistance*0.30, -cameraDistance*1.05];
+    // Background: a small round practical sitting on the floor behind the
+    // subject, aimed up to splash the backdrop wall (not a panel facing the
+    // subject). Kickers: small round floor practicals behind and to each
+    // side, for rim separation. Fill: large and low, under the camera.
+    const background=[0, -cameraDistance*0.95, cameraDistance*1.55];
+    const kickerL=[-cameraDistance*0.85, -cameraDistance*0.95, cameraDistance*0.75];
+    const kickerR=[ cameraDistance*0.85, -cameraDistance*0.95, cameraDistance*0.75];
     const fill=[0, -cameraDistance*0.95, cameraDistance*0.30];
     const keyStrength=+$("light-strength").value/10;
     const bgStrength=+$("light-bg-strength").value/10;
@@ -718,18 +775,38 @@ function frame(now=0) {
     }
     const keyIsHard=$("key-shape").value==="grid"||$("key-shape").value==="snoot";
     const fixtureRoles=[
-      {pos:key,        halfW:cameraDistance*(keyIsHard?0.028:0.11), halfH:cameraDistance*(keyIsHard?0.028:0.11), mat:FIXTURE_MAT_BASE+0},
-      {pos:background, halfW:cameraDistance*0.5,  halfH:cameraDistance*0.35, mat:FIXTURE_MAT_BASE+1},
-      {pos:kickerL,    halfW:cameraDistance*0.08, halfH:cameraDistance*0.25, mat:FIXTURE_MAT_BASE+2},
-      {pos:kickerR,    halfW:cameraDistance*0.08, halfH:cameraDistance*0.25, mat:FIXTURE_MAT_BASE+3},
-      {pos:fill,       halfW:cameraDistance*0.45, halfH:cameraDistance*0.45, mat:FIXTURE_MAT_BASE+4},
+      {pos:key,        halfW:cameraDistance*(keyIsHard?0.028:0.11), halfH:cameraDistance*(keyIsHard?0.028:0.11), mat:FIXTURE_MAT_BASE+0, round:false},
+      {pos:background, radius:cameraDistance*0.09, mat:FIXTURE_MAT_BASE+1, round:true},
+      {pos:kickerL,    radius:cameraDistance*0.06, mat:FIXTURE_MAT_BASE+2, round:true},
+      {pos:kickerR,    radius:cameraDistance*0.06, mat:FIXTURE_MAT_BASE+3, round:true},
+      {pos:fill,       halfW:cameraDistance*0.45, halfH:cameraDistance*0.45, mat:FIXTURE_MAT_BASE+4, round:false},
     ];
     const fixtureFaces=[];
     for (const role of fixtureRoles) {
-      const housingOffset=0.18*Math.max(role.halfW,role.halfH);
+      const size=role.round?role.radius:Math.max(role.halfW,role.halfH);
+      const housingOffset=0.18*size;
       const housingPos=role.pos.map((x,i)=>x-housingOffset*camFacing[i]);
-      fixtureFaces.push(...quadFace(housingPos, camFacing, role.halfW*1.3, role.halfH*1.3, FIXTURE_HOUSING_MAT));
-      fixtureFaces.push(...quadFace(role.pos, camFacing, role.halfW, role.halfH, role.mat));
+      if (role.round) {
+        fixtureFaces.push(...circleFace(housingPos, camFacing, role.radius*1.3, FIXTURE_HOUSING_MAT));
+        fixtureFaces.push(...circleFace(role.pos, camFacing, role.radius, role.mat));
+      } else {
+        fixtureFaces.push(...quadFace(housingPos, camFacing, role.halfW*1.3, role.halfH*1.3, FIXTURE_HOUSING_MAT));
+        fixtureFaces.push(...quadFace(role.pos, camFacing, role.halfW, role.halfH, role.mat));
+      }
+    }
+    // Debug-only coordinate labels: real extruded glyph geometry (not an
+    // HTML overlay) floated above each fixture, spelling its view-space
+    // X/Y/Z so the sign/placement convention is readable directly off the
+    // rendered scene instead of guessed from screenshots. No minus-sign
+    // glyph exists in the exported alphabet, so a negative value is spelled
+    // with a leading "N" (e.g. "Y" "N34" means Y = -34).
+    if ($("debug-coords") && $("debug-coords").checked) {
+      const fmt=(n)=>(n<0?"N":"")+String(Math.round(Math.abs(n)));
+      for (const role of fixtureRoles) {
+        const labelPos=role.pos.map((x,i)=>x+(i===1?cameraDistance*0.35:0));
+        const text=`X${fmt(role.pos[0])}Y${fmt(role.pos[1])}Z${fmt(role.pos[2])}`;
+        fixtureFaces.push(...stringFaces(text, labelPos, camFacing, cameraDistance*0.18, FIXTURE_LABEL_MAT));
+      }
     }
     if (fixtureMeshes) dispose(fixtureMeshes);
     fixtureMeshes=mesh(fixtureFaces);
@@ -769,6 +846,7 @@ async function boot() {
       fetch("shaders/base_material.webgl.shadow.frag.glsl").then((r)=>{ if(!r.ok) throw Error(`fragment shader ${r.status}`); return r.text(); }),
       fetch("assets.json").then((r)=>{ if(!r.ok) throw Error(`materials ${r.status}`); return r.json(); })]);
     ids=assets.material_index || {};
+    glyphMeshes=assets.meshes||{};
     for (const name of ["marble_clear_glass","marble_milk_glass","marble_cat_eye_blue","marble_cat_eye_green","marble_cat_eye_amber"])
       if (!Number.isInteger(ids[name])) throw Error(`material ${name} is absent from assets.json; export the catalogue`);
     const source=fragment.replace(/^(#version[^\n]*\n)/,"$1#define PLUCK_TRANSMISSION 1\n");
@@ -799,6 +877,13 @@ async function boot() {
       for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
       tables.pbr.data[b+0]=0.03; tables.pbr.data[b+1]=0.03; tables.pbr.data[b+2]=0.035; // near-black albedo
       tables.pbr.data[b+3]=0.8; tables.pbr.data[b+7]=1; // roughness, opacity; emission stays 0
+    }
+    FIXTURE_LABEL_MAT=FIXTURE_MAT_BASE+6;
+    {
+      const b=base(6);
+      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
+      tables.pbr.data[b+3]=1; tables.pbr.data[b+7]=1;
+      tables.pbr.data[b+8]=4; tables.pbr.data[b+9]=0.3; tables.pbr.data[b+10]=0.3; // bright red debug label, always visible
     }
     tables.pbr.update();
     const names=Object.keys(ids).filter((name)=>Number.isInteger(ids[name])).sort();
