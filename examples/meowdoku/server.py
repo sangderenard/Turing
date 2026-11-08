@@ -853,8 +853,8 @@ def make_handler(sessions: Sessions):
                 return
             if self.headers.get("X-Meowdoku-Loading") != "1":
                 return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
-            if length <= 0 or length > anim_mod.MAX_BYTES:
-                return refuse(f"the animation must be 1..{anim_mod.MAX_BYTES} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            if length <= 0:
+                return refuse("the animation body is empty", HTTPStatus.BAD_REQUEST)
             now, hits = time.time(), sessions.anim_hits.setdefault(self.client_address[0], [])
             hits[:] = [t for t in hits if now - t < 600]
             if len(hits) >= 5:

@@ -1,13 +1,13 @@
-"""[LOADING] The loading animation: a REDUCED, engine-free recording of a fountain, the store that holds it, and its validator.
+"""[LOADING] The loading animation: a compact, engine-free recording of a fountain, the store that holds it, and its validator.
 
 The animation is not a second capture path.  The page's state memory (``web/recording.js``: the compute runtime's recorded
-window of packed points) is FILTERED -- positions only, frames and grains decimated, quantized -- into the format below
+window of packed points) is FILTERED -- positions only, sampled frames, quantized -- into the format below
 (``web/loading_record.js`` does the filtering in the browser and uploads the result; ``web/loading_anim.js`` is the JS twin of
 this file's codec).  The loading panel (``web/loading_panel.js``) then plays it with a tiny WebGL2 shader and no engine.
 
-Format ``MLA1`` (little endian; every array is BYTE-PLANAR -- all low bytes, then all high bytes -- so gzip finds the zeros)::
+Format ``MLA2`` (little endian; every array is BYTE-PLANAR -- all low bytes, then all high bytes -- so the octet codec finds the zeros). MLA1 remains readable::
 
-    magic "MLA1" | u8 version=1 | u8 fps | u16 n grains | u16 frames F | u16 seam S | u16 outline polylines P
+    magic "MLA2" | u8 version=2 | u8 fps | u32 n grains | u32 frames F | u16 seam S | u16 outline polylines P
     f32 x0, x1, y0, y1                       the box the u16 positions are quantized into
     n   u16 radius                           (in the same units as positions: radius / max(x1-x0, y1-y0) * 65535)
     F   u16 angle                            the case's view angle per frame: (angle mod 2 pi) / 2 pi * 65536
@@ -33,15 +33,13 @@ from pathlib import Path
 
 import numpy as np
 
-MAGIC = b"MLA1"
-VERSION = 1
-MAX_BYTES = 1 << 20                 # an uploaded animation is at most 1 MiB raw ("well under 1 MB" is the target; this is the cap)
-MAX_GRAINS = 4096
-MAX_FRAMES = 4096
+MAGIC = b"MLA2"
+VERSION = 2
 MAX_POLYLINES = 8
 MAX_POINTS = 4096
 TEMP_SECONDS = 3 * 24 * 60 * 60       # ungraduated fountain captures live for three days
-HEADER = struct.Struct("<4sBBHHHH4f")       # magic, version, fps, n, frames, seam, polylines, bbox
+HEADER = struct.Struct("<4sBBIIHH4f")       # magic, version, fps, n, frames, seam, polylines, bbox
+LEGACY_HEADER = struct.Struct("<4sBBHHHH4f")
 
 
 class AnimError(ValueError):
@@ -77,21 +75,23 @@ def encode(anim: dict) -> bytes:
 
 def decode(data: bytes) -> dict:
     """The inverse of :func:`encode`, validating every length: raises :class:`AnimError` on anything that is not exactly one animation."""
-    if len(data) > MAX_BYTES:
-        raise AnimError(f"larger than the {MAX_BYTES}-byte cap")
-    if len(data) < HEADER.size:
+    if len(data) < LEGACY_HEADER.size:
         raise AnimError("shorter than the header")
-    magic, version, fps, n, frames, seam, polylines, *bbox = HEADER.unpack_from(data, 0)
-    if magic != MAGIC or version != VERSION:
-        raise AnimError("not an MLA1 animation")
-    if not (1 <= fps <= 120) or not (1 <= n <= MAX_GRAINS) or not (2 <= frames <= MAX_FRAMES) or polylines > MAX_POLYLINES:
+    legacy = data[:5] == b"MLA1\x01"
+    if not legacy and data[:5] != b"MLA2\x02":
+        raise AnimError("unknown animation format")
+    if not legacy and len(data) < HEADER.size:
+        raise AnimError("shorter than the header")
+    header = LEGACY_HEADER if legacy else HEADER
+    magic, version, fps, n, frames, seam, polylines, *bbox = header.unpack_from(data, 0)
+    if not (1 <= fps <= 120) or not (1 <= n <= 0xFFFFFFFF) or frames < 2 or polylines > MAX_POLYLINES:
         raise AnimError("header field out of range")
     if seam * 2 > frames:
         raise AnimError("the seam is longer than half the animation")
     x0, x1, y0, y1 = bbox
     if not all(math.isfinite(v) for v in bbox) or not (x1 > x0 and y1 > y0):
         raise AnimError("bad bounding box")
-    at = HEADER.size
+    at = header.size
 
     def take(count: int) -> np.ndarray:
         nonlocal at
@@ -137,7 +137,7 @@ def digest(data: bytes) -> str:
 
 
 def pack(raw: bytes) -> bytes:
-    """The stored/served form: the validated MLA1 stream through OUR octet codec (LZ77 + canonical Huffman, ``octet_codec``)."""
+    """The stored/served form: the validated MLA stream through OUR octet codec (LZ77 + canonical Huffman, ``octet_codec``)."""
     from src.common.tensors.compression.octet_codec import compress_octets
     return compress_octets(raw)
 
@@ -147,11 +147,7 @@ def unpack(packet: bytes) -> bytes:
     return decompress_octets(packet)
 
 
-#: [STUDIO] the library's caps: an upload that would pass either is refused (nothing is evicted without the owner)
-MAX_ENTRIES = 24
-MAX_LIBRARY_BYTES = 32 << 20
-MAX_TEMP_ENTRIES = 8
-MAX_TEMP_BYTES = 8 << 20
+#: [STUDIO] captures retain every recorded location; capacity is the actual storage available.
 MAX_PARAMS_BYTES = 2048
 DIGEST_RE = re.compile(r"^[0-9a-f]{16}$")
 
@@ -278,8 +274,8 @@ class Library:
     def caps(self) -> dict:
         entries = self.entries()
         pending = [e for e in entries if e.get("expires_at")]
-        return {"max_entries": MAX_ENTRIES, "max_bytes": MAX_LIBRARY_BYTES, "entries": len(entries), "used_bytes": sum(e["bytes"] for e in entries),
-                "max_temporary_entries": MAX_TEMP_ENTRIES, "max_temporary_bytes": MAX_TEMP_BYTES,
+        return {"max_entries": None, "max_bytes": None, "entries": len(entries), "used_bytes": sum(e["bytes"] for e in entries),
+                "max_temporary_entries": None, "max_temporary_bytes": None,
                 "temporary_entries": len(pending), "temporary_bytes": sum(e["bytes"] for e in pending)}
 
     def info(self) -> dict | None:
@@ -310,13 +306,6 @@ class Library:
                 if not temporary and self.meta(digest_).get("expires_at"):
                     return {**self.graduate(digest_), "active": digest_ == self.active_digest(), "duplicate": True}
                 return {**self.meta(digest_), "active": digest_ == self.active_digest(), "duplicate": True}
-            caps = self.caps()
-            if temporary:
-                pending = [e for e in self.entries() if e.get("expires_at")]
-                if len(pending) >= MAX_TEMP_ENTRIES or sum(e["bytes"] for e in pending) + len(packet) > MAX_TEMP_BYTES:
-                    raise LibraryFull("the temporary capture shelf is full; wait for expiry or graduate a capture")
-            if caps["entries"] >= MAX_ENTRIES or caps["used_bytes"] + len(packet) > MAX_LIBRARY_BYTES:
-                raise LibraryFull(f"the library is full ({caps['entries']}/{MAX_ENTRIES} entries, {caps['used_bytes']}/{MAX_LIBRARY_BYTES} bytes): delete one first")
             self.root.mkdir(parents=True, exist_ok=True)
             meta = {"digest": digest_, "raw_bytes": len(raw), "bytes": len(packet), "frames": int(anim["x"].shape[0]),
                     "grains": int(anim["x"].shape[1]), "fps": int(anim["fps"]), "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

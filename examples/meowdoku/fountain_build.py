@@ -584,7 +584,7 @@ def build_fallback_mobroad(tag: str, web_dir: Path, record: dict) -> dict:
 
 
 #: the sizes the road is built at: the 256-id wasm demonstration and the 4k mob (a larger mob would not fit the road)
-MOBROAD_SIZES = ("small", "4k")
+MOBROAD_SIZES = ("one", "small", "4k")
 
 
 def mobroad_manifest(records: dict) -> dict:

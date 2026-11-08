@@ -1707,6 +1707,7 @@ def run_frames(piece: LawPiece, columns: dict[str, np.ndarray], steps: int) -> d
 #: size tag -> (active ids, sort length).  ``small`` is the wasm demonstration; the rest are the
 #: ladder the page offers (4096 .. 10M).  The sort length is the next power of two.
 SIZES = {
+    "one": (1, 2),
     "small": (256, 256), "4k": (4096, 4096), "16k": (16384, 16384), "64k": (65536, 65536),
     "256k": (262144, 262144), "1M": (1048576, 1048576), "4M": (4194304, 4194304),
     "10M": (10_000_000, 10_000_000),

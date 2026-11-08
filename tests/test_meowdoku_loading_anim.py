@@ -1,5 +1,4 @@
-"""[LOADING] The loading animation: the MLA1 stream, its octet-codec packet (Python encode, JS decode bit-exact), the loop seam, and the
-store / upload rules (size cap, format, write-once)."""
+"""[LOADING] The loading animation: MLA2 plus readable MLA1 streams, codec parity, the loop seam, and upload rules."""
 
 import http.client
 import json
@@ -60,8 +59,26 @@ def test_malformed_streams_are_refused():
     for bad in (b"", raw[:-1], raw + b"\0", b"XXXX" + raw[4:], raw[:6] + bytes([0]) + raw[7:]):     # truncated, trailing, magic, fps 0
         with pytest.raises(L.AnimError):
             L.decode(bad)
-    with pytest.raises(L.AnimError):
-        L.decode(bytes(L.MAX_BYTES + 1))
+
+
+def test_more_than_u16_locations_round_trip():
+    anim = _anim(frames=32, grains=65536)
+    raw = L.encode(anim)
+    assert raw[:4] == b"MLA2"
+    _same(L.decode(raw), anim)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_existing_mla1_saves_still_decode_in_python_and_browser(tmp_path):
+    anim = _anim()
+    new = L.encode(anim)
+    old = L.LEGACY_HEADER.pack(b"MLA1", 1, anim["fps"], len(anim["radius"]), len(anim["x"]),
+                               anim["seam"], len(anim["outline"]), *anim["bbox"]) + new[L.HEADER.size:]
+    _same(L.decode(old), anim)
+    (tmp_path / "old.mla").write_bytes(L.pack(old))
+    subprocess.run([NODE, str(CHECK), "decode", str(tmp_path / "old.mla"), str(tmp_path / "old.json")],
+                   check=True, capture_output=True, text=True)
+    assert len(json.loads((tmp_path / "old.json").read_text())["radius"]) == len(anim["radius"])
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -156,8 +173,7 @@ def test_upload_rules(server):
     port, sessions = server
     raw = L.encode(_anim())
     assert _post(port, raw, {"X-Meowdoku-Loading": "0"})[0] == 403                         # not from the page's own script
-    assert _post(port, b"")[0] == 413                                                      # empty
-    assert _post(port, b"x", length=L.MAX_BYTES + 1)[0] == 413                             # over the cap (refused before reading)
+    assert _post(port, b"")[0] == 400                                                      # empty
     assert _post(port, b"not an animation")[0] == 400                                      # wrong format
     assert sessions.anim.info() is None
     status, reply = _post(port, raw)
@@ -172,6 +188,17 @@ def test_upload_rules(server):
     r = conn.getresponse()
     body = r.read()
     assert r.status == 200 and "immutable" in r.getheader("Cache-Control") and L.unpack(body) == raw
+
+
+def test_upload_keeps_a_stream_larger_than_the_old_megabyte_cap(server):
+    port, sessions = server
+    raw = L.encode(_anim(frames=60, grains=5000))
+    assert len(raw) > 1 << 20
+    status, reply = _post(port, raw)
+    assert status == 201
+    assert reply["stored"]["raw_bytes"] == len(raw)
+    assert reply["stored"]["grains"] == 5000
+    assert sessions.anim.info()["grains"] == 5000
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")

@@ -1,20 +1,21 @@
-// The loading animation (pure: no GPU, no DOM, so node holds it in a test).  Format MLA1 and its loop seam are documented in
+// The loading animation (pure: no GPU, no DOM, so node holds it in a test).  Formats MLA1/MLA2 and their loop seam are documented in
 // loading_anim.py, whose codec this twins byte for byte.  The file the page FETCHES is that stream through the octet codec
 // (octet_codec.js); `filterTape` is how the stream is MADE: a reduced filter of the compute runtime's state memory
 // (recording.js `Recording`).  For runs whose complete physics tape exceeds its sliding window, VisualTape keeps
-// only selected packed points at the requested output cadence; it cannot resume or replay the law.
+// packed points at the requested output cadence; it cannot resume or replay the law.
 import { decompressOctets } from "./octet_codec.js";
 import { decodeMeta } from "./particle_styles.js";
 
-export const MAGIC = "MLA1", HEADER_BYTES = 4 + 1 + 1 + 2 + 2 + 2 + 2 + 16, MAX_BYTES = 1 << 20;
+export const MAGIC = "MLA2", HEADER_BYTES = 4 + 1 + 1 + 4 + 4 + 2 + 2 + 16;
+const LEGACY_HEADER_BYTES = 30;
 const TAU = 2 * Math.PI;
 
-// A bounded, position-filter source for large simulations.  Frames are copied from the same packed point snapshots
+// A position-filter source for large simulations.  Frames are copied from the same packed point snapshots
 // handed to Recording.push; the full physics state and keyframes remain owned by the compute runtime.
 export class VisualTape {
-  constructor({ sourceSnap, stride, sourceCount, maxGrains, capBytes = 96 * 1048576 }) {
+  constructor({ sourceSnap, stride, sourceCount }) {
     this.snapEvery = sourceSnap * stride; this.stride = stride; this.sourceSnap = sourceSnap;
-    this.sourceCount = sourceCount; this.maxGrains = maxGrains; this.capBytes = capBytes;
+    this.sourceCount = sourceCount;
     this.frames = []; this.sourceFrames = []; this.inputs = []; this.lo = 1; this.hi = 0;
     this.ids = null; this.bytes = 0;
   }
@@ -25,12 +26,10 @@ export class VisualTape {
     if (!this.ids) {
       const live = [];
       for (let i = 0; i < this.sourceCount; i++) if (data[5 * i + 4] >= 50) live.push(i);
-      const skip = Math.max(1, Math.ceil(live.length / this.maxGrains));
-      this.ids = live.filter((_, j) => j % skip === 0);
+      this.ids = live;
       if (!this.ids.length) throw new Error("visual recording: no live grains");
     }
     const bytes = this.ids.length * 20;
-    if (this.bytes + bytes > this.capBytes) throw new Error("visual recording exceeded its 96 MiB memory budget: lower fps, grains or duration cap");
     const copy = new Float32Array(this.ids.length * 5), words = new Uint32Array(copy.buffer);
     const sourceWords = new Uint32Array(data.buffer, data.byteOffset, data.length);
     this.ids.forEach((id, j) => { for (let w = 0; w < 5; w++) words[5 * j + w] = sourceWords[5 * id + w]; });
@@ -55,9 +54,10 @@ export function encodeStream(anim) {
   const F = anim.x.length, n = anim.x[0].length, parts = [];
   const head = new DataView(new ArrayBuffer(HEADER_BYTES));
   for (let i = 0; i < 4; i++) head.setUint8(i, MAGIC.charCodeAt(i));
-  head.setUint8(4, 1); head.setUint8(5, anim.fps); head.setUint16(6, n, true); head.setUint16(8, F, true);
-  head.setUint16(10, anim.seam, true); head.setUint16(12, (anim.outline || []).length, true);
-  anim.bbox.forEach((v, i) => head.setFloat32(14 + 4 * i, v, true));
+  if (n > 0xffffffff || F > 0xffffffff) throw new Error("animation: counts exceed the stream format");
+  head.setUint8(4, 2); head.setUint8(5, anim.fps); head.setUint32(6, n, true); head.setUint32(10, F, true);
+  head.setUint16(14, anim.seam, true); head.setUint16(16, (anim.outline || []).length, true);
+  anim.bbox.forEach((v, i) => head.setFloat32(18 + 4 * i, v, true));
   parts.push(new Uint8Array(head.buffer), planar(anim.radius), planar(anim.angle));
   for (const poly of anim.outline || []) {
     const k = poly.length / 2, xs = new Uint16Array(k), ys = new Uint16Array(k);
@@ -78,14 +78,17 @@ export function encodeStream(anim) {
 }
 
 export function decodeStream(bytes) {
-  if (bytes.length > MAX_BYTES) throw new Error("animation: larger than the cap");
-  if (bytes.length < HEADER_BYTES) throw new Error("animation: shorter than the header");
+  if (bytes.length < LEGACY_HEADER_BYTES) throw new Error("animation: shorter than the header");
   const head = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
-  if (String.fromCharCode(...bytes.subarray(0, 4)) !== MAGIC || head.getUint8(4) !== 1) throw new Error("animation: not an MLA1 stream");
-  const fps = head.getUint8(5), n = head.getUint16(6, true), F = head.getUint16(8, true), seam = head.getUint16(10, true), P = head.getUint16(12, true);
-  const bbox = [0, 1, 2, 3].map((i) => head.getFloat32(14 + 4 * i, true));
+  const legacy = String.fromCharCode(...bytes.subarray(0, 4)) === "MLA1" && head.getUint8(4) === 1;
+  if (!legacy && (String.fromCharCode(...bytes.subarray(0, 4)) !== MAGIC || head.getUint8(4) !== 2)) throw new Error("animation: unknown stream format");
+  if (!legacy && bytes.length < HEADER_BYTES) throw new Error("animation: shorter than the header");
+  const fps = head.getUint8(5), n = legacy ? head.getUint16(6, true) : head.getUint32(6, true);
+  const F = legacy ? head.getUint16(8, true) : head.getUint32(10, true);
+  const seam = head.getUint16(legacy ? 10 : 14, true), P = head.getUint16(legacy ? 12 : 16, true);
+  const bbox = [0, 1, 2, 3].map((i) => head.getFloat32((legacy ? 14 : 18) + 4 * i, true));
   if (!fps || !n || F < 2 || P > 8 || seam * 2 > F || !(bbox[1] > bbox[0] && bbox[3] > bbox[2])) throw new Error("animation: header field out of range");
-  let at = HEADER_BYTES;
+  let at = legacy ? LEGACY_HEADER_BYTES : HEADER_BYTES;
   const take = (count) => { if (at + 2 * count > bytes.length) throw new Error("animation: truncated"); const a = unplanar(bytes, at, count); at += 2 * count; return a; };
   const radius = take(n), angle = take(F), outline = [];
   for (let p = 0; p < P; p++) {
@@ -127,7 +130,7 @@ export const angleOf = (u16) => (u16 / 65536) * TAU;
 //
 //   tape       a Recording
 //   from, to   the frames to keep (inclusive); the loop is this span
-//   maxGrains  grains kept (a stride over the packed ids; a grain must be alive in every kept frame)
+//   grains     every grain alive in every kept frame is retained
 //   bits       position bits kept (the stream stays u16: the value is shifted up, so the low bits are zero and the codec drops them)
 //   fps        output frames per second of simulated time; `law.dt` is the law's step in seconds
 //   turnSeconds  how long the view takes to follow a turn of the case (the drawing eases; the law's gravity changed at once)
@@ -135,17 +138,17 @@ const outlineBox = (lines) => {
   const pts = lines.flat();
   return pts.length ? [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[1]))] : null;
 };
-export function filterTape(tape, { from, to, maxGrains = 400, fps = 12, bits = 12, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0, angleAtStep = null }) {
+export function filterTape(tape, { from, to, fps = 12, bits = 12, dt, outline = [], view, turnSeconds = 0.45, seamSeconds = 1.0, angleAtStep = null }) {
   from = Math.max(from, tape.lo); to = Math.min(to, tape.hi);
   if (to <= from) throw new Error("filterTape: nothing recorded between the frames");
   const stride = Math.max(1, Math.round(1 / (fps * dt * tape.snapEvery)));          // recorded frames per kept frame
   const frames = []; for (let k = from; k <= to; k += stride) frames.push(k);
   const first = tape.get(from), total = Math.floor(first.length / 5);
   const alive = (data, i) => data[5 * i + 4] >= 50;
-  // the grains: alive in every kept frame, then thinned by a stride over their ids
+  // the grains alive in every kept frame, with no count thinning
   const live = [];
   for (let i = 0; i < total; i++) { let ok = true; for (const k of frames) if (!alive(tape.get(k), i)) { ok = false; break; } if (ok) live.push(i); }
-  const step = Math.max(1, Math.ceil(live.length / maxGrains)), ids = live.filter((_, j) => j % step === 0);
+  const ids = live;
   if (!ids.length) throw new Error("filterTape: no grain is alive in every kept frame");
   const box = view || outlineBox(outline) || [Infinity, -Infinity, Infinity, -Infinity];
   if (!view) for (const k of frames) { const d = tape.get(k); for (const i of ids) { box[0] = Math.min(box[0], d[5 * i]); box[1] = Math.max(box[1], d[5 * i]); box[2] = Math.min(box[2], d[5 * i + 1]); box[3] = Math.max(box[3], d[5 * i + 1]); } }

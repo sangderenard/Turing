@@ -67,19 +67,12 @@ def test_add_list_activate_delete(tmp_path):
         lib.put(b"junk")
 
 
-def test_caps(tmp_path, monkeypatch):
-    monkeypatch.setattr(L, "MAX_ENTRIES", 3)
+def test_library_keeps_saves_without_entry_or_byte_quota(tmp_path):
     lib = L.Library(tmp_path)
-    for seed in range(3):
+    for seed in range(5):
         lib.put(_raw(seed))
-    with pytest.raises(L.LibraryFull):
-        lib.put(_raw(9))
-    assert len(lib.entries()) == 3
-    lib.delete(lib.entries()[0]["digest"])
-    lib.put(_raw(9))                                                                                # room again
-    monkeypatch.setattr(L, "MAX_LIBRARY_BYTES", lib.caps()["used_bytes"] + 10)
-    with pytest.raises(L.LibraryFull):
-        lib.put(_raw(11))
+    assert len(lib.entries()) == 5
+    assert lib.caps()["max_entries"] is None and lib.caps()["max_bytes"] is None
 
 
 def test_temporary_capture_graduation_and_expiry(tmp_path, monkeypatch):
@@ -266,18 +259,16 @@ def test_upload_rules_still_hold(server):
     raw = _raw(1)
     h = {"X-Meowdoku-Loading": "1"}
     assert _req(port, "POST", "/api/loading_anim", raw, {"X-Meowdoku-Loading": "0"})[0] == 403
-    assert _req(port, "POST", "/api/loading_anim", b"", h)[0] == 413
-    assert _req(port, "POST", "/api/loading_anim", b"x", {**h, "Content-Length": str(L.MAX_BYTES + 1)})[0] == 413
+    assert _req(port, "POST", "/api/loading_anim", b"", h)[0] == 400
     assert _save(port, b"not an animation")[0] == 400
     assert sessions.anim.entries() == []
 
 
-def test_the_library_full_refuses_a_save(server, monkeypatch):
+def test_the_library_keeps_multiple_saves(server):
     port, sessions = server
-    monkeypatch.setattr(L, "MAX_ENTRIES", 1)
     assert _save(port, _raw(1))[0] == 201
-    status, reply = _save(port, _raw(2))
-    assert status == 507 and "full" in reply["error"]
+    assert _save(port, _raw(2))[0] == 201
+    assert len(sessions.anim.entries()) == 2
 
 
 # ---------------------------------------------------------------- the page side (node)
@@ -285,23 +276,23 @@ def test_the_library_full_refuses_a_save(server, monkeypatch):
 def test_recorder_parameter_handling():
     out = json.loads(subprocess.run([NODE, str(CHECK), "params"], check=True, capture_output=True, text=True).stdout)
     d = out["defaults"]
-    # the bare ?record_loading=1 is what the recorder always did: hourglass, small, 400 grains, 12 fps, 12 bits, settle x40, 4 turns, 0.4 s, max speed, fit
-    assert (d["chamber"], d["size"], d["grains"], d["fps"], d["bits"], d["settle"], d["turns"], d["flipSeconds"], d["speed"], d["fit"]) == \
-        ("sdf_hourglass", "small", 400, 12, 12, 40, 4, 0.4, 0, True)
+    assert (d["chamber"], d["size"], d["fps"], d["bits"], d["settle"], d["turns"], d["flipSeconds"], d["speed"]) == \
+        ("sdf_hourglass", "small", 12, 12, 40, 4, 0.4, 0)
     assert out["bare"] == {"on": True, "studio": False, "params": d} and out["off"]["on"] is False
     assert out["bad"]["params"] == d                                                                  # a malformed rp is the defaults
     w = out["wild"]                                                                                   # everything is clamped or dropped
-    assert (w["chamber"], w["size"], w["mix"], w["grainScale"], w["grains"], w["fps"], w["bits"], w["turns"], w["flipSeconds"], w["speed"], w["cap"], w["colour"], w["fit"]) == \
-        ("sdf_hourglass", "small", 1, 0.5, 1024, 2, 12, 4, 2, 0, 10, 2, False)
+    assert (w["chamber"], w["size"], w["mix"], w["grainScale"], w["fps"], w["bits"], w["turns"], w["flipSeconds"], w["speed"], w["cap"], w["colour"]) == \
+        ("sdf_hourglass", "small", 1, 0.5, 2, 12, 4, 2, 0, 10, 2)
     assert "junk" not in w
-    assert out["sizes"] == ["small", "4k", "16k", "64k", "256k", "1M", "4M", "10M"]
+    assert out["sizes"] == ["one", "small", "4k", "16k", "64k", "256k", "1M", "4M", "10M"]
+    assert out["sizeIds"]["one"] == 1
     assert out["sizeIds"]["256k"] == 262144 and out["sizeIds"]["10M"] == 10000000
     back = out["back"]
     assert back["on"] and back["studio"] and back["params"]["chamber"] == "sdf_circle" and back["params"]["bits"] == 10 and back["params"]["mix"] == 0.25 and back["params"]["turns"] == 6
     assert "record_loading=1" in out["query"] and "studio=1" in out["query"] and "rp=" in out["query"]
-    assert out["legacy"] == [[12, 400, 12], [10, 300, 11], [8, 256, 10], [6, 200, 10]]                # the legacy fit ladder, in order
-    assert out["fixed"] == [[8, 300, 16]]                                                             # no fit: exactly what was chosen
-    assert out["tight"] == [[8, 300, 11], [8, 256, 10], [6, 200, 10]]                                 # fit never goes looser than the choice
+    assert out["legacy"] == [[12, 256, 12]]
+    assert out["fixed"] == [[8, 256, 16]]
+    assert out["tight"] == [[8, 256, 11]]
     assert out["meta"]["mix"] == "default" and out["meta"]["capped"] is True and out["meta"]["bits"] == 12
     assert all(isinstance(v, (str, int, float, bool)) for v in out["meta"].values())                  # flat: the server keeps these
 
@@ -309,8 +300,7 @@ def test_recorder_parameter_handling():
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 def test_visual_projection_filters_existing_packed_snapshots():
     out = json.loads(subprocess.run([NODE, str(CHECK), "visual"], check=True, capture_output=True, text=True).stdout)
-    assert out == {"frames": 10, "sampled": 32, "step": 24, "grains": 16, "raw": 722, "capped": True}
-    assert out["raw"] < L.MAX_BYTES
+    assert out == {"frames": 10, "sampled": 256, "step": 24, "grains": 256, "raw": 10806}
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")

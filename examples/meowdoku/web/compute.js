@@ -693,15 +693,16 @@ export class ComputeRuntime {
     const v = rec.verdict, model = this.manifest.cost_model;
     const detail = `n=${rec.n.toLocaleString()}, ${rec.wgsl_abi.dispatches} dispatches, ${mb(rec.memory.arena_bytes)}: predicted ${v.speedup.toFixed(2)}x, needs ${model.min_speedup.toFixed(1)}x`;
     let product = null; this.warn = false;
-    if (rec.route === "webgpu-compute" && navigator.gpu) {
-      try { product = new GpuProduct(); await product.init(rec, this.manifest, Math.max(1, Math.min(16, Math.floor(spec.studio_count || 1)))); this.why = `compiler verdict: the dispatches pay (${detail})`; }
+    if ((rec.route === "webgpu-compute" || !rec.wasm) && navigator.gpu) {
+      try { product = new GpuProduct(); await product.init(rec, this.manifest, Math.max(1, Math.min(16, Math.floor(spec.studio_count || 1))));
+        this.why = rec.route === "webgpu-compute" ? `compiler verdict: the dispatches pay (${detail})` : `WebGPU product used while the CPU fallback is not built (${detail})`; }
       catch (error) {
         try { product?.destroy(); } catch { /* the device may be gone */ }
         product = null; this.warn = true;
         if (!rec.wasm) throw error;
         this.why = `FALLBACK to wasm: WebGPU could not run the generated program (${error.message || error})`;
       }
-    } else if (rec.route === "webgpu-compute") {
+    } else if (rec.route === "webgpu-compute" || !rec.wasm) {
       if (!rec.wasm) throw new Error("needs WebGPU: this size has no wasm product");
       this.warn = true; this.why = `FALLBACK to wasm: the compiler chose WebGPU compute (${detail}) but navigator.gpu is absent here (needs https and a WebGPU browser)`;
     } else this.why = `compiler verdict: the dispatches do not pay (${detail})`;

@@ -23,18 +23,15 @@ if (mode === "params") {
   }));
 } else if (mode === "visual") {
   const { VisualTape, filterTape, encodeStream } = await import(pathToFileURL(path.join(web, "loading_anim.js")).href);
-  const tape = new VisualTape({ sourceSnap: 6, stride: 3, sourceCount: 256, maxGrains: 32, capBytes: 20000 });
+  const tape = new VisualTape({ sourceSnap: 6, stride: 3, sourceCount: 256 });
   for (let k = 1; k <= 30; k += 3) {
     const frame = new Float32Array(256 * 5);
     for (let i = 0; i < 256; i++) { frame[5 * i] = i / 256; frame[5 * i + 1] = k / 100; frame[5 * i + 4] = 120; }
     tape.push(k, frame);
   }
   tape.inputs.push({ step: 6, values: { grav_x: 0, grav_y: -1 } });
-  const anim = filterTape(tape, { from: tape.lo, to: tape.hi, maxGrains: 16, fps: 20, bits: 12, dt: 1 / 360 });
-  let capped = false;
-  try { const tiny = new VisualTape({ sourceSnap: 6, stride: 1, sourceCount: 256, maxGrains: 32, capBytes: 100 }); tiny.push(1, new Float32Array(256 * 5).fill(120)); }
-  catch (error) { capped = /memory budget/.test(String(error)); }
-  console.log(JSON.stringify({ frames: tape.hi, sampled: tape.get(1).length / 5, step: tape.stepOf(2), grains: anim.grains, raw: encodeStream(anim).length, capped }));
+  const anim = filterTape(tape, { from: tape.lo, to: tape.hi, fps: 20, bits: 12, dt: 1 / 360 });
+  console.log(JSON.stringify({ frames: tape.hi, sampled: tape.get(1).length / 5, step: tape.stepOf(2), grains: anim.grains, raw: encodeStream(anim).length }));
 } else if (mode === "bits") {
   const { Recording } = await import(pathToFileURL(path.join(web, "recording.js")).href);
   const { filterTape, encodeStream } = await import(pathToFileURL(path.join(web, "loading_anim.js")).href);

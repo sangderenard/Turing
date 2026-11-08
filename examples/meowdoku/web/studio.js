@@ -2,7 +2,7 @@
 //  1. the loading screen: the real loading panel (loading_view.html -> loading_panel.js) held on a phase, playing any library entry;
 //  2. re-recording: loading_params.js controls -> the game page in an iframe running loading_record.js with those parameters;
 //  3. the library (/api/loading_library): thumbnails, play, compare two, and -- with the owner's token -- make active / delete.
-import { DEFAULTS, normalize, toQuery, CHAMBERS, SIZES, SIZE_IDS, BITS, COLOUR_SOURCES, RAW_CAP } from "./loading_params.js";
+import { DEFAULTS, normalize, toQuery, CHAMBERS, SIZES, SIZE_IDS, BITS, COLOUR_SOURCES } from "./loading_params.js";
 import { decodePacket, seam, angleOf } from "./loading_anim.js";
 const PHASES = { compiling: 1, downloading: 1, initializing: 1 };      // the panel's phases (loading_panel.js PHASES; importing that module would start a panel here)
 
@@ -58,7 +58,6 @@ const CONTROLS = [
   { k: "grainScale", label: "grain size (x radius)", type: "range", min: 0.5, max: 2, step: 0.05 },
   { k: "colour", label: "colour source (preview, metadata)", type: "select", options: COLOUR_SOURCES },
   ["Animation"],
-  { k: "grains", label: "grains kept", type: "range", min: 16, max: 1024, step: 16 },
   { k: "fps", label: "record fps", type: "range", min: 2, max: 30, step: 1 },
   { k: "bits", label: "bit depth", type: "select", options: BITS.map((b) => [b, `${b} bit`]) },
   { k: "cap", label: "duration cap (sim s)", type: "range", min: 10, max: 900, step: 10 },
@@ -69,8 +68,6 @@ const CONTROLS = [
   { k: "flipAxis", label: "flip axis", type: "select", options: [["y", "world Y / case normal (2-D)"], ["x", "world X / horizontal (3-D)"], ["z", "world Z / vertical (3-D)"]] },
   { k: "flipDirection", label: "flip direction", type: "select", options: [[1, "one way"], [-1, "reverse"]] },
   { k: "speed", label: "sim speed", type: "select", options: [[0, "max"], [1, "1x"], [2, "2x"], [4, "4x"]] },
-  ["Budget"],
-  { k: "fit", label: "tighten automatically to fit ~900 KB", type: "check" },
 ];
 function buildControls() {
   const box = $("controls"); box.textContent = "";
@@ -96,7 +93,7 @@ function buildControls() {
     input.addEventListener("input", () => {
       const v = c.type === "check" ? input.checked : (c.type === "select" ? (isNaN(Number(input.value)) ? input.value : Number(input.value)) : Number(input.value));
       S.params[c.k] = v; if (c.k === "mix") $("mixDefault").checked = false;
-      S.params = { ...normalize(S.params), fit: S.params.fit }; paintControls();
+      S.params = normalize(S.params); paintControls();
     });
     box.appendChild(lab);
   }
@@ -162,7 +159,7 @@ window.addEventListener("message", (e) => {
     recMsg(m.text); if (m.raw) stats([["raw stream", kb(m.raw)]]);
   } else if (m.stage === "error") {
     $("bar").value = 0; recMsg(m.text, "err");
-    stats(m.raw ? [["raw stream", `${kb(m.raw)} (cap ${kb(RAW_CAP)})`]] : []);
+    stats(m.raw ? [["raw stream", kb(m.raw)]] : []);
     stopLive(true);
   } else if (m.stage === "done") {
     $("bar").value = 100;
@@ -183,15 +180,15 @@ async function loadLibrary() {
     S.entries = body.entries || []; S.active = body.active;
     const c = body.caps || {};
     const candidates = S.entries.filter((e) => e.expires_at);
-    $("candidateNote").textContent = `${candidates.length}/${c.max_temporary_entries || 8} awaiting graduation, ${kb(c.temporary_bytes || 0)} of ${kb(c.max_temporary_bytes || 8 * 1048576)}`;
-    $("libNote").textContent = `${S.entries.length - candidates.length} permanent / ${S.entries.length}/${c.max_entries} total, ${kb(c.used_bytes || 0)} of ${kb(c.max_bytes || 0)}`;
+    $("candidateNote").textContent = `${candidates.length} awaiting graduation, ${kb(c.temporary_bytes || 0)} stored`;
+    $("libNote").textContent = `${S.entries.length - candidates.length} permanent / ${S.entries.length} total, ${kb(c.used_bytes || 0)} stored`;
   } catch (error) { $("libMsg").textContent = `could not read the library: ${error.message}`; $("libMsg").className = "msg err"; }
   if (S.A && !S.entries.some((e) => e.digest === S.A)) S.A = null;
   if (S.B && !S.entries.some((e) => e.digest === S.B)) S.B = null;
   if (S.playing && !S.entries.some((e) => e.digest === S.playing)) S.playing = null;
   paintCards(); showScreen(); paintCompare();
 }
-const paramsLine = (p) => (p && p.chamber ? `${p.chamber.replace("sdf_", "")}, ${p.size}, ${p.kept_grains || p.grains} grains, ${p.bits} bit, ${p.fps} fps, ${p.turns} turns, grain x${Number(p.grainScale).toFixed(2)}${p.mix === "default" ? "" : `, mix ${p.mix}`}` : (p && p.source ? `${p.source}${p.size ? ` ${p.size}` : ""}, visual-only${p.projected_3d ? " (3-D motion projected to X/Y)" : ""}, ${p.bits} bit, ${p.fps} fps` : (p && p.migrated ? "migrated from the single-file store" : "")));
+const paramsLine = (p) => (p && p.chamber ? `${p.chamber.replace("sdf_", "")}, ${p.size}, ${p.kept_grains || p.grains || "all live"} grains, ${p.bits} bit, ${p.fps} fps, ${p.turns} turns, grain x${Number(p.grainScale).toFixed(2)}${p.mix === "default" ? "" : `, mix ${p.mix}`}` : (p && p.source ? `${p.source}${p.size ? ` ${p.size}` : ""}, visual-only${p.projected_3d ? " (3-D motion projected to X/Y)" : ""}, ${p.bits} bit, ${p.fps} fps` : (p && p.migrated ? "migrated from the single-file store" : "")));
 function paintCards() {
   const box = $("lib"), shelf = $("candidates"); box.textContent = ""; shelf.textContent = "";
   if (!S.entries.some((e) => !e.expires_at)) { const p = document.createElement("p"); p.className = "hint"; p.textContent = "No permanent recordings yet: players see the procedural hourglass until one is made active."; box.appendChild(p); }

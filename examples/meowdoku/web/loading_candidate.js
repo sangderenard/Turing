@@ -2,7 +2,7 @@
 // loading recorder, then uses its existing visual filter and MLA1 codec.
 import { VisualTape, filterTape, encodeStream } from "./loading_anim.js";
 
-const FPS = 12, GRAINS = 256, BITS = 10, SECONDS = 30;
+const FPS = 12, BITS = 10, SECONDS = 30;
 
 export function beginCandidate({ compute, game, onStatus, onDone }) {
   if (!compute.ready || !compute.rec || !compute.manifest || !game?.compute)
@@ -10,8 +10,7 @@ export function beginCandidate({ compute, game, onStatus, onDone }) {
   if (compute.onSnapshot) throw new Error("another snapshot capture is in progress");
   const product = compute.product, dt = compute.manifest.law.dt;
   const stride = Math.max(1, Math.round(1 / (FPS * dt * compute.snap)));
-  const tape = new VisualTape({ sourceSnap: compute.snap, stride, sourceCount: compute.rec.n,
-    maxGrains: GRAINS * 2 });
+  const tape = new VisualTape({ sourceSnap: compute.snap, stride, sourceCount: compute.rec.n });
   let first = null, finished = false;
   const sourceGame = game.game, sourceSize = game.compute.size;
   const detach = () => { if (compute.onSnapshot === snapshot) compute.onSnapshot = null; };
@@ -22,7 +21,7 @@ export function beginCandidate({ compute, game, onStatus, onDone }) {
     try {
       if (tape.hi < 2) throw new Error("wait for at least two captured frames");
       onStatus("filtering compact visual frames…");
-      const anim = filterTape(tape, { from: tape.lo, to: tape.hi, maxGrains: GRAINS,
+      const anim = filterTape(tape, { from: tape.lo, to: tape.hi,
         fps: FPS, bits: BITS, dt, view: game.compute.view,
         outline: game.compute.chamber_outline || [], seamSeconds: 0,
         angleAtStep: (step) => compute.caseAngleAt(step) });

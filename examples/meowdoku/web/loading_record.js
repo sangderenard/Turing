@@ -1,18 +1,18 @@
 // [LOADING] Making the loading animation from the page's own fountain snapshots.  The state memory (compute.tape,
-// recording.js) is the source when it fits; larger runs sample its packed snapshots into a bounded visual-only tape.
+// recording.js) is the source when it fits; larger runs sample its packed snapshots into a visual-only tape.
 // This drives the existing fountain on a 2-D chamber (the hourglass by default), TURNS THE CASE OVER (compute.setCaseTilt,
 // the same input the "turn over" control writes -- logged at its step) each time the average kinetic energy
 // has fallen low enough that the grains have settled, a few rounds; then FILTERS the retained snapshots
-// (loading_anim.js `filterTape`: positions only, frames and grains decimated, quantized) and uploads the stream.  The server validates it,
+// (loading_anim.js `filterTape`: positions only, frames sampled, quantized) and uploads the stream.  The server validates it,
 // packs it with the octet codec and keeps it in the library (loading_anim.py); the first one becomes the one players get.
 //
 // Run by hand: open the page with ?record_loading=1 (the defaults below; skipped when the server already has an animation).
 // [STUDIO] The loading studio (studio.html) runs the same path in an iframe with `&studio=1&rp=<json>` (loading_params.js): the
-// parameters are the chamber, the sim size, the species mix, the grain size, the grains kept, the flip rule, fps / bits, the duration cap
+// parameters are the chamber, the sim size, the species mix, the grain size, the flip rule, fps / bits, the duration cap
 // and the colour source; it records even when an animation exists (the save goes into the library) and reports progress to its parent.
 // (Never automatic: it takes the page's fountain over for about a minute.)
 import { filterTape, encodeStream, VisualTape } from "./loading_anim.js";
-import { fromQuery, attempts, metadata, RAW_CAP } from "./loading_params.js";
+import { fromQuery, metadata } from "./loading_params.js";
 
 const SETTLE_SECONDS = 0.6;       // simulated seconds the average energy must stay below the threshold
 const WALL_CAP_MS = 10 * 60 * 1000;
@@ -51,13 +51,13 @@ export async function record({ state, newGame, act, compute }) {
   compute.setCaseTilt(0);
   const n = compute.rec.n, dt = compute.manifest.law.dt, settle = compute.manifest.settle || {};
   // A complete state memory retains every packed point at every compute snapshot.  If the requested duration cannot
-  // fit that window, keep a bounded visual projection of those same snapshots and leave physics replay switched off.
+  // fit that window, keep a visual projection of those same snapshots and leave physics replay switched off.
   const visualOnly = Math.ceil(P.cap / (dt * compute.snap)) * compute.product.frameBytes > compute.capBytes;
   compute.setRecording(!visualOnly);
   let visual = null, visualError = null, visualStart = null;
   if (visualOnly) {
     const stride = Math.max(1, Math.round(1 / (P.fps * dt * compute.snap)));
-    visual = new VisualTape({ sourceSnap: compute.snap, stride, sourceCount: n, maxGrains: Math.min(4096, P.grains * 2) });
+    visual = new VisualTape({ sourceSnap: compute.snap, stride, sourceCount: n });
     compute.onSnapshot = (k, data) => {
       if (visualStart === null || (k - visualStart) % stride !== 0 || visualError) return;
       try { visual.push(k, data); } catch (error) { visualError = error; compute.onSnapshot = null; }
@@ -112,21 +112,18 @@ export async function record({ state, newGame, act, compute }) {
   if (!visual && compute.tape.lo > out.from) { compute.setCaseTilt(0); return fail("the state memory's window slid past the start of the loop: lower the duration cap or the turns"); }
   if (capped) log("the duration cap ended the recording at frame", out.to);
 
-  // Filter the chosen snapshot source; with `fit`, tighten it until the stream fits the budget.
+  // Keep every live location from the chosen snapshots.  The compact stream still quantizes positions.
   report({ stage: "progress", text: "filtering captured frames" });
   let anim = null, bytes = null, tried = [];
   const source = visual || compute.tape;
   try {
-    for (const [fps, grains, bits] of attempts(P)) {             // the panel interpolates between frames
-      anim = filterTape(source, { from: visual ? source.lo : out.from, to: visual ? source.hi : out.to, maxGrains: grains, fps, bits, dt, outline, angleAtStep: (step) => compute.caseAngleAt(step) });
-      bytes = encodeStream(anim);
-      tried.push({ fps, grains, bits, raw: bytes.length });
-      log(`filtered ${anim.x.length} frames x ${anim.grains} grains at ${fps} fps, ${bits} bits: ${bytes.length} raw bytes`);
-      if (bytes.length <= (P.fit ? 900 * 1024 : RAW_CAP)) break;
-    }
+    anim = filterTape(source, { from: visual ? source.lo : out.from, to: visual ? source.hi : out.to,
+      fps: P.fps, bits: P.bits, dt, outline, angleAtStep: (step) => compute.caseAngleAt(step) });
+    bytes = encodeStream(anim);
+    tried.push({ fps: P.fps, grains: anim.grains, bits: P.bits, raw: bytes.length });
+    log(`filtered ${anim.x.length} frames x ${anim.grains} grains at ${P.fps} fps, ${P.bits} bits: ${bytes.length} raw bytes`);
   } catch (error) { compute.setCaseTilt(0); return fail(`filtering failed: ${error.message || error}`); }
   compute.setCaseTilt(0);
-  if (bytes.length > RAW_CAP) return fail(`the raw stream is ${bytes.length} bytes, over the ${RAW_CAP}-byte cap: lower the grains, fps, bits or the duration`, { raw: bytes.length, tried });
   const meta = metadata(P, { kept_fps: anim.fps, kept_grains: anim.grains, frames: anim.x.length, capped, sim_n: n, visual_only: visualOnly, effective_flip_seconds: longestFlip });
   report({ stage: "progress", text: "uploading", raw: bytes.length });
   const r = await fetch("/api/loading_anim", { method: "POST", headers: { "X-Meowdoku-Loading": "1", "X-Meowdoku-Params": encodeURIComponent(JSON.stringify(meta)), "Content-Type": "application/octet-stream" }, body: bytes });
