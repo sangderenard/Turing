@@ -19,6 +19,7 @@ assert.equal(current.camera.fov_degrees, 18);
 assert.equal(current.camera.focus_distance_m, .11);
 assert.ok(current.camera.eye_m[0] > 0 && current.camera.eye_m[1] > 0 && current.camera.eye_m[2] > .18);
 assert.deepEqual(current.checker.center_m, [0, 0, .06]);
+assert.equal(current.checker.normal_sign, 1);
 assert.ok(photoCameraFromStudio(0, 0, 2.3).camera.focus_distance_m < .11);
 assert.throws(() => photoCameraFromStudio(0, 0, 0), RangeError);
 console.log("marble photo camera framing: ok");

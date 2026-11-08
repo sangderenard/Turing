@@ -15,7 +15,8 @@ export function photoCameraFromStudio(yaw, pitch, distance) {
   return {
     camera: { eye_m: OBJECT_CENTER.map((v, i) => v + d * direction[i]), target_m: OBJECT_CENTER,
       fov_degrees: 18, aperture_radius_m: 0.002, focus_distance_m: d },
-    checker: { center_m: [0, 0, OBJECT_CENTER[2] - 0.12 * (direction[2] >= 0 ? 1 : -1)], width_m: 0.15, checks: 4 },
+    checker: { center_m: [0, 0, OBJECT_CENTER[2] - 0.12 * (direction[2] >= 0 ? 1 : -1)],
+      width_m: 0.15, checks: 4, normal_sign: direction[2] >= 0 ? 1 : -1 },
   };
 }
 

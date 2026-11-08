@@ -88,7 +88,10 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
         "center_m": _finite_vectors(checker_in.get("center_m", [0, 0, .30]), 3, "checker.center_m"),
         "width_m": _number(checker_in.get("width_m", .15), .02, 1, "checker.width_m"),
         "checks": int(_number(checker_in.get("checks", 4), 2, 32, "checker.checks")),
+        "normal_sign": int(_number(checker_in.get("normal_sign", -1), -1, 1, "checker.normal_sign")),
     }
+    if checker["normal_sign"] not in (-1, 1):
+        raise PhotoError("checker.normal_sign must be -1 or 1")
     lights_in = value.get("lights", [{"pos": [.14, .10, .17], "dir": [-.14, -.10, .13],
                                      "power": 1.0, "label": "preview-stage"}])
     if not isinstance(lights_in, list) or not 1 <= len(lights_in) <= 8:
