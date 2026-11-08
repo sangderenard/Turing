@@ -5,6 +5,7 @@
 // animates the difference between states; it decides nothing.
 
 import "./access.js";   // [ACCESS] window.meowdokuAccess: the tier (server-enforced); development options below are shown by it
+import { entries as localLogEntries, persist as persistLocalLog } from "./local_log.js";
 import "./loading_panel.js";  // [LOADING] establish the panel before the game module takes its API
 // FOUNTAIN DIAGNOSTICS to the server log (owner devices only: LAN/dev tier): every 5 s while a fountain game runs, the law's live inputs
 // (gravity, case rates/tilt), the gravity source and the readback's speed/escape counts -- so a fault seen on a phone is visible in the log.
@@ -26,7 +27,8 @@ setInterval(() => {
 // [ACCESS] local (LAN) and dev visitors get the Studio link in the bar, with the tier named in its title
 { const link = document.getElementById("studio-link"), A = window.meowdokuAccess || {};
   if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; }
-  const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = ""; }     // [LOG] the log page link, same visitors
+  const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = "";
+  const ticketsLink = document.getElementById("tickets-link"); if (ticketsLink && (A.edit || A.dev)) ticketsLink.style.display = ""; }     // [LOG] developer pages
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, SettleDetector } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
@@ -5362,6 +5364,68 @@ gravitySensor.start();
 const firstTap = () => { for (const type of ["click", "touchend"]) removeEventListener(type, firstTap, true); gravitySensor.grant(); };
 for (const type of ["click", "touchend"]) addEventListener(type, firstTap, true);
 window.meowdokuDebug.gravitySensor = gravitySensor;
+// A diagnostic ticket captures what the phone and compute runtime actually have now.
+// Keep non-finite numbers visible instead of JSON's silent conversion to null.
+function ticketJSON(value) {
+  return JSON.stringify(value, (_key, v) => typeof v === "number" && !Number.isFinite(v) ? String(v) : v);
+}
+function ticketParticles() {
+  const data = compute.points();
+  if (!data) return null;
+  const n = Math.min(compute.rec?.n || pointCount(data), pointCount(data));
+  const sample = [], bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity };
+  let live = 0, nonfinite = 0;
+  for (let i = 0; i < n; i++) {
+    const p = readPoint(data, i);
+    if (!p.alive) continue;
+    live++;
+    if (![p.x, p.y, p.z].every(Number.isFinite)) { nonfinite++; continue; }
+    bounds.minX = Math.min(bounds.minX, p.x); bounds.maxX = Math.max(bounds.maxX, p.x);
+    bounds.minY = Math.min(bounds.minY, p.y); bounds.maxY = Math.max(bounds.maxY, p.y);
+    bounds.minZ = Math.min(bounds.minZ, p.z); bounds.maxZ = Math.max(bounds.maxZ, p.z);
+    if (i % Math.max(1, Math.floor(n / 128)) === 0) sample.push({ id: i, ...p });
+  }
+  return { n, live, nonfinite, bounds: live > nonfinite ? bounds : null, sample };
+}
+document.getElementById("report-ticket")?.addEventListener("click", () => {
+  document.getElementById("ticket-result").textContent = "";
+  document.getElementById("ticket-dialog").showModal();
+});
+document.getElementById("report-ticket-toy")?.addEventListener("click", () => document.getElementById("report-ticket").click());
+document.getElementById("ticket-cancel")?.addEventListener("click", () => document.getElementById("ticket-dialog").close());
+document.getElementById("ticket-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = document.getElementById("ticket-send"), resultLine = document.getElementById("ticket-result");
+  const note = document.getElementById("ticket-note").value;
+  button.disabled = true; button.textContent = "Sending report…";
+  try {
+    persistLocalLog();
+    const game = state.game;
+    const gameText = ticketJSON(game);
+    const settings = {};
+    for (const key of ["meowdoku.tilt", "meowdoku.camgrav", "meowdoku.casetilt", "meowdoku.spin", "meowdoku.spinmotion", "meowdoku.gscale", "meowdoku.caseVibration", "meowdoku.watchcase", "meowdoku.pstyle", "meowdoku.speed"]) {
+      try { settings[key] = localStorage.getItem(key); } catch { settings[key] = "unavailable"; }
+    }
+    const report = { note: note.slice(0, 3000), at: Date.now(), url: location.pathname, ua: navigator.userAgent,
+      game: gameText && gameText.length < 24000 ? game : { game: game?.game, compute: game?.compute, omitted: "game state exceeded 24 KB" },
+      compute: { ready: compute.ready, running: compute.running, manifest: compute.manifestName, steps: compute.steps,
+        shown: compute.shown, mode: compute.play?.mode, recordOn: compute.recordOn, gravity: compute.gravity,
+        gravityScale: compute.gravityScale, lawInputs: compute.lawInputs, uniforms: compute.uniforms, diag: compute.diag,
+        caseTilt: compute.caseTilt, spin: compute.spin, rec: compute.rec && { n: compute.rec.n, pad: compute.rec.pad } },
+      phone: { state: gravitySensor.state, enabled: gravitySensor.enabled, last: gravitySensor.last,
+        rawLast: gravitySensor.rawLast, rawOrientation: gravitySensor.rawOrientation, rawMotion: gravitySensor.rawMotion,
+        lockedAngle: gravitySensor.lockedAngle, screenAngle: screen.orientation?.angle ?? window.orientation },
+      settings, particles: ticketParticles(), local_log: localLogEntries().slice(-100) };
+    let body = ticketJSON(report);
+    while (new Blob([body]).size > 80000 && report.local_log.length) { report.local_log.shift(); body = ticketJSON(report); }
+    if (new Blob([body]).size > 80000) throw new Error("state snapshot exceeds ticket limit");
+    const response = await fetch("/api/tickets", { method: "POST", headers: { "Content-Type": "application/json", "X-Meowdoku-Ticket": "1" }, body });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    resultLine.textContent = `Report sent. Ticket ${result.id}`;
+  } catch (error) { resultLine.textContent = `Report was not sent: ${error.message}`; }
+  finally { button.disabled = false; button.textContent = "Send ticket"; }
+});
 // THE LAYOUT LOCK.  While the phone's tilt drives a compute game's gravity, turning the phone must not re-lay the page out:
 // the world is to be tipped, not re-framed.  Where the browser can hold the orientation (screen.orientation.lock, mostly
 // Android in fullscreen) it does; elsewhere (iOS Safari) the page turns its own body back by the screen's turn, so the

@@ -70,15 +70,18 @@ export class GravitySensor {
   constructor({ onGravity, win = typeof window === "undefined" ? null : window, onState = () => {} }) {
     this.onGravity = onGravity; this.win = win; this.onState = onState;
     this.wanted = true; this.state = "idle"; this.listening = false; this.last = null; this.lockedAngle = null;
+    this.rawLast = null; this.rawOrientation = null; this.rawMotion = null; // diagnostic only: browser values before conversion
     this.ios = !!(win && win.DeviceOrientationEvent && typeof win.DeviceOrientationEvent.requestPermission === "function");
     this.haveOrientation = false;
     this.orient = (e) => {
+      this.rawLast = this.rawOrientation = { source: "deviceorientation", beta: e.beta, gamma: e.gamma, alpha: e.alpha, angle: screenAngle(this.win), at: Date.now() };
       if (e.beta == null || e.gamma == null) return;
       this.haveOrientation = true;
       this.#emit(gravityVector(e.beta, e.gamma, this.#angle()));
     };
     this.motion = (e) => {
       const a = e.accelerationIncludingGravity;
+      this.rawLast = this.rawMotion = { source: "devicemotion", x: a?.x, y: a?.y, z: a?.z, angle: screenAngle(this.win), at: Date.now() };
       if (this.haveOrientation || !a || a.x == null) return;
       this.#emit(gravityFromAcceleration(a.x, a.y, a.z, this.#angle(), !this.ios));
     };

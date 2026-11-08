@@ -182,6 +182,8 @@
   <button id="new">New</button>
   <a href="marble_studio.html" target="_blank" rel="noopener" style="color:var(--fg);background:var(--ctl);border:1px solid var(--line);border-radius:6px;padding:4px 10px;text-decoration:none" title="Design a close-up layered glass cat's-eye marble">Marble studio</a>
   <a id="studio-link" href="studio.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the loading studio: record, view and pick loading animations">Studio</a>  <a id="log-link" href="log.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="the server log, drawn as glyphs">Log</a>
+  <button id="report-ticket" type="button" title="Send the current game state and recent browser log to the server">Report issue</button>
+  <a id="tickets-link" href="tickets.html" target="_blank" rel="noopener" style="display:none; color: var(--fg); background: var(--ctl); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;" title="Review diagnostic tickets">Tickets</a>
 
   <button id="undo">Undo (U)</button>
   <button id="reset">Reset (R)</button>
@@ -244,7 +246,7 @@
   <label title="After a win or a loss, show the result, then start again">Auto restart <input id="autorestart" type="checkbox" checked></label>
   <span id="modes"></span>
   <span id="gamectl"></span>
-  <span id="compact-capture" style="display:none;align-items:center;gap:5px"><button id="capture-candidate">Record compact animation</button><button id="submit-candidate" disabled>Stop and submit</button><small id="capture-candidate-status" aria-live="polite"></small></span>
+  <span id="compact-capture" style="display:none;align-items:center;gap:5px"><button id="capture-candidate">Record compact animation</button><button id="submit-candidate" disabled>Stop and submit</button><button id="report-ticket-toy" type="button">Report issue</button><small id="capture-candidate-status" aria-live="polite"></small></span>
   <span id="hotbars"></span>
   <span id="wordle-opts"></span>
   <label title="Two on-screen thumbsticks: left turns and throttles (double tap: bomb), right climbs and fires while held">Thumbpads <input id="pads" type="checkbox"></label>
@@ -322,6 +324,11 @@
     check();
   })();
 </script>
+<dialog id="ticket-dialog" style="background:#141923;color:#e4eaf4;border:1px solid #56647a;border-radius:10px;max-width:min(90vw,520px);box-shadow:0 15px 60px #0009">
+  <form id="ticket-form"><h2>Report issue</h2><p>The current game state, particle sample, and recent browser log will be attached.</p>
+    <textarea id="ticket-note" rows="4" maxlength="3000" placeholder="What happened?" style="box-sizing:border-box;width:100%;background:#0c0e13;color:inherit;border:1px solid #56647a;border-radius:6px;padding:8px;font:inherit"></textarea>
+    <p id="ticket-result" role="status"></p><button id="ticket-send" type="submit">Send ticket</button> <button id="ticket-cancel" type="button">Close</button></form>
+</dialog>
 <script type="module" src="loading_panel.js"></script>   <!-- [LOADING] first: its fetch wrapper counts the page's downloads -->
 <script type="module" src="lifecycle.js"></script>
 <script type="module" src="local_log.js"></script>

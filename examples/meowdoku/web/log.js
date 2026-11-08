@@ -10,6 +10,7 @@ const MAX_ENTRIES = 20000, POLL_MS = 1500;
 
 const S = { entries: [], lines: [], sources: new Set(SOURCES), terms: [], last: 0, follow: true, fontPx: 18,
             scroll: 0, target: 0, scrollX: 0, maxCols: 0, dirty: true, subst: 0, visibleText: [], error: "" };
+try { S.last = Math.max(0, Number(new URLSearchParams(location.search).get("since")) || 0); } catch { /* ordinary log view starts at zero */ }
 window.__log = S;                                   // for tests and the curious
 
 // ---------------------------------------------------------------- the glyph scene

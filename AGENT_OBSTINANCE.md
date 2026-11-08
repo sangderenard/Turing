@@ -1,5 +1,16 @@
 # Agent Obstinance
 
+## 2026-11-07 — treating an older toy force regression as a gravity leak
+
+The user reported that both oil toys developed a strong, old corner-shove force
+and repeatedly said it was not gravity. The agent instead treated a separate
+Marble Madness to Fountain gravity-state leak as the reported cause and marked
+the toy regression fixed in the work tracker. The leak was real, but that
+inference left the reported failure unresolved and cost repeated clarification.
+The tracker now separates the two issues; a persistent iPhone diagnostic ticket
+path captures the failing runtime before any toy-physics edit. A measured
+device state and force-path trace should have preceded the causal claim.
+
 This is a short record of occasions when an agent was given a narrow,
 unambiguous instruction but substituted its own course of action.  It exists
 to make the cost of that behavior visible and to prevent its repetition.

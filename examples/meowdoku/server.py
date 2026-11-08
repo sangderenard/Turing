@@ -64,6 +64,7 @@ from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_fr
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
+from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
 from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE] immutable saved designs
@@ -339,6 +340,7 @@ class Sessions:
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(web_dir.parent / "marble_objects")
         self.marble_photos = marble_photo_mod.PhotoJobs(web_dir.parent / "marble_photos", ROOT.parent / "spectral-analyzer")
+        self.tickets = tickets_mod.Store(web_dir.parent / "tickets")
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
         self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
@@ -695,6 +697,17 @@ def make_handler(sessions: Sessions):
                 return
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
                 return self._log_get()
+            if path == "/api/tickets":
+                if not access_mod.require_tier(self, "dev"):
+                    return
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                from urllib.parse import parse_qs
+                ticket_id = (parse_qs(self.path.partition("?")[2]).get("id") or [None])[0]
+                try:
+                    return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
+                except (ValueError, FileNotFoundError):
+                    return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
@@ -965,6 +978,35 @@ def make_handler(sessions: Sessions):
                 print(f"[client-error] {self.client_address[0]}: {line}", flush=True)
                 self.send_response(204); self.end_headers()
                 return
+            if path0 in ("/api/tickets", "/api/tickets/status"):
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not access_mod.require_tier(self, "edit" if path0.endswith("/status") else "play"):
+                    return
+                if self.headers.get("X-Meowdoku-Ticket") != "1":
+                    self.close_connection = True
+                    return self._json({"error": "missing ticket header"}, HTTPStatus.FORBIDDEN)
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > tickets_mod.MAX_BYTES:
+                    self.close_connection = True
+                    return self._json({"error": "ticket is too large or empty"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                    if path0.endswith("/status"):
+                        result = sessions.tickets.update(payload.get("id"), payload.get("status"), payload.get("note", ""))
+                        return self._json(result)
+                    table = self._table()
+                    with table.lock:
+                        game = table.state()
+                    server_state = {k: game.get(k) for k in ("game", "player", "board", "level", "status", "phase", "tick") if k in game}
+                    result = sessions.tickets.submit(payload, peer=self.client_address[0], tier=self._tier,
+                                                     server_state=server_state, log_seq=logring_mod.RING.seq)
+                    print(f"[ticket] {result['id']} from {self.client_address[0]}", flush=True)
+                    return self._json(result, HTTPStatus.CREATED)
+                except (ValueError, TypeError, json.JSONDecodeError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                except FileNotFoundError:
+                    return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path0 in ("/api/loading_anim", "/api/loading_candidate") and not self._is_viewer():
                 return self._anim_post(int(self.headers.get("Content-Length") or 0), temporary=path0.endswith("candidate"))
             if path0 == "/api/marble_objects" and not self._is_viewer():
