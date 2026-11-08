@@ -34,7 +34,7 @@ import { EMOJI_ASSIGN, EMOJI_ASSIGN_IDS, EMOJI_OPTIONS } from "./particle_styles
 import { ALL_STYLES, PAGE_STYLES, DEFAULT_STYLE, capabilitiesOf, chooseStyle, styleAvailability, resolveColorSource, COLOR_SOURCES, DEFAULT_COLOR, PALETTE_IDS, MATERIAL_BUDGET, extendForInstancing, extendForOit, isGlass } from "./particle_styles.js";
 import { verifySavedMarbleObject } from "./marble_object.js";
 import { NOISE_DEFAULTS, NOISE_MODES, chooseNoise } from "./noise_filter.js";
-import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection } from "./gravity.js";
+import { GravitySensor, layoutTransform, screenAngle, caseModel, unrotateDirection, fountainGravitySource } from "./gravity.js";
 import { decodeSnapshot, SNAPSHOT_PROTOCOL, FLAG_CLEAR, BodyFlight, BODY_CORES } from "./bodies.js";
 import { shipStepper, cannonAimer, PilotTimeline, pilotControls as intervalControls } from "./pilot_timeline.js";
 import { LawClock } from "./pilot_clock.js";
@@ -5079,7 +5079,12 @@ function applyState(game, { meta = false } = {}) {
       marbleCase.gravity = [0, 0, -1];
       compute.setGravity(...marbleCase.gravity);
     }
-  } else if (previous?.game === "marble_madness") compute.setGravityScale(gravityScale);
+  } else if (previous?.game === "marble_madness") {
+    compute.setGravityScale(gravityScale);
+    compute.setSpin(cameraGravity ? 0 : caseSpin, spinMotion);
+    applyCaseTilt();
+    compute.setGravity(...(fountainGravitySource(cameraGravity, gravitySensor.enabled, gravitySensor.last) || [null]));
+  }
   tipjar.update(game);                               // TIP JAR: its panel (hidden for every other game)
   mobroad.update(game);                              // [MOBROAD] its status overlay (hidden for every other game)
   mobroad.state = state;

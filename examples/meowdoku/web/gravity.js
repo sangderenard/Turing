@@ -40,6 +40,13 @@ export function gravityFromAcceleration(ax, ay, az, angle = 0, reaction = true) 
   return [v[0], v[1], v[2]];
 }
 
+// On leaving a game that owns the gravity vector, restore the fountain's
+// active source. Null means the compute spec's authored gravity (straight
+// down); camera-down is written from the current view on the next frame.
+export function fountainGravitySource(cameraGravity, sensorEnabled, sensorLast) {
+  return !cameraGravity && sensorEnabled && sensorLast ? sensorLast : null;
+}
+
 // screen.orientation.angle where there is one (iOS before 16.4 has only window.orientation)
 export function screenAngle(w) {
   if (!w) return 0;
