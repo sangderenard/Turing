@@ -206,6 +206,12 @@ async function saveObject() {
   const geometry=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
     {coated:coatedId,paintA:paintAId,paintB:paintBId}));
   const geometryHash=await geometrySha256(geometry);
+  design.mesh_lods={};
+  for(const detail of ["medium","low"]) {
+    const lod=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
+      {coated:coatedId,paintA:paintAId,paintB:paintBId}),{detail});
+    design.mesh_lods[detail]=await geometrySha256(lod);
+  }
   if(geometryHash!==await geometrySha256(lastGeometry))rebuild();
   reportMass(geometry);
   const value={v:MARBLE_OBJECT_VERSION,name:$("object-name").value.trim(),

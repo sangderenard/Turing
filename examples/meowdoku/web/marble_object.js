@@ -111,6 +111,14 @@ export function massFromSavedMarbleObject(snapshot,geometry) {
 export async function verifySavedMarbleObject(snapshot) {
   const geometry=geometryFromSavedMarbleObject(snapshot),digest=await geometrySha256(geometry);
   if(digest!==snapshot.geometry_sha256)throw new Error("saved mesh recipe no longer matches its triangles");
+  const lods={};
+  for(const detail of ["medium","low"]) {
+    const mesh=geometryFromSavedMarbleObject(snapshot,{detail});
+    const expected=snapshot.design.mesh_lods?.[detail];
+    if(expected && await geometrySha256(mesh)!==expected)
+      throw new Error(`saved ${detail} mesh recipe no longer matches its triangles`);
+    lods[detail]=mesh;
+  }
   const mass=massFromSavedMarbleObject(snapshot,geometry),expected=snapshot.derived;
   const near=(a,b)=>Math.abs(a-b)<=Math.max(1e-12,Math.abs(b)*1e-6);
   if(!near(mass.massKg,expected.massKg)||
@@ -118,5 +126,5 @@ export async function verifySavedMarbleObject(snapshot) {
       mass.inertiaKgM2.some((row,i)=>row.some((x,j)=>!near(x,expected.inertiaKgM2[i][j])))||
       mass.massExact!==expected.massExact)
     throw new Error("saved mass or moment of inertia no longer matches the mesh");
-  return {geometry,mass};
+  return {geometry,mass,lods};
 }

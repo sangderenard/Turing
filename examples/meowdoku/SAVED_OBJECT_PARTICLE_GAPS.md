@@ -1,6 +1,6 @@
 # Saved Studio objects in the particle law
 
-The current Fountain/Marble Madness law accepts a **sphere approximation** of a saved marble or die. The displayed object can use its complete generated triangle mesh and material records; those triangles do not define contacts or inertia in the compiled law. This distinction must remain visible in the selector.
+The current Fountain/Marble Madness law accepts a **sphere approximation** of a saved marble or die. The displayed object uses instanced full, medium, or low geometry generated from the same saved recipe and material records. Saving records hashes for each detail level; rendering chooses detail from the submitted instance count and never changes to colored points merely because the triangle count is high. Instancing shares vertex storage and draw setup, but the GPU still shades each triangle for every instance, so very dense runs may be slow. These triangles do not define contacts or inertia in the compiled law. This distinction must remain visible in the selector.
 
 ## Fields the current law accepts
 

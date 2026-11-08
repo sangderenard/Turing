@@ -1,5 +1,6 @@
 import { buildMarbleObjectGeometry, geometryFromSavedMarbleObject, geometrySha256,
   massFromSavedMarbleObject, verifySavedMarbleObject } from "../examples/meowdoku/web/marble_object.js";
+import { designedMeshPlan } from "../examples/meowdoku/web/particle_styles.js";
 const assert=(ok,message)=>{if(!ok)throw new Error(message);};
 const index={marble_clear_glass:1,marble_cat_eye_blue:2,marble_milk_glass:3,
   metal_gold:4,stone_onyx:5};
@@ -22,12 +23,21 @@ const snapshot={v:1,name:"Clear D6",generator:"meowdoku-marble-object-v1",design
   materials:{index,extra,tables},physical};
 const ids={shell:1,eye:2,accent:3,confetti:4,mark:5,...extra};
 const geometry=buildMarbleObjectGeometry(design,ids),digest=await geometrySha256(geometry);
+design.mesh_lods={};
+for(const detail of ["medium","low"])
+  design.mesh_lods[detail]=await geometrySha256(buildMarbleObjectGeometry(design,ids,{detail}));
 snapshot.geometry_sha256=digest;
 snapshot.derived=massFromSavedMarbleObject(snapshot,geometry);
 const restored=JSON.parse(JSON.stringify(snapshot));
 const verified=await verifySavedMarbleObject(restored);
 assert(verified.geometry.triangleCount===geometry.triangleCount,"full mesh recipe roundtrip");
 assert(verified.mass.massKg===snapshot.derived.massKg,"mass receipt roundtrip");
+assert(verified.lods.medium.triangleCount<geometry.triangleCount,"medium LOD generated from saved recipe");
+assert(verified.lods.low.triangleCount<verified.lods.medium.triangleCount,"low LOD generated from saved recipe");
+const modeled={count:geometry.triangleCount*3,lods:{medium:{count:verified.lods.medium.triangleCount*3},low:{count:verified.lods.low.triangleCount*3}}};
+assert(designedMeshPlan({ready:true,designedMesh:modeled,count:1}).lod==="full","one object keeps the full mesh");
+const crowded=designedMeshPlan({ready:true,designedMesh:modeled,count:4096});
+assert(crowded.ok&&crowded.lod==="low","4k objects keep an instanced mesh instead of points");
 const low=geometryFromSavedMarbleObject(restored,{detail:"low"});
 assert(low.triangleCount<geometry.triangleCount,"low detail retains source design");
 assert(new Set(low.interior.map(f=>f[3])).size===new Set(geometry.interior.map(f=>f[3])).size,
@@ -35,4 +45,7 @@ assert(new Set(low.interior.map(f=>f[3])).size===new Set(geometry.interior.map(f
 const altered=JSON.parse(JSON.stringify(restored));altered.design["dice-bevel"]=80;
 let rejected=false;try{await verifySavedMarbleObject(altered);}catch(e){rejected=/mesh recipe/.test(e.message);}
 assert(rejected,"changed die geometry must fail digest verification");
+const badLod=JSON.parse(JSON.stringify(restored));badLod.design.mesh_lods.low="0".repeat(64);
+rejected=false;try{await verifySavedMarbleObject(badLod);}catch(e){rejected=/low mesh recipe/.test(e.message);}
+assert(rejected,"changed LOD receipt must fail verification");
 console.log(`saved object roundtrip: ${geometry.triangleCount} full / ${low.triangleCount} low triangles, verified moments`);

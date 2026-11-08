@@ -1817,7 +1817,7 @@ function litMesh(faces, uvOf) {
 }
 // The saved recipe is the geometry authority.  Install its full generated
 // triangles in the same material tables and Phong path as every scene mesh.
-const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, mesh: null, note: "" };
+const savedParticle = { entries: [], digest: "", snapshot: null, geometry: null, lods: null, mesh: null, note: "" };
 // Marble Madness can override the exterior's light response at the material-table seam.
 // The interior keeps every material authored in Studio.
 function marbleBaseLight(tables, id) {
@@ -1834,8 +1834,9 @@ function marbleBaseLight(tables, id) {
 function installSavedParticle(tables) {
   const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
   if (!snapshot || !geometry) return;
-  const faces = [...geometry.interior, ...geometry.glass];
-  const source = snapshot.materials.tables, used = [...new Set(faces.map((face) => face[3]))].sort((a, b) => a - b);
+  const levels = { full: geometry, medium: savedParticle.lods?.medium, low: savedParticle.lods?.low };
+  const allFaces = Object.values(levels).filter(Boolean).flatMap((level) => [...level.interior, ...level.glass]);
+  const source = snapshot.materials.tables, used = [...new Set(allFaces.map((face) => face[3]))].sort((a, b) => a - b);
   const remap = new Map();
   for (const id of used) {
     if (!Number.isInteger(id) || id < 0) throw new Error(`saved object has invalid material ${id}`);
@@ -1851,26 +1852,35 @@ function installSavedParticle(tables) {
     if (id === shell || id === snapshot.materials.extra?.coated) marbleBaseLight(tables, next);
     remap.set(id, next);
   }
-  const mapped = faces.map((face) => [face[0], face[1], face[2], remap.get(face[3]), face[4]]);
   const old = savedParticle.mesh;
-  if (old) for (const part of [old.opaque, old.glass]) if (part) {
+  const oldLevels = old ? [old, old.lods?.medium, old.lods?.low] : [];
+  for (const level of oldLevels) for (const part of [level?.opaque, level?.glass]) if (part) {
     state.vaoMaterials.delete(part.vao); gl.deleteVertexArray(part.vao); for (const buffer of part.buffers) gl.deleteBuffer(buffer);
   }
   const alpha = (face) => {
     const at = face[3] * tables.pbr.floats_per_record, pbr = tables.pbr.data;
     return Math.min(pbr[at + 7], 1 - 0.8 * pbr[at + 5]); // Pluck's effective alpha under transmission
   };
-  const opaqueFaces = mapped.filter((face) => !isGlass(alpha(face)));
-  const glassFaces = mapped.filter((face) => isGlass(alpha(face)));
-  const opaque = opaqueFaces.length ? { ...litMesh(opaqueFaces), array: true } : null;
-  const glass = glassFaces.length ? { ...litMesh(glassFaces), array: true } : null;
-  const vertices = mapped.flatMap((face) => face.slice(0, 3));
-  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
-  for (const v of vertices) for (let k = 0; k < 3; k++) { low[k] = Math.min(low[k], v[k]); high[k] = Math.max(high[k], v[k]); }
-  const center = low.map((v, k) => (v + high[k]) * 0.5);
-  let radius = 0;
-  for (const v of vertices) radius = Math.max(radius, Math.hypot(v[0] - center[0], v[1] - center[1], v[2] - center[2]));
-  savedParticle.mesh = { opaque, glass, count: mapped.length * 3, center, scale: 1 / Math.max(radius, 1e-6) };
+  const uploadLevel = (level) => {
+    if (!level) return null;
+    const mapped = [...level.interior, ...level.glass].map((face) => [face[0], face[1], face[2], remap.get(face[3]), face[4]]);
+    const opaqueFaces = mapped.filter((face) => !isGlass(alpha(face)));
+    const glassFaces = mapped.filter((face) => isGlass(alpha(face)));
+    const opaque = opaqueFaces.length ? { ...litMesh(opaqueFaces), array: true } : null;
+    const glass = glassFaces.length ? { ...litMesh(glassFaces), array: true } : null;
+    const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+    for (const face of mapped) for (const v of face.slice(0, 3)) for (let k = 0; k < 3; k++) {
+      low[k] = Math.min(low[k], v[k]); high[k] = Math.max(high[k], v[k]);
+    }
+    const center = low.map((v, k) => (v + high[k]) * 0.5);
+    let radius = 0;
+    for (const face of mapped) for (const v of face.slice(0, 3))
+      radius = Math.max(radius, Math.hypot(v[0] - center[0], v[1] - center[1], v[2] - center[2]));
+    return { opaque, glass, count: mapped.length * 3, center, scale: 1 / Math.max(radius, 1e-6) };
+  };
+  const full = uploadLevel(levels.full);
+  full.lods = { medium: uploadLevel(levels.medium), low: uploadLevel(levels.low) };
+  savedParticle.mesh = full;
 }
 async function refreshSavedParticleList() {
   try {
@@ -1884,11 +1894,11 @@ async function refreshSavedParticleList() {
 }
 async function selectSavedParticle(digest) {
   if (share.share.viewOnly) throw new Error("a view-only session cannot change particle physics or render selection");
-  if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.mesh = null; refreshLocalControls(); return; }
+  if (!digest) { savedParticle.digest = ""; savedParticle.snapshot = null; savedParticle.geometry = null; savedParticle.lods = null; savedParticle.mesh = null; refreshLocalControls(); return; }
   const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
   const snapshot = await response.json();
-  const { geometry } = await verifySavedMarbleObject(snapshot);
+  const { geometry, lods } = await verifySavedMarbleObject(snapshot);
   const physical = snapshot.physical;
   const values = { r0: physical["sim-radius"], rho0: physical["sim-rho"], mu0: physical["sim-mu"],
                    e0: physical["sim-e"], roll0: physical["sim-roll"], irr0: physical["sim-irr"] };
@@ -1898,7 +1908,7 @@ async function selectSavedParticle(digest) {
     const [min, max] = ranges[name];
     if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} outside native law range ${min}–${max}`);
   }
-  savedParticle.digest = digest; savedParticle.snapshot = snapshot; savedParticle.geometry = geometry;
+  savedParticle.digest = digest; savedParticle.snapshot = snapshot; savedParticle.geometry = geometry; savedParticle.lods = lods;
   uploadMaterials(state.game);
   particleStyle = "designed";
   try { localStorage.setItem("meowdoku.pstyle", particleStyle); } catch { /* storage may be blocked */ }
@@ -1911,7 +1921,7 @@ async function selectSavedParticle(digest) {
   });
   chain = step.catch((error) => console.warn("[meow] saved particle law", error));
   await step;
-  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: ${Math.round(savedParticle.mesh.count / 3).toLocaleString()} triangles per grain; the full mesh fits up to ${Math.floor(MATERIAL_BUDGET.maxTriangles / (savedParticle.mesh.count / 3)).toLocaleString()} visible grains at the current frame budget. Above that, colored points are drawn. Sphere contact and scalar moment in current law.`;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: instanced full/medium/low meshes (${[savedParticle.mesh, savedParticle.mesh.lods.medium, savedParticle.mesh.lods.low].map((level) => Math.round(level.count / 3).toLocaleString()).join(" / ")} triangles). Sphere contact and scalar moment in current law.`;
   refreshLocalControls();
 }
 const MARBLE = { mesh: null, key: "" };

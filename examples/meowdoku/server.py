@@ -477,7 +477,11 @@ def make_handler(sessions: Sessions):
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
             if not getattr(self, "path", "").startswith("/api/"):
-                self.send_header("Cache-Control", "no-cache")          # the page is edited live
+                path = getattr(self, "path", "").split("?", 1)[0]
+                self.send_header("Cache-Control", "no-store" if path in
+                                 ("/marble_studio.html", "/marble_studio.js", "/marble_object.js",
+                                  "/marble_mesh.js", "/dice_mesh.js", "/marble_photo.js", "/particle_styles.js")
+                                 else "no-cache")  # actively edited pages must revalidate
             super().end_headers()
 
         def _socket(self):

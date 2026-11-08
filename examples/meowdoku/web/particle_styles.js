@@ -84,7 +84,7 @@ export function chooseStyle(requested, caps, broken = {}, scene = null) {
     if (spec.designed) {
       const plan = designedMeshPlan(scene);
       if (!plan.ok) return instead(plan.reason);
-      return { style: id, requested: id, reason: plan.note };
+      return { style: id, requested: id, reason: plan.note, lod: plan.lod };
     }
     if (spec.emojiMesh) {
       const plan = emojiMeshPlan({ ...scene, budget, force: EMOJI_OPTIONS.forceMesh });
@@ -350,15 +350,18 @@ export function materialPlan({ ready = true, count = 0, radiusPx = 4, budget = M
   return { ok: true, lod, tris: SPHERE_TRIS[lod], note: `${count.toLocaleString("en-US")} grains as ${SPHERE_TRIS[lod]}-triangle spheres` };
 }
 
-// A saved object is always drawn from its generated triangle mesh.  Do not quietly
-// replace it with a sphere or a point when the full mesh exceeds the frame budget.
+// The triangle budget chooses an authored mesh detail level; it never replaces
+// a selected object with points because the instanced triangle count is high.
 export function designedMeshPlan({ ready = false, designedMesh = null, count = 0 } = {}) {
   if (!ready) return { ok: false, reason: "the scene's instanced Phong shader is unavailable" };
   if (!designedMesh || !designedMesh.count) return { ok: false, reason: "select a saved marble or die first" };
-  const triangles = designedMesh.count / 3 * count;
-  if (triangles > MATERIAL_BUDGET.maxTriangles)
-    return { ok: false, reason: `${Math.round(triangles).toLocaleString("en-US")} modeled triangles exceed this device's ${MATERIAL_BUDGET.maxTriangles.toLocaleString("en-US")} triangle budget` };
-  return { ok: true, note: `${count.toLocaleString("en-US")} fully modeled objects; ${Math.round(triangles).toLocaleString("en-US")} triangles` };
+  let lod = "full", mesh = designedMesh;
+  for (const detail of ["medium", "low"]) {
+    if (mesh.count / 3 * count <= MATERIAL_BUDGET.maxTriangles) break;
+    if (designedMesh.lods?.[detail]) { lod = detail; mesh = designedMesh.lods[detail]; }
+  }
+  const triangles = mesh.count / 3 * count;
+  return { ok: true, lod, note: `${count.toLocaleString("en-US")} modeled objects · ${lod} detail · ${Math.round(triangles).toLocaleString("en-US")} instanced triangles` };
 }
 
 // ---------------------------------------------------------------- emoji style (pure)
@@ -971,7 +974,7 @@ export class ParticleStyles {
       else if (choice.style === "material" || choice.style === "stained" || choice.style === "stained_fast") this.#material(ctx, choice, choice.style);
       else if (choice.style === "emoji") this.#emoji(ctx, guard);
       else if (choice.style === "emoji_mesh") this.#emojiMesh(ctx, choice);
-      else if (choice.style === "designed") this.#designedMesh(ctx);
+      else if (choice.style === "designed") this.#designedMesh(ctx, choice);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       this.broken[choice.style] = error.message; this.fallback = `${choice.style} unavailable (${error.message}): showing points`;
@@ -1066,12 +1069,9 @@ export class ParticleStyles {
       const eye = -(view[2] * ctx.board[0] * 0.5 + view[6] * ctx.y + view[10] * ctx.board[1] * 0.5 + view[14]);
       radiusPx = typicalRadius(ctx.data) * ctx.map[2] * ctx.focal * ctx.H / 2 / sizeDepth(c.proj || PERSPECTIVE_W, -eye);       // [CURVE] clip.w: the eye depth, 1 under an orthographic projection
     }
-    let liveCount = ctx.n;
-    if (ctx.scene && ctx.scene.designedMesh) {
-      liveCount = 0;
-      for (let i = 0; i < ctx.n; i++) if (ctx.data[5 * i + 4] >= 50) liveCount++;
-    }
-    const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: liveCount, radiusPx,
+    // The draw submits ctx.n instances, including parked law IDs, so detail
+    // selection must use that submitted count rather than only live grains.
+    const out = { ready: !!(ctx.scene && ctx.scene.instancing && ctx.scene.program), count: ctx.n, radiusPx,
       designedMesh: ctx.scene && ctx.scene.designedMesh };
     const tris = this.#emojiTris(ctx.scene);
     if (tris) out.tris = tris;
@@ -1421,8 +1421,9 @@ export class ParticleStyles {
     return vao;
   }
 
-  #designedMesh(ctx) {
-    const gl = this.gl, mesh = ctx.scene.designedMesh;
+  #designedMesh(ctx, choice) {
+    const gl = this.gl, original = ctx.scene.designedMesh;
+    const mesh = !choice.lod || choice.lod === "full" ? original : original?.lods?.[choice.lod];
     if (!mesh || !mesh.count) throw new Unavailable("no saved object mesh is loaded");
     const held = this.#sceneBegin(ctx), at = (name) => gl.getUniformLocation(ctx.scene.program, name);
     gl.uniform1f(at("uInstRot"), 2);
