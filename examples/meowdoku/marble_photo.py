@@ -236,7 +236,7 @@ class PhotoJobs:
             with self.lock:
                 if self.active_digest == digest:
                     status = self._status_locked(digest)
-                    if status["state"] in ("preparing", "exposing", "complete"):
+                    if status["state"] in ("preparing", "exposing", "encoding", "complete"):
                         return status
                 self._stop_locked()
                 self.active_digest = None
