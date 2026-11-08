@@ -26,6 +26,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   const config = {
     object_digest: objectDigest,
     exposure_seconds: options.seconds ?? 600,
+    orbit_frames: options.orbitFrames ?? 1,
     transport: options.transport ?? "fixed:3",
     scale_m: 0.025,
     object_center_m: OBJECT_CENTER,
@@ -64,19 +65,53 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
 
 export function createMarblePhoto(doc = document, currentCamera = null) {
   const $ = (id) => doc.getElementById(id);
-  const state = { objectDigest: null, jobDigest: null, timer: null, generation: 0 };
+  const state = { objectDigest: null, jobDigest: null, lastDigest: null, timer: null, generation: 0,
+    frames: [], selectedFrame: null, playTimer: null };
   const status = (value) => { $("photo-status").textContent = value; };
   const stopPolling = () => { if (state.timer) clearTimeout(state.timer); state.timer = null; };
+  const stopPlayback = () => {
+    if (state.playTimer) clearInterval(state.playTimer);
+    state.playTimer = null;
+    $("photo-play").textContent = "Play orbit";
+  };
+  const clearFrames = () => {
+    stopPlayback(); state.frames = []; state.selectedFrame = null;
+    $("photo-frames").replaceChildren(); $("photo-frames").hidden = true;
+    $("photo-play").hidden = true; $("photo-animation").hidden = true;
+  };
+  const showFrame = (frame, digest) => {
+    state.selectedFrame = frame.index;
+    const imageUrl = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(frame.image)}`;
+    $("photo-image").src = imageUrl;
+    $("photo-full").href = imageUrl; $("photo-full").hidden = false;
+    const hdr = $("photo-hdr");
+    hdr.hidden = !frame.hdr;
+    if (frame.hdr) { hdr.href = `/api/marble_photo/hdr?digest=${digest}&name=${encodeURIComponent(frame.hdr)}`; hdr.download = frame.hdr; }
+    $("photo-caption").textContent = `Orbit frame ${frame.index + 1} of ${state.frames.length}`;
+  };
+  const renderFrames = (frames, digest) => {
+    if (frames.length === state.frames.length) return;
+    state.frames = frames;
+    const strip = $("photo-frames"); strip.replaceChildren(); strip.hidden = frames.length < 2;
+    $("photo-play").hidden = frames.length < 2;
+    for (const frame of frames) {
+      const button = doc.createElement("button"); button.type = "button";
+      button.textContent = String(frame.index + 1); button.title = `View orbit frame ${frame.index + 1}`;
+      button.addEventListener("click", () => { stopPlayback(); showFrame(frame, digest); });
+      strip.append(button);
+    }
+  };
   const setButtons = () => {
     $("photo-start").disabled = !state.objectDigest;
     $("photo-cancel").disabled = !state.jobDigest;
   };
   const cancel = async () => {
     const digest = state.jobDigest;
-    state.jobDigest = null; state.generation++; stopPolling(); setButtons();
+    state.jobDigest = null; state.generation++; stopPolling(); stopPlayback(); setButtons();
     if (digest) {
       $("photo-hdr").hidden = true;
       $("photo-full").hidden = true;
+      clearFrames();
       await fetch("/api/marble_photo/cancel", { method: "POST",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) });
       status("Exposure canceled. The Phong preview remains interactive.");
@@ -86,11 +121,12 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     if (!state.objectDigest) return;
     state.objectDigest = null;
     const digest = state.jobDigest;
-    state.jobDigest = null; state.generation++; stopPolling(); setButtons();
+    state.jobDigest = null; state.generation++; stopPolling(); stopPlayback(); setButtons();
     if (digest) fetch("/api/marble_photo/cancel", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest }) }).catch(() => {});
     $("photo-hdr").hidden = true;
     $("photo-full").hidden = true;
+    clearFrames();
     if (!$("photo-panel").hidden) $("photo-caption").textContent = "Photo of the previous saved design";
     status("Design changed. Save it again before exposing another photo.");
   };
@@ -98,11 +134,11 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     if (!hexDigest.test(digest)) throw new Error("invalid saved object digest");
     if (state.objectDigest !== digest && state.jobDigest) {
       const prior = state.jobDigest;
-      state.jobDigest = null; state.generation++; stopPolling();
+      state.jobDigest = null; state.generation++; stopPolling(); stopPlayback();
       fetch("/api/marble_photo/cancel", { method: "POST",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ digest: prior }) }).catch(() => {});
     }
-    state.objectDigest = digest; setButtons();
+    state.objectDigest = digest; clearFrames(); setButtons();
     status(`Saved design ${digest.slice(0, 12)} is ready for a thin-lens photograph.`);
   };
   const poll = async (digest, generation) => {
@@ -112,24 +148,34 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
       const value = await response.json();
       if (!response.ok) throw new Error(value.error || `photo status HTTP ${response.status}`);
       if (state.jobDigest !== digest || generation !== state.generation) return;
+      renderFrames(value.frames || [], digest);
       if (value.image) {
         $("photo-panel").hidden = false;
         const imageUrl = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(value.image)}`;
-        $("photo-image").src = imageUrl;
-        $("photo-full").href = imageUrl;
-        $("photo-full").hidden = false;
-        $("photo-caption").textContent = `${value.transport || "Fixed-line"} · ${Math.round(value.elapsed_seconds || 0)} s exposure`;
+        if (state.selectedFrame === null) {
+          $("photo-image").src = imageUrl;
+          $("photo-full").href = imageUrl;
+          $("photo-full").hidden = false;
+          $("photo-caption").textContent = `${value.transport || "Fixed-line"} · frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} · ${Math.round(value.frame_elapsed_seconds || value.elapsed_seconds || 0)} s`;
+        }
       }
-      if (value.hdr) {
+      if (value.hdr && state.selectedFrame === null) {
         const link = $("photo-hdr");
         link.href = `/api/marble_photo/hdr?digest=${digest}&name=${encodeURIComponent(value.hdr)}`;
         link.download = value.hdr;
         link.hidden = false;
       }
-      status(value.state === "complete" ? `Photo complete · ${Math.round(value.elapsed_seconds || 0)} s exposure` :
+      if (value.animation) {
+        const link = $("photo-animation");
+        link.href = `/api/marble_photo/animation?digest=${digest}`;
+        link.title = `Available until ${new Date(value.animation_expires_at * 1000).toLocaleString()}`;
+        link.hidden = false;
+      }
+      status(value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${$("photo-seconds").value} s exposure per frame` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
-            `Exposing on GPU · ${Math.round(value.elapsed_seconds || 0)} s · ${(value.forward_ray_jobs || 0).toLocaleString()} ray jobs`);
+            value.state === "encoding" ? "Encoding the orbit with Turing's JPEG AVI writer…" :
+              `Exposing frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} on GPU · ${Math.round(value.frame_elapsed_seconds || 0)} s · ${(value.forward_ray_jobs || 0).toLocaleString()} ray jobs`);
       if (value.state === "complete" || value.state === "error" || value.state === "canceled") {
         state.jobDigest = null; setButtons(); return;
       }
@@ -143,23 +189,35 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     if (state.jobDigest) await cancel();
     const body = packMarblePhoto(geometry, state.objectDigest, {
       resolution: +$("photo-resolution").value, seconds: +$("photo-seconds").value,
+      orbitFrames: +$("photo-orbit-frames").value,
       transport: $("photo-transport").value,
       ...($("photo-camera").value === "studio" ? currentCamera?.() : {}),
     });
     $("photo-hdr").hidden = true;
     $("photo-full").hidden = true;
+    clearFrames();
     status(`Uploading ${geometry.triangleCount.toLocaleString()} saved triangles…`);
     const response = await fetch("/api/marble_photo", { method: "POST",
       headers: { "Content-Type": "application/octet-stream" }, body });
     const value = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(value.error || `photo HTTP ${response.status}`);
     if (!hexDigest.test(value.digest)) throw new Error("photo server returned no digest");
-    state.jobDigest = value.digest; const generation = ++state.generation;
+    state.jobDigest = state.lastDigest = value.digest; const generation = ++state.generation;
     $("photo-panel").hidden = false;
     $("photo-caption").textContent = "Preparing thin-lens photograph…";
     setButtons(); poll(value.digest, generation);
   };
   $("photo-cancel").addEventListener("click", () => cancel().catch((error) => status(error.message || String(error))));
+  $("photo-play").addEventListener("click", () => {
+    if (state.playTimer) { stopPlayback(); return; }
+    if (state.frames.length < 2) return;
+    $("photo-play").textContent = "Pause orbit";
+    let index = state.selectedFrame == null ? -1 : state.selectedFrame;
+    state.playTimer = setInterval(() => {
+      index = (index + 1) % state.frames.length;
+      showFrame(state.frames[index], state.jobDigest || state.lastDigest);
+    }, 125);
+  });
   setButtons();
   return { start, stale, saved, status };
 }

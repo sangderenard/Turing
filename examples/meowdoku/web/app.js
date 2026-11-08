@@ -1911,7 +1911,7 @@ async function selectSavedParticle(digest) {
   });
   chain = step.catch((error) => console.warn("[meow] saved particle law", error));
   await step;
-  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: modeled appearance; sphere contact and scalar moment in current law`;
+  savedParticle.note = `${snapshot.name || digest.slice(0, 8)}: ${Math.round(savedParticle.mesh.count / 3).toLocaleString()} triangles per grain; the full mesh fits up to ${Math.floor(MATERIAL_BUDGET.maxTriangles / (savedParticle.mesh.count / 3)).toLocaleString()} visible grains at the current frame budget. Above that, colored points are drawn. Sphere contact and scalar moment in current law.`;
   refreshLocalControls();
 }
 const MARBLE = { mesh: null, key: "" };
@@ -5740,8 +5740,9 @@ function refreshLocalControls() {
         option.disabled = !av.ok; option.textContent = av.ok ? base : `${base} (unavailable here)`; option.title = av.note;
       }
       const drawn = cloud && cloud.styles.fallback;
-      for (const option of select.options) if (option.value === "material" && option.dataset.label) {
-        option.textContent = drawn && particleStyle === "material" && option.disabled === false ? `${option.dataset.label} (drawing sand: see tooltip)` : option.dataset.label;
+      for (const option of select.options) if ((option.value === "material" || option.value === "designed") && option.dataset.label) {
+        const fallback = option.value === "designed" ? "colored points" : "sand";
+        option.textContent = drawn && particleStyle === option.value && option.disabled === false ? `${option.dataset.label} (drawing ${fallback}: see tooltip)` : option.dataset.label;
       }
       select.value = particleStyle;
       const glassInfo = cloud && cloud.styles.glassInfo;     // how the glass grains were composited in the last frame (OIT, or alpha and why)

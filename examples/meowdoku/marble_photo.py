@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -63,7 +64,7 @@ def _number(value: object, low: float, high: float, name: str) -> float:
 def _config(value: dict, saved: dict) -> tuple[dict, float]:
     if value.get("object_digest") != saved["digest"]:
         raise PhotoError("photo request does not name the saved object")
-    seconds = _number(value.get("exposure_seconds", 180), 1, 600, "exposure_seconds")
+    seconds = _number(value.get("exposure_seconds", 180), 1, 3600, "exposure_seconds")
     transport = str(value.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise PhotoError("transport must be fixed:1 or fixed:3")
@@ -71,9 +72,12 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
     checker_in = value.get("checker", {})
     if not isinstance(camera_in, dict) or not isinstance(checker_in, dict):
         raise PhotoError("camera and checker must be objects")
-    resolution = int(_number(camera_in.get("resolution", 256), 128, 512, "resolution"))
-    if resolution not in (128, 256, 512):
-        raise PhotoError("resolution must be 128, 256, or 512")
+    resolution = int(_number(camera_in.get("resolution", 256), 128, 2048, "resolution"))
+    if resolution not in (128, 256, 512, 768, 1024, 2048):
+        raise PhotoError("resolution must be 128, 256, 512, 768, 1024, or 2048")
+    orbit_frames = int(_number(value.get("orbit_frames", 1), 1, 32, "orbit_frames"))
+    if orbit_frames not in (1, 8, 16, 32):
+        raise PhotoError("orbit_frames must be 1, 8, 16, or 32")
     camera = {
         "resolution": resolution,
         "eye_m": _finite_vectors(camera_in.get("eye_m", [0, 0, .07]), 3, "camera.eye_m"),
@@ -112,6 +116,7 @@ def _config(value: dict, saved: dict) -> tuple[dict, float]:
         "object_digest": saved["digest"],
         "geometry_sha256": saved["geometry_sha256"],
         "exposure_seconds": seconds,
+        "orbit_frames": orbit_frames,
         "transport": transport,
         "scale_m": scale,
         "object_center_m": _finite_vectors(value.get("object_center_m", [0, 0, .18]), 3, "object_center_m"),
@@ -177,6 +182,35 @@ class PhotoJobs:
         self.lock = threading.Lock()
         self.active_digest: str | None = None
         self.process: subprocess.Popen | None = None
+        self._sweep_stop = threading.Event()
+        self._sweeper = threading.Thread(target=self._sweep_animations, daemon=True, name="marble-photo-expiry")
+        self._sweeper.start()
+
+    def _sweep_animations(self) -> None:
+        while not self._sweep_stop.is_set():
+            with self.lock:
+                self._expire_animations_locked()
+            self._sweep_stop.wait(60)
+
+    def _expire_animations_locked(self) -> None:
+        if not self.directory.exists():
+            return
+        for directory in self.directory.iterdir():
+            if not directory.is_dir() or not _DIGEST.fullmatch(directory.name):
+                continue
+            path = directory / "status.json"
+            try:
+                status = json.loads(path.read_text(encoding="utf-8"))
+                expires = float(status.get("animation_expires_at", 0))
+                if status.get("animation") == "orbit.avi" and 0 < expires <= time.time():
+                    (directory / "orbit.avi").unlink(missing_ok=True)
+                    status.pop("animation", None)
+                    status["animation_expired"] = True
+                    temp = directory / "status.expiry.tmp"
+                    temp.write_text(json.dumps(status), encoding="utf-8")
+                    os.replace(temp, path)
+            except (OSError, ValueError, TypeError):
+                continue
 
     def _stop_locked(self) -> None:
         process = self.process
@@ -218,7 +252,8 @@ class PhotoJobs:
                            "--payload", str(directory / "payload.npz"),
                            "--config", str(directory / "config.json"),
                            "--out", str(directory), "--seconds", str(seconds),
-                           "--native-module-dir", str(self.spectral_root)]
+                           "--native-module-dir", str(self.spectral_root),
+                           "--avi-writer-root", str(Path(__file__).resolve().parents[2])]
                 log = open(directory / "worker.log", "ab")
                 try:
                     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -233,8 +268,6 @@ class PhotoJobs:
                 return status
 
     def _status_locked(self, digest: str) -> dict:
-        if digest != self.active_digest:
-            raise PhotoError("photo digest is no longer active", 404)
         path = self.directory / digest / "status.json"
         try:
             status = json.loads(path.read_text(encoding="utf-8"))
@@ -245,7 +278,9 @@ class PhotoJobs:
                     "error": str(status.get("error", "Spectral worker failed"))}
         if status.get("digest") != digest:
             raise PhotoError("photo status digest mismatch", 503)
-        process = self.process
+        if digest != self.active_digest and status.get("state") != "complete":
+            raise PhotoError("photo digest is no longer active", 404)
+        process = self.process if digest == self.active_digest else None
         if process is not None and process.poll() not in (None, 0) and status.get("state") != "error":
             return {"digest": digest, "state": "error", "image": None,
                     "error": f"Spectral worker exited with code {process.returncode}"}
@@ -275,12 +310,26 @@ class PhotoJobs:
             raise PhotoError("invalid HDR exposure path", 400)
         with self.lock:
             status = self._status_locked(digest)
-            if status.get("hdr") != name:
+            available = {frame.get("hdr") for frame in status.get("frames", [])}
+            if status.get("hdr") != name and name not in available:
                 raise PhotoError("HDR exposure is unavailable", 404)
             try:
                 return (self.directory / digest / name).read_bytes()
             except OSError:
                 raise PhotoError("HDR exposure is unavailable", 404) from None
+
+    def animation(self, digest: str) -> bytes:
+        if not _DIGEST.fullmatch(digest):
+            raise PhotoError("invalid photo digest", 400)
+        with self.lock:
+            self._expire_animations_locked()
+            status = self._status_locked(digest)
+            if status.get("animation") != "orbit.avi" or time.time() >= float(status.get("animation_expires_at", 0)):
+                raise PhotoError("orbit animation has expired or is unavailable", 404)
+            try:
+                return (self.directory / digest / "orbit.avi").read_bytes()
+            except OSError:
+                raise PhotoError("orbit animation is unavailable", 404) from None
 
     def cancel(self, digest: str) -> dict:
         if not _DIGEST.fullmatch(digest):
@@ -290,9 +339,22 @@ class PhotoJobs:
                 raise PhotoError("photo digest is no longer active", 404)
             self._stop_locked()
             self.active_digest = None
+            (self.directory / digest / "orbit.avi").unlink(missing_ok=True)
+            path = self.directory / digest / "status.json"
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+                current["state"] = "canceled"
+                current.pop("animation", None)
+                temp = path.with_suffix(".cancel.tmp")
+                temp.write_text(json.dumps(current), encoding="utf-8")
+                os.replace(temp, path)
+            except (OSError, ValueError):
+                pass
             return {"digest": digest, "state": "canceled", "image": None}
 
     def close(self) -> None:
+        self._sweep_stop.set()
         with self.lock:
             self._stop_locked()
             self.active_digest = None
+        self._sweeper.join(timeout=2)

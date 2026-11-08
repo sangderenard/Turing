@@ -718,7 +718,7 @@ def make_handler(sessions: Sessions):
                 return self._anim_get()
             if path == "/api/loading_library":                    # [STUDIO] the library listing: anyone may view
                 return self._library_get()
-            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr"):
+            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
                 if not access_mod.require_tier(self, "edit"):
                     return
                 from urllib.parse import parse_qs
@@ -729,14 +729,16 @@ def make_handler(sessions: Sessions):
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
                     body = (sessions.marble_photos.hdr(digest, name) if path == "/api/marble_photo/hdr"
+                            else sessions.marble_photos.animation(digest) if path == "/api/marble_photo/animation"
                             else sessions.marble_photos.image(digest, name))
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
                 self._set_cookie = []
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
-                if path == "/api/marble_photo/hdr":
-                    self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
+                                 "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
+                if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
+                    self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()

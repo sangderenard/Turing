@@ -8,8 +8,11 @@ const config = (options) => {
   const view = new DataView(bytes);
   return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes, 16, view.getUint32(4, true))));
 };
-const builtIn = config({ resolution: 512 });
+const builtIn = config({ resolution: 1024, seconds: 1800, orbitFrames: 16 });
 assert.equal(builtIn.camera.fov_degrees, 18);
+assert.equal(builtIn.camera.resolution, 1024);
+assert.equal(builtIn.exposure_seconds, 1800);
+assert.equal(builtIn.orbit_frames, 16);
 assert.deepEqual(builtIn.camera.eye_m, [0, 0, .07]);
 assert.equal(builtIn.camera.focus_distance_m, .11);
 

@@ -200,13 +200,22 @@ async function refreshObjects(selected="") {
 async function saveObject() {
   if(!lastGeometry||!lastMass)throw new Error("the object is not ready yet");
   const design=readDesign(document,seed);design.opaqueSaved=opaqueSaved;
+  // Save the geometry regenerated from this exact recipe, even if a control
+  // changed after the last preview rebuild. The digest must describe the
+  // recipe that the simulator will regenerate on load.
+  const geometry=buildMarbleObjectGeometry(design,materialIdsForDesign(design,ids,
+    {coated:coatedId,paintA:paintAId,paintB:paintBId}));
+  const geometryHash=await geometrySha256(geometry);
+  if(geometryHash!==await geometrySha256(lastGeometry))rebuild();
+  reportMass(geometry);
   const value={v:MARBLE_OBJECT_VERSION,name:$("object-name").value.trim(),
     generator:"meowdoku-marble-object-v1",design,
     materials:{index:{...ids},extra:{coated:coatedId,paintA:paintAId,paintB:paintBId},
       tables:Object.fromEntries(Object.entries(tables).map(([name,table])=>[name,
         {stride:table.table.floats_per_record,data:Array.from(table.data)}]))},
     physical:readPhysical(document),derived:lastMass,
-    geometry_sha256:await geometrySha256(lastGeometry)};
+    geometry_sha256:geometryHash};
+  await verifySavedMarbleObject(value);
   const response=await fetch("/api/marble_objects",{method:"POST",
     headers:{"Content-Type":"application/json","X-Meowdoku-Marble":"1"},body:JSON.stringify(value)});
   const result=await response.json().catch(()=>({}));
@@ -221,7 +230,12 @@ async function loadObject() {
   const response=await fetch(`/api/marble_objects/${digest}`,{cache:"no-store"});
   if(!response.ok)throw new Error(`load HTTP ${response.status}`);
   const value=await response.json();
-  const {geometry}=await verifySavedMarbleObject(value);
+  let verified=true,geometry;
+  try { ({geometry}=await verifySavedMarbleObject(value)); }
+  catch(error) {
+    if(!/^saved mesh recipe no longer matches its triangles$|^saved mass or moment of inertia no longer matches the mesh$/.test(String(error.message)))throw error;
+    verified=false;
+  }
   if(Object.keys(value.materials.index).length!==Object.keys(ids).length||
       Object.entries(ids).some(([name,id])=>value.materials.index[name]!==id)||
       value.materials.extra.coated!==coatedId||value.materials.extra.paintA!==paintAId||
@@ -241,8 +255,12 @@ async function loadObject() {
   rebuild();syncMaterial();
   for(const field of ["dice-detail","dice-bevel","dice-face-relief","mark-scale","relief-depth","die-inclusion-size"])
     $(field).dispatchEvent(new Event("input"));
-  photo.saved(digest);
-  objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
+  if(verified) {
+    photo.saved(digest);
+    objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
+  } else {
+    objectStatus(`${value.name}: the stored mesh receipt no longer matches this recipe. The recipe is open for inspection; save it as a new object to verify its current mesh. The original is preserved.`);
+  }
 }
 function objectLibraryControls() {
   const run=(action)=>action().catch(error=>objectStatus(error.message||String(error)));

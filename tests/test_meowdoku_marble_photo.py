@@ -63,11 +63,13 @@ def photo_payload(tmp_path):
 
 def test_mrp1_matches_saved_geometry_and_pbr(photo_payload):
     store, digest, vertices, normals, ids = photo_payload
-    wire = _wire(digest, vertices, normals, ids, camera={"resolution": 256}, transport="fixed:3")
+    wire = _wire(digest, vertices, normals, ids, camera={"resolution": 1024}, transport="fixed:3",
+                 exposure_seconds=1800, orbit_frames=8)
     decoded_vertices, decoded_ids, pbr, config, seconds = photos.decode_upload(wire, store)
     np.testing.assert_array_equal(decoded_vertices, vertices)
     np.testing.assert_array_equal(decoded_ids, ids)
-    assert pbr.shape == (2, 16) and config["scale_m"] == .025 and seconds == 30
+    assert pbr.shape == (2, 16) and config["scale_m"] == .025 and seconds == 1800
+    assert config["camera"]["resolution"] == 1024 and config["orbit_frames"] == 8
     assert config["transport"] == "fixed:3"
     altered = bytearray(wire)
     altered[-4] = 0  # change the second face's material ID
@@ -140,11 +142,21 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         assert status == 200 and body.startswith(b"\x89PNG")
         assert request("GET", f"/api/marble_photo/image?digest={digest}&name=../payload.npz")[0] == 400
         (directory / "exposure-000120.npz").write_bytes(b"linear-rgb-hdr")
+        (directory / "orbit.avi").write_bytes(b"RIFFtestAVI ")
         (directory / "status.json").write_text(json.dumps({
             "digest": digest, "state": "complete", "image": "preview-000120.png",
-            "hdr": "exposure-000120.npz"}))
+            "hdr": "exposure-000120.npz", "frames": [{"index": 0, "image": "preview-000120.png",
+            "hdr": "exposure-000120.npz"}], "animation": "orbit.avi", "animation_expires_at": photos.time.time() + 3600}))
         status, body = request("GET", f"/api/marble_photo/hdr?digest={digest}&name=exposure-000120.npz")
         assert status == 200 and body == b"linear-rgb-hdr"
+        status, body = request("GET", f"/api/marble_photo/animation?digest={digest}")
+        assert status == 200 and body.startswith(b"RIFF")
+        expired = json.loads((directory / "status.json").read_text())
+        expired["animation_expires_at"] = photos.time.time() - 1
+        (directory / "status.json").write_text(json.dumps(expired))
+        assert request("GET", f"/api/marble_photo/animation?digest={digest}")[0] == 404
+        assert not (directory / "orbit.avi").exists()
+        assert json.loads((directory / "status.json").read_text())["animation_expired"]
         assert request("GET", f"/api/marble_photo/hdr?digest={digest}&name=../payload.npz")[0] == 400
         status, body = request("POST", "/api/marble_photo/cancel", json.dumps({"digest": digest}).encode(),
                                "application/json")
