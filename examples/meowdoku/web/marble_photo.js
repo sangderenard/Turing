@@ -66,7 +66,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
 export function createMarblePhoto(doc = document, currentCamera = null) {
   const $ = (id) => doc.getElementById(id);
   const state = { objectDigest: null, jobDigest: null, lastDigest: null, timer: null, generation: 0,
-    frames: [], selectedFrame: null, playTimer: null };
+    frames: [], selectedFrame: null, playTimer: null, frameImages: new Map(), displayToken: 0 };
   const status = (value) => { $("photo-status").textContent = value; };
   const stopPolling = () => { if (state.timer) clearTimeout(state.timer); state.timer = null; };
   const stopPlayback = () => {
@@ -76,18 +76,52 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
   };
   const clearFrames = () => {
     stopPlayback(); state.frames = []; state.selectedFrame = null;
+    state.frameImages.clear(); state.displayToken++; state.previewUrl = null;
     $("photo-frames").replaceChildren(); $("photo-frames").hidden = true;
     $("photo-play").hidden = true; $("photo-animation").hidden = true;
+  };
+  const drawImage = (image) => {
+    const canvas = $("photo-image");
+    if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
+      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+    }
+    canvas.getContext("2d").drawImage(image, 0, 0);
+  };
+  const frameImage = (url) => {
+    let cached = state.frameImages.get(url);
+    if (!cached) {
+      const image = new Image();
+      cached = { image, ready: false, failed: false };
+      cached.promise = new Promise((resolve, reject) => {
+        image.onload = async () => {
+          try { await image.decode(); cached.ready = true; resolve(image); }
+          catch (error) { cached.failed = true; reject(error); }
+        };
+        image.onerror = () => { cached.failed = true; reject(new Error("photo frame could not load")); };
+      });
+      image.src = url;
+      state.frameImages.set(url, cached);
+    }
+    return cached;
+  };
+  const drawWhenReady = (url, caption) => {
+    const token = ++state.displayToken;
+    frameImage(url).promise.then((image) => {
+      if (token !== state.displayToken) return;
+      drawImage(image);
+      $("photo-caption").textContent = caption;
+    }).catch((error) => {
+      if (token === state.displayToken) status(`Photo frame failed: ${error.message || error}`);
+    });
   };
   const showFrame = (frame, digest) => {
     state.selectedFrame = frame.index;
     const imageUrl = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(frame.image)}`;
-    $("photo-image").src = imageUrl;
+    drawWhenReady(imageUrl, `Orbit frame ${frame.index + 1} of ${state.frames.length}`);
     $("photo-full").href = imageUrl; $("photo-full").hidden = false;
     const hdr = $("photo-hdr");
     hdr.hidden = !frame.hdr;
     if (frame.hdr) { hdr.href = `/api/marble_photo/hdr?digest=${digest}&name=${encodeURIComponent(frame.hdr)}`; hdr.download = frame.hdr; }
-    $("photo-caption").textContent = `Orbit frame ${frame.index + 1} of ${state.frames.length}`;
   };
   const renderFrames = (frames, digest) => {
     if (frames.length === state.frames.length) return;
@@ -95,6 +129,8 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     const strip = $("photo-frames"); strip.replaceChildren(); strip.hidden = frames.length < 2;
     $("photo-play").hidden = frames.length < 2;
     for (const frame of frames) {
+      frameImage(`/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(frame.image)}`)
+        .promise.catch(() => {});
       const button = doc.createElement("button"); button.type = "button";
       button.textContent = String(frame.index + 1); button.title = `View orbit frame ${frame.index + 1}`;
       button.addEventListener("click", () => { stopPlayback(); showFrame(frame, digest); });
@@ -153,10 +189,15 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
         $("photo-panel").hidden = false;
         const imageUrl = `/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(value.image)}`;
         if (state.selectedFrame === null) {
-          $("photo-image").src = imageUrl;
+          if (state.previewUrl !== imageUrl) {
+            if (state.previewUrl && !state.frames.some((frame) => state.previewUrl.endsWith(encodeURIComponent(frame.image)))) {
+              state.frameImages.delete(state.previewUrl);
+            }
+            state.previewUrl = imageUrl;
+            drawWhenReady(imageUrl, `${value.transport || "Fixed-line"} · frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} · ${Math.round(value.frame_elapsed_seconds || value.elapsed_seconds || 0)} s`);
+          }
           $("photo-full").href = imageUrl;
           $("photo-full").hidden = false;
-          $("photo-caption").textContent = `${value.transport || "Fixed-line"} · frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} · ${Math.round(value.frame_elapsed_seconds || value.elapsed_seconds || 0)} s`;
         }
       }
       if (value.hdr && state.selectedFrame === null) {
@@ -174,7 +215,7 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
       status(value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${$("photo-seconds").value} s exposure per frame` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
-            value.state === "encoding" ? "Encoding the orbit with Turing's JPEG AVI writer…" :
+            value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
               `Exposing frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} on GPU · ${Math.round(value.frame_elapsed_seconds || 0)} s · ${(value.forward_ray_jobs || 0).toLocaleString()} ray jobs`);
       if (value.state === "complete" || value.state === "error" || value.state === "canceled") {
         state.jobDigest = null; setButtons(); return;
@@ -214,8 +255,12 @@ export function createMarblePhoto(doc = document, currentCamera = null) {
     $("photo-play").textContent = "Pause orbit";
     let index = state.selectedFrame == null ? -1 : state.selectedFrame;
     state.playTimer = setInterval(() => {
-      index = (index + 1) % state.frames.length;
-      showFrame(state.frames[index], state.jobDigest || state.lastDigest);
+      const next = (index + 1) % state.frames.length;
+      const frame = state.frames[next];
+      const url = `/api/marble_photo/image?digest=${state.jobDigest || state.lastDigest}&name=${encodeURIComponent(frame.image)}`;
+      if (!frameImage(url).ready) return;
+      index = next;
+      showFrame(frame, state.jobDigest || state.lastDigest);
     }, 125);
   });
   setButtons();

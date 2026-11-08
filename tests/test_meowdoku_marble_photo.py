@@ -135,11 +135,21 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         status, body = request("GET", f"/api/marble_photo?digest={digest}")
         assert status == 200 and json.loads(body)["state"] == "preparing"
         directory = sessions.marble_photos.directory / digest
+        _FakeProcess.instances[0].returncode = 0
+        status, body = request("GET", f"/api/marble_photo?digest={digest}")
+        assert status == 200 and json.loads(body)["state"] == "error"
+        _FakeProcess.instances[0].returncode = None
         (directory / "preview-000120.png").write_bytes(b"\x89PNG\r\n\x1a\nframe")
         (directory / "status.json").write_text(json.dumps({
             "digest": digest, "state": "exposing", "image": "preview-000120.png"}))
         status, body = request("GET", f"/api/marble_photo/image?digest={digest}&name=preview-000120.png")
         assert status == 200 and body.startswith(b"\x89PNG")
+        (directory / "orbit.avi.tmp").write_bytes(b"RIFFprogress")
+        (directory / "status.json").write_text(json.dumps({
+            "digest": digest, "state": "encoding", "image": "preview-000120.png",
+            "frames": [{"index": 0, "image": "preview-000120.png"}]}))
+        status, body = request("GET", f"/api/marble_photo?digest={digest}")
+        assert status == 200 and json.loads(body)["encoding_bytes"] == len(b"RIFFprogress")
         assert request("GET", f"/api/marble_photo/image?digest={digest}&name=../payload.npz")[0] == 400
         (directory / "exposure-000120.npz").write_bytes(b"linear-rgb-hdr")
         (directory / "orbit.avi").write_bytes(b"RIFFtestAVI ")

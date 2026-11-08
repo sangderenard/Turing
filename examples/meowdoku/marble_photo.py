@@ -281,9 +281,16 @@ class PhotoJobs:
         if digest != self.active_digest and status.get("state") != "complete":
             raise PhotoError("photo digest is no longer active", 404)
         process = self.process if digest == self.active_digest else None
-        if process is not None and process.poll() not in (None, 0) and status.get("state") != "error":
-            return {"digest": digest, "state": "error", "image": None,
-                    "error": f"Spectral worker exited with code {process.returncode}"}
+        if process is not None and process.poll() is not None and status.get("state") not in ("error", "complete", "canceled"):
+            return {"digest": digest, "state": "error", "image": status.get("image"),
+                    "frames": status.get("frames", []),
+                    "error": f"Spectral worker exited with code {process.returncode} before finishing the photo"}
+        if status.get("state") == "encoding":
+            temporary = self.directory / digest / "orbit.avi.tmp"
+            try:
+                status["encoding_bytes"] = temporary.stat().st_size
+            except OSError:
+                status["encoding_bytes"] = 0
         return status
 
     def status(self, digest: str) -> dict:
