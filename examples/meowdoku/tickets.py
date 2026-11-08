@@ -16,7 +16,8 @@ class Store:
         self.path = Path(path)
         self.lock = threading.Lock()
 
-    def submit(self, report: dict, *, peer: str, tier: str, server_state: dict, log_seq: int) -> dict:
+    def submit(self, report: dict, *, peer: str, tier: str, server_state: dict, log_seq: int,
+               server_log: list[dict] | None = None) -> dict:
         if not isinstance(report, dict):
             raise ValueError("report must be an object")
         body = json.dumps(report, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -25,7 +26,7 @@ class Store:
         now = time.time()
         ticket = {"id": f"{int(now)}-{secrets.token_hex(5)}", "created": now, "updated": now,
                   "status": "open", "peer": peer, "tier": tier, "log_seq": log_seq,
-                  "server_state": server_state, "report": report, "handling_note": ""}
+                  "server_state": server_state, "server_log": server_log or [], "report": report, "handling_note": ""}
         with self.lock:
             self.path.mkdir(parents=True, exist_ok=True)
             target = self.path / (ticket["id"] + ".json")

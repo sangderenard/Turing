@@ -35,9 +35,9 @@ async function show(id) {
       ["Phone", `${phone.state || "unknown"} · ${phone.rawLast?.source || "no sensor event"}`],
       ["Law gravity", JSON.stringify(c.gravity ?? (c.lawInputs ? [c.lawInputs.grav_x, c.lawInputs.grav_y, c.lawInputs.grav_z] : null))],
       ["Energy / speed", `${d.ke ?? "?"} / ${d.vmax2 == null ? "?" : Math.sqrt(d.vmax2).toFixed(3)}`],
-      ["Client log", `${r.local_log?.length ?? 0} lines · server seq ${ticket.log_seq}`],
+      ["Logs", `${r.local_log?.length ?? 0} client · ${ticket.server_log?.length ?? 0} server · seq ${ticket.log_seq}`],
     ]) { const box = el("div", ""); box.append(el("strong", name), el("span", value)); facts.append(box); }
-    const raw = el("pre", JSON.stringify({ report: ticket.report, server_state: ticket.server_state }, null, 2));
+    const raw = el("pre", JSON.stringify({ report: ticket.report, server_state: ticket.server_state, server_log: ticket.server_log }, null, 2));
     const rawDetails = document.createElement("details"); rawDetails.append(el("summary", "Full state and logs"), raw);
     detail.replaceChildren(heading, meta, facts, logLink, actions, note, rawDetails);
   } catch (error) { message.textContent = error.message; }

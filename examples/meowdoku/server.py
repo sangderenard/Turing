@@ -999,8 +999,10 @@ def make_handler(sessions: Sessions):
                     with table.lock:
                         game = table.state()
                     server_state = {k: game.get(k) for k in ("game", "player", "board", "level", "status", "phase", "tick") if k in game}
+                    log_seq = logring_mod.RING.seq
+                    server_log = logring_mod.RING.fetch(max(0, log_seq - 80), 80)["entries"]
                     result = sessions.tickets.submit(payload, peer=self.client_address[0], tier=self._tier,
-                                                     server_state=server_state, log_seq=logring_mod.RING.seq)
+                                                     server_state=server_state, log_seq=log_seq, server_log=server_log)
                     print(f"[ticket] {result['id']} from {self.client_address[0]}", flush=True)
                     return self._json(result, HTTPStatus.CREATED)
                 except (ValueError, TypeError, json.JSONDecodeError) as error:
