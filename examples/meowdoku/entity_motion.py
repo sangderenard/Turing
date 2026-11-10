@@ -1174,4 +1174,5 @@ def _build_one(out_dir: Path, fn, names, outputs_names, stem: str) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     wasm_path.write_bytes(wasm.binary)
     abi_path.write_text(json.dumps(contract, indent=1), encoding="utf-8")
+    wasm.api.write(out_dir / f"{stem}.api.yaml")
     return contract

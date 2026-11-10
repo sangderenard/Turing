@@ -1858,6 +1858,7 @@ class WGSLPassProgram:
     uniform_feeds: tuple[int, ...]      # formal ids whose value is element 0 of its slot
     backend_identity_decisions: tuple[Any, ...] = ()
     launch_plan: Any = None
+    api: Any = None                          # CompiledProgramAPI of the lowered Function, as ``WGSLModule.api``
     uniform_index: dict[int, int] = None     # uniform formal id -> element index in the arena's head
     lane_base: int = 0                       # unused: the uniform head is its own binding
     iota_ids: tuple[int, ...] = ()           # formals the shader derives from its invocation index
@@ -2109,11 +2110,38 @@ def emit_tensor_program_passes(
     total_groups = -(-n // local_x)
     group_x = min(total_groups, 16384)
     groups = (group_x, -(-total_groups // group_x), 1)
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+
+    api = CompiledProgramAPI(
+        module=name or function_name,
+        language="wgsl",
+        entry=entries[0],
+        entry_points=tuple(EntryPoint(entry, entry, "numerical") for entry in entries),
+        metadata={
+            "execution_model": "compute",
+            "storage": "WebGPU storage buffers",
+            "workgroup_size": plan.workgroup_size,
+            "dispatch_workgroups": groups,
+            "deployment": plan.deployment.as_record(),
+            "backend_identities": [d.as_record() for d in identity.decisions],
+            "count": n,
+            "dispatches": len(entries),
+            "slots": slots,
+            "bindings": bindings,
+            "slots_per_binding": spb,
+            # the formals in order, as the single-kernel module states them
+            "feed_span": [int(value.id) for value in function.args],
+            "uniform_feeds": sorted(int(i) for i in uniform_ids),
+            "feed_slots": {int(i): int(slot_of[i]) for i in formal_ids if i in slot_of},
+            "output_span": [int(i) for i in output_ids],
+            "output_slots": {int(i): int(slot_of[i]) for i in output_ids},
+        },
+    )
     return WGSLPassProgram(
         name or function_name, source, not all_shortfalls, tuple(dict.fromkeys(all_shortfalls)), n,
         tuple(entries), (local_x, 1, 1), groups, slots,
         {i: slot_of[i] for i in formal_ids if i in slot_of}, {i: slot_of[i] for i in output_ids}, uniform_ids,
-        identity.decisions, plan, uniform_index, lane_base, tuple(sorted(iota_set & formal_set)),
+        identity.decisions, plan, api, uniform_index, lane_base, tuple(sorted(iota_set & formal_set)),
         bindings, spb,
         slot_report=report,
     )

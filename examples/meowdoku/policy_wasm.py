@@ -96,6 +96,7 @@ def build_policy(out_dir: Path, params: dict, *, batch: int = 1, force: bool = F
         out_dir.mkdir(parents=True, exist_ok=True)
         wasm_path.write_bytes(wasm.binary)
         abi_path.write_text(json.dumps(contract, indent=1), encoding="utf-8")
+        wasm.api.write(out_dir / f"{stem}.api.yaml")
         build_policy.artifacts[stem] = (wasm, module, entry)
     write_weights(out_dir, params)
     return contract

@@ -619,6 +619,10 @@ class WasmCoreArtifact:
     #: attached book).  ``NativeSystem.slots`` reads the ProgramABI slot rows
     #: posted beside them under ``emission.backend``.
     emission: Any = field(default=None, repr=False, compare=False)
+    #: The calling contract (``compiled_program_api.CompiledProgramAPI``)
+    #: described from the same root ``Function`` this emission lowered; None
+    #: when the emission has shortfalls.
+    api: Any = field(default=None, repr=False, compare=False)
 
     @property
     def complete(self) -> bool:
@@ -2184,6 +2188,25 @@ def emit_ssa_module_to_wasm_core(
                 emission, Backend.WASM_BINARY, module_text, buffer_order_cell,
                 root=root,
             )
+    api = None
+    if not shortfalls:
+        from .compiled_program_api import CompiledProgramAPI, describe_fortran_function
+
+        source_names = {
+            int(value_id): str(source)
+            for source, value_id in tuple(root.metadata.get("parameter_names") or ())
+        }
+        for source, value_id in tuple(root.metadata.get("named_outputs") or ()):
+            source_names.setdefault(int(value_id), str(source))
+        entry_point = describe_fortran_function(
+            name, root, outputs=returned_values, kind="control",
+            source_names=source_names,
+            note="every parameter is a byte offset into the module's exported memory",
+        )
+        api = CompiledProgramAPI(
+            module=name, language="wasm", entry=name, entry_points=(entry_point,),
+            metadata={"memory_export": "memory", "reserved_bytes": int(aggregate_end)},
+        )
     return WasmCoreArtifact(
         name=name,
         binary=binary,
@@ -2202,6 +2225,7 @@ def emit_ssa_module_to_wasm_core(
         buffer_dtypes=tuple(buffer_dtypes),
         buffer_shapes=tuple(buffer_shapes),
         emission=emission_record,
+        api=api,
     )
 
 
