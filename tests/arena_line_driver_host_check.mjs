@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+const source=fs.readFileSync('examples/meowdoku/web/arena_line_driver_host.js','utf8');
+const sampler=source.slice(source.indexOf('function arenaLineSampleSupport'),source.indexOf('async function arenaLineInitialize'));
+const context=vm.createContext({shaderViewer:{colliders:[],geometry:[]},boxYawDegrees:()=>0,sampleDeclaredSurface:()=>({height:4})});vm.runInContext(sampler,context);
+assert.equal(context.arenaLineSampleSupport('world-floor',8,-15),0);
+context.shaderViewer.colliders=[{identity:'terrain',surface:{kind:'sampled-height-field',domain:{minimum_x:0,maximum_x:10,minimum_z:-20,maximum_z:0}}}];
+assert.throws(()=>context.arenaLineSampleSupport('world-floor',8,-15),/replaced/);
+assert.equal(context.arenaLineSampleSupport('terrain',8,-15),4);
+assert.throws(()=>context.arenaLineSampleSupport('terrain',20,-15),/outside|leaves/);
+assert.match(source,/z-index:111/);assert.match(source,/panel.error\|\|driver.status/);
+const model=JSON.parse(fs.readFileSync('build/dot-tire-state-candidate-20261110/model.json','utf8'));
+const packet=JSON.parse(fs.readFileSync('build/dot-arena-line-policy-20261110/qa-spawn-straight.json','utf8'));
+const segment=packet.circuits[0].segments[0];
+context.shaderViewer.colliders=model.document_geometry.boxes.filter(b=>b.surface).map(b=>({identity:b.identity,surface:b.surface}));
+for(let i=0;i<=12;i++)assert.equal(context.arenaLineSampleSupport('world-floor',segment.from[0],segment.from[1]+(segment.to[1]-segment.from[1])*i/12),0);
+console.log('6 host regressions +13 real-model QA support samples passed');

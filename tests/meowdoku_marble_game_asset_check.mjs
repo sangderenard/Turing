@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
-import {createStudioGameAsset,hydrateStudioGameAsset} from '../examples/meowdoku/web/marble_game_asset.js';
+import {createStudioGameAsset,hydrateStudioGameAsset,prepareStudioAmmunition} from '../examples/meowdoku/web/marble_game_asset.js';
 import {studioFlatSamplerPacket} from '../examples/meowdoku/web/marble_studio_subject_renderer.js';
 import {geometrySha256} from '../examples/meowdoku/web/marble_object.js';
 import {adaptMechanicalCreatureProjectiles} from '../examples/meowdoku/web/mechanical_creature_instances.js';
@@ -34,6 +34,21 @@ const packet={schema:'turing.studio-class-world-import.v1',revision:17,
     authoring:{object:{v:1,generator:'meowdoku-marble-object-v1',design:{'base-shape':'marble',coverage:0,'band-count':0},
       physical:{'radius-mm':10,'shell-density':2500},materials:{index:{shell:1,interior:0}}}}}};
 const before=structuredClone(packet),asset=await createStudioGameAsset(packet,{name:'  Test marble  '});
+const optional=await prepareStudioAmmunition(packet,{name:'Test marble'});
+assert.equal(optional.supported,true);assert.equal(optional.reason,null);assert.equal(optional.asset.identity,asset.identity);
+for(const change of [p=>p.scene.authoring.object.design['base-shape']='d6',p=>p.scene.authoring.object.design['base-shape']='bunny',
+  p=>p.scene.authoring.object.design['base-shape']='obj',p=>p.scene.authoring.object.design.coverage=1,
+  p=>p.scene.authoring.object.design['band-count']=1,p=>p.scene.subject.faces[2][0][0]=.9,
+  p=>{p.scene.subject.phong.interiorCount=3;p.scene.subject.phong.glassCount=0;}]) {
+  const candidate=structuredClone(packet);change(candidate);const result=await prepareStudioAmmunition(candidate);
+  assert.equal(result.supported,false);assert.equal(result.asset,null);assert.equal(result.code,'UNSUPPORTED_STUDIO_AMMUNITION');assert(result.reason);
+}
+for(const change of [p=>p.render.shaders.vertex='wrong',p=>p.scene.subject.faces[0][3]=999,
+  p=>p.scene.subject.faces[0][0][0]=NaN,p=>p.scene.subject.faces[0][0][0]=1e40,
+  p=>p.render.uniforms.find(u=>u.name==='uFieldGain').value=1]) {
+  const candidate=structuredClone(packet);candidate.scene.authoring.object.design['base-shape']='bunny';change(candidate);
+  await assert.rejects(()=>prepareStudioAmmunition(candidate),e=>e.code!=='UNSUPPORTED_STUDIO_AMMUNITION');
+}
 assert.deepEqual(packet,before);
 assert.equal(asset.name,'Test marble');
 assert.match(asset.identity,/^studio-marble:[a-f0-9]{64}$/);

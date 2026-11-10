@@ -10,14 +10,24 @@ const encode=bytes=>{let out='';for(let at=0;at<bytes.length;at+=32768)out+=Stri
 const decode=text=>Uint8Array.from(atob(text),c=>c.charCodeAt(0));
 const utf8=text=>new TextEncoder().encode(text);
 const assert=(ok,message)=>{if(!ok)throw Error(message);};
+const admit=(ok,message)=>{if(!ok)throw Object.assign(new Error(message),{code:'UNSUPPORTED_STUDIO_AMMUNITION'});};
 function admitSphere(subject,object) {
-  assert(object?.design?.['base-shape']==='marble','The existing launcher accepts spherical marble appearance, not die geometry.');
-  assert(Number(object.design.coverage)===0&&Number(object.design['band-count'])===0,
+  admit(object?.design?.['base-shape']==='marble','The existing launcher accepts spherical marble appearance, not this subject geometry.');
+  admit(Number(object.design.coverage)===0&&Number(object.design['band-count'])===0,
     'This transfer currently requires the original uncoated spherical outer shell.');
-  assert(Number.isSafeInteger(subject.phong?.glassCount)&&subject.phong.glassCount>0,
+  admit(Number.isSafeInteger(subject.phong?.glassCount)&&subject.phong.glassCount>0,
     'A nonempty authored spherical exterior is required.');
   for(const face of subject.faces.slice(subject.phong.interiorCount))for(const p of face.slice(0,3))
-    assert(Math.abs(Math.hypot(...p)-1)<1e-6,'The displayed exterior is not the existing unit-radius sphere.');
+    admit(Math.abs(Math.hypot(...p)-1)<1e-6,'The displayed exterior is not the existing unit-radius sphere.');
+}
+
+// Scene transfer and launcher admission are independent. Only the incumbent
+// sphere-body limitation is an optional capability result. Invalid captured
+// shader/material/geometry state still rejects before that admission check.
+export async function prepareStudioAmmunition(packet,options={}) {
+  try{return {supported:true,asset:await createStudioGameAsset(packet,options),reason:null};}
+  catch(error){if(error?.code!=='UNSUPPORTED_STUDIO_AMMUNITION')throw error;
+    return {supported:false,asset:null,reason:error.message,code:error.code};}
 }
 
 export async function createStudioGameAsset(packet,{name='Studio marble'}={}) {
@@ -25,13 +35,16 @@ export async function createStudioGameAsset(packet,{name='Studio marble'}={}) {
   const object=packet.scene.authoring?.object;
   assert(typeof name==='string'&&name.trim()&&name.length<=120,'A bounded asset name is required.');
   const subject=packet.scene.subject,faces=subject.faces;
+  // Invalid GPU attributes are malformed input, even when the subject is not
+  // launcher-compatible. Do not disguise that failure as optional ammunition.
+  for(const face of faces)for(const vector of [...face.slice(0,3),...face[4]])for(const value of vector)
+    assert(Number.isFinite(Math.fround(value)),'Studio coordinate exceeds its float32 GPU format.');
   // Admission is deliberately bounded to the existing uncoated sphere shell.
   // The game keeps its own radius, mass, contacts, inventory and state tensors.
   admitSphere(subject,object);
   const bytes=new Uint8Array(faces.length*76),view=new DataView(bytes.buffer),groups=[];let at=0;
   for(const face of faces){
     for(const vector of [...face.slice(0,3),...face[4]])for(const value of vector){
-      assert(Number.isFinite(Math.fround(value)),'Studio coordinate exceeds its float32 GPU format.');
       view.setFloat32(at,value,true);at+=4;}
     view.setUint32(at,face[3],true);at+=4;groups.push(face[5]??0);
   }

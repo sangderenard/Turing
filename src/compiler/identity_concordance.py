@@ -19712,6 +19712,13 @@ class IdentityBook:
         else:
             self.pages.book = self
         self._refresh_page_table()
+        # A cached symbolic reciprocal already owns a minted SSA id. Loading
+        # its book in a fresh process must reserve that id at the one issuer,
+        # or the next signal-core limb receives the same id and overwrites it.
+        # The mint page is the authority; no value-name or magnitude guess.
+        mint_page = self.pages.get(MINT_PAGE.name)
+        if mint_page is not None:
+            GLOBAL_MONOTONIC_IDS.reserve_existing(row[1] for row in mint_page.rows())
 
     # ------------------------------------------------------------ cold spill
     def spill_pages(self, names: Iterable[str], **kwargs: Any) -> Any:

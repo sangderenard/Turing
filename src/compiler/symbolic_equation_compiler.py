@@ -639,6 +639,46 @@ def _compile_sympy_equations_uncached(
         },
     )
     module = IRModule({name: function})
+    # The cached reciprocal constant and later signal-core limbs must share
+    # the book that minted their SSA ids. A cache hit without this owner
+    # restarted minting at 1000000000 and defined that value twice.
+    module.metadata["identity_book"] = current_identity_book()
+    # The direct symbolic route keeps the scheduler's graph IDs.  It must
+    # publish their SSA identities at this producer, just like the control
+    # and JavaScript lowerings.  Previously even x + 1 reached C emission
+    # with input id 1 on INGESTION_VALUE but absent from SSA_VALUE, so the
+    # emitter correctly refused the function header.  Cite the exact graph
+    # cells here; do not infer origins or weaken the emitter's source check.
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        CONTROL_SSA, FUNCTION_OUTPUT, FUNCTION_PARAMETER, SSA_BLOCK,
+        SSA_VALUE, SSABlockKind, SSAValueFact, SSAValueOrigin,
+    )
+    from .identity_concordance import Derived, Mode
+
+    book = current_identity_book()
+    cells = {}
+    for value in (*function.args, *(item.res for item in body if item.res is not None)):
+        cells[int(value.id)] = book.post(
+            SSA_VALUE, (name, int(value.id)),
+            SSAValueFact(value.dtype, tuple(value.shape or ()),
+                         SSAValueOrigin.ADOPTED_GRAPH_ID),
+            stage=CONTROL_SSA,
+            provenance=Derived((node_identity_cell(authored_graph, int(value.id), book=book),)),
+            mode=Mode.CONCORD,
+        )
+    for parameter, value_id in function.metadata["parameter_names"]:
+        book.post(FUNCTION_PARAMETER, (name, parameter), value_id,
+                  stage=CONTROL_SSA, provenance=Derived((cells[value_id],)),
+                  mode=Mode.CONCORD)
+    for slot, value in enumerate(output_values):
+        book.post(FUNCTION_OUTPUT, (name, slot), (None, int(value.id)),
+                  stage=CONTROL_SSA, provenance=Derived((cells[int(value.id)],)),
+                  mode=Mode.CONCORD)
+    book.post(SSA_BLOCK, (name, name, "entry"), SSABlockKind.ENTRY,
+              stage=CONTROL_SSA,
+              provenance=Derived(tuple(cells[int(value.id)] for value in output_values)),
+              mode=Mode.CONCORD)
     # The same contract-governed identity pass the whole-program path runs at
     # finalization; without it the direct scalar lanes would receive raw Pow
     # and each backend's private spelling table would become a second,

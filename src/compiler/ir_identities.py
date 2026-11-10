@@ -586,6 +586,13 @@ def _pow_signal_core(emitter, instruction):
         form = "math"
     elif attributes.get("source_type") == "BinOp":
         form = "operator"
+    elif (attributes.get("source_language") == "sympy"
+          and attributes.get("source_type") == "Pow"):
+        # The symbolic pneumatic law retains a SymPy Pow, not a Python
+        # BinOp. Its real-f64 materialization uses the existing power core
+        # and refuses complex results/undefined zero powers by name.
+        # Read the ingestion's source record; never infer origin from Pow.
+        form = "operator"
     else:
         raise ValueError(
             "float Pow carries neither a math.pow extraction contract nor "
@@ -880,7 +887,9 @@ def scalarize_elementwise_transcendentals(function, block_name, index):
     return name
 
 
-def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
+def lower_transcendentals_to_signal_cores(
+    functions, *, mode=None, instruction_filter=None,
+) -> dict:
     """Route scalar float64 ``math`` transcendentals through the signal cores.
 
     Program: any ``math.exp``/``math.log``/``math.sin``/... on a float.
@@ -905,6 +914,10 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     (``scalarize_elementwise_transcendentals``), rewritten here like any
     other, so every element is the core's double behind the core's guards;
     the receipt counts them (``elementwise``).
+
+    ``instruction_filter`` lets a target legalization rule select the ops
+    its instruction set cannot spell. Selected ops use this same core and
+    fault lowering; unselected ops retain their original identities.
 
     ``backend_intrinsic`` (the ``compute`` mode) rewrites nothing: each
     backend spells the op with its own math library (C libm, ``llvm.*`` or
@@ -936,6 +949,8 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
 
     def routed(instruction) -> bool:
         if policy != "signal_cores" or not scalar(instruction):
+            return False
+        if instruction_filter is not None and not instruction_filter(instruction):
             return False
         if str(instruction.op) not in TRANSCENDENTAL_SIGNAL_CORES:
             raise ValueError(
