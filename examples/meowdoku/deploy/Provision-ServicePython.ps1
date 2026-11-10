@@ -8,12 +8,13 @@ Download is NOT done here. Asset: cpython-3.11.18+20261026-x86_64-pc-windows-msv
 param(
     [Parameter(Mandatory = $true)][string]$Archive,
     [string]$Root = 'C:/dev/Powershell/srv',
+    [string]$Requirements = '',   # default: requirements-service.txt beside this script (Torch build); pass requirements-service-notorch.txt for the Torch-free service
     [switch]$WhatIf
 )
 $ErrorActionPreference = 'Stop'
 $AssetName    = 'cpython-3.11.18+20261026-x86_64-pc-windows-msvc-install_only.tar.gz'
 $ExpectedSha  = '75cb501dc11c7b55c6b447c58e4910bce5b1f609f1017328b4f3a858dfaf5428'
-$Requirements = Join-Path $PSScriptRoot 'requirements-service.txt'
+if (-not $Requirements) { $Requirements = Join-Path $PSScriptRoot 'requirements-service.txt' }
 $PyDir = "$Root/python"
 $Py    = "$PyDir/python.exe"
 
@@ -28,10 +29,12 @@ if (Test-Path -LiteralPath $PyDir) { throw "REFUSED: $PyDir already exists; remo
 
 function Cmd($t) { Write-Host "cmd: $t" }
 Cmd "New-Item -ItemType Directory -Force $Root"
-Cmd "tar -xzf $Archive -C $Root     (creates $PyDir)"
+# Windows' own bsdtar by absolute path: a Git-for-Windows tar earlier on PATH reads "C:" as a remote host.
+$Tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+Cmd "$Tar -xzf $Archive -C $Root     (creates $PyDir)"
 if (-not $WhatIf) {
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
-    & tar.exe -xzf $Archive -C $Root
+    & $Tar -xzf $Archive -C $Root
     if ($LASTEXITCODE -ne 0) { throw "tar failed with exit $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $Py)) { throw "extraction did not produce $Py" }
 }
