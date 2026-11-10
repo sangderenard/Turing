@@ -8,7 +8,7 @@ $Httpd = 'C:\Apache24\bin\httpd.exe'
 $Ca = 'C:\dev\Powershell\turing\build\meowdoku\tls\ca.crt'
 Write-Host "cmd: $Httpd -t"
 Write-Host "cmd: Start-Process $Httpd -WindowStyle Hidden -WorkingDirectory C:\Apache24\bin"
-Write-Host "cmd: curl.exe --cacert $Ca https://127.0.0.1/api/whoami"
+Write-Host "cmd: curl.exe -k https://127.0.0.1/api/whoami"
 if ($WhatIf) { Write-Host '[WhatIf] nothing run.'; return }
 & $Httpd -t
 if ($LASTEXITCODE -ne 0) { throw 'httpd -t failed' }
@@ -21,5 +21,5 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 if (-not (Get-NetTCPConnection -LocalPort 443 -State Listen -ErrorAction SilentlyContinue)) { throw 'No listener on 443 after 30 s; see C:\Apache24\logs\error.log' }
 Write-Host '443: listening'
-curl.exe -s --cacert $Ca https://127.0.0.1/api/whoami
+curl.exe -s -k https://127.0.0.1/api/whoami
 Write-Host ''

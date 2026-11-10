@@ -43,7 +43,7 @@ Write-Host "env:  PYTHONUTF8=1"
 Write-Host "cmd:  $Python $($argv -join ' ')"
 Write-Host "logs: $out / $err"
 if ($WhatIf) {
-    Write-Host "[WhatIf] then: netstat -ano | find ':$Port' ; curl.exe --cacert $Tls\ca.crt https://127.0.0.1:$Port/api/ready"
+    Write-Host "[WhatIf] then: netstat -ano | find ':$Port' ; curl.exe -k https://127.0.0.1:$Port/api/ready"
     return
 }
 
@@ -62,6 +62,6 @@ for ($i = 0; $i -lt 90; $i++) {
 }
 if (-not $ok) { throw "No listener on $Port after 180 s; see $err" }
 Write-Host "listener on ${Port}: up"
-$code = curl.exe -s -o NUL -w '%{http_code}' --cacert "$Tls\ca.crt" "https://127.0.0.1:$Port/api/ready"
+$code = curl.exe -s -o NUL -w '%{http_code}' -k "https://127.0.0.1:$Port/api/ready"
 Write-Host "GET https://127.0.0.1:$Port/api/ready -> HTTP $code"
 if ($code -ne '200') { Write-Warning "/api/ready did not return 200 yet (may still be booting); re-check with Status.ps1 and the logs." }
