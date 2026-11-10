@@ -123,3 +123,18 @@ writer pairs with it (`<stem>.abi.json`, or the `*.manifest.json` record naming 
 `described`, never `verified`. Scan: `python examples/meowdoku/lowering_library.py scan <web_dir> --db <accounts.db>`;
 read: `... list --db <accounts.db>`. Server integration (scan at startup into accounts.db; `/api/lowerings`) is pending
 in the live tree; server.py is not in this branch.
+
+
+### Blobs, versions, selection, leases
+
+`scan` also stores each built product's bytes in `lowering_blobs` (content-addressed by `product_sha256`, `kind` = file
+suffix; `store_blobs=False` skips it), so a lowering row always resolves to bytes via `blob_bytes`. `versions(core_id,
+backend)` lists lowerings newest first; each distinct sha256 is one version. `select_lowering(purpose, capabilities,
+prefer=, contract=)` takes `purpose = (family, name)` (a core's computational purpose is its declared family+name) and
+the set of backends the caller can execute, and returns the newest built lowering by `prefer` order then the fixed order
+(c, llvm, fortran, wasm, wgsl, spirv, cpython), or None; it never falls back to a non-executable backend. Role/tier
+rights are not interpreted: server authz passes only what the account may execute. `checkout` issues a `lowering_leases`
+row under `BEGIN IMMEDIATE` with a per-blob generation and deadline; `checkin` succeeds once, on matching account and
+generation; `expired` lists overdue unreturned leases (never deleted); `outstanding` counts open leases per blob (the
+contention signal). CLI: `store`, `versions`, `checkout`, `checkin`, `leases`. The HTTP surface
+(`/api/lowerings/checkout`, `/checkin`) is pending in the live tree.

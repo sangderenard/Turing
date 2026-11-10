@@ -38,6 +38,13 @@ LOWERINGS = ("CREATE TABLE IF NOT EXISTS lowerings (core_id TEXT NOT NULL REFERE
              "backend TEXT NOT NULL, contract TEXT, entry TEXT NOT NULL, api_path TEXT NOT NULL, abi_path TEXT, "
              "product_path TEXT, product_sha256 TEXT, abi_schema TEXT, arch TEXT, verdict TEXT NOT NULL, "
              "scanned REAL NOT NULL, PRIMARY KEY (core_id, backend, api_path))")
+BLOBS = ("CREATE TABLE IF NOT EXISTS lowering_blobs (product_sha256 TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+         "byte_count INTEGER NOT NULL, bytes BLOB NOT NULL, stored REAL NOT NULL)")
+LEASES = ("CREATE TABLE IF NOT EXISTS lowering_leases (lease_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+          "product_sha256 TEXT NOT NULL REFERENCES lowering_blobs(product_sha256), core_id TEXT NOT NULL, "
+          "backend TEXT NOT NULL, account_key TEXT NOT NULL, purpose TEXT NOT NULL, generation INTEGER NOT NULL, "
+          "issued REAL NOT NULL, deadline REAL NOT NULL, returned REAL)")
+BACKEND_ORDER = ("c", "llvm", "fortran", "wasm", "wgsl", "spirv", "cpython")
 
 
 @dataclass
@@ -71,6 +78,8 @@ def connect(db_path):
         db.execute("PRAGMA journal_mode=WAL")
         db.execute(CORES)
         db.execute(LOWERINGS)
+        db.execute(BLOBS)
+        db.execute(LEASES)
         with db:
             yield db
     finally:
@@ -167,11 +176,30 @@ def register(db_path, record: ProductRecord) -> None:
                     record.product_path, record.product_sha256, record.abi_schema, record.arch, record.verdict, now))
 
 
-def scan(root, db_path) -> list[ProductRecord]:
+def store_blob(db_path, product_path) -> str:
+    """Store the product file's bytes content-addressed (idempotent); returns its sha256."""
+    product_path = Path(product_path)
+    data = product_path.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    with connect(db_path) as db:
+        db.execute("INSERT OR IGNORE INTO lowering_blobs VALUES (?,?,?,?,?)",
+                   (sha, product_path.suffix.lstrip("."), len(data), data, time.time()))
+    return sha
+
+
+def blob_bytes(db_path, product_sha256) -> bytes | None:
+    with connect(db_path) as db:
+        row = db.execute("SELECT bytes FROM lowering_blobs WHERE product_sha256=?", (product_sha256,)).fetchone()
+    return None if row is None else bytes(row["bytes"])
+
+
+def scan(root, db_path, store_blobs=True) -> list[ProductRecord]:
     root = Path(root)
     records = [describe_product(p, root) for p in sorted(root.rglob("*.api.yaml"))]
     for record in records:
         register(db_path, record)
+        if store_blobs and record.product_path:
+            store_blob(db_path, root / record.product_path)
     return records
 
 
@@ -191,18 +219,161 @@ def lowerings(db_path, core_id=None, backend=None) -> list[dict]:
         return [dict(r) for r in db.execute(sql, args)]
 
 
+def versions(db_path, core_id, backend) -> list[dict]:
+    """All lowerings of that core/backend, newest scanned first; each distinct product_sha256 is one version."""
+    with connect(db_path) as db:
+        return [dict(r) for r in db.execute(
+            "SELECT * FROM lowerings WHERE core_id=? AND backend=? ORDER BY scanned DESC, api_path", (core_id, backend))]
+
+
+def _select(db, purpose, capabilities, prefer, contract):
+    family, name = purpose
+    caps = frozenset(capabilities)
+    rank = {b: i for i, b in enumerate(tuple(prefer) + BACKEND_ORDER)}
+    rows = [dict(r) for r in db.execute(
+        "SELECT l.* FROM lowerings l JOIN lowering_cores c ON c.core_id=l.core_id "
+        "JOIN lowering_blobs b ON b.product_sha256=l.product_sha256 "
+        "WHERE c.family=? AND c.name=? AND l.verdict='built'", (family, name))]
+    rows = [r for r in rows if r["backend"] in caps and (contract is None or r["contract"] == contract)]
+    rows.sort(key=lambda r: (rank.get(r["backend"], len(rank)), -r["scanned"]))
+    return rows[0] if rows else None
+
+
+def select_lowering(db_path, purpose, capabilities, *, prefer=(), contract=None) -> dict | None:
+    """Pick the lowering of a computational purpose that the caller can execute.
+
+    ``purpose`` is ``(family, name)``: a core's computational purpose IS its declared family + name.  ``capabilities``
+    is the set of backend names the caller can execute; it is the only capability interpreted here (role/tier/account
+    rights belong to the server authz layer, which passes in only what the account may execute).  Order: ``prefer``
+    backends first, then BACKEND_ORDER, then newest scanned.  Only built lowerings whose blob is stored qualify.
+    Returns None when nothing fits; never falls back to a backend outside ``capabilities``.
+    """
+    with connect(db_path) as db:
+        return _select(db, purpose, capabilities, prefer, contract)
+
+
+@dataclass
+class Lease:
+    lease_id: int
+    product_sha256: str
+    core_id: str
+    backend: str
+    generation: int
+    deadline: float
+    kind: str
+    byte_count: int
+    account_key: str = ""
+
+
+def checkout(db_path, purpose, capabilities, account_key, seconds, *, prefer=(), contract=None) -> Lease | None:
+    """Select (see select_lowering) and lease a version under BEGIN IMMEDIATE; fetch bytes with ``blob_bytes``.
+
+    Each lease gets a fresh per-blob generation (max existing + 1).  Capabilities beyond backends are not interpreted.
+    """
+    db = sqlite3.connect(Path(db_path), timeout=10, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        chosen = _select(db, purpose, capabilities, prefer, contract)
+        if chosen is None:
+            db.execute("ROLLBACK")
+            return None
+        sha, now = chosen["product_sha256"], time.time()
+        blob = db.execute("SELECT kind, byte_count FROM lowering_blobs WHERE product_sha256=?", (sha,)).fetchone()
+        gen = db.execute("SELECT COALESCE(MAX(generation),0)+1 FROM lowering_leases WHERE product_sha256=?",
+                         (sha,)).fetchone()[0]
+        cur = db.execute("INSERT INTO lowering_leases (product_sha256,core_id,backend,account_key,purpose,generation,"
+                         "issued,deadline) VALUES (?,?,?,?,?,?,?,?)",
+                         (sha, chosen["core_id"], chosen["backend"], account_key, f"{purpose[0]}:{purpose[1]}", gen,
+                          now, now + seconds))
+        db.execute("COMMIT")
+    except BaseException:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+    return Lease(cur.lastrowid, sha, chosen["core_id"], chosen["backend"], gen, now + seconds, blob["kind"],
+                 blob["byte_count"], account_key)
+
+
+def checkin(db_path, lease_id, account_key, generation) -> bool:
+    """Return a lease: succeeds once, only when account_key and generation match and it is not already returned."""
+    with connect(db_path) as db:
+        cur = db.execute("UPDATE lowering_leases SET returned=? WHERE lease_id=? AND account_key=? AND generation=? "
+                         "AND returned IS NULL", (time.time(), lease_id, account_key, generation))
+        return cur.rowcount == 1
+
+
+def _leases(db_path, where="", args=()) -> list[Lease]:
+    with connect(db_path) as db:
+        return [Lease(r["lease_id"], r["product_sha256"], r["core_id"], r["backend"], r["generation"], r["deadline"],
+                      r["kind"], r["byte_count"], r["account_key"]) for r in db.execute(
+            "SELECT l.*, b.kind, b.byte_count FROM lowering_leases l JOIN lowering_blobs b "
+            "ON b.product_sha256=l.product_sha256 " + where + " ORDER BY l.lease_id", args)]
+
+
+def expired(db_path, now=None) -> list[Lease]:
+    """Unreturned leases past their deadline (eligible for reassignment); nothing is deleted."""
+    return _leases(db_path, "WHERE l.returned IS NULL AND l.deadline < ?", (time.time() if now is None else now,))
+
+
+def outstanding(db_path, product_sha256) -> int:
+    """Open (unreturned) leases of one blob: the contention signal."""
+    with connect(db_path) as db:
+        return db.execute("SELECT COUNT(*) FROM lowering_leases WHERE product_sha256=? AND returned IS NULL",
+                          (product_sha256,)).fetchone()[0]
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("scan")
-    s.add_argument("root")
-    s.add_argument("--db", required=True)
+    for name in ("scan", "store"):
+        sp = sub.add_parser(name)
+        sp.add_argument("root")
+        sp.add_argument("--db", required=True)
     ls = sub.add_parser("list")
     ls.add_argument("--db", required=True)
+    v = sub.add_parser("versions")
+    v.add_argument("core_id")
+    v.add_argument("backend")
+    v.add_argument("--db", required=True)
+    co = sub.add_parser("checkout")
+    co.add_argument("--db", required=True)
+    co.add_argument("--purpose", required=True, help="family:name")
+    co.add_argument("--caps", required=True, help="comma-separated backends")
+    co.add_argument("--account", required=True)
+    co.add_argument("--seconds", type=float, required=True)
+    co.add_argument("--prefer", default="")
+    ci = sub.add_parser("checkin")
+    ci.add_argument("lease_id", type=int)
+    ci.add_argument("--db", required=True)
+    ci.add_argument("--account", required=True)
+    ci.add_argument("--generation", type=int, required=True)
+    lz = sub.add_parser("leases")
+    lz.add_argument("--db", required=True)
     args = parser.parse_args(argv)
-    if args.command == "scan":
+    if args.command in ("scan", "store"):
         found = scan(args.root, args.db)
         print(f"registered {len(found)} products")
+    elif args.command == "versions":
+        for row in versions(args.db, args.core_id, args.backend):
+            print(f"{row['product_sha256']}  {row['scanned']:.0f}  {row['api_path']}")
+        return 0
+    elif args.command == "checkout":
+        family, _, name = args.purpose.partition(":")
+        lease = checkout(args.db, (family, name), frozenset(filter(None, args.caps.split(","))), args.account,
+                         args.seconds, prefer=tuple(filter(None, args.prefer.split(","))))
+        print(lease if lease else "no executable lowering")
+        return 0 if lease else 1
+    elif args.command == "checkin":
+        ok = checkin(args.db, args.lease_id, args.account, args.generation)
+        print("returned" if ok else "refused")
+        return 0 if ok else 1
+    elif args.command == "leases":
+        for r in _leases(args.db):
+            print(r)
+        return 0
     for row in lowerings(args.db):
         print(f"{row['core_id']}  {row['backend']:<6} {row['verdict']:<9} {row['entry']}  {row['api_path']}")
     return 0
