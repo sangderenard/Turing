@@ -6,7 +6,7 @@ library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, u
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
-photo_submit, share_live, account_manage.  ``capabilities(principal, policy)`` is the one place they are computed:
+photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit.  ``capabilities(principal, policy)`` is the one place they are computed:
 
     effective = tier_caps[tier] | role_caps[role]
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
@@ -50,6 +50,9 @@ INTEGRATION SPEC (server.py is not in this branch).  Build the principal once in
     ~1423 /api/action single EDIT_ACTIONS require_tier edit        same                                     owner_tools
     new   account admin endpoints (grant/revoke/list)              role management                          account_manage
 
+COMPILE SUBMIT.  ``compile_submit`` (POST /api/mathlab/jobs: spend the single math-lab worker's compile time) is granted by NO tier, only by
+the roles member, operator, service and admin, so a guest or an anonymous LAN visitor (tier edit) cannot submit.
+
 SCRIPT ACCESS.  ``deploy_scripts`` is granted by no tier, only by role admin/operator.  deploy/*.ps1 run ``script-auth``: the account must
 verify, be in ``script_access`` (explicit allow-list) and hold deploy_scripts; every attempt is a ``script_audit`` row (exit 3 refuses).
 CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude/guest_agent.
@@ -79,7 +82,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
     _spec.loader.exec_module(_schema_version)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit")
 ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -90,15 +93,15 @@ DEFAULT_POLICY = {
         "shader": ["view_site"],
         "play": ["view_site", "play"],
         "dev": ["view_site", "play", "dev_ui"],
-        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate")],
+        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit")],
     },
     "role_caps": {
-        "member": ["studio_write", "photo_submit", "share_live"],
+        "member": ["studio_write", "photo_submit", "share_live", "compile_submit"],
         # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
-        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate"],
+        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit"],
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
-        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate"],
+        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit"],
         "admin": list(CAPS),
         "guest": [],
     },

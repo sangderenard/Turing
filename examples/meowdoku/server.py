@@ -80,6 +80,7 @@ from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real pas
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
+from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -367,6 +368,8 @@ class Sessions:
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
         self.accounts = accounts_mod.Accounts(self.state.accounts_db)   # [ACCOUNTS] real password login
         self.accounts_db = self.state.accounts_db
+        self.mathlab_lock = threading.Lock()
+        self.mathlab_worker = None                                      # [MATHLAB] set by main() unless --no-mathlab
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
         self.instance = ""                                                      # [INSTANCE] --instance NAME (account_instances binding)
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
@@ -654,6 +657,140 @@ def make_handler(sessions: Sessions):
                         "dev": "dev_ui" in caps, "edit": "owner_tools" in caps,
                         "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
                         "instance": sessions.instance or None})
+
+        # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
+        # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
+        _MATHLAB_FILES = ("law.at.py", "law.numpy.py", "law.abi.json", "law.wgsl.abi.json", "law.api.yaml")
+        _MATHLAB_ATTACHMENTS = ("law.numpy.py", "law.at.py")
+        _MATHLAB_BROWSER_LIMIT = 4096
+
+        def _mathlab_served_names(self, directory: Path) -> set:
+            """The files a job may serve: the fixed list plus every file products.json names, never the native library or piece."""
+            names = set(self._MATHLAB_FILES)
+            try:
+                record = json.loads((directory / "products.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                record = {}
+            native = record.get("targets", {}).get("native", {}) if isinstance(record, dict) else {}
+            refused = {str(native.get(k)) for k in ("file", "piece_file") if native.get(k)}
+            listed = [v for v in (record.get("files") or {}).values()] if isinstance(record, dict) else []
+            for target in (record.get("targets") or {}).values() if isinstance(record, dict) else ():
+                listed += [target.get(k) for k in ("file", "abi_file", "api_file") if isinstance(target, dict)]
+            for name in listed:
+                if isinstance(name, str) and name not in refused and not name.startswith("native/") \
+                        and not name.endswith((".dll", ".so", ".dylib", ".piece")):
+                    names.add(name)
+            names.add("products.json")
+            names.add("profile.server.json")
+            names.add("profile.browser.json")
+            return {n for n in names if "/" not in n and "\\" not in n and not n.endswith((".dll", ".so", ".dylib", ".piece"))}
+
+        def _mathlab_get(self, path: str) -> None:
+            import re as _re
+            from urllib.parse import unquote
+            if not self._require("compile_submit"):
+                return
+            self._set_cookie = []
+            owner = self._job_identity()[0][0]
+            self._set_cookie = []
+            parts = [unquote(x) for x in path[len("/api/mathlab/"):].split("/")]
+            db = math_jobs_mod.connect(sessions.accounts_db)
+            try:
+                if parts == ["jobs"]:
+                    return self._json({"jobs": math_jobs_mod.list_jobs(db, owner)})
+                if len(parts) >= 2 and parts[0] == "jobs" and _re.fullmatch(r"[0-9a-f]{16}", parts[1] or ""):
+                    job = math_jobs_mod.get_job(db, sessions.state, parts[1], owner)
+                    if job is None:
+                        return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                    if len(parts) == 2:
+                        return self._json(job)
+                    if len(parts) == 4 and parts[2] == "file":
+                        directory = math_jobs_mod.job_dir(sessions.state, parts[1])
+                        name = parts[3]
+                        target = directory / name
+                        if name not in self._mathlab_served_names(directory) or not target.is_file():
+                            return self._json({"error": "no such file"}, HTTPStatus.NOT_FOUND)
+                        data = target.read_bytes()
+                        ctype = ("application/wasm" if name.endswith(".wasm") else "application/json" if name.endswith(".json")
+                                 else "text/plain; charset=utf-8")
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", ctype)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Cache-Control", "no-store")
+                        if name in self._MATHLAB_ATTACHMENTS:
+                            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            finally:
+                db.close()
+
+        def _mathlab_post(self, path0: str) -> None:
+            import math as _math
+            import re as _re
+            if not self._require("compile_submit"):
+                return
+            owner = self._job_identity()[0][0]
+            self._set_cookie = []
+            body = self._body_json(8192)
+            if body is None:
+                return
+            db = math_jobs_mod.connect(sessions.accounts_db)
+            try:
+                if path0 == "/api/mathlab/jobs":
+                    text, targets = body.get("text"), body.get("targets")
+                    if not isinstance(text, str) or not (targets is None or isinstance(targets, list)):
+                        return self._json({"error": "expected {text: string, targets?: [names]}"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        result = math_jobs_mod.submit(db, sessions.state, owner, text, targets)
+                    except math_jobs_mod.LimitError as error:
+                        return self._json({"error": error.message}, error.status)
+                    except ValueError as error:
+                        return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                    if sessions.mathlab_worker is not None:
+                        sessions.mathlab_worker.wake()
+                    return self._json(result, HTTPStatus.UNPROCESSABLE_ENTITY if result["state"] == "rejected" else HTTPStatus.OK)
+                match = _re.fullmatch(r"/api/mathlab/jobs/([0-9a-f]{16})/browser_profile", path0)
+                if match:
+                    job = math_jobs_mod.get_job(db, sessions.state, match.group(1), owner)
+                    if job is None:
+                        return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                    if job["state"] != "complete":
+                        return self._json({"error": "the job has not completed"}, HTTPStatus.CONFLICT)
+
+                    def finite(key, low=0.0, optional=False):
+                        value = body.get(key)
+                        if value is None and optional:
+                            return None
+                        if isinstance(value, bool) or not isinstance(value, (int, float)) or not _math.isfinite(value) or value < low:
+                            raise ValueError(f"{key} must be a finite number >= {low}")
+                        return float(value)
+                    try:
+                        target = body.get("target")
+                        if target not in ("wasm", "wgsl"):
+                            raise ValueError("target must be wasm or wgsl")
+                        rows = finite("rows", 1.0)
+                        if rows > 1e9:
+                            raise ValueError("rows is out of range")
+                        entry = {"target": target, "rows": int(rows), "ns_per_row": finite("ns_per_row"),
+                                 "max_abs_err": finite("max_abs_err", optional=True),
+                                 "user_agent_hint": str(body.get("user_agent_hint") or "")[:200], "recorded": time.time()}
+                    except ValueError as error:
+                        return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                    with sessions.mathlab_lock:
+                        path = math_jobs_mod.job_dir(sessions.state, match.group(1)) / "profile.browser.json"
+                        try:
+                            held = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+                        except (OSError, ValueError):
+                            held = {}
+                        results = [r for r in held.get("results", []) if r.get("target") != target] + [entry]
+                        path.write_text(json.dumps({"schema": "turing.math-lab-browser-profile.v1", "results": results}, indent=1),
+                                        encoding="utf-8")
+                    return self._json({"ok": True, "results": results})
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            finally:
+                db.close()
 
         def do_HEAD(self):  # noqa: N802
             self._classify()
@@ -1084,6 +1221,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path.startswith("/api/mathlab/"):                  # [MATHLAB]
+                return self._mathlab_get(path)
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
                 return self._lifecycle_get()
             if path == "/api/ready":                              # [LOADING] per-product readiness, polled by the page (loading_panel.js)
@@ -1462,6 +1601,8 @@ def make_handler(sessions: Sessions):
             if self._tier == "shader":
                 self._shader_request(path0, "POST")
                 return
+            if path0.startswith("/api/mathlab/"):              # [MATHLAB]
+                return self._mathlab_post(path0)
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
                 try:
@@ -2125,6 +2266,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="[FEDERATE] the local Nodus host's 127.0.0.1 contract port that /ws/contract/<prefix> bridges to (with --federation-canvas)")
     parser.add_argument("--federation-canvas", default=None,
                         help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
+    parser.add_argument("--no-mathlab", action="store_true",
+                        help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -2173,6 +2316,8 @@ def main(argv: list[str] | None = None) -> int:
     startup_mod.Lanes(sessions.readiness).declare(lanes)            # every product is visible as "pending" from the first request
     lifecycle_mod.record_launch(lc.paths, args.port, args.bind, web_dir)
     threading.Thread(target=lc.run, name="lifecycle", daemon=True).start()
+    if not args.no_mathlab:                                          # [MATHLAB] ONE worker; running jobs from a previous run are requeued once
+        sessions.mathlab_worker = math_jobs_mod.Worker(sessions.accounts_db, state).start()
     scheme = "http"
     if args.tls_cert:
         import ssl
@@ -2201,6 +2346,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lc.stopping = True
+        if sessions.mathlab_worker is not None:
+            sessions.mathlab_worker.stop()
         sessions.marble_photos.close()
         if not lc.exit_code:
             lc.save_all()                                   # LIFECYCLE: a Ctrl-C keeps the sessions too

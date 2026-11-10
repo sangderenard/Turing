@@ -49,7 +49,7 @@ def test_guest_dns():
 
 
 def test_member_dns():
-    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "studio_write", "photo_submit", "share_live"}
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "studio_write", "photo_submit", "share_live", "compile_submit"}
 
 
 def test_admin_dns_no_lifecycle():

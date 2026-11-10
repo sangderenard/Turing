@@ -556,6 +556,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("marble_optical_authoring.js", "marble_studio_optical.js", "marble_optical_diagnostic.js", "marble_lens_controls.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("mathlab.html", "mathlab.js"):                                  # [MATHLAB] the math lab page (server.py /api/mathlab/*)
+        shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
     print(f"[export] emoji atlas {atlas['size'][0]}x{atlas['size'][1]}: {[k['name'] for k in atlas['kinds']]}", flush=True)

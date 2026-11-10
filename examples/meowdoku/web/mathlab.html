@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Math lab</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:60rem; margin:0 auto; padding:1.2rem 16px 4rem; }
+  h1 { font-size:1.3rem; margin:0 0 .2rem; } h2 { font-size:1.05rem; margin:1.6rem 0 .4rem; }
+  p.lede, .mut { color:var(--mut); }
+  textarea { width:100%; box-sizing:border-box; min-height:8rem; font:14px/1.4 ui-monospace, Consolas, monospace; padding:.6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  .row { display:flex; flex-wrap:wrap; gap:1rem; align-items:center; margin:.6rem 0; }
+  button { font:inherit; padding:.45rem 1.1rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { border-collapse:collapse; width:100%; background:var(--card); }
+  th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--mut); } td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  code, pre { font:13px ui-monospace, Consolas, monospace; } pre { background:var(--card); border:1px solid var(--line); padding:.5rem; overflow:auto; }
+  .note { border-left:3px solid var(--line); padding:.2rem .7rem; margin:.6rem 0; color:var(--mut); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Math lab</h1>
+  <p class="lede">Write equations, one <code>name = expression</code> per line. The compiler turns them into NumPy, WebAssembly, WebGPU and native products; each product is timed on the machine that ran it.</p>
+  <p id="gate" class="note" hidden></p>
+  <form id="form">
+    <textarea id="text" spellcheck="false" aria-label="equations">r = sqrt(x*x + y*y)
+e = x*y + 2*z</textarea>
+    <div class="row" id="targets"></div>
+    <div class="row"><button id="submit" type="submit">Submit</button><span id="status" class="mut" role="status"></span></div>
+  </form>
+  <section id="result" hidden>
+    <h2>Law</h2>
+    <div id="law"></div>
+    <h2>Targets</h2>
+    <table id="targettable"><thead><tr><th>target</th><th>state</th><th>compile s</th><th>detail</th></tr></thead><tbody></tbody></table>
+    <h2>Where it ran</h2>
+    <p class="note" id="machines">The server rows ran on the server machine. The browser rows ran on this device. They are different machines, so compare ns/row across them with that in mind.</p>
+    <table id="ran"><thead><tr><th>machine</th><th>product</th><th>rows</th><th class="num">ns/row</th><th class="num">max abs diff</th><th>reference</th></tr></thead><tbody></tbody></table>
+    <p class="mut" id="ranfoot"></p>
+    <h2>Downloads</h2>
+    <p id="downloads"></p>
+  </section>
+</main>
+<script type="module" src="mathlab.js"></script>
+</body>
+</html>

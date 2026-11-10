@@ -57,6 +57,7 @@ PRODUCTS_SCHEMA = "turing.math-lab-products.v1"
 PROFILE_SCHEMA = "turing.math-lab-profile.v1"
 WGSL_SCHEMA = "turing.math-lab-wgsl.v1"
 ALL_TARGETS = ("numpy", "wasm", "wgsl", "native")
+REFERENCE_ROWS = 64
 
 MAX_LINES = 32
 MAX_CHARS = 4096
@@ -609,6 +610,14 @@ def profile_server(products, rows=(1_000, 100_000), repeats: int = 20, seed: int
         for label, item in entry.items():
             item["speedup_vs_sympy"] = base / item["ns_per_row"]
         result["rows"][str(count)] = entry
+    # [MATHLAB] a small exact reference for the browser: seed, REFERENCE_ROWS input rows and the sympy outputs for them, so the page
+    # can feed the same rows to law.wasm and compare its own results against these numbers (the page measures its own timing).
+    ref_columns = _sample(inputs, REFERENCE_ROWS, seed)
+    ref_out = reference(*(ref_columns[n] for n in inputs))
+    result["reference"] = {
+        "seed": seed, "rows": REFERENCE_ROWS, "source": "sympy_lambdify (server)",
+        "inputs": {n: [float(v) for v in ref_columns[n]] for n in inputs},
+        "outputs": {n: [float(v) for v in col] for n, col in zip(outputs, ref_out)}}
     (out_dir / "profile.server.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     return result
 
