@@ -25,7 +25,9 @@ Write-Host ($__gate -join ' ')
 # ---- end gate
 $ErrorActionPreference = 'Stop'
 $Httpd = 'C:\Apache24\bin\httpd.exe'
-$Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'
+$ServicePython = 'C:\dev\Powershell\srv\python\python.exe'
+if (-not (Test-Path -LiteralPath $ServicePython)) { $ServicePython = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe' }   # until provisioned
+$Python = $ServicePython
 $Sup = 'C:\dev\Powershell\turing\examples\meowdoku\deploy\apache_supervisor.py'
 Write-Host "cmd: $Httpd -k stop   (fallback: Stop-Process on the 443 httpd listener and its httpd parent only)"
 Write-Host "then: poll '$Python $Sup --status' up to $InstanceTimeout s for all instances stopped; fallback: Stop-Process by pid from the table"

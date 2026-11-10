@@ -1,37 +1,47 @@
-[
-  {
-    "name": "meowdoku-a",
-    "kind": "meowdoku",
-    "port": 8766,
-    "route": "a",
-    "bind": "0.0.0.0",
-    "account": "svc-meowdoku-a",
-    "args": [
-      "--tls-cert", "build/meowdoku/tls/cert.pem",
-      "--tls-key", "build/meowdoku/tls/key.pem",
-      "--retain-fountain-products", "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json"
-    ],
-    "leases": []
-  },
-  {
-    "name": "nodus-messenger",
-    "kind": "nodus",
-    "port": null,
-    "route": "",
-    "bind": "127.0.0.1",
-    "account": "svc-nodus-messenger",
-    "args": [],
-    "leases": [],
-    "nodus": {
-      "tool": "C:/dev/Powershell/nodus/tools/run_canvas.py",
-      "canvas": "build/meowdoku/canvas/messenger.canvas",
-      "acquire": ["gui.proof:4"],
-      "rate": 60,
-      "dll": "C:/dev/Powershell/nodus/build-bridging/Release/nodus_headless.dll",
-      "path_prepend": [
-        "C:/dev/Powershell/nodus/build-bridging/Release",
-        "C:/Users/alber/AppData/Local/Programs/Python/Python311/Lib/site-packages/torch/lib"
-      ]
+{
+  "supervisor_python": "C:/dev/Powershell/srv/python/python.exe",
+  "instances": [
+    {
+      "name": "meowdoku-a",
+      "kind": "meowdoku",
+      "port": 8766,
+      "route": "a",
+      "bind": "0.0.0.0",
+      "account": "svc-meowdoku-a",
+      "args": [
+        "--tls-cert",
+        "build/meowdoku/tls/cert.pem",
+        "--tls-key",
+        "build/meowdoku/tls/key.pem",
+        "--retain-fountain-products",
+        "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json"
+      ],
+      "leases": [],
+      "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "nodus-messenger",
+      "kind": "nodus",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-nodus-messenger",
+      "args": [],
+      "leases": [],
+      "nodus": {
+        "tool": "C:/dev/Powershell/nodus/tools/run_canvas.py",
+        "canvas": "build/meowdoku/canvas/messenger.canvas",
+        "acquire": [
+          "gui.proof:4"
+        ],
+        "rate": 60,
+        "dll": "C:/dev/Powershell/nodus/build-service/Release/nodus_headless.dll",
+        "path_prepend": [
+          "C:/dev/Powershell/srv/python/Lib/site-packages/torch/lib",
+          "C:/dev/Powershell/nodus/build-service/Release"
+        ]
+      },
+      "python": "C:/dev/Powershell/srv/python/python.exe"
     }
-  }
-]
+  ]
+}

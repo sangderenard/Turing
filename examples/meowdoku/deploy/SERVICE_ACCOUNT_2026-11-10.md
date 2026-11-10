@@ -16,16 +16,19 @@ Because children inherit the token, the supervisor and both instances run as tha
 - `SeServiceLogonRight` (needed to run a service) and `SeDenyInteractiveLogonRight` (no console/RDP logon), via `secedit` export,
   edit, import of a temporary `.inf`; existing holders are preserved.
 - ACLs (icacls):
-  - RX, inherited: `C:/Apache24`, `C:/dev/Powershell/turing`, `C:/dev/Powershell/nodus`, the Python 3.11 directory (code and DLLs must load).
-  - RX, not inherited: `C:/Users/alber`, `AppData`, `Local`, `Programs` - traversal to the Python directory only.
+  - RX, inherited: `C:/Apache24`, `C:/dev/Powershell/turing`, `C:/dev/Powershell/nodus`, `C:/dev/Powershell/srv` (code and DLLs must load).
+  - No grant touches `C:/Users/alber`.
   - M, inherited: `C:/Apache24/logs`, `turing/build` (Meowdoku state, logs, accounts.db, tls), `nodus/out`.
   - R on `build/meowdoku/admin_token*.txt` and `tls/key.pem` (explicit; the service is added, alber's access is unchanged).
 
-## Weak point
+## Private interpreter (no operator profile, no machine-wide resource)
 
-Python lives under alber's profile (`C:/Users/alber/AppData/Local/Programs/Python/Python311`), including the torch DLLs
-used by Nodus. The service needs traversal of four profile folders plus RX on the whole Python tree. A machine-wide Python
-install (for example `C:/Python311`) would remove those profile ACLs; do that later and update the paths in the deploy scripts and conf.
+The service must not run as `alber` and must not use anything machine-wide (no all-users Python in Program Files). It gets its own
+CPython in `C:/dev/Powershell/srv/python` (relocatable python-build-standalone, release 20261026, asset
+`cpython-3.11.18+20261026-x86_64-pc-windows-msvc-install_only.tar.gz`, sha256 `75cb501dc11c7b55c6b447c58e4910bce5b1f609f1017328b4f3a858dfaf5428`),
+created by `Provision-ServicePython.ps1 -Archive <downloaded file>` (hash-verified, packages from `requirements-service.txt`, no PATH/registry
+changes). Torch IS installed there, exactly the operator's build (2.5.1+cu124), because the Nodus service build (`nodus/build-service`, with Torch, against this interpreter) must match it; the service never uses the operator's torch under `C:/Users/alber`.
+`instances.json` points each instance at that interpreter (`python` field); the service never reads `C:/Users/alber`.
 
 ## Consequences once Apache runs as the service
 
@@ -46,8 +49,7 @@ Dry run first: `pwsh -File ...\Setup-ServiceAccount.ps1 -WhatIf`. Exits 2 if not
 
 ```powershell
 sc.exe stop Apache2.4; sc.exe delete Apache2.4
-icacls C:\Apache24 /remove svc-meowdoku /t      # likewise turing, nodus, the Python dir
-icacls C:\Users\alber /remove svc-meowdoku      # and AppData, AppData\Local, ...\Programs
+icacls C:\Apache24 /remove svc-meowdoku /t      # likewise turing, nodus, srv
 Remove-LocalUser svc-meowdoku                    # then delete the .windows.secret file
 ```
 

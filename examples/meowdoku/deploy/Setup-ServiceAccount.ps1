@@ -2,7 +2,8 @@
 .SYNOPSIS  Create the local service account for Apache + Meowdoku + Nodus and install Apache as the Windows service Apache2.4 under it.
 Run ELEVATED (exit 2 otherwise; -WhatIf may run unelevated). Every step is idempotent and printed before it runs. The password is
 generated here, written ONLY to <SecretsDir>\<Name>.windows.secret (never overwritten, never echoed) and shown as <REDACTED> everywhere.
-See SERVICE_ACCOUNT_2026-11-10.md.
+The service never reads the operator's profile (C:/Users/alber): it runs from the private interpreter C:/dev/Powershell/srv/python
+(Provision-ServicePython.ps1) and uses no machine-wide resource. See SERVICE_ACCOUNT_2026-11-10.md.
 #>
 param(
     [string]$Name = 'svc-meowdoku',
@@ -13,8 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Repo      = 'C:/dev/Powershell/turing'
 $Nodus     = 'C:/dev/Powershell/nodus'
 $Apache    = 'C:/Apache24'
-$PyDir     = 'C:/Users/alber/AppData/Local/Programs/Python/Python311'
-$Traverse  = @('C:/Users/alber', 'C:/Users/alber/AppData', 'C:/Users/alber/AppData/Local', 'C:/Users/alber/AppData/Local/Programs')
+$Srv       = 'C:/dev/Powershell/srv'   # private interpreter tree (srv/python); no grant touches C:/Users/alber
 $Svc       = 'Apache2.4'
 $SecretFile = Join-Path $SecretsDir "$Name.windows.secret"
 
@@ -96,9 +96,7 @@ if (-not $WhatIf) { Remove-Item -LiteralPath $exportInf, $applyInf, $sdb -Force 
 # ---------------------------------------------------------------- (c) ACLs
 Step "(c) NTFS ACLs for $Name"
 Write-Host 'Read+execute with inheritance (the whole tree must be loadable):'
-foreach ($d in @($Apache, $Repo, $Nodus, $PyDir)) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)RX") }
-Write-Host "Traversal only (no inheritance: this folder, not its children) so the Python path under alber's profile is reachable and nothing else is:"
-foreach ($d in $Traverse) { Run 'icacls.exe' @($d, '/grant', "${Name}:(RX)") }
+foreach ($d in @($Apache, $Repo, $Nodus, $Srv)) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)RX") }
 Write-Host 'Modify (logs, state, build output):'
 foreach ($d in @("$Apache/logs", "$Repo/build", "$Nodus/out")) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)M") }
 Write-Host 'Secrets the service must read (explicit file-level grants; build/ already gives Modify by inheritance):'
@@ -127,7 +125,7 @@ Cmd "sc.exe qc $Svc"
 if (-not $WhatIf) { sc.exe qc $Svc }
 Cmd "groups of ${Name}: Get-LocalGroup | where member"
 if (-not $WhatIf) { Get-LocalGroup | Where-Object { Get-LocalGroupMember -Group $_ -Member $Name -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Name }
-foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $PyDir, "$Repo/build/meowdoku/tls/key.pem", $SecretFile)) {
+foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$Repo/build/meowdoku/tls/key.pem", $SecretFile)) {
     Cmd "icacls $d  (lines matching $Name)"
     if (-not $WhatIf -and (Test-Path -LiteralPath $d)) { icacls.exe $d | Select-String -SimpleMatch $Name }
 }

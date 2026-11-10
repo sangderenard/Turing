@@ -29,7 +29,9 @@ $rows = Get-NetTCPConnection -State Listen -LocalPort 80,443,8766,8767,8768 -Err
 if ($rows) { $rows | Format-Table -AutoSize } else { Write-Host 'No listeners on those ports.' }
 
 # Supervisor table (apache_supervisor.py --status): instances Apache owns, with pids and states.
-$Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'
+$ServicePython = 'C:\dev\Powershell\srv\python\python.exe'
+if (-not (Test-Path -LiteralPath $ServicePython)) { $ServicePython = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe' }   # until provisioned
+$Python = $ServicePython
 $Sup = Join-Path $PSScriptRoot 'apache_supervisor.py'
 Write-Host "cmd: $Python $Sup --status"
 $env:PYTHONUTF8 = '1'

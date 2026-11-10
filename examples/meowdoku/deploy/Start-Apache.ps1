@@ -26,7 +26,9 @@ Write-Host ($__gate -join ' ')
 # ---- end gate
 $ErrorActionPreference = 'Stop'
 $Httpd = 'C:\Apache24\bin\httpd.exe'
-$Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'
+$ServicePython = 'C:\dev\Powershell\srv\python\python.exe'
+if (-not (Test-Path -LiteralPath $ServicePython)) { $ServicePython = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe' }   # until provisioned
+$Python = $ServicePython
 $Repo = 'C:\dev\Powershell\turing'
 $Sup = Join-Path $Repo 'examples\meowdoku\deploy\apache_supervisor.py'
 Write-Host "cmd: $Httpd -t"

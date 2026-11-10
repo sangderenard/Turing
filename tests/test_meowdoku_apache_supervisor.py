@@ -129,3 +129,13 @@ def test_restart_on_crash_once(tmp_path):
             proc.kill()
         proc.stdout.close(); proc.stderr.close()
     assert _rows(db, "SELECT state FROM service_instances")[0]["state"] == "stopped"
+
+
+def test_instance_python_field_selects_interpreter(tmp_path):
+    spec = {"name": "pyinst", "kind": "meowdoku", "python": sys.executable, "port": 8999, "route": "", "bind": "127.0.0.1",
+            "account": "svc-pyinst", "args": [], "leases": []}
+    db, state, inst = _setup(tmp_path, spec)
+    out = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    command = json.loads(out.stdout)["instances"][0]["command"]
+    assert command[0] == sys.executable

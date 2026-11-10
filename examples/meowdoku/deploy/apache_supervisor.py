@@ -100,6 +100,9 @@ def load_instances(path):
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise SystemExit(f"cannot read {path}: {error}")
+    # instances.json: a list, or {"supervisor_python": <documented, read by nothing yet>, "instances": [...]}
+    if isinstance(data, dict):
+        data = data.get("instances", [])
     return data if isinstance(data, list) else []
 
 
@@ -132,7 +135,7 @@ class Instance:
 
     # ---- command
     def command(self):
-        py = sys.executable
+        py = self.spec.get("python") or sys.executable   # optional per-instance interpreter (the private service python)
         if self.kind == "meowdoku":
             argv = [py, "examples/meowdoku/server.py", "--port", str(self.port), "--bind", self.spec.get("bind", "127.0.0.1"),
                     *self.spec.get("args", [])]
