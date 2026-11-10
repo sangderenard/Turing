@@ -133,8 +133,25 @@ def plan_state_loops(loops: Iterable[StateLoop]) -> dict[str, object]:
 
 def emit_javascript_physics_worker(frequency_hz: float = 120.0) -> str:
     """Emit a long-lived state owner around the compiler's scalar physics ABI."""
+    from .abstract_ui_vehicles import VEHICLE_STATE_FEEDBACK
+    from .closed_solid_geometry import emit_closed_solid_javascript
+    closed_solid_geometry = emit_closed_solid_javascript()
+    import json
+    state_feedback = json.dumps(VEHICLE_STATE_FEEDBACK, separators=(",", ":"))
     interval = 1000.0 / frequency_hz
     return f'''"use strict";
+// The compiler's named validation ABI is not a numerical host fallback.
+const wasmImports={{turing:{{turing_validation_error(code){{
+  const error=new Error(`Turing numerical validation failed with code ${{code}}`);
+  error.code=Number(code);throw error;
+}}}}}};
+{closed_solid_geometry}
+const VEHICLE_STATE_FEEDBACK={state_feedback};
+function retainVehicleCompiledState(body,output){{
+  body.wasmState||={{}};
+  for(const [result,state] of Object.entries(VEHICLE_STATE_FEEDBACK))
+    if(Object.prototype.hasOwnProperty.call(output,result))body.wasmState[state]=output[result];
+}}
 const SNAPSHOT_STRIDE=162, SNAPSHOT_POOL_SIZE=3,FIXED_DT={1.0 / frequency_hz!r},PHYSICS_SUBSTEPS=3,SUBSTEP_DT=FIXED_DT/PHYSICS_SUBSTEPS;
 let instance=null, abi=null, vehicleInstance=null,vehicleDynoInstance=null,vehicleAbi=null,contactInstance=null,contactAbi=null,
   vehicleGpu=null, timer=null, sequence=0, snapshotInFlight=false,tickInFlight=false;
@@ -195,12 +212,12 @@ function sampleSurface(s,x,z){{
 }}
 function contactSurfaceAt(x,z,bodyY,reach,excluded=null,includeSolidTops=true){{
   let best=null;
-  const consider=(height,normal,identity,runtimePartId,material={{}})=>{{
+  const consider=(height,normal,identity,runtimePartId,material={{}},point=null)=>{{
     if(height<bodyY-reach||height>bodyY+reach)return;
-    const candidate={{height,normal,identity,runtimePartId:runtimePartId||0,material}};
+    const candidate={{height,normal,identity,runtimePartId:runtimePartId||0,material,...(point?{{point}}:{{}})}};
     if(!best||height>best.height||height===best.height&&candidate.runtimePartId<best.runtimePartId)best=candidate;
   }};
-  const terrainReplacesFloor=colliders.some(c=>{{const s=c.surface,d=s?.domain;return s?.kind==="sampled-height-field"&&
+  const terrainReplacesFloor=colliders.some(c=>{{const s=c.surface,d=s?.domain;return c.objectIdentity!==excluded&&s?.kind==="sampled-height-field"&&
     x>=d.minimum_x&&x<=d.maximum_x&&z>=d.minimum_z&&z<=d.maximum_z;}});
   if(!terrainReplacesFloor)consider(0,[0,1,0],"world-floor",0,
     {{identity:"compacted-world-floor",maximum_sink_depth_m:.018,equilibrium_sink_depth_m:.003,restitution:.10}});
@@ -212,7 +229,8 @@ function contactSurfaceAt(x,z,bodyY,reach,excluded=null,includeSolidTops=true){{
       consider(h,n.map(v=>v/l),c.identity,c.runtimePartId,s.contact_material||c.contact_material||{{}});continue;}}
     if(!includeSolidTops||c.role==="projectile-body"||!c.minimum||!c.maximum)continue;
     if(x<c.minimum[0]||x>c.maximum[0]||z<c.minimum[2]||z>c.maximum[2])continue;
-    consider(c.maximum[1],[0,1,0],c.identity,c.runtimePartId,c.contact_material||{{}});
+    const hit=closedSolidVerticalSupport(c,x,z,bodyY,reach);
+    if(hit)consider(hit.height,hit.normal,c.identity,c.runtimePartId,c.contact_material||{{}},hit.point);
   }}return best;
 }}
 async function checkedShaderModule(device,code,label){{
@@ -274,7 +292,7 @@ async function initializeVehicleGpu(program){{
       radialProbes=device.createBuffer({{size:60*4,
         usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC}}),
       terrainHeights=device.createBuffer({{size:4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}}),
-      wallColliders=device.createBuffer({{size:24,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}}),
+      wallColliders=device.createBuffer({{size:128,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}}),
       terrainParameters=device.createBuffer({{size:8,
         usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}}),
       contactBindGroup=device.createBindGroup({{layout:contactPipeline.getBindGroupLayout(0),entries:[
@@ -334,8 +352,8 @@ function configureResidentVehicleTerrain(gpu,allColliders=[]){
   const heights=new Float32Array(Math.max(1,packedHeights.length));heights.set(packedHeights),
     walls=allColliders.filter(collider=>!collider.surface&&collider.role!=="projectile-body"&&
       Array.isArray(collider.minimum)&&Array.isArray(collider.maximum)),
-    wallValues=new Float32Array(Math.max(6,walls.length*6));
-  walls.forEach((wall,index)=>wallValues.set([...wall.minimum,...wall.maximum].map(Number),index*6));
+    wallValues=new Float32Array(Math.max(CLOSED_SOLID_STRIDE,walls.length*CLOSED_SOLID_STRIDE));
+  walls.forEach((wall,index)=>{validateClosedSolid(wall);wallValues.set(closedSolidPack(wall),index*CLOSED_SOLID_STRIDE);});
   const
     parameters=new Float32Array([fields.length,walls.length,...descriptors]),oldTerrain=gpu.terrainHeights,
     oldWalls=gpu.wallColliders,oldParameters=gpu.terrainParameters,
@@ -423,6 +441,15 @@ function initializeResidentVehicleState(gpu,body){
   body.gpuEpoch=Number(body.gpuEpoch||0);body.gpuAppliedSnapshotSerial=Number(body.gpuAppliedSnapshotSerial||0);
   body.gpuStateDirty=false;body.gpuControlsDirty=false;return true;
 }
+// The output contract owns the names. No physics or missing-value zero fill here.
+function captureVehicleCompiledEnergy(body,output){
+  const contract=body.config.energy_diagnostics;if(!contract)return;
+  const values=Object.fromEntries(contract.outputs.map(name=>[name,
+    Object.prototype.hasOwnProperty.call(output,name)?output[name]:null]));
+  body.compiledEnergy={...contract,values,invalid:contract.outputs.filter(name=>
+    typeof values[name]==="number"&&!Number.isFinite(values[name])),
+    missing:contract.outputs.filter(name=>values[name]===null)};
+}
 function applyResidentVehicleSnapshot(gpu,body,values){
   const outputs=gpu.integration.outputs,slots=gpu.integration.output_slots||Object.fromEntries(outputs.map((name,index)=>[name,index])),
     output=Object.fromEntries(outputs.map(name=>[name,values[slots[name]]])),
@@ -432,6 +459,7 @@ function applyResidentVehicleSnapshot(gpu,body,values){
     feedStart=reducedStart+6,probeStart=feedStart+gpu.contact.inputs.length*gpu.wheelCount,
     contactFeed=values.subarray(feedStart,probeStart),ci=Object.fromEntries(
       gpu.contact.inputs.map((name,index)=>[name,index])),co=Object.fromEntries(gpu.contact.outputs.map((name,index)=>[name,index]));
+  captureVehicleCompiledEnergy(body,output);
   if(!Object.values(output).every(Number.isFinite)){
     resetVehicleDrivetrainState(body,"resident GPU produced a non-finite output");
     body.gpuEpoch=Number(body.gpuEpoch||0)+1;body.gpuStateDirty=true;
@@ -470,7 +498,7 @@ function applyResidentVehicleSnapshot(gpu,body,values){
       packedStart+co[`chassis_force_${axis}`]*gpu.wheelCount+lane])),0);
   body.radialProbePenetrations=names.map((_,wheel)=>Array.from(values.slice(
     probeStart+wheel*15,probeStart+(wheel+1)*15)));
-  body.radialProbeActiveCounts=body.radialProbePenetrations.map(samples=>samples.filter(value=>value>0).length);
+  body.radialProbeActiveCounts=body.radialProbePenetrations.map(samples=>Number(samples[3]>0));
   body.powertrain={engineTorque:output.engine_torque,clutchTorque:output.clutch_torque,
     transmissionOutputTorque:output.transmission_output_torque,drivelineTorque:output.driveline_torque,
     frontDifferentialTorque:output.front_differential_torque,rearDifferentialTorque:output.rear_differential_torque,
@@ -483,14 +511,7 @@ function applyResidentVehicleSnapshot(gpu,body,values){
     rollingResistanceReactionTorque:output.rolling_resistance_reaction_torque,
     tireContactReactionTorque:output.tire_contact_reaction_torque,
     drivetrainChassisReactionTorque:output.drivetrain_chassis_reaction_torque};
-  body.wasmState={engine_angular_speed:output.engine_angular_speed_next};
-  names.forEach(name=>{body.wasmState[`slip_sensor_velocity_${name}`]=output[`slip_sensor_velocity_${name}_next`];
-    body.wasmState[`friction_utilization_${name}`]=output[`friction_utilization_${name}_next`];
-    body.wasmState[`friction_utilization_sensor_velocity_${name}`]=
-      output[`friction_utilization_sensor_velocity_${name}_next`];
-    for(const axis of ["longitudinal","lateral"]){body.wasmState[`tire_deformation_${axis}_${name}`]=
-        output[`tire_deformation_${axis}_${name}_next`];body.wasmState[`tire_deformation_velocity_${axis}_${name}`]=
-        output[`tire_deformation_velocity_${axis}_${name}_next`];}});
+  retainVehicleCompiledState(body,output);
   if(resolveWorldBottom(body,previousPosition)){body.gpuEpoch=Number(body.gpuEpoch||0)+1;body.gpuStateDirty=true;
     if(body.bottomRejected)resetVehicleDrivetrainState(body,"resident GPU crossed the world-bottom guard");}
   updateVehicleOutriggers(body,FIXED_DT*4);
@@ -571,10 +592,14 @@ function ensureVehicleDamage(body){{
   if(body.damage)return body.damage;const names=["front_left","front_right","rear_left","rear_right"];
   body.damage={{mode:"parametric-damage",springPlasticSet:Object.fromEntries(names.map(name=>[name,0])),
     springHealth:Object.fromEntries(names.map(name=>[name,1])),halfshaftHealth:Object.fromEntries(names.map(name=>[name,1])),
-    members:{{}},junctions:{{}},dissipationPowerW:0,dissipatedEnergyJ:0,revision:0}};
+    members:{{}},junctions:{{}},dissipationPowerW:0,dissipatedEnergyJ:0,revision:0,
+    junctionLossTelemetry:{{kind:"estimated-constitutive-loss",mechanicalEnergyRemoved:false,
+      linearRate:"measured-length-difference-after-first-sample",
+      angularRate:"wheel-and-steering-rate-proxy-not-relative-joint-rotation"}}}};
   for(const edge of body.config.mechanical_graph?.edges||[]){{if(edge.damage)body.damage.members[edge.identity]={{
       elasticStrain:0,plasticStrain:0,restLength:Number(edge.damage.natural_rest_length??edge.rest_length),failed:false}};
     if(edge.joint_bushings)body.damage.junctions[edge.identity]={{previousLength:Number(edge.rest_length),
+      lossMeasurementInitialized:false,estimatedRelativeLinearSpeedMps:0,
       relativeLinearSpeedMps:0,relativeAngularSpeedRadS:0,powerW:0,energyJ:0}};}}
   return body.damage;
 }}
@@ -847,8 +872,9 @@ function prepareVehicleEnergy(body,dt){{
     type:"vehicle-energy",identity:body.identity,energy:{{...state,stateOfCharge:state.batteryChargeWh/
       Math.max(1e-9,state.batteryCapacityWh),totalMassKg:liveMass,
       jointBushingDissipationPowerW:Number(body.damage?.dissipationPowerW||0),
-      jointBushingDissipatedEnergyJ:Number(body.damage?.dissipatedEnergyJ||0)}},
-    damageMetrics:body.damage||null,
+      jointBushingDissipatedEnergyJ:Number(body.damage?.dissipatedEnergyJ||0),
+      jointBushingLossTelemetry:body.damage?.junctionLossTelemetry||null}},
+    damageMetrics:body.damage||null,compiledEnergy:body.compiledEnergy||null,
     driverAssistance:{{...ensureVehicleDriverAssistance(body)}}}});}}
 }}
 function applyVehicleChassisProfile(body,profile){{
@@ -886,7 +912,8 @@ function applyVehicleChassisGeometry(body,geometry){{
   for(const edge of body.config.mechanical_graph?.edges||[]){{const state=damage.members?.[edge.identity];
     if(state&&edge.damage)state.restLength=Number(edge.damage.natural_rest_length??edge.rest_length)*(
       1+Number(state.elasticStrain||0)+Number(state.plasticStrain||0));
-    const junction=damage.junctions?.[edge.identity];if(junction)junction.previousLength=Number(edge.rest_length);}}
+    const junction=damage.junctions?.[edge.identity];if(junction){{junction.previousLength=Number(edge.rest_length);
+      junction.lossMeasurementInitialized=false;}}}}
   body.mechanicalGraphPositions=null;requestParametricVehiclePipelines(body,"chassis geometry");
   body.gpuEpoch=Number(body.gpuEpoch||0)+1;body.gpuStateDirty=true;
 }}
@@ -1036,6 +1063,9 @@ function updateVehicleDamage(body,dt){{
       a=positions?.get(edge.a),b=positions?.get(edge.b);if(!parameters||!state||!a||!b)continue;
     const length=Math.hypot(...b.map((value,index)=>Number(value)-Number(a[index]))),
       linearSpeed=(length-Number(state.previousLength??length))/Math.max(1e-6,dt),
+      // Reference-to-spawn projection is not a timed displacement. Keep the
+      // actuator's existing rate history separate from estimated loss telemetry.
+      estimatedLinearSpeed=state.lossMeasurementInitialized?linearSpeed:0,
       corner=names.find(name=>edge.identity.includes(name)),wheelRate=corner&&(
         edge.constraint.includes("bearing")||edge.constraint.includes("shaft")||edge.constraint.includes("joint"))?
           Number(body.wheelOmegas?.[corner]||0):0,
@@ -1043,7 +1073,8 @@ function updateVehicleDamage(body,dt){{
       angularSpeed=wheelRate+steeringRate,
       linearDamping=Number(parameters.a?.linear_damping_n_s_per_m||0)+Number(parameters.b?.linear_damping_n_s_per_m||0),
       angularDamping=Number(parameters.a?.angular_damping_nm_s_per_rad||0)+Number(parameters.b?.angular_damping_nm_s_per_rad||0),
-      power=linearDamping*linearSpeed*linearSpeed+angularDamping*angularSpeed*angularSpeed;
+      power=linearDamping*estimatedLinearSpeed*estimatedLinearSpeed+angularDamping*angularSpeed*angularSpeed;
+    state.lossMeasurementInitialized=true;state.estimatedRelativeLinearSpeedMps=estimatedLinearSpeed;
     state.previousLength=length;state.relativeLinearSpeedMps=linearSpeed;state.relativeAngularSpeedRadS=angularSpeed;
     state.powerW=power;state.energyJ=Number(state.energyJ||0)+power*dt;junctionPower+=power;
   }}
@@ -1054,6 +1085,7 @@ function updateVehicleDamage(body,dt){{
 }}
 function solveMechanicalGraph(body){{
   const graph=body.config.mechanical_graph;if(!graph)return null;
+  const velocities=new Map(graph.nodes.map(node=>[node.identity,[0,0,0]]));
   const positions=new Map(graph.nodes.map(node=>[node.identity,node.reference_position.map(Number)])),
     fixed=new Set(graph.nodes.filter(node=>node.fixed_to==="chassis"&&!node.structural_deformable).map(node=>node.identity)),
     ch=body.config.chassis,w=body.config.wheels,t=body.config.tires,s=body.config.suspension,
@@ -1062,7 +1094,8 @@ function solveMechanicalGraph(body){{
       actuator=Number(body.levelingOffsets?.[name]||0),
       target=-ch.clearance-(s.rest_length+actuator-damage.springPlasticSet[name])+(body.compressions[name]||0)+t.radius,delta=target-hub[1];
     graph.nodes.filter(node=>node.generalized_coordinate===`compression_${{name}}`).forEach(node=>
-      positions.get(node.identity)[1]+=delta);}});
+      {{positions.get(node.identity)[1]+=delta;
+        velocities.get(node.identity)[1]+=Number(body.compressionVelocities?.[name]||0);}});}});
   const constraints=graph.edges.filter(edge=>(edge.constraint==="rigid-distance"||edge.constraint==="rigid-offset"||
       edge.constraint==="steering-link"||edge.constraint==="replaceable-sacrificial-knuckle-bushing")&&
     !damage.members[edge.identity]?.failed);
@@ -1071,16 +1104,30 @@ function solveMechanicalGraph(body){{
         targetLength=Number(damage.members[edge.identity]?.restLength??edge.rest_length)+Number(body.linkLengthModifiers?.[edge.identity]||0),
         error=(length-targetLength)/length,aFixed=fixed.has(edge.a),bFixed=fixed.has(edge.b),
         aScale=aFixed?0:bFixed?1:.5,bScale=bFixed?0:aFixed?1:.5;
-      for(let axis=0;axis<3;axis+=1){{a[axis]+=delta[axis]*error*aScale;b[axis]-=delta[axis]*error*bScale;}}}});
+      // Directional derivative of this exact positional projection. Rest lengths
+      // and damage are fixed parameters during the compression-motion derivative.
+      const va=velocities.get(edge.a),vb=velocities.get(edge.b),
+        deltaVelocity=vb.map((value,index)=>value-va[index]),
+        lengthVelocity=Math.hypot(...delta)>1e-8?
+          delta.reduce((sum,value,index)=>sum+value*deltaVelocity[index],0)/length:0,
+        errorVelocity=targetLength*lengthVelocity/(length*length);
+      for(let axis=0;axis<3;axis+=1){{
+        const correctionVelocity=deltaVelocity[axis]*error+delta[axis]*errorVelocity;
+        va[axis]+=correctionVelocity*aScale;vb[axis]-=correctionVelocity*bScale;
+        a[axis]+=delta[axis]*error*aScale;b[axis]-=delta[axis]*error*bScale;}}}});
     names.forEach(name=>{{const hub=positions.get(`suspension.${{name}}.hub`),
         actuator=Number(body.levelingOffsets?.[name]||0),target=-ch.clearance-(s.rest_length+actuator-
-          damage.springPlasticSet[name])+(body.compressions[name]||0)+t.radius;hub[1]+=(target-hub[1])*.38;}});}}
+          damage.springPlasticSet[name])+(body.compressions[name]||0)+t.radius;hub[1]+=(target-hub[1])*.38;
+      const hubVelocity=velocities.get(`suspension.${{name}}.hub`);
+      hubVelocity[1]+=(Number(body.compressionVelocities?.[name]||0)-hubVelocity[1])*.38;}});}}
   names.forEach(name=>{{const hub=positions.get(`suspension.${{name}}.hub`),patch=positions.get(`suspension.${{name}}.contact_patch`);
-    patch[0]=hub[0];patch[1]=hub[1]-t.radius;patch[2]=hub[2];}});body.mechanicalGraphPositions=positions;return positions;
+    patch[0]=hub[0];patch[1]=hub[1]-t.radius;patch[2]=hub[2];
+    velocities.set(`suspension.${{name}}.contact_patch`,[...velocities.get(`suspension.${{name}}.hub`)]);}});body.mechanicalGraphVelocities=velocities;body.mechanicalGraphPositions=positions;return positions;
 }}
-function terrainSegmentCrossing(start,finish,body,reach){{
+
+function terrainSegmentCrossing(start,finish,body,reach,includeSolidTops=true){{
   const at=fraction=>{{const p=start.map((value,index)=>value+(finish[index]-value)*fraction),
-      surface=contactSurfaceAt(p[0],p[2],p[1],reach,body.identity);
+      surface=contactSurfaceAt(p[0],p[2],p[1],reach,body.identity,includeSolidTops);
     return surface?{{fraction,p,surface,clearance:p[1]-surface.height}}:null;}};
   let previous=at(0);
   for(let subdivision=1;subdivision<=8;subdivision++){{const candidate=at(subdivision/8);
@@ -1093,26 +1140,17 @@ function terrainSegmentCrossing(start,finish,body,reach){{
   }}return null;
 }}
 function solidSegmentCrossing(start,finish,body){{
-  const delta=finish.map((value,index)=>value-start[index]);let best=null;
+  let best=null;
   for(const collider of colliders){{if(collider.objectIdentity===body.identity||collider.surface||
       collider.role==="projectile-body"||!collider.minimum||!collider.maximum)continue;
-    let enter=0,exit=1,enterNormal=null,valid=true;
-    for(let axis=0;axis<3;axis++){{const motion=delta[axis],minimum=Number(collider.minimum[axis]),
-        maximum=Number(collider.maximum[axis]);
-      if(Math.abs(motion)<1e-10){{if(start[axis]<minimum||start[axis]>maximum){{valid=false;break;}}continue;}}
-      let near=(minimum-start[axis])/motion,far=(maximum-start[axis])/motion,
-        nearNormal=[0,0,0],farNormal=[0,0,0];nearNormal[axis]=-1;farNormal[axis]=1;
-      if(near>far){{[near,far]=[far,near];[nearNormal,farNormal]=[farNormal,nearNormal];}}
-      if(near>enter){{enter=near;enterNormal=nearNormal;}}exit=Math.min(exit,far);
-      if(enter>exit){{valid=false;break;}}}}
-    if(!valid||!enterNormal||enter<0||enter>1||delta.reduce((sum,value,index)=>sum+value*enterNormal[index],0)>=0)continue;
-    const point=start.map((value,index)=>value+delta[index]*enter);
-    if(!best||enter<best.fraction)best={{fraction:enter,point,normal:enterNormal,identity:collider.identity,
+    const hit=closedSolidSegment(collider,start,finish);
+    if(hit&&(!best||hit.fraction<best.fraction))best={{...hit,identity:collider.identity,
       runtimePartId:collider.runtimePartId||0,material:collider.contact_material||{{}},solid:true}};
   }}return best;
 }}
+
 function analyticTorusTireContact(body,worldHub,forwardAxis,rightAxis,steer,camber,caster,
-    radius,sectionRadius,width,travel,reach,angular,dt){{
+    radius,sectionRadius,width,travel,reach,angular,dt,relativeHubVelocity){{
   const cs=Math.cos(steer),ss=Math.sin(steer),cc=Math.cos(caster),sc=Math.sin(caster),
     baseDown=rotateBodyVector(body,[0,-1,0]),
     casterForward=forwardAxis.map((value,index)=>value*cc-baseDown[index]*sc),
@@ -1126,9 +1164,9 @@ function analyticTorusTireContact(body,worldHub,forwardAxis,rightAxis,steer,camb
     unit=(value,fallback)=>{{const length=Math.hypot(...value);return length>1e-9?
       value.map(component=>component/length):[...fallback];}},dot=(a,b)=>a.reduce((sum,value,index)=>sum+value*b[index],0),
     hubAttachment=worldHub.map((value,index)=>value-body.position[index]),hubVelocity=[
-      body.velocity[0]+angular[1]*hubAttachment[2]-angular[2]*hubAttachment[1],
-      body.velocity[1]+angular[2]*hubAttachment[0]-angular[0]*hubAttachment[2],
-      body.velocity[2]+angular[0]*hubAttachment[1]-angular[1]*hubAttachment[0]],
+      body.velocity[0]+relativeHubVelocity[0]+angular[1]*hubAttachment[2]-angular[2]*hubAttachment[1],
+      body.velocity[1]+relativeHubVelocity[1]+angular[2]*hubAttachment[0]-angular[0]*hubAttachment[2],
+      body.velocity[2]+relativeHubVelocity[2]+angular[0]*hubAttachment[1]-angular[1]*hubAttachment[0]],
     probes=Array(15).fill(0);
   const planeCandidate=(surface,evaluationHub,evaluationPosition,temporal=false)=>{{if(!surface)return null;
     const normal=unit((surface.normal||[0,1,0]).map(Number),[0,1,0]),
@@ -1148,25 +1186,47 @@ function analyticTorusTireContact(body,worldHub,forwardAxis,rightAxis,steer,camb
     return {{...surface,point:projectedPoint,normal,axle,radial,angle,lateralFraction:0,normalDistance,
       normalAlignment:Math.max(0,dot(unit(evaluationHub.map((value,index)=>value-projectedPoint[index]),down),normal)),
       penetration:peak,score:peak,evaluationPosition,arcAngle,integrated}};}};
-  const currentSurface=contactSurfaceAt(worldHub[0],worldHub[2],worldHub[1],reach,body.identity),
+  const currentSurface=contactSurfaceAt(worldHub[0],worldHub[2],worldHub[1],reach,body.identity,false),
     current=planeCandidate(currentSurface,worldHub,body.position),radial=current?.radial||down,
     ringPoint=worldHub.map((value,index)=>value+radial[index]*majorRadius-(current?.normal||[0,1,0])[index]*sectionRadius),
     ringAttachment=ringPoint.map((value,index)=>value-body.position[index]),ringVelocity=[
-      body.velocity[0]+angular[1]*ringAttachment[2]-angular[2]*ringAttachment[1],
-      body.velocity[1]+angular[2]*ringAttachment[0]-angular[0]*ringAttachment[2],
-      body.velocity[2]+angular[0]*ringAttachment[1]-angular[1]*ringAttachment[0]],
+      body.velocity[0]+relativeHubVelocity[0]+angular[1]*ringAttachment[2]-angular[2]*ringAttachment[1],
+      body.velocity[1]+relativeHubVelocity[1]+angular[2]*ringAttachment[0]-angular[0]*ringAttachment[2],
+      body.velocity[2]+relativeHubVelocity[2]+angular[0]*ringAttachment[1]-angular[1]*ringAttachment[0]],
     nextRing=ringPoint.map((value,index)=>value+ringVelocity[index]*dt),
-    crossing=terrainSegmentCrossing(ringPoint,nextRing,body,reach)||solidSegmentCrossing(ringPoint,nextRing,body),
+    crossing=terrainSegmentCrossing(ringPoint,nextRing,body,reach,false)||solidSegmentCrossing(ringPoint,nextRing,body),
     crossingHub=worldHub.map((value,index)=>value+hubVelocity[index]*dt*Number(crossing?.fraction||0)),
     crossingPosition=body.position.map((value,index)=>value+body.velocity[index]*dt*Number(crossing?.fraction||0)),
     swept=planeCandidate(crossing,crossingHub,crossingPosition,Boolean(crossing)),
-    spatialSolid=solidSegmentCrossing(worldHub,ringPoint,body),solid=planeCandidate(spatialSolid,worldHub,body.position),
-    candidates=[current,swept,solid].filter(Boolean).filter(candidate=>candidate.solid||dot(candidate.normal,down)<-.04),
-    best=candidates.sort((a,b)=>b.score-a.score)[0];
+    candidates=[current,swept].filter(Boolean).filter(candidate=>candidate.solid||dot(candidate.normal,down)<-.04);
+  // Closed solids use the same three axle slices and closest-face geometry as
+  // vehicle_terrain_contact_geometry WGSL. A bridge top is not an infinite
+  // plane: below it the nearest face is its underside, or there is no overlap.
+  // Keep sampled terrain's one-sided correction separate from these candidates.
+  for(const collider of colliders){{
+    if(collider.objectIdentity===body.identity||collider.surface||collider.role==="projectile-body"||
+        !collider.minimum||!collider.maximum)continue;
+    const minimum=collider.minimum,maximum=collider.maximum,broadphase=radius+width+reach;
+    if(worldHub.some((value,axis)=>value<minimum[axis]-broadphase||value>maximum[axis]+broadphase))continue;
+    for(const lateralFraction of [-.38,0,.38]){{
+      const sliceHub=worldHub.map((value,axis)=>value+axle[axis]*width*lateralFraction),
+        closest=closedSolidClosest(collider,sliceHub),point=closest.point,normal=closest.normal,
+        normalDistance=closest.signedDistance;
+      const penetration=radius-normalDistance,score=penetration+Math.max(0,-dot(normal,baseDown))*.003;
+      if(penetration<-.006)continue;
+      const surface={{identity:collider.identity,runtimePartId:collider.runtimePartId||0,
+        material:collider.contact_material||{{}},height:point[1],point,normal,solid:true}},
+        candidate=planeCandidate(surface,worldHub,body.position,true);
+      candidates.push({{...candidate,point,normal,normalDistance,lateralFraction,
+        penetration:Math.max(0,penetration),score}});
+    }}
+  }}
+  const best=candidates.sort((a,b)=>b.score-a.score)[0];
   if(!best)return {{integral:null,probes,activeProbeCount:0}};
-  probes[0]=best.arcAngle;probes[1]=best.integrated;probes[2]=best.integrated/Math.max(best.arcAngle,1e-8);
+  probes[0]=best.arcAngle;probes[1]=best.integrated;probes[2]=best.integrated/Math.max(best.arcAngle,1e-8);probes[3]=best.penetration;
   return {{integral:best,probes,activeProbeCount:1}};
 }}
+
 function wheelContactRecords(body,dt){{
   const c=body.config,w=c.wheels,ch=c.chassis,s=c.suspension,t=c.tires,
     names=["front_left","front_right","rear_left","rear_right"],
@@ -1180,6 +1240,8 @@ function wheelContactRecords(body,dt){{
     centerOfMass=c.mechanical_graph?.load_audit?.center_of_mass||[0,0,0],damage=ensureVehicleDamage(body);
   return names.map((name,i)=>{{const o=offsets[i],localHub=graphPositions?.get(`suspension.${{name}}.hub`)||
       [o[0],-ch.clearance-s.rest_length+t.radius,o[1]],
+    relativeHubVelocity=rotateBodyVector(body,graphPositions?
+      body.mechanicalGraphVelocities.get(`suspension.${{name}}.hub`):[0,0,0]),
     actuator=Number(body.levelingOffsets?.[name]||0),hubOffset=rotateBodyVector(body,localHub),worldHub=body.position.map((value,index)=>value+hubOffset[index]),
     coiloverA=graphPositions?.get(`suspension.${{name}}.coilover_chassis`),
     coiloverB=graphPositions?.get(`suspension.${{name}}.lower_ball_joint`),
@@ -1191,14 +1253,14 @@ function wheelContactRecords(body,dt){{
     camber=Number(alignmentMeasured.camber_deg??alignmentTarget.camber_deg??0)*Math.PI/180,
     caster=Number(alignmentMeasured.caster_deg??alignmentTarget.caster_deg??0)*Math.PI/180,
     radialContact=analyticTorusTireContact(body,worldHub,forwardAxis,rightAxis,steer,camber,caster,
-      Number(t.radius),Number(t.toroid_section_radius_m),Number(t.width),Number(s.travel),reach,angular,dt),
+      Number(t.radius),Number(t.toroid_section_radius_m),Number(t.width),Number(s.travel),reach,angular,dt,relativeHubVelocity),
     candidate=radialContact.integral,n=candidate?.normal||[0,1,0],
     suspensionDown=rotateBodyVector(body,[0,-1,0]),alignment=-(suspensionDown[0]*n[0]+suspensionDown[1]*n[1]+
       suspensionDown[2]*n[2]),surfacePoint=candidate?.point||[wx,0,wz],contactOrigin=candidate?.evaluationPosition||body.position,
     originToSurface=surfacePoint.map((value,index)=>value-contactOrigin[index]),distanceAlongSuspension=originToSurface.reduce((sum,value,index)=>
       sum+value*suspensionDown[index],0),geometricCompression=Math.max(0,Math.min(s.travel,
       ch.clearance+(s.rest_length+Number(body.levelingOffsets?.[name]||0)-damage.springPlasticSet[name])-
-        distanceAlongSuspension)),supportWeight=candidate&&distanceAlongSuspension>0
+        distanceAlongSuspension)),supportWeight=candidate&&(distanceAlongSuspension>0||Number(candidate.penetration||0)>0)
         ?Math.max(c2Unit(geometricCompression/.025)*c2Unit((alignment-.18)/.34),
           c2Unit(Number(candidate.penetration||0)/.012)):0,
       supported=supportWeight>1e-6,support=supported?candidate:null,
@@ -1213,9 +1275,9 @@ function wheelContactRecords(body,dt){{
       forward[0]*n[1]-forward[1]*n[0]],
     worldCenterOfMass=rotateBodyVector(body,centerOfMass),attachment=surfacePoint.map((value,index)=>
       value-contactOrigin[index]-worldCenterOfMass[index]),
-    pointVelocity=[body.velocity[0]+angular[1]*attachment[2]-angular[2]*attachment[1],
-      body.velocity[1]+angular[2]*attachment[0]-angular[0]*attachment[2],
-      body.velocity[2]+angular[0]*attachment[1]-angular[1]*attachment[0]],
+    pointVelocity=[body.velocity[0]+relativeHubVelocity[0]+angular[1]*attachment[2]-angular[2]*attachment[1],
+      body.velocity[1]+relativeHubVelocity[1]+angular[2]*attachment[0]-angular[0]*attachment[2],
+      body.velocity[2]+relativeHubVelocity[2]+angular[0]*attachment[1]-angular[1]*attachment[0]],
     forwardSpeed=pointVelocity.reduce((sum,value,axis)=>sum+value*forward[axis],0),
     lateralSpeed=pointVelocity.reduce((sum,value,axis)=>sum+value*right[axis],0);
     return {{dt,support:supportWeight,hub_height:worldHub[1],hub_velocity_y:pointVelocity[1],
@@ -1267,6 +1329,7 @@ function wheelContactRecords(body,dt){{
       maximum_contact_area:t.maximum_contact_area,mu_static:t.static_friction,mu_kinetic:t.kinetic_friction,
       load_sensitivity:t.load_sensitivity,slip_transition_speed:t.slip_transition_speed}};}});
 }}
+
 function runScalarWasm(wasm,abi,inputs){{
   if(!wasm||!abi)throw new Error("compiled vehicle Wasm fallback is not initialized");
   const view=new DataView(wasm.exports.memory.buffer);
@@ -1277,6 +1340,7 @@ function runScalarWasm(wasm,abi,inputs){{
   return output;
 }}
 function applyVehicleWasmOutput(body,output,contacts,contactOutputs,previousPosition,dt){{
+  captureVehicleCompiledEnergy(body,output);
   const names=["front_left","front_right","rear_left","rear_right"];
   body.position=[output.position_x_next,output.position_y_next,output.position_z_next];
   body.velocity=[output.velocity_x_next,output.velocity_y_next,output.velocity_z_next];
@@ -1316,14 +1380,7 @@ function applyVehicleWasmOutput(body,output,contacts,contactOutputs,previousPosi
     rollingResistanceReactionTorque:output.rolling_resistance_reaction_torque,
     tireContactReactionTorque:output.tire_contact_reaction_torque,
     drivetrainChassisReactionTorque:output.drivetrain_chassis_reaction_torque}};
-  body.wasmState={{...body.wasmState,engine_angular_speed:output.engine_angular_speed_next}};
-  names.forEach(name=>{{body.wasmState[`slip_sensor_velocity_${{name}}`]=output[`slip_sensor_velocity_${{name}}_next`];
-    body.wasmState[`friction_utilization_${{name}}`]=output[`friction_utilization_${{name}}_next`];
-    body.wasmState[`friction_utilization_sensor_velocity_${{name}}`]=
-      output[`friction_utilization_sensor_velocity_${{name}}_next`];
-    for(const axis of ["longitudinal","lateral"]){{body.wasmState[`tire_deformation_${{axis}}_${{name}}`]=
-        output[`tire_deformation_${{axis}}_${{name}}_next`];body.wasmState[`tire_deformation_velocity_${{axis}}_${{name}}`]=
-        output[`tire_deformation_velocity_${{axis}}_${{name}}_next`];}}}});
+  retainVehicleCompiledState(body,output);
   // No post-step positional rejection: wheel, cage and body-shell wrenches own
   // contact. This keeps the fallback from adding energy after integration.
 }}
@@ -1457,6 +1514,19 @@ function vehicleExteriorContactSamples(body){{
       for(const x of [-.62,0,.62])for(const z of [-.79,.79])samples.push({{local:[halfLength*x,.58,halfWidth*z],shell:true}});}}
   }}return samples;
 }}
+function vehicleExteriorSurfaceContact(body,point,radius,reach){{
+  const terrain=contactSurfaceAt(point[0],point[2],body.position[1],reach,body.identity,false);
+  let best=terrain?{{surface:terrain,penetration:terrain.height+radius-point[1]}}:null;
+  for(const collider of colliders){{
+    if(collider.objectIdentity===body.identity||collider.surface||collider.role==="projectile-body"||
+        !collider.minimum||!collider.maximum)continue;
+    if(point.some((value,axis)=>value<collider.minimum[axis]-radius||value>collider.maximum[axis]+radius))continue;
+    const closest=closedSolidClosest(collider,point),penetration=radius-closest.signedDistance;
+    if(penetration>0&&(!best||penetration>best.penetration))best={{penetration,surface:{{
+      ...closest,height:closest.point[1],identity:collider.identity,runtimePartId:collider.runtimePartId||0,
+      material:collider.contact_material||{{}},solid:true}}}};
+  }}return best;
+}}
 function vehicleCageContactWrench(body,dt){{
   const c=body.config,layer=c.solid_contact,graph=c.mechanical_graph,shellLayer=c.body_shell||{{}},
     centerOfMass=graph?.load_audit?.center_of_mass||[0,0,0],force=[0,0,0],torque=[0,0,0],samples=vehicleExteriorContactSamples(body);
@@ -1467,8 +1537,8 @@ function vehicleCageContactWrench(body,dt){{
     share=Math.max(1,samples.reduce((sum,sample)=>{{const local=sample.local,
       radius=Number(sample.radius??(sample.shell?shellLayer.contact_radius_m:layer.cage_contact_radius)),
       offset=rotateBodyVector(body,local),point=body.position.map(
-        (value,index)=>value+offset[index]),surface=contactSurfaceAt(point[0],point[2],body.position[1],2.5,body.identity);
-      return sum+(surface&&surface.height+radius-point[1]>0?1:0);}},0));
+        (value,index)=>value+offset[index]),contact=vehicleExteriorSurfaceContact(body,point,radius,2.5);
+      return sum+(contact&&contact.penetration>0?1:0);}},0));
   for(const sample of samples){{const local=sample.local,radius=Number(sample.radius??(
       sample.shell?shellLayer.contact_radius_m:layer.cage_contact_radius)),
       stiffness=Number(sample.bumper?.compression_stiffness_n_per_m??(
@@ -1476,9 +1546,9 @@ function vehicleCageContactWrench(body,dt){{
       maximumForce=Number(sample.bumper?.maximum_force_n??(
         sample.shell?shellLayer.contact_maximum_force_n:layer.cage_contact_maximum_force)),offset=rotateBodyVector(body,local),
       attachment=rotateBodyVector(body,local.map((value,index)=>value-Number(centerOfMass[index]||0))),
-      point=body.position.map((value,index)=>value+offset[index]),surface=contactSurfaceAt(
-        point[0],point[2],body.position[1],2.5,body.identity);if(!surface)continue;
-    const penetration=surface.height+radius-point[1];if(penetration<=0)continue;
+      point=body.position.map((value,index)=>value+offset[index]),contact=vehicleExteriorSurfaceContact(body,point,radius,2.5);
+    if(!contact||contact.penetration<=0)continue;
+    const {{surface,penetration}}=contact;
     const n=surface.normal,pointVelocity=[
       body.velocity[0]+angular[1]*attachment[2]-angular[2]*attachment[1],
       body.velocity[1]+angular[2]*attachment[0]-angular[0]*attachment[2],
@@ -1512,10 +1582,10 @@ function resolveVehicleCagePenetration(body,dt){{
     for(const sample of samples){{if(sample.bumper)continue;const local=sample.local,radius=Number(sample.radius??(
         sample.shell?shellLayer.contact_radius_m:layer.cage_contact_radius)),
         offset=rotateBodyVector(body,local),
-        point=body.position.map((value,index)=>value+offset[index]),surface=contactSurfaceAt(
-          point[0],point[2],body.position[1],2.5,body.identity),penetration=surface?surface.height+radius-point[1]:0;
-      if(penetration>0&&(!deepest||penetration>deepest.penetration))deepest={{penetration,normal:surface.normal,
-        runtimePartId:surface.runtimePartId||0}};}}
+        point=body.position.map((value,index)=>value+offset[index]),contact=vehicleExteriorSurfaceContact(body,point,radius,2.5),
+        penetration=contact?.penetration||0;
+      if(penetration>0&&(!deepest||penetration>deepest.penetration))deepest={{penetration,normal:contact.surface.normal,
+        runtimePartId:contact.surface.runtimePartId||0}};}}
     if(!deepest)break;const correction=Math.min(deepest.penetration,Number(layer.maximum_correction_speed)*dt);
     for(let axis=0;axis<3;axis+=1)body.position[axis]+=deepest.normal[axis]*correction;
     const inward=body.velocity.reduce((sum,value,index)=>sum+value*deepest.normal[index],0);
@@ -1716,7 +1786,7 @@ function applyPendingVehicleCommands(body){{
     body.rollVelocity=0;body.pitchVelocity=0;body.yawVelocity=0;
     body.wheelOmegas={{front_left:0,front_right:0,rear_left:0,rear_right:0}};
     body.previousSlips={{front_left:0,front_right:0,rear_left:0,rear_right:0}};
-    body.wasmState={{}};body.effectiveThrottle=0;body.featheredThrottle=0;body.featheredThrottleVelocity=0;
+    body.wasmState=body.energy?.ignitionOn===false?{{engine_angular_speed:0}}:{{}};body.effectiveThrottle=0;body.featheredThrottle=0;body.featheredThrottleVelocity=0;
     body.tireDeformation={{}};
     body.levelingOffsets={{front_left:0,front_right:0,rear_left:0,rear_right:0}};body.levelingState={{}};
     body.supportSurfaceLatch=null;body.supportLatchRejected=false;
@@ -2183,9 +2253,9 @@ function tick(){{
   }}finally{{tickInFlight=false;}}
 }}
 onmessage=async event=>{{const m=event.data||{{}};
-  if(m.type==="init"){{const made=await WebAssembly.instantiate(m.wasm,{{}});instance=made.instance;abi={{...m.abi,entrypoint:m.entrypoint}};parameters=m.parameters||{{}};
+  if(m.type==="init"){{const made=await WebAssembly.instantiate(m.wasm,wasmImports);instance=made.instance;abi={{...m.abi,entrypoint:m.entrypoint}};parameters=m.parameters||{{}};
     if(m.vehicleWasm&&m.contactWasm){{const fallback=await Promise.all([
-      WebAssembly.instantiate(m.vehicleWasm.wasm,{{}}),WebAssembly.instantiate(m.contactWasm.wasm,{{}})]);
+      WebAssembly.instantiate(m.vehicleWasm.wasm,wasmImports),WebAssembly.instantiate(m.contactWasm.wasm,wasmImports)]);
       vehicleInstance=fallback[0].instance;contactInstance=fallback[1].instance;
       vehicleAbi={{...m.vehicleWasm.abi,entrypoint:m.vehicleWasm.entrypoint}};
       contactAbi={{...m.contactWasm.abi,entrypoint:m.contactWasm.entrypoint}};}}
@@ -2341,7 +2411,9 @@ onmessage=async event=>{{const m=event.data||{{}};
       gearset:m.gearset,transmissionPreset:m.transmissionPreset,
       releaseAllBrakes:m.releaseAllBrakes}};
     armEngine("transmission-control");}}}}
-  else if(m.type==="colliders"){{colliders=m.colliders||[];if(vehicleGpu?.residentGraph)
+  else if(m.type==="colliders"){{const nextColliders=m.colliders||[];
+    nextColliders.filter(c=>!c.surface&&c.minimum&&c.maximum).forEach(validateClosedSolid);
+    colliders=nextColliders;if(vehicleGpu?.residentGraph)
       configureResidentVehicleTerrain(vehicleGpu,colliders);
     armEngine("collider-field-change");}}
   else if(m.type==="parameters"){{Object.assign(parameters,m.parameters||{{}});armEngine("physics-field-change");}}

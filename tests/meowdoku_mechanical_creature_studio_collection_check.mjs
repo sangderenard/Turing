@@ -151,7 +151,22 @@ const partialHost=host();hooks.failSubject='other';
 const partial=await installStudioCollection({assets:[asset,secondAsset],host:partialHost});
 assert.deepEqual([...partialHost.mechanicalCreatureImportedAppearance.identities(input)],['chosen-near','chosen-far','chosen-pickup']);
 assert.equal(partial.readStatus().ready,1);partial.dispose();hooks.failSubject=null;
-for(const rows of [[],Array(9).fill(asset),[asset,asset],[{asset,quantity:0}],[{asset,quantity:129}]]){
+// A nonspherical Studio scene still needs the original empty appearance holder
+// for its room. It must not create a projectile renderer, icon or inventory.
+const emptyHost=host(),emptyCreated=created.length,emptyDraws=drawCalls.length,emptyStatuses=[];
+const empty=await installStudioCollection({assets:[],host:emptyHost,onStatus:value=>emptyStatuses.push(value)});
+const emptyAdapter=emptyHost.mechanicalCreatureImportedAppearance;
+for(let i=0;i<3;i++){
+  const ids=emptyAdapter.identities(input);assert.equal(ids.size,0);
+  assert.equal(emptyAdapter.draw({...input,identities:ids,phase:'opaque'}),true);
+  assert.equal(emptyAdapter.draw({...input,identities:ids,phase:'transparent'}),true);
+}
+assert.equal(emptyStatuses.at(-1).state,'ready');assert.equal(emptyStatuses.at(-1).assets.length,0);
+assert.equal(created.length,emptyCreated);assert.equal(drawCalls.length,emptyDraws);
+assert.equal(emptyHost.admissions.length,0);assert.equal(emptyHost.original.quantity,9);
+assert.equal(emptyHost.mechanicalCreatureAmmo.selected(),emptyHost.original);
+empty.dispose();empty.dispose();assert.equal(emptyHost.mechanicalCreatureImportedAppearance,null);
+for(const rows of [null,undefined,{},Array(9).fill(asset),[asset,asset],[{asset,quantity:0}],[{asset,quantity:129}]]){
   const h=host();await assert.rejects(()=>installStudioCollection({assets:rows,host:h}));
   assert.equal(h.mechanicalCreatureImportedAppearance,undefined);assert.equal(h.admissions.length,0);
 }

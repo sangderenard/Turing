@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import Any, Mapping
 
+from .closed_solid_geometry import emit_closed_solid_javascript
 from .abstract_ui import AbstractUI, AbstractUIPacket, javascript_with_system_root
 from .abstract_ui_actions import system_action_mezzanine_model
 from .abstract_ui_control_focus import ControlFocusPolicy
@@ -587,9 +588,9 @@ def world_div_map_model(
                 "course": {"kind": "elevated-thick-slab-skill-road", "sequence": index + 1,
                            "gap_is_skill_feature": index > 0, "depth_map": False},
             }
-            # Quarantined from the active course: these opaque disconnected slabs
-            # have produced underside/teleport contacts.  Keep their authored IDs
-            # for later repair, but do not render or register them as colliders.
+            # Closed surfaces retain exact local prism geometry and orientation;
+            # top, underside and side contacts share that same native solid.
+            geometry["boxes"].append(slab)
             slab_records.append(slab["identity"])
         # A separate low-speed pleasure road snakes across the north apron. It
         # deliberately avoids an inversion: alternating C2 climbs and descents
@@ -1404,7 +1405,7 @@ height:auto;border-left:0;border-top:1px solid var(--line)}.status{text-align:le
 DIV_MAP_CSS = f"{_palette_css(palette_data(DIV_MAP_PALETTE))}\n{_DIV_MAP_CSS_BODY}"
 
 
-DIV_MAP_JAVASCRIPT = r"""const SELF_SCRIPT = document.currentScript;
+DIV_MAP_JAVASCRIPT = emit_closed_solid_javascript() + r"""const SELF_SCRIPT = document.currentScript;
 const SELF_SOURCE = SELF_SCRIPT.textContent.replace(/^\n/, "").trimEnd();
 const model = JSON.parse(document.getElementById("abstract-ui-model").textContent);
 document.body.classList.add("qualification-pending");
@@ -1811,7 +1812,11 @@ class TuringEnginePCMProcessor extends AudioWorkletProcessor{
         required=outputOffset+this.blockSize*4;if(required>memory.buffer.byteLength)memory.grow(Math.ceil((required-memory.buffer.byteLength)/65536));
       const views=inputOffsets.map(offset=>new Float32Array(memory.buffer,offset,this.blockSize)),output=new Float32Array(
         memory.buffer,outputOffset,this.blockSize);for(let index=0;index<this.blockSize;index++)views[0][index]=index;
-      this.bank.set(descriptor.identity,{instance,views,output,run:()=>instance.exports[descriptor.entrypoint](this.blockSize,...inputOffsets,outputOffset)});}
+      if(!Array.isArray(descriptor.inputNames)||descriptor.inputNames.length!==this.inputNames.length||
+          new Set(descriptor.inputNames).size!==this.inputNames.length||descriptor.inputNames.some(name=>!this.inputNames.includes(name)))
+        throw new Error("engine PCM input contract mismatch: "+descriptor.identity);
+      const argumentOffsets=descriptor.inputNames.map(name=>inputOffsets[this.inputNames.indexOf(name)]);
+      this.bank.set(descriptor.identity,{instance,views,output,run:()=>instance.exports[descriptor.entrypoint](this.blockSize,...argumentOffsets,outputOffset)});}
     this.port.onmessage=event=>{const message=event.data||{};if(message.type==='telemetry'){
       for(const name of Object.keys(this.metrics))if(Number.isFinite(message[name]))this.metrics[name]=Number(message[name]);
       if(this.bank.has(message.profile))this.profile=message.profile;}};
@@ -1836,7 +1841,7 @@ async function ensureEngineSound(){
     const url=URL.createObjectURL(new Blob([engineSoundWorkletSource()],{type:"text/javascript"}));
     try{await context.audioWorklet.addModule(url);}finally{URL.revokeObjectURL(url);}
     const kernels=descriptor.kernels.map(kernel=>({identity:kernel.identity,entrypoint:kernel.entrypoint,
-      reservedBytes:kernel.reserved_bytes,binary:base64Bytes(kernel.binary_base64)})),profile=engineSoundProfileForPreset(
+      reservedBytes:kernel.reserved_bytes,inputNames:kernel.input_names,binary:base64Bytes(kernel.binary_base64)})),profile=engineSoundProfileForPreset(
         vehicleRuntime.powerUnitPreset),node=new AudioWorkletNode(context,"turing-engine-pcm",{numberOfInputs:0,numberOfOutputs:1,
         outputChannelCount:[1],processorOptions:{blockSize:descriptor.block_size,inputs:descriptor.inputs,kernels,initialProfile:profile,
           rolloffCoefficients:descriptor.mid_high_rolloff?.coefficients||[1]}}),
@@ -2028,11 +2033,16 @@ function finishVehicleQualification(body){
   if(q.maximumTiltRad>.72)q.failures.add(`body tilt reached ${(q.maximumTiltRad*180/Math.PI).toFixed(1)}°`);
   q.active=false;q.complete=true;q.passed=q.failures.size===0;
   stateLoopRuntime.worker?.postMessage({type:"vehicle-auxiliary",identity:vehicle?.identity,
-    ignitionOn:q.passed,starterEngaged:false});
+    ignitionOn:false,starterEngaged:false});
   const gate=document.getElementById("vehicle-qualification"),failures=gate?.querySelector("[data-qualification-failures]");
   if(q.passed){qualificationStatus(`qualified · residual ε ${q.epsilon.toExponential(3)} recorded (non-gating) · opening living map`);
     setTimeout(launchQualifiedLivingMap,700);}else{gate?.classList.add("failed");qualificationStatus("configuration failed physical qualification · living map withheld");
     if(failures)failures.textContent=[...q.failures].join(" · ");}
+}
+function vehiclePeakTirePenetration(body){
+  // Analytic contact diagnostics: arc radians, integrated depth, mean depth,
+  // then peak depth in metres. The historical probe array is mixed-unit.
+  return Math.max(0,...(body.radialProbePenetrations||[]).map(samples=>Number(samples[3])||0));
 }
 function updateVehicleQualification(body,sequence){
   const q=vehicleQualification,vehicle=vehicleRuntime.active;if(!q.active||body.identity!==vehicle?.identity)return;
@@ -2046,7 +2056,7 @@ function updateVehicleQualification(body,sequence){
   const contacts=(body.contactModes||[]).filter(value=>Number(value)>0).length;
   if(q.simulatedSeconds>1&&contacts<4)q.contactDropoutTicks+=deltaTicks;else q.contactDropoutTicks=0;
   q.longestContactDropoutTicks=Math.max(q.longestContactDropoutTicks,q.contactDropoutTicks);
-  const penetration=Math.max(0,...(body.radialProbePenetrations||[]).flat().map(value=>Number(value)||0));
+  const penetration=vehiclePeakTirePenetration(body);
   q.maximumPenetrationM=Math.max(q.maximumPenetrationM,penetration);q.maximumTiltRad=Math.max(q.maximumTiltRad,
     Math.hypot(Number(body.roll||0),Number(body.pitch||0)));
   const mass=Math.max(1,Number(vehicleRuntime.electrical.totalMassKg||vehicle.configuration.mass||1)),gravity=Math.abs(
@@ -3392,6 +3402,8 @@ function renderShadowPass(gl,celestial){
 }
 
 function createScalarTexture(gl, unit, values) {
+  if (!values || !Number.isInteger(values.length) || values.length < 1 ||
+      !Array.from(values).every(Number.isFinite)) throw new Error("Invalid scalar texture data");
   const texture = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -3461,10 +3473,19 @@ function configurePluckPhongResources(gl, program, choice) {
         1.0, 1.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     }
   });
-  const valuesByMember = {pbr, phong, enamel, texstack};
+  // No group-temperature field is authored here. As in Studio, keep thermal
+  // emission explicitly disabled; this zero texture is an inactive binding,
+  // not a fabricated temperature measurement.
+  const valuesByMember = {pbr, phong, enamel, texstack, thermal_k:[0]};
+  const bindings = choice.resource_bindings || [];
+  const materialUnits = {pbr:5, phong:6, enamel:7, texstack:8, thermal_k:9};
+  for (const binding of bindings) {
+    if (!Object.hasOwn(valuesByMember,binding.member_name))
+      throw new Error(`Unsupported Pluck resource ${binding.member_name}`);
+  }
   const textures = [];
-  (choice.resource_bindings || []).forEach(binding => {
-    const unit = Number(binding.recommended_texture_unit);
+  bindings.forEach(binding => {
+    const unit = materialUnits[binding.member_name];
     textures.push(createScalarTexture(gl, unit, valuesByMember[binding.member_name]));
     const location = gl.getUniformLocation(program, binding.sampler);
     if (location !== null) gl.uniform1i(location, unit);
@@ -3482,7 +3503,11 @@ function configurePluckPhongResources(gl, program, choice) {
     if (location !== null) gl.uniform1i(location, unit);
   });
   const uniform = name => gl.getUniformLocation(program, name);
-  let location = uniform("uMaterialCount");
+  let location = uniform("uThermalEmission");
+  if (location !== null) gl.uniform1i(location, 0);
+  location = uniform("uThermalGain");
+  if (location !== null) gl.uniform1f(location, 0);
+  location = uniform("uMaterialCount");
   if (location !== null) gl.uniform1i(location, colors.length);
   location = uniform("uMaterialColors[0]");
   if (location !== null) gl.uniform3fv(location, colors.flat());
@@ -3584,6 +3609,9 @@ function buildExtrudedBoxMesh(geometry, colors) {
       runtimePartId: turingWorld.partRuntimeId(partIdentity),
       minimum: [centerX-halfX, bottom, centerZ-halfZ],
       maximum: [centerX+halfX, top, centerZ+halfZ],
+      solid_shape: {kind:"oriented-box",origin:[centerX,(bottom+top)*.5,centerZ],
+        minimum:[-halfX,(bottom-top)*.5,-halfZ],maximum:[halfX,(top-bottom)*.5,halfZ],
+        axes:[[1,0,0],[0,1,0],[0,0,1]]},
     });
   }
   function heightFieldPrism(box, centerX, centerZ, halfX, halfZ, bottom, color, boxIndex) {
@@ -3853,6 +3881,14 @@ function buildExtrudedBoxMesh(geometry, colors) {
             .forEach(([point,normal])=>emit(point,normal,shade));
         }
       };
+    // Add three pulsing collars to the existing shader mesh, without changing
+    // authored material/color. Visible outside the car and in parked updates.
+    if(box.diagnostic_problem){
+      const alert=colorVector(box.diagnostic_problem==="invalid"?"#ff00ff":box.diagnostic_problem==="energy-rise"?"#ffd166":"#ff3f62"),
+        pulse=1+.2*Math.sin(performance.now()*.008),collarRadius=Math.max(.035,radius*2.4)*pulse;
+      for(const t of [.2,.5,.8]){const start=a.map((value,i)=>value+(b[i]-value)*(t-.018)),
+        end=a.map((value,i)=>value+(b[i]-value)*(t+.018));tube(start,end,collarRadius,alert,8);}
+    }
     if(box.mechanical_edge?.constraint==="spring-damper"){
       const edge=box.mechanical_edge,visual=edge.visualization||{},silver=colorVector(colors["rollbar-silver"]||colors.line),
         length=Math.max(.001,Math.hypot(...b.map((value,index)=>value-a[index]))),
@@ -3985,13 +4021,19 @@ function buildExtrudedBoxMesh(geometry, colors) {
       vertices[offset+3]=normal[0];vertices[offset+4]=normal[1];vertices[offset+5]=normal[2];
     }
     colliders.slice(firstCollider).forEach(collider=>{
-      const corners=[[collider.minimum[0],collider.minimum[2]],[collider.maximum[0],collider.minimum[2]],
-        [collider.maximum[0],collider.maximum[2]],[collider.minimum[0],collider.maximum[2]]]
-        .map(([x,z])=>{const point=rotate([x-cx,0,z-cz]);return[cx+point[0],cz+point[2]];});
-      collider.minimum[0]=Math.min(...corners.map(point=>point[0]));
-      collider.maximum[0]=Math.max(...corners.map(point=>point[0]));
-      collider.minimum[2]=Math.min(...corners.map(point=>point[1]));
-      collider.maximum[2]=Math.max(...corners.map(point=>point[1]));
+      // Retain the exact local prism before broadphase expansion. Rendered
+      // vertices and contact faces share this same rigid transform.
+      const originalMinimum=[...collider.minimum],originalMaximum=[...collider.maximum],
+        transform=point=>{const v=rotate([point[0]-cx,point[1]-centerY,point[2]-cz]);
+          return[cx+v[0],centerY+v[1],cz+v[2]];},corners=[];
+      for(const x of [originalMinimum[0],originalMaximum[0]])
+        for(const y of [originalMinimum[1],originalMaximum[1]])
+          for(const z of [originalMinimum[2],originalMaximum[2]])corners.push(transform([x,y,z]));
+      if(collider.solid_shape){const shape=collider.solid_shape;
+        shape.origin=transform(shape.origin);shape.axes=shape.axes.map(rotate);}
+      for(let axis=0;axis<3;axis++){
+        collider.minimum[axis]=Math.min(...corners.map(point=>point[axis]));
+        collider.maximum[axis]=Math.max(...corners.map(point=>point[axis]));}
       collider.rotation=[Number(rotation[0]||0),boxYawDegrees(box),Number(rotation[2]||0)];
       if(collider.surface){
         const origin=collider.surface.origin,dx=origin[0]-cx,dz=origin[2]-cz;
@@ -4627,7 +4669,7 @@ function rebuildPortableSceneMesh({dynamicOnly=false}={}) {
     installVehiclePresentationMesh(buildExtrudedBoxMesh(dynamicGeometry,model.appearance.colors).mesh);return;
   }
   const dynamicSet=new Set(dynamicGeometry),staticGeometry=shaderViewer.geometry.filter(box=>
-      !dynamicSet.has(box)&&!String(box.identity||"").includes("/elevated-skill-road-slab-")),
+      !dynamicSet.has(box)),
     realization=buildExtrudedBoxMesh(staticGeometry,model.appearance.colors),
     dynamicRealization=buildExtrudedBoxMesh(dynamicGeometry,model.appearance.colors);
   shaderViewer.baseMesh = realization.mesh;
@@ -6606,6 +6648,14 @@ async function initializeWorldPhysicsWasm() {
           if(message.identity===(vehicleRuntime.active?.identity||vehicleRuntime.parkedState?.identity)){
             vehicleRuntime.electrical={...vehicleRuntime.electrical,...(message.energy||{})};
             if(message.damageMetrics)vehicleRuntime.damage=message.damageMetrics;
+            const previousEnergy=vehicleRuntime.compiledEnergy,nextEnergy=message.compiledEnergy;
+            vehicleRuntime.energyRisingNodes=new Set();
+            if(nextEnergy?.schema==="browser-vehicle-compiled-energy-compartments-v1")
+              for(const [id,names]of Object.entries(nextEnergy.node_outputs||{})){
+                const current=names.map(name=>nextEnergy.values?.[name]),prior=names.map(name=>previousEnergy?.values?.[name]);
+                if(current.every(Number.isFinite)&&prior.every(Number.isFinite)&&
+                  current.reduce((a,b)=>a+b,0)>prior.reduce((a,b)=>a+b,0))vehicleRuntime.energyRisingNodes.add(id);}
+            vehicleRuntime.compiledEnergy=nextEnergy||null;vehicleRuntime.energyDiagnosticsAt=performance.now();
             vehicleRuntime.driverAssistance={...vehicleRuntime.driverAssistance,...(message.driverAssistance||{})};
             updateVehicleTransmissionControls();}
         } else if(message.type==="vehicle-alignment"){
@@ -7132,7 +7182,16 @@ function updateVehicleBodyPresentation(vehicle,state){
   const positions=vehicleRuntime.mechanicalNodePositions.size?vehicleRuntime.mechanicalNodePositions:
     solveVehicleMechanicalGraph(vehicle,state);
   vehicleRuntime.mechanicalLinkBoxes.forEach(member=>{
-    const edge=member.mechanical_edge,a=[...positions.get(edge.a)],authoredB=[...positions.get(edge.b)],
+    const edge=member.mechanical_edge,pointA=positions.get(edge.a),pointB=positions.get(edge.b);
+    member.diagnostic_problem=vehicleGraphProblem(edge,vehicleRuntime.damage,pointA,pointB)||
+      (performance.now()-vehicleRuntime.energyDiagnosticsAt<1000&&(vehicleRuntime.energyRisingNodes?.has(edge.a)||vehicleRuntime.energyRisingNodes?.has(edge.b))?"energy-rise":null);
+    const valid=p=>Array.isArray(p)&&p.length===3&&p.every(Number.isFinite);
+    // Hold the last drawable location for an invalid coordinate, visibly marked.
+    // This is rendering isolation, not a replacement physical state.
+    const safeA=valid(pointA)?pointA:member.link_state?.localA,
+      safeB=valid(pointB)?pointB:member.link_state?.localB;
+    if(!valid(safeA)||!valid(safeB))return;
+    const a=[...safeA],authoredB=[...safeB],
       b=edge.runtime_failed?a.map((value,index)=>value+(authoredB[index]-value)*.43):authoredB;
     member.appearance.face_color=edge.runtime_failed?"#ff4f62":model.appearance.colors[edge.palette_role];
     if(edge.identity.startsWith("lighting.headlamp."))member.appearance.face_color=
@@ -7246,13 +7305,13 @@ function vehicleTerrainRestPose(vehicle,position,yaw,compressions){
       [axleOffset-Number(wheels.wheelbase_half_length),-wheels.track_half_width],
       [axleOffset-Number(wheels.wheelbase_half_length),wheels.track_half_width]],cy=Math.cos(yaw),sy=Math.sin(yaw),
     samples=corners.map(([forward,right])=>cameraGroundHeight(position[0]+forward*cy-right*sy,
-      position[2]+forward*sy+right*cy)),wheelbase=Math.max(1e-6,Number(wheels.wheelbase_half_length)),
+      position[2]+forward*sy+right*cy,position[1])),wheelbase=Math.max(1e-6,Number(wheels.wheelbase_half_length)),
     track=Math.max(1e-6,Number(wheels.track_half_width)),forwardSlope=(samples[0]+samples[1]-samples[2]-samples[3])/(4*wheelbase),
     rightSlope=(samples[1]+samples[3]-samples[0]-samples[2])/(4*track),pitch=Math.atan(forwardSlope),
     roll=-Math.atan(rightSlope),pose={roll,pitch,yaw},bodyHeights=corners.map(([forward,right],index)=>{
       const contactLocal=[Number(forward),-Number(chassis.clearance)-Number(suspension.rest_length)+
         Number(compressions[names[index]]||0),Number(right)],offset=rotateVehiclePresentationVector(contactLocal,pose),
-        ground=cameraGroundHeight(position[0]+offset[0],position[2]+offset[2]);return ground-offset[1];});
+        ground=cameraGroundHeight(position[0]+offset[0],position[2]+offset[2],position[1]);return ground-offset[1];});
   return {roll,pitch,yaw,bodyY:Math.max(...bodyHeights)+.008};
 }
 
@@ -7325,6 +7384,7 @@ function setActiveVehicle(identity,{placeAtActor=false,inventoryItem=null}={}) {
   vehicleRuntime.steeringSystem={...(vehicle.steering_control||vehicle.configuration.steering_control||{})};
   vehicleRuntime.shockParameters={...vehicle.configuration_defaults};
   vehicleRuntime.damage=null;
+  vehicleRuntime.compiledEnergy=null;vehicleRuntime.energyRisingNodes=new Set();vehicleRuntime.energyDiagnosticsAt=0;
   vehicleRuntime.wheelAngles=[0,0,0,0];vehicleRuntime.camera=null;vehicleRuntime.presentationAccumulator=0;
   vehicleRuntime.state=vehicleSpawnState(vehicle,placeAtActor);
   viewportControls.yaw=vehicleRuntime.state.yaw;viewportControls.pitch=0;
@@ -7901,6 +7961,7 @@ function registerActiveVehiclePhysicsBody() {
     transmission:{...vehicleRuntime.transmission},
     brakeLocks:{...vehicleRuntime.brakeLocks},
     config:{...vehicle.configuration,mechanical_graph:vehicle.physics.mechanical_graph,
+      energy_diagnostics:vehicle.physics.energy_diagnostics,
       chassis_leveling:{...vehicleRuntime.chassisLeveling},wheel_alignment:JSON.parse(JSON.stringify(vehicleRuntime.wheelAlignment)),
       steering_control:{...vehicleRuntime.steeringSystem}},
     wheelAlignment:JSON.parse(JSON.stringify(vehicleRuntime.wheelAlignment)),
@@ -8662,9 +8723,48 @@ function drawShaderCrosshair(gl, width, height) {
   gl.enable(gl.DEPTH_TEST);
 }
 
+// Explicit invalid telemetry is distinct from a missing channel. These markers
+// are presentation-only; they never repair or write a value back to the solver.
+function vehicleGraphProblem(edge,damage,a,b){
+  const invalid=value=>typeof value==="number"&&!Number.isFinite(value),
+    badPoint=p=>Array.isArray(p)&&p.some(invalid),
+    member=damage?.members?.[edge.identity],joint=damage?.junctions?.[edge.identity];
+  if(badPoint(a)||badPoint(b)||[member,joint].some(record=>record&&Object.values(record).some(invalid)))return "invalid";
+  return member?.failed||edge.runtime_failed?"broken":null;
+}
+
 // Read-only analysis of the authored mechanical graph and worker telemetry.
 // Junction loss is the existing damping estimate, not conserved total energy.
-function vehicleDamageGraphMetrics(graph,damage,metric="health"){
+// Axial stiffness Laplacian L = B^T K B, where each incidence row projects
+// nodal displacement onto the authored member axis. E = .5 u^T L u.
+// This is a small-displacement, presentation-derived estimate, NOT total machine
+// energy. Rotations, tire membranes, torsion, fuel and kinetic energy are excluded.
+function vehicleDamageGraphMetrics(graph,damage,metric="health",positions=new Map(),compiled=null){
+  const references=new Map((graph?.nodes||[]).map(n=>[n.identity,n.reference_position])),
+    vector=p=>Array.isArray(p)&&p.length===3&&p.every(Number.isFinite),
+    nodeEnergy=new Map(),laplacianAction=new Map(),compiledNodes=new Map();
+  if(compiled?.schema==="browser-vehicle-compiled-energy-compartments-v1"){
+    for(const [id,names]of Object.entries(compiled.node_outputs||{})){
+      const values=names.map(name=>compiled.values?.[name]);
+      if(values.every(v=>typeof v==="number"&&Number.isFinite(v)))compiledNodes.set(id,values.reduce((a,b)=>a+b,0));
+    }
+  }
+  const axialEnergy=edge=>{
+    const ra=references.get(edge.a),rb=references.get(edge.b),a=positions.get(edge.a),b=positions.get(edge.b),
+      k=edge.damage?.axial_stiffness_n_per_m,plastic=damage?.members?.[edge.identity]?.plasticStrain;
+    // A fuse's elasticStrain is utilization, not strain. Do not assign it joules.
+    if(edge.sacrificial_break_bushing||!vector(ra)||!vector(rb)||!vector(a)||!vector(b)||
+      !Number.isFinite(k)||k<=0||!Number.isFinite(plastic)||plastic!==0)return null;
+    const axis=rb.map((v,i)=>v-ra[i]),length=Math.hypot(...axis);if(!(length>0))return null;
+    const n=axis.map(v=>v/length),extension=n.reduce((sum,v,i)=>sum+v*((b[i]-rb[i])-(a[i]-ra[i])),0),
+      energy=.5*k*extension*extension;
+    if(!Number.isFinite(energy))return null;
+    for(const [id,sign]of [[edge.a,-1],[edge.b,1]]){
+      nodeEnergy.set(id,(nodeEnergy.get(id)||0)+energy*.5);
+      const action=laplacianAction.get(id)||[0,0,0];
+      laplacianAction.set(id,action.map((v,i)=>v+sign*k*extension*n[i]));}
+    return energy;
+  };
   const nodes=graph?.nodes||[],edges=graph?.edges||[],ids=new Set(nodes.map(n=>n.identity)),
     adjacency=new Map(nodes.map(n=>[n.identity,[]])),degrees=new Map(nodes.map(n=>[n.identity,0])),
     finite=v=>typeof v==="number"&&Number.isFinite(v)?v:null;
@@ -8681,7 +8781,8 @@ function vehicleDamageGraphMetrics(graph,damage,metric="health"){
     if(!dangling&&!broken){adjacency.get(edge.a).push(edge.b);adjacency.get(edge.b).push(edge.a);
       degrees.set(edge.a,degrees.get(edge.a)+1);degrees.set(edge.b,degrees.get(edge.b)+1);}
     const value=metric==="health"?(h===null?null:1-h):metric==="strain"?finite(state?.plasticStrain):
-      metric==="power"?finite(junction?.powerW):metric==="energy"?finite(junction?.energyJ):null;
+      metric==="power"?finite(junction?.powerW):metric==="energy"?finite(junction?.energyJ):
+      metric==="laplacian"?(!dangling&&!broken?axialEnergy(edge):null):null;
     return {edge,health:h,broken,dangling,value};});
   const components=new Map();let count=0;
   for(const node of nodes){if(components.has(node.identity))continue;const todo=[node.identity];components.set(node.identity,count);
@@ -8690,14 +8791,19 @@ function vehicleDamageGraphMetrics(graph,damage,metric="health"){
   const palette=["#66d9ff","#ffd166","#c69cff","#54e39b","#ff8c9d","#f7b267"],
     maximum=metric==="health"?1:Math.max(0,...records.map(r=>r.value??0));
   for(const record of records){const ratio=maximum>0?Math.max(0,Math.min(1,(record.value??0)/maximum)):0;
-    record.color=record.dangling?"#ff00ff":record.broken?"#ff3f62":metric==="graph"?
+    record.problem=vehicleGraphProblem(record.edge,damage,positions.get(record.edge.a),positions.get(record.edge.b));
+    record.color=record.problem==="invalid"?"#ff00ff":record.dangling?"#ff00ff":record.broken?"#ff3f62":metric==="graph"?
       palette[components.get(record.edge.a)%palette.length]:record.value===null?"#6d7773":
       ratio>.75?"#ff5f7d":ratio>.4?"#ffd166":"#54e39b";}
-  return {records,maximum,components,degrees,componentCount:count,
+  const compiledMaximum=Math.max(0,...compiledNodes.values());
+  return {records,maximum,components,degrees,nodeEnergy,laplacianAction,compiledNodes,
+    total:records.reduce((sum,r)=>sum+(r.value??0),0),componentCount:count,
     isolated:nodes.filter(n=>degrees.get(n.identity)===0).length,
     dangling:records.filter(r=>r.dangling).length,
     missing:records.filter(r=>r.value===null).length,
-    nodeColor:id=>palette[(components.get(id)??0)%palette.length]};
+    nodeColor:id=>metric==="compiled"?(compiledNodes.has(id)?
+      (compiledNodes.get(id)>compiledMaximum*.75?"#ff5f7d":compiledNodes.get(id)>compiledMaximum*.4?"#ffd166":"#54e39b"):"#6d7773"):
+      palette[(components.get(id)??0)%palette.length]};
 }
 
 function drawVehicleShaderHud(gl,width,height){
@@ -8705,7 +8811,7 @@ function drawVehicleShaderHud(gl,width,height){
   if(!program||!vehicle||!shaderViewer.shaderOnly){vehicleRuntime.shaderHudHitRegions=[];return;}
   vehicleRuntime.shaderHudHitRegions=[];
   const locations=shaderViewer.vehicleHudLocations,ratio=Math.min(2,window.devicePixelRatio||1),
-    panelWidth=154*ratio,panelHeight=321*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
+    panelWidth=154*ratio,panelHeight=354*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
     travel=Math.max(1e-6,Number(vehicle.configuration.suspension.travel));
   const rgba=(color,alpha=1)=>[...colorVector(color),alpha],draw=(x,y,w,h,color,ellipse=false,angle=0)=>{
     if(w<=0||h<=0)return;gl.uniform4f(locations.uRect,x,y,w,h);
@@ -8718,7 +8824,7 @@ function drawVehicleShaderHud(gl,width,height){
       T:["111","010","010","010","010"],F:["111","100","110","100","100"],
       H:["101","101","111","101","101"],L:["100","100","100","100","111"],
       R:["110","101","110","101","101"],V:["101","101","101","101","010"]},
-    extraGlyphs={E:["111","100","110","100","111"],G:["011","100","101","101","011"],J:["001","001","001","101","010"],
+    extraGlyphs={K:["101","101","110","101","101"],P:["110","101","110","100","100"],D:["110","101","101","101","110"],E:["111","100","110","100","111"],G:["011","100","101","101","011"],J:["001","001","001","101","010"],
       W:["101","101","101","111","101"],I:["111","010","010","010","111"],O:["010","101","101","101","010"],
       N:["101","111","111","111","101"],M:["101","111","111","101","101"],X:["101","101","010","101","101"],
       "0":["111","101","101","101","111"],"1":["010","110","010","010","111"],"2":["110","001","010","100","111"],
@@ -8823,14 +8929,14 @@ function drawVehicleShaderHud(gl,width,height){
   vehicleRuntime.shaderHudHitRegions.push({action:"chassis-leveling",x:panelX+7*ratio,y:levelingY,w:140*ratio,h:17*ratio});
   // Every authored graph node is shown, including isolated equipment and contact samples.
   // Missing endpoints are counted, never placed at invented coordinates.
-  const metric=vehicleRuntime.damageMetric||"health",metrics=[["health","H"],["strain","S"],["power","W"],["energy","J"],["graph","G"]];
-  metrics.forEach(([key,label],i)=>{const x=panelX+(7+i*28)*ratio,y=panelY+205*ratio;
-    draw(x,y,26*ratio,15*ratio,rgba(metric===key?"#245e50":"#202e29",.98));
+  const metric=vehicleRuntime.damageMetric||"laplacian",metrics=[["health","H"],["strain","S"],["power","W"],["energy","J"],["graph","G"],["laplacian","L"],["compiled","E"]];
+  metrics.forEach(([key,label],i)=>{const x=panelX+(7+i*20)*ratio,y=panelY+205*ratio;
+    draw(x,y,18*ratio,15*ratio,rgba(metric===key?"#245e50":"#202e29",.98));
     glyphText(label,x+10*ratio,y+3*ratio,ratio,rgba("#e6fff5",1));
-    vehicleRuntime.shaderHudHitRegions.push({action:"damage-metric",metric:key,x,y,w:26*ratio,h:15*ratio});});
+    vehicleRuntime.shaderHudHitRegions.push({action:"damage-metric",metric:key,x,y,w:18*ratio,h:15*ratio});});
   const graph=vehicle.physics?.mechanical_graph,nodes=new Map((graph?.nodes||[]).map(node=>[node.identity,
       vehicleRuntime.mechanicalNodePositions.get(node.identity)||node.reference_position])),
-    analysis=vehicleDamageGraphMetrics(graph,vehicleRuntime.damage,metric),damageX=panelX+7*ratio,damageY=panelY+223*ratio,
+    analysis=vehicleDamageGraphMetrics(graph,vehicleRuntime.damage,metric,vehicleRuntime.mechanicalNodePositions,vehicleRuntime.compiledEnergy),damageX=panelX+7*ratio,damageY=panelY+223*ratio,
     damageW=140*ratio,damageH=65*ratio,valid=p=>Array.isArray(p)&&p.length===3&&p.every(Number.isFinite),
     positions=[...nodes.values()].filter(valid),
     minX=Math.min(-1,...positions.map(p=>p[0])),maxX=Math.max(1,...positions.map(p=>p[0])),
@@ -8842,14 +8948,23 @@ function drawVehicleShaderHud(gl,width,height){
       thickness=Math.max(1.1,Math.min(3.2,Number(edge.radius||.01)*90))*ratio;
     draw((ax+bx)/2-thickness/2,(ay+by)/2-length/2,thickness,length,rgba(record.color,.94),false,Math.atan2(dx,-dy));});
   for(const [id,p]of nodes){if(!valid(p))continue;const [x,y]=project(p),degree=analysis.degrees.get(id)||0,
-      size=(degree===0?3.5:1.5)*ratio,color=metric==="graph"?analysis.nodeColor(id):degree===0?"#c69cff":"#b5c9c0";
+      size=(degree===0?3.5:1.5)*ratio,color=(metric==="graph"||metric==="compiled")?analysis.nodeColor(id):degree===0?"#c69cff":"#b5c9c0";
     draw(x-size/2,y-size/2,size,size,rgba(color,.98),true);}
   const maxText=analysis.maximum.toExponential(1).toUpperCase(),legend=metric==="graph"?
     `G ${analysis.componentCount} ISO ${analysis.isolated}`:
-    `${metric==="health"?"H":metric==="strain"?"S":metric==="power"?"W EST":"J EST"} MAX ${maxText}`;
+    metric==="compiled"?`E J PART N ${analysis.compiledNodes.size}`:
+    metric==="laplacian"?`L J EST ${analysis.total.toExponential(1).toUpperCase()}`:
+    `${metric==="health"?"H":metric==="strain"?"S":metric==="power"?"W EST":"J LOSS"} MAX ${maxText}`;
   glyphText(legend,damageX,damageY+69*ratio,ratio,rgba("#c6d7ce",1));
   glyphText(`NA ${metric==="graph"?analysis.dangling:analysis.missing} N ${nodes.size} E ${analysis.records.length}`,
     damageX,damageY+78*ratio,ratio,rgba("#94a89e",1));
+  const energy=vehicleRuntime.compiledEnergy,energyValues=energy?.values,
+    finiteEnergy=energyValues&&energy.outputs.every(name=>Number.isFinite(energyValues[name]));
+  glyphText(finiteEnergy?`KE J ${energy.outputs.filter(name=>name!=="energy_chassis_gravity_j").reduce(
+    (sum,name)=>sum+energyValues[name],0).toExponential(1).toUpperCase()}`:"KE J NA",
+    damageX,damageY+90*ratio,ratio,rgba("#c6d7ce",1));
+  glyphText("PARTIAL NOT TOTAL",damageX,damageY+99*ratio,ratio,rgba("#94a89e",1));
+  glyphText("GOLD KE RISE",damageX,damageY+110*ratio,ratio,rgba("#ffd166",1));
   gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);
 }
 
@@ -8907,14 +9022,16 @@ function drawVehicleCanvasHud(context,width,height){
   context.restore();
 }
 
-function cameraGroundHeight(worldX,worldZ){
+function cameraGroundHeight(worldX,worldZ,referenceY=Infinity){
   let height=0;
   const terrainSources=shaderViewer.colliders.length?shaderViewer.colliders:
     (model.document_geometry?.boxes||[]).filter(box=>box.surface);
   terrainSources.forEach(source=>{
     if(!source.surface&&Array.isArray(source.minimum)&&Array.isArray(source.maximum)&&
         worldX>=source.minimum[0]&&worldX<=source.maximum[0]&&worldZ>=source.minimum[2]&&worldZ<=source.maximum[2]){
-      height=Math.max(height,Number(source.maximum[1]||0));return;
+      const startY=Number.isFinite(referenceY)?referenceY+.05:Number(source.maximum[1])+.05,
+        hit=closedSolidVerticalSupport(source,worldX,worldZ,startY,Math.max(0,startY-source.minimum[1]+.05));
+      if(hit)height=Math.max(height,hit.height);return;
     }
     const surface=source.surface,domain=surface?.domain;if(!surface||!domain)return;
     if(worldX<domain.minimum_x||worldX>domain.maximum_x||worldZ<domain.minimum_z||worldZ>domain.maximum_z)return;
@@ -9131,7 +9248,7 @@ function geometryBox(identity) {
 }
 
 function boxYawDegrees(box) {
-  return Number(box?.placement?.rotation?.[1] || 0);
+  return Number(box?.placement?.rotation?.[1] ?? box?.placement?.yaw_degrees ?? 0);
 }
 
 function property(name, value) {
@@ -9538,14 +9655,9 @@ function projectileContactNormal(state, contactIdentity, radius) {
   if(state.position[1]<=radius+.025)return [0,1,0];
   const collider=shaderViewer.colliders.find(item=>item.identity===contactIdentity);
   if(!collider||collider.role==="projectile-body")return null;
-  const candidates=[
-    [Math.abs(state.position[0]-collider.minimum[0]),[-1,0,0]],
-    [Math.abs(state.position[0]-collider.maximum[0]),[1,0,0]],
-    [Math.abs(state.position[2]-collider.minimum[2]),[0,0,-1]],
-    [Math.abs(state.position[2]-collider.maximum[2]),[0,0,1]],
-    [Math.abs(state.position[1]-collider.maximum[1]),[0,1,0]],
-  ];
-  return candidates.sort((a,b)=>a[0]-b[0])[0][1];
+  if(collider.surface)return normalized3([-sampleDeclaredSurface(collider.surface,state.position[0],state.position[2]).gradient[0],1,
+    -sampleDeclaredSurface(collider.surface,state.position[0],state.position[2]).gradient[1]]);
+  return closedSolidClosest(collider,state.position).normal;
 }
 
 function bounceProjectile(state,radius) {

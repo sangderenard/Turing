@@ -890,6 +890,7 @@ def ingest_sympy_expression(
         node_id = next_process_value_id(graph)
         attributes = dict(attributes or {})
         attributes.setdefault("source_type", type(value).__name__)
+        attributes.setdefault("source_language", "sympy")
         node_type = rule.node_type or rule.operation
         operation = rule.operation
         parents = list(zip(parent_ids, roles))

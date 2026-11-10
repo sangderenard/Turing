@@ -24,7 +24,11 @@ def capture():
       const parts=[];const collect=prefix=>p=>parts.push({...p,id:prefix+'/'+p.id});
       const room=studioRoomBounds(3,3);
       studioRoomFaces({scale:3,floorDrop:3,material:()=>0,onSurface:collect('room')});
-      studioTableFaces(defaultStudioTable(),{marble_clear_glass:0},room.floorY,collect('table'));
+      // This fixture tests the original five-part clear-glass slab, not
+      // today's authoring defaults (milk glass with an additional skirt).
+      const table={...defaultStudioTable(),material:'marble_clear_glass',
+        width:5.2,length:3,height:3.02,skirt:{enabled:false,material:'black_felt'}};
+      studioTableFaces(table,{marble_clear_glass:0},room.floorY,collect('table'));
       const subject={id:'subject',radius:1,position:[0,0,0],
         model:[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],faces:[parts[0].faces[0]],
         motion:{mode:'off',velocityM:[0,0,0],angularVelocity:[0,0,0],age:0}};

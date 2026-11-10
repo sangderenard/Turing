@@ -1,6 +1,6 @@
 import {shopLightVerticalPlacement,SHOP_LED_LAYOUTS,SHOP_EMISSION_PROFILES,shopLightProfileKey,SHOP_LIGHT_MODELS,MAX_SHOP_LIGHTS,createShopLight,defaultShopLights,validateShopLights} from './marble_shop_lights.js';
 
-const MODEL_LABELS={'8ft-2tube':'8 ft / 2 tubes','4ft-4tube':'4 ft / 4 tubes'};
+const MODEL_LABELS={'8ft-2tube':'8 ft / 2 tubes','4ft-4tube':'4 ft / 4 tubes','4ft-2tube':'4 ft / 2 tubes','2ft-2tube':'2 ft / 2 tubes'};
 
 /** Edits the shop module's canonical records, never renderer/material copies.
  * Callbacks are synchronous: validateChange(next, previous) runs before commit;
@@ -61,6 +61,7 @@ export function createShopLightControls(container,materialNames,{getUnitMm=()=>3
   };
   field('enabled','Enabled in Studio',{type:'checkbox'});
   field('model','Fixture model',{choices:Object.keys(SHOP_LIGHT_MODELS).map(model=>[model,MODEL_LABELS[model]])});
+  field('rackBus','Track bus',{choices:[['','Unassigned'],...['upper-wall','middle-wall','edge','near-edge','center'].map(id=>[id,id])],read:f=>f.rackBus??'',write:(f,value)=>{if(value)f.rackBus=value;else delete f.rackBus;}});
   field('source','Light source',{choices:[['tubes','Tubes'],['led-array','LED array']],write:(f,value)=>{f.source=value;f.emitterProfile=(value==='led-array'?'led_':'fluorescent_')+(f.emitterProfile?.includes('warm')?'warm_white':'cool_white');}});
   field('ledLayout','LED packing / color groups',{choices:Object.entries(SHOP_LED_LAYOUTS)});
   field('emitterProfile','Emission profile (single-color layout)',{choices:Object.entries(SHOP_EMISSION_PROFILES),read:shopLightProfileKey});

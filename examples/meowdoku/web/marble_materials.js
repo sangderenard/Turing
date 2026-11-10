@@ -3,7 +3,7 @@
 // Saved fixed fixture IDs (ten sources, housing, label) never move. Shop
 // emitters append after those twelve slots, including when a fixture is off.
 export const STUDIO_FIXED_MATERIAL_ROWS = 12;
-export const STUDIO_RUNTIME_MATERIAL_ROWS = STUDIO_FIXED_MATERIAL_ROWS + 16;
+export const STUDIO_RUNTIME_MATERIAL_ROWS = STUDIO_FIXED_MATERIAL_ROWS + 256;
 const TABLE_NAMES = ["pbr", "phong", "enamel", "texstack"];
 const EXTRA_NAMES = ["coated", "paintA", "paintB"];
 const LEGACY_EXTRAS = {coated:32, paintA:33, paintB:34};
@@ -94,7 +94,7 @@ export function savedMaterialRows(materials, index, extra, tables) {
     // Old Studio allocated 32+9 rows, overlapping extras with three fixtures.
     // Accept the bytes as saved, but only restore named rows and extras 32..34.
     // Newer saved catalogues may still contain the former nine-row light rig.
-    if ((count !== savedBase + STUDIO_RUNTIME_MATERIAL_ROWS && count !== savedBase + STUDIO_FIXED_MATERIAL_ROWS + 8 && count !== savedBase + STUDIO_FIXED_MATERIAL_ROWS && count !== savedBase + 9 && !(legacy && count === 41)) ||
+    if ((count !== savedBase + STUDIO_RUNTIME_MATERIAL_ROWS && count !== savedBase + STUDIO_FIXED_MATERIAL_ROWS + 16 && count !== savedBase + STUDIO_FIXED_MATERIAL_ROWS + 8 && count !== savedBase + STUDIO_FIXED_MATERIAL_ROWS && count !== savedBase + 9 && !(legacy && count === 41)) ||
         (savedCount !== undefined && savedCount !== count))
       throw new Error("saved material layout differs from this catalogue");
     savedCount = count;

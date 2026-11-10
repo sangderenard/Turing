@@ -1,0 +1,11 @@
+2026-11-10 Studio layer published with streamed preview pose (MEASURED, Windows Chrome/WebGL2 and local Apache HTTPS)
+
+Stage: build/dot-studio-pose-20261110. Existing guarded additive publisher installed and HTTPS-hash-verified all 24 manifest files through https://127.0.0.1/. It verified all 297 pre-existing live files unchanged. Primary Studio and original game remain untouched. No server restart by this lane. Publication receipt: stage/publication.json. Optional live entry: /marble_studio_layer.html.
+
+Final focused aggregate passed 38 pytest cases in 7.19 seconds, plus room lifecycle and scene asset checks, generated game/Studio syntax checks. Five additional preparation tests passed after the explicitly original-table fixture correction. Full repository tests and native solver compilation were not run.
+
+Approved existing read-only QA server on 127.0.0.1:8898 served the identical stage and unchanged live assets, blocked production APIs and POST. Chrome opened the game, imported current Studio, and reported native frames. Rotating preview/return to Studio caused authored scene updates to settle; original launcher fired a Studio-tagged ball and returned its original identity, membership, world position/velocity and mapped Studio model. Stop removed the iframe; reopen negotiated a distinct epoch and continued receiving frames. Photo camera remained unchanged. Initial page boot can take several seconds; console also reported unrelated extension checksum errors.
+
+The existing full-scene GPU harness (QA-only path substitutions, not in publication manifest) passed with 37 parts, 5184 static and 72960 subject triangles, three streamed poses, zero canonical Studio pixel differences and zero max delta. Shared transparent sorting, split phases and GL-state restoration passed. QA extras were not published.
+
+Production browser navigation encountered Chrome certificate authority trust failure. No warning bypass or trust setting edit was made; production bytes were verified using the existing deployment CA. Public TLS/reachability is owned by the Apache lane. Dynamic native fixture bodies/toppling, returned-body ray-job insertion and exact solver/GPU completion barrier remain unavailable. Pose streaming is displayed-preview authority, not replacement native physics. Existing original worker dt and body state remain authoritative.
