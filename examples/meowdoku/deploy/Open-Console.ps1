@@ -43,6 +43,8 @@ if (Test-Path -LiteralPath $PidFile) {
 $argv = @("--attach=127.0.0.1:$($row.console_port)", "--console-token-file=$Token")
 Write-Host "cmd: $Shell $($argv -join ' ')"
 if ($WhatIf) { Write-Host '[WhatIf] not launching.'; return }
+# The viewer is the Torch build: its DLLs resolve from the build directory and the operator's Torch lib.
+$env:PATH = 'C:\dev\Powershell\nodus\build-bridging\Release;C:\Users\alber\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\lib;' + $env:PATH
 $p = Start-Process -FilePath $Shell -ArgumentList $argv -PassThru
 Set-Content -LiteralPath $PidFile -Value $p.Id -Encoding ascii
 Write-Host "console viewer pid $($p.Id) (recorded in $PidFile)"
