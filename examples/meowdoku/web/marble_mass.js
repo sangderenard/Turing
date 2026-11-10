@@ -56,9 +56,10 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   add(total,outer,glassDensity);
   components.push({name:"shell",volumeM3:outer.volume*radiusM**3,massKg:outer.volume*radiusM**3*glassDensity});
   for (const part of [...mesh.ribbons.map((x)=>({...x,name:"ribbon"})),
-    ...mesh.tubes.map((x)=>({...x,name:"tube"})),...mesh.confetti.map((x)=>({...x,name:"confetti"}))]) {
+    ...mesh.tubes.map((x)=>({...x,name:"tube"})),...mesh.confetti.map((x)=>({...x,name:"confetti"})),
+    ...(mesh.bubbles||[]).map((x)=>({...x,name:"air bubble"}))]) {
     const integral=integrate(mesh.interior.slice(part.start,part.start+part.count));
-    const density=densityByRole[part.densityRole];
+    const density=part.densityRole==="air"?1.225:densityByRole[part.densityRole];
     if (!(density>0)) throw new RangeError("positive inclusion density required");
     add(total,integral,density-glassDensity);
     components[0].volumeM3-=integral.volume*radiusM**3;
@@ -90,10 +91,11 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
     inertia[i][j]=radiusM**5*((i===j?trace:0)-total.second[i][j])
       -mass*((i===j?dot(center,center):0)-center[i]*center[j]);
   }
-  // The generator bounds ribbon cross-sections by their lane spacing, packs
+  // The legacy layout bounds ribbon cross-sections by their lane spacing, packs
   // confetti by disjoint enclosing spheres, confines hybrid dye to an inner
   // radial zone, and separates ring radii and spiral turns. Thus component
-  // volume subtraction resolves the generated designs without a mesh union.
+  // volume subtraction resolves separated designs without a mesh union.
+  // Centered axial ribbons overlap and are explicitly mechanicsResolved=false.
   const determinant = (a) => a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
     -a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
     +a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]);
@@ -108,7 +110,7 @@ export function marbleMass(mesh, {radiusM,densityByRole,enamelMaterial,enamelThi
   const valid=massExact&&mesh.contactModel!=='polyhedron';
   return {massKg:mass,centerM:center,inertiaKgM2:inertia,components,
     principalMoments:principalMoments(inertia),
-    massExact,validForRoll:valid,mechanicsNote:mesh.mechanicsResolved===false?"Final die mesh mechanical domain is unresolved":
+    massExact,validForRoll:valid,mechanicsNote:mesh.mechanicsResolved===false?(mesh.mechanicsNote || "Final mesh mechanical domain is unresolved"):
       unresolvedMark?"Relief uses body substrate; distinct marking bulk density is unresolved":
       mesh.contactModel==='polyhedron'?"Closed die mass and moments calculated for body substrate; rolling needs shape-aware contact dynamics":
       approximateCoating?"Enamel thin film uses an area estimate; rolling waits for closed coating geometry":

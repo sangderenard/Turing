@@ -161,7 +161,9 @@ def kernel(x, n):
     assert "fn numerical_region_1(" in artifact.source
     assert "  loop {" in artifact.source
     assert "    continuing {" in artifact.source
-    assert "break if (!" in artifact.source
+    assert "if (!" in artifact.source
+    assert "{ break; }" in artifact.source
+    assert "break if" not in artifact.source
 
 
 def test_ast_generated_bitwise_operation_uses_wgsl_bitcasts():

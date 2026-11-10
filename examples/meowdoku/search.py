@@ -1,4 +1,4 @@
-"""Two-ply search over the value network, batched.
+"""Batched minimax search over the value network.
 
 A one-ply player takes the move whose successor looks best and is mated by
 anything that calculates.  This search looks one reply deeper: for every
@@ -18,9 +18,8 @@ own king are impossible and skipped).
     best_move(game, net)            -> (src, dst)
     search_value(game, net)         -> the root's searched value for White
 
-Replies use the pseudo-legal generator for speed (a reply that leaves the
-opponent's own king attacked is still counted, which only makes the search
-cautious); root moves are fully legal.
+All plies use legal moves. The best root candidates receive a third ply in
+one additional batched network call.
 """
 from __future__ import annotations
 
@@ -41,32 +40,15 @@ PAD = 2.0                                           # beyond any value: never ch
 
 
 def _replies(game: Chess, src: int, dst: int):
-    """The opponent's pseudo-legal replies to ``src -> dst`` as (pieces,
-    turn) successor positions, plus whether the mover is then without any
-    legal move (mate or stalemate) and whether it is in check."""
+    """The opponent's legal replies to ``src -> dst`` as successor positions."""
     saved = (game.pieces, game.ids, game.turn, getattr(game, "rights", set()), getattr(game, "ep", None))
     game.pieces, game.ids = dict(game.pieces), dict(game.ids)
     game.apply_move(src, dst)
     game.turn = "black" if game.turn == "white" else "white"
     mover = game.turn                                # the side to reply
     in_check = game.in_check(mover)
-    replies = []
-    if in_check:
-        # In check the replies must be the legal ones (the others do not
-        # exist), and none of them means mate.
-        replies = [game.peek(cell, to) for cell, to in game.all_legal_moves()]
-        no_legal = not replies
-    else:
-        for cell, (kind, side) in list(game.pieces.items()):
-            if side != mover:
-                continue
-            for to in game.pseudo_moves(cell):
-                target = game.pieces.get(to)
-                if target and target[0] == "king":   # a reply that takes our king: our move was illegal; not here
-                    continue
-                replies.append(game.peek(cell, to))
-        # Stalemate is only possible with few pseudo-legal replies; check then.
-        no_legal = (len(replies) <= 12) and not game.all_legal_moves()
+    replies = [game.peek(cell, to) for cell, to in game.all_legal_moves()]
+    no_legal = not replies
     game.pieces, game.ids, game.turn = saved[:3]
     game.rights, game.ep = saved[3], saved[4]
     return replies, no_legal, in_check
@@ -110,11 +92,69 @@ def searched_values(game: Chess, net) -> tuple[list[tuple[int, int]], np.ndarray
     return moves, root
 
 
-def best_move(game: Chess, net, *, rng: np.random.Generator | None = None, temperature: float = 0.0):
+def _after(game: Chess, move: tuple[int, int]) -> Chess:
+    """A full legal successor, including castling and en-passant state."""
+    child = Chess("search")
+    child.pieces, child.ids = dict(game.pieces), dict(game.ids)
+    child.turn = game.turn
+    child.rights, child.ep = set(game.rights), game.ep
+    child.apply_move(*move)
+    child.turn = "black" if child.turn == "white" else "white"
+    return child
+
+
+def _third_ply_values(game: Chess, net, moves: list[tuple[int, int]]) -> np.ndarray:
+    """Minimax one ply further for selected root moves, with one leaf batch."""
+    white_root = game.turn == "white"
+    leaves, reply_groups = [], []
+    for root_move in moves:
+        after_root = _after(game, root_move)
+        replies = after_root.all_legal_moves()
+        if not replies:
+            outcome = after_root.outcome()
+            reply_groups.append((MATE if outcome == "white" else -MATE if outcome == "black" else 0.0, []))
+            continue
+        group = []
+        for reply in replies:
+            after_reply = _after(after_root, reply)
+            ours = after_reply.all_legal_moves()
+            if not ours:
+                outcome = after_reply.outcome()
+                value = MATE if outcome == "white" else -MATE if outcome == "black" else 0.0
+                group.append((value, None))
+                continue
+            start = len(leaves)
+            leaves.extend(encode(*after_reply.peek(*move)) for move in ours)
+            group.append((None, (start, len(leaves))))
+        reply_groups.append((None, group))
+    values = net.values(np.stack(leaves)) if leaves else np.zeros(0)
+    scores = []
+    for terminal, group in reply_groups:
+        if terminal is not None:
+            scores.append(terminal)
+            continue
+        reply_scores = []
+        for value, span in group:
+            if span is not None:
+                a, b = span
+                value = float(values[a:b].max() if white_root else values[a:b].min())
+            reply_scores.append(value)
+        scores.append(min(reply_scores) if white_root else max(reply_scores))
+    return np.asarray(scores, dtype=np.float64)
+
+
+def best_move(game: Chess, net, *, rng: np.random.Generator | None = None,
+              temperature: float = 0.0, depth: int = 3, beam: int = 3):
     moves, root = searched_values(game, net)
     if not moves:
         return None
     sign = 1.0 if game.turn == "white" else -1.0
+    if depth >= 3 and len(moves) > 1:
+        selected = np.argsort(-(root * sign), kind="stable")[:max(1, beam)]
+        deeper = _third_ply_values(game, net, [moves[int(i)] for i in selected])
+        # The deeper search ranks the selected moves against each other.
+        moves = [moves[int(i)] for i in selected]
+        root = deeper
     scores = root * sign
     if rng is not None and temperature > 0:
         logits = (scores - scores.max()) / temperature

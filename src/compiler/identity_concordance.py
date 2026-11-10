@@ -10598,6 +10598,34 @@ class CorrelationTable:
                 expected_dtype = python_int_literal_dtype(literal)
             except (TypeError, OverflowError):
                 expected_dtype = None
+            # An explicit scalar source annotation is a different domain
+            # from an unannotated Python literal. Accept it only together
+            # with the exact same-value ABI receipt which cites it.
+            from .concordance_declarations import ANNOTATION_DECLARATION, VALUE_TYPE_ABI
+            from ..transmogrifier.dtype_layout import source_annotation_dtype, resolve
+            authored_domains = []
+            for abi_cell in materialization_sources:
+                if abi_cell.page != VALUE_TYPE_ABI or int(abi_cell.row[1]) != int(value_id):
+                    continue
+                abi = book.page(VALUE_TYPE_ABI).cell(abi_cell.row, abi_cell.column)
+                arms = tuple(getattr(abi, "physical_alternatives", ()))
+                if len(arms) != 1 or arms[0].storage != "scalar" or arms[0].rank != 0 or arms[0].shape:
+                    continue
+                arm = arms[0]
+                for annotation_cell in materialization_sources.intersection(arm.source_cells):
+                    if annotation_cell.page != ANNOTATION_DECLARATION:
+                        continue
+                    annotation = book.page(ANNOTATION_DECLARATION).cell(annotation_cell.row, annotation_cell.column)
+                    width = source_annotation_dtype(annotation.annotation)
+                    layout = resolve(width) if width is not None else None
+                    if width == arm.dtype and layout is not None and layout.kind in {"int", "uint"}:
+                        bits = layout.byte_size * 8
+                        lower = -(1 << (bits - 1)) if layout.kind == "int" else 0
+                        upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
+                        if lower <= literal <= upper:
+                            authored_domains.append(width)
+            if len(set(authored_domains)) == 1:
+                expected_dtype = authored_domains[0]
             discrepancies = []
             if expected_dtype is None or str(dtype) != expected_dtype:
                 discrepancies.append(

@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import {registerObjAsset,ensureObjAsset,importedObjectGeometry,importedMechanics} from '../examples/meowdoku/web/marble_imported_object.js';
+import {buildMarbleObjectGeometry,geometrySha256,verifySavedMarbleObject} from '../examples/meowdoku/web/marble_object.js';
+import {prepareObjectSnapshot} from '../examples/meowdoku/web/marble_object_snapshot.js';
+const digest='a'.repeat(64),source={digest,name:'Open triangle',geometry:{vertices:[0,0,0,1,0,0,0,1,0],material_ids:[0]}};
+registerObjAsset(source);source.geometry.vertices[0]=99;
+const design={'base-shape':'obj',source_asset:digest,material_mode:'studio-shell',kind:'clear','bubble-count':0,
+ shell:'glass',eye:'glass',accent:'glass','confetti-material':'glass','mark-material':'glass'};
+const m=importedObjectGeometry(design,0);assert.equal(m.glass[0][0][0],0);assert.deepEqual(m.glass[0][4],[[0,0,1],[0,0,1],[0,0,1]]);
+assert.equal(m.mechanicsResolved,false);assert.equal(importedMechanics().massKg,null);
+assert.deepEqual(buildMarbleObjectGeometry(design,{shell:0},{detail:'proxy'}).glass,m.glass);
+const tables=Object.fromEntries(['pbr','phong','enamel','texstack'].map(k=>[k,{stride:16,data:Array(16).fill(0)}]));
+const snapshot={v:1,name:'Supplied triangle',generator:'meowdoku-imported-object-v1',design,materials:{index:{glass:0},extra:{coated:0,paintA:0,paintB:0},tables},physical:{'radius-mm':10}};
+const prepared=await prepareObjectSnapshot(snapshot);assert.equal(prepared.value.derived.massKg,null);
+const reordered=JSON.parse(JSON.stringify(prepared.value));reordered.derived=Object.fromEntries(Object.entries(reordered.derived).reverse());
+const verified=await verifySavedMarbleObject(reordered);assert.equal(verified.geometry.triangleCount,1);
+const falseMass=structuredClone(prepared.value);falseMass.derived.massKg=1;
+await assert.rejects(verifySavedMarbleObject(falseMass),/must not claim/);
+const tampered=structuredClone(prepared.value);tampered.geometry_sha256='0'.repeat(64);
+await assert.rejects(verifySavedMarbleObject(tampered),/no longer matches/);
+await assert.rejects(ensureObjAsset('b'.repeat(64),{fetcher:async()=>({ok:false,status:404})}),/unavailable/);
+assert.throws(()=>registerObjAsset({digest:'c'.repeat(64),geometry:{vertices:[NaN,0,0],material_ids:[]}}),/Invalid/);
+assert.equal(await geometrySha256(verified.geometry),prepared.value.geometry_sha256);
+console.log('Supplied subject geometry, snapshot, unavailable asset, tamper and mechanics checks passed');

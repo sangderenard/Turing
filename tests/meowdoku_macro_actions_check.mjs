@@ -1,0 +1,31 @@
+import {studioDisplayedSubjectCenter,PhotographicCameraBinding} from '../examples/meowdoku/web/marble_camera_binding.js';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {createStudioLensControls,cameraFocusDiagnostic} from '../examples/meowdoku/web/marble_lens_controls.js';
+import {studioScaleTransform,studioFrameDistance} from '../examples/meowdoku/web/marble_studio_scale.js';
+const inventory=JSON.parse(fs.readFileSync(new URL('../examples/meowdoku/lens_contract_catalog.json',import.meta.url)));
+const catalog={schema:'studio-lens-catalog-v1',profiles:inventory.contracts.filter(p=>p.kind==='authored-thin-profile'),references:inventory.contracts.filter(p=>p.kind!=='authored-thin-profile')};
+const files=[new URL('../examples/meowdoku/web/marble_studio.js',import.meta.url)];if(process.argv[2])files.push(process.argv[2]);
+for(const file of files){
+ const nodes=new Map();
+ const $=id=>nodes.get(id);
+ for(const id of ['photo-lens-controls','photo-lens','photo-lens-status','photo-focus-mm','photo-focal-mm','photo-f-number','photo-focus-slider','photo-focal-slider','photo-aperture-slider','photo-lens-inventory','photo-focus-diagnostic','photo-frame-focus','photo-focus-target','frame-marble','photo-camera','photo-auto-snapshot'])nodes.set(id,{value:'',dataset:{},listeners:{},addEventListener(k,v){this.listeners[k]=v;},append(){},click(){this.listeners.click?.();}});
+ Object.assign($('photo-lens'),{value:'unchanged'});$('photo-focus-mm').value='230';$('photo-focal-mm').value='50';$('photo-f-number').value='18.94125455';$('photo-auto-snapshot').checked=true;
+ const controls=createStudioLensControls({getElementById:$,createElement:()=>({}),dispatchEvent(){},defaultView:{Event}},{fetcher:async()=>({ok:true,json:async()=>catalog})});await controls.ready;
+ const initial={eye_m:[0,0,.023126041588229562],target_m:[0,0,0],fov_degrees:26.991466561591622,focus_distance_m:.023126041588229562,aperture_radius_m:.0013198703356214598};
+ $('photo-lens').value='macro_50mm';$('photo-lens').listeners.change();
+ let changes=0,status='';
+ const photo={lensFov:controls.fov,lensMinimumFocus:controls.minimumFocus,focusLensAt:controls.focusAt,status:m=>status=m};
+ const subject=studioScaleTransform({version:1,mode:'fixed',unitMm:10},2,false);
+ const context=vm.createContext({$,photo,Math,studioDisplayedSubjectCenter,photographicCameraBinding:new PhotographicCameraBinding(),rollState:null,isMarbleChase:()=>false,studioPhotoCamera:()=>({camera:controls.applyCamera(initial)}),studioSubjectTransform:()=>subject,studioFrameDistance,canvas:{clientWidth:800,clientHeight:600},studioOrbitTarget:[0,0,0],distance:initial.focus_distance_m/.01,liveRay:{cameraChanged:()=>changes++}});
+ const source=fs.readFileSync(file,'utf8'),start=source.indexOf('  $("photo-focus-target")?.addEventListener'),end=source.indexOf('  for(const field of ["paint-a-color"',start);assert(start>0&&end>start);
+ vm.runInContext(source.slice(start,end),context);
+ assert(cameraFocusDiagnostic(controls.applyCamera(initial)).warning);
+ $('photo-focus-target').click();const focused=controls.applyCamera(initial);
+ assert.equal(focused.focus_distance_m,initial.focus_distance_m);assert.equal(focused.lens_selection.key,null);assert.equal($('photo-camera').value,'studio');assert.equal(context.distance,initial.focus_distance_m/.01);assert.equal(changes,1);assert(!cameraFocusDiagnostic(focused).warning);assert.match(status,/aperture are unchanged/);
+ $('photo-lens').value='macro_50mm';$('photo-lens').listeners.change();$('frame-marble').click();assert(context.distance*.01>=.23);
+ $('photo-lens').value='custom';$('photo-lens').listeners.change();$('photo-frame-focus').click();assert(context.distance*.01<.02);assert.equal(controls.applyCamera(initial).focus_distance_m,context.distance*.01);assert.deepEqual(Array.from(context.studioOrbitTarget),subject.subjectCenter);
+ assert.match(status,/analytical framing/);
+ console.log('PASS actual macro handlers: '+file);
+}

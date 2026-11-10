@@ -697,11 +697,17 @@ instance.exports.abstract_ui_wheel_contact(0);console.log(JSON.stringify(payload
 def test_sympy_contact_precompile_is_one_opt_in_packed_tensor_dispatch():
     compiled = compile_wheel_contact_abstract_tensor(packed_outputs=True)
     regions = [name for name in compiled.module.functions
-               if name.startswith("numerical_region_")]
+               if "__planned_region_" in name]
     artifact = compiled.artifacts[0]
     metadata = artifact.api.to_mapping()["metadata"]
 
-    assert regions == ["numerical_region_0"]
+    # One GPU entry/dispatch may call many compiler-owned regions. Preserve
+    # every region instead of requiring source partitioning to disappear.
+    assert regions
+    root = compiled.module.functions[compiled.function_name]
+    called = {i.attributes.get("callee") for block in root.blocks.values()
+              for i in block.instrs if i.op == "Call"}
+    assert set(regions) <= called
     assert compiled.packed_outputs is True
     assert artifact.complete
     # The launch covers every contact lane (40 today: four tyres plus the

@@ -1,0 +1,9 @@
+# Color-priority display and raw calibration retention
+
+Reference output remains default. Measured fixed-Y gamut projection cancels saturation changes at boundary colors and desaturates bright green. Optional custom Color priority display compresses negative channels toward scene-linear neutral, then uses one max-channel scalar shoulder. Positive RGB ratios survive the shoulder; neutral ramps and raw HDR remain unchanged. This trades display brightness for color, not a Canon/ACES/ICC calibration. Explicit Specular clipping retains original policy.
+
+Live saturation is prominent beside display look. Live display changes preserve current rays/checkpoints. Completed photos and direct Film Science preview share the same choice and metadata. Gaussian-response inversion and three-line CIE profile remain separate and unchanged. Three discrete wavelengths cannot reproduce broadband metamerism.
+
+Calibration dataset now retains exact raw HDR archives, SHA256, linear statistics and recorded provenance; PNG ratios explicitly visual-only. No model trained or matrix fitted. Further measurements must use raw linear values with fixed exposure normalization and held-out mixed spectra, not auto-normalized PNGs.
+
+Verification: 159 focused Turing Python tests,58 Spectral profile/color-priority tests; Node live,retouch,Film Science and raw-calibration suites. Tests include exact saved/live display parity, neutral ramps, positive ratio preservation, previous saturation failure, raw immutability, and no live reset. Lens stage and small-triangle determinant fix separately verified by their owners. Publication recorded in build/dot-color-lens-release-20261109/verification.json only when present; no claim of publication before that receipt. Source/published Studio differ intentionally; scoped patched bootstrap excludes unshipped chase/physics.

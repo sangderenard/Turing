@@ -10,6 +10,17 @@
   main { display:grid; grid-template-columns:minmax(400px,1fr) minmax(300px,390px); min-height:calc(100vh - 56px); }
   .stage { position:relative; min-height:65vh; overflow:hidden; background:radial-gradient(circle at 50% 45%,#304762,#09121e 70%); }
   canvas { display:block; width:100%; height:100%; touch-action:none; }
+  #live-ray-view { position:absolute; inset:0; width:100%; height:100%; background:transparent; opacity:0; pointer-events:none; z-index:1; }
+  #live-ray-view[hidden] { display:none; }
+  .optical-invalid-warning { padding:10px; border:2px solid #ff7b74; background:#5d1111; color:#fff; font-weight:800; font-size:14px; }
+  .optical-stage-warning { position:absolute; left:14px; right:14px; top:14px; z-index:5; margin:0; }
+  .optical-invalid-warning[hidden] { display:none; }
+  #optical-material-controls, #optical-material-rows fieldset { min-width:0; }
+  #optical-material-rows fieldset { border:1px solid #4c6682; border-radius:6px; margin:0; padding:8px; }
+  #optical-material-rows legend { max-width:100%; overflow-wrap:anywhere; }
+  #optical-material-rows label { font-size:12px; }
+  .stage.live-ray-mode .photo-panel { visibility:hidden; }
+  .stage.live-ray-mode .stage-note { z-index:2; }
   .stage-note { position:absolute; left:18px; bottom:16px; color:#c5d7e9; background:#0d1727c9; border-radius:8px; padding:7px 10px; }
   #drive-pad { position:absolute; left:18px; bottom:58px; display:grid; grid-template-columns:repeat(3,42px); gap:4px;
                padding:8px; border:1px solid #8dc1e6; border-radius:10px; background:#0d1727ed; touch-action:none; }
@@ -18,6 +29,22 @@
   #drive-pad button:active { background:#547ca4; }
   #drive-status { grid-column:1/-1; max-width:136px; font-size:11px; line-height:1.25; text-align:center; }
   .photo-panel { position:absolute; right:14px; top:14px; width:min(32vw,290px); min-width:185px; margin:0; padding:9px; background:#0d1727ed; border:1px solid #536b82; border-radius:9px; box-shadow:0 9px 35px #0008; }
+  #photo-retouch { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px 8px; margin-top:8px; padding-top:7px; border-top:1px solid #536b82; }
+  #photo-retouch[hidden], #photo-frames[hidden] { display:none; }
+  #photo-retouch > p { grid-column:1 / -1; margin:0 0 2px; font-size:11px; color:#9db4cf; }
+  #photo-retouch label { font-size:11px; gap:1px; }
+  #photo-retouch button { grid-column:1 / -1; }
+  .photo-panel { max-height:calc(100% - 28px); overflow-y:auto; }
+  #retouch-profile-info { min-width:0; font-size:11px; overflow-wrap:anywhere; }
+  #retouch-profile-info p { margin:4px 0; }
+  #retouch-profile-info pre { max-width:100%; overflow-x:auto; font-size:10px; }
+  #retouch-profile-warning { color:#ffd18c; }
+  #photo-focus-diagnostic[data-warning=true] { color:#ffe1aa; border-left:4px solid #ffb454; padding-left:8px; }
+  #photo-lens-controls[data-focus-warning=true] > summary::after { content:" · Focus mismatch"; color:#ffbf7b; font-weight:700; }
+  #chart-report { margin-top:8px; padding-top:7px; border-top:1px solid #536b82; font-size:11px; }
+  #chart-report table { width:100%; border-collapse:collapse; }
+  #chart-report th, #chart-report td { padding:2px 4px; text-align:left; border-bottom:1px solid #26384a; }
+  #chart-report td:nth-child(2) span, #chart-report td:nth-child(3) span { display:inline-block; width:10px; height:10px; margin-right:3px; vertical-align:middle; border:1px solid #556; }
   .photo-panel canvas { display:block; width:100%; height:auto; aspect-ratio:1; object-fit:contain; background:#080c12; image-rendering:auto; }
   .photo-panel figcaption { color:#c5d7e9; font-size:12px; padding-top:6px; }
   #photo-frames { display:flex; gap:4px; overflow-x:auto; margin-top:7px; }
@@ -32,65 +59,267 @@
   input[type=range] { padding:0; width:100%; } input[type=color] { width:100%; height:34px; padding:2px; }
   button { cursor:pointer; } button:hover { border-color:#b5e7ff; } .wide { grid-column:1/-1; }
   output { color:#b5e7ff; font-variant-numeric:tabular-nums; } #message { color:#ffd18c; min-height:1.5em; }
+  #backdrop-layer-controls fieldset { min-width:0; border:1px solid #4c6682; border-radius:6px; margin:8px 0; }
+  #backdrop-layer-controls[hidden], #backdrop-layer-controls fieldset[hidden] { display:none; }
+  #studio-surface-controls, #studio-surface-advanced { min-width:0; border:1px solid #4c6682; border-radius:6px; padding:10px; }
+  .studio-surface-matrix { display:grid; grid-template-columns:auto minmax(0,1fr) minmax(0,1fr); gap:6px; align-items:center; }
+  .studio-surface-matrix button { min-height:54px; white-space:normal; }
+  .studio-surface-matrix button[aria-pressed=true] { background:#214d68; border-color:#b5e7ff; }
+  #studio-surface-controls .studio-surface-toggle { display:flex; align-items:center; gap:8px; margin:10px 0; }
+  #studio-surface-advanced summary { cursor:pointer; color:#b5e7ff; }
+  #studio-surface-restore-controls { display:grid; gap:8px; }
+  #studio-gobo-advanced { min-width:0; margin-top:8px; }
+  #studio-gobo-advanced > summary { font-size:12px; color:#aec0d3; }
+  .studio-gobo-row { min-width:0; border:1px solid #4c6682; border-radius:6px; margin:8px 0; padding:8px; gap:6px; }
+  #studio-gobo-controls p { font-size:11px; margin:8px 0; }
+  #studio-gobo-controls input[aria-invalid=true] { border-color:#ffbd73; }
+  .lighting-pose-lock { display:flex; align-items:center; gap:8px; }
+  .lighting-profiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-bottom:16px; }
+  .lighting-profiles [role=status] { grid-column:1/-1; color:#aec0d3; font-size:12px; }
+  #light-strength-levels { margin:10px 0 16px; }
+  #light-strength-levels summary { cursor:pointer; color:#b5e7ff; }
+  #light-strength-levels p { margin:8px 0; font-size:12px; }
+  .light-strength-level { min-width:0; margin:8px 0; border:1px solid #4c6682; border-radius:6px; }
+  .light-strength-level .lighting-pose-lock { margin-bottom:8px; }
+  .light-strength-level input:disabled { opacity:.55; }
+  #photo-film-response fieldset { min-width:0; border:1px solid #4c6682; border-radius:6px; margin:0; }
+  #photo-film-response h3 { font-size:14px; margin:8px 0; }
+  #photo-film-response p { font-size:12px; margin:8px 0; }
+  .film-science { margin-top:14px; padding-top:8px; border-top:1px solid #4c6682; }
+  .film-science-panels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+  .film-science figure { min-width:0; margin:0; }
+  .film-science figcaption { min-height:3em; font-size:12px; font-weight:600; margin:8px 0; }
+  .film-science canvas { display:block; width:100%; height:auto; background:#080c12; border:1px solid #4c6682; }
+  .film-patch-legend { list-style:none; padding:0; margin:8px 0; font-size:10px; line-height:1.5; overflow-wrap:anywhere; }
+  #film-preview-metrics, #film-preview-profile, #film-preview-warnings, #film-preview-corrections { overflow-wrap:anywhere; }
+  .film-science-results[hidden] { display:none; }
+  @media(max-width:420px) { .film-science-panels { grid-template-columns:1fr; } }
   @media(max-width:850px) { main { grid-template-columns:1fr; } .stage { min-height:58vh; height:58vh; } aside { max-height:none; border-left:0; border-top:1px solid #32465c; } }
+label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
 </style></head><body>
 <header><strong>Meowdoku · Marble studio</strong><a href="/">Games</a><span id="message" role="status"></span></header>
-  <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><div class="stage-note">Drag to turn · scroll to zoom · hold D-pad to tilt the physical course</div><div id="drive-pad" hidden aria-label="Camera-oriented marble course tilt"><span></span><button type="button" data-drive="up" aria-label="Nudge up">↑</button><span></span><button type="button" data-drive="left" aria-label="Nudge left">←</button><button type="button" data-drive="neutral" aria-label="Release tilt">•</button><button type="button" data-drive="right" aria-label="Nudge right">→</button><span></span><button type="button" data-drive="down" aria-label="Nudge down">↓</button><span></span><output id="drive-status">Hold an arrow to tilt the toy course</output></div><figure class="photo-panel" id="photo-panel" hidden><canvas id="photo-image" role="img" aria-label="Progressive thin-lens photograph of the saved marble"></canvas><figcaption id="photo-caption">Preparing photo…</figcaption><a id="photo-full" hidden target="_blank" rel="noopener">Open full-size photo</a> <a id="photo-hdr" hidden download>Download linear HDR exposure</a> <a id="photo-animation" hidden download="marble-orbit.avi">Download JPEG orbit animation</a><div id="photo-frames" hidden></div><button type="button" id="photo-play" hidden>Play orbit</button></figure></div>
+  <main><div class="stage"><canvas id="view" aria-label="Phong-lit cat's-eye marble preview"></canvas><canvas id="live-ray-view" role="img" aria-label="Live ray samples over the Phong preview; untouched pixels remain clear" aria-hidden="true" hidden></canvas><p id="live-optical-warning" class="optical-invalid-warning optical-stage-warning" role="alert" hidden></p><div class="stage-note">Drag to turn · scroll to zoom · hold D-pad to tilt the physical course</div><div id="drive-pad" hidden aria-label="Camera-oriented marble course tilt"><span></span><button type="button" data-drive="up" aria-label="Nudge up">↑</button><span></span><button type="button" data-drive="left" aria-label="Nudge left">←</button><button type="button" data-drive="neutral" aria-label="Release tilt">•</button><button type="button" data-drive="right" aria-label="Nudge right">→</button><span></span><button type="button" data-drive="down" aria-label="Nudge down">↓</button><span></span><output id="drive-status">Hold an arrow to tilt the toy course</output></div><figure class="photo-panel" id="photo-panel" hidden><canvas id="photo-image" role="img" aria-label="Progressive thin-lens photograph of the saved marble"></canvas><figcaption id="photo-caption">Preparing photo…</figcaption><p id="photo-optical-warning" class="optical-invalid-warning" role="alert" hidden></p><a id="photo-full" hidden target="_blank" rel="noopener">Open full-size photo</a> <a id="photo-hdr" hidden download>Download linear HDR exposure</a> <a id="photo-animation" hidden download="marble-orbit.avi">Download JPEG orbit animation</a><div id="photo-frames" hidden></div><button type="button" id="photo-play" hidden>Play orbit</button><div id="photo-retouch" hidden><p>Live re-tonemap of the saved linear exposure -- no re-trace.</p><div class="wide" id="retouch-profile-info"><p id="retouch-profile-name">Sensor profile: waiting for exposure metadata.</p><p id="retouch-profile-display"></p><p id="retouch-profile-rendered"></p><p id="retouch-profile-warning" role="status" hidden></p><details><summary>Sensor matrix and reference</summary><p id="retouch-profile-reference"></p><p id="retouch-profile-condition"></p><pre id="retouch-profile-matrix"></pre><p id="retouch-profile-limits"></p></details><p>Read-only sensor conversion from this exposure. Raw HDR stays unchanged; the display path applies its transfer once.</p></div><label>Normalization<select id="retouch-normalization" disabled><option value="auto99">Auto: 99th percentile (default)</option><option value="percentile">Adjustable percentile</option><option value="specular">Specular shot: clipped highlights</option><option value="manual">Manual scene-linear white</option></select></label><label>White percentile <output id="retouch-normalization-percentile-out">99%</output><input id="retouch-normalization-percentile" type="range" min="1" max="100" step="0.1" value="99" aria-describedby="retouch-normalization-help" disabled></label><p id="retouch-normalization-help">Auto keeps the original 99th-percentile white. Adjustable percentile uses the slider (1 to 100). Lower values brighten the image and clip more highlights. Specular shot starts at 95 and forces linear clipping above the chosen white. Only the display changes; raw HDR is preserved.</p><label>White reference<input id="retouch-normalization-white" type="number" min="0.000001" max="1000000000000" step="any" value="1" disabled></label><label class="wide">Tone curve<select id="retouch-tone-curve" disabled><option value="exponential">Exponential luminance</option><option value="linear">Linear luminance</option></select></label><label>Display look<select id="retouch-display-look" disabled><option value="reference">Reference: luminance priority</option><option value="color_priority">Color priority: preserve highlight color</option></select></label><label>Saturation <output id="retouch-saturation-out">1.00</output><input id="retouch-saturation" type="range" min="0" max="200" step="1" value="100" aria-describedby="retouch-color-help" disabled></label><label>Vibrance <output id="retouch-vibrance-out">0.00</output><input id="retouch-vibrance" type="range" min="-100" max="100" step="1" value="0" aria-describedby="retouch-color-help" disabled></label><label class="wide">Black point (fraction of normalized white) <output id="retouch-black-point-out">0.00</output><input id="retouch-black-point" type="range" min="0" max="50" step="1" value="0" aria-describedby="retouch-color-help" disabled></label><p id="retouch-color-help">Artistic display controls. Saturation: 0 to 2 (neutral 1). Vibrance: -1 to 1 (neutral 0), weighted toward low-chroma colours. Black point: 0 to 0.50 (neutral 0), a fraction of the selected white before tone mapping. Not a calibrated or perceptually uniform adjustment.</p><label class="wide">Isolated-highlight (firefly) filter<input id="retouch-firefly-filter" type="checkbox" aria-describedby="retouch-firefly-help" disabled></label><label>Highlight threshold <output id="retouch-firefly-threshold-out">8×</output><input id="retouch-firefly-threshold" type="number" min="2" max="64" step="any" value="8" aria-describedby="retouch-firefly-help" disabled></label><label>Filter strength <output id="retouch-firefly-strength-out">1.00</output><input id="retouch-firefly-strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="retouch-firefly-help" disabled></label><p id="retouch-firefly-help">Off by default. Flags an interior pixel only when its luminance exceeds the threshold times its brightest of eight neighbours, then blends toward that neighbour luminance by the selected strength. Runs after RGB gains and before tone mapping; raw HDR and the white reference stay unchanged. May reduce genuine isolated glints or sharp highlight peaks.</p><p id="retouch-display-summary">Normalization, tone and artistic colour controls require a recorded sensor profile.</p><label>Exposure <output id="retouch-exposure-out">0.00</output><input id="retouch-exposure" type="range" min="-600" max="600" step="5" value="0"></label><label>Gamma <output id="retouch-gamma-out">1.00</output><input id="retouch-gamma" type="range" min="20" max="300" step="5" value="100"></label><label>Red <output id="retouch-red-out">1.00</output><input id="retouch-red" type="range" min="0" max="300" step="5" value="100"></label><label>Green <output id="retouch-green-out">1.00</output><input id="retouch-green" type="range" min="0" max="300" step="5" value="100"></label><label>Blue <output id="retouch-blue-out">1.00</output><input id="retouch-blue" type="range" min="0" max="300" step="5" value="100"></label><label>White balance <output id="retouch-whitebalance-out">0.00</output><input id="retouch-whitebalance" type="range" min="-300" max="300" step="5" value="0"></label><label>Tint <output id="retouch-tint-out">0.00</output><input id="retouch-tint" type="range" min="-300" max="300" step="5" value="0"></label><label>Intensity <output id="retouch-intensity-out">1.00</output><input id="retouch-intensity" type="range" min="0" max="300" step="5" value="100"></label><button type="button" id="retouch-apply">Apply</button><button type="button" id="retouch-reset">Reset to baked exposure</button></div><div id="chart-report" hidden><p>Colour chart: target vs. measured (linear, averaged per patch)</p><table id="chart-report-table"><thead><tr><th>Patch</th><th>Target</th><th>Measured</th><th>Δ</th></tr></thead><tbody></tbody></table></div></figure></div>
 <aside><h1>Design a marble or die</h1><p>Turn closed solids and dyed inclusions under the exported Pluck material tables and Phong shader.</p>
-  <h2>Lighting</h2><div class="grid">
+  <h2>Lighting</h2><div id="lighting-profiles"></div><div class="grid" id="studio-scene-controls">
+    <div id="studio-scale-controls" class="wide grid"></div>
+    <p class="wide">A (exposure) owns these lights and room settings. B (room) follows A unless a setting is unlocked for Phong only. Filters start white; zero strength switches a light off.</p>
+    <label>Key Left strength <output id="light-strength-left-out"></output><input id="light-strength-left" type="range" min="0" max="4000" value="220"></label>
+    <label>Key Left filter<input id="key-filter-left" type="color" value="#ffffff"></label>
+    <label>Key Right strength <output id="light-strength-right-out"></output><input id="light-strength-right" type="range" min="0" max="4000" value="0"></label>
+    <label>Key Right filter<input id="key-filter-right" type="color" value="#ffffff"></label>
+    <label>Background strength <output id="light-bg-strength-out"></output><input id="light-bg-strength" type="range" min="0" max="2000" value="60"></label>
+    <label>Background filter<input id="background-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Left strength <output id="light-kicker-left-strength-out"></output><input id="light-kicker-left-strength" type="range" min="0" max="2000" value="0"></label>
+    <label>Kicker Left filter<input id="kicker-left-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Right strength <output id="light-kicker-right-strength-out"></output><input id="light-kicker-right-strength" type="range" min="0" max="2000" value="15"></label>
+    <label>Kicker Right filter<input id="kicker-right-filter" type="color" value="#ffffff"></label>
+    <label>Fill Lower strength <output id="light-fill-lower-strength-out"></output><input id="light-fill-lower-strength" type="range" min="0" max="2000" value="0"></label>
+    <label>Fill Lower filter<input id="fill-lower-filter" type="color" value="#ffffff"></label>
+    <label>Fill Upper strength <output id="light-fill-upper-strength-out"></output><input id="light-fill-upper-strength" type="range" min="0" max="2000" value="0"></label>
+    <label>Fill Upper filter<input id="fill-upper-filter" type="color" value="#ffffff"></label>
+    <label>Left key angle (degrees)<input id="key-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left key radial distance (Studio units)<input id="key-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-left-placement-status" class="wide" role="status"></output>
+    <label>Right key angle (degrees)<input id="key-right-arc" type="number" min="-180" max="180" step="0.1"></label><label>Right key radial distance (Studio units)<input id="key-right-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-right-placement-status" class="wide" role="status"></output>
+    <label>Left kicker angle (degrees)<input id="kicker-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left kicker radial distance (Studio units)<input id="kicker-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="kicker-left-placement-status" class="wide" role="status"></output>
+    <label>Right kicker angle (degrees)<input id="kicker-right-arc" type="number" min="-180" max="180" step="0.1"></label><label>Right kicker radial distance (Studio units)<input id="kicker-right-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="kicker-right-placement-status" class="wide" role="status"></output>
+    <label>Left kicker base inset from back wall (Studio units)<input id="kicker-left-wall-gap" type="number" min="0" step="0.01"></label>
+    <label>Right kicker base inset from back wall (Studio units)<input id="kicker-right-wall-gap" type="number" min="0" step="0.01"></label>
+    <label>Background base inset from back wall (Studio units)<input id="background-wall-gap" type="number" min="0" step="0.01"></label>
+    <output id="background-placement-status" class="wide" role="status"></output><p class="wide">Kicker inset sets the base radius from the straight subject-back wall line, then its angle sweeps that radius around the subject. Background inset is its distance in front of the back wall. Changing room size updates these readouts without moving saved lights.</p>
+    <p class="wide">Key angle zero is the camera-side +Z line; kicker zero is the subject-back −Z line. Positive angles sweep toward each light’s own side; 45° is diagonal and 180° reaches the opposite/front line. Radius is distance from the subject axis. New rigs are fitted near their respective room walls; these views edit saved absolute poses, not automatic wall-following.</p>
+    <label>Table stage left strength <output id="light-table-left-strength-out"></output><input id="light-table-left-strength" type="range" min="0" max="2000" value="60"></label>
+    <label>Table stage left filter<input id="table-left-filter" type="color" value="#ffffff"></label>
+    <label>Stage left arc (degrees)<input id="table-left-arc" type="number" min="-180" max="180" step="0.1" value="-86.906" aria-describedby="stage-placement-help table-left-placement-status"></label>
+    <label>Stage left elevation (degrees)<input id="table-left-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
+    <label>Stage left radius (Studio units)<input id="table-left-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-left-placement-status"></label>
+    <output class="wide" id="table-left-placement-status" role="status"></output>
+    <label>Table stage right strength <output id="light-table-right-strength-out"></output><input id="light-table-right-strength" type="range" min="0" max="2000" value="60"></label>
+    <label>Table stage right filter<input id="table-right-filter" type="color" value="#ffffff"></label>
+    <label>Stage right arc (degrees)<input id="table-right-arc" type="number" min="-180" max="180" step="0.1" value="86.906" aria-describedby="stage-placement-help table-right-placement-status"></label>
+    <label>Stage right elevation (degrees)<input id="table-right-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
+    <label>Stage right radius (Studio units)<input id="table-right-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-right-placement-status"></label>
+    <output class="wide" id="table-right-placement-status" role="status"></output>
+    <p class="wide" id="stage-placement-help">Stage azimuth zero is +Z; negative turns left and positive right. Elevation is above/below the subject centre. Radius is full 3D distance, not lamp size. These author the existing X/Y/Z while preserving aim and lock. Moving a stage light off the table may leave its stand unsupported; placement warnings remain.</p>
+    <label>Lower fill camera-wall inset (Studio units)<input id="lower-fill-wall-gap" type="number" min="0" max="50" step="0.01" value="1"></label>
+    <label>Lower fill height (Studio Y)<input id="lower-fill-height" type="number" min="-50" max="50" step="0.01" value="0"></label>
+    <label class="wide"><input id="lower-fill-lock" type="checkbox" checked> Lower fill aim at subject</label>
+    <label>Lower fill yaw (degrees)<input id="lower-fill-yaw" type="number" min="-180" max="180" step="0.1" value="0"></label>
+    <label>Lower fill pitch (degrees)<input id="lower-fill-pitch" type="number" min="-90" max="90" step="0.1" value="0"></label>
+    <p class="wide">Inset is the light origin's distance from the camera-side (+Z) wall, not housing clearance. Height uses world Y. Unlock aim for all-around direction: yaw 0 faces -Z, 180 faces +Z; pitch +90 points up, -90 down. Room resizing updates the inset readout without moving saved lights.</p>
+    <output class="wide" id="lower-fill-placement-status" role="status"></output>
+    <fieldset class="wide grid" id="overhead-fill-controls"><legend>Overhead fill: ceiling drop and gimbal aim</legend>
+    <label class="wide">Lower from ceiling (Studio units)<input id="overhead-fill-drop" type="number" min="0" step="0.01" aria-describedby="overhead-fill-help top-fill-height-status"></label>
+    <label>Overhead X position<input id="overhead-fill-x" type="number" min="-50" max="50" step="0.01"></label>
+    <label>Overhead Z position<input id="overhead-fill-z" type="number" min="-50" max="50" step="0.01"></label>
+    <label class="wide"><input id="overhead-fill-lock" type="checkbox" checked> Track subject (uncheck for manual gimbal aim)</label>
+    <label>Gimbal yaw (degrees)<input id="overhead-fill-yaw" type="number" min="-180" max="180" step="0.1"></label>
+    <label>Gimbal pitch (degrees)<input id="overhead-fill-pitch" type="number" min="-90" max="90" step="0.1"></label>
+    <p class="wide" id="overhead-fill-help">Larger ceiling drop lowers the light. Drop measures from the ceiling to the emitting face origin, not the housing top. Uncheck Track subject to aim the whole fixture and its light: yaw 0 faces -Z, 90 faces +X; pitch -90 points down and 0 is level. Unlocking restores saved manual aim. Housing and grid clearance still apply. Room resizing updates this readout without moving saved lights.</p>
+    <label class="wide">Overhead height above marble centre (Studio units)<input id="top-fill-height" type="number" min="0" max="50" step="0.01" value="3.2" aria-describedby="top-fill-height-help top-fill-height-status"></label>
+    <p class="wide" id="top-fill-height-help">0 reaches the marble centre at its current size. This edits the same absolute Y as Advanced; resizing the marble updates this readout without moving the light. X/Z stay unchanged. Check the clearance warning before rendering. Saved poses below the centre load unchanged; use Advanced for those positions.</p>
+    <output class="wide" id="top-fill-height-status" role="status"></output>
+    </fieldset>
+    <label>Gridded underlight strength <output id="light-under-strength-out"></output><input id="light-under-strength" type="range" min="0" max="2000" value="15"></label>
+    <label>Gridded underlight filter<input id="under-filter" type="color" value="#ffffff"></label>
+    <label class="wide">Underlight height (Studio Y)<input id="underlight-height" type="number" min="-50" max="50" step="0.01" value="-1.60" aria-describedby="underlight-height-help underlight-height-status"></label>
+    <p class="wide" id="underlight-height-help">More negative lowers the light. The table top is at Y = -1.00; the fresh underlight default is -1.60. This is the same Y position available in Advanced, saved with the lighting profile.</p>
+    <output class="wide" id="underlight-height-status" role="status"></output>
+    <details id="studio-lighting-advanced" class="wide"><summary>Advanced: light position, aim and key shape</summary><div class="grid">
     <label class="wide">Key shape<select id="key-shape">
       <option value="bare">Bare (no modifier)</option>
       <option value="scrim">Scrim (soft, wide diffusion)</option>
       <option value="grid">Grid (moderate, soft-edged)</option>
       <option value="snoot" selected>Snoot (narrow, hard-edged)</option>
     </select></label>
-    <label>Key filter<input id="key-filter" type="color" value="#fff1e0"></label>
-    <label>Key X <output id="light-x-out"></output><input id="light-x" type="range" min="-5000" max="5000" value="-180"></label>
-    <label>Key Y <output id="light-y-out"></output><input id="light-y" type="range" min="-5000" max="5000" value="220"></label>
-    <label>Key Z <output id="light-z-out"></output><input id="light-z" type="range" min="-5000" max="5000" value="220"></label>
-    <label>Key strength <output id="light-strength-out"></output><input id="light-strength" type="range" min="0" max="4000" value="220"></label>
-    <label>Background strength <output id="light-bg-strength-out"></output><input id="light-bg-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Kicker strength <output id="light-kicker-strength-out"></output><input id="light-kicker-strength" type="range" min="0" max="2000" value="90"></label>
-    <label>Fill strength <output id="light-fill-strength-out"></output><input id="light-fill-strength" type="range" min="0" max="2000" value="50"></label>
-    <p class="wide">Every light is real emissive geometry (visible in the scene), not a synthetic Phong point light: background is a bare panel behind the subject aimed away from camera, splashing the backdrop. The two kickers are bare rim panels behind each side. Key is shaped (bare/scrim/grid/snoot) and color-filtered. Fill is a large soft panel low and under the camera. The marble is lit only by directly seeing these panels (through its own reflection/transmission) plus its own ambient floor -- there is no separate invisible light array.</p>
+    <label>Key pair X (mirrored) <output id="light-x-out"></output><input id="light-x" type="range" min="-5000" max="5000" value="-180"></label>
+    <label>Key pair Y <output id="light-y-out"></output><input id="light-y" type="range" min="-5000" max="5000" value="220"></label>
+    <label>Key pair Z <output id="light-z-out"></output><input id="light-z" type="range" min="-5000" max="5000" value="220"></label>
+    <div id="light-pose-controls" class="wide"></div>
+    <p class="wide">Select any light above to position and aim it independently. The key pair sliders remain linked shortcuts. On-subject lock follows the preview subject; unlock to aim across the glass or at the backdrop.</p>
+    <label class="wide"><input id="debug-coords" type="checkbox"> Show fixture coordinate labels (debug)</label>
+    </div></details>
+    <label class="wide">Room scale <output id="room-scale-out">6</output>×<input id="room-scale" type="range" min="1" max="8" step="0.25" value="6"></label>
+    <p class="wide">Scale expands the room around the floor contact plane and moves the backdrop to the rear wall. The default concentric rig follows the room size; Advanced mats, the marble and lights keep their authored sizes. Keep the camera inside the room for an unobstructed view.</p>
+    <div id="studio-table-controls" class="wide grid"></div>
+    <div id="studio-surface-controls" class="wide"></div>
+    <details id="studio-surface-advanced" class="wide"><summary>Advanced: individual materials and backdrop mats</summary><div class="grid">
+    <div id="studio-surface-restore-controls" class="wide"></div>
+    <label>Floor pattern<select id="floor-pattern"><option value="solid" selected>Solid</option><option value="checker">Checker</option></select></label>
+    <label>Floor material A<select id="floor-material-a"></select></label>
+    <label>Floor material B<select id="floor-material-b"></select></label>
+    <label>Wall pattern<select id="wall-pattern"><option value="solid" selected>Solid</option><option value="checker">Checker</option></select></label>
+    <label>Wall material A<select id="wall-material-a"></select></label>
+    <label>Wall material B<select id="wall-material-b"></select></label>
+    <label>Ceiling pattern<select id="ceiling-pattern"><option value="solid" selected>Solid</option><option value="checker">Checker</option></select></label>
+    <label>Ceiling material A<select id="ceiling-material-a"></select></label>
+    <label>Ceiling material B<select id="ceiling-material-b"></select></label>
+    <label>Backdrop layers <output id="backdrop-layers-out"></output><input id="backdrop-layers" type="range" min="0" max="6" value="0"></label>
+    <label>Default backdrop material<select id="backdrop-material"><option value="calibration">Calibration (colour chart)</option></select></label>
+    <label class="wide"><input id="backdrop-sweep" type="checkbox"> Sweep backdrop onto floor (cyclorama)</label>
+    <div id="backdrop-layer-controls" class="wide"></div>
+    <p class="wide">Four walls share the wall materials above. Each active backdrop has its own material, shape, centre height and full width/height in Studio units. Circular mats do not sweep onto the floor. Editing a default rig mat switches to Advanced without resetting any layer. Hidden layers keep their settings. Lighting profiles save this room setup and the previous Advanced settings in this browser, separately from saved objects.</p>
+    <details id="studio-gobo-advanced" class="wide"><summary>Gobos</summary><div id="studio-gobo-controls"></div></details>
+    </div></details>
+    <p class="wide">The ten lights are visible emissive fixtures shared by preview, photo and live ray view. Two small snooted lights rest stage left and right on the table; a large rectangular egg-crate underlight sits below the product. Its light passes through a clear tabletop; opaque table materials block it in ray views. The Phong preview approximates direct lighting and does not trace occlusion through the table or grid.</p>
+    <p class="wide">Ray-traced photos use these fixture positions, manual directions, strengths, and backdrop faces. Locked lights aim at the saved marble's centre; preview motion itself is not baked into the photo.</p>
   </div>
   <h2>Saved objects</h2><div class="grid">
     <label class="wide">Object name<input id="object-name" type="text" maxlength="80" value="My marble"></label>
-    <button id="save-object">Save object</button><button id="refresh-objects">Refresh library</button>
+    <label class="wide"><input id="object-autosave" type="checkbox" checked> Autosave object changes <output id="object-autosave-status" aria-live="polite">Ready</output></label>
+    <button id="save-object">Save version / retry</button><button id="download-object">Save object to file</button><button id="refresh-objects">Refresh library</button>
+    <p class="wide">Autosave waits 0.8 seconds after object edits and saves a new immutable version. Rig-only edits do not save objects. Previous versions are not overwritten. JSON files contain the object recipe, materials and physical properties, not the lighting rig. Library capacity is 128 versions; save a file backup if it is full.</p>
     <label class="wide">Saved design<select id="saved-object"><option value="">Choose a saved object</option></select></label>
     <button id="load-object" class="wide">Load selected design</button>
     <output id="object-status" class="wide" role="status">Saved designs are shared with the particle simulator.</output>
   </div>
+  <h2>Colour calibration</h2><div class="grid" id="calibration-controls">
+    <label class="wide">Calibration recipe (YAML)<input id="calibration-yaml-upload" type="file" accept=".yaml,.yml,text/yaml"></label>
+    <button id="calibration-run" disabled>Run calibration</button>
+    <output id="calibration-status" class="wide" role="status">Upload a calibration YAML to run an automatic single-light colour sweep.</output>
+    <div id="calibration-gallery" class="wide" hidden></div>
+    <button id="calibration-download" class="wide" hidden>Download calibration dataset (JSON)</button>
+    <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
+  </div>
+  <h2>Live ray-traced camera</h2><div class="grid" id="live-ray-controls">
+    <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Replace the camera with live rays</label>
+    <output class="wide" id="live-status" role="status" aria-live="polite" style="white-space:normal;overflow-wrap:anywhere">Enable live rays to save the current static design, or save/load one manually.</output>
+    <label>Ray history per pixel <output id="live-history-out">16</output><input id="live-history" type="range" min="1" max="2722" step="1" value="16"><input id="live-history-count" type="number" min="1" max="2722" step="1" value="16" aria-label="Exact live ray history per pixel"></label>
+    <label>Forward rays per sensor sweep<input id="live-ray-batch" type="number" min="128" max="65536" step="1" value="8192" aria-describedby="live-batch-help"></label>
+    <p class="wide" id="live-batch-help">Actual total forward rays across the scene: 128–65,536. Lower batches respond faster; higher batches add more light-field samples. Changes apply at the next sensor-sweep boundary and reset accumulated history. The additive light field can also become brighter with a larger batch.</p>
+    <label>Live longest edge<select id="live-resolution"><option value="128">128 pixels</option><option value="256" selected>256 pixels</option><option value="512">512 pixels</option><option value="768">768 pixels (cooperative)</option><option value="1024">1024 pixels (cooperative)</option><option value="2048">2048 pixels (cooperative)</option><option value="4096">4096 pixels (cooperative)</option></select></label>
+    <output class="wide" id="live-history-memory" aria-live="polite"></output>
+    <label class="wide"><input id="live-checkpoint" type="checkbox" checked> Keep evicted rays in a linear checkpoint</label>
+    <label class="wide">Live exposure (stops) <output id="live-exposure-out">0.00</output><input id="live-exposure" type="range" min="-600" max="600" step="5" value="0"></label>
+    <label class="wide">White balance (cool to warm) <output id="live-whitebalance-out">0.00</output><input id="live-whitebalance" type="range" min="-300" max="300" step="5" value="0"></label>
+    <label class="wide">Tint (green to magenta) <output id="live-tint-out">0.00</output><input id="live-tint" type="range" min="-300" max="300" step="5" value="0"></label>
+    <label>Normalizer<select id="live-normalization"><option value="auto99">Auto: 99th percentile (default)</option><option value="percentile">Adjustable percentile</option><option value="specular">Specular shot: clipped highlights</option><option value="manual">Manual white reference</option></select></label>
+    <label>White percentile <output id="live-normalization-percentile-out">99%</output><input id="live-normalization-percentile" type="range" min="1" max="100" step="0.1" value="99" aria-describedby="live-normalization-help" disabled></label>
+    <p id="live-normalization-help" class="wide">Adjustable percentile chooses the white from 1 to 100. Specular shot starts at 95 and clips luminance above that white with a linear tone curve. Auto retains 99 and exponential tone. Display edits preserve the raw ray history and checkpoint sums.</p>
+    <label>White reference<input id="live-normalization-white" type="number" min="0.000001" max="1000000000000" step="any" value="1" disabled></label>
+    <label class="wide">Display look<select id="live-display-look"><option value="reference">Reference: luminance priority</option><option value="color_priority">Color priority: preserve highlight color</option></select></label>
+    <label class="wide">Saturation <output id="live-saturation-out">1.00</output><input id="live-saturation" type="range" min="0" max="200" step="1" value="100"></label>
+    <p class="wide">Color priority is an optional custom rendering look, not a sensor calibration or Canon profile. It keeps positive RGB ratios through the highlight shoulder, trading some brightness for color. Specular mode keeps its intentional white clipping. Raw HDR is unchanged.</p>
+    <details class="wide"><summary>Live color and highlight cleanup</summary><div class="grid">
+      <label>Vibrance <output id="live-vibrance-out">0.00</output><input id="live-vibrance" type="range" min="-100" max="100" step="1" value="0"></label>
+      <label>Black point <output id="live-black-point-out">0.00</output><input id="live-black-point" type="range" min="0" max="50" step="1" value="0"></label>
+      <label><input id="live-firefly-filter" type="checkbox">Suppress isolated bright pixels</label>
+      <label>Isolation threshold <output id="live-firefly-threshold-out">8.00×</output><input id="live-firefly-threshold" type="range" min="200" max="6400" step="100" value="800" disabled></label>
+      <label>Cleanup strength <output id="live-firefly-strength-out">1.00</output><input id="live-firefly-strength" type="range" min="0" max="100" step="1" value="100" disabled></label>
+      <p class="wide">These controls develop the live linear sensor data without restarting rays or changing saved materials. White balance and tint are linear RGB gains, not a measured illuminant calibration. Isolated-pixel cleanup can reduce genuine tiny glints; it is not a general denoiser. Specular mode intentionally clips highlights to white. Lower live exposure to retain more of their color.</p>
+    </div></details>
+    <button class="wide" id="live-download" disabled>Download last ray image (PNG)</button>
+    <p class="wide">The circular array keeps the newest N linear sensor-ray contributions per pixel. With checkpointing on, evicted rays are flattened into compensated sums and sample counts, then combined once with the ring for continued convergence. Off means old rays are discarded. Camera, scene, batch-size, history-size and checkpoint-mode changes clear accumulated history; display color and cleanup controls do not. Capacity adapts to resolution, up to 2 GiB including checkpoint state, subject to GPU limits and available memory. The size turns bright red above 512 MiB. Large histories can slow updates. Checkpoint weights are exact up to 2^53 samples; sums and the displayed image have finite floating-point precision. Drag to orbit and scroll to zoom. RGB only, using film sensitivity, gamma and bounce controls below. Updates are limited to four per second as tracing allows. Object changes autosave when enabled. Phong stays underneath while scenes update; only valid sampled pixels cover it, including genuinely black samples. Untouched pixels stay transparent. The PNG download contains rays and transparency only, never the underlying Phong view. Animated motion and particle simulation are not captured. A running photo is never interrupted.</p>
+  </div>
+  <section id="work-sharing" aria-labelledby="work-sharing-title"><h2 id="work-sharing-title">Work sharing · engines and device participation</h2><p>Real server-job sharing. Choose an engine and work settings here, then enable sharing for Live or the next exposure. Spheres, materials and later transport remain on the server. Completed exposures require a full sensor pass and may take much longer than the selected exposure time.</p><div id="work-sharing-controls"></div><div class="grid">
+    <label class="wide"><input type="checkbox" id="live-client-intersections"> Cooperative Live device intersections (experimental)</label>
+    <output class="wide" id="live-client-status" role="status"></output><div class="wide" id="live-client-participation"></div>
+    <label class="wide"><input id="photo-client-intersections" type="checkbox"> Use this device for this exposure’s triangle intersections (experimental)</label>
+    <div id="photo-client-participation" class="wide"></div>
+    <details class="wide" open><summary>My jobs</summary><section id="marble-jobs"></section></details>
+  </div></section>
   <h2>Thin-lens photograph</h2><div class="grid" id="photo-controls">
+    <strong class="wide">Exposure geometry · photos and live rays</strong>
+    <label>Triangle budget<input id="photo-triangle-budget" type="number" min="1000" max="1000000" step="1" value="250000" required aria-describedby="photo-geometry-help"></label>
+    <label>Sphere coverage<select id="photo-sphere-coverage" aria-describedby="photo-geometry-help"><option value="mesh">Saved triangle mesh</option><option id="photo-sphere-exact" value="exact" selected>Exact analytic spheres</option></select></label>
+    <p class="wide" id="photo-geometry-help">The budget is a hard limit on actual scene triangles, including interiors and fixtures. An over-budget scene is rejected, never silently simplified. Exact analytic spheres uses continuous boundaries for saved, uniform, nonemissive spherical marbles and their declared bubbles. Save older designs again to record exact sphere metadata. Coatings, painted bands and non-spherical shapes are unsupported: choose Saved triangle mesh explicitly for these designs. There is no automatic fallback. Changes apply to the next photo or restart live rays; an active photograph is unchanged.</p>
+    <p class="wide" id="photo-geometry-diagnostic" role="status" aria-live="polite">Geometry counts will be reported by the next photo or live scene.</p>
+    <details id="photo-lens-controls" class="wide"><summary>Lens collection · focus, focal length &amp; aperture</summary><div class="grid">
+      <label class="wide">Analytical lens<select id="photo-lens"><option value="unchanged" selected>Original camera settings (no overrides)</option><option value="custom">Custom analytical lens</option></select></label>
+      <label>Axial focus distance (mm)<input id="photo-focus-mm" type="number" min="1" max="10000" step="any" value="110" disabled><input id="photo-focus-slider" aria-label="Axial focus distance, logarithmic slider" type="range" min="0" max="4" step="0.001" value="2.041392685" disabled></label>
+      <label>Focal length / zoom (mm)<input id="photo-focal-mm" type="number" min="10.069" max="500" step="any" value="75.76501818" disabled><input id="photo-focal-slider" aria-label="Focal length and zoom" type="range" min="10.07" max="500" step="any" value="75.76501818" disabled></label>
+      <label>Aperture (f-number)<input id="photo-f-number" type="number" min="1" max="64" step="any" value="18.94125455" disabled><input id="photo-aperture-slider" aria-label="Aperture f-number, logarithmic slider" type="range" min="0" max="6" step="0.001" value="4.24346" disabled></label>
+      <button id="photo-frame-focus" type="button" class="wide">Frame &amp; focus marble</button>
+      <button id="photo-focus-target" type="button" class="wide">Focus camera target (Custom analytical)</button>
+      <p id="photo-focus-diagnostic" class="wide" role="status" aria-live="polite"></p>
+      <label class="wide"><input id="studio-dof" type="checkbox" checked> Phong depth-of-field preview</label>
+      <output id="studio-dof-status" class="wide" role="status">Preparing depth-buffer focus blur.</output>
+      <p class="wide">Aperture and focus blur the actual Phong image, including the player camera, using 48 dithered depth samples with a 64-pixel radius limit. This screen-space approximation uses opaque depth: glass, refraction, reflections and hidden surfaces need the ray tracer. Photos and live rays are unchanged.</p>
+      <p id="photo-lens-status" class="wide" role="status" aria-live="polite"></p><p id="photo-lens-inventory" class="wide">Loading the source lens collection…</p>
+      <p class="wide">These controls reuse the existing component-built shader. Focal length changes field of view; scrolling still moves the camera. Prime profiles have fixed focal length. Changes leave an active photograph unchanged.</p>
+    </div></details>
     <label>Photo camera<select id="photo-camera"><option value="builtin" selected>Built-in close-up</option><option value="studio">Current Studio orbit and zoom</option></select></label>
-    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option></select></label>
+    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option></select></label>
     <label>Light transport<select id="photo-transport"><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
-    <label>Exposure per frame<select id="photo-seconds"><option value="0.1">0.1 second</option><option value="0.25">0.25 second</option><option value="0.5">0.5 second</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30">30 seconds</option><option value="180">3 minutes</option><option value="600" selected>10 minutes</option><option value="1200">20 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option></select></label>
+    <label>Exposure per frame<select id="photo-seconds"><option value="0.1">0.1 second</option><option value="0.25">0.25 second</option><option value="0.5">0.5 second</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="180">3 minutes</option><option value="600">10 minutes</option><option value="1200">20 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option></select></label>
     <label>Orbit frames<select id="photo-orbit-frames"><option value="1" selected>Still photo</option><option value="8">8 frames · full turn</option><option value="16">16 frames · full turn</option><option value="32">32 frames · full turn</option></select></label>
     <label>Display gamma <output id="photo-gamma-out">1.00</output><input id="photo-gamma" type="range" min="20" max="500" step="5" value="100"></label>
-    <button id="photo-start">Expose saved object</button><button id="photo-cancel" disabled>Cancel exposure</button>
-    <output id="photo-status" class="wide" role="status">Save or load a design, then expose a progressive RGB thin-lens photo on the GPU.</output>
-    <p class="wide">Built-in framing fills more of the photo. Current Studio orbit and zoom sets the first frame; an orbit takes evenly spaced views around the vertical axis. Exposure time applies to each frame, so 8 frames at 10 minutes take about 80 minutes plus setup and encoding. Subsecond drafts still take at least one GPU pass per frame, plus setup and AVI encoding. The Phong preview stays interactive. The Spectral thin-lens tracer preserves linear HDR for each RGB frame. The server keeps the finished JPEG AVI animation for 24 hours.</p>
+    <label>Bounce depth<select id="photo-bounce-mode"><option value="auto" selected>Auto (render cap 200)</option><option value="manual">Manual</option></select></label>
+    <label>Light bounces <output id="photo-bounces-out">Auto, cap 200</output><input id="photo-bounces-slider" type="range" min="0" max="100" step="0.01" value="12.28" aria-valuetext="4 bounces" aria-describedby="photo-bounces-help" title="1–200 bounces; finer control at lower values"></label>
+    <label>Exact bounce count<input id="photo-bounces" type="number" min="1" max="200" step="1" value="4" aria-describedby="photo-bounces-help"></label>
+    <p class="wide" id="photo-bounces-help">Auto uses four sparse 64-ray scatters through the room, examining the whole remaining energy tail with at least 64 bounces of look-ahead, up to probe depth 1000. The render cap is separately 200. It can miss rare paths; persistent energy or poor coverage is reported, never called convergence. Manual retains 1–200 bounces with finer low-count control. High limits can substantially slow photos and live ray updates.</p>
+    <p class="wide" id="photo-bounce-diagnostic" role="status" aria-live="polite">Auto will estimate depth for the next photo or live scene. This is a transport-energy pilot, not an image-error guarantee.</p>
+    <details id="photo-film-response" class="wide"><summary>Film Science: sensitivity, colour panels &amp; hue</summary></details>
+    <label title="Capture the current object for this photo only, even when object autosave is off. Does not create a library version. The snapshot stays with the photo job."><input id="photo-auto-snapshot" type="checkbox" checked> Snapshot before exposure</label>
+    <button id="photo-start">Expose</button><button id="photo-cancel" disabled>Cancel exposure</button>
+    <output id="photo-status" class="wide" role="status">Expose the current design with an exposure-only snapshot, or turn the snapshot toggle off to use an explicitly saved design.</output>
+    <p class="wide">Built-in framing fills more of the photo. Current Studio orbit and zoom sets the first frame; an orbit takes evenly spaced views around the vertical axis. Exposure time applies to each frame, so 8 frames at 10 minutes take about 80 minutes plus setup and encoding. Subsecond drafts still take at least one GPU pass per frame, plus setup and AVI encoding. Light bounces controls how many times a ray can reflect/refract -- raise it for glass or gem subjects with deep internal reflections, at the cost of exposure time. The Phong preview stays interactive. The Spectral thin-lens tracer preserves linear HDR for each RGB frame. The server keeps the finished JPEG AVI animation for 24 hours.</p>
+  </div>
+  <h2>Supplied subject</h2><div class="grid">
+    <label class="wide">OBJ library<select id="obj-asset"><option value="">Choose a supplied OBJ</option></select></label>
+    <button id="obj-refresh" type="button">Refresh OBJ library</button><button id="obj-use" type="button">Use subject</button>
+    <label>OBJ file<input id="obj-file" type="file" accept=".obj"></label>
+    <label>Optional MTL<input id="obj-mtl" type="file" accept=".mtl"></label>
+    <button id="obj-upload" type="button">Save OBJ privately</button>
+    <p class="wide">Supplied geometry is kept as supplied, with flat face normals and a Studio shell material override. No automatic hole repair or solid certification. Mass, inertia and rolling remain unavailable. Original source materials stay in the asset.</p>
   </div>
   <h2>Shape</h2><div class="grid">
-    <label>Base solid<select id="base-shape"><option value="marble">Spherical marble</option><option value="d4">D4 tetrahedron</option><option value="d6">D6 cube</option><option value="d8">D8 octahedron</option><option value="d10">D10 trapezohedron</option><option value="d12">D12 dodecahedron</option><option value="d20">D20 icosahedron</option></select></label>
+    <label>Base solid<select id="base-shape"><option value="obj">Supplied OBJ subject</option><option value="marble" selected>Spherical marble</option><option value="d4">D4 tetrahedron</option><option value="d6">D6 cube</option><option value="d8">D8 octahedron</option><option value="d10">D10 trapezohedron</option><option value="d12">D12 dodecahedron</option><option value="d20">D20 icosahedron</option></select></label>
     <label>Die shell preset<select id="die-shell-preset"><option value="porcelain">Opaque porcelain</option><option value="clear">Clear glass, dark numerals</option><option value="milk">Milk glass, dark numerals</option><option value="custom">Custom shell material</option></select></label>
-    <label>Marble kind<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="clear">No inner decoration</option></select></label>
+    <label>Inner decoration<select id="kind"><option value="cat_eye">Cat's-eye ribbons</option><option value="confetti">Rolled confetti</option><option value="hybrid">Ribbons + confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="clear">No inner decoration</option></select></label>
     <label>Preset<select id="preset"><option value="custom">Custom</option><option value="classic">Classic cat's-eye</option><option value="galaxy">Galaxy · confetti + enamel</option><option value="uniform">Uniform confetti</option><option value="spiral">Tubular spiral</option><option value="rings">Swooping rings</option><option value="bare">No inner decoration</option><option value="porcelain">Porcelain painted bands</option></select></label>
-    <label>Outer material<select id="shell"></select></label>
-    <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
-    <label>Accent material<select id="accent"><option value="marble_milk_glass">Milk glass</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
-    <label>Confetti material<select id="confetti-material"></select></label>
+    <label><input id="confetti-enabled" type="checkbox"> Add confetti to this decoration</label>
     <label>Confetti chips <output id="confetti-count-out"></output><input id="confetti-count" type="range" min="30" max="500" value="220"></label>
+    <label>Air bubbles <output id="bubble-count-out">0</output><input id="bubble-count" type="range" min="0" max="64" step="1" value="0"></label>
+    <p class="wide">Air bubbles appear in live ray view and photographs, not Phong. Requires a physical radius of at least 1 mm, transparent nonmetal nonemissive glass, separated inclusions, and no enamel or painted bands. Reroll changes bubble positions and sizes.</p>
     <label>Width <output id="width-out"></output><input id="width" type="range" min="8" max="42" value="28"></label>
     <label>Length <output id="length-out"></output><input id="length" type="range" min="40" max="85" value="75"></label>
-    <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="18"></label>
-    <label>Separate ribbons <output id="strands-out"></output><input id="strands" type="range" min="2" max="7" value="3"></label>
+    <label>Curve <output id="curve-out"></output><input id="curve" type="range" min="-28" max="28" value="0"></label>
+    <label>Ribbon layout<select id="ribbon-layout"><option value="axial">Centered axial cross</option><option value="separated">Separated lanes (legacy)</option></select></label>
+    <label>Axially spaced ribbons <output id="strands-out"></output><input id="strands" type="range" min="2" max="7" value="2"></label>
     <label>Ribbon thickness <output id="thickness-out"></output><input id="thickness" type="range" min="8" max="80" value="35"></label>
     <label>Twist along curve <output id="twist-out"></output><input id="twist" type="range" min="-320" max="320" value="90"></label>
     <label>Tip taper <output id="tip-out"></output><input id="tip" type="range" min="60" max="300" value="135"></label>
     <label>Ribbon flare <output id="flare-out"></output><input id="flare" type="range" min="0" max="60" value="18"></label>
-    <label>Ribbon phase offset <output id="phase-out"></output><input id="phase" type="range" min="0" max="360" value="0"></label>
+    <label>Ribbon phase offset <output id="phase-out"></output><input id="phase" type="range" min="0" max="360" value="45"></label>
     <label>Inclusion yaw <output id="orientation-yaw-out"></output><input id="orientation-yaw" type="range" min="-180" max="180" value="0"></label>
     <label>Inclusion pitch <output id="orientation-pitch-out"></output><input id="orientation-pitch" type="range" min="-180" max="180" value="0"></label>
     <label>Inclusion roll <output id="orientation-roll-out"></output><input id="orientation-roll" type="range" min="-180" max="180" value="0"></label>
@@ -100,17 +329,13 @@
     <button id="reroll" class="wide">Reroll dyed shape</button>
   </div>
   <h2>Outer shell</h2><div class="grid">
-    <label class="wide"><input id="opaque" type="checkbox"> Opaque outer material (transmission 0, opacity 1)</label>
     <label>Enamel shell coverage <output id="coverage-out"></output><input id="coverage" type="range" min="0" max="100" value="0"></label>
-    <label><input id="checker" type="checkbox" checked> Lit floor and wall</label>
-    <label>Scene pattern<select id="scene-pattern"><option value="checker">Classic checkerboard</option><option value="porcelain">Porcelain tiles</option><option value="metal">Metal bands</option></select></label>
+    <label><input id="checker" type="checkbox" checked> Lit floor/wall/ceiling</label>
+    <label class="wide"><input id="window-glass" type="checkbox"> Window glass (off = fully covered plaster)</label>
     <label>Exterior color bands <output id="band-count-out"></output><input id="band-count" type="range" min="0" max="12" value="0"></label>
     <label>Band width <output id="band-width-out"></output><input id="band-width" type="range" min="2" max="48" value="18"></label>
     <label>Band swirl <output id="band-curve-out"></output><input id="band-curve" type="range" min="-400" max="400" value="120"></label>
-    <label>Paint A color<input id="paint-a-color" type="color" value="#3769a8"></label>
-    <label>Paint B color<input id="paint-b-color" type="color" value="#e7b35a"></label>
     <label>Dice marking style<select id="marking-mode"><option value="flat">Flat dye</option><option value="recessed">Recessed relief</option><option value="raised">Raised relief</option></select></label>
-    <label>Dice marking material<select id="mark-material"></select></label>
     <label>Mark scale <output id="mark-scale-out"></output><input id="mark-scale" type="range" min="30" max="90" value="72"></label>
     <label>Relief depth <output id="relief-depth-out"></output><input id="relief-depth" type="range" min="0" max="80" value="20"></label>
     <label>Numeral mesh detail <output id="dice-detail-out">48</output><input id="dice-detail" type="range" min="24" max="96" step="8" value="48"></label>
@@ -121,8 +346,11 @@
     <label class="wide"><input id="compensate-raised" type="checkbox" checked> Keep raised marks inside face support plane</label>
     <p class="wide">The selected ribbons, confetti, or tubes fit inside the die and displace its body material. Choose a transparent outer material to see them. Bevel, face recess, and raised marks alter the closed die mesh and its moments of inertia. The bevel generates radius-accurate edge fillets and corner caps at sampled vertices; triangle density controls visible smoothness. Keeping mark peaks inside the rim equalizes the support profile; statistical fairness is not established.</p>
   </div>
-  <h2>Physical properties</h2><div class="grid">
-    <label>Marble radius (mm)<input id="radius-mm" type="number" min="1" max="100" step="0.1" value="10"></label>
+  <h2>Marble size &amp; physical properties</h2><div class="grid">
+    <label>Marble-only radius (mm)<input id="radius-mm" type="number" min="0.1" max="200" step="any" value="10"></label>
+    <label>Marble size <output id="marble-scale-out"></output><input id="marble-scale-slider" type="range" min="0" max="100" step="0.01" value="60.59"></label>
+    <button id="frame-marble" type="button" class="wide">Frame &amp; focus marble</button>
+    <p class="wide">Size changes keep the material definition and table contact. Thickness, absorption, mass and inertia change physically. User orbit stays centred on the displayed marble without changing zoom. A held photographic pose stays fixed. Particle-course radius remains a separate simulator setting.</p>
     <label>Shell density (kg/m³)<input id="shell-density" type="number" min="1" max="30000" step="10" value="2500"></label>
     <label>Dye density (kg/m³)<input id="eye-density" type="number" min="1" max="30000" step="10" value="2500"></label>
     <label>Accent density (kg/m³)<input id="accent-density" type="number" min="1" max="30000" step="10" value="2500"></label>
@@ -148,7 +376,8 @@
   </div>
   <h2>Preview motion</h2><div class="grid">
     <label>Engine<select id="preview-engine"><option value="visual">Visual preview (cheap)</option><option value="particle">Particle simulation (compiled law)</option></select></label>
-    <label>Camera<select id="preview-camera"><option value="case">Case view</option><option value="marble">Marble perspective</option></select></label>
+    <label>Camera<select id="preview-camera"><option value="marble">Auto chase marble</option><option value="marble-fixed">Chase with fixed heading</option><option value="case">Case view</option></select></label>
+    <button type="button" id="chase-recenter" disabled>Recenter chase (R)</button>
     <label>Concurrent marbles<input id="preview-count" type="number" min="1" max="16" step="1" value="1"></label>
     <label>Other marbles<select id="preview-others"><option value="identical">Identical current design</option><option value="random" disabled>Random saved designs (future four-species mapping)</option></select></label>
     <label>Motion<select id="preview-motion"><option value="off">Off</option><option value="rotate">Rotate</option><option value="rock">Rock</option><option value="flip">Flip</option></select></label>
@@ -156,26 +385,42 @@
     <label>Cycles per second<input id="preview-hz" type="range" min="0.05" max="2" step="0.05" value="0.5"><output id="preview-hz-out">0.50 Hz</output></label>
     <label>Phase offset<input id="preview-phase" type="range" min="0" max="360" step="1" value="0"><output id="preview-phase-out">0°</output></label>
     <label>Rock arc<input id="preview-arc" type="range" min="5" max="180" step="1" value="60"><output id="preview-arc-out">60°</output></label>
-    <p class="wide">Visual preview moves the displayed object only; it is the cheap close-up option. Particle simulation runs 1–16 copies of the current design in the same compiled toy course as Marble Madness: ramps, throat, and pegs have native wall contacts. Hold the camera-oriented D-pad to tilt its gravity direction. Marble perspective follows particle 0 while the course moves around it. Every copy shares the selected radius, density, friction, restitution, and rolling settings. Different saved designs need a verified four-species assignment; the current law still uses spherical contact and scalar moment of inertia.</p>
+    <p class="wide">Visual preview moves the displayed object only; it is the cheap close-up option. Particle simulation runs 1-16 copies of the current design in the same compiled toy course as Marble Madness: ramps, throat, and pegs have native wall contacts. Click the view and hold WASD/arrows, or use the camera-oriented D-pad, to tilt its gravity direction. Keyboard drive stops when the view loses focus. Auto chase follows particle 0 with a level horizon, smooth aim and a short look-ahead. Drag to orbit, scroll to zoom, or press R to recenter. Heading stays fixed while steering; after you release, it gently turns behind the rolling marble. Fixed-heading chase never turns automatically. Every copy shares the selected radius, density, friction, restitution, and rolling settings. Different saved designs need a verified four-species assignment; the current law still uses spherical contact and scalar moment of inertia.</p>
     <output id="preview-sim-status" class="wide">Particle simulation loads when selected. It uses the compiled sphere-contact law; modeled dice appearance does not yet supply shape contact.</output>
   </div>
   </div>
-  <h2>Material</h2><div class="grid">
+  <h2>Material</h2><div id="material-editor" class="grid">
+    <label>Outer material<select id="shell"></select></label>
+    <label>Dyed material<select id="eye"><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_amber">Amber</option></select></label>
+    <label>Accent material<select id="accent"><option value="marble_cat_eye_green">Green</option><option value="marble_cat_eye_blue">Blue</option><option value="marble_cat_eye_amber">Amber</option><option value="marble_milk_glass">Milk glass (artistic)</option></select></label>
+    <label>Confetti material<select id="confetti-material"></select></label>
+    <label>Dice marking material<select id="mark-material"></select></label>
+    <label>Paint A color<input id="paint-a-color" type="color" value="#3769a8"></label>
+    <label>Paint B color<input id="paint-b-color" type="color" value="#e7b35a"></label>
+    <label class="wide"><input id="opaque" type="checkbox"> Opaque outer material (transmission 0, opacity 1)</label>
+
     <label class="wide">Edit layer<select id="layer"><option value="glass">Outer material</option><option value="enamel">Coated part of shell</option><option value="paintA">Paint band A</option><option value="paintB">Paint band B</option><option value="mark">Dice markings</option><option value="eye">Dyed eye</option><option value="accent">Accent</option><option value="confetti">Confetti</option></select></label>
+      <label class="wide">Marble material engine<select id="optical-mode"><option value="legacy">Legacy</option><option value="glass_rod" selected>Glass rod</option><option value="injection_dye">Injection dye</option></select></label>
+    <label>Product stage and lighting engine<select id="scene-stage-engine"><option value="legacy">Legacy</option><option value="dielectric">Dielectric volumes</option></select></label>
+    <label>Remaining room engine<select id="scene-room-engine"><option value="legacy">Legacy</option><option value="dielectric">Dielectric volumes</option></select></label>
+    <p class="wide">The same material buffers serve all three engines. Stage includes the table, skirt, lights and stands. Room includes walls, floor, ceiling, backdrop and free-standing gobos. Opaque surfaces retain their surface properties. Dielectric glass needs closed volumes and authored transmittance; unsupported open glass reports an error. Scene engine choices and shared scene material edits are saved with lighting profiles.</p>
     <label>Albedo<input id="albedo" type="color"></label><label>Inner color<input id="inner" type="color"></label>
     <label>Roughness <output id="roughness-out"></output><input id="roughness" type="range" min="0" max="100" value="10"></label>
     <label>Metallic <output id="metallic-out"></output><input id="metallic" type="range" min="0" max="100" value="0"></label>
     <label>Transmission <output id="transmission-out"></output><input id="transmission" type="range" min="0" max="100" value="80"></label>
     <label>Opacity <output id="opacity-out"></output><input id="opacity" type="range" min="0" max="100" value="30"></label>
     <label>Index of refraction <output id="ior-out"></output><input id="ior" type="range" min="100" max="250" value="150"></label>
-    <label>Ambient <output id="ambient-out"></output><input id="ambient" type="range" min="0" max="12" value="5"></label>
     <label>Specular <output id="specular-out"></output><input id="specular" type="range" min="0" max="100" value="80"></label>
     <label>Shininess <output id="shininess-out"></output><input id="shininess" type="range" min="1" max="300" value="120"></label>
     <label>Emission<input id="emission" type="color"></label>
     <label>Enamel thickness (nm) <output id="enamel-thickness-out"></output><input id="enamel-thickness" type="range" min="0" max="1000" value="0"></label>
     <label>Enamel index <output id="enamel-ior-out"></output><input id="enamel-ior" type="range" min="100" max="250" value="152"></label>
     <label>Enamel color<input id="enamel-color" type="color"></label>
+    <div id="optical-material-controls" style="display:contents">
+      <output id="optical-material-status" hidden></output>
+      <div id="optical-material-rows" style="display:contents" title="Illustrative uncalibrated spectral values"></div>
+    </div>
     <button id="reset-material" class="wide">Restore catalogue material</button>
   </div>
   <p style="margin-top:14px">Save a design to keep its shape, materials and mechanical properties. Preview motion, lighting and thin-lens camera settings remain local to this page.</p>
-</aside></main><script type="module" src="marble_studio.js"></script></body></html>
+</aside></main><script type="module" src="marble_studio.js"></script><script type="module" src="marble_jobs.js"></script></body></html>

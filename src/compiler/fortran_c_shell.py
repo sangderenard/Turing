@@ -25882,6 +25882,29 @@ def _class_surface_ssa_program(
                 contract["python_types"] = ordered
                 contract.pop("python_type", None)
 
+    # Exact local annotation receipts are attached by lexical bind_target,
+    # before canonicalization. Do not recover these from name histories.
+    # Keep semantic SOURCE_VALUE_CLASS independent of its physical width.
+    for planned_graph, _process in settlement_graph_owners:
+        for node_id, data in planned_graph.nodes(data=True):
+            declaration = (data.get("attributes") or {}).get("local_scalar_annotation")
+            if declaration is None:
+                continue
+            dtype, declaration_cell = declaration
+            from ..transmogrifier.dtype_layout import source_annotation_dtype
+            declared_fact = _cell_fact(declaration_cell)
+            if source_annotation_dtype(declared_fact.annotation) != dtype:
+                raise ValueError("local scalar declaration receipt disagrees with its dtype")
+            value_id = int(data.get("value_id", node_id))
+            contract = linked_value_abi_by_graph.setdefault(id(planned_graph), {}).setdefault(value_id, {})
+            if contract.get("dtype") not in (None, "", dtype):
+                raise ValueError("authored local scalar conflicts with an existing physical ABI")
+            contract.update(storage="scalar", dtype=dtype, rank=0, shape=())
+            linked_value_type_source_cells_by_graph.setdefault(id(planned_graph), {})[value_id] = tuple(dict.fromkeys((
+                *linked_value_type_source_cells_by_graph.get(id(planned_graph), {}).get(value_id, ()),
+                declaration_cell,
+            )))
+
     # A native type predicate is an API declaration of the class domain its
     # section consumes.  Join that declaration to the exact subject before
     # VALUE_TYPE_ABI is published.  Direct ``Any``/``object`` parameters,
@@ -27780,24 +27803,10 @@ def _class_surface_ssa_program(
                     # program whose callees are about to be specialized
                     # anyway.  Everything the two callsites DO agree on
                     # (dtype, storage, rank when equal) is kept.
-                    # Use the book captured by this whole-program settlement.
-                    # Nested shell planning can temporarily install its own
-                    # context book; publishing through that ambient context
-                    # made the polymorphism receipt disappear before SSA
-                    # lowering could consult it.
-                    page = shape_identity_book.page(
-                        "linked_value_abi_polymorphism"
-                    )
-                    row = (
-                        str(callee_graph.graph.get("function_name")),
-                        int(callee_id),
-                    )
-                    page.set(row, len(page.history(row)), (
-                        str(caller_graph.graph.get("function_name")),
-                        int(caller_id),
-                        tuple(existing[key]),
-                        tuple(value),
-                    ))
+                    # note_shape below publishes the disagreement on the
+                    # captured book's value_shape_polymorphism page with
+                    # both statement cells as provenance.  A second raw
+                    # trace page would bypass that contract.
                     existing.pop("shape", None)
                     if len(tuple(value)) != int(
                         existing.get("rank", len(tuple(value)))
@@ -30714,22 +30723,12 @@ def _class_surface_ssa_program(
                 return "float64"
             return None
 
+        from ..transmogrifier.dtype_layout import source_annotation_dtype
+
         annotation_dtypes: dict[str, str] = {}
         authored_annotations = _current_authored_parameter_annotations(graph_obj)
         for parameter_name, annotation in authored_annotations.items():
-            spelling = str(annotation).strip()
-            dtype = {
-                "bool": "bool",
-                "int": "int64",
-                "float": "float64",
-                # ``Any``/``object`` declares a Python value whose payload is
-                # not a native scalar.  The repository ABI already has one
-                # concrete representation for that boundary: the fixed-width
-                # opaque reference handle.  Leaving the declaration as None
-                # loses the authored type rather than preserving uncertainty.
-                "Any": "opaque_ref",
-                "object": "opaque_ref",
-            }.get(spelling)
+            dtype = source_annotation_dtype(annotation)
             if dtype is not None:
                 annotation_dtypes[str(parameter_name)] = dtype
         if function_reference is not None and source_function_table is not None:
@@ -30755,13 +30754,7 @@ def _class_surface_ssa_program(
                             annotation if isinstance(annotation, str)
                             else getattr(annotation, "__name__", "")
                         )
-                        dtype = {
-                            "bool": "bool",
-                            "int": "int64",
-                            "float": "float64",
-                            "Any": "opaque_ref",
-                            "object": "opaque_ref",
-                        }.get(str(spelling))
+                        dtype = source_annotation_dtype(spelling)
                         if dtype is not None:
                             annotation_dtypes[str(parameter.name)] = dtype
 
@@ -30794,19 +30787,9 @@ def _class_surface_ssa_program(
         for binding_name, annotation in dict(
             graph_obj.graph.get("type_annotations") or {}
         ).items():
-            dtype = {
-                "bool": "bool",
-                "int": "int64",
-                "float": "float64",
-                # A destructured row which is itself indexed has both a
-                # scalar-looking use and a nested-row use.  The variant
-                # planner's numerical default is not its storage identity:
-                # an authored tuple crosses that boundary as the existing
-                # integer row handle.  Retain that declaration so the row
-                # key stored by identity_spill._reindex_in_place agrees with
-                # the resident dict[tuple, ...] key column.
-                "tuple": "int64",
-            }.get(str(annotation).strip())
+            # The tuple row handle is not a numeric scalar annotation.
+            dtype = ("int64" if str(annotation).strip() == "tuple"
+                     else source_annotation_dtype(annotation))
             if dtype is None:
                 continue
             for value_id in identities.get(str(binding_name), ()):
@@ -30894,6 +30877,19 @@ def _class_surface_ssa_program(
                                     )
                                     if literal_cell in source_edge_targets:
                                         evidence.append(literal_cell)
+                local_scalar = attributes.get("local_scalar_annotation")
+                if local_scalar is not None:
+                    from .concordance_declarations import VALUE_TYPE_ABI
+                    dtype, annotation_cell = local_scalar
+                    abi_cell = shape_identity_book.latest_ref(
+                        VALUE_TYPE_ABI, (graph_obj.graph.get("lexical_read_scope"), materialized_value_id),
+                    )
+                    abi_fact = None if abi_cell is None else _cell_fact(abi_cell)
+                    arms = tuple(getattr(abi_fact, "physical_alternatives", ()))
+                    if (len(arms) == 1 and arms[0].storage == "scalar"
+                            and arms[0].dtype == dtype
+                            and annotation_cell in arms[0].source_cells):
+                        evidence.extend((annotation_cell, abi_cell))
                 if source_identity is not None or evidence:
                     constant_source_cells[materialized_value_id] = tuple(
                         dict.fromkeys((
@@ -32212,7 +32208,7 @@ def _class_surface_ssa_program(
         for value_id, literal in constant_values.items():
             literal_dtype = scalar_fact_dtype(literal)
             if literal_dtype is not None:
-                parameter_value_dtypes[int(value_id)] = literal_dtype
+                parameter_value_dtypes.setdefault(int(value_id), literal_dtype)
 
         # A schema-known record constructor only packages its field
         # residents. It cannot mutate a keyed/list field while doing so,
@@ -59070,6 +59066,16 @@ def _class_surface_ssa_program(
                 file=_sys.stderr, flush=True,
             )
         for caller in all_functions.values():
+            # Region result views still have cut-time dtypes until the exact
+            # result projection below. As in physical-call adaptation, those
+            # provisional outputs cannot contract a consumer formal first.
+            unsettled_region_result_ids = {
+                int(value_id)
+                for owner_block in caller.blocks.values()
+                for owner_instruction in owner_block.instrs
+                if owner_instruction.op in {"Call", "call"}
+                for value_id in owner_instruction.attributes.get("output_ids", ())
+            }
             for block in caller.blocks.values():
                 for instruction in block.instrs:
                     if (
@@ -59358,6 +59364,10 @@ def _class_surface_ssa_program(
                             and actual_dtype != "unknown"
                             and actual_dtype != formal_dtype
                             and not formal_is_contracted
+                            and not (
+                                callee.metadata.get("source_region_integral")
+                                and int(actual.id) in unsettled_region_result_ids
+                            )
                         ):
                             # Wrong record: the resident formal is retyped with
                             # no REVISE of its ssa_value row. Rule: post the
@@ -64474,6 +64484,19 @@ def _lower_ast_source_to_ssa_impl(
         raise TypeError(
             "extraction_contract must be a path or ExtractionContract"
         )
+    glsl_tree = None
+    glsl_source_receipt = None
+    if str(source_language).casefold() == "glsl":
+        from .glsl_ast_ingestion import lower_glsl_source_to_ast, retain_glsl_source_evidence
+        glsl_result = lower_glsl_source_to_ast(source, function_name=entrypoint)
+        if not glsl_result.complete:
+            raise ValueError(glsl_result.shortfall_report())
+        glsl_tree = retain_glsl_source_evidence(glsl_result.module, source)
+        source = ast.unparse(glsl_tree)
+        glsl_source_receipt = {
+            "source_sha256": authored_source_sha256,
+            "normalized_ast_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        }
     compile_substage("source normalisation: loop interchange and AST parsing")
     interchange = interchange_reduction_loops(
         source, licensed=bool(work_contract.inexact_identities),
@@ -64487,7 +64510,12 @@ def _lower_ast_source_to_ssa_impl(
             "ssa-source: loop interchange considered "
             f"{len(interchange.decisions)} reduction nest(s)"
         )
-    tree = ast.parse(source)
+    if glsl_tree is not None:
+        if glsl_source_receipt["normalized_ast_sha256"] != transformed_source_sha256:
+            raise ValueError("GLSL source correspondence cannot yet follow loop interchange")
+        tree = glsl_tree
+    else:
+        tree = ast.parse(source)
     # Dynamic string components call ordinary authored source.  Install the
     # formatter definitions before source pursuit so their FunctionTable
     # addresses, bodies and internal dependencies follow the same path as
@@ -66098,6 +66126,8 @@ def _lower_ast_source_to_ssa_impl(
 
     graph.build_from_ast(
         tree,
+        source_cells=(getattr(glsl_tree,"_glsl_definition_sources",None)
+                      if glsl_tree is not None else None),
         filename=source_module,
         resolve_unresolved_parents=True,
         parent_include=(
@@ -66928,6 +66958,8 @@ def _lower_ast_source_to_ssa_impl(
         "changed": authored_source_sha256 != transformed_source_sha256,
         "decisions": decision_records,
     }
+    if glsl_source_receipt is not None:
+        module.metadata["glsl_source_ingestion"] = glsl_source_receipt
     module.metadata["loop_interchange"] = receipt
     module.metadata["source_thread_regions"] = graph.G.graph.get("thread_regions", ())
     module.metadata["single_exit_guard_normalization"] = (

@@ -514,6 +514,39 @@ def plan_region_to_ssa_instrs(
             return str(dtype)
         return None
 
+    def integer_literal_dtype(value_id: int, literal: int) -> str:
+        """Use an exact annotated carrier; otherwise keep Python's domain."""
+        from .concordance_declarations import ANNOTATION_DECLARATION, VALUE_TYPE_ABI
+        from ..transmogrifier.dtype_layout import (
+            python_int_literal_dtype, source_annotation_dtype, resolve,
+        )
+
+        if lexical_read_scope is not None:
+            book = current_identity_book()
+            abi = book.page(VALUE_TYPE_ABI).latest(
+                (tuple(lexical_read_scope), int(value_id)),
+            )
+            arms = tuple(getattr(abi, "physical_alternatives", ()))
+            if len(arms) == 1:
+                arm = arms[0]
+                if (arm.storage == "scalar" and arm.rank == 0 and not arm.shape
+                        and arm.dtype == source_dtype_of.get(int(value_id))):
+                    for cell in arm.source_cells:
+                        if cell.page != ANNOTATION_DECLARATION:
+                            continue
+                        declaration = book.page(ANNOTATION_DECLARATION).cell(cell.row, cell.column)
+                        width = source_annotation_dtype(declaration.annotation)
+                        layout = resolve(width) if width is not None else None
+                        if width != arm.dtype or layout is None or layout.kind not in {"int", "uint"}:
+                            continue
+                        bits = layout.byte_size * 8
+                        lower = -(1 << (bits - 1)) if layout.kind == "int" else 0
+                        upper = (1 << (bits - (1 if layout.kind == "int" else 0))) - 1
+                        if not lower <= literal <= upper:
+                            raise ValueError(f"source integer literal {literal} does not fit declared {width}")
+                        return str(width)
+        return python_int_literal_dtype(literal)
+
     # An authored Python scalar literal is a weak operand: it names a value,
     # not an element width, so beside a typed float operand it does not widen
     # the result (``float32 * 2.0`` is float32, as in the eager lane).
@@ -663,11 +696,7 @@ def plan_region_to_ssa_instrs(
             elif opcode in {"const", "constant"}:
                 literal = dict(item.attributes).get("value")
                 if isinstance(literal, int) and not isinstance(literal, bool):
-                    from ..transmogrifier.dtype_layout import (
-                        python_int_literal_dtype,
-                    )
-
-                    inferred = python_int_literal_dtype(literal)
+                    inferred = integer_literal_dtype(output_id, literal)
                 else:
                     inferred = (
                         "bool" if isinstance(literal, bool)
@@ -717,12 +746,8 @@ def plan_region_to_ssa_instrs(
             if isinstance(literal, bool):
                 dtype_of[int(item.outputs[0])] = "bool"
             elif isinstance(literal, int):
-                from ..transmogrifier.dtype_layout import (
-                    python_int_literal_dtype,
-                )
-
-                dtype_of[int(item.outputs[0])] = python_int_literal_dtype(
-                    literal,
+                dtype_of[int(item.outputs[0])] = integer_literal_dtype(
+                    int(item.outputs[0]), literal,
                 )
             elif isinstance(literal, float):
                 dtype_of[int(item.outputs[0])] = "float64"

@@ -10,10 +10,16 @@ function rotated([x,y,z], yaw, pitch, roll) {
   return [cz*X-sz*Y,sz*X+cz*Y,ZZ];
 }
 function orient(faces,start,end,o) {
-  if (!o.orientationYaw && !o.orientationPitch && !o.orientationRoll) return;
+  // Preserve the exact shared generator frame for opt-in volume authoring.
+  // p = origin + scale * (q.x*axes[0] + q.y*axes[1] + q.z*axes[2]).
+  const frame={origin:[0,0,0],axes:[[1,0,0],[0,1,0],[0,0,1]],scale:1};
+  if (!o.orientationYaw && !o.orientationPitch && !o.orientationRoll) return frame;
   const center=[0,0,0],count=(end-start)*3;
   for(let f=start;f<end;f++) for(const vertex of faces[f].slice(0,3))
     for(let k=0;k<3;k++) center[k]+=vertex[k]/count;
+  frame.axes=frame.axes.map(axis=>rotated(axis,o.orientationYaw,o.orientationPitch,o.orientationRoll));
+  const rotatedCenter=rotated(center,o.orientationYaw,o.orientationPitch,o.orientationRoll);
+  frame.origin=center.map((x,k)=>x-rotatedCenter[k]);
   for(let f=start;f<end;f++) {
     const face=faces[f];
     for(let v=0;v<3;v++) {
@@ -26,8 +32,11 @@ function orient(faces,start,end,o) {
   for(let f=start;f<end;f++) for(const vertex of faces[f].slice(0,3)) furthest=Math.max(furthest,Math.hypot(...vertex));
   if(furthest>0.94) {
     const scale=0.94/furthest;
+    frame.scale=scale;
+    frame.origin=frame.origin.map(x=>x*scale);
     for(let f=start;f<end;f++) for(let v=0;v<3;v++) faces[f][v]=faces[f][v].map((x)=>x*scale);
   }
+  return frame;
 }
 
 function unit(x, y, z) {
@@ -39,6 +48,9 @@ function checked(options) {
   const o = { rings: 24, segments: 48, eyeWidth: 0.28, eyeLength: 0.75,
     eyeCurve: 0.18, strandCount: 3, ribbonThickness: 0.035,
     ribbonTwist: 0.9, ribbonTip: 1.35, ribbonFlare: 0.18, ribbonPhase: 0,
+    // Omitted layout preserves v1 saved recipes and existing game geometry.
+    // New Studio designs explicitly select axial, with a shared centreline.
+    ribbonLayout: "separated",
     kind: "cat_eye", confettiCount: 220, enamelCoverage: 0,
     paintBandCount: 0, paintBandWidth: 0.18, paintBandCurve: 1.2,
     tubeCount: 2, tubeRadius: 0.024, tubeTurns: 2.2,
@@ -49,6 +61,7 @@ function checked(options) {
     throw new RangeError("marble tessellation outside supported range");
   if (o.seed < 0 || o.seed > 0x7fffffff) throw new RangeError("seed outside supported range");
   if (!["cat_eye", "confetti", "hybrid", "clear", "spiral", "rings"].includes(o.kind) ||
+      !["separated", "axial"].includes(o.ribbonLayout) ||
       o.confettiCount < 0 || o.confettiCount > 500 ||
       o.ribbonPhase < 0 || o.ribbonPhase > TAU ||
       o.enamelCoverage < 0 || o.enamelCoverage > 1 || o.paintBandCount < 0 || o.paintBandCount > 12 ||
@@ -57,6 +70,7 @@ function checked(options) {
       o.tubeTurns < 1 || o.tubeTurns > 4 ||
       [o.orientationYaw,o.orientationPitch,o.orientationRoll].some((v)=>!Number.isFinite(v)||Math.abs(v)>Math.PI))
     throw new RangeError("marble kind or coverage outside supported range");
+  if (o.confettiEnabled !== undefined && typeof o.confettiEnabled !== "boolean") throw new TypeError("confetti enabled must be boolean");
   if (o.kind === "hybrid" && (o.orientationYaw || o.orientationPitch || o.orientationRoll))
     throw new RangeError("hybrid orientation is fixed to keep dye and confetti volumes disjoint");
   if (!(o.eyeWidth >= 0.08 && o.eyeWidth <= 0.42 && o.eyeLength >= 0.4 && o.eyeLength <= 0.85 &&
@@ -91,6 +105,8 @@ export function catEyeMarble(materials, options = {}) {
   for (const key of ["enamel", "confetti", "paintA", "paintB"])
     if (materials[key] !== undefined && (!Number.isInteger(materials[key]) || materials[key] < 0))
       throw new TypeError(`invalid material ${key}`);
+  if (materials.ribbons !== undefined && (!Array.isArray(materials.ribbons) || materials.ribbons.length < o.strandCount || materials.ribbons.some(id => !Number.isInteger(id) || id < 0)))
+    throw new TypeError("invalid ribbon materials");
   const sphere = (radius) => (i, j) => {
     const theta = Math.PI * i / o.rings, phi = TAU * j / o.segments;
     return [radius * Math.sin(theta) * Math.cos(phi), radius * Math.cos(theta), radius * Math.sin(theta) * Math.sin(phi)];
@@ -114,8 +130,9 @@ export function catEyeMarble(materials, options = {}) {
   // Each blade has its own closed cross-section, tapering to two points. The
   // broad faces, narrow bevel-like sides and curled tips therefore present
   // different normals to the real Phong light. The blades twist with the
-  // shared curve but are offset in depth, like dyed glass drawn through a
-  // clear marble, rather than sectors of one broad spindle.
+  // shared curve. Axial ribbons have exactly the same centreline and shape,
+  // rotated evenly through pi (a blade is two-sided). The legacy separated
+  // layout remains byte-for-byte reproducible for existing saved recipes.
   for (let strand = 0; strand < (o.kind === "cat_eye" || o.kind === "hybrid" ? o.strandCount : 0); strand++) {
     const lane = strand - (o.strandCount - 1) / 2;
     const phase = ((o.seed + strand * 619) % 997) / 997 * TAU;
@@ -123,6 +140,17 @@ export function catEyeMarble(materials, options = {}) {
       const theta = Math.PI * i / o.rings, phi = TAU * j / o.segments;
       const s = Math.max(0, Math.sin(theta)), y = o.eyeLength * Math.cos(theta);
       const t = y / o.eyeLength, centre = o.eyeCurve * (1 - t*t);
+      if (o.ribbonLayout === "axial") {
+        const commonPhase = (o.seed % 997) / 997 * TAU;
+        const angle = o.ribbonPhase + Math.PI * strand / o.strandCount + o.ribbonTwist * t;
+        const width = o.eyeWidth * Math.pow(s, o.ribbonTip)
+          * (1 + o.ribbonFlare * Math.sin(2 * theta + commonPhase) * s);
+        const thick = o.ribbonThickness * Math.pow(s, Math.max(0.6, o.ribbonTip * 0.7));
+        const p = Math.sign(Math.cos(phi)) * Math.sqrt(Math.abs(Math.cos(phi)));
+        const q = Math.sign(Math.sin(phi)) * Math.sqrt(Math.abs(Math.sin(phi)));
+        return [centre + width*p*Math.cos(angle) - thick*q*Math.sin(angle),
+          y, width*p*Math.sin(angle) + thick*q*Math.cos(angle)];
+      }
       const angle = 0.38 * lane + o.ribbonTwist * t + 0.18 * Math.sin(theta + phase);
       const ux = Math.cos(angle), uz = Math.sin(angle), vx = -uz, vz = ux;
       const rawWidth = o.eyeWidth * (0.46 + 0.08 * Math.sin(phase + strand)) * Math.pow(s, o.ribbonTip)
@@ -152,7 +180,7 @@ export function catEyeMarble(materials, options = {}) {
       const t = a.map((v, k) => v - b[k]), q = c.map((v, k) => v - d[k]);
       return unit(q[1]*t[2]-q[2]*t[1], q[2]*t[0]-q[0]*t[2], q[0]*t[1]-q[1]*t[0]);
     };
-    const start = interior.length, material = strand % 2 ? materials.accent : materials.eye;
+    const start = interior.length, material = materials.ribbons?.[strand] ?? (strand % 2 ? materials.accent : materials.eye);
     surface(interior, point, normal, o.rings, o.segments, material);
     ribbons.push({ start, count: interior.length - start, material, densityRole: strand % 2 ? "accent" : "eye" });
   }
@@ -209,16 +237,29 @@ export function catEyeMarble(materials, options = {}) {
   // A common rigid transform preserves separation among distinct closed
   // inclusions. In hybrid designs the ribbons are confined to an inner radial
   // zone, leaving a clear annulus for independently packed confetti chips.
-  orient(interior,0,interior.length,o);
+  const inclusionFrame=orient(interior,0,interior.length,o);
   if(o.kind==="hybrid") {
     let furthest=0;
     for(const face of interior) for(const p of face.slice(0,3)) furthest=Math.max(furthest,Math.hypot(p[0],p[2]));
     if(furthest>0.65) {
       const scale=0.65/furthest;
+      inclusionFrame.scale*=scale;
+      inclusionFrame.origin=inclusionFrame.origin.map(x=>x*scale);
       for(const face of interior) for(let k=0;k<3;k++) face[k]=face[k].map((x)=>x*scale);
     }
   }
-  if (o.kind === "confetti" || o.kind === "hybrid") {
+  if (o.confettiEnabled ?? (o.kind === "confetti" || o.kind === "hybrid")) {
+    // New overlays keep the authored decoration unchanged. Conservative boxes
+    // around each closed inclusion exclude chips without guessing a surface
+    // intersection or shrinking/rotating the user's ribbons and tubes.
+    // The historical hybrid path retains its exact original packing recipe.
+    const overlay=o.kind!=="hybrid" && interior.length>0;
+    const exclusions=overlay?[...ribbons,...tubes].map(part=>{
+      const lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity];
+      for(const face of interior.slice(part.start,part.start+part.count))for(const p of face.slice(0,3))
+        for(let i=0;i<3;i++){lo[i]=Math.min(lo[i],p[i]);hi[i]=Math.max(hi[i],p[i]);}
+      return {lo,hi};
+    }):[];
     // Each rolled chip is a closed tetrahedral inclusion. A spherical swirl
     // places the chips through the interior, rather than painting the shell.
     let state = (o.seed ^ 0x9e3779b9) >>> 0;
@@ -228,12 +269,15 @@ export function catEyeMarble(materials, options = {}) {
       if (++attempts > 30000) throw new RangeError("confetti cannot be packed without overlap");
       const hybrid=o.kind==="hybrid";
       const y = (random() * 2 - 1) * (hybrid ? 0.40 : 0.60);
-      const r = hybrid ? 0.72 + 0.06 * random() : 0.15 + 0.53 * random();
+      const r = hybrid ? 0.72 + 0.06 * random() : overlay ? 0.72 + 0.16 * random() : 0.15 + 0.53 * random();
       const phi = TAU * (attempts * 0.61803398875 + random() * 0.18) + 1.2 * y;
       const center = [r * Math.cos(phi), y, r * Math.sin(phi)];
       const size = 0.012 + random() * 0.018, angle = TAU * random();
+      if(overlay && (Math.hypot(...center)+1.02*size+0.003>=0.96 ||
+        exclusions.some(({lo,hi})=>center.every((x,i)=>x+1.02*size+0.003>=lo[i] && x-1.02*size-0.003<=hi[i]))))continue;
       if (occupied.some(({center:other,size:otherSize}) =>
-        Math.hypot(...center.map((x,i)=>x-other[i])) < 1.02*(size+otherSize)+0.003)) continue;
+        (overlay ? center.every((x,i)=>Math.abs(x-other[i]) < 1.02*(size+otherSize)+0.003) :
+          Math.hypot(...center.map((x,i)=>x-other[i])) < 1.02*(size+otherSize)+0.003))) continue;
       occupied.push({center,size});
       const u = [Math.cos(angle), 0, Math.sin(angle)];
       const v = [-Math.sin(angle), 0, Math.cos(angle)];
@@ -251,6 +295,9 @@ export function catEyeMarble(materials, options = {}) {
       k++;
     }
   }
+  const overlappingRibbons = o.ribbonLayout === "axial" && ribbons.length > 1;
   return { interior, glass, triangleCount: interior.length + glass.length,
-    ribbons, confetti, tubes, parameters: {...o,shellMaterial:materials.glass} };
+    mechanicsResolved: !overlappingRibbons,
+    mechanicsNote: overlappingRibbons ? "Axial ribbons overlap; exact material-union mass and rolling inertia are unresolved" : undefined,
+    ribbons, confetti, tubes, inclusionFrame, parameters: {...o,shellMaterial:materials.glass} };
 }

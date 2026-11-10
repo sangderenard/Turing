@@ -1,0 +1,9 @@
+# Separate intersection residency from transport identity
+
+Source-only relay/client update. Optional query_geometry_hash identifies the authoritative intersection-only packed data; query_kernel binds its compiled law. The cache/ack key is this pair. Existing packets without this field retain conservative full revision/geometry-hash residency behavior.
+
+Full token, revision, sample_prefix, geometry_hash and engine kernel remain mandatory immutable result identity. New-format results additionally echo query_geometry_hash. A cached scene descriptor must never overwrite the current loan's transport revision/hash when it is included in a poll response. A trusted producer supplying different geometry under the same query identity is rejected rather than silently replacing acknowledged data.
+
+Browser backend query revision is derived from query_geometry_hash plus query law. Material-only transport revisions therefore do not reinstall the BVH or require another geometry transfer. Canonical page Room/Exposure equivalence is not assumed. captureCurrentStudioScene explicitly captures the displayed studio channel while sceneForPhoto captures the saved exposure profile/canonical pose. MRP1 contains raw marble faces plus fixtures; native stage preparation changes/appends geometry and owner IDs. Reusing those page arrays needs matching canonical typed-array hashes and an explicit owner/transform mapping first.
+
+Validation:23 relay/process tests pass, including material-only revision reuse, retained full result binding, stale result refusal and changed geometry under unchanged query ID refusal. Node participant regression confirms one setScene installation across two transport revisions and correct new revision/hash on the second result. No publication or restart. Per-component missing-piece transfer and verified page-owned geometry reuse remain unfinished; this slice only omits the entire unchanged authoritative query descriptor.

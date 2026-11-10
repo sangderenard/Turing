@@ -1,0 +1,71 @@
+  agent/segmented-wasm-homepage              [m d531ba0d [[34morigin/agent/segmented-wasm-homepage[m] Publish segmented WebAssembly Mandelbrot homepage
+  agent/versioned-wasm-assets                [m 8c8cf580 [[34morigin/agent/versioned-wasm-assets[m] Version segmented WebAssembly site assets
++ [36mclaude/project-thread-4l36ur               [m 7555924f ([36mC:/dev/Powershell/turing-pr904[m) [[34morigin/claude/project-thread-4l36ur[m] Record #904 Linux gate against fresh main
++ [36mclaude/project-thread-h1z2w1               [m ee659652 ([36mC:/dev/Powershell/turing-pr895[m) [[34morigin/claude/project-thread-h1z2w1[m: behind 3] Document current main re-gate for lane D D2
++ [36mclaude/project-thread-m6dfqi-limbs         [m aede6930 ([36mC:/dev/Powershell/turing-pr911[m) [[34morigin/claude/project-thread-m6dfqi-limbs[m] Merge remote-tracking branch 'origin/main' into claude/project-thread-m6dfqi-limbs
++ [36mclaude/project-thread-umsbgm               [m 52c37484 ([36mC:/dev/Powershell/turing-pr913[m) [[34morigin/claude/project-thread-umsbgm[m] Record PR 913 current-main Linux validation
+  codex/bootstrap-format-spec-closure        [m c17188c2 [[34morigin/codex/bootstrap-format-spec-closure[m] Retain exact format-spec dependencies in bootstrap validation
++ [36mcodex/checkpoint-corrupt-payload-2026-10-04[m 8dd9ba24 ([36mC:/dev/Powershell/.checkpoint-review/turing[m) [[34morigin/codex/checkpoint-corrupt-payload-2026-10-04[m] Treat corrupt checkpoint pickle payloads as cache misses
+  codex/columnar-webgl-surface               [m 4fcd7090 [[34morigin/codex/columnar-webgl-surface[m] Preserve whole-program deployment through Wasm
++ [36mcodex/compiler-handoff-2026-10-24          [m ac8495f2 ([36mC:/dev/Powershell/turing-handoff-2026-10-24[m) [[34morigin/codex/compiler-handoff-2026-10-24[m] Document compiler handoff and merged PR trajectory
+  codex/exact-mixed-integer-comparisons      [m 3c1fd183 [[34morigin/codex/exact-mixed-integer-comparisons[m] Widen uint32 operands into exact int64 comparison domain
++ [36mcodex/fortran-rank2-spans                  [m a1cf5499 ([36mC:/dev/Powershell/turing-e28[m) [[34morigin/codex/fortran-rank2-spans[m] Record E28 Linux corpus and gate receipt
++ [36mcodex/fortran-returned-tuple-crash         [m 562d663c ([36mC:/dev/Powershell/turing-corpus-exit[m) [[34morigin/codex/fortran-returned-tuple-crash[m] Clean hazard receipt formatting after main merge
++ [36mcodex/lifted-tail-jumps                    [m d2ee445c ([36mC:/dev/Powershell/turing-tail-jumps[m) [[34morigin/codex/lifted-tail-jumps[m] Record tail-jump split and unverified gates
+  codex/local-physical-dtype-sync            [m 61d75ef5 [[34morigin/codex/local-physical-dtype-sync[m] It's like, am I bad at comments on purpose? Is it spiteful?
+  codex/local-state-2026-10-14               [m 96edd51c [[34morigin/codex/local-state-2026-10-14[m] Checkpoint local compiler probe state
++ [36mcodex/mapping-child-sequence-views         [m 4899e00d ([36mC:/dev/Powershell/turing-return-spans[m) [[34morigin/codex/mapping-child-sequence-views[m] Record String Core continuation and pending full native acceptance
++ [36mcodex/memory-graph-integer-allocation      [m 65c1e446 ([36mC:/dev/turing-memory-graph[m) Replace memory graph cell allocator with exact intervals
+  codex/native-type-audit                    [m 36bfd8d8 [[34morigin/codex/native-type-audit[m] Audit native type coverage and reproduce unsigned representation loss
+  codex/native-type-completeness             [m 2b9e1f2a [[34morigin/codex/native-type-completeness[m] Preserve canonical native types across C LLVM and Fortran
++ [36mcodex/nodus-named-tensor-calls-2026-10-03  [m 580a8eb4 ([36mC:/dev/Powershell/.integration-table-publish/turing[m) [[34morigin/codex/nodus-named-tensor-calls-2026-10-03[m] Resolve named tensor Calls at the Nodus membrane
+  codex/owned-array-record-heap              [m 6e91dcaa [[34morigin/codex/owned-array-record-heap[m] Record isolated owned-array verification
+  codex/python-bool-integer-results          [m 4f9940e5 [[34morigin/codex/python-bool-integer-results[m] Limit scalar leaf conversion to exact bool widening
+  codex/recursive-reduction-bridge           [m 56255f42 [[34morigin/codex/recursive-reduction-bridge[m] Regulate identity through the concordance; fix one-value/two-binding loop miscompiles
++ [36mcodex/scatter-semantic-kernel              [m 6c994dc9 ([36mC:/dev/Powershell/turing-scatter-semantic[m) [[34morigin/codex/scatter-semantic-kernel[m] Keep malformed scatter attrs as validation issue
+  codex/string-core-return-identities        [m 3defac09 [[34morigin/codex/string-core-return-identities[m] Keep returned values tied to accepted source identities
++ [36mcodex/token-orchard-array-dtype            [m af421c5b ([36mC:/dev/Powershell/turing-array-dtype[m) [[34morigin/codex/token-orchard-array-dtype[m] Keep authored uint32 array rows through append lowering
+  codex/token-orchard-call-result-slots      [m 77195eb4 [[34morigin/codex/token-orchard-call-result-slots[m] Merge remote-tracking branch 'origin/main' into codex/token-orchard-call-result-slots
++ [36mcodex/token-orchard-candidates-view        [m 4c48b937 ([36mC:/dev/Powershell/turing-candidates-view[m) [[34morigin/codex/token-orchard-candidates-view[m] Record whole-core next refusal after candidate view repair
+  codex/token-orchard-demo-compile           [m 74dbd043 [[34morigin/codex/token-orchard-demo-compile[m] Complete scatter reduction kernels across native backends
++ [36mcodex/token-orchard-integer-llvm           [m 53b93fc1 ([36mC:/dev/Powershell/turing-token-llvm[m) [[34morigin/codex/token-orchard-integer-llvm[m] Record final Token Orchard integer span validation
++ [36mcodex/token-orchard-lease-type             [m fc0f69c6 ([36mC:/dev/Powershell/turing-lease-type[m) [[34morigin/codex/token-orchard-lease-type[m] Post call-frame replacement lease type from callee formal
+  codex/token-orchard-native-fortran         [m fbdabdfc [[34morigin/codex/token-orchard-native-fortran[m] Run linked tensor target through native Fortran
++ [36mcodex/token-orchard-record-view            [m f18fa180 ([36mC:/dev/Powershell/turing-record-view[m) [[34morigin/codex/token-orchard-record-view[m] Record corpus fuzz and fresh-main Linux gate
+  codex/token-orchard-region-scalar          [m 666df3d8 [[34morigin/codex/token-orchard-region-scalar[m] Preserve source-proven scalar storage for indexed Python values
+  codex/token-orchard-return-spans           [m edf0dd8f [[34morigin/codex/token-orchard-return-spans[m] Bind retired list result placeholders to linked physical projections
++ [36mcodex/token-orchard-sequence-view          [m 7b4cdb3b ([36mC:/dev/Powershell/turing-sequence-view[m) [[34morigin/codex/token-orchard-sequence-view[m] Complete resident sequence types from reconciled record field views
++ [36mcodex/token-orchard-storage-roles          [m 5276db26 ([36mC:/dev/Powershell/turing-region-scalar[m) [[34morigin/codex/token-orchard-storage-roles[m] Merge remote-tracking branch 'origin/main' into codex/token-orchard-storage-roles
+  codex/token-orchard-target-link-abi        [m bade5873 [[34morigin/codex/token-orchard-target-link-abi[m] Run linked tensor target through native Fortran
++ [36mcodex/token-orchard-uint64                 [m 039a958a ([36mC:/dev/Powershell/turing-token-uint64[m) [[34morigin/codex/token-orchard-uint64[m] Document uint64 refusal validation receipt
++ [36mcodex/vjp-source-provenance                [m f8fba1aa ([36mC:/dev/Powershell/turing-vjp-provenance[m) [[34morigin/codex/vjp-source-provenance[m] Record final VJP corpus and Linux receipts
+  fix/audit-findings-zero                    [m 7162f7fc [[34morigin/main[m: ahead 4, behind 929] A declared scalar parameter's Python type wins over the one its dtype implies
+  fix/break-edge-value                       [m fd122682 [[34morigin/main[m: behind 928] Break edge carries each binding's own site value and leaves from its terminal arm
+  fix/closure-build-costs                    [m 5d0760c7 [[34morigin/main[m: behind 997] _materialize_operands: index a hub parent's children by consumer
+  fix/conditional-field-store                [m 7f345f24 [[34morigin/main[m: behind 995] Place a declared scalar field store at its authored arm, not after its source's producer
+  fix/cross-book-stamps                      [m 129c20fa [[34morigin/main[m: behind 999] Callsite specialization: the root graph is not visited a second time as its own function-table entry
+  fix/dead-metadata-worklist                 [m 8abd4997 [[34morigin/main[m: behind 926] Replace dead-metadata restart scan with a position-ordered worklist
+  fix/ellipsis-store-ingestion               [m 1e7f040c [[34morigin/main[m: behind 999] Ingest a sole `x[...]` as one full-extent access instead of an expanded index
+  fix/field-write-leftovers                  [m f1753bce [[34morigin/main[m: ahead 4, behind 994] Decide "no alias for a slot-loaded field" from a book page, not function metadata
+  fix/float32-result-dtype                   [m 6a9ca446 [[34morigin/main[m: behind 998] float32 spans are a storage class: declared in dtype_layout, float/float* buffers in the LLVM and C module lanes
+  fix/fork-read-scope-projection             [m ae88b987 [[34morigin/main[m: behind 925] A dispatch region's read-scope fork holds its own nodes' rows, as a declared projection
+  fix/host-layout-rows                       [m 52e76de1 [[34morigin/main[m: behind 995] Add probe_host_layout_rows: slot rows, API_CONTRACT, header, C host
+  fix/per-copy-shape-proofs                  [m 33b135c4 [[34morigin/main[m: behind 997] Tests: shape rows are keyed by the copy's scope, not the authored name
+  fix/progress-and-memory-budget             [m 81be1e80 [[34morigin/main[m: behind 904] Frontier audit: efficiency, progress and memory-regulation lanes dispatched
+  fix/raw-primitive-posts                    [m f71bc750 [[34morigin/main[m: behind 909] callsite_return_specialization: callee row element is a shape scope (per-copy keying)
+  fix/region-metadata-copy                   [m 9df413c7 [[34morigin/main[m: behind 1003] A dispatch region copies its own nodes' identity tokens and shares read-only function tables
+  fix/state-machine-tick-rows                [m b643e4f3 [[34morigin/main[m: behind 993] Probe part B: a marked class through lower_ast_source_to_ssa, rows and native runs
+  id-identity-sweep                          [m f1e50fd3 WIP: monotonic graph node identity (fixes determinism, breaks shell attribution)
+* [32mmain                                       [m 8e540752 [[34morigin/main[m: ahead 1] sync for web agent
+  panic_edits_temp                           [m b994fff2 [[34morigin/panic_edits_temp[m] prototype tensor view on a node attribute
+  piece-link-stub                            [m 2b28e675 Descriptor query: read the owner's polymorphic-formal rows once per outermost query
+  snapshot/numerals-2026-09-25               [m 5561b717 Snapshot before numeral type-concordance testing (2026-09-25)
+  split/glsl-leaves                          [m 6e800b39 [[34morigin/main[m: behind 995] Relocate the receiver-resolution prepasses out of glsl_deployment_strategy
+  split/glsl-leaves-2                        [m 78033d8e [[34morigin/main[m: ahead 14, behind 929] Relocate callsite tensor specialization out of glsl_deployment_strategy
+  split/shell-leaves                         [m 9baaa133 [[34morigin/main[m: behind 995] Move sequence storage binding out of fortran_c_shell
+  split/shell-leaves-2                       [m 83d44979 [[34morigin/main[m: ahead 15, behind 899] Move call argument harmonization out of fortran_c_shell
+  split/shell-leaves-2-pre-rebase            [m 73732cca [[34morigin/main[m: ahead 15, behind 929] Move call argument harmonization out of fortran_c_shell
+  tests-copy-on-read-sourced                 [m 96075375 Copy-on-read and dispatch tests seed their rows as roots: the test is the ingestion
++ [36mwindows-parity-2026-10-24                  [m 009379e4 ([36mC:/dev/Powershell/win-main[m) [[34morigin/windows-parity-2026-10-24[m] Document the Windows parity lane
+  wip/2026-10-03-inflight                    [m 8ac1d52e [[34morigin/wip/2026-10-03-inflight[m: ahead 1] WIP checkpoint (UNVERIFIED): other agents' in-flight compiler/dt edits taken into main for continuation
++ [36mworktree-agent-aa7b073f48b96f004           [m 8af44b07 ([36mC:/dev/Powershell/turing/.claude/worktrees/agent-aa7b073f48b96f004[m) Remove the dead Unsourced branches: a post derives from its cells or is refused

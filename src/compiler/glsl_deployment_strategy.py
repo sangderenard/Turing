@@ -7570,7 +7570,7 @@ def _build_shell_hierarchy_plan(
                         "sum", "prod", "min", "max", "cumsum", "cumprod",
                         # A view or a gather re-addresses its VALUE's
                         # elements; the index operand names no element class.
-                        "reshape", "view", "flatten", "gather",
+                        "reshape", "view", "flatten", "gather", "detach",
                         "indexed", "getitem", "subscript",
                     }
                     and not tensor.get("dtype")
@@ -7625,6 +7625,12 @@ def _build_shell_hierarchy_plan(
                             operation, _node, declared, _shape_dtype_cache,
                             logical,
                         )
+                if operation == "detach" and parents:
+                    # Autograd detach changes gradient ownership, not the
+                    # value's physical tensor extent or element type.
+                    source = _shape_dtype_cache.get(parents[0])
+                    if source is not None:
+                        logical = source[0]
                 if operation == "mean" and not tensor.get("dtype"):
                     # ``x.mean()`` (numpy, AbstractTensor): a float operand's
                     # width stands; an integer or bool operand means float64.
@@ -7935,6 +7941,26 @@ def _build_shell_hierarchy_plan(
 
             _fixed_width_row_width(int(value_id))
             record = _value_shape_dtype(value_id)
+            node = graph.G.nodes.get(int(value_id), {})
+            local_declaration = (node.get("attributes") or {}).get("local_scalar_annotation")
+            if local_declaration is not None:
+                # The lexical annotation's settled physical receipt owns the
+                # fixed-width local. A tensor inferred before ABI settlement
+                # is not a competing declaration for this exact value.
+                from .concordance_declarations import ANNOTATION_DECLARATION
+                from .identity_concordance import current_identity_book
+                from ..transmogrifier.dtype_layout import source_annotation_dtype
+                width, annotation_cell = local_declaration
+                annotation_fact = current_identity_book().page(ANNOTATION_DECLARATION).cell(
+                    annotation_cell.row, annotation_cell.column,
+                )
+                if source_annotation_dtype(annotation_fact.annotation) != width:
+                    raise ValueError("local scalar width disagrees with its declaration")
+                exact = _concorded_value_type_descriptor(graph, int(value_id))
+                if exact is not None and exact.get("dtype") == width and not exact.get("shape"):
+                    return (record[0], (), width), _dtype_producer_cells(
+                        graph, int(value_id), annotation_cell,
+                    )
             if record[2] is not None:
                 extra_cells = ()
                 node = graph.G.nodes.get(int(value_id), {})
@@ -8005,6 +8031,36 @@ def _build_shell_hierarchy_plan(
                 return (record[0], record[1], process_fact[2]), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
+            if (
+                str(node.get("op") or node.get("type") or "").casefold()
+                == "input"
+                and attributes.get("binding_kind") == "loop"
+            ):
+                # A callsite's exact iterable-member class lives on the
+                # source numeric specialization page.  The loop Input may
+                # have no local tensor or scalar-plan annotation; read its
+                # posted class instead of assigning a provisional dtype to
+                # the graph node.
+                from ..common.tensors.topological_reducer import _source_numeric_scope
+                from .source_evidence_resolver import ClassEvidence, require_class
+
+                class_answer = require_class(
+                    _source_numeric_scope(graph.G), int(value_id),
+                    book=current_identity_book(),
+                )
+                if isinstance(class_answer, ClassEvidence):
+                    class_dtype = {
+                        "builtins.int": "int64",
+                        "builtins.float": "float64",
+                        "builtins.bool": "bool",
+                    }.get(str(class_answer.class_identity))
+                    if class_dtype is not None:
+                        return (record[0], record[1], class_dtype), tuple(
+                            dict.fromkeys((
+                                class_answer.subject_cell,
+                                *class_answer.proof_cells,
+                            ))
+                        )
             # A collection the callsite specialization folded from its
             # actual (an unannotated ``atoms`` bound to ``[a, b]``) keeps
             # the element class the call edge settled
@@ -36323,6 +36379,150 @@ def _post_callsite_loop_element_classes(
                 else:
                     target_attributes.pop("result_class_ref", None)
                 relinked_loop_targets.add(int(target_value_id))
+
+    # `enumerate(zip(xs, ys))` binds the nested pair from the two exact
+    # iterable arguments.  The direct/enumerate projections above only see
+    # one flat target; they cannot state either member of that pair.  Read
+    # each argument's element-class evidence and publish the corresponding
+    # loop binding in this callsite's source-value-class page.  No loop Input
+    # or intermediate sequence description is rewritten.
+    def builtin_identity(value_id: int) -> str:
+        program = (specialized.G.nodes[value_id].get("attributes") or {}).get(
+            "python_identity_program"
+        ) or {}
+        identities = tuple(program.get("identities") or ())
+        return str(identities[0]) if len(identities) == 1 else ""
+
+    def positional_sources(value_id: int) -> tuple[int, ...]:
+        positions = sorted(
+            (int(str(role)[4:]), int(parent))
+            for parent, role in specialized.G.nodes[value_id].get("parents") or ()
+            if str(role).startswith("arg:") and str(role)[4:].isdigit()
+            and int(parent) in specialized.G
+        )
+        return tuple(parent for position, parent in positions)
+
+    for loop_id, loop_data in specialized.G.nodes(data=True):
+        expression = loop_data.get("expr_obj")
+        if not isinstance(expression, ast.For):
+            continue
+        iterable_ids = tuple(
+            int(parent) for parent, role in loop_data.get("parents") or ()
+            if str(role) == "iterable" and int(parent) in specialized.G
+        )
+        if len(iterable_ids) != 1 or builtin_identity(iterable_ids[0]) != "builtins.enumerate":
+            continue
+        enumerated = positional_sources(iterable_ids[0])
+        if len(enumerated) != 1 or builtin_identity(enumerated[0]) != "builtins.zip":
+            continue
+        zipped = positional_sources(enumerated[0])
+        target = expression.target
+        if (
+            len(zipped) != 2 or not isinstance(target, ast.Tuple)
+            or len(target.elts) != 2
+            or not isinstance(target.elts[1], ast.Tuple)
+            or len(target.elts[1].elts) != 2
+        ):
+            continue
+        target_bindings = dict((loop_data.get("attributes") or {}).get(
+            "loop_target_bindings") or {})
+        for source_id, target_name in zip(zipped, target.elts[1].elts):
+            if not isinstance(target_name, ast.Name):
+                continue
+            target_id = target_bindings.get(target_name.id)
+            if target_id is None or int(target_id) not in specialized.G:
+                continue
+            if builtin_identity(source_id) != "builtins.list":
+                continue
+            materialized = tuple(map(int, (
+                specialized.G.nodes[source_id].get("attributes") or {}
+            ).get("materialized_source_value_ids") or ()))
+            if len(materialized) != 1 or materialized[0] not in specialized.G:
+                continue
+            member_source = materialized[0]
+            source_data = specialized.G.nodes[member_source]
+            source_attrs = source_data.get("attributes") or {}
+            element_fact = source_attrs.get("callsite_sequence_element_class_fact")
+            element_cells = tuple(source_attrs.get(
+                "callsite_sequence_element_class_cells") or ())
+            element_class = None
+            if (
+                isinstance(element_fact, tuple) and len(element_fact) >= 3
+                and int(element_fact[1]) == 1 and element_cells
+                and str(element_fact[0]) in {
+                    "builtins.int", "builtins.float", "builtins.bool",
+                }
+            ):
+                element_class = str(element_fact[0])
+            elif (
+                source_attrs.get("binding_kind") == "parameter"
+                and source_attrs.get("sequence_element_class_ref") in {
+                    "builtins.int", "builtins.float", "builtins.bool",
+                }
+                and source_attrs.get("sequence_element_annotation_cell") is not None
+            ):
+                # An empty actual has no member from which to infer a class.
+                # The callee's authored sequence annotation still gives the
+                # class of any member the loop could bind.
+                element_class = str(source_attrs["sequence_element_class_ref"])
+                element_cells = (
+                    source_attrs["sequence_element_annotation_cell"],
+                )
+            elif builtin_identity(member_source) == "builtins.getattr":
+                arguments = positional_sources(member_source)
+                if len(arguments) >= 2:
+                    attribute = specialized.G.nodes[arguments[1]]
+                    attribute_name = (attribute.get("attributes") or {}).get(
+                        "value", attribute.get("constant")
+                    )
+                    descriptor = _tensor_descriptor(specialized, arguments[0])
+                    receiver_data = specialized.G.nodes[arguments[0]]
+                    receiver_name = (receiver_data.get("attributes") or {}).get(
+                        "binding_name"
+                    )
+                    receiver_history = tuple(map(int, (
+                        specialized.G.graph.get("identity_table") or {}
+                    ).get(str(receiver_name), ())))
+                    if (
+                        descriptor is None and receiver_name is not None
+                        and arguments[0] in receiver_history
+                    ):
+                        descriptor = tensor_descriptors.get(str(receiver_name))
+                    if attribute_name == "shape" and _descriptor_states_tensor_contract(
+                        descriptor
+                    ):
+                        element_class = "builtins.int"
+                        element_cells = _dtype_producer_cells(
+                            specialized, arguments[0],
+                            node_identity_cell(specialized, member_source),
+                        )
+            if element_class is None or not element_cells:
+                continue
+            if callee_scope is None:
+                raise ValueError("callsite zip class requires the forked read scope")
+            target_id = int(target_id)
+            target_value = int(specialized.G.nodes[target_id].get(
+                "value_id", target_id
+            ))
+            row = (callee_scope, target_value)
+            previous = book.latest_ref(SOURCE_VALUE_CLASS, row)
+            fact = (element_class, 1, "callsite zipped iterable element class")
+            if class_page.latest(row) == fact:
+                continue
+            cells = tuple(dict.fromkeys(filter(None, (
+                previous, *element_cells,
+                node_identity_cell(specialized, source_id),
+                node_identity_cell(specialized, enumerated[0]),
+                node_identity_cell(specialized, iterable_ids[0]),
+                node_identity_cell(specialized, target_id),
+            ))))
+            book.post(
+                SOURCE_VALUE_CLASS, row, fact,
+                stage=PLANNER_TENSOR_SPECIALIZATION,
+                provenance=Derived(cells),
+                mode=Mode.CONCORD if previous is None else Mode.REVISE,
+            )
+            relinked_loop_targets.add(target_value)
 
     if not relinked_loop_targets:
         return

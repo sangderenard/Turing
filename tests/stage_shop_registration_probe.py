@@ -1,0 +1,17 @@
+from pathlib import Path
+source=Path('examples/meowdoku/web/marble_studio.js').read_text()
+build=Path('build/meowdoku/web/marble_studio.js').read_text()
+stage=Path('build/dot-shop-registration');stage.mkdir(exist_ok=True)
+build=build.replace('import {shopLightEmitterAllocations,','import {shopLightEmissionRecords,shopLightEmitterAllocations,').replace(',shopLightPhongSamples','')
+a=build.index('    for (const [i,role] of fixtureRoles.entries()) {',build.index('const coneAngles='));b=build.index('    gl.uniform1i(loc(P,"uNumLights")',a)
+c=source.index('    // Shop fixtures enter the same registration loop');d=source.index('    gl.uniform1i(loc(P,"uNumLights")',c)
+build=build[:a]+source[c:d]+build[b:]
+build=build.replace('function shopLightState(', 'let shopEmissionProfiles;\nfunction shopLightState(')
+build=build.replace('    ids=assets.material_index || {};','    shopEmissionProfiles=assets.emitterProfiles;\n    ids=assets.material_index || {};')
+build=build.replace('{channel:"exposure"});','{channel:"exposure",profiles:shopEmissionProfiles});').replace('shopLightState("studio"));','shopLightState("studio"),{profiles:shopEmissionProfiles});').replace('shopLightState());','shopLightState(),{profiles:shopEmissionProfiles});')
+build=build.replace('return {vertices,material_ids:materialIds,pbr,material_engines};','const emitter_profiles=shopLightEmissionRecords(shopLightState("exposure"),FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,materialIndex,shopEmissionProfiles);\n  return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles};')
+(stage/'marble_studio.js').write_text(build)
+s=Path('build/meowdoku/web/marble_studio_lighting.js').read_text()
+line=next(l for l in Path('examples/meowdoku/web/marble_studio_lighting.js').read_text().splitlines() if "key==='emitterProfile'" in l)
+s=s.replace("        if(root==='shopLights'&&key==='source')",line+"\n        if(root==='shopLights'&&key==='source')")
+(stage/'marble_studio_lighting.js').write_text(s)

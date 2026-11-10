@@ -127,7 +127,7 @@ helpers_spec: Dict[str, str] = {
         "T(X): transpose last two dims of X (matrix transpose); vectors are treated as row matrices.",
 }
 
-def unbroadcast(G, target_shape):
+def unbroadcast(G, target_shape: tuple[int, ...]):
     g_shape = list(getattr(G, "shape", ()))
     t_shape = list(target_shape)
 

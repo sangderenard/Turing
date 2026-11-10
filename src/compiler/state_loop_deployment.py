@@ -848,6 +848,7 @@ function prepareVehicleEnergy(body,dt){{
       Math.max(1e-9,state.batteryCapacityWh),totalMassKg:liveMass,
       jointBushingDissipationPowerW:Number(body.damage?.dissipationPowerW||0),
       jointBushingDissipatedEnergyJ:Number(body.damage?.dissipatedEnergyJ||0)}},
+    damageMetrics:body.damage||null,
     driverAssistance:{{...ensureVehicleDriverAssistance(body)}}}});}}
 }}
 function applyVehicleChassisProfile(body,profile){{

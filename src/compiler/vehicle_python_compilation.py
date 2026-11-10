@@ -50,7 +50,8 @@ FIXTURE_CORNERS = ("front_left", "front_right", "rear_left", "rear_right")
 
 
 def symbolic_abstract_tensor_source(compilation: Any, function_name: str,
-                                    precision_policy: Any = None) -> str:
+                                    precision_policy: Any = None, *,
+                                    shader_precision: Any = None) -> str:
     """The AbstractTensor stage of one sympy-authored law, as Python source.
 
     One program, three stages: the law is ingested by the compiler into the
@@ -82,6 +83,11 @@ def symbolic_abstract_tensor_source(compilation: Any, function_name: str,
         plan = plan_precision(compilation.function, precision_policy, argument_names)
         metadata["precision_plan"] = plan.receipt()
     sections: list = []
+    if plan is not None and plan.wide_ids and shader_precision is not None:
+        raise NotImplementedError(
+            "shader literal policy with automatically widened Precision sections "
+            "requires an explicit section element contract"
+        )
     if plan is not None and plan.wide_ids:
         from .ssa_python_materializer import materialize_precision_sections
 
@@ -91,6 +97,7 @@ def symbolic_abstract_tensor_source(compilation: Any, function_name: str,
     else:
         statements, uses_math = materialize_function_body(
             compilation.function, parameter_names=argument_names, tensor_vocabulary=True,
+            shader_precision=shader_precision,
         )
     function = ast.FunctionDef(
         name=function_name,

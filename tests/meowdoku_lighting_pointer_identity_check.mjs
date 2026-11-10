@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const file=process.env.STUDIO_TEST_WEB_ROOT?`${process.env.STUDIO_TEST_WEB_ROOT}/marble_studio_lighting.js`:new URL('../examples/meowdoku/web/marble_studio_lighting.js',import.meta.url);
+const source=fs.readFileSync(file,'utf8');
+const start=source.indexOf('  const invalidateRenderEvent=event=>{'),end=source.indexOf('  const $ = id => doc.getElementById(id);',start);
+assert(start>0&&end>start);
+const listeners=new Map();let invalidations=0;
+vm.runInNewContext(source.slice(start,end),{doc:{addEventListener(kind,fn,capture){assert.equal(capture,true);listeners.set(kind,fn);}},invalidateRenderState(){invalidations++;}});
+const event=(type,id,toolbox=false)=>({type,target:{id,closest:selector=>selector==='#camera-toolbox'&&toolbox?{}:null}});
+for(const type of ['input','change','click'])listeners.get(type)(event(type,'camera-range-hit',true));
+for(const id of ['view','photo-image'])listeners.get('click')(event('click',id));
+assert.equal(invalidations,0,'Non-authoring pointer tools preserve lighting identity');
+for(const type of ['input','change','click'])listeners.get(type)(event(type,'key-brightness'));
+assert.equal(invalidations,3,'Actual authoring events retain existing invalidation');
+listeners.get('input')(event('input','radius-mm'));assert.equal(invalidations,4);
+listeners.get('click')({type:'click'});assert.equal(invalidations,5,'Unknown legacy events are conservative');
+console.log('PASS exact lighting event hook: ray selection and hit controls preserve identity; authoring still invalidates');

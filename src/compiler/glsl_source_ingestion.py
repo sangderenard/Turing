@@ -84,8 +84,8 @@ _TOKEN = re.compile(
     r"(?P<space>\s+)"
     r"|(?P<number>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFuU]?)"
     r"|(?P<name>[A-Za-z_]\w*)"
-    r"|(?P<operator>==|!=|<=|>=|&&|\|\||<<|>>|\+=|-=|\*=|/=|%=|"
-    r"[+\-*/%<>&|^!~?:=(),.\[\]])"
+    r"|(?P<operator>\+\+|--|==|!=|<=|>=|&&|\|\||<<|>>|\+=|-=|\*=|/=|%=|"
+    r"[{};+\-*/%<>&|^!~?:=(),.\[\]])"
 )
 
 _BINARY_PRECEDENCE = {
@@ -119,12 +119,12 @@ _SCALAR_TYPES = frozenset(GLSL_CASTS)
 def _without_comments(source: str) -> str:
     source = re.sub(
         r"/\*.*?\*/",
-        lambda match: "\n" * match.group(0).count("\n"),
+        lambda match: re.sub(r"[^\n]", " ", match.group(0)),
         source,
         flags=re.DOTALL,
     )
-    source = re.sub(r"//[^\n]*", "", source)
-    return re.sub(r"^[ \t]*#[^\n]*", "", source, flags=re.MULTILINE)
+    source = re.sub(r"//[^\n]*", lambda m: " " * len(m.group()), source)
+    return re.sub(r"^[ \t]*#[^\n]*", lambda m: " " * len(m.group()), source, flags=re.MULTILINE)
 
 
 def _tokenize(text: str, *, start_line: int = 1) -> list[_Token]:
@@ -470,7 +470,9 @@ class _ExpressionParser:
 
 
 def _main_body(source: str) -> tuple[str, int, str]:
-    match = re.search(r"\bvoid\s+(\w+)\s*\([^)]*\)\s*\{", source)
+    match = re.search(r"\bvoid\s+(main)\s*\([^)]*\)\s*\{", source)
+    if match is None:
+        match = re.search(r"\bvoid\s+(\w+)\s*\([^)]*\)\s*\{", source)
     if match is None:
         raise ValueError("GLSL source has no void entry function")
     depth = 1

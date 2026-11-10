@@ -253,12 +253,14 @@ class _BodyMaterializer:
         argument_names: Mapping[int, str],
         tensor_vocabulary: bool = False,
         precision_plan: Any = None,
+        shader_precision: Any = None,
     ):
         self.function = function
         # A precision plan is honoured by materialize_precision_sections,
         # which emits the wide values as their own section function; the
         # body materializer itself is width-agnostic.
         self.precision_plan = precision_plan
+        self.shader_precision = shader_precision
         self.names: dict[int, str] = dict(argument_names)
         self.statements: list[ast.stmt] = []
         self.uses_math = False
@@ -355,6 +357,16 @@ class _BodyMaterializer:
                     "so there is no literal to emit"
                 )
             self.assign(result, _constant(payload))
+            if self.shader_precision is not None:
+                dtype = self.shader_precision.literal_dtype(
+                    result.id, result.dtype, payload,
+                )
+                if dtype is not None:
+                    assignment = self.statements[-1]
+                    self.statements[-1] = ast.AnnAssign(
+                        target=assignment.targets[0], annotation=ast.Constant(dtype),
+                        value=assignment.value, simple=1,
+                    )
             self._mark_constant(result, constant=True)
             return
 
@@ -958,6 +970,7 @@ def materialize_function_body(
     parameter_names: Sequence[str] | None = None,
     tensor_vocabulary: bool = False,
     precision_plan: Any = None,
+    shader_precision: Any = None,
 ) -> tuple[list[ast.stmt], bool]:
     """One SSA function's body as statements, plus whether it needs ``math``.
 
@@ -998,7 +1011,7 @@ def materialize_function_body(
 
     materializer = _BodyMaterializer(
         function, argument_names=names, tensor_vocabulary=tensor_vocabulary,
-        precision_plan=precision_plan,
+        precision_plan=precision_plan, shader_precision=shader_precision,
     )
     block_count = len(getattr(function, "blocks", {}) or {})
     if precision_plan is not None and precision_plan.wide_ids:

@@ -534,6 +534,8 @@ _OP_I32_MUL = 0x6C
 _OP_I32_DIV_S = 0x6D
 _OP_I32_SHL = 0x74
 _F64_OPS = {"Add": 0xA0, "Sub": 0xA1, "Mul": 0xA2, "Div": 0xA3}
+_F32_OPS = {"Add": 0x92, "Sub": 0x93, "Mul": 0x94, "Div": 0x95}
+_F32_COMPARISONS = {"Lt": 0x5D, "Le": 0x5F, "Gt": 0x5E, "Ge": 0x60, "Eq": 0x5B, "Ne": 0x5C}
 _I32_OPS = {"Add": 0x6A, "Sub": 0x6B, "Mul": 0x6C, "Div": 0x6D}
 _I32_COMPARISONS = {
     "Lt": 0x48, "Le": 0x4C, "Gt": 0x4A, "Ge": 0x4E, "Eq": 0x46, "Ne": 0x47,
@@ -571,6 +573,8 @@ _CONVERSIONS = {
 }
 _CAST_CONVERSIONS = {
     **_CONVERSIONS, ("f64", "i64"): (0xB0,),
+    ("f32", "i32"): (0xA8,),  # explicit GLSL int(f32), truncate toward zero
+    ("i32", "f32"): (0xB2,),  # explicit signed int32 -> float32
     ("f64", "f32"): (0xB6,),  # f32.demote_f64 (fptrunc)
 }
 _INDEX_CONVERSIONS = {**_CONVERSIONS, ("i64", "i32"): (0xA7,)}
@@ -863,7 +867,7 @@ def emit_ssa_module_to_wasm_core(
     output_elements: dict[int, int] = {}
     for output in returned_values:
         value_id = int(output.id)
-        if value_id in argument_ids:
+        if value_id in argument_ids and is_pointer(root, output):
             continue
         output_parameter_indices[value_id] = len(parameters)
         published = posted_ssa_value_fact(root, value_id, book=book)
@@ -871,7 +875,7 @@ def emit_ssa_module_to_wasm_core(
         output_dtypes[value_id] = (
             "float64" if physical in _F64_DTYPES
             else "int64" if physical in _I64_DTYPES
-            else "float64" if value_kind(output) in (None, "f64") else "int64"
+            else "float64" if value_kind(output) in (None, "f32", "f64") else "int64"
         )
         if tuple(output.shape or ()) and all(
             type(axis) is int and axis >= 0 for axis in output.shape
@@ -1008,11 +1012,16 @@ def emit_ssa_module_to_wasm_core(
             builder.raw(*conversion)
         return True
 
+    # Studio batch inputs are authored float32 spans. Read their posted physical
+    # dtype rather than treating every tensor as f64: both address stride and
+    # the host packing contract must remain four bytes for these scene columns.
     def physical_kind(env, value):
         fact = posted_ssa_value_fact(env.function, int(value.id), book=book)
         if fact is None:
             return None
         spelling = str(fact.physical_dtype or "").casefold()
+        if spelling in _F32_DTYPES:
+            return "f32"
         if spelling in _F64_DTYPES:
             return "f64"
         if spelling in _I64_DTYPES:
@@ -1325,6 +1334,8 @@ def emit_ssa_module_to_wasm_core(
                 builder.i64_const(int(held))
             elif kind == "i32":
                 builder.i32_const(int(held))
+            elif kind == "f32":
+                builder.raw(0x43, *_struct.pack("<f", float(held)))
             else:
                 builder.value_const(float(held))
             builder.local_set(slot_for(env, instruction.res, kind))
@@ -1374,7 +1385,7 @@ def emit_ssa_module_to_wasm_core(
                 or env.pointer_element_kind.get(base_id)
                 or physical_kind(env, instruction.args[0])
             )
-            if element_kind not in {"i32", "i64", "f64"}:
+            if element_kind not in {"i32", "i64", "f32", "f64"}:
                 shortfalls.append(WasmEmissionShortfall(
                     operation, f"{env.function.name}: %t{base_id} has no proved element layout",
                 ))
@@ -1385,7 +1396,7 @@ def emit_ssa_module_to_wasm_core(
                     and push_as(env, instruction.args[1], "i32", operation,
                                 _INDEX_CONVERSIONS)):
                 return
-            builder.i32_const(2 if element_kind == "i32" else 3)
+            builder.i32_const(2 if element_kind in {"i32", "f32"} else 3)
             builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
             builder.local_set(slot_for(env, instruction.res, "i32"))
             env.pointer_element_kind[int(instruction.res.id)] = element_kind
@@ -1413,7 +1424,7 @@ def emit_ssa_module_to_wasm_core(
                     == str(instruction.res.dtype).casefold()
                 and result_fact.storage is None
             )
-            if (element_kind not in {"i32", "i64", "f64"}
+            if (element_kind not in {"i32", "i64", "f32", "f64"}
                     or not (result_kind == element_kind or imported_typed_load)
                     or result_fact is None or result_fact.storage == "span"):
                 shortfalls.append(WasmEmissionShortfall(
@@ -1424,7 +1435,9 @@ def emit_ssa_module_to_wasm_core(
                 return
             if not push_as(env, instruction.args[0], "i32", operation):
                 return
-            if element_kind == "i32":
+            if element_kind == "f32":
+                builder.raw(0x2A, 2, 0)  # f32.load, four-byte natural alignment
+            elif element_kind == "i32":
                 builder.i32_load()
             elif element_kind == "i64":
                 builder.i64_load()
@@ -1434,7 +1447,7 @@ def emit_ssa_module_to_wasm_core(
             return
         if operation == "Store" and len(instruction.args) >= 2:
             element_kind = env.pointer_element_kind.get(int(instruction.args[1].id))
-            if element_kind not in {"i32", "i64", "f64"}:
+            if element_kind not in {"i32", "i64", "f32", "f64"}:
                 shortfalls.append(WasmEmissionShortfall(
                     operation, "store target has no proved element layout",
                 ))
@@ -1442,7 +1455,9 @@ def emit_ssa_module_to_wasm_core(
             if not (push_as(env, instruction.args[1], "i32", operation)
                     and push_as(env, instruction.args[0], element_kind, operation)):
                 return
-            if element_kind == "i32":
+            if element_kind == "f32":
+                builder.raw(0x38, 2, 0)  # f32.store, four-byte natural alignment
+            elif element_kind == "i32":
                 builder.i32_store_width(32)
             elif element_kind == "i64":
                 builder.i64_store()
@@ -1463,7 +1478,7 @@ def emit_ssa_module_to_wasm_core(
             else:
                 if push(env, source) is None:
                     return
-                builder.raw(0x9A)  # f64.neg
+                builder.raw(0x8C if kind == "f32" else 0x9A)  # f32/f64.neg
             builder.local_set(slot_for(env, instruction.res, kind or "f64"))
             return
         if operation == "Abs" and instruction.args and env.kinds.get(
@@ -1472,8 +1487,9 @@ def emit_ssa_module_to_wasm_core(
             # spelling here yet and still refuses below, by name).
             if push(env, instruction.args[0]) is None:
                 return
-            builder.raw(_OP_F64_ABS)
-            builder.local_set(slot_for(env, instruction.res, "f64"))
+            kind = env.kinds.get(int(instruction.args[0].id))
+            builder.raw(0x8B if kind == "f32" else _OP_F64_ABS)
+            builder.local_set(slot_for(env, instruction.res, kind))
             return
         if operation in {"Cast", "CastLike"} and instruction.args:
             result_shape = tuple(getattr(instruction.res, "shape", ()) or ())
@@ -1577,6 +1593,8 @@ def emit_ssa_module_to_wasm_core(
                     builder.i64_const(0).raw(_OP_I64_NE)
                 elif held == "f64":
                     builder.value_const(0.0).raw(_OP_F64_NE)
+                elif held == "f32":
+                    builder.raw(0x43, 0, 0, 0, 0, 0x5C)  # f32.const 0; f32.ne
                 else:
                     builder.i32_const(0).raw(_OP_I32_NE)
             elif not push_as(
@@ -1637,7 +1655,11 @@ def emit_ssa_module_to_wasm_core(
                     operation, "imported signed remainder has no i32 operands",
                 ))
             return
-        if operation == "Select" and instruction.attributes.get("llvm_opcode") == "select":
+        if operation == "LNot" and len(instruction.args)==1 and value_kind(instruction.args[0])=="i32":
+            if push_as(env, instruction.args[0], "i32", operation):
+                builder.raw(0x45).local_set(slot_for(env,instruction.res,"i32"))
+            return
+        if operation == "Select":
             if (len(instruction.args) != 3 or instruction.res is None
                     or value_kind(instruction.args[0]) != "i32"
                     or value_kind(instruction.args[1]) != value_kind(instruction.args[2])
@@ -1651,6 +1673,12 @@ def emit_ssa_module_to_wasm_core(
                     and push_as(env, instruction.args[2], kind, operation)
                     and push_as(env, instruction.args[0], "i32", operation)):
                 builder.select().local_set(slot_for(env, instruction.res, kind))
+            return
+        if operation in {"LAnd", "LOr"}:
+            if len(instruction.args)==2 and all(str(a.dtype) in {"bool", "i1"} for a in instruction.args):
+                if all(push_as(env,a,"i32",operation) for a in instruction.args):
+                    builder.raw(0x71 if operation=="LAnd" else 0x72).local_set(slot_for(env,instruction.res,"i32"))
+            else: shortfalls.append(WasmEmissionShortfall(operation,"logical operands must be boolean i32"))
             return
         if operation in {"And", "Or", "Xor", "Shl", "AShr"}:
             bitops = {
@@ -1677,7 +1705,7 @@ def emit_ssa_module_to_wasm_core(
             kind = value_kind(instruction.res) or (
                 "f64" if "f64" in kinds else kinds[0] or "f64"
             )
-            if (kind != "f64" and operation == "Div"
+            if (kind not in {"f32", "f64"} and operation == "Div"
                     and not (kind == "i32"
                              and instruction.attributes.get("llvm_opcode") == "sdiv"
                              and all(value_kind(arg) == "i32"
@@ -1692,7 +1720,7 @@ def emit_ssa_module_to_wasm_core(
             ):
                 return
             builder.raw({
-                "f64": _F64_OPS, "i64": _I64_OPS, "i32": _I32_OPS,
+                "f32": _F32_OPS, "f64": _F64_OPS, "i64": _I64_OPS, "i32": _I32_OPS,
             }[kind][operation])
             builder.local_set(slot_for(env, instruction.res, kind))
             return
@@ -1700,7 +1728,7 @@ def emit_ssa_module_to_wasm_core(
             kinds = {env.kinds.get(int(a.id)) for a in instruction.args}
             kind = (
                 "f64" if "f64" in kinds or None in kinds
-                else "i64" if "i64" in kinds else "i32"
+                else "f32" if "f32" in kinds else "i64" if "i64" in kinds else "i32"
             )
             if not all(
                 push_as(env, argument, kind, operation)
@@ -1708,10 +1736,14 @@ def emit_ssa_module_to_wasm_core(
             ):
                 return
             builder.raw({
-                "f64": _F64_COMPARISONS, "i64": _I64_COMPARISONS,
+                "f32": _F32_COMPARISONS, "f64": _F64_COMPARISONS, "i64": _I64_COMPARISONS,
                 "i32": _I32_COMPARISONS,
             }[kind][operation])
             builder.local_set(slot_for(env, instruction.res, "i32"))
+            return
+        if operation in {"Sqrt", "sqrt"} and len(instruction.args)==1 and value_kind(instruction.args[0])=="f32" and value_kind(instruction.res)=="f32":
+            if push_as(env,instruction.args[0],"f32",operation):
+                builder.raw(0x91).local_set(slot_for(env,instruction.res,"f32"))
             return
         if operation in _WASM_UNARY_OPS and len(instruction.args) == 1 and instruction.res is not None:
             source_kind = value_kind(instruction.args[0])
@@ -1857,6 +1889,8 @@ def emit_ssa_module_to_wasm_core(
         if fact is None:
             return None
         spelling = str(fact.physical_dtype or "").casefold()
+        if spelling in _F32_DTYPES:
+            return "f32"
         if spelling in _F64_DTYPES:
             return "f64"
         if spelling in _I64_DTYPES:
@@ -1990,10 +2024,10 @@ def emit_ssa_module_to_wasm_core(
     # -- the exported entry --------------------------------------------------
     root_env = _Env({
         value_id: index for index, (_, value_id) in enumerate(parameters)
-        if value_id in argument_ids
+        if value_id in argument_ids and index not in output_parameter_indices.values()
     }, root)
-    for kind, value_id in parameters:
-        if value_id not in argument_ids:
+    for parameter_index, (kind, value_id) in enumerate(parameters):
+        if value_id not in argument_ids or parameter_index in output_parameter_indices.values():
             continue
         root_env.kinds[value_id] = "i32" if kind == "buffer" else kind
     for kind, value_id in parameters:
@@ -2076,7 +2110,12 @@ def emit_ssa_module_to_wasm_core(
                 continue
             builder.local_get(output_parameter)
             if output_dtypes[int(returned.id)] == "int64":
-                if push_as(root_env, returned, "i64", "Ret"):
+                # A signed GLSL int32 result uses signed extension. Bool still
+                # uses the unsigned extension declared by the common ABI.
+                conversions = _CONVERSIONS
+                if str(returned.dtype).casefold() in {"int32", "i32"}:
+                    conversions = {**_CONVERSIONS, ("i32", "i64"): (0xAC,)}
+                if push_as(root_env, returned, "i64", "Ret", conversions):
                     builder.raw(_OP_I64_STORE, 3, 0)
             elif push_as(root_env, returned, "f64", "Ret"):
                 builder.store()
@@ -2148,7 +2187,7 @@ def emit_ssa_module_to_wasm_core(
         dtype = output_dtypes.get(value_id)
         if dtype is None:
             physical = None if value is None else physical_kind(root_env, value)
-            dtype = {"i64": "int64", "i32": "int32", "f64": "float64"}.get(physical, "float64")
+            dtype = {"i64": "int64", "i32": "int32", "f32": "float32", "f64": "float64"}.get(physical, "float64")
         buffer_dtypes.append(dtype)
         buffer_shapes.append(tuple(getattr(value, "shape", ()) or ()))
     emission_record = None
@@ -2299,11 +2338,12 @@ class WasmCoreExecution:
         argument_kinds: list[str] = []
         output_dtypes = dict(artifact.output_dtypes)
         output_elements = dict(artifact.output_elements)
+        buffer_dtypes = dict(zip(artifact.buffer_order, artifact.buffer_dtypes))
         for kind, value_id in artifact.parameters:
             fed = feeds.get(int(value_id))
             argument_kinds.append(kind)
             if kind == "buffer":
-                dtype = output_dtypes.get(int(value_id), "float64")
+                dtype = buffer_dtypes.get(int(value_id), output_dtypes.get(int(value_id), "float64"))
                 held = np.ascontiguousarray(
                     np.atleast_1d(np.asarray(
                         (np.zeros(output_elements[int(value_id)], dtype=dtype)

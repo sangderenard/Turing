@@ -1,0 +1,7 @@
+# Studio lights off, excluding shop lights
+
+One visible Turn off Studio lights (A + B) button edits the existing ten STUDIO_LIGHTS strength fields to zero. It clears their old exposure-split state and solo audition, and removes only matching B strength overrides. Shops, filters, poses, material data, geometry and all other Room overrides remain unchanged. It is an explicit level edit, not a new runtime mask. The existing save/load profile path persists zero levels. The button was not clicked in the user session.
+
+PASS full meowdoku_marble_studio_lighting_check.mjs including original DOM handlers for a previously nonzero A/B rig, shop/state equality, save/reload, shared PBR emission writer zero rows and unchanged extra rows, and original renderer registration loop zero Studio intensity inputs with untouched shop intensity/color. The last check runs at the CPU-to-GL boundary, not GPU pixels or completed native ray exposure. No actual phone visual test claimed.
+
+Published one checked block insertion into existing live marble_studio_lighting.js, retaining unrelated unpublished source. Syntax checked and HTTPS bytes verified. No server restart or live session operation. Receipt: build\dot-studio-lights-off-20261110T145120Z\receipt.json

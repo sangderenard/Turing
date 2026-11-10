@@ -500,7 +500,12 @@ def _propagate_scalar_dtypes(functions) -> None:
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
                  not in aggregate_result_ids
                  or (instruction.attributes.get("computed_tensor_metadata")
-                     and int(instruction.res.id) in metadata_output_ids))
+                     and int(instruction.res.id) in metadata_output_ids)
+                 or (
+                     value_cell(int(instruction.res.id))[1] is not None
+                     and getattr(value_cell(int(instruction.res.id))[1], "physical_dtype", None)
+                     == dtype_of.get(int(instruction.res.id))
+                 ))
             and dtype_of.get(int(instruction.res.id), "") in _DECLARED_LITERAL_DTYPES
             and (not instruction.args or address_base.get(int(instruction.args[0].id))
                  not in heap_element_of)

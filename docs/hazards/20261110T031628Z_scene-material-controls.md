@@ -1,0 +1,11 @@
+2026-11-10 Scene material controls (desktop source and narrow live release)
+
+Three independently selected material transport groups are wired: existing marble Legacy/Glass rod/Injection dye, product stage and lighting Legacy/Dielectric, and remaining room Legacy/Dielectric. Stage and room start Legacy, and absent old profile settings migrate without rewriting stored profiles. Existing bottom material editor selects actual scene catalogue materials and retains the single PBR/Phong/enamel/texstack buffer rows and optical record map. Unmeasured scene spectra start unset, not RGB-derived.
+
+sceneForPhoto takes the actual generator parts, preserves every triangle, rekeys global materials into one compact table, and emits the reviewed scene_material_engines contract. Native fixture emission uses the same writeStudioFixtureRows as Phong. Five real table solids keep separate optical ownership; opaque skirt and stands keep ordinary surface law. Open/mixed-material transmissive geometry rejects explicitly, with no Legacy fallback. packMarblePhoto preserves metadata.
+
+Passed source and exact staged photo/strength/geometry pack tests; optical editor, profile round-trip/migration, scene engine helper and shared material layout tests. Actual JS table contract passes Python backend admission. Actual Chrome fresh tab boot shows 72,960 triangles, all three choices and scene material targets. Stage dielectric activates the original five optical fields and leaves PBR IOR editable; room opaque material retains surface controls. Engine/target switching leaves object status Ready and no object save. No ray image was submitted in this UI smoke test.
+
+Release: build/dot-scene-engines-20261110/publication.json. Eight assets, 255 unrelated files hash-unchanged, existing foot-scale adaptive clipping preserved. No server restart. Staged and source main remain distinct; hidden native scene handoff, chase camera, DOF and upcoming kicker/shop work were not activated. Screenshot: build/dot-scene-engines-20261110/shared-material-editor-live.png.
+
+Browser user-data reset was stopped before any export or deletion; no storage changes. Supported browser has no storage-management API. A temporary read-only reset preview page was removed and its tab closed. Existing Studio tab was never reloaded or edited.

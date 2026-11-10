@@ -1064,6 +1064,25 @@ def specialize_python_precision_widths(
     iterable_domains = {}
     for node_id, data in target.nodes(data=True):
         actual_class = (data.get("attributes") or {}).get("callsite_iterable_element_class_cell")
+        if actual_class is None and metadata.get("lexical_read_scope") is not None:
+            # A callsite can publish an exact iterable-member class directly
+            # on its forked source row (nested zip projection).  Read that
+            # receipt before minting the numeric scope; it belongs in the
+            # specialization identity even when no node attribute mirrors it.
+            candidate = class_book.latest_ref(
+                _SOURCE_VALUE_CLASS,
+                (tuple(metadata["lexical_read_scope"]), int(data.get("value_id", node_id))),
+            )
+            if candidate is not None:
+                candidate_fact = class_book.page(_SOURCE_VALUE_CLASS).cell(
+                    candidate.row, candidate.column,
+                )
+                if (
+                    isinstance(candidate_fact, tuple)
+                    and len(candidate_fact) >= 3
+                    and candidate_fact[2] == "callsite zipped iterable element class"
+                ):
+                    actual_class = candidate
         if actual_class is None:
             continue
         value_id = int(data.get("value_id", node_id))
@@ -6200,11 +6219,10 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             return (value, reads, tuple(dict.fromkeys(proofs))) if with_proof else (value, reads)
 
         if site is None:
-            if with_bounds:
-                # No authored site, so no guard bounds: the half-bound form
-                # returns four members like its other exits.
-                return None, None, (), ()
-            return answer(interval, ())
+            # A folded callsite has no authored guard expression to walk.
+            # The bound-query protocol still has four fields: no lower or
+            # upper bound and no controlling read or source proof.
+            return (None, None, (), ()) if with_bounds else answer(interval, ())
         site_span = source_span_cell(unit, site_id) if site_ast is None else None
         if site_ast is not None:
             row = source_span_row(None, site_ast)
@@ -8518,6 +8536,7 @@ def _normalize_lexical_values(
     }
 
     local_class_declarations: dict[str, tuple[str, Any]] = {}
+    local_scalar_declarations: dict[str, tuple[str, Any]] = {}
     # Locals whose declaration is ``C | None``: ``local_class_declarations``
     # holds the present arm ``C`` (what a presence refinement proves), never
     # the class of every value the local binds.
@@ -8554,6 +8573,13 @@ def _normalize_lexical_values(
                 )
                 if len(span_row) >= 2 else None
             )
+            # Fixed-width source annotations declare a physical scalar carrier,
+            # not a new Python semantic class. Retain the exact declaration
+            # here; bind_target attaches it to the actual lexical value.
+            from ...transmogrifier.dtype_layout import source_annotation_dtype
+            declared_dtype = source_annotation_dtype(declaration.get("annotation"))
+            if declared_dtype not in {None, "opaque_ref"} and annotation_cell is not None:
+                local_scalar_declarations[name] = (declared_dtype, annotation_cell)
             if isinstance(annotation_expression, ast.Subscript):
                 aggregate = annotation_expression.value
                 aggregate_name = (
@@ -17022,6 +17048,14 @@ def _normalize_lexical_values(
                             element_annotation_cell
                         ),
                     })
+            scalar_declaration = local_scalar_declarations.get(target.id)
+            if scalar_declaration is not None and int(value) in graph.G:
+                dtype, declaration_cell = scalar_declaration
+                attributes = graph.G.nodes[int(value)].setdefault("attributes", {})
+                incumbent = attributes.get("local_scalar_annotation")
+                if incumbent is not None and incumbent[0] != dtype:
+                    raise ValueError("one source value has incompatible scalar declarations")
+                attributes["local_scalar_annotation"] = (dtype, declaration_cell)
             local_class_declaration = local_class_declarations.get(target.id)
             if local_class_declaration is not None and int(value) in graph.G:
                 if target.id not in local_optional_class_declarations:

@@ -18,6 +18,11 @@ prebaked board database) and a JSON API over the games in ``games.py``:
     GET  /api/state
     POST /api/profile {"name": "..."}      -> pick this session's player profile
     GET  /api/profile                      -> the profile, and the current game's top scores
+    POST /api/account/signup {"username","password"}  -> create a real login, own this browser's content
+    POST /api/account/login  {"username","password"}  -> real login (accounts.py; separate from /api/profile)
+    POST /api/account/logout {}
+    GET  /api/account/me                   -> the logged-in account, or null
+    GET  /api/account/assets               -> this account's owned marble designs/photos + migrated profile
 
 Finished games (``Game.result()``) are recorded on the session's profile
 (``profiles.py``); every state carries ``player`` and that game's ``record``.
@@ -67,9 +72,11 @@ from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped te
 from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
+from meowdoku import obj_assets as obj_assets_mod
 from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE] immutable saved designs
 from meowdoku import marble_photo as marble_photo_mod  # noqa: E402  [MARBLE PHOTO] Spectral worker process
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
+from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real password login, SQLite-backed, separate from profiles.py
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PRODUCT_WAIT_SECONDS = 90       # [LOADING] how long a request for a building product file waits before "503, retry"
@@ -320,6 +327,8 @@ COOKIE = "meowdoku_session"
 PLAYER_COOKIE = "meowdoku_player"      # the long-lived player identity (per port, like COOKIE)
 PLAYER_COOKIE_SECONDS = 2 * 365 * 24 * 3600
 SESSION_IDLE_SECONDS = 2 * 3600
+ACCOUNT_COOKIE = "meowdoku_account"    # a real login session token (accounts.py) -- distinct from
+                                       # both COOKIE (game-table) and PLAYER_COOKIE (passwordless name)
 
 
 class Sessions:
@@ -340,11 +349,16 @@ class Sessions:
         self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(web_dir.parent / "marble_objects")
         self.marble_photos = marble_photo_mod.PhotoJobs(web_dir.parent / "marble_photos", ROOT.parent / "spectral-analyzer")
+        from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
+        self.client_ray_bridge = ClientRayProcessBridge()
         self.tickets = tickets_mod.Store(web_dir.parent / "tickets")
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
         self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
+        self.accounts = accounts_mod.Accounts(web_dir.parent / "accounts.db")   # [ACCOUNTS] real password login
+        self.obj_assets = obj_assets_mod.Store(web_dir.parent / "obj_assets", self.accounts, ROOT.parent / "spectral-analyzer")
+        self.marble_objects.obj_assets = self.obj_assets
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -413,6 +427,47 @@ def make_handler(sessions: Sessions):
                 table.player_token, table.player = held, name
             return table
 
+        def _job_identity(self):
+            import hashlib
+            table = self._table()
+            account = self._account()
+            # A shared browser is not permission to access another login's jobs.
+            # Anonymous jobs stay browser-owned; migration is not implicit.
+            keys = (["account:" + str(account["id"])] if account is not None else
+                    ["browser:" + hashlib.sha256((table.player_token or self._token).encode()).hexdigest()])
+            return keys, account
+
+        def _job_authorize(self, digest):
+            from meowdoku import job_library
+            keys, account = self._job_identity()
+            if not job_library.allowed(sessions.marble_photos.directory, digest, keys):
+                raise marble_photo_mod.PhotoError("job belongs to another identity", 403)
+
+        def _is_secure(self) -> bool:
+            import ssl
+            return isinstance(self.connection, ssl.SSLSocket) or self.headers.get("X-Forwarded-Proto") == "https"
+
+        def _account(self) -> dict | None:
+            """The logged-in account for this request (accounts.py), or None.
+            Reads ACCOUNT_COOKIE only -- never issues one itself; that only
+            happens on a successful /api/account/signup or /api/account/login."""
+            from http.cookies import SimpleCookie
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+            return sessions.accounts.user_for_token(token)
+
+        def _set_account_cookie(self, token: str) -> None:
+            if not getattr(self, "_set_cookie", None):
+                self._set_cookie = []
+            secure = "; Secure" if self._is_secure() else ""
+            self._set_cookie.append(
+                f"{ACCOUNT_COOKIE}={token}; Path=/; Max-Age={accounts_mod.SESSION_SECONDS}; HttpOnly; SameSite=Lax{secure}")
+
+        def _clear_account_cookie(self) -> None:
+            if not getattr(self, "_set_cookie", None):
+                self._set_cookie = []
+            self._set_cookie.append(f"{ACCOUNT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+
         # ---- [ACCESS] origin and tier, from the socket peer and the Host header only (never a forwarding header: there is no proxy)
         def _classify(self) -> None:
             self._origin, self._tier = sessions.access.decide(self.client_address[0], self.headers.get("Host"))
@@ -479,8 +534,13 @@ def make_handler(sessions: Sessions):
             if not getattr(self, "path", "").startswith("/api/"):
                 path = getattr(self, "path", "").split("?", 1)[0]
                 self.send_header("Cache-Control", "no-store" if path in
-                                 ("/marble_studio.html", "/marble_studio.js", "/marble_object.js",
-                                  "/marble_mesh.js", "/dice_mesh.js", "/marble_photo.js", "/particle_styles.js")
+                                 ("/marble_studio.html", "/marble_studio.js", "/marble_drive_input.js", "/marble_chase_camera.js", "/marble_studio_scene.js", "/marble_studio_transition.js", "/marble_studio_phong.js", "/marble_studio_dof.js", "/marble_camera_toolbox.js", "/marble_camera_toolbox_mount.js", "/marble_spot_sample.js", "/marble_rangefinder.js", "/marble_rangefinder_panel.js", "/marble_camera_binding.js", "/marble_object.js",
+                                  "/marble_mesh.js", "/dice_mesh.js", "/marble_photo.js", "/marble_live.js", "/marble_downloads.js", "/marble_autosave.js", "/marble_object_snapshot.js", "/marble_imported_object.js", "/marble_geometry_policy.js", "/marble_film_response.js", "/marble_film_science.js",
+                                  "/marble_room.js", "/marble_studio_lighting.js", "/marble_light_strengths.js", "/marble_backdrop.js",
+                                  "/marble_glass_preview.js", "/marble_materials.js", "/marble_studio_surfaces.js",
+                                  "/marble_studio_table.js", "/marble_studio_scale.js", "/marble_table_lights.js", "/marble_bubbles.js",
+                                  "/marble_studio_gobos.js", "/marble_lighting_profiles.js", "/particle_styles.js",
+                                  "/marble_optical_authoring.js", "/marble_studio_optical.js", "/marble_optical_diagnostic.js", "/marble_lens_controls.js")
                                  else "no-cache")  # actively edited pages must revalidate
             super().end_headers()
 
@@ -722,6 +782,23 @@ def make_handler(sessions: Sessions):
                 return self._anim_get()
             if path == "/api/loading_library":                    # [STUDIO] the library listing: anyone may view
                 return self._library_get()
+            if path == "/api/marble_photo/jobs":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                from meowdoku import job_library
+                keys, account = self._job_identity()
+                digests = sessions.accounts.assets_for_user(account["id"], "marble_photo") if account else ()
+                return self._json(job_library.entries(sessions.marble_photos, keys, digests))
+            if path == "/api/marble_photo/lenses":
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                from meowdoku.marble_lens_contract import lens_catalog
+                try:
+                    return self._json(lens_catalog(sessions.marble_photos.spectral_root))
+                except (ValueError, OSError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
                 if not access_mod.require_tier(self, "edit"):
                     return
@@ -729,6 +806,7 @@ def make_handler(sessions: Sessions):
                 query = parse_qs(self.path.partition("?")[2])
                 digest = (query.get("digest") or [""])[0]
                 try:
+                    self._job_authorize(digest)
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
@@ -748,8 +826,31 @@ def make_handler(sessions: Sessions):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/api/obj_assets" or path.startswith("/api/obj_assets/"):
+                account = self._account()
+                account_id = account["id"] if account else None
+                try:
+                    if path == "/api/obj_assets":
+                        return self._json({"entries": sessions.obj_assets.entries(account_id)})
+                    parts = path[len("/api/obj_assets/"):].split("/")
+                    if len(parts) == 1:
+                        return self._json(sessions.obj_assets.get(parts[0], account_id))
+                    if len(parts) != 2 or parts[1] not in ("source", "mtl"):
+                        return self._json({"error": "OBJ asset unavailable"}, HTTPStatus.NOT_FOUND)
+                    body = sessions.obj_assets.source(parts[0], account_id, mtl=parts[1] == "mtl")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                except obj_assets_mod.AssetError as error:
+                    return self._json({"error": str(error)}, error.status)
             if path == "/api/marble_objects":
-                return self._json({"entries": sessions.marble_objects.entries()})
+                account = self._account()
+                return self._json({"entries": sessions.marble_objects.for_account(account["id"] if account else None).entries()})
             if path == "/api/marble_preview_spec":
                 # The Studio drive uses the same compiled 4k SDF toy course and
                 # contact law as Marble Madness in an independent 1–16 marble run.
@@ -773,11 +874,45 @@ def make_handler(sessions: Sessions):
                 return self._json(spec)
             if path.startswith("/api/marble_objects/"):
                 try:
-                    return self._json(sessions.marble_objects.get(path.rsplit("/", 1)[1]))
+                    account = self._account()
+                    return self._json(sessions.marble_objects.for_account(account["id"] if account else None).get(path.rsplit("/", 1)[1]))
                 except (KeyError, FileNotFoundError):
                     return self._json({"error": "no such marble object"}, HTTPStatus.NOT_FOUND)
                 except marble_objects_mod.ObjectError as error:
-                    return self._json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.INTERNAL_SERVER_ERROR))
+            if path == "/api/account/me":
+                self._set_cookie = []
+                account = self._account()
+                return self._json({"account": account})
+            if path == "/api/account/assets":
+                self._set_cookie = []
+                account = self._account()
+                if account is None:
+                    return self._json({"error": "not logged in"}, HTTPStatus.UNAUTHORIZED)
+                marble_object_digests = sessions.accounts.assets_for_user(account["id"], "marble_object")
+                marble_objects = []
+                for digest in marble_object_digests:
+                    try:
+                        entry = sessions.marble_objects.for_account(account["id"]).get(digest)
+                        marble_objects.append({"digest": digest, "name": entry.get("name"),
+                                               "shape": entry.get("design", {}).get("base-shape")})
+                    except (KeyError, FileNotFoundError, marble_objects_mod.ObjectError):
+                        continue
+                marble_photo_digests = sessions.accounts.assets_for_user(account["id"], "marble_photo")
+                marble_photos = []
+                for digest in marble_photo_digests:
+                    try:
+                        from meowdoku import job_library
+                        if not job_library.allowed(sessions.marble_photos.directory, digest, ["account:" + str(account["id"])]):
+                            continue
+                        marble_photos.append({"digest": digest, **sessions.marble_photos.status(digest)})
+                    except marble_photo_mod.PhotoError:
+                        continue
+                profile_names = sessions.accounts.assets_for_user(account["id"], "profile")
+                profile = sessions.profiles.profile(profile_names[0]) if profile_names else None
+                return self._json({"account": account, "marble_objects": marble_objects,
+                                   "marble_photos": marble_photos, "profile": profile,
+                                   "obj_assets": sessions.obj_assets.entries(account["id"])})
             if path == "/api/spectate/watch":
                 return self._watch()
             if path == "/ws/spectate":                           # [LIVEVIEW] the viewer's read-only push socket
@@ -970,6 +1105,29 @@ def make_handler(sessions: Sessions):
 
         def do_POST(self):  # noqa: N802
             path0 = self.path.split("?", 1)[0]
+            # Worker-only payload mailbox: credentials are process-local and
+            # distinct from browser ray credentials. Never accepts browser Origin.
+            if path0.startswith("/api/client_rays/engine/"):
+                from meowdoku.client_ray_relay import RelayError, MAX_SCENE_BYTES, MAX_BODY
+                try:
+                    if self.client_address[0] not in ("127.0.0.1", "::1") or self.headers.get("Origin") is not None:
+                        raise RelayError("engine mailbox is loopback-only",403)
+                    job=self.headers.get("X-Meowdoku-Engine-Job", "")
+                    auth=self.headers.get("Authorization", "")
+                    if not auth.startswith("Bearer "):
+                        raise RelayError("missing engine credential",403)
+                    secret=auth[7:]
+                    sessions.client_ray_bridge.authenticate(job,secret)
+                    action=path0.rsplit("/",1)[1]
+                    length=int(self.headers.get("Content-Length",0))
+                    if not 0<length<=(MAX_SCENE_BYTES if action=="scene" else MAX_BODY):
+                        raise RelayError("invalid bounded engine request",413)
+                    body=json.loads(self.rfile.read(length))
+                    if not isinstance(body,dict):raise RelayError("expected engine request object")
+                    return self._json(sessions.client_ray_bridge.engine(job,secret,action,body))
+                except (ValueError,TypeError,KeyError) as error:
+                    self.close_connection=True
+                    return self._json({"error":str(error)},getattr(error,"status",400))
             self._classify()                                      # [ACCESS]
             if self._tier == "shader":
                 self._shader_request(path0, "POST")
@@ -1017,6 +1175,25 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path0 in ("/api/loading_anim", "/api/loading_candidate") and not self._is_viewer():
                 return self._anim_post(int(self.headers.get("Content-Length") or 0), temporary=path0.endswith("candidate"))
+            if path0 == "/api/obj_assets":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                account = self._account()
+                if account is None:
+                    return self._json({"error": "Log in to add an OBJ asset"}, HTTPStatus.UNAUTHORIZED)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if self.headers.get("Transfer-Encoding") or not 0 < length <= obj_assets_mod.MAX_BYTES:
+                        self.close_connection = True
+                        raise obj_assets_mod.AssetError("OBJ upload size is invalid", 413)
+                    if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                        raise obj_assets_mod.AssetError("Expected application/json")
+                    result = sessions.obj_assets.put(json.loads(self.rfile.read(length)), account["id"])
+                    return self._json(result, HTTPStatus.CREATED)
+                except (ValueError, TypeError) as error:
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 == "/api/marble_objects" and not self._is_viewer():
                 if not access_mod.require_tier(self, "edit"):
                     return
@@ -1028,13 +1205,65 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "marble object is too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 try:
                     value = json.loads(self.rfile.read(length))
-                    return self._json(sessions.marble_objects.put(value), HTTPStatus.CREATED)
+                    account = self._account()
+                    result = sessions.marble_objects.for_account(account["id"] if account else None).put(value)
+                    if account is not None:
+                        sessions.accounts.claim(account["id"], "marble_object", result["digest"])
+                    return self._json(result, HTTPStatus.CREATED)
                 except (ValueError, TypeError, marble_objects_mod.ObjectError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            if path0 in ("/api/marble_photo", "/api/marble_photo/cancel") and not self._is_viewer():
+            if path0 == "/api/marble_camera/housing":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not access_mod.require_tier(self, "edit"):
+                    return
+                from meowdoku.marble_camera_housing import HousingError, MAX_REQUEST_BYTES, housing_response
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if self.headers.get("Transfer-Encoding") or not 0 < length <= MAX_REQUEST_BYTES:
+                        raise HousingError("Invalid bounded camera housing request", 413)
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        raise HousingError("Incomplete camera housing request")
+                    result = housing_response(body, sessions.marble_photos.spectral_root)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(result)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(result)
+                    return
+                except (ValueError, TypeError) as error:
+                    self.close_connection = True
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 in ("/api/marble_photo", "/api/marble_photo/cancel", "/api/marble_photo/live", "/api/marble_photo/retouch", "/api/marble_photo/film_preview") and not self._is_viewer():
                 if not access_mod.require_tier(self, "edit"):
                     return
                 length = int(self.headers.get("Content-Length") or 0)
+                if path0 == "/api/marble_photo/live":
+                    if length <= 0 or length > 4096:
+                        return self._json({"error": "invalid live control request"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        from meowdoku.marble_live import update_live
+                        body = json.loads(self.rfile.read(length))
+                        if not isinstance(body, dict):
+                            raise ValueError("live control must be an object")
+                        digest = str(body.get("digest", ""))
+                        self._job_authorize(digest)
+                        result = (sessions.marble_photos.cancel(digest, live_only=True) if body.get("stop") is True
+                                  else update_live(sessions.marble_photos, digest, body))
+                        return self._json(result)
+                    except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
+                        return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+                if path0 == "/api/marble_photo/film_preview":
+                    if length <= 0 or length > 4096:
+                        return self._json({"error": "invalid film preview request"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        from meowdoku.film_science import preview_film
+                        body = json.loads(self.rfile.read(length))
+                        return self._json(preview_film(body, sessions.marble_photos.spectral_root))
+                    except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
+                        return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
                 if path0 == "/api/marble_photo":
                     if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/octet-stream":
                         return self._json({"error": "expected MRP1 application/octet-stream"}, HTTPStatus.BAD_REQUEST)
@@ -1042,17 +1271,74 @@ def make_handler(sessions: Sessions):
                         self.close_connection = True
                         return self._json({"error": "marble photo upload size is invalid"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                     try:
-                        return self._json(sessions.marble_photos.start(self.rfile.read(length), sessions.marble_objects),
-                                          HTTPStatus.ACCEPTED)
+                        keys, account = self._job_identity()
+                        import ssl
+                        scheme="https" if isinstance(self.connection,ssl.SSLSocket) else "http"
+                        result = sessions.marble_photos.start(self.rfile.read(length), sessions.marble_objects.for_account(account["id"] if account else None), owners=keys,
+                            client_bridge=sessions.client_ray_bridge,
+                            bridge_url=f"{scheme}://127.0.0.1:{self.server.server_port}/api/client_rays/engine",
+                            bridge_ca=sessions.web_dir.parent/"tls"/"ca.crt")
+                        if account is not None:
+                            sessions.accounts.claim(account["id"], "marble_photo", result["digest"])
+                        return self._json(result, HTTPStatus.ACCEPTED)
                     except marble_photo_mod.PhotoError as error:
                         return self._json({"error": str(error)}, error.status)
+                if path0 == "/api/marble_photo/retouch":
+                    if length <= 0 or length > 4096:
+                        return self._json({"error": "invalid retouch request"}, HTTPStatus.BAD_REQUEST)
+                    try:
+                        body = json.loads(self.rfile.read(length))
+                        digest = str(body.get("digest", ""))
+                        self._job_authorize(digest)
+                        return self._json(sessions.marble_photos.retouch(digest, body))
+                    except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
+                        return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
                 if length <= 0 or length > 1024:
                     return self._json({"error": "invalid photo cancel request"}, HTTPStatus.BAD_REQUEST)
                 try:
                     digest = json.loads(self.rfile.read(length)).get("digest", "")
+                    self._job_authorize(digest)
                     return self._json(sessions.marble_photos.cancel(digest))
                 except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 in ("/api/account/signup", "/api/account/login"):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 1024:
+                    self._set_cookie = []
+                    return self._json({"error": "expected {\"username\", \"password\"}"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    body = json.loads(self.rfile.read(length))
+                    username, password = str(body.get("username", "")), str(body.get("password", ""))
+                    user = (sessions.accounts.signup(username, password) if path0.endswith("signup")
+                            else sessions.accounts.login(username, password))
+                    self._set_cookie = []
+                    self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+                    # Carry forward this browser's existing passwordless profile
+                    # (profiles.py) onto the new/just-logged-in account, so
+                    # game stats/inventory earned before the account existed
+                    # are not left behind. First claim only: an account that
+                    # already has a profile, or a profile another account
+                    # already claimed, is left as-is.
+                    from http.cookies import SimpleCookie
+                    jar = SimpleCookie(self.headers.get("Cookie", ""))
+                    held = jar[PLAYER_COOKIE].value if PLAYER_COOKIE in jar else None
+                    name = sessions.profiles.by_token(held) if held else None
+                    if name:
+                        sessions.accounts.claim(user["id"], "profile", name)
+                    return self._json({"account": user}, HTTPStatus.CREATED if path0.endswith("signup") else HTTPStatus.OK)
+                except (ValueError, TypeError, json.JSONDecodeError) as error:
+                    self._set_cookie = []
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                except accounts_mod.AccountError as error:
+                    self._set_cookie = []
+                    return self._json({"error": str(error)}, error.status)
+            if path0 == "/api/account/logout":
+                from http.cookies import SimpleCookie
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                sessions.accounts.logout(jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
+                self._set_cookie = []
+                self._clear_account_cookie()
+                return self._json({"ok": True})
             if path0 in ("/api/loading_library/activate", "/api/loading_library/delete", "/api/loading_library/graduate") and not self._is_viewer():     # [STUDIO]
                 if not access_mod.require_tier(self, "edit"):          # [ACCESS] the tier is in addition to the owner token checked inside
                     return
@@ -1063,6 +1349,32 @@ def make_handler(sessions: Sessions):
                 return self._refuse_viewer()                  # every POST (new, action, profile, share, spectate) is an owner's
             length = int(self.headers.get("Content-Length") or 0)
             path = self.path.split("?", 1)[0]
+            if path.startswith("/api/client_rays/"):
+                from meowdoku.client_ray_relay import RelayError, handle_relay_post
+                if not access_mod.require_tier(self,"edit"):return
+                keys, account=self._job_identity()
+                if path=="/api/client_rays/join":
+                    try:
+                        import ssl
+                        secure=isinstance(self.connection,ssl.SSLSocket)
+                        if not secure and self.client_address[0] not in ("127.0.0.1","::1"):
+                            raise RelayError("ray participation requires HTTPS",403)
+                        origin=self.headers.get("Origin")
+                        if origin and origin!=("https://" if secure else "http://")+self.headers.get("Host",""):
+                            raise RelayError("cross-origin participation is not allowed",403)
+                        if self.headers.get("X-Meowdoku-Rays")!="1" or not 0<length<=1024:
+                            raise RelayError("invalid ray join request",400)
+                        body=json.loads(self.rfile.read(length))
+                        if not isinstance(body,dict):raise RelayError("expected ray join object")
+                        with sessions.marble_photos.lock:
+                            sessions.marble_photos._cleanup_client_bridge_locked()
+                        connection=sessions.client_ray_bridge.join(body.get("job"),keys[0])
+                        sessions.marble_photos.renew_participant_live(body.get("job"),keys[0])
+                        return self._json(connection)
+                    except (ValueError,TypeError) as error:
+                        return self._json({"error":str(error)},getattr(error,"status",400))
+                if handle_relay_post(self,sessions.client_ray_bridge.relay,keys[0],on_poll=sessions.marble_photos.renew_participant_live):return
+                return self._json({"error":"unknown ray route"},404)
             if path.startswith("/api/share") or path.startswith("/api/spectate"):
                 if length > 2 * share_mod.SHARE_MAX_BYTES:
                     return self._share_error(share_mod.ShareError("too large", 413))
@@ -1090,6 +1402,23 @@ def make_handler(sessions: Sessions):
                 except (ValueError, TypeError) as error:
                     return self._share_error(error)
                 return self._json({"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND)
+            if path == "/api/action/batch":
+                from meowdoku import action_batch
+                if self.headers.get("X-Meowdoku-Batch") != "1":
+                    return self._json({"error": "missing batch header"}, HTTPStatus.FORBIDDEN)
+                if length <= 0 or length > action_batch.MAX_BYTES:
+                    self.close_connection = True
+                    return self._json({"error": "batch exceeds 64 KiB"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                    action_batch.validate(payload)
+                    if any(a.get("type") in access_mod.EDIT_ACTIONS for a in payload.get("actions", [])):
+                        if not access_mod.require_tier(self, "edit"):
+                            return
+                    # No payload-selected table, owner, profile, or credential.
+                    return self._json(action_batch.execute(self._table(), payload))
+                except (ValueError, TypeError, RecursionError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
             if path.startswith("/api/action") and str(payload.get("type")) in access_mod.EDIT_ACTIONS and not access_mod.require_tier(self, "edit"):
                 return                                            # [ACCESS] process-wide controls (learner, Lichess, pilot weights)
@@ -1334,7 +1663,7 @@ def prepare_lanes(web_dir: Path, args) -> dict:
     ``fountain``: the fountain families as they always ran (GPU products before CPU fallbacks within each); ``autopilot``: the weights."""
     step = lambda products, fn: (products, fn)                                  # noqa: E731
     both = lambda family: (family, f"{family}_cpu")                             # noqa: E731
-    return {
+    lanes = {
         "laws": [step(("predictor",), lambda c: prepare_predictor(web_dir, c)),
                  step(("policy",), lambda c: prepare_policy(web_dir, c)),
                  step(("graph",), lambda c: prepare_graph_products(web_dir, c))],
@@ -1347,6 +1676,14 @@ def prepare_lanes(web_dir: Path, args) -> dict:
                      step(both("fountain3d_wheel"), lambda c: prepare_fountain3d_wheel(web_dir, c))],
         "autopilot": [step(("autopilot",), lambda c: prepare_autopilot(args))],
     }
+    retained = getattr(args, "retain_fountain_products", None)
+    if retained:
+        from meowdoku.retained_products import prepare_retained
+        # Backend-only restarts must not rebuild changed, unreleased physics.
+        # Verify the retained release itself, never manufacture a source digest.
+        products = tuple(name for family in startup_mod.FAMILY_NAMES for name in both(family))
+        lanes["fountain"] = [step(products, lambda c: prepare_retained(web_dir, Path(retained), c))]
+    return lanes
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1363,6 +1700,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="access tier policy file (default <web-dir>/../access.json; see access.py)")
     parser.add_argument("--no-wasm", action="store_true",
                         help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
+    parser.add_argument("--retain-fountain-products", metavar="RECEIPT",
+                        help="serve SHA-256-pinned existing fountain products without rebuilding; validate before binding; other startup lanes are unchanged")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -1370,6 +1709,13 @@ def main(argv: list[str] | None = None) -> int:
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
         return 1
+    if args.retain_fountain_products:
+        from meowdoku.retained_products import validate_receipt
+        try:
+            validate_receipt(web_dir, Path(args.retain_fountain_products))
+        except ValueError as error:
+            print(f"[meowdoku] retained fountain startup refused: {error}; no build attempted", flush=True)
+            return 1
     # [LOADING] BIND FIRST.  Nothing below the listening socket waits on a compile: the prepare steps run in background lanes
     # (startup.py), each product reporting its state to /api/ready; a game's page starts when ITS products are ready (the Meowdoku
     # puzzle, chess, ... need none: playable at once) and a request for a file that is still building waits for it.

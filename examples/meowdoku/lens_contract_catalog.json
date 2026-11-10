@@ -1,0 +1,5244 @@
+{
+  "schema": "lens-contract-collection-v1",
+  "contracts": [
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "fisheye_15mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/fisheye_15mm.yaml",
+      "source_sha256": "e76ff45b2315c935ae42c2218317506840ca09389fccb823dc8aae00e602b902",
+      "source_profile": {
+        "name": "fisheye_15mm",
+        "focal_mm": 15.0,
+        "min_focal_mm": 15.0,
+        "max_focal_mm": 15.0,
+        "is_zoom": false,
+        "min_focus_m": 0.2,
+        "max_aperture_fstop": 2.8,
+        "distortion_k1": -0.35,
+        "distortion_k2": 0.04,
+        "vignetting": 0.35,
+        "transmission": [
+          0.94,
+          0.93,
+          0.9,
+          0.78
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.015,
+          "minimum": 0.015,
+          "maximum": 0.015,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 0.2,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 2.8,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": -0.35,
+        "distortion_k2": 0.04,
+        "vignetting": 0.35,
+        "transmission": [
+          0.94,
+          0.93,
+          0.9,
+          0.78
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "macro_50mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/macro_50mm.yaml",
+      "source_sha256": "56884b154938ecb285f5b4163f59e49fedfb2ee52ddd2bad3db63c8fb02c8bcb",
+      "source_profile": {
+        "name": "macro_50mm",
+        "focal_mm": 50.0,
+        "min_focal_mm": 50.0,
+        "max_focal_mm": 50.0,
+        "is_zoom": false,
+        "min_focus_m": 0.23,
+        "max_aperture_fstop": 2.8,
+        "distortion_k1": 0.0003,
+        "distortion_k2": 0.0,
+        "vignetting": 0.08,
+        "transmission": [
+          0.985,
+          0.98,
+          0.975,
+          0.9
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.05,
+          "minimum": 0.05,
+          "maximum": 0.05,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 0.23,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 2.8,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": 0.0003,
+        "distortion_k2": 0.0,
+        "vignetting": 0.08,
+        "transmission": [
+          0.985,
+          0.98,
+          0.975,
+          0.9
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "mirror_500mm_f8",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/mirror_500mm_f8.yaml",
+      "source_sha256": "70d4890830a4f98ac42e381146d88b2a033da0f776088f3c85c459ce4e441053",
+      "source_profile": {
+        "name": "mirror_500mm_f8",
+        "specs_only": true,
+        "lens_type": "mirror",
+        "focal_mm": 500.0,
+        "min_focal_mm": 500.0,
+        "max_focal_mm": 500.0,
+        "is_zoom": false,
+        "max_aperture_fstop": 8.0,
+        "fixed_aperture": true
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.5,
+          "minimum": 0.5,
+          "maximum": 0.5,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": null,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 8.0,
+          "maximum": 8.0,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": null,
+        "distortion_k2": null,
+        "vignetting": null,
+        "transmission": null,
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices.",
+        "Specs-only mirror lens: central obstruction, annular bokeh and mirror optics are not modeled."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "portrait_85mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/portrait_85mm.yaml",
+      "source_sha256": "0d62fde54da6017aaae69d70d0baf74c3b6e32678e59323df293672abf3ef5a4",
+      "source_profile": {
+        "name": "portrait_85mm",
+        "focal_mm": 85.0,
+        "min_focal_mm": 85.0,
+        "max_focal_mm": 85.0,
+        "is_zoom": false,
+        "min_focus_m": 0.85,
+        "max_aperture_fstop": 1.2,
+        "distortion_k1": 0.0004,
+        "distortion_k2": 0.0,
+        "vignetting": 0.12,
+        "transmission": [
+          0.99,
+          0.98,
+          0.97,
+          0.88
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.085,
+          "minimum": 0.085,
+          "maximum": 0.085,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 0.85,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 1.2,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": 0.0004,
+        "distortion_k2": 0.0,
+        "vignetting": 0.12,
+        "transmission": [
+          0.99,
+          0.98,
+          0.97,
+          0.88
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "standard_35mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/standard_35mm.yaml",
+      "source_sha256": "7c4d8fba3bc000164918c8280c5e521b9c69776c5bb00cb982f8a570fd5ef003",
+      "source_profile": {
+        "name": "standard_35mm",
+        "focal_mm": 35.0,
+        "min_focal_mm": 35.0,
+        "max_focal_mm": 35.0,
+        "is_zoom": false,
+        "min_focus_m": 0.45,
+        "max_aperture_fstop": 1.4,
+        "distortion_k1": 0.001,
+        "distortion_k2": 0.0,
+        "vignetting": 0.15,
+        "transmission": [
+          0.98,
+          0.97,
+          0.95,
+          0.85
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.035,
+          "minimum": 0.035,
+          "maximum": 0.035,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 0.45,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 1.4,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": 0.001,
+        "distortion_k2": 0.0,
+        "vignetting": 0.15,
+        "transmission": [
+          0.98,
+          0.97,
+          0.95,
+          0.85
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "tele_135mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/tele_135mm.yaml",
+      "source_sha256": "159d0e4eecc0382d69c53f40a786e82b30422cd8cad4a72e17b61a074abac2e1",
+      "source_profile": {
+        "name": "tele_135mm",
+        "focal_mm": 135.0,
+        "min_focal_mm": 135.0,
+        "max_focal_mm": 135.0,
+        "is_zoom": false,
+        "min_focus_m": 1.1,
+        "max_aperture_fstop": 1.8,
+        "distortion_k1": 0.0002,
+        "distortion_k2": 0.0,
+        "vignetting": 0.1,
+        "transmission": [
+          0.98,
+          0.975,
+          0.965,
+          0.86
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.135,
+          "minimum": 0.135,
+          "maximum": 0.135,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 1.1,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 1.8,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": 0.0002,
+        "distortion_k2": 0.0,
+        "vignetting": 0.1,
+        "transmission": [
+          0.98,
+          0.975,
+          0.965,
+          0.86
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "wide_24mm",
+      "kind": "authored-thin-profile",
+      "source": "configs/lenses/wide_24mm.yaml",
+      "source_sha256": "9fd39777d6dc1f7b2aa50a578c8430d8ee943e233bfc23fd04c026784f9e112e",
+      "source_profile": {
+        "name": "wide_24mm",
+        "focal_mm": 24.0,
+        "min_focal_mm": 24.0,
+        "max_focal_mm": 24.0,
+        "is_zoom": false,
+        "min_focus_m": 0.25,
+        "max_aperture_fstop": 2.8,
+        "distortion_k1": -0.012,
+        "distortion_k2": 0.0,
+        "vignetting": 0.22,
+        "transmission": [
+          0.97,
+          0.96,
+          0.94,
+          0.82
+        ]
+      },
+      "calibration": {
+        "status": "authored-not-measured",
+        "surface_prescription": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "default": 0.024,
+          "minimum": 0.024,
+          "maximum": 0.024,
+          "adjustable": false
+        },
+        "focus_distance": {
+          "unit": "m",
+          "minimum": 0.25,
+          "maximum": null,
+          "reference": "unspecified-in-source",
+          "bound_basis": "authored-profile-not-ray-validated"
+        },
+        "aperture": {
+          "unit": "f-number",
+          "minimum": 2.8,
+          "maximum": null,
+          "pupil_relation": "diameter_m = focal_length_m / f_number"
+        }
+      },
+      "effects": {
+        "distortion_k1": -0.012,
+        "distortion_k2": 0.0,
+        "vignetting": 0.22,
+        "transmission": [
+          0.97,
+          0.96,
+          0.94,
+          0.82
+        ],
+        "transmission_wavelengths_nm": null,
+        "coordinate_and_band_conventions": "not specified by the YAML; preserve until resolved"
+      },
+      "shader_adapter_ready": false,
+      "limitations": [
+        "This profile contains no glass surfaces or measured calibration.",
+        "Do not infer spectral wavelengths, principal planes, working distance or a compound prescription.",
+        "Distortion and vignetting coefficients are retained; their shader convention is not invented here.",
+        "Unauthored focus/effect fields remain unknown; application travel limits are separate choices."
+      ]
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "camera_designer.camera_preset.PRESET_REGISTRY:gullstrand_eye",
+      "kind": "compound-paraxial-equivalent",
+      "source": "camera_designer.camera_preset.PRESET_REGISTRY:gullstrand_eye",
+      "prescription_sha256": "55900b1740c604d44a3f8fc0070645cfa6a27a47236a6d25cb85c4ef55d9ef59",
+      "reference_wavelength_nm": 587.0,
+      "index_basis": "caller-resolved scalar prescription at the declared wavelength",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 4,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          1.2574007032868764,
+          0.005560309857151534
+        ],
+        [
+          66.496082941496,
+          1.0893415455081543
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        0.0,
+        0.0076
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.336,
+      "cardinal": {
+        "first_vertex_x_m": 0.0,
+        "last_vertex_x_m": 0.0076,
+        "front_principal_plane_x_m": 0.0013435610272977735,
+        "rear_principal_plane_x_m": 0.0024284571905713185,
+        "object_effective_focal_length_m": -0.015038479798574169,
+        "image_effective_focal_length_m": -0.02009140901089509,
+        "back_focal_distance_m": -0.025262951820323773
+      },
+      "sensor_x_m": 0.024,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 0.002402624471713091,
+        "entrance_radius_m": 0.004071936942698839,
+        "exit_x_m": 0.0048683815160482586,
+        "exit_radius_m": 0.0038597769178238105,
+        "f_number_estimate": -1.8466002801859225
+      },
+      "calibration": {
+        "status": "paraxial-probe-failed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1e+30,
+        "max_reduced_angle_error": 1e+30,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.289093287884925e-12,
+            "reduced_angle_error": 1.0646940541659752e-09
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 2.0158691542752037e-12,
+            "reduced_angle_error": 9.774398884677613e-10
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 2.770664194628363e-12,
+            "reduced_angle_error": 9.207790534811883e-10
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": false
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": false
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": false
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 2.770664194628363e-12,
+            "reduced_angle_error": 9.207790534811883e-10
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 2.0158691542752037e-12,
+            "reduced_angle_error": 9.774398884677613e-10
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.289093287884925e-12,
+            "reduced_angle_error": 1.0646940541659752e-09
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": false,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": -0.003532202983213382,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": -0.0062103030078431804,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": -0.009358188215078833,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": -0.013111355563622393,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": -0.01506681029890727,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": -0.016707953718198474,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": -0.01736567753132736,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": -0.0176027203136171,
+            "real_image_after_last_surface": false
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": false
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged.",
+        "Registry surface conventions are preserved; negative power or a non-air image medium is not relabeled as a positive air thin lens."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "source_prescription": {
+        "name": "gullstrand_eye",
+        "body": {
+          "width": 0.139,
+          "height": 0.101,
+          "depth": 0.077,
+          "grip_width": 0.044,
+          "label": "body"
+        },
+        "mount_ring": {
+          "type": "mount_ring",
+          "z_flange": 0.0,
+          "r_inner": 0.0,
+          "r_outer": 0.006,
+          "back_clearance": 0.0
+        },
+        "lens_group": {
+          "label": "lens_group",
+          "elements": [
+            {
+              "surface": {
+                "type": "conic",
+                "R": 0.0078,
+                "K": 0.0,
+                "r_max": 0.005,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "cornea",
+                "n_d": 1.376,
+                "V_d": 0.0,
+                "B": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "C": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "z_vertex": 0.0,
+              "label": "cornea_front",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "surface": {
+                "type": "conic",
+                "R": 0.006500000000000001,
+                "K": 0.0,
+                "r_max": 0.005,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "aqueous",
+                "n_d": 1.336,
+                "V_d": 0.0,
+                "B": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "C": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "z_vertex": -0.0005,
+              "label": "cornea_back",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "surface": {
+                "type": "conic",
+                "R": 0.010199999999999999,
+                "K": 0.0,
+                "r_max": 0.004,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "lens",
+                "n_d": 1.413,
+                "V_d": 0.0,
+                "B": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "C": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "z_vertex": -0.0036000000000000003,
+              "label": "lens_front",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "surface": {
+                "type": "conic",
+                "R": -0.006,
+                "K": 0.0,
+                "r_max": 0.004,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "vitreous",
+                "n_d": 1.336,
+                "V_d": 0.0,
+                "B": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "C": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "z_vertex": -0.0076,
+              "label": "lens_back",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            }
+          ]
+        },
+        "aperture_stop": {
+          "type": "aperture_stop",
+          "z_pos": -0.0036000000000000003,
+          "r_inner": 0.0,
+          "r_outer": 0.004,
+          "n_blades": 0,
+          "aperture_rot": 0.0,
+          "thickness_m": 0.0001,
+          "material_name": "blackened_steel"
+        },
+        "sensor": {
+          "type": "sensor",
+          "z_pos": -0.024,
+          "r_max": 0.012,
+          "pixel_pitch": 3.76e-06,
+          "curvature_R": -0.012
+        },
+        "focal_mm": 17.0,
+        "f_number": 2.1,
+        "fov_deg": 120.0,
+        "wavelengths": [
+          0.486,
+          0.587,
+          0.656
+        ],
+        "sensor_log_scale": false,
+        "emitters": [],
+        "projector_back": {
+          "enabled": false,
+          "power": 10.0,
+          "z_offset": 0.002,
+          "radius_scale": 1.0,
+          "spectral_weights": [],
+          "color": [
+            0.95,
+            0.97,
+            1.0
+          ],
+          "profile_name": "",
+          "spatial_samples": 64,
+          "scrim_transmission": [],
+          "scrim_diffusion": 0.02,
+          "asset_key": "",
+          "source_role": "projector",
+          "label": "projector_back"
+        }
+      },
+      "source_sha256": "22f3f1b7237151a53a78931aaf3aab6d06b0d11f79b0c7f8d2399b542e3c0597",
+      "conversion": {
+        "entry": "CompoundLens.from_preset",
+        "axial_scale": -1.0,
+        "basis": "existing camera_designer.scene_builder exact transport"
+      },
+      "authored_metadata": {
+        "focal_length_m": 0.017,
+        "f_number": 2.1,
+        "fov_degrees": 120.0
+      },
+      "label_is_not_measurement": true,
+      "accepted_as_named_camera_preset": false,
+      "preset_fit": {
+        "status": "not-approved",
+        "reason": "registry metadata and sensor/focus domain are not calibrated by this export"
+      }
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "camera_designer.camera_preset.PRESET_REGISTRY:simple_doublet_50mm_f1.8",
+      "kind": "compound-paraxial-equivalent",
+      "source": "camera_designer.camera_preset.PRESET_REGISTRY:simple_doublet_50mm_f1.8",
+      "prescription_sha256": "21b95d1e2e88828ed11def903827b1407b51961b44d19aac4928fa39163cf053",
+      "reference_wavelength_nm": 587.0,
+      "index_basis": "caller-resolved scalar prescription at the declared wavelength",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 3,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          1.254360777626893,
+          0.008223233614528076
+        ],
+        [
+          48.395200568199705,
+          1.1144840184966864
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        -0.06,
+        -0.05
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": -0.06,
+        "last_vertex_x_m": -0.054,
+        "front_principal_plane_x_m": -0.057634393139142946,
+        "rear_principal_plane_x_m": -0.055255909152983916,
+        "object_effective_focal_length_m": -0.020663206025787112,
+        "image_effective_focal_length_m": -0.020663206025787112,
+        "back_focal_distance_m": -0.021919115178771025
+      },
+      "sensor_x_m": 0.0024,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": -0.056450444363559504,
+        "entrance_radius_m": 0.01549132785710394,
+        "exit_x_m": -0.05,
+        "exit_radius_m": 0.0139,
+        "f_number_estimate": -0.6669281747952767
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1.0829311995481494e-13,
+        "max_reduced_angle_error": 2.484810178796093e-10,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 7.896112793291925e-14,
+            "reduced_angle_error": 2.484810178796093e-10
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.0829311995481494e-13,
+            "reduced_angle_error": 1.7092268973870756e-10
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 4.4627343677048834e-14,
+            "reduced_angle_error": 1.1882355613768852e-10
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 3.5313767071009283e-16,
+            "reduced_angle_error": 2.3416542955980585e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 3.5313767071009283e-16,
+            "reduced_angle_error": 2.3416542955980585e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 4.4627343677048834e-14,
+            "reduced_angle_error": 1.1882355613768852e-10
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.0829311995481494e-13,
+            "reduced_angle_error": 1.7092268973870756e-10
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 7.896112793291925e-14,
+            "reduced_angle_error": 2.484810178796093e-10
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": false,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": -0.06068593049161017,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": -0.06299197532880149,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": -0.06599627384013274,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": -0.07007254495001942,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": -0.07244864291096557,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": -0.07459735047472292,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": -0.07550175832832284,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": -0.07583411306168805,
+            "real_image_after_last_surface": false
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": false
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged.",
+        "Registry surface conventions are preserved; negative power or a non-air image medium is not relabeled as a positive air thin lens."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "source_prescription": {
+        "name": "simple_doublet_50mm_f1.8",
+        "body": {
+          "width": 0.139,
+          "height": 0.101,
+          "depth": 0.077,
+          "grip_width": 0.044,
+          "label": "body"
+        },
+        "mount_ring": {
+          "type": "mount_ring",
+          "z_flange": 0.0,
+          "r_inner": 0.021,
+          "r_outer": 0.031,
+          "back_clearance": 0.004
+        },
+        "lens_group": {
+          "label": "lens_group",
+          "elements": [
+            {
+              "surface": {
+                "type": "conic",
+                "R": 0.0305,
+                "K": 0.0,
+                "r_max": 0.018,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "BK7",
+                "n_d": 1.5168,
+                "V_d": 64.17,
+                "B": [
+                  1.03961212,
+                  0.23179234,
+                  1.01046945
+                ],
+                "C": [
+                  0.00600069867,
+                  0.0200179144,
+                  103.560653
+                ]
+              },
+              "z_vertex": 0.06,
+              "label": "doublet_front_1",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "surface": {
+                "type": "conic",
+                "R": -0.0925,
+                "K": 0.0,
+                "r_max": 0.018,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "SF5",
+                "n_d": 1.6727,
+                "V_d": 32.21,
+                "B": [
+                  1.46141885,
+                  0.247713019,
+                  0.949995832
+                ],
+                "C": [
+                  0.0111826126,
+                  0.0508191367,
+                  112.041888
+                ]
+              },
+              "z_vertex": 0.057,
+              "label": "doublet_cemented",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "surface": {
+                "type": "conic",
+                "R": -0.0215,
+                "K": 0.0,
+                "r_max": 0.018,
+                "r_min": 0.0
+              },
+              "glass_out": {
+                "name": "air",
+                "n_d": 1.0,
+                "V_d": 0.0,
+                "B": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "C": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "z_vertex": 0.054,
+              "label": "doublet_rear",
+              "shift_xy_m": [
+                0.0,
+                0.0
+              ],
+              "tilt_xy_deg": [
+                0.0,
+                0.0
+              ]
+            }
+          ]
+        },
+        "aperture_stop": {
+          "type": "aperture_stop",
+          "z_pos": 0.05,
+          "r_inner": 0.0,
+          "r_outer": 0.0139,
+          "n_blades": 8,
+          "aperture_rot": 0.0,
+          "thickness_m": 0.0001,
+          "material_name": "blackened_steel"
+        },
+        "sensor": {
+          "type": "sensor",
+          "z_pos": -0.0024,
+          "r_max": 0.0215,
+          "pixel_pitch": 3.76e-06,
+          "curvature_R": 0.0
+        },
+        "focal_mm": 50.0,
+        "f_number": 1.8,
+        "fov_deg": 46.8,
+        "wavelengths": [
+          0.486,
+          0.587,
+          0.656
+        ],
+        "sensor_log_scale": false,
+        "emitters": [],
+        "projector_back": {
+          "enabled": false,
+          "power": 10.0,
+          "z_offset": 0.002,
+          "radius_scale": 1.0,
+          "spectral_weights": [],
+          "color": [
+            0.95,
+            0.97,
+            1.0
+          ],
+          "profile_name": "",
+          "spatial_samples": 64,
+          "scrim_transmission": [],
+          "scrim_diffusion": 0.02,
+          "asset_key": "",
+          "source_role": "projector",
+          "label": "projector_back"
+        }
+      },
+      "source_sha256": "75fb62653e014b965e75bec74a94c6a918c2bc12ceaffeb31e97f611c6fb7f4e",
+      "conversion": {
+        "entry": "CompoundLens.from_preset",
+        "axial_scale": -1.0,
+        "basis": "existing camera_designer.scene_builder exact transport"
+      },
+      "authored_metadata": {
+        "focal_length_m": 0.05,
+        "f_number": 1.8,
+        "fov_degrees": 46.8
+      },
+      "label_is_not_measurement": true,
+      "accepted_as_named_camera_preset": false,
+      "preset_fit": {
+        "status": "not-approved",
+        "reason": "registry metadata and sensor/focus domain are not calibrated by this export"
+      }
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:50/2",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:50/2",
+      "prescription_sha256": "ddf816f8ccddb6e339eb68aa356d8c840831f8deb9e474113e94bbb7ecc3fc92",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.6226733888766135,
+          0.1290473587224512
+        ],
+        [
+          -7.366280994981572,
+          0.07933676767424391
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.2375999999999998
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.2375999999999998,
+        "front_principal_plane_x_m": 1.1959834527019777,
+        "rear_principal_plane_x_m": 1.186376511324989,
+        "object_effective_focal_length_m": 0.13575371353350085,
+        "image_effective_focal_length_m": 0.13575371353350085,
+        "back_focal_distance_m": 0.08453022485848996
+      },
+      "sensor_x_m": 1.2586,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1152107758922738,
+        "entrance_radius_m": 0.012817472992668803,
+        "exit_x_m": 1.134075502193137,
+        "exit_radius_m": 0.020547787679966803,
+        "f_number_estimate": 5.2956504613330475
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 5.6542007268725256e-14,
+        "max_reduced_angle_error": 1.2874800374039139e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 5.6542007268725256e-14,
+            "reduced_angle_error": 1.2874800374039139e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.037673636253289e-14,
+            "reduced_angle_error": 2.424557408141348e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 4.3239099875179345e-14,
+            "reduced_angle_error": 6.383293280889588e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 8.34709295498108e-15,
+            "reduced_angle_error": 7.586317243686255e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 8.34709295498108e-15,
+            "reduced_angle_error": 7.586317243686255e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 4.3239099875179345e-14,
+            "reduced_angle_error": 6.383293280889588e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.037673636253289e-14,
+            "reduced_angle_error": 2.424557408141348e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 5.6542007268725256e-14,
+            "reduced_angle_error": 1.2874800374039139e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": -1.8716718018118137,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": -22.60362321334938,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 3.318835700683697,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.7919031861058232,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.5286652983650868,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.3858479835893818,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.3407599425150039,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.3258239955809434,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "rear_group_center_m": 1.2438978861048922,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0018598241544174857,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "rear_group_center_m": 1.2307166018640083,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0008971878956707767,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              2.7067610269776146,
+              1.3163330851961526
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.5425812840636841,
+              0.515187622048823
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2636714682416663,
+              0.2872189998542207
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.12084520658804143,
+              0.14428620167952122
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.07691832122787012,
+              0.0958544112508819
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.06248676501830297,
+              0.07943298767008655
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.221489737373737,
+              1.2476
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.06070443522253832,
+              0.07738683223111531
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.05,
+          0.05
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 2.0,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2586,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.05,
+        "actual_focal_length_m": 0.13575371353350085,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.0823309916601267,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.05,
+          "requested_maximum": 0.05,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 2.0,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:80/1.4",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:80/1.4",
+      "prescription_sha256": "086359a14a11d458df3bb1b555dd32e6a529aa0746f29b72f7a9a9879604d35f",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.5255265557647101,
+          0.11116192214685798
+        ],
+        [
+          -12.52691163186034,
+          -0.7468996024192674
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.2449840661842266
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.2449840661842266,
+        "front_principal_plane_x_m": 1.2104517382860984,
+        "rear_principal_plane_x_m": 1.2071077357542637,
+        "object_effective_focal_length_m": 0.07982813556827913,
+        "image_effective_focal_length_m": 0.07982813556827913,
+        "back_focal_distance_m": 0.04195180513831608
+      },
+      "sensor_x_m": 1.293,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1430949985800212,
+        "entrance_radius_m": 0.029453279728504762,
+        "exit_x_m": 0.9829336655366543,
+        "exit_radius_m": 0.1244058669907816,
+        "f_number_estimate": 1.3551654740001975
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 2.2435972215273034e-13,
+        "max_reduced_angle_error": 1.7378066487997584e-11,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 2.2435972215273034e-13,
+            "reduced_angle_error": 1.7378066487997584e-11
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.2322124555788367e-14,
+            "reduced_angle_error": 1.5321694379812761e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 9.955191781606948e-15,
+            "reduced_angle_error": 9.52170966042349e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 8.115803493656537e-14,
+            "reduced_angle_error": 3.816690385505077e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 8.115803493656537e-14,
+            "reduced_angle_error": 3.816690385505077e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 9.955191781606948e-15,
+            "reduced_angle_error": 9.52170966042349e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.2322124555788367e-14,
+            "reduced_angle_error": 1.5321694379812761e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 2.2435972215273034e-13,
+            "reduced_angle_error": 1.7378066487997584e-11
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.3855458367268767,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.3784641890129543,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.3669690651343247,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.3450668857238028,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.3268581078828392,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.3046558740702707,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.2929498287428596,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.2881953585351655,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.10227446771560067,
+              0.10796906577912524
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.08933393118375044,
+              0.10520629062733655
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.07002349507099392,
+              0.10027487122749723
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.038104331040334616,
+              0.08897181429042034
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.015505250173654117,
+              0.07699922306147644
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "rear_group_center_m": 1.2126989484966701,
+            "sensor_plane_residual_m": -7.757288145171515e-10,
+            "exact_near_axis_max_sensor_radius_m": 5.83612941299134e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "rear_group_center_m": 1.2244123387870813,
+            "sensor_plane_residual_m": 1.805040561464466e-10,
+            "exact_near_axis_max_sensor_radius_m": 2.3533756967643576e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "rear_group_center_m": 1.2294600854169078,
+            "sensor_plane_residual_m": 4.999556324492005e-11,
+            "exact_near_axis_max_sensor_radius_m": 1.5743211916670764e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2044513838197848,
+              1.2703764960899973
+            ],
+            "rear_group_center_m": 1.2301505337227927,
+            "sensor_plane_residual_m": 8.971263731893941e-10,
+            "exact_near_axis_max_sensor_radius_m": 1.4267237517546095e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.08,
+          0.08
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 1.4,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.293,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "passed",
+        "requested_focal_length_m": 0.08,
+        "actual_focal_length_m": 0.07982813556827913,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 1.3463526322698982e-06,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": true
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.08,
+          "requested_maximum": 0.08,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 1.4,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": true
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:150/2.8",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:150/2.8",
+      "prescription_sha256": "53fc134fcde509f4ddc399308d1c04931ecb5b4567fc3254bb637734f168de21",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.6922268923200939,
+          0.1534413720556599
+        ],
+        [
+          -6.760958141509825,
+          -0.054043976128643256
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.2633199178924572
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.2633199178924572,
+        "front_principal_plane_x_m": 1.2269015681013018,
+        "rear_principal_plane_x_m": 1.2177978038313908,
+        "object_effective_focal_length_m": 0.1479080300557348,
+        "image_effective_focal_length_m": 0.1479080300557348,
+        "back_focal_distance_m": 0.10238591599466834
+      },
+      "sensor_x_m": 1.3825,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.119351643683255,
+        "entrance_radius_m": 0.027121840084308513,
+        "exit_x_m": 0.9276198287160343,
+        "exit_radius_m": 0.08432432664221787,
+        "f_number_estimate": 2.726732950197354
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 6.959953175855044e-14,
+        "max_reduced_angle_error": 3.04717069719157e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 6.959953175855044e-14,
+            "reduced_angle_error": 3.04717069719157e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 6.228197685777086e-15,
+            "reduced_angle_error": 2.4245368083000707e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 2.7428707295349374e-14,
+            "reduced_angle_error": 7.397204187077969e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.731283166958239e-14,
+            "reduced_angle_error": 1.2659925445614824e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.731283166958239e-14,
+            "reduced_angle_error": 1.2659925445614824e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 2.7428707295349374e-14,
+            "reduced_angle_error": 7.397204187077969e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 6.228197685777086e-15,
+            "reduced_angle_error": 2.4245368083000707e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 6.959953175855044e-14,
+            "reduced_angle_error": 3.04717069719157e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 3.049372382462961,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 2.5815192719984834,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 2.147199952971248,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.7429338163871593,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.5682807818968616,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.4367358480029786,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.387409133094168,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.3700742072064542,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.239033585989775,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0015649348469842714,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.2329004032916178,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0007733790622981847,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.2201872875528377,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0003775327248573062,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              29.853074767785262,
+              0.2792374178737822
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.24137505064964193,
+              0.23913514262534474
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.199030817149379,
+            "sensor_plane_residual_m": 3.5633118677935727e-10,
+            "exact_near_axis_max_sensor_radius_m": 1.628452918572918e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.2492522292611294,
+            "sensor_plane_residual_m": -2.8570723564769196e-10,
+            "exact_near_axis_max_sensor_radius_m": 7.601048723814355e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.2678925029485786,
+            "sensor_plane_residual_m": 7.116087719083453e-10,
+            "exact_near_axis_max_sensor_radius_m": 4.6314119192861734e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.178888222222222,
+              1.3715000000000002
+            ],
+            "rear_group_center_m": 1.2704330267068478,
+            "sensor_plane_residual_m": -7.142759717027047e-10,
+            "exact_near_axis_max_sensor_radius_m": 4.847279553384012e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.15,
+          0.15
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 2.8,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.3825,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.15,
+        "actual_focal_length_m": 0.1479080300557348,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.005104659576997239,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.15,
+          "requested_maximum": 0.15,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 2.8,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:55-110",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:55-110",
+      "prescription_sha256": "d8805d706861ff046698d69d45c0d76c63975993b41ddafa5dec296d79ee682b",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.5183333136561973,
+          0.11423270419860121
+        ],
+        [
+          -12.151134252793888,
+          -0.7486629058040591
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.2468100287245267
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.2468100287245267,
+        "front_principal_plane_x_m": 1.2149094383639119,
+        "rear_principal_plane_x_m": 1.2071703805794942,
+        "object_effective_focal_length_m": 0.08229684399792322,
+        "image_effective_focal_length_m": 0.08229684399792322,
+        "back_focal_distance_m": 0.04265719585289068
+      },
+      "sensor_x_m": 1.2959,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1464063069266544,
+        "entrance_radius_m": 0.010775301081356083,
+        "exit_x_m": 0.967718441917135,
+        "exit_radius_m": 0.04663146234248919,
+        "f_number_estimate": 3.818772365457007
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 2.1911157377417848e-13,
+        "max_reduced_angle_error": 1.6576806388061277e-11,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 2.1911157377417848e-13,
+            "reduced_angle_error": 1.6576806388061277e-11
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.226030131503417e-14,
+            "reduced_angle_error": 1.3721859884246665e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.3124723001662654e-14,
+            "reduced_angle_error": 1.0854334466826876e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 7.964141058604528e-14,
+            "reduced_angle_error": 3.863101163828833e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 7.964141058604528e-14,
+            "reduced_angle_error": 3.863101163828833e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.3124723001662654e-14,
+            "reduced_angle_error": 1.0854334466826876e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.226030131503417e-14,
+            "reduced_angle_error": 1.3721859884246665e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 2.1911157377417848e-13,
+            "reduced_angle_error": 1.6576806388061277e-11
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.3911412487838162,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.3840423561165027,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.372454055037019,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.35014828454642,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.3313746672404618,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.3081965792446495,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.295846925202638,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.290805290343169,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.10910295092030542,
+              0.11096681527657726
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.09452588823292118,
+              0.10821261851016017
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.07302415377567906,
+              0.10327409634526252
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.03812645770414225,
+              0.09184512996578365
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.01389089912912489,
+              0.07956986112375186
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "rear_group_center_m": 1.2146649316415101,
+            "sensor_plane_residual_m": 1.362960855288975e-10,
+            "exact_near_axis_max_sensor_radius_m": 5.408469150509389e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "rear_group_center_m": 1.2270252235827126,
+            "sensor_plane_residual_m": -7.56105178467692e-10,
+            "exact_near_axis_max_sensor_radius_m": 2.2316335723262214e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "rear_group_center_m": 1.232414092191143,
+            "sensor_plane_residual_m": -6.51339204793544e-10,
+            "exact_near_axis_max_sensor_radius_m": 1.4753974280636798e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2034899541889124,
+              1.2740602190037795
+            ],
+            "rear_group_center_m": 1.2331554826507007,
+            "sensor_plane_residual_m": -3.548552562904206e-10,
+            "exact_near_axis_max_sensor_radius_m": 1.3737242836049223e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.055,
+          0.11
+        ],
+        "zoom": 0.5,
+        "focus_distance_m": 1.0,
+        "f_number": 4.0,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2959,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "passed",
+        "requested_focal_length_m": 0.0825,
+        "actual_focal_length_m": 0.08229684399792322,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 1.4726267654197045e-06,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": true
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.055,
+          "requested_maximum": 0.11,
+          "sampled_zoom": 0.5,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 4.0,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": true
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:80-160",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:80-160",
+      "prescription_sha256": "c1dbe453af265889e5c25213a2d89e5d29ca877ff5dd0bb31ea7c8f68660d72d",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.6685439871012427,
+          0.15013383490097792
+        ],
+        [
+          -7.484196231425189,
+          -0.18492587437868596
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.257858124662156
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.257858124662156,
+        "front_principal_plane_x_m": 1.2293237314654224,
+        "rear_principal_plane_x_m": 1.213570668447818,
+        "object_effective_focal_length_m": 0.1336148824908047,
+        "image_effective_focal_length_m": 0.1336148824908047,
+        "back_focal_distance_m": 0.0893274262764666
+      },
+      "sensor_x_m": 1.3424,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1314079707450284,
+        "entrance_radius_m": 0.013821227385005413,
+        "exit_x_m": 1.1273874459640325,
+        "exit_radius_m": 0.025832234847853637,
+        "f_number_estimate": 4.8336836797780665
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 7.151628939115577e-14,
+        "max_reduced_angle_error": 3.0122899210812196e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 7.151628939115577e-14,
+            "reduced_angle_error": 3.0122899210812196e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 8.4288689038408e-15,
+            "reduced_angle_error": 2.8778665377409557e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 4.025011796299563e-14,
+            "reduced_angle_error": 9.257505447445545e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 8.264735941519545e-15,
+            "reduced_angle_error": 1.2682040510250073e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 8.264735941519545e-15,
+            "reduced_angle_error": 1.2682040510250073e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 4.025011796299563e-14,
+            "reduced_angle_error": 9.257505447445545e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 8.4288689038408e-15,
+            "reduced_angle_error": 2.8778665377409557e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 7.151628939115577e-14,
+            "reduced_angle_error": 3.0122899210812196e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.9481154906439508,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.8615482379896204,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.7465010607869562,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.5861523810807536,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.490342487834618,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.4021669192610706,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.3646079991207538,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.3507385800512797,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.7193767602440904,
+              0.35812232266090627
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.5928708045286475,
+              0.3442428446103978
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.438296251628552,
+              0.32013081589910364
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2451458390734147,
+              0.2678638348030702
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.14045720524290162,
+              0.21664233057776427
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.0503394197324909,
+              0.14170273914125198
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.013627125757869951,
+              0.09515655546792878
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.00031098871959556185,
+              0.07457585060127214
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2393641820875418,
+              1.3314000000000001
+            ],
+            "rear_group_center_m": 1.2410080483412491,
+            "sensor_plane_residual_m": -5.219655818677893e-10,
+            "exact_near_axis_max_sensor_radius_m": 6.7056531903803354e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.08,
+          0.16
+        ],
+        "zoom": 0.5,
+        "focus_distance_m": 1.0,
+        "f_number": 4.5,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.3424,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.12,
+        "actual_focal_length_m": 0.1336148824908047,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.022362376070208745,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.08,
+          "requested_maximum": 0.16,
+          "sampled_zoom": 0.5,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 4.5,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:65Macro",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:65Macro",
+      "prescription_sha256": "5ab14d6ebb4090826a027f7e67613e1ed5ed81bbc7e59198ae717f29de18164d",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.6462955840342028,
+          0.13060007373096713
+        ],
+        [
+          -7.194022509102007,
+          0.09354872814022042
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.239417155780798
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.239417155780798,
+        "front_principal_plane_x_m": 1.1970006165831317,
+        "rear_principal_plane_x_m": 1.1902507241330955,
+        "object_effective_focal_length_m": 0.1390042912341158,
+        "image_effective_focal_length_m": 0.1390042912341158,
+        "back_focal_distance_m": 0.0898378595864133
+      },
+      "sensor_x_m": 1.2755,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1150985728421134,
+        "entrance_radius_m": 0.01182187515911564,
+        "exit_x_m": 1.1239909839709952,
+        "exit_radius_m": 0.0197733541193385,
+        "f_number_estimate": 5.879113480864838
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 5.3113570263945906e-14,
+        "max_reduced_angle_error": 1.448547431634993e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 5.3113570263945906e-14,
+            "reduced_angle_error": 1.448547431634993e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 8.843543200531562e-15,
+            "reduced_angle_error": 2.339807221671958e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 3.599852756381097e-14,
+            "reduced_angle_error": 5.755934194984907e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.0623841284235387e-14,
+            "reduced_angle_error": 7.876995530722939e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.0623841284235387e-14,
+            "reduced_angle_error": 7.876995530722939e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 3.599852756381097e-14,
+            "reduced_angle_error": 5.755934194984907e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 8.843543200531562e-15,
+            "reduced_angle_error": 2.339807221671958e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 5.3113570263945906e-14,
+            "reduced_angle_error": 1.448547431634993e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": -1.0849102054944884,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": -5.103596483768128,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 4.091018086350919,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.8515283168158625,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.5513585686377807,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.3965805916023815,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.3488317782033508,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.3331295305504858,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "rear_group_center_m": 1.246195630285207,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0017875556340323081,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "rear_group_center_m": 1.2364948156356255,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0008708273049424783,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "rear_group_center_m": 1.2154722599238101,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.00041244462323481183,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.6406647376280163,
+              0.4994597188561607
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2662923164402726,
+              0.2990021194267263
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.10638261143782657,
+              0.15399937653508688
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.06075293774284174,
+              0.10088982605760366
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.046098342154665684,
+              0.08238499794350318
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2152232653198651,
+              1.2645000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.04429974221803379,
+              0.0800610943639335
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.065,
+          0.065
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 2.8,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2755,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.065,
+        "actual_focal_length_m": 0.1390042912341158,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.07351193313947735,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.065,
+          "requested_maximum": 0.065,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 2.8,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:120Macro",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:120Macro",
+      "prescription_sha256": "9ce6c21362189956e6173249ab0ae50b931eff2ecf9391ca8fecd274c931f244",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.5868792687398329,
+          0.14205336286993486
+        ],
+        [
+          -8.325736935746045,
+          -0.31130581675759295
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.257880426567838
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.257880426567838,
+        "front_principal_plane_x_m": 1.2285002701715908,
+        "rear_principal_plane_x_m": 1.2082607070825324,
+        "object_effective_focal_length_m": 0.12010948793091947,
+        "image_effective_focal_length_m": 0.12010948793091947,
+        "back_focal_distance_m": 0.07048976844561379
+      },
+      "sensor_x_m": 1.3424,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.166891762640928,
+        "entrance_radius_m": 0.02243909239675295,
+        "exit_x_m": 1.1033704215059166,
+        "exit_radius_m": 0.04776819029815713,
+        "f_number_estimate": 2.6763446089356964
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1.0909413360204491e-13,
+        "max_reduced_angle_error": 4.9991192419386946e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.0909413360204491e-13,
+            "reduced_angle_error": 4.9991192419386946e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 9.19578269868021e-15,
+            "reduced_angle_error": 4.0367519439990507e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 3.725046428270946e-14,
+            "reduced_angle_error": 1.073289514989112e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 2.9874830026802544e-14,
+            "reduced_angle_error": 1.765031873370189e-12
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 2.9874830026802544e-14,
+            "reduced_angle_error": 1.765031873370189e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 3.725046428270946e-14,
+            "reduced_angle_error": 1.073289514989112e-12
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 9.19578269868021e-15,
+            "reduced_angle_error": 4.0367519439990507e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.0909413360204491e-13,
+            "reduced_angle_error": 4.9991192419386946e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.668686847089446,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.6327814836426342,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.5797396402064152,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.49344812109607,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.4333720652681592,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.371128592250093,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.3422765158888583,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.331234036576407,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              1.132125471677481,
+              0.22965836231308123
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.7328497935084339,
+              0.22375598620120418
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.4176484513277767,
+              0.2130609481674437
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.16249599233028023,
+              0.18774610367630373
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.061919811566754746,
+              0.15964404946584376
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "rear_group_center_m": 1.2180147288828564,
+            "sensor_plane_residual_m": -9.415208612750803e-10,
+            "exact_near_axis_max_sensor_radius_m": 2.4618595939498826e-11,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "rear_group_center_m": 1.2469033431265077,
+            "sensor_plane_residual_m": -5.388918200566195e-10,
+            "exact_near_axis_max_sensor_radius_m": 9.850309776833141e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "rear_group_center_m": 1.2595777050332981,
+            "sensor_plane_residual_m": -1.8062840112520462e-10,
+            "exact_near_axis_max_sensor_radius_m": 6.126160241256857e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": true,
+            "rear_group_bounds_m": [
+              1.2076140911222009,
+              1.3292902746124657
+            ],
+            "rear_group_center_m": 1.2613714936358624,
+            "sensor_plane_residual_m": 1.1353740170250148e-10,
+            "exact_near_axis_max_sensor_radius_m": 5.609868397994742e-12,
+            "exact_probe_count": 4,
+            "reason": "near-axis focus checks passed"
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.12,
+          0.12
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 2.8,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.3424,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "passed",
+        "requested_focal_length_m": 0.12,
+        "actual_focal_length_m": 0.12010948793091947,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": -1.782429213115222e-06,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": true
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.12,
+          "requested_maximum": 0.12,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 2.8,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": true
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:FishEye",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:FishEye",
+      "prescription_sha256": "93178b6e566239c1295eaea08c5ab1b3772a89bad320d8c712890714d93e84fc",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.9032649452576892,
+          0.08661694954622237
+        ],
+        [
+          -3.835007152217634,
+          0.7393438464463408
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.1856177826391001
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.1856177826391001,
+        "front_principal_plane_x_m": 1.1389675795136216,
+        "rear_principal_plane_x_m": 1.1603935650815467,
+        "object_effective_focal_length_m": 0.2607557066540904,
+        "image_effective_focal_length_m": 0.2607557066540904,
+        "back_focal_distance_m": 0.235531489096537
+      },
+      "sensor_x_m": 1.2264,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1050340047761185,
+        "entrance_radius_m": 0.0037067056569676207,
+        "exit_x_m": 1.1334947344931474,
+        "exit_radius_m": 0.004061681302539488,
+        "f_number_estimate": 35.173511304295104
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1.0761331672233705e-14,
+        "max_reduced_angle_error": 6.147797724999522e-13,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 6.090254982184934e-15,
+            "reduced_angle_error": 6.147797724999522e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 2.3663542506784443e-15,
+            "reduced_angle_error": 4.244200206126453e-14
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 8.57675095673383e-16,
+            "reduced_angle_error": 2.383292808981821e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.0761331672233705e-14,
+            "reduced_angle_error": 3.3525416329779206e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.0761331672233705e-14,
+            "reduced_angle_error": 3.3525416329779206e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 8.57675095673383e-16,
+            "reduced_angle_error": 2.383292808981821e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 2.3663542506784443e-15,
+            "reduced_angle_error": 4.244200206126453e-14
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 6.090254982184934e-15,
+            "reduced_angle_error": 6.147797724999522e-13
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.0590734600853426,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.049169211452934,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.0276411084264858,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 0.9449644522107975,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 0.6883665262692825,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 2.055347115119636,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.5053818516056636,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.4352933411777498,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.16161110248164023,
+              -0.19917136752060394
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.17096780655562327,
+              -0.21173846306915545
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.19127430222709751,
+              -0.23924648414037453
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.2688612919138035,
+              -0.3473950597227775
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.5057092477419207,
+              -0.7105876028459787
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.8286587323749304,
+              0.8337873439014003
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2697152805279672,
+              0.31496115933069047
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2007001091454348,
+              0.24044341707891959
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.166651857239057,
+              1.2154
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.1936270315470665,
+              0.232655090555151
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.02,
+          0.02
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 2.8,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2264,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.02,
+        "actual_focal_length_m": 0.2607557066540904,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.27993159094756837,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.02,
+          "requested_maximum": 0.02,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 2.8,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:4\u00d7/0.1",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:4\u00d7/0.1",
+      "prescription_sha256": "3dabe66eb5871e2e2c80e0b7e00531f021166dd37267b37ad566e6a241ed1e75",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.6629552847282755,
+          0.12404518834869874
+        ],
+        [
+          -7.438677364439261,
+          0.11655064382600044
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.2321
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.2321,
+        "front_principal_plane_x_m": 1.1897643061920318,
+        "rear_principal_plane_x_m": 1.1867902360783957,
+        "object_effective_focal_length_m": 0.13443250069972373,
+        "image_effective_focal_length_m": 0.13443250069972373,
+        "back_focal_distance_m": 0.08912273677811944
+      },
+      "sensor_x_m": 1.2531,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1133601156428057,
+        "entrance_radius_m": 0.002316235714004078,
+        "exit_x_m": 1.135823965285201,
+        "exit_radius_m": 0.003584661933181074,
+        "f_number_estimate": 29.019607090707144
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 5.0656625839558614e-14,
+        "max_reduced_angle_error": 1.2710701631848953e-12,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 5.0656625839558614e-14,
+            "reduced_angle_error": 1.2710701631848953e-12
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.0176961100824122e-14,
+            "reduced_angle_error": 2.579874790360759e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 3.357977246688359e-14,
+            "reduced_angle_error": 5.082173288976921e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 8.148458646652264e-15,
+            "reduced_angle_error": 7.286563744008734e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 8.148458646652264e-15,
+            "reduced_angle_error": 7.286563744008734e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 3.357977246688359e-14,
+            "reduced_angle_error": 5.082173288976921e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.0176961100824122e-14,
+            "reduced_angle_error": 2.579874790360759e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 5.0656625839558614e-14,
+            "reduced_angle_error": 1.2710701631848953e-12
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": -0.3727937372700858,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": -1.8671112591453052,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 5.493177658685942,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.8476179258814216,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 1.5355202623543935,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 1.3847826231337461,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.3395824983377316,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.324848518116446,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -1.3348251174181551,
+              -4.492233483098652
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "rear_group_center_m": 1.2402565323267023,
+            "sensor_plane_residual_m": null,
+            "exact_near_axis_max_sensor_radius_m": 0.0009511807645253595,
+            "exact_probe_count": 4,
+            "reason": "focus residual or exact ray checks failed"
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              7.17971879942875,
+              1.9536000250309653
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.6044884967807556,
+              0.5704254613891566
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2769449367466461,
+              0.29982034649950506
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.12636150342934993,
+              0.14846722593242068
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.08212337504118028,
+              0.0999984474652913
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.06779230032924799,
+              0.08386888007298654
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.2171041818181816,
+              1.2421000000000002
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.06602923674088612,
+              0.08186968507470449
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.045,
+          0.045
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 10.0,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2531,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.045,
+        "actual_focal_length_m": 0.13443250069972373,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.08665191540493455,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.045,
+          "requested_maximum": 0.045,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 10.0,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:10\u00d7/0.25",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:10\u00d7/0.25",
+      "prescription_sha256": "5f6bad1e89cc35c120dc2e0fbf6b6740e4610f2d2d4926468fc3b70e186308c8",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.9090220193682771,
+          0.08426200428442135
+        ],
+        [
+          -3.4589032359847605,
+          0.7794595352073601
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.1822243070707068
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.1822243070707068,
+        "front_principal_plane_x_m": 1.134760229687331,
+        "rear_principal_plane_x_m": 1.155921755532048,
+        "object_effective_focal_length_m": 0.28910898391041484,
+        "image_effective_focal_length_m": 0.28910898391041484,
+        "back_focal_distance_m": 0.26280643237175605
+      },
+      "sensor_x_m": 1.2243,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1157358535150568,
+        "entrance_radius_m": 0.0023615284919954564,
+        "exit_x_m": 1.1426449672414343,
+        "exit_radius_m": 0.0024548093176696016,
+        "f_number_estimate": 61.21225826628118
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1.0181823916974309e-14,
+        "max_reduced_angle_error": 5.724541324368497e-13,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 6.500628892602486e-15,
+            "reduced_angle_error": 5.724541324368497e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.9188396395896853e-15,
+            "reduced_angle_error": 3.115627059731979e-14
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 7.67273095627724e-16,
+            "reduced_angle_error": 2.425326785107998e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.0181823916974309e-14,
+            "reduced_angle_error": 2.9564900332589017e-13
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.0181823916974309e-14,
+            "reduced_angle_error": 2.9564900332589017e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 7.67273095627724e-16,
+            "reduced_angle_error": 2.425326785107998e-13
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 1.9188396395896853e-15,
+            "reduced_angle_error": 3.115627059731979e-14
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 6.500628892602486e-15,
+            "reduced_angle_error": 5.724541324368497e-13
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.0657047710592205,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.0568975232589777,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.0379963510725698,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 0.9683578086991148,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 0.7782191297398453,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 2.5646906152801794,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": 1.552929623015398,
+            "real_image_after_last_surface": true
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 1.4625365215981,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.1571273048968218,
+              -0.18531366127499882
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.1658035297307372,
+              -0.1961986254064687
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.1844171718913734,
+              -0.21967837772322252
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.2529217711271402,
+              -0.30761981772420777
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.4393689408011163,
+              -0.5598395396673262
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              1.3474539165644912,
+              1.2646995472882523
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.32579475632614074,
+              0.3664531504377506
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.235760561082909,
+              0.2710463044389031
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1702243070707066,
+              1.2133
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              0.2268523810437606,
+              0.2614338043409119
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.018,
+          0.018
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 4.0,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2243,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.018,
+        "actual_focal_length_m": 0.28910898391041484,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": 0.32989794192366406,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.018,
+          "requested_maximum": 0.018,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 4.0,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    },
+    {
+      "schema": "derived-thin-lens-contract-v1",
+      "key": "thick_lens_focus_lab._LENS_PRESETS_6x6:40\u00d7/0.65",
+      "kind": "compound-paraxial-equivalent",
+      "source": "thick_lens_focus_lab._LENS_PRESETS_6x6:40\u00d7/0.65",
+      "prescription_sha256": "70990a50a02e1e8881d5810b135bbcc654fff621383b5804d43c827c0208450b",
+      "reference_wavelength_nm": null,
+      "index_basis": "resolved scalar prescription indices; wavelength unspecified",
+      "axis": "canonical +X, object to sensor",
+      "length_unit": "m",
+      "surface_count": 8,
+      "stop_count": 1,
+      "matrix_convention": "[height_m, refractive_index * slope]",
+      "matrix": [
+        [
+          0.9867239050666089,
+          0.08355109067724971
+        ],
+        [
+          -0.559986300578012,
+          0.966037742602417
+        ]
+      ],
+      "matrix_reference_planes_x_m": [
+        1.0710000000000002,
+        1.180351098998325
+      ],
+      "object_medium_ior": 1.0,
+      "image_medium_ior": 1.0,
+      "cardinal": {
+        "first_vertex_x_m": 1.0710000000000002,
+        "last_vertex_x_m": 1.180351098998325,
+        "front_principal_plane_x_m": 1.131648371866468,
+        "rear_principal_plane_x_m": 1.1566432066450878,
+        "object_effective_focal_length_m": 1.7857579711643132,
+        "image_effective_focal_length_m": 1.7857579711643132,
+        "back_focal_distance_m": 1.7620500788110758
+      },
+      "sensor_x_m": 1.2105,
+      "pupils": {
+        "basis": "existing CompoundLens paraxial pupil estimates; not full-field ray calibration",
+        "entrance_x_m": 1.1080894525010916,
+        "entrance_radius_m": 0.0015093868788657722,
+        "exit_x_m": 1.1398593086301152,
+        "exit_radius_m": 0.0015217697853306491,
+        "f_number_estimate": 591.5507800446165
+      },
+      "calibration": {
+        "status": "paraxial-probe-passed",
+        "height_tolerance_m": 1e-08,
+        "reduced_angle_tolerance": 1e-06,
+        "max_height_error_m": 1.3011550929580007e-14,
+        "max_reduced_angle_error": 1.4566323949978532e-13,
+        "probes": [
+          {
+            "height_m": -1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.1016171698810528e-14,
+            "reduced_angle_error": 1.4566323949978532e-13
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 5.045944673383318e-17,
+            "reduced_angle_error": 1.3525676211640844e-16
+          },
+          {
+            "height_m": -1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.1601997049307021e-14,
+            "reduced_angle_error": 4.4231464194424697e-14
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.3011550929580007e-14,
+            "reduced_angle_error": 5.564856030409321e-14
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 0.0,
+            "reduced_angle_error": 0.0
+          },
+          {
+            "height_m": 0.0,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.3011550929580007e-14,
+            "reduced_angle_error": 5.564856030409321e-14
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": -0.0001,
+            "passed": true,
+            "height_error_m": 1.1601997049307021e-14,
+            "reduced_angle_error": 4.4231464194424697e-14
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0,
+            "passed": true,
+            "height_error_m": 5.045944673383318e-17,
+            "reduced_angle_error": 1.3525676211640844e-16
+          },
+          {
+            "height_m": 1e-05,
+            "angle_rad": 0.0001,
+            "passed": true,
+            "height_error_m": 1.1016171698810528e-14,
+            "reduced_angle_error": 1.4566323949978532e-13
+          }
+        ]
+      },
+      "eligible_for_air_to_air_positive_thin_lens": true,
+      "focus": {
+        "validated_actuation_range_m": null,
+        "conjugate_estimates": [
+          {
+            "object_distance_from_front_vertex_m": 0.005,
+            "image_x_m": 1.0884893498197097,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.01,
+            "image_x_m": 1.08308470445842,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.02,
+            "image_x_m": 1.0721803234490312,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.05,
+            "image_x_m": 1.0386860221481913,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.1,
+            "image_x_m": 0.9801141216288745,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 0.3,
+            "image_x_m": 0.704726592536747,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 1.0,
+            "image_x_m": -1.4554602415744593,
+            "real_image_after_last_surface": false
+          },
+          {
+            "object_distance_from_front_vertex_m": 5.0,
+            "image_x_m": 3.916153316474304,
+            "real_image_after_last_surface": true
+          }
+        ],
+        "datum": "front vertex; not front housing or sensor",
+        "mechanical_travel_known": true,
+        "sampled_actuator_checks": [
+          {
+            "focus_distance_from_front_vertex_m": 0.005,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.12174494258993929,
+              -0.12383955192987117
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.01,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.12713216534307525,
+              -0.1293446040710695
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.02,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.13800130655023723,
+              -0.14045208096498873
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.05,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.17138662771255664,
+              -0.17457453245172094
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.1,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.22976528366097315,
+              -0.2342605324728244
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 0.3,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -0.5041987124514964,
+              -0.5151533346368428
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 1.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              -2.654300419919731,
+              -2.7339145849611235
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 5.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              2.700775548854402,
+              2.733310531884489
+            ]
+          },
+          {
+            "focus_distance_from_front_vertex_m": 10.0,
+            "available": false,
+            "rear_group_bounds_m": [
+              1.1663867373737369,
+              1.1995
+            ],
+            "reason": "requested focus is not bracketed by the existing actuator",
+            "end_stop_residual_m": [
+              2.112814157057719,
+              2.1425636536220107
+            ]
+          }
+        ],
+        "sampled_checks_are_not_continuous_domain": true
+      },
+      "limitations": [
+        "One solved prescription and one reference index, not a measured zoom or focus sweep.",
+        "Near-axis checks do not certify full-field distortion, vignetting, aperture throughput or bokeh.",
+        "A positive conjugate does not prove the sensor or focus group can travel there.",
+        "The current Studio shader does not consume principal-plane-separated contracts yet.",
+        "Source prescription, exact transport, and wavelength sampling are unchanged."
+      ],
+      "installed_in_studio": false,
+      "shader_adapter_ready": false,
+      "authored_solver_input": {
+        "form": "four_group_zoom_surrogate",
+        "focal_length_range_m": [
+          0.0045,
+          0.0045
+        ],
+        "zoom": 0.0,
+        "focus_distance_m": 1.0,
+        "f_number": 1.5,
+        "entrance_x_m": 1.08,
+        "sensor_x_m": 1.2105,
+        "sensor_clearance_m": 0.03,
+        "image_radius_m": 0.04,
+        "group_count": 4,
+        "default_ior": 1.55,
+        "min_air_gap_m": 0.008,
+        "group_thickness_m": 0.018,
+        "max_group_radius_m": 0.08,
+        "lock_focal_length": true,
+        "lock_entrance_position": true,
+        "lock_sensor_position": true,
+        "focal_length_tolerance_m": 0.0005,
+        "group_positions_m": null,
+        "group_focal_lengths_m": null,
+        "group_powers_dpt": null,
+        "group_aperture_radii_m": null,
+        "group_thicknesses_m": null,
+        "group_radius_front_m": null,
+        "group_radius_back_m": null,
+        "group_conic_front": null,
+        "group_conic_back": null,
+        "group_iors": null,
+        "lock_group_positions": false,
+        "lock_group_powers": false
+      },
+      "label_is_not_measurement": true,
+      "preset_fit": {
+        "status": "failed",
+        "requested_focal_length_m": 0.0045,
+        "actual_focal_length_m": 1.7857579711643132,
+        "focal_tolerance_m": 0.0005,
+        "actual_sensor_focus_residual_m": -2.6120435609966375,
+        "sensor_focus_tolerance_m": 5e-06,
+        "exact_refinement_accepted": false
+      },
+      "controls": {
+        "focal_length": {
+          "unit": "m",
+          "requested_minimum": 0.0045,
+          "requested_maximum": 0.0045,
+          "sampled_zoom": 0.0,
+          "validated_zoom_interval": null
+        },
+        "aperture": {
+          "unit": "f-number",
+          "authored_maximum_opening": 1.5,
+          "validated_adjustment_range": null
+        },
+        "focus_distance": {
+          "unit": "m",
+          "reference": "first refracting vertex",
+          "mode": "solve and validate within rear-group travel",
+          "validated_continuous_interval": null
+        }
+      },
+      "accepted_as_named_camera_preset": false
+    }
+  ],
+  "failures": [],
+  "installed_in_studio": false
+}

@@ -291,6 +291,94 @@ def _shader_float32_storage(
     )
 
 
+def _webgpu_static_aggregate_indexes(module, outputs, *, backend):
+    """Erase only redundant, proven static aggregate-index operands.
+
+    The WGSL aggregate projection already consumes aggregate_index. This
+    exact identity removes its duplicate scalar operand and now-unused Const;
+    it never narrows an integer or changes a numerical data use.
+    """
+    if backend != "webgpu":
+        return module, dict(outputs), None
+    candidates = {}
+    for name, function in module.functions.items():
+        definitions = {}
+        uses = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    definitions.setdefault(int(instruction.res.id), []).append(instruction)
+                for position, value in enumerate(instruction.args):
+                    uses.setdefault(int(value.id), []).append((instruction, position, value))
+        protected = {int(v.id) for v in (*function.args, *outputs.get(name, ()))}
+        protected.update(int(value) for block in function.blocks.values()
+                         for instruction in block.instrs
+                         for value in instruction.attributes.get("output_ids", ()))
+        selected = set()
+        for value_id, definitions_for_value in definitions.items():
+            if value_id in protected or len(definitions_for_value) != 1:
+                continue
+            constant = definitions_for_value[0]
+            literal = constant.attributes.get("value")
+            if (constant.op != "Const" or constant.args or constant.res.dtype != "int64"
+                    or constant.res.shape or type(literal) is not int or literal < 0):
+                continue
+            consumers = uses.get(value_id, ())
+            if not consumers:
+                continue
+            valid = True
+            for consumer, position, occurrence in consumers:
+                if (consumer.op != "GetElementPtr" or position != 1
+                        or len(consumer.args) != 2 or consumer.res is None
+                        or (consumer.arg_roles and len(consumer.arg_roles) != 2)
+                        or consumer.res.dtype != "ptr" or occurrence.dtype != "int64"
+                        or occurrence.shape or consumer.args[0].dtype != "ssa.aggregate"
+                        or type(consumer.attributes.get("aggregate_index")) is not int
+                        or consumer.attributes["aggregate_index"] != literal):
+                    valid = False
+                    break
+                owners = definitions.get(int(consumer.args[0].id), ())
+                if len(owners) != 1 or owners[0].op != "Call":
+                    valid = False
+                    break
+                call = owners[0]
+                published = tuple(call.attributes.get("output_ids") or ())
+                if (call.attributes.get("callee") not in module.functions
+                        or literal >= len(published)
+                        or consumer.attributes.get("source_output_id") != published[literal]):
+                    valid = False
+                    break
+            if valid:
+                selected.add(value_id)
+        if selected:
+            candidates[name] = selected
+    if not candidates:
+        return module, dict(outputs), None
+    before = _topology_sha(module)
+    transformed = copy.deepcopy(module)
+    for name, selected in candidates.items():
+        for block in transformed.functions[name].blocks.values():
+            retained = []
+            for instruction in block.instrs:
+                if instruction.op == "Const" and instruction.res.id in selected:
+                    continue
+                if (instruction.op == "GetElementPtr" and len(instruction.args) == 2
+                        and instruction.args[1].id in selected):
+                    instruction.args = instruction.args[:1]
+                    if instruction.arg_roles:
+                        instruction.arg_roles = instruction.arg_roles[:1]
+                retained.append(instruction)
+            block.instrs = retained
+    decision = BackendIdentityDecision(
+        identity="webgpu_static_aggregate_index_elision", priority=110,
+        backends=("webgpu",), applied=True, exact=True,
+        reasons=tuple(f"{name}: elided exclusively static aggregate indexes {tuple(sorted(ids))}"
+                      for name, ids in sorted(candidates.items())),
+        before_sha256=before, after_sha256=_topology_sha(transformed),
+    )
+    return transformed, _rewrite_output_values(transformed, outputs), decision
+
+
 def apply_backend_identities(
     module: IRModule,
     outputs: Mapping[str, Sequence[SSAValue]],
@@ -327,6 +415,11 @@ def apply_backend_identities(
         licensed_inexact=bool(licensed_inexact),
     )
     decisions.append(decision)
+    current, current_outputs, index_decision = _webgpu_static_aggregate_indexes(
+        current, current_outputs, backend=str(backend),
+    )
+    if index_decision is not None:
+        decisions.append(index_decision)
     return BackendIdentityResult(current, current_outputs, tuple(decisions))
 
 

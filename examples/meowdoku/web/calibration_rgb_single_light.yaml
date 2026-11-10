@@ -1,0 +1,44 @@
+name: RGB single-light calibration
+description: Isolates Key Left as the only active fixture and sweeps it through seven known filter colours against a neutral subject and matte room, so the live Phong preview and the Spectral ray tracer can both be checked against the colour that was actually asked for.
+camera: studio
+resolution: 128
+exposure_seconds: 0.1
+max_bounces: 2
+key_shape: bare
+subject:
+  shell: marble_clear_glass
+  eye: marble_cat_eye_blue
+  accent: marble_milk_glass
+room:
+  wall_material: ceramic_porcelain
+  floor_material: ceramic_porcelain
+  ceiling_material: ceramic_porcelain
+cases:
+  - name: white
+    role: key_left
+    filter: "#ffffff"
+    strength: 1500
+  - name: red
+    role: key_left
+    filter: "#ff0000"
+    strength: 1500
+  - name: green
+    role: key_left
+    filter: "#00ff00"
+    strength: 1500
+  - name: blue
+    role: key_left
+    filter: "#0000ff"
+    strength: 1500
+  - name: cyan
+    role: key_left
+    filter: "#00ffff"
+    strength: 1500
+  - name: magenta
+    role: key_left
+    filter: "#ff00ff"
+    strength: 1500
+  - name: yellow
+    role: key_left
+    filter: "#ffff00"
+    strength: 1500

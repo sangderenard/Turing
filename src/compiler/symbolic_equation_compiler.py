@@ -500,7 +500,9 @@ def _compile_sympy_equations_uncached(
         positional_parameters=tuple(row[0] for row in symbolic_inputs),
         keyword_only_parameters=(),
         parameter_defaults={},
-        canonical_value_ids=True,
+        # SymPy nodes still own INGESTION_VALUE identities. Only canonical
+        # relabeling may claim canonical_value_ids and a lexical read scope.
+        # Scheduling synthesizes output Stores from these ingestion cells.
         identity_table={
             **{input_name: (node_id,) for input_name, node_id in symbolic_inputs},
             **{output_name: (int(root),) for output_name, root in zip(output_names, roots)},

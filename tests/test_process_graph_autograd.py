@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from src.compiler.process_graph_autograd import (
+    _build_backward_rule_process_graph,
     abstract_tensor_program_to_process_graph,
     ConditionalAdjointContract,
     compile_process_graph_backward,
@@ -20,8 +21,32 @@ from src.compiler.process_graph_autograd import (
     isolate_process_program_adjoint_regions,
     lower_training_motion_to_repository_ssa,
     obtain_graph_reverse,
+    reverse_compile_book,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def test_backward_registry_keeps_index_adjoint_raise_as_concorded_exception():
+    from src.compiler.concordance_declarations import (
+        SOURCE_EXCEPTION_INGESTION, SOURCE_EXCEPTION_OPERATION, SOURCE_SPAN,
+    )
+    from src.compiler.identity_concordance import current_identity_book
+
+    with reverse_compile_book():
+        graph = _build_backward_rule_process_graph()
+        book = current_identity_book()
+        assert graph.function_table.reference("index_adjoint") is not None
+        guards = []
+        for row in book.page(SOURCE_EXCEPTION_OPERATION).rows():
+            cell = book.latest_ref(SOURCE_EXCEPTION_OPERATION, row)
+            if book.page(SOURCE_EXCEPTION_OPERATION).cell(cell.row, cell.column)[0] != "exception_raise":
+                continue
+            causes = {parent for parent, _stage in book.edges_into(cell)}
+            if any(parent.page == SOURCE_SPAN and parent.row[1] == "index_adjoint"
+                   for parent in causes):
+                guards.append(causes)
+        assert len(guards) == 1
+        assert any(parent.page == SOURCE_EXCEPTION_INGESTION for parent in guards[0])
 
 
 def _add(graph, node_id, op, parents=(), *, label=None, shape=(1,)):

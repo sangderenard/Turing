@@ -843,7 +843,7 @@ def _cross(a, b):
     return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
 
 
-def _contact(dl, valid, n, vr, spin_slip, wrel, kn, m_eff, mu, zeta, roll, radius, reff, rbar, hertz, coh, split=False):
+def _contact(dl, valid, n, vr, spin_slip, wrel, kn, m_eff, mu, zeta, roll, radius, reff, rbar, hertz, coh, split=False, *, dt=DT):
     """Force (3-vector) and torque (3-vector) on the particle from one contact.  ``dl`` is the signed overlap (> 0
     touching), ``valid`` the weight of the contact (0 or 1 for a pair; a wall's share), ``n`` the unit normal pointing at
     THIS particle, ``vr`` its velocity relative to the other body, ``spin_slip`` = (r_i w_i + r_j w_j) x n, ``wrel`` =
@@ -868,7 +868,7 @@ def _contact(dl, valid, n, vr, spin_slip, wrel, kn, m_eff, mu, zeta, roll, radiu
     # tanh of the slip speed over VREF, argument clamped (a tanh built from exp(2x) is inf/inf = NaN past ~44 in f32)
     tanh = (vtn * (1.0 / VREF)).clamp(0.0, 20.0).tanh()
     coulomb = mu * rep * tanh
-    stick = (FRICTION_SHARE / (3.5 * DT)) * m_eff * vtn          # the most that removes FRICTION_SHARE of the slip in one step
+    stick = (FRICTION_SHARE / (3.5 * dt)) * m_eff * vtn          # the most that removes FRICTION_SHARE of the slip in one step
     ft_mag = coulomb - (coulomb - stick).clamp(0.0, 1.0e30)
     ft = (-(ft_mag / vtn) * vt[0], -(ft_mag / vtn) * vt[1], -(ft_mag / vtn) * vt[2])
     tq_f = _cross(n, ft)
@@ -878,7 +878,7 @@ def _contact(dl, valid, n, vr, spin_slip, wrel, kn, m_eff, mu, zeta, roll, radiu
     wtn = (_dot(wt, wt) + 1.0e-20).sqrt()
     tanh_r = (wtn * (1.0 / WREF)).clamp(0.0, 20.0).tanh()
     r_max = roll * rep * reff * tanh_r
-    r_stick = (FRICTION_SHARE / DT) * (0.4 * m_eff * rbar * rbar) * wtn
+    r_stick = (FRICTION_SHARE / dt) * (0.4 * m_eff * rbar * rbar) * wtn
     r_mag = r_max - (r_max - r_stick).clamp(0.0, 1.0e30)
     force = (fn * n[0] + ft[0], fn * n[1] + ft[1], fn * n[2] + ft[2])
     torque = (-radius * tq_f[0] - (r_mag / wtn) * wt[0], -radius * tq_f[1] - (r_mag / wtn) * wt[1],
@@ -1098,20 +1098,34 @@ def sdf_field(x, y, z, q):
     return (AbstractTensor.where(pick > 0.5, d_s, d_f),) + tuple(f_n[i] + pick * (s_n[i] - f_n[i]) for i in range(3))
 
 
-def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = False):
+def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = False, *, environment=None, dt=DT):
     """The fountain law over ``n`` ids; ``active`` of them (default all) are ever emitted, the rest stay parked.
     The chamber, inlet, species table and every tunable are runtime uniforms: see ``uniforms``.  ``sdf`` = False compiles the SDF walls out
     (the law as it was before them; the reference the tests hold ``sdf_on = 0`` bit-identical to)."""
+    # An authored environment replaces, rather than overlays, the toy chamber.
+    # It contributes named scalar inputs, contacts through the SAME wall law,
+    # and containment diagnostics. The default ABI and operation order stay
+    # unchanged. Compilers trace this branch once; there is no runtime dispatch.
+    if not math.isfinite(dt) or not 0 < dt <= DT:
+        raise ValueError("native timestep must be positive and no larger than the default")
+    names = BODY_ARGUMENTS if body else ARGUMENTS
+    if environment is not None:
+        if sdf or body:
+            raise ValueError("authored environments require sdf=False and body=False")
+        extra = tuple(environment.input_names)
+        if len(set(extra)) != len(extra) or set(extra).intersection(names):
+            raise ValueError("environment input names must be unique and independent")
+        names = names + extra
     active = int(n if active is None else active)
     stages = merge_exchange_stages(n)
     search_steps = int(math.ceil(math.log2(n + 1))) + 1
     scan_shifts = reduction_shifts(n)
-    queue = max(1, int(active * QUEUE_STEPS * DT / EMIT_SPAN))        # the armed queue's length, in ids
+    queue = max(1, int(active * QUEUE_STEPS * dt / EMIT_SPAN))        # the armed queue's length, in ids
     nsp = len(SPECIES)
 
     def fountain_step(*args):
         """One fixed step of every particle (see the module docstring)."""
-        a = dict(zip(BODY_ARGUMENTS if body else ARGUMENTS, args))
+        a = dict(zip(names, args))
         x, y, z, vx, vy, vz, wx, wy, wz, age, rs = (a[k] for k in STATE)
         pid, ir, ig, ib = (a[k] for k in CONSTANTS)
         half, nozzle_y, bar_half, cols, rows, lays, cell, dh, bar_z = (a[k] for k in ("half", "nozzle_y", "bar_half", "cols", "rows", "lays", "cell", "dh", "bar_z"))
@@ -1261,9 +1275,9 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
                 dist = (dx * dx + dyy * dyy + dzz * dzz + 1.0e-12).sqrt()
                 # an armed id is emitted only into a CLEAR slot: no live neighbour, at the position it moves to this
                 # step, within the contact distance (plus EMIT_MARGIN): the grain is placed overlapping nothing
-                nxt_x = x - (xj + vxj * DT)
-                nxt_y = y - (yj + vyj * DT)
-                nxt_z = z - (zj + vzj * DT)
+                nxt_x = x - (xj + vxj * dt)
+                nxt_y = y - (yj + vyj * dt)
+                nxt_z = z - (zj + vzj * dt)
                 blk[0] = blk[0] + pending * valid * (1.0 - armed_j) * as_float(
                     radius + rj + EMIT_MARGIN - (nxt_x * nxt_x + nxt_y * nxt_y + nxt_z * nxt_z + 1.0e-12).sqrt() > 0.0)
                 # ... and not into the slot of a LOWER armed id that is within contact distance of this slot (the lower
@@ -1278,7 +1292,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
                 wrel = (wx - wj[0], wy - wj[1], wz - wj[2])
                 force, torque = _contact(radius + rj - dist, valid * (1.0 - armed_j), nrm, vr, spin_slip, wrel, kn, m_eff,
                                          (mu * muj).sqrt(), (zeta * zetaj).sqrt(), (roll * rollj).sqrt(), radius,
-                                         radius * rj / (radius + rj), 0.5 * (radius + rj), hertz, coh)
+                                         radius * rj / (radius + rj), 0.5 * (radius + rj), hertz, coh, dt=dt)
                 blk[2] = blk[2] + as_float(radius + rj - dist > 0.0) * valid * (1.0 - armed_j)         # a real contact closes the surface
                 for k in range(3):
                     f_[k] = f_[k] + force[k]
@@ -1324,49 +1338,53 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             vr = (vx, vy, vz) if vel is None else (vx - vel[0], vy - vel[1], vz - vel[2])
             sp = w_self if spin is None else spin
             res = _contact(dl, valid, n_vec, vr, _cross((radius * sp[0], radius * sp[1], radius * sp[2]), n_vec),
-                           sp, kw, mass, mu, zeta, roll, radius, radius, radius, hertz, coh, split)
+                           sp, kw, mass, mu, zeta, roll, radius, radius, radius, hertz, coh, split, dt=dt)
             force, torque = res[0], res[1]
             blk[2] = blk[2] + as_float(dl.clamp(0.0, 1.0e9) * valid > 0.0)               # a wall touching the grain closes its surface too
             for k in range(3):
                 f_[k] = f_[k] + force[k]
                 q_[k] = q_[k] + torque[k]
             return res[0], res[2] if split else None
-        # THICK, SIDED, OVERLAPPING walls.  Each segment is a half-space bounded by its line, whose normal is the segment's LEFT
-        # normal (the polyline runs with the chamber on its left): a grain on the wrong side of the line, however deep, is
-        # pushed back toward the chamber by the same contact law (never a clamp or a teleport).  The overlap is bounded by a
-        # THICKNESS of 6 radii (the penetration depth the spring feels saturates there: a bounded, stable force) and the
-        # segment extends past each end by ``ext`` (a third of the half-width), its weight tapering linearly to 0 over that
-        # margin, so neighbouring walls overlap at every vertex: a grain that outruns a corner is still met by one of the walls
-        # and there is no half-weight seam.  A grain inside the chamber near a concave corner meets both walls, as it does
-        # against a floor and a side wall.
-        ext = 0.3 * half + 1.0e-6
-        for k in range(NV - 1):
-            ax, ay, bx, by = a[f"px{k}"], a[f"py{k}"], a[f"px{k + 1}"], a[f"py{k + 1}"]
-            ex, ey = bx - ax, by - ay
-            len2 = ex * ex + ey * ey
-            seg_len = (len2 + 1.0e-12).sqrt()
-            inv_len = 1.0 / seg_len
-            nlx, nly = -ey * inv_len, ex * inv_len
-            side_s = (x - ax) * nlx + (y - ay) * nly
-            along = ((x - ax) * ex + (y - ay) * ey) * inv_len                 # distance along the segment from its start
-            w_start = ((along + ext) * (1.0 / ext)).clamp(0.0, 1.0)
-            w_end = ((seg_len + ext - along) * (1.0 / ext)).clamp(0.0, 1.0)
-            share = as_float(len2 > 1.0e-8) * w_start * w_end
-            wall(_cap(radius - side_s, 6.0 * radius), live * share, (zero + nlx, zero + nly, zero))
-        wall(radius - (dh - z), live, (zero, zero, zero - 1.0))             # the front plexiglass (+z), its normal points at the grain: -z
-        wall(radius - (z + dh), live, (zero, zero, zero + 1.0))             # the back plexiglass (-z)
-        wall(radius - (lid - y), live, (zero, zero - 1.0, zero))            # the lid: a ceiling at the runtime height ``lid`` (far unless the page closes it)
-        # the SDF walls (``sdf_on`` = 1): the SAME thick sided saturating contact against the composed analytic chamber SDF of the true 3-D solids.
-        # Contact when d < radius, the penetration (radius - d) saturating at 6 radii, the force along the SDF's analytic gradient (into the
-        # fluid): a grain on the wrong side of a wall is pushed back by a bounded force, never clamped or moved.  sdf_on = 0: the validity
-        # weight is an exact zero, so every term is an exact zero (and the law is the old law bit for bit).
-        if sdf:
-            sdf_on = a["sdf_on"]
-            d_sdf, sdf_nx, sdf_ny, sdf_nz = sdf_field(x, y, z, lambda k, field: a[f"q{k}{field}"])
-            wall(_cap(radius - d_sdf, 6.0 * radius), live * sdf_on, (sdf_nx, sdf_ny, sdf_nz))
-            sdf_gone = live * sdf_on * as_float(d_sdf < -radius)           # the grain centre is more than a radius on the wrong side
+        if environment is not None:
+            environment.contacts((x, y, z), radius, live, a, wall)
+            sdf_gone = zero
         else:
-            sdf_gone = x * 0.0
+            # THICK, SIDED, OVERLAPPING walls.  Each segment is a half-space bounded by its line, whose normal is the segment's LEFT
+            # normal (the polyline runs with the chamber on its left): a grain on the wrong side of the line, however deep, is
+            # pushed back toward the chamber by the same contact law (never a clamp or a teleport).  The overlap is bounded by a
+            # THICKNESS of 6 radii (the penetration depth the spring feels saturates there: a bounded, stable force) and the
+            # segment extends past each end by ``ext`` (a third of the half-width), its weight tapering linearly to 0 over that
+            # margin, so neighbouring walls overlap at every vertex: a grain that outruns a corner is still met by one of the walls
+            # and there is no half-weight seam.  A grain inside the chamber near a concave corner meets both walls, as it does
+            # against a floor and a side wall.
+            ext = 0.3 * half + 1.0e-6
+            for k in range(NV - 1):
+                ax, ay, bx, by = a[f"px{k}"], a[f"py{k}"], a[f"px{k + 1}"], a[f"py{k + 1}"]
+                ex, ey = bx - ax, by - ay
+                len2 = ex * ex + ey * ey
+                seg_len = (len2 + 1.0e-12).sqrt()
+                inv_len = 1.0 / seg_len
+                nlx, nly = -ey * inv_len, ex * inv_len
+                side_s = (x - ax) * nlx + (y - ay) * nly
+                along = ((x - ax) * ex + (y - ay) * ey) * inv_len                 # distance along the segment from its start
+                w_start = ((along + ext) * (1.0 / ext)).clamp(0.0, 1.0)
+                w_end = ((seg_len + ext - along) * (1.0 / ext)).clamp(0.0, 1.0)
+                share = as_float(len2 > 1.0e-8) * w_start * w_end
+                wall(_cap(radius - side_s, 6.0 * radius), live * share, (zero + nlx, zero + nly, zero))
+            wall(radius - (dh - z), live, (zero, zero, zero - 1.0))             # the front plexiglass (+z), its normal points at the grain: -z
+            wall(radius - (z + dh), live, (zero, zero, zero + 1.0))             # the back plexiglass (-z)
+            wall(radius - (lid - y), live, (zero, zero - 1.0, zero))            # the lid: a ceiling at the runtime height ``lid`` (far unless the page closes it)
+            # the SDF walls (``sdf_on`` = 1): the SAME thick sided saturating contact against the composed analytic chamber SDF of the true 3-D solids.
+            # Contact when d < radius, the penetration (radius - d) saturating at 6 radii, the force along the SDF's analytic gradient (into the
+            # fluid): a grain on the wrong side of a wall is pushed back by a bounded force, never clamped or moved.  sdf_on = 0: the validity
+            # weight is an exact zero, so every term is an exact zero (and the law is the old law bit for bit).
+            if sdf:
+                sdf_on = a["sdf_on"]
+                d_sdf, sdf_nx, sdf_ny, sdf_nz = sdf_field(x, y, z, lambda k, field: a[f"q{k}{field}"])
+                wall(_cap(radius - d_sdf, 6.0 * radius), live * sdf_on, (sdf_nx, sdf_ny, sdf_nz))
+                sdf_gone = live * sdf_on * as_float(d_sdf < -radius)           # the grain centre is more than a radius on the wrong side
+            else:
+                sdf_gone = x * 0.0
         tb = zero
         if body:
             # ---- the HINGED BODY (waterwheel), the 2-D law's: a hub disc and ``body_np`` capsule paddles in the body frame (hinge ``body_x, body_y``,
@@ -1414,22 +1432,22 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         buoy = 1.0 - fl_rho / density
         speed_now = (vx * vx + vy * vy + vz * vz).sqrt()
         kdrag = 4.5 * fl_mu / (density * radius * radius) + 0.176 * fl_rho / (density * radius) * speed_now
-        damp = 1.0 / (1.0 + live * kdrag * DT)
-        # THERMOSTAT (Langevin): a random force per component of variance 2 gamma m kT / DT, with gamma the drag rate just
+        damp = 1.0 / (1.0 + live * kdrag * dt)
+        # THERMOSTAT (Langevin): a random force per component of variance 2 gamma m kT / dt, with gamma the drag rate just
         # added (fluctuation-dissipation), so the grain's velocity relaxes to a Maxwell distribution of temperature kT; the
-        # factor sqrt(1 + gamma DT / 2) makes the implicit drag's stationary variance exactly kT / m.  The same for the spin
+        # factor sqrt(1 + gamma dt / 2) makes the implicit drag's stationary variance exactly kT / m.  The same for the spin
         # (its rate: the spin drag plus the fluid's rotational Stokes drag).  The noise is a pure hash of (id, step, component),
         # so a replay repeats it; at kT = 0 every term is an exact zero.
         gamma_r = spin_drag + 10.0 * fl_mu / (density * radius * radius)
-        step_now = (age * (1.0 / DT) + 0.5).floor()
-        f_amp = (2.0 * kdrag * mass * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * kdrag * DT).sqrt()
-        q_amp = (2.0 * gamma_r * inertia * temp * (1.0 / DT)).sqrt() * (1.0 + 0.5 * gamma_r * DT).sqrt()
+        step_now = (age * (1.0 / dt) + 0.5).floor()
+        f_amp = (2.0 * kdrag * mass * temp * (1.0 / dt)).sqrt() * (1.0 + 0.5 * kdrag * dt).sqrt()
+        q_amp = (2.0 * gamma_r * inertia * temp * (1.0 / dt)).sqrt() * (1.0 + 0.5 * gamma_r * dt).sqrt()
         for k in range(3):
             f_[k] = f_[k] + f_amp * _noise(pid, step_now, k)
             q_[k] = q_[k] + q_amp * _noise(pid, step_now, 3 + k)
         # the CASE FRAME (the walls are static here; legacy z turns use case_omega/case_domega, with x/y components
         # available for a full 3-D turn): besides the rotated gravity a grain feels the centrifugal
-        # w^2 (r - p) and Euler -dw x (r - p) accelerations, and its velocity turns by -2 w DT (Coriolis, an exact rotation, so any
+        # w^2 (r - p) and Euler -dw x (r - p) accelerations, and its velocity turns by -2 w dt (Coriolis, an exact rotation, so any
         # rate is stable); its own z-spin gains -dw/dt.  The defaults (0) add exact zeros.
         # The turning case is capped at what the walls can hold: the centrifugal load of a grain at the far wall (w^2 R) must be
         # met by the contact spring (omega^2 x penetration), so w is limited to omega sqrt(0.5 r / R) for the grain's radius r and
@@ -1467,25 +1485,25 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         fict_y = AbstractTensor.where(vector_on, -cent[1] - euler[1], old_fict_y)
         fict_z = AbstractTensor.where(vector_on, -cent[2] - euler[2], zero)
         # Translating case frame: the housing is static here, while the
-        # particles feel -d²(case displacement)/dt².  The same displaced-fluid
+        # particles feel -dÃ‚Â²(case displacement)/dtÃ‚Â².  The same displaced-fluid
         # buoyancy factor as gravity applies to this inertial acceleration.
         shake_cap = omega * omega * 0.5 * radius
         shake_x = -_cap(-_cap(a["case_acc_x"], shake_cap), shake_cap)
         shake_y = -_cap(-_cap(a["case_acc_y"], shake_cap), shake_cap)
         shake_z = -_cap(-_cap(a["case_acc_z"], shake_cap), shake_cap)
-        vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x - shake_x * buoy) * DT) * damp
-        vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y - shake_y * buoy) * DT) * damp
-        turn = (case_omega * DT) * -2.0
+        vx_a = (vx + live * (f_[0] / mass + grav[0] * buoy + fict_x - shake_x * buoy) * dt) * damp
+        vy_a = (vy + live * (f_[1] / mass + grav[1] * buoy + fict_y - shake_y * buoy) * dt) * damp
+        turn = (case_omega * dt) * -2.0
         c_turn, s_turn = turn.cos(), turn.sin()
         vx_c = AbstractTensor.where(live > 0.5, vx_a * c_turn - vy_a * s_turn, vx_a)
         vy_c = AbstractTensor.where(live > 0.5, vx_a * s_turn + vy_a * c_turn, vy_a)
         vxn = AbstractTensor.where(just > 0.5, vx0, vx_c)
         vyn = AbstractTensor.where(just > 0.5, vy0, AbstractTensor.where(arming > 0.5, vy * 0.0 + ARMED, vy_c))
-        vz_a = (vz + live * (f_[2] / mass + grav[2] * buoy + fict_z - shake_z * buoy) * DT) * damp
+        vz_a = (vz + live * (f_[2] / mass + grav[2] * buoy + fict_z - shake_z * buoy) * dt) * damp
         # Rodrigues' exact Coriolis rotation about the full case angular vector; legacy z rotations retain their
         # original arithmetic.  omega=0 gives the identity because both cross products are zero.
         axis = tuple(v * (1.0 / om_eff_mag) for v in om)
-        turn3 = om_eff_mag * (-2.0 * DT)
+        turn3 = om_eff_mag * (-2.0 * dt)
         c3, s3 = turn3.cos(), turn3.sin()
         va = (vx_a, vy_a, vz_a)
         cross_v = _cross(axis, va)
@@ -1495,14 +1513,14 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         vy_c = AbstractTensor.where(vector_on, AbstractTensor.where(live > 0.5, rotated[1], vy_a), vy_c)
         vz_c = AbstractTensor.where(vector_on, AbstractTensor.where(live > 0.5, rotated[2], vz_a), vz_a)
         vzn = AbstractTensor.where(just > 0.5, vz0, vz_c)
-        sdamp = (1.0 - just) / (1.0 + live * gamma_r * DT)
-        wxn = (wx + live * (q_[0] / inertia - AbstractTensor.where(vector_on, al[0], zero)) * DT) * sdamp
-        wyn = (wy + live * (q_[1] / inertia - AbstractTensor.where(vector_on, al[1], zero)) * DT) * sdamp
-        wzn = (wz + live * (q_[2] / inertia - AbstractTensor.where(vector_on, al[2], case_domega)) * DT) * sdamp
-        xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * DT)
-        yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * DT)
-        zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * DT)
-        age_next = age + DT
+        sdamp = (1.0 - just) / (1.0 + live * gamma_r * dt)
+        wxn = (wx + live * (q_[0] / inertia - AbstractTensor.where(vector_on, al[0], zero)) * dt) * sdamp
+        wyn = (wy + live * (q_[1] / inertia - AbstractTensor.where(vector_on, al[1], zero)) * dt) * sdamp
+        wzn = (wz + live * (q_[2] / inertia - AbstractTensor.where(vector_on, al[2], case_domega)) * dt) * sdamp
+        xn = AbstractTensor.where(place > 0.5, x0, x + live * vxn * dt)
+        yn = AbstractTensor.where(place > 0.5, y0, y + live * vyn * dt)
+        zn = AbstractTensor.where(place > 0.5, z0, z + live * vzn * dt)
+        age_next = age + dt
         # ---- ORBEEZ: a swelling species takes up solvent through its OPEN surface.  A grain's surface is closed by what it touches (the
         # grains and walls in contact, ``FULL_COORDINATION`` closing it entirely), so its radius grows at ``swell`` x its initial radius per
         # second times the exposed fraction times the solvent present (the fluid's: 0 in air), up to ``swmax`` x the initial radius.  The
@@ -1512,7 +1530,7 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
         swell = pick(table("swell"), g1, g2, g3)
         swmax = pick(table("swmax"), g1, g2, g3)
         exposure = (1.0 - blk[2] * (1.0 / FULL_COORDINATION)).clamp(0.0, 1.0)
-        grown = _cap(rs + live * (swell * radius0 * exposure * solvent) * DT, radius0 * swmax)
+        grown = _cap(rs + live * (swell * radius0 * exposure * solvent) * dt, radius0 * swmax)
         rs_next = AbstractTensor.where(place > 0.5, radius0, grown)
         # ---- colour from the angle of the launch vector.  theta_c is a hashed launch angle (+-0.7 rad, whatever the cone):
         # the hue turns four times as fast as it so the fan spans most of the wheel: trig = atan2, rotation = the
@@ -1550,8 +1568,11 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             * as_float(vxn.abs() < 1.0e30) * as_float(vyn.abs() < 1.0e30) * as_float(vzn.abs() < 1.0e30) \
             * as_float(wxn.abs() < 1.0e30) * as_float(wyn.abs() < 1.0e30) * as_float(wzn.abs() < 1.0e30)
         placed = finite * as_float((xn.abs() + yn.abs() + zn.abs()) >= 1.0e-30) * as_float(vyn >= ARMED * 0.5)
-        inside_box = (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) \
-            * (1.0 - as_float(zn.abs() > dh + radius)) * (1.0 - sdf_gone)
+        if environment is None:
+            inside_box = (1.0 - as_float(xn.abs() > half + radius)) * (1.0 - as_float(yn < -radius)) \
+                * (1.0 - as_float(zn.abs() > dh + radius)) * (1.0 - sdf_gone)
+        else:
+            inside_box = environment.contains((xn, yn, zn), radius, a)
         outside = placed * (1.0 - inside_box)
         c_nan = 1.0 - finite
         c_parked = finite * (1.0 - placed)
@@ -1581,10 +1602,10 @@ def make_law(n: int, active: int | None = None, sdf: bool = True, body: bool = F
             # ``rotational_friction.friction_impulse`` does: the viscous drag ``gam I |omega|`` capped at sticking (it never reverses omega).
             inertia_b = a["body_i"]
             tau_c = tb.index_select(0, pid * 0.0)
-            om1 = a["bom"] + (tau_c + a["body_tau"] + a["body_alpha"] * inertia_b) * (1.0 / inertia_b) * DT
-            mag = _min(a["body_gam"] * inertia_b * om1.abs() * DT, om1.abs() * inertia_b)
+            om1 = a["bom"] + (tau_c + a["body_tau"] + a["body_alpha"] * inertia_b) * (1.0 / inertia_b) * dt
+            mag = _min(a["body_gam"] * inertia_b * om1.abs() * dt, om1.abs() * inertia_b)
             om2 = om1 - _sgn(om1) * mag * (1.0 / inertia_b)
-            th1 = a["bth"] + om2 * DT
+            th1 = a["bth"] + om2 * dt
             th2 = th1 - TAU * (th1 * (1.0 / TAU) + 0.5).floor()
             return (xn, yn, zn, vxn, vyn, vzn, wxn, wyn, wzn, age_next, rs_next, th2, om2, cr, cg, cb, radius, act,
                     ke, v2, c_nan, c_out, c_parked, c_live, c_drop, th2, om2, tau_c)

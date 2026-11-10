@@ -1,0 +1,9 @@
+# Three material renderer versions
+
+User explicitly requested selectable Legacy, Glass rod and Injection dye versions, defaulting new designs to Glass rod, with opaque inner Legacy defaults. Implemented visible/open selector, startup Glass rod authoring profile and historical-design preservation: restore of a saved design without optical authoring stays Legacy, while authored mode/spectra round-trip unchanged. Legacy blue/green/amber PBR defaults are now transmission0/opacity1; named identities, IOR and colors remain unchanged. Optical snapshots still override legacy alpha to T1/opacity0 and use their stored explicit spectra. No saved objects or current user data were rewritten.
+
+Source material_catalog and production assets agree. Assets publication changed exactly six PBR values, no other semantic asset contents. Only optical controls JS, targeted HTML selector/explanation and assets.json published, each HTTPS hash verified. No server restart. Receipt build/dot-three-material-versions-20261109/receipt.json.
+
+Tests: full Node optical save/load/re-save and ownership authoring suite passed, including fresh Glass rod default, absent historical mode stays Legacy, all three authored modes preserved and existing spectra preserved. Five Python material catalog/native table and material-ID tests passed. Photo-only limitations remain explicit for rod/injection; no claim these modes work in live rendering. Existing current tabs need refresh for new startup defaults; refreshing/loading does not migrate stored designs.
+
+Image interpretation: user clarified the clear/colorless image was Legacy. Do not infer screenshot correspondence from job ordering. Optical rendering can legitimately produce blue from its selected spectra; that is material behavior, not proof of an engine color-correction defect. Earlier neutral clear-host initialization change applies only to new optical records; existing blue-biased authored host spectra remain untouched.

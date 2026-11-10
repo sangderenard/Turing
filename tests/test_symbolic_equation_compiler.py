@@ -180,3 +180,47 @@ def test_tanh_lowers_to_llvm_as_a_declared_libm_call():
     )
     assert fortran.complete, [s.format() for s in fortran.shortfalls]
     assert "tanh(" in fortran.source
+
+
+def test_symbolic_scheduled_stores_keep_exact_ingestion_provenance(monkeypatch):
+    from src.compiler import symbolic_equation_compiler as compiler
+    from src.compiler.concordance_declarations import INGESTION_VALUE
+    from src.compiler.identity_concordance import current_identity_book
+    from src.common.tensors.topological_reducer import _posted_node_identity_cell
+
+    original = compiler.process_graph_to_ssa_instrs
+    observed = []
+
+    def inspect_schedule(graph, **kwargs):
+        scope = graph.G.graph["ingestion_value_scope"]
+        assert not graph.G.graph.get("canonical_value_ids", False)
+        assert graph.G.graph.get("lexical_read_scope") is None
+        result = original(graph, **kwargs)
+        book = current_identity_book()
+        for node_id, data in graph.G.nodes(data=True):
+            if data["type"] != "Store":
+                continue
+            cell = _posted_node_identity_cell(graph, node_id)
+            assert cell is not None and cell.page == INGESTION_VALUE
+            assert cell.row[0] == scope
+            producer = _posted_node_identity_cell(graph, data["parents"][0][0])
+            assert producer in {cause for cause, _stage in book.edges_into(cell)}
+            observed.append(cell)
+        return result
+
+    monkeypatch.setattr(compiler, "process_graph_to_ssa_instrs", inspect_schedule)
+    x = sympy.Symbol("scope_input")
+    compiler.compile_sympy_equations((sympy.Eq(sympy.Symbol("scope_output"), x + 1, evaluate=False),))
+    assert observed
+
+
+def test_canonical_store_without_lexical_scope_still_fails():
+    import copy
+    import pytest
+    from src.compiler.ssa_builder import process_graph_to_ssa_instrs
+    x = sympy.Symbol("guard_input")
+    compiled = compile_sympy_equations((sympy.Eq(sympy.Symbol("guard_output"), x + 1, evaluate=False),))
+    invalid = copy.deepcopy(compiled.process_graph)
+    invalid.G.graph["canonical_value_ids"] = True
+    with pytest.raises(ValueError, match="has no lexical read scope"):
+        process_graph_to_ssa_instrs(invalid)

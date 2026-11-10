@@ -261,6 +261,13 @@ class _FunctionEmitter:
         self.outputs = tuple(outputs)
         self.loops = tuple(loop_records)
         self.callees = dict(callees or {})
+        self.aggregate_call_arities = {
+            int(instruction.res.id): len(self.callees[str(instruction.attributes["callee"])])
+            for block in function.blocks.values() for instruction in block.instrs
+            if instruction.op == "Call" and instruction.res is not None
+            and instruction.res.dtype == "ssa.aggregate"
+            and str(instruction.attributes.get("callee", "")) in self.callees
+        }
         self.store_outputs = store_outputs
         self.packed_outputs = bool(packed_outputs)
         self.invocation_count = int(invocation_count)
@@ -338,6 +345,10 @@ class _FunctionEmitter:
                 comparison if dtype == "bool"
                 else f"select(0.0f, 1.0f, {comparison})"
             )
+        elif operation in {"LAnd", "LOr"} and len(args)==2 and dtype=="bool":
+            expression = f"(bool({args[0]}) {'&&' if operation=='LAnd' else '||'} bool({args[1]}))"
+        elif operation == "LNot" and len(args)==1 and dtype=="bool":
+            expression = f"(!bool({args[0]}))"
         elif operation in _BINARY and len(args) == 2:
             expression = _BINARY[operation].format(*args)
         elif operation in _UNARY and len(args) == 1:
@@ -399,8 +410,14 @@ class _FunctionEmitter:
             # from there keeps this exact when the constant that spells it
             # has been folded away.
             index = instr.attributes.get("aggregate_index")
+            arity = self.aggregate_call_arities.get(int(instr.args[0].id))
+            if arity is not None and (
+                type(index) is not int or not 0 <= index < arity
+            ):
+                self.fail(operation, "aggregate index is outside the callee return contract")
+                return
             self.aliases[result.id] = (
-                args[0] if index is None else f"{args[0]}[{int(index)}]"
+                args[0] if index is None or arity == 1 else f"{args[0]}[{int(index)}]"
             )
             return
         elif operation in {"Load", "load"} and args:
@@ -463,7 +480,7 @@ class _FunctionEmitter:
         self.lines.append(f"{indent}loop {{")
         for instr in header_work:
             self.emit_assignment(instr, indent + "  ")
-        self.lines.append(f"{indent}  break if (!{self.operand(condition_instr.args[0])});")
+        self.lines.append(f"{indent}  if (!{self.operand(condition_instr.args[0])}) {{ break; }}")
         self.emit_block(body, indent + "  ", omit_control=True)
         self.lines.append(f"{indent}  continuing {{")
         self.emit_block(latch, indent + "    ", omit_control=True)
@@ -531,9 +548,10 @@ class _FunctionEmitter:
                     f"outputs[{binding * self.invocation_count}u + linear_index]"
                     if self.packed_outputs else f"output_{binding}[linear_index]"
                 )
-                self.lines.append(
-                    f"  {target} = {self.aliases.get(value_id, f'v_{value_id}')};"
-                )
+                value = self.aliases.get(value_id, f"v_{value_id}")
+                output = next(item for item in self.outputs if item.id == value_id)
+                if self.dtype(output) == "bool": value = f"select(0u, 1u, {value})"
+                self.lines.append(f"  {target} = {value};")
         elif len(self.outputs) == 1:
             self.lines.append(f"  return {self.operand(self.outputs[0])};")
         elif self.outputs:
@@ -898,6 +916,7 @@ def emit_module(
     output_binding_base = 1 if packed_feeds else len(function.args)
     if packed_outputs:
         dtype = next(iter(output_dtypes), "f32")
+        if dtype == "bool": dtype = "u32"
         bindings.append(
             f"@group(0) @binding({output_binding_base}) var<storage, read_write> outputs: array<{dtype}>;"
         )
@@ -908,6 +927,7 @@ def emit_module(
         for index, value in enumerate(output_values):
             binding = output_binding_base + index
             dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+            if dtype == "bool": dtype = "u32"
             bindings.append(
                 f"@group(0) @binding({binding}) var<storage, read_write> output_{index}: array<{dtype}>;"
             )
@@ -2117,3 +2137,144 @@ def emit_tensor_program_passes(
         bindings, spb,
         slot_report=report,
     )
+
+class _CFGFunctionEmitter(_FunctionEmitter):
+    """Existing scalar expressions plus exact CFG dispatch and typed storage."""
+    def emit_assignment(self, instr, indent):
+        op = str(instr.op)
+        args = [self.operand(v) for v in instr.args]
+        result = instr.res
+        if op == 'GetElementPtr':
+            if len(args) != 2 or instr.args[0].id not in self.storage_roots:
+                self.fail(op, 'CFG address requires a declared typed array root'); return
+            self.lines.append(f'{indent}index_{result.id} = u32({args[1]});')
+            self.aliases[result.id] = f'{args[0]}[index_{result.id}]'
+        elif op == 'Store':
+            if len(args) != 2 or instr.args[1].id not in self.aliases:
+                self.fail(op, 'CFG store has no declared address'); return
+            self.lines.append(f'{indent}{args[1]} = {args[0]};')
+        elif op == 'Cast':
+            self.lines.append(f'{indent}{_name(result)} = {self.dtype(result)}({args[0]});')
+        elif op == 'Const' and 'values' in instr.attributes:
+            values = instr.attributes['values']; dtype = self.dtype(result)
+            if tuple(result.shape) != (len(values),):
+                self.fail(op, 'Local array has no exact flat layout'); return
+            self.lines.append(f'{indent}{_name(result)} = array<{dtype}, {len(values)}>(' + ', '.join(_literal(v,dtype) for v in values) + ');')
+        else:
+            super().emit_assignment(instr, indent)
+
+
+def emit_cfg_module(module, *, name, count, shared_args=(), preferred_local_size=64):
+    """Emit an inlined source CFG, one complete invocation per GPU work item.
+
+    Uses the same typed SSA operations as ordinary WGSL emission. CFG edges
+    carry simultaneous Phi copies. No source-function names or traversal laws
+    are recognized here. Geometry spans are shared, per-item scalars packed by
+    dtype, and a runtime count is provided in the controls buffer at slot zero.
+    """
+    from .identity_concordance import CorrelationTable
+    from .ir_identities import precision_backend_shortfalls
+    from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
+    from .shader_component_abi import component_abi_from_layout
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+    if CorrelationTable.build(module).findings(module):
+        raise WGSLEmissionError('CFG module has unresolved identity findings')
+    if precision_backend_shortfalls(module,'webgpu'):
+        raise WGSLEmissionError('WebGPU cannot honor module precision obligations')
+    f=module.functions[name]; shared=set(shared_args)
+    if not shared <= {v.id for v in f.args}: raise ValueError('Unknown shared formal')
+    returns=[i.args for b in f.blocks.values() for i in b.instrs if str(i.op)=='Ret']
+    if len(returns)!=1: raise WGSLEmissionError('CFG emission requires one declared exit')
+    outputs=returns[0]; launch=plan_wgsl_launch(count,preferred_local_size=preferred_local_size)
+    emitter=_CFGFunctionEmitter(f,outputs=outputs,loop_records=())
+    emitter.storage_roots=set(); bindings=[]; feed_bindings=[]; output_bindings=[]; layout=[]
+    # Dynamic dispatch bound is separate from the fixed per-column capacity.
+    bindings.append('@group(0) @binding(0) var<storage, read> controls: array<u32>;')
+    feed_bindings.append(BufferBinding('controls','feed','u32',0,value_id=None))
+    layout.append({'binding':0,'name':'controls','dtype':'uint32','role':'count','elements':1})
+    grouped={}; spans=[]; uniforms=[]
+    for v in f.args:
+        dtype=emitter.dtype(v)
+        if dtype not in {'f32','i32','u32'}: raise WGSLEmissionError('CFG formal requires a supported storage scalar')
+        if v.shape:
+            if v.id not in shared or len(v.shape)!=1: raise WGSLEmissionError('CFG spans must be flat shared arguments')
+            spans.append(v)
+        elif v.id in shared: uniforms.append(v)
+        else: grouped.setdefault(dtype,[]).append(v)
+    initial=[]
+    for dtype,values in grouped.items():
+        binding=len(bindings);buf=f'items_{binding}'
+        bindings.append(f'@group(0) @binding({binding}) var<storage, read> {buf}: array<{dtype}>;')
+        feed_bindings.append(BufferBinding(buf,'feed',dtype,binding,value_id=None))
+        layout.append({'binding':binding,'name':buf,'dtype':{'f32':'float32','i32':'int32','u32':'uint32'}[dtype],'role':'items','value_ids':[v.id for v in values],'capacity':count})
+        for offset,v in enumerate(values): initial.append(f'  {_name(v)} = {buf}[{offset*count}u + linear_index];')
+    for v in [*uniforms,*spans]:
+        dtype=emitter.dtype(v);binding=len(bindings);buf=f'feed_{v.id}'
+        bindings.append(f'@group(0) @binding({binding}) var<storage, read> {buf}: array<{dtype}>;')
+        feed_bindings.append(BufferBinding(buf,'feed',dtype,binding,value_id=v.id))
+        layout.append({'binding':binding,'name':buf,'dtype':{'f32':'float32','i32':'int32','u32':'uint32'}[dtype],'role':'span' if v.shape else 'uniform','value_id':v.id,'elements':v.shape[0] if v.shape else 1})
+        if v.shape: emitter.aliases[v.id]=buf;emitter.storage_roots.add(v.id)
+        else: initial.append(f'  {_name(v)} = {buf}[0u];')
+    for j,v in enumerate(outputs):
+        dtype=emitter.dtype(v);dtype='u32' if dtype=='bool' else dtype;binding=len(bindings);buf=f'output_{j}'
+        bindings.append(f'@group(0) @binding({binding}) var<storage, read_write> {buf}: array<{dtype}>;')
+        output_bindings.append(BufferBinding(buf,'output',dtype,binding,value_id=v.id))
+        layout.append({'binding':binding,'name':buf,'dtype':{'f32':'float32','i32':'int32','u32':'uint32'}[dtype],'role':'output','value_id':v.id,'elements':count})
+    if len(bindings)>8: raise WGSLEmissionError('CFG bindings exceed WebGPU guaranteed eight storage slots')
+    values={v.id:v for v in f.args}
+    values.update({i.res.id:i.res for b in f.blocks.values() for i in b.instrs if i.res is not None})
+    declarations=[]
+    for v in values.values():
+        if v.id in emitter.aliases: continue
+        if str(v.dtype)=='ptr': declarations.append(f'  var index_{v.id}: u32;');continue
+        dtype=emitter.dtype(v)
+        if dtype is None: continue
+        if v.shape:
+            if len(v.shape)!=1: raise WGSLEmissionError('Local storage must be a flat array')
+            dtype=f'array<{dtype}, {v.shape[0]}>';emitter.storage_roots.add(v.id)
+        declarations.append(f'  var {_name(v)}: {dtype};');emitter.declared.add(v.id)
+    labels={label:i for i,label in enumerate(f.blocks)}
+    def edge(source,target,indent):
+        if target not in labels: raise WGSLEmissionError('CFG branch target absent')
+        phis=[i for i in f.blocks[target].instrs if str(i.op)=='Phi']
+        for phi in phis:
+            incoming=tuple(phi.attributes.get('incoming_blocks',()))
+            if source not in incoming: raise WGSLEmissionError('CFG phi lacks predecessor')
+            value=phi.args[incoming.index(source)]
+            emitter.lines.append(f'{indent}let edge_{phi.res.id} = {emitter.operand(value)};')
+        for phi in phis: emitter.lines.append(f'{indent}{_name(phi.res)} = edge_{phi.res.id};')
+        emitter.lines.append(f'{indent}pc = {labels[target]}u;')
+    emitter.lines=['  var pc: u32 = 0u;','  loop {','    switch pc {']
+    for label,block in f.blocks.items():
+        emitter.lines.append(f'      case {labels[label]}u: {{')
+        for instruction in block.instrs:
+            op=str(instruction.op)
+            if op=='Phi':continue
+            if op=='Br': edge(label,instruction.attributes['target'],'        ');emitter.lines.append('        continue;')
+            elif op=='CondBr':
+                emitter.lines.append(f'        if ({emitter.operand(instruction.args[0])}) {{');edge(label,instruction.attributes['true_target'],'          ')
+                emitter.lines.append('        } else {');edge(label,instruction.attributes['false_target'],'          ')
+                emitter.lines.extend(['        }','        continue;'])
+            elif op=='Ret':
+                for j,v in enumerate(instruction.args):
+                    expression=emitter.operand(v)
+                    if emitter.dtype(v)=='bool':expression=f'select(0u, 1u, {expression})'
+                    emitter.lines.append(f'        output_{j}[linear_index] = {expression};')
+                emitter.lines.append('        return;')
+            else: emitter.emit_assignment(instruction,'        ')
+        emitter.lines.append('      }')
+    emitter.lines.extend(['      default: { return; }','    }','  }'])
+    local=launch.workgroup_size
+    source='\n'.join([*bindings,f'@compute @workgroup_size({local[0]}, {local[1]}, {local[2]})',
+        'fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {',f'  let linear_index = gid.x + gid.y * grid.x * {local[0]}u + gid.z * grid.x * grid.y * {local[0]*local[1]}u;',
+        f'  if (linear_index >= controls[0u] || linear_index >= {count}u) {{ return; }}',*declarations,*initial,*emitter.lines,'}',''])
+    io=ShaderIOLayout(COMPUTE.name,feeds=tuple(feed_bindings),outputs=tuple(output_bindings))
+    abi=component_abi_from_layout(name,'wgsl',io,decorations={'execution_model':'compute','workgroup_size':local})
+    api=CompiledProgramAPI(module=name,language='wgsl',entry='main',entry_points=(EntryPoint('main','main','numerical'),),metadata={'count':count,'workgroup_size':local,'bindings':layout,'io_layout':io.to_mapping(),'execution_model':'compute','cfg_dispatch':True})
+    result=WGSLModule(name,source,not emitter.shortfalls,tuple(emitter.shortfalls),api,launch,io,abi)
+    if result.complete:
+        from .concordance_declarations import Backend,ArtifactPart,EMISSION_WGSL,VALUE_WITHOUT_IDENTITY_CELL
+        from .emission_concordance import emission_book,post_artifact_part,value_cell
+        book=emission_book(module,'emit_cfg_module')
+        post_artifact_part(book,name,Backend.WGSL,ArtifactPart.MODULE_TEXT,data=source,sources=tuple(value_cell(book,f,v.id) for v in values.values()),reason=VALUE_WITHOUT_IDENTITY_CELL,stage=EMISSION_WGSL,module=module,what='emit_cfg_module')
+    return result

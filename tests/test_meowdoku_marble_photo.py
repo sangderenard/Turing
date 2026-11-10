@@ -88,6 +88,7 @@ class _FakeProcess:
 
     def __init__(self, command, **kwargs):
         self.command = command
+        self.kwargs = kwargs
         self.returncode = None
         self.instances.append(self)
 
@@ -107,20 +108,29 @@ class _FakeProcess:
 def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monkeypatch):
     store, saved_digest, vertices, normals, ids = photo_payload
     monkeypatch.setattr(photos.subprocess, "Popen", _FakeProcess)
+    monkeypatch.setattr(photos.PhotoJobs, "_validate_geometry", lambda self, payload, config: {
+        "sphere_coverage": "mesh", "triangle_budget": 250000,
+        "input_triangles": len(vertices), "effective_triangles": len(vertices), "analytic_spheres": 0,
+    })
     _FakeProcess.instances.clear()
     web = tmp_path / "build" / "meowdoku" / "web"
     web.mkdir(parents=True)
     (web / "boards.json").write_text(json.dumps({"boards": [], "levels": {}}))
     sessions = server.Sessions(web, None)
+    sessions.access.lookup = lambda url: None  # local HTTP test must not contact a public IP echo service
     sessions.marble_objects = store
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.make_handler(sessions))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
 
+    cookie = ""
     def request(method, path, body=b"", content_type="application/octet-stream"):
+        nonlocal cookie
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        conn.request(method, path, body=body, headers={"Content-Type": content_type})
+        conn.request(method, path, body=body, headers={"Content-Type": content_type, "Cookie": cookie})
         response = conn.getresponse()
+        # Requests from one browser retain its ownership cookie.
+        cookie = "; ".join(v.split(";")[0] for k,v in response.getheaders() if k.lower()=="set-cookie") or cookie
         data = response.read()
         status = response.status
         conn.close()
@@ -132,8 +142,29 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         started = json.loads(body)
         assert status == 202 and started["state"] == "preparing"
         digest = started["digest"]
+        own_jobs = json.loads(request("GET", "/api/marble_photo/jobs")[1])
+        assert [entry["digest"] for entry in own_jobs["entries"]] == [digest]
+        assert own_jobs["queue_available"] is False
+        stranger = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        stranger.request("GET", "/api/marble_photo/jobs")
+        response = stranger.getresponse()
+        assert json.loads(response.read())["entries"] == []
+        stranger.close()
+        stranger = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        stranger.request("POST", "/api/marble_photo/cancel", json.dumps({"digest":digest}), {"Content-Type":"application/json"})
+        response = stranger.getresponse()
+        assert response.status == 403
+        response.read(); stranger.close()
         assert len(_FakeProcess.instances) == 1
         assert "--seconds" in _FakeProcess.instances[0].command
+        live_wire = _wire(saved_digest, vertices, normals, ids, transport="fixed:3",
+                          live={"session_id":"a"*32,"history_samples":8,"aspect":2})
+        assert request("POST", "/api/marble_photo", live_wire)[0] == 409
+        assert len(_FakeProcess.instances) == 1  # live never displaces this photo
+        assert request("POST", "/api/marble_photo/live", json.dumps({"digest":digest,"stop":True}).encode(),
+                       "application/json")[0] == 409
+        assert _FakeProcess.instances[0].returncode is None
+
         assert request("POST", "/api/marble_photo", wire)[0] == 202
         assert len(_FakeProcess.instances) == 1  # same saved scene reuses its job
         status, body = request("GET", f"/api/marble_photo?digest={digest}")
@@ -177,7 +208,124 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         assert status == 200 and json.loads(body)["state"] == "canceled"
         assert _FakeProcess.instances[0].returncode == -15
         assert request("GET", f"/api/marble_photo?digest={digest}")[0] == 404
+        code, body = request("POST", "/api/marble_photo", live_wire)
+        assert code == 202
+        live_digest = json.loads(body)["digest"]
+        assert len(_FakeProcess.instances) == 2
+        live_dir = sessions.marble_photos.directory / live_digest
+        control = json.loads((live_dir / "live-control.json").read_text())
+        assert control["live"]["history_samples"] == 8 and control["live"]["width"] == 256
+        assert request("POST", "/api/marble_photo", wire)[0] == 409  # photo cannot silently replace live
+        code, _ = request("POST", "/api/marble_photo/live", json.dumps({"digest":live_digest,"revision":1,
+            "camera":{"eye_m":[.1,0,.07]},"live":{"history_samples":4}}).encode(), "application/json")
+        assert code == 200
+        control = json.loads((live_dir / "live-control.json").read_text())
+        assert control["revision"] == 1 and control["live"]["history_samples"] == 4
+        assert request("POST", "/api/marble_photo/live", json.dumps({"digest":live_digest,"revision":0}).encode(),
+                       "application/json")[0] == 409
+        assert request("POST", "/api/marble_photo/live", json.dumps({"digest":live_digest,"stop":True}).encode(),
+                       "application/json")[0] == 200
+        assert _FakeProcess.instances[1].returncode == -15
+
     finally:
         sessions.marble_photos.close()
         httpd.shutdown()
         httpd.server_close()
+
+def test_matching_live_marker_does_not_transfer_ownership(tmp_path,photo_payload,monkeypatch):
+    store,digest,vertices,normals,ids=photo_payload
+    monkeypatch.setattr(photos.subprocess,'Popen',_FakeProcess)
+    monkeypatch.setattr(photos.PhotoJobs,'_validate_geometry',lambda *args:{})
+    jobs=photos.PhotoJobs(tmp_path/'jobs',tmp_path)
+    wire=_wire(digest,vertices,normals,ids,transport='fixed:3',live={'session_id':'f'*32,'history_samples':8,'aspect':2})
+    try:
+        first=jobs.start(wire,store,owners=['account:1'])
+        process=jobs.process
+        altered=_wire(digest,vertices,normals,ids,transport='fixed:3',live={'session_id':'f'*32,'history_samples':16,'aspect':2})
+        with pytest.raises(photos.PhotoError,match='another identity'):
+            jobs.start(altered,store,owners=['account:2'])
+        assert jobs.process is process and process.poll() is None
+        assert jobs.active_digest==first['digest']
+    finally:jobs.close()
+
+def test_client_job_secret_environment_and_cleanup(tmp_path,photo_payload,monkeypatch):
+    from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
+    from meowdoku.client_ray_relay import RelayError
+    store,digest,vertices,normals,ids=photo_payload
+    monkeypatch.setattr(photos.subprocess,'Popen',_FakeProcess)
+    monkeypatch.setattr(photos.PhotoJobs,'_validate_geometry',lambda *args:{})
+    jobs=photos.PhotoJobs(tmp_path/'jobs',tmp_path);bridge=ClientRayProcessBridge()
+    wire=_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':128},client_intersections=True)
+    try:
+        result=jobs.start(wire,store,owners=['account:1'],client_bridge=bridge,bridge_url='https://127.0.0.1:9000/api/client_rays/engine',bridge_ca=tmp_path/'ca.crt')
+        env=jobs.process.kwargs['env'];secret=env['MEOWDOKU_RAY_BRIDGE_SECRET']
+        assert result['client_join']['credential']!=secret
+        assert env['MEOWDOKU_RAY_BRIDGE_JOB']==result['digest']
+        config=(jobs.directory/result['digest']/'config.json').read_text()
+        assert secret not in config and result['client_join']['credential'] not in config
+        jobs.process.returncode=0
+        jobs.status(result['digest'])
+        with pytest.raises(RelayError):bridge.join(result['digest'],'account:1')
+    finally:jobs.close()
+
+@pytest.mark.parametrize('options',[{'camera':{'resolution':8192}}, {'transport':'rgb'}, {'orbit_frames':2}])
+def test_client_job_rejects_unsupported_mode(photo_payload,options):
+    store,digest,vertices,normals,ids=photo_payload
+    base={'transport':'fixed:3','camera':{'resolution':128},'client_intersections':True,**options}
+    with pytest.raises(photos.PhotoError):photos.decode_upload(_wire(digest,vertices,normals,ids,**base),store)
+
+@pytest.mark.parametrize('resolution',[128,256,512,768,1024,2048,4096])
+def test_cooperative_still_admits_all_exposure_sizes(photo_payload,resolution):
+    store,digest,vertices,normals,ids=photo_payload
+    config=photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':resolution},client_intersections=True),store)[3]
+    assert config['client_intersections'] is True and config['camera']['resolution']==resolution
+
+
+@pytest.mark.parametrize('resolution',[128,256,512,768,1024,2048,4096])
+def test_cooperative_live_admits_all_exposure_sizes(photo_payload,resolution):
+    store,digest,vertices,normals,ids=photo_payload
+    config=photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':resolution},client_intersections=True,live={'session_id':'a'*32,'history_samples':8,'aspect':1}),store)[3]
+    assert config['client_intersections'] is True and config['live']['width']==resolution
+
+
+def test_participant_live_renewal_preserves_scene_and_owner(tmp_path,photo_payload,monkeypatch):
+    import json,time
+    from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
+    store,digest,vertices,normals,ids=photo_payload
+    monkeypatch.setattr(photos.subprocess,'Popen',_FakeProcess)
+    monkeypatch.setattr(photos.PhotoJobs,'_validate_geometry',lambda *args:{})
+    jobs=photos.PhotoJobs(tmp_path/'jobs',tmp_path);bridge=ClientRayProcessBridge()
+    wire=_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':128},client_intersections=True,live={'session_id':'a'*32,'history_samples':8})
+    try:
+        result=jobs.start(wire,store,owners=['account:1'],client_bridge=bridge,bridge_url='https://127.0.0.1:9000/api/client_rays/engine',bridge_ca=tmp_path/'ca.crt')
+        path=jobs.directory/result['digest']/'live-control.json'
+        before=json.loads(path.read_text());before['expires_at']=time.time()-5
+        path.write_text(json.dumps(before))
+        jobs.renew_participant_live(result['digest'],'account:2')
+        assert json.loads(path.read_text())==before
+        jobs.renew_participant_live('f'*64,'account:1')
+        assert json.loads(path.read_text())==before
+        jobs.process.returncode=0
+        jobs.renew_participant_live(result['digest'],'account:1')
+        assert json.loads(path.read_text())==before
+        jobs.process.returncode=None
+        jobs.renew_participant_live(result['digest'],'account:1')
+        after=json.loads(path.read_text())
+        assert after['expires_at']>time.time()
+        assert {k:v for k,v in after.items() if k!='expires_at'}=={k:v for k,v in before.items() if k!='expires_at'}
+        jobs.renew_participant_live(result['digest'],'account:1')
+        assert json.loads(path.read_text())==after
+        config_path=jobs.directory/result['digest']/'config.json'
+        original=json.loads(config_path.read_text())
+        for config in ({**original,'client_intersections':False}, {k:v for k,v in original.items() if k!='live'}):
+            config_path.write_text(json.dumps(config))
+            path.write_text(json.dumps(before))
+            jobs.renew_participant_live(result['digest'],'account:1')
+            assert json.loads(path.read_text())==before
+    finally:jobs.close()
+
+
+def test_cooperative_4k_history_budget_is_not_bypassed(photo_payload):
+    store,digest,vertices,normals,ids=photo_payload
+    with pytest.raises(photos.PhotoError,match='2 GiB'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':4096},client_intersections=True,live={'session_id':'a'*32,'history_samples':16,'aspect':1}),store)

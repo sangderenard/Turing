@@ -47,6 +47,38 @@ WIDE_OPERATIONS = WIDE_OPERATIONS_BY_TARGET["eager"]
 
 
 @dataclass(frozen=True)
+class ShaderPrecisionPolicy:
+    """Source-materialization precision, before typed ingestion or emission.
+
+    Unstamped floating literals default to binary32. An existing SSA floating
+    width is an authored declaration and wins over the default; callers can
+    explicitly request another width per value. This never retypes backend IR,
+    integer constants, or an authored Precision section.
+    """
+
+    default_dtype: str = "float32"
+    literal_overrides: Mapping[int, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        allowed = {"float32", "float64"}
+        if self.default_dtype not in allowed:
+            raise ValueError("shader floating precision must be float32 or float64")
+        if any(dtype not in allowed for dtype in self.literal_overrides.values()):
+            raise ValueError("shader literal overrides must be float32 or float64")
+
+    def literal_dtype(self, value_id, source_dtype, payload):
+        if source_dtype not in (None, "", "float32", "float64"):
+            return None
+        if not isinstance(payload, (int, float)) or isinstance(payload, bool):
+            return None
+        if source_dtype in (None, "") and not isinstance(payload, float):
+            return None
+        return self.literal_overrides.get(
+            int(value_id), source_dtype or self.default_dtype,
+        )
+
+
+@dataclass(frozen=True)
 class PrecisionPolicy:
     """The configurable standard, and the inputs it is measured on.
 

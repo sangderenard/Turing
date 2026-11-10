@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {querySettings,nextQueryDelay,cameraQueryBatch,LocalQueryLoop} from '../examples/meowdoku/web/client_ray_diagnostic.js';
+assert.equal(nextQueryDelay({batch:16,hz:2,duty:10},10),490);
+assert.equal(nextQueryDelay({batch:16,hz:10,duty:10},100),900);
+for(const x of [{batch:0},{hz:100},{duty:0}])assert.throws(()=>querySettings(x));
+const b=cameraQueryBatch({eye_m:[0,0,1],target_m:[0,0,0],fov_degrees:30},1);
+assert.deepEqual(Array.from(b.rays),[0,0,1,0,0,0,-1,1000]);
+assert.throws(()=>cameraQueryBatch({eye_m:[0,0,0],target_m:[0,0,0],fov_degrees:30},16));
+let pending=[],closed=0,results=0,resolve,key='a',time=0,creates=0;
+const backend={setScene(){},query(){return new Promise(r=>resolve=r);},close(){closed++;}};
+const loop=new LocalQueryLoop({createBackend:async()=>{creates++;return backend;},getWork:()=>({key,scene:{revision:key},rays:b.rays}),onResult:()=>results++,clock:()=>time,schedule:(f,ms)=>{pending.push({f,ms});return pending.length;},unschedule:()=>{pending=[];}});
+loop.setEnabled(true);let run=pending.shift().f();await Promise.resolve();assert.equal(creates,1);loop.setHidden(true);resolve({});await run;assert.equal(results,0);assert.equal(closed,1);assert.equal(pending.length,0);
+loop.setHidden(false);run=pending.shift().f();await Promise.resolve();key='b';time=20;resolve({});await run;assert.equal(results,0);assert.equal(pending.length,1);
+loop.setEnabled(false);assert.equal(pending.length,0);assert.equal(closed,2);
+loop.setEnabled(true);run=pending.shift().f();await Promise.resolve();time=30;resolve({});await run;assert.equal(results,1);loop.close();
+console.log('Client diagnostic settings, camera launch, duty, cancellation, hidden pause, stale rejection and repeated enable passed.');

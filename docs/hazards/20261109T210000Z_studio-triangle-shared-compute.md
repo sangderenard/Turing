@@ -1,0 +1,58 @@
+# Studio triangle law through shared SSA, Wasm and WebGPU
+
+The earlier separate BVH moller_trumbore law is not interchangeable with the active Studio hit_tri. Studio uses a relative parallel threshold, barycentric tolerance and 1e-6 self-hit guard. This change reads the actual `hit_tri` text from Spectral `demo_pluck_gl.py`; there is no manually rewritten intersection equation. `examples/meowdoku/studio_triangle_compute.py` builds the same ingested SSA into the existing Wasm core and WebGPU compute emitters.
+
+Compiler work: `glsl_function_ingestion.py` extends pure-function ingestion with scalarized vector dot/cross/length and predicated terminating return guards. Unsupported loops, nested blocks and unknown statements fail closed. Struct field mapping is an explicit input ABI. Original GLSL source is a declared concordance root; generated SSA values derive from source and operand refs. This is not full GLSL storage/control-flow lowering. Inactive arithmetic can execute, but return/out selections mask it; out parameters are initialized to zero on otherwise undefined miss paths and must not be consumed when valid is false.
+
+The existing Wasm core had f32 type recognition without corresponding arithmetic support. Added f32 constants, arithmetic, comparisons, magnitude, negation and square root, boolean logical ops and typed Select. Arithmetic remains float32; public output buffer ABI promotes scalar float32 to float64 without losing information. Existing WebGPU emitter now preserves typed boolean logical operations and stores boolean outputs as u32 (WGSL storage cannot contain bool).
+
+Build: `python -m examples.meowdoku.studio_triangle_compute`. Artifacts: `build/dot-client-ray-20261109/studio-compute/studio_hit_tri.json`, `.wasm`, `.wgsl`. Manifest includes exact source and hashes of both artifact byte sequences. WGSL is written as UTF8 bytes, avoiding Windows newline conversion hash drift, which the browser validation caught during development.
+
+Reusable browser host: `web/studio_triangle_compute.js`, export StudioTriangleCompute.create(base,{backend:'auto'|'wasm'|'webgpu'}), setScene({revision,triangles}), query(Float32Array rays,revision,{signal}). It verifies artifact hashes, retains a copied scene, freezes query rays, rejects stale/reentrant/aborted queries, and returns count/hits/revision/kernel/backend. It contains record packing and nearest-hit reduction only, not JS intersection math. Provided triangle order and strict < ties are preserved; server must export its actual BVH traversal order and filters. Missing WebGPU can select Wasm; corrupt artifacts or compile errors do not silently fall back. GPU resources are released. The current host is brute force, capped at 4096 triangles/rays and 1,048,576 pairs per query. Over-budget tasks reject explicitly and must remain retained/reissued, not dropped. These are not production-scale BVH performance claims.
+
+Verification:
+- Targeted regression selection 15 passed (8.06s), including new original-law tests, existing GLSL ingestion, Wasm multiblock calls and Wasm page product.
+- New original-law Wasm tests cover front/back hit, outside, parallel, behind, degenerate, miniature triangle and accepted barycentric tolerance.
+- The exact 256 sensor-launch rays exported by the real Studio accumulator were executed with the compiled Wasm: same hit IDs/validity, max distance delta 2.384185791015625e-7.
+- Chrome WebGPU compute on the same SSA: same 256 hit IDs/validity and distance max delta 0.
+- Reusable browser runtime tested for both backends, including stale revision and aborted query rejection. Receipt `build/dot-client-ray-20261109/studio-compute/runtime-result.json`.
+- Coordination worker resumed the external Wasm result into the actual full sensor pipeline and reported bitwise image parity. It owns the corresponding server-side lease/continuation tests and deployment decision.
+
+No production default/local handoff claim is made by these kernel artifacts alone. Actual publication must include renderer continuation, exact scene admission, lease expiry/recovery, identity validation and completed-ray ownership. Whole-volume/parametric-region transport and arbitrary large scenes remain outside this bounded host.
+
+Independent review tightened the frontend admission boundary: integer literals/arithmetic and non-float scalar casts are explicitly rejected rather than given float semantics; a real top-level final return is required instead of accepting a guard-only function. Five adversarial tests now cover these cases. Generated scalar SSA IDs are recorded as MINTED, not adopted graph IDs. The source-root/operand provenance remains intact. New focused suite: 7 passed. Typed boolean changes concern logical operations and output storage only; boolean input storage is not claimed supported by this work.
+The admission review also identified preprocessor conditionals as unsafe to discard. The frontend now accepts only unique valid numeric #defines and rejects #if/#else/#undef and malformed numeric macros. Four additional adversarial cases pass. This does not implement GLSL preprocessing generally.
+
+## BVH intermediate checkpoint (9 November)
+
+`studio_bvh_compute.py` compiles the original Studio `hit_tri` and `slab_axis` through shared SSA to the existing Wasm/WebGPU emitters. `web/studio_bvh_compute.js` temporarily orchestrates the original right-first LIFO traversal and ordered leaf visitation on the host. It performs no handwritten intersection/slab arithmetic. The combined query identity covers the source of `hit_tri`, `slab_axis`, `hit_aabb`, `nearest_filtered` and the versioned orchestration policy. The engine shader identity remains separate.
+
+Node Wasm tested the real 256-ray three-triangle sensor fixture: exact primitive/tie/miss identity; maximum distance difference from original GPU reference 2.384185791015625e-7. Receipt: `build/dot-client-ray-20261109/studio-compute/bvh-wasm-return.json`. This is not yet proof for the full saved stage. An isolated browser startup was blocked by network policy before compute; the new BVH WebGPU path has not yet been execution-validated. Prior original-triangle-only WebGPU evidence does not establish BVH correctness.
+
+Scene admission currently caps 200,000 triangles and 400,000 nodes, validates unique primitive coverage and acyclic bounded traversal, and requires epsilon 1e-7. It does not admit region-dependent thresholds or filters. Analytic sphere/partition competition remains on the authoritative server. It is not a complete scene renderer and no server savings are established.
+
+The intermediate holds CPU typed geometry once per scene, then uploads compact candidate batches to the compiled GPU law. Full compiler-lowered traversal with indexed resident GPU geometry remains the intended next step. Do not call this entire traversal compiled or GPU-resident.
+
+The browser already owns authored geometry: `marble_studio.js::mesh` uploads nonindexed xyz positions and normals plus integer material/group attributes to WebGL buffers. `lastGeometry` and the same pure face builders retain CPU authoring data. `sceneForPhoto` converts the canonical Exposure profile to metres, while the displayed Room/physics pose can differ; Spectral additionally packs/reorders and appends camera/other scene geometry. Reuse must establish an explicit primitive/transform/append mapping and immutable revision, not assume current WebGL primitive IDs equal native trace IDs. WebGLBuffer is not directly a WebGPU storage buffer. Avoid retransmitting a full unchanged scene per ray batch; cache the verified scene by revision and geometry hash.
+
+### Actual saved-stage candidate verification
+
+The subsequent CPU-host/Wasm BVH test passed the authoritative candidate-only GPU fixture for the real saved stage: 95,217 triangles, 65,535 nodes, 256 camera-origin probes. All primitive identities matched; maximum distance difference was 2.9802322387695312e-8. It evaluated 50,498 nodes and 5,023 triangles in 5.65 seconds. This removes the old 4,096-triangle admission obstruction for this intermediate, but is not evidence of a speedup or complete region/sphere-render support. Receipt: `build/dot-client-ray-20261109/studio-compute/stage-bvh-wasm-return.json`; authoritative exporter is Spectral `tests/export_stage_candidate_query.py`.
+
+Additional tests: `tests/test_studio_slab_compute.py` passes original compiled slab inout/parallel cases, right-first multi-node tie ordering, misses, incomplete/duplicate BVH rejection and stale revision rejection. Existing 11 original triangle/frontend tests also pass. The continuation owner independently consumed the smaller BVH Wasm result into the original sensor with bitwise image parity.
+
+### Region-primary compiled variant
+
+`examples/meowdoku/studio_region_compute.py` extracts `hit_tri` and `studio_region_epsilon` from the actual assembled `_GPU_SENSOR_REGION_CS`. It lowers the exact helper through common SSA using a narrow single-expression pure-helper facility, retaining coordinate-relative epsilon divided by direction length. It emits the same runtime ABI into the separate `studio-region-compute` directory. Its distinct combined identity is b099b882d3d970d8553af17e20a504afcdb786b3118640677db99f069a77640c. `StudioBvhCompute.setScene` requires explicit `query_variant: region-bvh` for these artifacts and rejects routing region work to the plain law.
+
+At this checkpoint 14 targeted tests pass, including original compiled region-law submicrometre thresholds and non-unit directions. Full region continuation fixture validation is pending. This is only the initial primary triangle query with region filter proven -1 by the engine owner; sphere/rod-partition competition, membership changes and spectral volume transport remain on the server. It does not offload arbitrary internal boundary/classification queries.
+
+### Actual region-stage client result
+
+The new region-primary Wasm/BVH runtime passed all 256 exact captured aperture rays from the saved 95,217-triangle scene (3 regions and analytic spheres), against the original assembled region GPU candidate query. Primitive identities match exactly; maximum t difference 1.4901161193847656e-8. It visited 59,210 nodes and tested 7,251 triangles in 6.11 seconds. Receipt `build/dot-client-ray-20261109/studio-region-compute/stage-region-wasm-return.json` was passed to the continuation owner for full-image resume. This establishes the actual region candidate variant, not just the plain approximation. Seven slab/helper/BVH tests and eleven original triangle tests pass separately (18 total).
+
+### Native tool-row boundary
+
+The same region SSA now emits a complete CModule artifact through the existing C backend after posting the source-derived entry-block provenance. Generated entry `studio_region_hit_tri(void **buffers, long long *extents)` has 15 scalar double input columns, uint8 validity output column15, double distance output column16. Source is retained beside the region artifacts. However `ssa_c_backend.py::_scalar_c_type` explicitly widens float32 scalar arithmetic to double; this product is therefore not yet an exact float32 substitute. No native triangle DLL was compiled or numerical parity claimed. Native integration must choose a declared float32 scalar compilation policy or explicitly verify/qualify widened semantics; do not silently change the global backend policy.
+
+`examples/meowdoku/studio_bvh_stdio.mjs` provides the tested Node/Wasm JSON-lines compute adapter for the Nodus ServicePeer. It has no lease/ownership/commit authority and no Python computation in its query path.

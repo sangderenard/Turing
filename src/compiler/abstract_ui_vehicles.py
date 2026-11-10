@@ -4118,136 +4118,63 @@ def symbolic_wheel_contact_wasm_plugin() -> WorldWasmPlugin:
 def compile_wheel_contact_abstract_tensor(
     *, packed_outputs: bool = False,
 ) -> WheelContactTensorPrecompile:
-    """Vectorize the SymPy law on a real four-wheel AbstractTensor axis.
+    """Compile the complete authored contact law through the shader source ABI.
 
-    SymPy remains the mathematical authority.  Common-subexpression
-    elimination is a precompile concern: it produces compact Python whose
-    arguments are four-element tensors, and the ordinary AOT frontend then
-    captures those tensor operations and lowers them to repository SSA.
+    The precision system preserves binary32 literal declarations before source
+    ingestion. The ordinary source compiler retains every planned region and
+    all seven authored returns; no numerical region is selected or discarded.
+    Native double tensor kernels are not the shader arithmetic authority.
     """
-
-    import contextlib
-    import copy
-    import io
-    import warnings
-
+    from types import SimpleNamespace
     import numpy as np
-
-    from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
-    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
-        c_backend_repository_ssa_reference,
+    from .fortran_c_shell import lower_ast_source_to_ssa
+    from .precision_policy import ShaderPrecisionPolicy
+    from .vehicle_python_compilation import (
+        symbolic_abstract_tensor_source, vehicle_python_extraction_contract,
     )
-    from ..transmogrifier.ssa import IRModule
-    from .precompile_to_ssa import lower_precompile_and_control_to_ssa
-    from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
-
-    # One program, three stages: the contact law's AbstractTensor stage is the
-    # compiler's own materialization of the SSA that compile_wheel_contact_ssa
-    # produced (CSE, identities, precision contracts), not a sympy printer.
-    # That SSA is disk-cached per source revision, so this costs nothing.
-    from .vehicle_python_compilation import symbolic_abstract_tensor_source
+    from ..common.tensors import AbstractTensor
 
     compiled_law = compile_wheel_contact_ssa()
     argument_names = tuple(compiled_law.function.metadata["argument_names"])
+    output_names = tuple(compiled_law.function.metadata["output_names"])
+    if output_names != CONTACT_PATCH_OUTPUTS:
+        raise RuntimeError("authored contact output ABI changed")
+    entrypoint = "abstract_ui_wheel_contact_tensor"
     source = symbolic_abstract_tensor_source(
-        compiled_law, "abstract_ui_wheel_contact_tensor",
+        compiled_law, entrypoint, shader_precision=ShaderPrecisionPolicy(),
     )
-    feeds = {name: np.ones(4, dtype=np.float32) for name in argument_names}
-    # Give discovery physically non-singular bounds without baking them into
-    # the program; every argument remains mutable and runtime-parametric.
-    for name, value in {
-        "dt": 1 / 120, "support": 1, "suspension_travel": .34,
-        "maximum_compression_speed": 1.25, "tire_pressure": 155000,
-        "minimum_contact_area": .006, "maximum_contact_area": .045,
-        "corner_weight": 1520, "slip_transition_speed": .38,
-    }.items():
-        if name in feeds:
-            feeds[name].fill(value)
-    captured = io.StringIO()
-    with warnings.catch_warnings(), contextlib.redirect_stdout(captured):
-        warnings.simplefilter("ignore")
-        compilation = compile_ast_aot(
-            source,
-            "abstract_ui_wheel_contact_tensor",
-            feeds,
-            backend="webgpu",
-            precompile_only=True,
-            mutable_parameters=argument_names,
-        )
-    lowered = lower_precompile_and_control_to_ssa(
-        compilation.compiled_shell_program,
-        compilation.shell_control_program,
-        numerical_name="abstract_ui_wheel_contact_tensor",
-        control_name="abstract_ui_wheel_contact_tensor_control",
-        region_programs=compilation.region_programs,
-    )
-    if lowered.shortfalls:
-        raise RuntimeError("wheel-contact AbstractTensor lowering failed: " + "; ".join(
-            item.format() for item in lowered.shortfalls
-        ))
-    numerical_names = tuple(
-        name for name in lowered.module.functions
-        if name.startswith("numerical_region_")
-    )
-    if len(numerical_names) != 1:
-        raise RuntimeError(
-            "wheel-contact precompile must remain one vectorized numerical "
-            f"region, found {len(numerical_names)}"
-        )
-    numerical_name = numerical_names[0]
-    numerical = copy.deepcopy(lowered.module.functions[numerical_name])
-    # Every mutable input is a contact-patch vector: four tyres followed by the
-    # cage nodes and member midpoints.  AOT deliberately leaves shapes abstract;
-    # this purpose-baked precompile owns the fixed lane count.
     lanes = contact_lane_count()
-    for value in numerical.args:
-        value.shape = (lanes,)
-        value.dtype = "float32"
-    for block in numerical.blocks.values():
-        for instruction in block.instrs:
-            if instruction.res is not None:
-                instruction.res.shape = (lanes,)
-                instruction.res.dtype = "float32"
-    numerical_module = IRModule({numerical_name: numerical})
-    tensor_shortfalls = lower_tensor_calls_to_repository_ssa(
-        numerical_module, c_backend_repository_ssa_reference()
+    # These arrays declare physical spans only; canonical ingestion does not
+    # execute them or bake their contents into the source program.
+    inputs = SimpleNamespace(
+        entrypoint=entrypoint,
+        feeds={name: np.empty(lanes, dtype=np.float32) for name in argument_names},
     )
-    if tensor_shortfalls:
-        raise RuntimeError("wheel-contact tensor SSA lowering failed: " + "; ".join(
-            item.format() for item in tensor_shortfalls
-        ))
-    numerical_outputs = next(
-        instruction.args
-        for block in numerical.blocks.values()
-        for instruction in block.instrs
-        if instruction.op.lower() in {"ret", "return"}
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source, entrypoint, name="abstract_ui_wheel_contact_shader",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        extraction_contract=vehicle_python_extraction_contract(inputs),
+        runtime_closure_only=True,
     )
-    if len(numerical_outputs) != len(CONTACT_PATCH_TENSOR_REDUCER_OUTPUTS):
-        raise RuntimeError("wheel-contact tensor reducer output count changed")
-    reducer_publications = dict(zip(
-        CONTACT_PATCH_TENSOR_REDUCER_OUTPUTS, numerical_outputs, strict=True,
-    ))
-    numerical_outputs = tuple(reducer_publications[name] for name in CONTACT_PATCH_OUTPUTS)
+    if len(exports) != 1:
+        raise RuntimeError("contact shader must export one authored entry")
+    root = exports[0]
+    public_outputs = tuple(outputs.get(root, ()))
+    if len(public_outputs) != len(output_names):
+        raise RuntimeError("contact shader did not preserve all authored returns")
     artifact = emit_webgpu_module(
-        numerical_module,
-        name=numerical_name,
-        outputs={numerical_name: numerical_outputs},
-        count=contact_lane_count(),
-        preferred_local_size=contact_lane_count(),
-        packed_outputs=packed_outputs,
+        module, name="abstract_ui_wheel_contact_shader",
+        outputs={root: public_outputs}, count=lanes,
+        preferred_local_size=lanes, packed_outputs=packed_outputs,
     )
     if not artifact.complete:
         raise RuntimeError("wheel-contact tensor WGSL emission failed: " + "; ".join(
             item.format() for item in artifact.shortfalls
         ))
     return WheelContactTensorPrecompile(
-        source=source,
-        module=lowered.module,
-        artifacts=(artifact,),
-        function_name="abstract_ui_wheel_contact_tensor_control",
-        argument_names=argument_names,
-        output_names=CONTACT_PATCH_OUTPUTS,
-        packed_outputs=bool(packed_outputs),
+        source=source, module=module, artifacts=(artifact,),
+        function_name=root, argument_names=argument_names,
+        output_names=output_names, packed_outputs=bool(packed_outputs),
     )
 
 

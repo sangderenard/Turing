@@ -183,6 +183,19 @@ def _concord_exact_region_feed_dtypes(
                 )):
                     feed_resident = residents.get(int(feed_id))
                     actual_resident = residents.get(int(actual.id))
+                    # A numeric conversion retains its exact source producer.
+                    # feed_ids may still name a preheader seed while this
+                    # occurrence consumes the loop update. Follow only the
+                    # posted conversion edge, never a guessed capture alias.
+                    conversion_row = (actual.accounting or {}).get('call_input_conversion')
+                    if (isinstance(conversion_row, tuple) and len(conversion_row) == 4
+                            and conversion_row[0] == str(caller.name)
+                            and conversion_row[2] == str(callee.name)
+                            and int(conversion_row[3]) == int(callee.args[position].id)):
+                        conversion_fact = book.page('call_input_conversion').latest(conversion_row)
+                        if (conversion_fact is not None
+                                and int(conversion_fact[0]) == int(actual.id)):
+                            actual_resident = residents.get(int(conversion_row[1]), actual_resident)
                     # A returned aggregate member can replace the provisional
                     # value captured when the region was cut while retaining
                     # that cut-time value in ``feed_ids``.  The actual
@@ -194,11 +207,18 @@ def _concord_exact_region_feed_dtypes(
                     # capture.  This is the same structural rule used below
                     # for declared reference residents: consumers read the
                     # published producer view before a provisional cut view.
+                    from .identity_concordance import loop_scope_declarations
+                    carried_resident = actual_resident is not None and any(
+                        int(rebind['outer']) == int(feed_id)
+                        and int(rebind['carried']) == int(actual_resident.id)
+                        for scope in loop_scope_declarations(book, caller.name)
+                        for rebind in scope['rebinds']
+                    )
                     resident = (
                         actual_resident
-                        if actual_resident is not None
-                        and (actual_resident.accounting or {}).get(
-                            'ssa_call_result_from'
+                        if actual_resident is not None and (
+                            (actual_resident.accounting or {}).get('ssa_call_result_from')
+                            or carried_resident
                         )
                         else feed_resident
                     )
@@ -254,7 +274,12 @@ def _concord_exact_region_feed_dtypes(
                         if payload.dtype is None:
                             raise ConcordanceRefusal("returned region feed has no physical type")
                         if producer_backed or structure.kind == "scalar":
-                            revised_feed_dtypes[position] = str(payload.dtype)
+                            # This is the physical call boundary. A logical
+                            # dtype retained from region cutting must not
+                            # overwrite the settled producer's physical width.
+                            revised_feed_dtypes[position] = str(
+                                payload.physical_dtype or payload.dtype
+                            )
                     elif (
                         resident is not None
                         and (resident.accounting or {}).get(

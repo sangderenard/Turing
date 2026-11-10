@@ -1447,6 +1447,8 @@ def _build_backward_rule_process_graph() -> ProcessGraph:
         UNTRANSLATED_NODE_TYPE,
         reduce_abstract_tensor_topology,
     )
+    from .source_exception_ingestion import ingest_exception_syntax
+    from ..transmogrifier.graph.python_special_cases import record_python_control_scopes
 
     helpers = (
         registry.unbroadcast,
@@ -1481,9 +1483,15 @@ def _build_backward_rule_process_graph() -> ProcessGraph:
         "normalize_index": normalize_index,
         "flat_index_ids": flat_index_ids,
     }
+    tree = ast.parse(source, filename="<abstract-tensor-backward-rules>")
+    # This registry build does not run source pursuit, so build_from_ast's
+    # source-control normalizers do not run. Apply the same authored exception
+    # conversion as the public source compiler before graph ingestion.
+    ingest_exception_syntax(tree)
+    record_python_control_scopes(tree)
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
-            ast.parse(source, filename="<abstract-tensor-backward-rules>"),
+            tree,
             resolve_unresolved_parents=False,
             source_cells=source_cells,
         )
@@ -2843,6 +2851,21 @@ def fuse_forward_loss_backward(
         motion.G.graph["execution_contract"] = copy.deepcopy(
             dict(execution_contract)
         )
+    # This fused motion is a numeric DAG with calls into separately owned
+    # backward-rule functions; it has no authored branch of its own. Unlike
+    # an AST-reduced function, it has no source-control ingestion writer to
+    # declare that empty activity graph. Publish the declaration from the
+    # exact motion roots so scope forks can read it without inventing
+    # conditional ownership from syntax or node names.
+    from .concordance_declarations import SOURCE_ACTIVITY_SCOPE
+    from .identity_concordance import Derived, Mode
+    book.post(
+        SOURCE_ACTIVITY_SCOPE, (motion_scope,), motion_scope,
+        stage=FORWARD_LOSS_BACKWARD_FUSION,
+        provenance=Derived(tuple(dict.fromkeys(
+            _graph_node_cell(motion, int(root)) for root in motion.roots
+        ))), mode=Mode.CONCORD,
+    )
     _annotate_numeric_metadata(motion)
     return ForwardLossBackwardMotion(
         graph=motion,

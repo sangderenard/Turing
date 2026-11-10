@@ -231,6 +231,14 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
                               if isinstance(node, (ast.expr, ast.stmt)) else None))
             if conversion is not None:
                 node._turing_source_cells = (conversion,)
+            elif isinstance(node, (ast.expr, ast.stmt)) and getattr(node, "_turing_source_definition", None) is not None:
+                # A language reader can retain a finer authored declaration
+                # than its generated function root. This is source provenance,
+                # not an exception/resource conversion or activity replacement.
+                declaration = node._turing_source_definition
+                if not isinstance(declaration, SourceDefinition):
+                    raise TypeError("Per-node source declaration must be book-independent")
+                node._turing_source_cells = (declaration,)
             elif cells_by_name:
                 cell = cells_by_name.get(self.qualname.split(".")[0])
                 node._turing_source_cells = (

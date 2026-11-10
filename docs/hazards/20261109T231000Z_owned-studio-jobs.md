@@ -1,0 +1,13 @@
+# Ownership-scoped Studio jobs facade
+
+The new job_library module is an ownership/visibility index, not a FIFO, scheduler or replacement for Nodus. Existing PhotoJobs still owns one GPU subprocess and rejects busy submissions. GET /api/marble_photo/jobs explicitly reports scheduling=single_gpu, queue_available=false and live_yield=false. It returns actual status fields, image/HDR references, timestamps and can_cancel; abandoned nonterminal jobs are labeled interrupted, never secretly restarted. Result limit is 256.
+
+Newly admitted jobs are indexed by authenticated account exclusively, or a hash of the anonymous browser's persistent player token when logged out. Account and browser identities are not alternatives for an account-owned job. Logging into another account on the same browser does not authorize access. Anonymous jobs are not silently migrated into accounts. No cookies or session secrets are stored in the index.
+
+Indexed owner checks protect status, image/HDR/animation, cancel, live update, retouch and active-worker replacement. A client-authored live session marker is not authority to replace another user's worker. Existing account asset references cannot override the new owner index. Legacy unindexed jobs keep their prior access semantics and appear only via established account asset claims; anonymous historical jobs are not guessed or globally listed.
+
+Independent review found and corrected three pre-release issues: shared browser fallback across logins, stale account-asset references bypassing indexed ownership, and matching live markers allowing replacement across owners. Ownership is recorded only after busy checks, before destructive replacement. Tests cover real HTTP two-cookie isolation, same browser account A/B/logged-out switching, stale account references, partial/orphan statuses, and exact active-worker preservation against forged live markers.
+
+At preparation time production server PID53476 boot775d6760ce04 had user Live worker55992 active. No restart or publication occurred; a server restart cannot preserve that GL accumulator merely by pausing. Frontend worker has a scoped publisher and is waiting for an idle release. Native Nodus host/admission remains a separate unimplemented production integration; no native scheduling capability is claimed by this facade.
+
+The owned facade and jobs UI were published with the cooperative client slice, verified at boot40aadfd71841/PID49956. The prior active user Live had ended before the fresh process check; no active Spectral worker was interrupted. One session restored. See build/dot-client-jobs-release-20261109/verified.json. General queue capability is still false.

@@ -50,17 +50,18 @@ def validate_object(value: object) -> dict:
         raise ObjectError("unexpected or missing object fields")
     if not isinstance(value["name"], str) or not 1 <= len(value["name"].strip()) <= 80:
         raise ObjectError("name must be 1..80 characters")
-    if value["generator"] != "meowdoku-marble-object-v1":
+    imported = value["generator"] == "meowdoku-imported-object-v1"
+    if value["generator"] not in ("meowdoku-marble-object-v1", "meowdoku-imported-object-v1"):
         raise ObjectError("unsupported mesh generator")
     if (not isinstance(value["design"], dict) or value["design"].get("base-shape") not in
-            ("marble", "d4", "d6", "d8", "d10", "d12", "d20")):
+            (("obj",) if imported else ("marble", "d4", "d6", "d8", "d10", "d12", "d20"))):
         raise ObjectError("invalid design")
     if not isinstance(value["physical"], dict) or not isinstance(value["derived"], dict):
         raise ObjectError("physical and derived properties are required")
     if not _DIGEST.fullmatch(str(value["geometry_sha256"])):
         raise ObjectError("invalid geometry digest")
     materials = value["materials"]
-    if not isinstance(materials, dict) or set(materials) != {"index", "extra", "tables"}:
+    if not isinstance(materials, dict) or set(materials) not in ({"index", "extra", "tables"}, {"index", "extra", "tables", "authoring"}):
         raise ObjectError("invalid material library")
     if not isinstance(materials["index"], dict) or not isinstance(materials["extra"], dict):
         raise ObjectError("invalid material ids")
@@ -82,22 +83,73 @@ def validate_object(value: object) -> dict:
     if any(len(materials["tables"][name]["data"]) // materials["tables"][name]["stride"] <= maximum_id
            for name in _TABLES):
         raise ObjectError("material id exceeds saved float tables")
+    if "authoring" in materials:
+        from .marble_material_authoring import validate_material_authoring
+        try:
+            validate_material_authoring(materials["authoring"],len(materials["tables"]["pbr"]["data"])//materials["tables"]["pbr"]["stride"])
+        except (ValueError,TypeError,KeyError) as error:
+            raise ObjectError(str(error)) from error
     _finite_tree(value)
-    if not isinstance(value["derived"].get("massKg"), (int, float)) or value["derived"]["massKg"] <= 0:
+    if imported:
+        design = value["design"]
+        if not _DIGEST.fullmatch(str(design.get("source_asset", ""))) or design.get("material_mode") != "studio-shell":
+            raise ObjectError("invalid imported source or material mode")
+        if design.get("shell") not in materials["index"]:
+            raise ObjectError("imported shell material is unavailable")
+        expected = {"massKg": None, "massExact": False, "validForRoll": False,
+                    "centerM": None, "inertiaKgM2": None, "components": [],
+                    "principalMoments": [], "mechanicsNote": "Imported mesh mechanics have not been certified"}
+        if json.dumps(value["derived"], sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ObjectError("imported mesh mechanics have not been certified")
+    elif not isinstance(value["derived"].get("massKg"), (int, float)) or value["derived"]["massKg"] <= 0:
         raise ObjectError("positive mass receipt required")
     return value
 
 
-def source_digest(value: dict) -> str:
+def source_receipt(value: dict) -> bytes:
+    """The authoritative immutable source bytes, also retained by replay receipts.
+
+    Keep Python's canonical numeric spelling. A browser must preserve these
+    bytes rather than re-encode them with a different JSON number formatter.
+    This adds no storage/API fields and does not change existing object IDs.
+    """
     source = {key: value[key] for key in ("v", "generator", "design", "materials", "physical", "geometry_sha256")}
-    canonical = json.dumps(source, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    return json.dumps(source, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def source_digest(value: dict) -> str:
+    return hashlib.sha256(source_receipt(value)).hexdigest()
 
 
 class Store:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, obj_assets=None, account_id=None):
         self.directory = Path(directory)
         self.lock = threading.Lock()
+        self.obj_assets = obj_assets
+        self.account_id = account_id
+
+    def for_account(self, account_id):
+        view = Store(self.directory, self.obj_assets, account_id)
+        view.lock = self.lock
+        return view
+
+    def validate_source(self, value):
+        if value.get("generator") != "meowdoku-imported-object-v1":
+            return None
+        if self.obj_assets is None:
+            raise ObjectError("imported asset store is unavailable")
+        from .obj_assets import AssetError, subject_packet
+        try:
+            asset = self.obj_assets.get(value["design"]["source_asset"], self.account_id)
+        except AssetError as exc:
+            error = ObjectError(str(exc))
+            error.status = exc.status
+            raise error from exc
+        shell = value["materials"]["index"][value["design"]["shell"]]
+        packed = subject_packet(asset, shell)
+        if hashlib.sha256(packed.tobytes()).hexdigest() != value["geometry_sha256"]:
+            raise ObjectError("imported geometry differs from its source asset")
+        return packed
 
     def entries(self) -> list[dict]:
         if not self.directory.exists():
@@ -108,9 +160,11 @@ class Store:
                 continue
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
+                if value.get("generator") == "meowdoku-imported-object-v1":
+                    self.validate_source(value)
                 out.append({"digest": path.stem, "name": value["name"],
                             "shape": value["design"]["base-shape"],
-                            "kind": value["design"]["kind"],
+                            "kind": value["design"].get("kind", "obj"),
                             "massKg": value["derived"]["massKg"],
                             "mechanicsExact": bool(value["derived"].get("massExact")),
                             "bytes": path.stat().st_size})
@@ -124,12 +178,14 @@ class Store:
         path = self.directory / f"{digest}.json"
         value = json.loads(path.read_text(encoding="utf-8"))
         validate_object(value)
+        self.validate_source(value)
         if source_digest(value) != digest:
             raise ObjectError("stored object digest mismatch")
         return {**value, "digest": digest}
 
     def put(self, value: dict) -> dict:
         validate_object(value)
+        self.validate_source(value)
         digest = source_digest(value)
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(raw) > MAX_BYTES:

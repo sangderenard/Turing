@@ -21403,10 +21403,23 @@ class _ControlSSABuilder(TiledObject):
                 seed_dtype = python_int_literal_dtype(seed_literal)
             else:
                 seed_dtype = "float64"
+            # A folded literal still owns its declared physical ABI. Its
+            # Python host value is only a fallback when no scalar receipt
+            # exists (e.g. ordinary unannotated Python loop seeds).
+            seed_abi_cell = self._book().latest_ref(
+                VALUE_TYPE_ABI, (self.lexical_read_scope, seed_id),
+            )
+            seed_abi = (None if seed_abi_cell is None else
+                        self._book().page(VALUE_TYPE_ABI).cell(
+                            seed_abi_cell.row, seed_abi_cell.column))
+            seed_arms = tuple(getattr(seed_abi, "physical_alternatives", ()))
+            if len(seed_arms) == 1 and seed_arms[0].storage == "scalar":
+                seed_dtype = str(seed_arms[0].dtype)
             seed_value = self.fresh_value(
                 dtype=seed_dtype,
                 transform=CONTROL_CONST,
-                operands=(seed_id, loop.source_loop_node_id),
+                operands=(seed_id, loop.source_loop_node_id,
+                          *((seed_abi_cell,) if seed_abi_cell is not None else ())),
             )
             self.emit(
                 Handler.Const, [], seed_value,
@@ -22728,10 +22741,23 @@ class _ControlSSABuilder(TiledObject):
                 seed_dtype = python_int_literal_dtype(seed_literal)
             else:
                 seed_dtype = "float64"
+            # A folded literal still owns its declared physical ABI. Its
+            # Python host value is only a fallback when no scalar receipt
+            # exists (e.g. ordinary unannotated Python loop seeds).
+            seed_abi_cell = self._book().latest_ref(
+                VALUE_TYPE_ABI, (self.lexical_read_scope, seed_id),
+            )
+            seed_abi = (None if seed_abi_cell is None else
+                        self._book().page(VALUE_TYPE_ABI).cell(
+                            seed_abi_cell.row, seed_abi_cell.column))
+            seed_arms = tuple(getattr(seed_abi, "physical_alternatives", ()))
+            if len(seed_arms) == 1 and seed_arms[0].storage == "scalar":
+                seed_dtype = str(seed_arms[0].dtype)
             seed_value = self.fresh_value(
                 dtype=seed_dtype,
                 transform=CONTROL_CONST,
-                operands=(seed_id, loop.source_loop_node_id),
+                operands=(seed_id, loop.source_loop_node_id,
+                          *((seed_abi_cell,) if seed_abi_cell is not None else ())),
             )
             self.emit(
                 Handler.Const, [], seed_value,

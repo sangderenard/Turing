@@ -6605,6 +6605,7 @@ async function initializeWorldPhysicsWasm() {
         } else if(message.type==="vehicle-energy"){
           if(message.identity===(vehicleRuntime.active?.identity||vehicleRuntime.parkedState?.identity)){
             vehicleRuntime.electrical={...vehicleRuntime.electrical,...(message.energy||{})};
+            if(message.damageMetrics)vehicleRuntime.damage=message.damageMetrics;
             vehicleRuntime.driverAssistance={...vehicleRuntime.driverAssistance,...(message.driverAssistance||{})};
             updateVehicleTransmissionControls();}
         } else if(message.type==="vehicle-alignment"){
@@ -8661,12 +8662,50 @@ function drawShaderCrosshair(gl, width, height) {
   gl.enable(gl.DEPTH_TEST);
 }
 
+// Read-only analysis of the authored mechanical graph and worker telemetry.
+// Junction loss is the existing damping estimate, not conserved total energy.
+function vehicleDamageGraphMetrics(graph,damage,metric="health"){
+  const nodes=graph?.nodes||[],edges=graph?.edges||[],ids=new Set(nodes.map(n=>n.identity)),
+    adjacency=new Map(nodes.map(n=>[n.identity,[]])),degrees=new Map(nodes.map(n=>[n.identity,0])),
+    finite=v=>typeof v==="number"&&Number.isFinite(v)?v:null;
+  const health=edge=>{const member=damage?.members?.[edge.identity],
+    corner=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity.includes(`${name}_halfshaft`)),
+    spring=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity===`suspension.${name}.coilover`);
+    if(member?.failed)return 0;
+    if(corner)return finite(damage?.halfshaftHealth?.[corner]);
+    if(spring)return finite(damage?.springHealth?.[spring]);
+    const strain=finite(member?.plasticStrain),fracture=finite(edge.damage?.fracture_strain);
+    return strain!==null&&fracture>0?Math.max(0,1-strain/fracture):null;};
+  const records=edges.map(edge=>{const h=health(edge),broken=h===0||edge.runtime_failed===true,
+    dangling=!ids.has(edge.a)||!ids.has(edge.b),state=damage?.members?.[edge.identity],junction=damage?.junctions?.[edge.identity];
+    if(!dangling&&!broken){adjacency.get(edge.a).push(edge.b);adjacency.get(edge.b).push(edge.a);
+      degrees.set(edge.a,degrees.get(edge.a)+1);degrees.set(edge.b,degrees.get(edge.b)+1);}
+    const value=metric==="health"?(h===null?null:1-h):metric==="strain"?finite(state?.plasticStrain):
+      metric==="power"?finite(junction?.powerW):metric==="energy"?finite(junction?.energyJ):null;
+    return {edge,health:h,broken,dangling,value};});
+  const components=new Map();let count=0;
+  for(const node of nodes){if(components.has(node.identity))continue;const todo=[node.identity];components.set(node.identity,count);
+    for(let i=0;i<todo.length;i++)for(const other of adjacency.get(todo[i]))if(!components.has(other)){
+      components.set(other,count);todo.push(other);}count++;}
+  const palette=["#66d9ff","#ffd166","#c69cff","#54e39b","#ff8c9d","#f7b267"],
+    maximum=metric==="health"?1:Math.max(0,...records.map(r=>r.value??0));
+  for(const record of records){const ratio=maximum>0?Math.max(0,Math.min(1,(record.value??0)/maximum)):0;
+    record.color=record.dangling?"#ff00ff":record.broken?"#ff3f62":metric==="graph"?
+      palette[components.get(record.edge.a)%palette.length]:record.value===null?"#6d7773":
+      ratio>.75?"#ff5f7d":ratio>.4?"#ffd166":"#54e39b";}
+  return {records,maximum,components,degrees,componentCount:count,
+    isolated:nodes.filter(n=>degrees.get(n.identity)===0).length,
+    dangling:records.filter(r=>r.dangling).length,
+    missing:records.filter(r=>r.value===null).length,
+    nodeColor:id=>palette[(components.get(id)??0)%palette.length]};
+}
+
 function drawVehicleShaderHud(gl,width,height){
   const program=shaderViewer.vehicleHudProgram,vehicle=vehicleRuntime.active;
   if(!program||!vehicle||!shaderViewer.shaderOnly){vehicleRuntime.shaderHudHitRegions=[];return;}
   vehicleRuntime.shaderHudHitRegions=[];
   const locations=shaderViewer.vehicleHudLocations,ratio=Math.min(2,window.devicePixelRatio||1),
-    panelWidth=154*ratio,panelHeight=286*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
+    panelWidth=154*ratio,panelHeight=321*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
     travel=Math.max(1e-6,Number(vehicle.configuration.suspension.travel));
   const rgba=(color,alpha=1)=>[...colorVector(color),alpha],draw=(x,y,w,h,color,ellipse=false,angle=0)=>{
     if(w<=0||h<=0)return;gl.uniform4f(locations.uRect,x,y,w,h);
@@ -8679,7 +8718,14 @@ function drawVehicleShaderHud(gl,width,height){
       T:["111","010","010","010","010"],F:["111","100","110","100","100"],
       H:["101","101","111","101","101"],L:["100","100","100","100","111"],
       R:["110","101","110","101","101"],V:["101","101","101","101","010"]},
-    glyphText=(text,x,y,scale,color)=>{let cursor=x;for(const character of text){const rows=glyphs[character]||[];
+    extraGlyphs={E:["111","100","110","100","111"],G:["011","100","101","101","011"],J:["001","001","001","101","010"],
+      W:["101","101","101","111","101"],I:["111","010","010","010","111"],O:["010","101","101","101","010"],
+      N:["101","111","111","111","101"],M:["101","111","111","101","101"],X:["101","101","010","101","101"],
+      "0":["111","101","101","101","111"],"1":["010","110","010","010","111"],"2":["110","001","010","100","111"],
+      "3":["110","001","010","001","110"],"4":["101","101","111","001","001"],"5":["111","100","110","001","110"],
+      "6":["011","100","111","101","111"],"7":["111","001","010","010","010"],"8":["111","101","111","101","111"],
+      "9":["111","101","111","001","110"],".":["000","000","000","000","010"],"+":["000","010","111","010","000"],"-":["000","000","111","000","000"]},
+    glyphText=(text,x,y,scale,color)=>{let cursor=x;for(const character of text){const rows=glyphs[character]||extraGlyphs[character]||[];
       rows.forEach((bits,row)=>[...bits].forEach((bit,column)=>{if(bit==="1")draw(cursor+column*scale,y+row*scale,scale,scale,color);}));
       cursor+=4*scale;}},
     dial=(cx,cy,r,value,color)=>{
@@ -8775,33 +8821,35 @@ function drawVehicleShaderHud(gl,width,height){
   draw(panelX+7*ratio,levelingY,140*ratio,17*ratio,rgba(levelingEnabled?"#173f37":"#252d2b",.96));
   glyphText("LVL",panelX+59*ratio,levelingY+3*ratio,2*ratio,rgba(levelingEnabled?"#8effc7":"#71817b",1));
   vehicleRuntime.shaderHudHitRegions.push({action:"chassis-leveling",x:panelX+7*ratio,y:levelingY,w:140*ratio,h:17*ratio});
-  // Actual mechanical graph damage, projected top-down. Every edge is drawn;
-  // damageable members shade green -> amber -> red, while non-damageable
-  // reference members remain muted. This is presentation of worker-owned
-  // plastic strain/fracture state, never a DOM approximation.
+  // Every authored graph node is shown, including isolated equipment and contact samples.
+  // Missing endpoints are counted, never placed at invented coordinates.
+  const metric=vehicleRuntime.damageMetric||"health",metrics=[["health","H"],["strain","S"],["power","W"],["energy","J"],["graph","G"]];
+  metrics.forEach(([key,label],i)=>{const x=panelX+(7+i*28)*ratio,y=panelY+205*ratio;
+    draw(x,y,26*ratio,15*ratio,rgba(metric===key?"#245e50":"#202e29",.98));
+    glyphText(label,x+10*ratio,y+3*ratio,ratio,rgba("#e6fff5",1));
+    vehicleRuntime.shaderHudHitRegions.push({action:"damage-metric",metric:key,x,y,w:26*ratio,h:15*ratio});});
   const graph=vehicle.physics?.mechanical_graph,nodes=new Map((graph?.nodes||[]).map(node=>[node.identity,
       vehicleRuntime.mechanicalNodePositions.get(node.identity)||node.reference_position])),
-    edges=graph?.edges||[],damage=vehicleRuntime.damage||{},damageX=panelX+7*ratio,damageY=panelY+222*ratio,
-    damageW=140*ratio,damageH=57*ratio,positions=[...nodes.values()],
-    minX=Math.min(-1,...positions.map(value=>Number(value?.[0]||0))),maxX=Math.max(1,...positions.map(value=>Number(value?.[0]||0))),
-    minZ=Math.min(-1,...positions.map(value=>Number(value?.[2]||0))),maxZ=Math.max(1,...positions.map(value=>Number(value?.[2]||0)));
+    analysis=vehicleDamageGraphMetrics(graph,vehicleRuntime.damage,metric),damageX=panelX+7*ratio,damageY=panelY+223*ratio,
+    damageW=140*ratio,damageH=65*ratio,valid=p=>Array.isArray(p)&&p.length===3&&p.every(Number.isFinite),
+    positions=[...nodes.values()].filter(valid),
+    minX=Math.min(-1,...positions.map(p=>p[0])),maxX=Math.max(1,...positions.map(p=>p[0])),
+    minZ=Math.min(-1,...positions.map(p=>p[2])),maxZ=Math.max(1,...positions.map(p=>p[2])),
+    project=p=>[damageX+(p[2]-minZ)/Math.max(1e-6,maxZ-minZ)*damageW,damageY+(maxX-p[0])/Math.max(1e-6,maxX-minX)*damageH];
   draw(damageX,damageY,damageW,damageH,rgba("#0b1513",.96));
-  edges.forEach(edge=>{const a=nodes.get(edge.a),b=nodes.get(edge.b);if(!a||!b)return;
-    const ax=damageX+(Number(a[2])-minZ)/Math.max(1e-6,maxZ-minZ)*damageW,
-      ay=damageY+(maxX-Number(a[0]))/Math.max(1e-6,maxX-minX)*damageH,
-      bx=damageX+(Number(b[2])-minZ)/Math.max(1e-6,maxZ-minZ)*damageW,
-      by=damageY+(maxX-Number(b[0]))/Math.max(1e-6,maxX-minX)*damageH,
-      dx=bx-ax,dy=by-ay,length=Math.max(.8*ratio,Math.hypot(dx,dy)),state=damage.members?.[edge.identity],
-      halfshaftName=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity.includes(`${name}_halfshaft`)),
-      springName=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity===`suspension.${name}.coilover`),
-      fracture=Math.max(1e-8,Number(edge.damage?.fracture_strain||.08)),plastic=state?Number(state.plasticStrain||0)/fracture:0,
-      health=halfshaftName?Number(damage.halfshaftHealth?.[halfshaftName]??1):springName?
-        Number(damage.springHealth?.[springName]??1):state?.failed?0:state?Math.max(0,1-plastic):null,
-      color=health===null?"#3b5049":health<=0?"#ff3f62":health<.45?"#ff8a4c":health<.82?"#ffd166":"#54e39b",
-      thickness=Math.max(1.1,Math.min(3.2,Number(edge.radius||.01)*90))*ratio,
-      angle=Math.atan2(dx,-dy);
-    draw((ax+bx)/2-thickness/2,(ay+by)/2-length/2,thickness,length,rgba(color,.94),false,angle);
-  });
+  analysis.records.forEach(record=>{const edge=record.edge,a=nodes.get(edge.a),b=nodes.get(edge.b);if(!valid(a)||!valid(b))return;
+    const [ax,ay]=project(a),[bx,by]=project(b),dx=bx-ax,dy=by-ay,length=Math.max(.8*ratio,Math.hypot(dx,dy)),
+      thickness=Math.max(1.1,Math.min(3.2,Number(edge.radius||.01)*90))*ratio;
+    draw((ax+bx)/2-thickness/2,(ay+by)/2-length/2,thickness,length,rgba(record.color,.94),false,Math.atan2(dx,-dy));});
+  for(const [id,p]of nodes){if(!valid(p))continue;const [x,y]=project(p),degree=analysis.degrees.get(id)||0,
+      size=(degree===0?3.5:1.5)*ratio,color=metric==="graph"?analysis.nodeColor(id):degree===0?"#c69cff":"#b5c9c0";
+    draw(x-size/2,y-size/2,size,size,rgba(color,.98),true);}
+  const maxText=analysis.maximum.toExponential(1).toUpperCase(),legend=metric==="graph"?
+    `G ${analysis.componentCount} ISO ${analysis.isolated}`:
+    `${metric==="health"?"H":metric==="strain"?"S":metric==="power"?"W EST":"J EST"} MAX ${maxText}`;
+  glyphText(legend,damageX,damageY+69*ratio,ratio,rgba("#c6d7ce",1));
+  glyphText(`NA ${metric==="graph"?analysis.dangling:analysis.missing} N ${nodes.size} E ${analysis.records.length}`,
+    damageX,damageY+78*ratio,ratio,rgba("#94a89e",1));
   gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);
 }
 
@@ -8812,7 +8860,8 @@ function handleVehicleShaderHudPointer(event){
     y=(event.clientY-bounds.top)*canvas.height/Math.max(1,bounds.height),
     hit=vehicleRuntime.shaderHudHitRegions.find(region=>x>=region.x&&x<=region.x+region.w&&y>=region.y&&y<=region.y+region.h);
   if(!hit)return false;
-  if(hit.action==="traction-control")controlVehicleTransmission({tractionControlEnabled:
+  if(hit.action==="damage-metric")vehicleRuntime.damageMetric=hit.metric;
+  else if(hit.action==="traction-control")controlVehicleTransmission({tractionControlEnabled:
     vehicleRuntime.transmission.tractionControlEnabled===false});
   else if(hit.action==="abs")controlVehicleTransmission({absEnabled:vehicleRuntime.transmission.absEnabled===false});
   else if(hit.action==="traction-authority")controlVehicleTransmission({tractionControlAuthority:

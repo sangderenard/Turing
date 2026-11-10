@@ -3218,6 +3218,7 @@ EMISSION_C = declare_stage("emission_c")
 EMISSION_LLVM = declare_stage("emission_llvm")
 EMISSION_FORTRAN = declare_stage("emission_fortran")
 EMISSION_WASM = declare_stage("emission_wasm")
+EMISSION_WGSL = declare_stage("emission_wgsl")
 EMISSION_JAVASCRIPT = declare_stage("emission_javascript")
 #: ``compile`` / ``compile_standalone`` / ``write``: the files and the
 #: command made from the module text.
@@ -3263,6 +3264,7 @@ class Backend(Enum):
     FORTRAN = "fortran"
     WASM_WAT = "wasm_wat"
     WASM_BINARY = "wasm_binary"
+    WGSL = "wgsl"
     JAVASCRIPT = "javascript"
 
 
@@ -5490,3 +5492,30 @@ def canonical_python_subtype_identities(
                 admitted.add(derived)
                 changed = True
     return tuple(sorted(admitted))
+
+# -- Pure GLSL numerical function ingestion -----------------------------------
+# Original shader text is the root; scalarized SSA operations derive from it.
+@dataclass(frozen=True)
+class GLSLPureFunctionSource:
+    name: str
+    source: str
+
+GLSL_FUNCTION_INGESTION = declare_stage('glsl_function_ingestion')
+AUTHORED_GLSL_FUNCTION = declare_transform('authored_glsl_function', 0)
+GLSL_PURE_FUNCTION_SOURCE = declare_page('glsl_pure_function_source', (
+    RowField('function', K.SCOPE),
+), GLSLPureFunctionSource)
+
+# Scalar-to-batch wrapper: generated control derives from the callee identity.
+@dataclass(frozen=True)
+class ScalarBatchContract:
+    callee: str
+    capacity: int
+    input_ids: tuple[int, ...]
+    output_ids: tuple[int, ...]
+    shared_argument_ids: tuple[int, ...] = ()
+
+SCALAR_BATCH_LOWERING = declare_stage('scalar_batch_lowering')
+SCALAR_BATCH_CONTRACT = declare_page('scalar_batch_contract', (
+    RowField('function', K.SCOPE),
+), ScalarBatchContract)

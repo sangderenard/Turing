@@ -111,3 +111,65 @@ arena calls `ensure` once at its first start and writes
 `chess_net.pretrained.json`.  The download itself was not run from this
 session (the sandbox refused the fetch); the first arena start on the LAN
 server performs it, and `MEOWDOKU_NO_PRETRAIN=1` opts out.
+
+## Training and search after the live Lichess stall
+
+The live server kept serving Lichess after its background learner stopped.
+Lichess inference and the learner share one `ConvValueNet`, while
+`AbstractTensor.autograd.no_grad()` is process-wide. A training step inside
+that scope was measured to fail with `No gradient found for input`. The
+network now serializes evaluation, training and checkpoint access. A learner
+failure is shown in the page status and printed with a traceback. The old
+server was stopped at the user's request; the revised server has not been
+started on port 8766.
+
+The network has a third, residual 3x3 convolution. Its weights and bias start
+at zero so existing eight-tensor `chess_conv.npz` checkpoints retain exactly
+their old predictions. Both the old and new checkpoint layouts load; the new
+layer receives gradients. Lichess and play-the-network search evaluate all
+legal replies, then add a third ply for the three best candidates from the
+two-ply pass. The deeper leaves are valued in one batch. Chess no longer
+permits a king capture as a legal move.
+
+The existing ProcessGraph/LLVM path compiled a small version of the network's
+forward graph, but reverse compilation stopped in the shared backward-rule
+registry at an unadmitted `Raise` in `index_adjoint`, before reaching the chess
+network. Routing the same reverse graph toward C stopped at that same
+backend-independent boundary, before C emission. Compiled training is therefore
+not installed. The local NumPy training
+step for 256 positions took 0.237 seconds on this machine after the added
+convolution; a standalone learner advanced the cached corpus from epoch 0.02
+to 0.12 in 25 seconds with its worker alive.
+
+The registry's missing exception-conversion handoff was repaired afterward:
+`index_adjoint` keeps its guard as a concorded native exception operation.
+The small chess reverse graph now passes the registry and stops at a later
+training-motion lowering refusal, `conditional ownership requires ingested
+control activity`. Neither C nor LLVM training has been emitted yet. See
+`docs/hazards/20261105T090043Z_main.md`.
+
+## Lichess idle control and later reverse frontiers
+
+The page now has **Stop Lichess after game** and **Resume Lichess** buttons in
+Lichess mode. A stop request lets the current game finish, declines new
+incoming challenges, and cancels an outgoing challenge. It stops seeking
+once idle; the local chess learner continues. The server was restarted on
+port 8766 with these controls, and both actions were checked through HTTP.
+After restart the live status showed pre-training epoch 0.75 and 50 self-play
+games, so the learner was still advancing.
+
+The generated training motion now declares its empty control activity with
+motion-root evidence. The linker no longer writes a redundant raw
+polymorphism trace, and `detach` retains its input tensor type and shape in
+region planning. A small native reverse probe passed all three former
+refusals, then stopped at an untyped host scalar `ts` in `unbroadcast`.
+Compiled training remains unavailable; the running server trains with the
+existing Python/NumPy path. See `docs/hazards/20261105T092023Z_main.md`.
+
+The `unbroadcast` class handoff now reads the source evidence for the nested
+`enumerate(zip(...))` loop. The helper's `tuple[int, ...]` annotation covers
+the empty target shape, which has no element to inspect. The small native
+reverse probe passed that refusal and reached a separate fused-motion
+activity error: its forward `unfold2d` node has no ingested evaluation point.
+Compiled training is still unavailable. See
+`docs/hazards/20261105T101433Z_main.md`.

@@ -1842,7 +1842,9 @@ function marbleBaseLight(tables, id) {
 function installSavedParticle(tables) {
   const snapshot = savedParticle.snapshot, geometry = savedParticle.geometry;
   if (!snapshot || !geometry) return;
-  const levels = { full: geometry, medium: savedParticle.lods?.medium, low: savedParticle.lods?.low, proxy: savedParticle.lods?.proxy };
+  // Cavity boundaries are retained in the saved recipe but omitted from Phong.
+  const visible=(g)=>!g?.bubbles?.length?g:{...g,interior:g.interior.filter((f,i)=>!g.bubbles.some(b=>i>=b.start&&i<b.start+b.count))};
+  const levels = { full: visible(geometry), medium: visible(savedParticle.lods?.medium), low: visible(savedParticle.lods?.low), proxy: visible(savedParticle.lods?.proxy) };
   const allFaces = Object.values(levels).filter(Boolean).flatMap((level) => [...level.interior, ...level.glass]);
   const source = snapshot.materials.tables, used = [...new Set(allFaces.map((face) => face[3]))].sort((a, b) => a - b);
   const remap = new Map();
@@ -1907,6 +1909,7 @@ async function selectSavedParticle(digest) {
   const response = await fetch(`/api/marble_objects/${encodeURIComponent(digest)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`saved object HTTP ${response.status}`);
   const snapshot = await response.json();
+  if(snapshot.generator==="meowdoku-imported-object-v1")throw new Error("Supplied OBJ mechanics are not certified; sphere/disk particle laws are unavailable.");
   const { geometry, lods } = await verifySavedMarbleObject(snapshot);
   const physical = snapshot.physical;
   const values = { r0: physical["sim-radius"], rho0: physical["sim-rho"], mu0: physical["sim-mu"],
@@ -6639,6 +6642,7 @@ function litPass(cam, now, casters, opts = {}) {
   gl.uniformMatrix3fv(gl.getUniformLocation(P, "uCatCcmMatrix"), false, new Float32Array([1,0,0, 0,1,0, 0,0,1]));
   gl.uniform1i(gl.getUniformLocation(P, "uEnableSpecular"), 1); gl.uniform1i(gl.getUniformLocation(P, "uEnableEmissionDirect"), 0);
   gl.uniform1i(gl.getUniformLocation(P, "uRenderPass"), 0); gl.uniform1f(gl.getUniformLocation(P, "uFieldGain"), 0.0);
+  gl.uniform1f(gl.getUniformLocation(P, "uAmbientFloorGain"), 1.0);
   gl.uniform1f(gl.getUniformLocation(P, "uExposure"), state.debug.exposure);
   gl.uniform1i(gl.getUniformLocation(P, "uThermalEmission"), 0); gl.uniform1f(gl.getUniformLocation(P, "uThermalGain"), 0.08);
   gl.uniform1f(gl.getUniformLocation(P, "uThermalRefK"), 1000.0); gl.uniform1f(gl.getUniformLocation(P, "uThermalFloorK"), 720.0);

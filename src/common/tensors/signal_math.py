@@ -449,11 +449,20 @@ def evaluate_core(reduced: Any, core: BakedCore, *,
     # completely, because sin'(pi/2) = 0 makes that one endpoint free, and
     # sine was the only function the old LUT path ever tested.
     base = position.floor()
-    base = _where(base < 0.0, base * 0.0, base)
-    base = _where(
-        base > float(highest), base * 0.0 + float(highest), base,
-    )
     weight = position - base
+    # The INDEX is clamped by a true selection, not the arithmetic _where: a
+    # NaN position (an argument outside every reduction) must not survive
+    # into the gather, where it becomes INT64_MIN and reads outside the table
+    # (a native access violation).  NaN fails both comparisons and lands on a
+    # node; the weight above keeps the NaN, so the answer is still NaN.
+    if wide:
+        # Measurement at bake time: finite points on the interval, carried
+        # wide; the arithmetic selection stays exact there and fast.
+        base = _where(base < 0.0, base * 0.0, base)
+        base = _where(base > float(highest), base * 0.0 + float(highest), base)
+    else:
+        base = AbstractTensor.where(base >= 0.0, base, 0.0)
+        base = AbstractTensor.where(base <= float(highest), base, float(highest))
     index = _index_tensor(base)
     left = table.index_select(0, index)
     right = table.index_select(0, index + 1)
@@ -1758,6 +1767,10 @@ class SignalMath:
         """``sqrt(x) = 2**k * sqrt(m)`` with ``m`` in the baked band."""
 
         value = _tensor(value)
+        # sqrt(0) = 0 exactly; its binade would be log(0) = -inf, so the
+        # reduction runs on 1 there and the answer is selected back.
+        zero = value == 0.0
+        original, value = value, _where(zero, value * 0.0 + 1.0, value)
         exponent = _even_binade(value)
         mantissa = value * ((exponent * 0.0 + 4.0) ** (-exponent))
         above, below = mantissa > 1.0, mantissa < 0.25
@@ -1777,7 +1790,8 @@ class SignalMath:
         root = evaluate_core(mantissa, self.cores["sqrt"])
         root = 0.5 * (root + mantissa / root)
         root = 0.5 * (root + mantissa / root)
-        return root * ((exponent * 0.0 + 2.0) ** exponent)
+        root = root * ((exponent * 0.0 + 2.0) ** exponent)
+        return _where(zero, original * 0.0, root)
 
     def hypot(self, real: Any, imaginary: Any) -> Any:
         """Modulus without the intermediate overflow of ``sqrt(x*x + y*y)``."""

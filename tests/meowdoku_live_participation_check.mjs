@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {createLiveParticipation,LIVE_CLIENT_INTERSECTIONS_READY} from '../examples/meowdoku/web/marble_live_participation.js';
+const elements=Object.fromEntries(['live-client-intersections','live-client-participation','live-client-status'].map(id=>[id,{checked:false,textContent:''}]));
+const doc={getElementById:id=>elements[id]};
+const held=createLiveParticipation(doc);assert.equal(held.requested(),false);assert.equal(elements['live-client-intersections'].disabled,!LIVE_CLIENT_INTERSECTIONS_READY);
+let mounted=0,destroyed=0;
+const p=createLiveParticipation(doc,{ready:true,mount:()=>{mounted++;return {destroy:()=>destroyed++};}});
+assert.equal(p.requested(),false);elements['live-client-intersections'].checked=true;assert.equal(p.requested(),true);
+p.connect({digest:'one'},true);assert.equal(mounted,1);p.connect({digest:'one'},true);assert.equal(mounted,1,'reused scene keeps the same client loop');
+p.connect({digest:'two'},true);assert.equal(mounted,2);assert.equal(destroyed,1);
+p.stop();assert.equal(destroyed,2);p.stop();assert.equal(destroyed,2);
+const failed=createLiveParticipation(doc,{ready:true,mount:()=>{throw Error('no authorized join');}});failed.connect({digest:'three'},true);assert.match(elements['live-client-status'].textContent,/no authorized join/);
+console.log('Live participation opt-in, admission gate, retained same-job connection, replacement cleanup and visible errors passed');

@@ -8,7 +8,10 @@
 // It also owns the page's readiness client: `gate(game)` holds a game until ITS products are built (the panel shows meanwhile) and
 // `whenReady(names)` waits silently for a product, using the polling pattern of lifecycle.js.  The panel never takes input.
 import { decodePacket, seam, angleOf } from "./loading_anim.js";
-import "./access.js";   // [ACCESS] sets window.meowdokuAccess (the shader tier shows this panel alone; ?loading_demo is a development option)
+// The isolated static export uses this same renderer and a baked packet. It
+// never asks the live server for access, readiness, or an animation selection.
+const standalone = typeof document !== "undefined" && document.documentElement.dataset.meowdokuStatic === "shader";
+const access = standalone ? Object.freeze({shader:true,dev:false}) : (await import("./access.js")).default;
 
 // ------------------------------------------------------------------ pure helpers (tested in node)
 export const PHASES = {
@@ -62,15 +65,15 @@ function start() {
     data: null, fails: 0, timer: null, waiters: new Set(),
     shownAt: 0, visible: false, stageAt: null, stage: { phase: "downloading", detail: "", names: [] }, stages: [], raf: 0, gl: null, anim: null, animUrl: null, animTried: false,
     tint: PHASES.downloading.tint.slice(), phase: "downloading", t0: performance.now(),
-    forced: window.meowdokuAccess.shader ? "downloading" : window.meowdokuAccess.dev ? new URLSearchParams(location.search).get("loading_demo") : null,   // [ACCESS]
-    pick: new URLSearchParams(location.search).get("loading_anim"),      // [STUDIO] play this library entry (a digest) instead of the active one
+    forced: access.shader ? "downloading" : access.dev ? new URLSearchParams(location.search).get("loading_demo") : null,   // [ACCESS]
+    pick: standalone ? null : new URLSearchParams(location.search).get("loading_anim"),      // [STUDIO] play this library entry (a digest) instead of the active one
   };
   const dl = { loaded: 0, total: 0, inflight: 0 };
   const webgpu = !!navigator.gpu;
 
   // ---- bytes: same-origin GET fetches (not /api/) are counted as their bodies stream through
   const nativeFetch = window.fetch.bind(window);
-  window.fetch = async (input, init) => {
+  if (!standalone) window.fetch = async (input, init) => {
     let abs; const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
     try { abs = new URL(typeof input === "string" ? input : input.url, location.href); } catch { return nativeFetch(input, init); }
     if (method !== "GET" || abs.origin !== location.origin || abs.pathname.startsWith("/api/")) return nativeFetch(input, init);
@@ -99,6 +102,7 @@ function start() {
 
   // ---- readiness client (the lifecycle.js pattern: one poll, backing off when the server is unreachable)
   const fetchReady = async () => {
+    if (standalone) return S.data = {loading_anim:{present:true,url:new URL("./loading_anim.mla",import.meta.url).href},products:{}};
     try {
       const r = await nativeFetch("/api/ready", { cache: "no-store" });
       if (!r.ok) throw new Error(String(r.status));
@@ -135,7 +139,7 @@ function start() {
   const dot = document.createElement("span"); dot.className = "lp-dot";
   const text = document.createElement("span");
   caption.append(dot, text); root.append(canvas, caption);
-  if (window.meowdokuAccess.shader) caption.style.display = "none";                   // [ACCESS] shader only: the animation, no words
+  if (access.shader) caption.style.display = "none";                   // [ACCESS] shader only: the animation, no words
   document.body.appendChild(root);
 
   // ---- colours: the page's own (CSS custom properties), parsed once per frame
@@ -378,7 +382,7 @@ function start() {
     done() { S.init = null; },
     state: () => ({ bootMs: S.bootMs, phase: S.phase, holds: [...S.holds.keys()], dl: { ...dl }, visible: S.visible, anim: !!S.anim }),
   };
-  window.meowdokuLoading = api;
+  if (!standalone) window.meowdokuLoading = api;
   hold("boot", "boot");                                              // from the first byte until the first game is drawn
   window.addEventListener("error", (event) => {
     // An unrelated resource or extension error must not expose an unfinished
@@ -388,7 +392,7 @@ function start() {
   if (S.forced) refresh();
   fetchReady().then(loadAnimation);
   // [STUDIO] a page held on a demo phase (?loading_demo=) can be steered by its same-origin parent (studio.html): the phase, the entry played
-  if (S.forced) window.addEventListener("message", (e) => {
+  if (S.forced && !standalone) window.addEventListener("message", (e) => {
     if (e.origin !== location.origin || !e.data || e.data.type !== "loading-view") return;
     if (PHASES[e.data.phase]) S.forced = e.data.phase;
     if ("anim" in e.data) { S.pick = e.data.anim || null; S.anim = null; S.animTried = false; fetchReady().then(loadAnimation); }

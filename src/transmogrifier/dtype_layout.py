@@ -231,6 +231,33 @@ def resolve(name: object) -> DTypeLayout | None:
     return None if canonical is None else DTYPES[canonical]
 
 
+def source_annotation_dtype(annotation: object) -> str | None:
+    """Resolve an authored scalar annotation without losing explicit widths.
+
+    Python builtin classes keep their language widths; fixed-width declarations
+    use this module's existing layout authority, including forward strings.
+    Unknown classes/containers are not guessed to be numeric.
+    """
+    import ast
+    spelling = str(annotation).strip()
+    if spelling[:1] in {"'", '"'}:
+        try:
+            value = ast.literal_eval(spelling)
+        except (ValueError, SyntaxError):
+            return None
+        if not isinstance(value, str):
+            return None
+        spelling = value
+    builtin = {"bool": "bool", "int": "int64", "float": "float64",
+               "Any": "opaque_ref", "object": "opaque_ref"}
+    if spelling in builtin:
+        return builtin[spelling]
+    layout = resolve(spelling)
+    if layout is None or layout.kind not in {"bool", "int", "uint", "float"}:
+        return None
+    return layout.name
+
+
 def layout_for(name: object) -> DTypeLayout:
     """The layout ``name`` spells; ``KeyError`` for an unknown spelling."""
 

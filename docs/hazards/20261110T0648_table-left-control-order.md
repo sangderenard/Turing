@@ -1,0 +1,3 @@
+# Table stage left power placement
+
+At390px viewport, existing left power control was1004.5px above left arc because unrelated key/kicker placement fields intervened. Right power was65.5px above its arc. Both existed and were registered through the same Studio light system. Moved only existing left power/filter labels to immediately before left arc, preserving IDs, values and all state. Narrow same reorder applied to source and live HTML without full export or restart. New390px fresh view shows both pairs67.5px apart. Full Studio lighting suite passes; served HTTPS HTML hash verified. Backup build/dot-table-left-power-20261110/marble_studio.html. Phone itself not inspected; this is responsive browser reproduction. User desktop tab untouched.

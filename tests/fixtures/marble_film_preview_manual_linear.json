@@ -1,0 +1,263 @@
+{
+  "ok": true,
+  "input_space": "linear sensor RGB",
+  "sensor_rgb": [
+    [
+      1.0,
+      1.0,
+      1.0
+    ],
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ],
+    [
+      1.0,
+      1.0,
+      0.0
+    ],
+    [
+      1.0,
+      0.0,
+      1.0
+    ],
+    [
+      0.0,
+      1.0,
+      1.0
+    ],
+    [
+      0.2,
+      0.2,
+      0.2
+    ]
+  ],
+  "patch_names": [
+    "White",
+    "Red",
+    "Green",
+    "Blue",
+    "Yellow",
+    "Magenta",
+    "Cyan",
+    "Gray 20%"
+  ],
+  "input_display_rgb8": [
+    [
+      255,
+      255,
+      255
+    ],
+    [
+      255,
+      0,
+      0
+    ],
+    [
+      0,
+      255,
+      0
+    ],
+    [
+      0,
+      0,
+      255
+    ],
+    [
+      255,
+      255,
+      0
+    ],
+    [
+      255,
+      0,
+      255
+    ],
+    [
+      0,
+      255,
+      255
+    ],
+    [
+      124,
+      124,
+      124
+    ]
+  ],
+  "output_display_rgb8": [
+    [
+      170,
+      170,
+      170
+    ],
+    [
+      122,
+      0,
+      33
+    ],
+    [
+      83,
+      182,
+      0
+    ],
+    [
+      24,
+      0,
+      56
+    ],
+    [
+      159,
+      179,
+      0
+    ],
+    [
+      111,
+      0,
+      122
+    ],
+    [
+      91,
+      175,
+      170
+    ],
+    [
+      80,
+      80,
+      80
+    ]
+  ],
+  "linear_srgb": [
+    [
+      0.9997315961668176,
+      0.9996319775102854,
+      1.0000364675614473
+    ],
+    [
+      0.735415268485444,
+      -0.06862877524857205,
+      -0.007602395833867372
+    ],
+    [
+      0.1130101525546984,
+      1.212144870898654,
+      -0.13695119432018177
+    ],
+    [
+      0.15130617512667524,
+      -0.14388411813979643,
+      1.1445900577154964
+    ],
+    [
+      0.8484254210401424,
+      1.1435160956500818,
+      -0.14455359015404914
+    ],
+    [
+      0.8867214436121192,
+      -0.21251289338836848,
+      1.136987661881629
+    ],
+    [
+      0.26431632768137364,
+      1.0682607527588575,
+      1.0076388633953146
+    ],
+    [
+      0.19994631923336353,
+      0.19992639550205712,
+      0.20000729351228946
+    ]
+  ],
+  "display_white": 2.5,
+  "profile": {
+    "id": "marble-fixed3-cie1931-d65-v1",
+    "observer": "CIE 1931 2 degree",
+    "source": "https://doi.org/10.25039/CIE.DS.xvudnb9b",
+    "transport_wavelengths_nm": [
+      650.0,
+      550.0,
+      450.0
+    ],
+    "reference_white": "equal-power three-line reference, Bradford adapted to D65",
+    "output_space": "linear sRGB D65",
+    "condition_number": 1.0006276716644262,
+    "condition_limit": 1000.0,
+    "minimum_singular_value": 0.9996862626298156,
+    "neutral_fallback": false,
+    "fallback_intensity": null,
+    "warning": null,
+    "sensor_to_xyz": [
+      [
+        0.27736582870927795,
+        0.4553313105115721,
+        0.21752308317490765
+      ],
+      [
+        0.10674798651596844,
+        0.8810315884789297,
+        0.01190278640081245
+      ],
+      [
+        -0.0011903341917778008,
+        0.016489406247682945,
+        1.0737442874681804
+      ]
+    ],
+    "sensor_to_linear_srgb": [
+      [
+        0.735415268485444,
+        0.1130101525546984,
+        0.15130617512667524
+      ],
+      [
+        -0.06862877524857205,
+        1.212144870898654,
+        -0.14388411813979643
+      ],
+      [
+        -0.007602395833867372,
+        -0.13695119432018177,
+        1.1445900577154964
+      ]
+    ],
+    "display_transform": "separate selectable luminance tone and normalization; neutral-axis gamut compression; sRGB transfer once",
+    "exposure_reference": "default: 99th percentile of positive profiled luminance; manual white is a relative display reference, not radiometric calibration",
+    "limits": "Three discrete lines only; reference profile, not measured camera calibration."
+  },
+  "display_transform": {
+    "normalization": "manual",
+    "normalization_white": 2.5,
+    "tone_curve": "linear",
+    "firefly_filter": false,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_point": 0.0,
+    "firefly_threshold": 8.0,
+    "firefly_strength": 1.0,
+    "normalization_percentile": 99.0,
+    "effective_white": 2.5,
+    "tone_formula": "clip(Y/white,0,1)",
+    "transfer": "standard sRGB once, followed by optional artistic gamma/intensity",
+    "gamut_mapping": "neutral-axis compression at mapped luminance",
+    "white_units": "relative profiled linear luminance before artistic gains",
+    "black_point_formula": "x=max((Y/white-black_point)/(1-black_point),0); tone uses x",
+    "chroma_formula": "chroma *= saturation*(1+vibrance*(1-C)); C=clip((maxRGB-minRGB)/maxAbsRGB,0,1)",
+    "creative_controls": "Artistic linear-sRGB adjustments; not calibration or perceptually uniform saturation",
+    "firefly_method": "if interior luminance exceeds threshold times the maximum of 8 neighbors, blend toward that maximum by strength; RGB ratios preserved; after gains, before tone",
+    "firefly_warning": "May reduce genuine isolated glints or sharp highlight peaks. Brightest-neighbor comparison protects connected detail; borders, raw HDR and white reference stay unchanged.",
+    "effective_percentile": null,
+    "specular_clip_mode": false,
+    "highlight_policy": "Linear normalized luminance at or above white is clipped to display white; lower values remain graded."
+  }
+}

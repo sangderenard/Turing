@@ -1,0 +1,309 @@
+{
+  "background": {
+    "sources": [
+      "background:51",
+      "background:14"
+    ],
+    "coplanar": false,
+    "intersection_point_count": 1,
+    "intersection_extremes_are_exact_shared_vertices": true,
+    "plane_side_signs": [
+      [
+        0,
+        -1,
+        -1
+      ],
+      [
+        0,
+        1,
+        -1
+      ]
+    ],
+    "intersection_midpoint_strict_triangle_interiors": [
+      false,
+      false
+    ],
+    "shared_native_vertices": 1,
+    "intersection_points_exact": [
+      [
+        "13948315/4294967296",
+        "9101451/536870912",
+        "-11433419/536870912"
+      ]
+    ],
+    "complete_cross_boundary_scan": {
+      "total_pairs": 864,
+      "bbox_overlap_pairs_exactly_tested": 100,
+      "intersection_classes": {
+        "noncoplanar/point": 84,
+        "noncoplanar/segment-or-area": 12
+      },
+      "examples": {
+        "noncoplanar/point": {
+          "sources": [
+            "background:48",
+            "background:12"
+          ],
+          "coplanar": false,
+          "intersection_point_count": 1,
+          "intersection_extremes_are_exact_shared_vertices": true,
+          "plane_side_signs": [
+            [
+              0,
+              -1,
+              -1
+            ],
+            [
+              0,
+              -1,
+              -1
+            ]
+          ],
+          "intersection_midpoint_strict_triangle_interiors": [
+            false,
+            false
+          ],
+          "shared_native_vertices": 1,
+          "intersection_points_exact": [
+            [
+              "16106127/4294967296",
+              "8219423/536870912",
+              "-5959267/268435456"
+            ]
+          ]
+        },
+        "noncoplanar/segment-or-area": {
+          "sources": [
+            "background:49",
+            "background:13"
+          ],
+          "coplanar": false,
+          "intersection_point_count": 2,
+          "intersection_extremes_are_exact_shared_vertices": true,
+          "plane_side_signs": [
+            [
+              0,
+              -1,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ]
+          ],
+          "intersection_midpoint_strict_triangle_interiors": [
+            false,
+            false
+          ],
+          "shared_native_vertices": 2,
+          "intersection_points_exact": [
+            [
+              "13948315/4294967296",
+              "9101451/536870912",
+              "-11433419/536870912"
+            ],
+            [
+              "16106127/4294967296",
+              "8219423/536870912",
+              "-5959267/268435456"
+            ]
+          ]
+        }
+      },
+      "all_intersections_are_exact_shared_vertices_or_edges": true
+    }
+  },
+  "table-left": {
+    "emitter_points_against_closed_stand": {
+      "outside": {
+        "point": [
+          -0.01850000023841858,
+          0.04280000180006027,
+          0.0010000000474974513
+        ],
+        "direction": [
+          1,
+          0,
+          0
+        ]
+      },
+      "inside": {
+        "point": [
+          -0.018305612727999687,
+          0.04227821032206217,
+          0.0008392736005286375
+        ],
+        "direction": [
+          1,
+          0,
+          0
+        ]
+      }
+    },
+    "intersection": {
+      "sources": [
+        "table-left:45",
+        "fixture-table-left/outer/0/2/1/1/1/0"
+      ],
+      "coplanar": false,
+      "intersection_point_count": 2,
+      "intersection_extremes_are_exact_shared_vertices": false,
+      "plane_side_signs": [
+        [
+          -1,
+          1,
+          1
+        ],
+        [
+          -1,
+          1,
+          1
+        ]
+      ],
+      "intersection_midpoint_strict_triangle_interiors": [
+        true,
+        true
+      ],
+      "shared_native_vertices": 0,
+      "intersection_points_exact": [
+        [
+          "-4898947/268435456",
+          "141264547691/3351014014976",
+          "211566718697/214464896958464"
+        ],
+        [
+          "-4898947/268435456",
+          "479234466156218237724001/11361593839304326219038720",
+          "2113338258581210749803883/1817855014288692195046195200"
+        ]
+      ]
+    }
+  },
+  "table-right": {
+    "sources": [
+      "table-right:57",
+      "table-right:19"
+    ],
+    "coplanar": false,
+    "intersection_point_count": 1,
+    "intersection_extremes_are_exact_shared_vertices": true,
+    "plane_side_signs": [
+      [
+        0,
+        -1,
+        -1
+      ],
+      [
+        -1,
+        0,
+        -1
+      ]
+    ],
+    "intersection_midpoint_strict_triangle_interiors": [
+      false,
+      false
+    ],
+    "shared_native_vertices": 1,
+    "intersection_points_exact": [
+      [
+        "2526251/134217728",
+        "1466601/33554432",
+        "13578355/8589934592"
+      ]
+    ],
+    "complete_cross_boundary_scan": {
+      "total_pairs": 864,
+      "bbox_overlap_pairs_exactly_tested": 98,
+      "intersection_classes": {
+        "noncoplanar/point": 84,
+        "noncoplanar/segment-or-area": 12
+      },
+      "examples": {
+        "noncoplanar/point": {
+          "sources": [
+            "table-right:48",
+            "table-right:12"
+          ],
+          "coplanar": false,
+          "intersection_point_count": 1,
+          "intersection_extremes_are_exact_shared_vertices": true,
+          "plane_side_signs": [
+            [
+              0,
+              -1,
+              -1
+            ],
+            [
+              0,
+              -1,
+              -1
+            ]
+          ],
+          "intersection_midpoint_strict_triangle_interiors": [
+            false,
+            false
+          ],
+          "shared_native_vertices": 1,
+          "intersection_points_exact": [
+            [
+              "1245589/67108864",
+              "5744519/134217728",
+              "-8477239/68719476736"
+            ]
+          ]
+        },
+        "noncoplanar/segment-or-area": {
+          "sources": [
+            "table-right:49",
+            "table-right:13"
+          ],
+          "coplanar": false,
+          "intersection_point_count": 2,
+          "intersection_extremes_are_exact_shared_vertices": true,
+          "plane_side_signs": [
+            [
+              0,
+              1,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "intersection_midpoint_strict_triangle_interiors": [
+            false,
+            false
+          ],
+          "shared_native_vertices": 2,
+          "intersection_points_exact": [
+            [
+              "1245589/67108864",
+              "5744519/134217728",
+              "-8477239/68719476736"
+            ],
+            [
+              "10069575/536870912",
+              "5814889/134217728",
+              "655229/17179869184"
+            ]
+          ]
+        }
+      },
+      "all_intersections_are_exact_shared_vertices_or_edges": true
+    }
+  },
+  "underlight": {
+    "result": "proved",
+    "triangles": 1208,
+    "vertices": 516,
+    "examined_pairs": 46544,
+    "exact_pairs": 13996,
+    "bvh_nodes": 879,
+    "seconds": 2.5442152998875827,
+    "max_pairs": 50000,
+    "evidence_id": "turing.native-f32-embedding:ebd3a5d1d5dea4f29644a1752ea09a856fb7c107b6891d707076fc656978cb24"
+  }
+}

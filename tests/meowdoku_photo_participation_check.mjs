@@ -1,0 +1,26 @@
+import assert from 'node:assert/strict';
+import {clientIntersectionEligible,clientIntersectionBase,createPhotoParticipation} from '../examples/meowdoku/web/marble_photo_participation.js';
+import {packMarblePhoto} from '../examples/meowdoku/web/marble_photo.js';
+const config=options=>{const b=packMarblePhoto({interior:[],glass:[]},'a'.repeat(64),options);return JSON.parse(new TextDecoder().decode(new Uint8Array(b,16,new DataView(b).getUint32(4,true))));};
+assert.equal(config({}).client_intersections,undefined);
+for(const resolution of [128,256,512,768,1024,2048,4096])assert.equal(config({clientIntersections:true,resolution}).client_intersections,true);
+for(const opt of [{resolution:8192},{orbitFrames:8},{transport:'fixed:1'},{live:{session_id:'test'}}])assert.throws(()=>config({...opt,clientIntersections:true}),/Device intersections require/);
+assert.equal(clientIntersectionEligible({resolution:128}),true);
+assert.equal(clientIntersectionBase({query_variant:'plain-bvh'}),'/client-ray-plain/');
+assert.equal(clientIntersectionBase({query_variant:'region-bvh'}),'/client-ray-region/');
+assert.throws(()=>clientIntersectionBase({query_variant:'unknown'}),/not available/);
+const controls=Object.fromEntries(['photo-client-intersections','photo-client-participation','photo-transport','photo-orbit-frames','photo-resolution'].map(id=>[id,{value:'',checked:false,addEventListener(type,fn){this.change=fn;}}]));
+controls['photo-transport'].value='fixed:3';controls['photo-orbit-frames'].value='1';controls['photo-resolution'].value='8192';
+const doc={getElementById:id=>controls[id]};let mounts=0,stops=0,enabled=false;
+const participant=createPhotoParticipation(doc,{mount:options=>{mounts++;assert.equal(options.job,'j');assert.equal(options.credential,'secret');return {element:{querySelector:()=>({checked:false})},loop:{setEnabled:v=>enabled=v},destroy:()=>stops++};},createBackend(){}});
+assert.equal(controls['photo-client-intersections'].disabled,true);
+controls['photo-client-intersections'].checked=true;assert.equal(participant.requested(),false);
+controls['photo-resolution'].value='256';controls['photo-resolution'].change();assert.equal(participant.requested(),true);
+participant.connect({digest:'j',client_join:{job:'j',credential:'secret'}},false);assert.equal(mounts,0);
+participant.connect({digest:'j',client_join:{job:'j',credential:'secret'}},true);assert.equal(mounts,1);assert.equal(enabled,true);
+participant.stop();assert.equal(stops,1);participant.stop();assert.equal(stops,1);
+assert.throws(()=>participant.connect({},true),/did not supply/);
+assert.throws(()=>participant.connect({digest:'wrong',client_join:{job:'j',credential:'secret'}},true),/did not supply/);
+console.log('photo participation: payload scope, off default, UI gating, explicit opt-in connection, backend routes and cleanup passed');
+
+for(const resolution of [128,256,512,768,1024,2048])assert.equal(config({clientIntersections:true,resolution}).client_intersections,true);

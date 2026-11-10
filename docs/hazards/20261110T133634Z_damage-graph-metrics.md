@@ -1,0 +1,9 @@
+# Damage graph metrics, staged only
+
+Original shader HUD in abstract_ui_div_map.py now offers H damage health, S plastic strain, W estimated junction loss power, J accumulated estimated junction loss, and G intact connected components. Uses existing worker values only; no total-energy conservation claim. Gray is unavailable telemetry, red is failed, magenta is dangling endpoint. Numerical scales use displayed maximum; energy/power labels say EST.
+
+All authored graph nodes are drawn, including isolated nodes. Exact published graph contains241nodes/339edges and10previously invisible isolated nodes:8body-shell contact samples plus turret ammunition/fire-control. This is graph coverage, not proof every physical part has a graph record. Graph colors classify connected components; failure removes connectivity but not source graph geometry. No contact/load-path physics is changed.
+
+Per-edge damageMetrics is added to the existing250ms vehicle-energy message because previous damage event only published on revision changes. No new timer or force path. Current full generator is blocked by a separately reported canonical lowering error. Reversible tools/upgrade_mechanical_damage_hud.py stages these exact presentation/telemetry edits in original page bytes without recompilation. Current artifact build/dot-damage-metrics-20261110/index-v2.html, SHA2563a58b254314c94aa4a5b39d2176d0f610143d44dffe589ea3c392f2c68707356. Original page/model/kernel identity verified apart from single worker telemetry field.
+
+Passed node tests/mechanical_damage_metrics_check.mjs including actual original HUD draw/pointer command tests, source/staged JS syntax and Python compile. Browser GPU QA not completed: Windows attached but CUA browser list empty and Chrome unavailable. Original-shader fixture hud-check.html uses actual graph and explicitly unavailable telemetry, not fake energy. No live files published or services restarted.

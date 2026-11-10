@@ -214,11 +214,39 @@ def terrain_depth_rgba(height: np.ndarray) -> np.ndarray:
     return (rgba * 255.0).round().astype(np.uint8)
 
 
+def register_material_catalog(db) -> tuple[dict[str, int], dict[str, int]]:
+    """Keep saved object material IDs stable as the public catalogue grows.
+
+    Studio's original 32-entry catalogue put its three authored coating/paint
+    rows at 32..34. They are private records, not selectable room finishes.
+    Reserve them at that same boundary before registering newer materials.
+    """
+    material_index = {role: db.register(f"meowdoku_{role}", PHONG_MATERIALS[role]) for role in PHONG_MATERIALS}
+    material_extras = {}
+    for name, material in MATERIAL_CATALOG.items():
+        material_index[name] = db.register(name, material)
+        if name == "calibration_gray20":
+            if material_index[name] != 31:
+                raise ValueError("the saved Studio catalogue boundary changed")
+            for role, source in (("coated", "marble_clear_glass"),
+                                 ("paintA", "ceramic_porcelain"),
+                                 ("paintB", "ceramic_porcelain")):
+                material_extras[role] = db.register(f"meowdoku_studio_{role}", MATERIAL_CATALOG[source])
+    if material_extras != {"coated": 32, "paintA": 33, "paintB": 34}:
+        raise ValueError("the saved Studio coating/paint slots changed")
+    # Stable independent authoring rows, compiled by the same MaterialDatabase.
+    # Append only: old saved IDs and private coating/paint slots never move.
+    for ribbon in range(7):
+        source = "marble_cat_eye_green" if ribbon % 2 else "marble_cat_eye_blue"
+        name = f"ribbon_{ribbon + 1}"
+        material_index[name] = db.register(name, MATERIAL_CATALOG[source])
+    return material_index, material_extras
+
+
 def export_assets(out: Path) -> dict:
     _, _, MaterialDatabase = _spectral()
     db = MaterialDatabase()
-    material_index = {role: db.register(f"meowdoku_{role}", PHONG_MATERIALS[role]) for role in PHONG_MATERIALS}
-    material_index.update({name: db.register(name, material) for name, material in MATERIAL_CATALOG.items()})
+    material_index, material_extras = register_material_catalog(db)
     tensors = db.build_tensors()
     tables = {
         "pbr": tensors["pbr"], "phong": tensors["phong_compat"],
@@ -374,12 +402,15 @@ def export_assets(out: Path) -> dict:
     assets = {
         "meshes": meshes,
         "material_index": material_index,
+        "material_extras": material_extras,
         "materials": {name: {"floats_per_record": int(table.shape[1]), "records": int(table.shape[0]),
                              "data": np.asarray(table, np.float32).reshape(-1).tolist()}
                       for name, table in tables.items()},
         "lights": [{"position": list(p), "color": list(c), "intensity": float(i)} for p, c, i in LIGHTS],
         "terrain": export_terrain(),
     }
+    from .material_library_export import export_named_emitter_profiles
+    assets["emitterProfiles"]=export_named_emitter_profiles()
     (out / "assets.json").write_text(json.dumps(assets), encoding="utf-8")
     return assets
 
@@ -519,9 +550,11 @@ def main(argv: list[str] | None = None) -> int:
     for name in SHADERS:
         shutil.copyfile(SPECTRAL_ROOT / "csrc" / "shaders" / "generated" / name, out / "shaders" / name)
     export_shadow_fragment(out / "shaders" / "base_material.webgl.shadow.frag.glsl")
-    for name in ("index.html", "app.js", "marble_controls.js", "marble_mesh.js", "dice_mesh.js", "marble_mass.js", "marble_roll.js", "marble_studio.html", "marble_studio.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js", "tickets.html", "tickets.js"):
+    for name in ("index.html", "app.js", "marble_controls.js", "marble_mesh.js", "dice_mesh.js", "marble_mass.js", "marble_roll.js", "marble_studio.html", "marble_studio.js", "bodies.js", "pilot_timeline.js", "pilot_clock.js", "game_clock.js", "world_zoom.js", "world_curve.js", "compute.js", "compute_state.js", "recording.js", "replay_layers.js", "gravity.js", "particle_styles.js", "noise_filter.js", "share.js", "lifecycle.js", "wheel_blur.js", "tipjar.js", "qr_wall.js", "wordle_layout.js", "mobroad.js", "loading_panel.js", "loading_anim.js", "loading_record.js", "octet_codec.js", "access.js", "shader.html", "loading_params.js", "loading_view.html", "studio.html", "studio.js", "log.html", "log.js", "log_view.js", "local_log.js", "settings_reset.js", "tickets.html", "tickets.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
-    for name in ("marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_photo.js", "marble_rotation.js", "emoji_tumble.js", "loading_candidate.js"):
+    for name in ("marble_jobs.js", "marble_jobs.html", "marble_photo_participation.js", "marble_live_participation.js", "client_ray_participation.js", "client_ray_settings.js", "client_ray_controls.js", "client_ray_diagnostic.js", "client_ray_kernel.js", "client_triangle_kernel.js", "studio_bvh_compute.js", "studio_traversal_compute.js", "studio_triangle_compute.js", "studio_slab_compute.js", "studio_compiled_law_batch.js", "marble_bubbles.js", "marble_object.js", "case_motion.js", "case_vibration.js", "marble_preview_motion.js", "marble_sim_preview.js", "marble_drive_input.js", "marble_chase_camera.js", "marble_studio_scene.js", "marble_studio_transition.js", "marble_studio_phong.js", "marble_studio_dof.js", "marble_camera_toolbox.js", "marble_camera_toolbox_mount.js", "marble_spot_sample.js", "marble_rangefinder.js", "marble_rangefinder_panel.js", "marble_camera_binding.js", "marble_photo.js", "marble_live.js", "marble_downloads.js", "marble_autosave.js", "marble_object_snapshot.js", "marble_geometry_policy.js", "marble_hdr_retouch.js", "npz.js", "marble_rotation.js", "emoji_tumble.js", "loading_candidate.js", "marble_calibration.js", "calibration_rgb_single_light.yaml", "marble_lighting.js", "marble_lighting_profiles.js", "marble_backdrop.js", "marble_studio_lighting.js", "marble_fixture_sizes.js", "marble_light_placement.js", "marble_light_strengths.js", "marble_film_response.js", "marble_film_science.js", "marble_room.js", "marble_glass_preview.js", "marble_materials.js", "marble_studio_surfaces.js", "marble_studio_table.js", "marble_studio_scale.js", "marble_table_lights.js", "marble_studio_gobos.js"):
+        shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("marble_optical_authoring.js", "marble_studio_optical.js", "marble_optical_diagnostic.js", "marble_lens_controls.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
@@ -539,3 +572,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

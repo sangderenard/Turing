@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 def _surface(albedo, *, roughness, metallic=0.0, transmission=0.0,
-             ior=1.5, opacity=1.0, emission=(0.0, 0.0, 0.0), ambient=0.18,
+             ior=1.5, opacity=1.0, emission=(0.0, 0.0, 0.0), ambient=0.0,
              spec_strength=0.5, shininess=80.0, grain=0.0, inner_color=None):
     return {
         "albedo": albedo, "roughness": roughness, "metallic": metallic,
@@ -49,25 +49,33 @@ MATERIAL_CATALOG = {
                            spec_strength=0.68, shininess=40, grain=0.040),
     "metal_oxidized_copper": _surface((0.20, 0.47, 0.42), roughness=0.72, metallic=0.42,
                                       spec_strength=0.38, shininess=18, grain=0.055),
+    # Nominal artistic glass compositions, not measured dispersion curves:
+    # soda-lime-like clear glass n=1.52 and slightly higher-index dyed glass
+    # n=1.54. Transmission=1 / opacity=0 enables the dielectric branch; its
+    # Fresnel reflection remains. Opacity is a forced surface-reflection mix
+    # in the current ray shader, not pigment density or volume scattering.
     "marble_clear_glass": _surface((0.93, 0.97, 1.0), roughness=0.035,
-                                   transmission=0.96, opacity=0.16, ior=1.52,
-                                   ambient=0.12, spec_strength=0.96, shininess=260,
+                                   transmission=1.0, opacity=0.0, ior=1.52,
+                                   spec_strength=0.96, shininess=260,
                                    grain=0.002, inner_color=(0.91, 0.95, 1.0)),
+    # Retained artistic milky preset; not a calibrated scattering medium.
     "marble_milk_glass": _surface((0.96, 0.92, 0.88), roughness=0.38,
                                   transmission=0.42, opacity=0.79, ior=1.48,
-                                  ambient=0.19, spec_strength=0.48, shininess=30,
+                                  spec_strength=0.48, shininess=30,
                                   grain=0.045, inner_color=(0.93, 0.86, 0.79)),
+    # Opaque legacy inner defaults requested by the user. Optical rod/dye
+    # snapshots independently use explicit volume spectra and transparent interfaces.
     "marble_cat_eye_blue": _surface((0.10, 0.43, 0.91), roughness=0.12,
-                                    transmission=0.35, opacity=0.90, ior=1.52,
-                                    ambient=0.18, spec_strength=0.88, shininess=160,
+                                    transmission=0.0, opacity=1.0, ior=1.54,
+                                    spec_strength=0.88, shininess=160,
                                     grain=0.012, inner_color=(0.07, 0.23, 0.77)),
     "marble_cat_eye_green": _surface((0.08, 0.73, 0.39), roughness=0.13,
-                                     transmission=0.34, opacity=0.91, ior=1.52,
-                                     ambient=0.18, spec_strength=0.86, shininess=150,
+                                     transmission=0.0, opacity=1.0, ior=1.54,
+                                     spec_strength=0.86, shininess=150,
                                      grain=0.014, inner_color=(0.05, 0.46, 0.24)),
     "marble_cat_eye_amber": _surface((0.98, 0.49, 0.08), roughness=0.13,
-                                     transmission=0.32, opacity=0.92, ior=1.52,
-                                     ambient=0.18, spec_strength=0.86, shininess=150,
+                                     transmission=0.0, opacity=1.0, ior=1.54,
+                                     spec_strength=0.86, shininess=150,
                                      grain=0.013, inner_color=(0.78, 0.24, 0.04)),
     "stone_onyx": _surface((0.028, 0.035, 0.045), roughness=0.16,
                            spec_strength=0.68, shininess=130, grain=0.015),
@@ -76,4 +84,50 @@ MATERIAL_CATALOG = {
                            spec_strength=0.65, shininess=72, grain=0.025),
     "ceramic_porcelain": _surface((0.91, 0.89, 0.84), roughness=0.16,
                                   spec_strength=0.62, shininess=120, grain=0.008),
+    # A genuine photographic blackout material: dead matte black cloth, not
+    # polished black stone. stone_onyx is glossy (spec_strength 0.68,
+    # shininess 130) -- it still catches a visible highlight. Felt has
+    # near-zero albedo AND near-zero specular/shininess, so it absorbs
+    # instead of reflecting: the real studio technique of blacking out
+    # everything except the lights actually being tested.
+    "black_felt": _surface((0.012, 0.012, 0.013), roughness=1.0,
+                           spec_strength=0.0, shininess=1.0, grain=0.08),
+    # Real architectural matte plaster: a warm bone/cream wall finish, not a
+    # polished studio surface -- very rough (plaster is matte, not glossy),
+    # near-zero specular, no metallic/transmission.
+    "stucco_plaster": _surface((0.82, 0.76, 0.63), roughness=0.92,
+                               spec_strength=0.08, shininess=8, grain=0.035),
+    # Colour calibration chart: real pure-reference materials (not a texture
+    # swap) so the backdrop roll can hang an actual emissive colour chart on
+    # the Studio wall -- each patch a real catalog material with a genuine
+    # emission colour, carried through the same emission-profile pipeline
+    # every other emissive material uses.
+    "calibration_white":   _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(30, 30, 30)),
+    "calibration_red":     _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(30, 0, 0)),
+    "calibration_green":   _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(0, 30, 0)),
+    "calibration_blue":    _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(0, 0, 30)),
+    "calibration_yellow":  _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(30, 30, 0)),
+    "calibration_magenta": _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(30, 0, 30)),
+    "calibration_cyan":    _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(0, 30, 30)),
+    "calibration_gray20":  _surface((0.02, 0.02, 0.02), roughness=1.0, emission=(6, 6, 6)),
+    # Studio finishes are distinct opaque dielectric materials, not aliases for
+    # cream stucco, porcelain or polished onyx. Append to preserve existing IDs.
+    # These are artistic paint/plaster approximations, not measured samples.
+    # Gloss belongs to the solid paint's surface; no thin-film interference
+    # enamel is authored (MaterialDatabase keeps coating thickness at zero).
+    "white_gloss_paint": _surface((0.90, 0.90, 0.90), roughness=0.065,
+                                  spec_strength=0.82, shininess=220, grain=0.002),
+    "white_plaster": _surface((0.90, 0.90, 0.90), roughness=0.96,
+                              spec_strength=0.025, shininess=4, grain=0.04),
+    "black_gloss_paint": _surface((0.012, 0.012, 0.012), roughness=0.065,
+                                  spec_strength=0.82, shininess=220, grain=0.002),
+    # Illustrative opaque matte paint, not measured optical calibration or felt.
+    # Append only: existing saved material IDs must not move.
+    "black_matte_paint": _surface((0.025, 0.025, 0.025), roughness=0.8,
+                                  spec_strength=0.25, shininess=12, grain=0.0),
+    # Artistic polished reflectors: RGB conductor approximation, not measured n/k spectra.
+    "polished_silver": _surface((0.91, 0.93, 0.96), roughness=0.005, metallic=1.0,
+                                spec_strength=0.98, shininess=512, grain=0.0),
+    "polished_gold": _surface((1.00, 0.72, 0.29), roughness=0.005, metallic=1.0,
+                              spec_strength=0.96, shininess=512, grain=0.0),
 }
