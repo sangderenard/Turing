@@ -194,3 +194,45 @@ def test_console_port_column_added_to_old_table(tmp_path):
         out = subprocess.run([sys.executable, str(SUP), "--db", str(db), "--status"], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0, out.stderr
     assert "console_port" in {r["name"] for r in _rows(db, "PRAGMA table_info(service_instances)")}
+
+
+_NODUS_CONTRACT_STUB = """import json, os, sys, time
+print(json.dumps({"canvas": sys.argv[sys.argv.index('--canvas') + 1],
+                  "contract_ports": [{"prefix": "py.stub", "capacity": 4, "listen_port": 47777}], "pid": os.getpid()}), flush=True)
+time.sleep(120)
+"""
+
+_ARGV_RECORDER = "import json, sys, time\nopen(sys.argv[1], 'w').write(json.dumps(sys.argv[2:]))\nprint('up', flush=True)\ntime.sleep(120)\n"
+
+
+def test_federation_from_hands_contract_port_and_canvas_to_dependent(tmp_path):
+    tool = tmp_path / "stub_contract_canvas.py"
+    tool.write_text(_NODUS_CONTRACT_STUB, encoding="utf-8")
+    canvas = tmp_path / "x.canvas"
+    canvas.write_text("canvas", encoding="utf-8")
+    recorder, record = tmp_path / "recorder.py", tmp_path / "argv.json"
+    recorder.write_text(_ARGV_RECORDER, encoding="utf-8")
+    nodus = {"name": "nodus-stub", "kind": "nodus", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-nodus-stub",
+             "args": [], "leases": [], "python": sys.executable,
+             "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1}}
+    dependent = {"name": "meow-stub", "kind": "command", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-meow-stub",
+                 "args": [sys.executable, str(recorder), str(record)], "leases": [], "federation_from": "nodus-stub"}
+    db, state, inst = tmp_path / "accounts.db", tmp_path / "state", tmp_path / "instances.json"
+    inst.write_text(json.dumps([dependent, nodus]), encoding="utf-8")      # dependent listed first: the supervisor starts the source first
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        _wait(lambda: len([r for r in _rows(db, "SELECT * FROM service_instances") if r["state"] == "running"]) == 2, timeout=60)
+        argv = json.loads(record.read_text(encoding="utf-8"))
+        assert argv[argv.index("--federation-port") + 1] == "47777"
+        assert argv[argv.index("--federation-canvas") + 1] == str(canvas)
+        row = _rows(db, "SELECT contract_prefix, contract_port FROM service_instances WHERE name = 'nodus-stub'")[0]
+        assert row == {"contract_prefix": "py.stub", "contract_port": 47777}
+        status = subprocess.run(_cmd(db, state, inst, "--status"), capture_output=True, text=True, timeout=60)
+        assert {r["name"]: r["contract_port"] for r in json.loads(status.stdout)}["nodus-stub"] == 47777
+        proc.stdin.close()
+        assert proc.wait(timeout=45) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
+    assert _rows(db, "SELECT contract_port FROM service_instances WHERE name = 'nodus-stub'")[0]["contract_port"] is None

@@ -8,6 +8,7 @@
       "route": "a",
       "bind": "0.0.0.0",
       "account": "svc-meowdoku-a",
+      "federation_from": "nodus-messenger",
       "args": [
         "--tls-cert",
         "build/meowdoku/tls/cert.pem",

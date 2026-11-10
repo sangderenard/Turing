@@ -56,7 +56,8 @@ EXIT_RESTART = lifecycle_mod.EXIT_RESTART
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
     account_user_id INTEGER NOT NULL, pid INTEGER, state TEXT NOT NULL, started REAL, stopped REAL,
-    restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER, console_port INTEGER);
+    restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER, console_port INTEGER,
+    contract_prefix TEXT, contract_port INTEGER);
 CREATE TABLE IF NOT EXISTS instance_leases (name TEXT NOT NULL, lease_id INTEGER NOT NULL, product_sha256 TEXT NOT NULL,
     generation INTEGER NOT NULL, PRIMARY KEY(name, lease_id));
 """
@@ -73,8 +74,10 @@ def connect(db_path):
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(DDL)
-        if "console_port" not in {r[1] for r in db.execute("PRAGMA table_info(service_instances)")}:
-            db.execute("ALTER TABLE service_instances ADD COLUMN console_port INTEGER")   # tables made before the console existed
+        have = {r[1] for r in db.execute("PRAGMA table_info(service_instances)")}
+        for column, kind in (("console_port", "INTEGER"), ("contract_prefix", "TEXT"), ("contract_port", "INTEGER")):
+            if column not in have:
+                db.execute(f"ALTER TABLE service_instances ADD COLUMN {column} {kind}")   # tables made before the column existed
         _schema_version.declare(db, "supervisor", 1)
         with db:
             yield db
@@ -153,6 +156,9 @@ class Instance:
         self.logfile = None
         self.skip_reason = None
         self.console_port = None  # the port the host reported on its first JSON line
+        self.contract_prefix = None   # first entry of that line's contract_ports: its prefix and listen_port
+        self.contract_port = None
+        self.federation_args = []     # [FEDERATE] --federation-port/--federation-canvas, set by begin() from spec["federation_from"]
 
     def console_requested(self) -> bool:
         n = self.spec.get("nodus") or {}
@@ -181,6 +187,7 @@ class Instance:
             except OSError:
                 pass
         self.console_port = None
+        self.contract_prefix = self.contract_port = None
 
     # ---- command
     def command(self):
@@ -192,7 +199,7 @@ class Instance:
                 argv += ["--state-dir", str(self.sup.paths.root)]
             if self.route:
                 argv += ["--route", self.route]
-            return argv + ["--instance", self.name]
+            return argv + ["--instance", self.name, *self.federation_args]
         if self.kind == "nodus":
             n = self.spec["nodus"]
             argv = [py, n["tool"], "--canvas", str(_abs(n["canvas"])), "--rate", str(n.get("rate", 60))]
@@ -203,7 +210,7 @@ class Instance:
                 argv += ["--console-port", str(int(cp)), "--console-token-file", str(self.console_token_path())]
             return argv + list(self.spec.get("args", []))
         # "python -c" style stand-ins (tests): kind 'command' is not shipped; args is the full argv
-        return list(self.spec.get("args", []))
+        return list(self.spec.get("args", [])) + self.federation_args
 
     def env(self):
         env = dict(os.environ, PYTHONUTF8="1")
@@ -289,11 +296,15 @@ class Instance:
         try:
             for line in self.logfile.read_text(encoding="utf-8", errors="replace").splitlines():
                 if self.kind == "nodus" and line.startswith("{") and "contract_ports" in line:
+                    try:
+                        first = json.loads(line)
+                    except ValueError:
+                        first = {}
                     if self.console_requested():
-                        try:
-                            self.console_port = json.loads(line).get("console_port")
-                        except ValueError:
-                            self.console_port = None
+                        self.console_port = first.get("console_port")
+                    ports = first.get("contract_ports") or []
+                    if ports and isinstance(ports[0], dict) and ports[0].get("listen_port"):
+                        self.contract_prefix, self.contract_port = ports[0].get("prefix"), int(ports[0]["listen_port"])
                     return True
                 if self.kind == "command" and line.strip():
                     return True
@@ -305,7 +316,9 @@ class Instance:
         alive = bool(self.proc and self.proc.poll() is None)
         cols = {"state": self.state, "pid": self.proc.pid if alive else None,
                 "restarts": len(self.starts), "supervisor_pid": os.getpid(),
-                "console_port": self.console_port if alive or self.state == "starting" else None, **fields}
+                "console_port": self.console_port if alive or self.state == "starting" else None,
+                "contract_prefix": self.contract_prefix if alive or self.state == "starting" else None,
+                "contract_port": self.contract_port if alive or self.state == "starting" else None, **fields}
         sets = ", ".join(f"{k} = ?" for k in cols)
         with connect(self.sup.db_path) as db:
             db.execute("INSERT OR IGNORE INTO service_instances (name, kind, port, route, account_user_id, state) VALUES (?,?,?,?,?,?)",
@@ -327,8 +340,33 @@ class Instance:
             self.sup.log(f"{self.name}: port {self.port} already has a listener; not launching over it (state external)")
             self.record(started=None)
             return
+        self.federation_args = self.resolve_federation()
         self.take_leases()
         self.launch()
+
+    def resolve_federation(self):
+        """[FEDERATE] ``federation_from: <nodus instance name>`` (meowdoku, or the command stand-in): wait for that host's first JSON line,
+        then hand the child its contract port and canvas.  Not running / no contract port / unknown name: no flags, and the reason is logged."""
+        source_name = self.spec.get("federation_from")
+        if not source_name or self.kind not in ("meowdoku", "command"):
+            return []
+        source = next((i for i in self.sup.instances if i.name == source_name and i.kind == "nodus"), None)
+        if source is None:
+            self.sup.log(f"{self.name}: federation_from {source_name!r}: no such nodus instance; launching without federation flags")
+            return []
+        end = time.monotonic() + START_TIMEOUT["nodus"]
+        while source.state == "starting" and time.monotonic() < end:
+            source.poll()
+            time.sleep(0.2)
+        if source.state != "running":
+            self.sup.log(f"{self.name}: federation_from {source_name!r}: instance is {source.state}, not running; launching without federation flags")
+            return []
+        if not source.contract_port:
+            self.sup.log(f"{self.name}: federation_from {source_name!r}: the host reported no contract port; launching without federation flags")
+            return []
+        canvas = str(_abs(source.spec["nodus"]["canvas"]))
+        self.sup.log(f"{self.name}: federating {source_name!r} contract port {source.contract_port} ({source.contract_prefix}) canvas {canvas}")
+        return ["--federation-port", str(source.contract_port), "--federation-canvas", canvas]
 
     def poll(self):
         if self.state in ("skipped", "external", "failed", "stopped", "new"):
@@ -470,7 +508,7 @@ class Supervisor:
             reason = inst.check()
             out.append({"name": inst.name, "kind": inst.kind, "account": spec.get("account"), "port": inst.port,
                         "route": inst.route, "console_port": (spec.get("nodus") or {}).get("console_port", spec.get("console_port")),
-                        "leases": spec.get("leases", []),
+                        "leases": spec.get("leases", []), "federation_from": spec.get("federation_from"),
                         "command": inst.command() if not reason else None, "skipped": reason})
         return out
 
@@ -481,7 +519,9 @@ class Supervisor:
             if hasattr(signal, sig):
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
         if manage:
-            for spec in load_instances(self.instances_path):
+            specs = load_instances(self.instances_path)
+            sources = {s.get("federation_from") for s in specs}
+            for spec in sorted(specs, key=lambda s: s.get("name") not in sources):      # a federation source starts before its dependents
                 inst = Instance(spec, self)
                 self.instances.append(inst)
                 try:
