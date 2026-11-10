@@ -45,11 +45,11 @@ def P(role, origin="dns", tier="shader"):
 
 
 def test_guest_dns():
-    assert authz.capabilities(P("guest"), authz.DEFAULT_POLICY) == {"view_site"}
+    assert authz.capabilities(P("guest"), authz.DEFAULT_POLICY) == {"view_site", "photo_read"}
 
 
 def test_member_dns():
-    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "studio_write", "photo_submit", "share_live", "compile_submit"}
+    assert authz.capabilities(P("member"), authz.DEFAULT_POLICY) == {"view_site", "photo_read", "studio_write", "photo_submit", "share_live", "compile_submit", "message"}
 
 
 def test_admin_dns_no_lifecycle():
@@ -69,7 +69,7 @@ def test_policy_override_after_mtime_bump(tmp_path):
     f = tmp_path / "authz_policy.json"
     pol = authz.Policy(f)
     g = P("guest")
-    assert authz.capabilities(g, pol.get()) == {"view_site"}
+    assert authz.capabilities(g, pol.get()) == {"view_site", "photo_read"}
     f.write_text(json.dumps({"tier_caps": {"shader": ["view_site", "play"]}}), encoding="utf-8")
     st = f.stat()
     os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))

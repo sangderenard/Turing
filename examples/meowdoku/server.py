@@ -82,6 +82,7 @@ from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] clien
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
+from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
@@ -820,6 +821,66 @@ def make_handler(sessions: Sessions):
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
                         "origin_tier": self._origin_tier})
 
+        # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
+        # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
+        def _messages_route(self, path: str, method: str) -> None:
+            from urllib.parse import parse_qs
+            admin = path.startswith("/api/messages/admin/")
+            if not self._require("account_manage" if admin else "message"):
+                return
+            self._set_cookie = []
+            me = self._principal().user_id
+            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+            body = {}
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    self.close_connection = True
+                    return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                body = self._body_json(16384)
+                if body is None:
+                    return
+            db = messaging_mod.connect(sessions.accounts_db)
+            try:
+                try:
+                    if method == "GET" and path == "/api/messages/contacts":
+                        return self._json(messaging_mod.contacts(db, me))
+                    if method == "GET" and path == "/api/messages/thread":
+                        before = query.get("before")
+                        return self._json(messaging_mod.thread(db, me, query.get("peer"), int(before) if before else None))
+                    if method == "GET" and path == "/api/messages/since":
+                        rows = messaging_mod.long_poll(db, me, int(query.get("after") or 0), float(query.get("wait") or 0))
+                        return self._json({"messages": rows, "latest": messaging_mod.latest_id(db, me)})
+                    if method == "GET" and path == "/api/messages/admin/thread":
+                        before = query.get("before")
+                        return self._json(messaging_mod.admin_thread(db, me, query.get("a"), query.get("b"), int(before) if before else None))
+                    if method == "POST" and path == "/api/messages/contacts":
+                        action, name = body.get("action"), body.get("username")
+                        if action == "request":
+                            return self._json(messaging_mod.request_contact(db, me, name))
+                        if action in ("accept", "decline"):
+                            return self._json(messaging_mod.respond_contact(db, me, name, action == "accept"))
+                        if action == "block":
+                            return self._json(messaging_mod.block(db, me, name))
+                        if action == "remove":
+                            return self._json(messaging_mod.remove(db, me, name))
+                        return self._json({"error": "action must be request, accept, decline, block or remove"}, HTTPStatus.BAD_REQUEST)
+                    if method == "POST" and path == "/api/messages/send":
+                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body")))
+                    if method == "POST" and path == "/api/messages/read":
+                        return self._json(messaging_mod.mark_read(db, me, body.get("peer"), int(body.get("up_to") or 0)))
+                    if method == "POST" and path == "/api/messages/admin/remove":
+                        return self._json(messaging_mod.admin_remove(db, me, int(body.get("id"))))
+                    if method == "POST" and path == "/api/messages/admin/suspend":
+                        return self._json(messaging_mod.admin_suspend(db, me, body.get("username"), bool(body.get("suspended"))))
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                except messaging_mod.MessagingError as error:
+                    return self._json({"error": error.message}, error.status)
+                except (ValueError, TypeError):
+                    return self._json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
+            finally:
+                db.close()
+        # ---- end [MESSAGES]
+
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
         _MATHLAB_FILES = ("law.at.py", "law.numpy.py", "law.abi.json", "law.wgsl.abi.json", "law.api.yaml")
@@ -1464,6 +1525,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path.startswith("/api/messages/"):                 # [MESSAGES]
+                return self._messages_route(path, "GET")
             if path.startswith("/api/mathlab/"):                  # [MATHLAB]
                 return self._mathlab_get(path)
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
@@ -1890,6 +1953,8 @@ def make_handler(sessions: Sessions):
             if self._tier == "shader":
                 if self._shader_request(path0, "POST"):
                     return
+            if path0.startswith("/api/messages/"):             # [MESSAGES]
+                return self._messages_route(path0, "POST")
             if path0.startswith("/api/mathlab/"):              # [MATHLAB]
                 return self._mathlab_post(path0)
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)

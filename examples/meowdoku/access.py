@@ -69,7 +69,7 @@ LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
 SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js")
 SHADER_PAGE = "/shader.html"
 # Public sign-in: the only other things the shader tier may reach (server.py _shader_request / _login_post).  Sign-up stays closed.
-SHADER_LOGIN_FILES = ("/login.html", "/login.js")
+SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js")   # the widget renders nothing without the message capability
 SHADER_LOGIN_GETS = ("/api/account/me",)
 SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
 SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim")
