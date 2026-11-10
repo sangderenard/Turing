@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browse</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --acc:#1a5fb4; --card:#fff; --sel:#e8f0fb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; --sel:#26324a; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:78rem; margin:0 auto; padding:1rem 16px 4rem; }
+  nav#crumbs { display:flex; flex-wrap:wrap; gap:.3rem; margin-bottom:.6rem; } nav#crumbs a { color:var(--acc); text-decoration:none; } nav#crumbs span.sep { color:var(--mut); }
+  a { color:var(--acc); }
+  #narration { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.2rem 1rem; margin:.6rem 0; }
+  #narration h1, #narration h2, #narration h3 { font-size:1.05rem; margin:.7rem 0 .3rem; }
+  code, pre { font:13px ui-monospace, Consolas, monospace; } pre { background:var(--card); border:1px solid var(--line); padding:.5rem; overflow:auto; max-height:24rem; white-space:pre-wrap; }
+  .bar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin:.6rem 0; }
+  input[type=search] { font:inherit; padding:.35rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); min-width:14rem; }
+  button { font:inherit; padding:.35rem .9rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  .cols { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:1rem; } @media (max-width:52rem) { .cols { grid-template-columns:1fr; } }
+  table { border-collapse:collapse; width:100%; background:var(--card); }
+  th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; cursor:pointer; user-select:none; } td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr.sel td { background:var(--sel); } tbody tr { cursor:pointer; }
+  #detail { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.6rem 1rem; align-self:start; min-height:6rem; overflow:auto; }
+  .mut { color:var(--mut); } .bad { color:#b3261e; } [hidden] { display:none !important; }
+  img.preview { max-width:100%; }
+</style>
+</head>
+<body>
+<main>
+  <nav id="crumbs" aria-label="breadcrumb"></nav>
+  <p id="status" class="mut" role="status">Loading...</p>
+  <section id="narration" hidden></section>
+  <div class="bar">
+    <input id="filter" type="search" placeholder="filter (name, type, kind)" aria-label="filter">
+    <button id="narrate" hidden>Narrate</button>
+    <button id="agent">Copy as agent prompt</button>
+    <span class="mut">j/k move, Enter open, Backspace up</span>
+  </div>
+  <div class="cols">
+    <table id="table"><thead><tr>
+      <th data-k="name">Name</th><th data-k="kind">Kind</th><th data-k="bytes">Bytes</th><th data-k="mtime">Modified</th><th data-k="content_type">Type</th>
+    </tr></thead><tbody></tbody></table>
+    <aside id="detail"><span class="mut">Select an entry.</span></aside>
+  </div>
+</main>
+<script type="module" src="/browse.js"></script>
+</body>
+</html>

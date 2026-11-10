@@ -18,6 +18,33 @@
         "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json"
       ],
       "leases": [],
+      "python": "C:/dev/Powershell/srv/python/python.exe",
+      "site": "stable"
+    },
+    {
+      "name": "meowdoku-dev",
+      "kind": "meowdoku",
+      "site": "dev",
+      "enabled": true,
+      "port": 8768,
+      "route": "b",
+      "bind": "127.0.0.1",
+      "account": "svc-meowdoku-dev",
+      "state_dir": "C:/dev/Powershell/srv/state-dev",
+      "args": [
+        "--tls-cert",
+        "build/meowdoku/tls/cert.pem",
+        "--tls-key",
+        "build/meowdoku/tls/key.pem",
+        "--web-dir",
+        "C:/dev/Powershell/srv/state-dev/web",
+        "--require-cap",
+        "dev_ui",
+        "--no-idle-train",
+        "--no-mathlab",
+        "--no-wasm"
+      ],
+      "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe"
     },
     {

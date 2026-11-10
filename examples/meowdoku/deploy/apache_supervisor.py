@@ -158,6 +158,8 @@ class Instance:
         self.console_port = None  # the port the host reported on its first JSON line
         self.contract_prefix = None   # first entry of that line's contract_ports: its prefix and listen_port
         self.contract_port = None
+        # [ROUTE] per-instance "state_dir" (a path, absolute or relative to the repo root): that child's --state-dir and nothing else
+        self.paths = StatePaths(_abs(spec["state_dir"])) if spec.get("state_dir") else sup.paths
         self.federation_args = []     # [FEDERATE] --federation-port/--federation-canvas, set by begin() from spec["federation_from"]
 
     def console_requested(self) -> bool:
@@ -195,10 +197,13 @@ class Instance:
         if self.kind == "meowdoku":
             argv = [py, "examples/meowdoku/server.py", "--port", str(self.port), "--bind", self.spec.get("bind", "127.0.0.1"),
                     *self.spec.get("args", [])]
-            if not self.sup.paths.is_legacy:            # an explicit state root is handed to the child; the old layout is its own default
-                argv += ["--state-dir", str(self.sup.paths.root)]
+            if not self.paths.is_legacy:                # an explicit state root is handed to the child; the old layout is its own default
+                argv += ["--state-dir", str(self.paths.root)]
+            if self.paths is not self.sup.paths:        # [ROUTE] a per-instance root shares the supervisor's accounts.db (users, roles, sessions, preferences)
+                argv += ["--accounts-db", str(self.sup.db_path)]
             if self.route:
                 argv += ["--route", self.route]
+            argv += self.sup.route_args()               # [ROUTE] --routes / --stable-route / --dev-route from the enabled instances
             return argv + ["--instance", self.name, *self.federation_args]
         if self.kind == "nodus":
             n = self.spec["nodus"]
@@ -223,6 +228,8 @@ class Instance:
 
     def check(self):
         """A reason this instance cannot run, or None."""
+        if self.spec.get("enabled", True) is False:       # [ROUTE] rollback switch: "enabled": false
+            return "disabled (enabled: false)"
         if self.kind not in ("meowdoku", "nodus", "command"):
             return f"unknown kind {self.kind!r}"
         if self.kind == "nodus":
@@ -332,6 +339,8 @@ class Instance:
             self.state = "skipped"
             self.sup.log(f"{self.name}: skipped: {self.skip_reason}")
             return
+        if self.spec.get("state_dir"):
+            self.paths.ensure(restrict=False)               # [ROUTE] the instance's own root, created on a real run only (never plan/status)
         self.uid = ensure_service_user(self.spec["account"], self.sup.db_path)
         with connect(self.sup.db_path) as db:
             db.execute("INSERT OR REPLACE INTO account_instances VALUES (?, ?)", (self.uid, self.name))
@@ -425,7 +434,7 @@ class Instance:
         """The Stop-Meowdoku.ps1 request: POST {op:restart,in:N} with the admin token; the server saves sessions and exits 75."""
         import ssl
         import urllib.request
-        paths = lifecycle_mod.state_paths(self.sup.paths, int(self.port))
+        paths = lifecycle_mod.state_paths(self.paths, int(self.port))
         token = paths["token"].read_text(encoding="utf-8").strip()
         tls = "--tls-cert" in self.spec.get("args", [])
         ctx = None
@@ -501,6 +510,21 @@ class Supervisor:
                 out.flush()
         self.stop.set()
 
+    def route_args(self):
+        """[ROUTE] ``--routes a,b --stable-route a --dev-route b`` for every meowdoku child: built from the ENABLED meowdoku instances
+        (a disabled dev instance contributes no route, so the page reports no Development server).  Optional per-instance ``"site"``:
+        "stable" (default) | "dev"."""
+        on = [s for s in load_instances(self.instances_path)
+              if s.get("kind") == "meowdoku" and s.get("route") and s.get("enabled", True) is not False]
+        out = []
+        if on:
+            out += ["--routes", ",".join(s["route"] for s in on)]
+            for flag, site in (("--stable-route", "stable"), ("--dev-route", "dev")):
+                first = next((s["route"] for s in on if (s.get("site") or "stable") == site), None)
+                if first:
+                    out += [flag, first]
+        return out
+
     def plan(self):
         out = []
         for spec in load_instances(self.instances_path):
@@ -509,7 +533,8 @@ class Supervisor:
             out.append({"name": inst.name, "kind": inst.kind, "account": spec.get("account"), "port": inst.port,
                         "route": inst.route, "console_port": (spec.get("nodus") or {}).get("console_port", spec.get("console_port")),
                         "leases": spec.get("leases", []), "federation_from": spec.get("federation_from"),
-                        "command": inst.command() if not reason else None, "skipped": reason})
+                        "command": inst.command() if not reason else None, "skipped": reason,
+                        "state_dir": str(inst.paths.root) if spec.get("state_dir") else None})
         return out
 
     def run(self, manage=True):

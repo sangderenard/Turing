@@ -6,7 +6,7 @@ library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, u
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
-photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit.  ``capabilities(principal, policy)`` is the one place they are computed:
+photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit.  ``capabilities(principal, policy)`` is the one place they are computed:
 
     effective = tier_caps[tier] | role_caps[role]
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
@@ -31,9 +31,9 @@ INTEGRATION SPEC (server.py is not in this branch).  Build the principal once in
     ~515  do_HEAD           tier == 'shader'                       HEAD refused for shader tier             not view_site
     ~760  do_GET            tier == 'shader'                       shader-only redirect                     not view_site
     ~765  /api/tickets GET  require_tier dev                       ticket list                              dev_ui
-    ~788  marble_photo/jobs require_tier edit                      photo job list                           photo_submit
-    ~795  marble_photo/lenses require_tier edit                    lens list                                photo_submit
-    ~803  marble_photo*     require_tier edit                      photo image/hdr/animation reads          photo_submit
+    ~788  marble_photo/jobs require_tier edit                      photo job list                           photo_read
+    ~795  marble_photo/lenses require_tier edit                    lens list                                photo_read
+    ~803  marble_photo*     require_tier edit                      photo image/hdr/animation reads          photo_read
     ~952  _ready            tier != 'shader'                       full readiness snapshot                  view_site
     ~987  loading anim upload  require_tier play|edit              temporary / permanent upload             play / owner_tools
     ~1048 owner_authorize   origin == 'lan' bypass                 loading-anim owner check                 library_manage (token check stays)
@@ -81,7 +81,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
     _schema_version = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_schema_version)
 
-CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
+CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit")
 ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
@@ -90,9 +90,9 @@ POLICY_FILE = "authz_policy.json"
 
 DEFAULT_POLICY = {
     "tier_caps": {
-        "shader": ["view_site"],
-        "play": ["view_site", "play"],
-        "dev": ["view_site", "play", "dev_ui"],
+        "shader": ["view_site", "photo_read"],
+        "play": ["view_site", "play", "photo_read"],
+        "dev": ["view_site", "play", "dev_ui", "photo_read"],
         "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit")],
     },
     "role_caps": {
@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS script_audit (
     host TEXT
 );
 CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL);
+-- [ROUTE] schema 2: the site (stable|dev) a dev_ui account prefers behind the Apache front (get_site_pref/set_site_pref)
+CREATE TABLE IF NOT EXISTS account_prefs (user_id INTEGER PRIMARY KEY, site TEXT NOT NULL CHECK(site IN ('stable','dev')), updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS peer_grants (
     grant_id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer TEXT NOT NULL,
@@ -225,7 +227,7 @@ def _connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(conn, "authz", 1)       # first: a newer database is refused before this module writes anything
+        _schema_version.declare(conn, "authz", 2)       # first: a newer database is refused before this module writes anything
     except _schema_version.SchemaVersionError:
         conn.close()
         raise
@@ -236,6 +238,35 @@ def _connect(db_path) -> sqlite3.Connection:
                            "INSERT INTO account_roles SELECT user_id, role, granted_by, created_at FROM account_roles_old;"
                            "DROP TABLE account_roles_old; COMMIT;")
     return conn
+
+
+# [ROUTE] per-account site preference (table account_prefs, created by _DDL above; schema 2's forward migration is only that CREATE IF NOT EXISTS)
+SITES = ("stable", "dev")
+
+
+def get_site_pref(db, user_id):
+    """'stable' | 'dev' | None.  ``db`` is a sqlite connection (from _connect) or a path."""
+    if not hasattr(db, "execute"):
+        conn = _connect(db)
+        try:
+            return get_site_pref(conn, user_id)
+        finally:
+            conn.close()
+    row = db.execute("SELECT site FROM account_prefs WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+def set_site_pref(db, user_id, site) -> None:
+    if site not in SITES:
+        raise ValueError(f"site must be one of {SITES}")
+    if not hasattr(db, "execute"):
+        conn = _connect(db)
+        try:
+            return set_site_pref(conn, user_id, site)
+        finally:
+            conn.close()
+    with db:
+        db.execute("INSERT OR REPLACE INTO account_prefs (user_id, site, updated) VALUES (?, ?, ?)", (user_id, site, time.time()))
 
 
 def role_of(db_path, user_id) -> str:

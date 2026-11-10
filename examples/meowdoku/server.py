@@ -81,6 +81,7 @@ from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real pas
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
+from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
@@ -470,10 +471,10 @@ def make_handler(sessions: Sessions):
                     ["browser:" + hashlib.sha256((table.player_token or self._token).encode()).hexdigest()])
             return keys, account
 
-        def _job_authorize(self, digest):
+        def _job_authorize(self, digest, *, allow_legacy=True):
             from meowdoku import job_library
             keys, account = self._job_identity()
-            if not job_library.allowed(sessions.marble_photos.directory, digest, keys):
+            if not job_library.allowed(sessions.marble_photos.directory, digest, keys, allow_legacy=allow_legacy):
                 raise marble_photo_mod.PhotoError("job belongs to another identity", 403)
 
         def _is_secure(self) -> bool:
@@ -598,6 +599,7 @@ def make_handler(sessions: Sessions):
                 db.close()
             self._bind_instance(user["id"])
             self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+            self._route_after_login(user["id"])                   # [ROUTE]
             from http.cookies import SimpleCookie
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             held = jar[PLAYER_COOKIE].value if PLAYER_COOKIE in jar else None
@@ -716,6 +718,97 @@ def make_handler(sessions: Sessions):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
+
+        # ---- [ROUTE] Stable server / Development server selection behind the Apache front (cookie meowdoku_route; the proxy's rewrite rule
+        # sends route b to the Development server).  Two shared instances of the whole service.  Not the dev page vs shader page (access tier
+        # + role) and not a per-user leased server.  Stored preference values: 'stable' | 'dev'.
+        _ROUTE_OPEN = ("/login.html", "/login.js", "/api/account/login", "/api/account/logout", "/api/account/me", "/api/whoami", "/api/route")
+
+        def _route_stable(self) -> str:
+            return getattr(sessions, "stable_route", "") or "a"
+
+        def _route_set(self, route: str) -> None:
+            if not getattr(self, "_set_cookie", None):
+                self._set_cookie = []
+            self._set_cookie = [c for c in self._set_cookie if not c.startswith(proxy_trust_mod.ROUTE_COOKIE + "=")]
+            self._set_cookie.append(proxy_trust_mod.route_cookie(route))
+
+        def _route_gate(self, path: str) -> bool:
+            """--require-cap: True when the request was refused here (403 + the cookie reset to the Stable server's route).  The route cookie alone never grants access."""
+            cap = getattr(sessions, "require_cap", "")
+            if not cap or path in self._ROUTE_OPEN:
+                return False
+            self._classify()
+            if cap in self._caps():
+                return False
+            self.close_connection = True
+            self._set_cookie = []
+            self._route_set(self._route_stable())
+            self._json({"error": f"this instance needs {cap}"}, HTTPStatus.FORBIDDEN)
+            return True
+
+        def _route_site_route(self, site) -> str:
+            dev = getattr(sessions, "dev_route", "")
+            return dev if site == "dev" and dev else self._route_stable()
+
+        def _route_pref(self, user_id):
+            conn = authz_mod._connect(sessions.accounts_db)
+            try:
+                return authz_mod.get_site_pref(conn, user_id)
+            finally:
+                conn.close()
+
+        def _route_after_login(self, user_id: int) -> None:
+            """On login: a dev_ui account with a stored preference gets that server's route (Development only when a dev route is configured); everyone else the Stable server's."""
+            role = authz_mod.role_of(sessions.accounts_db, user_id)
+            lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
+            tier = lift.get(role, "shader") if self._origin_tier == "shader" else self._origin_tier
+            principal = authz_mod.Principal(role, user_id, None, self._origin, tier)
+            site = self._route_pref(user_id) if "dev_ui" in authz_mod.capabilities(principal, sessions.authz_policy.get()) else None
+            self._route_set(self._route_site_route(site))
+
+        def _route_get(self) -> None:
+            self._set_cookie = []
+            from http.cookies import SimpleCookie
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            account = self._account()
+            pref = self._route_pref(account["id"]) if account is not None and "dev_ui" in self._caps() else None
+            self._json({"route": sessions.route or None, "routes": list(getattr(sessions, "routes", [])),
+                        "selected": jar[proxy_trust_mod.ROUTE_COOKIE].value if proxy_trust_mod.ROUTE_COOKIE in jar else None,
+                        "preference": pref, "stable_route": self._route_stable(),
+                        "dev_route": getattr(sessions, "dev_route", "") or None,
+                        "dev_available": bool(getattr(sessions, "dev_route", ""))})
+
+        def _route_post(self) -> None:
+            """POST /api/route {route} or {site: stable|dev}: dev_ui only; sets the cookie (whatever this instance's own route is) and stores the account's Stable/Development server preference."""
+            if not self._require("dev_ui"):
+                return
+            body = self._body_json()
+            if body is None:
+                return
+            self._set_cookie = []
+            routes = list(getattr(sessions, "routes", []))
+            site = body.get("site")
+            if site is not None:
+                if site not in authz_mod.SITES:
+                    return self._json({"error": "site must be stable or dev"}, HTTPStatus.BAD_REQUEST)
+                if site == "dev" and not getattr(sessions, "dev_route", ""):
+                    return self._json({"error": "no Development server is enabled"}, HTTPStatus.CONFLICT)
+                route = self._route_site_route(site)
+            else:
+                route = str(body.get("route", ""))
+                if route not in routes:
+                    return self._json({"error": "unknown route", "routes": routes}, HTTPStatus.BAD_REQUEST)
+                site = "dev" if route == getattr(sessions, "dev_route", "") else ("stable" if route == self._route_stable() else None)
+            account = self._account()
+            if site is not None and account is not None:
+                conn = authz_mod._connect(sessions.accounts_db)
+                try:
+                    authz_mod.set_site_pref(conn, account["id"], site)
+                finally:
+                    conn.close()
+            self._route_set(route)
+            self._json({"route": route, "site": site, "routes": routes})
 
         def _whoami(self) -> None:
             self._set_cookie = []
@@ -861,8 +954,83 @@ def make_handler(sessions: Sessions):
             finally:
                 db.close()
 
+        # ---- [LISTING] GET /browse/<root>/<path...> (listing.py): site / math / docs roots, json | text | html
+        def _browse_context(self):
+            owner = self._job_identity()[0][0] if "compile_submit" in self._caps() else None
+            state = sessions.state
+
+            def owned():
+                if owner is None:
+                    return []
+                db = math_jobs_mod.connect(sessions.accounts_db)
+                try:
+                    return math_jobs_mod.list_jobs(db, owner)
+                finally:
+                    db.close()
+
+            def owns(job_id):
+                if owner is None:
+                    return False
+                db = math_jobs_mod.connect(sessions.accounts_db)
+                try:
+                    return math_jobs_mod.get_job(db, state, job_id, owner) is not None
+                finally:
+                    db.close()
+
+            def page():
+                for candidate in (web_dir / "browse.html", Path(__file__).resolve().parent / "web" / "browse.html"):
+                    try:
+                        return candidate.read_bytes()
+                    except OSError:
+                        continue
+                return None
+
+            return listing_mod.Context(
+                web_dir=Path(web_dir), owned_jobs=owned, owns_job=owns, job_dir=lambda job_id: math_jobs_mod.job_dir(state, job_id),
+                served_names=self._mathlab_served_names, lowering_rows=lambda: lowering_mod.lowerings(sessions.accounts_db), html_page=page)
+
+        def _browse_get(self) -> None:
+            if not self._require("dev_ui"):                      # the weakest gate first: a guest or shader visitor learns nothing, not even root names
+                return
+            self._set_cookie = []
+            status, headers, body = listing_mod.browse(self.path, self.headers.get("Accept", ""), self.client_address[0],
+                                                       self._caps(), self._browse_context())
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            if isinstance(body, Path):
+                with open(body, "rb") as handle:
+                    while True:
+                        block = handle.read(1 << 20)
+                        if not block:
+                            break
+                        self.wfile.write(block)
+            else:
+                self.wfile.write(body)
+
+        def _static_directory_redirect(self, path: str) -> bool:
+            """A static GET naming a directory with no index.html (the stock handler would list it): dev_ui holders go to /browse/site/..., others 404."""
+            from urllib.parse import quote
+            try:
+                target = Path(self.translate_path(path))
+                if not target.is_dir() or (target / "index.html").exists() or (target / "index.htm").exists():
+                    return False
+            except (OSError, ValueError):
+                return False
+            if "dev_ui" in self._caps():
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/browse/site/" + quote(path.strip("/"), safe="/") + ("/" if path.strip("/") else ""))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return True
+
         def do_HEAD(self):  # noqa: N802
             self._classify()
+            if self._route_gate(self.path.split("?", 1)[0]):      # [ROUTE]
+                return
             if self._tier == "shader" or self.path.startswith("/api/") or self.path.startswith("/ws"):
                 self.send_response(HTTPStatus.FORBIDDEN); self.send_header("Content-Length", "0"); self.end_headers()
                 return
@@ -877,7 +1045,7 @@ def make_handler(sessions: Sessions):
             cookies = getattr(self, "_set_cookie", None) or ()
             for cookie in cookies:
                 self.send_header("Set-Cookie", cookie)
-            if cookies and sessions.route:
+            if cookies and sessions.route and not any(c.startswith(proxy_trust_mod.ROUTE_COOKIE + "=") for c in cookies):   # [ROUTE]
                 self.send_header("Set-Cookie", proxy_trust_mod.route_cookie(sessions.route))
             self.end_headers()
             self.wfile.write(body)
@@ -885,7 +1053,7 @@ def make_handler(sessions: Sessions):
         def end_headers(self):
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
-            if not getattr(self, "path", "").startswith("/api/"):
+            if not getattr(self, "path", "").startswith(("/api/", "/browse")):    # [LISTING] /browse sets its own no-store
                 path = getattr(self, "path", "").split("?", 1)[0]
                 self.send_header("Cache-Control", "no-store" if path in
                                  ("/marble_studio.html", "/marble_studio.js", "/marble_drive_input.js", "/marble_chase_camera.js", "/marble_studio_scene.js", "/marble_studio_transition.js", "/marble_studio_phong.js", "/marble_studio_dof.js", "/marble_camera_toolbox.js", "/marble_camera_toolbox_mount.js", "/marble_spot_sample.js", "/marble_rangefinder.js", "/marble_rangefinder_panel.js", "/marble_camera_binding.js", "/marble_object.js",
@@ -1273,6 +1441,12 @@ def make_handler(sessions: Sessions):
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             self._classify()                                      # [ACCESS]
+            if self._route_gate(path):                            # [ROUTE]
+                return
+            if path == "/api/route":                              # [ROUTE]
+                return self._route_get()
+            if path == "/browse" or path.startswith("/browse/"):  # [LISTING] gated per root inside; the shader tier gets 403, never the shader page
+                return self._browse_get()
             if self._tier == "shader" and self._shader_request(path, "GET"):
                 return
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
@@ -1303,14 +1477,14 @@ def make_handler(sessions: Sessions):
             if path == "/api/marble_photo/jobs":
                 if self._is_viewer():
                     return self._refuse_viewer()
-                if not self._require("photo_submit"):
+                if not self._require("photo_read"):
                     return
                 from meowdoku import job_library
                 keys, account = self._job_identity()
                 digests = sessions.accounts.assets_for_user(account["id"], "marble_photo") if account else ()
                 return self._json(job_library.entries(sessions.marble_photos, keys, digests))
             if path == "/api/marble_photo/lenses":
-                if not self._require("photo_submit"):
+                if not self._require("photo_read"):
                     return
                 from meowdoku.marble_lens_contract import lens_catalog
                 try:
@@ -1318,13 +1492,14 @@ def make_handler(sessions: Sessions):
                 except (ValueError, OSError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
-                if not self._require("photo_submit"):
+                if not self._require("photo_read"):
                     return
                 from urllib.parse import parse_qs
                 query = parse_qs(self.path.partition("?")[2])
                 digest = (query.get("digest") or [""])[0]
                 try:
-                    self._job_authorize(digest)
+                    # Read-only visitors must not inherit the old submitter access to unindexed photos.
+                    self._job_authorize(digest, allow_legacy="photo_submit" in self._caps())
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
@@ -1480,6 +1655,8 @@ def make_handler(sessions: Sessions):
                 self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
                 self.send_header("Retry-After", "5"); self.send_header("Content-Length", "0")
                 self.end_headers()
+                return
+            if self._static_directory_redirect(path):             # [LISTING] a bare directory is no longer the stock index
                 return
             return super().do_GET()
 
@@ -1643,6 +1820,10 @@ def make_handler(sessions: Sessions):
 
         def do_POST(self):  # noqa: N802
             path0 = self.path.split("?", 1)[0]
+            if self._route_gate(path0):                           # [ROUTE]
+                return
+            if path0 == "/api/route":                             # [ROUTE]
+                return self._route_post()
             # Worker-only payload mailbox: credentials are process-local and
             # distinct from browser ray credentials. Never accepts browser Origin.
             if path0.startswith("/api/client_rays/engine/"):
@@ -1956,6 +2137,7 @@ def make_handler(sessions: Sessions):
                 sessions.accounts.logout(jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None)
                 self._set_cookie = []
                 self._clear_account_cookie()
+                self._route_set(self._route_stable())             # [ROUTE]
                 return self._json({"ok": True})
             if path0 in ("/api/loading_library/activate", "/api/loading_library/delete", "/api/loading_library/graduate") and not self._is_viewer():     # [STUDIO]
                 if not self._require("library_manage"):               # [AUTHZ] the capability is in addition to the owner token checked inside
@@ -2341,6 +2523,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
+    parser.add_argument("--accounts-db", default=None,      # [ROUTE]
+                        help="[ROUTE] accounts.db shared with another instance (one identity, session, role and stored preference); default <state>/sql/accounts.db. "
+                             "Content, logs, run files and the job library stay under this instance's own state root; the lowering scan is skipped")
+    parser.add_argument("--routes", default="",      # [ROUTE]
+                        help="[ROUTE] comma list of every route a dev_ui account may select with POST /api/route (the supervisor passes the enabled instances' routes)")
+    parser.add_argument("--require-cap", default="",      # [ROUTE]
+                        help="[ROUTE] refuse every request (except login/whoami/route) from a principal without this capability, e.g. dev_ui, and reset the route cookie")
+    parser.add_argument("--stable-route", default="",      # [ROUTE]
+                        help="[ROUTE] route of the Stable server (the instance without --require-cap)")
+    parser.add_argument("--dev-route", default="",      # [ROUTE]
+                        help="[ROUTE] route of the Development server; absent = none is enabled (a stored 'dev' preference falls back to the Stable server)")
     args = parser.parse_args(argv)
     if args.route:
         try:
@@ -2374,6 +2567,12 @@ def main(argv: list[str] | None = None) -> int:
     profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.route = args.route
+    sessions.routes = [r for r in args.routes.split(",") if r]                    # [ROUTE]
+    if args.accounts_db:                                                          # [ROUTE] every module opens sessions.accounts_db; Accounts and the policy follow it
+        sessions.accounts_db = Path(args.accounts_db)
+        sessions.accounts = accounts_mod.Accounts(sessions.accounts_db)
+        sessions.authz_policy = authz_mod.Policy.beside(sessions.accounts_db)
+    sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
     if args.access:
@@ -2403,6 +2602,9 @@ def main(argv: list[str] | None = None) -> int:
     prepare_threads = startup_mod.Lanes(sessions.readiness).start(lanes)   # [LOADING] the builds begin once the socket is accepting
 
     def scan_lowerings():                                            # [LOWERINGS] once, after the products are built/retained; never fatal
+        if args.accounts_db:                                         # [ROUTE] the catalogue belongs to the server that owns the database
+            print("[meowdoku] lowering scan skipped: --accounts-db is shared, the catalogue belongs to its owner", flush=True)
+            return
         for thread in prepare_threads:
             thread.join()
         try:

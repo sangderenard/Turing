@@ -16,6 +16,7 @@
   button:disabled { opacity:.5; cursor:default; }
   .bad { color:var(--bad); } .ok { color:var(--ok); } .mut { color:var(--mut); }
   ul { padding-left:1.2rem; }
+  button[aria-pressed="true"] { border-color:var(--ok); color:var(--ok); font-weight:600; }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -35,6 +36,12 @@
       <li><a href="/">Main page</a></li>
       <li><a href="/mathlab.html">Math lab</a></li>
     </ul>
+    <div id="server" hidden>
+      <p><strong>Server</strong> <span class="mut">(answering now: <span id="instance">-</span>)</span></p>
+      <button id="site-stable" type="button" aria-pressed="false">Stable server</button>
+      <button id="site-dev" type="button" aria-pressed="false">Development server</button>
+      <p class="mut" id="server-note">Your choice is remembered for this account.</p>
+    </div>
     <button id="signout" type="button">Sign out</button>
   </section>
   <p id="status" class="mut" role="status"></p>

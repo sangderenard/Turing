@@ -40,7 +40,7 @@ class SchemaVersionTests(unittest.TestCase):
             self.assertEqual([r[:2] for r in schema_version.report(c)], [("job_library", 1)])
         finally:
             c.close()
-        self.assertTrue(all(r[1] == 1 and r[3] for r in rows))
+        self.assertTrue(all(r[1] == (2 if r[0] == "authz" else 1) and r[3] for r in rows))
 
     def test_newer_database_refused_and_nothing_written(self):
         c = sqlite3.connect(self.db)
@@ -48,7 +48,7 @@ class SchemaVersionTests(unittest.TestCase):
         c.close()
         with self.assertRaises(schema_version.SchemaVersionError) as cm:
             authz._connect(self.db)
-        self.assertEqual((cm.exception.module, cm.exception.stored, cm.exception.version), ("authz", 99, 1))
+        self.assertEqual((cm.exception.module, cm.exception.stored, cm.exception.version), ("authz", 99, 2))
         c = sqlite3.connect(self.db)
         try:
             self.assertEqual([r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")], ["schema_version"])

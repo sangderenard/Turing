@@ -71,11 +71,11 @@ def test_dry_run_prints_plan_and_changes_nothing(tmp_path):
     assert not db.exists()
 
 
-def test_shipped_instances_dry_run_lists_both():
+def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "nodus-messenger"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):
@@ -236,3 +236,38 @@ def test_federation_from_hands_contract_port_and_canvas_to_dependent(tmp_path):
             proc.kill()
         proc.stdout.close(); proc.stderr.close()
     assert _rows(db, "SELECT contract_port FROM service_instances WHERE name = 'nodus-stub'")[0]["contract_port"] is None
+
+
+def _dev_pair(tmp_path, dev_enabled=True):
+    def spec(name, route, site, **extra):
+        return {"name": name, "kind": "meowdoku", "port": 59001 if site == "stable" else 59002, "route": route, "site": site, "bind": "127.0.0.1",
+                "account": f"svc-{name}", "args": [], "leases": [], **extra}
+    inst = tmp_path / "instances.json"
+    inst.write_text(json.dumps({"state_dir": str(tmp_path / "root"), "instances": [
+        spec("m-a", "a", "stable"), spec("m-dev", "b", "dev", state_dir=str(tmp_path / "devroot"), enabled=dev_enabled)]}), encoding="utf-8")
+    return inst
+
+
+def _plan(tmp_path, inst):
+    out = subprocess.run([sys.executable, str(SUP), "--db", str(tmp_path / "a.db"), "--instances", str(inst), "--once", "--dry-run"],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return {i["name"]: i for i in json.loads(out.stdout)["instances"]}
+
+
+def test_per_instance_state_dir_reaches_only_that_child_and_routes_are_passed(tmp_path):
+    plan = _plan(tmp_path, _dev_pair(tmp_path))
+    a, dev = plan["m-a"]["command"], plan["m-dev"]["command"]
+    assert a[a.index("--state-dir") + 1] == str(tmp_path / "root")
+    assert dev[dev.index("--state-dir") + 1] == str(tmp_path / "devroot")
+    for cmd in (a, dev):
+        assert cmd[cmd.index("--routes") + 1] == "a,b"
+        assert cmd[cmd.index("--stable-route") + 1] == "a" and cmd[cmd.index("--dev-route") + 1] == "b"
+    assert not (tmp_path / "devroot").exists() and not (tmp_path / "a.db").exists()          # dry-run creates nothing
+
+
+def test_disabled_instance_is_skipped_and_contributes_no_route(tmp_path):
+    plan = _plan(tmp_path, _dev_pair(tmp_path, dev_enabled=False))
+    assert plan["m-dev"]["skipped"] == "disabled (enabled: false)" and plan["m-dev"]["command"] is None
+    a = plan["m-a"]["command"]
+    assert a[a.index("--routes") + 1] == "a" and "--dev-route" not in a
