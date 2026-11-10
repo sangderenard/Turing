@@ -11,6 +11,13 @@ Green: `python -m pytest tests/test_repo_world_scan.py -q` — 2 passed in
 1.5 s on a fixture repository built in `tmp_path` (9 files, 4 regions,
 8 portal pairs, 3 unresolved references, 1 unparsable Python file noted).
 
+Also measured: `scan_repository('.')` on this clean commit afc9b4bb took 47 s
+and produced 243 regions, 5,500 rooms, 15,119 portal pairs (14,545 Python,
+574 ES-module), 16,648 unresolved references, 39.7 MB of JSON. 998 of the
+unresolved are `meowdoku.*`: Python resolution is repository-root only and
+`examples/meowdoku` is imported with `examples/` on sys.path (design note,
+gap H). The rest are stdlib and third-party names.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

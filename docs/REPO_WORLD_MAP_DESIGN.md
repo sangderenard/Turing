@@ -224,6 +224,29 @@ Nothing in `abstract_ui_*.py` was edited on this branch.
 - **G. Calls inside files.** Function-level calls across files are not
   extracted; only module imports are. Adding them needs the compiler's own
   process graph for Python, not a second resolver.
+- **H. Import roots other than the repository root.** Python names resolve
+  only from the repository root. Measured on this repository's own clean
+  commit (`afc9b4bb`, 47 s, 243 regions, 5,500 rooms, 15,119 portal pairs,
+  16,648 unresolved, JSON 39.7 MB): 998 unresolved references are
+  `meowdoku.*`, because `examples/meowdoku` is run with `examples/` on
+  `sys.path`. The rest of the unresolved set is standard library and
+  third-party (`typing`, `numpy`, `pytest`, `OpenGL`, …) as expected. The
+  scanner needs the repository's declared import roots as an input; it must
+  not guess them from directory names.
+
+## 7. Measurement on this repository (observed, 2026-11-10)
+
+| quantity | value |
+|---|---|
+| scan time, clean commit `afc9b4bb` | 47 s |
+| regions / rooms | 243 / 5,500 |
+| portal pairs (python / es-module) | 15,119 (14,545 / 574) |
+| unresolved references | 16,648 (8 self-references) |
+| `to_data()` as JSON | 39.7 MB |
+
+The current page embeds its whole model in one document (~800 KB for one
+class), so gap E is confirmed at this size: the world builder cannot embed
+this record set; it has to select a window or serve it separately.
 
 ## 6. What feeding the records into the world builder requires
 
