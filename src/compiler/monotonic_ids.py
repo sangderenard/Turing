@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from threading import Lock
 
-from .id_space import MINTED, compose
+from .id_space import MINTED, compose, has_flag, serial_of
 
 
 class MonotonicIdSource:
@@ -47,6 +47,19 @@ class MonotonicIdSource:
 
     def mint_block(self, count: int) -> tuple[int, ...]:
         return tuple(self.mint() for _ in range(int(count)))
+
+    def reserve_existing(self, value_ids) -> None:
+        """Keep restored compiler identities outside future minted serials.
+
+        Deserialized identity books supply their authoritative mint rows.
+        Reserving advances the issuer only; it never renumbers a value or
+        invents provenance for one.
+        """
+        next_serial = max((serial_of(value_id) + 1 for value_id in value_ids
+                           if value_id is not None and has_flag(value_id, MINTED)),
+                          default=0)
+        with self._lock:
+            self._next = max(self._next, next_serial)
 
     def peek(self) -> int:
         with self._lock:

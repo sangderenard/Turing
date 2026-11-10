@@ -379,6 +379,69 @@ def _webgpu_static_aggregate_indexes(module, outputs, *, backend):
     return transformed, _rewrite_output_values(transformed, outputs), decision
 
 
+def _wasm_scalar_power_cores(module, outputs, *, backend, licensed_inexact):
+    """Legalize powers without a scalar Wasm instruction using signal cores."""
+    if backend != "wasm":
+        return module, dict(outputs), None
+    from .ir_identities import (
+        _constant_value, lower_transcendentals_to_signal_cores,
+        two_product_flavor_scope,
+    )
+    from .identity_concordance import _ACTIVE_IDENTITY_BOOK
+    from .ssa_wasm_backend import _MAX_UNROLLED_POWER
+
+    selected = {}
+    for name, function in module.functions.items():
+        if outputs and name not in outputs:
+            continue
+        constants = {int(i.res.id): _constant_value(i)
+                     for b in function.blocks.values() for i in b.instrs
+                     if i.op == "Const" and i.res is not None}
+        ids = set()
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op != "Pow" or len(instruction.args) != 2 or instruction.res is None:
+                    continue
+                exponent = constants.get(int(instruction.args[1].id))
+                # Keep the direct lane's existing instruction spellings. The
+                # unbounded live pneumatic exponent has none; route that op,
+                # with its original provenance, through the canonical core.
+                direct = exponent in (2.0, -1.0)
+                direct |= (exponent is not None and float(exponent).is_integer()
+                           and 2 <= abs(int(exponent)) <= _MAX_UNROLLED_POWER)
+                direct |= licensed_inexact and exponent in (0.5, -0.5)
+                if not direct:
+                    ids.add(int(instruction.res.id))
+        if ids:
+            selected[name] = ids
+    if not selected:
+        return module, dict(outputs), None
+    before = _topology_sha(module)
+    transformed = copy.deepcopy(module)
+    own = transformed.metadata.get("identity_book")
+    token = _ACTIVE_IDENTITY_BOOK.set(own) if own is not None else None
+    try:
+        with two_product_flavor_scope("split"):
+            for name, ids in selected.items():
+                lower_transcendentals_to_signal_cores(
+                    {name: transformed.functions[name]}, mode="scientific",
+                    instruction_filter=lambda instruction, ids=ids:
+                        instruction.op == "Pow" and instruction.res is not None
+                        and int(instruction.res.id) in ids,
+                )
+    finally:
+        if token is not None:
+            _ACTIVE_IDENTITY_BOOK.reset(token)
+    decision = BackendIdentityDecision(
+        identity="wasm_scalar_power_signal_cores", priority=120,
+        backends=("wasm",), applied=True, exact=True,
+        reasons=tuple(f"{name}: canonical split power cores for {tuple(sorted(ids))}"
+                      for name, ids in sorted(selected.items())),
+        before_sha256=before, after_sha256=_topology_sha(transformed),
+    )
+    return transformed, _rewrite_output_values(transformed, outputs), decision
+
+
 def apply_backend_identities(
     module: IRModule,
     outputs: Mapping[str, Sequence[SSAValue]],
@@ -420,6 +483,12 @@ def apply_backend_identities(
     )
     if index_decision is not None:
         decisions.append(index_decision)
+    current, current_outputs, power_decision = _wasm_scalar_power_cores(
+        current, current_outputs, backend=str(backend),
+        licensed_inexact=bool(licensed_inexact),
+    )
+    if power_decision is not None:
+        decisions.append(power_decision)
     return BackendIdentityResult(current, current_outputs, tuple(decisions))
 
 

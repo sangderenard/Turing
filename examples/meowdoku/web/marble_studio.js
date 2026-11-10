@@ -1,3 +1,4 @@
+import {studioLightingRackGeometry} from './marble_lighting_racks.js';
 // Reuse the server loading panel; its boot hold covers Studio asset/GPU setup.
 import "./loading_panel.js";
 import {ensureObjAsset, importedMechanics} from "./marble_imported_object.js";
@@ -916,8 +917,10 @@ function shopLightState(channel="studio") {
 }
 function shopLightGeometryForStudio(channel="studio") {
   const state=shopLightState(channel);
-  return studioShopLightGeometry(state,ids,shopLightEmitterAllocations(state,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS),{
-    bounds:studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)),unitMm:studioSubjectTransform(false,channel).unitM*1000});
+  const options={bounds:studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)),unitMm:studioSubjectTransform(false,channel).unitM*1000};
+  const geometry=studioShopLightGeometry(state,ids,shopLightEmitterAllocations(state,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS),options);
+  const rails=studioLightingRackGeometry(studioRenderState(channel)?.lightingRacks,ids,{...options,topMaterial:state.topMaterial});
+  return {...geometry,faces:[...geometry.faces,...rails.faces],parts:[...geometry.parts,...rails.parts]};
 }
 function shopLightFacesForStudio(channel="studio",onPart) {
   const geometry=shopLightGeometryForStudio(channel);
@@ -926,7 +929,7 @@ function shopLightFacesForStudio(channel="studio",onPart) {
 }
 function rebuildShopMeshes() {
   const state=shopLightState(),materials=[state?.backingMaterial,state?.topMaterial].map(name=>ids[name]);
-  const key=JSON.stringify([state,studioRoomScale(),studioFloorDrop(),studioSubjectTransform(false).unitM,
+  const key=JSON.stringify([state,studioRenderState()?.lightingRacks,studioRoomScale(),studioFloorDrop(),studioSubjectTransform(false).unitM,
     materials.map(id=>id===undefined?null:[read("pbr",id,5),read("pbr",id,7)])]);
   if(key===shopMeshKey)return shopGeometry;
   const geometry=shopLightGeometryForStudio(),opaque=[],transparent=[];

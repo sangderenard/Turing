@@ -168,4 +168,297 @@ assert(context.collectProjectilePickup(fired));context.publishMechanicalCreature
 assert.equal(returned.read().bodies.length,0);
 assert.equal(faults.length,1,'only the deliberate earlier rollback fault was reported');
 api.setSink(null); context.publishMechanicalCreatureStudioSnapshot(1224, .016); assert.equal(api.readSnapshot(), null);
-console.log(`PASS: ${base}; native 15-contact updates, exact registry, cancellation, commit rollback, copied double-slot state, authoritative worker publication, actual original launcher and edited environment -> Studio return consumer`);
+
+// Execute the COMPLETE original worker and its exact original main-thread
+// message handler. Controlled queues expose legal delivery order; no timer or
+// physics tick is run and no worker protocol is substituted. Actual structured
+// cloning/transfers detach the original buffers, as the browser transport does.
+const workerInbox=[],mainInbox=[];
+const originalWorkerContext=vm.createContext({onmessage:null,performance:{now:()=>0},console,
+  postMessage:(message,transfer=[])=>mainInbox.push(structuredClone(message,{transfer})),
+  setInterval:()=>1,clearInterval(){},close(){}});
+vm.runInContext(originalWorker,originalWorkerContext);
+vm.runInContext(`instance={};timer=1;sequence=40;snapshotCapacity=1;
+  snapshotBuffers=Array.from({length:SNAPSHOT_POOL_SIZE},()=>new ArrayBuffer(SNAPSHOT_STRIDE*8));`,originalWorkerContext);
+const workerObservers=new Set();
+const originalTransport={postMessage:(message,transfer=[])=>workerInbox.push(structuredClone(message,{transfer})),
+  addEventListener(type,listener){assert.equal(type,'message');workerObservers.add(listener);},
+  removeEventListener(type,listener){assert.equal(type,'message');workerObservers.delete(listener);}};
+context.stateLoopRuntime.worker=originalTransport;context.stateLoopRuntime.latestSequence=40;
+context.stateLoopRuntime.slotRecords=[];
+const originalHandler=page.slice(page.indexOf('      worker.onmessage = event => {',page.indexOf('function initializeWorldPhysicsWasm')),
+  page.indexOf('      worker.onerror = event => {',page.indexOf('function initializeWorldPhysicsWasm')));
+assert(originalHandler.startsWith('      worker.onmessage = event => {'));
+vm.runInContext(`{const worker=stateLoopRuntime.worker;${originalHandler}}`,context);
+const toWorker=async()=>{assert(workerInbox.length);const message=workerInbox.shift();
+  await originalWorkerContext.onmessage({data:message});return message;};
+const toMain=()=>{assert(mainInbox.length);const message=mainInbox.shift(),event={data:message};
+  originalTransport.onmessage(event);for(const observer of workerObservers)observer(event);return message;};
+const nativePublish=time=>originalWorkerContext.publishSnapshot(time);
+nativePublish(2000);nativePublish(2001);
+assert.equal(mainInbox.length,1,'the original three-buffer pool still permits only one snapshot in flight');
+assert.equal(mainInbox[0].sequence,41);
+const barrierRequest=request(8);barrierRequest.definition.boxes[1].center[0]+=.625;
+const barrierUpdate=api.queueEnvironment(barrierRequest);context.applyMechanicalCreatureStudioEnvironment();await barrierUpdate;
+assert.equal(workerInbox[0].type,'colliders');
+api.setSink(()=>{},{epoch:'native-worker-barrier'});
+context.publishMechanicalCreatureStudioSnapshot(2002,.016);
+assert.deepEqual(structuredClone(api.readSnapshot().environments[0].workerColliderBarrier),{
+  scope:'worker-collider-field',status:'awaiting-original-recycle',postedAfterSequence:40,requiredSequence:42,observedSequence:null});
+const postedPacket=api.readSnapshot();
+context.stateLoopRuntime.latestSequence=99;context.publishMechanicalCreatureStudioSnapshot(2002.5,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null,
+  'a global sequence change without this worker message is not a barrier');
+context.stateLoopRuntime.latestSequence=40;
+toMain();assert.equal(context.stateLoopRuntime.latestSequence,41);
+assert.deepEqual(workerInbox.map(message=>message.type),['colliders','recycle']);
+assert.equal(vm.runInContext('colliders.length',originalWorkerContext),0,
+  'N+1 can reach main while the environment collider message is still unconsumed');
+context.publishMechanicalCreatureStudioSnapshot(2003,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null,'N+1 cannot acknowledge the environment');
+await toWorker();
+assert.equal(vm.runInContext('colliders.length',originalWorkerContext),15);
+assert.equal(mainInbox.length,0,'full-dynamics collider handling emits no engine-state acknowledgment');
+nativePublish(2004);assert.equal(mainInbox.length,0,'a consumed collider message cannot bypass the outstanding buffer');
+await toWorker();nativePublish(2005);assert.equal(mainInbox[0].sequence,42);
+toMain();context.publishMechanicalCreatureStudioSnapshot(2006,.016);
+assert.equal(api.readSnapshot().environments[0].colliderPublication,'posted-to-original-worker');
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,42);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.status,'observed-after-original-recycle');
+assert.equal(postedPacket.environments[0].workerColliderBarrier.observedSequence,null,'prior receipts remain immutable');
+assert.equal(context.stateLoopRuntime.latestSequence,42);
+assert.equal(vm.runInContext('JSON.stringify(colliders)',originalWorkerContext),JSON.stringify(context.shaderViewer.colliders),
+  'original N+2 publication follows consumption of the exact original collider payload');
+assert.equal(model.loop_deployment.workers[0].source,originalWorker,'worker code is untouched');
+
+// A rejected render commit posts the candidate and then the restored field.
+// Neither the prior proof nor N+1 may acknowledge that rollback publication.
+const rollbackPending=api.queueEnvironment({...request(9),commit:()=>false});
+const rollbackRejected=assert.rejects(rollbackPending,/synchronously/);
+context.applyMechanicalCreatureStudioEnvironment();await rollbackRejected;
+context.publishMechanicalCreatureStudioSnapshot(2007,.016);
+assert.equal(api.readSnapshot().environments[0].sequence,8);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.requiredSequence,44);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null);
+assert.deepEqual(workerInbox.map(message=>message.type),['recycle','colliders','colliders']);
+await toWorker();nativePublish(2008);toMain();
+context.publishMechanicalCreatureStudioSnapshot(2009,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null);
+await toWorker();await toWorker();await toWorker();nativePublish(2010);toMain();
+context.publishMechanicalCreatureStudioSnapshot(2011,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,44);
+assert.equal(vm.runInContext('JSON.stringify(colliders)',originalWorkerContext),JSON.stringify(context.shaderViewer.colliders));
+assert.equal(workerObservers.size,1,'reposting replaces the old passive observer');
+
+const retiredEpochObserver=[...workerObservers][0];
+api.setSink(null);assert.equal(workerObservers.size,0,'closed epochs unregister the passive observer');
+assert.equal(api.readSnapshot(),null);
+api.setSink(()=>{},{epoch:'reopened-native-worker-barrier'});
+assert.equal(workerObservers.size,1);
+context.publishMechanicalCreatureStudioSnapshot(2012,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null);
+retiredEpochObserver({data:{type:'snapshot-buffer',sequence:44}});
+context.publishMechanicalCreatureStudioSnapshot(2013,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,null,
+  'a retired epoch observer cannot satisfy the new epoch');
+await toWorker();nativePublish(2014);toMain();context.publishMechanicalCreatureStudioSnapshot(2015,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.observedSequence,45);
+
+const retiredWorkerObserver=[...workerObservers][0];
+context.stateLoopRuntime.worker={postMessage(){}};
+retiredWorkerObserver({data:{type:'snapshot-buffer',sequence:45}});
+context.publishMechanicalCreatureStudioSnapshot(2016,.016);
+assert.equal(workerObservers.size,0,'worker replacement unregisters the old source observer');
+assert.equal(api.readSnapshot().environments[0].colliderPublication,'native-scene-ready-worker-pending');
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier,null,
+  'replacement workers cannot inherit the retired worker proof');
+context.stateLoopRuntime.worker=originalTransport;context.stateLoopRuntime.ready=false;
+context.markMechanicalCreatureStudioColliderPublication();context.publishMechanicalCreatureStudioSnapshot(2017,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier,null);
+context.stateLoopRuntime.ready=true;
+originalTransport.postMessage({type:'colliders',colliders:context.shaderViewer.colliders});
+context.markMechanicalCreatureStudioColliderPublication();context.publishMechanicalCreatureStudioSnapshot(2018,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.postedAfterSequence,45);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier.requiredSequence,47);
+assert.equal(workerObservers.size,1);
+context.stateLoopRuntime.latestSequence=0;context.publishMechanicalCreatureStudioSnapshot(2019,.016);
+assert.equal(api.readSnapshot().environments[0].workerColliderBarrier,null,'sequence reset invalidates proof even on the same object');
+assert.equal(workerObservers.size,0);
+assert.equal(faults.length,2,'only the two deliberate commit failures were reported');
+api.setSink(null);
+
+// Bounded topology: disable and restore only startup-registered table parts.
+// The small authored-source fixture exercises prepareEnvironment as well as
+// real queued native rebuilding; no fabricated registry or contact solver.
+context.stateLoopRuntime.worker={postMessage:message=>posts.push(message)};
+context.initializePhysicsSnapshotSlots(128);assert(context.firePhysicsBall());
+const retainedProjectile=[...context.projectileState.values()][0];
+const projectileBefore=JSON.stringify({position:retainedProjectile.position,velocity:retainedProjectile.velocity,
+  radius:retainedProjectile.box.radius,membership:context.stateLoopRuntime.bodies.get(retainedProjectile.identity)});
+const geometry=context.shaderViewer.geometry,registeredRefs=initial.proxyIdentities.map(identity=>
+  model.document_geometry.boxes.find(box=>box.identity===identity));
+const unrelated=model.document_geometry.boxes.find(box=>box.label==='Outer yard north flat apron');
+assert(unrelated);geometry.unshift(unrelated);
+const documentRefs=[...model.document_geometry.boxes],worldRefs=[...model.world.objects],
+  runtimeRefs=[...context.turingWorld.runtimeObjects],registryBefore=JSON.stringify(model.world.identity_specialization),
+  playerBefore=JSON.stringify(model.entity_mezzanine),hiddenCenter=[...registeredRefs[1].center];
+const sourceRoom={},axes=[['leftX','rightX'],['floorY','ceilingY'],['backZ','frontZ']];
+axes.forEach(([low,high],axis)=>{sourceRoom[low]=(initial.boundsM.minimum[axis]-initial.translationM[axis])/initial.unitM;
+  sourceRoom[high]=(initial.boundsM.maximum[axis]-initial.translationM[axis])/initial.unitM;});
+const tableOffSource={schema:'turing.studio-class-world-import.v1',classIdentity:initial.sourceClassIdentity,revision:10,
+  scene:{frame:{unitM:initial.unitM},room:sourceRoom,parts:[]}};
+const tableOff=api.prepareEnvironment(tableOffSource,{assetIdentity:'studio-scene:table-off'});
+assert.equal(tableOff.definition.boxes.length,initial.boxes.length,'complete registered descriptors remain retained');
+assert.deepEqual([...tableOff.definition.activeProxyIdentities],[initial.identity]);
+assert.deepEqual([...tableOff.building.proxyIds],[initial.identity],'only active native proxies are sent to renderer admission');
+assert.deepEqual([...tableOff.definition.boxes[1].center],hiddenCenter,'hidden table retains last admitted geometry');
+assert.notEqual(hiddenCenter[0],initial.boxes[1].center[0],'retained geometry differs from the startup pose');
+const disable=api.queueEnvironment({...tableOff,sequence:10});context.applyMechanicalCreatureStudioEnvironment();await disable;
+const studioContacts=()=>context.shaderViewer.colliders.filter(row=>initial.proxyIdentities.includes(row.objectIdentity));
+assert.equal(studioContacts().length,6);assert.equal(geometry,context.shaderViewer.geometry);
+assert(geometry.includes(unrelated));assert(geometry.includes(retainedProjectile.box));
+assert(registeredRefs.slice(1).every(box=>!geometry.includes(box)&&box.placement.custody==='placed'));
+assert(!context.shaderViewer.identitySpans.some(span=>span.identity.includes('/part:table/')));
+const disabledGeometry=geometry.slice();
+const rollbackEnable=api.queueEnvironment({...request(11),commit:()=>false});
+const rollbackEnableCheck=assert.rejects(rollbackEnable,/synchronously/);
+context.applyMechanicalCreatureStudioEnvironment();await rollbackEnableCheck;
+assert.equal(studioContacts().length,6);
+disabledGeometry.forEach((box,index)=>assert.equal(geometry[index],box,'failed topology commit restores exact active geometry order'));
+assert.equal(geometry.length,disabledGeometry.length);
+const enable=api.queueEnvironment(request(12));context.applyMechanicalCreatureStudioEnvironment();await enable;
+assert.equal(studioContacts().length,15);
+registeredRefs.forEach(box=>assert.equal(geometry.find(value=>value.identity===box.identity),box));
+const singleOff=request(13);singleOff.definition.activeProxyIdentities=initial.proxyIdentities.filter(id=>id!==registeredRefs[3].identity);
+const partial=api.queueEnvironment(singleOff);context.applyMechanicalCreatureStudioEnvironment();await partial;
+assert.equal(studioContacts().length,14);assert(!geometry.includes(registeredRefs[3]));
+for(const span of context.shaderViewer.identitySpans)
+  assert.equal(geometry[span.boxIndex].identity,span.identity,'unchanged native picking indices match each active original box');
+assert.equal(geometry[0],unrelated);assert(geometry.includes(retainedProjectile.box));
+assert.equal(JSON.stringify({position:retainedProjectile.position,velocity:retainedProjectile.velocity,
+  radius:retainedProjectile.box.radius,membership:context.stateLoopRuntime.bodies.get(retainedProjectile.identity)}),projectileBefore);
+assert.equal(JSON.stringify(model.entity_mezzanine),playerBefore);
+assert.equal(JSON.stringify(model.world.identity_specialization),registryBefore);
+documentRefs.forEach((box,index)=>assert.equal(model.document_geometry.boxes[index],box));
+worldRefs.forEach((object,index)=>assert.equal(model.world.objects[index],object));
+runtimeRefs.forEach((object,index)=>assert.equal(context.turingWorld.runtimeObjects[index],object));
+const invalidActive=request(14);invalidActive.definition.activeProxyIdentities=[initial.identity,'unregistered-table'];
+assert.throws(()=>api.queueEnvironment(invalidActive),/registered subset/);
+const noRoom=request(14);noRoom.definition.activeProxyIdentities=initial.proxyIdentities.slice(1);
+assert.throws(()=>api.queueEnvironment(noRoom),/containing its building/);
+const custody=request(14);custody.definition.boxes[1].placement.custody='inventory';
+assert.throws(()=>api.queueEnvironment(custody),/ownership/);
+assert.equal(faults.length,3,'only deliberate commit failures were reported');
+
+// A genuinely later-authored cuboid is admitted only by the canonical class
+// extension. The unpatched original must refuse it, not invent another registry.
+const cuboid=(id,x)=>({id,construction:'cuboid',closed:true,convex:true,faces:[
+  [[x,0,0],[x+1,0,0],[x+1,1,1]],[[x,0,0],[x+1,1,1],[x,1,1]] ]});
+const laterSource=structuredClone(tableOffSource);laterSource.revision=14;
+laterSource.scene.parts=[cuboid('table/slab',0),cuboid('shelf/later',2)];
+const lateIdentity=initial.identity+'/part:shelf/later';
+if(typeof context.turingWorld.appendObjects!=='function') {
+  assert.throws(()=>api.prepareEnvironment(laterSource,{assetIdentity:'studio-scene:later'}),/canonical append admission/);
+  assert.equal(context.turingWorld.object(lateIdentity),null);
+} else {
+  const countBefore=model.world.objects.length,partCountBefore=model.world.identity_specialization.semantic_parts.length;
+  const newPrepared=api.prepareEnvironment(laterSource,{assetIdentity:'studio-scene:later'});
+  assert.equal(model.world.objects.length,countBefore,'preparation never admits an object');
+  assert.equal(newPrepared.definition.boxes.length,11);
+  assert.deepEqual([...newPrepared.building.proxyIds],[initial.identity,registeredRefs[1].identity,lateIdentity]);
+  const beforeLateGeometry=geometry.slice(),beforeLateRevision=context.shaderViewer.revision;
+  api.setSink(()=>{},{epoch:'late-admission'});context.publishMechanicalCreatureStudioSnapshot(3000,.016);
+  const beforeLateReceipt=api.readSnapshot().environments[0];
+  const failedLate=api.queueEnvironment({...newPrepared,sequence:14,commit:()=>false});
+  assert.equal(model.world.objects.length,countBefore,'enqueue never admits an object');
+  const failedLateCheck=assert.rejects(failedLate,/synchronously/);
+  context.applyMechanicalCreatureStudioEnvironment();await failedLateCheck;
+  assert.equal(model.world.objects.length,countBefore+1,'late failure retains the canonical admission');
+  const lateObject=context.turingWorld.object(lateIdentity),lateBox=lateObject.extensions['abstract_ui.document_geometry'];
+  const lateRuntimeId=context.turingWorld.objectRuntimeId(lateIdentity),latePartId=context.turingWorld.partRuntimeId(lateIdentity+'/surface:body');
+  assert(lateRuntimeId>0&&latePartId>0);assert(model.document_geometry.boxes.includes(lateBox));
+  assert(!geometry.includes(lateBox),'late render failure leaves admitted part inactive');
+  assert.equal(model.world.identity_specialization.semantic_parts.length,partCountBefore+1);
+  beforeLateGeometry.forEach((box,index)=>assert.equal(geometry[index],box));
+  assert.equal(geometry.length,beforeLateGeometry.length);assert.equal(context.shaderViewer.revision,beforeLateRevision);
+  context.publishMechanicalCreatureStudioSnapshot(3016,.016);
+  assert.equal(api.readSnapshot().environments[0].assetIdentity,beforeLateReceipt.assetIdentity);
+  assert.equal(api.readSnapshot().environments[0].sequence,13,'inactive admission is not an activated environment receipt');
+  assert(!context.shaderViewer.colliders.some(row=>row.objectIdentity===lateIdentity));
+
+  laterSource.revision=15;
+  const retryPrepared=api.prepareEnvironment(laterSource,{assetIdentity:'studio-scene:later-retry'});
+  const retry=api.queueEnvironment({...retryPrepared,sequence:15});context.applyMechanicalCreatureStudioEnvironment();await retry;
+  assert.equal(model.world.objects.length,countBefore+1,'retry allocates no duplicate object');
+  assert.equal(model.world.identity_specialization.semantic_parts.length,partCountBefore+1);
+  assert.equal(context.turingWorld.object(lateIdentity),lateObject);assert.equal(context.turingWorld.objectRuntimeId(lateIdentity),lateRuntimeId);
+  assert.equal(context.turingWorld.partRuntimeId(lateIdentity+'/surface:body'),latePartId);assert(geometry.includes(lateBox));
+  assert.equal(geometry.find(box=>box.identity===registeredRefs[1].identity),registeredRefs[1],'mixed old/new update preserves old refs');
+  assert.equal(context.shaderViewer.colliders.filter(row=>row.objectIdentity===lateIdentity).length,1);
+  assert.equal(context.shaderViewer.colliders.find(row=>row.objectIdentity===lateIdentity).runtimePartId,latePartId);
+  context.publishMechanicalCreatureStudioSnapshot(3032,.016);
+  assert.equal(api.readSnapshot().environments[0].sequence,15);
+  const lateOffSource=structuredClone(tableOffSource);lateOffSource.revision=16;
+  const lateOff=api.prepareEnvironment(lateOffSource,{assetIdentity:'studio-scene:later-off'});
+  const lateOffPending=api.queueEnvironment({...lateOff,sequence:16});context.applyMechanicalCreatureStudioEnvironment();await lateOffPending;
+  assert(!geometry.includes(lateBox));assert.equal(studioContacts().length,6);
+  laterSource.revision=17;
+  const lateOn=api.prepareEnvironment(laterSource,{assetIdentity:'studio-scene:later-on'});
+  const lateOnPending=api.queueEnvironment({...lateOn,sequence:17});context.applyMechanicalCreatureStudioEnvironment();await lateOnPending;
+  assert.equal(context.turingWorld.object(lateIdentity),lateObject);assert(geometry.includes(lateBox));
+  assert.equal(model.world.objects.length,countBefore+1);
+
+  const rejectedSource=structuredClone(laterSource);rejectedSource.revision=18;
+  rejectedSource.scene.parts.push(cuboid('shelf/new-first',4),cuboid('shelf/rejected',6));
+  const rejected=api.prepareEnvironment(rejectedSource,{assetIdentity:'studio-scene:rejected'});
+  const rejectionCount=model.world.objects.length,rejectionGeometry=geometry.slice();
+  rejected.definition.boxes.at(-1).half_extent[0]=-1;
+  assert.throws(()=>api.queueEnvironment({...rejected,sequence:18}),/dimensions/);
+  assert.equal(model.world.objects.length,rejectionCount,'entire batch validates before any admission');
+  const wrongParent=api.prepareEnvironment(rejectedSource,{assetIdentity:'studio-scene:wrong-parent'});
+  wrongParent.definition.boxes.at(-1).parent_identity='unrelated-building';
+  assert.throws(()=>api.queueEnvironment({...wrongParent,sequence:18}),/owned authored static cuboid/);
+  const wrongRecipe=api.prepareEnvironment(rejectedSource,{assetIdentity:'studio-scene:wrong-recipe'});
+  wrongRecipe.definition.boxes.at(-1).physics.body='dynamic';
+  assert.throws(()=>api.queueEnvironment({...wrongRecipe,sequence:18}),/owned authored static cuboid/);
+  const wrongClass=structuredClone(rejectedSource);wrongClass.classIdentity='python:unrelated.Source';
+  assert.throws(()=>api.prepareEnvironment(wrongClass,{assetIdentity:'studio-scene:wrong-class'}),/owner/);
+  assert.equal(model.world.objects.length,rejectionCount);
+  rejectionGeometry.forEach((box,index)=>assert.equal(geometry[index],box));
+  assert.equal(context.turingWorld.object(initial.identity+'/part:shelf/new-first'),null);
+  for(const span of context.shaderViewer.identitySpans)assert.equal(geometry[span.boxIndex].identity,span.identity);
+  assert.equal(JSON.stringify({position:retainedProjectile.position,velocity:retainedProjectile.velocity,
+    radius:retainedProjectile.box.radius,membership:context.stateLoopRuntime.bodies.get(retainedProjectile.identity)}),projectileBefore);
+  assert.equal(JSON.stringify(model.entity_mezzanine),playerBefore);
+  worldRefs.forEach((object,index)=>assert.equal(model.world.objects[index],object));
+  runtimeRefs.forEach((object,index)=>assert.equal(context.turingWorld.runtimeObjects[index],object));
+  // Prevalidate while arrays have their normal bounded size. Then exercise
+  // only the admission boundary with sparse maximum lengths: never iterate,
+  // clone or stringify the expanded document array.
+  const capacityPrepared=api.prepareEnvironment(rejectedSource,{assetIdentity:'studio-scene:capacity'});
+  const capacityUpdates=context.validateMechanicalCreatureStudioEnvironment({...capacityPrepared,sequence:18}).updates;
+  assert.equal(capacityUpdates.filter(update=>!update.object).length,2);
+  const documentBoxes=model.document_geometry.boxes,normalLength=documentBoxes.length,
+    documentKeys=Object.keys(documentBoxes);
+  const counts=()=>({world:model.world.objects.length,objects:context.turingWorld.objects.size,
+    parts:context.turingWorld.semanticParts.size,runtimeObjects:context.turingWorld.runtimeObjects.length,
+    runtimeParts:context.turingWorld.runtimeParts.length,objectRows:model.world.identity_specialization.objects.length,
+    partRows:model.world.identity_specialization.semantic_parts.length,order:model.world.object_order.length,
+    structuralOrder:model.world.structural_object_order.length});
+  const beforeCapacity=counts();
+  for(const sparseLength of [0xfffffffe,0xffffffff]) {
+    documentBoxes.length=sparseLength;
+    let failure;
+    try {context.admitMechanicalCreatureStudioParts(capacityPrepared.definition,capacityUpdates);}
+    catch(error){failure=error;}
+    finally{documentBoxes.length=normalLength;}
+    assert.deepEqual(counts(),beforeCapacity,'document capacity refusal must precede canonical registry writes');
+    assert.deepEqual(Object.keys(documentBoxes),documentKeys,'sparse capacity refusal must not add document keys');
+    assert.match(failure?.message??'',/document geometry capacity/);
+    assert.equal(context.turingWorld.object(initial.identity+'/part:shelf/new-first'),null);
+    assert.equal(context.turingWorld.object(initial.identity+'/part:shelf/rejected'),null);
+    assert(capacityUpdates.filter(update=>!update.object).length===2,'rejected updates remain unadmitted');
+  }
+  assert.equal(faults.length,4);api.setSink(null);
+}
+console.log(`PASS: ${base}; native contacts/original launcher, exact worker FIFO/recycle barrier, registered toggles, canonical new-part admission ${typeof context.turingWorld.appendObjects==='function'?'with inactive late-failure retention and no-growth retry':'explicitly unavailable'}; no physics ticks or GPU completion claim`);

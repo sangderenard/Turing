@@ -26,6 +26,7 @@ from .symbolic_equation_compiler import (
     symbolic_equations_cached,
 )
 from .vehicle_balloon_tire import balloon_tire_graph_abi
+from .vehicle_energy_diagnostics import (ENERGY_OUTPUTS, ENERGY_DIAGNOSTICS_CONTRACT, vehicle_energy_expressions)
 
 
 ABSTRACT_UI_VEHICLE_VERSION = "abstract-ui-vehicle-slot-v0"
@@ -194,8 +195,70 @@ VEHICLE_STATE_OUTPUTS = (
     "traction_control_dissipation_torque", "service_brake_reaction_torque",
     "rolling_resistance_reaction_torque", "tire_contact_reaction_torque",
     "drivetrain_chassis_reaction_torque",
+    *ENERGY_OUTPUTS,
 )
 
+
+# One authored state-feedback contract for GPU commit and browser handoff.
+# Values keep their declared units; telemetry and control fields are not state.
+VEHICLE_STATE_FEEDBACK = {
+    **{f"position_{axis}_next": f"position_{axis}" for axis in "xyz"},
+    **{f"velocity_{axis}_next": f"velocity_{axis}" for axis in "xyz"},
+    "roll_next": "roll", "pitch_next": "pitch", "yaw_next": "yaw",
+    "roll_velocity_next": "roll_velocity", "pitch_velocity_next": "pitch_velocity",
+    "yaw_velocity_next": "yaw_velocity",
+    **{f"wheel_omega_{wheel}_next": f"wheel_omega_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"wheel_angle_{wheel}_next": f"wheel_angle_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"slip_longitudinal_{wheel}_next": f"previous_slip_longitudinal_{wheel}"
+       for wheel in WHEEL_NAMES},
+    **{f"slip_sensor_velocity_{wheel}_next": f"slip_sensor_velocity_{wheel}"
+       for wheel in WHEEL_NAMES},
+    **{f"friction_utilization_{wheel}_next": f"friction_utilization_{wheel}"
+       for wheel in WHEEL_NAMES},
+    **{f"friction_utilization_sensor_velocity_{wheel}_next":
+       f"friction_utilization_sensor_velocity_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"tire_deformation_longitudinal_{wheel}_next": f"tire_deformation_longitudinal_{wheel}"
+       for wheel in WHEEL_NAMES},
+    **{f"tire_deformation_velocity_longitudinal_{wheel}_next":
+       f"tire_deformation_velocity_longitudinal_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"tire_deformation_lateral_{wheel}_next": f"tire_deformation_lateral_{wheel}"
+       for wheel in WHEEL_NAMES},
+    **{f"tire_deformation_velocity_lateral_{wheel}_next":
+       f"tire_deformation_velocity_lateral_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"compression_{wheel}_next": f"compression_{wheel}" for wheel in WHEEL_NAMES},
+    **{f"compression_velocity_{wheel}_next": f"compression_velocity_{wheel}"
+       for wheel in WHEEL_NAMES},
+    "engine_angular_speed_next": "engine_angular_speed",
+    "differential_wrench_shaft_omega_front_next": "differential_wrench_shaft_omega_front",
+    "differential_wrench_shaft_omega_rear_next": "differential_wrench_shaft_omega_rear",
+    "traction_battery_charge_fraction_next": "traction_battery_charge_fraction",
+    "clutch_temperature_k_next": "clutch_temperature_k",
+    "clutch_health_next": "clutch_health",
+    "clutch_wear_next": "clutch_wear",
+    "clutch_glaze_next": "clutch_glaze",
+    "alternator_cvt_ratio_state_next": "alternator_cvt_ratio_state",
+    "alternator_cvt_wear_next": "alternator_cvt_wear",
+    "alternator_cvt_glaze_next": "alternator_cvt_glaze",
+    "accessory_battery_cube_charge_fraction_next": "accessory_battery_cube_charge_fraction",
+    "air_mix_reserve_gas_mass_kg_next": "air_mix_reserve_gas_mass_kg",
+    "air_mix_reserve_temperature_k_next": "air_mix_reserve_temperature_k",
+    "direct_drive_bypass_engagement_next": "direct_drive_bypass_engagement",
+    "direct_drive_bypass_tooth_health_next": "direct_drive_bypass_tooth_health",
+    "hub_locker_wear_front_left_next": "hub_locker_wear_front_left",
+    "hub_locker_wear_front_right_next": "hub_locker_wear_front_right",
+    "hub_locker_wear_rear_left_next": "hub_locker_wear_rear_left",
+    "hub_locker_wear_rear_right_next": "hub_locker_wear_rear_right",
+    "hub_locker_glaze_front_left_next": "hub_locker_glaze_front_left",
+    "hub_locker_glaze_front_right_next": "hub_locker_glaze_front_right",
+    "hub_locker_glaze_rear_left_next": "hub_locker_glaze_rear_left",
+    "hub_locker_glaze_rear_right_next": "hub_locker_glaze_rear_right",
+    "differential_locker_wear_front_next": "differential_locker_wear_front",
+    "differential_locker_wear_rear_next": "differential_locker_wear_rear",
+    "differential_locker_wear_center_next": "differential_locker_wear_center",
+    "differential_locker_glaze_front_next": "differential_locker_glaze_front",
+    "differential_locker_glaze_rear_next": "differential_locker_glaze_rear",
+    "differential_locker_glaze_center_next": "differential_locker_glaze_center",
+}
 
 def _number(mapping: Mapping[str, Any], name: str, *, positive: bool = False) -> float:
     value = mapping.get(name)
@@ -2046,7 +2109,7 @@ def _hard_clamp(value: sympy.Basic, lower: sympy.Basic | float,
 
 @lru_cache(maxsize=1)
 def _symbolic_vehicle_equations_loaded() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
-    return symbolic_equations_cached(_symbolic_vehicle_equations_authored)
+    return symbolic_equations_cached(_symbolic_vehicle_equations_authored, key_sources=(vehicle_energy_expressions,))
 
 
 def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
@@ -2503,9 +2566,12 @@ def _symbolic_vehicle_equations_authored() -> tuple[tuple[sympy.Equality, ...], 
           * s["alternator_cvt_ratio_state"] ** 2)
     engine_angular_acceleration = engine_acceleration_torque / effective_engine_inertia
     engine_angular_speed_raw = (s["engine_angular_speed"] + dt * engine_angular_acceleration)
-    engine_angular_speed_next = s["assembly_alpha_drivetrain"] * _c2_clamp(
+    # A speed boundary cannot add crank kinetic energy. The smooth positive
+    # part mapped a stopped, unpowered crank to ~0.25 rad/s on every substep.
+    # Use the existing exact projection here; the interior engine law remains
+    # unchanged, with derivative corners only at zero and the speed ceiling.
+    engine_angular_speed_next = s["assembly_alpha_drivetrain"] * _hard_clamp(
         engine_angular_speed_raw, 0, s["engine_redline_angular_speed"] * sympy.Float("1.03"),
-        sympy.Float("0.5"),
     )
     charge_request = _c2_unit((s["traction_battery_target_charge_fraction"]
                                - s["traction_battery_charge_fraction"])
@@ -2977,6 +3043,7 @@ def _symbolic_vehicle_equations_authored() -> tuple[tuple[sympy.Equality, ...], 
         "tire_contact_reaction_torque": tire_contact_reaction_torque,
         "drivetrain_chassis_reaction_torque": drivetrain_chassis_reaction_torque,
     }
+    expressions.update(vehicle_energy_expressions(s, effective_engine_inertia))
     equations = tuple(sympy.Eq(sympy.Symbol(name, real=True), expression, evaluate=False)
                       for name, expression in expressions.items())
     return equations, s
@@ -2988,7 +3055,7 @@ def compile_symbolic_vehicle_physics() -> SymbolicEquationCompilation:
                          for name in VEHICLE_STATE_OUTPUTS)
     return compile_symbolic_program(
         _symbolic_vehicle_equations_authored, name="abstract_ui_vehicle_step",
-        publications=publications,
+        publications=publications, key_sources=(vehicle_energy_expressions,),
     )
 
 
@@ -3013,7 +3080,7 @@ def compile_symbolic_vehicle_physics_gpu_ssa() -> SymbolicEquationCompilation:
                          for name in VEHICLE_STATE_OUTPUTS)
     return compile_symbolic_program(
         _symbolic_vehicle_equations_authored, name="abstract_ui_vehicle_step_gpu",
-        publications=publications, dtype="float32",
+        publications=publications, dtype="float32", key_sources=(vehicle_energy_expressions,),
     )
 
 
@@ -4329,6 +4396,7 @@ def _vehicle_terrain_contact_webgpu(
     if missing:
         raise RuntimeError(f"terrain contact kernel does not populate contact inputs: {sorted(missing)}")
     stores = "\n".join(store(name, expressions[name]) for name in contact_inputs)
+    from .closed_solid_geometry import CLOSED_SOLID_STRIDE, CLOSED_SOLID_OFFSETS, emit_closed_solid_wgsl
     template = r'''struct TerrainSample {
   height: f32,
   normal: vec3<f32>,
@@ -4345,7 +4413,7 @@ struct TerrainCrossing {
 @group(0) @binding(2) var<storage, read> vehicle_feed: array<f32>;
 @group(0) @binding(3) var<storage, read_write> contact_feed: array<f32>;
 @group(0) @binding(4) var<storage, read> controls: array<f32>;
-// Axis-aligned solid wall prisms, packed as minimum.xyz, maximum.xyz.
+// Canonical oriented solid boxes; padded local bounds, origin, basis and broadphase.
 // They are uploaded only when authored world geometry changes.
 @group(0) @binding(5) var<storage, read> wall_colliders: array<f32>;
 // Resident 4 x 15 torus-contact diagnostic lanes. Slots 0..2 per wheel carry
@@ -4375,6 +4443,8 @@ fn rotate_body(v: vec3<f32>, roll: f32, pitch: f32, yaw: f32) -> vec3<f32> {
   let p = vec3<f32>(r.x * cp - r.y * sp, r.x * sp + r.y * cp, r.z);
   return vec3<f32>(p.x * cy - p.z * sy, p.y, p.x * sy + p.z * cy);
 }
+@@CLOSED_SOLID_HELPERS@@
+
 fn terrain_sample(x: f32, z: f32, query_y: f32) -> TerrainSample {
   // Header: field_count, wall_count. Each field then owns twelve floats:
   // origin.xyz, cell.xz, columns, rows, domain x/x/z/z, height-buffer offset.
@@ -4484,9 +4554,17 @@ fn vehicle_cage_patch_contact(lane: u32, position: vec3<f32>, velocity: vec3<f32
   let sample = terrain_sample(patch_world.x, patch_world.z, patch_world.y);
   let is_shell = lane >= @@SHELL_LANE_START@@u;
   let patch_radius = select(@@CAGE_RADIUS@@, @@SHELL_RADIUS@@, is_shell);
-  let squash = sample.height + patch_radius - patch_world.y;
+  var squash = sample.height + patch_radius - patch_world.y;
+  var contact_valid = sample.valid; var contact_normal = sample.normal;
+  for(var solid_index=0u;solid_index<u32(terrain_parameters[1u]);solid_index+=1u){
+    let closest=closed_solid_closest(patch_world,solid_index);
+    let penetration=patch_radius-closest.signed_distance;
+    if(penetration>0.0f && (contact_valid==0u || penetration>squash)){
+      squash=penetration;contact_normal=closest.normal;contact_valid=1u;
+    }
+  }
   let shell_enabled = select(1.0f, controls[@@CONTROL_BODY_SHELL_ACTIVE@@u], is_shell);
-  let touching = select(0.0f, shell_enabled, sample.valid != 0u && squash > 0.0f
+  let touching = select(0.0f, shell_enabled, contact_valid != 0u && squash > 0.0f
     && squash <= @@CAGE_MAXIMUM_SQUASH@@);
   let forward_axis = rotate_body(vec3<f32>(1.0f, 0.0f, 0.0f), roll, pitch, yaw);
   let right_axis = rotate_body(vec3<f32>(0.0f, 0.0f, 1.0f), roll, pitch, yaw);
@@ -4495,7 +4573,7 @@ fn vehicle_cage_patch_contact(lane: u32, position: vec3<f32>, velocity: vec3<f32
     + pitch_axis * @@PITCH_VELOCITY@@;
   let arm = patch_offset - rotate_body(@@CENTER_OF_MASS@@, roll, pitch, yaw);
   let patch_velocity = velocity + cross(angular, arm);
-  let normal = sample.normal;
+  let normal = contact_normal;
   let along = safe_normalize(forward_axis - normal * dot(forward_axis, normal), forward_axis);
   let across = safe_normalize(cross(along, normal), right_axis);
 @@CAGE_STORES@@
@@ -4522,7 +4600,9 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   let pitch_axis = vec3<f32>(-sin(yaw), 0.0f, cos(yaw));
   let angular = forward_axis * @@ROLL_VELOCITY@@ + vec3<f32>(0.0f, @@YAW_VELOCITY@@, 0.0f)
     + pitch_axis * @@PITCH_VELOCITY@@;
-  let hub_velocity = velocity + cross(angular, hub_offset);
+  // Wheel-relative motion is the derivative of hub_local.y with respect to compression.
+  let relative_hub_velocity = rotate_body(vec3<f32>(0.0f, @@COMPRESSION_VELOCITY@@, 0.0f), roll, pitch, yaw);
+  let hub_velocity = velocity + relative_hub_velocity + cross(angular, hub_offset);
   // Per-wheel knuckle coordinates are solved from column -> pinion -> rack ->
   // spherical tie-rod length constraints.  The contact frame consumes that
   // joint coordinate directly; it is not a cosmetic steering transform.
@@ -4597,39 +4677,16 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   // available torque, normal load and Coulomb friction permit it.
   let wall_count = u32(terrain_parameters[1u]);
   for (var wall_index = 0u; wall_index < wall_count; wall_index += 1u) {
-    let base = wall_index * 6u;
-    let wall_minimum = vec3<f32>(wall_colliders[base], wall_colliders[base + 1u], wall_colliders[base + 2u]);
-    let wall_maximum = vec3<f32>(wall_colliders[base + 3u], wall_colliders[base + 4u], wall_colliders[base + 5u]);
+    let base = wall_index * @@CLOSED_SOLID_STRIDE@@u;
+    let wall_minimum = vec3<f32>(wall_colliders[base+@@SOLID_WORLD_MIN@@u],wall_colliders[base+@@SOLID_WORLD_MIN@@u+1u],wall_colliders[base+@@SOLID_WORLD_MIN@@u+2u]);
+    let wall_maximum = vec3<f32>(wall_colliders[base+@@SOLID_WORLD_MAX@@u],wall_colliders[base+@@SOLID_WORLD_MAX@@u+1u],wall_colliders[base+@@SOLID_WORLD_MAX@@u+2u]);
     let broadphase_reach = vec3<f32>(@@TIRE_RADIUS@@ + @@TIRE_WIDTH@@ + @@CONTACT_REACH@@);
-    if (any(world_hub < wall_minimum - broadphase_reach) || any(world_hub > wall_maximum + broadphase_reach)) {
-      continue;
-    }
+    if (any(world_hub < wall_minimum - broadphase_reach) || any(world_hub > wall_maximum + broadphase_reach)) { continue; }
     for (var lateral_index = 0u; lateral_index < 3u; lateral_index += 1u) {
       let slice_hub = world_hub + axle * (@@TIRE_WIDTH@@ * LATERAL_FRACTIONS[lateral_index]);
-      var point = clamp(slice_hub, wall_minimum, wall_maximum);
-      let outside_delta = slice_hub - point; let outside_distance = length(outside_delta);
-      var candidate_normal = safe_normalize(outside_delta, vec3<f32>(0.0f, 1.0f, 0.0f));
-      var normal_distance = outside_distance;
-      if (outside_distance <= 1.0e-6f) {
-        var face_distance = slice_hub.x - wall_minimum.x;
-        candidate_normal = vec3<f32>(-1.0f, 0.0f, 0.0f); point.x = wall_minimum.x;
-        if (wall_maximum.x - slice_hub.x < face_distance) {
-          face_distance = wall_maximum.x - slice_hub.x; candidate_normal = vec3<f32>(1.0f, 0.0f, 0.0f); point.x = wall_maximum.x;
-        }
-        if (slice_hub.y - wall_minimum.y < face_distance) {
-          face_distance = slice_hub.y - wall_minimum.y; candidate_normal = vec3<f32>(0.0f, -1.0f, 0.0f); point = vec3<f32>(slice_hub.x, wall_minimum.y, slice_hub.z);
-        }
-        if (wall_maximum.y - slice_hub.y < face_distance) {
-          face_distance = wall_maximum.y - slice_hub.y; candidate_normal = vec3<f32>(0.0f, 1.0f, 0.0f); point = vec3<f32>(slice_hub.x, wall_maximum.y, slice_hub.z);
-        }
-        if (slice_hub.z - wall_minimum.z < face_distance) {
-          face_distance = slice_hub.z - wall_minimum.z; candidate_normal = vec3<f32>(0.0f, 0.0f, -1.0f); point = vec3<f32>(slice_hub.x, slice_hub.y, wall_minimum.z);
-        }
-        if (wall_maximum.z - slice_hub.z < face_distance) {
-          face_distance = wall_maximum.z - slice_hub.z; candidate_normal = vec3<f32>(0.0f, 0.0f, 1.0f); point = vec3<f32>(slice_hub.x, slice_hub.y, wall_maximum.z);
-        }
-        normal_distance = -face_distance;
-      }
+      let closest = closed_solid_closest(slice_hub,wall_index);
+      let point = closest.point; let candidate_normal = closest.normal;
+      let normal_distance = closest.signed_distance;
       let penetration = @@TIRE_RADIUS@@ - normal_distance;
       let score = penetration + max(0.0f, dot(candidate_normal, -down)) * 0.003f;
       if (penetration >= -0.006f && score > best_score) {
@@ -4646,11 +4703,13 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   if (best_score > -1.0e19f && (distance_along > 0.0f || tire_radial_compression > 0.0f)) {
     support = max(c2_unit(geometric_compression / 0.025f), c2_unit(tire_radial_compression / 0.012f));
   }
+  // Keep peak depth in metres separate from the mixed-unit arc diagnostics.
+  radial_probes[lane * 15u + 3u] = tire_radial_compression;
   let radial_out = safe_normalize(surface_point - world_hub, down);
   let rolling_raw = cross(axle, radial_out); let tangent_raw = rolling_raw - surface_normal * dot(rolling_raw, surface_normal);
   let rolling = safe_normalize(tangent_raw, rolling_axis); let right = safe_normalize(cross(rolling, surface_normal), axle);
   let attachment = surface_point - position - rotate_body(@@CENTER_OF_MASS@@, roll, pitch, yaw);
-  let point_velocity = velocity + cross(angular, attachment);
+  let point_velocity = velocity + relative_hub_velocity + cross(angular, attachment);
   let tire_radial_velocity = dot(point_velocity, surface_normal);
   let slip_longitudinal = dot(point_velocity, rolling) - vehicle_feed[@@WHEEL_OMEGA_BASE@@u + lane] * @@TIRE_RADIUS@@;
   let slip_lateral = dot(point_velocity, right);
@@ -4749,6 +4808,10 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
     replacements = {
         "@@LANES@@": str(lanes),
         "@@WHEEL_LANES@@": str(len(WHEEL_NAMES)),
+        "@@CLOSED_SOLID_HELPERS@@": emit_closed_solid_wgsl(),
+        "@@CLOSED_SOLID_STRIDE@@": str(CLOSED_SOLID_STRIDE),
+        "@@SOLID_WORLD_MIN@@": str(CLOSED_SOLID_OFFSETS["world_minimum"]),
+        "@@SOLID_WORLD_MAX@@": str(CLOSED_SOLID_OFFSETS["world_maximum"]),
         "@@CAGE_RADIUS@@": _wgsl_number(float(solid["cage_contact_radius"])),
         "@@SHELL_RADIUS@@": _wgsl_number(float(source["body_shell"]["contact_radius_m"])),
         "@@SHELL_LANE_START@@": str(next(index for index, lane in enumerate(contact_patch_lanes())
@@ -4768,6 +4831,7 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
         "@@PITCH_VELOCITY@@": vehicle("pitch_velocity"),
         "@@YAW_VELOCITY@@": vehicle("yaw_velocity"),
         "@@COMPRESSION_BASE@@": str(vehicle_index["compression_front_left"]),
+        "@@COMPRESSION_VELOCITY@@": expressions["compression_velocity"],
         "@@CONTROL_BODY_SHELL_ACTIVE@@": str(VEHICLE_CONTROL_INDEX["body_shell_active"]),
         "@@CONTROL_KNUCKLE_ANGLE_BASE@@": str(VEHICLE_CONTROL_INDEX["front_left_knuckle_angle"]),
         "@@WHEEL_OMEGA_BASE@@": str(vehicle_index["wheel_omega_front_left"]),
@@ -4808,6 +4872,9 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
             "bindings": ["terrain_heights", "terrain_parameters", "vehicle_feed", "contact_feed", "controls",
             "wall_colliders", "radial_probes"],
         },
+        "closed_solid_abi": {"schema": "oriented-box", "stride_floats": CLOSED_SOLID_STRIDE,
+                             "offsets": dict(CLOSED_SOLID_OFFSETS),
+                             "world_bounds_role": "broadphase-only", "basis": "world-space-columns"},
         "terrain_parameter_abi": [
             "field_count", "wall_count",
             "field[12]:origin_xyz,cell_xz,columns,rows,domain_xxzz,height_offset",
@@ -4854,12 +4921,11 @@ def _vehicle_gpu_graph_adapters(
             f"finite_or(contact_feed[{ci['slip_longitudinal']}u * {lanes}u + {lane}u], 0.0f);",
             f"  vehicle_feed[{vi[f'slip_lateral_{wheel}']}u] = "
             f"finite_or(contact_feed[{ci['slip_lateral']}u * {lanes}u + {lane}u], 0.0f);",
-            f"  vehicle_feed[{vi[f'target_compression_{wheel}']}u] = "
-            f"finite_or(contact_feed[{ci['geometric_compression']}u * {lanes}u + {lane}u], 0.0f);",
-            f"  vehicle_feed[{vi[f'wheel_support_{wheel}']}u] = "
-            f"finite_or(contact_feed[{ci['support']}u * {lanes}u + {lane}u], 0.0f);",
-            f"  vehicle_feed[{vi[f'linkage_motion_ratio_{wheel}']}u] = "
-            f"finite_or(contact_feed[{ci['linkage_motion_ratio']}u * {lanes}u + {lane}u], 1.0f);",
+            # The unsprung transition consumes the tire reaction, not a
+            # geometric compression target or a support override. Those old
+            # inputs are absent from its compiled ABI. Linkage motion ratio
+            # remains the machine's initialized parameter (GPU geometry used
+            # to write the constant 1); it is not a tire-law input either.
             f"  let normal_load_{lane} = {normal_load};",
             f"  vehicle_feed[{vi[f'contact_normal_force_{wheel}']}u] = finite_or(normal_load_{lane}, 0.0f);",
             f"  let normal_force_{lane} = vec3<f32>({normal[0]}, {normal[1]}, {normal[2]}) * normal_load_{lane};",
@@ -4933,35 +4999,8 @@ fn assemble_vehicle_graph_inputs(@builtin(global_invocation_id) gid: vec3<u32>) 
   vehicle_feed[{vi['contact_wrench_torque_z']}u] = chassis_torque.z;
 }}'''
     commits: list[str] = []
-    direct = {
-        **{f"position_{axis}_next": f"position_{axis}" for axis in "xyz"},
-        **{f"velocity_{axis}_next": f"velocity_{axis}" for axis in "xyz"},
-        "roll_next": "roll", "pitch_next": "pitch", "yaw_next": "yaw",
-        "roll_velocity_next": "roll_velocity", "pitch_velocity_next": "pitch_velocity",
-        "yaw_velocity_next": "yaw_velocity",
-        **{f"wheel_omega_{wheel}_next": f"wheel_omega_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"wheel_angle_{wheel}_next": f"wheel_angle_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"slip_longitudinal_{wheel}_next": f"previous_slip_longitudinal_{wheel}"
-           for wheel in WHEEL_NAMES},
-        **{f"slip_sensor_velocity_{wheel}_next": f"slip_sensor_velocity_{wheel}"
-           for wheel in WHEEL_NAMES},
-        **{f"friction_utilization_{wheel}_next": f"friction_utilization_{wheel}"
-           for wheel in WHEEL_NAMES},
-        **{f"friction_utilization_sensor_velocity_{wheel}_next":
-           f"friction_utilization_sensor_velocity_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"tire_deformation_longitudinal_{wheel}_next": f"tire_deformation_longitudinal_{wheel}"
-           for wheel in WHEEL_NAMES},
-        **{f"tire_deformation_velocity_longitudinal_{wheel}_next":
-           f"tire_deformation_velocity_longitudinal_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"tire_deformation_lateral_{wheel}_next": f"tire_deformation_lateral_{wheel}"
-           for wheel in WHEEL_NAMES},
-        **{f"tire_deformation_velocity_lateral_{wheel}_next":
-           f"tire_deformation_velocity_lateral_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"compression_{wheel}_next": f"compression_{wheel}" for wheel in WHEEL_NAMES},
-        **{f"compression_velocity_{wheel}_next": f"compression_velocity_{wheel}"
-           for wheel in WHEEL_NAMES},
-        "engine_angular_speed_next": "engine_angular_speed",
-    }
+    direct = {output: feed for output, feed in VEHICLE_STATE_FEEDBACK.items()
+              if output in vo and feed in vi}
     for output, feed in direct.items():
         # This is the vehicle's own persistent state, read back as "now" by
         # every kernel next tick.  A single non-finite output here does not
@@ -8755,7 +8794,7 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
             {"from": "engine", "to": "engine_mount", "channel": "engine_acceleration_torque"},
             {"from": "engine_mount", "to": "chassis", "channel": "powertrain_reaction_torque_xyz"},
         ],
-        "compiled_outputs": list(VEHICLE_STATE_OUTPUTS[-15:]),
+        "compiled_outputs": list(VEHICLE_STATE_OUTPUTS[-15-len(ENERGY_OUTPUTS):-len(ENERGY_OUTPUTS)]),
         "conservation_rule": "chassis-local crank reaction plus engine-and-transmission r-cross-inertial-force is applied to chassis-frame torque",
     }
     # Engine definitions are durable selectable records; the vehicle physics is
@@ -8974,15 +9013,15 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
                 "maximum_actuator_rate_m_s": 0.055,
                 "pose_lerp_rate_m_s": 0.055,
                 "hydraulic_authority": {
-                    "piston_area_m2": float(suspension["leveling_actuator_piston_area_m2"]),
-                    "manifold_pressure_pa": float(suspension["leveling_manifold_pressure_pa"]),
-                    "maximum_flow_m3_s": float(suspension["leveling_maximum_flow_m3_s"]),
-                    "efficiency": float(suspension["leveling_hydraulic_efficiency"]),
+                    "piston_area_m2": float(config.source["suspension"]["leveling_actuator_piston_area_m2"]),
+                    "manifold_pressure_pa": float(config.source["suspension"]["leveling_manifold_pressure_pa"]),
+                    "maximum_flow_m3_s": float(config.source["suspension"]["leveling_maximum_flow_m3_s"]),
+                    "efficiency": float(config.source["suspension"]["leveling_hydraulic_efficiency"]),
                 },
                 "trim_stage": {
                     "placement": "series-coilover-preload-collar",
-                    "stroke_m": float(suspension["leveling_trim_stroke_m"]),
-                    "maximum_rate_m_s": float(suspension["leveling_trim_rate_m_s"]),
+                    "stroke_m": float(config.source["suspension"]["leveling_trim_stroke_m"]),
+                    "maximum_rate_m_s": float(config.source["suspension"]["leveling_trim_rate_m_s"]),
                     "round_robin": True,
                     "alignment_actuators_are_trim_actuators": False,
                 },
@@ -9076,6 +9115,7 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
                         "parallel_spring_lanes": list(WHEEL_NAMES),
                         "webgpu_program": webgpu["identity"],
                         "mechanical_graph": mechanical_graph,
+                        "energy_diagnostics": ENERGY_DIAGNOSTICS_CONTRACT,
                         "contact_patch_shape": {
                             "law": "pressure-area-divided-by-load-sensitive-effective-tread-width",
                             "area_authority": "compiled-wheel-contact-kernel",

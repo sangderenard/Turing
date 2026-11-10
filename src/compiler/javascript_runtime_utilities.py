@@ -139,6 +139,111 @@ class TuringWorldRegistry {
       this.runtimeParts[entry.runtime_id] = part;
     });
   }
+  // studio-runtime-append-begin
+  // A Studio part first enabled after startup needs admission to this same
+  // authored registry, not a replacement registry or an unowned runtime ID 0.
+  // Admission is independent of active mesh membership. Keep admitted IDs if
+  // later presentation fails; hide the new part rather than recycling its ID.
+  appendObjects(objects, {structural = true} = {}) {
+    if (!Array.isArray(objects) || typeof structural !== "boolean")
+      throw new TypeError("world append requires an object batch and structural flag");
+    const admitted = structuredClone(objects);
+    const world = this.world, newObjects = new Map(), newParts = new Map();
+    const liveIdentities = new Set(world.objects.map(object => object.identity));
+    const livePartIdentities = new Set(world.objects.flatMap(object =>
+      (object.semantic_parts || []).map(part => part.identity)));
+    const identifier = value => typeof value === "string" && value.length > 0;
+    for (const object of admitted) {
+      if (!object || !identifier(object.identity) || object.identity === world.identity || object.identity === world.root ||
+          this.objects.has(object.identity) ||
+          liveIdentities.has(object.identity) || newObjects.has(object.identity))
+        throw new Error(`duplicate or empty appended world identity ${object?.identity}`);
+      if (!identifier(object.parent) || !Array.isArray(object.semantic_parts))
+        throw new TypeError(`appended world object requires parent and semantic parts: ${object.identity}`);
+      newObjects.set(object.identity, object);
+      for (const part of object.semantic_parts) {
+        if (!part || !identifier(part.identity) || this.semanticParts.has(part.identity) ||
+            livePartIdentities.has(part.identity) || newParts.has(part.identity))
+          throw new Error(`duplicate or empty appended semantic part identity ${part?.identity}`);
+        if (part.object !== undefined && part.object !== object.identity)
+          throw new Error(`appended semantic part owner disagrees: ${part.identity}`);
+        newParts.set(part.identity, {...part, object: object.identity});
+      }
+    }
+    const roots = new Set([world.root, world.identity].filter(identifier));
+    for (const object of admitted) {
+      const visited = new Set([object.identity]);
+      let parent = object.parent;
+      while (!roots.has(parent)) {
+        if (visited.has(parent)) throw new Error(`appended world parent cycle: ${object.identity}`);
+        visited.add(parent);
+        const owner = newObjects.get(parent) || this.objects.get(parent);
+        if (!owner) throw new Error(`unknown appended world parent ${parent}`);
+        parent = owner.parent;
+      }
+    }
+    const specialization = world.identity_specialization || {
+      authority: "authored-string-identity", missing_runtime_id: 0,
+      objects: [...this.objectRuntimeIds].map(([identity, runtime_id]) => ({identity, runtime_id})),
+      semantic_parts: [...this.partRuntimeIds].map(([identity, runtime_id]) => ({identity, runtime_id,
+        object_runtime_id: this.objectRuntimeId(this.semanticParts.get(identity).object)})),
+    };
+    if (specialization.authority !== "authored-string-identity" || specialization.missing_runtime_id !== 0 ||
+        !Array.isArray(specialization.objects) || !Array.isArray(specialization.semantic_parts))
+      throw new TypeError("world append requires its authored identity specialization");
+    const objectOrder = world.object_order || world.objects.map(object => object.identity);
+    const structuralOrder = world.structural_object_order || [];
+    const writableArray = array => Array.isArray(array) && Object.isExtensible(array) &&
+      Object.getOwnPropertyDescriptor(array, "length")?.writable;
+    const targets = [world.objects, objectOrder, specialization.objects, specialization.semantic_parts,
+      this.runtimeObjects, this.runtimeParts, ...(structural ? [structuralOrder] : [])];
+    if (targets.some(array => !writableArray(array)))
+      throw new TypeError("world append destinations must be mutable arrays");
+    for (const key of ["identity_specialization", "object_order", ...(structural ? ["structural_object_order"] : [])]) {
+      const property = Object.getOwnPropertyDescriptor(world, key);
+      if (property ? !("value" in property) || !property.writable : !Object.isExtensible(world))
+        throw new TypeError(`world append destination is not writable: ${key}`);
+    }
+    for (const object of admitted) {
+      const children = this.children.get(object.parent);
+      if (children && !writableArray(children))
+        throw new TypeError(`world append child list is not mutable: ${object.parent}`);
+    }
+    const firstObjectId = this.runtimeObjects.length, firstPartId = this.runtimeParts.length;
+    if (firstObjectId + admitted.length >= 0x100000000 || firstPartId + newParts.size >= 0x100000000)
+      throw new RangeError("world runtime identity space is exhausted");
+    const objectRows = admitted.map((object, index) => ({identity: object.identity, runtime_id: firstObjectId + index}));
+    const objectIds = new Map(objectRows.map(row => [row.identity, row.runtime_id]));
+    const partRows = [...newParts.values()].map((part, index) => ({identity: part.identity,
+      runtime_id: firstPartId + index, object_runtime_id: objectIds.get(part.object)}));
+    // All cloning, identities, ownership and destinations have been validated.
+    // These synchronous writes preserve the incumbent maps, arrays and entries.
+    if (admitted.length) {
+      world.identity_specialization = specialization;
+      world.object_order = objectOrder;
+      if (structural) world.structural_object_order = structuralOrder;
+      for (let index = 0; index < admitted.length; index++) {
+        const object = admitted[index], row = objectRows[index];
+        this.objects.set(object.identity, object);
+        if (!this.children.has(object.parent)) this.children.set(object.parent, []);
+        this.children.get(object.parent).push(object.identity);
+        this.objectRuntimeIds.set(object.identity, row.runtime_id);
+        this.runtimeObjects.push(object);
+        world.objects.push(object); objectOrder.push(object.identity);
+        if (structural) structuralOrder.push(object.identity);
+        specialization.objects.push(row);
+      }
+      for (const row of partRows) {
+        const part = newParts.get(row.identity);
+        this.semanticParts.set(row.identity, part);
+        this.partRuntimeIds.set(row.identity, row.runtime_id);
+        this.runtimeParts.push(part); specialization.semantic_parts.push(row);
+      }
+    }
+    return Object.freeze({objects: Object.freeze(objectRows.map(row => Object.freeze({...row}))),
+      semantic_parts: Object.freeze(partRows.map(row => Object.freeze({...row}))), structural});
+  }
+  // studio-runtime-append-end
   object(identity) { return this.objects.get(identity) || null; }
   part(identity) { return this.semanticParts.get(identity) || null; }
   objectRuntimeId(identity) { return this.objectRuntimeIds.get(identity) || 0; }

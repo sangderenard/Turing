@@ -88,6 +88,20 @@ try {
  assert(lit>1000,'Whole Studio scene not visible');assert(changed===0,`Scene pixel mismatch ${changed}, max ${maxDelta}`);
  clean();renderer.draw({view,projection,phase:'opaque'});renderer.draw({view,projection,phase:'transparent'});assert(pixels().every((x,i)=>x===candidate[i]),'Scene split phases differ');
  clean();renderer.draw({view,projection});assert(pixels().every((x,i)=>x===candidate[i]),'Scene repeat differs');assert(gl.getError()===gl.NO_ERROR,'Scene renderer GL error');
+ // A fixed game camera must re-sort moving subject glass with static furniture.
+ // Compare range streaming against fresh native planning at each exact pose.
+ let poseFrames=0;
+ for(const shift of [-1.5,2.25,0]) {
+   const pose=Array.from(packet.scene.subject.model);pose[12]+=shift;pose[14]-=shift;
+   const other={...asset,packet:{...packet,scene:{...packet.scene,subject:{...packet.scene.subject,model:pose}}}};
+   const reference=createStudioSceneRenderer({gl,asset:other,placement,entrance});
+   clean();reference.draw({view,projection});const expected=pixels();
+   const oldBuffer=gl.getParameter(gl.ARRAY_BUFFER_BINDING);renderer.setSubjectPose(pose);
+   assert(gl.getParameter(gl.ARRAY_BUFFER_BINDING)===oldBuffer,'Pose update leaked buffer binding');
+   clean();renderer.draw({view,projection,phase:'opaque'});renderer.draw({view,projection,phase:'transparent'});
+   assert(pixels().every((x,i)=>x===expected[i]),'Streamed pose differs from full native scene planning');
+   assert(gl.getError()===gl.NO_ERROR,'Pose streaming GL error');reference.dispose();poseFrames++;
+ }
  renderer.dispose();assert(!renderer.ready,'Disposed scene still ready');
- out.textContent=JSON.stringify({pass:true,counts:renderer.counts,canonicalStudioPixelDifferences:changed,maxDelta,visiblePixels:lit,fixtureDirectEmission:true,sharedGlassSort:true,splitPhasesMatch:true,restoredState:true,sourceDoorway:renderer.entrance.sourceBounds},null,2);
+ out.textContent=JSON.stringify({pass:true,poseFrames,counts:renderer.counts,canonicalStudioPixelDifferences:changed,maxDelta,visiblePixels:lit,fixtureDirectEmission:true,sharedGlassSort:true,splitPhasesMatch:true,restoredState:true,sourceDoorway:renderer.entrance.sourceBounds},null,2);
 }catch(error){out.textContent=JSON.stringify({pass:false,error:String(error),stack:error.stack},null,2);}

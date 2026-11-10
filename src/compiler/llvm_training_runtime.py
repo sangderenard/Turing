@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import functools
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -204,9 +205,16 @@ def _compile_artifact_to_wasm(artifact: Any, *, directory: Path, what: str) -> P
     source = directory / f"{artifact.name}.ll"
     wasm = directory / f"{artifact.name}.wasm"
     source.write_text(artifact.llvm_ir, encoding="utf-8")
-    command = [
-        sys.executable, "-m", "ziglang", "cc",
-        "--target=wasm32-freestanding", "-nostdlib", "-O2",
+    # Zig 0.16 on Windows rejects verified LLVM .ll inputs with Unexpected.
+    # An explicitly selected installed clang consumes the SAME emitted IR and
+    # ABI; no fallback source, second emitter, or modified graph is introduced.
+    configured_clang = os.environ.get("TURING_WASM_CLANG")
+    if configured_clang and not Path(configured_clang).is_file():
+        raise ValueError("TURING_WASM_CLANG must name an existing clang executable")
+    driver = [configured_clang] if configured_clang else [sys.executable, "-m", "ziglang", "cc"]
+    target = "wasm32-unknown-unknown" if configured_clang else "wasm32-freestanding"
+    command = driver + [
+        f"--target={target}", "-nostdlib", "-O2",
         "-Wl,--no-entry", f"-Wl,--export={artifact.name}",
         "-Wl,--export=__heap_base", "-Wl,--export-memory",
         "-o", str(wasm), str(source),

@@ -41,8 +41,8 @@ function environment(value) {
 export function createMechanicalCreatureStudioReturnStore({epoch,environment:initialEnvironment,
   appearanceAssetIdentities,fixedQuaternionXYZW}={}) {
   identity(epoch,'epoch');
-  fail(Array.isArray(appearanceAssetIdentities)&&appearanceAssetIdentities.length>0&&appearanceAssetIdentities.length<=8,
-    'One to eight admitted appearance identities are required');
+  fail(Array.isArray(appearanceAssetIdentities)&&appearanceAssetIdentities.length<=8,
+    'Zero to eight admitted appearance identities are required');
   const appearances=new Set(appearanceAssetIdentities.map(value=>identity(value,'appearanceAssetIdentity')));
   fail(appearances.size===appearanceAssetIdentities.length,'Duplicate appearance identity');
   const q=vector(fixedQuaternionXYZW,4,'fixedQuaternionXYZW');
@@ -156,7 +156,7 @@ export function createMechanicalCreatureStudioReturnStore({epoch,environment:ini
  * createStudioSubjectRenderer owns all GPU drawing and GL state restoration.
  */
 export async function createMechanicalCreatureStudioReturn({assets,...options}={}) {
-  fail(Array.isArray(assets)&&assets.length>0&&assets.length<=8,'One to eight exact Studio appearance assets are required');
+  fail(Array.isArray(assets)&&assets.length<=8,'Zero to eight exact Studio appearance assets are required');
   const hydrated=[];for(const asset of assets)hydrated.push(await hydrateStudioGameAsset(asset));
   const store=createMechanicalCreatureStudioReturnStore({...options,appearanceAssetIdentities:hydrated.map(asset=>asset.identity)});
   const byIdentity=new Map(hydrated.map(asset=>[asset.identity,asset])),renderers=new Map();let ownerGL=null,closed=false;

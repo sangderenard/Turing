@@ -4,10 +4,12 @@ import {writeStudioFixtureRows} from './marble_studio_scene.js';
 // Tube length is the real emitting span; the housing adds 3 inches overall.
 export const SHOP_LIGHT_MODELS=Object.freeze({
   '8ft-2tube':Object.freeze({lengthFeet:8,tubes:2,widthFeet:.75}),
+  '4ft-2tube':Object.freeze({lengthFeet:4,tubes:2,widthFeet:.75}),
+  '2ft-2tube':Object.freeze({lengthFeet:2,tubes:2,widthFeet:.75}),
   '4ft-4tube':Object.freeze({lengthFeet:4,tubes:4,widthFeet:1.25}),
 });
 export const SHOP_LIGHT_MATERIALS=Object.freeze({backingMaterial:'metal_silver',topMaterial:'black_matte_paint'});
-export const MAX_SHOP_LIGHTS=8;
+export const MAX_SHOP_LIGHTS=128;
 export const SHOP_LED_LAYOUTS=Object.freeze({legacy:'Original 32 emitters',dense:'Dense / selected profile','dense-mixed':'Dense / alternating cool and warm'});
 const mixed=f=>f.source==='led-array'&&f.ledLayout==='dense-mixed';
 const sourceForRow=(f,row)=>mixed(f)?{...f,emitterProfile:row.secondary?'led_warm_white':'led_cool_white'}:f;
@@ -57,12 +59,13 @@ function shopState(value) {
        Math.abs(f.yaw)>180||f.ceilingDropFeet<0||f.dimmer<0||f.dimmer>1||
        !Array.isArray(f.filter)||f.filter.length!==3||!f.filter.every(v=>finite(v)&&v>=0&&v<=1))
       throw new Error(`${f.id}: invalid shop-light position, ceiling drop, dimmer or filter`);
+    if(f.rackBus!==undefined&&!['upper-wall','middle-wall','edge','near-edge','center'].includes(f.rackBus))throw Error(`${f.id}: unknown lighting bus`);
     const ledLayout=f.ledLayout??'legacy';
     if(!Object.hasOwn(SHOP_LED_LAYOUTS,ledLayout))throw Error(`${f.id}: unknown LED layout`);
     const sourceLevel=f.sourceLevel??1;
     if(!finite(sourceLevel)||sourceLevel<0||sourceLevel>400)throw Error(`${f.id}: source level must be between 0 and 400 Studio emission units`);
     if(f.emitterProfile!==undefined&&!Object.hasOwn(SHOP_EMISSION_PROFILES,f.emitterProfile))throw Error(`${f.id}: unknown emission profile`);
-    return {ledLayout,emitterProfile:shopLightProfileKey(f),id:f.id,model:f.model,enabled:f.enabled,source:f.source,x:f.x,z:f.z,yaw:f.yaw,
+    return {...(f.rackBus===undefined?{}:{rackBus:f.rackBus}),ledLayout,emitterProfile:shopLightProfileKey(f),id:f.id,model:f.model,enabled:f.enabled,source:f.source,x:f.x,z:f.z,yaw:f.yaw,
       ceilingDropFeet:f.ceilingDropFeet,sourceLevel,dimmer:f.dimmer,filter:[...f.filter],exposureMode:f.exposureMode};
   });
   return {version:1,backingMaterial:value.backingMaterial,topMaterial:value.topMaterial,fixtures};
@@ -236,3 +239,5 @@ export function studioShopLightGeometry(value,ids,emitterRows,{bounds,unitMm}={}
   return {faces,parts,emitters};
 }
 
+
+export {boxFaces as shopLightBoxFaces};

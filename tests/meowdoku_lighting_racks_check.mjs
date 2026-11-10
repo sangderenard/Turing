@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import {LIGHTING_BUSES,defaultLightingRacks,validateLightingRacks,layoutLightingRackFixtures,studioLightingRackGeometry} from '../examples/meowdoku/web/marble_lighting_racks.js';
+import {defaultShopLights,createShopLight,validateShopLights,studioShopLightGeometry,shopLightEmitterAllocations,MAX_SHOP_LIGHTS} from '../examples/meowdoku/web/marble_shop_lights.js';
+import {studioRoomBounds} from '../examples/meowdoku/web/marble_room.js';
+const ids={metal_silver:1,black_matte_paint:2},unitMm=304.8;
+const racks=defaultLightingRacks(),original=defaultShopLights(),bounds=studioRoomBounds(6,3.98);
+assert.equal(LIGHTING_BUSES.length,5);
+assert.deepEqual(validateLightingRacks(JSON.parse(JSON.stringify(racks))),racks);
+assert.deepEqual(layoutLightingRackFixtures(original,racks,{bounds,unitMm}),original);
+for(const edit of [r=>r.craneX=NaN,r=>r.craneZ=2,r=>r.buses[0].dimmer=2,r=>r.buses[0].dropFeet=-1,r=>r.buses[1].id=r.buses[0].id,r=>r.solo='missing']){const r=structuredClone(racks);edit(r);assert.throws(()=>validateLightingRacks(r));}
+racks.buses.forEach(b=>b.enabled=true);
+original.fixtures.push({...createShopLight('manual','4ft-2tube'),rackBus:'edge',x:2});
+const before=structuredClone({original,racks});
+const layout=layoutLightingRackFixtures(original,racks,{bounds,unitMm});
+assert.deepEqual({original,racks},before,'Layout is a pure authored-state operation');
+assert.deepEqual(layout.fixtures.slice(0,3),original.fixtures,'Manually assigned bus members are preserved');
+assert(layout.fixtures.length<=MAX_SHOP_LIGHTS);
+assert.equal(new Set(layout.fixtures.map(f=>f.id)).size,layout.fixtures.length);
+assert.deepEqual(new Set(layout.fixtures.filter(f=>f.id.startsWith('rack-')).map(f=>f.rackBus)),new Set(LIGHTING_BUSES.map(b=>b.id)));
+assert(layout.fixtures.filter(f=>f.id.startsWith('rack-')).every(f=>f.sourceLevel===400&&f.exposureMode==='continuous'));
+validateShopLights(layout,Object.keys(ids));
+const geometry=studioShopLightGeometry(layout,ids,shopLightEmitterAllocations(layout,10),{bounds,unitMm});
+assert.equal(geometry.parts.length,layout.fixtures.length);
+const supports=studioLightingRackGeometry(racks,ids,{bounds,unitMm});
+assert.equal(supports.emitters.length,0);assert.equal(supports.parts.length,20);
+assert(supports.faces.every(f=>f[3]===ids.black_matte_paint));
+for(const face of supports.faces)for(const p of face.slice(0,3))assert(p.every(Number.isFinite));
+const prior=layout.fixtures.find(f=>f.id.startsWith('rack-'));
+Object.assign(prior,{sourceLevel:17,dimmer:.3,filter:[.1,.2,.7],ceilingDropFeet:2,exposureMode:'off'});
+const refit=layoutLightingRackFixtures(layout,racks,{bounds:studioRoomBounds(7,3.98),unitMm});
+const retained=refit.fixtures.find(f=>f.id===prior.id);
+for(const k of ['sourceLevel','dimmer','filter','ceilingDropFeet','exposureMode'])assert.deepEqual(retained[k],prior[k]);
+const override=structuredClone(racks);override.buses.find(b=>b.id===prior.rackBus).dropFeet=1;
+assert.equal(layoutLightingRackFixtures(layout,override,{bounds,unitMm}).fixtures.find(f=>f.id===prior.id).ceilingDropFeet,1);
+for(const scale of [5,6,7,8]){const b=studioRoomBounds(scale,3.98),s=layoutLightingRackFixtures(original,racks,{bounds:b,unitMm});assert(s.fixtures.length<=MAX_SHOP_LIGHTS);studioShopLightGeometry(s,ids,shopLightEmitterAllocations(s,10),{bounds:b,unitMm});}
+for(const x of [-1,1])for(const z of [-1,1]){const r={...racks,craneX:x,craneZ:z};const s=layoutLightingRackFixtures(original,r,{bounds,unitMm});studioShopLightGeometry(s,ids,shopLightEmitterAllocations(s,10),{bounds,unitMm});}
+assert.throws(()=>layoutLightingRackFixtures(original,racks,{bounds:studioRoomBounds(1),unitMm}),/small|fit/);
+const disabled=structuredClone(racks);disabled.buses.find(b=>b.id==='edge').enabled=false;
+const removed=layoutLightingRackFixtures(layout,disabled,{bounds,unitMm});
+assert(removed.fixtures.some(f=>f.id==='manual'));
+assert(!removed.fixtures.some(f=>f.id.startsWith('rack-edge-')));
+console.log('Lighting rack layout, retained fixture settings, bounds, shared geometry and crane travel passed');

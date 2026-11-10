@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {validateStudioLightTransform} from '../examples/meowdoku/web/marble_studio_subject_renderer.js';
 if(!vm.SourceTextModule)throw Error('Use node --experimental-vm-modules');
 const moduleSource=fs.readFileSync(new URL('../examples/meowdoku/web/mechanical_creature_studio_room.js',import.meta.url),'utf8');
 const sourceIdentity='python:test.StudioManager',I=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],created=[],disposed=[],draws=[],hydrations=[],slow=new Map();
@@ -14,12 +15,12 @@ const fakeHydrate=async a=>{hydrations.push(a.identity);if(a.bad)throw Error('te
 let failedStage=null,failedDraw=null;
 const fakeRenderer=({asset,placement})=>{
   if(asset.identity===failedStage)throw Error('test GPU stage failure');
-  const r={identity:asset.identity,placement,ready:true,counts:{parts:37},bounds:{},draw(c){if(r.identity===failedDraw)throw Error('test GPU draw failure');assert(r.ready);draws.push({id:r.identity,phase:c.phase});},
+  const r={identity:asset.identity,placement,ready:true,counts:{parts:37},bounds:{},pose:null,validateSubjectPose(p){validateStudioLightTransform(new Float32Array(p));},setSubjectPose(p){r.pose=Array.from(p);},draw(c){if(r.identity===failedDraw)throw Error('test GPU draw failure');assert(r.ready);draws.push({id:r.identity,phase:c.phase,pose:r.pose?.slice()});},
     dispose(){if(r.ready){r.ready=false;disposed.push(r.identity);}}};created.push(r);return r;
 };
 const sandbox=vm.createContext({structuredClone,console:{warn(){}}}),module=new vm.SourceTextModule(moduleSource,{context:sandbox});
 const verifications=[];
-const imports={'./marble_studio_scene_asset.js':{hydrateStudioSceneAsset:fakeHydrate,
+const imports={'./marble_studio_subject_renderer.js':{validateStudioLightTransform},'./marble_studio_scene_asset.js':{hydrateStudioSceneAsset:fakeHydrate,
   verifyStudioSceneAssetIdentity:async a=>{verifications.push(a.identity);if(a.bad)throw Error('test checksum failure');return a.identity;},createStudioSceneRenderer:fakeRenderer},
   './mechanical_creature_studio_camera.js':{mechanicalCreatureStudioCamera:c=>({view:I,projection:I,gameSnapshotSequence:c.stateLoopRuntime.latestSequence})}};
 await module.link(name=>{const values=imports[name];assert(values);return new vm.SyntheticModule(Object.keys(values),function(){for(const [k,v]of Object.entries(values))this.setExport(k,v);},{context:sandbox});});
@@ -39,12 +40,29 @@ assert(!room.readStatus().ready);adapter.draw({...c,identities:ids,phase:'opaque
 adapter.draw({...c,identities:ids,phase:'transparent'});const receipt=await room.ready;
 assert(visible);assert.equal(receipt.sequence,0);assert.equal(receipt.gameSnapshotSequence,41);assert.equal(receipt.environment.colliderPublication,'pre-existing-native-environment');
 assert(room.readStatus().ready);assert.equal(created.length,1);frame(owned,c);assert.equal(created.length,1);
+// Latest two-slot pose is detached, environment-bound and latched across both passes.
+const pose=(sequence,x=sequence)=>({assetIdentity:a.identity,revision:1,environmentSequence:0,sequence,model:[...I.slice(0,12),x,0,0,1]});
+assert.equal(room.previewPose({...pose(1),assetIdentity:'wrong'}),false);
+assert.equal(room.previewPose({...pose(1),revision:2}),false);
+assert.equal(room.previewPose({...pose(1),environmentSequence:1}),false);
+const detached=pose(1);assert(room.previewPose(detached));detached.model[12]=99;
+const poseIds=adapter.identities(c);adapter.draw({...c,identities:poseIds,phase:'opaque'});
+assert(room.previewPose(pose(2)));assert(room.previewPose(pose(3)));
+adapter.draw({...c,identities:poseIds,phase:'transparent'});
+assert.equal(draws.at(-2).pose[12],1);assert.equal(draws.at(-1).pose[12],1,'mid-frame arrivals cannot split phases');
+frame(owned,c);assert.equal(draws.at(-1).pose[12],3,'latest bounded slot wins');assert.equal(created.length,1);
+assert.equal(room.previewPose(pose(3)),false);assert.equal(room.previewPose(pose(2)),false);
+assert.throws(()=>room.previewPose({...pose(4),model:Array(16).fill(NaN)}),/finite affine/);
+for(const model of [[2,...I.slice(1)],[-1,...I.slice(1)],[0,...I.slice(1)]])assert.throws(()=>room.previewPose({...pose(4),model}));
+const overflow=[...I];overflow[12]=1e100;assert.throws(()=>room.previewPose({...pose(4),model:overflow}),/finite/);
+assert.equal(room.readStatus().poseSequence,3);frame(owned,c);assert.equal(room.readStatus().appliedPoseSequence,3);
+assert(room.previewPose(pose(4)));
 // A hydrated candidate cannot hide old proxies until its matching environment exists.
 const pending=room.update({asset:b,building:building(b),sequence:1});let bVisible=false;pending.then(()=>bVisible=true);await flush();
 frame(owned,c);assert.equal(room.readStatus().identity,a.identity);assert(!bVisible);assert(!disposed.includes(a.identity));
 const cb=context(b),ib=adapter.identities(cb);adapter.draw({...cb,identities:ib,phase:'opaque'});
 assert(!disposed.includes(a.identity));adapter.draw({...cb,identities:ib,phase:'transparent'});await pending;
-assert.equal(room.readStatus().identity,b.identity);assert(disposed.includes(a.identity));
+assert.equal(room.readStatus().identity,b.identity);assert(disposed.includes(a.identity));assert.equal(created.at(-1).pose,null,'replacement cannot inherit old pose');assert.equal(room.previewPose(pose(5)),false);
 // Replaying the same owned input object avoids rehydration, not the visible ack.
 const beforeHydrations=hydrations.length,same=room.update({asset:b,building:building(b),sequence:2});await flush();frame(owned,cb);await same;assert.equal(hydrations.length,beforeHydrations);assert(verifications.includes(b.identity));
 await assert.rejects(room.update({asset:b,building:building(b),sequence:2}),e=>e.code==='STALE_STUDIO_UPDATE');
@@ -54,7 +72,7 @@ const bad=asset('bad',3);bad.bad=true;const failed=room.update({asset:bad,buildi
 assert.equal(room.readStatus().identity,b.identity);assert(room.readStatus().ready);
 const gpuBad=asset('gpu-bad',3);failedStage=gpuBad.identity;const failedGpu=room.update({asset:gpuBad,building:building(gpuBad),sequence:4});await flush();frame(owned,cb);
 await assert.rejects(failedGpu,/GPU stage/);assert.equal(room.readStatus().identity,b.identity);failedStage=null;
-room.dispose();assert.equal(owned.mechanicalCreatureImportedAppearance,owned.previous);await assert.rejects(room.update({asset:b,building:building(b),sequence:5}),e=>e.code==='CLOSED_STUDIO_ROOM');
+room.dispose();assert.equal(room.previewPose(pose(6)),false);assert.equal(owned.mechanicalCreatureImportedAppearance,owned.previous);await assert.rejects(room.update({asset:b,building:building(b),sequence:5}),e=>e.code==='CLOSED_STUDIO_ROOM');
 // Native host transaction path: stage in one original frame, commit at the
 // next existing controls boundary, then acknowledge both actual visible passes.
 const dynamicHost=host(),queues=[],queue=p=>{const wait=deferred();queues.push({...p,...wait});return wait.promise;};

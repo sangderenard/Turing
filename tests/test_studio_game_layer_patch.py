@@ -10,6 +10,7 @@ def test_current_studio_narrow_layer_seams():
     assert receipt['original_recovered_exactly']
     assert not receipt['enabled_by_default']
     assert not receipt['photo_camera_changed']
+    assert b'subjectPose:lastStudioFrame.model' in output
     assert b'phase:"opaque"' in output and b'phase:"transparent"' in output
     with pytest.raises(ValueError, match='already installed'):
         patch_studio_game_layer(output)

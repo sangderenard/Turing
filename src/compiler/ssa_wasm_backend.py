@@ -14,9 +14,11 @@ from .output_publication import (
 )
 from .wasm_binary import (
     CodeBuilder,
+    WasmImport,
     OP_F64_CONVERT_I32_S,
     OP_I32_ADD,
     OP_I32_AND,
+    OP_I32_OR,
     OP_I32_GE_S,
     OP_I32_TRUNC_F64_S,
     build_module,
@@ -52,6 +54,8 @@ class SSAWasmArtifact:
     shortfalls: tuple[WasmEmissionShortfall, ...]
     output_publications: tuple[Mapping[str, Any], ...] = ()
     output_surfaces: Mapping[str, Any] | None = None
+    imports: tuple[WasmImport, ...] = ()
+    backend_identity_decisions: tuple[Any, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -74,8 +78,122 @@ class SSAWasmArtifact:
 _MAX_UNROLLED_POWER = 8
 
 #: SSA comparison names to the f64 opcode that spells each.
-_F64_COMPARISONS = {"Lt": "lt", "Le": "le", "Gt": "gt",
-                    "Ge": "ge", "Eq": "eq", "Ne": "ne"}
+_SCALAR_F64_COMPARISONS = {"Lt": "lt", "Le": "le", "Gt": "gt",
+                           "Ge": "ge", "Eq": "eq", "Ne": "ne"}
+
+
+def _emit_wasm_phi_edge(function, source_block, target_block, *,
+                        builder, destination_for, push_incoming, wat_lines=None):
+    """Read every incoming Phi before writing any destination (parallel copy)."""
+    target = function.blocks.get(target_block)
+    if target is None:
+        return
+    destinations = []
+    for instruction in target.instrs:
+        if str(instruction.op) != "Phi" or instruction.res is None:
+            continue
+        incoming = tuple(instruction.attributes.get("incoming_blocks") or ())
+        for position, origin in enumerate(incoming):
+            if str(origin) == source_block and position < len(instruction.args):
+                destinations.append(destination_for(instruction))
+                push_incoming(instruction, instruction.args[position])
+    for destination in reversed(destinations):
+        builder.local_set(destination)
+        if wat_lines is not None:
+            wat_lines.append(f"    local.set {destination}")
+
+
+def _emit_wasm_cfg(function, *, builder, shortfalls, emit_instruction,
+                   emit_condition, on_return, assign_edge, prepare_phi,
+                   label_local=None, wat_lines=None):
+    """The shared label dispatcher for the scalar and repository-call ABIs.
+
+    This is the module lane's existing nested-block dispatcher. Only value
+    transport and return publication depend on the lane's calling convention.
+    """
+    def wat(line):
+        if wat_lines is not None:
+            wat_lines.append(f"    {line}")
+
+    order = list(function.blocks)
+    if label_local is None:
+        label_local = builder.declare_local("i32")  # zero-initialised: entry
+    for block_name in order:
+        for instruction in function.blocks[block_name].instrs:
+            if str(instruction.op) == "Phi" and instruction.res is not None:
+                prepare_phi(instruction)
+    count = len(order)
+    builder.loop()
+    wat("loop")
+    for _ in range(count):
+        builder.block()
+        wat("block")
+    for index in range(count):
+        builder.local_get(label_local).i32_const(index)
+        builder.raw(_OP_I32_EQ).br_if(index)
+        wat(f"local.get {label_local} i32.const {index} i32.eq br_if {index}")
+    builder.raw(_OP_UNREACHABLE)
+    wat("unreachable")
+    for index, block_name in enumerate(order):
+        builder.end()
+        wat(f"end (; {block_name} ;)")
+        depth_to_loop = count - 1 - index
+        for instruction in function.blocks[block_name].instrs:
+            operation = str(instruction.op)
+            if operation == "Phi":
+                continue
+            if operation == "Br":
+                target = str(instruction.attributes.get("target"))
+                if target not in function.blocks:
+                    shortfalls.append(WasmEmissionShortfall(
+                        "Br", f"{function.name} has unknown target {target!r}",
+                    ))
+                    continue
+                assign_edge(block_name, target)
+                builder.i32_const(order.index(target)).local_set(label_local)
+                builder.br(depth_to_loop)
+                wat(f"i32.const {order.index(target)} local.set {label_local} "
+                    f"br {depth_to_loop}")
+                continue
+            if operation == "CondBr":
+                on_true = str(instruction.attributes.get("true_target"))
+                on_false = str(instruction.attributes.get("false_target"))
+                if on_true not in function.blocks or on_false not in function.blocks:
+                    shortfalls.append(WasmEmissionShortfall(
+                        "CondBr", f"{function.name} has unknown target",
+                    ))
+                    continue
+                if not emit_condition(instruction):
+                    continue
+                builder.if_()
+                wat("if")
+                assign_edge(block_name, on_true)
+                builder.i32_const(order.index(on_true)).local_set(label_local)
+                builder.br(depth_to_loop + 1)
+                wat(f"i32.const {order.index(on_true)} local.set {label_local} "
+                    f"br {depth_to_loop + 1}")
+                builder.else_()
+                wat("else")
+                assign_edge(block_name, on_false)
+                builder.i32_const(order.index(on_false)).local_set(label_local)
+                builder.br(depth_to_loop + 1)
+                wat(f"i32.const {order.index(on_false)} local.set {label_local} "
+                    f"br {depth_to_loop + 1}")
+                builder.end()
+                wat("end")
+                continue
+            if operation in ("Ret", "Return"):
+                on_return(instruction)
+                builder.raw(_OP_RETURN)
+                wat("return")
+                continue
+            emit_instruction(instruction)
+    builder.end()
+    wat("end")
+    # Every block branches or returns; unreachable is stack-polymorphic so
+    # functions with values in their result signature also validate here.
+    builder.raw(_OP_UNREACHABLE)
+    wat("unreachable")
 
 
 def emit_ssa_function_to_wasm(
@@ -108,13 +226,19 @@ def emit_ssa_function_to_wasm(
                 f"unknown work contract {work_contract!r}; presets: "
                 f"{sorted(PRESETS)}"
             )
+    from .backend_identities import apply_backend_identities
+
+    prepared = apply_backend_identities(
+        module, {function_name: tuple(
+            value for block in function.blocks.values() for instruction in block.instrs
+            if str(instruction.op) in {"Ret", "Return"} for value in instruction.args
+        )}, backend="wasm",
+        licensed_inexact=contract.inexact_identities,
+    )
+    module = prepared.module
+    function = module.functions[function_name]
     input_names = tuple(function.metadata.get("argument_names", ()))
     output_names = tuple(function.metadata.get("output_names", ()))
-    if set(function.blocks) != {"entry"}:
-        return SSAWasmArtifact(
-            name, "", b"", input_names, output_names, (), (),
-            (WasmEmissionShortfall("control", "direct scalar WASM requires one entry block"),),
-        )
     if len(input_names) != len(function.args):
         input_names = tuple(f"arg{index}" for index in range(len(function.args)))
 
@@ -128,7 +252,8 @@ def emit_ssa_function_to_wasm(
                   "Log": "log", "Tanh": "tanh"}
     required_tables = sorted({
         _TABLE_OPS[str(instruction.op)]
-        for instruction in function.blocks["entry"].instrs
+        for block in function.blocks.values()
+        for instruction in block.instrs
         if str(instruction.op) in _TABLE_OPS
     })
     if str(trig_solver) not in {"lut", "continuous"}:
@@ -153,7 +278,8 @@ def emit_ssa_function_to_wasm(
     ]
     all_result_ids = {
         int(instruction.res.id)
-        for instruction in function.blocks["entry"].instrs
+        for block in function.blocks.values()
+        for instruction in block.instrs
         if instruction.res is not None
     }
     for value in function.args:
@@ -161,6 +287,14 @@ def emit_ssa_function_to_wasm(
     for value_id in sorted(all_result_ids):
         locals_by_id[value_id] = builder.declare_local("f64")
         wat_lines.append(f"    (local $t{value_id} f64)")
+    use_dispatch = len(function.blocks) != 1 or any(
+        str(instruction.op) in {"Br", "CondBr", "Phi"}
+        for block in function.blocks.values() for instruction in block.instrs
+    )
+    label_local = None
+    if use_dispatch:
+        label_local = builder.declare_local("i32")
+        wat_lines.append("    (local $dispatch i32)")
     input_offsets = tuple(
         arena_base + index * 8 for index in range(len(function.args))
     )
@@ -174,7 +308,19 @@ def emit_ssa_function_to_wasm(
         )
 
     constants: dict[int, float] = {}
-    outputs: tuple[int, ...] = ()
+    returns = [
+        instruction
+        for block in function.blocks.values() for instruction in block.instrs
+        if str(instruction.op) in {"Ret", "Return"}
+    ]
+    outputs = tuple(int(value.id) for value in returns[0].args) if returns else ()
+    if not output_names:
+        output_names = tuple(f"output{index}" for index in range(len(outputs)))
+    output_offsets = tuple(
+        arena_base + (len(function.args) + index) * 8
+        for index in range(len(outputs))
+    )
+    imports: list[WasmImport] = []
     shortfalls: list[WasmEmissionShortfall] = []
     from .ir_identities import precision_backend_shortfalls
     shortfalls.extend(
@@ -191,31 +337,46 @@ def emit_ssa_function_to_wasm(
     def get(value_id: int) -> None:
         builder.local_get(locals_by_id[int(value_id)])
 
-    for instruction in function.blocks["entry"].instrs:
+    def emit_straight_instruction(instruction):
         # Ingested scalar SSA arrives with graph-native spellings
         # (``maximum``/``minimum``); read them through the one table every
         # SSA reader shares, as ``ssa_c_backend.emit_ssa_function_to_c`` does.
         op = str(instruction.op)
         op = TENSOR_OPERATION_SCALAR_SPELLING.get(op.casefold(), op)
-        if op == "Ret":
-            outputs = tuple(int(value.id) for value in instruction.args)
-            continue
+        if op in {"Call", "call"}:
+            if instruction.attributes.get("callee") != "turing_validation_error":
+                shortfalls.append(WasmEmissionShortfall(
+                    op, "direct scalar WASM only calls the validation runtime",
+                ))
+                return
+            if not imports:
+                imports.append(WasmImport(
+                    module="turing", field="turing_validation_error", kind="func",
+                    parameter_types=("i32",),
+                ))
+            code = int(instruction.attributes.get("error_code", 0))
+            builder.i32_const(code).call(0).raw(_OP_RETURN)
+            # Canonical signal-core fault blocks branch back to their tail.
+            # End this slot-memory invocation even when the host only records
+            # the code, so the tail cannot publish a failed computation.
+            wat_lines.append(f"    i32.const {code} call $turing_validation_error return")
+            return
         if instruction.res is None:
             shortfalls.append(WasmEmissionShortfall(op, "instruction has no result"))
-            continue
+            return
         unchecked = python_int_unchecked_refusal(
             instruction, "direct scalar WASM f64", DOUBLE_EXACT,
         )
         if unchecked is not None:
             shortfalls.append(WasmEmissionShortfall(op, unchecked))
-            continue
+            return
         result_id = int(instruction.res.id)
         if op == "Const":
             value = float(instruction.attributes.get("constant", instruction.attributes.get("value")))
             constants[result_id] = value
             builder.value_const(value).local_set(locals_by_id[result_id])
             wat_lines.append(f"    f64.const {value.hex()} local.set $t{result_id}")
-            continue
+            return
         if op == "Pi":
             # The shared materialisation, as in the C and LLVM lanes, so the
             # four backends carry one constant with one declared bound rather
@@ -230,12 +391,12 @@ def emit_ssa_function_to_wasm(
                 shortfalls.append(WasmEmissionShortfall(
                     op, "pi materialisation was rejected",
                 ))
-                continue
+                return
             value = float(materialization.value)
             constants[result_id] = value
             builder.value_const(value).local_set(locals_by_id[result_id])
             wat_lines.append(f"    f64.const {value.hex()} local.set $t{result_id}")
-            continue
+            return
         args = tuple(int(value.id) for value in instruction.args)
         wat_operation = None
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
@@ -340,10 +501,36 @@ def emit_ssa_function_to_wasm(
                 f"(; {_TABLE_OPS[str(op)]} from the baked table at "
                 f"byte {entry['base']}, measured error {entry['bound']:.2e} ;)"
             )
-        elif op in {"Abs", "Sqrt", "Neg"} and len(args) == 1:
+        elif op in {"Abs", "Sqrt", "Neg", "Floor"} and len(args) == 1:
             get(args[0]); builder.op(op.lower())
             wat_operation = f"local.get $t{args[0]} f64.{op.lower()}"
-        elif str(op) in _F64_COMPARISONS and len(args) == 2:
+        elif op == "Round" and len(args) == 1:
+            # Repository Round is ties-to-even (LLVM llvm.roundeven.f64,
+            # C nearbyint), including the signal cores' binade selection.
+            get(args[0]); builder.op("nearest")
+            wat_operation = f"local.get $t{args[0]} f64.nearest"
+        elif (op in {"And", "Or"} and len(args) == 2
+              and str(instruction.res.dtype).casefold() in {"bool", "i1"}):
+            # Predicate locals use the same f64 0/1 representation as Cast
+            # and comparisons; normalize operands before the i32 operation.
+            # Integer And/Or are bitwise and are not this boolean spelling.
+            get(args[0]); builder.value_const(0.0).op("ne")
+            get(args[1]); builder.value_const(0.0).op("ne")
+            builder.raw(OP_I32_AND if op == "And" else OP_I32_OR)
+            builder.op("convert_i32_u")
+            wat_operation = (
+                f"local.get $t{args[0]} f64.const 0 f64.ne "
+                f"local.get $t{args[1]} f64.const 0 f64.ne "
+                f"i32.{op.lower()} f64.convert_i32_u"
+            )
+        elif (op == "Not" and len(args) == 1
+              and str(instruction.res.dtype).casefold() in {"bool", "i1"}):
+            get(args[0]); builder.value_const(0.0).op("eq")
+            builder.op("convert_i32_u")
+            wat_operation = (
+                f"local.get $t{args[0]} f64.const 0 f64.eq f64.convert_i32_u"
+            )
+        elif str(op) in _SCALAR_F64_COMPARISONS and len(args) == 2:
             # A COMPARISON IS AN INSTRUCTION HERE, not a missing feature.
             # WebAssembly has f64.le and the whole family; the table in
             # wasm_binary has carried their opcodes all along and this
@@ -357,10 +544,10 @@ def emit_ssa_function_to_wasm(
             # it is converted back the same way the mask reaches i1 in
             # the LLVM lane: by its truthiness, not by a special type.
             get(args[0]); get(args[1])
-            builder.op(_F64_COMPARISONS[str(op)])
+            builder.op(_SCALAR_F64_COMPARISONS[str(op)])
             builder.op("convert_i32_u")
             wat_operation = (f"local.get $t{args[0]} local.get $t{args[1]} "
-                             f"f64.{_F64_COMPARISONS[str(op)]} "
+                             f"f64.{_SCALAR_F64_COMPARISONS[str(op)]} "
                              f"f64.convert_i32_u")
         elif str(op) in {"Select", "where"} and len(args) == 3:
             # Select(mask, when_true, when_false) -- the same order the
@@ -409,7 +596,9 @@ def emit_ssa_function_to_wasm(
                 if int(exponent) < 0:
                     # 1/x^n rather than x^-n, for the same reason -1.0
                     # above is spelled as a divide
-                    builder.local_set(temp := builder.temp())
+                    # Vehicle reciprocal powers require a declared f64 local;
+                    # CodeBuilder has no implicit temp() allocator.
+                    builder.local_set(temp := builder.declare_local("f64"))
                     builder.value_const(1.0)
                     builder.local_get(temp)
                     builder.op("div")
@@ -445,33 +634,77 @@ def emit_ssa_function_to_wasm(
                     f"under contract {contract.name!r}; deploy/fast permit "
                     "the sqrt-family reduction",
                 ))
-                continue
+                return
             else:
                 shortfalls.append(WasmEmissionShortfall(
                     op, f"WebAssembly has no direct power for exponent {exponent!r}",
                 ))
-                continue
+                return
         else:
             shortfalls.append(WasmEmissionShortfall(op, "no direct scalar WASM spelling"))
-            continue
+            return
         builder.local_set(locals_by_id[result_id])
         wat_lines.append(f"    {wat_operation} local.set $t{result_id}")
 
-    if not output_names:
-        output_names = tuple(f"output{index}" for index in range(len(outputs)))
+    if not returns:
+        shortfalls.append(WasmEmissionShortfall("Ret", "function has no return"))
     if len(output_names) != len(outputs):
         shortfalls.append(WasmEmissionShortfall("Ret", "output names do not match return arity"))
-    output_offsets = tuple(
-        arena_base + (len(function.args) + index) * 8
-        for index in range(len(outputs))
-    )
-    for value_id, offset in zip(outputs, output_offsets):
-        builder.local_get(0).i32_const(offset).raw(OP_I32_ADD)
-        get(value_id)
-        builder.store()
-        wat_lines.append(
-            f"    local.get $io i32.const {offset} i32.add local.get $t{value_id} f64.store"
+
+    def on_return(instruction):
+        if len(instruction.args) != len(output_offsets):
+            shortfalls.append(WasmEmissionShortfall("Ret", "return arities disagree"))
+            return
+        for value, offset in zip(instruction.args, output_offsets):
+            value_id = int(value.id)
+            builder.local_get(0).i32_const(offset).raw(OP_I32_ADD)
+            get(value_id)
+            builder.store()
+            wat_lines.append(
+                f"    local.get $io i32.const {offset} i32.add local.get $t{value_id} f64.store"
+            )
+
+    def emit_condition(instruction):
+        if len(instruction.args) != 1:
+            shortfalls.append(WasmEmissionShortfall("CondBr", "condition arity is not one"))
+            return False
+        get(int(instruction.args[0].id))
+        builder.value_const(0.0).op("ne")
+        wat_lines.append(f"    local.get $t{instruction.args[0].id} f64.const 0 f64.ne")
+        return True
+
+    def phi_destination(instruction):
+        return locals_by_id[int(instruction.res.id)]
+
+    def push_phi(instruction, value):
+        get(int(value.id))
+        wat_lines.append(f"    local.get $t{value.id}")
+
+    def assign_edge(source, target):
+        _emit_wasm_phi_edge(
+            function, source, target, builder=builder,
+            destination_for=phi_destination, push_incoming=push_phi,
+            wat_lines=wat_lines,
         )
+
+    if use_dispatch:
+        _emit_wasm_cfg(
+            function, builder=builder, shortfalls=shortfalls,
+            emit_instruction=emit_straight_instruction,
+            emit_condition=emit_condition, on_return=on_return,
+            assign_edge=assign_edge, prepare_phi=phi_destination,
+            label_local=label_local, wat_lines=wat_lines,
+        )
+    else:
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) in {"Ret", "Return"}:
+                    on_return(instruction)
+                    break
+                emit_straight_instruction(instruction)
+    if imports:
+        wat_lines.insert(1, '  (import "turing" "turing_validation_error" '
+                         '(func $turing_validation_error (param i32)))')
     wat_lines.extend(("  )", ")", ""))
     arena_bytes = arena_base + (len(function.args) + len(outputs)) * 8
     binary = b"" if shortfalls else build_module(
@@ -481,6 +714,7 @@ def emit_ssa_function_to_wasm(
         memory_pages=max(1, (arena_bytes + 65535) // 65536),
         data=tables["data"],
         data_offset=0,
+        imports=imports,
     )
     publications = function_output_publications(function)
     return SSAWasmArtifact(
@@ -494,13 +728,15 @@ def emit_ssa_function_to_wasm(
         tuple(shortfalls),
         publications,
         publication_surface_plan(publications, target="wasm"),
+        tuple(imports),
+        prepared.decisions,
     )
 
 
 # ---------------------------------------------------------------------------
 # Repository-call module emission: the batched lane.
 #
-# The scalar artifact above is one straight-line block behind slot-in-memory
+# The scalar artifact above uses the same CFG dispatcher behind slot-in-memory
 # scalars. The precision benchmark's kernels are a counted loop calling a
 # planned region once per element, addressing arrays through
 # GetElementPtr/Load/Store. This emitter takes that whole module and produces
@@ -1909,121 +2145,44 @@ def emit_ssa_module_to_wasm_core(
             if argument is not None and value_kind(argument) is not None
         ), "f64")
 
-    def edge_assignments(env, function, source_block: str, target_block: str) -> None:
-        # Every Phi on an edge reads its incoming value before any Phi on
-        # that edge is written: a parallel copy.  Writing them one by one let
-        # ``j = phi(.., i)`` read the ``i`` the same edge had just advanced
-        # (c125 returned 10 where Python returns 9).  All incoming values go
-        # on the Wasm stack first; the locals are set from the top down.
-        target = function.blocks.get(target_block)
-        if target is None:
-            return
-        destinations = []
-        for instruction in target.instrs:
-            if str(instruction.op) != "Phi" or instruction.res is None:
-                continue
-            incoming = tuple(
-                instruction.attributes.get("incoming_blocks") or ()
-            )
-            for position, origin in enumerate(incoming):
-                if str(origin) == source_block and position < len(
-                    instruction.args
-                ):
-                    destinations.append(slot_for(
-                        env, instruction.res, phi_kind(instruction),
-                    ))
-                    push_as(
-                        env, instruction.args[position],
-                        phi_kind(instruction), "Phi",
-                    )
-        for destination in reversed(destinations):
-            builder.local_set(destination)
-
     def emit_cfg(function, env, on_return) -> None:
-        """The function's CFG through the classic label dispatcher: a loop
-        over nested blocks selected by a label local, WebAssembly's
-        structured spelling of an arbitrary branch.  ``on_return`` emits a
-        ``Ret``'s values in the function's own convention."""
+        def prepare_phi(instruction):
+            return slot_for(env, instruction.res, phi_kind(instruction))
 
-        order = list(function.blocks)
-        label_local = builder.declare_local("i32")  # zero-initialised: entry
-        # Phi results need their locals to exist before any predecessor
-        # writes them, so walk them first.
-        for block_name in order:
-            for instruction in function.blocks[block_name].instrs:
-                if str(instruction.op) == "Phi" and instruction.res is not None:
-                    slot_for(env, instruction.res, phi_kind(instruction))
-        count = len(order)
-        builder.loop()
-        for _ in range(count):
-            builder.block()
-        for index in range(count):
-            builder.local_get(label_local).i32_const(index)
-            builder.raw(_OP_I32_EQ).br_if(index)
-        builder.raw(_OP_UNREACHABLE)
-        for index, block_name in enumerate(order):
-            builder.end()  # opens block ``index``'s straight-line code region
-            depth_to_loop = count - 1 - index
-            for instruction in function.blocks[block_name].instrs:
-                operation = str(instruction.op)
-                if operation == "Phi":
-                    continue  # defined by edge assignments
-                if operation in ("Call", "call"):
-                    emit_call(env, instruction)
-                    continue
-                if operation == "Br":
-                    target = str(instruction.attributes.get("target"))
-                    if target not in function.blocks:
-                        shortfalls.append(WasmEmissionShortfall(
-                            "Br", f"{function.name} has unknown target {target!r}",
-                        ))
-                        continue
-                    edge_assignments(env, function, block_name, target)
-                    builder.i32_const(order.index(target))
-                    builder.local_set(label_local)
-                    builder.br(depth_to_loop)
-                    continue
-                if operation == "CondBr":
-                    on_true = str(instruction.attributes.get("true_target"))
-                    on_false = str(instruction.attributes.get("false_target"))
-                    if on_true not in function.blocks or on_false not in function.blocks:
-                        shortfalls.append(WasmEmissionShortfall(
-                            "CondBr", f"{function.name} has unknown target",
-                        ))
-                        continue
-                    condition = push(env, instruction.args[0])
-                    if condition == "i64":
-                        builder.i64_const(0).raw(_OP_I64_NE)
-                    elif condition != "i32":
-                        if condition is not None:
-                            shortfalls.append(WasmEmissionShortfall(
-                                operation,
-                                f"condition %t{instruction.args[0].id} is "
-                                f"{condition}",
-                            ))
-                        continue
-                    builder.if_()
-                    edge_assignments(env, function, block_name, on_true)
-                    builder.i32_const(order.index(on_true))
-                    builder.local_set(label_local)
-                    builder.br(depth_to_loop + 1)
-                    builder.else_()
-                    edge_assignments(env, function, block_name, on_false)
-                    builder.i32_const(order.index(on_false))
-                    builder.local_set(label_local)
-                    builder.br(depth_to_loop + 1)
-                    builder.end()
-                    continue
-                if operation in ("Ret", "Return"):
-                    on_return(instruction)
-                    builder.raw(_OP_RETURN)
-                    continue
+        def push_phi(instruction, value):
+            push_as(env, value, phi_kind(instruction), "Phi")
+
+        def assign_edge(source_block, target_block):
+            # The shared edge copy reads all incoming values before writing
+            # any destination, preserving the loop-header swap contract.
+            _emit_wasm_phi_edge(
+                function, source_block, target_block, builder=builder,
+                destination_for=prepare_phi, push_incoming=push_phi,
+            )
+
+        def emit_condition(instruction):
+            condition = push(env, instruction.args[0])
+            if condition == "i64":
+                builder.i64_const(0).raw(_OP_I64_NE)
+            elif condition != "i32":
+                if condition is not None:
+                    shortfalls.append(WasmEmissionShortfall(
+                        "CondBr", f"condition %t{instruction.args[0].id} is {condition}",
+                    ))
+                return False
+            return True
+
+        def emit_instruction(instruction):
+            if str(instruction.op) in ("Call", "call"):
+                emit_call(env, instruction)
+            else:
                 emit_straight_instruction(env, instruction)
-        builder.end()  # the dispatcher loop
-        # Every block branches or returns, so this point is never reached;
-        # ``unreachable`` is stack-polymorphic, which lets a function with
-        # results validate here.
-        builder.raw(_OP_UNREACHABLE)
+
+        _emit_wasm_cfg(
+            function, builder=builder, shortfalls=shortfalls,
+            emit_instruction=emit_instruction, emit_condition=emit_condition,
+            on_return=on_return, assign_edge=assign_edge, prepare_phi=prepare_phi,
+        )
 
     # -- the exported entry --------------------------------------------------
     root_env = _Env({
