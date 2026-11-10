@@ -36,7 +36,13 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-STATE_DIR = ROOT / "build" / "meowdoku"
+try:
+    from meowdoku.state_paths import StatePaths
+except ImportError:                    # run as a script before the package is on the path
+    sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
+    from meowdoku.state_paths import StatePaths
+DEFAULT_STATE = StatePaths.legacy(ROOT)            # no --state-dir: the old layout
+STATE_DIR = DEFAULT_STATE.run_dir                  # module-level default for callers that pass nothing (= build/meowdoku)
 DEFAULT_PORT = 8766
 EXIT_RESTART = 75                      # EX_TEMPFAIL: a scheduled exit the supervisor relaunches at once
 DUMP_VERSION = 1
@@ -59,8 +65,13 @@ class LifecycleError(ValueError):
 
 
 # --------------------------------------------------------------------------- paths and identity
-def state_paths(state_dir: Path, port: int) -> dict[str, Path]:
-    """The default port keeps the plain names; any other port gets its own files so servers on one machine never meet."""
+def state_paths(state_dir, port: int) -> dict[str, Path]:
+    """The default port keeps the plain names; any other port gets its own files so servers on one machine never meet.
+
+    ``state_dir`` is a StatePaths (sessions and launch under run/, the token under secrets/) or a plain directory, which keeps its
+    old meaning: all three files directly in it."""
+    if isinstance(state_dir, StatePaths):
+        return {"sessions": state_dir.sessions_dir(port), "token": state_dir.admin_token(port), "launch": state_dir.launch_json(port)}
     suffix = "" if port == DEFAULT_PORT else f"_{port}"
     return {"sessions": state_dir / f"sessions{suffix}", "token": state_dir / f"admin_token{suffix}.txt",
             "launch": state_dir / f"launch{suffix}.json"}
@@ -393,7 +404,7 @@ class Lifecycle:
 
     def __init__(self, sessions, state_dir: Path, port: int, table_factory, clock=time.time):
         self.sessions, self.port, self.clock, self.table_factory = sessions, port, clock, table_factory
-        self.paths = state_paths(Path(state_dir), port)
+        self.paths = state_paths(state_dir if isinstance(state_dir, StatePaths) else Path(state_dir), port)
         self.store = SessionStore(self.paths["sessions"], clock)
         self.token = load_or_make_token(self.paths["token"])
         self.boot = secrets.token_hex(6)
@@ -564,7 +575,7 @@ def supervise(launch_file: Path, *, max_backoff: float = 30.0, relaunch_delay: f
 
 
 # --------------------------------------------------------------------------- command line
-def _post_admin(port: int, state_dir: Path, body: dict[str, Any]) -> dict[str, Any]:
+def _post_admin(port: int, state_dir, body: dict[str, Any]) -> dict[str, Any]:
     import urllib.error
     import urllib.request
     token = state_paths(state_dir, port)["token"].read_text(encoding="utf-8").strip()      # never printed
@@ -580,7 +591,7 @@ def _post_admin(port: int, state_dir: Path, body: dict[str, Any]) -> dict[str, A
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="meowdoku.lifecycle", description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--state-dir", default=str(STATE_DIR))
+    parser.add_argument("--state-dir", default=None, help="the state root (state_paths.py); default: the old build/meowdoku layout")
     sub = parser.add_subparsers(dest="cmd", required=True)
     restart = sub.add_parser("restart", help="announce a restart in N seconds")
     restart.add_argument("--in", dest="seconds", type=float, default=60.0)
@@ -591,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     sup.add_argument("--max-backoff", type=float, default=30.0)
     sup.add_argument("server_args", nargs="*", help="first run only: server.py arguments, when no launch.json exists yet")
     args = parser.parse_args(argv)
-    state_dir = Path(args.state_dir)
+    state_dir = StatePaths(Path(args.state_dir)) if args.state_dir else DEFAULT_STATE
     if args.cmd == "supervise":
         launch = Path(args.launch_file) if args.launch_file else state_paths(state_dir, args.port)["launch"]
         if not launch.exists():

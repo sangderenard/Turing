@@ -80,6 +80,7 @@ from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real pas
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
+from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PRODUCT_WAIT_SECONDS = 90       # [LOADING] how long a request for a building product file waits before "503, retry"
@@ -337,34 +338,35 @@ ACCOUNT_COOKIE = "meowdoku_account"    # a real login session token (accounts.py
 class Sessions:
     """session token -> that client's own Table; idle ones expire."""
 
-    def __init__(self, web_dir: Path, profiles: Profiles | None = None):
+    def __init__(self, web_dir: Path, profiles: Profiles | None = None, state: StatePaths | None = None):
         self.web_dir = web_dir
         self.profiles = profiles
+        self.state = state or StatePaths.legacy_at(web_dir.parent)      # [STATE] no --state-dir: everything beside web/, as before
         self.lock = threading.Lock()
         self.tables: dict[str, list] = {}       # token -> [Table, last_seen]
-        self.shares = share_mod.ShareStore(web_dir.parent / "shares")     # build/meowdoku/shares (gitignored with build/)
+        self.shares = share_mod.ShareStore(self.state.shares_dir)     # build/meowdoku/shares (gitignored with build/)
         self.spectate = share_mod.Spectate()                              # owner session -> its view-only live share
         self.share_hits: dict[str, list] = {}                             # client address -> recent share POST times
         boards = json.loads((web_dir / "boards.json").read_text(encoding="utf-8"))
         self.board_count = len(boards["boards"])
         self.lifecycle = None                   # LIFECYCLE: set by main(); restores a saved session for a cookie that has a file
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
-        self.anim = anim_mod.Store(web_dir.parent)        # [LOADING] build/meowdoku/loading_anim.mla
-        self.marble_objects = marble_objects_mod.Store(web_dir.parent / "marble_objects")
-        self.marble_photos = marble_photo_mod.PhotoJobs(web_dir.parent / "marble_photos", ROOT.parent / "spectral-analyzer")
+        self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
+        self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer")
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
-        self.tickets = tickets_mod.Store(web_dir.parent / "tickets")
+        self.tickets = tickets_mod.Store(self.state.tickets_dir)
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
-        self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
+        self.access = access_mod.Access(self.state.access_json)   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
-        self.accounts = accounts_mod.Accounts(web_dir.parent / "accounts.db")   # [ACCOUNTS] real password login
-        self.accounts_db = web_dir.parent / "accounts.db"
+        self.accounts = accounts_mod.Accounts(self.state.accounts_db)   # [ACCOUNTS] real password login
+        self.accounts_db = self.state.accounts_db
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
         self.instance = ""                                                      # [INSTANCE] --instance NAME (account_instances binding)
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
-        self.obj_assets = obj_assets_mod.Store(web_dir.parent / "obj_assets", self.accounts, ROOT.parent / "spectral-analyzer")
+        self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, ROOT.parent / "spectral-analyzer")
         self.marble_objects.obj_assets = self.obj_assets
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
@@ -1421,7 +1423,7 @@ def make_handler(sessions: Sessions):
                         result = sessions.marble_photos.start(self.rfile.read(length), sessions.marble_objects.for_account(account["id"] if account else None), owners=keys,
                             client_bridge=sessions.client_ray_bridge,
                             bridge_url=f"{scheme}://127.0.0.1:{self.server.server_port}/api/client_rays/engine",
-                            bridge_ca=sessions.web_dir.parent/"tls"/"ca.crt")
+                            bridge_ca=sessions.state.tls_dir/"ca.crt")
                         if account is not None:
                             sessions.accounts.claim(account["id"], "marble_photo", result["digest"])
                         return self._json(result, HTTPStatus.ACCEPTED)
@@ -1906,18 +1908,27 @@ def prepare_lanes(web_dir: Path, args) -> dict:
     return lanes
 
 
+def resolve_state(state_dir, web_dir: Path) -> StatePaths:
+    """--state-dir PATH -> the new layout rooted there; absent -> the old layout beside web_dir (what web_dir.parent always meant)."""
+    return StatePaths(Path(state_dir)) if state_dir else StatePaths.legacy_at(Path(web_dir).parent)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--web-dir", default=str(WEB_DIR))
-    parser.add_argument("--profiles", default=str(PROFILES),
-                        help="profile/score file; a second (dev) server keeps its own so it never clobbers the live one")
+    parser.add_argument("--state-dir", default=None,
+                        help="the state root (sql/ content/ products/ canvas/ logs/ secrets/ run/; see state_paths.py); "
+                             "default: the old layout beside --web-dir (build/meowdoku)")
+    parser.add_argument("--profiles", default=None,
+                        help="profile/score file (default <state>/content/profiles.json, or build/meowdoku/profiles.json without --state-dir); "
+                             "a second (dev) server keeps its own so it never clobbers the live one")
     parser.add_argument("--tls-cert", default=None,
                         help="PEM certificate: serve https/wss (browsers expose WebGPU only to secure pages)")
     parser.add_argument("--tls-key", default=None, help="PEM private key for --tls-cert")
     parser.add_argument("--access", default=None,
-                        help="access tier policy file (default <web-dir>/../access.json; see access.py)")
+                        help="access tier policy file (default <state>/sql/access.json, or <web-dir>/../access.json without --state-dir; see access.py)")
     parser.add_argument("--no-wasm", action="store_true",
                         help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--retain-fountain-products", metavar="RECEIPT",
@@ -1955,15 +1966,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.port != 8766:
         COOKIE = f"meowdoku_session_{args.port}"
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
-    logring_mod.RING = logring_mod.Ring(path=web_dir.parent / "log_ring.jsonl"); logring_mod.tee_stdout()   # [LOG]
-    sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
+    state = resolve_state(args.state_dir, web_dir)
+    state.ensure(restrict=False)        # ACLs on secrets/ are set by the operator (operators.py / ensure()), never by a server start
+    logring_mod.RING = logring_mod.Ring(path=state.log_ring); logring_mod.tee_stdout()   # [LOG]
+    profiles_path = Path(args.profiles) if args.profiles else (state.profiles_json if args.state_dir else PROFILES)
+    sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.route = args.route
     sessions.instance = args.instance
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(sessions))
-    lc = lifecycle_mod.Lifecycle(sessions, web_dir.parent, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
+    lc = lifecycle_mod.Lifecycle(sessions, state, args.port, lambda: Table(web_dir, sessions.profiles))     # LIFECYCLE
     lc.server, sessions.lifecycle = server, lc
     sessions.readiness.predictor_stems = predictor_stems()
     lanes = prepare_lanes(web_dir, args)

@@ -42,8 +42,9 @@ from meowdoku import accounts as accounts_mod        # noqa: E402  (its own scry
 from meowdoku import authz as authz_mod              # noqa: E402
 from meowdoku import lifecycle as lifecycle_mod      # noqa: E402
 from meowdoku import lowering_library as lib         # noqa: E402
+from meowdoku.state_paths import StatePaths          # noqa: E402
 
-STATE = ROOT / "build" / "meowdoku"
+STATE = StatePaths.legacy(ROOT).root                # the old layout: no --state-dir, no "state_dir" in instances.json
 LEASE_SECONDS = 86400
 RENEW_MARGIN = 3600
 STOP_WAIT = 20.0
@@ -82,7 +83,7 @@ def connect(db_path):
 
 def ensure_service_user(username, db_path=None) -> int:
     """The service account's user id; created with a random password that is stored nowhere (only its scrypt hash), role 'service'."""
-    db_path = Path(db_path) if db_path else STATE / "accounts.db"
+    db_path = Path(db_path) if db_path else StatePaths.legacy_at(STATE).accounts_db
     username = accounts_mod.Accounts._clean_username(username)
     with connect(db_path) as db:
         row = db.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
@@ -97,15 +98,26 @@ def ensure_service_user(username, db_path=None) -> int:
     return uid
 
 
-def load_instances(path):
+def _read_instances(path):
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise SystemExit(f"cannot read {path}: {error}")
-    # instances.json: a list, or {"supervisor_python": <documented, read by nothing yet>, "instances": [...]}
+
+
+def load_instances(path):
+    # instances.json: a list, or {"supervisor_python": <documented, read by nothing yet>, "state_dir": <state root>, "instances": [...]}
+    data = _read_instances(path)
     if isinstance(data, dict):
         data = data.get("instances", [])
     return data if isinstance(data, list) else []
+
+
+def instances_state_dir(path):
+    """The top-level ``state_dir`` of the object form of instances.json (a path, absolute or relative to the repo root), or None."""
+    data = _read_instances(path)
+    value = data.get("state_dir") if isinstance(data, dict) else None
+    return _abs(value) if value else None
 
 
 def listening(port, host="127.0.0.1") -> bool:
@@ -117,8 +129,8 @@ def listening(port, host="127.0.0.1") -> bool:
 
 
 def console_secret_path(state_dir, name) -> Path:
-    """Per-run read-only-console token file: <state>/operator_credentials/<instance>.console.secret (the operators.py secrets dir)."""
-    return Path(state_dir) / "operator_credentials" / f"{name}.console.secret"
+    """Per-run read-only-console token file: <operator_credentials>/<instance>.console.secret (the operators.py secrets dir)."""
+    return StatePaths.coerce(state_dir).operator_credentials_dir / f"{name}.console.secret"
 
 
 def _abs(path):
@@ -146,7 +158,7 @@ class Instance:
         return self.kind == "nodus" and (n.get("console_port", self.spec.get("console_port")) is not None)
 
     def console_token_path(self) -> Path:
-        return console_secret_path(self.sup.state_dir, self.name)
+        return console_secret_path(self.sup.paths, self.name)
 
     def write_console_token(self):
         """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
@@ -175,6 +187,8 @@ class Instance:
         if self.kind == "meowdoku":
             argv = [py, "examples/meowdoku/server.py", "--port", str(self.port), "--bind", self.spec.get("bind", "127.0.0.1"),
                     *self.spec.get("args", [])]
+            if not self.sup.paths.is_legacy:            # an explicit state root is handed to the child; the old layout is its own default
+                argv += ["--state-dir", str(self.sup.paths.root)]
             if self.route:
                 argv += ["--route", self.route]
             return argv + ["--instance", self.name]
@@ -372,12 +386,12 @@ class Instance:
         """The Stop-Meowdoku.ps1 request: POST {op:restart,in:N} with the admin token; the server saves sessions and exits 75."""
         import ssl
         import urllib.request
-        paths = lifecycle_mod.state_paths(self.sup.state_dir, int(self.port))
+        paths = lifecycle_mod.state_paths(self.sup.paths, int(self.port))
         token = paths["token"].read_text(encoding="utf-8").strip()
         tls = "--tls-cert" in self.spec.get("args", [])
         ctx = None
         if tls:
-            ca = self.sup.state_dir / "tls" / "ca.crt"
+            ca = self.sup.paths.tls_dir / "ca.crt"
             ctx = ssl.create_default_context(cafile=str(ca)) if ca.exists() else ssl.create_default_context()
             ctx.check_hostname = False                  # the cert names the LAN address, not 127.0.0.1; trust rests on the CA
             if not ca.exists():
@@ -405,8 +419,10 @@ class Instance:
 
 class Supervisor:
     def __init__(self, db_path, instances_path, state_dir):
-        self.db_path, self.instances_path, self.state_dir = Path(db_path), Path(instances_path), Path(state_dir)
-        self.log_dir = self.state_dir / "logs"
+        """state_dir: a StatePaths, or a plain directory (the old meaning: the legacy layout rooted there)."""
+        self.paths = StatePaths.coerce(state_dir)
+        self.db_path, self.instances_path, self.state_dir = Path(db_path), Path(instances_path), self.paths.run_dir
+        self.log_dir = self.paths.logs_dir
         self.stop = threading.Event()
         self.instances = []
         self.secrets_restricted = False
@@ -424,7 +440,7 @@ class Supervisor:
 
     def acquire_lock(self) -> bool:
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(self.state_dir / "supervisor.lock", "a+b")
+        self._lock_file = open(self.state_dir / "supervisor.lock", "a+b")       # <state>/run/supervisor.lock in the new layout
         try:
             if os.name == "nt":
                 import msvcrt
@@ -508,20 +524,26 @@ def status(db_path):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--db", default=str(STATE / "accounts.db"))
+    ap.add_argument("--db", default=None, help="default <state>/sql/accounts.db (build/meowdoku/accounts.db without a state root)")
     ap.add_argument("--instances", default=str(HERE / "instances.json"))
-    ap.add_argument("--state-dir", default=str(STATE))
+    ap.add_argument("--state-dir", default=None,
+                    help="the state root (state_paths.py); overrides \"state_dir\" in instances.json; default: the old build/meowdoku layout")
     ap.add_argument("--status", action="store_true", help="print service_instances as JSON and exit")
     ap.add_argument("--once", action="store_true", help="with --dry-run: print the plan and exit")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
-    sup = Supervisor(args.db, args.instances, args.state_dir)
+    chosen = Path(args.state_dir) if args.state_dir else instances_state_dir(args.instances)
+    paths = StatePaths(chosen) if chosen else StatePaths.legacy_at(STATE)
+    sup = Supervisor(args.db or paths.accounts_db, args.instances, paths)
+    args.db = str(sup.db_path)
     if args.status:
         print(json.dumps(status(args.db), indent=1))
         return 0
     if args.once and args.dry_run:
         print(json.dumps({"db": str(sup.db_path), "access_log": str(sup.log_dir / "apache-access.log"), "instances": sup.plan()}, indent=1))
         return 0
+    if chosen:
+        paths.ensure(restrict=False)            # the directories; the ACLs on secrets/ are the operator's step (operators.py)
     return sup.run(manage=sup.acquire_lock())
 
 

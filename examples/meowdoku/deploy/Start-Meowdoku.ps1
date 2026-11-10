@@ -12,15 +12,18 @@ param(
     [switch]$WhatIf,
     [string]$User = $env:MEOWDOKU_OPERATOR,
     [string]$PasswordFile,
-    [string]$AccountsDb
+    [string]$AccountsDb,
+    [string]$StateDir        # the state root (state_paths.py); default empty (or $env:MEOWDOKU_STATE_DIR) = the old build\meowdoku layout
 )
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -37,8 +40,8 @@ $ErrorActionPreference = 'Stop'
 Write-Warning "Apache owns the live instances (deploy\apache_supervisor.py, instances.json): use Start-Apache.ps1 / Stop-Apache.ps1. This script is for manual dev use; a port the supervisor manages will be left alone or fought over."
 $Repo   = 'C:\dev\Powershell\turing'
 $Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'
-$Tls    = Join-Path $Repo 'build\meowdoku\tls'
-$LogDir = Join-Path $Repo 'build\meowdoku\logs'
+$Tls    = if ($StateDir) { Join-Path $StateDir 'secrets\tls' } else { Join-Path $Repo 'build\meowdoku\tls' }
+$LogDir = if ($StateDir) { Join-Path $StateDir 'logs' } else { Join-Path $Repo 'build\meowdoku\logs' }
 $Stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 if ($Dev) {
@@ -51,10 +54,11 @@ if ($Dev) {
         '--no-wasm', '--no-idle-train', '--route', $Route)
 } else {
     $argv = @('examples\meowdoku\server.py', '--port', "$Port", '--bind', $Bind,
-        '--tls-cert', 'build\meowdoku\tls\cert.pem', '--tls-key', 'build\meowdoku\tls\key.pem',
+        '--tls-cert', "$Tls\cert.pem", '--tls-key', "$Tls\key.pem",
         '--retain-fountain-products', 'C:\dev\Powershell\turing\build\dot-retained-fountain-20261109\fountain-receipt.json',
         '--route', $Route)
 }
+if ($StateDir) { $argv += @('--state-dir', $StateDir) }
 $out = Join-Path $LogDir "$Port-$Stamp.out.log"
 $err = Join-Path $LogDir "$Port-$Stamp.err.log"
 

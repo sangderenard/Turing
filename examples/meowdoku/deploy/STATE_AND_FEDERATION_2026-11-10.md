@@ -135,3 +135,15 @@ Not covered: NAT traversal (the owner must be reachable at Apache's 443, or the 
 8. **Lease the first worktree.** `git worktree add` at a short path, new instance with its own service account, route and port, same root; run with `schema_version` enforcement; then try an own-root lease. Verify: two revisions serve the same accounts, an incompatible schema is refused, then retire the old `build/meowdoku` state copy after one Litestream restore drill (CLOUD_HOSTING section 6 step 5).
 
 Federation (section 4) comes after step 8 and needs its own review before any code.
+
+## Implemented (code only), 2026-11-10
+
+Migration steps 1-3 are code; the live cutover has NOT run (no state moved or copied, no process started or stopped, `build/meowdoku` untouched, no root created).
+
+- `examples/meowdoku/state_paths.py`: `StatePaths(root)` (new layout), `StatePaths.legacy(repo_root)` / `legacy_at(base)` (today's `build/meowdoku` names), `ensure()` (dirs plus the operators.py icacls step on `secrets/`).
+- `server.py --state-dir PATH`: absent means the old layout beside `--web-dir`. `Sessions(web_dir, profiles, state)` holds it; accounts.db, access.json, authz policy, profiles, content dirs, log ring, bridge CA and the lifecycle token/session/launch files come from it. `--web-dir` unchanged.
+- `lifecycle.py --state-dir`: `state_paths()` takes a StatePaths (sessions/launch in `run/`, token in `secrets/`) or a plain dir (old meaning). `STATE_DIR` stays as the default.
+- `deploy/apache_supervisor.py --state-dir` and top-level `"state_dir"` in the object form of instances.json (flag wins): db defaults to `<root>/sql/accounts.db`, logs to `<root>/logs`, console tokens to `<root>/secrets/operator_credentials`, lock to `<root>/run`; meowdoku children get `--state-dir`. Without either, nothing changes. Note: the supervisor's pre-existing `--state-dir` now names the root (new layout), not the old base.
+- `deploy/operators.py --state-dir` replaces `--db`/`--secrets-dir`.
+- `deploy/*.ps1`: `-StateDir` (or `$env:MEOWDOKU_STATE_DIR`), empty means legacy; threads the gate's `-AccountsDb` default, operator secret, tls, logs, pid files and `apache_supervisor.py --status`; Setup-ServiceAccount.ps1 derives `$SecretsDir` and the token/key grants.
+- Not done: `job_library` still resolves beside the photo dir (`job_library_db` is not wired), `tipjar.json` and `lichess_token.txt` still read `build/meowdoku`, instances.json args (tls, canvas) stay literal, the schema_version table, and the default flip (step 7).

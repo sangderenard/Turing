@@ -8,6 +8,7 @@ The service never reads the operator's profile (C:/Users/alber): it runs from th
 param(
     [string]$Name = 'svc-meowdoku',
     [string]$SecretsDir = 'C:/dev/Powershell/turing/build/meowdoku/operator_credentials',
+    [string]$StateDir,   # the state root (examples/meowdoku/state_paths.py); empty (or $env:MEOWDOKU_STATE_DIR) = the old build/meowdoku layout
     [switch]$WhatIf
 )
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,13 @@ $Repo      = 'C:/dev/Powershell/turing'
 $Nodus     = 'C:/dev/Powershell/nodus'
 $Apache    = 'C:/Apache24'
 $Srv       = 'C:/dev/Powershell/srv'   # private interpreter tree (srv/python); no grant touches C:/Users/alber
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }
+if ($StateDir) {
+    if (-not $PSBoundParameters.ContainsKey('SecretsDir')) { $SecretsDir = Join-Path $StateDir 'secrets/operator_credentials' }
+    $StateBase = $StateDir; $SecretsBase = Join-Path $StateDir 'secrets'; $ModifyDirs = @($StateDir)   # Modify on the root; secrets/ is cut to the operator by operators.py / StatePaths.ensure()
+} else {
+    $StateBase = "$Repo/build/meowdoku"; $SecretsBase = $StateBase; $ModifyDirs = @("$Repo/build")
+}
 $Svc       = 'Apache2.4'
 $SecretFile = Join-Path $SecretsDir "$Name.windows.secret"
 
@@ -98,12 +106,12 @@ Step "(c) NTFS ACLs for $Name"
 Write-Host 'Read+execute with inheritance (the whole tree must be loadable):'
 foreach ($d in @($Apache, $Repo, $Nodus, $Srv)) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)RX") }
 Write-Host 'Modify (logs, state, build output):'
-foreach ($d in @("$Apache/logs", "$Repo/build", "$Nodus/out")) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)M") }
+foreach ($d in (@("$Apache/logs") + $ModifyDirs + @("$Nodus/out"))) { Run 'icacls.exe' @($d, '/grant', "${Name}:(OI)(CI)M") }
 Write-Host 'Secrets the service must read (explicit file-level grants; build/ already gives Modify by inheritance):'
-$tokens = @(Get-ChildItem -Path "$Repo/build/meowdoku" -Filter 'admin_token*.txt' -ErrorAction SilentlyContinue)
-if ($tokens.Count -eq 0) { Cmd "icacls $Repo/build/meowdoku/admin_token.txt /grant ${Name}:(R)   (no admin_token*.txt present now)" }
+$tokens = @(Get-ChildItem -Path $SecretsBase -Filter 'admin_token*.txt' -ErrorAction SilentlyContinue)
+if ($tokens.Count -eq 0) { Cmd "icacls $SecretsBase/admin_token.txt /grant ${Name}:(R)   (no admin_token*.txt present now)" }
 foreach ($f in $tokens) { Run 'icacls.exe' @($f.FullName, '/grant', "${Name}:(R)") }
-Run 'icacls.exe' @("$Repo/build/meowdoku/tls/key.pem", '/grant', "${Name}:(R)")
+Run 'icacls.exe' @("$SecretsBase/tls/key.pem", '/grant', "${Name}:(R)")
 Write-Host 'NOTE: key.pem keeps its existing entries (alber etc.); the service is only ADDED. Tighten by hand if desired.'
 Write-Host "NOTE: other operators' *.secret files under operator_credentials inherit Modify from build/; consider cutting inheritance there."
 
@@ -125,7 +133,7 @@ Cmd "sc.exe qc $Svc"
 if (-not $WhatIf) { sc.exe qc $Svc }
 Cmd "groups of ${Name}: Get-LocalGroup | where member"
 if (-not $WhatIf) { Get-LocalGroup | Where-Object { Get-LocalGroupMember -Group $_ -Member $Name -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Name }
-foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$Repo/build/meowdoku/tls/key.pem", $SecretFile)) {
+foreach ($d in @($Apache, "$Apache/logs", $Repo, "$Repo/build", $Nodus, "$Nodus/out", $Srv, "$SecretsBase/tls/key.pem", $SecretFile)) {
     Cmd "icacls $d  (lines matching $Name)"
     if (-not $WhatIf -and (Test-Path -LiteralPath $d)) { icacls.exe $d | Select-String -SimpleMatch $Name }
 }

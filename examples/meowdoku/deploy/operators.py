@@ -3,6 +3,7 @@
   python operators.py bootstrap --db build/meowdoku/accounts.db --users admin,codex,claude,guest_agent \\
                                 --secrets-dir build/meowdoku/operator_credentials
   python operators.py rotate <username> --db ... --secrets-dir ...
+  python operators.py bootstrap --state-dir C:/dev/Powershell/srv/state     (db = <state>/sql/accounts.db, secrets = <state>/secrets/operator_credentials)
 
 bootstrap: each missing account is created with a fresh ``secrets.token_urlsafe(32)`` password written ONLY to
 ``<secrets-dir>/<username>.secret`` (an existing secret file is never overwritten; the account is then left as it is).
@@ -25,6 +26,7 @@ sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "examples")) if p not in sys.p
 
 from meowdoku import accounts as accounts_mod        # noqa: E402
 from meowdoku import authz as authz_mod              # noqa: E402
+from meowdoku.state_paths import StatePaths          # noqa: E402
 
 BOOTSTRAP = "operator:bootstrap"
 
@@ -90,14 +92,24 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="operators.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("bootstrap")
-    p.add_argument("--db", required=True)
+    p.add_argument("--db")
     p.add_argument("--users", default="admin,codex,claude,guest_agent")
-    p.add_argument("--secrets-dir", required=True)
+    p.add_argument("--secrets-dir")
+    p.add_argument("--state-dir", help="the state root: replaces --db and --secrets-dir")
     p = sub.add_parser("rotate")
     p.add_argument("username")
-    p.add_argument("--db", required=True)
-    p.add_argument("--secrets-dir", required=True)
+    p.add_argument("--db")
+    p.add_argument("--secrets-dir")
+    p.add_argument("--state-dir", help="the state root: replaces --db and --secrets-dir")
     args = ap.parse_args(argv)
+    if args.state_dir:
+        if args.db or args.secrets_dir:
+            ap.error("--state-dir replaces --db and --secrets-dir; give either, not both")
+        paths = StatePaths(Path(args.state_dir))
+        args.db, args.secrets_dir = str(paths.accounts_db), str(paths.operator_credentials_dir)
+        paths.sql_dir.mkdir(parents=True, exist_ok=True)
+    elif not (args.db and args.secrets_dir):
+        ap.error("give --state-dir, or both --db and --secrets-dir")
     try:
         if args.cmd == "bootstrap":
             lines = bootstrap(Path(args.db), [u.strip() for u in args.users.split(",") if u.strip()], Path(args.secrets_dir))

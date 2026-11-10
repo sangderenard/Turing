@@ -4,14 +4,16 @@ Apache starts deploy\apache_supervisor.py as the 443 vhost's piped CustomLog pro
 launches the Meowdoku and Nodus instances in instances.json and supervises them until Apache closes its stdin (Stop-Apache.ps1).
 Do not also run Start-Meowdoku.ps1 for an instance listed in instances.json: a port that already has a listener is left alone (state 'external').
 #>
-param([switch]$WhatIf, [int]$InstanceTimeout = 300, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb)
+param([switch]$WhatIf, [int]$InstanceTimeout = 300, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -53,7 +55,7 @@ $settled = @('running', 'external', 'skipped', 'failed')
 $rows = @()
 for ($i = 0; $i -lt $InstanceTimeout; $i += 2) {
     Start-Sleep -Seconds 2
-    $json = & $Python $Sup --status 2>$null
+    $json = & $Python $Sup --status @SupArgs 2>$null
     if ($LASTEXITCODE -eq 0 -and $json) { $rows = @($json | ConvertFrom-Json) }
     if ($rows.Count -gt 0 -and -not ($rows | Where-Object { $settled -notcontains $_.state })) { break }
 }

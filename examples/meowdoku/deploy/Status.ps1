@@ -1,12 +1,14 @@
 <#  Listeners on 80/443/8766/8767/8768 with owning PID and process name. Read-only. #>
-param([switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb)
+param([switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -35,7 +37,7 @@ $Python = $ServicePython
 $Sup = Join-Path $PSScriptRoot 'apache_supervisor.py'
 Write-Host "cmd: $Python $Sup --status"
 $env:PYTHONUTF8 = '1'
-$json = & $Python $Sup --status 2>$null
+$json = & $Python $Sup --status @SupArgs 2>$null
 if ($LASTEXITCODE -eq 0 -and $json) {
     $inst = @($json | ConvertFrom-Json)
     if ($inst.Count) { $inst | Format-Table name, kind, port, route, state, pid, restarts, supervisor_pid -AutoSize } else { Write-Host 'Supervisor table is empty.' }

@@ -1,14 +1,16 @@
 <#
 .SYNOPSIS  Close the read-only console viewer opened by Open-Console.ps1. Stops only that frontend_shell.exe; never touches the host.
 #>
-param([Parameter(Mandatory)][string]$Instance, [switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb)
+param([Parameter(Mandatory)][string]$Instance, [switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -22,7 +24,7 @@ if ($__code -ne 0) { throw (($__gate | ForEach-Object { "$_" }) -join ' ') }
 Write-Host ($__gate -join ' ')
 # ---- end gate
 
-$PidFile = Join-Path $__repo "build\meowdoku\console-$Instance.pid"
+$PidFile = if ($StateDir) { Join-Path $StateDir "run\console-$Instance.pid" } else { Join-Path $__repo "build\meowdoku\console-$Instance.pid" }
 if (-not (Test-Path -LiteralPath $PidFile)) { Write-Host "No console recorded for $Instance."; return }
 $id = [int](Get-Content -LiteralPath $PidFile | Select-Object -First 1)
 $proc = Get-Process -Id $id -ErrorAction SilentlyContinue

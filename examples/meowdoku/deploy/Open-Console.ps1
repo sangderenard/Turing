@@ -2,14 +2,16 @@
 .SYNOPSIS  Open the read-only administrative console viewer (frontend_shell --attach) on a running Nodus instance.
 The viewer only reads: opening or closing it never touches the running graph. Close with Close-Console.ps1 -Instance <name>.
 #>
-param([Parameter(Mandatory)][string]$Instance, [switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb)
+param([Parameter(Mandatory)][string]$Instance, [switch]$WhatIf, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -23,18 +25,18 @@ if ($__code -ne 0) { throw (($__gate | ForEach-Object { "$_" }) -join ' ') }
 Write-Host ($__gate -join ' ')
 # ---- end gate
 
-$State = Join-Path $__repo 'build\meowdoku'
+$State = if ($StateDir) { Join-Path $StateDir 'run' } else { Join-Path $__repo 'build\meowdoku' }
 $PidFile = Join-Path $State "console-$Instance.pid"
 $ServicePython = 'C:\dev\Powershell\srv\python\python.exe'
 if (-not (Test-Path -LiteralPath $ServicePython)) { $ServicePython = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe' }
 $Shell = 'C:/dev/Powershell/nodus/build-bridging/Release/frontend_shell.exe'
-$json = & $ServicePython (Join-Path $PSScriptRoot 'apache_supervisor.py') --status 2>$null
+$json = & $ServicePython (Join-Path $PSScriptRoot 'apache_supervisor.py') --status @SupArgs 2>$null
 if ($LASTEXITCODE -ne 0 -or -not $json) { throw 'REFUSED supervisor table unavailable.' }
 $row = @($json | ConvertFrom-Json) | Where-Object { $_.name -eq $Instance } | Select-Object -First 1
 if (-not $row) { throw "REFUSED no such instance: $Instance" }
 if ($row.state -ne 'running') { throw "REFUSED instance $Instance is not running (state $($row.state))." }
 if (-not $row.console_port) { throw "REFUSED instance $Instance has no console port." }
-$Token = Join-Path $State "operator_credentials\$Instance.console.secret"
+$Token = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$Instance.console.secret" } else { Join-Path $State "operator_credentials\$Instance.console.secret" }
 if (-not (Test-Path -LiteralPath $Token)) { throw "REFUSED console token file missing: $Token" }
 if (Test-Path -LiteralPath $PidFile) {
     $old = (Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)

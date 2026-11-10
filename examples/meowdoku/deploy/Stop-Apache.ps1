@@ -3,14 +3,16 @@
 httpd.exe -k stop first, falling back to Stop-Process on the httpd listener of 443 (and its httpd parent). Then waits up to 40 s for the
 supervisor table to show every instance stopped, falling back to Stop-Process on leftover instance pids from the table.
 #>
-param([switch]$WhatIf, [int]$InstanceTimeout = 40, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb)
+param([switch]$WhatIf, [int]$InstanceTimeout = 40, [string]$User = $env:MEOWDOKU_OPERATOR, [string]$PasswordFile, [string]$AccountsDb, [string]$StateDir)
 
 # ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
 $__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $StateDir) { $StateDir = $env:MEOWDOKU_STATE_DIR }   # empty = the old build\meowdoku layout
+$SupArgs = if ($StateDir) { @('--state-dir', $StateDir) } else { @() }
 if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
-if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $AccountsDb) { $AccountsDb = if ($StateDir) { Join-Path $StateDir 'sql\accounts.db' } else { Join-Path $__repo 'build\meowdoku\accounts.db' } }
 if (-not $PasswordFile) {
-    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    $__default = if ($StateDir) { Join-Path $StateDir "secrets\operator_credentials\$User.secret" } else { Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret" }
     if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
 }
 $__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
@@ -48,7 +50,7 @@ else {
 $env:PYTHONUTF8 = '1'
 $rows = @()
 for ($i = 0; $i -lt $InstanceTimeout; $i += 2) {
-    $json = & $Python $Sup --status 2>$null
+    $json = & $Python $Sup --status @SupArgs 2>$null
     if ($LASTEXITCODE -eq 0 -and $json) { $rows = @($json | ConvertFrom-Json) }
     $live = @($rows | Where-Object { $_.pid -and (Get-Process -Id $_.pid -ErrorAction SilentlyContinue) })
     if ($live.Count -eq 0 -and -not ($rows | Where-Object { @('running', 'starting', 'backoff', 'stopping') -contains $_.state })) { break }
