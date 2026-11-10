@@ -1,0 +1,17 @@
+Guest photo-read support (source-only, 2026-11-10)
+
+User request: "can you tweak that so there's a photo read and loading screens are guest if not signed in and should get photo read support"
+
+Narrow changes: authz.py adds photo_read to default tiers; access.py admits only exact photo GET routes through the shader/loading-screen gate. server.py uses photo_read for GET jobs/lenses/status/image/HDR/animation. Existing ownership and viewer restrictions stay. Read-only callers cannot use the legacy unindexed-job bypass; existing submitters retain their prior semantics. POST submit/cancel/live/retouch/film_preview gates are unchanged. Existing LAN edit-tier privileges are unchanged. web/access.js now retains role, signed_in and immutable capabilities from whoami, with guest/no-capabilities on lookup failure. No new public-photo marker or private-photo sharing is introduced.
+
+Validation: 59 tests passed, one deselected in the guest-photo, authz, job-library, public-login and access suites. The deselected pre-existing test_policy_file_is_reread_on_change starts a public IP lookup; the first broader run hit the network-policy block for api.ipify.org. All remaining tests used local/offline fixtures. Node tests/meowdoku_guest_access_check.mjs passed. py_compile and scoped git diff --check passed. New HTTP tests cover guest-owned reads, other browser/account refusals, unindexed legacy refusal, metadata/lens access, policy revocation, unchanged loading page/readiness, and mutation refusals. No full repository suite or visual browser QA claimed.
+
+No live state, service processes, ports, credentials, login source, deployment assets or configuration changed. No commit, push, publication, or restart. Shared server.py already had foreign edits; only the photo-read hunks were changed, verified against a saved pre-edit baseline in build/dot-guest-photo-read-baseline-20261110. Source will load on a future authorized coordinated backend restart; web/access.js still needs normal authorized publication. Operator lane owns restart/publication.
+
+Publication update 2026-11-10T21:36:08.824266+00:00
+
+The operator lane's subsequent 15:35 rollout loaded the backend photo_read changes. Read-only verification of live 8766 with the local CA and simulated outside Host/forwarding headers returned role guest, shader tier, capabilities photo_read/view_site, and GET photo jobs 200 empty.
+
+Following the user go-live direction, the existing authz.py script-auth gate accepted codex for the narrow Publish-GuestPhotoRead-access.js operation. Only stable build/meowdoku/web/access.js was atomically replaced after source/target hash checks, with a backup and guarded rollback on verification failure. TLS-verified backend GET and curl through https://stichka.duckdns.org with local --resolve both served exact SHA256 52495bdf0fbbde7c2a54272d246e954fd5442461668a0c3377787977fca05300. No insecure TLS option used. Node access metadata regression passed again. Receipt and prior bytes: build/dot-guest-photo-read-baseline-20261110/publication.json and live-access.js.before.
+
+No restart, Apache/config edits, login changes, Studio/pathing publish, or changes to development instance's separate access.js by this lane. Through-Apache check is local, not a real off-network device test. Existing anonymous LAN edit privileges (including photo_submit) remain unchanged; outside/loading-screen guest defaults gain only photo_read.

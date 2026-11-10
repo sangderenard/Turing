@@ -50,6 +50,9 @@ INTEGRATION SPEC (server.py is not in this branch).  Build the principal once in
     ~1423 /api/action single EDIT_ACTIONS require_tier edit        same                                     owner_tools
     new   account admin endpoints (grant/revoke/list)              role management                          account_manage
 
+PHOTO READ.  All default tiers allow photo_read; photo GETs retain their identity checks.
+A read-only caller cannot read unindexed legacy photos. Rendering and mutations still require photo_submit/share_live.
+
 COMPILE SUBMIT.  ``compile_submit`` (POST /api/mathlab/jobs: spend the single math-lab worker's compile time) is granted by NO tier, only by
 the roles member, operator, service and admin, so a guest or an anonymous LAN visitor (tier edit) cannot submit.
 

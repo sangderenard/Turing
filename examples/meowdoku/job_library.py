@@ -41,12 +41,13 @@ def claim(directory,digest,owners):
             db.execute('INSERT INTO job_owners VALUES (?,?,?)',(digest,json.dumps(sorted(set(owners))),time.time()))
 
 
-def allowed(directory,digest,owners):
+def allowed(directory,digest,owners,*,allow_legacy=True):
     with connect(directory) as db:
         row=db.execute('SELECT owners FROM job_owners WHERE digest=?',(digest,)).fetchone()
     # Legacy unindexed jobs keep their existing access semantics, but are not
-    # enumerated to strangers. No guessing/importing ownership from a digest.
-    return row is None or bool(set(json.loads(row[0])).intersection(owners))
+    # enumerated to strangers. New read-only callers must pass allow_legacy=False.
+    # No guessing/importing ownership from a digest.
+    return allow_legacy if row is None else bool(set(json.loads(row[0])).intersection(owners))
 
 
 def entries(jobs,owners,account_digests=()):
