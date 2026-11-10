@@ -529,9 +529,37 @@ def list_peers(db_path) -> list[dict]:
 
 
 # ---- CLI ------------------------------------------------------------------------------------------------------------------
+MIN_CLI_PASSWORD = 12
+
+
+def _cli_password(args, username: str) -> str:
+    """The password for set-password / create-user: --password-file, or two getpass prompts (--prompt).  Never echoed, never printed."""
+    import getpass
+    if args.password_file:
+        password = Path(args.password_file).read_text(encoding="utf-8").strip()
+    elif args.prompt:
+        password = getpass.getpass(f"new password for {username}: ")
+        if getpass.getpass("again: ") != password:
+            raise AuthzError("the two entries differ", 400)
+    else:
+        raise AuthzError("no credential: pass --prompt or --password-file", 400)
+    if len(password) < MIN_CLI_PASSWORD:
+        raise AuthzError(f"password must be at least {MIN_CLI_PASSWORD} characters", 400)
+    return password
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="authz.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("set-password", "create-user"):
+        p = sub.add_parser(name)
+        p.add_argument("username")
+        p.add_argument("--db", required=True)
+        p.add_argument("--prompt", action="store_true", help="read the password with getpass (twice)")
+        p.add_argument("--password-file", default=None)
+        if name == "create-user":
+            p.add_argument("--role", choices=("member", "operator", "admin"), required=True)
+            p.add_argument("--granted-by", required=True, help="operator:<name>")
     for name in ("grant-admin", "revoke-admin"):
         p = sub.add_parser(name)
         p.add_argument("username")
@@ -579,7 +607,27 @@ def main(argv=None) -> int:
     p.add_argument("--policy", default=None)
     args = ap.parse_args(argv)
     try:
-        if args.cmd == "grant-admin":
+        if args.cmd == "set-password":
+            accounts = _accounts_module()
+            password = _cli_password(args, args.username)
+            acc = accounts.Accounts(Path(args.db))
+            try:
+                acc.set_password(args.username, password)
+            except accounts.AccountError as error:
+                raise AuthzError(str(error), error.status)
+            print(f"OK {args.username}")
+        elif args.cmd == "create-user":
+            accounts = _accounts_module()
+            password = _cli_password(args, args.username)
+            acc = accounts.Accounts(Path(args.db))
+            try:
+                acc.ensure_user(args.username, password)
+                acc.set_password(args.username, password)
+            except accounts.AccountError as error:
+                raise AuthzError(str(error), error.status)
+            grant_role(args.db, args.username, args.role, args.granted_by)
+            print(f"OK {args.username}")
+        elif args.cmd == "grant-admin":
             print(f"admin granted to {args.username} (user {grant_admin(args.db, args.username, args.granted_by)})")
         elif args.cmd == "revoke-admin":
             print(f"admin revoked from {args.username} (user {revoke_admin(args.db, args.username, args.granted_by)})")

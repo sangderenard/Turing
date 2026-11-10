@@ -76,6 +76,7 @@ from meowdoku import obj_assets as obj_assets_mod
 from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE] immutable saved designs
 from meowdoku import marble_photo as marble_photo_mod  # noqa: E402  [MARBLE PHOTO] Spectral worker process
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
+from meowdoku import login_guard as login_guard_mod  # noqa: E402  [LOGIN] brute-force limits for /api/account/login
 from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real password login, SQLite-backed, separate from profiles.py
 from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
@@ -506,8 +507,15 @@ def make_handler(sessions: Sessions):
         # peer is a trusted proxy (proxy_trust.py), whose X-Forwarded-For names the real client; a header from any other peer is never read.
         def _classify(self) -> None:
             client_ip, self._scheme, self._via_proxy = proxy_trust_mod.client_origin(self.client_address[0], self.headers)
-            self._origin, self._tier = sessions.access.decide(client_ip, self.headers.get("Host"))
+            self._client_ip = client_ip
+            self._origin, self._origin_tier = sessions.access.decide(client_ip, self.headers.get("Host"))
+            self._tier = self._origin_tier
             self._principal_cache = None
+            if self._origin_tier == "shader":                    # [LOGIN] a signed-in account lifts the shader lock; its caps still come from its role
+                account = self._account()
+                lift = {"member": "play", "service": "play", "operator": "dev", "admin": "edit"}
+                if account is not None:
+                    self._tier = lift.get(authz_mod.role_of(sessions.accounts_db, account["id"]), "shader")
 
         # ---- [AUTHZ] the request's principal and its capabilities (authz.py); built lazily after _classify
         def _principal(self):
@@ -546,20 +554,79 @@ def make_handler(sessions: Sessions):
                 self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                 return None
 
+        def _login_post(self) -> None:
+            """[LOGIN] POST /api/account/login: JSON only, rate-limited per client/username (login_guard.py), uniform failure body."""
+            self._set_cookie = []
+            if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                self.close_connection = True
+                return self._json({"error": "expected application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 1024:
+                return self._json({"error": "expected {\"username\", \"password\"}"}, HTTPStatus.BAD_REQUEST)
+            try:
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("expected an object")
+                username, password = str(body.get("username", "")), str(body.get("password", ""))
+            except (ValueError, TypeError):
+                return self._json({"error": "expected {\"username\", \"password\"}"}, HTTPStatus.BAD_REQUEST)
+            client = self._client_ip
+            db = login_guard_mod.connect(sessions.accounts_db)
+            try:
+                wait = login_guard_mod.check(db, client, username)
+                if wait:
+                    out = json.dumps({"error": "too many attempts", "retry_after": int(wait)}).encode("utf-8")
+                    self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(out)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Retry-After", str(int(wait)))
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
+                try:
+                    user = sessions.accounts.login(username, password)
+                except accounts_mod.AccountError:                 # wrong password, unknown user and a malformed name look the same
+                    login_guard_mod.record(db, client, username, False)
+                    time.sleep(0.25)
+                    return self._json({"error": "wrong username or password"}, HTTPStatus.UNAUTHORIZED)
+                login_guard_mod.record(db, client, username, True)
+            finally:
+                db.close()
+            self._bind_instance(user["id"])
+            self._set_account_cookie(sessions.accounts.create_session(user["id"]))
+            from http.cookies import SimpleCookie
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            held = jar[PLAYER_COOKIE].value if PLAYER_COOKIE in jar else None
+            name = sessions.profiles.by_token(held) if held else None
+            if name:
+                sessions.accounts.claim(user["id"], "profile", name)
+            return self._json({"account": user})
+
         def _shader_request(self, path: str, method: str) -> bool:
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
+            if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
+                return False                                   # [LOGIN] served by do_POST's login/logout branches
+            if method == "POST" and path == "/api/account/signup":
+                self.close_connection = True
+                self._set_cookie = []
+                self._json({"error": "sign-up is closed here"}, HTTPStatus.FORBIDDEN)
+                return True
             if method != "GET":
                 self.close_connection = True
                 self._set_cookie = []
                 self._json({"error": "shader tier"}, HTTPStatus.FORBIDDEN)
                 return True
-            if path in access_mod.SHADER_APIS:
+            if path in access_mod.SHADER_APIS or path in access_mod.SHADER_LOGIN_GETS:
                 return False                                   # served below (/api/ready is reduced for this tier)
             if path.startswith("/api/") or path.startswith("/ws"):
                 self._set_cookie = []
                 self._json({"error": "shader tier"}, HTTPStatus.FORBIDDEN)
                 return True
-            if path not in access_mod.SHADER_FILES:
+            if path not in access_mod.SHADER_FILES and path not in access_mod.SHADER_LOGIN_FILES:
                 self.path = access_mod.SHADER_PAGE                # any other page address is the shader page
             super().do_GET()
             return True
@@ -656,7 +723,9 @@ def make_handler(sessions: Sessions):
             self._json({"origin": self._origin, "tier": self._tier,
                         "dev": "dev_ui" in caps, "edit": "owner_tools" in caps,
                         "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
-                        "instance": sessions.instance or None})
+                        "instance": sessions.instance or None,
+                        "signed_in": self._principal().user_id is not None, "username": self._principal().username,
+                        "origin_tier": self._origin_tier})
 
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
@@ -1599,8 +1668,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error":str(error)},getattr(error,"status",400))
             self._classify()                                      # [ACCESS]
             if self._tier == "shader":
-                self._shader_request(path0, "POST")
-                return
+                if self._shader_request(path0, "POST"):
+                    return
             if path0.startswith("/api/mathlab/"):              # [MATHLAB]
                 return self._mathlab_post(path0)
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
@@ -1772,6 +1841,8 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.marble_photos.cancel(digest))
                 except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 == "/api/account/login":
+                return self._login_post()
             if path0 in ("/api/account/signup", "/api/account/login"):
                 length = int(self.headers.get("Content-Length") or 0)
                 if length <= 0 or length > 1024:

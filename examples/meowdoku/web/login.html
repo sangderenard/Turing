@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:24rem; margin:0 auto; padding:2rem 16px 4rem; }
+  h1 { font-size:1.3rem; margin:0 0 1rem; }
+  label { display:block; margin:.7rem 0 .2rem; color:var(--mut); }
+  input { width:100%; box-sizing:border-box; font:inherit; padding:.5rem .6rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  button { font:inherit; padding:.45rem 1.1rem; margin-top:1rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .bad { color:var(--bad); } .ok { color:var(--ok); } .mut { color:var(--mut); }
+  ul { padding-left:1.2rem; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sign in</h1>
+  <form id="form" autocomplete="on">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button id="submit" type="submit">Sign in</button>
+  </form>
+  <section id="who" hidden>
+    <p>Signed in as <strong id="name"></strong> (<span id="role"></span>).</p>
+    <ul>
+      <li><a href="/">Main page</a></li>
+      <li><a href="/mathlab.html">Math lab</a></li>
+    </ul>
+    <button id="signout" type="button">Sign out</button>
+  </section>
+  <p id="status" class="mut" role="status"></p>
+</main>
+<script src="login.js"></script>
+</body>
+</html>

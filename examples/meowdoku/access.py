@@ -68,6 +68,10 @@ LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
 # The shader tier's whole world: these files (the page, the panel script that draws the animation, its decoder) and three small APIs.
 SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js")
 SHADER_PAGE = "/shader.html"
+# Public sign-in: the only other things the shader tier may reach (server.py _shader_request / _login_post).  Sign-up stays closed.
+SHADER_LOGIN_FILES = ("/login.html", "/login.js")
+SHADER_LOGIN_GETS = ("/api/account/me",)
+SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
 SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim")
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.

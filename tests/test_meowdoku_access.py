@@ -182,7 +182,7 @@ def test_whoami_reports_the_tier_and_nothing_else(tiered):
         set_tier(tier)
         status, who = _get(port, "/api/whoami", {"X-Secret": "abc"})
         assert status == 200 and who["tier"] == tier and who["origin"] == "lan"
-        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities"}
+        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities", "instance", "signed_in", "username", "origin_tier"}
         assert who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev")) and who["shader"] == (tier == "shader")
 
 
