@@ -44,5 +44,6 @@
       },
       "python": "C:/dev/Powershell/srv/python/python.exe"
     }
-  ]
+  ],
+  "state_dir": "C:/dev/Powershell/srv/state"
 }

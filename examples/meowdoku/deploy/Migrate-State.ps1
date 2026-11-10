@@ -46,7 +46,7 @@ if ($DryRun -or $WhatIf) { return }
 
 Write-Host ''
 Write-Host 'Follow-up (nothing below has been done):'
-Write-Host "  1. instances.json (object form): set top-level  ""state_dir"": ""$($StateDir -replace '\','/')"""
+Write-Host "  1. instances.json (object form): set top-level  ""state_dir"": ""$($StateDir.Replace('\','/'))"""
 Write-Host "  2. set the environment for the scripts:  `$env:MEOWDOKU_STATE_DIR = '$StateDir'  (and persist it for the service account)"
 Write-Host '  3. Start-Apache.ps1'
 Write-Host "  Rollback: Rollback-State.ps1 (prints it); $LegacyBase is untouched."
