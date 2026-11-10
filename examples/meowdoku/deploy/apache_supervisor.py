@@ -54,7 +54,7 @@ EXIT_RESTART = lifecycle_mod.EXIT_RESTART
 DDL = """
 CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT,
     account_user_id INTEGER NOT NULL, pid INTEGER, state TEXT NOT NULL, started REAL, stopped REAL,
-    restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER);
+    restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER, console_port INTEGER);
 CREATE TABLE IF NOT EXISTS instance_leases (name TEXT NOT NULL, lease_id INTEGER NOT NULL, product_sha256 TEXT NOT NULL,
     generation INTEGER NOT NULL, PRIMARY KEY(name, lease_id));
 CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL);
@@ -72,6 +72,8 @@ def connect(db_path):
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(DDL)
+        if "console_port" not in {r[1] for r in db.execute("PRAGMA table_info(service_instances)")}:
+            db.execute("ALTER TABLE service_instances ADD COLUMN console_port INTEGER")   # tables made before the console existed
         with db:
             yield db
     finally:
@@ -114,6 +116,11 @@ def listening(port, host="127.0.0.1") -> bool:
         return False
 
 
+def console_secret_path(state_dir, name) -> Path:
+    """Per-run read-only-console token file: <state>/operator_credentials/<instance>.console.secret (the operators.py secrets dir)."""
+    return Path(state_dir) / "operator_credentials" / f"{name}.console.secret"
+
+
 def _abs(path):
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
@@ -132,6 +139,35 @@ class Instance:
         self.backoff, self.next_start, self.deadline = 1.0, 0.0, 0.0
         self.logfile = None
         self.skip_reason = None
+        self.console_port = None  # the port the host reported on its first JSON line
+
+    def console_requested(self) -> bool:
+        n = self.spec.get("nodus") or {}
+        return self.kind == "nodus" and (n.get("console_port", self.spec.get("console_port")) is not None)
+
+    def console_token_path(self) -> Path:
+        return console_secret_path(self.sup.state_dir, self.name)
+
+    def write_console_token(self):
+        """A fresh token for this run (overwritten on every launch), in the restricted secrets dir."""
+        path = self.console_token_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.sup.secrets_restricted:
+            self.sup.secrets_restricted = True
+            sys.path[:0] = [p for p in (str(HERE),) if p not in sys.path]
+            import operators as operators_mod            # noqa: E402  (the same icacls restriction operators.py applies)
+            self.sup.log(operators_mod._restrict(path.parent))
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secrets.token_urlsafe(32))
+
+    def remove_console_token(self):
+        if self.console_requested():
+            try:
+                self.console_token_path().unlink()
+            except OSError:
+                pass
+        self.console_port = None
 
     # ---- command
     def command(self):
@@ -147,6 +183,9 @@ class Instance:
             argv = [py, n["tool"], "--canvas", str(_abs(n["canvas"])), "--rate", str(n.get("rate", 60))]
             for a in n.get("acquire", []):
                 argv += ["--acquire", a]
+            if self.console_requested():
+                cp = n.get("console_port", self.spec.get("console_port"))
+                argv += ["--console-port", str(int(cp)), "--console-token-file", str(self.console_token_path())]
             return argv + list(self.spec.get("args", []))
         # "python -c" style stand-ins (tests): kind 'command' is not shipped; args is the full argv
         return list(self.spec.get("args", []))
@@ -213,6 +252,8 @@ class Instance:
     # ---- process
     def launch(self):
         self.sup.log_dir.mkdir(parents=True, exist_ok=True)
+        if self.console_requested():
+            self.write_console_token()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.logfile = self.sup.log_dir / f"{self.name}-{stamp}.log"
         out = open(self.logfile, "ab")
@@ -233,6 +274,11 @@ class Instance:
         try:
             for line in self.logfile.read_text(encoding="utf-8", errors="replace").splitlines():
                 if self.kind == "nodus" and line.startswith("{") and "contract_ports" in line:
+                    if self.console_requested():
+                        try:
+                            self.console_port = json.loads(line).get("console_port")
+                        except ValueError:
+                            self.console_port = None
                     return True
                 if self.kind == "command" and line.strip():
                     return True
@@ -241,8 +287,10 @@ class Instance:
         return False
 
     def record(self, **fields):
-        cols = {"state": self.state, "pid": self.proc.pid if self.proc and self.proc.poll() is None else None,
-                "restarts": len(self.starts), "supervisor_pid": os.getpid(), **fields}
+        alive = bool(self.proc and self.proc.poll() is None)
+        cols = {"state": self.state, "pid": self.proc.pid if alive else None,
+                "restarts": len(self.starts), "supervisor_pid": os.getpid(),
+                "console_port": self.console_port if alive or self.state == "starting" else None, **fields}
         sets = ", ".join(f"{k} = ?" for k in cols)
         with connect(self.sup.db_path) as db:
             db.execute("INSERT OR IGNORE INTO service_instances (name, kind, port, route, account_user_id, state) VALUES (?,?,?,?,?,?)",
@@ -281,6 +329,7 @@ class Instance:
                 self.sup.log(f"{self.name}: scheduled exit ({code}); relaunching")
                 self.launch()
                 return
+            self.remove_console_token()
             self.starts = [t for t in self.starts if now - t < RESTART_WINDOW]
             if len(self.starts) >= MAX_RESTARTS:
                 self.state = "failed"
@@ -347,6 +396,7 @@ class Instance:
                 self.proc.wait(5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        self.remove_console_token()
         if self.uid is not None and self.state not in ("skipped", "external"):
             self.return_leases()
             self.state = "stopped"
@@ -359,6 +409,7 @@ class Supervisor:
         self.log_dir = self.state_dir / "logs"
         self.stop = threading.Event()
         self.instances = []
+        self.secrets_restricted = False
         self._lock_file = None
 
     def log(self, text):
@@ -401,7 +452,8 @@ class Supervisor:
             inst = Instance(spec, self)
             reason = inst.check()
             out.append({"name": inst.name, "kind": inst.kind, "account": spec.get("account"), "port": inst.port,
-                        "route": inst.route, "leases": spec.get("leases", []),
+                        "route": inst.route, "console_port": (spec.get("nodus") or {}).get("console_port", spec.get("console_port")),
+                        "leases": spec.get("leases", []),
                         "command": inst.command() if not reason else None, "skipped": reason})
         return out
 

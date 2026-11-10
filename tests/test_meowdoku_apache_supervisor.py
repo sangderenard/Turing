@@ -139,3 +139,58 @@ def test_instance_python_field_selects_interpreter(tmp_path):
     assert out.returncode == 0, out.stderr
     command = json.loads(out.stdout)["instances"][0]["command"]
     assert command[0] == sys.executable
+
+
+_NODUS_STUB = """import json, os, sys, time
+open(sys.argv[0] + '.argv', 'w').write(json.dumps(sys.argv[1:]))
+tok = sys.argv[sys.argv.index('--console-token-file') + 1]
+open(sys.argv[0] + '.tokseen', 'w').write(str(os.path.exists(tok)))
+print(json.dumps({"canvas": sys.argv[sys.argv.index('--canvas') + 1], "contract_ports": [], "console_port": 47699, "pid": os.getpid()}), flush=True)
+time.sleep(120)
+"""
+
+
+def test_nodus_console_token_port_and_cleanup(tmp_path):
+    tool = tmp_path / "stub_canvas.py"
+    tool.write_text(_NODUS_STUB, encoding="utf-8")
+    canvas = tmp_path / "x.canvas"
+    canvas.write_text("canvas", encoding="utf-8")
+    spec = {"name": "nodus-stub", "kind": "nodus", "port": None, "route": "", "bind": "127.0.0.1", "account": "svc-nodus-stub",
+            "args": [], "leases": [], "python": sys.executable,
+            "nodus": {"tool": str(tool), "canvas": str(canvas), "acquire": [], "rate": 1, "console_port": 0}}
+    db, state, inst = _setup(tmp_path, spec)
+    token = state / "operator_credentials" / "nodus-stub.console.secret"
+    plan = subprocess.run(_cmd(db, state, inst, "--once", "--dry-run"), capture_output=True, text=True, timeout=60)
+    command = json.loads(plan.stdout)["instances"][0]["command"]
+    assert command[command.index("--console-port") + 1] == "0" and command[command.index("--console-token-file") + 1] == str(token)
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        row = _wait(lambda: next((r for r in _rows(db, "SELECT * FROM service_instances") if r["state"] == "running"), None))
+        assert row["console_port"] == 47699
+        assert token.exists() and len(token.read_text(encoding="utf-8")) >= 32
+        argv = json.loads(Path(str(tool) + ".argv").read_text(encoding="utf-8"))
+        assert "--console-port" in argv and argv[argv.index("--console-token-file") + 1] == str(token)
+        assert Path(str(tool) + ".tokseen").read_text(encoding="utf-8") == "True"   # the file existed before the host started
+        status = subprocess.run(_cmd(db, state, inst, "--status"), capture_output=True, text=True, timeout=60)
+        assert json.loads(status.stdout)[0]["console_port"] == 47699
+        proc.stdin.close()
+        assert proc.wait(timeout=45) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
+    assert not token.exists()
+    assert _rows(db, "SELECT console_port, state FROM service_instances")[0] == {"console_port": None, "state": "stopped"}
+
+
+def test_console_port_column_added_to_old_table(tmp_path):
+    db = tmp_path / "accounts.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE service_instances (name TEXT PRIMARY KEY, kind TEXT NOT NULL, port INTEGER, route TEXT, "
+                 "account_user_id INTEGER NOT NULL, pid INTEGER, state TEXT NOT NULL, started REAL, stopped REAL, "
+                 "restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER)")
+    conn.commit(); conn.close()
+    for _ in range(2):                                    # idempotent
+        out = subprocess.run([sys.executable, str(SUP), "--db", str(db), "--status"], capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+    assert "console_port" in {r["name"] for r in _rows(db, "PRAGMA table_info(service_instances)")}

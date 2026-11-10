@@ -35,6 +35,7 @@
           "gui.proof:4"
         ],
         "rate": 60,
+        "console_port": 47612,
         "dll": "C:/dev/Powershell/nodus/build-service/Release/nodus_headless.dll",
         "path_prepend": [
           "C:/dev/Powershell/srv/python/Lib/site-packages/torch/lib",
