@@ -164,7 +164,7 @@ def diagnostics(db, paths, name, lines: int = 80) -> dict:
     except (TypeError, ValueError):
         want = 80
     logs = Path(paths.logs_dir)
-    pattern = re.compile(r"^" + re.escape(name) + r"-[\w.]+\.log$")
+    pattern = re.compile(r"^" + re.escape(name) + r"-\d{8}-\d{6}\.log$")   # the supervisor's stamp: <name>-YYYYMMDD-HHMMSS.log
     candidates = []
     try:
         candidates = [p for p in logs.iterdir() if pattern.match(p.name) and p.is_file()]

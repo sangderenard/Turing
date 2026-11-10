@@ -96,7 +96,7 @@ def seeded(server):
     db.close()
     logs = Path(server.sessions.state.logs_dir)
     logs.mkdir(parents=True, exist_ok=True)
-    (logs / "dev-test-20260101.log").write_text("\n".join(["line %d" % i for i in range(300)] + ["login token=abc ok", "password: hunter2"]), encoding="utf-8")
+    (logs / "dev-test-20260101-120000.log").write_text("\n".join(["line %d" % i for i in range(300)] + ["login token=abc ok", "password: hunter2"]), encoding="utf-8")
     pd._git_cache.clear()
     return server
 
@@ -140,7 +140,7 @@ def test_diagnostics_refusals_scrub_and_cap(seeded):
     assert _call(seeded.port, "/api/profile/diagnostics?name=..%2F..%2Fetc%2Fpasswd", headers=h)[0] in (400, 404)
     assert _call(seeded.port, "/api/profile/diagnostics?name=..%5Cx", headers=h)[0] in (400, 404)
     status, _, body = _call(seeded.port, "/api/profile/diagnostics?name=dev-test&lines=9999", headers=h)
-    assert status == 200 and len(body["lines"]) <= 200 and body["log"] == "dev-test-20260101.log"
+    assert status == 200 and len(body["lines"]) <= 200 and body["log"] == "dev-test-20260101-120000.log"
     text = "\n".join(body["lines"])
     assert "abc" not in text and "hunter2" not in text and "token=[scrubbed]" in text
     status, _, body = _call(seeded.port, "/api/profile/diagnostics?name=dev-test&lines=5", headers=h)
