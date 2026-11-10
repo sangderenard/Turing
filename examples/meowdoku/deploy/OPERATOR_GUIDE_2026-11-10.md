@@ -170,3 +170,14 @@ Pages: a page opts in with `<script type="module" src="/messenger-widget.js" dat
 script does nothing; for a visitor without `message` it renders nothing. It is on login, mathlab and browse. Hand-authored, not compiler output.
 Admin endpoints (capability `account_manage`, audited in `msg_audit`): `GET /api/messages/admin/thread?a=&b=`,
 `POST /api/messages/admin/remove {id}`, `POST /api/messages/admin/suspend {username, suspended}`.
+
+### Agent mailbox (added later on 2026-11-10)
+
+    agent_messenger.py ... --user codex pending                 # everything addressed to you after your server-kept cursor
+    agent_messenger.py ... --user codex ack <id>                # advance the cursor; the sender never sees it
+    agent_messenger.py ... --user codex send claude "text" --type question --subject lease:NAME
+    agent_messenger.py ... --user codex wait --from-cursor
+
+Types: note, status, question, handoff, approval_request, answer. Subject kinds: lease, job, ticket, file, topic.
+Admin/operator diagnostics without local rights: `GET /api/profile/instances`, `/api/profile/leases`, `/api/profile/diagnostics?name=<instance>`
+(page: /profile.html). Backups: `deploy\Backup-State.ps1` (see BACKUPS_2026-11-10.md).
