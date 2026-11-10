@@ -27,6 +27,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from meowdoku import schema_version as _schema_version
+except ImportError:      # loaded by path or run as a script: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("meowdoku_schema_version", Path(__file__).with_name("schema_version.py"))
+    _schema_version = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_schema_version)
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -80,6 +88,7 @@ def connect(db_path):
         db.execute(LOWERINGS)
         db.execute(BLOBS)
         db.execute(LEASES)
+        _schema_version.declare(db, "lowering_library", 1)
         with db:
             yield db
     finally:

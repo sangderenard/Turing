@@ -70,6 +70,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from meowdoku import schema_version as _schema_version
+except ImportError:      # loaded by path or run as a script: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("meowdoku_schema_version", Path(__file__).with_name("schema_version.py"))
+    _schema_version = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_schema_version)
+
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
         "share_live", "account_manage", "deploy_scripts", "federate")
 ROLES = ("admin", "member", "service", "operator", "guest")
@@ -115,6 +123,7 @@ CREATE TABLE IF NOT EXISTS script_audit (
     allowed INTEGER,
     host TEXT
 );
+CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS peer_grants (
     grant_id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer TEXT NOT NULL,
@@ -212,6 +221,11 @@ def _connect(db_path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        _schema_version.declare(conn, "authz", 1)       # first: a newer database is refused before this module writes anything
+    except _schema_version.SchemaVersionError:
+        conn.close()
+        raise
     conn.executescript(_DDL)
     sql = (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'account_roles'").fetchone() or [""])[0] or ""
     if "'operator'" not in sql:     # a table created before the service/operator roles: rebuild it with the wider CHECK (rows kept)
@@ -549,6 +563,8 @@ def main(argv=None) -> int:
     p.add_argument("--db", required=True)
     p = sub.add_parser("peer-list")
     p.add_argument("--db", required=True)
+    p = sub.add_parser("schema", help="print the schema_version rows (module, version, updated_at, writer)")
+    p.add_argument("--db", required=True)
     p = sub.add_parser("show")
     p.add_argument("username")
     p.add_argument("--db", required=True)
@@ -591,6 +607,13 @@ def main(argv=None) -> int:
                 state = "revoked" if g["revoked_at"] else ("expired" if g["expires_at"] <= time.time() else "live")
                 print(f"{g['grant_id']} {g['peer']} {g['direction']} {g['prefix']} ops={g['allowed_ops']} svc={g['service_user_id']} "
                       f"expires={time.strftime('%Y-%m-%d', time.localtime(g['expires_at']))} {state}")
+        elif args.cmd == "schema":
+            conn = sqlite3.connect(str(args.db), timeout=10)
+            try:
+                for module, version, at, writer in _schema_version.report(conn):
+                    print(f"{module} version={version} writer={writer} updated_at={at:.0f}")
+            finally:
+                conn.close()
         elif args.cmd == "show":
             conn = _connect(args.db)
             try:

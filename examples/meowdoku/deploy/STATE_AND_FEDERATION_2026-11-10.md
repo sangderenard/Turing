@@ -157,3 +157,11 @@ Decisions: the grant is the credential (service to service, no cookie); the rout
 Covered (stub contract port, ephemeral ports, temp state): Hello role/id as granted, peer Result reaches the port, Receipt returns, wrong secret / revoked / expired / wrong prefix / digest mismatch / no instance refused, a frame kind outside allowed_ops or a peer-sent Hello closes 1008 and never reaches the port, closing either side closes the other, `EnginePeer` runs over `PeerSocket`.
 
 Not covered: any real Nodus host or cross-machine run; the Apache wstunnel path (untested live, no TLS); NAT traversal, QoS and backpressure beyond the bounded WS/TCP buffers, durability or replay; the graph-definition digest is of the canvas file, not the canonical `GraphDefinition.to_mapping()` JSON, and the api digest omits logical_abi_digest per core (both are section 4's fuller design); no rate limiting of failed grants; a federated peer's own Hello in the Nodus console/ownership model is unexamined.
+
+## schema_version implemented
+
+`examples/meowdoku/schema_version.py` (`declare`, `report`, `SchemaVersionError`) is live. Table `schema_version(module, version, updated_at, writer)`; `writer` is the 12-char git head read from `.git/HEAD`. A stored version above the code's refuses (an older checkout never touches a newer database); lower is updated after the module's own forward migration; absent is inserted.
+
+Modules declared at version 1: `accounts` (accounts.Accounts), `authz` (authz._connect, declared before its DDL so a refusal writes nothing; now also owns `account_instances`), `lowering_library` (connect), `job_library` (connect; its own job-library.sqlite), `supervisor` (apache_supervisor.connect; service_instances, instance_leases). server.py no longer creates `account_instances`; it calls `authz._connect`. Inspect with `python authz.py schema --db accounts.db`.
+
+Rule for new tables: declare through `schema_version.declare(conn, "<module>", N)` in your module's connect(); bump N when the DDL changes incompatibly; one writer (module) per table.

@@ -6,12 +6,21 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+try:
+    from meowdoku import schema_version as _schema_version
+except ImportError:      # loaded by path or run as a script: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("meowdoku_schema_version", Path(__file__).with_name("schema_version.py"))
+    _schema_version = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_schema_version)
+
 
 @contextmanager
 def connect(directory):
     directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     db=sqlite3.connect(directory/'job-library.sqlite',timeout=10)
     db.execute('CREATE TABLE IF NOT EXISTS job_owners (digest TEXT PRIMARY KEY, owners TEXT NOT NULL, created REAL NOT NULL)')
+    _schema_version.declare(db,'job_library',1)
     try:
         with db:
             yield db

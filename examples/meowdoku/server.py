@@ -593,9 +593,9 @@ def make_handler(sessions: Sessions):
             if not sessions.instance:
                 return
             import sqlite3
+            authz_mod._connect(sessions.accounts_db).close()          # authz.py owns the account_instances DDL
             conn = sqlite3.connect(str(sessions.accounts_db), timeout=10)
             try:
-                conn.execute("CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL)")
                 conn.execute("INSERT OR IGNORE INTO account_instances (user_id, instance) VALUES (?, ?)", (user_id, sessions.instance))
                 conn.commit()
             finally:

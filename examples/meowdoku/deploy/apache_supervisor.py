@@ -16,7 +16,7 @@ from more than one process) stays a log sink.  A port that already has a listene
 
   python apache_supervisor.py --status                 # service_instances as JSON
   python apache_supervisor.py --once --dry-run         # print what would be done, change nothing
-Tables in accounts.db: service_instances, instance_leases, account_instances (users under an instance; written by server.py --instance).
+Tables in accounts.db: service_instances, instance_leases, account_instances (users under an instance; DDL owned by authz.py, written by server.py --instance).
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "examples")) if p not in sys.p
 
 from meowdoku import accounts as accounts_mod        # noqa: E402  (its own scrypt hashing; not duplicated here)
 from meowdoku import authz as authz_mod              # noqa: E402
+from meowdoku import schema_version as _schema_version   # noqa: E402
 from meowdoku import lifecycle as lifecycle_mod      # noqa: E402
 from meowdoku import lowering_library as lib         # noqa: E402
 from meowdoku.state_paths import StatePaths          # noqa: E402
@@ -58,7 +59,6 @@ CREATE TABLE IF NOT EXISTS service_instances (name TEXT PRIMARY KEY, kind TEXT N
     restarts INTEGER NOT NULL DEFAULT 0, supervisor_pid INTEGER, console_port INTEGER);
 CREATE TABLE IF NOT EXISTS instance_leases (name TEXT NOT NULL, lease_id INTEGER NOT NULL, product_sha256 TEXT NOT NULL,
     generation INTEGER NOT NULL, PRIMARY KEY(name, lease_id));
-CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL);
 """
 
 
@@ -75,6 +75,7 @@ def connect(db_path):
         db.executescript(DDL)
         if "console_port" not in {r[1] for r in db.execute("PRAGMA table_info(service_instances)")}:
             db.execute("ALTER TABLE service_instances ADD COLUMN console_port INTEGER")   # tables made before the console existed
+        _schema_version.declare(db, "supervisor", 1)
         with db:
             yield db
     finally:

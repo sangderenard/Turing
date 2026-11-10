@@ -33,6 +33,14 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from meowdoku import schema_version as _schema_version
+except ImportError:      # loaded by path or run as a script: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("meowdoku_schema_version", Path(__file__).with_name("schema_version.py"))
+    _schema_version = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_schema_version)
+
 USERNAME = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
 MIN_PASSWORD = 8
 SESSION_SECONDS = 30 * 24 * 3600
@@ -92,6 +100,7 @@ class Accounts:
                 PRIMARY KEY (asset_type, asset_key)
             );
         """)
+        _schema_version.declare(self._conn, "accounts", 1)
         self._conn.commit()
 
     # ---- identity -----------------------------------------------------------
