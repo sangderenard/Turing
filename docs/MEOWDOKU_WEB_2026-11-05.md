@@ -111,3 +111,15 @@ arena calls `ensure` once at its first start and writes
 `chess_net.pretrained.json`.  The download itself was not run from this
 session (the sandbox refused the fetch); the first arena start on the LAN
 server performs it, and `MEOWDOKU_NO_PRETRAIN=1` opts out.
+
+## Lowering library (2026-11-10)
+
+`examples/meowdoku/lowering_library.py` catalogues the lowerings (wasm, wgsl, c, llvm, fortran, spirv, cpython) of one
+computational core in the same SQLite file the server already opens (`accounts.db`). Two tables: `lowering_cores`
+(core_id, family, name, source_function, logical_abi_digest, source_digest, extraction_contract_sha256, first_seen) and
+`lowerings` (core_id, backend, contract, entry, api_path, abi_path, product_path, product_sha256, abi_schema, arch,
+verdict, scanned). Rows come only from each product's declared `turing-compiled-program-api-v1` YAML plus the JSON the
+writer pairs with it (`<stem>.abi.json`, or the `*.manifest.json` record naming the `.wgsl`); verdict is `built` or
+`described`, never `verified`. Scan: `python examples/meowdoku/lowering_library.py scan <web_dir> --db <accounts.db>`;
+read: `... list --db <accounts.db>`. Server integration (scan at startup into accounts.db; `/api/lowerings`) is pending
+in the live tree; server.py is not in this branch.
