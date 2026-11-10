@@ -64,6 +64,11 @@ class StatePaths:
     def access_json(self) -> Path:
         return self.sql_dir / "access.json"
 
+    # ---- jobs (source_divider: one directory per divide-and-lower job; legacy build/meowdoku/jobs)
+    @property
+    def jobs_dir(self) -> Path:
+        return self.root / "jobs"
+
     # ---- content
     @property
     def profiles_json(self) -> Path:

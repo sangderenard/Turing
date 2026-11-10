@@ -163,5 +163,8 @@ def test_supervisor_passes_state_dir_to_meowdoku_children(tmp_path):
     assert command[command.index("--state-dir") + 1] == str(tmp_path / "root")
     assert plan["db"] == str(tmp_path / "root" / "sql" / "accounts.db")
     assert not (tmp_path / "root").exists()                                            # a dry run creates nothing
-    legacy = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
+    # The shipped instances.json carries state_dir since the 2026-11-10 cutover, so the legacy check uses its own file.
+    bare = tmp_path / "bare.json"
+    bare.write_text(json.dumps({"instances": [spec]}), encoding="utf-8")
+    legacy = subprocess.run([sys.executable, str(SUP), "--instances", str(bare), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert "--state-dir" not in next(i for i in json.loads(legacy.stdout)["instances"] if i["kind"] == "meowdoku")["command"]
