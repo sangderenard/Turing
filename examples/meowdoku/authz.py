@@ -59,7 +59,10 @@ CLI: ``python authz.py grant-admin <user> --db accounts.db --granted-by operator
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 import sys
 import threading
@@ -68,7 +71,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts")
+        "share_live", "account_manage", "deploy_scripts", "federate")
 ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -79,15 +82,15 @@ DEFAULT_POLICY = {
         "shader": ["view_site"],
         "play": ["view_site", "play"],
         "dev": ["view_site", "play", "dev_ui"],
-        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts")],
+        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live"],
         # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
-        "service": ["studio_write", "photo_submit", "share_live", "library_manage"],
+        "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate"],
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
-        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin"],
+        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate"],
         "admin": list(CAPS),
         "guest": [],
     },
@@ -111,6 +114,19 @@ CREATE TABLE IF NOT EXISTS script_audit (
     script TEXT,
     allowed INTEGER,
     host TEXT
+);
+CREATE TABLE IF NOT EXISTS peer_grants (
+    grant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('host','engine')),
+    allowed_ops TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    issued_by TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    revoked_at REAL,
+    service_user_id INTEGER NOT NULL
 );
 """
 _lock = threading.Lock()
@@ -383,6 +399,118 @@ def script_auth(db_path, script: str, username: str, password_file=None, prompt:
     return allowed, reason
 
 
+# ---- [FEDERATE] peer grants: the credential a remote Nodus instance presents at /ws/contract/<prefix> (server.py) -------------
+FRAME_KINDS = {"offer": 1, "accept": 2, "result": 3, "receipt": 4, "hello": 5, "submit": 6, "admitted": 7, "route": 8, "decision": 9}
+DIRECTION_ROLE = {"host": 1, "engine": 2}          # the Nodus Hello role the bridge sends for the peer
+_PEER_COLUMNS = ("grant_id", "peer", "prefix", "direction", "allowed_ops", "issued_by", "created_at", "expires_at", "revoked_at",
+                 "service_user_id")
+
+
+def _peer_ops(allowed_ops) -> str:
+    """'result,receipt' / '3,4' / [3, 'receipt'] -> '3,4' (sorted frame-kind numbers).  Hello (5) is never grantable: the bridge sends it."""
+    items = allowed_ops.split(",") if isinstance(allowed_ops, str) else list(allowed_ops)
+    kinds = set()
+    for item in items:
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        kind = FRAME_KINDS.get(text) if not text.isdigit() else int(text)
+        if kind is None or not 1 <= kind <= 9:
+            raise AuthzError(f"unknown frame kind {item!r} (kinds 1-9 or {', '.join(FRAME_KINDS)})", 400)
+        if kind == 5:
+            raise AuthzError("hello cannot be granted: the bridge sends the Hello itself", 400)
+        kinds.add(kind)
+    if not kinds:
+        raise AuthzError("a grant needs at least one allowed frame kind", 400)
+    return ",".join(str(k) for k in sorted(kinds))
+
+
+def _secret_hash(secret: str) -> str:
+    """The secret is 256 random bits (token_urlsafe(32)), so a salted-scrypt stretch buys nothing; sha256 is compared in constant time."""
+    return hashlib.sha256(str(secret).encode("utf-8")).hexdigest()
+
+
+def _peer_row(row) -> dict:
+    return dict(zip(_PEER_COLUMNS, row))
+
+
+def grant_peer(db_path, peer: str, prefix: str, direction: str, allowed_ops, days: float, issued_by: str,
+               service_user=None) -> tuple[int, str]:
+    """Issue a federation grant -> (grant_id, secret).  The secret is returned once; only its hash is stored.
+    ``service_user`` (username or id; default: the account named ``peer``) must be a SERVICE-role account; its id becomes the Hello id."""
+    if direction not in DIRECTION_ROLE:
+        raise AuthzError("direction is 'host' (participant) or 'engine' (producer)", 400)
+    if not str(peer).strip() or not str(prefix).strip():
+        raise AuthzError("peer and prefix are required", 400)
+    if not float(days) > 0:
+        raise AuthzError("days must be positive", 400)
+    ops = _peer_ops(allowed_ops)
+    conn = _connect(db_path)
+    try:
+        who = peer if service_user is None else service_user
+        if isinstance(who, int) or str(who).isdigit():
+            row = conn.execute("SELECT id FROM users WHERE id = ?", (int(who),)).fetchone()
+            if row is None:
+                raise AuthzError(f"no such account id {who!r}", 404)
+            uid = row[0]
+        else:
+            uid = _user_id(conn, who)
+        role = (conn.execute("SELECT role FROM account_roles WHERE user_id = ?", (uid,)).fetchone() or ["member"])[0]
+        if role != "service":
+            raise AuthzError(f"account {uid} has role {role!r}; a peer grant needs a service account", 400)
+        secret, now = secrets.token_urlsafe(32), time.time()
+        cur = conn.execute("INSERT INTO peer_grants (peer, prefix, direction, allowed_ops, secret_hash, issued_by, created_at, "
+                           "expires_at, service_user_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                           (str(peer), str(prefix), direction, ops, _secret_hash(secret), str(issued_by), now,
+                            now + float(days) * 86400.0, uid))
+        conn.commit()
+        return cur.lastrowid, secret
+    finally:
+        conn.close()
+
+
+def revoke_peer(db_path, grant_id) -> bool:
+    """Revoke a grant (idempotent: the first revocation time stays).  False when there is no such grant."""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("UPDATE peer_grants SET revoked_at = COALESCE(revoked_at, ?) WHERE grant_id = ?", (time.time(), int(grant_id)))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def verify_peer(db_path, grant_id, secret, prefix, direction) -> dict | None:
+    """The grant row (no secret hash) when the secret matches and the grant is live, unrevoked and for exactly this prefix and
+    direction; else None (callers give no reason, so a probe learns nothing about which check failed)."""
+    try:
+        gid = int(grant_id)
+    except (TypeError, ValueError):
+        return None
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT " + ", ".join(_PEER_COLUMNS) + ", secret_hash FROM peer_grants WHERE grant_id = ?", (gid,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    grant, stored = _peer_row(row[:-1]), row[-1]
+    ok = hmac.compare_digest(_secret_hash(secret if isinstance(secret, str) else ""), stored)
+    if not ok or grant["revoked_at"] is not None or grant["expires_at"] <= time.time():
+        return None
+    if grant["prefix"] != prefix or grant["direction"] != direction:
+        return None
+    return grant
+
+
+def list_peers(db_path) -> list[dict]:
+    conn = _connect(db_path)
+    try:
+        return [_peer_row(r) for r in conn.execute("SELECT " + ", ".join(_PEER_COLUMNS) + " FROM peer_grants ORDER BY grant_id")]
+    finally:
+        conn.close()
+
+
 # ---- CLI ------------------------------------------------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="authz.py")
@@ -406,6 +534,20 @@ def main(argv=None) -> int:
     p.add_argument("--user", required=True)
     p.add_argument("--password-file", default=None)
     p.add_argument("--prompt", action="store_true", help="ask for the password on the console")
+    p.add_argument("--db", required=True)
+    p = sub.add_parser("peer-grant", help="issue a federation grant; the secret is printed once, on stdout, on the SECRET line")
+    p.add_argument("peer")
+    p.add_argument("--db", required=True)
+    p.add_argument("--prefix", required=True)
+    p.add_argument("--direction", choices=sorted(DIRECTION_ROLE), required=True)
+    p.add_argument("--ops", required=True, help="allowed frame kinds, comma list of numbers or names (not hello)")
+    p.add_argument("--days", type=float, required=True)
+    p.add_argument("--issued-by", required=True)
+    p.add_argument("--service-user", default=None, help="the local SERVICE account whose id is the Hello id (default: an account named PEER)")
+    p = sub.add_parser("peer-revoke")
+    p.add_argument("grant_id", type=int)
+    p.add_argument("--db", required=True)
+    p = sub.add_parser("peer-list")
     p.add_argument("--db", required=True)
     p = sub.add_parser("show")
     p.add_argument("username")
@@ -437,6 +579,18 @@ def main(argv=None) -> int:
                 print(f"REFUSED {reason}", file=sys.stderr)
                 return 3
             print(f"OK {args.user}")
+        elif args.cmd == "peer-grant":
+            gid, secret = grant_peer(args.db, args.peer, args.prefix, args.direction, args.ops, args.days, args.issued_by,
+                                     service_user=args.service_user)
+            print(f"grant {gid} issued to {args.peer} ({args.direction} on {args.prefix}); the secret is shown ONCE and cannot be recovered:")
+            print(f"SECRET {secret}")
+        elif args.cmd == "peer-revoke":
+            print(f"grant {args.grant_id} revoked" if revoke_peer(args.db, args.grant_id) else f"no grant {args.grant_id}")
+        elif args.cmd == "peer-list":
+            for g in list_peers(args.db):
+                state = "revoked" if g["revoked_at"] else ("expired" if g["expires_at"] <= time.time() else "live")
+                print(f"{g['grant_id']} {g['peer']} {g['direction']} {g['prefix']} ops={g['allowed_ops']} svc={g['service_user_id']} "
+                      f"expires={time.strftime('%Y-%m-%d', time.localtime(g['expires_at']))} {state}")
         elif args.cmd == "show":
             conn = _connect(args.db)
             try:

@@ -335,6 +335,10 @@ ACCOUNT_COOKIE = "meowdoku_account"    # a real login session token (accounts.py
                                        # both COOKIE (game-table) and PLAYER_COOKIE (passwordless name)
 
 
+class FederationUnavailable(Exception):
+    """[FEDERATE] this server fronts no Nodus instance (or its canvas is missing); the message is the refusal reason."""
+
+
 class Sessions:
     """session token -> that client's own Table; idle ones expire."""
 
@@ -368,6 +372,22 @@ class Sessions:
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
         self.obj_assets = obj_assets_mod.Store(self.state.obj_assets_dir, self.accounts, ROOT.parent / "spectral-analyzer")
         self.marble_objects.obj_assets = self.obj_assets
+
+    # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
+    federation_port: int | None = None          # --federation-port: the local Nodus host's 127.0.0.1 contract port (not read from the supervisor yet)
+    federation_canvas: str | None = None        # --federation-canvas: the running Nodus instance's canvas file
+
+    def federation_identity(self) -> dict:
+        """{"graph_definition_digest", "api_digests", "port"} of the Nodus instance this server fronts: sha256 of its canvas file and the
+        sorted ``module:entry`` pairs of every ``*.api.yaml`` under web_dir (federation_peer.identity_digests, the same function the peer
+        runs).  Raises FederationUnavailable with a reason when no instance is configured (no --federation-port/--federation-canvas)."""
+        from meowdoku import federation_peer
+        if not self.federation_port or not self.federation_canvas:
+            raise FederationUnavailable("no Nodus instance is configured for federation (--federation-port and --federation-canvas)")
+        if not Path(self.federation_canvas).is_file():
+            raise FederationUnavailable("the configured Nodus canvas file is missing")
+        return {**federation_peer.identity_digests(self.federation_canvas, self.web_dir), "port": int(self.federation_port)}
+    # ---- [FEDERATE end]
 
     def get(self, token: str | None) -> tuple[str, Table, bool]:
         now = time.time()
@@ -825,6 +845,168 @@ def make_handler(sessions: Sessions):
             self.close_connection = True      # the refused request's body is unread: the connection must not carry on
             self._json({"error": "this is a view-only link: it cannot send inputs or controls"}, HTTPStatus.FORBIDDEN)
 
+        # ---- [FEDERATE begin] ``/ws/contract/<prefix>``: a remote Nodus instance joins this instance's loopback contract port.
+        def _contract_socket(self, prefix: str) -> None:
+            """Bridge one WebSocket to the local contract port (STATE_AND_FEDERATION_2026-11-10.md section 4, phase 1).
+
+            CREDENTIAL.  The peer GRANT (authz.peer_grants; grant_id + secret) IS the credential -- service to service, no login cookie.
+            The route still sits behind the normal access tier: a shader-tier origin is refused by do_GET's shader gate before this
+            runs, and any other origin must hold ``view_site``.  Viewer links never reach it.  The grant names the prefix, the Nodus role
+            (host=participant 1 / engine=producer 2), the frame kinds the peer may send, an expiry, and the local SERVICE account whose
+            id becomes Hello.id (the peer cannot choose it).
+            FLOW.  1) the peer's first message is a JSON promise {grant_id, secret, direction, graph_definition_digest, api_digests};
+            2) the grant is verified, then the peer's digests must equal ``Sessions.federation_identity()`` (the local instance: canvas
+            sha256 + api.yaml module:entry pairs); the answer is {"ok":true,"hello_id":N} or {"ok":false,"reason":...} and a refusal
+            closes (1008); 3) the server connects to 127.0.0.1:<--federation-port>, writes the Hello itself and relays.  Binary messages
+            only, exactly 72 bytes each; a frame whose kind is outside the grant's allowed_ops (or Hello, or malformed) closes 1008.
+            Either side closing closes the other."""
+            import socket
+            import hmac
+            if not self._require("view_site"):
+                return
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+                return self._json({"error": "expected a WebSocket upgrade"}, HTTPStatus.BAD_REQUEST)
+            self._set_cookie = []
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_key(key))
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            wlock, done, upstream = threading.Lock(), threading.Event(), None
+
+            def send(opcode: int, payload: bytes) -> None:
+                with wlock:
+                    self.wfile.write(frame(opcode, payload))
+                    self.wfile.flush()
+
+            def close(code: int, reason: str = "") -> None:
+                try:
+                    send(0x8, struct.pack(">H", code) + reason.encode("utf-8")[:100])
+                except (OSError, ValueError):
+                    pass
+
+            def refuse(reason: str, code: int = 1008) -> None:
+                try:
+                    send(0x1, json.dumps({"ok": False, "reason": reason}).encode("utf-8"))
+                except (OSError, ValueError):
+                    pass
+                close(code)
+
+            def read(limit: int):
+                """The next data message (opcode, payload) within ``limit`` bytes, answering pings; None on close/EOF; "big" past the limit."""
+                while True:
+                    head = self.rfile.read(2)
+                    if len(head) < 2:
+                        return None
+                    fin, op, length = head[0] & 0x80, head[0] & 0x0F, head[1] & 0x7F
+                    if length == 126:
+                        length = struct.unpack(">H", self.rfile.read(2))[0]
+                    elif length == 127:
+                        length = struct.unpack(">Q", self.rfile.read(8))[0]
+                    if length > limit or not fin:
+                        return "big"
+                    mask = self.rfile.read(4) if head[1] & 0x80 else b""
+                    data = self.rfile.read(length)
+                    if len(data) < length:
+                        return None
+                    if mask:
+                        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+                    if op == 0x8:
+                        return None
+                    if op == 0x9:
+                        send(0xA, data)
+                        continue
+                    if op == 0xA:
+                        continue
+                    return op, data
+
+            try:
+                first = read(16384)
+                if first is None:
+                    return
+                if first == "big" or first[0] not in (0x1, 0x2):
+                    return refuse("the first message must be the JSON promise (at most 16 KiB)")
+                try:
+                    promise = json.loads(first[1].decode("utf-8"))
+                    direction = str(promise["direction"])
+                    grant = authz_mod.verify_peer(sessions.accounts_db, promise["grant_id"], promise["secret"], prefix, direction)
+                except (ValueError, KeyError, TypeError):
+                    return refuse("malformed promise")
+                if grant is None:
+                    print(f"[federation] refused grant for prefix {prefix!r} ({self.client_address[0]})", flush=True)
+                    return refuse("grant refused")
+                try:
+                    local = sessions.federation_identity()
+                except FederationUnavailable as error:
+                    return refuse(str(error))
+                mismatched = []
+                if not hmac.compare_digest(str(promise.get("graph_definition_digest")), str(local["graph_definition_digest"])):
+                    mismatched.append("graph_definition_digest")
+                if promise.get("api_digests") != local["api_digests"]:
+                    mismatched.append("api_digests")
+                if mismatched:
+                    return refuse("promise does not match this instance: " + ", ".join(mismatched) + " differ")
+                allowed = {int(k) for k in grant["allowed_ops"].split(",") if k}
+                try:
+                    upstream = socket.create_connection(("127.0.0.1", int(local["port"])), timeout=5.0)
+                    upstream.settimeout(None)
+                    # the bridge's Hello (kind 5: v0 role, v1 id, v2 version 2); the peer never sends one
+                    upstream.sendall(struct.pack("<II8Q", 0x31434E4E, 5, authz_mod.DIRECTION_ROLE[grant["direction"]],
+                                                 int(grant["service_user_id"]), 2, 0, 0, 0, 0, 0))
+                except OSError:
+                    return refuse("the local contract port is unreachable", 1011)
+                send(0x1, json.dumps({"ok": True, "hello_id": int(grant["service_user_id"])}).encode("utf-8"))
+                print(f"[federation] {grant['peer']} joined {prefix!r} as {grant['direction']} (id {grant['service_user_id']})", flush=True)
+
+                def downstream() -> None:                # contract port -> peer, whole 72-byte frames
+                    buffer = bytearray()
+                    try:
+                        while not done.is_set():
+                            data = upstream.recv(72 - len(buffer))
+                            if not data:
+                                break
+                            buffer.extend(data)
+                            if len(buffer) == 72:
+                                send(0x2, bytes(buffer))
+                                buffer.clear()
+                    except (OSError, ValueError):
+                        pass
+                    finally:
+                        done.set()
+                        close(1000)
+                        try:
+                            self.connection.shutdown(socket.SHUT_RD)      # unblock the peer-side read
+                        except OSError:
+                            pass
+                threading.Thread(target=downstream, name="federation-down", daemon=True).start()
+                while not done.is_set():
+                    message = read(72)
+                    if message is None:
+                        break
+                    if message == "big":
+                        close(1009, "frames are exactly 72 bytes")
+                        break
+                    op, data = message
+                    kind = struct.unpack("<II", data[:8])[1] if len(data) >= 8 else 0
+                    if op != 0x2 or len(data) != 72 or struct.unpack("<I", data[:4])[0] != 0x31434E4E or kind not in allowed:
+                        close(1008, f"frame kind {kind} is outside this grant")
+                        break
+                    upstream.sendall(data)
+            except (ConnectionError, OSError, ValueError, struct.error):
+                pass
+            finally:
+                done.set()
+                if upstream is not None:
+                    try:
+                        upstream.close()
+                    except OSError:
+                        pass
+                self.close_connection = True
+        # ---- [FEDERATE end]
+
         def _share_error(self, error) -> None:
             self._set_cookie = []
             if getattr(error, "status", 0) == 413:
@@ -1068,6 +1250,8 @@ def make_handler(sessions: Sessions):
                     return self._json(sessions.shares.get(path[len("/api/share/"):]))
                 except share_mod.ShareError as error:
                     return self._share_error(error)
+            if path.startswith("/ws/contract/") and not self._is_viewer():      # [FEDERATE] a peer's contract-port bridge (grant-authenticated)
+                return self._contract_socket(path[len("/ws/contract/"):])
             if self._is_viewer() and (path.startswith("/ws") or (path.startswith("/api/") and not path.startswith("/api/catalog"))):
                 return self._refuse_viewer()
             if self.path.startswith("/ws"):
@@ -1937,6 +2121,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="balancer route name: every response that sets a cookie also sets meowdoku_route=NAME (Apache stickysession)")
     parser.add_argument("--instance", default="",
                         help="service instance name (deploy/apache_supervisor.py): accounts that sign up or log in here are bound to it in account_instances")
+    parser.add_argument("--federation-port", type=int, default=None,
+                        help="[FEDERATE] the local Nodus host's 127.0.0.1 contract port that /ws/contract/<prefix> bridges to (with --federation-canvas)")
+    parser.add_argument("--federation-canvas", default=None,
+                        help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -1973,6 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
     sessions = Sessions(web_dir, Profiles(profiles_path), state)
     sessions.route = args.route
     sessions.instance = args.instance
+    sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
