@@ -1,7 +1,8 @@
 """Meowdoku permissions: three roles (admin, member, guest) over the existing origin tiers.
 
 ROLES.  ``guest`` is the absence of an account.  ``member`` is any account in ``accounts.db`` ``users`` without a row in
-``account_roles``.  ``admin`` is an ``account_roles`` row.  A request's PRINCIPAL is (role, user_id, username, origin, tier); origin and
+``account_roles``.  ``admin`` is an ``account_roles`` row; so is ``service`` (the supervisor's instance accounts: member caps +
+library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, username, origin, tier); origin and
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
@@ -64,7 +65,7 @@ from pathlib import Path
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
         "share_live", "account_manage")
-ROLES = ("admin", "member", "guest")
+ROLES = ("admin", "member", "service", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
 POLICY_FILE = "authz_policy.json"
@@ -78,6 +79,9 @@ DEFAULT_POLICY = {
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live"],
+        # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
+        # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
+        "service": ["studio_write", "photo_submit", "share_live", "library_manage"],
         "admin": list(CAPS),
         "guest": [],
     },
@@ -86,7 +90,7 @@ DEFAULT_POLICY = {
 _DDL = """
 CREATE TABLE IF NOT EXISTS account_roles (
     user_id INTEGER PRIMARY KEY,
-    role TEXT NOT NULL CHECK(role IN ('admin','member')),
+    role TEXT NOT NULL CHECK(role IN ('admin','member','service')),
     granted_by TEXT NOT NULL,
     created_at REAL NOT NULL
 );
@@ -103,7 +107,7 @@ class AuthzError(Exception):
 
 @dataclass(frozen=True)
 class Principal:
-    role: str                 # admin | member | guest
+    role: str                 # admin | member | service | guest
     user_id: int | None
     username: str | None
     origin: str               # lan | ip | dns
@@ -175,6 +179,11 @@ def _connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_DDL)
+    sql = (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'account_roles'").fetchone() or [""])[0] or ""
+    if "'service'" not in sql:      # a table created before the service role: rebuild it with the wider CHECK (rows kept)
+        conn.executescript("BEGIN; ALTER TABLE account_roles RENAME TO account_roles_old;" + _DDL +
+                           "INSERT INTO account_roles SELECT user_id, role, granted_by, created_at FROM account_roles_old;"
+                           "DROP TABLE account_roles_old; COMMIT;")
     return conn
 
 

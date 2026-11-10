@@ -7,6 +7,7 @@ python.exe running server.py. Admin token: build\meowdoku\admin_token_<port>.txt
 #>
 param([Parameter(Mandatory)][int]$Port, [int]$In = 10, [switch]$Force, [switch]$WhatIf)
 $ErrorActionPreference = 'Stop'
+Write-Warning "Apache owns the live instances (deploy\apache_supervisor.py, instances.json): use Start-Apache.ps1 / Stop-Apache.ps1. This script is for manual dev use; a port the supervisor manages will be left alone or fought over."
 $Repo = 'C:\dev\Powershell\turing'
 $State = Join-Path $Repo 'build\meowdoku'
 $Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'

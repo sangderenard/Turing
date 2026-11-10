@@ -12,6 +12,7 @@ param(
     [switch]$WhatIf
 )
 $ErrorActionPreference = 'Stop'
+Write-Warning "Apache owns the live instances (deploy\apache_supervisor.py, instances.json): use Start-Apache.ps1 / Stop-Apache.ps1. This script is for manual dev use; a port the supervisor manages will be left alone or fought over."
 $Repo   = 'C:\dev\Powershell\turing'
 $Python = 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe'
 $Tls    = Join-Path $Repo 'build\meowdoku\tls'

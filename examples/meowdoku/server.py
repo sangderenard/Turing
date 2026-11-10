@@ -362,6 +362,7 @@ class Sessions:
         self.accounts = accounts_mod.Accounts(web_dir.parent / "accounts.db")   # [ACCOUNTS] real password login
         self.accounts_db = web_dir.parent / "accounts.db"
         self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
+        self.instance = ""                                                      # [INSTANCE] --instance NAME (account_instances binding)
         self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
         self.obj_assets = obj_assets_mod.Store(web_dir.parent / "obj_assets", self.accounts, ROOT.parent / "spectral-analyzer")
         self.marble_objects.obj_assets = self.obj_assets
@@ -552,6 +553,45 @@ def make_handler(sessions: Sessions):
             self._set_cookie = []
             self._json(logring_mod.RING.fetch(since, limit, set(q["src"][0].split(",")) if q.get("src") else None))
 
+        def _instance_of(self, user_id) -> str | None:
+            """The service instance a user is bound to (account_instances, written by bind below / deploy/apache_supervisor.py)."""
+            if user_id is None:
+                return sessions.instance or None
+            import sqlite3
+            conn = sqlite3.connect(str(sessions.accounts_db), timeout=10)
+            try:
+                row = conn.execute("SELECT instance FROM account_instances WHERE user_id = ?", (user_id,)).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            finally:
+                conn.close()
+            return row[0] if row else (sessions.instance or None)
+
+        def _bind_instance(self, user_id: int) -> None:
+            if not sessions.instance:
+                return
+            import sqlite3
+            conn = sqlite3.connect(str(sessions.accounts_db), timeout=10)
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS account_instances (user_id INTEGER PRIMARY KEY, instance TEXT NOT NULL)")
+                conn.execute("INSERT OR IGNORE INTO account_instances (user_id, instance) VALUES (?, ?)", (user_id, sessions.instance))
+                conn.commit()
+            finally:
+                conn.close()
+
+        def _user_list(self) -> list:
+            import sqlite3
+            conn = sqlite3.connect(str(sessions.accounts_db), timeout=10)
+            try:
+                try:
+                    rows = conn.execute("SELECT u.username, i.instance FROM users u LEFT JOIN account_instances i ON i.user_id = u.id "
+                                        "ORDER BY u.username").fetchall()
+                except sqlite3.OperationalError:
+                    rows = conn.execute("SELECT username, NULL FROM users ORDER BY username").fetchall()
+                return [{"username": r[0], "instance": r[1]} for r in rows]
+            finally:
+                conn.close()
+
         def _admin_list(self) -> list:
             import sqlite3
             authz_mod._connect(sessions.accounts_db).close()          # make sure account_roles exists
@@ -590,7 +630,8 @@ def make_handler(sessions: Sessions):
             caps = self._caps()
             self._json({"origin": self._origin, "tier": self._tier,
                         "dev": "dev_ui" in caps, "edit": "owner_tools" in caps,
-                        "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps)})
+                        "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps),
+                        "instance": sessions.instance or None})
 
         def do_HEAD(self):  # noqa: N802
             self._classify()
@@ -969,7 +1010,7 @@ def make_handler(sessions: Sessions):
                 if not self._require("account_manage"):
                     return
                 self._set_cookie = []
-                return self._json({"admins": self._admin_list()})
+                return self._json({"admins": self._admin_list(), "users": self._user_list()})
             if path == "/api/lowerings":
                 if not self._require("view_site"):
                     return
@@ -985,7 +1026,8 @@ def make_handler(sessions: Sessions):
                 self._set_cookie = []
                 account = self._account()
                 role = authz_mod.role_of(sessions.accounts_db, account["id"]) if account else "guest"
-                return self._json({"account": account, "role": role})
+                return self._json({"account": account, "role": role,
+                                   "instance": self._instance_of(account["id"] if account else None)})
             if path == "/api/account/assets":
                 self._set_cookie = []
                 account = self._account()
@@ -1414,6 +1456,7 @@ def make_handler(sessions: Sessions):
                     user = (sessions.accounts.signup(username, password) if path0.endswith("signup")
                             else sessions.accounts.login(username, password))
                     self._set_cookie = []
+                    self._bind_instance(user["id"])
                     self._set_account_cookie(sessions.accounts.create_session(user["id"]))
                     # Carry forward this browser's existing passwordless profile
                     # (profiles.py) onto the new/just-logged-in account, so
@@ -1881,6 +1924,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="serve SHA-256-pinned existing fountain products without rebuilding; validate before binding; other startup lanes are unchanged")
     parser.add_argument("--route", default="",
                         help="balancer route name: every response that sets a cookie also sets meowdoku_route=NAME (Apache stickysession)")
+    parser.add_argument("--instance", default="",
+                        help="service instance name (deploy/apache_supervisor.py): accounts that sign up or log in here are bound to it in account_instances")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
@@ -1913,6 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
     logring_mod.RING = logring_mod.Ring(path=web_dir.parent / "log_ring.jsonl"); logring_mod.tee_stdout()   # [LOG]
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
     sessions.route = args.route
+    sessions.instance = args.instance
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
