@@ -138,6 +138,7 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True, body: bool = False) -
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
                                    model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
     (web_dir / f"{prefix}_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    compiled.api.write(web_dir / f"{prefix}_{tag}.api.yaml")
     out_ids = [int(v.id) for v in outputs]
     geo = F.basin(active)
     stride = max(1, -(-pad // DISPLAY_MAX))
@@ -374,6 +375,7 @@ def build_size_purrline(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         raise RuntimeError("fountain purrline shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs, model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
     (web_dir / f"fountain_purrline_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    compiled.api.write(web_dir / f"fountain_purrline_{tag}.api.yaml")
     out_ids = [int(v.id) for v in outputs]
     geo = F.basin(active)
     stride = max(1, -(-pad // DISPLAY_MAX))
@@ -539,6 +541,7 @@ def build_size_mobroad(tag: str, web_dir: Path, wasm: bool = True) -> dict:
         raise RuntimeError("fountain mobroad shader is incomplete: " + "; ".join(s.format() for s in compiled.shortfalls))
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs, model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
     (web_dir / f"fountain_mobroad_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    compiled.api.write(web_dir / f"fountain_mobroad_{tag}.api.yaml")
     out_ids = [int(v.id) for v in outputs]
     geo = F.mobroad_geometry(F.cell_needed(F.species_params({"fl_mu": F.MOB_MARCH["fl_mu"]})))
     stride = max(1, -(-pad // DISPLAY_MAX))

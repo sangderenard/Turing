@@ -139,6 +139,7 @@ def build_size(tag: str, web_dir: Path, wasm: bool = True, variant: str = "sdf")
     payoff = webgpu_compute_payoff(program.module, "fountain_step", outputs=outputs,
                                    model=WebGPUComputeCostModel(), dispatches=compiled.dispatches)
     (web_dir / f"{prefix}_{tag}.wgsl").write_text(compiled.source, encoding="utf-8", newline="\n")
+    compiled.api.write(web_dir / f"{prefix}_{tag}.api.yaml")
     out_ids = [int(v.id) for v in outputs]
     geo = F.basin(active)
     stride = max(1, -(-pad // DISPLAY_MAX))

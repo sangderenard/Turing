@@ -173,3 +173,29 @@ reverse probe passed that refusal and reached a separate fused-motion
 activity error: its forward `unfold2d` node has no ingested evaluation point.
 Compiled training is still unavailable. See
 `docs/hazards/20261105T101433Z_main.md`.
+## Lowering library (2026-11-10)
+
+`examples/meowdoku/lowering_library.py` catalogues the lowerings (wasm, wgsl, c, llvm, fortran, spirv, cpython) of one
+computational core in the same SQLite file the server already opens (`accounts.db`). Two tables: `lowering_cores`
+(core_id, family, name, source_function, logical_abi_digest, source_digest, extraction_contract_sha256, first_seen) and
+`lowerings` (core_id, backend, contract, entry, api_path, abi_path, product_path, product_sha256, abi_schema, arch,
+verdict, scanned). Rows come only from each product's declared `turing-compiled-program-api-v1` YAML plus the JSON the
+writer pairs with it (`<stem>.abi.json`, or the `*.manifest.json` record naming the `.wgsl`); verdict is `built` or
+`described`, never `verified`. Scan: `python examples/meowdoku/lowering_library.py scan <web_dir> --db <accounts.db>`;
+read: `... list --db <accounts.db>`. Server integration (scan at startup into accounts.db; `/api/lowerings`) is pending
+in the live tree; server.py is not in this branch.
+
+
+### Blobs, versions, selection, leases
+
+`scan` also stores each built product's bytes in `lowering_blobs` (content-addressed by `product_sha256`, `kind` = file
+suffix; `store_blobs=False` skips it), so a lowering row always resolves to bytes via `blob_bytes`. `versions(core_id,
+backend)` lists lowerings newest first; each distinct sha256 is one version. `select_lowering(purpose, capabilities,
+prefer=, contract=)` takes `purpose = (family, name)` (a core's computational purpose is its declared family+name) and
+the set of backends the caller can execute, and returns the newest built lowering by `prefer` order then the fixed order
+(c, llvm, fortran, wasm, wgsl, spirv, cpython), or None; it never falls back to a non-executable backend. Role/tier
+rights are not interpreted: server authz passes only what the account may execute. `checkout` issues a `lowering_leases`
+row under `BEGIN IMMEDIATE` with a per-blob generation and deadline; `checkin` succeeds once, on matching account and
+generation; `expired` lists overdue unreturned leases (never deleted); `outstanding` counts open leases per blob (the
+contention signal). CLI: `store`, `versions`, `checkout`, `checkin`, `leases`. The HTTP surface
+(`/api/lowerings/checkout`, `/checkin`) is pending in the live tree.
