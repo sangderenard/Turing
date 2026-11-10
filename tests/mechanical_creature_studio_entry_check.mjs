@@ -40,6 +40,8 @@ function setup(){
     'cameraGroundHeight','sampleContactSurface','playerColliderVerticalOverlap','cancelEntityNavigation',
     'seedViewportControlPose','setViewportControlHighlight','requestViewportControls','clearActiveVehicle',
     'cloneVehicleState','synchronizePortalBody','registerPlayerPhysicsBody','respawnViewportActor','mechanicalCreatureStudioFreeze'];
+  if(page.includes('function closedSolidVerticalSupport('))nativeNames.unshift('closedSolidShape','closedSolidLocalVector',
+    'closedSolidLocalPoint','closedSolidWorldVector','closedSolidRay','closedSolidVerticalSupport');
   vm.runInContext(nativeNames.map(name=>exact(name)).join('\n'),context);
   const geometry=model.document_geometry.boxes;
   context.shaderViewer={geometry,revision:1,element,mapElement:null,canvas:{requestPointerLock(){calls.push('lock-request');}},active:true};
