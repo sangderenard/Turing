@@ -67,3 +67,12 @@ def test_current_full_adapter_chain_and_qualification(current,tmp_path):
         result=subprocess.run(command,cwd=ROOT,capture_output=True,text=True,timeout=30)
         assert result.returncode==0,result.stdout+result.stderr
     assert hashlib.sha256(CURRENT.read_bytes()).hexdigest()==SHA
+
+
+def test_oriented_qualification_snapshot_backpressure():
+    candidate=ROOT/'build/dot-oriented-arena-candidate-20261110/index.html'
+    if not candidate.exists(): pytest.skip('Frozen oriented full game is not present')
+    assert hashlib.sha256(candidate.read_bytes()).hexdigest()=='297cda67f0c96cc2dada8278fcd1f559b279fd14ba3c8d31b62448e1f1fa82a1'
+    result=subprocess.run(['node',str(ROOT/'tests/mechanical_creature_qualification_backpressure_check.mjs'),str(candidate)],
+        cwd=ROOT,capture_output=True,text=True,timeout=45)
+    assert result.returncode==0,result.stdout+result.stderr
