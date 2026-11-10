@@ -1,0 +1,137 @@
+{
+  "started": "2026-11-10T14:15:13",
+  "url": "wss://stichka.duckdns.org/ws/contract/gui.proof",
+  "steps": [
+    {
+      "step": "1 grants",
+      "ok": true,
+      "t": 0.047,
+      "engine_grant": 5,
+      "host_grant": 6,
+      "engine_uid": 2
+    },
+    {
+      "step": "2 digests",
+      "ok": true,
+      "t": 0.062,
+      "graph": "35bbb584520db1961cfe6835e18affb62e92d262451d561334bedd097d48aabd",
+      "api_count": 0
+    },
+    {
+      "step": "3a connect via apache (CA-verified)",
+      "ok": true,
+      "t": 0.093,
+      "seconds": 0.031,
+      "engine_hello": 2,
+      "host_hello": 1
+    },
+    {
+      "step": "3b round trip",
+      "ok": true,
+      "t": 0.172,
+      "elapsed": 0.079,
+      "frame_times": {
+        "Submit-sent": 0.0,
+        "Admitted": 0.016,
+        "Offer": 0.032,
+        "Route": 0.063,
+        "Receipt": 0.079
+      },
+      "admitted": [
+        100
+      ],
+      "result": 555,
+      "receipts": [
+        true
+      ],
+      "engine_error": "None",
+      "host_error": "None"
+    },
+    {
+      "step": "4a wrong secret refused",
+      "ok": true,
+      "t": 0.687,
+      "reason": "grant refused"
+    },
+    {
+      "step": "4b revoke engine grant",
+      "ok": true,
+      "t": 0.687
+    },
+    {
+      "step": "4c revoked reconnect refused",
+      "ok": true,
+      "t": 0.687,
+      "reason": "grant refused"
+    },
+    {
+      "step": "5 final revoke",
+      "ok": true,
+      "t": 0.703,
+      "peers": [
+        {
+          "grant_id": 5,
+          "peer": "proof-engine",
+          "prefix": "gui.proof",
+          "direction": "engine",
+          "allowed_ops": "6,9",
+          "issued_by": "operator:claude-proof",
+          "created_at": 1794341713.314145,
+          "expires_at": 1794428113.314145,
+          "revoked_at": 1794341713.9654942,
+          "service_user_id": 2
+        },
+        {
+          "grant_id": 6,
+          "peer": "proof-host",
+          "prefix": "gui.proof",
+          "direction": "host",
+          "allowed_ops": "2,3",
+          "issued_by": "operator:claude-proof",
+          "created_at": 1794341713.3294199,
+          "expires_at": 1794428113.3294199,
+          "revoked_at": 1794341713.9800372,
+          "service_user_id": 1
+        }
+      ]
+    },
+    {
+      "step": "6 host untouched",
+      "ok": true,
+      "t": 0.718,
+      "before": {
+        "47611": [
+          "14464"
+        ],
+        "47612": [
+          "14464"
+        ]
+      },
+      "after": {
+        "47611": [
+          "14464"
+        ],
+        "47612": [
+          "14464"
+        ]
+      }
+    }
+  ],
+  "pids_before": {
+    "47611": [
+      "14464"
+    ],
+    "47612": [
+      "14464"
+    ]
+  },
+  "pids_after": {
+    "47611": [
+      "14464"
+    ],
+    "47612": [
+      "14464"
+    ]
+  },
+  "overall": true
+}
