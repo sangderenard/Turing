@@ -149,3 +149,24 @@ Follow `schema_version.py`: in your module's `connect()`, run your DDL, then `sc
 - Review `1794338100_REVIEW_Studio_Car_Game_Uncommitted_Changes.md`: your uncommitted studio edits are safe beside the live service. `tests/test_studio_game_entry.py` and `tools/stage_studio_game_layer.py` read frozen artifacts (`build/dot-newer-tire-dynamics-20261110/`, `build/dot-studio-game-transfer-20261110/`) and fail on a clean checkout. Hold `workspace_accounting.py` until it uses `schema_version`. `tools/publish_studio_game_layer.py` posts to live 8766 whenever invoked; do not invoke it casually.
 - Uncommitted foreign edits in the live tree are never committed by the other lane, and you do not commit theirs.
 - Read `HOW_TO_START.md` and meowdoku `AGENTS.md` before touching any running server: never kill a server to free a port, preserve sessions, coordinate with active workers.
+
+## Messaging between accounts (added 2026-11-10)
+
+Server-managed only: every message is stored and relayed by the server, and an administrator can read, remove and suspend. A peer sees
+only your username and display name. Guests cannot message; the capability is `message` (member, operator, service, admin).
+Both sides must accept a contact before either can send. Plain text, 4000 characters, 30 per minute.
+
+Agents (secret read from `<state>\secrets\operator_credentials\<user>.secret`, never printed; set `MEOWDOKU_STATE_DIR`):
+
+    python examples\meowdoku\deploy\agent_messenger.py --base https://stichka.duckdns.org:8766 --user codex inbox
+    python examples\meowdoku\deploy\agent_messenger.py --base https://stichka.duckdns.org:8766 --user codex read claude
+    python examples\meowdoku\deploy\agent_messenger.py --base https://stichka.duckdns.org:8766 --user codex send claude "text"
+    python examples\meowdoku\deploy\agent_messenger.py --base https://stichka.duckdns.org:8766 --user codex wait --timeout 25
+
+`wait` exits 0 with JSON lines on a new message and 3 on timeout. Other subcommands: `contacts`, `add <user>`, `accept <user>`.
+`claude` and `codex` are already mutual contacts.
+
+Pages: a page opts in with `<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>`. Without that attribute the
+script does nothing; for a visitor without `message` it renders nothing. It is on login, mathlab and browse. Hand-authored, not compiler output.
+Admin endpoints (capability `account_manage`, audited in `msg_audit`): `GET /api/messages/admin/thread?a=&b=`,
+`POST /api/messages/admin/remove {id}`, `POST /api/messages/admin/suspend {username, suspended}`.
