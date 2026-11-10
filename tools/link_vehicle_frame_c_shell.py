@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -53,9 +54,11 @@ def main() -> int:
     if fc is None:
         raise RuntimeError("existing native C shell's adjacent GCC was not found")
     cc = Path(fc).with_name("gcc.exe" if sys.platform == "win32" else "gcc")
+    compiler_environment = dict(os.environ)
+    compiler_environment["PATH"] = str(cc.parent) + os.pathsep + compiler_environment.get("PATH", "")
     print("Compiling emitted C with", cc, flush=True)
     subprocess.run([str(cc), "-O0", "-fno-sanitize=all", "-c",
-                    str(source), "-o", str(obj)], check=True)
+                    str(source), "-o", str(obj)], check=True, env=compiler_environment)
     parameters = tuple(Parameter(name, role, "float64", "double", "c_double",
                                  "reference", (count,), source_name=name)
                        for name, role, count in (("input", "input", len(inputs)),
