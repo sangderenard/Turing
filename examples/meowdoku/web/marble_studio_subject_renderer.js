@@ -204,7 +204,7 @@ export function createStudioSubjectRenderer({gl,packet,samplers}={}) {
     if(resources.program)gl.deleteProgram(resources.program);};
   const allocate=(kind,list)=>{const x=gl[`create${kind}`]();if(!x)throw Error(`Cannot allocate Studio ${kind}.`);resources[list].push(x);return x;};
   const uploadMesh=(faces,transparent)=>{
-    const result={vao:allocate('VertexArray','vaos'),count:faces.length*3,centres:triangleCentres(faces),sortAxis:null};
+    const result={vao:allocate('VertexArray','vaos'),count:faces.length*3,centres:triangleCentres(faces),sortAxis:null,attributes:[]};
     gl.bindVertexArray(result.vao);
     const values=[[],[],[],[]];
     for(const [a,b,c,id,n,gid=0]of faces)for(const [k,p]of [a,b,c].entries()) {
@@ -212,7 +212,8 @@ export function createStudioSubjectRenderer({gl,packet,samplers}={}) {
     }
     for(let k=0;k<4;k++) {
       const index=[0,1,2,4][k],integer=k>=2,data=integer?new Int32Array(values[k]):new Float32Array(values[k]);
-      gl.bindBuffer(gl.ARRAY_BUFFER,allocate('Buffer','buffers'));gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+      const buffer=allocate('Buffer','buffers');result.attributes.push(buffer);
+      gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
       gl.enableVertexAttribArray(index);
       if(integer)gl.vertexAttribIPointer(index,1,gl.INT,0,0);else gl.vertexAttribPointer(index,3,gl.FLOAT,false,0,0);
     }
@@ -330,7 +331,33 @@ export function createStudioSubjectRenderer({gl,packet,samplers}={}) {
         omittedBubbleTriangles:plan.omittedBubbleTriangles};
     }finally{restore(gl,before);}
   }
-  return {draw,dispose,subjectId:packet.scene.subject.id,revision:packet.revision,
+  // Update only an existing transparent range. Keep the shared VAO, material
+  // ownership and original centroid sorting; pose changes invalidate that sort.
+  function updateTransparentRange(first,faces) {
+    if(closed||gl.isContextLost())throw Error('Studio subject renderer is closed or context lost.');
+    if(gl.getParameter(gl.TRANSFORM_FEEDBACK_ACTIVE)&&!gl.getParameter(gl.TRANSFORM_FEEDBACK_PAUSED))
+      throw Error('Finish the incumbent transform feedback pass before updating the subject.');
+    if(!Number.isSafeInteger(first)||first<0||first+faces.length>plan.transparent.length)
+      throw Error('Transparent update must preserve the existing triangle range.');
+    const positions=new Float32Array(faces.length*9),normals=new Float32Array(faces.length*9);
+    for(let i=0;i<faces.length;i++) {
+      const f=faces[i],old=plan.transparent[first+i];
+      if(f[3]!==old[3]||(f[5]??0)!==(old[5]??0))throw Error('Transparent material ownership cannot change with pose.');
+      for(let k=0;k<3;k++) {
+        if(!finite(f[k])||f[k].length!==3||!finite(f[4]?.[k])||f[4][k].length!==3)throw Error('Nonfinite transparent pose.');
+        positions.set(f[k],i*9+k*3);normals.set(f[4][k],i*9+k*3);
+      }
+    }
+    const before=gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+    try {
+      gl.bindBuffer(gl.ARRAY_BUFFER,transparent.attributes[0]);gl.bufferSubData(gl.ARRAY_BUFFER,first*36,positions);
+      gl.bindBuffer(gl.ARRAY_BUFFER,transparent.attributes[1]);gl.bufferSubData(gl.ARRAY_BUFFER,first*36,normals);
+    }finally{gl.bindBuffer(gl.ARRAY_BUFFER,before);}
+    const centres=triangleCentres(faces);
+    for(let i=0;i<faces.length;i++)transparent.centres[first+i]=centres[i];
+    transparent.sortAxis=null;
+  }
+  return {draw,dispose,updateTransparentRange,subjectId:packet.scene.subject.id,revision:packet.revision,
     counts:{opaqueTriangles:plan.opaque.length,transparentTriangles:plan.transparent.length,omittedBubbleTriangles:plan.omittedBubbleTriangles},
     mode:'exact-Studio-Phong-premultiplied-raster',get ready(){return !closed&&!gl.isContextLost();}};
 }
