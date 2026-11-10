@@ -146,7 +146,7 @@ def test_exact_key_sets_a_peer_sees(server):
     contact = _call(server.port, "/api/messages/contacts", cookie=cb)[1]["contacts"][0]
     assert set(contact) == {"username", "display_name", "unread", "last"} and contact["display_name"] == "Ann A"
     message = _call(server.port, "/api/messages/thread?peer=ann", cookie=cb)[1]["messages"][0]
-    assert set(message) == {"id", "from", "to", "created", "body", "removed"}
+    assert set(message) == {"id", "from", "to", "created", "body", "removed", "subject", "type"}
     polled = _call(server.port, "/api/messages/since?after=0", cookie=ca)[1]["messages"][0]       # the sender sees no read state either
     assert set(polled) == set(message)
     _call(server.port, "/api/messages/contacts", "POST", cb, {"username": "ann", "action": "request"})
@@ -280,6 +280,83 @@ def test_agent_client_drives_the_flow(server, capsys, tmp_path):
     threading.Timer(0.5, lambda: _send(server, _login(server, "claude"), "codex", "wake up")).start()
     code, out = run("codex", "wait", "--timeout", "10")
     line = json.loads(out)
-    assert code == 0 and line["body"] == "wake up" and line["from"] == "claude" and set(line) == {"id", "from", "to", "created", "body"}
+    assert code == 0 and line["body"] == "wake up" and line["from"] == "claude" and set(line) == {"id", "from", "to", "created", "body", "subject", "type"}
     assert run("codex", "contacts")[0] == 0
+    # pending / ack / typed + subject send / wait --from-cursor
+    assert run("claude", "send", "codex", "need approval", "--type", "approval_request", "--subject", "job:j-7")[0] == 0
+    code, out = run("codex", "pending")
+    lines = [json.loads(x) for x in out.splitlines()]
+    assert code == 0 and [m["body"] for m in lines] == ["hello codex", "wake up", "need approval"]
+    assert lines[-1]["type"] == "approval_request" and lines[-1]["subject"] == {"kind": "job", "ref": "j-7"}
+    assert run("codex", "ack", str(lines[1]["id"]))[0] == 0
+    assert [json.loads(x)["body"] for x in run("codex", "pending")[1].splitlines()] == ["need approval"]
+    code, out = run("codex", "wait", "--from-cursor", "--timeout", "5")
+    assert code == 0 and json.loads(out)["body"] == "need approval"
+    assert run("claude", "send", "codex", "x", "--subject", "nocolon")[0] == 1
     assert agent_messenger.main(["--base", base, "--user", "claude", "--password-file", str(tmp_path / "missing"), "contacts"]) == 1
+
+
+def test_migration_v1_to_v2_keeps_rows(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(str(path))
+    old.execute("CREATE TABLE msg_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, "
+                "body TEXT NOT NULL, created REAL NOT NULL, read_at REAL, removed_at REAL, removed_by INTEGER)")
+    old.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created) VALUES (1, 2, 'legacy', 5.0)")
+    old.execute("CREATE TABLE schema_version (module TEXT PRIMARY KEY, version INTEGER NOT NULL, updated_at REAL NOT NULL, writer TEXT NOT NULL)")
+    old.execute("INSERT INTO schema_version VALUES ('messaging', 1, 0, 'test')")
+    old.commit()
+    old.close()
+    db = messaging.connect(path)
+    row = db.execute("SELECT body, subject_kind, subject_ref, msg_type FROM msg_messages").fetchone()
+    assert tuple(row) == ("legacy", None, None, "note")
+    assert db.execute("SELECT version FROM schema_version WHERE module = 'messaging'").fetchone()[0] == 2
+    db.close()
+    messaging.connect(path).close()                                      # a second open is a no-op
+
+
+def test_subject_and_type_validation_and_filters(server):
+    ca, cb = _user(server, "ann"), _user(server, "ben")
+    _friends(server, "ann", ca, "ben", cb)
+
+    def send(**extra):
+        return _call(server.port, "/api/messages/send", "POST", ca, {"to": "ben", "body": "m", **extra})
+
+    for bad in ({"type": "shout"}, {"type": 5}, {"subject": {"kind": "bogus", "ref": "x"}}, {"subject": {"kind": "job", "ref": ""}},
+                {"subject": {"kind": "job", "ref": "x" * 201}}, {"subject": {"kind": "job"}}, {"subject": "job:1"}):
+        assert send(**bad)[0] == 400, bad
+    plain = send()[1]["id"]
+    tagged = send(type="question", subject={"kind": "ticket", "ref": "T-1"})[1]["id"]
+    other = send(subject={"kind": "lease", "ref": "L-9"})[1]["id"]
+    got = {m["id"]: m for m in _call(server.port, "/api/messages/thread?peer=ann", cookie=cb)[1]["messages"]}
+    assert got[plain]["subject"] is None and got[plain]["type"] == "note"
+    assert got[tagged]["subject"] == {"kind": "ticket", "ref": "T-1"} and got[tagged]["type"] == "question"
+    only = _call(server.port, "/api/messages/thread?peer=ann&subject_kind=ticket&subject_ref=T-1", cookie=cb)[1]["messages"]
+    assert [m["id"] for m in only] == [tagged]
+    assert [m["id"] for m in _call(server.port, "/api/messages/since?after=0&subject_kind=lease", cookie=cb)[1]["messages"]] == [other]
+    assert _call(server.port, "/api/messages/since?after=0&subject_kind=bogus", cookie=cb)[0] == 400
+
+
+def test_inbox_ack_round_trip_monotonic_and_hidden_from_sender(server):
+    ca, cb = _user(server, "ann"), _user(server, "ben")
+    _friends(server, "ann", ca, "ben", cb)
+    ids = [_send(server, ca, "ben", f"m{i}")[1]["id"] for i in range(3)]
+    mine = _send(server, cb, "ann", "from ben")[1]["id"]
+    box = _call(server.port, "/api/messages/inbox", cookie=cb)[1]
+    assert [m["id"] for m in box["messages"]] == ids and box["cursor"] == 0       # only messages TO ben
+    assert _call(server.port, "/api/messages/ack", "POST", cb, {"up_to": ids[1]})[1]["cursor"] == ids[1]
+    box = _call(server.port, "/api/messages/inbox", cookie=cb)[1]
+    assert [m["id"] for m in box["messages"]] == [ids[2]] and box["cursor"] == ids[1]
+    assert _call(server.port, "/api/messages/ack", "POST", cb, {"up_to": 1})[1]["cursor"] == ids[1]         # never backwards
+    assert _call(server.port, "/api/messages/ack", "POST", cb, {"up_to": mine + 1000})[1]["cursor"] == ids[2]  # never beyond the latest to me
+    assert _call(server.port, "/api/messages/inbox", cookie=cb)[1] == {"messages": [], "cursor": ids[2]}
+    assert _call(server.port, "/api/messages/ack", "POST", cb, {"up_to": "x"})[0] == 400
+    assert _call(server.port, "/api/messages/ack", "POST", cb, {"up_to": -1})[0] == 400
+    # the sender sees nothing of the recipient's cursor on any endpoint
+    seen = [_call(server.port, p, cookie=ca)[1] for p in (f"/api/messages/thread?peer=ben", "/api/messages/since?after=0", "/api/messages/contacts")]
+    seen.append(_call(server.port, "/api/messages/inbox", cookie=ca)[1])
+    text = json.dumps(seen)
+    assert "cursor" not in text.replace('"cursor": 0', "") and "acked" not in text
+    assert _call(server.port, "/api/messages/inbox", cookie=ca)[1]["cursor"] == 0
+    assert [m["id"] for m in _call(server.port, "/api/messages/inbox", cookie=ca)[1]["messages"]] == [mine]
+

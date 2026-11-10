@@ -83,7 +83,9 @@ from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilit
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
+from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
+from meowdoku import divider_intake as divider_intake_mod  # noqa: E402  [DIVIDER] source-divider intake and status (no worker)
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -821,6 +823,82 @@ def make_handler(sessions: Sessions):
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
                         "origin_tier": self._origin_tier})
 
+        # ---- [DIVIDER] /api/divider/jobs...: the source divider's intake and status (divider_intake.py; the page is web/divider.html).
+        # Capability compile_submit.  A job is visible to its owner (and to account_manage) only; anyone else gets 404.  Nothing here
+        # compiles or fetches: a repo link is only recorded.  sessions.divider_hook (None unless an operator sets it) is called after a job
+        # is accepted and may run attempts; the server never starts a worker thread for the divider.
+        _DIVIDER_BODY_CAP = 20 * 1024 * 1024
+
+        def _divider_who(self):
+            self._set_cookie = []
+            return self._job_identity()[0][0], "account_manage" in self._caps()
+
+        def _divider_error(self, error) -> None:
+            self.close_connection = True
+            return self._json({"error": error.message}, error.status)
+
+        def _divider_get(self, path: str) -> None:
+            import re as _re
+            if not self._require("compile_submit"):
+                return
+            owner, admin = self._divider_who()
+            parts = path[len("/api/divider/"):].split("/")
+            if parts == ["jobs"]:
+                return self._json({"jobs": divider_intake_mod.list_jobs(sessions.state, owner, admin)})
+            if len(parts) == 2 and parts[0] == "jobs" and _re.fullmatch(r"[0-9a-f]{12}", parts[1] or ""):
+                job = divider_intake_mod.get_job(sessions.state, parts[1], owner, admin)
+                if job is None:
+                    return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                return self._json(job)
+            return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def _divider_post(self, path0: str) -> None:
+            import re as _re
+            if not self._require("compile_submit"):
+                return
+            owner, admin = self._divider_who()
+            match = _re.fullmatch(r"/api/divider/jobs/([0-9a-f]{12})/cancel", path0)
+            try:
+                if match:
+                    try:
+                        if int(self.headers.get("Content-Length") or 0) > 0:
+                            self.rfile.read(min(int(self.headers.get("Content-Length")), 4096))
+                    except (ValueError, OSError):
+                        pass
+                    job = divider_intake_mod.cancel_job(sessions.state, match.group(1), owner, admin)
+                    if job is None:
+                        return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                    return self._json(job)
+                if path0 != "/api/divider/jobs":
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype == "application/json":
+                    body = self._body_json(4096)
+                    if body is None:
+                        return
+                    job_id = divider_intake_mod.accept_repo_link(sessions.state, owner, body.get("repo"), body.get("ref"))
+                elif ctype == "application/octet-stream":
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        length = 0
+                    filename = self.headers.get("X-Filename") or ""
+                    cap = (divider_intake_mod.MAX_PY_BYTES if filename.lower().endswith(".py") else self._DIVIDER_BODY_CAP)
+                    if length <= 0:
+                        raise divider_intake_mod.DividerError("Content-Length is required", 411)
+                    if length > cap:                                  # refused BEFORE the body is read
+                        raise divider_intake_mod.DividerError(f"body exceeds {cap} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length))
+                else:
+                    raise divider_intake_mod.DividerError("expected application/octet-stream or application/json", 415)
+            except divider_intake_mod.DividerError as error:
+                return self._divider_error(error)
+            hook = getattr(sessions, "divider_hook", None)
+            if callable(hook):
+                hook(job_id)
+            return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
+        # ---- end [DIVIDER]
+
         # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
         # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
         def _messages_route(self, path: str, method: str) -> None:
@@ -846,10 +924,14 @@ def make_handler(sessions: Sessions):
                         return self._json(messaging_mod.contacts(db, me))
                     if method == "GET" and path == "/api/messages/thread":
                         before = query.get("before")
-                        return self._json(messaging_mod.thread(db, me, query.get("peer"), int(before) if before else None))
+                        return self._json(messaging_mod.thread(db, me, query.get("peer"), int(before) if before else None,
+                                                               subject_kind=query.get("subject_kind"), subject_ref=query.get("subject_ref")))
                     if method == "GET" and path == "/api/messages/since":
-                        rows = messaging_mod.long_poll(db, me, int(query.get("after") or 0), float(query.get("wait") or 0))
+                        rows = messaging_mod.long_poll(db, me, int(query.get("after") or 0), float(query.get("wait") or 0),
+                                                       subject_kind=query.get("subject_kind"), subject_ref=query.get("subject_ref"))
                         return self._json({"messages": rows, "latest": messaging_mod.latest_id(db, me)})
+                    if method == "GET" and path == "/api/messages/inbox":
+                        return self._json(messaging_mod.inbox(db, me))
                     if method == "GET" and path == "/api/messages/admin/thread":
                         before = query.get("before")
                         return self._json(messaging_mod.admin_thread(db, me, query.get("a"), query.get("b"), int(before) if before else None))
@@ -865,7 +947,9 @@ def make_handler(sessions: Sessions):
                             return self._json(messaging_mod.remove(db, me, name))
                         return self._json({"error": "action must be request, accept, decline, block or remove"}, HTTPStatus.BAD_REQUEST)
                     if method == "POST" and path == "/api/messages/send":
-                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body")))
+                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body"), subject=body.get("subject"), msg_type=body.get("type")))
+                    if method == "POST" and path == "/api/messages/ack":
+                        return self._json(messaging_mod.ack(db, me, body.get("up_to")))
                     if method == "POST" and path == "/api/messages/read":
                         return self._json(messaging_mod.mark_read(db, me, body.get("peer"), int(body.get("up_to") or 0)))
                     if method == "POST" and path == "/api/messages/admin/remove":
@@ -880,6 +964,45 @@ def make_handler(sessions: Sessions):
             finally:
                 db.close()
         # ---- end [MESSAGES]
+
+        # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
+        # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
+        def _profile_route(self, path: str, method: str) -> None:
+            import sqlite3
+            from urllib.parse import parse_qs
+            self._classify()
+            self._set_cookie = []
+            if method != "GET":
+                self.close_connection = True
+                return self._json({"error": "read-only"}, HTTPStatus.METHOD_NOT_ALLOWED)
+            principal = self._principal()
+            if principal.user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                if path == "/api/profile/me":
+                    db = sqlite3.connect(sessions.accounts_db, timeout=10)
+                    return self._json(profile_mod.me(db, principal, self._caps()))
+                if path not in ("/api/profile/instances", "/api/profile/leases", "/api/profile/diagnostics"):
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                caps = self._caps()
+                if "account_manage" not in caps and "lifecycle_admin" not in caps:
+                    return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
+                db = sqlite3.connect(sessions.accounts_db, timeout=10)
+                query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                if path == "/api/profile/instances":
+                    return self._json({"instances": profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)})
+                if path == "/api/profile/leases":
+                    return self._json({"leases": profile_mod.leases(db)})
+                return self._json(profile_mod.diagnostics(db, sessions.state, query.get("name"), int(query.get("lines") or 80)))
+            except profile_mod.ProfileError as error:
+                return self._json({"error": error.message}, error.status)
+            except (ValueError, TypeError):
+                return self._json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
+            finally:
+                if db is not None:
+                    db.close()
+        # ---- end [PROFILE]
 
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
@@ -1527,8 +1650,12 @@ def make_handler(sessions: Sessions):
                 return self._whoami()
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
+            if path.startswith("/api/profile/"):                  # [PROFILE]
+                return self._profile_route(path, "GET")
             if path.startswith("/api/mathlab/"):                  # [MATHLAB]
                 return self._mathlab_get(path)
+            if path.startswith("/api/divider/"):                  # [DIVIDER]
+                return self._divider_get(path)
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
                 return self._lifecycle_get()
             if path == "/api/ready":                              # [LOADING] per-product readiness, polled by the page (loading_panel.js)
@@ -1955,8 +2082,12 @@ def make_handler(sessions: Sessions):
                     return
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
+            if path0.startswith("/api/profile/"):              # [PROFILE]
+                return self._profile_route(path0, "POST")
             if path0.startswith("/api/mathlab/"):              # [MATHLAB]
                 return self._mathlab_post(path0)
+            if path0.startswith("/api/divider/"):              # [DIVIDER]
+                return self._divider_post(path0)
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
                 try:

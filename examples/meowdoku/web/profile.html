@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Profile</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --acc:#1a5fb4; --card:#fff; --sel:#e8f0fb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; --sel:#26324a; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:78rem; margin:0 auto; padding:1rem 16px 4rem; }
+  a { color:var(--acc); }
+  h1 { font-size:1.3rem; margin:.4rem 0; } h2 { font-size:1.05rem; margin:1.2rem 0 .4rem; }
+  code, pre { font:13px ui-monospace, Consolas, monospace; }
+  pre { background:var(--card); border:1px solid var(--line); padding:.5rem; overflow:auto; max-height:24rem; white-space:pre-wrap; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.6rem 1rem; }
+  .bar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin:.6rem 0; }
+  button { font:inherit; padding:.35rem .9rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; background:var(--card); }
+  th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  tr.sel td { background:var(--sel); } #instances tbody tr { cursor:pointer; }
+  .mut { color:var(--mut); } .bad { color:#b3261e; } [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="/browse">Back to browse</a></nav>
+  <h1>Profile</h1>
+  <p id="status" class="mut" role="status">Loading...</p>
+  <section id="me" class="card"></section>
+  <section id="admin" hidden>
+    <div class="bar"><button id="refresh" type="button">Refresh</button><span class="mut">Refreshes every 15 s while this tab is visible.</span></div>
+    <p class="mut">Start, stop and sync are not yet available here; this page only displays.</p>
+    <h2>Instances</h2>
+    <div class="scroll"><table id="instances"><thead><tr>
+      <th>Instance</th><th>Kind</th><th>State</th><th>Address</th><th>Git</th><th>PID / restarts</th><th>Started</th>
+    </tr></thead><tbody></tbody></table></div>
+    <h2>Leases</h2>
+    <div class="scroll"><table id="leases"><thead><tr>
+      <th>Owner</th><th>Table</th><th>Purpose</th><th>Taken</th><th>Expires</th><th>State</th>
+    </tr></thead><tbody></tbody></table></div>
+    <h2>Diagnostics <span id="diag-name" class="mut">(select an instance)</span></h2>
+    <pre id="diag">Click an instance row to load the tail of its log.</pre>
+  </section>
+</main>
+<script type="module" src="/profile.js"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+</body>
+</html>

@@ -2,8 +2,13 @@
 
   python agent_messenger.py --base https://stichka.duckdns.org:8766 --user claude contacts
   ... add <username> | accept <username> | send <username> <text | -> | read <username> [--limit N]
-  ... wait [--after ID] [--timeout S]      long-polls; prints incoming messages as JSON lines {id, from, to, created, body}; exit 0 on a
-                                           message, 3 on timeout
+  ... send <username> <text | -> [--type note|status|question|handoff|approval_request|answer] [--subject KIND:REF]
+                                           KIND is lease|job|ticket|file|topic
+  ... wait [--after ID | --from-cursor] [--timeout S]
+                                           long-polls; prints incoming messages as JSON lines {id, from, to, created, body, subject, type};
+                                           exit 0 on a message, 3 on timeout; --from-cursor starts after the server-kept ack cursor
+  ... pending                              messages to me past my server-kept cursor, as JSON lines (does not advance the cursor)
+  ... ack <id>                             advance my server-kept cursor to <id> (the sender never sees it)
   ... inbox                                unread summary (per contact, plus pending requests)
 
 The password is read from --password-file, else <state>/secrets/operator_credentials/<user>.secret (state = --state-dir, else
@@ -78,7 +83,7 @@ def read_secret(user: str, password_file: str | None, state_dir: str | None) -> 
 
 
 def _emit(message: dict) -> None:
-    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body")}, ensure_ascii=False), flush=True)
+    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body", "subject", "type")}, ensure_ascii=False), flush=True)
 
 
 def run(client: Client, args) -> int:
@@ -91,7 +96,20 @@ def run(client: Client, args) -> int:
         print(json.dumps(client.call("/api/messages/contacts", {"username": args.username, "action": action})))
     elif cmd == "send":
         text = sys.stdin.read() if args.text == "-" else args.text
-        print(json.dumps(client.call("/api/messages/send", {"to": args.username, "body": text})))
+        payload = {"to": args.username, "body": text}
+        if args.type:
+            payload["type"] = args.type
+        if args.subject:
+            kind, sep, ref = args.subject.partition(":")
+            if not sep:
+                raise ClientError("--subject must be KIND:REF")
+            payload["subject"] = {"kind": kind, "ref": ref}
+        print(json.dumps(client.call("/api/messages/send", payload)))
+    elif cmd == "pending":
+        for message in client.call("/api/messages/inbox")["messages"]:
+            _emit(message)
+    elif cmd == "ack":
+        print(json.dumps(client.call("/api/messages/ack", {"up_to": args.id})))
     elif cmd == "read":
         messages = client.call(f"/api/messages/thread?peer={q(args.username)}")["messages"][-args.limit:]
         for message in messages:
@@ -103,7 +121,10 @@ def run(client: Client, args) -> int:
         print(json.dumps({"unread": {c["username"]: c["unread"] for c in data["contacts"] if c["unread"]},
                           "requests": [r["username"] for r in data["requests"]]}))
     elif cmd == "wait":
-        after = args.after if args.after is not None else client.call("/api/messages/since?after=-1")["latest"]
+        if args.from_cursor:
+            after = client.call("/api/messages/inbox")["cursor"]
+        else:
+            after = args.after if args.after is not None else client.call("/api/messages/since?after=-1")["latest"]
         deadline = time.monotonic() + args.timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -136,11 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("send")
     s.add_argument("username")
     s.add_argument("text", help="the message, or - to read it from stdin")
+    s.add_argument("--type", choices=("note", "status", "question", "handoff", "approval_request", "answer"))
+    s.add_argument("--subject", metavar="KIND:REF")
+    sub.add_parser("pending")
+    sub.add_parser("ack").add_argument("id", type=int)
     r = sub.add_parser("read")
     r.add_argument("username")
     r.add_argument("--limit", type=int, default=50)
     w = sub.add_parser("wait")
     w.add_argument("--after", type=int)
+    w.add_argument("--from-cursor", action="store_true", help="start after the server-kept ack cursor instead of the latest message")
     w.add_argument("--timeout", type=float, default=60.0)
     return p
 

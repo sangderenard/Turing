@@ -82,6 +82,7 @@ async function start() {
   if (!who || !Array.isArray(who.capabilities) || who.capabilities.indexOf("message") < 0) return;
 
   const host = document.createElement("div");
+  host.style.cssText = "all:initial !important;display:block !important";   // inline !important beats a host page stylesheet rule
   const root = host.attachShadow({ mode: "closed" });
   root.appendChild(el("style", { text: CSS }));
   document.body.appendChild(host);
@@ -104,7 +105,7 @@ async function start() {
   async function loadContacts() {
     state.contacts = await api("/api/messages/contacts");
     setUnread(countUnread(state.contacts));
-    if (state.open) renderBody();
+    if (state.open && !state.peer) renderBody();   // an open thread re-renders itself; rebuilding here looped loadThread
   }
   async function lightCheck() { if (!state.open) { try { await loadContacts(); } catch (e) { /* keep the last badge */ } } }
   lightCheck();
@@ -172,7 +173,8 @@ async function start() {
   function msgNode(m) {
     const mine = m.from === who.username;
     const node = el("div", { class: "msg" + (mine ? " mine" : "") + (m.removed ? " removed" : "") });
-    node.appendChild(document.createTextNode(m.removed ? "[removed by an administrator]" : m.body));
+    if (!m.removed && m.subject) node.appendChild(el("div", { class: "note", text: m.subject.kind + ": " + m.subject.ref }));
+    node.appendChild(document.createTextNode(m.removed ? "[removed by an administrator]" : (m.type && m.type !== "note" ? "[" + m.type + "] " : "") + m.body));
     node.appendChild(el("span", { class: "when", text: new Date(m.created * 1000).toLocaleString() }));
     return node;
   }

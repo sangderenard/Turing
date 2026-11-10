@@ -1,9 +1,8 @@
 // Math lab page: submit math, poll the one server worker, show the products and time them where they run.
 // The server rows (sympy, NumPy product, native) are measured by the server (profile.server.json).  The browser rows are
 // measured HERE, on this device: law.wasm through TuringGraphProgram (turing-wasm-shell.js), 64 reference rows checked against
-// the server's own sympy outputs.  WGSL is not timed: see WGSL_GAP.
-const WGSL_GAP = 'not timed in the browser: the WebGPU runtime in compute.js (GpuProduct) is private to the fountain manifest ' +
-  '(state commit, pack pass, display stride) and no standalone-law runner is exported; no second runner was written.';
+// the server's own sympy outputs.  law.wgsl is timed by timeWgsl (mathlab_wgsl_timing.js) on this device's WebGPU, float32.
+import {timeWgsl} from './mathlab_wgsl_timing.js';
 
 // ---- the timing function (pure: takes an instantiated program, so a node test can call it without a page) ----------------
 export function mulberry32(seed) {
@@ -55,7 +54,7 @@ export function timeWasm(program, reference, {runs = 50, warmup = 5, seed = 1, n
     program.run();
     times.push(now() - t0);
   }
-  return {rows: batch, runs, ns_per_row: median(times) * 1e6 / batch, max_abs_err: maxAbs};
+  return {rows: batch, runs, ns_per_row: median(times) * 1e6 / batch, max_abs_err: maxAbs, columns};
 }
 
 export function shortUserAgent(ua = (typeof navigator !== 'undefined' ? navigator.userAgent : '')) {
@@ -138,12 +137,16 @@ function renderResult(job, extra) {
   }
   const stored = (job.browser_profile && job.browser_profile.results) || [];
   const mine = extra.measurements.length ? extra.measurements : stored;
+  const adapterText = (adapter) => [adapter && adapter.vendor, adapter && adapter.architecture].filter(Boolean).join('/') || 'adapter info withheld';
   for (const m of mine) {
-    ran.append(el('tr', {}, el('td', {}, `this browser (${m.user_agent_hint || extra.machine})`), el('td', {}, `${m.target} product (law.${m.target === 'wasm' ? 'wasm' : 'wgsl'})`),
+    const f32 = m.target === 'wgsl' ? ` f32, ${adapterText(extra.wgsl && extra.wgsl.adapter)}` : '';
+    ran.append(el('tr', {}, el('td', {}, `this browser (${m.user_agent_hint || extra.machine})`), el('td', {}, `${m.target} product (law.${m.target === 'wasm' ? 'wasm' : 'wgsl'})${f32}`),
       el('td', {class: 'num'}, m.rows), el('td', {class: 'num'}, fmt(m.ns_per_row)), el('td', {class: 'num'}, sci(m.max_abs_err)),
       el('td', {}, m.max_abs_err === null || m.max_abs_err === undefined ? 'no reference' : '64 server reference rows')));
   }
-  $('ranfoot').textContent = `This browser: ${extra.machine}; ${extra.gpu}. WebGPU row: ${WGSL_GAP}` +
+  const wgslState = products.targets && products.targets.wgsl && products.targets.wgsl.state === 'complete';
+  $('ranfoot').textContent = `This browser: ${extra.machine}; ${extra.gpu}.` +
+    (wgslState && extra.wgsl && !extra.wgsl.ok ? ` WGSL row not timed: ${extra.wgsl.reason}.` : '') +
     (extra.note ? ' ' + extra.note : '');
   const id = job.job_id;
   const files = ['law.numpy.py', 'law.at.py'].filter((name) => (name === 'law.numpy.py' ? products.targets && products.targets.numpy && products.targets.numpy.state === 'complete'
@@ -161,6 +164,7 @@ async function measureWasm(job, extra) {
     const program = await TuringGraphProgram.load(base + 'law.wasm', base + 'law.abi.json');
     const reference = job.profile ? job.profile.reference : null;
     const timing = timeWasm(program, reference);
+    extra.columns = timing.columns;
     const entry = {target: 'wasm', rows: timing.rows, ns_per_row: timing.ns_per_row, max_abs_err: timing.max_abs_err, user_agent_hint: extra.machine};
     extra.measurements.push(entry);
     const posted = await api(`/api/mathlab/jobs/${job.job_id}/browser_profile`, {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -168,6 +172,35 @@ async function measureWasm(job, extra) {
     if (!posted.ok) extra.note = `The server did not store the browser timing (${posted.status}).`;
   } catch (error) {
     extra.note = `wasm could not be timed in this browser: ${error.message}`;
+  }
+}
+
+async function measureWgsl(job, extra) {
+  const wgsl = job.products && job.products.targets && job.products.targets.wgsl;
+  extra.wgsl = null;
+  if (!wgsl || wgsl.state !== 'complete') return;
+  try {
+    const base = `/api/mathlab/jobs/${job.job_id}/file/`;
+    const [shader, abi] = await Promise.all([fetch(base + (wgsl.file || 'law.wgsl'), {credentials: 'same-origin'}).then((r) => { if (!r.ok) throw new Error(`law.wgsl ${r.status}`); return r.text(); }),
+      fetch(base + (wgsl.abi_file || 'law.wgsl.abi.json'), {credentials: 'same-origin'}).then((r) => { if (!r.ok) throw new Error(`law.wgsl.abi.json ${r.status}`); return r.json(); })]);
+    const names = abi.arguments;
+    let columns = extra.columns;
+    if (!columns) {  // wasm was not timed: draw the same seeded domain
+      const random = mulberry32(1);
+      columns = {};
+      for (const name of names) columns[name] = Float64Array.from({length: abi.count}, () => 0.5 + 1.5 * random());
+    }
+    const reference = job.profile ? job.profile.reference : null;
+    const timing = await timeWgsl({shader, abi}, columns, abi.count, {reference});
+    extra.wgsl = timing;
+    if (!timing.ok) return;
+    const entry = {target: 'wgsl', rows: timing.rows, ns_per_row: timing.ns_per_row, max_abs_err: timing.max_abs_err, user_agent_hint: extra.machine};
+    extra.measurements.push(entry);
+    const posted = await api(`/api/mathlab/jobs/${job.job_id}/browser_profile`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(entry)});
+    if (!posted.ok) extra.note = ((extra.note || '') + ` The server did not store the WGSL timing (${posted.status}).`).trim();
+  } catch (error) {
+    extra.wgsl = {ok: false, reason: error.message};
   }
 }
 
@@ -224,7 +257,10 @@ async function main() {
         return;
       }
       $('status').textContent = 'complete; timing the wasm product in this browser...';
+      extra.columns = null;
       await measureWasm(job, extra);
+      $('status').textContent = 'complete; timing the WGSL product on this device (WebGPU)...';
+      await measureWgsl(job, extra);
       const final = (await api(`/api/mathlab/jobs/${id}`)).body || job;
       renderResult(final, extra);
       $('status').textContent = 'complete';

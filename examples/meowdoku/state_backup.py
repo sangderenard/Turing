@@ -58,7 +58,10 @@ def _check_out(state_dir: Path, out: Path):
     except (OSError, subprocess.SubprocessError) as error:
         raise BackupError(f"REFUSED: cannot check whether --out is inside a git tree ({type(error).__name__})")
     if r.returncode == 0 and r.stdout.strip() == "true":
-        raise BackupError(f"REFUSED: --out {out} is inside a git working tree")
+        # A path the enclosing repository IGNORES is not tracked and cannot be committed by accident (the state root itself sits in one).
+        ig = subprocess.run(["git", "-C", str(probe), "check-ignore", "-q", str(out)], capture_output=True, text=True, timeout=30)
+        if ig.returncode != 0:
+            raise BackupError(f"REFUSED: --out {out} is inside a git working tree and not ignored by it")
 
 
 def _backup_db(src: Path, dst: Path):

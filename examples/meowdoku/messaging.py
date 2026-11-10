@@ -1,8 +1,9 @@
 """Meowdoku user-to-user messaging: contacts and messages in accounts.db (server.py [MESSAGES], web/messenger-widget.js).
 
-Tables (schema module ``messaging`` 1; this module is their one writer):
+Tables (schema module ``messaging`` 2; this module is their one writer):
     msg_contacts  (user_id, peer_id, state requested|accepted|blocked, created, updated)   DIRECTED rows, one per side
-    msg_messages  (id, sender_id, recipient_id, body, created, read_at)
+    msg_messages  (id, sender_id, recipient_id, body, created, read_at, ..., subject_kind, subject_ref, msg_type)   v2 adds the last three
+    msg_cursor    (user_id, acked_id, updated)   the RECIPIENT's own ack cursor; never returned to any other account
 
 A conversation exists only when BOTH directions are ``accepted``.  ``request_contact(me, X)`` sets MY row for X to accepted and X's row
 for me to requested (pending X's decision); ``respond_contact(me, X, True)`` sets my row accepted.  A row ``blocked`` on either side
@@ -42,12 +43,17 @@ MAX_PER_MINUTE, MAX_PER_DAY = 30, 2000
 MAX_CONTACTS, MAX_PENDING = 200, 20
 MAX_WAITERS, MAX_WAITERS_PER_ACCOUNT = 64, 2
 MAX_WAIT_S = 25.0
+SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic")
+MSG_TYPES = ("note", "status", "question", "handoff", "approval_request", "answer")
+MAX_SUBJECT_REF = 200
 
 DDL = ("CREATE TABLE IF NOT EXISTS msg_contacts (user_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
        "state TEXT NOT NULL CHECK(state IN ('requested','accepted','blocked')), created REAL NOT NULL, updated REAL NOT NULL, "
        "PRIMARY KEY(user_id, peer_id))",
        "CREATE TABLE IF NOT EXISTS msg_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, "
-       "recipient_id INTEGER NOT NULL, body TEXT NOT NULL, created REAL NOT NULL, read_at REAL, removed_at REAL, removed_by INTEGER)",
+       "recipient_id INTEGER NOT NULL, body TEXT NOT NULL, created REAL NOT NULL, read_at REAL, removed_at REAL, removed_by INTEGER, "
+       "subject_kind TEXT, subject_ref TEXT, msg_type TEXT NOT NULL DEFAULT 'note')",
+       "CREATE TABLE IF NOT EXISTS msg_cursor (user_id INTEGER PRIMARY KEY, acked_id INTEGER NOT NULL, updated REAL NOT NULL)",
        "CREATE TABLE IF NOT EXISTS msg_suspended (user_id INTEGER PRIMARY KEY, by_id INTEGER NOT NULL, created REAL NOT NULL)",
        "CREATE TABLE IF NOT EXISTS msg_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER NOT NULL, action TEXT NOT NULL, "
        "target TEXT NOT NULL, created REAL NOT NULL)",
@@ -62,18 +68,26 @@ class MessagingError(Exception):
 
 
 def connect(db_path) -> sqlite3.Connection:
-    """Own connection to accounts.db (autocommit).  Declares schema module ``messaging`` 1."""
+    """Own connection to accounts.db (autocommit).  Declares schema module ``messaging`` 2 (v1 migrates in place by ADD COLUMN)."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(db_path), timeout=10, isolation_level=None, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(db, "messaging", 1)
+        _schema_version.declare(db, "messaging", 2)
     except _schema_version.SchemaVersionError:
         db.close()
         raise
     for ddl in DDL:
         db.execute(ddl)
+    have = {r["name"] for r in db.execute("PRAGMA table_info(msg_messages)")}
+    for column, decl in (("subject_kind", "TEXT"), ("subject_ref", "TEXT"), ("msg_type", "TEXT NOT NULL DEFAULT 'note'")):
+        if column not in have:
+            try:
+                db.execute(f"ALTER TABLE msg_messages ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as error:       # another process on the same database added it first
+                if "duplicate column" not in str(error).lower():
+                    raise
     return db
 
 
@@ -244,10 +258,46 @@ def _clean(body) -> str:
 
 
 def _row(db_row, names, admin: bool = False) -> dict:
-    """The one message shape a user sees: exactly id, from, to, created, body, removed (no read state, no ids of accounts)."""
+    """The one message shape a user sees: exactly id, from, to, created, body, removed, subject, type (no read/ack state, no account ids)."""
     gone = db_row["removed_at"] is not None
     return {"id": db_row["id"], "from": names[db_row["sender_id"]], "to": names[db_row["recipient_id"]],
-            "created": db_row["created"], "body": db_row["body"] if (admin or not gone) else "", "removed": gone}
+            "created": db_row["created"], "body": db_row["body"] if (admin or not gone) else "", "removed": gone,
+            "subject": None if db_row["subject_kind"] is None else {"kind": db_row["subject_kind"], "ref": db_row["subject_ref"]},
+            "type": db_row["msg_type"]}
+
+
+def _subject(subject):
+    """(None, None), or (kind, ref) from {"kind": one of SUBJECT_KINDS, "ref": 1..MAX_SUBJECT_REF chars}."""
+    if subject is None:
+        return None, None
+    if not isinstance(subject, dict) or set(subject) != {"kind", "ref"}:
+        raise MessagingError("subject must be {kind, ref}", 400)
+    kind, ref = subject["kind"], subject["ref"]
+    if kind not in SUBJECT_KINDS or not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_SUBJECT_REF or "\x00" in ref:
+        raise MessagingError(f"subject kind must be one of {', '.join(SUBJECT_KINDS)} and ref 1 to {MAX_SUBJECT_REF} characters", 400)
+    return kind, ref
+
+
+def _type(msg_type) -> str:
+    if msg_type is None:
+        return "note"
+    if msg_type not in MSG_TYPES:
+        raise MessagingError(f"type must be one of {', '.join(MSG_TYPES)}", 400)
+    return msg_type
+
+
+def _subject_filter(kind, ref):
+    """(sql fragment, args) for the optional subject_kind / subject_ref filters of thread and since."""
+    sql, args = "", []
+    if kind is not None:
+        if kind not in SUBJECT_KINDS:
+            raise MessagingError(f"subject_kind must be one of {', '.join(SUBJECT_KINDS)}", 400)
+        sql += " AND subject_kind = ?"
+        args.append(kind)
+    if ref is not None:
+        sql += " AND subject_ref = ?"
+        args.append(str(ref))
+    return sql, args
 
 
 def _suspended(db, user_id) -> bool:
@@ -262,9 +312,11 @@ def _names(db, rows) -> dict:
     return {r["id"]: r["username"] for r in db.execute(f"SELECT id, username FROM users WHERE id IN ({marks})", tuple(ids))}
 
 
-def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None) -> dict:
+def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None, subject=None, msg_type=None) -> dict:
     now = time.time() if now is None else now
     text = _clean(body)
+    skind, sref = _subject(subject)
+    mtype = _type(msg_type)
     peer = _peer(db, peer_username)
     if _suspended(db, me) or peer is None or peer[0] == me or not _mutual(db, me, peer[0]):
         raise MessagingError("you cannot message this user", 403)
@@ -278,8 +330,8 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
             raise MessagingError(f"at most {MAX_PER_MINUTE} messages per minute", 429)
         if day >= MAX_PER_DAY:
             raise MessagingError(f"at most {MAX_PER_DAY} messages per day", 429)
-        mid = db.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created) VALUES (?,?,?,?)",
-                         (me, peer[0], text, now)).lastrowid
+        mid = db.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created, subject_kind, subject_ref, msg_type) "
+                         "VALUES (?,?,?,?,?,?,?)", (me, peer[0], text, now, skind, sref, mtype)).lastrowid
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -288,7 +340,7 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
     return {"ok": True, "id": mid, "created": now}
 
 
-def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
+def thread(db, me: int, peer_username, before_id=None, limit: int = 50, subject_kind=None, subject_ref=None) -> dict:
     """Messages between ``me`` and the peer, oldest first: the newest ``limit`` below ``before_id``.  An unknown peer is an empty thread."""
     limit = max(1, min(int(limit), 200))
     peer = _peer(db, peer_username)
@@ -296,6 +348,9 @@ def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
         return {"messages": [], "more": False}
     args = [me, peer[0], peer[0], me]
     sql = "SELECT * FROM msg_messages WHERE ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))"
+    extra, extra_args = _subject_filter(subject_kind, subject_ref)
+    sql += extra
+    args += extra_args
     if before_id is not None:
         sql += " AND id < ?"
         args.append(int(before_id))
@@ -306,11 +361,12 @@ def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
     return {"messages": [_row(r, names) for r in rows], "more": more}
 
 
-def since(db, me: int, after_id, limit: int = 200) -> list:
+def since(db, me: int, after_id, limit: int = 200, subject_kind=None, subject_ref=None) -> list:
     """Every message to or from ``me`` with id > after_id, oldest first: the poll primitive."""
     limit = max(1, min(int(limit), 500))
-    rows = db.execute("SELECT * FROM msg_messages WHERE id > ? AND (sender_id = ? OR recipient_id = ?) ORDER BY id LIMIT ?",
-                      (int(after_id or 0), me, me, limit)).fetchall()
+    extra, extra_args = _subject_filter(subject_kind, subject_ref)
+    rows = db.execute("SELECT * FROM msg_messages WHERE id > ? AND (sender_id = ? OR recipient_id = ?)" + extra + " ORDER BY id LIMIT ?",
+                      (int(after_id or 0), me, me, *extra_args, limit)).fetchall()
     names = _names(db, rows)
     return [_row(r, names) for r in rows]
 
@@ -320,19 +376,19 @@ def latest_id(db, me: int) -> int:
     return db.execute("SELECT COALESCE(MAX(id), 0) FROM msg_messages WHERE sender_id = ? OR recipient_id = ?", (me, me)).fetchone()[0]
 
 
-def long_poll(db, me: int, after_id, wait: float, hub: Hub | None = None, limit: int = 200) -> list:
+def long_poll(db, me: int, after_id, wait: float, hub: Hub | None = None, limit: int = 200, subject_kind=None, subject_ref=None) -> list:
     hub = hub or HUB
     if int(after_id or 0) < 0:                  # after=-1: no messages, just ``latest_id`` (the caller reports it)
         return []
     wait = max(0.0, min(float(wait), MAX_WAIT_S))
     if wait <= 0:
-        return since(db, me, after_id, limit)
+        return since(db, me, after_id, limit, subject_kind, subject_ref)
     hub.enter(me)
     deadline = time.monotonic() + wait
     try:
         while True:
             seen = hub.seq                      # read BEFORE the query: a send in between shows as a changed seq
-            rows = since(db, me, after_id, limit)
+            rows = since(db, me, after_id, limit, subject_kind, subject_ref)
             if rows:
                 return rows
             remaining = deadline - time.monotonic()
@@ -350,6 +406,39 @@ def mark_read(db, me: int, peer_username, up_to_id) -> dict:
     cur = db.execute("UPDATE msg_messages SET read_at = ? WHERE recipient_id = ? AND sender_id = ? AND id <= ? AND read_at IS NULL",
                      (time.time(), me, peer[0], int(up_to_id)))
     return {"ok": True, "marked": cur.rowcount}
+
+
+# ---- server-kept cursor (the recipient's own state; no function here returns it to anyone else) ----------------------------------
+def _cursor(db, me) -> int:
+    row = db.execute("SELECT acked_id FROM msg_cursor WHERE user_id = ?", (me,)).fetchone()
+    return row["acked_id"] if row else 0
+
+
+def inbox(db, me: int, limit: int = 200) -> dict:
+    """Messages TO ``me`` with id > my acked cursor, oldest first (at most 200), plus the cursor."""
+    limit = max(1, min(int(limit), 200))
+    cursor = _cursor(db, me)
+    rows = db.execute("SELECT * FROM msg_messages WHERE recipient_id = ? AND id > ? ORDER BY id LIMIT ?", (me, cursor, limit)).fetchall()
+    names = _names(db, rows)
+    return {"messages": [_row(r, names) for r in rows], "cursor": cursor}
+
+
+def ack(db, me: int, up_to, now: float | None = None) -> dict:
+    """Advance my cursor to ``up_to`` (monotonic; never beyond the latest id addressed to me).  Returns only my own cursor."""
+    now = time.time() if now is None else now
+    if isinstance(up_to, bool) or not isinstance(up_to, int) or up_to < 0:
+        raise MessagingError("up_to must be a non-negative integer", 400)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        top = db.execute("SELECT COALESCE(MAX(id), 0) FROM msg_messages WHERE recipient_id = ?", (me,)).fetchone()[0]
+        cursor = max(_cursor(db, me), min(up_to, top))
+        db.execute("INSERT INTO msg_cursor (user_id, acked_id, updated) VALUES (?,?,?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET acked_id = excluded.acked_id, updated = excluded.updated", (me, cursor, now))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return {"ok": True, "cursor": cursor}
 
 
 # ---- operator oversight (server.py gates these on account_manage) ----------------------------------------------------------------
