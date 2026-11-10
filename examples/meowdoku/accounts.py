@@ -118,6 +118,32 @@ class Accounts:
             self._conn.commit()
             return {"id": cursor.lastrowid, "username": username}
 
+    def ensure_user(self, username: str, password: str, display_name: str | None = None) -> int:
+        """Create the account if absent (same hashing as signup) and return its id; an existing account is left unchanged."""
+        username = self._clean_username(username)
+        with self.lock:
+            row = self._conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
+        if row:
+            return row[0]
+        user = self.signup(username, password)
+        if display_name:
+            with self.lock:
+                self._conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user["id"]))
+                self._conn.commit()
+        return user["id"]
+
+    def set_password(self, username: str, password: str) -> int:
+        if len(str(password)) < MIN_PASSWORD:
+            raise AccountError(f"password must be at least {MIN_PASSWORD} characters")
+        password_hash = _hash_password(str(password))
+        with self.lock:
+            row = self._conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone()
+            if row is None:
+                raise AccountError("no such account", 404)
+            self._conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, row[0]))
+            self._conn.commit()
+            return row[0]
+
     def login(self, username: str, password: str) -> dict:
         username = self._clean_username(username)
         with self.lock:

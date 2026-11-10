@@ -9,8 +9,30 @@ param(
     [string]$Route = 'a',
     [string]$Bind = '0.0.0.0',
     [switch]$Dev,
-    [switch]$WhatIf
+    [switch]$WhatIf,
+    [string]$User = $env:MEOWDOKU_OPERATOR,
+    [string]$PasswordFile,
+    [string]$AccountsDb
 )
+
+# ---- Operator gate (authz.py script-auth): only accounts in script_access with deploy_scripts may run this script. Not skippable; -WhatIf is gated too.
+$__repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+if (-not $User) { throw 'REFUSED no operator: pass -User <name> (or set MEOWDOKU_OPERATOR) and -PasswordFile <path>.' }
+if (-not $AccountsDb) { $AccountsDb = Join-Path $__repo 'build\meowdoku\accounts.db' }
+if (-not $PasswordFile) {
+    $__default = Join-Path $__repo "build\meowdoku\operator_credentials\$User.secret"
+    if (Test-Path -LiteralPath $__default) { $PasswordFile = $__default }
+}
+$__args = @((Join-Path $__repo 'examples\meowdoku\authz.py'), 'script-auth', $MyInvocation.MyCommand.Name, '--user', $User, '--db', $AccountsDb)
+if ($PasswordFile) { $__args += @('--password-file', $PasswordFile) }
+$__eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$env:PYTHONUTF8 = '1'
+$__gate = & 'C:\Users\alber\AppData\Local\Programs\Python\Python311\python.exe' @__args 2>&1
+$__code = $LASTEXITCODE
+$ErrorActionPreference = $__eap
+if ($__code -ne 0) { throw (($__gate | ForEach-Object { "$_" }) -join ' ') }
+Write-Host ($__gate -join ' ')
+# ---- end gate
 $ErrorActionPreference = 'Stop'
 Write-Warning "Apache owns the live instances (deploy\apache_supervisor.py, instances.json): use Start-Apache.ps1 / Stop-Apache.ps1. This script is for manual dev use; a port the supervisor manages will be left alone or fought over."
 $Repo   = 'C:\dev\Powershell\turing'

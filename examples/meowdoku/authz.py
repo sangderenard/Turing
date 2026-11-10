@@ -50,6 +50,10 @@ INTEGRATION SPEC (server.py is not in this branch).  Build the principal once in
     ~1423 /api/action single EDIT_ACTIONS require_tier edit        same                                     owner_tools
     new   account admin endpoints (grant/revoke/list)              role management                          account_manage
 
+SCRIPT ACCESS.  ``deploy_scripts`` is granted by no tier, only by role admin/operator.  deploy/*.ps1 run ``script-auth``: the account must
+verify, be in ``script_access`` (explicit allow-list) and hold deploy_scripts; every attempt is a ``script_audit`` row (exit 3 refuses).
+CLI: ``script-grant|script-revoke|script-list|script-auth``; ``deploy/operators.py`` bootstraps admin/codex/claude/guest_agent.
+
 CLI: ``python authz.py grant-admin <user> --db accounts.db --granted-by operator:<prefix>``; ``revoke-admin``; ``show``; ``caps``.
 """
 from __future__ import annotations
@@ -64,8 +68,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_submit",
-        "share_live", "account_manage")
-ROLES = ("admin", "member", "service", "guest")
+        "share_live", "account_manage", "deploy_scripts")
+ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
 POLICY_FILE = "authz_policy.json"
@@ -75,13 +79,15 @@ DEFAULT_POLICY = {
         "shader": ["view_site"],
         "play": ["view_site", "play"],
         "dev": ["view_site", "play", "dev_ui"],
-        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage")],
+        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live"],
         # service: a supervisor-owned instance account (deploy/apache_supervisor.py).  Member caps plus library_manage, so the
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
         "service": ["studio_write", "photo_submit", "share_live", "library_manage"],
+        # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
+        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin"],
         "admin": list(CAPS),
         "guest": [],
     },
@@ -90,9 +96,21 @@ DEFAULT_POLICY = {
 _DDL = """
 CREATE TABLE IF NOT EXISTS account_roles (
     user_id INTEGER PRIMARY KEY,
-    role TEXT NOT NULL CHECK(role IN ('admin','member','service')),
+    role TEXT NOT NULL CHECK(role IN ('admin','member','service','operator')),
     granted_by TEXT NOT NULL,
     created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS script_access (
+    username TEXT PRIMARY KEY,
+    granted_by TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS script_audit (
+    ts REAL,
+    username TEXT,
+    script TEXT,
+    allowed INTEGER,
+    host TEXT
 );
 """
 _lock = threading.Lock()
@@ -180,7 +198,7 @@ def _connect(db_path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_DDL)
     sql = (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'account_roles'").fetchone() or [""])[0] or ""
-    if "'service'" not in sql:      # a table created before the service role: rebuild it with the wider CHECK (rows kept)
+    if "'operator'" not in sql:     # a table created before the service/operator roles: rebuild it with the wider CHECK (rows kept)
         conn.executescript("BEGIN; ALTER TABLE account_roles RENAME TO account_roles_old;" + _DDL +
                            "INSERT INTO account_roles SELECT user_id, role, granted_by, created_at FROM account_roles_old;"
                            "DROP TABLE account_roles_old; COMMIT;")
@@ -251,6 +269,120 @@ def principal_from(account, origin: str, tier: str, db_path) -> Principal:
     return Principal(role_of(db_path, account["id"]), account["id"], account["username"], origin, tier)
 
 
+def grant_role(db_path, username: str, role: str, granted_by: str) -> int:
+    """Set a non-admin role row (operator, service, member) for an account; admin goes through grant_admin's grantor check."""
+    if role == "admin":
+        return grant_admin(db_path, username, granted_by)
+    if role not in ROLES or role == "guest":
+        raise AuthzError(f"cannot grant role {role!r}", 400)
+    with _lock:
+        conn = _connect(db_path)
+        try:
+            uid = _user_id(conn, username)
+            conn.execute("INSERT OR REPLACE INTO account_roles (user_id, role, granted_by, created_at) VALUES (?, ?, ?, ?)",
+                         (uid, role, str(granted_by), time.time()))
+            conn.commit()
+            return uid
+        finally:
+            conn.close()
+
+
+# ---- script access: who may run deploy/*.ps1 ------------------------------------------------------------------------------
+def script_grant(db_path, username: str, granted_by: str) -> None:
+    with _lock:
+        conn = _connect(db_path)
+        try:
+            name = conn.execute("SELECT username FROM users WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone()
+            if name is None:
+                raise AuthzError(f"no such account {username!r}", 404)
+            conn.execute("INSERT OR REPLACE INTO script_access (username, granted_by, created_at) VALUES (?, ?, ?)",
+                         (name[0], str(granted_by), time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def script_revoke(db_path, username: str) -> None:
+    with _lock:
+        conn = _connect(db_path)
+        try:
+            conn.execute("DELETE FROM script_access WHERE username = ? COLLATE NOCASE", (str(username),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def script_list(db_path) -> list:
+    conn = _connect(db_path)
+    try:
+        return [r[0] for r in conn.execute("SELECT username FROM script_access ORDER BY username")]
+    finally:
+        conn.close()
+
+
+def script_allowed(db_path, username: str) -> bool:
+    """True only when the username is in script_access AND the account's capabilities include deploy_scripts."""
+    conn = _connect(db_path)
+    try:
+        if conn.execute("SELECT 1 FROM script_access WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone() is None:
+            return False
+        row = conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return False
+    principal = Principal(role_of(db_path, row[0]), row[0], str(username), "lan", "shader")
+    return "deploy_scripts" in capabilities(principal, Policy.beside(db_path).get())
+
+
+def _accounts_module():
+    try:
+        from meowdoku import accounts
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import accounts
+    return accounts
+
+
+def script_auth(db_path, script: str, username: str, password_file=None, prompt: bool = False) -> tuple:
+    """(allowed, reason).  Verifies the password with accounts' own verification, checks script_allowed, writes a script_audit row."""
+    import getpass
+    import socket
+    accounts = _accounts_module()
+    reason = ""
+    password = ""
+    try:
+        if password_file:
+            password = Path(password_file).read_text(encoding="utf-8").strip()
+        elif prompt:
+            # Only an explicit --prompt may block on the console: on Windows
+            # getpass reads the console directly even when stdin is not a tty.
+            password = getpass.getpass(f"password for {username}: ")
+        else:
+            reason = "no credential: pass --password-file, or --prompt for an interactive login"
+    except OSError:
+        reason = "password file unreadable"
+    if not reason:
+        conn = _connect(db_path)
+        try:
+            row = conn.execute("SELECT password_hash FROM users WHERE username = ? COLLATE NOCASE", (str(username),)).fetchone()
+        finally:
+            conn.close()
+        if row is None or not accounts._verify_password(password, row[0]):
+            reason = "wrong username or password"
+        elif not script_allowed(db_path, username):
+            reason = "account is not allowed to run the deploy scripts"
+    allowed = not reason
+    conn = _connect(db_path)
+    try:
+        conn.execute("INSERT INTO script_audit (ts, username, script, allowed, host) VALUES (?, ?, ?, ?, ?)",
+                     (time.time(), str(username), str(script), int(allowed), socket.gethostname()))
+        conn.commit()
+    finally:
+        conn.close()
+    return allowed, reason
+
+
 # ---- CLI ------------------------------------------------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="authz.py")
@@ -260,6 +392,21 @@ def main(argv=None) -> int:
         p.add_argument("username")
         p.add_argument("--db", required=True)
         p.add_argument("--granted-by", required=True)
+    p = sub.add_parser("script-grant")
+    p.add_argument("username")
+    p.add_argument("--db", required=True)
+    p.add_argument("--granted-by", required=True)
+    p = sub.add_parser("script-revoke")
+    p.add_argument("username")
+    p.add_argument("--db", required=True)
+    p = sub.add_parser("script-list")
+    p.add_argument("--db", required=True)
+    p = sub.add_parser("script-auth")
+    p.add_argument("script_name")
+    p.add_argument("--user", required=True)
+    p.add_argument("--password-file", default=None)
+    p.add_argument("--prompt", action="store_true", help="ask for the password on the console")
+    p.add_argument("--db", required=True)
     p = sub.add_parser("show")
     p.add_argument("username")
     p.add_argument("--db", required=True)
@@ -275,6 +422,21 @@ def main(argv=None) -> int:
             print(f"admin granted to {args.username} (user {grant_admin(args.db, args.username, args.granted_by)})")
         elif args.cmd == "revoke-admin":
             print(f"admin revoked from {args.username} (user {revoke_admin(args.db, args.username, args.granted_by)})")
+        elif args.cmd == "script-grant":
+            script_grant(args.db, args.username, args.granted_by)
+            print(f"script access granted to {args.username}")
+        elif args.cmd == "script-revoke":
+            script_revoke(args.db, args.username)
+            print(f"script access revoked from {args.username}")
+        elif args.cmd == "script-list":
+            for name in script_list(args.db):
+                print(name)
+        elif args.cmd == "script-auth":
+            allowed, reason = script_auth(args.db, args.script_name, args.user, args.password_file, prompt=args.prompt)
+            if not allowed:
+                print(f"REFUSED {reason}", file=sys.stderr)
+                return 3
+            print(f"OK {args.user}")
         elif args.cmd == "show":
             conn = _connect(args.db)
             try:

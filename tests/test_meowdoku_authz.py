@@ -62,7 +62,7 @@ def test_admin_lan_everything():
 
 def test_member_lan_edit_has_no_admin_caps():
     caps = authz.capabilities(P("member", "lan", "edit"), authz.DEFAULT_POLICY)
-    assert caps == ALL - {"lifecycle_admin", "account_manage"}
+    assert caps == ALL - {"lifecycle_admin", "account_manage", "deploy_scripts"}
 
 
 def test_policy_override_after_mtime_bump(tmp_path):

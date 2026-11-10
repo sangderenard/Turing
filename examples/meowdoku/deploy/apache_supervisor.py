@@ -9,6 +9,8 @@ starts it at startup, restarts it if it exits, and closes its stdin at shutdown.
     a scheduled lifecycle exit (75) relaunches at once);
   * on stdin EOF / SIGTERM / CTRL_BREAK: graceful stop (Meowdoku: the session-preserving lifecycle restart request, exit-only here
     because this process does not relaunch it; Nodus: CTRL_BREAK), wait 20 s, terminate, check every lease in, mark ``stopped``, exit 0.
+NOT GATED: unlike deploy/*.ps1 (operator gate, authz.py script-auth; see LAUNCH_2026-11-10.md "Who may run the scripts"), this process is
+launched by httpd under Apache's identity, not by a user, so it carries no -User/-PasswordFile check.
 Only one supervisor manages instances (an OS lock on ``<state>/supervisor.lock``); a second one (httpd on Windows can open the pipe
 from more than one process) stays a log sink.  A port that already has a listener is not launched over (state ``external``).
 
