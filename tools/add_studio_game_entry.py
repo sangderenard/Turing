@@ -24,7 +24,7 @@ def patch_studio_game_entry(source: bytes, *, expected_source_sha256: str) -> tu
         raise ValueError('Studio player entry is already installed')
     if 'const mechanicalCreatureStudioBridgeState' not in document:
         raise ValueError('Studio player entry requires the original runtime bridge')
-    helper = HELPER.read_text(encoding='utf-8')
+    helper = HELPER.read_bytes().decode('utf-8')
     if '</script' in helper.lower():
         raise ValueError('Unsafe helper script terminator')
     changes = [(SIGNATURE, 'function respawnViewportActor(studioSpawn=null){'),
