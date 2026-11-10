@@ -54,7 +54,10 @@ def test_hairpin_needs_the_public_ip():
 
 
 def test_forwarding_headers_are_ignored():
-    """The decision is a function of (peer, Host) alone; a spoofed X-Forwarded-For can neither grant nor remove LAN."""
+    """From a peer that is not a trusted proxy, a spoofed X-Forwarded-For can neither grant nor remove LAN (proxy_trust.py)."""
+    from meowdoku import proxy_trust
+    saved = set(proxy_trust.TRUSTED_PROXIES)
+    proxy_trust.TRUSTED_PROXIES.clear()                    # the loopback test peer is an ordinary, untrusted peer here
     sessions = srv.Sessions(_web(Path(__import__("tempfile").mkdtemp())), None)
     sessions.access = A.Access(None)
     sessions.access._found, sessions.access._found_at = PUBLIC, time.time()
@@ -69,6 +72,7 @@ def test_forwarding_headers_are_ignored():
         # and the signature of the function takes no headers at all
         assert A.classify("8.8.8.8", "1.2.3.4", (PUBLIC,)) == "ip"
     finally:
+        proxy_trust.TRUSTED_PROXIES.update(saved)
         httpd.shutdown(); httpd.server_close()
 
 
@@ -178,7 +182,7 @@ def test_whoami_reports_the_tier_and_nothing_else(tiered):
         set_tier(tier)
         status, who = _get(port, "/api/whoami", {"X-Secret": "abc"})
         assert status == 200 and who["tier"] == tier and who["origin"] == "lan"
-        assert set(who) == {"origin", "tier", "dev", "edit", "shader"}
+        assert set(who) == {"origin", "tier", "dev", "edit", "shader", "role", "capabilities"}
         assert who["edit"] == (tier == "edit") and who["dev"] == (tier in ("edit", "dev")) and who["shader"] == (tier == "shader")
 
 
@@ -219,7 +223,7 @@ def test_edit_endpoints_are_refused_below_edit(tiered):
         if tier != "shader":
             for kind in OWNER_ACTIONS:
                 status, body = _get(port, "/api/action", method="POST", body=json.dumps({"type": kind}).encode())
-                assert status == 403 and "edit" in body["error"], (tier, kind)
+                assert status == 403 and body["error"] == "this needs owner_tools", (tier, kind)
     assert sessions.anim.info() is None
 
 

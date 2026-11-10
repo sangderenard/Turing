@@ -77,6 +77,9 @@ from meowdoku import marble_objects as marble_objects_mod  # noqa: E402  [MARBLE
 from meowdoku import marble_photo as marble_photo_mod  # noqa: E402  [MARBLE PHOTO] Spectral worker process
 from meowdoku import access as access_mod  # noqa: E402  [ACCESS] (origin -> tier: lan/dns/ip -> edit/dev/play/shader)
 from meowdoku import accounts as accounts_mod  # noqa: E402  [ACCOUNTS] real password login, SQLite-backed, separate from profiles.py
+from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] client origin/scheme from a trusted reverse proxy only
+from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
+from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
 PRODUCT_WAIT_SECONDS = 90       # [LOADING] how long a request for a building product file waits before "503, retry"
@@ -357,6 +360,9 @@ class Sessions:
         self.access = access_mod.Access(web_dir.parent / "access.json")   # [ACCESS] build/meowdoku/access.json (gitignored); main() may point it elsewhere
         self.anim_misses: dict[str, list] = {}            # [STUDIO] wrong owner tokens per address
         self.accounts = accounts_mod.Accounts(web_dir.parent / "accounts.db")   # [ACCOUNTS] real password login
+        self.accounts_db = web_dir.parent / "accounts.db"
+        self.authz_policy = authz_mod.Policy.beside(self.accounts_db)           # [AUTHZ] authz_policy.json beside accounts.db
+        self.route = ""                                                         # [PROXY] --route NAME: balancer stickiness cookie value
         self.obj_assets = obj_assets_mod.Store(web_dir.parent / "obj_assets", self.accounts, ROOT.parent / "spectral-analyzer")
         self.marble_objects.obj_assets = self.obj_assets
 
@@ -445,7 +451,9 @@ def make_handler(sessions: Sessions):
 
         def _is_secure(self) -> bool:
             import ssl
-            return isinstance(self.connection, ssl.SSLSocket) or self.headers.get("X-Forwarded-Proto") == "https"
+            if not hasattr(self, "_scheme"):
+                self._classify()
+            return isinstance(self.connection, ssl.SSLSocket) or self._scheme == "https"
 
         def _account(self) -> dict | None:
             """The logged-in account for this request (accounts.py), or None.
@@ -468,9 +476,49 @@ def make_handler(sessions: Sessions):
                 self._set_cookie = []
             self._set_cookie.append(f"{ACCOUNT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
 
-        # ---- [ACCESS] origin and tier, from the socket peer and the Host header only (never a forwarding header: there is no proxy)
+        # ---- [ACCESS] origin and tier, from the client address and the Host header.  The client address is the socket peer, except when the
+        # peer is a trusted proxy (proxy_trust.py), whose X-Forwarded-For names the real client; a header from any other peer is never read.
         def _classify(self) -> None:
-            self._origin, self._tier = sessions.access.decide(self.client_address[0], self.headers.get("Host"))
+            client_ip, self._scheme, self._via_proxy = proxy_trust_mod.client_origin(self.client_address[0], self.headers)
+            self._origin, self._tier = sessions.access.decide(client_ip, self.headers.get("Host"))
+            self._principal_cache = None
+
+        # ---- [AUTHZ] the request's principal and its capabilities (authz.py); built lazily after _classify
+        def _principal(self):
+            if getattr(self, "_principal_cache", None) is None:
+                self._principal_cache = authz_mod.principal_from(self._account(), self._origin, self._tier, sessions.accounts_db)
+            return self._principal_cache
+
+        def _caps(self) -> frozenset:
+            return authz_mod.capabilities(self._principal(), sessions.authz_policy.get())
+
+        def _require(self, cap: str) -> bool:
+            """True when the request holds ``cap``; otherwise a 403 is sent and False returned (same contract as access.require_tier)."""
+            self._classify()
+            try:
+                authz_mod.require(self._principal(), cap, sessions.authz_policy.get())
+            except authz_mod.AuthzError as error:
+                self.close_connection = True
+                self._set_cookie = []
+                self._json({"error": error.message}, error.status)
+                return False
+            return True
+
+        def _body_json(self, limit: int = 4096):
+            """The request body as a JSON object, or None after a 400 was sent."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= limit:
+                    raise ValueError("body size is invalid")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("expected a JSON object")
+                return body
+            except (ValueError, TypeError) as error:
+                self.close_connection = True
+                self._set_cookie = []
+                self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return None
 
         def _shader_request(self, path: str, method: str) -> bool:
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
@@ -492,7 +540,7 @@ def make_handler(sessions: Sessions):
 
         def _log_get(self) -> None:                               # [LOG]
             from urllib.parse import parse_qs
-            if not access_mod.require_tier(self, "dev"):
+            if not self._require("dev_ui"):
                 return
             if self._is_viewer():
                 return self._refuse_viewer()
@@ -504,11 +552,45 @@ def make_handler(sessions: Sessions):
             self._set_cookie = []
             self._json(logring_mod.RING.fetch(since, limit, set(q["src"][0].split(",")) if q.get("src") else None))
 
+        def _admin_list(self) -> list:
+            import sqlite3
+            authz_mod._connect(sessions.accounts_db).close()          # make sure account_roles exists
+            conn = sqlite3.connect(str(sessions.accounts_db), timeout=10)
+            try:
+                return [{"username": r[0], "granted_by": r[1], "created_at": r[2]} for r in conn.execute(
+                    "SELECT u.username, r.granted_by, r.created_at FROM account_roles r JOIN users u ON u.id = r.user_id "
+                    "WHERE r.role = 'admin' ORDER BY u.username")]
+            finally:
+                conn.close()
+
+        def _lowering_blob(self, sha: str) -> None:
+            """Stream a stored lowering's bytes to the account that holds an open, unexpired lease on that exact blob."""
+            if not self._require("studio_write"):
+                return
+            self._set_cookie = []
+            if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+                return self._json({"error": "expected a sha256"}, HTTPStatus.BAD_REQUEST)
+            key = self._job_identity()[0][0]
+            leases = lowering_mod._leases(sessions.accounts_db, "WHERE l.returned IS NULL AND l.product_sha256 = ? AND l.account_key = ? "
+                                          "AND l.deadline > ?", (sha, key, time.time()))
+            data = lowering_mod.blob_bytes(sessions.accounts_db, sha) if leases else None
+            if data is None:
+                return self._json({"error": "no open lease for that blob"}, HTTPStatus.FORBIDDEN)
+            ctype = {"wasm": "application/wasm", "json": "application/json", "wgsl": "text/plain; charset=utf-8",
+                     "c": "text/plain; charset=utf-8", "ll": "text/plain; charset=utf-8"}.get(leases[0].kind, "application/octet-stream")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
         def _whoami(self) -> None:
             self._set_cookie = []
+            caps = self._caps()
             self._json({"origin": self._origin, "tier": self._tier,
-                        "dev": access_mod.at_least(self._tier, "dev"), "edit": access_mod.at_least(self._tier, "edit"),
-                        "shader": self._tier == "shader"})
+                        "dev": "dev_ui" in caps, "edit": "owner_tools" in caps,
+                        "shader": self._tier == "shader", "role": self._principal().role, "capabilities": sorted(caps)})
 
         def do_HEAD(self):  # noqa: N802
             self._classify()
@@ -523,8 +605,11 @@ def make_handler(sessions: Sessions):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            for cookie in getattr(self, "_set_cookie", None) or ():
+            cookies = getattr(self, "_set_cookie", None) or ()
+            for cookie in cookies:
                 self.send_header("Set-Cookie", cookie)
+            if cookies and sessions.route:
+                self.send_header("Set-Cookie", proxy_trust_mod.route_cookie(sessions.route))
             self.end_headers()
             self.wfile.write(body)
 
@@ -762,7 +847,7 @@ def make_handler(sessions: Sessions):
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
                 return self._log_get()
             if path == "/api/tickets":
-                if not access_mod.require_tier(self, "dev"):
+                if not self._require("dev_ui"):
                     return
                 if self._is_viewer():
                     return self._refuse_viewer()
@@ -785,14 +870,14 @@ def make_handler(sessions: Sessions):
             if path == "/api/marble_photo/jobs":
                 if self._is_viewer():
                     return self._refuse_viewer()
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("photo_submit"):
                     return
                 from meowdoku import job_library
                 keys, account = self._job_identity()
                 digests = sessions.accounts.assets_for_user(account["id"], "marble_photo") if account else ()
                 return self._json(job_library.entries(sessions.marble_photos, keys, digests))
             if path == "/api/marble_photo/lenses":
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("photo_submit"):
                     return
                 from meowdoku.marble_lens_contract import lens_catalog
                 try:
@@ -800,7 +885,7 @@ def make_handler(sessions: Sessions):
                 except (ValueError, OSError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("photo_submit"):
                     return
                 from urllib.parse import parse_qs
                 query = parse_qs(self.path.partition("?")[2])
@@ -880,10 +965,27 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "no such marble object"}, HTTPStatus.NOT_FOUND)
                 except marble_objects_mod.ObjectError as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.INTERNAL_SERVER_ERROR))
+            if path == "/api/account/admin/list":
+                if not self._require("account_manage"):
+                    return
+                self._set_cookie = []
+                return self._json({"admins": self._admin_list()})
+            if path == "/api/lowerings":
+                if not self._require("view_site"):
+                    return
+                self._set_cookie = []
+                by_core: dict = {}
+                for low in lowering_mod.lowerings(sessions.accounts_db):
+                    by_core.setdefault(low["core_id"], []).append(low)
+                return self._json({"cores": [{**core, "lowerings": by_core.get(core["core_id"], [])}
+                                             for core in lowering_mod.cores(sessions.accounts_db)]})
+            if path.startswith("/api/lowerings/blob/"):
+                return self._lowering_blob(path.rsplit("/", 1)[1])
             if path == "/api/account/me":
                 self._set_cookie = []
                 account = self._account()
-                return self._json({"account": account})
+                role = authz_mod.role_of(sessions.accounts_db, account["id"]) if account else "guest"
+                return self._json({"account": account, "role": role})
             if path == "/api/account/assets":
                 self._set_cookie = []
                 account = self._account()
@@ -984,7 +1086,7 @@ def make_handler(sessions: Sessions):
             def refuse(message, status):
                 self.close_connection = True                       # the body may be unread
                 return self._json({"error": message}, status)
-            if not access_mod.require_tier(self, "play" if temporary else "edit"):
+            if not self._require("play" if temporary else "owner_tools"):
                 return
             if self.headers.get("X-Meowdoku-Loading") != "1":
                 return refuse("missing the loading-animation header", HTTPStatus.FORBIDDEN)
@@ -1043,10 +1145,10 @@ def make_handler(sessions: Sessions):
             # a LOCAL (LAN-origin) visitor is the owner's own network: no token for the studio (the owner asked for it open to creative use);
             # remote visitors still need the token
             self._classify()
-            if getattr(self, "_origin", None) == "lan":
+            if getattr(self, "_origin", None) == "lan" and "library_manage" in self._caps():
                 ok, status, why = True, 200, ""
             else:
-                ok, status, why = anim_mod.owner_authorize(isinstance(self.connection, ssl.SSLSocket), self.headers.get("X-Forwarded-Proto"), direct,
+                ok, status, why = anim_mod.owner_authorize(isinstance(self.connection, ssl.SSLSocket), "https" if self._scheme == "https" else None, direct,
                                                            self.headers.get("X-Meowdoku-Admin"), lc.token)
             if not ok:
                 if status == 401:
@@ -1079,7 +1181,7 @@ def make_handler(sessions: Sessions):
         def _lifecycle_post(self, path: str, length: int) -> None:
             lc = sessions.lifecycle
             if path == "/api/admin/lifecycle":
-                if not access_mod.require_tier(self, "edit"):      # [ACCESS] the tier is in addition to the token below
+                if not self._require("owner_tools"):               # [AUTHZ] edit-tier equivalent; the loopback + admin token below stays the authority
                     return
                 forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
                 ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
@@ -1145,7 +1247,7 @@ def make_handler(sessions: Sessions):
             if path0 in ("/api/tickets", "/api/tickets/status"):
                 if self._is_viewer():
                     return self._refuse_viewer()
-                if not access_mod.require_tier(self, "edit" if path0.endswith("/status") else "play"):
+                if not self._require("owner_tools" if path0.endswith("/status") else "play"):
                     return
                 if self.headers.get("X-Meowdoku-Ticket") != "1":
                     self.close_connection = True
@@ -1178,7 +1280,7 @@ def make_handler(sessions: Sessions):
             if path0 == "/api/obj_assets":
                 if self._is_viewer():
                     return self._refuse_viewer()
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("studio_write"):
                     return
                 account = self._account()
                 if account is None:
@@ -1195,7 +1297,7 @@ def make_handler(sessions: Sessions):
                 except (ValueError, TypeError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 == "/api/marble_objects" and not self._is_viewer():
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("studio_write"):
                     return
                 length = int(self.headers.get("Content-Length") or 0)
                 if self.headers.get("X-Meowdoku-Marble") != "1":
@@ -1215,7 +1317,7 @@ def make_handler(sessions: Sessions):
             if path0 == "/api/marble_camera/housing":
                 if self._is_viewer():
                     return self._refuse_viewer()
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("studio_write"):
                     return
                 from meowdoku.marble_camera_housing import HousingError, MAX_REQUEST_BYTES, housing_response
                 try:
@@ -1237,7 +1339,7 @@ def make_handler(sessions: Sessions):
                     self.close_connection = True
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 in ("/api/marble_photo", "/api/marble_photo/cancel", "/api/marble_photo/live", "/api/marble_photo/retouch", "/api/marble_photo/film_preview") and not self._is_viewer():
-                if not access_mod.require_tier(self, "edit"):
+                if not self._require("share_live" if path0 == "/api/marble_photo/live" else "photo_submit"):
                     return
                 length = int(self.headers.get("Content-Length") or 0)
                 if path0 == "/api/marble_photo/live":
@@ -1332,6 +1434,81 @@ def make_handler(sessions: Sessions):
                 except accounts_mod.AccountError as error:
                     self._set_cookie = []
                     return self._json({"error": str(error)}, error.status)
+            if path0 in ("/api/account/admin/grant", "/api/account/admin/revoke"):
+                if not self._require("account_manage"):
+                    return
+                body = self._body_json()
+                if body is None:
+                    return
+                self._set_cookie = []
+                try:
+                    act = authz_mod.grant_admin if path0.endswith("grant") else authz_mod.revoke_admin
+                    act(sessions.accounts_db, str(body.get("username", "")), self._principal().username)
+                except authz_mod.AuthzError as error:
+                    return self._json({"error": error.message}, error.status)
+                return self._json({"ok": True, "admins": self._admin_list()})
+            if path0 == "/api/admin/account/grant":              # bootstrap: the operator's loopback + admin token creates the first admin
+                lc = sessions.lifecycle
+                if lc is None:
+                    return self._json({"error": "operator actions are not available on this server"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                forwarded = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via"))
+                ok, status, why = lifecycle_mod.admin_authorize(self.client_address[0], self.headers.get("Host", ""), forwarded,
+                                                                self.headers.get("X-Meowdoku-Admin"), lc.token)
+                if not ok:
+                    self.close_connection = True
+                    return self._json({"error": why}, status)
+                body = self._body_json()
+                if body is None:
+                    return
+                import hashlib
+                self._set_cookie = []
+                try:
+                    authz_mod.grant_admin(sessions.accounts_db, str(body.get("username", "")),
+                                          "operator:" + hashlib.sha256(lc.token.encode("utf-8")).hexdigest()[:12])
+                except authz_mod.AuthzError as error:
+                    return self._json({"error": error.message}, error.status)
+                return self._json({"ok": True, "admins": self._admin_list()})
+            if path0 == "/api/lowerings/checkout":
+                if not self._require("studio_write"):
+                    return
+                body = self._body_json()
+                if body is None:
+                    return
+                try:
+                    purpose = body.get("purpose")
+                    if not (isinstance(purpose, list) and len(purpose) == 2 and all(isinstance(x, str) for x in purpose)):
+                        raise ValueError("purpose must be [family, name]")
+                    caps, prefer = body.get("capabilities"), body.get("prefer") or []
+                    if not (isinstance(caps, list) and all(isinstance(x, str) for x in caps) and isinstance(prefer, list)
+                            and all(isinstance(x, str) for x in prefer)):
+                        raise ValueError("capabilities and prefer are lists of backend names")
+                    seconds = float(body.get("seconds", 60))
+                    if not 0 < seconds <= 3600:
+                        raise ValueError("seconds must be in (0, 3600]")
+                except (ValueError, TypeError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                key = self._job_identity()[0][0]
+                lease = lowering_mod.checkout(sessions.accounts_db, tuple(purpose), caps, key, seconds, prefer=tuple(prefer))
+                if lease is None:
+                    return self._json({"error": "no lowering fits that purpose and those capabilities"}, HTTPStatus.NOT_FOUND)
+                import dataclasses
+                out = dataclasses.asdict(lease)
+                out.pop("account_key", None)
+                return self._json(out)
+            if path0 == "/api/lowerings/checkin":
+                if not self._require("studio_write"):
+                    return
+                body = self._body_json()
+                if body is None:
+                    return
+                try:
+                    lease_id, generation = int(body["lease_id"]), int(body["generation"])
+                except (KeyError, ValueError, TypeError):
+                    return self._json({"error": "expected {\"lease_id\", \"generation\"}"}, HTTPStatus.BAD_REQUEST)
+                key = self._job_identity()[0][0]
+                if not lowering_mod.checkin(sessions.accounts_db, lease_id, key, generation):
+                    return self._json({"error": "no such open lease for this identity"}, HTTPStatus.CONFLICT)
+                return self._json({"ok": True})
             if path0 == "/api/account/logout":
                 from http.cookies import SimpleCookie
                 jar = SimpleCookie(self.headers.get("Cookie", ""))
@@ -1340,7 +1517,7 @@ def make_handler(sessions: Sessions):
                 self._clear_account_cookie()
                 return self._json({"ok": True})
             if path0 in ("/api/loading_library/activate", "/api/loading_library/delete", "/api/loading_library/graduate") and not self._is_viewer():     # [STUDIO]
-                if not access_mod.require_tier(self, "edit"):          # [ACCESS] the tier is in addition to the owner token checked inside
+                if not self._require("library_manage"):               # [AUTHZ] the capability is in addition to the owner token checked inside
                     return
                 return self._library_post(path0, int(self.headers.get("Content-Length") or 0))
             if path0 in ("/api/admin/lifecycle", "/api/lifecycle/restore") and not self._is_viewer():
@@ -1351,7 +1528,7 @@ def make_handler(sessions: Sessions):
             path = self.path.split("?", 1)[0]
             if path.startswith("/api/client_rays/"):
                 from meowdoku.client_ray_relay import RelayError, handle_relay_post
-                if not access_mod.require_tier(self,"edit"):return
+                if not self._require("share_live"):return
                 keys, account=self._job_identity()
                 if path=="/api/client_rays/join":
                     try:
@@ -1413,15 +1590,15 @@ def make_handler(sessions: Sessions):
                     payload = json.loads(self.rfile.read(length))
                     action_batch.validate(payload)
                     if any(a.get("type") in access_mod.EDIT_ACTIONS for a in payload.get("actions", [])):
-                        if not access_mod.require_tier(self, "edit"):
+                        if not self._require("owner_tools"):
                             return
                     # No payload-selected table, owner, profile, or credential.
                     return self._json(action_batch.execute(self._table(), payload))
                 except (ValueError, TypeError, RecursionError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
-            if path.startswith("/api/action") and str(payload.get("type")) in access_mod.EDIT_ACTIONS and not access_mod.require_tier(self, "edit"):
-                return                                            # [ACCESS] process-wide controls (learner, Lichess, pilot weights)
+            if path.startswith("/api/action") and str(payload.get("type")) in access_mod.EDIT_ACTIONS and not self._require("owner_tools"):
+                return                                            # [AUTHZ] process-wide controls (learner, Lichess, pilot weights)
             table = self._table()
             try:
                 with table.lock:
@@ -1702,9 +1879,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="build the fountains' GPU products only (skip the slow wasm fallback compiles)")
     parser.add_argument("--retain-fountain-products", metavar="RECEIPT",
                         help="serve SHA-256-pinned existing fountain products without rebuilding; validate before binding; other startup lanes are unchanged")
+    parser.add_argument("--route", default="",
+                        help="balancer route name: every response that sets a cookie also sets meowdoku_route=NAME (Apache stickysession)")
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     args = parser.parse_args(argv)
+    if args.route:
+        try:
+            proxy_trust_mod.route_cookie(args.route)
+        except ValueError as error:
+            parser.error(str(error))
     web_dir = Path(args.web_dir)
     if not (web_dir / "boards.json").exists():
         print(f"no export at {web_dir}; run examples/meowdoku/web_export.py first", flush=True)
@@ -1728,6 +1912,7 @@ def main(argv: list[str] | None = None) -> int:
         PLAYER_COOKIE = f"meowdoku_player_{args.port}"
     logring_mod.RING = logring_mod.Ring(path=web_dir.parent / "log_ring.jsonl"); logring_mod.tee_stdout()   # [LOG]
     sessions = Sessions(web_dir, Profiles(Path(args.profiles)))
+    sessions.route = args.route
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
@@ -1750,7 +1935,17 @@ def main(argv: list[str] | None = None) -> int:
                                             do_handshake_on_connect=False)
         scheme = "https"
     print(f"[meowdoku] serving {web_dir} at {scheme}://{args.bind}:{args.port}/  ({sessions.board_count} prebaked boards; chess, checkers, wordle)", flush=True)
-    startup_mod.Lanes(sessions.readiness).start(lanes)               # [LOADING] the builds begin once the socket is accepting
+    prepare_threads = startup_mod.Lanes(sessions.readiness).start(lanes)   # [LOADING] the builds begin once the socket is accepting
+
+    def scan_lowerings():                                            # [LOWERINGS] once, after the products are built/retained; never fatal
+        for thread in prepare_threads:
+            thread.join()
+        try:
+            found = lowering_mod.scan(web_dir, sessions.accounts_db)
+            print(f"[meowdoku] lowering library: {len(found)} products catalogued", flush=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"[meowdoku] lowering library scan failed: {type(error).__name__}: {error}", flush=True)
+    threading.Thread(target=scan_lowerings, name="lowering-scan", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

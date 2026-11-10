@@ -1,7 +1,8 @@
 """Access tiers: who is asking, by where they came from, decides what they may see and do.
 
-ORIGIN of a request (``classify``), from the socket's peer address and the Host header ONLY.  There is no reverse proxy in front of
-this server, so ``X-Forwarded-For`` / ``Forwarded`` / ``X-Real-IP`` are NEVER read: a client can write anything in a header.
+ORIGIN of a request (``classify``), from the client address and the Host header ONLY.  The client address is the socket peer, unless
+the peer is a trusted reverse proxy (proxy_trust.client_origin, loopback by default): then it is the proxy's X-Forwarded-For client.
+From any other peer ``X-Forwarded-For`` / ``Forwarded`` / ``X-Real-IP`` are NEVER read: a client can write anything in a header.
 
     lan   the peer is loopback, private (10/8, 172.16/12, 192.168/16), link-local (169.254/16, fe80::/10), IPv6 ULA (fc00::/7), or the
           server's OWN public IP.  That last one is the NAT hairpin: a phone on the home Wi-Fi that opens the site through the public
