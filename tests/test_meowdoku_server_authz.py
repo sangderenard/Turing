@@ -85,7 +85,7 @@ def test_direct_peer_with_spoofed_forwarding_header_keeps_todays_classification(
 def test_trusted_proxy_forwarding_a_public_client_is_dns_and_guest(server):
     status, who, _, _ = _call(server.port, "/api/whoami", headers=PUBLIC_XFF)
     assert status == 200 and who["origin"] == "dns" and who["role"] == "guest"
-    assert who["tier"] == "play" and who["capabilities"] == ["play", "view_site"] and who["edit"] is False
+    assert who["tier"] == "play" and who["capabilities"] == ["photo_read", "play", "view_site"] and who["edit"] is False
     status, who, _, _ = _call(server.port, "/api/whoami", headers={"Host": "127.0.0.1"})        # no X-Forwarded-For: a local direct caller
     assert who["origin"] == "lan"
 

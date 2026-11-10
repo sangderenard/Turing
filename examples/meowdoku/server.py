@@ -1819,6 +1819,45 @@ def make_handler(sessions: Sessions):
                 return self._json({"error": f"{type(error).__name__}: {error}"}, getattr(error, "status", 400))
 
         def do_POST(self):  # noqa: N802
+            # A POST that answers without reading its body (a 403 before the
+            # body, sign-out, ...) leaves those bytes on a kept-alive
+            # connection. Behind Apache that connection is shared, so the next
+            # request on it, possibly another visitor's, began with the stale
+            # bytes and was answered 501 (measured 2026-11-10: sign-out then
+            # whoami). Count what the handler reads and drain the rest; a body
+            # too large to drain closes the connection instead.
+            try:
+                declared = max(0, int(self.headers.get("Content-Length") or 0))
+            except ValueError:
+                declared = 0
+            raw, taken = self.rfile, [0]
+
+            class _Counting:
+                def read(_s, n=-1):
+                    data = raw.read(n); taken[0] += len(data); return data
+                def readline(_s, n=-1):
+                    data = raw.readline(n); taken[0] += len(data); return data
+                def readinto(_s, buffer):
+                    count = raw.readinto(buffer); taken[0] += count or 0; return count
+                def __getattr__(_s, name):
+                    return getattr(raw, name)
+
+            self.rfile = _Counting()
+            try:
+                return self._do_post()
+            finally:
+                self.rfile = raw
+                left = declared - taken[0]
+                if left > 0:
+                    if left <= (1 << 20):
+                        try:
+                            raw.read(left)
+                        except OSError:
+                            self.close_connection = True
+                    else:
+                        self.close_connection = True
+
+        def _do_post(self):
             path0 = self.path.split("?", 1)[0]
             if self._route_gate(path0):                           # [ROUTE]
                 return
