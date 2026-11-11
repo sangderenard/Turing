@@ -85,6 +85,7 @@ from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS]
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
 from meowdoku.rest_api import reports as shared_reports
+from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
@@ -1899,6 +1900,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path == "/api/index" and shared_catalog is not None:   # [INDEX] the declared catalog of this API
+                return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]

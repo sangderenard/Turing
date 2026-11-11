@@ -55,6 +55,8 @@ from speaktome_api import reports  # noqa: E402  account-owned guestbook; separa
 if reports.API_VERSION != 1:
     raise ImportError("This Turing host requires SpeakToMe experience-report contract version 1")
 
+# The declared catalog of this API (speaktome_api.catalog), served at /api/index; an older checkout has none.
+catalog = importlib.import_module("speaktome_api.catalog") if (REPOSITORY / "speaktome_api" / "catalog.py").is_file() else None
 # The manual is a map (speaktome_man.as_map); an older checkout without it still serves everything else.
 manual = _load("speaktome_man") if (REPOSITORY / "speaktome_man" / "__init__.py").is_file() else None
 # The Goal document format (speaktome_goal): what the part-by-part builder's units are processed into.
