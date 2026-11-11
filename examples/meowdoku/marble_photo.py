@@ -871,6 +871,10 @@ class PhotoJobs:
             digest = hashlib.sha256(payload.read_bytes() + canonical).hexdigest()
             (staging / "config.json").write_text(json.dumps(config), encoding="utf-8")
             geometry_stats = self._validate_geometry(payload, staging / "config.json")
+            from meowdoku import job_library
+            collation = job_library.collation_manifest(digest, config,
+                tile_contract=_tile_contract(str(self.spectral_root)) if tile_plan else None)
+            job_library.write_collation(staging, collation)
             with self.lock:
                 from meowdoku import job_library
                 # Client-authored live.session_id is a scene continuity marker,
@@ -909,6 +913,8 @@ class PhotoJobs:
                 directory.mkdir(exist_ok=True)
                 os.replace(payload, directory / "payload.npz")
                 os.replace(staging / "config.json", directory / "config.json")
+                if collation is not None:
+                    os.replace(staging / "collation.json", directory / "collation.json")
                 if "live" in config:
                     (directory / "live-control.json").write_text(json.dumps({
                         "revision": 0, "camera": config["camera"], "live": config["live"],
@@ -952,7 +958,7 @@ class PhotoJobs:
                 self.active_digest = digest
                 return {**status,"client_join":client_join} if client_join is not None else status
 
-    def _status_locked(self, digest: str) -> dict:
+    def _status_locked(self, digest: str, *, retained_artifact: bool = False) -> dict:
         self._cleanup_client_bridge_locked()
         path = self.directory / digest / "status.json"
         try:
@@ -964,11 +970,11 @@ class PhotoJobs:
                     "error": str(status.get("error", "Spectral worker failed"))}
         if status.get("digest") != digest:
             raise PhotoError("photo status digest mismatch", 503)
-        if digest != self.active_digest and status.get("state") != "complete":
+        if digest != self.active_digest and status.get("state") != "complete" and not retained_artifact:
             raise PhotoError("photo digest is no longer active", 404)
         process = self.process if digest == self.active_digest else None
         if process is not None and process.poll() is not None and status.get("state") not in ("error", "complete", "canceled"):
-            return {"digest": digest, "state": "error", "image": status.get("image"),
+            return {**status, "digest": digest, "state": "error", "image": status.get("image"),
                     "frames": status.get("frames", []),
                     "error": f"Spectral worker exited with code {process.returncode} before finishing the photo"}
         if status.get("state") == "encoding":
@@ -991,7 +997,14 @@ class PhotoJobs:
         if not _DIGEST.fullmatch(digest) or not pattern.fullmatch(name):
             raise PhotoError("invalid photo artifact path", 400)
         with self.lock:
-            status = self._status_locked(digest)
+            status = self._status_locked(digest, retained_artifact=True)
+            if digest != self.active_digest and status.get("state") != "complete":
+                # A canceled/interrupted camera sequence keeps finished frames.
+                # Only recorded child results survive this read-only exception;
+                # a last progressive preview never becomes a completed frame.
+                field = "hdr" if hdr else "image"
+                if name not in {frame.get(field) for frame in status.get("frames", [])}:
+                    raise PhotoError("completed child artifact is unavailable", 404)
             if hdr:
                 available = {frame.get("hdr") for frame in status.get("frames", [])}
                 if status.get("hdr") != name and name not in available:
