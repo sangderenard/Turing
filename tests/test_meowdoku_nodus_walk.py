@@ -121,3 +121,35 @@ def test_walker_cli_drives_a_walk(server, fake, tmp_path, capsys):
     assert code == 0 and "closed" in out
     code, _, err = run("where")
     assert code == 1 and "enter" in err
+
+
+# ---- the edge shapes the live host really sends (found live 2026-11-10: the edge between two modules was not walkable) ----
+
+def _feeds(graph):
+    from meowdoku import nodus_service
+    tracks = nodus_service.as_living_map(graph, "inst")["tracks"]
+    return sorted((t["source"].rsplit("/", 1)[-1], t["target"].rsplit("/", 1)[-1]) for t in tracks if t["relationship"] == "feeds")
+
+
+def test_edge_ends_named_by_native_indices_are_walkable():
+    graph = {"canvas": "c", "revision": 1,
+             "modules": [{"index": 0, "rows": [{"index": 0, "tool": "ADD"}], "contacts": []},
+                         {"index": 1, "rows": [], "contacts": []}],
+             "edges": [{"index": 0, "source": {"module_index": 0, "contact_index": 0},
+                        "target": {"module_index": 1, "contact_index": 0}, "slots": 4, "token_bytes": 64}],
+             "contract_ports": [{"prefix": "p", "capacity": 4, "edge": 0}]}
+    assert _feeds(graph) == [("m0", "m1")]
+
+
+def test_edge_ends_named_as_graph_definition_connectors_are_walkable():
+    graph = {"canvas": "c", "revision": 1,
+             "modules": [{"index": 0, "stable_id": 11, "label": "source", "rows": [],
+                          "contacts": [{"index": 0, "ordinal": 0, "direction": "output", "name": None}]},
+                         {"index": 1, "stable_id": 12, "label": "sink", "rows": [],
+                          "contacts": [{"index": 0, "ordinal": 0, "direction": "input", "name": None}]}],
+             "edges": [{"index": 0, "source": {"module_id": 11, "direction": "output", "ordinal": 0},
+                        "target": {"module_id": 12, "direction": "input", "ordinal": 0}}]}
+    from meowdoku import nodus_service
+    assert _feeds(graph) == [("m0", "m1")]
+    names = {n["identity"].rsplit("/", 1)[-1]: n["name"] for n in nodus_service.as_generic_graph(graph, "inst")}
+    assert names["m0"] == "source" and names["m1"] == "sink"

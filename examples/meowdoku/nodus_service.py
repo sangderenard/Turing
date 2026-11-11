@@ -291,12 +291,16 @@ def as_generic_graph(graph_json, instance) -> list:
         return [{"relationship": "contained-by", "target": target}]
 
     contact_id = {}
+    module_by_stable = {}       # graph-definition v1 names a connector by the module's persistent id ...
+    contact_by_ordinal = {}     # ... its direction and its ordinal; the host adds each contact's flat index
     for mpos, module in enumerate(g.get("modules") or []):
         if not isinstance(module, dict):
             continue
         mi = _idx(module, mpos)
         mid = f"{root}/m{mi}"
-        add(mid, "module", module.get("name") or f"module {mi}", contained(root),
+        if isinstance(module.get("stable_id"), int) and module["stable_id"] > 0:
+            module_by_stable[module["stable_id"]] = mi
+        add(mid, "module", module.get("label") or module.get("name") or f"module {mi}", contained(root),
             _scalars(module, ("index", "name")))
         for rpos, row in enumerate(module.get("rows") or []):
             ri = _idx(row, rpos)
@@ -308,12 +312,23 @@ def as_generic_graph(graph_json, instance) -> list:
             name = (contact.get("name") if isinstance(contact, dict) else contact) or f"contact {ci}"
             add(cid, "contact", name, contained(mid), _scalars(contact, ("index", "name")))
             contact_id[(mi, ci)] = cid
+            if isinstance(contact, dict) and isinstance(contact.get("ordinal"), int) and contact.get("direction") in ("input", "output"):
+                contact_by_ordinal[(mi, contact["direction"], contact["ordinal"])] = ci
     modules_present = {k[0] for k in contact_id} | {_idx(m, p) for p, m in enumerate(g.get("modules") or []) if isinstance(m, dict)}
 
     def end(spec):
         """The contact node an edge end names; a contact the module did not list is declared here under its module."""
         spec = spec if isinstance(spec, dict) else {}
-        mi, ci = spec.get("module"), spec.get("contact")
+        # The three shapes the host really sends (nodus_graph/console_views.py): native indices when the canvas has
+        # no strict definition; a graph-definition v1 connector (persistent module id, direction, ordinal); and the
+        # plain {module, contact} pair.
+        if isinstance(spec.get("module_index"), int):
+            mi, ci = spec["module_index"], spec.get("contact_index")
+        elif isinstance(spec.get("module_id"), int):
+            mi = module_by_stable.get(spec["module_id"])
+            ci = contact_by_ordinal.get((mi, spec.get("direction"), spec.get("ordinal")))
+        else:
+            mi, ci = spec.get("module"), spec.get("contact")
         if not isinstance(mi, int) or not isinstance(ci, int):
             return None
         if (mi, ci) not in contact_id:
@@ -331,8 +346,8 @@ def as_generic_graph(graph_json, instance) -> list:
         ei = _idx(edge, epos)
         eid = f"{root}/e{ei}"
         deps = contained(root)
-        for relationship, key in (("from-contact", "from"), ("to-contact", "to")):
-            target = end(edge.get(key))
+        for relationship, keys in (("from-contact", ("source", "from")), ("to-contact", ("target", "to"))):
+            target = end(next((edge[key] for key in keys if key in edge), None))
             if target is not None:
                 deps.append({"relationship": relationship, "target": target})
         add(eid, "edge", f"edge {ei}", deps, _scalars(edge, ("index",)))
