@@ -144,6 +144,31 @@ def test_a_merged_branch_is_removed_only_after_the_grace_period(world):
     assert remote_has(world, "elsewhere") is None, "it was never pushed, and a checked-out branch is left alone"
 
 
+def test_an_old_branch_already_in_the_live_source_has_no_deadline_left(world):
+    import time
+    work, db, policy = world["work"], world["db"], world["policy"]
+    merged = branch(world, "long-done")
+    run(work, "merge", "-q", "--ff-only", "long-done")
+    run(work, "push", "-q", "origin", "main")
+    local_only = branch(world, "in-live-only")
+    run(work, "merge", "-q", "--ff-only", "in-live-only")          # in what is checked out here, not on the remote
+    unmerged = branch(world, "old-but-its-own")
+    fresh = actions(branch_gate.clean(policy, db, apply=True, log=lambda line: None))
+    assert fresh["long-done"] == "wait" and fresh["in-live-only"] == "wait", "a recent commit waits out the grace period"
+    later = time.time() + 31 * DAY                                  # the same commits, now older than stale_days
+    dry = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=False, now=later, log=lambda line: None)}
+    assert dry["long-done"]["action"] == "would remove" and "days old" in dry["long-done"]["reason"]
+    assert "remote copy would be kept" in dry["in-live-only"]["reason"]
+    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=later, log=lambda line: None)}
+    assert done["long-done"]["action"] == "removed" and remote_has(world, "long-done") is None
+    assert done["in-live-only"]["action"] == "removed" and "remote copy kept" in done["in-live-only"]["reason"]
+    assert remote_has(world, "in-live-only") == local_only, "its commits are not on the remote anywhere else"
+    assert done["old-but-its-own"]["action"] == "keep" and remote_has(world, "old-but-its-own") == unmerged
+    names = run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
+    assert "long-done" not in names and "in-live-only" not in names and "old-but-its-own" in names
+    assert merged != local_only
+
+
 def test_a_branch_that_moved_after_it_was_seen_merged_starts_its_grace_again(world):
     work, db, policy = world["work"], world["db"], world["policy"]
     branch(world, "done-work")

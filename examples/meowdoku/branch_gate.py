@@ -12,9 +12,13 @@ whoever holds the Git credential (an operator, or a worker started by one), neve
 
 Without ``--apply`` (and with the policy's ``apply`` false) ``land`` and ``clean`` only say what they would do.
 
-What ``clean`` removes: a branch whose every commit is on the repository's default branch on the remote, that the
-cleaner first saw in that state at least ``grace_days`` ago, that is not protected by the policy, not checked out
-in any worktree (a checked-out branch is in use, here and on the remote), and not kept by its review. A branch with a commit of its own is never removed, whatever its age;
+What ``clean`` removes: a branch whose every commit is already in the live source, that is not protected by the
+policy, not checked out in any worktree (a checked-out branch is in use, here and on the remote), and not kept by
+its review. The live source is what the repository's own checkout has checked out (the branch the service runs
+from), or its default branch on the remote. The deadline is ``grace_days`` after the cleaner first saw the branch
+in that state; a branch whose last commit is already older than ``stale_days`` has no deadline left to wait for
+and is removed at the first look. The remote copy goes only when its commits are on the remote too (on the default
+branch or on the pushed live branch); otherwise it is kept and said so. A branch with a commit of its own is never removed, whatever its age;
 it is reported as unmerged. Removal is by expected commit, locally and on the remote, so a branch that moved
 between the look and the removal is left alone.
 
@@ -44,7 +48,7 @@ except ImportError:  # run as a plain script, or loaded by path
     import branch_review  # type: ignore
 
 HOOK_MARK = "# speaktome branch gate"
-DEFAULTS = {"grace_days": 14, "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
+DEFAULTS = {"grace_days": 14, "stale_days": 30, "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
 
@@ -80,7 +84,9 @@ def protected(policy, repository, branch) -> bool:
 
 
 def branches(path, default, remote="origin") -> list:
-    """Every local branch: its commit, whether all of it is on the remote default branch, where it is checked out."""
+    """Every local branch: its commit and that commit's time, where it is checked out, and where all of it already is:
+    ``merged`` on the remote default branch, ``live`` in what this checkout has checked out, ``on_remote`` on the
+    remote default branch or on the remote copy of the checked-out branch."""
     trees, at = {}, None
     for line in git(path, "worktree", "list", "--porcelain").splitlines():
         if line.startswith("worktree "):
@@ -88,12 +94,23 @@ def branches(path, default, remote="origin") -> list:
         elif line.startswith("branch refs/heads/"):
             trees[line[18:]] = at
     target = f"refs/remotes/{remote}/{default}"
+    working = git(path, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    pushed = f"refs/remotes/{remote}/{working}" if working else None
+    if pushed and not git(path, "rev-parse", "-q", "--verify", pushed, check=False):
+        pushed = None
+
+    def within(commit, ref) -> bool:
+        return subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", commit, ref],
+                              capture_output=True).returncode == 0
+
     out = []
-    for line in git(path, "for-each-ref", "refs/heads", "--format=%(refname:short)\t%(objectname)").splitlines():
-        name, _, head = line.partition("\t")
-        merged = subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", head, target],
-                                capture_output=True).returncode == 0
+    for line in git(path, "for-each-ref", "refs/heads",
+                    "--format=%(refname:short)\t%(objectname)\t%(committerdate:unix)").splitlines():
+        name, head, stamp = line.split("\t")
+        merged = within(head, target)
         out.append({"branch": name, "head": head, "merged": merged, "worktree": trees.get(name),
+                    "tip_time": float(stamp), "live": within(head, "HEAD"),
+                    "on_remote": merged or bool(pushed and within(head, pushed)),
                     "remote_head": git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{name}", check=False) or None})
     return out
 
@@ -125,7 +142,7 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local) -> str:
 
 def clean(policy, db, *, apply, now=None, log=print) -> list:
     now = time.time() if now is None else now
-    grace = float(policy["grace_days"]) * 86400.0
+    grace, stale = float(policy["grace_days"]) * 86400.0, float(policy["stale_days"]) * 86400.0
     actions = []
     for name, declared in sorted(policy["repositories"].items()):
         path = declared["path"]
@@ -137,24 +154,29 @@ def clean(policy, db, *, apply, now=None, log=print) -> list:
             entry = {"repository": name, "branch": row["branch"], "head": row["head"]}
             if protected(policy, name, row["branch"]):
                 entry.update(action="keep", reason="protected by the policy")
-            elif not row["merged"]:
+            elif not (row["merged"] or row["live"]):
                 branch_review.forget_merged(db, name, row["branch"])
-                entry.update(action="keep", reason="has commits that are not on the default branch")
+                entry.update(action="keep", reason="has commits that are not in the live source")
             elif branch_review.kept(db, name, row["branch"]):
                 entry.update(action="keep", reason="kept by its review")
             elif row["worktree"] is not None:
                 entry.update(action="keep", reason="checked out in a worktree, so in use")
             else:
                 since = branch_review.merged_since(db, name, row["branch"], row["head"], now)
-                left = since + grace - now
+                age = now - row["tip_time"]
+                left = 0.0 if age >= stale else since + grace - now
+                why = (f"in the live source and its last commit is {age / 86400.0:.0f} days old" if age >= stale
+                       else "in the live source for the whole grace period")
                 if left > 0:
-                    entry.update(action="wait", reason=f"merged; {left / 86400.0:.1f} days of grace left")
+                    entry.update(action="wait", reason=f"in the live source; {left / 86400.0:.1f} days of grace left")
                 elif not apply:
-                    entry.update(action="would remove", reason="merged for the whole grace period")
+                    entry.update(action="would remove", reason=why if row["on_remote"] else why + "; the remote copy would be kept")
                 else:
                     try:
                         detail = remove_branch(path, row["branch"], row["head"], remote=policy["remote"],
-                                               delete_remote=policy["delete_remote"], local="free")
+                                               delete_remote=policy["delete_remote"] and row["on_remote"], local="free")
+                        if not row["on_remote"] and row["remote_head"]:
+                            detail += "; remote copy kept: the live branch holding it is not on the remote"
                         branch_review.forget_merged(db, name, row["branch"])
                         entry.update(action="removed", reason=detail)
                     except GateError as error:
