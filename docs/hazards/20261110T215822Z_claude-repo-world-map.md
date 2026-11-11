@@ -28,9 +28,12 @@ GitHub into a temporary directory and scans all of it; the manifest is
 `docs/repo_world_workspace.json` (15 repositories, 51 worktrees skipped,
 discovered from git metadata only). `tests/test_repo_world_workspace.py` —
 2 passed in 2.5 s on a fixture workspace with bare "origin" repositories.
-The clone against github.com itself was not run here (network, and two refs
-need the owner's confirmation: root set to `nogodsnomasters` per AGENTS.md,
-speaktome left on `codex/direct-x86-vocabulary-report`).
+Run against github.com on the owner's go-ahead (2026-11-11): all 15
+repositories cloned and scanned, no failed clones, 235 s; totals 1,611
+regions, 13,270 rooms, 18,467 portal pairs, 37,169 unresolved references,
+56.7 MB JSON, 14 mounts. Per-repository table in the design note §7a. The
+root repository's `nogodsnomasters` branch on GitHub has 867 regions and
+2,677 rooms, far more than the root AGENTS.md says it tracks.
 
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.

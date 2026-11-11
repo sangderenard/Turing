@@ -269,6 +269,38 @@ Nothing in `abstract_ui_*.py` was edited on this branch.
   scanner needs the repository's declared import roots as an input; it must
   not guess them from directory names.
 
+## 7a. Measurement of the whole workspace from GitHub (observed, 2026-11-11)
+
+`scan_workspace(docs/repo_world_workspace.json)`: all 15 repositories cloned
+and scanned from github.com, no failed clones (including `pcb` → electrofluid
+and `speaktome` on its session branch), 14 mounts, 235 s end to end.
+
+| repository | commit | regions | rooms | portal pairs | unresolved |
+|---|---|---|---|---|---|
+| `.` (nogodsnomasters) | 937de5dd | 867 | 2,677 | 35 | 5,124 |
+| amp | 2b61525d | 84 | 262 | 74 | 637 |
+| fftfree | cb884533 | 7 | 44 | 0 | 111 |
+| geometry | 97128724 | 14 | 172 | 0 | 0 |
+| lfsavoider | c7412218 | 2 | 28 | 0 | 0 |
+| meta-nn | 93fc1dc9 | 13 | 191 | 411 | 1,035 |
+| nodus | fe678e9e | 43 | 486 | 40 | 600 |
+| pcb | b6c64e6e | 5 | 48 | 73 | 125 |
+| pigeon | c8f4854c | 1 | 13 | 17 | 95 |
+| socratic | 6054198b | 11 | 142 | 217 | 1,018 |
+| speaktome | 86721ddb | 210 | 2,388 | 712 | 4,666 |
+| spectral-analyzer | edddb335 | 103 | 1,029 | 1,557 | 6,175 |
+| tensor-calculator | 34f9fec6 | 4 | 6 | 0 | 0 |
+| turing | d2a7f022 | 245 | 5,772 | 15,331 | 17,583 |
+| wheelhouse | 0c4c7a37 | 2 | 12 | 0 | 0 |
+| **total** | | **1,611** | **13,270** | **18,467** | **37,169** |
+
+Workspace JSON: 56.7 MB. The root repository alone holds 867 regions and
+2,677 rooms on GitHub's `nogodsnomasters` branch, far more than the
+coordination files the root AGENTS.md describes; what it tracks there is
+worth reading before the world builder lays it out. C++ repositories
+(geometry, fftfree, nodus) show few or no portals because only Python and
+ES-module imports are extracted (gap G).
+
 ## 7. Measurement on this repository (observed, 2026-11-10)
 
 | quantity | value |
