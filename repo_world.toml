@@ -1,0 +1,3 @@
+# Declared inputs for the repository world map scanner (src/compiler/repo_world_scan.py).
+# examples/ is on sys.path when the Meowdoku server and its tests run, so `meowdoku.*` resolves from there.
+import_roots = ["examples"]

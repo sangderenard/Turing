@@ -85,6 +85,7 @@ from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS]
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
+from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku import divider_intake as divider_intake_mod  # noqa: E402  [DIVIDER] source-divider intake and status (no worker)
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
@@ -1179,6 +1180,38 @@ def make_handler(sessions: Sessions):
             except (living_data_query.QueryError, RecursionError):
                 return self._json({"error": "invalid or excessive Living Data query"}, 400)
 
+        # ---- [WORLDMAP] GET /api/worldmap/index and /api/worldmap/map?repo=<owner__name>&commit=<40 hex> (worldmap.py; the page is web/worldmap.html).
+        # dev_ui only, no-store; map.json is streamed (gzip when the client accepts it); the only request-derived parts are the two validated names.
+        def _worldmap_get(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            if not self._require("dev_ui"):
+                return
+            self._set_cookie = []
+            try:
+                if path == "/api/worldmap/index":
+                    return self._json(worldmap_mod.index(sessions.state))
+                if path != "/api/worldmap/map":
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                file = worldmap_mod.map_path(sessions.state, query.get("repo", ""), query.get("commit", ""))
+            except worldmap_mod.WorldMapError as error:
+                return self._json({"error": error.message}, error.status)
+            body = file.read_bytes()
+            gz = "gzip" in self.headers.get("Accept-Encoding", "").lower()
+            if gz:
+                import gzip
+                body = gzip.compress(body, 6)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Vary", "Accept-Encoding")
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        # ---- end [WORLDMAP]
+
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
         _MATHLAB_FILES = ("law.at.py", "law.numpy.py", "law.abi.json", "law.wgsl.abi.json", "law.api.yaml")
@@ -1835,6 +1868,8 @@ def make_handler(sessions: Sessions):
                 return self._messages_route(path, "GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]
                 return self._profile_route(path, "GET")
+            if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
+                return self._worldmap_get(path)
             if path.startswith("/api/mathlab/"):                  # [MATHLAB]
                 return self._mathlab_get(path)
             if path.startswith("/api/divider/"):                  # [DIVIDER]
