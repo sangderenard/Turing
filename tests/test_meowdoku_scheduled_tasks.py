@@ -74,33 +74,59 @@ def test_the_manual_itself_bakes(tmp_path):
     assert changed and (tmp_path / "manual" / "index.html").is_file(), sentence
 
 
-def test_a_backup_leaves_named_folders_out_and_keeps_a_small_window(tmp_path):
+def test_the_nightly_backup_is_text_and_databases_with_no_rolling_window(tmp_path):
+    """The owner's policy: "just the non binary files and the database nightly no rolling window"."""
+    import sqlite3
     from meowdoku import state_backup
     state = tmp_path / "state"
     (state / "sql").mkdir(parents=True)
-    (state / "content" / "marble_photos" / "job").mkdir(parents=True)
-    (state / "content" / "marble_photos" / "job" / "big.bin").write_bytes(b"x" * 4096)
-    (state / "content" / "marble_photos_index.txt").write_text("not inside the excluded folder", encoding="utf-8")
-    (state / "content" / "profiles.json").write_text("{}", encoding="utf-8")
+    db = sqlite3.connect(state / "sql" / "accounts.db")
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    db.execute("INSERT INTO users (username) VALUES ('ann')")
+    db.commit()
+    db.close()
+    photos = state / "content" / "marble_photos" / "job"
+    photos.mkdir(parents=True)
+    (photos / "exposure.npz").write_bytes(b"PK\x03\x04" + bytes(range(256)) * 16)
+    (photos / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    (photos / "status.json").write_text('{"state": "complete"}', encoding="utf-8")
+    (state / "content" / "profiles.json").write_text('{"name": "caf\u00e9"}', encoding="utf-8")
     (state / "jobs" / "cron").mkdir(parents=True)
     (state / "jobs" / "cron" / "cron.table").write_text("x * * * * *\n", encoding="utf-8")
+    assert state_backup.is_text_file(photos / "status.json") and not state_backup.is_text_file(photos / "preview.png")
     out = tmp_path / "backups"
     sentences = []
-    for _round in range(3):
-        sentences.append(scheduled_tasks.backup_state(state, out, keep=2, exclude=("content/marble_photos",),
+    for _round in range(2):
+        sentences.append(scheduled_tasks.backup_state(state, out, keep=1, exclude=(), text_only=True,
                                                       state_backup=state_backup))
         time.sleep(1.1)                                  # snapshots are named by the second
     kept = sorted(p.name for p in out.iterdir() if p.is_dir())
-    assert len(kept) == 2, "only the window asked for is kept"
-    newest = out / kept[-1]
+    assert len(kept) == 1, "no rolling window: each night's copy replaces the last"
+    newest = out / kept[0]
     names = sorted(p.relative_to(newest).as_posix() for p in newest.rglob("*") if p.is_file())
-    assert "content/profiles.json" in names and "jobs/cron/cron.table" in names
-    assert "content/marble_photos_index.txt" in names, "a name that merely begins like the folder is not left out"
-    assert not any(name.startswith("content/marble_photos/") for name in names)
+    assert names == ["content/marble_photos/job/status.json", "content/profiles.json", "jobs/cron/cron.table",
+                     "manifest.json", "sql/accounts.db"]
     manifest = json.loads((newest / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["excluded"] == ["content/marble_photos"]
-    assert "left out: content/marble_photos" in sentences[-1] and "1 old removed, keeping 2" in sentences[-1]
+    assert manifest["text_only"] is True and manifest["binary_left_out"]["files"] == 2
+    assert manifest["binary_left_out"]["bytes"] == (photos / "exposure.npz").stat().st_size + (photos / "preview.png").stat().st_size
+    copied = sqlite3.connect(newest / "sql" / "accounts.db")
+    assert copied.execute("SELECT username FROM users").fetchall() == [("ann",)]
+    copied.close()
+    assert "binary left out: 2 files" in sentences[-1] and "1 old removed, keeping 1" in sentences[-1]
     assert state_backup.verify(newest)["ok"]
+
+
+def test_a_backup_can_also_leave_a_named_folder_out(tmp_path):
+    from meowdoku import state_backup
+    state = tmp_path / "state"
+    (state / "sql").mkdir(parents=True)
+    (state / "content" / "big" / "job").mkdir(parents=True)
+    (state / "content" / "big" / "job" / "notes.txt").write_text("text, but in the folder left out", encoding="utf-8")
+    (state / "content" / "big_index.txt").write_text("not inside the folder", encoding="utf-8")
+    manifest = state_backup.snapshot(state, tmp_path / "backups", keep=1, exclude=("content/big",))
+    names = sorted(entry["rel"] for entry in manifest["files"])
+    assert names == ["content/big_index.txt"], "a name that merely begins like the folder is not left out"
+    assert manifest["excluded"] == ["content/big"] and manifest["text_only"] is False
 
 
 def test_a_task_is_offered_only_when_what_it_needs_was_given():
@@ -109,7 +135,7 @@ def test_a_task_is_offered_only_when_what_it_needs_was_given():
     assert scheduled_tasks.handlers(Statuses) == {}
     assert sorted(scheduled_tasks.handlers(Statuses, web_dir="w", manual=object(), site=None, graph_view=None)) == ["manual.hardcopy"]
     both = scheduled_tasks.handlers(Statuses, web_dir="w", manual=object(), site=None, graph_view=None,
-                                    backup={"state_dir": "s", "backup_dir": "b", "keep": 3, "exclude": (), "module": None})
+                                    backup={"state_dir": "s", "backup_dir": "b", "keep": 1, "exclude": (), "text_only": True, "module": None})
     assert sorted(both) == ["manual.hardcopy", "state.backup"]
 
 

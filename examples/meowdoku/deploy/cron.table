@@ -9,6 +9,6 @@
 # Check that the published hard copy of the manual still matches the manual; rebuild it when it does not.
 manual.hardcopy 17 * * * * missed=once
 
-# One snapshot of the state root each night (09:30 UTC), without the folders the task worker is told to leave out.
-# Large binary products such as photo jobs are a different policy and are not in it. After a gap, one run covers it.
+# One snapshot of the state root each night (09:30 UTC): the databases and the text files, no binary files, and
+# only the last one is kept (no rolling window). Binary products are a different policy. After a gap, one run covers it.
 state.backup 30 9 * * * missed=once

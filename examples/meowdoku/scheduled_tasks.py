@@ -13,8 +13,9 @@ of its own, so that baking and backing up are off the server's plate.
 nothing is written. When it differs the whole folder is replaced, so pages of places that no longer exist go away.
 
 `state.backup` is a snapshot of the state root through `state_backup.snapshot` (databases through the sqlite backup
-API, files copied, a manifest with hashes), leaving out the folders the deployment names and keeping a small number
-of snapshots. Large binary products (photo jobs) are a different policy and are not this task's.
+API, files copied, a manifest with hashes). The owner's policy, 2026-11-11: "just the non binary files and the
+database nightly no rolling window". So the deployment runs it text-only and keeps one snapshot: each night's copy
+replaces the last. Binary products (photo jobs and the like) are a different policy and are not this task's.
 """
 from __future__ import annotations
 
@@ -57,13 +58,15 @@ def refresh_hard_copy(web_dir, *, name, document, site, graph_view) -> tuple:
     return True, f"the {name} hard copy was rebuilt: {pages} pages from map {digest[:12]}"
 
 
-def backup_state(state_dir, backup_dir, *, keep, exclude, state_backup) -> str:
-    """One snapshot of the state root without the excluded folders; returns the sentence for the result."""
-    manifest = state_backup.snapshot(state_dir, backup_dir, keep=keep, exclude=tuple(exclude))
+def backup_state(state_dir, backup_dir, *, keep, exclude, state_backup, text_only=False) -> str:
+    """One snapshot of the state root; returns the sentence for the result."""
+    manifest = state_backup.snapshot(state_dir, backup_dir, keep=keep, exclude=tuple(exclude), text_only=text_only)
     size = sum(entry["size"] for entry in manifest["files"])
+    binary = manifest["binary_left_out"]
     return (f"snapshot {Path(manifest['snapshot']).name}: {len(manifest['files'])} files, {size} bytes, "
             f"{len(manifest['skipped'])} skipped, {len(manifest['removed'])} old removed, keeping {keep}; "
-            f"left out: {', '.join(exclude) or 'nothing'}")
+            f"binary left out: {binary['files']} files, {binary['bytes']} bytes; "
+            f"folders left out: {', '.join(exclude) or 'none'}")
 
 
 def load_cron_host(nodus_tools):
@@ -83,7 +86,7 @@ def load_cron_host(nodus_tools):
 def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
-    `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "module"}` (module = state_backup)."""
+    `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup)."""
     table = {}
     if web_dir is not None and manual is not None:
         def manual_hardcopy(request):
@@ -94,7 +97,8 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
     if backup is not None:
         def state_backup_task(request):
             return cron_host.DONE, backup_state(backup["state_dir"], backup["backup_dir"], keep=backup["keep"],
-                                                exclude=backup["exclude"], state_backup=backup["module"])
+                                                exclude=backup["exclude"], state_backup=backup["module"],
+                                                text_only=bool(backup.get("text_only")))
         table["state.backup"] = state_backup_task
     return table
 

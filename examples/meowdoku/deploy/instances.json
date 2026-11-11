@@ -108,9 +108,8 @@
         "--backup-dir",
         "C:/dev/Powershell/srv/backups",
         "--backup-keep",
-        "3",
-        "--backup-exclude",
-        "content/marble_photos"
+        "1",
+        "--backup-text-only"
       ]
     }
   ],

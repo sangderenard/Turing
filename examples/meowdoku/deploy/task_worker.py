@@ -1,14 +1,15 @@
 """The site's task worker: it performs the scheduled tasks the Nodus cron tool asks for, so the web server does not.
 
     python examples/meowdoku/deploy/task_worker.py --state-dir STATE --web-dir WEB --cron-jobs-dir STATE/jobs/cron \
-        --backup-dir BACKUPS --backup-keep 3 --backup-exclude content/marble_photos [--cron-port PORT]
+        --backup-dir BACKUPS --backup-keep 1 --backup-text-only [--cron-port PORT]
 
 A process of its own under the supervisor (an instance of kind `command` that names the Nodus host and the `cron`
 prefix; the supervisor then appends `--cron-port`). It serves nothing and listens on nothing: it connects to the cron
 prefix as a host and waits to be asked. What it can be asked:
 
   manual.hardcopy   check the published hard copy of the manual against the manual; rebuild it when they differ
-  state.backup      one snapshot of the state root (when --backup-dir is given), without the --backup-exclude folders
+  state.backup      one snapshot of the state root (when --backup-dir is given): with --backup-text-only the
+                    databases and the text files, no binary files; --backup-keep 1 means no rolling window
 
 At its own start it also makes sure the manual's hard copy exists, so the site has one before the first schedule.
 Without `--cron-port` (the Nodus host declares no cron port) it does that one check and then idles, so the supervisor
@@ -40,7 +41,8 @@ def main(argv=None) -> int:
     parser.add_argument("--cron-jobs-dir", required=True)
     parser.add_argument("--cron-port", type=int, default=None, help="appended by the supervisor from the declared cron prefix")
     parser.add_argument("--backup-dir", default=None, help="where state snapshots go; without it state.backup is not offered")
-    parser.add_argument("--backup-keep", type=int, default=3, help="how many snapshots to keep")
+    parser.add_argument("--backup-keep", type=int, default=1, help="how many snapshots to keep (1 = the last one only)")
+    parser.add_argument("--backup-text-only", action="store_true", help="databases and text files only; no binary files")
     parser.add_argument("--backup-exclude", action="append", default=[], metavar="STATE-RELATIVE-FOLDER",
                         help="a folder of the state root a snapshot leaves out (repeatable)")
     parser.add_argument("--federation-port", default=None, help=argparse.SUPPRESS)      # the supervisor passes these to any
@@ -59,7 +61,8 @@ def main(argv=None) -> int:
             say(f"[worker] the manual hard copy could not be written at start: {type(error).__name__}: {error}")
     if args.backup_dir:
         needs["backup"] = {"state_dir": args.state_dir, "backup_dir": args.backup_dir, "keep": max(1, args.backup_keep),
-                           "exclude": tuple(args.backup_exclude), "module": state_backup}
+                           "exclude": tuple(args.backup_exclude), "text_only": args.backup_text_only,
+                           "module": state_backup}
 
     stop = threading.Event()
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
