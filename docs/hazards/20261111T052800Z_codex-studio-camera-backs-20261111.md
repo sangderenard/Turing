@@ -17,4 +17,9 @@ worktree outside Powershell; moved only this owned worktree under Powershell
 and used SPEAKTOME_REPO=C:/dev/Powershell/speaktome. No source change to obtain
 dependencies. hazards_log.py still rejects pre-existing malformed filename;
 read latest ten dated receipts and legacy baseline directly. Full suite and
-new GPU exposure not run. Browser visual check pending at this receipt.
+new GPU exposure not run. Real Chrome fixture with actual panel HTML/CSS/module verified all presets,
+custom invalid/recovered edits, reference reset and collapse/reopen. Found
+binary-float APS-C label; fixed display rounding and added regression test.
+Inspected screenshot build/camera-back-controls.png. Fixture uses a 2:1 camera
+aspect; it does not exercise integrated WebGL/GPU alignment. Closed owned
+loopback server/browser tab after the check.

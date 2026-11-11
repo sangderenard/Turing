@@ -46,3 +46,13 @@ photo camera and camera binding checks pass. The legacy photo room Node check
 fails with `shopEmissionProfiles is not defined` both here and in a fresh
 untouched 61a32c63 worktree; it predates this change. No full repository suite,
 new GPU exposure, public deployment or server restart is claimed.
+
+Real Chrome UI verification used the actual lens panel HTML/CSS and control
+module in an isolated loopback fixture, not the live site. All six presets,
+custom empty/valid dimensions, reference reset, and collapsing/reopening the
+panel worked. The 2:1 camera output reported the correct physical crop and the
+resolution remained 512 × 512. Visual inspection found a binary-float label
+(23.599999999999998 mm); display formatting is now rounded without changing
+physical arithmetic. Screenshot: build/camera-back-controls.png. The full
+integrated WebGL scene and a live GPU exposure were not exercised by this UI
+fixture. The temporary server and browser tab were closed.

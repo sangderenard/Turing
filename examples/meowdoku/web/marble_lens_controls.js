@@ -58,9 +58,10 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
   const select = $("photo-lens"), status = $("photo-lens-status");
   const focus = $("photo-focus-mm"), focal = $("photo-focal-mm"), aperture = $("photo-f-number");
   const focusSlider = $("photo-focus-slider"), focalSlider = $("photo-focal-slider"), apertureSlider = $("photo-aperture-slider");
+  const backMm = metres => Number((metres*1000).toFixed(3));
   const backSelect=$("photo-camera-back"), backWidth=$("photo-back-width-mm"), backHeight=$("photo-back-height-mm");
   if(backSelect)for(const p of CAMERA_BACK_PRESETS){const option=doc.createElement("option");option.value=p.key;
-    option.textContent=`${p.label} (${p.width_m*1000} × ${p.height_m*1000} mm)`;backSelect.append(option);}
+    option.textContent=`${p.label} (${backMm(p.width_m)} × ${backMm(p.height_m)} mm)`;backSelect.append(option);}
   const selectedBack=()=>cameraBack(backSelect?.value??"reference",+backWidth?.value,+backHeight?.value);
   let profiles = [], failure = "", lastValidFov = null;
   const settings = () => ({key: select.value, focusMm: +focus.value, focalMm: +focal.value, fNumber: +aperture.value, back:selectedBack()});
@@ -100,7 +101,7 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
       if(backSelect){
         backWidth.disabled=backHeight.disabled=backSelect.value!=="custom";
         const back=result.camera_back, gate=sensorGate(back);
-        if(back && back.key!=="custom"){backWidth.value=String(back.width_m*1000);backHeight.value=String(back.height_m*1000);}
+        if(back && back.key!=="custom"){backWidth.value=String(backMm(back.width_m));backHeight.value=String(backMm(back.height_m));}
         $("photo-back-status").textContent=back ?
           `${(back.width_m*1000).toFixed(2)} × ${(back.height_m*1000).toFixed(2)} mm back. Square output uses a centered ${(gate.width_m*1000).toFixed(2)} × ${(gate.height_m*1000).toFixed(2)} mm crop; other output aspects crop to fit without stretching. Pixel sizes, oversampling and tiling are independent.` :
           "Original 24 mm reference height; width follows output aspect. Pixel sizes and render quality are unchanged.";

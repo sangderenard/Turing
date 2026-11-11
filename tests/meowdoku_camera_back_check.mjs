@@ -43,6 +43,8 @@ const $=id=>elements.get(id),doc={getElementById:$,createElement:()=>new Element
 const controls=createStudioLensControls(doc,{fetcher:async()=>({ok:true,json:async()=>({schema:'studio-lens-catalog-v1',profiles:[]})})});
 await controls.ready;
 assert.equal($('photo-camera-back').children.length,6);
+assert.match($('photo-camera-back').children.find(e=>e.value==='aps_c').textContent,/23\.6/);
+assert(!/99999/.test($('photo-camera-back').children.find(e=>e.value==='aps_c').textContent));
 $('photo-camera-back').value='aps_c';$('photo-camera-back').fire('change');
 assert(controls.applyCamera(base).fov_degrees<18);assert($('photo-back-width-mm').disabled);
 assert.match($('photo-back-status').textContent,/centered/);
