@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 import io
 import itertools
+import importlib.util
+from functools import lru_cache
 import json
 import math
 import os
@@ -56,6 +58,17 @@ class PhotoError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+@lru_cache(maxsize=4)
+def _tile_contract(root):
+    path = Path(root) / "camera_designer" / "marble_tiles.py"
+    spec = importlib.util.spec_from_file_location("studio_source_tile_contract", path)
+    if spec is None or spec.loader is None or not path.is_file():
+        raise PhotoError("Spectral tiled-photo support is unavailable", 503)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _finite_vectors(value: object, length: int, name: str) -> list[float]:
@@ -134,9 +147,19 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     checker_in = value.get("checker", {})
     if not isinstance(camera_in, dict) or not isinstance(checker_in, dict):
         raise PhotoError("camera and checker must be objects")
-    resolution = int(_number(camera_in.get("resolution", 256), 128, 4096, "resolution"))
-    if resolution not in (128, 256, 512, 768, 1024, 2048, 4096):
-        raise PhotoError("resolution must be 128, 256, 512, 768, 1024, 2048, or 4096")
+    resolution = camera_in.get("resolution", 256)
+    if type(resolution) is not int or not 128 <= resolution <= 32768:
+        raise PhotoError("resolution must be an integer from 128 to 32768")
+    custom_size = "width" in camera_in or "height" in camera_in
+    oversampling = value.get("oversampling", 1)
+    if type(oversampling) is not int or not 1 <= oversampling <= 4:
+        raise PhotoError("oversampling must be an integer multiplier from 1 to 4")
+    tiled = "tiled" in value or oversampling > 1 or custom_size or resolution not in (128,256,512,768,1024,2048,4096)
+    if tiled:
+        try:
+            _tile_contract(str(spectral_root)).tile_plan(value)
+        except ValueError as error:
+            raise PhotoError(str(error)) from error
     orbit_frames = int(_number(value.get("orbit_frames", 1), 1, 32, "orbit_frames"))
     if orbit_frames not in (1, 8, 16, 32):
         raise PhotoError("orbit_frames must be 1, 8, 16, or 32")
@@ -150,6 +173,8 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         "aperture_blades": int(_number(camera_in.get("aperture_blades", 0), 0, 16, "camera.aperture_blades")),
         "aperture_rotation_radians": _number(camera_in.get("aperture_rotation_radians", 0), -7, 7, "camera.aperture_rotation_radians"),
     }
+    if custom_size:
+        camera.update(width=camera_in["width"], height=camera_in["height"])
     try:
         camera = apply_lens_selection(camera, camera_in.get("lens_selection"), spectral_root)
     except (ValueError, OSError) as error:
@@ -290,6 +315,9 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         # re-enabling, not live against production.
         # "room": room,
     }
+    if tiled:
+        config["tiled"] = value.get("tiled", {"tile_size": 1024})
+        config["oversampling"] = oversampling
     participation=value.get("client_intersections",False)
     if type(participation) is not bool:
         raise PhotoError("client_intersections must be a boolean")
@@ -773,6 +801,14 @@ class PhotoJobs:
         if config.get("client_intersections") and (not owners or client_bridge is None or not bridge_url):
             raise PhotoError("Authenticated client work bridge is unavailable",503)
         self.directory.mkdir(parents=True, exist_ok=True)
+        tile_plan = None
+        if "tiled" in config:
+            contract = _tile_contract(str(self.spectral_root))
+            tile_plan = contract.tile_plan(config)
+            try:
+                contract.require_tile_disk(self.directory, tile_plan)
+            except ValueError as error:
+                raise PhotoError(str(error), 507) from error
         with tempfile.TemporaryDirectory(prefix="marble-photo-", dir=self.directory) as temporary:
             staging = Path(temporary)
             payload = staging / "payload.npz"
@@ -826,7 +862,8 @@ class PhotoJobs:
                     }), encoding="utf-8")
                 status = {"digest": digest, "state": "preparing", "image": None,
                           "object_digest": config["object_digest"],
-                          "exposure_seconds": seconds, "geometry_stats": geometry_stats}
+                          "exposure_seconds": seconds, "geometry_stats": geometry_stats,
+                          **({"tiled": tile_plan} if tile_plan else {})}
                 (directory / "status.json").write_text(json.dumps(status), encoding="utf-8")
                 command = [sys.executable, "-m", "camera_designer.marble_preview_worker",
                            "--payload", str(directory / "payload.npz"),
@@ -894,31 +931,29 @@ class PhotoJobs:
         with self.lock:
             return self._status_locked(digest)
 
-    def image(self, digest: str, name: str) -> bytes:
-        if not _DIGEST.fullmatch(digest) or not _IMAGE.fullmatch(name):
-            raise PhotoError("invalid photo image path", 400)
-        with self.lock:
-            self._status_locked(digest)
-            # A newer frame may publish between the status poll and the
-            # browser's image fetch. Every numbered frame under this digest
-            # represents the same saved scene, so older frames remain valid.
-            try:
-                return (self.directory / digest / name).read_bytes()
-            except OSError:
-                raise PhotoError("photo frame is unavailable", 404) from None
-
-    def hdr(self, digest: str, name: str) -> bytes:
-        if not _DIGEST.fullmatch(digest) or not _HDR.fullmatch(name):
-            raise PhotoError("invalid HDR exposure path", 400)
+    def open_artifact(self, digest: str, name: str, *, hdr: bool = False):
+        """Open a verified artifact; callers stream it after existing ownership authorization."""
+        pattern = _HDR if hdr else _IMAGE
+        if not _DIGEST.fullmatch(digest) or not pattern.fullmatch(name):
+            raise PhotoError("invalid photo artifact path", 400)
         with self.lock:
             status = self._status_locked(digest)
-            available = {frame.get("hdr") for frame in status.get("frames", [])}
-            if status.get("hdr") != name and name not in available:
-                raise PhotoError("HDR exposure is unavailable", 404)
+            if hdr:
+                available = {frame.get("hdr") for frame in status.get("frames", [])}
+                if status.get("hdr") != name and name not in available:
+                    raise PhotoError("HDR exposure is unavailable", 404)
             try:
-                return (self.directory / digest / name).read_bytes()
+                return (self.directory / digest / name).open("rb")
             except OSError:
-                raise PhotoError("HDR exposure is unavailable", 404) from None
+                raise PhotoError("photo artifact is unavailable", 404) from None
+
+    def image(self, digest: str, name: str) -> bytes:
+        with self.open_artifact(digest, name) as stream:
+            return stream.read()
+
+    def hdr(self, digest: str, name: str) -> bytes:
+        with self.open_artifact(digest, name, hdr=True) as stream:
+            return stream.read()
 
     def animation(self, digest: str) -> bytes:
         if not _DIGEST.fullmatch(digest):
@@ -964,6 +999,8 @@ class PhotoJobs:
         result = {"ok": True}
         with self.lock:
             status = self._status_locked(digest)
+            if status.get("tiled"):
+                raise PhotoError("Tiled HDR retouch is not available in the interactive editor; download the HDR or set gamma before exposing", 409)
             directory = self.directory / digest
             temp = directory / "retouch.json.tmp"
             temp.write_text(json.dumps(clean), encoding="utf-8")
@@ -1022,7 +1059,12 @@ class PhotoJobs:
                 raise PhotoError("photo digest is no longer active", 404)
             self._stop_locked()
             self.active_digest = None
-            (self.directory / digest / "orbit.avi").unlink(missing_ok=True)
+            directory = self.directory / digest
+            # These are internal scratch stores, not finished PNG/HDR artifacts.
+            # Reclaim the disk-backed full sensor only after its owner has exited.
+            for name in ("tile-sensor.npy", "tile-output.npy", "tile-srgb.npy", "tile-luma.bin"):
+                (directory / name).unlink(missing_ok=True)
+            (directory / "orbit.avi").unlink(missing_ok=True)
             path = self.directory / digest / "status.json"
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))

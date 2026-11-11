@@ -1837,9 +1837,13 @@ def make_handler(sessions: Sessions):
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
-                    body = (sessions.marble_photos.hdr(digest, name) if path == "/api/marble_photo/hdr"
-                            else sessions.marble_photos.animation(digest) if path == "/api/marble_photo/animation"
-                            else sessions.marble_photos.image(digest, name))
+                    artifact = None
+                    if path == "/api/marble_photo/animation":
+                        body = sessions.marble_photos.animation(digest)
+                        length = len(body)
+                    else:
+                        artifact = sessions.marble_photos.open_artifact(digest, name, hdr=path.endswith("/hdr"))
+                        length = os.fstat(artifact.fileno()).st_size
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
                 self._set_cookie = []
@@ -1848,10 +1852,15 @@ def make_handler(sessions: Sessions):
                                  "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
                 if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
                     self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(length))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(body)
+                if artifact is not None:
+                    with artifact:
+                        while block := artifact.read(1024 * 1024):
+                            self.wfile.write(block)
+                else:
+                    self.wfile.write(body)
                 return
             if path == "/api/obj_assets" or path.startswith("/api/obj_assets/"):
                 account = self._account()

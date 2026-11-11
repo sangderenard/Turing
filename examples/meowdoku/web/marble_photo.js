@@ -147,6 +147,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   const config = {
     object_digest: objectDigest,
     exposure_seconds: options.seconds ?? 30,
+    oversampling: options.oversampling ?? 1,
     orbit_frames: options.orbitFrames ?? 1,
     transport: options.transport ?? "fixed:3",
     gamma: options.gamma ?? 1.0,
@@ -164,6 +165,20 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
     },
     checker: options.checker ?? { center_m: [0, 0, 0.30], width_m: 0.15, checks: 4 },
   };
+  if (options.width !== undefined || options.height !== undefined) {
+    if (![options.width, options.height].every(v => Number.isInteger(v) && v >= 128 && v <= 32768))
+      throw new RangeError("Custom photo width and height must be integers from 128 to 32768.");
+    config.camera.width = options.width; config.camera.height = options.height;
+  }
+  if (!Number.isInteger(config.oversampling) || config.oversampling < 1 || config.oversampling > 4)
+    throw new RangeError("Oversampling must be an integer multiplier from 1 to 4.");
+  const tiled = config.oversampling > 1 || options.tiled !== undefined || config.camera.width !== undefined || config.camera.height !== undefined ||
+    ![128,256,512,768,1024,2048,4096].includes(config.camera.resolution);
+  if (tiled) {
+    if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || options.live || options.clientIntersections)
+      throw new RangeError("Device intersections require ordinary RGB still photos; custom, large and oversampled photos use server tiles.");
+    config.tiled = options.tiled ?? {tile_size: 1024};
+  }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
   if (options.clientIntersections) {
@@ -667,7 +682,10 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       }
       showBounceDiagnostic(doc, value);
       showGeometryDiagnostic(doc, value);
-      status(state.retouchError || (value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
+      status(state.retouchError || (value.tiled ? (value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
+        value.state === "complete" ? `Tiled photo complete · ${value.tiled.output_width} × ${value.tiled.output_height} · ${value.tiled.completed_tiles} tiles` :
+        value.state === "assembling" ? `Assembling ${value.tiled.output_width} × ${value.tiled.output_height} photo from linear HDR tiles…` :
+        `Tiled photo · ${value.tiled.completed_tiles}/${value.tiled.total_tiles} tiles complete · ${value.tiled.exposure_seconds_per_tile} s per tile`) : value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
             value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
@@ -706,7 +724,11 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     if (state.jobDigest) throw new Error("An exposure is already running. Wait for it to finish or use Cancel exposure.");
     const objectDigest = state.objectDigest;
     const options = {
-      resolution: +$("photo-resolution").value, seconds: +$("photo-seconds").value,
+      resolution: $("photo-resolution").value === "custom" ? 256 : +$("photo-resolution").value,
+      ...($("photo-resolution").value === "custom" ? {width:+$("photo-width").value, height:+$("photo-height").value} : {}),
+      seconds: +$("photo-seconds").value,
+      oversampling: +($("photo-oversampling")?.value || 1),
+      ...($("photo-tile-size")?.value && $("photo-tile-size").value !== "auto" ? {tiled:{tile_size:+$("photo-tile-size").value}} : {}),
       orbitFrames: +$("photo-orbit-frames").value,
       transport: $("photo-transport").value,
       filmResponse: responseForExposure,
