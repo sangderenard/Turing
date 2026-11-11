@@ -4577,10 +4577,12 @@ function restoreLivingEdits() {
       if (payload) livingEditPersistence.backend = "local-storage";
     } catch (_) {}
   }
-  if (!payload) return;
+  // Portal openings a producer declared become splats on every load, saved game or not: a fresh visitor has
+  // no payload, and without this the doors of a world would exist only for someone who had already saved.
+  if (!payload) { migrateLegacyPortalOpenings(); return; }
   try {
     const saved = JSON.parse(payload);
-    if (saved.version !== (model.persistence?.version || 1)) return;
+    if (saved.version !== (model.persistence?.version || 1)) { migrateLegacyPortalOpenings(); return; }
     Object.entries(saved.objects || {}).forEach(([identity, edit]) => {
       const box = shaderViewer.geometry.find(item => item.identity === identity);
       if (!box) return;
@@ -4654,6 +4656,7 @@ function restoreLivingEdits() {
       `restored ${migratedPortals} legacy portal port${migratedPortals === 1 ? "" : "s"} as graph splats`);
   } catch (error) {
     console.warn("AbstractUI saved edits were ignored", error);
+    migrateLegacyPortalOpenings();   // converts only what is still an opening, so it is safe to repeat
   }
 }
 
@@ -8328,6 +8331,10 @@ function completeIslandArrival(identity, position, velocity, radius) {
   const target = pair && portalRuntime.splats.find(splat =>
     splat.port_role === "out" && splat.pair === pair);
   if (!target) return false;
+  // A door is walked through. A walker who is seated in the vehicle arrives on foot; otherwise the vehicle
+  // carries the walker's position away again on the next cycle (seen in a real page).
+  if (identity === viewportControls.policy?.actor && typeof vehicleRuntime !== "undefined" &&
+      vehicleRuntime.active) clearActiveVehicle();
   const clearance = Math.max(0.09, radius + 0.035);
   position.forEach((_, axis) => { position[axis] = target.center[axis] + target.normal[axis] * clearance; });
   if (velocity) velocity.forEach((_, axis) => { velocity[axis] = 0; });
@@ -8347,8 +8354,10 @@ function leaveThroughIslandDoor(identity, source) {
   if (identity !== viewportControls.policy?.actor) return false;
   const detail = {island: source.island, pair: source.pair, source: source.identity,
     href: source.href || null};
+  // Every issued action names a registered edge; the timer refuses one that does not.
+  const edge = actionEdges.register(source.identity, "leave-through-island-door", source.island);
   abstractUISystemTimer.issue({actor: identity, type: "leave-through-island-door",
-    source: source.identity, destination: source.island,
+    source: source.identity, destination: source.island, edge,
     backing_graph: portalRuntime.graph.identity, issued_at: performance.now()});
   let proceed = true;
   try {

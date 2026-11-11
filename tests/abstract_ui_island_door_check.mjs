@@ -139,3 +139,32 @@ const walkIn = (world, identity) => {
   assert.deepEqual(position, [1, 2, 3]);
 }
 console.log("island door ok");
+
+// A fresh visitor has no saved game. The declared doors must still become splats: every way out of the restore
+// function converts them (found in a real browser: with no payload the outside page had no door at all).
+{
+  const restore = fn("restoreLivingEdits");
+  assert.ok(restore.includes("if (!payload) { migrateLegacyPortalOpenings(); return; }"));
+  assert.ok(restore.includes("{ migrateLegacyPortalOpenings(); return; }\n    Object.entries(saved.objects"));
+  assert.ok(/console\.warn\("AbstractUI saved edits were ignored", error\);\n\s+migrateLegacyPortalOpenings\(\);/.test(restore));
+  // Converting twice is harmless: the second pass finds no portal openings left on the hosts.
+  const twice = island([lotHost()]);
+  assert.equal(twice.migrateLegacyPortalOpenings(), 2);
+  assert.equal(twice.migrateLegacyPortalOpenings(), 0);
+  assert.equal(twice.portalRuntime.splats.length, 2);
+}
+console.log("fresh visitor gets doors ok");
+
+// Found in a real page: the game's action timer refuses an issued action whose edge is not registered, and a
+// walker seated in the vehicle was carried away again after arriving.
+{
+  const outside = island([lotHost()]);
+  outside.migrateLegacyPortalOpenings();
+  walkIn(outside, "walker");
+  assert.equal(outside.issued.at(-1).edge,
+    `${door}/enter:in|leave-through-island-door|island:owner/name/src/x.py`);
+  const arrive = fn("completeIslandArrival");
+  assert.ok(arrive.includes("vehicleRuntime.active) clearActiveVehicle();"));
+  assert.ok(arrive.indexOf("clearActiveVehicle()") < arrive.indexOf("position.forEach"));
+}
+console.log("action edge and on-foot arrival ok");
