@@ -22,6 +22,16 @@ unresolved are `meowdoku.*`: Python resolution is repository-root only and
 `examples/meowdoku` is imported with `examples/` on sys.path (design note,
 gap H). The rest are stdlib and third-party names.
 
+2026-11-11: `src/compiler/repo_world_workspace.py` clones the whole workspace
+(root repository plus every child repository, in the on-disk layout) from
+GitHub into a temporary directory and scans all of it; the manifest is
+`docs/repo_world_workspace.json` (15 repositories, 51 worktrees skipped,
+discovered from git metadata only). `tests/test_repo_world_workspace.py` —
+2 passed in 2.5 s on a fixture workspace with bare "origin" repositories.
+The clone against github.com itself was not run here (network, and two refs
+need the owner's confirmation: root set to `nogodsnomasters` per AGENTS.md,
+speaktome left on `codex/direct-x86-vocabulary-report`).
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

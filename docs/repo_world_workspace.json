@@ -1,0 +1,83 @@
+{
+  "schema": "repo-world-workspace-manifest-v0",
+  "repositories": [
+    {
+      "path": ".",
+      "clone_url": "https://github.com/sangderenard/nogodsnomasters.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "amp",
+      "clone_url": "https://github.com/sangderenard/amp.git",
+      "ref": "main"
+    },
+    {
+      "path": "fftfree",
+      "clone_url": "https://github.com/sangderenard/fftfree.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "geometry",
+      "clone_url": "https://github.com/sangderenard/geometry.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "lfsavoider",
+      "clone_url": "https://github.com/sangderenard/lfsavoider.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "meta-nn",
+      "clone_url": "https://github.com/sangderenard/meta-nn.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "nodus",
+      "clone_url": "https://github.com/sangderenard/nodus.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "pcb",
+      "clone_url": "https://github.com/sangderenard/electrofluid.git",
+      "ref": "main"
+    },
+    {
+      "path": "pigeon",
+      "clone_url": "https://github.com/sangderenard/pigeon.git",
+      "ref": "main"
+    },
+    {
+      "path": "socratic",
+      "clone_url": "https://github.com/sangderenard/socratic.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "speaktome",
+      "clone_url": "https://github.com/sangderenard/speaktome.git",
+      "ref": "codex/direct-x86-vocabulary-report"
+    },
+    {
+      "path": "spectral-analyzer",
+      "clone_url": "https://github.com/sangderenard/spectral-analyzer.git",
+      "ref": "nogodsnomasters"
+    },
+    {
+      "path": "tensor-calculator",
+      "clone_url": "https://github.com/sangderenard/tensor-calculator.git",
+      "ref": "main"
+    },
+    {
+      "path": "turing",
+      "clone_url": "https://github.com/sangderenard/Turing.git",
+      "ref": "main"
+    },
+    {
+      "path": "wheelhouse",
+      "clone_url": "https://github.com/sangderenard/wheelhouse.git",
+      "ref": "nogodsnomasters"
+    }
+  ],
+  "skipped": [
+    "51 git worktrees of the repositories above (turing-*, win-main*, speaktome-*, spectral-*): views, not repositories"
+  ]
+}

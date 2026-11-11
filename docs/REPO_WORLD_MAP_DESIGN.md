@@ -137,6 +137,38 @@ the only thing the scan can describe. The `--path` form exists for fixture
 tests, not for the owner's checkout. Git LFS smudge is disabled during the
 clone so no large binaries are fetched; the scan reads text sources only.
 
+### The whole workspace, in its on-disk layout
+
+The owner's workspace is one root repository (`nogodsnomasters`) whose child
+directories are independent repositories. `src/compiler/repo_world_workspace.py`
+clones all of it from GitHub in that layout:
+
+1. `discover` reads only git metadata of the local tree (which top-level
+   directories are repositories, each one's remote URL normalised to GitHub
+   HTTPS, its current branch) and writes `docs/repo_world_workspace.json`.
+   No file contents are read. Git worktrees (a `.git` file) are skipped as
+   views of another entry; a repository with no remote is skipped with a
+   note. The committed manifest is the owner's to edit; its `ref` per entry
+   is what GitHub is asked for.
+2. `clone` recreates the layout under an empty destination with shallow
+   clones, root first, children inside it. Nothing is copied from disk.
+3. `scan` clones into a temporary directory, runs `scan_repository` on every
+   clone and emits one workspace record: each repository's scan plus a
+   `mounts` table saying which root-repository region each child
+   repository's root region (`dir:.`) is contained by.
+
+```bash
+python -m src.compiler.repo_world_workspace scan docs/repo_world_workspace.json --json
+```
+
+Manifest state at 2026-11-11: 15 repositories, 51 worktrees skipped. The
+root entry's ref was set to `nogodsnomasters` (the branch the root AGENTS.md
+names) rather than the session branch the checkout was on; `speaktome` is
+recorded on its session branch `codex/direct-x86-vocabulary-report`, which
+may not be the branch GitHub should serve. `pcb` points at the
+`electrofluid` repository, which may be private; a failed clone is a note,
+not a crash, unless `strict` is set.
+
 ### Reference extraction
 
 - **Python**: `ast.parse` per tracked `.py`; `Import` and `ImportFrom`
