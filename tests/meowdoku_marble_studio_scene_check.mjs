@@ -1,3 +1,4 @@
+import * as sceneBuilder from '../examples/meowdoku/web/studio_scene_builder.js';
 // Actual authoring builders and current-Studio capture, CPU only. No native
 // contact admission, ray job, active browser, or server publication occurs.
 import assert from 'node:assert/strict';
@@ -31,12 +32,12 @@ coverage('room',room);coverage('table',furniture);coverage('gobo',gobos);coverag
 assert.equal(new Set(parts.filter(p=>p.id.startsWith('table/')).map(p=>p.bodyId)).size,1,'Table construction stays one compound');
 assert.equal(new Set(parts.filter(p=>p.id.startsWith('room/')).map(p=>p.bodyId)).size,1);
 assert.deepEqual(parts.filter(p=>p.id.startsWith('gobo/')).map(p=>p.id),['gobo/7']);
-const context=vm.createContext({STUDIO_LIGHTS,tableLightModifierFaces,Math,structuredClone,lightStandFacesForStudio:()=>[],
+const context=vm.createContext({shopEmissionProfiles:undefined,STUDIO_LIGHTS,tableLightModifierFaces,Math,structuredClone,lightStandFacesForStudio:()=>[],
   shopLightFacesForStudio:()=>[],shopLightState:()=>undefined,writeShopLightEmitterRows,STUDIO_FIXED_MATERIAL_ROWS,backdropSupportFacesForStudio:()=>[]});
 // Existing fixture primitives and their existing authoring function, not a
 // second fixture generator or a simplified collider used only by tests.
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function stringFaces(')),context);
-vm.runInContext(source.slice(source.indexOf('function buildFixtureFaces('),source.indexOf('// The ray-traced photo\'s')),context);
+Object.assign(context,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,context.ids??{})});
+Object.assign(context,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,context.ids??{})});
 const fixtureRoles=[{pos:[0,4,1],dir:[0,-1,0],halfW:.5,halfH:.5,mat:3,roleIndex:0,round:false,shape:'bare'},
   {pos:[2,3,1],dir:[0,0,-1],radius:.2,mat:4,roleIndex:2,round:true,shape:'bare',gobo:true}];
 coverage('fixture',cb=>context.buildFixtureFaces(fixtureRoles,5,cb));

@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 import {applyLightTools,defaultLightTools,migrateLightTools} from '../examples/meowdoku/web/marble_light_tools.js';
 import {applyFixtureSizes,defaultFixtureSizes} from "../examples/meowdoku/web/marble_fixture_sizes.js";
 // Exercise the production fixture builder, emissive-material writer and photo
@@ -59,10 +59,8 @@ function fixtureContext(text) {
     checkerboardFaces: () => [], backdropRollFaces: () => [],
   });
   function $(id) { return nodes[id]; }
-  vm.runInContext(text.slice(text.indexOf('const ROOM_FIXTURES ='), text.indexOf('const currentCameraOptions =')), context);
-  vm.runInContext(text.slice(text.indexOf('function quadFace('), text.indexOf('function digitFaces(')), context);
-  vm.runInContext(text.slice(text.indexOf('function studioRenderState('), text.indexOf('function surfaceMaterial(')), context);
-  vm.runInContext(text.slice(text.indexOf('function computeFixtureRoles('), text.indexOf('\nfunction syncMaterial()')).replace('export function', 'function'), context);
+installStudioSceneBuilders(context);
+  vm.runInContext(text.slice(text.indexOf('function studioRenderState('), text.indexOf('// Capture actual page values;')), context);
   installScenePackerInputs(context);
   return context;
 }
@@ -78,6 +76,7 @@ function preview(text = source, target = context) {
   const end = text.indexOf('tables.pbr.update();', start) + 'tables.pbr.update();'.length;
   const values = vm.runInContext('computeFixtureRoles()', target);
   target.roleColor = values.roleColor; target.roleStrength = values.roleStrength; target.fixtureRoles = values.fixtureRoles;
+  target.displayedShop = {emitters:[]}; // This fixture tests the ten house sources only.
   vm.runInContext(`{${text.slice(start, end)}}`, target, {timeout: 1000});
   const lightStart = text.indexOf('const coneAngles=', frame), lightEnd = text.indexOf('gl.uniform1i(loc(P,"uNumLights")', lightStart);
   target.view = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; target.transformPoint = (_, p) => p;
