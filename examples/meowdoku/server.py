@@ -1873,7 +1873,7 @@ def make_handler(sessions: Sessions):
                     return self._json(lens_catalog(sessions.marble_photos.spectral_root))
                 except (ValueError, OSError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
-            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
+            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation"):
                 if not self._require("photo_read"):
                     return
                 from urllib.parse import parse_qs
@@ -1881,7 +1881,7 @@ def make_handler(sessions: Sessions):
                 digest = (query.get("digest") or [""])[0]
                 try:
                     # Read-only visitors must not inherit the old submitter access to unindexed photos.
-                    self._job_authorize(digest, allow_legacy="photo_submit" in self._caps())
+                    self._job_authorize(digest, allow_legacy=path != "/api/marble_photo/field" and "photo_submit" in self._caps())
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
@@ -1890,14 +1890,15 @@ def make_handler(sessions: Sessions):
                         body = sessions.marble_photos.animation(digest)
                         length = len(body)
                     else:
-                        artifact = sessions.marble_photos.open_artifact(digest, name, hdr=path.endswith("/hdr"))
+                        artifact = (sessions.marble_photos.open_field(digest, name) if path.endswith("/field") else
+                                    sessions.marble_photos.open_artifact(digest, name, hdr=path.endswith("/hdr")))
                         length = os.fstat(artifact.fileno()).st_size
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
                 self._set_cookie = []
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
-                                 "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
+                                 "application/octet-stream" if path in ("/api/marble_photo/hdr", "/api/marble_photo/field") else "image/png")
                 if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
                     self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
                 self.send_header("Content-Length", str(length))

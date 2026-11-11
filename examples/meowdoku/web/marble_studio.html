@@ -219,6 +219,11 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <button id="calibration-download" class="wide" hidden>Download calibration dataset (JSON)</button>
     <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
   </div>
+  <h2>Ray field in Phong</h2><div class="grid" id="phong-light-field-controls">
+    <label class="wide"><input type="checkbox" id="phong-light-field"> Receive the ray tracer's forward volume</label>
+    <output class="wide" id="phong-light-field-status" role="status">Off. Opt in before starting an RGB still or Live job.</output>
+    <p class="wide">Automatically routes the real accumulated volume into Phong's existing glow input. This is undirected energy, not ray-bent reflections or a replacement for the photograph. Live replaces the volume each sweep; still exposures accumulate it. Nothing is accumulated a second time in the browser. Use the static, unrolled pose with Room B linked to Exposure A. Scene and camera edits hide old data.</p>
+  </div>
   <h2>Live ray-traced camera</h2><div class="grid" id="live-ray-controls">
     <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Replace the camera with live rays</label>
     <output class="wide" id="live-status" role="status" aria-live="polite" style="white-space:normal;overflow-wrap:anywhere">Enable live rays to save the current static design, or save/load one manually.</output>

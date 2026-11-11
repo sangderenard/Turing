@@ -39,6 +39,7 @@ MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 MAX_TRIANGLES = 500_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE = re.compile(r"^preview-[0-9]{6}\.png$")
+_FIELD = re.compile(r"^light-field-[0-9a-f]{32}\.bin$")
 _HDR = re.compile(r"^exposure-[0-9]{6}\.npz$")
 # Exact float64 luminance row generated from the IEC primaries/D65 matrix in
 # Spectral marble_color_profile.SRGB_TO_XYZ. Keep percentile and pixel output
@@ -150,6 +151,11 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     transport = str(value.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise PhotoError("transport must be fixed:1 or fixed:3")
+    receive_light_field = value.get("receive_light_field", False)
+    if type(receive_light_field) is not bool:
+        raise PhotoError("receive_light_field must be a boolean")
+    if receive_light_field and transport != "fixed:3":
+        raise PhotoError("receive_light_field requires fixed:3 transport")
     film_response = None
     if transport == "fixed:3":
         film_response = _film_response(value.get("film_response", {
@@ -202,6 +208,8 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             raise PhotoError("camera_poses cannot be combined with orbit, tiles, live view or client intersections")
         if "projection" in camera_in:
             raise PhotoError("camera_poses use only the existing analytical camera projection")
+    if receive_light_field and (tiled or orbit_frames != 1 or poses_in is not None):
+        raise PhotoError("receive_light_field requires one non-tiled camera without camera_poses")
     camera = _camera_config(camera_in, resolution, spectral_root)
     checker = {
         "center_m": _finite_vectors(checker_in.get("center_m", [0, 0, .30]), 3, "checker.center_m"),
@@ -339,6 +347,9 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         # re-enabling, not live against production.
         # "room": room,
     }
+    # Omitted and false preserve the pre-existing canonical job digest.
+    if receive_light_field:
+        config["receive_light_field"] = True
     if tiled:
         config["tiled"] = value.get("tiled", {"tile_size": 1024})
         config["oversampling"] = oversampling
@@ -1013,6 +1024,56 @@ class PhotoJobs:
                 return (self.directory / digest / name).open("rb")
             except OSError:
                 raise PhotoError("photo artifact is unavailable", 404) from None
+
+    def open_field(self, digest: str, name: str):
+        """Stream only the opted-in job's current, revision-matched field."""
+        if not _DIGEST.fullmatch(digest) or not _FIELD.fullmatch(name):
+            raise PhotoError("invalid light field artifact path", 400)
+        with self.lock:
+            status = self._status_locked(digest)
+            if status.get("state") not in ("exposing", "live", "complete"):
+                raise PhotoError("light field is unavailable", 404)
+            directory = self.directory / digest
+            try:
+                config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+                revision = (json.loads((directory / "live-control.json").read_text(encoding="utf-8"))["revision"]
+                            if "live" in config else 0)
+            except (OSError, ValueError, KeyError, TypeError):
+                raise PhotoError("light field configuration is unavailable", 404) from None
+            field = status.get("light_field")
+            if not isinstance(config, dict) or config.get("receive_light_field") is not True or not isinstance(field, dict):
+                raise PhotoError("light field is unavailable", 404)
+            if (field.get("name") != name or field.get("digest") != digest
+                    or field.get("live_revision") != revision):
+                raise PhotoError("light field is stale or unavailable", 404)
+            dimensions = field.get("dimensions")
+            lo, hi = field.get("bounds_min_m"), field.get("bounds_max_m")
+            if (field.get("schema") != "studio.forward-field.v1"
+                    or field.get("format") != "rgb-f32le"
+                    or field.get("layout") != "zyx-interleaved-rgb"
+                    or field.get("color_space") != "linear-srgb"
+                    or type(revision) is not int or type(field.get("live_revision")) is not int or revision < 0
+                    or type(field.get("sequence")) is not int or field["sequence"] < 0
+                    or not isinstance(dimensions, list) or len(dimensions) != 3
+                    or any(type(n) is not int or not 1 <= n <= 256 for n in dimensions)
+                    or type(field.get("byte_length")) is not int
+                    or field["byte_length"] != math.prod(dimensions) * 12
+                    or not isinstance(lo, list) or not isinstance(hi, list) or len(lo) != 3 or len(hi) != 3
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in lo + hi)
+                    or any(a >= b for a, b in zip(lo, hi))):
+                raise PhotoError("invalid light field metadata", 503)
+            path = directory / name
+            try:
+                # Do not let an advertised filename redirect to another job or arbitrary file.
+                if path.is_symlink() or path.resolve().parent != directory.resolve():
+                    raise PhotoError("light field is unavailable", 404)
+                stream = path.open("rb")
+                if os.fstat(stream.fileno()).st_size != field["byte_length"]:
+                    stream.close()
+                    raise PhotoError("light field length mismatch", 503)
+                return stream
+            except OSError:
+                raise PhotoError("light field is unavailable", 404) from None
 
     def image(self, digest: str, name: str) -> bytes:
         with self.open_artifact(digest, name) as stream:

@@ -22,7 +22,7 @@ export function liveHistoryLimit(edge,aspect,checkpoint=false,blockLimit=MAX_LIV
 }
 
 export function createLiveRayView({doc=document, canvas, getGeometry, getScene, getPose, getFilmResponse, ensureSaved,
-  getOpticalMode=()=>"legacy", participationFactory=createLiveParticipation}) {
+  getOpticalMode=()=>"legacy", participationFactory=createLiveParticipation, fieldView=null}) {
   const $=id=>doc.getElementById(id), toggle=$("live-rays"), length=$("live-history"), resolution=$("live-resolution"), output=$("live-status");
   const participation=participationFactory(doc);
   const rodWarning=createRodBundleWarning(doc,'live-optical-warning');
@@ -127,8 +127,9 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
       if(!state.pendingSave&&!state.controlError&&!state.displayError&&!state.cameraError&&(state.restart||!state.digest)) {
         const previousDigest=state.digest;
         const pose=requestedPose,live=settings(),clientIntersections=participation.requested();
+        const fieldTicket=fieldView?.capture({saved:true});
         const body=packMarblePhoto(getGeometry(),state.objectDigest,{...getScene(),camera:{...pose,resolution:+resolution.value},
-          resolution:+resolution.value,seconds:3600,transport:"fixed:3",orbitFrames:1,live,clientIntersections,...geometryPolicy,
+          resolution:+resolution.value,seconds:3600,transport:"fixed:3",orbitFrames:1,live,clientIntersections,receiveLightField:!!fieldTicket,...geometryPolicy,
           filmResponse:getFilmResponse(),maxBounces:photoBounceCount(doc),bounceMode:photoBounceMode(doc),gamma:+$("photo-gamma").value/100});
         text("Preparing the real ray-traced view…");
         showGeometryDiagnostic(doc,null);
@@ -152,6 +153,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         state.digest=job.digest;state.restart=false;state.geometryPolicy=geometryPolicy;state.geometryError=null;
         if(job.digest!==previousDigest){state.revision=0;state.poseKey=JSON.stringify({camera:pose,live});}
         state.heartbeat=0;
+        fieldView?.connect(job.digest,fieldTicket,state.revision);
         blank();show(true);
       }
       // A rejected resize may leave UI history capacity sized for a different
@@ -171,6 +173,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         await post("/api/marble_photo/live",{digest,revision:state.revision,camera:pose,live});
         if(!current(generation))return;
         state.poseKey=poseKey;state.heartbeat=Date.now();
+        fieldView?.revise(digest,state.revision);
       }
       const status=await request(`/api/marble_photo?digest=${digest}`);
       if(!current(generation))return;
@@ -184,6 +187,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
       if(state.pendingSave||state.geometryError||state.controlError){blank();text(state.pendingSave?state.pendingMessage:state.controlError??`Live scene unchanged: ${state.geometryError}. Phong preview shown.`);return;}
       if(state.displayError){text(state.displayError);return;}
       if(status.state!=="live"||status.live_revision!==state.revision)return;
+      void fieldView?.observe(status,digest);
       // This viewer displays status.image, whose recipe is display_transform.
       // Retouched-image metadata belongs to a different image, not this frame.
       const displayWhite=status.display_transform?.effective_white??status.display_white;
@@ -215,7 +219,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
     participation.stop();
     state.enabled=false;state.generation++;toggle.checked=false;
     if(state.timer)clearTimeout(state.timer);state.timer=null;
-    const digest=state.digest;state.digest=null;state.restart=false;
+    const digest=state.digest;fieldView?.stop(digest);state.digest=null;state.restart=false;
     show(false);blank();text(message);
     const generation=state.generation;
     const stopping=state.stopping.then(()=>cancel(digest));
@@ -240,6 +244,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
   const change=()=>{if(toggle.checked)void start().catch(error=>stop(`Live rays not started: ${error.message||error}`));else void stop();};
   toggle.addEventListener("change",change);
   const restart=()=>{
+    fieldView?.invalidate();
     if(!state.enabled)return;
     blank();
     if(state.pendingSave){state.restart=true;return;}
@@ -299,7 +304,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
   doc.defaultView.addEventListener("pagehide",onPageHide);
   return {
     saved(digest){const changed=digest!==state.objectDigest||state.pendingSave;state.objectDigest=digest;state.pendingSave=false;if(changed)restart();},
-    pendingSave(message="Saving object changes. Phong preview shown while rays update."){state.pendingSave=true;state.pendingMessage=message;blank();if(state.enabled)text(message);},
+    pendingSave(message="Saving object changes. Phong preview shown while rays update."){fieldView?.invalidate();state.pendingSave=true;state.pendingMessage=message;blank();if(state.enabled)text(message);},
     cameraChanged(){if(state.enabled)blank();},
     stale(){state.objectDigest=null;if(state.enabled)void stop("Design changed. Save it again before starting live rays.");},
     sceneChanged:restart,

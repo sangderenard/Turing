@@ -191,6 +191,13 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
+  if (options.receiveLightField !== undefined && typeof options.receiveLightField !== "boolean")
+    throw new TypeError("receiveLightField must be a boolean.");
+  if (options.receiveLightField) {
+    if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || tiled || options.cameraPoses)
+      throw new RangeError("Forward-field reception requires one ordinary RGB still or Live camera.");
+    config.receive_light_field = true;
+  }
   if(config.camera.camera_back){
     let aspect=(config.camera.width??config.camera.resolution)/(config.camera.height??config.camera.resolution);
     // Live's existing shader uses the viewport aspect; its integer pixel grid
@@ -237,7 +244,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   return buffer;
 }
 
-export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null) {
+export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null, fieldView = null) {
   const $ = (id) => doc.getElementById(id);
   const lensControls = createStudioLensControls(doc);
   const participation = createPhotoParticipation(doc);
@@ -595,6 +602,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
   const cancel = async () => {
     participation.stop();
     const digest = state.jobDigest;
+    fieldView?.stop(digest);
     state.jobDigest = null; state.generation++; stopPolling(); stopPlayback(); setButtons();
     if (digest) {
       $("photo-hdr").hidden = true;
@@ -606,6 +614,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     }
   };
   const stale = (invalidateObject=true) => {
+    fieldView?.invalidate();
     if (!state.objectDigest && !state.jobDigest && !state.retouchDigest) return;
     if(invalidateObject)state.objectDigest = null;
     // Editing a recipe must not cancel its already captured still exposure.
@@ -644,6 +653,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       if (!response.ok) throw new Error(value.error || `photo status HTTP ${response.status}`);
       if (!current() || requestNumber < state.appliedStatusRequest) return;
       state.appliedStatusRequest = requestNumber;
+      void fieldView?.observe(value,digest);
       const opticalImageKey=`${digest}/${value.image??''}/${value.live_revision??''}`;
       rodWarning.observe(value,opticalImageKey);
       syncRetouchProfile(value);
@@ -740,7 +750,9 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
         camera: {eye_m: subjectCenter.map((v,i)=>[0,0,.07][i]+(v-OBJECT_CENTER[i])), target_m: subjectCenter}};
     if (state.jobDigest) throw new Error("An exposure is already running. Wait for it to finish or use Cancel exposure.");
     const objectDigest = state.objectDigest;
+    const fieldTicket = fieldView?.capture({saved:!snapshotEnabled});
     const options = {
+      receiveLightField:!!fieldTicket,
       resolution: $("photo-resolution").value === "custom" ? 256 : +$("photo-resolution").value,
       ...($("photo-resolution").value === "custom" ? {width:+$("photo-width").value, height:+$("photo-height").value} : {}),
       seconds: +$("photo-seconds").value,
@@ -778,6 +790,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     if (!response.ok) throw new Error(value.error || `photo HTTP ${response.status}`);
     if (!hexDigest.test(value.digest)) throw new Error("photo server returned no digest");
     state.jobDigest = state.lastDigest = value.digest; const generation = ++state.generation;
+    fieldView?.connect(value.digest,fieldTicket);
     $("photo-panel").hidden = false;
     $("photo-caption").textContent = "Preparing thin-lens photograph…";
     setButtons(); poll(value.digest, generation);

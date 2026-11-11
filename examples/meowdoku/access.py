@@ -74,7 +74,7 @@ SHADER_LOGIN_GETS = ("/api/account/me",)
 SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
 # GET routing only: the photo handlers still require photo_read and check ownership.
 PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/marble_photo",
-                   "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation")
+                   "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation")
 SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim") + PHOTO_READ_APIS
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.

@@ -15,6 +15,7 @@ import { MarbleChaseCamera, chaseViewMatrix } from "./marble_chase_camera.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
 import { createLiveRayView } from "./marble_live.js";
+import {createStudioLightField} from "./marble_light_field.js";
 import { createObjectAutosave } from "./marble_autosave.js";
 import { prepareObjectSnapshot, objectSnapshotKey } from "./marble_object_snapshot.js";
 import { downloadMarbleObject } from "./marble_downloads.js";
@@ -46,7 +47,11 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
 let opticalControls = null;
-let liveRay = null;
+let liveRay = null, lightField = null;
+// A late-bound facade lets existing photo controls start before WebGL setup.
+const fieldView={capture:context=>lightField?.capture(context),connect:(...args)=>lightField?.connect(...args),
+  observe:(...args)=>lightField?.observe(...args),invalidate:()=>lightField?.invalidate(),stop:digest=>lightField?.stop(digest),
+  revise:(...args)=>lightField?.revise(...args)};
 const photographicCameraBinding=new PhotographicCameraBinding();
 document.addEventListener("studio-lens-change", () => liveRay?.cameraChanged());
 let studioSceneRevision=0,lastStudioFrame=null;
@@ -67,7 +72,7 @@ const currentCameraOptions = (snapshot = false, {usePhotoCamera=true}={}) => ({
   fixtures: sceneForPhoto(!snapshot),
 });
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()));
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView);
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -681,6 +686,26 @@ function studioBuilderLighting(channel="studio") {
     gobos:studioLighting?.gobos?.getState(),lightStands:studioLighting?.lightStands?.getState(),shopLights:shopLightState(channel),
   };
 }
+function fieldSceneKey({saved=false}={}) {
+  if($("preview-engine").value!=="visual"||$("preview-motion").value!=="off"||!$("inertia-lock").checked||
+      rollState?.orientation.some((v,i)=>v!==[1,0,0,0][i])||rollState?.position.some(v=>v!==0))
+    throw Error("Use the static, unrolled Studio pose to receive its ray field.");
+  if(!studioLighting||!lastGeometry)throw Error("Studio scene is not ready.");
+  if(saved&&(!savedObjectSnapshot||objectSnapshotKey(savedObjectSnapshot.value)!==objectKey))
+    throw Error("Save the current object before receiving its field.");
+  const a=studioBuilderLighting("exposure"),b=studioBuilderLighting("studio");
+  // Ignore only authoring metadata, not resolved geometry or materials. The
+  // strength records store both channels, so compare their actual rig too.
+  const normalize=value=>Array.isArray(value)?value.map(normalize):value&&typeof value==="object"?
+    Object.fromEntries(Object.keys(value).filter(k=>k!=="roomOverrides").sort().map(k=>[k,normalize(value[k])])):value;
+  const profile=value=>JSON.stringify(normalize(value));
+  if(profile(a)!==profile(b)||profile(computeFixtureRoles(undefined,"exposure"))!==profile(computeFixtureRoles(undefined,"studio")))
+    throw Error("Link Room B to Exposure A; their different scenes cannot share a field.");
+  const subject=studioSubjectTransform(saved,"exposure"),current=studioSubjectTransform(false,"studio");
+  if(profile(subject)!==profile(current))throw Error("The displayed subject size differs from the captured ray scene.");
+  return JSON.stringify([objectKey,profile(a),studioLighting.strengths.getSolo("exposure"),
+    yaw,pitch,distance,subject.unitM,subject.subjectCenter]);
+}
 function studioBuilderOptions(channel="studio",saved=false) {
   return {lighting:studioBuilderLighting(channel),subject:studioSubjectTransform(saved,channel),geometrySubject:studioSubjectTransform(false,channel),
     materials:{ids,fixtureMaterialBase:FIXTURE_MAT_BASE,pbr:{data:tables.pbr.data,stride:tables.pbr.table.floats_per_record}}};
@@ -957,7 +982,7 @@ function controls() {
   const skipPhotoInvalidation=new Set(["object-name","saved-object","obj-asset","obj-file","obj-mtl","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
-    if(event.target.closest?.('#camera-toolbox'))return;
+    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls'))return;
     if(event.target.closest?.('#photo-camera-binding'))return;
     if(applyingObject||event.target.closest("#optical-material-controls")||event.target.closest("#room-profile-overrides")||event.target.closest("#live-ray-controls")||event.target.id==="object-autosave")return;
     if(event.target.id==="object-name"){objectEdited();return;}
@@ -1380,6 +1405,7 @@ function frame(now=0) {
       gl.uniform2fv(loc(P,`uLightSpotCone[${i}]`),lightSpotCone[i]);
     }
     field(P,"uLightCalibration",1); field(P,"uExposure",1); field(P,"uFieldGain",0);
+    lightField?.bind(P,view,subject.unitM,OBJECT_CENTER);
     field(P,"uAmbientFloorGain",0); // no invisible indirect-light floor: pure emitter lighting only
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
@@ -1612,6 +1638,7 @@ async function boot() {
     gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
     gl.texStorage3D(gl.TEXTURE_2D_ARRAY,1,gl.DEPTH_COMPONENT24,1,1,1);
     floatTexture({data:[0],floats_per_record:1},10);
+    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,onChange:()=>liveRay?.sceneChanged()});
     controls(); syncMaterial(); rebuild({invalidatePhoto:false});
     opticalControls=createOpticalMaterialControls({getContext:()=>({geometry:lastGeometry,
       design:readSubjectDesign(),shell:ids[$('shell').value],selectedMaterial:selected(),
@@ -1623,7 +1650,7 @@ async function boot() {
     refreshSceneMaterialTargets();
     objectLibraryControls();
     objectKey=objectSnapshotKey(captureObjectSnapshot());
-    liveRay=createLiveRayView({doc:document,canvas,getGeometry:()=>savedObjectSnapshot?.geometry??lastGeometry,
+    liveRay=createLiveRayView({doc:document,canvas,fieldView,getGeometry:()=>savedObjectSnapshot?.geometry??lastGeometry,
       getOpticalMode:()=>opticalControls?.mode??'legacy',
       ensureSaved:async()=>{if(objectAutosave.enabled)await saveObject();else if(objectAutosave.dirty)throw new Error("Save your object changes or enable autosave first.");},
       getScene:()=>currentCameraOptions(false,{usePhotoCamera:false}),getPose:()=>validatePhotoFocus(studioPhotoCamera(true,{usePhotoCamera:false}).camera),
