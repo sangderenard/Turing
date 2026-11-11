@@ -153,3 +153,29 @@ There is no pose editor or second queue/renderer in this change.
 Checks: `tests/test_meowdoku_camera_pose_sequences.py`,
 `node tests/camera_pose_sequence_check.mjs`, and Spectral's
 `tests/test_marble_camera_pose_sequences.py` (CPU doubles, not GPU evidence).
+
+## Host integration: pictures through the shared REST API (2026-11-11)
+
+The binding this document left open now exists in source. It is not live until the service restarts with a canvas
+that declares the Studio prefix; see `docs/hazards/20261111T133801Z_main.md`.
+
+- Route: `POST /api/show/pictures {request_id, settings?, photo?}` answers 202 with a receipt;
+  `GET /api/show/pictures/{id}` reads it. The handler bodies are `picture_route` in the SpeakToMe repository's
+  `speaktome_api/routes.py` (API_VERSION 2). Capability `photo_submit`, and a signed-in account.
+- Host: `examples/meowdoku/studio_pictures.py`. The server is the host peer of a dedicated prefix (`studio.product`;
+  its dispatch is `StudioAgentProducts.build`) and, per request, the engine peer whose producer commit calls
+  `commit_studio_ray` with the existing `PhotoJobs`, the account's saved objects and owner keys, then the existing
+  account claim. The request is always `ray-payload`; `scene` is not offered over HTTP.
+- Authority: the account, owner keys and a recheck come from the authenticated request. The recheck runs before
+  preparation, in the dispatch authorization, and again inside `commit_studio_ray`. Nothing in the body is identity.
+  The product's SHA-256 is integrity evidence only.
+- Settings: a supplied `settings` record must be complete (object, the fully resolved Exposure lighting profile,
+  camera in metres) and replaces the baked defaults whole. `--studio-defaults` names the baked record.
+- Receipt states: queued, preparing, then committed (with the real job record), refused, failed or uncertain. An
+  error raised by the commit is recorded as uncertain and is never retried.
+- Not carried: the client work-sharing bridge options of the HTTP photo path.
+- Configuration: `--studio-nodus-port`, `--studio-nodus-prefix`, `--studio-assets`, `--studio-defaults`; the
+  supervisor supplies the port from the instance's `studio_prefix`. The canvas file must declare the prefix
+  (nodus `tools/add_contract_port.py`); the result store is 48 MiB.
+- Checks: `tests/test_meowdoku_studio_pictures.py` (the real Nodus round trip is opt-in with
+  NODUS_HEADLESS_TEST_DLL). No GPU exposure has been made through this path yet.

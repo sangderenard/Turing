@@ -13,7 +13,7 @@ def run_import(repo, extra=""):
     return subprocess.run(
         [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(ROOT / 'examples')!r}); "
          + extra + "from meowdoku.rest_api import routes; "
-         "assert routes.API_VERSION == 1; "
+         "assert routes.API_VERSION == 2; "
          "assert 'tensors' not in sys.modules; assert 'torch' not in sys.modules; "
          "print(routes.__file__)"], env=env, capture_output=True, text=True, timeout=15)
 
@@ -46,7 +46,7 @@ def test_incompatible_route_contract_is_refused(tmp_path):
     package = tmp_path / 'speaktome_api'
     package.mkdir()
     (package / '__init__.py').write_text('')
-    (package / 'routes.py').write_text('API_VERSION = 2\n')
+    (package / 'routes.py').write_text('API_VERSION = 1\n')
     result = run_import(tmp_path)
     assert result.returncode != 0
-    assert 'requires SpeakToMe REST API_VERSION 1' in result.stderr
+    assert 'requires SpeakToMe REST API_VERSION 2' in result.stderr

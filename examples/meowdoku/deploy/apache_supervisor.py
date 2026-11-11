@@ -310,6 +310,8 @@ class Instance:
                     if self.console_requested():
                         self.console_port = first.get("console_port")
                     ports = first.get("contract_ports") or []
+                    self.contract_ports = {p.get("prefix"): int(p["listen_port"]) for p in ports
+                                           if isinstance(p, dict) and p.get("prefix") and p.get("listen_port")}
                     if ports and isinstance(ports[0], dict) and ports[0].get("listen_port"):
                         self.contract_prefix, self.contract_port = ports[0].get("prefix"), int(ports[0]["listen_port"])
                     return True
@@ -375,7 +377,16 @@ class Instance:
             return []
         canvas = str(_abs(source.spec["nodus"]["canvas"]))
         self.sup.log(f"{self.name}: federating {source_name!r} contract port {source.contract_port} ({source.contract_prefix}) canvas {canvas}")
-        return ["--federation-port", str(source.contract_port), "--federation-canvas", canvas]
+        flags = ["--federation-port", str(source.contract_port), "--federation-canvas", canvas]
+        studio = self.spec.get("studio_prefix")     # [SHOW] the declared Studio prefix on the same host, when this instance names one
+        if studio:
+            port = getattr(source, "contract_ports", {}).get(studio)
+            if port:
+                self.sup.log(f"{self.name}: Studio pictures use {source_name!r} contract port {port} ({studio})")
+                flags += ["--studio-nodus-port", str(port), "--studio-nodus-prefix", studio]
+            else:
+                self.sup.log(f"{self.name}: studio_prefix {studio!r}: the host declares no such contract port; pictures stay off")
+        return flags
 
     def poll(self):
         if self.state in ("skipped", "external", "failed", "stopped", "new"):

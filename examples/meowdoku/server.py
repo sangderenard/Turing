@@ -374,6 +374,14 @@ class Sessions:
         self.living_data_cursors = CursorStore()
         from meowdoku.living_data_static import StaticWorlds
         self.living_data_static = StaticWorlds()
+        self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
+        from meowdoku.living_data_query import GraphView
+        from meowdoku import rest_api as shared_rest_loader
+        # [SITE] a map as pages: rendered on first look and kept under products/site; the maps this host declares
+        self.site = shared_rest_loader.site.Site(self.state.products_dir / "site", GraphView)
+        self.site_maps = {"system": {"source": self.system_map, "capability": "dev_ui", "ttl": 5.0}}
+        if shared_rest_loader.manual is not None:
+            self.site_maps["manual"] = {"source": shared_rest_loader.manual.as_map, "capability": "view_site", "ttl": 3600.0}
         self.tickets = tickets_mod.Store(self.state.tickets_dir)
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
@@ -392,6 +400,18 @@ class Sessions:
     # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
     federation_port: int | None = None          # --federation-port: the local Nodus host's 127.0.0.1 contract port (not read from the supervisor yet)
     federation_canvas: str | None = None        # --federation-canvas: the running Nodus instance's canvas file
+
+    def system_map(self) -> dict:
+        """[SITE] the running Nodus canvas as the Living Data map: the same document GET /api/nodus/map returns."""
+        import sqlite3
+        from meowdoku import nodus_service as nodus_mod
+        db = sqlite3.connect(Path(self.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            g = nodus_mod.graph(db, self.state, None)
+            g.setdefault("canvas", nodus_mod.digest(db, self.state, g["instance"]).get("canvas"))
+            return nodus_mod.as_living_map(g, g["instance"])
+        finally:
+            db.close()
 
     def federation_identity(self) -> dict:
         """{"graph_definition_digest", "api_digests", "port"} of the Nodus instance this server fronts: sha256 of its canvas file and the
@@ -1039,6 +1059,25 @@ def make_handler(sessions: Sessions):
             return shared_rest.living_data_cursor_route(
                 self, path, method, service=sessions.living_data_cursors,
                 CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
+
+        # ---- [SHOW] /api/show/pictures: a picture of the Studio scene, asked for through the shared REST contract and made by
+        # the existing photo service (studio_pictures.py).  Account, owner keys and the authority recheck come from this request.
+        def _picture_route(self, path, method):
+            from meowdoku.studio_pictures import PictureError
+            from meowdoku.living_data_query import MAX_BODY
+            self._classify()
+            account, origin, tier = self._account(), self._origin, self._tier
+            keys = ["account:" + str(account["id"])] if account is not None else []
+
+            def recheck():
+                principal = authz_mod.principal_from(account, origin, tier, sessions.accounts_db)
+                return account is not None and "photo_submit" in authz_mod.capabilities(principal, sessions.authz_policy.get())
+            return shared_rest.picture_route(self, path, method, service=sessions.studio_pictures, owners=keys,
+                                             recheck=recheck, PictureError=PictureError, MAX_BODY=MAX_BODY)
+
+        # ---- [SITE] /site/<map>/...: a declared map as pages (speaktome_api.site); each map names its own capability.
+        def _site_get(self, path):
+            return shared_rest.site_route(self, path, site=sessions.site, maps=sessions.site_maps)
 
         # Read-only projection of a caller-supplied canonical Living Data map.
         def _living_data_query(self):
@@ -1778,6 +1817,10 @@ def make_handler(sessions: Sessions):
                 return self._living_data_dm(path, "GET")
             if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
                 return self._living_data_cursor(path, "GET")
+            if path.startswith("/api/show/pictures/"):
+                return self._picture_route(path, "GET")
+            if path == "/site" or path.startswith("/site/"):
+                return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
             if path == "/api/tickets":
@@ -2244,6 +2287,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path0, "POST")
             if path0 == "/api/living-data/query":
                 return self._living_data_query()
+            if path0 == "/api/show/pictures":
+                return self._picture_route(path0, "POST")
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
@@ -2922,6 +2967,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="[FEDERATE] the local Nodus host's 127.0.0.1 contract port that /ws/contract/<prefix> bridges to (with --federation-canvas)")
     parser.add_argument("--federation-canvas", default=None,
                         help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
+    parser.add_argument("--studio-nodus-port", type=int, default=None,
+                        help="[SHOW] the local Nodus host's 127.0.0.1 contract port of the Studio prefix (with --studio-assets)")
+    parser.add_argument("--studio-nodus-prefix", default="studio.product", help="[SHOW] the Studio contract prefix on that port")
+    parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
+    parser.add_argument("--studio-defaults", default=None,
+                        help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
     parser.add_argument("--no-mathlab", action="store_true",
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument("--no-idle-train", action="store_true",
@@ -2978,6 +3029,16 @@ def main(argv: list[str] | None = None) -> int:
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
+    if args.studio_nodus_port and args.studio_assets:               # [SHOW] settings -> Nodus -> owned photo job
+        from meowdoku import studio_agent, studio_pictures
+        sessions.studio_pictures = studio_pictures.StudioPictures(
+            port=args.studio_nodus_port, prefix=args.studio_nodus_prefix,
+            products=studio_agent.StudioAgentProducts(Path(args.studio_assets),
+                                                      defaults=Path(args.studio_defaults) if args.studio_defaults else None),
+            store_dir=sessions.state.jobs_dir / "studio-product", photo_jobs=sessions.marble_photos,
+            saved_objects_for=sessions.marble_objects.for_account,
+            claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
+        print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
