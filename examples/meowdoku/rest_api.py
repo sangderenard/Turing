@@ -52,8 +52,8 @@ if routes.API_VERSION != 3:
 from speaktome_api import site  # noqa: E402  (after the version check, so an older checkout is refused with that message)
 from speaktome_api import reports  # noqa: E402  account-owned guestbook; separate from incident tickets
 
-if reports.API_VERSION != 1:
-    raise ImportError("This Turing host requires SpeakToMe experience-report contract version 1")
+if reports.API_VERSION != 2:
+    raise ImportError("This Turing host requires SpeakToMe experience-report contract version 2")
 
 # The declared catalog of this API (speaktome_api.catalog), served at /api/index; an older checkout has none.
 catalog = importlib.import_module("speaktome_api.catalog") if (REPOSITORY / "speaktome_api" / "catalog.py").is_file() else None
@@ -61,3 +61,7 @@ catalog = importlib.import_module("speaktome_api.catalog") if (REPOSITORY / "spe
 manual = _load("speaktome_man") if (REPOSITORY / "speaktome_man" / "__init__.py").is_file() else None
 # The Goal document format (speaktome_goal): what the part-by-part builder's units are processed into.
 goal = _load("speaktome_goal") if (REPOSITORY / "speaktome_goal" / "__init__.py").is_file() else None
+
+from speaktome_api import groups
+if groups.API_VERSION != 1:
+    raise ImportError("This Turing host requires SpeakToMe group contract version 1")

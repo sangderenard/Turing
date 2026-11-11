@@ -85,6 +85,8 @@ from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS]
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
 from meowdoku.rest_api import reports as shared_reports
+from meowdoku.rest_api import groups as shared_groups
+from meowdoku import account_content
 from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
 from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
@@ -655,6 +657,12 @@ def make_handler(sessions: Sessions):
 
         def _shader_request(self, path: str, method: str) -> bool:
             """The shader tier gets the shader page and its few assets, nothing else.  True when the request was answered here."""
+            # Content routes enforce session/group/public policy themselves. This
+            # grants no other shader-tier capability or access to other APIs.
+            if path == "/api/reports" or path.startswith("/api/reports/") or path == "/api/account/groups" or path.startswith("/api/account/groups/"):
+                return False
+            if method == "GET" and path in ("/reports.html", "/reports.js"):
+                return False
             if method == "POST" and path in access_mod.SHADER_LOGIN_POSTS:
                 return False                                   # [LOGIN] served by do_POST's login/logout branches
             if method == "POST" and path == "/api/account/signup":
@@ -940,6 +948,12 @@ def make_handler(sessions: Sessions):
                 hook(job_id)
             return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
         # ---- end [DIVIDER]
+
+        def _groups_route(self, path: str, method: str) -> None:
+            return shared_groups.route(self, path, method,
+                service_type=account_content.Groups, accounts=sessions.accounts,
+                account_cookie=ACCOUNT_COOKIE, AccessError=account_content.AccessError,
+                SchemaVersionError=account_content.schema_version.SchemaVersionError)
 
         def _reports_route(self, path: str, method: str) -> None:
             return shared_reports.route(self, path, method,
@@ -1489,7 +1503,7 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
-            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports")) and self.close_connection:
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports", "/api/account/groups")) and self.close_connection:
                 self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
@@ -1903,6 +1917,8 @@ def make_handler(sessions: Sessions):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
+            if path == "/api/account/groups" or path.startswith("/api/account/groups/"):
+                return self._groups_route(path, "GET")
             if path == "/api/reports" or path.startswith("/api/reports/"):
                 return self._reports_route(path, "GET")
             if path == "/api/tickets":
@@ -2392,6 +2408,8 @@ def make_handler(sessions: Sessions):
                 return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
+            if path0 == "/api/account/groups" or path0.startswith("/api/account/groups/"):
+                return self._groups_route(path0, "POST")
             if path0 == "/api/reports" or path0.startswith("/api/reports/"):
                 return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]

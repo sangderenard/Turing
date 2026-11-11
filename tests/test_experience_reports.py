@@ -13,15 +13,18 @@ from http.server import ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'examples')]
-from meowdoku import accounts, experience_reports as reports, schema_version
+from meowdoku import accounts, experience_reports as reports, schema_version, account_content
 
 
 def fixture_users(account):
     with account.lock:
         db = account._conn
-        for i, name in enumerate(('alice', 'bob', 'operator'), 1):
+        for i, name in enumerate(('alice', 'bob', 'operator', 'admin'), 1):
             db.execute('INSERT INTO users VALUES(?,?,?,NULL,0)', (i, name, 'fixture-not-a-password'))
             db.execute('INSERT INTO sessions VALUES(?,?,0,9999999999)', ('fixture-' + str(i), i))
+        db.execute("CREATE TABLE IF NOT EXISTS account_roles (user_id INTEGER PRIMARY KEY, role TEXT, granted_by TEXT, created_at REAL)")
+        db.execute("INSERT INTO account_roles VALUES(3,'operator','fixture',0)")
+        db.execute("INSERT INTO account_roles VALUES(4,'admin','fixture',0)")
         db.commit()
 
 
@@ -61,6 +64,33 @@ class ReportTests(unittest.TestCase):
                     self.service.examine(token, target)
                 self.assertEqual((str(caught.exception), caught.exception.status), ('report not found', 404))
         self.assertFalse(self.service.map('fixture-2')['map']['world']['objects'])
+
+    def test_admin_read_all_and_immediate_revocation(self):
+        alice = self.service.make('fixture-1', payload('alice'))['id']
+        bob = self.service.make('fixture-2', payload('bob'))['id']
+        self.assertEqual(self.service.listing('fixture-4')['reports'], [])
+        listing = self.service.listing('fixture-4', scope='all')
+        self.assertTrue(listing['can_read_all'])
+        self.assertEqual({r['id'] for r in listing['reports']}, {alice, bob})
+        self.assertEqual(self.service.examine('fixture-4', alice)['report']['owner_id'], 1)
+        mapped = self.service.map('fixture-4', scope='all')
+        self.assertEqual(mapped['map']['identity'], 'reports:all')
+        self.assertEqual({r['report_id'] for r in mapped['map']['world']['objects']}, {alice, bob})
+        for token in ('fixture-1', 'fixture-2', 'fixture-3'):
+            with self.assertRaises(reports.ReportError) as caught:
+                self.service.listing(token, scope='all')
+            self.assertEqual(caught.exception.status, 403)
+        with self.accounts.lock:
+            self.accounts._conn.execute("DELETE FROM account_roles WHERE user_id=4")
+            self.accounts._conn.commit()
+        with self.assertRaises(reports.ReportError) as caught:
+            self.service.examine('fixture-4', alice)
+        self.assertEqual(caught.exception.status, 404)
+        with self.assertRaises(reports.ReportError) as caught:
+            self.service.map('fixture-4', scope='all')
+        self.assertEqual(caught.exception.status, 403)
+        own = self.service.make('fixture-4', payload('own'))['id']
+        self.assertEqual(self.service.examine('fixture-4', own)['report']['owner_id'], 4)
 
     def test_replay_and_changed_content(self):
         first = self.service.make('fixture-1', payload())
@@ -144,6 +174,121 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(self.service.listing('fixture-1', category='LOG')['reports']), 1)
 
 
+class SharingTests(unittest.TestCase):
+    def setUp(self):
+        ReportTests.setUp(self)
+        self.groups=account_content.Groups(self.accounts)
+
+    def group(self):
+        return self.groups.create('fixture-1',dict(name='A shared place',request_id='group'))['id']
+
+    def accept(self,gid,user=2):
+        name={2:'bob',3:'operator',4:'admin'}[user]
+        self.groups.invite('fixture-1',gid,dict(username=name,request_message='Please join this shared place.'))
+        invitation=self.groups.invitations('fixture-'+str(user))['invitations'][0]
+        self.assertNotIn('invited_by',invitation)
+        self.groups.respond('fixture-'+str(user),invitation['id'],{'accept':True})
+
+    def test_personal_public_revocation_and_stale_share(self):
+        rid=self.service.make('fixture-1',payload())['id']
+        body=dict(visibility='public',group_id=None,expected_revision=0,sign_off=True)
+        with self.assertRaises(reports.ReportError):
+            self.service.sharing('fixture-4',rid,body)
+        with self.assertRaises(reports.ReportError):
+            self.service.examine(None,rid,public=True)
+        result=self.service.sharing('fixture-1',rid,body)
+        self.assertEqual(result['access']['signed_off_by'],1)
+        public=self.service.examine(None,rid,public=True)['report']
+        self.assertNotIn('owner_id',public)
+        self.assertNotIn('signed_off_by',public['access'])
+        self.assertNotIn('owner_id',self.service.examine('fixture-2',rid)['report'])
+        self.assertEqual(self.service.listing(None,scope='public',public=True)['reports'][0]['id'],rid)
+        with self.assertRaises(reports.ReportError) as error:
+            self.service.sharing('fixture-1',rid,body)
+        self.assertEqual(error.exception.status,409)
+        body.update(visibility='personal',sign_off=False,expected_revision=1)
+        self.service.sharing('fixture-1',rid,body)
+        self.assertEqual(self.service.listing(None,scope='public',public=True)['reports'],[])
+        with self.assertRaises(reports.ReportError): self.service.examine('fixture-2',rid)
+        self.assertEqual(self.service.examine('fixture-4',rid)['report']['owner_id'],1)
+
+    def test_groups_are_memberships_not_friendships_and_revoke_at_read(self):
+        gid=self.group(); rid=self.service.make('fixture-1',payload())['id']
+        self.service.sharing('fixture-1',rid,dict(visibility='group',group_id=gid,expected_revision=0,sign_off=False))
+        self.groups.invite('fixture-1',gid,dict(username='bob',request_message='Read this shared place.'))
+        self.assertEqual(self.groups.listing('fixture-2')['groups'],[])
+        with self.assertRaises(account_content.AccessError): self.groups.examine('fixture-2',gid)
+        with self.assertRaises(reports.ReportError): self.service.examine('fixture-2',rid)
+        self.accept(gid)
+        self.assertEqual(self.service.examine('fixture-2',rid)['report']['owner_id'],1)
+        self.assertEqual(self.service.listing('fixture-2',scope='shared')['reports'][0]['id'],rid)
+        # No friend graph table is created or changed by group membership.
+        self.assertIsNone(self.accounts._conn.execute("SELECT name FROM sqlite_master WHERE name='msg_contacts'").fetchone())
+        self.groups.leave('fixture-2',gid,{})
+        self.assertEqual(self.service.listing('fixture-2',scope='shared')['reports'],[])
+        with self.assertRaises(reports.ReportError): self.service.examine('fixture-2',rid)
+        with self.assertRaises(reports.ReportError): self.service.examine(None,rid,public=True)
+
+    def test_group_admin_scope_consent_and_identity_boundaries(self):
+        gid=self.group(); self.accept(gid,2)
+        self.assertEqual(self.groups.create('fixture-1',dict(name='A shared place',request_id='group'))['created'],False)
+        revision=self.groups.examine('fixture-1',gid)['group']['revision']
+        with self.assertRaises(account_content.AccessError):
+            self.groups.member('fixture-4',gid,dict(username='bob',role='admin',expected_revision=revision))
+        with self.assertRaises(account_content.AccessError):
+            self.groups.member('fixture-2',gid,dict(username='operator',role='member',expected_revision=revision))
+        self.groups.member('fixture-1',gid,dict(username='bob',role='admin',expected_revision=revision))
+        with self.assertRaises(account_content.AccessError):
+            self.groups.member('fixture-2',gid,dict(username='admin',role='admin',expected_revision=revision+1))
+        with self.assertRaises(account_content.AccessError):
+            self.groups.member('fixture-1',gid,dict(username='operator',role='member',expected_revision=revision+1))
+        # Removal cannot be used to probe an unrelated account or disclose its ID.
+        for name in ('operator','unknown-account'):
+            with self.assertRaises(account_content.AccessError) as error:
+                self.groups.member('fixture-2',gid,dict(username=name,role=None,expected_revision=revision+1))
+            self.assertEqual((str(error.exception),error.exception.status),('member not found',404))
+            self.assertEqual(self.groups.examine('fixture-1',gid)['group']['revision'],revision+1)
+        for name in ('operator','unknown-account'):
+            self.assertEqual(self.groups.invite('fixture-2',gid,dict(username=name,request_message='Join?')),{'requested':True})
+        pending=self.groups.invitations('fixture-3')['invitations'][0]
+        self.groups.member('fixture-1',gid,dict(username='bob',role=None,expected_revision=revision+1))
+        with self.assertRaises(account_content.AccessError):
+            self.groups.respond('fixture-3',pending['id'],{'accept':True})
+        self.assertEqual(self.groups.invitations('fixture-3')['invitations'],[])
+        self.assertEqual(self.accounts._conn.execute('SELECT count(*) FROM account_content_invitations WHERE user_id=3').fetchone()[0],0)
+        self.groups.invite('fixture-1',gid,dict(username='operator',request_message='Fresh owner invitation.'))
+        self.assertEqual(len(self.groups.invitations('fixture-3')['invitations']),1)
+
+    def test_admin_demotion_and_leave_revoke_invitation_authority(self):
+        gid=self.group(); self.accept(gid,2)
+        self.groups.member('fixture-1',gid,dict(username='bob',role='admin',expected_revision=1))
+        self.groups.invite('fixture-2',gid,dict(username='operator',request_message='Join?'))
+        old=self.groups.invitations('fixture-3')['invitations'][0]['id']
+        self.groups.member('fixture-1',gid,dict(username='bob',role='member',expected_revision=2))
+        self.groups.member('fixture-1',gid,dict(username='bob',role='admin',expected_revision=3))
+        with self.assertRaises(account_content.AccessError): self.groups.respond('fixture-3',old,{'accept':True})
+        self.assertEqual(self.groups.invitations('fixture-3')['invitations'],[])
+        self.groups.invite('fixture-2',gid,dict(username='operator',request_message='A new invitation.'))
+        self.groups.leave('fixture-2',gid,{})
+        self.assertEqual(self.accounts._conn.execute('SELECT count(*) FROM account_content_invitations WHERE user_id=3').fetchone()[0],0)
+        self.groups.invite('fixture-1',gid,dict(username='operator',request_message='Owner invitation.'))
+        self.assertEqual(len(self.groups.invitations('fixture-3')['invitations']),1)
+
+    def test_shared_policy_has_no_generic_ownership_mutation(self):
+        # A second content kind can use the same policy without duplicating a
+        # report group table or changing that domain's authoritative owner.
+        gid=self.group(); self.accept(gid)
+        with self.groups.transaction('fixture-1') as (db,actor):
+            body=dict(visibility='group',group_id=gid,expected_revision=0,sign_off=False)
+            account_content.set_access(db,'fixture-document','doc-a',1,actor,body)
+            self.assertTrue(account_content.can_read(db,'fixture-document','doc-a',1,2))
+            self.assertFalse(account_content.can_read(db,'fixture-photo','doc-a',1,2))
+            self.assertFalse(account_content.can_read(db,'fixture-document','doc-a',1,4))
+            self.assertTrue(account_content.can_read(db,'fixture-document','doc-a',1,4,allow_admin=True))
+            with self.assertRaises(account_content.AccessError):
+                account_content.set_access(db,'fixture-document','doc-a',1,2,body)
+
+
 class ReportHTTPTests(unittest.TestCase):
     def setUp(self):
         from meowdoku import server
@@ -185,21 +330,56 @@ class ReportHTTPTests(unittest.TestCase):
             self.assertEqual(self.call(method='POST', body=payload(), headers=headers)[0], status)
         bad = payload(); bad['owner_id'] = 2
         self.assertEqual(self.call(method='POST', body=bad)[0], 400)
-        self.assertEqual(self.call('/api/reports?scope=all')[0], 400)
+        self.assertEqual(self.call('/api/reports?scope=all')[0], 403)
         self.assertEqual(self.call('/api/reports?offset=0&offset=1')[0], 400)
         huge = payload(); huge['body'] = 'x' * 140000
         self.assertEqual(self.call(method='POST', body=huge)[0], 413)
         self.assertEqual(self.call('/api/reports?offset=0', method='POST', body=payload())[0], 400)
 
-    def test_viewer_and_missing_dev_capability_cannot_initialize_reports(self):
+    def test_viewer_denied_but_signed_in_members_do_not_need_dev_tier(self):
         for method in ('GET', 'POST'):
             self.assertEqual(self.call(method=method, body=payload() if method == 'POST' else None,
                 headers={self.server_mod.share_mod.VIEWER_HEADER: 'fixture-viewer'})[0], 403)
-        with patch.object(self.sessions.access, 'decide', return_value=('dns', 'play')):
-            self.assertEqual(self.call()[0], 403)
-            self.assertEqual(self.call(method='POST', body=payload())[0], 403)
         self.assertIsNone(self.sessions.accounts._conn.execute(
             "SELECT name FROM sqlite_master WHERE name='experience_reports'").fetchone())
+        with patch.object(self.sessions.access, 'decide', return_value=('dns', 'shader')):
+            self.assertEqual(self.call(token=None)[0],401)
+            self.assertEqual(self.call()[0],200)
+            self.assertEqual(self.call(method='POST', body=payload())[0],201)
+
+    def test_http_public_toggle_admin_and_group_consent(self):
+        _, result=self.call(method='POST',body=payload())
+        rid=result['id']; path='/api/reports/'+rid
+        share=dict(visibility='public',group_id=None,expected_revision=0,sign_off=True)
+        self.assertEqual(self.call(path+'/sharing','POST',token=4,body=share)[0],404)
+        self.assertEqual(self.call('/api/reports?scope=all',token=4)[0],200)
+        self.assertEqual(self.call('/api/reports?scope=all',token=3)[0],403)
+        self.assertEqual(self.call('/api/reports/public/'+rid,token=None)[0],404)
+        self.assertEqual(self.call(path+'/sharing','POST',body=share)[0],200)
+        self.assertEqual(self.call(path+'/sharing','POST',body=share)[0],409)
+        with patch.object(self.sessions.access,'decide',return_value=('dns','shader')):
+            status,public=self.call('/api/reports/public/'+rid,token=None)
+            self.assertEqual(status,200)
+            self.assertNotIn('owner_id',public['report'])
+            self.assertNotIn('signed_off_by',public['report']['access'])
+            self.assertEqual(self.call('/api/reports/public',token=None)[1]['reports'][0]['id'],rid)
+        share.update(visibility='personal',expected_revision=1,sign_off=False)
+        self.assertEqual(self.call(path+'/sharing','POST',body=share)[0],200)
+        self.assertEqual(self.call('/api/reports/public/'+rid,token=None)[0],404)
+        self.assertEqual(self.call('/api/account/groups',token=None)[0],401)
+        status,group=self.call('/api/account/groups','POST',body=dict(name='A shared place',request_id='place'))
+        self.assertEqual(status,201); gid=group['id']; base='/api/account/groups/'+gid
+        self.assertEqual(self.call(base,token=2)[0],404)
+        self.assertEqual(self.call(base+'/invite','POST',body=dict(username='bob',request_message='Join this place.'))[0],200)
+        invitation=self.call('/api/account/groups/invitations',token=2)[1]['invitations'][0]
+        self.assertNotIn('invited_by',invitation)
+        self.assertEqual(self.call('/api/account/groups/invitations/'+invitation['id'],'POST',token=2,body={'accept':True})[0],200)
+        self.assertEqual(self.call(base,token=2)[0],200)
+        share.update(visibility='group',group_id=gid,expected_revision=2)
+        self.assertEqual(self.call(path+'/sharing','POST',body=share)[0],200)
+        self.assertEqual(self.call(path,token=2)[0],200)
+        self.assertEqual(self.call(base+'/leave','POST',token=2,body={})[0],200)
+        self.assertEqual(self.call(path,token=2)[0],404)
 
     def test_malformed_framing_closes_without_schema_writes(self):
         for lengths, transfer, raw in ((['2', '2'], None, b'{}'), (['2'], 'chunked', b'{}'),
