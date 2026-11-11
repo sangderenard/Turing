@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 import {applyLightTools,defaultLightTools,migrateLightTools} from '../examples/meowdoku/web/marble_light_tools.js';
 import {applyFixtureSizes,defaultFixtureSizes} from "../examples/meowdoku/web/marble_fixture_sizes.js";
 // Production emitter faces, independent poses and the actual MRP1 upload.
@@ -22,10 +22,8 @@ const context=vm.createContext({applyLightTools,defaultLightTools:migrateLightTo
   FIXTURE_MAT_BASE:38,studioLighting:null,studioTableState:()=>({enabled:false}),lightStandFacesForStudio:()=>[],
   rgb:v=>[1,3,5].map(k=>parseInt(v.slice(k,k+2),16)/255),
   tables:{pbr:{table:{floats_per_record:16},data:[]}},tableFaces:()=>[], goboFaces:()=>[],checkerboardFaces:()=>[],backdropRollFaces:()=>[],studioSubjectTransform:()=>({subjectCenter:[0,0,0]}),studioPhotoScale:()=>.025});
-vm.runInContext(source.slice(source.indexOf('const ROOM_FIXTURES ='),source.indexOf('const currentCameraOptions =')),context);
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),context);
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),context);
-vm.runInContext(source.slice(source.indexOf('function computeFixtureRoles('),source.indexOf('\nfunction syncMaterial()')).replace('export function','function'),context);
+installStudioSceneBuilders(context);
+vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('// Capture actual page values;')),context);
 installScenePackerInputs(context);
 const run=code=>JSON.parse(JSON.stringify(vm.runInContext(code,context,{timeout:1000})));
 const rig=run('computeFixtureRoles()');

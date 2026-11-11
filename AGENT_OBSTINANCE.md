@@ -1,5 +1,17 @@
 # Agent Obstinance
 
+## 2026-11-11 - treating the Studio agent short circuit as another renderer host
+
+The user asked to reuse Marble Studio's scene construction and optionally issue
+existing ray jobs. The earlier standalone work centered a captured rendering
+adapter, and the correction briefly added a hidden-controls page host. The agent
+kept interpreting the request as raster execution rather than settings-to-scene
+data, requiring repeated clarification and producing an unnecessary page test.
+The hidden-page/Phong experiment was removed without deployment. The correction
+now extracts the existing scene builders for Node and returns their blob or the
+existing MRP1 ray payload. Identifying the requested product boundary before
+choosing a rendering runtime would have prevented the detour.
+
 ## 2026-11-07 — treating an older toy force regression as a gravity leak
 
 The user reported that both oil toys developed a strong, old corner-shove force

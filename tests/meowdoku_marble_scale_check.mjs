@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 // Real normalized meshes and MRP1 payloads, without a browser, server or GPU.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -46,7 +46,8 @@ const context=vm.createContext({$:id=>nodes[id],OBJECT_CENTER,STUDIO_LIGHTS,ids:
   computeFixtureRoles:()=>({fixtureRoles:[],roleColor:STUDIO_LIGHTS.map(()=>[1,1,1]),roleStrength:STUDIO_LIGHTS.map(()=>0)}),
   buildFixtureFaces:()=>[],
 });
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),context);
+installStudioSceneBuilders(context);
+vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('// Capture actual page values;')),context);
 vm.runInContext(source.slice(source.indexOf('function studioRoomScale('),source.indexOf('function goboFaces(')),context);
 vm.runInContext(source.slice(source.indexOf('export function sceneForPhoto('),source.indexOf('\nfunction syncMaterial()')).replace('export function','function'),context);
 installScenePackerInputs(context);
@@ -185,7 +186,7 @@ near(shop.unitM,.3048);near(shop.radiusM,.025);near(shop.subjectCenter[1]-shop.s
 near(shop.subjectRadius,.025/.3048);
 near(8*shop.unitM,2.4384);near(4*shop.unitM,1.2192);
 assert.deepEqual(validateStudioScale({version:1,mode:'fixed',unitMm:10}),state);
-console.log('New shop one-foot units preserve independent marble radius and saved mm rigs');
+if(!process.argv.includes('--json'))console.log('New shop one-foot units preserve independent marble radius and saved mm rigs');
 
 // Tangency uses physical radius and actual table top, never a memorized centre.
 for(const unitMm of [.1,10,200,304.8])for(const radiusMm of [.1,1,10,25,100,200]){
@@ -198,7 +199,7 @@ for(const unitMm of [.1,10,200,304.8])for(const radiusMm of [.1,1,10,25,100,200]
  for(const theta of [.001,.1,Math.PI/2,Math.PI])
   assert.ok(t.subjectCenter[1]-t.subjectRadius*Math.cos(theta)>top);
 }
-console.log('Physical marble size and unique spherical table-contact point survive all supported rig units/radii');
+if(!process.argv.includes('--json'))console.log('Physical marble size and unique spherical table-contact point survive all supported rig units/radii');
 
 for(const radius of [.1,1,10,25,200])for(const scale of [1,6,8]){
  const t=studioScaleTransform(defaultStudioScale(),radius,true),d=studioFrameDistance(t,1,.001);
@@ -207,4 +208,4 @@ for(const radius of [.1,1,10,25,200])for(const scale of [1,6,8]){
  for(const x of [room.leftX,room.rightX])for(const y of [room.floorY,room.ceilingY])for(const z of [room.backZ,room.frontZ])
   assert.ok(clip.far>d+Math.hypot(x-t.subjectCenter[0],y-t.subjectCenter[1],z-t.subjectCenter[2]));
 }
-console.log('Adaptive clipping preserves1mm macro focus and full room extents at one-foot scale');
+if(!process.argv.includes('--json'))console.log('Adaptive clipping preserves1mm macro focus and full room extents at one-foot scale');

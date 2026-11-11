@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 import {applyLightTools,defaultLightTools,migrateLightTools} from '../examples/meowdoku/web/marble_light_tools.js';
 import {applyFixtureSizes,defaultFixtureSizes} from "../examples/meowdoku/web/marble_fixture_sizes.js";
 import {defaultStudioScale,studioScaleTransform} from '../examples/meowdoku/web/marble_studio_scale.js';
@@ -70,10 +70,12 @@ const context=vm.createContext({applyLightTools,defaultLightTools:migrateLightTo
   computeFixtureRoles:()=>({fixtureRoles:[],roleColor:STUDIO_LIGHTS.map(()=>[1,1,1]),roleStrength:STUDIO_LIGHTS.map(()=>0)}),
   buildFixtureFaces:()=>[],
 });
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),context);
+installStudioSceneBuilders(context);
+vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('// Capture actual page values;')),context);
 vm.runInContext(source.slice(source.indexOf('function studioRoomScale('),source.indexOf('function checkerboardFaces(')),context);
 vm.runInContext(source.slice(source.indexOf('function perspective('),source.indexOf('const loc =')),context);
 vm.runInContext(source.slice(source.indexOf('export function sceneForPhoto('),source.indexOf('\nfunction syncMaterial()')).replace('export function','function'),context);
+context.shopLightFacesForStudio=()=>[]; // This focused fixture predates shop/rack material rows.
 installScenePackerInputs(context);
 const run=code=>copy(vm.runInContext(code,context,{timeout:1000}));
 const geometry=catEyeMarble({glass:0,eye:0,accent:0},{kind:'clear',rings:8,segments:12});
@@ -154,10 +156,8 @@ const fixtureContext=vm.createContext({applyLightTools,defaultLightTools:migrate
   FIXTURE_MAT_BASE:10,studioLighting:null,studioTableState:()=>({...defaultStudioTable(),width:5.2,length:3,height:3.02,material:"marble_clear_glass",skirt:{enabled:false,material:"black_felt"}}),
   studioRoomBounds,studioRoomScale:()=>3,studioFloorDrop:()=>3,FLOOR_FIXTURE_INDICES,tableLightRoles,tableLightModifierFaces,
   rgb:value=>[1,3,5].map(k=>parseInt(value.slice(k,k+2),16)/255)});
-vm.runInContext(source.slice(source.indexOf('const ROOM_FIXTURES ='),source.indexOf('const currentCameraOptions =')),fixtureContext);
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),fixtureContext);
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),fixtureContext);
-vm.runInContext(source.slice(source.indexOf('function computeFixtureRoles('),source.indexOf('export function sceneForPhoto(')),fixtureContext);
+installStudioSceneBuilders(fixtureContext);
+vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('// Capture actual page values;')),fixtureContext);
 const roles=copy(vm.runInContext('computeFixtureRoles().fixtureRoles',fixtureContext));
 const background=roles[2];assert.equal(background.shroudLength,1.2);assert.equal(background.gobo,true);
 fixtureContext.testRole=background;
@@ -182,7 +182,11 @@ assert.equal(hit(sub([3,0,-2],background.pos)),true,'Off-axis source ray meets e
 for(const index of FLOOR_FIXTURE_INDICES) {
   fixtureContext.testRole=roles[index];
   const faces=copy(vm.runInContext('buildFixtureFaces([testRole],99)',fixtureContext));
-  near(Math.min(...faces.flatMap(f=>f.slice(0,3).map(p=>p[1]))),bounds.floorY+.02);
+  const low=Math.min(...faces.flatMap(f=>f.slice(0,3).map(p=>p[1])));
+  if(roles[index].defaultFloorHeight!==undefined) {
+    near(roles[index].pos[1],bounds.floorY+roles[index].defaultFloorHeight);
+    assert(low>bounds.floorY,'Wall-relative kickers preserve their authored raised height above the real floor');
+  } else near(low,bounds.floorY+.02);
 }
 if(process.argv.includes('--json'))console.log(JSON.stringify(cases));
 else console.log('Studio table: closed supports, saved-radius contact/scene/camera, legacy scale, clear-glass PBR and real background can rays passed');
