@@ -1912,6 +1912,10 @@ def make_handler(sessions: Sessions):
                 return self._whoami()
             if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
                 return self._reviews_route(path, "GET")
+            if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
+                from meowdoku import file_index
+                self._classify()
+                return file_index.http_route(self, path, db_path=Path(sessions.accounts_db).with_name("file_index.db"))
             if path == "/api/index" and shared_catalog is not None:   # [INDEX] the declared catalog of this API
                 return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]

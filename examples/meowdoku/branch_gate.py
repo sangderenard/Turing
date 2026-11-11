@@ -45,6 +45,11 @@ open to anyone. ``cleaner`` (the command) makes the account through the supervis
 random password that is stored nowhere, so nobody signs in as it. Until the core's files are closed to every other
 account by the operating system this is a declared rule, not a wall.
 
+``publish_notices`` keeps the record of removals in Git as well as in SQL: it writes every notice to the policy's
+``notices_file`` (one line each: when, repository, branch, commit, by whom, why) and, when asked, commits and pushes
+that file in the repository that holds it. The task worker does this after any run that removed something, so
+GitHub's history of that file is the history of what was removed.
+
 ``improper_saves`` is the cleaner's other job: it reads each repository's own checkout and reports what was saved there
 outside a commit (changed and untracked files, and the large untracked ones that look like temporary binaries or
 data). It removes nothing.
@@ -64,6 +69,7 @@ branch's name beyond those declared patterns.
 from __future__ import annotations
 
 import argparse
+import csv
 import fnmatch
 import json
 import os
@@ -84,6 +90,7 @@ except ImportError:  # run as a plain script, or loaded by path
 HOOK_MARK = "# speaktome branch gate"
 DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
             "worktree_idle_days": 1, "cleaner": "svc-pale-rider", "cleaner_display_name": "Pale Rider",
+            "notices_file": "C:/dev/Powershell/REMOVAL_NOTICES.csv",
             "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
@@ -247,6 +254,33 @@ def cleaner(policy, db, actor, apply) -> str | None:
     if not branch_review.is_service(db, declared):
         raise GateError(f"the cleanup account {declared} does not exist as a service account; run the cleaner command first")
     return declared
+
+
+def publish_notices(policy, db, *, commit, log=print) -> str:
+    """Write every notice of removal to the notices file; with ``commit``, commit and push it. Returns a sentence."""
+    file = Path(policy["notices_file"])
+    notices = sorted(branch_review.removed(db, limit=1000000), key=lambda n: (n["removed_at"], n["repository"], n["branch"]))
+    with open(file, "w", encoding="utf-8", newline="\n") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["removed_at_utc", "repository", "branch", "head", "removed_by", "reason"])
+        for n in notices:
+            writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(n["removed_at"])), n["repository"], n["branch"],
+                             n["head"], n["removed_by"] or "", n["reason"]])
+    said = f"{len(notices)} notices written to {file.name}"
+    if not commit:
+        return said
+    home = file.parent
+    if not git(home, "status", "--porcelain", "--", file.name, check=False):
+        return said + "; already recorded in Git"
+    git(home, "add", "--", file.name)
+    git(home, "commit", "-q", "-m", f"Removal notices: {len(notices)} records", "--", file.name)
+    branch = git(home, "branch", "--show-current")
+    git(home, "push", policy["remote"], branch)
+    default = next((d["default"] for d in policy["repositories"].values() if Path(d["path"]).resolve() == home.resolve()), None)
+    if default and default != branch:
+        git(home, "push", policy["remote"], f"HEAD:refs/heads/{default}")
+    log(f"[notices] {said}; committed and pushed")
+    return said + "; committed and pushed"
 
 
 def improper_saves(policy, *, large_bytes=1 << 20) -> list:
@@ -515,6 +549,7 @@ def main(argv=None) -> int:
     sub.add_parser("check-push").add_argument("repository", nargs="?")
     sub.add_parser("cleaner", help="make the policy's cleanup account, as the supervisor makes service accounts")
     sub.add_parser("inspect", help="report what the core holds outside a commit")
+    sub.add_parser("notices", help="write the notices of removal to the notices file").add_argument("--commit", action="store_true")
     sub.add_parser("install-hook")
     sub.add_parser("remove-hook")
     args = parser.parse_args(argv)
@@ -538,6 +573,9 @@ def main(argv=None) -> int:
             return 0
         db = sqlite3.connect(args.db, timeout=10, isolation_level=None)
         try:
+            if args.command == "notices":
+                print(publish_notices(policy, db, commit=args.commit))
+                return 0
             if args.command == "check-push":
                 name = args.repository or repository_of(policy, os.getcwd())
                 refused = check_push(policy, db, name, sys.stdin.read().splitlines()) if name else []

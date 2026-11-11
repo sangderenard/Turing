@@ -363,7 +363,7 @@ def test_the_task_worker_offers_land_and_clean_and_reports_while_apply_is_off(wo
     cron_host = SimpleNamespace(DONE=2, UNCHANGED=3)
     table = scheduled_tasks.handlers(cron_host, branches={"policy": world["policy_file"], "accounts_db": world["db_file"],
                                                          "module": branch_gate})
-    assert set(table) == {"reviews.land", "branches.clean"} <= set(scheduled_tasks.PREFIX_TASKS["cron"]) | set(table)
+    assert set(table) == {"reviews.land", "branches.clean", "core.index"} <= set(scheduled_tasks.PREFIX_TASKS["cron"])
     status, said, detail = table["reviews.land"]({})
     assert status == 3 and said == "1 would land" and detail[0]["branch"] == "feature" and remote_has(world, "feature") == head
     status, said, detail = table["branches.clean"]({})
@@ -504,3 +504,25 @@ def test_the_shipped_policy_names_real_repositories_and_mocks_the_lock():
     assert shipped["worktree_idle_days"] == 1
     assert branch_gate.protected(shipped, "turing", "main") and branch_gate.protected(shipped, "turing", "snapshot/x")
     assert not branch_gate.protected(shipped, "turing", "codex/anything")
+
+
+def test_the_notices_of_removal_are_kept_in_git_as_well_as_sql(world):
+    import csv
+    import time
+    work, db = world["work"], world["db"]
+    policy = dict(world["policy"], notices_file=str(work / "REMOVAL_NOTICES.csv"))
+    merged = branch(world, "finished")
+    run(work, "merge", "-q", "--ff-only", "finished")
+    run(work, "push", "-q", "origin", "main")
+    branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=time.time() + 31 * DAY, log=lambda line: None)
+    assert branch_gate.publish_notices(policy, db, commit=False).startswith("1 notices written")
+    with open(work / "REMOVAL_NOTICES.csv", encoding="utf-8", newline="") as handle:
+        lines = list(csv.reader(handle))
+    assert lines[0] == ["removed_at_utc", "repository", "branch", "head", "removed_by", "reason"]
+    assert lines[1][1:5] == ["work", "finished", merged, CLEANER] and lines[1][0].endswith("Z")
+    policy["lock"] = "mock"
+    said = branch_gate.publish_notices(policy, db, commit=True, log=lambda line: None)
+    assert said.endswith("committed and pushed")
+    assert "Removal notices: 1 records" in run(work, "log", "-1", "--format=%s")
+    assert run(world["remote"], "rev-parse", "refs/heads/main") == run(work, "rev-parse", "HEAD"), "the record is on the remote"
+    assert branch_gate.publish_notices(policy, db, commit=True, log=lambda line: None).endswith("already recorded in Git")

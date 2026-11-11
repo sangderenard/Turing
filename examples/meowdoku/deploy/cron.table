@@ -20,3 +20,6 @@ reviews.land */10 * * * * missed=once
 # Once a day (09:45 UTC), remove branches that have been fully merged for the policy's grace period. While the
 # branch policy's apply is false this only reports what it would remove.
 branches.clean 45 9 * * * missed=once
+
+# Once a day (10:15 UTC), the cleanup account rebuilds the flat index of every file in the core (file_index.py).
+core.index 15 10 * * * missed=once

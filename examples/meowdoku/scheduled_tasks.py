@@ -42,7 +42,8 @@ AUDIENCE_TERMS = {"admin": ("role:admin",), "everyone": ("kind:person",)}     # 
 SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
-PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean"),
+PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean",
+                         "core.index"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -207,11 +208,27 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                     counts[entry["action"]] = counts.get(entry["action"], 0) + 1
                 acted = any(entry["action"] in ("landed", "removed") for entry in done)
                 said = ", ".join(f"{count} {action}" for action, count in sorted(counts.items())) or "nothing to do"
+                if which == "clean" and any(entry["action"] == "removed" for entry in done):
+                    try:                         # the record of what was removed goes into Git's history as well as SQL
+                        db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                        try:
+                            said += "; " + gate.publish_notices(policy, db, commit=True)
+                        finally:
+                            db.close()
+                    except Exception as error:
+                        said += f"; the notices were not published ({type(error).__name__})"
                 skipped = sum(1 for entry in done if entry.get("remote_skipped"))
                 if skipped:
                     said += f"; {skipped} remote copies left because a GitHub rule forbids deleting them"
                 return (cron_host.DONE if acted else cron_host.UNCHANGED), said, [e for e in done if e["action"] not in ("keep", "wait")]
             return task
+        def core_index(request):
+            from pathlib import Path
+            from meowdoku import file_index
+            policy = branches["module"].load_policy(branches["policy"])
+            made = file_index.build(policy, Path(branches["accounts_db"]).with_name("file_index.db"), actor=policy["cleaner"])
+            return cron_host.DONE, f"{made['entries']} entries indexed in {made['seconds']} s", made
+        table["core.index"] = core_index
         table["reviews.land"] = branch_task("land")
         table["branches.clean"] = branch_task("clean")
     if web_dir is not None and manual is not None:
