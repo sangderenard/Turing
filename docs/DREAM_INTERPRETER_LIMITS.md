@@ -206,6 +206,14 @@ What is built, pinned by `tests/test_dream_work_table.py` (5 passed):
   contributions. The scanner writes no content, geometry or portals for it.
   A `.dream` file that does not frame is a note, not a failure.
 
+Where it is kept: the work table and the claims are personal assets. They
+stay in memory unless the call declares otherwise; the user-space declaration
+is `repo_world_sink.work_table_bundle` / `scan_bundle` + `submit(store,
+actor_id, bundle)`, which seals them into the author's account workspace
+through the service's store (`REPO_WORLD_MAP_DESIGN.md` §2, retention).
+`author` on a block is still free text; joining it to a `users.id` row is the
+service's identity rule and is not done here.
+
 What is not built: the claim is a scan record only; nothing in
 `abstract_ui_*` consumes it (the same gaps A-D in
 `REPO_WORLD_MAP_DESIGN.md` that keep every scan record out of the world

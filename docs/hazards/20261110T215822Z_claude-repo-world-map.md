@@ -92,6 +92,35 @@ Tests: 11 passed (scan, workspace, work table) in 7.5 s; the stream test
 asserts no temp dir/file and an unchanged tmp_path. Live: lfsavoider streamed
 in 1.3 s; turing main streamed as recorded in the design note §7.
 
+2026-11-11, user-space sink (owner: "Yes, wire it"): `src/compiler/
+repo_world_sink.py` seals `scan_bundle` (summary + claims, `scan.json` only
+with `full=True`) and `work_table_bundle` into an account workspace through
+`examples/meowdoku/workspace_accounting.Store` (reserve a lease sized from
+the bundle, `seal_and_submit`, `get_ticket`); `read_bundle` returns the
+owner's bytes. The store module, `schema_version.py`, its test and its
+foundation note were brought from main VERBATIM (`git checkout main --`),
+unchanged, so the later merge sees identical files; its 37 tests pass on this
+base. `tests/test_repo_world_sink.py`: 3 passed in 1.2 s on a fixture
+accounts database (users 1-3, admin 3), the store's own fixture pattern.
+No CLI, no HTTP route; the service has no workspace route yet.
+
+FINDING, same day: main carries a DIVERGENT scanner. Commit 526cae74
+(2026-11-10 18:52, Fable 5.2) continued from this branch's first commit
+afc9b4bb on main: `repo-world-scan-v1`, an extractor-plugin registry
+(`EXTRACTOR_MODULES`: C includes, CMake, HTML, dynamic JS, PowerShell, shell),
+declared Python import roots (`repo_world.toml`, pyproject/pytest
+declarations), `portal_record.py`, `tools/compile_repo_world_map.py` (fresh
+clones to a `--work` dir, map files to a served `--out` dir) and
+`/worldmap.html`. This branch continued from the same afc9b4bb with the
+stream lanes (no disk), the `languages` table from `DREAM_LANGUAGE_
+TRANSLATIONS`, the workspace scan, stand-ins and claimed rooms.
+`git merge-tree main HEAD` conflicts in `src/compiler/repo_world_scan.py`,
+`tests/test_repo_world_scan.py` and `docs/DREAM_DOCUMENT.md`. Main's compile
+job keeps clones and map files on disk, which the owner's retention rule
+(above) now excludes for transient intermediaries. Not reconciled here: the
+merge is a design join (registry + import roots + stream lanes + claims), to
+be done once, deliberately, not in passing.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

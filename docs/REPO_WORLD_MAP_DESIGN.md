@@ -150,11 +150,24 @@ tests, not for the owner's checkout.
 
 **The record set's retention is the call's declaration.** The scan returns
 records in memory. The CLI writes them only where told: `--json` to stdout,
-`--out <file>` to the path the call names. A user-space sink (the service's
-per-account workspace store, `examples/meowdoku/workspace_accounting.py` on
-main, whose `seal_and_submit(actor_id, workspace_id, files)` takes exactly a
-`{name: bytes}` map) is the service's call to make with an authenticated
-actor; the scanner does not import the service and does not pick a sink.
+`--out <file>` to the path the call names. The user-space declaration is
+`src/compiler/repo_world_sink.py` (2026-11-11): `scan_bundle(scan)` is the
+personal part of a scan (`summary.json` with commit, origin, counts,
+languages, notes; `claims.json` with every claimed room), `work_table_bundle
+(document)` is a dream document's stand-ins and satisfaction tree, and
+`submit(store, actor_id, bundle)` seals the bundle into the actor's account
+workspace through the service's existing store
+(`examples/meowdoku/workspace_accounting.Store`: lease, quota, sealed review
+snapshot, admin review), reserving a lease sized from the bundle when none is
+given. `actor_id` is a `users.id` row of the accounts database and the store
+authenticates it; the sink decides nothing about identity. The bundle's
+`base_revision` is the sha256 of its paths and bytes, so the lease names the
+record it holds. The store's bundle cap is 1 MiB and 128 files, so the full
+record set (`scan.json`, tens of MB for a real repository) goes in only when
+the call asks (`full=True`) and fits; otherwise the store refuses before
+anything is kept. `read_bundle` returns the owner's bytes. There is no CLI
+and no HTTP route: the actor is a session the service authenticates
+(`SessionAccess`), and the service has no workspace route yet.
 
 ### The whole workspace, in its on-disk layout
 
