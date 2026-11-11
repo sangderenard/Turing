@@ -3,14 +3,23 @@
 const RECTANGLES=new Set(['key-left','key-right','fill-lower','fill-upper','underlight']);
 const ROUND_RADII={background:.3,'kicker-left':.2,'kicker-right':.2,'table-left':.09,'table-right':.09};
 export const LIGHT_TOOL_KINDS={grid:'Grid',snoot:'Snoot'};
+// The mount follows the selected head, never the fixture's job in the rig.
+// Omitted heads retain the exact pre-modular geometry of saved profiles.
+export const LIGHT_HEAD_KINDS={native:'Original head',round:'Round head', 'softbox-1x4':'1 × 4 ft softbox + grid'};
+export function lightHeadIsRectangular(lightId,sizes){
+ const head=sizes?.lights?.find(light=>light.id===lightId)?.head??'native';
+ return head==='softbox-1x4'||(head==='native'&&RECTANGLES.has(lightId));
+}
 export const LEGACY_GRID_SETTINGS={cellsX:6,cellsY:8,depth:.20,thickness:.025};
 export const DEFAULT_GRID_ACCENT={enabled:false,material:'housing',pattern:'checker',size:1,scope:'interiors',width:.2};
 const clone=value=>JSON.parse(JSON.stringify(value));
-export function compatibleLightTools(lightId){
- return RECTANGLES.has(lightId)?['grid']:Object.hasOwn(ROUND_RADII,lightId)?['snoot']:[];
+export function compatibleLightTools(lightId,sizes){
+ return RECTANGLES.has(lightId)||Object.hasOwn(ROUND_RADII,lightId)?[lightHeadIsRectangular(lightId,sizes)?'grid':'snoot']:[];
 }
 export function lightToolFootprint(lightId,sizes,keyShape='bare'){
  const size=sizes?.lights?.find(light=>light.id===lightId)??{width:1,height:1};
+ if(size.head==='softbox-1x4')return {width:size.width,height:4*size.height};
+ if(size.head==='round')return {diameter:.4*size.width};
  if(RECTANGLES.has(lightId)){
   const base=lightId==='underlight'?[1.8,2.4]:lightId.startsWith('key-')?
    (['grid','snoot'].includes(keyShape)?[.2,.2]:[.76,.76]):[.6,.6];
@@ -19,29 +28,44 @@ export function lightToolFootprint(lightId,sizes,keyShape='bare'){
  return {diameter:2*ROUND_RADII[lightId]*size.width};
 }
 export function createLightTool(lightId,kind,sizes,keyShape='bare'){
- if(!compatibleLightTools(lightId).includes(kind))throw Error('Grid requires a rectangular fixture; snoot requires a round fixture.');
+ if(!compatibleLightTools(lightId,sizes).includes(kind))throw Error('Grid requires a rectangular fixture; snoot requires a round fixture.');
  const footprint=lightToolFootprint(lightId,sizes,keyShape);
  return {id:`${lightId}-${kind}`,lightId,kind,enabled:true,offset:0,
   settings:kind==='grid'?{...LEGACY_GRID_SETTINGS,interiorMaterial:'polished_silver',outerMaterial:'housing'}: {length:.44,mountRatio:1.25,mountAperture:0,exitAperture:footprint.diameter}};
 }
+export function createSoftboxGrid(lightId,sizes){
+ const size=sizes.lights.find(light=>light.id===lightId),factor=Math.min(size.width,size.height),grid=createLightTool(lightId,'grid',sizes);
+ grid.settings={cellsX:2,cellsY:8,depth:Math.max(.01,Math.min(2,.25*factor)),thickness:Math.max(.002,Math.min(.2,.015*factor)),interiorMaterial:'housing',outerMaterial:'housing'};
+ return grid;
+}
 export function migrateLightTools(sizes){
  const attachments=[];
  for(const [lightId,length,mountRadius]of [['background',1.2,.375],['kicker-left',.44,null],['kicker-right',.44,null],['table-left',.36,.1125],['table-right',.36,.1125]]){
+  if(!compatibleLightTools(lightId,sizes).includes('snoot'))continue;
   const size=sizes?.lights?.find(light=>light.id===lightId),radius=ROUND_RADII[lightId]*(size?.width??1);
   const entrance=mountRadius??radius*1.1,tool=createLightTool(lightId,'snoot',sizes);
   tool.enabled=size?.snoot??true;tool.settings={length:size?.snootLength??length,mountRatio:mountRadius===null?1.1:1.25,mountAperture:mountRadius===null?0:mountRadius*2,exitAperture:entrance*2};
   attachments.push(tool);
  }
- const under=sizes?.lights?.find(light=>light.id==='underlight'),grid=createLightTool('underlight','grid',sizes);
+ const under=sizes?.lights?.find(light=>light.id==='underlight');
+ if(compatibleLightTools('underlight',sizes).includes('grid')){
+ const grid=under?.head==='softbox-1x4'?createSoftboxGrid('underlight',sizes):createLightTool('underlight','grid',sizes);
  grid.enabled=under?.grid??true;grid.settings.interiorMaterial='housing';
- for(const key of Object.keys(LEGACY_GRID_SETTINGS))grid.settings[key]=under?.['grid'+key[0].toUpperCase()+key.slice(1)]??LEGACY_GRID_SETTINGS[key];
+ if(under?.head!=='softbox-1x4')for(const key of Object.keys(LEGACY_GRID_SETTINGS))grid.settings[key]=under?.['grid'+key[0].toUpperCase()+key.slice(1)]??LEGACY_GRID_SETTINGS[key];
  attachments.push(grid);
+ }
+ for(const size of sizes?.lights??[])if(size.head==='softbox-1x4'&&size.id!=='underlight'){
+  attachments.push(createSoftboxGrid(size.id,sizes));
+ }
  return {version:1,attachments};
 }
 export function defaultLightTools(sizes){
- const result=migrateLightTools(sizes),over=createLightTool('fill-upper','grid',sizes);
- over.settings={cellsX:8,cellsY:8,depth:1,thickness:.025,interiorMaterial:'polished_silver',outerMaterial:'housing'};result.attachments.push(over);
- for(const tool of result.attachments)if(tool.kind==='grid')tool.settings.interiorMaterial='polished_silver';
+ const result=migrateLightTools(sizes);
+ if(compatibleLightTools('fill-upper',sizes).includes('grid')&&!result.attachments.some(t=>t.lightId==='fill-upper')){
+  const over=createLightTool('fill-upper','grid',sizes);
+  over.settings={cellsX:8,cellsY:8,depth:1,thickness:.025,interiorMaterial:'polished_silver',outerMaterial:'housing'};result.attachments.push(over);
+ }
+ for(const tool of result.attachments)if(tool.kind==='grid'&&sizes?.lights?.find(light=>light.id===tool.lightId)?.head!=='softbox-1x4')tool.settings.interiorMaterial='polished_silver';
  return result;
 }
 export function validateLightTools(value,sizes,keyShape='bare',materialNames=null){
@@ -51,7 +75,7 @@ export function validateLightTools(value,sizes,keyShape='bare',materialNames=nul
  const attachments=value.attachments.map(tool=>{
   if(!tool||typeof tool.id!=='string'||!/^[a-zA-Z0-9-]{1,80}$/.test(tool.id)||ids.has(tool.id))throw Error('Each light tool needs a unique stable ID');
   ids.add(tool.id);
-  if(!compatibleLightTools(tool.lightId).includes(tool.kind))throw Error('Grid requires a rectangular fixture; snoot requires a round fixture.');
+  if(!compatibleLightTools(tool.lightId,sizes).includes(tool.kind))throw Error('Grid requires a rectangular fixture; snoot requires a round fixture.');
   const mount=tool.lightId+'/'+tool.kind;if(mounts.has(mount))throw Error('Only one tool of each kind can occupy a light mount');mounts.add(mount);
   if(typeof tool.enabled!=='boolean'||!Number.isFinite(tool.offset)||tool.offset<0||tool.offset>10)throw Error('Invalid light tool enabled state or axial offset');
   const s=tool.settings,footprint=lightToolFootprint(tool.lightId,sizes,keyShape);let settings;
@@ -121,11 +145,11 @@ export function createLightToolControls(groups,{getSizes,materialNames=[],getKey
    const {doc,id,element}=view;view.fields=[];view.outputs=[];element.replaceChildren();
    const label=doc.createElement('label'),select=doc.createElement('select');label.textContent='Attach tool ';select.id=`light-tool-attach-${id}`;owned.add(select.id);
    const empty=doc.createElement('option');empty.value='';empty.textContent='Choose a tool';select.append(empty);
-   for(const kind of compatibleLightTools(id))if(!state.attachments.some(t=>t.lightId===id&&t.kind===kind)){
+   for(const kind of compatibleLightTools(id,getSizes()))if(!state.attachments.some(t=>t.lightId===id&&t.kind===kind)){
     const option=doc.createElement('option');option.value=kind;option.textContent=LIGHT_TOOL_KINDS[kind];select.append(option);
    }
    select.value='';select.disabled=select.children.length===1;label.append(select);element.append(label);
-   const compatibility=doc.createElement('p');compatibility.textContent=RECTANGLES.has(id)?'Rectangular mount: grid supported. Round snoots require a round fixture.':'Round mount: snoot supported. Rectangular grids require a rectangular fixture.';element.append(compatibility);
+   const compatibility=doc.createElement('p');compatibility.textContent=lightHeadIsRectangular(id,getSizes())?'Rectangular head: grid supported.':'Round head: snoot supported.';element.append(compatibility);
    select.addEventListener('change',()=>{if(!select.value)return;const next=clone(state);next.attachments.push(createLightTool(id,select.value,getSizes(),getKeyShape()));commit(next,id,true);select.value='';});
    for(const tool of state.attachments.filter(t=>t.lightId===id)){
     const panel=doc.createElement('fieldset'),legend=doc.createElement('legend');legend.textContent=LIGHT_TOOL_KINDS[tool.kind];panel.append(legend);

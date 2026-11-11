@@ -1,5 +1,16 @@
 # Agent Obstinance
 
+## 2026-11-11 - using emissive calibration rows for reflective graph paper
+
+The user requested a real graph-paper gobo/backdrop with colored swatches and
+no fake lighting. I selected the existing calibration_* material names without
+reading their PBR rows. Those rows are emissive chart lights, not reflective
+inks. The first 30-second one-tile acceptance therefore used the wrong materials
+and showed gray swatches. The preset now uses the existing non-emissive surface
+palette unchanged, and its regression checks every chosen emission triplet is
+zero. Inspecting material values, not inferring behavior from their names, would
+have prevented the incorrect render and repeat exposure.
+
 ## 2026-11-11 - treating the Studio agent short circuit as another renderer host
 
 The user asked to reuse Marble Studio's scene construction and optionally issue

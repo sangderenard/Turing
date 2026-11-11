@@ -34,6 +34,12 @@ const fieldView=new DataView(fieldRay.bytes.buffer,fieldRay.bytes.byteOffset,fie
 const fieldConfig=JSON.parse(new TextDecoder().decode(fieldRay.bytes.slice(16,16+fieldView.getUint32(4,true))));
 assert.equal(fieldConfig.receive_light_field,true,'Existing agent product must preserve explicit field opt-in');
 assert(!('receive_light_field' in config),'Default agent product must remain opted out');
+const sampledRay=await buildStudioAgentProduct({...request,operation:'ray-payload',
+  photo:{resolution:128,samplesPerOutputPixel:64,oversampling:2,maxBounces:1}},{assets});
+const sampledView=new DataView(sampledRay.bytes.buffer,sampledRay.bytes.byteOffset,sampledRay.bytes.byteLength);
+const sampledConfig=JSON.parse(new TextDecoder().decode(sampledRay.bytes.slice(16,16+sampledView.getUint32(4,true))));
+assert.equal(sampledConfig.samples_per_output_pixel,64);
+assert.deepEqual(sampledConfig.tiled,{tile_size:1024});
 
 await assert.rejects(buildStudioAgentProduct({...request,shader:'invented'},{assets}),/Unknown/);
 await assert.rejects(buildStudioAgentProduct({...request,settings:{...settings,camera:{}}},{assets}),/focus/);

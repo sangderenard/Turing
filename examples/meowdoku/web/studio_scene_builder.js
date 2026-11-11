@@ -341,6 +341,11 @@ export function createStudioSceneGeometry({lighting,materials,subject,geometrySu
   const shopLightFaces=onPart=>{const geometry=shopLightGeometry();for(const part of geometry.parts)onPart?.(part);return geometry.faces;};
   return {roomFaces,backdropRollFaces,tableFaces,goboFaces,lightStandFaces,backdropHolderFaces,shopLightGeometry,shopLightFaces};
 }
+// Canonical ownership shared by photo material-engine groups and raster receivers.
+export const STUDIO_SCENE_PART_GROUP=Object.freeze({
+  fixture:'stage',room:'room',backdrop:'room',backdropHolder:'room',
+  table:'stage',gobo:'room',lightStand:'stage',shopLight:'room',
+});
 export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySubject=subject,rayOriginM,shopEmissionProfiles,solo=null,getOpticalRecord}) {
   const {ids,pbr:sourcePbr,fixtureMaterialBase:FIXTURE_MAT_BASE}=materials;
   const FIXTURE_HOUSING_MAT=FIXTURE_MAT_BASE+STUDIO_LIGHTS.length;
@@ -353,14 +358,14 @@ export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySub
       throw new Error(`${prefix}: generated scene parts do not cover the actual triangles.`);
     parts.push(...captured);return faces;
   };
-  collect('stage','Light fixture',cb=>buildStudioFixtureFaces(fixtureRoles,FIXTURE_HOUSING_MAT,cb,ids));
-  collect('room','Room',cb=>geometry.roomFaces(cb));
-  collect('room','Backdrop',cb=>geometry.backdropRollFaces(cb));
-  collect('room','Backdrop holder',cb=>geometry.backdropHolderFaces(cb));
-  collect('stage','Table',cb=>geometry.tableFaces(cb));
-  collect('room','Gobo',cb=>geometry.goboFaces(cb));
-  collect('stage','Light stand',cb=>geometry.lightStandFaces(fixtureRoles,cb));
-  collect('room','Shop light',cb=>geometry.shopLightFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.fixture,'Light fixture',cb=>buildStudioFixtureFaces(fixtureRoles,FIXTURE_HOUSING_MAT,cb,ids));
+  collect(STUDIO_SCENE_PART_GROUP.room,'Room',cb=>geometry.roomFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.backdrop,'Backdrop',cb=>geometry.backdropRollFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.backdropHolder,'Backdrop holder',cb=>geometry.backdropHolderFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.table,'Table',cb=>geometry.tableFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.gobo,'Gobo',cb=>geometry.goboFaces(cb));
+  collect(STUDIO_SCENE_PART_GROUP.lightStand,'Light stand',cb=>geometry.lightStandFaces(fixtureRoles,cb));
+  collect(STUDIO_SCENE_PART_GROUP.shopLight,'Shop light',cb=>geometry.shopLightFaces(cb));
   return packStudioPhotoParts({parts,materials,subject,rayOriginM,lighting,roleColor,roleStrength,shopEmissionProfiles,getOpticalRecord});
 }
 

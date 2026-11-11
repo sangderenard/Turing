@@ -1,4 +1,4 @@
-"""Opt-in receiver lifecycle against the real browser modules (Node CPU gate)."""
+"""Scalar/v2 directional receiver, identity mapping and atomic GL lifecycle."""
 from pathlib import Path
 import shutil
 import subprocess

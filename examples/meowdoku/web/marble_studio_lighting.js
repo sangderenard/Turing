@@ -370,15 +370,20 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
       } finally {applying = false;}
     },
   });
-  const fixtureSizes=createFixtureSizeControls($("lighting-profiles"),()=>{
+  const fixtureSizes=createFixtureSizeControls($("lighting-profiles"),({headChanged}={})=>{
     // Removing a tool removes its Room overrides too, so reattachment cannot
     // resurrect hidden settings. Surviving stable IDs retain their overrides.
-    const ids=new Set(fixtureSizes.tools.getState().attachments.map(tool=>tool.id));
+    const attachments=fixtureSizes.tools.getState().attachments,ids=new Set(attachments.map(tool=>tool.id));
+    if(headChanged){
+      const replaced=new Set(attachments.filter(tool=>tool.lightId===headChanged).map(tool=>tool.id));
+      roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>!item.path.startsWith(`fixtureSizes/lights/@${headChanged}/`)&&![...replaced].some(id=>item.path.startsWith(`lightTools/attachments/@${id}/`)))};
+    }
     if(fixtureSizes.getState().underlightFit)roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>!/^fixtureSizes\/lights\/@underlight\/(width|height)$/.test(item.path))};
     roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>{const match=/^lightTools\/attachments\/@([^/]+)\//.exec(item.path);return !match||ids.has(match[1]);})};
     onChange();syncPoseShortcuts();syncPlacementWarnings();
   },(next,before,id,tools)=>validateFixturePose(poses.getState(),id,next,tools),{
     materialNames,getTable:()=>table?.getState(),getKeyShape:()=>fields['key-shape'].value,
+    getUnitMm:()=>studioScaleTransform(scale?.getState()??defaultStudioScale(),Number($("radius-mm").value),table?.getState().enabled??true).unitM*1000,
     validateChange:(next,before,id)=>validateFixturePose(poses.getState(),id,fixtureSizes.getState(),next),
   });
   keyShapeStatus=doc.createElement('output');keyShapeStatus.id='key-shape-status';
@@ -450,7 +455,11 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
     {onChange, onRoomChange, onBackdropChange, syncBackdropVisibility, getRoomFloorDrop:()=>tableFloorDrop(table.getState())});
   const gobos = createStudioGoboControls($("studio-gobo-controls"), materialNames, () => {
     onGoboChange(); onChange();
-  });
+  },{referencePlacement:()=>{
+    const subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),table.getState().enabled);
+    const half=32/(subject.unitM*1000);
+    return {unitMm:subject.unitM*1000,center:[0,table.getState().enabled?-1+half:subject.subjectCenter[1],-subject.subjectRadius-.14]};
+  }});
   const kickerGuides=lightGuideRole?createKickerHeightGuides(fixtureSizes.element,{
     getSnapshots:()=>{
       const tableState=table.getState(),subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),tableState.enabled);

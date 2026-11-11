@@ -40,6 +40,19 @@ MAX_TRIANGLES = 500_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE = re.compile(r"^preview-[0-9]{6}\.png$")
 _FIELD = re.compile(r"^light-field-[0-9a-f]{32}\.bin$")
+_FIELD_ESTIMATOR = "track-length-throughput-v1"
+_FIELD_ROOT_ESTIMATOR = "track-length-root-sweep-v1"
+_SURFACE_TRANSPORT = "studio-pbr-mixture-v1"
+_FIELD_INTERNAL_MEDIA = dict(version="canonical-beer-segment-integral-v1",
+    scope="actual valid interior and exterior traced segments", entry_packet=True,
+    integration="per-recording-cell integral of canonical Beer transmittance",
+    optical_authority="installed medium/region/dye helper", invalid_ownership="excluded",
+    external_extinction="unsupported; request rejected")
+_FIELD_AXES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+_ICO_A, _ICO_B = .5257311121191336, .85065080835204
+_FIELD_ICOSAHEDRON = [[0, _ICO_A, _ICO_B], [0, -_ICO_A, _ICO_B], [0, _ICO_A, -_ICO_B], [0, -_ICO_A, -_ICO_B],
+    [_ICO_A, _ICO_B, 0], [-_ICO_A, _ICO_B, 0], [_ICO_A, -_ICO_B, 0], [-_ICO_A, -_ICO_B, 0],
+    [_ICO_B, 0, _ICO_A], [_ICO_B, 0, -_ICO_A], [-_ICO_B, 0, _ICO_A], [-_ICO_B, 0, -_ICO_A]]
 _HDR = re.compile(r"^exposure-[0-9]{6}\.npz$")
 # Exact float64 luminance row generated from the IEC primaries/D65 matrix in
 # Spectral marble_color_profile.SRGB_TO_XYZ. Keep percentile and pixel output
@@ -61,6 +74,216 @@ class PhotoError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+def _validate_vector_bundle_metadata(field, config):
+    """The scalar prefix is unchanged; every v2 section owns a contiguous span."""
+    def require(condition):
+        if not condition:
+            raise PhotoError("invalid light field vector bundle metadata", 503)
+
+    require(isinstance(field.get("sha256"), str) and bool(_DIGEST.fullmatch(field["sha256"])))
+    require(isinstance(field.get("scene_sha256"), str) and bool(_DIGEST.fullmatch(field["scene_sha256"])))
+    require(isinstance(config.get("geometry_sha256"), str)
+            and bool(_DIGEST.fullmatch(config["geometry_sha256"]))
+            and field.get("geometry_sha256") == config["geometry_sha256"])
+    materials = field.get("materials")
+    require(isinstance(materials, dict) and type(materials.get("count")) is int
+            and 1 <= materials["count"] <= 65536)
+    offset = math.prod(field["dimensions"]) * 12
+    directional = field.get("directional")
+    require(isinstance(directional, dict))
+    internal = config.get("light_field_internal_media", False)
+    require(type(internal) is bool)
+    if internal:
+        receipt = directional.get("internal_media")
+        require(field["schema"] == "studio.forward-field.v6"
+                and isinstance(receipt, dict) and receipt == _FIELD_INTERNAL_MEDIA
+                and receipt.get("entry_packet") is True)
+    else:
+        require("internal_media" not in directional)
+    dims = directional.get("dimensions")
+    normalized = field["schema"] in ("studio.forward-field.v4", "studio.forward-field.v5", "studio.forward-field.v6")
+    require(isinstance(dims, list) and len(dims) == 3
+            and all(type(n) is int and 1 <= n <= (64 if normalized else 32) for n in dims))
+    if normalized:
+        require(dims == [dims[0]] * 3 and dims[0] in (32, 64)
+                and config.get("light_field_grid_size") == dims[0]
+                and type(config.get("light_field_grid_size")) is int
+                and config.get("light_field_schema") == field["schema"]
+                and config.get("light_field_estimator") == _FIELD_ROOT_ESTIMATOR)
+    require(directional.get("format") == "rgb-direction-f32le"
+            and directional.get("estimator") == (_FIELD_ROOT_ESTIMATOR if normalized else _FIELD_ESTIMATOR)
+            and directional.get("direction_space") == "world"
+            and directional.get("layout") == "zyx-bin-channel"
+            and directional.get("channels") == ["R", "G", "B", "mean_propagation_x",
+                                                "mean_propagation_y", "mean_propagation_z"])
+    bins = 6
+    if field["schema"] in ("studio.forward-field.v3", "studio.forward-field.v4", "studio.forward-field.v5", "studio.forward-field.v6"):
+        bins = directional.get("bin_count")
+        require(type(bins) is int and bins in (6, 12))
+        require(config.get("light_field_stencil", bins) == bins)
+        require(directional.get("stencil") == ("axes6-v1" if bins == 6 else "icosahedron12-v1"))
+        basis = directional.get("bin_directions")
+        expected = _FIELD_AXES if bins == 6 else _FIELD_ICOSAHEDRON
+        require(isinstance(basis, list) and len(basis) == bins)
+        for row, wanted in zip(basis, expected):
+            require(isinstance(row, list) and len(row) == 3
+                    and all(type(v) in (int, float) and math.isfinite(v) and abs(v - w) <= 1e-7
+                            for v, w in zip(row, wanted)))
+        weights = directional.get("weight_from_linear_rgb")
+        # Inverse of the producer's existing fixed3 CIE/D65 RGB conversion.
+        expected_weights = [1.4400948563066378, .7787163904320042, .781188753261357]
+        require(isinstance(weights, list) and len(weights) == 3
+                and all(type(v) in (int, float) and math.isfinite(v) and abs(v - w) <= 1e-7
+                        for v, w in zip(weights, expected_weights)))
+        require(directional.get("bins") == (["+X", "-X", "+Y", "-Y", "+Z", "-Z"] if bins == 6
+                                            else [f"I{i}" for i in range(12)]))
+    else:
+        require(directional.get("bins") == ["+X", "-X", "+Y", "-Y", "+Z", "-Z"])
+    sections = [(directional, math.prod(dims) * bins * 6 * 4)]
+    for key, stride, fmt in (("triangles", 16, "u32le"), ("sources", 48, "f32le"),
+                             ("materials", 64, "f32le"), ("source_pbr16", 64, "f32le")):
+        section = field.get(key)
+        require(isinstance(section, dict))
+        count = section.get("count")
+        require(type(count) is int and 0 <= count <= MAX_TRIANGLES
+                and section.get("stride_bytes") == stride and type(section.get("stride_bytes")) is int
+                and section.get("format") == fmt)
+        sections.append((section, count * stride))
+    require(field["triangles"].get("channels") == ["triangle_id", "material_id", "flags", "class_mask"])
+    bits = field["triangles"].get("class_bits")
+    require(isinstance(bits, dict) and bits == {"volumetric": 1, "reflectance": 2, "glass": 4}
+            and all(type(v) is int for v in bits.values()))
+    require(field["sources"].get("layout") == "baked-source-records")
+    if normalized:
+        sampling = directional.get("root_sampling")
+        require(isinstance(sampling, dict))
+        require(sampling.get("version") == "per-complete-pump-inverse-replay-v1"
+                and sampling.get("incomplete_dispatch") is False)
+        for key in ("source_root_count", "completed_root_sweeps", "recorded_root_jobs",
+                    "normalization_divisor", "excluded_partial_root_jobs"):
+            require(type(sampling.get(key)) is int and 0 <= sampling[key] <= 2**53 - 1)
+        roots, sweeps = sampling["source_root_count"], sampling["completed_root_sweeps"]
+        require(roots > 0 and roots == field["sources"]["count"] and sweeps > 0
+                and sampling["recorded_root_jobs"] >= roots * sweeps
+                and sampling["normalization_divisor"] == sweeps)
+        if field["schema"] == "studio.forward-field.v6":
+            require(type(directional.get("quantization_divisor")) is int
+                    and directional["quantization_divisor"] == 16777216
+                    and directional.get("quantization_version") == "fixed24-track-length-v1")
+            populations = directional.get("source_populations")
+            settings = config.get("emitter_sampling")
+            require(isinstance(populations, dict) and isinstance(settings, dict)
+                    and settings.get("refresh_each_sweep") is True)
+            require(populations.get("version") == "native-angular-refresh-mean-v1"
+                    and populations.get("generator") == "native-emissive-triangle-roots-v1")
+            for key in ("ray_budget", "base_seed", "first_index", "last_index", "count", "latest_seed"):
+                require(type(populations.get(key)) is int and 0 <= populations[key] <= 2**53 - 1)
+            require(populations["ray_budget"] == settings.get("ray_budget")
+                    and populations["base_seed"] == settings.get("seed")
+                    and populations["count"] == sweeps
+                    and populations["last_index"] - populations["first_index"] + 1 == sweeps
+                    and populations["latest_seed"] == (populations["base_seed"] + populations["last_index"]) % 2147483648)
+            for key in ("latest_sources_sha256", "rolling_sha256"):
+                require(isinstance(populations.get(key), str) and bool(_DIGEST.fullmatch(populations[key])))
+    require(materials.get("layout") == "native-pbr16")
+    lineage = field["source_pbr16"]
+    ids = lineage.get("material_ids")
+    require(lineage.get("layout") == "authored-pbr16" and isinstance(ids, list)
+            and len(ids) == lineage["count"]
+            and all(type(i) is int and 0 <= i < materials["count"] for i in ids))
+    for section, size in sections:
+        require(type(section.get("offset_bytes")) is int and section["offset_bytes"] == offset
+                and type(section.get("byte_length")) is int and section["byte_length"] == size)
+        offset += size
+    require(field["byte_length"] == offset)
+    if field["schema"] == "studio.forward-field.v5" or (field["schema"] == "studio.forward-field.v6" and config.get("light_field_region") == "subject"):
+        receipt = config.get("light_field_subject_region")
+        require(isinstance(receipt, dict) and config.get("light_field_region") == "subject")
+        # The shared producer helper derived this receipt from verified uploaded
+        # geometry before job hashing. Never accept request-authored ROI bounds.
+        for key in ("dimensions", "bounds_min_m", "bounds_max_m", "cell_size_m", "margin_m", "region"):
+            require(key in receipt and directional.get(key) == receipt[key])
+        require(type(directional.get("cell_size_m")) in (int, float)
+                and directional["cell_size_m"] == config.get("light_field_cell_size_m")
+                and .00005 <= directional["cell_size_m"] <= .01
+                and type(directional.get("margin_m")) in (int, float)
+                and directional["margin_m"] == config.get("light_field_margin_m"))
+        region = directional["region"]
+        require(isinstance(region, dict) and region.get("kind") == "subject"
+                and region.get("subject_geometry_sha256") == config["geometry_sha256"])
+        require(isinstance(region.get("world_geometry_sha256"), str)
+                and bool(_DIGEST.fullmatch(region["world_geometry_sha256"])))
+        arrays = [directional["bounds_min_m"], directional["bounds_max_m"],
+                  region.get("actual_bounds_min_m"), region.get("actual_bounds_max_m")]
+        require(all(isinstance(a, list) and len(a) == 3
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in a) for a in arrays))
+        lo, hi, actual_lo, actual_hi = arrays
+        pitch = directional["cell_size_m"]
+        require(type(region.get("effective_margin_m")) in (int, float)
+                and region["effective_margin_m"] == max(pitch, directional["margin_m"]))
+        require(all(a < b and c <= d and a < c and d < b
+                    and math.isclose(b - a, n * pitch, rel_tol=1e-12, abs_tol=1e-15)
+                    for a, b, c, d, n in zip(lo, hi, actual_lo, actual_hi, dims)))
+        for key, expected in (("padding_min_m", [c - a for a, c in zip(lo, actual_lo)]),
+                              ("padding_max_m", [b - d for b, d in zip(hi, actual_hi)])):
+            padding = region.get(key)
+            require(isinstance(padding, list) and len(padding) == 3
+                    and all(type(v) in (int, float) and math.isfinite(v)
+                            and math.isclose(v, w, rel_tol=1e-12, abs_tol=1e-15)
+                            and v + 1e-15 >= region["effective_margin_m"]
+                            for v, w in zip(padding, expected)))
+
+
+def _validate_vector_bundle_payload(stream, field):
+    """Verify the same opened immutable file that the HTTP handler will stream."""
+    digest = hashlib.sha256()
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+    if digest.hexdigest() != field["sha256"]:
+        raise PhotoError("light field content hash mismatch", 503)
+    if field["schema"] == "studio.forward-field.v6":
+        source = field["sources"]
+        stream.seek(source["offset_bytes"])
+        digest = hashlib.sha256(stream.read(source["byte_length"]))
+        if digest.hexdigest() != field["directional"]["source_populations"]["latest_sources_sha256"]:
+            raise PhotoError("light field latest source population hash mismatch", 503)
+    # Bound peak allocation independently of the field dimensions.
+    for offset, size in ((0, field["triangles"]["offset_bytes"]),
+                         (field["sources"]["offset_bytes"],
+                          field["sources"]["byte_length"] + field["materials"]["byte_length"]
+                          + field["source_pbr16"]["byte_length"])):
+        stream.seek(offset)
+        while size:
+            chunk = stream.read(min(size, 1024 * 1024))
+            if not chunk or not np.isfinite(np.frombuffer(chunk, dtype="<f4")).all():
+                raise PhotoError("invalid light field vector samples", 503)
+            size -= len(chunk)
+    triangles = field["triangles"]
+    stream.seek(triangles["offset_bytes"])
+    start = 0
+    while start < triangles["count"]:
+        count = min(16384, triangles["count"] - start)
+        rows = np.frombuffer(stream.read(count * 16), dtype="<u4").reshape(count, 4)
+        if (not np.array_equal(rows[:, 0], np.arange(start, start + count))
+                or np.any(rows[:, 1] >= field["materials"]["count"])
+                or np.any(rows[:, 3] & np.uint32(0xfffffff8))
+                or np.any((rows[:, 3] & 1) == 0)):
+            raise PhotoError("invalid light field triangle identities or classifications", 503)
+        start += count
+    stream.seek(0)
+
+
+@lru_cache(maxsize=4)
+def _directional_contract(root):
+    path = Path(root) / "camera_designer" / "studio_directional_field.py"
+    spec = importlib.util.spec_from_file_location("studio_source_directional_contract", path)
+    if spec is None or spec.loader is None or not path.is_file():
+        raise PhotoError("Spectral subject-field support is unavailable", 503)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @lru_cache(maxsize=4)
@@ -151,6 +374,8 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     transport = str(value.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise PhotoError("transport must be fixed:1 or fixed:3")
+    if "surface_transport" in value and value["surface_transport"] != _SURFACE_TRANSPORT:
+        raise PhotoError("unsupported surface_transport; expected studio-pbr-mixture-v1")
     receive_light_field = value.get("receive_light_field", False)
     if type(receive_light_field) is not bool:
         raise PhotoError("receive_light_field must be a boolean")
@@ -191,7 +416,7 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     oversampling = value.get("oversampling", 1)
     if type(oversampling) is not int or not 1 <= oversampling <= 4:
         raise PhotoError("oversampling must be an integer multiplier from 1 to 4")
-    tiled = "tiled" in value or oversampling > 1 or custom_size or resolution not in (128,256,512,768,1024,2048,4096)
+    tiled = "tiled" in value or "samples_per_output_pixel" in value or oversampling > 1 or custom_size or resolution not in (128,256,512,768,1024,2048,4096)
     if tiled:
         try:
             _tile_contract(str(spectral_root)).tile_plan(value)
@@ -348,11 +573,47 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         # "room": room,
     }
     # Omitted and false preserve the pre-existing canonical job digest.
+    if "surface_transport" in value:
+        if transport != "fixed:3" or fixtures is None:
+            raise PhotoError("surface_transport requires fixed:3 and authored fixtures")
+        config["surface_transport"] = _SURFACE_TRANSPORT
     if receive_light_field:
         config["receive_light_field"] = True
+        # The field estimator changes the requested product, so it must change
+        # the canonical job identity rather than reuse a completed fog field.
+        estimator = value.get("light_field_estimator", _FIELD_ESTIMATOR)
+        if estimator not in (_FIELD_ESTIMATOR, _FIELD_ROOT_ESTIMATOR):
+            raise PhotoError("unsupported light_field_estimator")
+        normalized = estimator == _FIELD_ROOT_ESTIMATOR
+        config["light_field_estimator"] = estimator
+        stencil = value.get("light_field_stencil", 12)
+        if type(stencil) is not int or stencil not in (6, 12):
+            raise PhotoError("light_field_stencil must be 6 or 12")
+        config["light_field_stencil"] = stencil
+        grid = value.get("light_field_grid_size", 64 if normalized else 32)
+        if type(grid) is not int or grid not in ((32, 64) if normalized else (32,)):
+            raise PhotoError("light_field_grid_size requires 32, or 64 with track-length-root-sweep-v1")
+        # Old tabs omit the estimator and must retain their v3 reader and job
+        # identity. The new UI explicitly requests normalized v4 and its grid.
+        if normalized:
+            config["light_field_grid_size"] = grid
+        config["light_field_schema"] = "studio.forward-field.v4" if normalized else "studio.forward-field.v3"
+        if "light_field_region" in value:
+            if value["light_field_region"] != "subject" or not normalized:
+                raise PhotoError("light_field_region requires subject and track-length-root-sweep-v1")
+            pitch = value.get("light_field_cell_size_m", .0005)
+            margin = value.get("light_field_margin_m", .001)
+            if type(pitch) not in (int, float) or not math.isfinite(pitch) or not .00005 <= pitch <= .01:
+                raise PhotoError("subject light_field_cell_size_m must be between 0.00005 and 0.01")
+            if type(margin) not in (int, float) or not math.isfinite(margin) or not 0 <= margin <= .032:
+                raise PhotoError("light_field_margin_m must be finite and between 0 and 0.032")
+            config.update(light_field_region="subject", light_field_cell_size_m=pitch,
+                          light_field_margin_m=margin, light_field_schema="studio.forward-field.v5")
     if tiled:
         config["tiled"] = value.get("tiled", {"tile_size": 1024})
         config["oversampling"] = oversampling
+        if "samples_per_output_pixel" in value:
+            config["samples_per_output_pixel"] = value["samples_per_output_pixel"]
     participation=value.get("client_intersections",False)
     if type(participation) is not bool:
         raise PhotoError("client_intersections must be a boolean")
@@ -376,6 +637,41 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             raise PhotoError("invalid live view session")
         settings["session_id"] = session
         config["live"] = settings
+    if "emitter_sampling" in value:
+        sampling = value["emitter_sampling"]
+        keys = {"version", "ray_budget", "seed", "refresh_each_sweep"}
+        if not isinstance(sampling, dict) or set(sampling) != keys:
+            raise PhotoError("emitter_sampling requires version, ray_budget, seed, and refresh_each_sweep")
+        if type(sampling["version"]) is not int or sampling["version"] != 1:
+            raise PhotoError("unsupported emitter_sampling version")
+        if type(sampling["ray_budget"]) is not int or not 128 <= sampling["ray_budget"] <= 65536:
+            raise PhotoError("emitter_sampling ray_budget must be an integer between 128 and 65536")
+        if type(sampling["seed"]) is not int or not 0 <= sampling["seed"] <= 2147483647:
+            raise PhotoError("emitter_sampling seed must be an integer between 0 and 2147483647")
+        if type(sampling["refresh_each_sweep"]) is not bool:
+            raise PhotoError("emitter_sampling refresh_each_sweep must be a boolean")
+        if transport != "fixed:3" or fixtures is None:
+            raise PhotoError("emitter_sampling requires fixed:3 and authored fixtures")
+        if sampling["refresh_each_sweep"]:
+            if ("live" not in config or not receive_light_field
+                    or config.get("light_field_estimator") != _FIELD_ROOT_ESTIMATOR):
+                raise PhotoError("emitter_sampling refresh requires live root-sweep light field")
+            if sampling["ray_budget"] > config["live"]["ray_batch_size"]:
+                raise PhotoError("emitter_sampling ray_budget exceeds live ray_batch_size")
+        # Immutable source sampling affects the product identity. Rounded actual
+        # root capacity is checked by the existing CPU scene admission next.
+        config["emitter_sampling"] = dict(sampling)
+        if sampling["refresh_each_sweep"]:
+            config["light_field_schema"] = "studio.forward-field.v6"
+    internal = value.get("light_field_internal_media", False)
+    if type(internal) is not bool:
+        raise PhotoError("light_field_internal_media must be a boolean")
+    if internal:
+        if config.get("light_field_schema") != "studio.forward-field.v6":
+            raise PhotoError("light_field_internal_media requires refreshed v6 light field")
+        if any(key in value for key in ("volume_extinction", "volume_extinction_sigma_t_m_inv", "volume_extinction_bounds_m")):
+            raise PhotoError("light_field_internal_media cannot be combined with external volume_extinction")
+        config["light_field_internal_media"] = True
     # Optics use the complete image, never a tile's temporary allocation.
     # Live's established shader contract uses the displayed viewport aspect.
     aspect = config["live"]["aspect"] if "live" in config else camera.get("width", resolution) / camera.get("height", resolution)
@@ -531,6 +827,10 @@ def decode_upload(raw: bytes, saved_objects, spectral_root: Path = SPECTRAL_ROOT
         if spheres is not None:
             config["analytic_spheres"] = spheres
         preflight_triangle_budget(positions.reshape(count, 3, 3), config, spheres)
+        if config.get("light_field_region") == "subject":
+            receipt = _directional_contract(str(spectral_root)).subject_field_region(positions.reshape(count, 3, 3), config)
+            config["light_field_subject_region"] = receipt
+            config["light_field_grid_size"] = receipt["dimensions"][0]
     except (ValueError, KeyError, TypeError) as exc:
         raise PhotoError(str(exc)) from exc
     return positions.copy().reshape(count, 3, 3), ids.astype(np.int32), pbr, config, seconds
@@ -1043,12 +1343,20 @@ class PhotoJobs:
             field = status.get("light_field")
             if not isinstance(config, dict) or config.get("receive_light_field") is not True or not isinstance(field, dict):
                 raise PhotoError("light field is unavailable", 404)
+            if "surface_transport" in config:
+                if config["surface_transport"] != _SURFACE_TRANSPORT or field.get("surface_transport") != _SURFACE_TRANSPORT:
+                    raise PhotoError("light field surface_transport receipt mismatch", 503)
+            elif "surface_transport" in field:
+                raise PhotoError("unexpected light field surface_transport receipt", 503)
             if (field.get("name") != name or field.get("digest") != digest
                     or field.get("live_revision") != revision):
                 raise PhotoError("light field is stale or unavailable", 404)
+            if config.get("light_field_schema") in ("studio.forward-field.v4", "studio.forward-field.v5", "studio.forward-field.v6") and field.get("schema") != config["light_field_schema"]:
+                raise PhotoError("light field estimator schema mismatch", 503)
             dimensions = field.get("dimensions")
             lo, hi = field.get("bounds_min_m"), field.get("bounds_max_m")
-            if (field.get("schema") != "studio.forward-field.v1"
+            vector_bundle = field.get("schema") in ("studio.forward-field.v2", "studio.forward-field.v3", "studio.forward-field.v4", "studio.forward-field.v5", "studio.forward-field.v6")
+            if (field.get("schema") not in ("studio.forward-field.v1", "studio.forward-field.v2", "studio.forward-field.v3", "studio.forward-field.v4", "studio.forward-field.v5", "studio.forward-field.v6")
                     or field.get("format") != "rgb-f32le"
                     or field.get("layout") != "zyx-interleaved-rgb"
                     or field.get("color_space") != "linear-srgb"
@@ -1057,11 +1365,14 @@ class PhotoJobs:
                     or not isinstance(dimensions, list) or len(dimensions) != 3
                     or any(type(n) is not int or not 1 <= n <= 256 for n in dimensions)
                     or type(field.get("byte_length")) is not int
-                    or field["byte_length"] != math.prod(dimensions) * 12
+                    or not 0 < field["byte_length"] <= 256 * 1024 * 1024
+                    or (not vector_bundle and field["byte_length"] != math.prod(dimensions) * 12)
                     or not isinstance(lo, list) or not isinstance(hi, list) or len(lo) != 3 or len(hi) != 3
                     or any(type(v) not in (int, float) or not math.isfinite(v) for v in lo + hi)
                     or any(a >= b for a, b in zip(lo, hi))):
                 raise PhotoError("invalid light field metadata", 503)
+            if vector_bundle:
+                _validate_vector_bundle_metadata(field, config)
             path = directory / name
             try:
                 # Do not let an advertised filename redirect to another job or arbitrary file.
@@ -1071,6 +1382,12 @@ class PhotoJobs:
                 if os.fstat(stream.fileno()).st_size != field["byte_length"]:
                     stream.close()
                     raise PhotoError("light field length mismatch", 503)
+                if vector_bundle:
+                    try:
+                        _validate_vector_bundle_payload(stream, field)
+                    except Exception:
+                        stream.close()
+                        raise
                 return stream
             except OSError:
                 raise PhotoError("light field is unavailable", 404) from None

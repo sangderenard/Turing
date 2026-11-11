@@ -219,17 +219,54 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <button id="calibration-download" class="wide" hidden>Download calibration dataset (JSON)</button>
     <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
   </div>
+  <h2>Phong photos &amp; video</h2><div class="grid" id="phong-capture-controls">
+    <button type="button" id="phong-capture-photo" disabled>Take Phong PNG</button>
+    <label>Video frame rate<select id="phong-capture-fps"><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
+    <button type="button" id="phong-capture-start" disabled>Record Phong video</button><button type="button" id="phong-capture-stop" disabled>Stop recording</button>
+    <output class="wide" id="phong-capture-status" role="status" aria-live="polite">Waiting for the first completed Phong frame.</output>
+    <a class="wide" id="phong-capture-png" hidden download>Download PNG</a><a class="wide" id="phong-capture-video" hidden download>Download video</a>
+    <p class="wide">Captures the displayed Phong canvas at its pixel size, including its active secondary passes and depth-of-field. Ray overlays and controls are excluded. No ray job or audio is started. Video runs at up to the selected frame rate and stops after two minutes, when the preview size changes, or when you leave this tab. Maximum 128 MiB. Download before closing the page.</p>
+  </div>
   <h2>Ray field in Phong</h2><div class="grid" id="phong-light-field-controls">
-    <label class="wide"><input type="checkbox" id="phong-light-field"> Receive the ray tracer's forward volume</label>
+    <label class="wide"><input type="checkbox" id="ray-surface-transport"> Corrected opaque PBR transport for ray photos and Live</label>
+    <p class="wide">Uses the corrected diffuse/specular mixture for opaque PBR surfaces. Glass and native conductors keep their existing transport. Changing this setting starts a new Live job; it does not change lights or exposure.</p>
+    <label class="wide"><input type="checkbox" id="phong-light-field"> Receive the ray tracer's directional field bundle</label>
+    <label>Direction stencil <select id="phong-field-stencil"><option value="6">6 axis directions</option><option value="12" selected>12 geodesic directions</option></select></label>
+    <label>Recording region <select id="phong-field-region"><option value="scene" selected>Whole scene</option><option value="subject">Bounded subject</option></select></label>
+    <label>Subject cell size (mm)<input type="number" id="phong-field-cell-mm" value="0.5" min="0.05" max="10" step="0.05" disabled></label>
+    <label>Subject margin (mm)<input type="number" id="phong-field-margin-mm" value="1" min="0" max="32" step="0.5" disabled></label>
+    <p class="wide">Bounded subject recording covers its full outer geometry plus the requested margin and at least one outside cell. The server chooses the smallest 32 or 64 cube at the exact cell size. If it does not fit, the request is rejected rather than coarsened. Stage and room geometry remain in ray transport.</p>
+    <label>Spatial divisions / scale <select id="phong-field-grid-size"><option value="32">32 divisions per axis</option><option value="64" selected>64 divisions per axis</option></select></label>
+    <output class="wide" id="phong-field-division-status">World-space cell dimensions appear when a field bundle arrives. 64 divisions use 8× the spatial storage of 32.</output>
+    <fieldset class="wide" id="phong-field-categories"><legend>Apply the field to selected geometry</legend>
+      <label><input type="checkbox" id="phong-field-subject"> Subject</label>
+      <label><input type="checkbox" id="phong-field-stage"> Stage</label>
+      <label><input type="checkbox" id="phong-field-room"> Room</label>
+    </fieldset>
+    <output class="wide" id="phong-field-category-status">No receiving categories selected. Ordinary primary shading remains active.</output>
+    <p class="wide">These opt-ins select which geometry receives the same global field. They do not remove occluders or emitters, allocate separate grids, or restart the ray job.</p>
+    <p class="wide">The 64 grid has eight times as many spatial cells as 32. New fields average full-coverage pump estimates after correcting each root's replay count; partial-coverage pumps are excluded. Legacy fields remain readable and are labelled unnormalized. This normalization does not remove three-band spectral color limitations.</p>
+    <label class="wide"><input type="checkbox" id="phong-field-spatial-linear" checked> Energy-weighted spatial reconstruction (where supported)</label>
+    <label class="wide"><input type="checkbox" id="phong-field-secondary" checked> Secondary material passes: volumetric, reflectance, glass</label>
+    <label class="wide"><input type="checkbox" id="phong-field-specular"> Use primary Phong specular instead of field specular</label>
     <output class="wide" id="phong-light-field-status" role="status">Off. Opt in before starting an RGB still or Live job.</output>
-    <p class="wide">Automatically routes the real accumulated volume into Phong's existing glow input. This is undirected energy, not ray-bent reflections or a replacement for the photograph. Live replaces the volume each sweep; still exposures accumulate it. Nothing is accumulated a second time in the browser. Use the static, unrolled pose with Room B linked to Exposure A. Scene and camera edits hide old data.</p>
+    <output class="wide" id="phong-secondary-status" role="status">Three material passes run in the same frame after primary opaque visibility, followed by one display conversion. Sorted glass layers are retained.</output>
+    <p class="wide">Uses actual traced energy and propagation vectors in 12 geodesic directions by default, or 6 axis directions for comparison, plus material metadata. Twelve directions double the directional payload and sampling work. Spatial reconstruction interpolates energy-weighted moments where float filtering is supported; otherwise nearest sampling is reported above. Volumetric means the material's thickness, translucence and re-emission response, not invented atmospheric fog. This coarse field is not a lossless scene reflection or a replacement for the photograph. Fresh-population Live integrates successive source populations; older live fields replace each sweep. Still exposures accumulate their field. Older scalar fields retain glow only. Use the static, unrolled pose with Room B linked to Exposure A. Scene, stencil and camera edits hide old data.</p>
   </div>
   <h2>Live ray-traced camera</h2><div class="grid" id="live-ray-controls">
-    <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Replace the camera with live rays</label>
+    <label>Live display <select id="live-display-mode"><option value="overlay" selected>Ray-traced image overlay</option><option value="field-feed">Phong with continuous light-field feed (no ray overlay)</option></select></label>
+    <p class="wide">Field-feed mode keeps Phong and the selected field responses visible while the same live ray worker streams field bundles. It skips downloading the image overlay; the worker still computes sensor samples. Choose the receiving categories above.</p>
+    <label class="wide"><input type="checkbox" id="live-emitter-sampling"> Configure canonical emitter sampling</label>
+    <label>Source population ray budget<input type="number" id="live-emitter-ray-budget" min="128" max="65536" step="1" value="4096" disabled></label>
+    <label>Initial angular sampling seed<input type="number" id="live-emitter-seed" min="0" max="2147483647" step="1" value="42" disabled></label>
+    <label class="wide"><input type="checkbox" id="live-emitter-refresh" checked disabled> Refresh emitter angular samples each sweep</label>
+    <label class="wide"><input type="checkbox" id="live-field-internal-media"> Record traced paths inside optical media in the field (requires fresh Live populations)</label>
+    <p class="wide">Field-feed mode enables these controls. Fresh angular source populations are integrated into successive cumulative field updates. The seed changes canonical angular disk samples; emitter positions and the spectral band cycle stay fixed. The actual rounded source count must fit the forward-ray batch below. Changing sampling settings starts a replacement live job. No gain or targeting bias is added.</p>
+    <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Run live rays in the selected display mode</label>
     <output class="wide" id="live-status" role="status" aria-live="polite" style="white-space:normal;overflow-wrap:anywhere">Enable live rays to save the current static design, or save/load one manually.</output>
     <label>Ray history per pixel <output id="live-history-out">16</output><input id="live-history" type="range" min="1" max="2722" step="1" value="16"><input id="live-history-count" type="number" min="1" max="2722" step="1" value="16" aria-label="Exact live ray history per pixel"></label>
     <label>Forward rays per sensor sweep<input id="live-ray-batch" type="number" min="128" max="65536" step="1" value="8192" aria-describedby="live-batch-help"></label>
-    <p class="wide" id="live-batch-help">Actual total forward rays across the scene: 128–65,536. Lower batches respond faster; higher batches add more light-field samples. Changes apply at the next sensor-sweep boundary and reset accumulated history. The additive light field can also become brighter with a larger batch.</p>
+    <p class="wide" id="live-batch-help">Actual total forward rays across the scene: 128–65,536. Lower batches respond faster; higher batches add samples. This is distinct from the source population budget above. A complete normalized update must cover every actual source root. Changes apply at a sensor-sweep boundary and reset accumulated history; batch size is not a brightness control.</p>
     <label>Live longest edge<select id="live-resolution"><option value="128">128 pixels</option><option value="256" selected>256 pixels</option><option value="512">512 pixels</option><option value="768">768 pixels (cooperative)</option><option value="1024">1024 pixels (cooperative)</option><option value="2048">2048 pixels (cooperative)</option><option value="4096">4096 pixels (cooperative)</option></select></label>
     <output class="wide" id="live-history-memory" aria-live="polite"></output>
     <label class="wide"><input id="live-checkpoint" type="checkbox" checked> Keep evicted rays in a linear checkpoint</label>

@@ -53,7 +53,7 @@ function link(gl,sources) {
 }
 
 // Copy by declared GL type, never by numeric value (sampler types must not alias).
-export function copyPhongUniforms(gl,from,to) {
+export function copyPhongUniforms(gl,from,to,{allowInactive=false}={}) {
   const samplers=new Set(['SAMPLER_2D','SAMPLER_3D','SAMPLER_CUBE','SAMPLER_2D_SHADOW',
     'SAMPLER_2D_ARRAY','SAMPLER_2D_ARRAY_SHADOW','SAMPLER_CUBE_SHADOW','INT_SAMPLER_2D',
     'INT_SAMPLER_3D','INT_SAMPLER_CUBE','INT_SAMPLER_2D_ARRAY','UNSIGNED_INT_SAMPLER_2D',
@@ -76,6 +76,9 @@ export function copyPhongUniforms(gl,from,to) {
     for(let j=0;j<info.size;j++) {
       const name=info.size>1?info.name.replace('[0]',`[${j}]`):info.name,
         originalLocation=gl.getUniformLocation(from,name),location=gl.getUniformLocation(to,name);
+      // A canonical material variant may intentionally optimize a primary-only
+      // input away. ID capture remains strict; secondary shading opts in.
+      if(location===null&&allowInactive)continue;
       if(originalLocation===null||location===null)throw Error(`Cannot preserve active Phong uniform ${name}.`);
       const value=gl.getUniform(from,originalLocation);
       if(value===null)throw Error(`Cannot preserve active Phong uniform ${name}.`);

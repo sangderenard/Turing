@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {createLiveRayView,liveDimensions,liveHistoryLimit,MAX_LIVE_HISTORY_BYTES,LIVE_HISTORY_WARNING_BYTES} from "../examples/meowdoku/web/marble_live.js";
+import {createLiveRayView,liveDimensions,liveHistoryLimit,MAX_LIVE_HISTORY_BYTES,LIVE_HISTORY_WARNING_BYTES,liveEmitterSampling} from "../examples/meowdoku/web/marble_live.js";
 import {createPhotoBounceControls} from "../examples/meowdoku/web/marble_photo.js";
 const flush=async()=>{for(let i=0;i<100;i++)await Promise.resolve();};
 const defer=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {promise,resolve};};
@@ -33,6 +33,7 @@ function harness(options={}){
  $("live-history").value="16";$("live-resolution").value="128";$("preview-engine").value="visual";$("preview-motion").value="off";$("photo-bounces").value="4";$("photo-gamma").value="100";
  $("live-tint").value="0";$("live-normalization").value="auto99";$("live-normalization-white").value="1";$("photo-bounce-mode").value="manual";
  $("live-normalization-percentile").value="99";$("live-ray-batch").value="8192";
+ $("live-display-mode").value="overlay";$("live-emitter-ray-budget").value="4096";$("live-emitter-seed").value="42";$("live-emitter-refresh").checked=true;
  for(const [id,value] of Object.entries({exposure:0,whitebalance:0,saturation:100,vibrance:0,"black-point":0,"firefly-threshold":800,"firefly-strength":100}))$("live-"+id).value=String(value);
  $("photo-triangle-budget").value="250000";$("photo-sphere-coverage").value="mesh";
  createPhotoBounceControls(doc);
@@ -53,6 +54,44 @@ function harness(options={}){
   async enable(){api.saved(A);$("live-rays").checked=true;$("live-rays").fire("change");await flush();},
   async tick(){const entry=timers.entries().next().value;assert.ok(entry);timers.delete(entry[0]);entry[1]();await flush();},
   async close(){api.dispose();await flush();Object.assign(globalThis,saved);}};
+}
+{
+ const observations=[],connections=[],ticket={stencil:12,gridSize:64,region:'scene'};
+ const fieldView={capture:()=>ticket,connect:(...args)=>connections.push(args),observe:(...args)=>observations.push(args),invalidate(){},stop(){},revise(){}};
+ const h=harness({fieldView});try {
+  h.$('live-display-mode').value='field-feed';h.$('live-display-mode').fire('change');
+  assert(h.$('phong-light-field').checked);assert(h.$('live-emitter-sampling').checked);
+  h.$('live-field-internal-media').checked=true;
+  h.$('ray-surface-transport').checked=true;
+  await h.enable();assert(h.api.enabled);assert(h.api.fieldFeed);assert.equal(connections.length,1);assert.equal(observations.length,1);
+  assert.equal(h.$('live-ray-view').hidden,true);assert.equal(h.$('live-ray-view').style.opacity,'0');assert.equal(h.$('view').style.opacity,'');
+  assert(!h.requests.some(r=>r.url.startsWith('/api/marble_photo/image')));assert(!h.paints.includes('draw'));
+  const body=h.requests.find(r=>r.url==='/api/marble_photo').options.body;
+  const config=JSON.parse(new TextDecoder().decode(new Uint8Array(body,16,new DataView(body).getUint32(4,true))));
+  assert.deepEqual(config.emitter_sampling,{version:1,ray_budget:4096,seed:42,refresh_each_sweep:true});assert.equal(config.receive_light_field,true);
+  assert.equal(config.light_field_internal_media,true);
+  assert.equal(config.surface_transport,'studio-pbr-mixture-v1');
+  await h.tick();assert.equal(observations.length,2);assert.equal(h.requests.filter(r=>r.url==='/api/marble_photo').length,1);
+  assert.match(h.$('live-status').textContent,/worker still computes sensor samples/);
+  assert.match(h.$('live-status').textContent,/No receiving categories.*ordinary primary Phong/);
+  for(const name of ['subject','stage','room'])assert.equal(h.$(`phong-field-${name}`).checked,false,'field-feed never silently opts categories in');
+  h.$('live-display-mode').value='overlay';h.$('live-display-mode').fire('change');await h.tick();assert(h.paints.includes('draw'));
+  h.$('live-display-mode').value='field-feed';h.$('live-display-mode').fire('change');await h.tick();
+  assert.equal(h.requests.filter(r=>r.url==='/api/marble_photo').length,1,'display-only mode changes keep the same captured worker');
+  assert.equal(h.$('live-ray-view').hidden,true);
+  h.$('live-emitter-ray-budget').value='127';assert.throws(()=>liveEmitterSampling(h.doc),/budget/);
+  h.$('live-emitter-ray-budget').value='4096';h.$('live-emitter-seed').value='2147483648';assert.throws(()=>liveEmitterSampling(h.doc),/seed/);
+ }finally{await h.close();}
+}
+{
+ const fieldView={capture:()=>({stencil:12,gridSize:64,region:'scene'}),connect(){},observe(){},invalidate(){},stop(){},revise(){}};
+ const h=harness({fieldView}),image=defer();try {
+  h.$('live-emitter-sampling').checked=true;
+  h.hook=r=>r.url.startsWith('/api/marble_photo/image')?image.promise:null;
+  await h.enable();h.$('live-display-mode').value='field-feed';h.$('live-display-mode').fire('change');
+  image.resolve(reply({}));await flush();assert(!h.paints.includes('draw'),'late image cannot cover field-feed Phong');
+  assert.equal(h.$('live-ray-view').hidden,true);
+ }finally{image.resolve(reply({}));await h.close();}
 }
 {
  const h=harness();try{

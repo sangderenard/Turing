@@ -317,12 +317,17 @@ class DiscreteFluid:
             m_over_rho = (self.m[pj] / self.rho[pj])
             w = W * m_over_rho
 
-            rho[pi]  += self.m[pj] * W
-            denom[pi] += w
-            P[pi]    += self.P[pj] * w
-            T[pi]    += self.T[pj] * w
-            S[pi]    += self.S[pj] * w
-            v[pi]    += self.v[pj] * w[:, None]
+            # A query has one repeated pi for every supporting particle.
+            # Advanced-index += keeps only the last neighbor: two equal
+            # particles gave half the density and 320 K instead of the
+            # 280/320 K mean. Scatter-add every contribution, as the SPH
+            # reconstruction requires, including the normalization weight.
+            np.add.at(rho, pi, self.m[pj] * W)
+            np.add.at(denom, pi, w)
+            np.add.at(P, pi, self.P[pj] * w)
+            np.add.at(T, pi, self.T[pj] * w)
+            np.add.at(S, pi, self.S[pj] * w)
+            np.add.at(v, pi, self.v[pj] * w[:, None])
 
         eps = 1e-12
         denom = np.maximum(denom, eps)

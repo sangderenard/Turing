@@ -17,6 +17,9 @@ export function objectSnapshotKey(snapshot) {
 
 export async function prepareObjectSnapshot(captured) {
   const value=structuredClone(captured),{design,materials}=value;
+  // Identity of the captured editable state, before canonical optical rows and
+  // derived mesh receipts are added. Keep this local, outside the saved value.
+  const authoringKey=objectSnapshotKey(value);
   if(design.optical_authoring?.legacy_pbr)restoreOpticalSurfaceRows(value);
   if(design["base-shape"]==="obj")await ensureObjAsset(design.source_asset);
   const ids=materialIdsForDesign(design,materials.index,materials.extra),pbr=materials.tables.pbr;
@@ -34,5 +37,5 @@ export async function prepareObjectSnapshot(captured) {
     design.mesh_lods[detail]=geometry.imported?value.geometry_sha256:await geometrySha256(buildMarbleObjectGeometry(design,ids,{detail}));
   value.derived=massFromSavedMarbleObject(value,geometry);
   await verifySavedMarbleObject(value);
-  return {value,geometry};
+  return {value,geometry,authoringKey};
 }

@@ -18,6 +18,24 @@ def test_large_and_supersampled_config(photo_payload):
     assert auto['camera']['width']==8001 and auto['tiled']=={'tile_size':1024}
 
 
+def test_uniform_sample_target_is_owned_config(photo_payload):
+    store,digest,v,n,ids=photo_payload
+    _,_,_,config,_=photos.decode_upload(_wire(digest,v,n,ids,transport='fixed:3',
+        samples_per_output_pixel=64,oversampling=2),store,SPEC)
+    assert config['samples_per_output_pixel']==64
+    assert config['tiled']=={'tile_size':1024}
+    assert photos._tile_contract(str(SPEC)).tile_plan(config)['target_samples_per_pixel']==16
+    _,_,_,legacy,_=photos.decode_upload(_wire(digest,v,n,ids,transport='fixed:3'),store,SPEC)
+    assert 'samples_per_output_pixel' not in legacy and 'tiled' not in legacy
+
+
+@pytest.mark.parametrize('target',[None,True,0,-1,1.5,'64',65537])
+def test_bad_uniform_sample_target_rejected(photo_payload,target):
+    store,digest,v,n,ids=photo_payload
+    with pytest.raises(photos.PhotoError,match='samples_per_output_pixel'):
+        photos.decode_upload(_wire(digest,v,n,ids,transport='fixed:3',samples_per_output_pixel=target),store,SPEC)
+
+
 @pytest.mark.parametrize('options',[
  {'transport':'fixed:1','camera':{'resolution':8192}},
  {'transport':'fixed:3','camera':{'resolution':8192},'client_intersections':True},

@@ -1,7 +1,9 @@
 """Bounded Node scene-product worker and existing ray-job commit seam.
 
-The existing HTTP/Nodus owner supplies authorization and account scope. This
-module starts no listener, browser, renderer, queue or independent job store.
+The existing HTTP/Nodus owner supplies authorization and account scope.
+By default this module starts no listener, browser, renderer or job store.
+An explicitly configured phong_host additionally admits render-captured PNG
+products through the same authorized dispatch, never through ray-job commit.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ class StudioAgentError(ValueError):
 def product_bytes(product: dict, *, content_type: str | None = None) -> bytes:
     if not isinstance(product, dict) or set(product) != {"content_type", "encoding", "sha256", "blob"}:
         raise StudioAgentError("Invalid Studio product envelope")
-    if product["content_type"] not in ("application/json", "application/octet-stream") or product["encoding"] != "base64":
+    if product["content_type"] not in ("application/json", "application/octet-stream", "image/png") or product["encoding"] != "base64":
         raise StudioAgentError("Unsupported Studio blob format")
     if content_type is not None and product["content_type"] != content_type:
         raise StudioAgentError("Wrong Studio product type")
@@ -40,7 +42,7 @@ def product_bytes(product: dict, *, content_type: str | None = None) -> bytes:
 
 
 class StudioAgentProducts:
-    def __init__(self, assets: Path, *, defaults: Path | None = None, node: str | None = None, timeout: float = 60):
+    def __init__(self, assets: Path, *, defaults: Path | None = None, node: str | None = None, timeout: float = 60, phong_host=None):
         self.assets = Path(assets).resolve(strict=True)
         self.defaults = Path(defaults).resolve(strict=True) if defaults is not None else None
         self.node = node or shutil.which("node")
@@ -49,13 +51,23 @@ class StudioAgentProducts:
         if not 0 < timeout <= 120:
             raise StudioAgentError("Invalid Studio worker timeout")
         self.timeout = timeout
+        self.phong_host = phong_host
 
     def build(self, request: dict) -> dict:
-        """Pure product preparation. Safe inside an authorized Nodus dispatch.
+        """Product preparation inside an authorized Nodus dispatch.
 
-        No ray job is submitted here, even for a ray-payload request. Timeout
-        cannot leave an exposure running because this worker never starts one.
+        No ray job is submitted here. render-captured uses the optional bounded
+        software-WebGL host; scene/ray-payload remain the pure Node builder.
         """
+        if isinstance(request, dict) and request.get("operation") == "render-captured":
+            if (set(request) != {"schema", "operation", "camera"} or
+                    request.get("schema") != "turing.studio-agent-request.v1"):
+                raise StudioAgentError("render-captured accepts only schema, operation and camera; no settings override")
+            if self.phong_host is None:
+                raise StudioAgentError("This host has no trusted captured Studio Phong scene")
+            product = self.phong_host.render(request["camera"])
+            product_bytes(product, content_type="image/png")
+            return product
         raw = json.dumps(request, allow_nan=False, separators=(",", ":")).encode()
         if len(raw) > MAX_BYTES:
             raise StudioAgentError("Studio request exceeds byte budget")

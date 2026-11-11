@@ -173,7 +173,12 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   if (!Number.isInteger(config.oversampling) || config.oversampling < 1 || config.oversampling > 4)
     throw new RangeError("Oversampling must be an integer multiplier from 1 to 4.");
-  const tiled = config.oversampling > 1 || options.tiled !== undefined || config.camera.width !== undefined || config.camera.height !== undefined ||
+  if (options.samplesPerOutputPixel !== undefined) {
+    if (!Number.isInteger(options.samplesPerOutputPixel) || options.samplesPerOutputPixel < 1 || options.samplesPerOutputPixel > 65536)
+      throw new RangeError("Samples per output pixel must be an integer from 1 to 65536.");
+    config.samples_per_output_pixel = options.samplesPerOutputPixel;
+  }
+  const tiled = config.oversampling > 1 || options.samplesPerOutputPixel !== undefined || options.tiled !== undefined || config.camera.width !== undefined || config.camera.height !== undefined ||
     ![128,256,512,768,1024,2048,4096].includes(config.camera.resolution);
   if (tiled) {
     if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || options.live || options.clientIntersections)
@@ -191,13 +196,52 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
+  if(options.surfaceTransport!==undefined) {
+    if(options.surfaceTransport!=='studio-pbr-mixture-v1')throw new RangeError('Unsupported surface transport.');
+    if(config.transport!=='fixed:3')throw new RangeError('Corrected opaque PBR transport requires RGB rays.');
+    config.surface_transport=options.surfaceTransport;
+  }
+  if(options.emitterSampling!==undefined) {
+    const sampling=options.emitterSampling;
+    if(!sampling||sampling.version!==1||Object.keys(sampling).some(k=>!['version','ray_budget','seed','refresh_each_sweep'].includes(k))||
+        !Number.isSafeInteger(sampling.ray_budget)||sampling.ray_budget<128||sampling.ray_budget>65536||
+        !Number.isSafeInteger(sampling.seed)||sampling.seed<0||sampling.seed>2147483647||typeof sampling.refresh_each_sweep!=='boolean')
+      throw new RangeError('Invalid canonical emitter sampling settings.');
+    if(sampling.refresh_each_sweep&&(!options.live||!options.receiveLightField||config.transport!=='fixed:3'))
+      throw new RangeError('Fresh source populations require Live RGB field reception.');
+    config.emitter_sampling=structuredClone(sampling);
+  }
+  if(options.lightFieldInternalMedia!==undefined) {
+    if(typeof options.lightFieldInternalMedia!=='boolean')throw new TypeError('lightFieldInternalMedia must be a boolean.');
+    if(options.lightFieldInternalMedia&&(!options.live||!options.receiveLightField||!options.emitterSampling?.refresh_each_sweep))
+      throw new RangeError('Internal medium field recording requires fresh Live field populations.');
+    if(options.lightFieldInternalMedia)config.light_field_internal_media=true;
+  }
   if (options.receiveLightField !== undefined && typeof options.receiveLightField !== "boolean")
     throw new TypeError("receiveLightField must be a boolean.");
   if (options.receiveLightField) {
     if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || tiled || options.cameraPoses)
       throw new RangeError("Forward-field reception requires one ordinary RGB still or Live camera.");
     config.receive_light_field = true;
+    const stencil=options.lightFieldStencil??12;
+    if(!Number.isInteger(stencil)||![6,12].includes(stencil))throw new RangeError('Light field stencil must be 6 or 12.');
+    config.light_field_stencil=stencil;
+    const grid=options.lightFieldGridSize??64;
+    if(!Number.isInteger(grid)||![32,64].includes(grid))throw new RangeError('Light field grid must be 32 or 64.');
+    config.light_field_grid_size=grid;
+    config.light_field_estimator='track-length-root-sweep-v1';
+    if(options.lightFieldRegion!==undefined) {
+      if(options.lightFieldRegion!=='subject')throw new RangeError('Only bounded subject recording is supported.');
+      const pitch=options.lightFieldCellSizeM??.0005,margin=options.lightFieldMarginM??.001;
+      if(typeof pitch!=='number'||!Number.isFinite(pitch)||pitch<.00005||pitch>.01)throw new RangeError('Subject cell size must be between 0.05 and 10 mm.');
+      if(typeof margin!=='number'||!Number.isFinite(margin)||margin<0||margin>.032)throw new RangeError('Subject margin must be between 0 and 32 mm.');
+      config.light_field_region='subject';config.light_field_cell_size_m=pitch;config.light_field_margin_m=margin;
+      delete config.light_field_grid_size; // Exact pitch and subject bounds determine the smallest supported cube.
+    } else if(options.lightFieldCellSizeM!==undefined||options.lightFieldMarginM!==undefined)
+      throw new RangeError('Physical cell size and margin require bounded subject recording.');
   }
+  else if(options.lightFieldStencil!==undefined||options.lightFieldGridSize!==undefined||options.lightFieldRegion!==undefined||options.lightFieldCellSizeM!==undefined||options.lightFieldMarginM!==undefined)
+    throw new RangeError('Light field options require field reception.');
   if(config.camera.camera_back){
     let aspect=(config.camera.width??config.camera.resolution)/(config.camera.height??config.camera.resolution);
     // Live's existing shader uses the viewport aspect; its integer pixel grid
@@ -712,7 +756,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       status(state.retouchError || (value.tiled ? (value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
         value.state === "complete" ? `Tiled photo complete · ${value.tiled.output_width} × ${value.tiled.output_height} · ${value.tiled.completed_tiles} tiles` :
         value.state === "assembling" ? `Assembling ${value.tiled.output_width} × ${value.tiled.output_height} photo from linear HDR tiles…` :
-        `Tiled photo · ${value.tiled.completed_tiles}/${value.tiled.total_tiles} tiles complete · ${value.tiled.exposure_seconds_per_tile} s per tile`) : value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
+        `Tiled photo · ${value.tiled.completed_tiles}/${value.tiled.total_tiles} tiles complete · ${value.tiled.target_samples_per_output_pixel ? `${value.tiled.target_samples_per_output_pixel} samples per output pixel (requested ${value.tiled.requested_samples_per_output_pixel})` : `${value.tiled.exposure_seconds_per_tile} s per tile`}`) : value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
             value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
@@ -752,7 +796,10 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     const objectDigest = state.objectDigest;
     const fieldTicket = fieldView?.capture({saved:!snapshotEnabled});
     const options = {
+      ...($('ray-surface-transport')?.checked?{surfaceTransport:'studio-pbr-mixture-v1'}:{}),
       receiveLightField:!!fieldTicket,
+      ...(fieldTicket?{lightFieldStencil:fieldTicket.stencil,lightFieldGridSize:fieldTicket.gridSize}:{}),
+      ...(fieldTicket?.region==='subject'?{lightFieldRegion:'subject',lightFieldCellSizeM:fieldTicket.cellSizeM,lightFieldMarginM:fieldTicket.marginM}:{}),
       resolution: $("photo-resolution").value === "custom" ? 256 : +$("photo-resolution").value,
       ...($("photo-resolution").value === "custom" ? {width:+$("photo-width").value, height:+$("photo-height").value} : {}),
       seconds: +$("photo-seconds").value,

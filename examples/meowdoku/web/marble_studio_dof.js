@@ -120,13 +120,16 @@ export function createStudioDof(gl,{samples=4,maxRadius=64}={}) {
     finally{gl.bindFramebuffer(gl.READ_FRAMEBUFFER,read);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,draw);gl.bindRenderbuffer(gl.RENDERBUFFER,rb);restoreTextures(tex);}
   }
   return {
-    begin(width,height){
+    begin(width,height,{singleSample=false}={}){
       if(disposed||pending||gl.isContextLost())throw new Error("DOF renderer is not available");
       if(!Number.isInteger(width)||!Number.isInteger(height)||width<1||height<1||Math.max(width,height)>gl.getParameter(gl.MAX_TEXTURE_SIZE))throw new Error("Invalid DOF image size");
       if(!p){p=program(gl);vao=gl.createVertexArray();}
       if(!target||target.w!==width||target.h!==height){const next=allocate(width,height);release(target);target=next;}
-      pending={read:gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),draw:gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING)};
-      gl.bindFramebuffer(gl.FRAMEBUFFER,target.msFbo||target.fbo);
+      // A secondary linear renderer resolves color and copies opaque depth to
+      // this target. WebGL forbids single-sample -> multisample depth blits.
+      pending={read:gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),draw:gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING),
+        multisample:!!target.msFbo&&!singleSample};
+      gl.bindFramebuffer(gl.FRAMEBUFFER,pending.multisample?target.msFbo:target.fbo);
     },
     finish(camera,{unitM,near,far}){
       if(!pending)throw new Error("DOF frame has not begun");
@@ -135,7 +138,7 @@ export function createStudioDof(gl,{samples=4,maxRadius=64}={}) {
         depthMask:gl.getParameter(gl.DEPTH_WRITEMASK),colorMask:gl.getParameter(gl.COLOR_WRITEMASK),caps:caps.map(x=>gl.isEnabled(x)),textures:textureState()};
       try {
         const params=dofParameters(camera,{unitM,near,far,height:target.h,maxRadius});
-        if(target.msFbo){gl.bindFramebuffer(gl.READ_FRAMEBUFFER,target.msFbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,target.fbo);
+        if(original.multisample){gl.bindFramebuffer(gl.READ_FRAMEBUFFER,target.msFbo);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,target.fbo);
           gl.disable(gl.SCISSOR_TEST);gl.blitFramebuffer(0,0,target.w,target.h,0,0,target.w,target.h,gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT,gl.NEAREST);}
         gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,original.draw);gl.viewport(0,0,target.w,target.h);
         caps.forEach(x=>gl.disable(x));gl.depthMask(false);gl.colorMask(true,true,true,true);
@@ -144,7 +147,7 @@ export function createStudioDof(gl,{samples=4,maxRadius=64}={}) {
         gl.uniform2f(gl.getUniformLocation(p,"uSize"),target.w,target.h);gl.uniform2f(gl.getUniformLocation(p,"uClip"),near,far);
         gl.uniform4f(gl.getUniformLocation(p,"uOptics"),unitM,params.focus,params.aperture*params.pixelScale,maxRadius);
         gl.drawArrays(gl.TRIANGLES,0,3);
-        return {samples:target.samples,diskSamples:48,maxRadius,depthMode:"opaque",colorMode:"display-linearized",...params};
+        return {samples:original.multisample?target.samples:0,diskSamples:48,maxRadius,depthMode:"opaque",colorMode:"display-linearized",...params};
       }finally{
         gl.bindFramebuffer(gl.READ_FRAMEBUFFER,original.read);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,original.draw);
         gl.useProgram(saved.program);gl.bindVertexArray(saved.vao);gl.viewport(...saved.viewport);gl.depthMask(saved.depthMask);gl.colorMask(...saved.colorMask);

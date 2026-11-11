@@ -1,4 +1,4 @@
-import {computeStudioFixtureRoles,buildStudioFixtureFaces,createStudioSceneGeometry,buildStudioPhotoFixtures,initializeStudioFixtureRows} from './studio_scene_builder.js';
+import {STUDIO_SCENE_PART_GROUP,computeStudioFixtureRoles,buildStudioFixtureFaces,createStudioSceneGeometry,buildStudioPhotoFixtures,initializeStudioFixtureRows} from './studio_scene_builder.js';
 // Reuse the server loading panel; its boot hold covers Studio asset/GPU setup.
 import "./loading_panel.js";
 import {ensureObjAsset, importedMechanics} from "./marble_imported_object.js";
@@ -16,6 +16,8 @@ import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
 import { createLiveRayView } from "./marble_live.js";
 import {createStudioLightField} from "./marble_light_field.js";
+import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
+import {createStudioSecondaryField,secondaryFieldFragment} from "./marble_secondary_field.js";
 import { createObjectAutosave } from "./marble_autosave.js";
 import { prepareObjectSnapshot, objectSnapshotKey } from "./marble_object_snapshot.js";
 import { downloadMarbleObject } from "./marble_downloads.js";
@@ -40,6 +42,7 @@ import {restoreOpticalSurfaceRows,prepareOpticalSnapshot} from "./marble_optical
 import {packStudioScene,writeStudioFixtureRows} from "./marble_studio_scene.js";
 import {stageStudioPhong} from "./marble_studio_phong.js";
 import {createStudioDof,dofCameraFromView} from "./marble_studio_dof.js";
+import {mountPhongCapture} from "./marble_phong_capture.js";
 import {mountStudioCameraToolbox} from "./marble_camera_toolbox_mount.js";
 import {PhotographicCameraBinding,mountPhotographicCameraBinding,linkedPhotoOrbit,studioDisplayedSubjectCenter} from "./marble_camera_binding.js";
 
@@ -47,7 +50,7 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
 let opticalControls = null;
-let liveRay = null, lightField = null;
+let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null, fieldMaskFallback = null;
 // A late-bound facade lets existing photo controls start before WebGL setup.
 const fieldView={capture:context=>lightField?.capture(context),connect:(...args)=>lightField?.connect(...args),
   observe:(...args)=>lightField?.observe(...args),invalidate:()=>lightField?.invalidate(),stop:digest=>lightField?.stop(digest),
@@ -57,7 +60,7 @@ document.addEventListener("studio-lens-change", () => liveRay?.cameraChanged());
 let studioSceneRevision=0,lastStudioFrame=null;
 // Conservative edit revision catches an edit and reversal during a hidden
 // bake. Exact captured data is still compared before ownership transfers.
-for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox'))studioSceneRevision++;},true);
+for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories'))studioSceneRevision++;},true);
 let suppliedSubjectAsset=null;
 let objectAutosave=null, savedObjectSnapshot=null, objectKey="", objectEditQueued=false, applyingObject=false, objectLoadIntent=0;
 // Keep the ray-traced photo's "Current Studio orbit and zoom" camera option
@@ -85,6 +88,7 @@ const photographicCameraControls=mountPhotographicCameraBinding({doc:document,bi
 // presented and cleared -- when the drawing buffer is preserved.
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false, preserveDrawingBuffer: true });
 const studioDof=gl?createStudioDof(gl):null;
+const phongCapture=mountPhongCapture({doc:document,canvas,gl});
 let lastDofOptics=null;
 function dofStatus(text){const out=$("studio-dof-status");if(out&&out.textContent!==text)out.textContent=text;}
 if (!gl) message.textContent = "WebGL 2 is required for this studio";
@@ -164,7 +168,8 @@ function mesh(faces) {
     else gl.vertexAttribPointer(index, 3, gl.FLOAT, false, 0, 0);
   }
   gl.bindVertexArray(null);
-  return { vao, buffers, count: pos.length/3 };
+  const categories=faces.map(face=>face.sceneCategory??null);
+  return { vao, buffers, count: pos.length/3, categories, categoryRuns:fieldCategoryRuns(categories) };
 }
 function dispose(mesh) {
   if (!mesh) return;
@@ -178,15 +183,19 @@ function transparentMesh(faces) {
   gl.bindVertexArray(null);
   return result;
 }
-function drawTransparent(result,modelView) {
+function drawTransparent(result,modelView,setCategory=null) {
   gl.bindVertexArray(result.vao);
   const axis=[modelView[2],modelView[6],modelView[10]];
   if(!result.sortAxis||axis.some((v,k)=>v!==result.sortAxis[k])) {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,result.indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,transparentTriangleOrder(result.centres,modelView),gl.DYNAMIC_DRAW);
+    const order=transparentTriangleOrder(result.centres,modelView);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,order,gl.DYNAMIC_DRAW);
+    result.sortedCategoryRuns=fieldCategoryRuns(result.categories,order);
     result.sortAxis=axis;
   }
-  gl.drawElements(gl.TRIANGLES,result.count,gl.UNSIGNED_INT,0);
+  if(setCategory)for(const run of result.sortedCategoryRuns) {
+    setCategory(run.category);gl.drawElements(gl.TRIANGLES,run.count,gl.UNSIGNED_INT,run.first*4);
+  } else gl.drawElements(gl.TRIANGLES,result.count,gl.UNSIGNED_INT,0);
 }
 function digitFaces(char, center, dir, scale, materialId) {
   const g=glyphMeshes[char];
@@ -441,7 +450,7 @@ async function loadObject() {
   } finally {applyingObject=false;}
   objectKey=objectSnapshotKey(captureObjectSnapshot());
   if(verified) {
-    acceptSavedObject({digest},{value,geometry});
+    acceptSavedObject({digest},{value,geometry,authoringKey:objectKey});
     objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
   } else {
     objectKey="";objectEdited();
@@ -691,7 +700,8 @@ function fieldSceneKey({saved=false}={}) {
       rollState?.orientation.some((v,i)=>v!==[1,0,0,0][i])||rollState?.position.some(v=>v!==0))
     throw Error("Use the static, unrolled Studio pose to receive its ray field.");
   if(!studioLighting||!lastGeometry)throw Error("Studio scene is not ready.");
-  if(saved&&(!savedObjectSnapshot||objectSnapshotKey(savedObjectSnapshot.value)!==objectKey))
+  if(saved&&(!savedObjectSnapshot||savedObjectSnapshot.authoringKey!==objectKey||
+      savedObjectSnapshot.authoringKey!==objectSnapshotKey(captureObjectSnapshot())))
     throw Error("Save the current object before receiving its field.");
   const a=studioBuilderLighting("exposure"),b=studioBuilderLighting("studio");
   // Ignore only authoring metadata, not resolved geometry or materials. The
@@ -705,6 +715,30 @@ function fieldSceneKey({saved=false}={}) {
   if(profile(subject)!==profile(current))throw Error("The displayed subject size differs from the captured ray scene.");
   return JSON.stringify([objectKey,profile(a),studioLighting.strengths.getSolo("exposure"),
     yaw,pitch,distance,subject.unitM,subject.subjectCenter]);
+}
+let fieldMaterialProjection=null;
+function fieldMaterialRows() {
+  const data=new Float32Array(tables.pbr.data),stride=tables.pbr.table.floats_per_record;
+  const {roleColor,roleStrength}=computeFixtureRoles(undefined,"studio");
+  writeStudioFixtureRows(data,stride,FIXTURE_MAT_BASE,roleColor,roleStrength);
+  writeShopLightEmitterRows(data,stride,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,shopLightState("studio"),{profiles:shopEmissionProfiles});
+  // Lookup identity follows the same opt-in projection used by saved/ray
+  // snapshots. Never install these projected rows in the preview material
+  // texture. Keep raw rows too: edits hidden by that projection still stale a
+  // received field. Geometry membership is inspected only on a cache miss.
+  const previous=fieldMaterialProjection;
+  if(!previous||previous.key!==objectKey||previous.revision!==studioSceneRevision||previous.geometry!==lastGeometry||previous.stride!==stride||
+      previous.data.length!==data.length||data.some((v,i)=>!Object.is(v,previous.data[i]))) {
+    const design=readSubjectDesign(),optical=opticalControls?.capture(lastGeometry);
+    const pbr={data:Array.from(data),stride};
+    if(optical) {
+      prepareOpticalSnapshot({design:{...design,optical_authoring:optical},materials:{tables:{pbr}},
+        physical:{'radius-mm':Number($('radius-mm').value)}},lastGeometry,ids[design.shell]);
+    }
+    fieldMaterialProjection={key:objectKey,revision:studioSceneRevision,geometry:lastGeometry,stride,data,
+      lookupData:new Float32Array(pbr.data)};
+  }
+  return {data,stride,lookupData:fieldMaterialProjection.lookupData};
 }
 function studioBuilderOptions(channel="studio",saved=false) {
   return {lighting:studioBuilderLighting(channel),subject:studioSubjectTransform(saved,channel),geometrySubject:studioSubjectTransform(false,channel),
@@ -785,7 +819,8 @@ function rebuildStandMeshes(fixtureRoles) {
     material===undefined?null:[read("pbr",material,5),read("pbr",material,7)]]);
   if(key===standMeshKey)return;
   const opaque=[],transparent=[];
-  for(const face of [...lightStandFacesForStudio("studio",fixtureRoles),...backdropSupportFacesForStudio("studio")])
+  for(const face of [...withSceneCategory(lightStandFacesForStudio("studio",fixtureRoles),STUDIO_SCENE_PART_GROUP.lightStand),
+    ...withSceneCategory(backdropSupportFacesForStudio("studio"),STUDIO_SCENE_PART_GROUP.backdropHolder)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:transparent).push(face);
   dispose(standOpaque);dispose(standGlass);standOpaque=mesh(opaque);standGlass=transparentMesh(transparent);
   standTransparentFaces=transparent;standMeshKey=key;sceneGlassKey=null;
@@ -808,7 +843,7 @@ function rebuildShopMeshes() {
     materials.map(id=>id===undefined?null:[read("pbr",id,5),read("pbr",id,7)])]);
   if(key===shopMeshKey)return shopGeometry;
   const geometry=shopLightGeometryForStudio(),opaque=[],transparent=[];
-  for(const face of geometry.faces)
+  for(const face of withSceneCategory(geometry.faces,STUDIO_SCENE_PART_GROUP.shopLight))
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:transparent).push(face);
   dispose(shopOpaque);dispose(shopGlass);shopOpaque=mesh(opaque);shopGlass=transparentMesh(transparent);
   shopTransparentFaces=transparent;shopMeshKey=key;shopGeometry=geometry;sceneGlassKey=null;
@@ -818,7 +853,8 @@ function rebuildTable() {
   dispose(tableOpaque); const opaque=[]; tableTransparentFaces=[];
   // Free-standing gobos share the existing furniture partition and world-space
   // glass sort, including when their front and back use different materials.
-  for(const face of [...tableFaces(),...goboFaces()])
+  for(const face of [...withSceneCategory(tableFaces(),STUDIO_SCENE_PART_GROUP.table),
+    ...withSceneCategory(goboFaces(),STUDIO_SCENE_PART_GROUP.gobo)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:tableTransparentFaces).push(face);
   tableOpaque=mesh(opaque); sceneGlassKey=null;
 }
@@ -835,7 +871,7 @@ function transparentSet(model) {
     };
     const faces=marbleTransparentFaces.map(([a,b,c,id,ns,gid=0])=>
       [transformPoint(model,a),transformPoint(model,b),transformPoint(model,c),id,ns.map(normal),gid]);
-    dispose(sceneGlass); sceneGlass=transparentMesh([...tableTransparentFaces,...standTransparentFaces,...shopTransparentFaces,...faces]); sceneGlassKey=key;
+    dispose(sceneGlass); sceneGlass=transparentMesh([...tableTransparentFaces,...standTransparentFaces,...shopTransparentFaces,...withSceneCategory(faces,'subject')]); sceneGlassKey=key;
   }
   return sceneGlass;
 }
@@ -982,7 +1018,7 @@ function controls() {
   const skipPhotoInvalidation=new Set(["object-name","saved-object","obj-asset","obj-file","obj-mtl","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
-    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls'))return;
+    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls'))return;
     if(event.target.closest?.('#photo-camera-binding'))return;
     if(applyingObject||event.target.closest("#optical-material-controls")||event.target.closest("#room-profile-overrides")||event.target.closest("#live-ray-controls")||event.target.id==="object-autosave")return;
     if(event.target.id==="object-name"){objectEdited();return;}
@@ -1295,11 +1331,22 @@ function frame(now=0) {
   }
   const w=Math.max(1,Math.round(canvas.clientWidth*devicePixelRatio)), h=Math.max(1,Math.round(canvas.clientHeight*devicePixelRatio));
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
-  let dofActive=false;
-  if(P&&interior&&$("studio-dof")?.checked)try{studioDof.begin(w,h);dofActive=true;}
+  let dofActive=false,secondaryActive=false;
+  const ordinaryPrimary=P;
+  const wantsSecondary=!!(P&&interior&&secondaryField&&lightField?.hasDirectional&&lightField?.hasReceivers&&$("phong-field-secondary")?.checked);
+  if(P&&interior&&$("studio-dof")?.checked)try{studioDof.begin(w,h,{singleSample:wantsSecondary});dofActive=true;}
   catch(error){$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
   try {
-  gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(wantsSecondary) {
+    P=fieldPrimary;
+    secondaryActive=secondaryField.begin(w,h);
+  }
+  gl.viewport(0,0,w,h);
+  // Inverse of the canonical display curve for the existing backdrop only.
+  // It must be linear before glass blends over it; no radiance is normalized.
+  if(secondaryActive)gl.clearColor(0.007880049518042097,0.014670364583228053,0.023430969800125,1);
+  else gl.clearColor(0.035,0.075,0.12,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
     const follow=isMarbleChase();
     let cameraDistance=simOn?Math.max(distance,7):distance;
@@ -1346,9 +1393,36 @@ function frame(now=0) {
     const viewFovDegrees=dofCamera.fov_degrees;
     const clip=studioCameraClip(subject,cameraDistance,studioRoomBounds(studioRoomScale(),studioFloorDrop()),studioOrbitTarget);
     const viewFar=simOn?30:clip.far,viewNear=chase?Math.min(.01,chase.radius*.2):simOn ? .01 : clip.near;
-    const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
-      gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h,viewFovDegrees,
+    let drawingProgram=P;
+    const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(drawingProgram,"uMV"),false,matrix);
+      gl.uniformMatrix4fv(loc(drawingProgram,"uMVP"),false,multiply(perspective(w/h,viewFovDegrees,
         viewFar,viewNear),matrix)); };
+    const opaqueDraws=[],transparentDraws=[];
+    let scalarFieldActive=false;
+    const setFieldCategory=category=>{
+      const enabled=fieldCategoryEnabled(lightField?.categoryMask??0,category);
+      integer(drawingProgram,"uFieldCategoryDisabled",Number(!enabled));
+      if(!secondaryActive)field(drawingProgram,"uFieldGain",Number(scalarFieldActive&&enabled));
+    };
+    const drawOwnedMesh=(resource,category=null)=>{
+      gl.bindVertexArray(resource.vao);
+      if(secondaryActive||scalarFieldActive)for(const run of resource.categoryRuns) {
+        setFieldCategory(run.category??category);gl.drawArrays(gl.TRIANGLES,run.first,run.count);
+      } else gl.drawArrays(gl.TRIANGLES,0,resource.count);
+    };
+    const drawOwnedTransparent=(resource,matrix,category=null)=>drawTransparent(resource,matrix,
+      secondaryActive||scalarFieldActive?group=>setFieldCategory(group??category):null);
+    const drawOpaqueMesh=(resource,matrix,emissionDirect=false,category=null)=>{
+      if(!resource?.count)return;
+      setTransform(matrix);drawOwnedMesh(resource,category);
+      if(secondaryActive)opaqueDraws.push({resource,matrix,emissionDirect,category});
+    };
+    const drawGlassMesh=(resource,matrix,sorted=true,category=null)=>{
+      if(!resource?.count)return;
+      if(secondaryActive){transparentDraws.push({resource,matrix,sorted,category});return;}
+      setTransform(matrix);if(sorted)drawOwnedTransparent(resource,matrix,category);
+      else drawOwnedMesh(resource,category);
+    };
     setTransform(mv);
     // Real room fixtures, each a fixed scene object nailed in place in the
     // room, exactly like the checkerboard backdrop/floor -- none of them
@@ -1405,9 +1479,13 @@ function frame(now=0) {
       gl.uniform2fv(loc(P,`uLightSpotCone[${i}]`),lightSpotCone[i]);
     }
     field(P,"uLightCalibration",1); field(P,"uExposure",1); field(P,"uFieldGain",0);
-    lightField?.bind(P,view,subject.unitM,OBJECT_CENTER);
+    if(!secondaryActive&&lightField?.hasReceivers)scalarFieldActive=lightField.bind(P,view,subject.unitM,OBJECT_CENTER);
     field(P,"uAmbientFloorGain",0); // no invisible indirect-light floor: pure emitter lighting only
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
+    if(secondaryActive) {
+      if(!lightField.bindMaterialMask(P,fieldMaskFallback,view,subject.unitM,OBJECT_CENTER))throw Error('Directional material identity became stale.');
+      integer(P,"uFieldReplaceSpecular",Number(!$("phong-field-specular")?.checked));
+    }
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
     integer(P,"uThermalEmission",0); field(P,"uThermalGain",0); field(P,"uThermalRefK",1000); field(P,"uThermalFloorK",720);
     integer(P,"uShadowEnabled",0); integer(P,"uShadowLightCount",0);
@@ -1416,21 +1494,17 @@ function frame(now=0) {
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
     gl.disable(gl.BLEND); gl.depthMask(true);
     if (!simOn && tableOpaque?.count) {
-      setTransform(view); gl.bindVertexArray(tableOpaque.vao);
-      gl.drawArrays(gl.TRIANGLES,0,tableOpaque.count); setTransform(mv);
+      drawOpaqueMesh(tableOpaque,view);setTransform(mv);
     }
     if(standOpaque?.count) {
-      setTransform(view);gl.bindVertexArray(standOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,standOpaque.count);setTransform(mv);
+      drawOpaqueMesh(standOpaque,view);setTransform(mv);
     }
     if (simOn&&sim.cageOpaque) {
-      setTransform(multiply(view,caseM));gl.bindVertexArray(sim.cageOpaque.vao);
-      gl.drawArrays(gl.TRIANGLES,0,sim.cageOpaque.count);setTransform(mv);
+      drawOpaqueMesh(sim.cageOpaque,multiply(view,caseM));setTransform(mv);
     } else if (!simOn&&studioControlValue("checker") && checkerMesh) {
-      setTransform(view); gl.bindVertexArray(checkerMesh.vao);
-      gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count);
+      drawOpaqueMesh(checkerMesh,view,false,STUDIO_SCENE_PART_GROUP.room);
       if (backdropMesh && backdropMesh.count) {
-        gl.bindVertexArray(backdropMesh.vao);
-        gl.drawArrays(gl.TRIANGLES,0,backdropMesh.count);
+        drawOpaqueMesh(backdropMesh,view,false,STUDIO_SCENE_PART_GROUP.backdrop);
       }
       setTransform(mv);
     }
@@ -1471,32 +1545,42 @@ function frame(now=0) {
     // (fixed room constants, or the live camera axis for fill), exactly
     // like the checkerboard backdrop and the marble itself -- drawn with
     // the same `view` matrix, not an identity-transform shortcut.
-    setTransform(view); gl.bindVertexArray(fixtureMeshes.vao);
-    gl.drawArrays(gl.TRIANGLES,0,fixtureMeshes.count);
-    if(shopOpaque?.count){gl.bindVertexArray(shopOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,shopOpaque.count);}
+    drawOpaqueMesh(fixtureMeshes,view,true,STUDIO_SCENE_PART_GROUP.fixture);
+    if(shopOpaque?.count)drawOpaqueMesh(shopOpaque,view,true);
     integer(P,"uEnableEmissionDirect",0);
     setTransform(mv);
     if(haveParticle) for(const model of simOn?particleObjects:[object]) {
       const modelView=simOn?multiply(view,model):mv;
       setTransform(modelView);
       gl.disable(gl.BLEND);gl.depthMask(true);
-      gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
+      drawOpaqueMesh(interior,modelView,false,simOn?null:"subject");
       gl.disable(gl.BLEND);gl.depthMask(true);
-      gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);
+      drawOpaqueMesh(glassOpaque,modelView,false,simOn?null:"subject");
       gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
       if(!simOn&&(tableTransparentFaces.length||standTransparentFaces.length||shopTransparentFaces.length)) {
-        setTransform(view); drawTransparent(transparentSet(multiply(object,preview)),view);
-      } else drawTransparent(glass,modelView);
+        drawGlassMesh(transparentSet(multiply(object,preview)),view);
+      } else drawGlassMesh(glass,modelView,true,simOn?null:"subject");
     }
     if(simOn&&sim.cageGlass) {
       setTransform(multiply(view,caseM));gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
-      gl.bindVertexArray(sim.cageGlass.vao);gl.drawArrays(gl.TRIANGLES,0,sim.cageGlass.count);
+      drawGlassMesh(sim.cageGlass,multiply(view,caseM),false);
     }
     if(simOn&&standGlass?.count) {
-      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawTransparent(standGlass,view);
+      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawGlassMesh(standGlass,view);
     }
     if(simOn&&shopGlass?.count) {
-      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawTransparent(shopGlass,view);
+      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawGlassMesh(shopGlass,view);
+    }
+    if(secondaryActive) {
+      secondaryField.finish({bind:shader=>lightField.bindSecondary(shader,view,subject.unitM,OBJECT_CENTER),
+        phongSpecular:$("phong-field-specular")?.checked===true,
+        drawOpaque(shader){drawingProgram=shader;for(const {resource,matrix,emissionDirect,category}of opaqueDraws){
+          integer(shader,"uEnableEmissionDirect",Number(emissionDirect));setTransform(matrix);
+          drawOwnedMesh(resource,category);}},
+        drawTransparent(shader){drawingProgram=shader;integer(shader,"uEnableEmissionDirect",0);
+          for(const {resource,matrix,sorted,category}of transparentDraws){setTransform(matrix);
+            if(sorted)drawOwnedTransparent(resource,matrix,category);else drawOwnedMesh(resource,category);}}});
+      drawingProgram=P;gl.useProgram(P);setTransform(mv);
     }
     gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
     const lighting=studioRenderState("studio");
@@ -1519,10 +1603,13 @@ function frame(now=0) {
     }catch(error){studioDof.cancel();$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
     else if(!$("studio-dof")?.checked&&!$("studio-dof-status")?.textContent.startsWith("Phong DOF unavailable"))dofStatus("Phong DOF off. Photos and live rays retain their lens settings.");
   }
+    // Copies the finished primary/secondary/DOF output, never the ray overlay.
+    if(P&&interior)phongCapture.frame();
     if(message.textContent.startsWith('Studio preview unavailable: '))message.textContent='';
   } catch(error) {
+    phongCapture.fail(error);
     lastStudioFrame=null;message.textContent='Studio preview unavailable: '+(error.message||String(error));
-  } finally {if(dofActive)studioDof.cancel();}
+  } finally {secondaryField?.cancel();if(dofActive)studioDof.cancel();P=ordinaryPrimary;if(P)gl.useProgram(P);}
   requestAnimationFrame(frame);
 }
 async function boot() {
@@ -1541,6 +1628,12 @@ async function boot() {
       if (!Number.isInteger(ids[name])) throw Error(`material ${name} is absent from assets.json; export the catalogue`);
     const source=fragment.replace(/^(#version[^\n]*\n)/,"$1#define PLUCK_TRANSMISSION 1\n#define PLUCK_PREMULTIPLIED_GLASS 1\n");
     P=program(vertex,source);
+    try {
+      fieldPrimary=program(vertex,source.replace(/^(#version[^\n]*\n)/,'$1#define PLUCK_FIELD_PRIMARY 1\n'));
+      secondaryField=createStudioSecondaryField({gl,primary:fieldPrimary,secondary:program(vertex,secondaryFieldFragment(source))});
+    }
+    catch(error){$("phong-field-secondary").checked=false;$("phong-field-secondary").disabled=true;
+      $("phong-secondary-status").textContent=`Secondary passes unavailable: ${error.message}`;}
     gl.useProgram(P);
     const extra=studioMaterialExtras(assets), authoredRows=studioMaterialBase(assets,extra);
     coatedId=extra.coated; paintAId=extra.paintA; paintBId=extra.paintB;
@@ -1628,8 +1721,15 @@ async function boot() {
     copyCoating(); copyPaint(); checkerMesh=checkerboard(); backdropMesh=backdropRoll();rebuildTable();
     if ($("backdrop-layers-out")) $("backdrop-layers-out").value=$("backdrop-layers").value;
     if ($("room-scale-out")) $("room-scale-out").value=$("room-scale").value;
-    for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
-      uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10})) integer(P,name,unit);
+    for(const shader of [P,fieldPrimary].filter(Boolean)) {
+      gl.useProgram(shader);
+      for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
+        uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10,uFieldMaterialMask:13})) integer(shader,name,unit);
+    }
+    gl.useProgram(P);
+    fieldMaskFallback=gl.createTexture();gl.activeTexture(gl.TEXTURE0+13);gl.bindTexture(gl.TEXTURE_2D,fieldMaskFallback);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.R32UI,1,1,0,gl.RED_INTEGER,gl.UNSIGNED_INT,new Uint32Array(1));
     flatArray(4,[0,255,128,255]); flatArray(5,[255,255,255,255]); flatArray(6,[128,255,255,255]); flatArray(7,[0,0,0,0]);
     const volume=gl.createTexture(); gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_3D,volume);
     gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
@@ -1638,7 +1738,7 @@ async function boot() {
     gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
     gl.texStorage3D(gl.TEXTURE_2D_ARRAY,1,gl.DEPTH_COMPONENT24,1,1,1);
     floatTexture({data:[0],floats_per_record:1},10);
-    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,onChange:()=>liveRay?.sceneChanged()});
+    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,getSceneMaterials:fieldMaterialRows,onChange:()=>liveRay?.sceneChanged()});
     controls(); syncMaterial(); rebuild({invalidatePhoto:false});
     opticalControls=createOpticalMaterialControls({getContext:()=>({geometry:lastGeometry,
       design:readSubjectDesign(),shell:ids[$('shell').value],selectedMaterial:selected(),
