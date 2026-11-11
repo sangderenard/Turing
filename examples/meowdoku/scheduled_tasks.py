@@ -203,6 +203,9 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                     counts[entry["action"]] = counts.get(entry["action"], 0) + 1
                 acted = any(entry["action"] in ("landed", "removed") for entry in done)
                 said = ", ".join(f"{count} {action}" for action, count in sorted(counts.items())) or "nothing to do"
+                skipped = sum(1 for entry in done if entry.get("remote_skipped"))
+                if skipped:
+                    said += f"; {skipped} remote copies left because a GitHub rule forbids deleting them"
                 return (cron_host.DONE if acted else cron_host.UNCHANGED), said, [e for e in done if e["action"] not in ("keep", "wait")]
             return task
         table["reviews.land"] = branch_task("land")

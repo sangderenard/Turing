@@ -25,6 +25,12 @@ account (``branch_review.register``, or by submitting it) lives ``registered_day
 registered to nobody ``unregistered_days``. A branch under review is never removed. Every removal is written to
 ``branch_removed`` with the commit the branch was at.
 
+Before a branch is removed on the remote, the tool asks GitHub which rules apply to it (``gh api
+repos/<owner>/<name>/rules/branches/<branch>``). Where a rule forbids deletion the remote copy is left, the local
+branch is still removed, and the entry carries ``remote_skipped`` with the rule; the summary counts those. A remote
+that is not GitHub, or a question GitHub does not answer, is not a refusal: the removal is tried and any refusal is
+reported as a failure.
+
 ``lock`` is "mock" or "enforce". In mock the push check says what it would have refused, prints the advice
 (``branch_review.advice``) and lets the push through. A branch with a commit of its own is never removed, whatever its age;
 it is reported as unmerged. Removal is by expected commit, locally and on the remote, so a branch that moved
@@ -43,10 +49,12 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 try:
@@ -124,17 +132,49 @@ def branches(path, default, remote="origin") -> list:
     return out
 
 
-def remove_branch(path, branch, head, *, remote, delete_remote, local) -> str:
+def github_slug(path, remote="origin") -> str | None:
+    """``owner/name`` when the remote is a GitHub repository, else None."""
+    match = re.search(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$", git(path, "remote", "get-url", remote, check=False))
+    return match[1] if match else None
+
+
+def github_rules(slug, branch) -> list | None:
+    """The rule types GitHub applies to one branch (with their ruleset ids), or None when it cannot be asked."""
+    try:
+        done = subprocess.run(["gh", "api", f"repos/{slug}/rules/branches/{urllib.parse.quote(branch, safe='')}"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        rules = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return rules if isinstance(rules, list) else None
+
+
+def deletion_forbidden(path, remote, branch) -> str | None:
+    """The reason GitHub would refuse to delete this branch, or None when no rule says so (or nothing could be asked)."""
+    slug = github_slug(path, remote)
+    for rule in (github_rules(slug, branch) or []) if slug else []:
+        if isinstance(rule, dict) and rule.get("type") == "deletion":
+            return f"a GitHub rule of {slug} forbids deleting it (ruleset {rule.get('ruleset_id')})"
+    return None
+
+
+def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=None) -> str:
     """Remove one branch at exactly ``head``; each side is left alone if it has moved.
 
     ``local`` is what is known of the local branch: "free" (at ``head``, checked out nowhere), "checked out", or
-    "absent" (no local branch at ``head``).
+    "absent" (no local branch at ``head``). ``skipped`` is a list that receives the reason when a rule of the remote
+    forbids the removal there.
     """
     done = []
     remote_head = git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{branch}", check=False)
     if delete_remote and remote_head:
+        forbidden = deletion_forbidden(path, remote, branch) if remote_head == head else None
         if remote_head != head:
             done.append("remote copy kept: it is at a different commit")
+        elif forbidden:
+            done.append(f"remote copy kept: {forbidden}")
+            if skipped is not None:
+                skipped.append(forbidden)
         else:
             git(path, "push", f"--force-with-lease=refs/heads/{branch}:{head}", remote, f":refs/heads/{branch}")
             done.append("removed on the remote")
@@ -189,11 +229,18 @@ def clean(policy, db, *, apply, now=None, log=print) -> list:
                 if left > 0:
                     entry.update(action="wait" if contained else "keep", reason=waiting)
                 elif not apply:
+                    forbidden = (deletion_forbidden(path, policy["remote"], row["branch"])
+                                 if policy["delete_remote"] and remote_too and row["remote_head"] == row["head"] else None)
                     entry.update(action="would remove", reason=why if remote_too else why + "; the remote copy would be kept")
+                    if forbidden:
+                        entry.update(remote_skipped=forbidden, reason=f"{why}; the remote copy would be kept: {forbidden}")
                 else:
                     try:
+                        skips = []
                         detail = remove_branch(path, row["branch"], row["head"], remote=policy["remote"],
-                                               delete_remote=policy["delete_remote"] and remote_too, local="free")
+                                               delete_remote=policy["delete_remote"] and remote_too, local="free", skipped=skips)
+                        if skips:
+                            entry["remote_skipped"] = skips[0]
                         if not remote_too and row["remote_head"]:
                             detail += "; remote copy kept: the live branch holding it is not on the remote"
                         branch_review.forget_merged(db, name, row["branch"])
@@ -371,6 +418,7 @@ def main(argv=None) -> int:
             apply = bool(args.apply or policy["apply"])
             done = (land if args.command == "land" else clean)(policy, db, apply=apply)
             print(json.dumps({"applied": apply, "count": len(done),
+                              "remote_skipped": sum(1 for e in done if e.get("remote_skipped")),
                               "by_action": {a: sum(1 for e in done if e["action"] == a) for a in sorted({e["action"] for e in done})}}))
             return 0
         finally:

@@ -283,7 +283,7 @@ def test_command_line_reports_without_applying(world, capsys):
     assert branch_gate.main(base + ["submit", "work", "feature", "--as", "ann", "--timeout-hours", "0"]) == 0
     assert json.loads(capsys.readouterr().out)["head"] == head
     assert branch_gate.main(base + ["land"]) == 0
-    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"applied": False, "count": 1, "by_action": {"would land": 1}}
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"applied": False, "count": 1, "remote_skipped": 0, "by_action": {"would land": 1}}
     assert remote_has(world, "feature") == head
     assert branch_gate.main(base + ["submit", "work", "feature", "--as", "nobody"]) == 2
     assert branch_gate.main(base + ["status"]) == 0
@@ -376,6 +376,33 @@ def test_the_mock_lock_says_what_it_would_refuse_and_lets_the_push_through(world
     assert pushed.returncode == 0 and remote_has(world, "main") == head
     assert "would be refused" in pushed.stderr and "mock: allowed this time" in pushed.stderr
     assert "reviews_checkout repository=work" in pushed.stderr and "reviews_submit" in pushed.stderr
+
+
+def test_a_remote_rule_against_deletion_is_asked_first_and_the_skip_is_reported(world, monkeypatch):
+    import time
+    work, db, policy = world["work"], world["db"], world["policy"]
+    assert branch_gate.github_slug(work) is None and branch_gate.deletion_forbidden(work, "origin", "x") is None, "not GitHub: nothing to ask"
+    merged = branch(world, "ruled")
+    run(work, "merge", "-q", "--ff-only", "ruled")
+    run(work, "push", "-q", "origin", "main")
+    asked = []
+
+    def rules(slug, name):
+        asked.append((slug, name))
+        return [{"type": "deletion", "ruleset_id": 7}, {"type": "non_fast_forward", "ruleset_id": 7}] if name == "ruled" else []
+
+    monkeypatch.setattr(branch_gate, "github_slug", lambda path, remote="origin": "owner/name")
+    monkeypatch.setattr(branch_gate, "github_rules", rules)
+    later = time.time() + 31 * DAY
+    dry = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=False, now=later, log=lambda line: None)}
+    assert dry["ruled"]["action"] == "would remove" and "ruleset 7" in dry["ruled"]["remote_skipped"]
+    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=later, log=lambda line: None)}
+    assert done["ruled"]["action"] == "removed" and "forbids deleting it" in done["ruled"]["remote_skipped"]
+    assert remote_has(world, "ruled") == merged, "the remote copy is left where the rule forbids removing it"
+    assert "ruled" not in run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
+    assert ("owner/name", "ruled") in asked
+    monkeypatch.setattr(branch_gate, "github_rules", lambda slug, name: None)
+    assert branch_gate.deletion_forbidden(work, "origin", "anything") is None, "no answer is not a refusal"
 
 
 def test_the_gate_pushes_a_branch_its_author_never_pushed(world):
