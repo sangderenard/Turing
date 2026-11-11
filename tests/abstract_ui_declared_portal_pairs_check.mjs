@@ -10,7 +10,7 @@ const fn = name => {
   return match[0];
 };
 const build = new Function("portalRuntime", [fn("portalCurvePoint"), fn("portalApertureClass"),
-  fn("portalDeclaredPair"), fn("rebuildPortalGraph"), "return rebuildPortalGraph;"].join("\n"));
+  fn("portalDeclaredPair"), fn("portalDoorTransition"), fn("rebuildPortalGraph"), "return rebuildPortalGraph;"].join("\n"));
 const splat = (identity, port_role, x, extra = {}) => ({identity, port_role, center: [x, 0, 0], normal: [0, 0, 1], ...extra});
 const graphOf = splats => {
   const runtime = {splats, graph: {identity: "g", sigma: 4.0, nodes: [], edges: []}};

@@ -118,6 +118,7 @@ class AbstractUIRegion:
     position: GridPosition
     buildings: tuple[AbstractUIBuilding, ...]
     intention: UIIntention
+    openings: tuple[Mapping[str, Any], ...] = ()   # producer-declared, on the region's courtyard box
 
 
 @dataclass(frozen=True, slots=True)

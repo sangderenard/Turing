@@ -338,7 +338,9 @@ def world_div_map_graph(world: AbstractUIWorld) -> dict[str, Any]:
                     _room_model(room, building.identity) for room in building.rooms
                 ],
             })
+        declared = [dict(opening) for opening in getattr(region, "openings", ())]
         regions.append({
+            **({"openings": declared} if declared else {}),
             "identity": region.identity,
             "kind": "region",
             "name": region.name,
@@ -4360,6 +4362,12 @@ function portalDeclaredPair(splat) {
   return splat?.pair || null;
 }
 
+function portalDoorTransition(source, target) {
+  // A LOCAL portal is the tube ride through this space. A NONLOCAL portal is a door: a material sheet in a
+  // doorway, crossed at once, with no tube. Both ends of the pair must declare it.
+  return source?.transition === "door" && target?.transition === "door";
+}
+
 function activePortalPlacementProfile() {
   const profiles = model.placement?.portal_contract?.modes || {};
   const mode = activeToolMode()?.name || "standard";
@@ -4401,6 +4409,7 @@ function rebuildPortalGraph() {
         weight: candidate.raw / total, distance: candidate.distance,
         aperture_class: portalApertureClass(source), aperture_scale: handleScale,
         path_model: "relaxed-quaternion-cubic",
+        ...(portalDoorTransition(source, candidate.target) ? {transition: "door", path_model: "material-sheet"} : {}),
         control_points: [[...source.center], sourceControl, targetControl, [...candidate.target.center]]};
       let length = 0, previous = edge.control_points[0];
       for (let step = 1; step <= 20; step += 1) {
@@ -4419,6 +4428,7 @@ function buildPortalTubeMesh() {
   const vertices = [], sides = 12, segments = 24;
   const emit = (point, normal, color) => vertices.push(...point, ...normal, ...color);
   portalRuntime.graph.edges.forEach(edge => {
+    if (edge.transition === "door") return;   // a door is a sheet in its doorway, not a tube
     const source = portalRuntime.splats.find(splat => splat.identity === edge.source);
     const target = portalRuntime.splats.find(splat => splat.identity === edge.target);
     const inColor = colorVector(model.appearance.colors["portal-in"]);
@@ -4517,16 +4527,20 @@ function migrateLegacyPortalOpenings() {
       if (opening.kind !== "portal") { retained.push(opening); index.set(opening.identity, opening); return; }
       legacy.push({host, opening});
       const transform = portalOpeningTransform(host, opening);
+      // The wall normal points out of the host. An opening that faces inward is entered from inside the host
+      // and arrived at inside it (the one passage of an interior).
+      const facing = opening.facing === "inward" ? -1 : 1;
       const role = opening.port_role || (legacy.length % 2 ? "in" : "out");
       portalRuntime.splats.push({identity: opening.identity, port_role: role,
         port_set_identity: portalRuntime.graph.identity, backing: "probabilistic-tube-graph",
         backing_graph: portalRuntime.graph.identity, distribution: "normalized-spatial-gaussian",
         intermediary_manifold: "directed-tube-edge", center: [...transform.position],
-        normal: [transform.normal[0], 0, transform.normal[1]],
-        tangent: [transform.tangent[0], 0, transform.tangent[1]], bitangent: [0, 1, 0],
+        normal: [transform.normal[0] * facing, 0, transform.normal[1] * facing],
+        tangent: [transform.tangent[0] * facing, 0, transform.tangent[1] * facing], bitangent: [0, 1, 0],
         radius: Math.max(0.18, Math.min(transform.width, transform.height) * 0.5),
         object_identity: host.identity, part_identity: opening.identity,
         ...(opening.pair ? {pair: opening.pair} : {}),
+        ...(opening.transition ? {transition: opening.transition} : {}),
         ...(opening.aperture_class ? {aperture_class: opening.aperture_class} : {}),
         ...(opening.reference ? {reference: opening.reference} : {}),
         triangle_memberships: [], division: {operation: "legacy-opening-to-radial-chart",
@@ -8208,7 +8222,8 @@ function advancePortalTransit(identity, position, velocity, radius, now) {
   const source = portalRuntime.splats.find(splat => splat.identity === transit.source);
   const target = portalRuntime.splats.find(splat => splat.identity === transit.target);
   if (!edge || !source || !target) { portalRuntime.transits.delete(identity); return false; }
-  const t = Math.max(0, Math.min(1, (now - transit.started) / transit.duration));
+  const t = transit.duration > 0
+    ? Math.max(0, Math.min(1, (now - transit.started) / transit.duration)) : 1;
   const point = portalCurvePoint(edge, t), frame = portalCurveFrame(edge, source, t);
   const suctionProgress = Math.max(0, Math.min(1, t / 0.22));
   const suction = 1 - suctionProgress * suctionProgress * (3 - 2 * suctionProgress);
@@ -8278,7 +8293,8 @@ function traversePortalBody(identity, position, velocity, radius = 0.001) {
     if (!graphEdge) { setPlacementStatus("IN splat has no OUT distribution yet"); continue; }
     portalRuntime.transits.set(identity, {edge: graphEdge.identity, source: source.identity,
       target: graphEdge.target, started: now,
-      duration: Math.max(280, graphEdge.length / portalRuntime.graph.traversalSpeed * 1000),
+      duration: graphEdge.transition === "door" ? 0 :
+        Math.max(280, graphEdge.length / portalRuntime.graph.traversalSpeed * 1000),
       local_u: localU, local_v: localV, entry_velocity: velocity ? [...velocity] : [0, 0, 0],
       entry_facing: identity === viewportControls.policy?.actor
         ? normalized3(shaderViewer.cameraFacing || [1, 0, 0]) : null});
