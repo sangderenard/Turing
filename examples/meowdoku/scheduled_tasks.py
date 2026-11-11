@@ -16,6 +16,15 @@ nothing is written. When it differs the whole folder is replaced, so pages of pl
 API, files copied, a manifest with hashes). The owner's policy, 2026-11-11: "just the non binary files and the
 database nightly no rolling window". So the deployment runs it text-only and keeps one snapshot: each night's copy
 replaces the last. Binary products (photo jobs and the like) are a different policy and are not this task's.
+
+`system.broadcast` is one system event told to an audience as messages from the system account (the Nodus host's
+own service account, shown as "Nodus"). It is not on the schedule: an engine asks for it once, when the event
+happens (nodus `tools/task_request.py`). The system account is made a contact of each recipient first.
+
+The audience is not looked up here. It is a search of the USER LIST, which is its own table on the canvas (prefix
+`userlist`): that table receives search terms and its finished output is every identity that matched
+(`identity.search`); another tool of it represents one identity (`identity.represent`). The broadcast asks that
+table for one tick and then tells each identity it returned. The tools are `identity_tools.py`; they only read.
 """
 from __future__ import annotations
 
@@ -29,6 +38,91 @@ import time
 MANUAL_FOLDER = "manual"
 STAMP = "hard-copy.json"
 HOST_ID = 7301
+AUDIENCE_TERMS = {"admin": ("role:admin",), "everyone": ("kind:person",)}     # an audience is a search of the user list
+SYSTEM_DISPLAY_NAME = "Nodus"
+USERLIST_ENGINE_ID = 7203
+# Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
+PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast"),
+                "userlist": ("identity.search", "identity.represent")}
+
+
+def _system(db, username):
+    """The system account's id; it is shown to people as Nodus."""
+    row = db.execute("SELECT id, display_name FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
+    if row is None:
+        raise LookupError(f"no system account {username!r}")
+    if row["display_name"] != SYSTEM_DISPLAY_NAME:
+        db.execute("UPDATE users SET display_name = ? WHERE id = ?", (SYSTEM_DISPLAY_NAME, row["id"]))
+    return row["id"]
+
+
+def find_identities(db, terms, userlist=None) -> tuple:
+    """The identities a list of search terms matches, and how they were found.
+
+    With a ``userlist`` table to ask ({"port", "jobs_dir", "native", "task_request"}) the search is ONE TICK OF THAT
+    TABLE: a contract carrying the terms, performed by the table's host, whose finished output is the identities.
+    Without one (no such port on this canvas) the same tool is called here directly."""
+    from meowdoku import identity_tools
+    if userlist is not None:
+        asked = userlist["task_request"].submit(userlist["native"], port=userlist["port"], engine_id=USERLIST_ENGINE_ID,
+                                                jobs_dir=userlist["jobs_dir"], task="identity.search",
+                                                fields={"terms": list(terms)}, timeout=10.0)
+        record = userlist["task_request"].result(userlist["jobs_dir"], asked["contract"]) if asked["outcome"] == "done" else None
+        if record is not None and isinstance(record.get("output"), list):
+            return record["output"], f"userlist table, contract {asked['contract']}"
+        return identity_tools.search(db, terms), f"directly (the userlist table answered {asked['outcome']})"
+    return identity_tools.search(db, terms), "directly"
+
+
+def befriend_everyone(accounts_db, system_username, *, messaging) -> str:
+    """Make the system account a mutual contact of every account that is not a service account."""
+    db = messaging.connect(accounts_db)
+    try:
+        system_id = _system(db, system_username)
+        from meowdoku import identity_tools
+        people = [int(i["identity"].split(":", 1)[1]) for i in identity_tools.search(db, AUDIENCE_TERMS["everyone"])]
+        people = [user_id for user_id in people if user_id != system_id]
+        mutual = messaging.befriend_all(db, system_id, people)
+    finally:
+        db.close()
+    return f"{SYSTEM_DISPLAY_NAME} is a contact of {mutual} of {len(people)} accounts"
+
+
+def broadcast(accounts_db, system_username, request, *, messaging, userlist=None) -> str:
+    """One system event to an audience, as messages from the system account.  The request carries ``text``, and
+    either ``audience`` (admin | everyone) or ``terms`` (search terms of the user list), and optionally ``msg_type``
+    and ``subject`` ({kind, ref}).  The audience is found by searching the user list (``find_identities``); each
+    identity found is made a contact of the system (one that blocked it is skipped) and told.  Returns the sentence."""
+    text, audience = request.get("text"), request.get("audience", "admin")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("a broadcast needs text")
+    if "terms" in request:
+        terms, audience = request["terms"], "matching"
+    elif audience in AUDIENCE_TERMS:
+        terms = AUDIENCE_TERMS[audience]
+    else:
+        raise ValueError(f"audience must be one of {', '.join(AUDIENCE_TERMS)}")
+    db = messaging.connect(accounts_db)
+    sent, skipped = 0, 0
+    try:
+        system_id = _system(db, system_username)
+        identities, how = find_identities(db, terms, userlist)
+        for identity in identities:
+            user_id = int(identity["identity"].split(":", 1)[1])
+            if user_id == system_id:
+                continue
+            if not messaging.system_contact(db, system_id, user_id):
+                skipped += 1
+                continue
+            try:
+                messaging.send(db, system_id, identity["username"], text, subject=request.get("subject"),
+                               msg_type=request.get("msg_type"))
+                sent += 1
+            except messaging.MessagingError:
+                skipped += 1
+    finally:
+        db.close()
+    return f"told {sent} {audience} account(s)" + (f", {skipped} skipped" if skipped else "") + f"; audience found {how}"
 
 
 def refresh_hard_copy(web_dir, *, name, document, site, graph_view) -> tuple:
@@ -83,9 +177,11 @@ def load_cron_host(nodus_tools):
     return sys.modules[name]
 
 
-def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None) -> dict:
+def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
+    `system` is `{"accounts_db", "username", "module", "userlist"?}` (module = messaging): the account system events
+    are sent as, and optionally the userlist table to ask for an audience ({"port", "jobs_dir", "native", "task_request"}).
     `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup)."""
     table = {}
     if web_dir is not None and manual is not None:
@@ -100,11 +196,52 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                                                 exclude=backup["exclude"], state_backup=backup["module"],
                                                 text_only=bool(backup.get("text_only")))
         table["state.backup"] = state_backup_task
+    if system is not None:
+        def system_broadcast(request):
+            return cron_host.DONE, broadcast(system["accounts_db"], system["username"], request, messaging=system["module"],
+                                             userlist=system.get("userlist"))
+        table["system.broadcast"] = system_broadcast
+
+        def identity_search(request):
+            from meowdoku import identity_tools
+            db = system["module"].connect(system["accounts_db"])
+            try:
+                found = identity_tools.search(db, request.get("terms"))
+            finally:
+                db.close()
+            return cron_host.DONE, f"{len(found)} identities matched", found
+        table["identity.search"] = identity_search
+
+        def identity_represent(request):
+            from meowdoku import identity_tools
+            db = system["module"].connect(system["accounts_db"])
+            try:
+                one = identity_tools.represent(db, request.get("identity"))
+            finally:
+                db.close()
+            if one is None:
+                return cron_host.UNCHANGED, "no such identity"
+            return cron_host.DONE, f"{one['identity']} is {one['username']}", one
+        table["identity.represent"] = identity_represent
     return table
 
 
-def start(*, port, jobs_dir, native, nodus_tools, log=print, **needs):
-    """Join the cron prefix as a host for every task `handlers(**needs)` gives. Returns the CronHost; close() it."""
+def load_task_request(nodus_tools):
+    """The actual nodus `tools/task_request.py`, loaded by path."""
+    path = Path(nodus_tools).resolve() / "task_request.py"
+    name = "_meowdoku_nodus_task_request"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def start(*, port, jobs_dir, native, nodus_tools, log=print, prefix="cron", host_id=HOST_ID, **needs):
+    """Join one task prefix as its host, for the tasks that prefix performs (PREFIX_TASKS) among those
+    `handlers(**needs)` gives. Returns the CronHost; close() it."""
     cron_host = load_cron_host(nodus_tools)
-    return cron_host.CronHost(native, port=port, host_id=HOST_ID, jobs_dir=jobs_dir, log=log,
-                              handlers=handlers(cron_host, **needs))
+    offered = handlers(cron_host, **needs)
+    mine = {name: offered[name] for name in PREFIX_TASKS[prefix] if name in offered}
+    return cron_host.CronHost(native, port=port, host_id=host_id, jobs_dir=jobs_dir, log=log, handlers=mine)

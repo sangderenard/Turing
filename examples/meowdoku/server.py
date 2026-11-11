@@ -1049,10 +1049,11 @@ def make_handler(sessions: Sessions):
         # ---- [CONTROL] /api/control/instances: force a shutdown, restart or start of an instance (instance_control.py).
         # Not under /api/admin: the proxy refuses that whole prefix, which belongs to the loopback token endpoints.  This one
         # is authorized by the signed-in account's role, so it is reachable wherever the account is.
-        # GET lists the instances and the recent requests; POST {instance, action, reason?} records a request that the
-        # supervisor performs within a second or two, whether or not the instance is responsive.  Capability: account_manage
+        # GET lists the instances and the recent requests; POST {instance, action, reason?, delay?} records a request that the
+        # supervisor performs within a second or two, or after ``delay`` seconds (a countdown it announces to every admin
+        # through Nodus); POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
-        def _instance_control(self, method: str) -> None:
+        def _instance_control(self, method: str, cancel: bool = False) -> None:
             import sqlite3
             from meowdoku import instance_control
             self._classify()
@@ -1077,9 +1078,14 @@ def make_handler(sessions: Sessions):
                 known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
                 if method == "GET":
                     return self._json({"instances": known, "requests": instance_control.recent(db)})
+                if cancel:                               # the interrupt: stop a request whose countdown is still running
+                    made = instance_control.cancel(db, body.get("id"), user_id=principal.user_id, username=principal.username)
+                    print(f"[control] {principal.username} interrupted request {made['id']}", flush=True)
+                    return self._json({"request": made})
                 made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
                                                 user_id=principal.user_id, username=principal.username,
-                                                reason=body.get("reason"), known=[i["name"] for i in known])
+                                                reason=body.get("reason"), delay_s=body.get("delay", 0),
+                                                known=[i["name"] for i in known])
                 print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
                 return self._json({"request": made}, HTTPStatus.ACCEPTED)
             except instance_control.ControlError as error:
@@ -2338,6 +2344,8 @@ def make_handler(sessions: Sessions):
                 return self._picture_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
+            if path0 == "/api/control/instances/cancel":
+                return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]

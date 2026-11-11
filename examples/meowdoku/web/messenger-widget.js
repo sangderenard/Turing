@@ -185,7 +185,22 @@ async function start() {
     const node = el("div", { class: "msg" + (mine ? " mine" : "") + (m.removed ? " removed" : "") });
     if (!m.removed && m.subject) node.appendChild(el("div", { class: "note", text: m.subject.kind + ": " + m.subject.ref }));
     node.appendChild(document.createTextNode(m.removed ? "[removed by an administrator]" : (m.type && m.type !== "note" ? "[" + m.type + "] " : "") + m.body));
+    if (!m.removed && m.image) {
+      const url = safeImageURL(m.image, m.id);
+      node.appendChild(url ? el("img", { class: "attachment", src: url, alt: "Chat image", loading: "lazy", referrerpolicy: "no-referrer" }) :
+        el("div", { class: "note", text: "[Image locked. Both people must enable images in this chat to reveal it.]" }));
+    }
     node.appendChild(el("span", { class: "when", text: new Date(m.created * 1000).toLocaleString() }));
+    // A system announcement of a counted-down restart or shutdown: its subject names the control request, and the
+    // button interrupts that request.  The server decides whether this account may; the button only asks.
+    if (!mine && !m.removed && m.type === "approval_request" && m.subject && m.subject.kind === "control") {
+      const stop = el("button", { class: "small", text: "Interrupt", on: { click: async () => {
+        stop.disabled = true;
+        try { await api("/api/control/instances/cancel", { id: Number(m.subject.ref) }); stop.textContent = "Interrupted"; }
+        catch (e) { stop.textContent = e.message; }
+      } } });
+      node.appendChild(el("div", { class: "note" }, stop));
+    }
     return node;
   }
   async function selectPeer(username) {

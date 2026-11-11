@@ -8,6 +8,8 @@ prefix; the supervisor then appends `--cron-port`). It serves nothing and listen
 prefix as a host and waits to be asked. What it can be asked:
 
   manual.hardcopy   check the published hard copy of the manual against the manual; rebuild it when they differ
+  system.broadcast  tell an audience one system event, as messages from the system account (when --accounts-db and
+                    --system-account are given); asked for once per event, never on the schedule
   state.backup      one snapshot of the state root (when --backup-dir is given): with --backup-text-only the
                     databases and the text files, no binary files; --backup-keep 1 means no rolling window
 
@@ -26,7 +28,7 @@ import threading
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 
-from meowdoku import rest_api, scheduled_tasks, state_backup, studio_product_nodus  # noqa: E402
+from meowdoku import messaging, rest_api, scheduled_tasks, state_backup, studio_product_nodus  # noqa: E402
 from meowdoku.living_data_query import GraphView  # noqa: E402
 
 
@@ -45,6 +47,11 @@ def main(argv=None) -> int:
     parser.add_argument("--backup-text-only", action="store_true", help="databases and text files only; no binary files")
     parser.add_argument("--backup-exclude", action="append", default=[], metavar="STATE-RELATIVE-FOLDER",
                         help="a folder of the state root a snapshot leaves out (repeatable)")
+    parser.add_argument("--userlist-port", type=int, default=None, help="appended by the supervisor from the declared userlist prefix")
+    parser.add_argument("--userlist-jobs-dir", default=None, help="the userlist table's directory (one request and result file per search)")
+    parser.add_argument("--accounts-db", default=None, help="the accounts database; with --system-account, system.broadcast is offered")
+    parser.add_argument("--system-account", default=None,
+                        help="the account system events are sent as (the Nodus host's service account, shown as Nodus)")
     parser.add_argument("--federation-port", default=None, help=argparse.SUPPRESS)      # the supervisor passes these to any
     parser.add_argument("--federation-canvas", default=None, help=argparse.SUPPRESS)    # instance that names a Nodus host
     args = parser.parse_args(argv)
@@ -64,23 +71,40 @@ def main(argv=None) -> int:
                            "exclude": tuple(args.backup_exclude), "text_only": args.backup_text_only,
                            "module": state_backup}
 
+    native, tools = studio_product_nodus.nodus_modules()[0], studio_product_nodus.DEFAULT_NODUS_TOOLS
+    if args.accounts_db and args.system_account:
+        needs["system"] = {"accounts_db": args.accounts_db, "username": args.system_account, "module": messaging}
+        if args.userlist_port and args.userlist_jobs_dir:      # the broadcast finds its audience by asking this table
+            needs["system"]["userlist"] = {"port": args.userlist_port, "jobs_dir": args.userlist_jobs_dir, "native": native,
+                                           "task_request": scheduled_tasks.load_task_request(tools)}
+        try:
+            say("[worker] at start: " + scheduled_tasks.befriend_everyone(args.accounts_db, args.system_account, messaging=messaging))
+        except Exception as error:
+            say(f"[worker] the system account could not be made a contact at start: {type(error).__name__}: {error}")
+
     stop = threading.Event()
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stop.set())
-    host = None
+    hosts = []
     if args.cron_port:
-        host = scheduled_tasks.start(port=args.cron_port, jobs_dir=args.cron_jobs_dir,
-                                     native=studio_product_nodus.nodus_modules()[0],
-                                     nodus_tools=studio_product_nodus.DEFAULT_NODUS_TOOLS, log=say, **needs)
+        host = scheduled_tasks.start(port=args.cron_port, jobs_dir=args.cron_jobs_dir, native=native, nodus_tools=tools,
+                                     log=say, **needs)
+        hosts.append(host)
         say(f"[worker] performing {', '.join(sorted(host.handlers)) or 'nothing'} from Nodus port {args.cron_port}")
     else:
         say("[worker] no cron port was given; nothing will be scheduled here")
+    if args.userlist_port and args.userlist_jobs_dir and "system" in needs:
+        Path(args.userlist_jobs_dir).mkdir(parents=True, exist_ok=True)
+        host = scheduled_tasks.start(port=args.userlist_port, jobs_dir=args.userlist_jobs_dir, native=native, nodus_tools=tools,
+                                     log=say, prefix="userlist", host_id=scheduled_tasks.HOST_ID + 1, **needs)
+        hosts.append(host)
+        say(f"[worker] the userlist table performs {', '.join(sorted(host.handlers))} from Nodus port {args.userlist_port}")
     try:
         while not stop.wait(1.0):
             pass
     finally:
-        if host is not None:
+        for host in hosts:
             host.close()
     say("[worker] stopped")
     return 0

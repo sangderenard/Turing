@@ -74,7 +74,8 @@
         "acquire": [
           "gui.proof:4:54000",
           "studio.product:4:7200",
-          "cron:4:36000"
+          "cron:4:36000",
+          "userlist:4:3600"
         ],
         "rate": 60,
         "console_port": 47612,
@@ -109,9 +110,22 @@
         "C:/dev/Powershell/srv/backups",
         "--backup-keep",
         "1",
-        "--backup-text-only"
-      ]
+        "--backup-text-only",
+        "--accounts-db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--system-account",
+        "svc-nodus-messenger",
+        "--userlist-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/userlist"
+      ],
+      "userlist_prefix": "userlist"
     }
   ],
-  "state_dir": "C:/dev/Powershell/srv/state"
+  "state_dir": "C:/dev/Powershell/srv/state",
+  "system_events": {
+    "from": "nodus-messenger",
+    "prefix": "cron",
+    "jobs_dir": "C:/dev/Powershell/srv/state/jobs/cron",
+    "engine_id": 7202
+  }
 }

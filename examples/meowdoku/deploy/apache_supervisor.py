@@ -21,6 +21,7 @@ Tables in accounts.db: service_instances, instance_leases, account_instances (us
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import secrets
@@ -115,6 +116,14 @@ def load_instances(path):
     if isinstance(data, dict):
         data = data.get("instances", [])
     return data if isinstance(data, list) else []
+
+
+def instances_system_events(path):
+    """[CONTROL] The top-level ``system_events`` of the object form of instances.json: where system events are asked
+    for ({"from": <nodus instance>, "prefix": <its task prefix>, "jobs_dir": <that prefix's directory>, "engine_id"})."""
+    data = _read_instances(path)
+    value = data.get("system_events") if isinstance(data, dict) else None
+    return dict(value) if isinstance(value, dict) and value.get("from") and value.get("prefix") and value.get("jobs_dir") else None
 
 
 def instances_state_dir(path):
@@ -394,6 +403,14 @@ class Instance:
                 flags += ["--cron-port", str(port)]
             else:
                 self.sup.log(f"{self.name}: cron_prefix {cron!r}: the host declares no such contract port; no scheduled tasks")
+        userlist = self.spec.get("userlist_prefix")  # [CONTROL] the user list as a table: this instance performs its searches
+        if userlist:
+            port = getattr(source, "contract_ports", {}).get(userlist)
+            if port:
+                self.sup.log(f"{self.name}: the user list table is {source_name!r} contract port {port} ({userlist})")
+                flags += ["--userlist-port", str(port)]
+            else:
+                self.sup.log(f"{self.name}: userlist_prefix {userlist!r}: the host declares no such contract port; searched directly")
         return flags
 
     def poll(self):
@@ -531,6 +548,7 @@ class Supervisor:
         self.log_dir = self.paths.logs_dir
         self.stop = threading.Event()
         self.instances = []
+        self.system_events = None       # [CONTROL] {"from", "prefix", "jobs_dir", "engine_id"}: where system events are asked for
         self.secrets_restricted = False
         self._lock_file = None
 
@@ -603,6 +621,7 @@ class Supervisor:
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
         if manage:
             specs = load_instances(self.instances_path)
+            self.system_events = instances_system_events(self.instances_path)
             sources = {s.get("federation_from") for s in specs}
             for spec in sorted(specs, key=lambda s: s.get("name") not in sources):      # a federation source starts before its dependents
                 inst = Instance(spec, self)
@@ -632,11 +651,14 @@ class Supervisor:
         """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a
         federation are started first and stopped last, as at the start and stop of the whole stack."""
         from meowdoku import instance_control
-        light = sqlite3.connect(self.db_path, timeout=5)          # once a second: a plain read, not the full schema check
+        light = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)   # once a second: a plain connection
         try:
-            todo = instance_control.pending(light)
+            news = instance_control.to_announce(light)
+            todo = instance_control.due(light)
         finally:
             light.close()
+        for item in news:
+            self.announce(item)
         if not todo:
             return
         sources = {i.spec.get("federation_from") for i in self.instances}
@@ -660,6 +682,43 @@ class Supervisor:
             self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {detail}")
             with connect(self.db_path) as db:
                 instance_control.finish(db, item["id"], state, detail)
+
+    def announce(self, item):
+        """[CONTROL] Tell every admin about a counted-down request, or its interruption: one task asked of the Nodus
+        task table (nodus tools/task_request.py), performed by the task worker as a broadcast from the system account.
+        The request is marked announced whatever happens: an announcement that cannot be made is logged, not retried,
+        and never holds up the request itself."""
+        from meowdoku import instance_control
+        cancelled = item["state"] == "cancelled"
+        seconds = max(0, int(round(item["due_at"] - time.time())))
+        what = f"{item['action']} of {'every instance' if item['instance'] == instance_control.ALL else item['instance']}"
+        if cancelled:
+            text = f"The {what} (request {item['id']}) was interrupted: {item['detail']}. Nothing will happen."
+        else:
+            text = (f"There will be a {what} in {seconds} seconds (request {item['id']}), asked by {item['requested_name']}"
+                    + (f": {item['reason']}" if item["reason"] else "") + ". Interrupt it to stop it.")
+        outcome = {"outcome": "not configured"}
+        events = self.system_events or {}
+        source = next((i for i in self.instances if i.name == events.get("from") and i.kind == "nodus"), None)
+        port = getattr(source, "contract_ports", {}).get(events.get("prefix")) if source is not None else None
+        if port:
+            try:
+                from meowdoku import studio_product_nodus
+                native = studio_product_nodus.nodus_modules()[0]
+                spec = importlib.util.spec_from_file_location("_supervisor_task_request",
+                                                              studio_product_nodus.DEFAULT_NODUS_TOOLS / "task_request.py")
+                task_request = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(task_request)
+                outcome = task_request.submit(
+                    native, port=port, engine_id=int(events.get("engine_id", 7202)), jobs_dir=events["jobs_dir"],
+                    task="system.broadcast", timeout=5.0,
+                    fields={"text": text, "audience": "admin", "msg_type": "status" if cancelled else "approval_request",
+                            "subject": {"kind": "control", "ref": str(item["id"])}})
+            except Exception as error:
+                outcome = {"outcome": "failed", "error": repr(error)}
+        self.log(f"request {item['id']}: announced ({'interrupted' if cancelled else f'in {seconds} s'}) -> {outcome}")
+        with connect(self.db_path) as db:
+            instance_control.mark_announced(db, item["id"], 2 if cancelled else 1)
 
     def shutdown(self):
         self.log("stopping instances")

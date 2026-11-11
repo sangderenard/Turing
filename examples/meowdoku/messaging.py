@@ -46,11 +46,16 @@ MAX_PER_MINUTE, MAX_PER_DAY = 30, 2000
 MAX_CONTACTS, MAX_PENDING = 200, 20
 MAX_WAITERS, MAX_WAITERS_PER_ACCOUNT = 64, 2
 MAX_WAIT_S = 25.0
-SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic")
+SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic", "control")   # control: ref is an instance_requests id
 MSG_TYPES = ("note", "status", "question", "handoff", "approval_request", "answer")
 MAX_SUBJECT_REF = 200
 HANDLE_TTL = 60
 HANDLE_ACTION = "send"
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16 * 1024 * 1024
+MAX_IMAGE_STORAGE_PER_ACCOUNT = 32 * 1024 * 1024
+MAX_IMAGE_STORAGE_TOTAL = 256 * 1024 * 1024
+MAX_IMAGE_REQUEST = 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 32768
 
 DDL = ("CREATE TABLE IF NOT EXISTS msg_contacts (user_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
        "state TEXT NOT NULL CHECK(state IN ('requested','accepted','blocked')), created REAL NOT NULL, updated REAL NOT NULL, "
@@ -167,6 +172,34 @@ def _put(db, user_id, peer_id, state, now):
 
 def _mutual(db, a, b) -> bool:
     return _state(db, a, b) == "accepted" and _state(db, b, a) == "accepted"
+
+
+# ---- the system as a contact ------------------------------------------------------------------------------------------------------
+def system_contact(db, system_id: int, user_id: int, now: float | None = None) -> bool:
+    """Make the system account and one account mutual contacts.  For system broadcasts only: the system is not a
+    person, so this is not a request the account answers and the contact limits do not apply to it.  An account that
+    has BLOCKED the system stays blocked and gets nothing.  True when the two are mutual afterwards."""
+    if system_id == user_id:
+        return False
+    now = time.time() if now is None else now
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if "blocked" in (_state(db, user_id, system_id), _state(db, system_id, user_id)):
+            db.execute("COMMIT")
+            return False
+        for a, b in ((system_id, user_id), (user_id, system_id)):
+            if _state(db, a, b) != "accepted":
+                _put(db, a, b, "accepted", now)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return True
+
+
+def befriend_all(db, system_id: int, user_ids) -> int:
+    """``system_contact`` for each given account; returns how many are mutual with the system afterwards."""
+    return sum(1 for user_id in user_ids if system_contact(db, system_id, int(user_id)))
 
 
 # ---- contacts -------------------------------------------------------------------------------------------------------------------
