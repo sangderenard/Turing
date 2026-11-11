@@ -123,11 +123,25 @@
       "userlist_prefix": "userlist"
     },
     {
-      "name": "relay",
+      "name": "udp-router",
       "kind": "command",
       "port": null,
       "route": "",
       "bind": "0.0.0.0",
+      "account": "svc-udp-router",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
+        "0.0.0.0",
+        "47699"
+      ]
+    },
+    {
+      "name": "relay",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
       "account": "svc-relay",
       "leases": [],
       "args": [

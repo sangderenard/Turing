@@ -1,5 +1,6 @@
 {
   "host": "0.0.0.0",
+  "router": "127.0.0.1:47699",
   "first_port": 47700,
   "last_port": 47763,
   "addresses_per_account": 8,

@@ -11,10 +11,14 @@ account's address to another's, any kind, any bytes.
                                                               or to "47702" (a package, straight to that address)
     receive(db, address, user_id=, after=, limit=)      what arrived, oldest first, with who sent it
 
-    python relay.py --db <accounts.db> --config deploy/relay.json      the relay process (run by the supervisor)
+    udp_router <bind-host> <local-port>                 the native router (run by the supervisor)
+    python relay.py --db <accounts.db> --config deploy/relay.json      this service, connected locally to the router
 
-The relay process binds one socket per open address, writes every datagram that arrives as a row, and sends every
-row waiting to go out. The rows are also the record: who sent what to whom, when.
+Every UDP socket belongs to the native router, ``udp_router`` (nodus ``tools/udp_router``), which the supervisor
+runs. This module is one of the server's services and reaches the router over a local connection: it says which
+addresses are open and what to send. The router is greedy: each round it drains everything that has arrived and
+hands over ONE conglomerate record per destination, and that record is stored as one row. ``receive`` unpacks the
+records, so a caller still reads datagrams, in arrival order, each with who sent it.
 
 What keeps it from being a weapon: a datagram leaves only from an address its sender opened while signed in, one
 datagram out for one request, at most ``rate_per_minute`` per address. A stranger can send TO an address, never
@@ -28,14 +32,16 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import selectors
+import queue
 import socket
 import sqlite3
+import struct
 import sys
+import threading
 import time
 from pathlib import Path
 
-DEFAULTS = {"host": "0.0.0.0", "first_port": 47700, "last_port": 47763, "addresses_per_account": 8, "max_body": 60000,
+DEFAULTS = {"host": "0.0.0.0", "router": "127.0.0.1:47699", "first_port": 47700, "last_port": 47763, "addresses_per_account": 8, "max_body": 60000,
             "rate_per_minute": 600, "kept_per_address": 1000}
 KIND_MAX = 64
 DDL = (
@@ -162,83 +168,134 @@ def receive(db, address, *, user_id, after=0, limit=100) -> dict:
         raise RelayError("after and limit must be whole numbers")
     rows = db.execute("SELECT id, peer, kind, body, created_at FROM relay_packages WHERE address = ? AND direction = 'in' AND id > ? "
                       "ORDER BY id LIMIT ?", (address, after, max(1, min(limit, 500)))).fetchall()
-    return {"address": address, "after": rows[-1][0] if rows else after,
-            "packages": [{"id": r[0], "from": r[1], "kind": r[2], "body_base64": base64.b64encode(r[3]).decode("ascii"),
-                          "bytes": len(r[3]), "at": r[4]} for r in rows]}
+    packages = []
+    for row_id, peer, kind, data, at in rows:    # a conglomerate record is read back as the datagrams it holds
+        for sender, payload in (unpack_record(data) if kind == CONGLOMERATE else [(peer, data)]):
+            packages.append({"id": row_id, "from": sender, "kind": "datagram" if kind == CONGLOMERATE else kind,
+                             "body_base64": base64.b64encode(payload).decode("ascii"), "bytes": len(payload), "at": at})
+    return {"address": address, "after": rows[-1][0] if rows else after, "records": len(rows), "packages": packages}
+
+
+FRAME = struct.Struct("<BH4sHI")       # op, port, ipv4 (network order), peer port, payload length
+OPEN, CLOSE, SEND, NOTE, READY, OPENED, BATCH = 1, 2, 3, 5, 6, 7, 8
+ENTRY = struct.Struct("<4sHH")          # inside a conglomerate record: ipv4, peer port, length; the payload follows
+CONGLOMERATE = "datagrams"              # the kind of a row that holds one conglomerate record
+
+
+def unpack_record(record: bytes) -> list:
+    """The datagrams of one conglomerate record, in arrival order: (peer "ip:port", payload)."""
+    count = struct.unpack_from("<I", record, 0)[0]
+    out, at = [], 4
+    for _ in range(count):
+        ip, peer_port, length = ENTRY.unpack_from(record, at)
+        at += ENTRY.size
+        out.append((f"{socket.inet_ntoa(ip)}:{peer_port}", record[at:at + length]))
+        at += length
+    return out
 
 
 class Relay:
-    """The process side: one UDP socket per open address. ``step`` does one round and is what the loop repeats."""
+    """The service side of the UDP router. The native ``udp_router`` (nodus tools/udp_router) holds every UDP socket;
+    this class is one of the server's services and reaches it over a local connection. It says which addresses are
+    open and what to send, and stores what the router hands back. The router is greedy: everything that arrived for
+    one destination comes as ONE conglomerate record, and that record is one row."""
 
     def __init__(self, db_path, config, log=print):
         self.db_path, self.config, self.log = str(db_path), config, log
-        self.selector = selectors.DefaultSelector()
-        self.sockets = {}
+        self.sockets = set()                     # the addresses the router has confirmed open for this service
+        self.failed = set()
+        self.frames = queue.Queue()
+        host, _, port = config["router"].rpartition(":")
+        self.router = socket.create_connection((host, int(port)), timeout=10)        # a local connection, never a listener
+        self.router.settimeout(None)
+        threading.Thread(target=self._read, args=(self.router.makefile("rb"),), daemon=True).start()
+
+    def _read(self, stream) -> None:
+        try:
+            while True:
+                head = stream.read(FRAME.size)
+                if len(head) < FRAME.size:
+                    break
+                op, port, ip, peer_port, length = FRAME.unpack(head)
+                self.frames.put((op, port, stream.read(length) if length else b""))
+        except OSError:
+            pass
+        self.frames.put(None)
+
+    def _tell(self, op, port, ip=b"\0\0\0\0", peer_port=0, payload=b"") -> None:
+        self.router.sendall(FRAME.pack(op, port, ip, peer_port, len(payload)) + payload)
 
     def _db(self):
         db = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         ensure(db)
         return db
 
-    def _sync(self, db) -> None:
-        wanted = {r[0] for r in db.execute("SELECT address FROM relay_addresses WHERE closed_at IS NULL")}
-        for address in set(self.sockets) - wanted:
-            sock = self.sockets.pop(address)
-            self.selector.unregister(sock)
-            sock.close()
-        for address in wanted - set(self.sockets):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def _take(self, db, wait) -> int:
+        """Handle what the router has reported, waiting up to ``wait`` for the first frame. Returns datagrams taken in."""
+        taken, timeout = 0, wait
+        while True:
             try:
-                sock.bind((self.config["host"], address))
-            except OSError as error:
-                sock.close()
-                self.log(f"[relay] address {address} cannot be bound: {error}")
-                continue
-            sock.setblocking(False)
-            self.selector.register(sock, selectors.EVENT_READ, address)
-            self.sockets[address] = sock
+                frame = self.frames.get(timeout=timeout) if timeout else self.frames.get_nowait()
+            except queue.Empty:
+                return taken
+            timeout = 0
+            if frame is None:
+                raise RelayError("the UDP router closed the connection", 503)
+            op, port, payload = frame
+            if op == BATCH:                      # one row for everything that arrived for this destination
+                db.execute("INSERT INTO relay_packages (address, direction, peer, kind, body, created_at) VALUES (?,?,?,?,?,?)",
+                           (port, "in", "*", CONGLOMERATE, payload, time.time()))
+                _trim(db, port, self.config)
+                taken += struct.unpack_from("<I", payload, 0)[0]
+            elif op == OPENED:
+                self.sockets.add(port)
+            elif op == NOTE:
+                self.log(f"[relay] address {port}: {payload.decode('utf-8', 'replace')}")
+                if port not in self.sockets:
+                    self.failed.add(port)
+
+    def _sync(self, db) -> int:
+        wanted = {r[0] for r in db.execute("SELECT address FROM relay_addresses WHERE closed_at IS NULL")}
+        for address in self.sockets - wanted:
+            self._tell(CLOSE, address)
+            self.sockets.discard(address)
+        self.failed &= wanted
+        asked = wanted - self.sockets - self.failed
+        for address in asked:
+            self._tell(OPEN, address)
+        taken, deadline = 0, time.time() + 2.0
+        while asked - self.sockets - self.failed and time.time() < deadline:     # an address is used only once it listens
+            taken += self._take(db, 0.05)
+        return taken
 
     def step(self, wait=0.05) -> tuple:
         """(datagrams taken in, datagrams sent out) in one round."""
         db = self._db()
         try:
-            self._sync(db)
-            taken = sent = 0
-            if not self.sockets:
-                time.sleep(wait)                 # nothing is open: do not spin
-            for key, _events in (self.selector.select(wait) if self.sockets else []):
-                for _ in range(64):
-                    try:
-                        data, peer = key.fileobj.recvfrom(65535)
-                    except (BlockingIOError, ConnectionResetError):
-                        break
-                    except OSError:
-                        break
-                    db.execute("INSERT INTO relay_packages (address, direction, peer, kind, body, created_at) VALUES (?,?,?,?,?,?)",
-                               (key.data, "in", f"{peer[0]}:{peer[1]}", "datagram", data[: self.config["max_body"]], time.time()))
-                    _trim(db, key.data, self.config)
-                    taken += 1
+            taken = self._sync(db)
+            sent = 0
             for row in db.execute("SELECT id, address, peer, body FROM relay_packages WHERE direction = 'out' AND sent_at IS NULL "
                                   "ORDER BY id LIMIT 256").fetchall():
-                sock = self.sockets.get(row[1])
                 host, _, port = row[2].rpartition(":")
-                outcome = time.time()
-                if sock is not None:
+                if row[1] in self.sockets:
                     try:
-                        sock.sendto(row[3], (host, int(port)))
+                        target = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
+                        self._tell(SEND, row[1], socket.inet_aton(target), int(port), row[3])
                         sent += 1
                     except OSError as error:
                         self.log(f"[relay] {row[1]} -> {row[2]}: {error}")
-                db.execute("UPDATE relay_packages SET sent_at = ? WHERE id = ?", (outcome, row[0]))     # tried once, never again
+                db.execute("UPDATE relay_packages SET sent_at = ? WHERE id = ?", (time.time(), row[0]))     # tried once, never again
             db.execute("DELETE FROM relay_packages WHERE direction = 'out' AND sent_at IS NOT NULL AND sent_at < ?", (time.time() - 3600.0,))
+            taken += self._take(db, wait)
             return taken, sent
         finally:
             db.close()
 
     def close(self) -> None:
-        for sock in self.sockets.values():
-            self.selector.unregister(sock)
-            sock.close()
+        try:
+            self.router.close()                  # the router gives up this service's ports when the connection closes
+        except OSError:
+            pass
         self.sockets.clear()
 
 
@@ -306,8 +363,15 @@ def main(argv=None) -> int:
     parser.add_argument("--db", required=True, help="the accounts database")
     parser.add_argument("--config", default=None)
     args, _rest = parser.parse_known_args(argv)          # the supervisor may append arguments meant for other instances
-    relay = Relay(args.db, load_config(args.config))
-    print(f"[relay] addresses {relay.config['first_port']}-{relay.config['last_port']} on {relay.config['host']} (UDP)", flush=True)
+    config = load_config(args.config)
+    relay = None
+    while relay is None:                                 # the router may still be starting
+        try:
+            relay = Relay(args.db, config)
+        except OSError as error:
+            print(f"[relay] the UDP router at {config['router']} is not reachable yet: {error}", flush=True)
+            time.sleep(2.0)
+    print(f"[relay] addresses {config['first_port']}-{config['last_port']}; UDP sockets held by the router at {config['router']}", flush=True)
     try:
         while True:
             relay.step()

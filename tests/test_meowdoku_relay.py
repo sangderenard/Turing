@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from meowdoku import relay  # noqa: E402
 
 ANN, BOB = 2, 3
+NATIVE = Path(__file__).resolve().parents[2] / "nodus" / "build-router" / "Release" / "udp_router.exe"
+pytestmark = pytest.mark.skipif(not NATIVE.is_file(), reason="the native udp_router executable is not built")
 
 
 def free_ports(count):
@@ -36,13 +38,29 @@ def free_ports(count):
 
 @pytest.fixture
 def world(tmp_path):
+    import subprocess
+    import time
     first = free_ports(3)
-    config = {**relay.DEFAULTS, "host": "127.0.0.1", "first_port": first, "last_port": first + 2, "addresses_per_account": 2,
-              "rate_per_minute": 5, "kept_per_address": 3}
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    control = probe.getsockname()[1]
+    probe.close()
+    router = subprocess.Popen([str(NATIVE), "127.0.0.1", str(control)], stdout=subprocess.DEVNULL)
+    config = {**relay.DEFAULTS, "host": "127.0.0.1", "router": f"127.0.0.1:{control}", "first_port": first,
+              "last_port": first + 2, "addresses_per_account": 2, "rate_per_minute": 5, "kept_per_address": 100}
     db = sqlite3.connect(tmp_path / "accounts.db", isolation_level=None)
-    process = relay.Relay(tmp_path / "accounts.db", config, log=lambda line: None)
-    yield {"db": db, "config": config, "relay": process, "db_file": tmp_path / "accounts.db"}
+    process = None
+    for _ in range(50):
+        try:
+            process = relay.Relay(tmp_path / "accounts.db", config, log=lambda line: None)
+            break
+        except OSError:
+            time.sleep(0.1)
+    assert process is not None, "the router did not accept a local connection"
+    yield {"db": db, "config": config, "relay": process, "db_file": tmp_path / "accounts.db", "router": router}
     process.close()
+    router.kill()
+    router.wait(timeout=5)
 
 
 def body(package):
@@ -68,27 +86,55 @@ def test_a_datagram_goes_out_from_an_address_and_the_reply_comes_back_to_it(worl
     peer.close()
 
 
-def test_anyone_may_send_to_an_address_and_nobody_sends_through_one_that_is_not_theirs(world):
+def test_everything_that_arrived_for_a_destination_is_one_conglomerate_record(world):
     db, config, process = world["db"], world["config"], world["relay"]
     mine = relay.open_address(db, user_id=ANN, username="ann", config=config)["address"]
+    other = relay.open_address(db, user_id=BOB, username="bob", config=config)["address"]
     process.step()
-    stranger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    for text in (b"one", b"two", b"three", b"four"):
-        stranger.sendto(text, ("127.0.0.1", mine))
+    senders = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(3)]
+    for index in range(30):
+        senders[index % 3].sendto(f"ray {index}".encode(), ("127.0.0.1", mine))
+    senders[0].sendto(b"elsewhere", ("127.0.0.1", other))
     taken = 0
-    for _ in range(20):
+    for _ in range(40):
         taken += process.step(wait=0.2)[0]
-        if taken == 4:
+        if taken == 31:
             break
-    assert taken == 4
-    assert [body(p) for p in relay.receive(db, mine, user_id=ANN)["packages"]] == [b"two", b"three", b"four"], "the oldest is dropped"
+    assert taken == 31
+    got = relay.receive(db, mine, user_id=ANN)
+    assert [body(p) for p in got["packages"]] == [f"ray {i}".encode() for i in range(30)], "in arrival order, none lost"
+    assert got["records"] < 30, "the router hands over what arrived together as one record, not one row per datagram"
+    assert {p["from"] for p in got["packages"]} == {f"127.0.0.1:{s.getsockname()[1]}" for s in senders}
+    rows = db.execute("SELECT kind, peer FROM relay_packages WHERE address = ? AND direction = 'in'", (mine,)).fetchall()
+    assert set(rows) == {("datagrams", "*")} and len(rows) == got["records"]
+    assert [body(p) for p in relay.receive(db, other, user_id=BOB)["packages"]] == [b"elsewhere"], "one record per destination"
     for user in (BOB, None, True, "2"):
         with pytest.raises(relay.RelayError):
             relay.send(db, mine, user_id=user, to="127.0.0.1:9", body=b"x", config=config)
         with pytest.raises(relay.RelayError):
             relay.receive(db, mine, user_id=user)
     assert db.execute("SELECT COUNT(*) FROM relay_packages WHERE direction = 'out'").fetchone()[0] == 0
-    stranger.close()
+    for sender in senders:
+        sender.close()
+
+
+def test_the_service_only_holds_a_local_connection_and_the_router_holds_the_sockets(world):
+    db, config, process = world["db"], world["config"], world["relay"]
+    mine = relay.open_address(db, user_id=ANN, username="ann", config=config)["address"]
+    assert process.step()[1] == 0 and mine in process.sockets
+    assert process.router.getpeername()[0] == "127.0.0.1" and process.router.type == socket.SOCK_STREAM
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    with pytest.raises(OSError):
+        probe.bind(("127.0.0.1", mine))          # taken: by the native router, not by this process
+    probe.close()
+    assert world["router"].poll() is None
+    second = relay.Relay(world["db_file"], config, log=lambda line: None)
+    second._tell(relay.OPEN, mine)
+    notes = []
+    second.log = notes.append
+    second._take(second._db(), 2.0)
+    assert notes and "another service holds this port" in notes[0], "a port belongs to the connection that opened it"
+    second.close()
 
 
 def test_a_package_goes_address_to_address_without_a_socket(world):
