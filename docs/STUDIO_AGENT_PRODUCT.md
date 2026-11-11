@@ -121,3 +121,35 @@ renderers are interchangeable.
   `nodus/build-bridging/Release/nodus_contract_service.dll`; an older local
   `nodus/build/Release` DLL stalled after result delivery. Neither was rebuilt
   or installed by this change.
+
+## Explicit camera sequences
+
+For `ray-payload`, `photo.cameraPoses` is an ordered list of 1..32 camera
+**overrides**, packed as `camera_poses` in the existing MRP1 request. Each entry
+inherits the common `settings.camera`; omitted controls keep that camera's
+values. Allowed override fields are `eye_m`, `target_m`, `fov_degrees`,
+`aperture_radius_m`, `focus_distance_m`, `aperture_blades`,
+`aperture_rotation_radians`, `lens_selection`, `camera_back` and
+`back_reference_fov_degrees`. Positions are scene metres. Eye and target must
+remain distinct in the sensor's float32 look-at basis.
+
+The existing API resolves every entry through the same numeric bounds,
+source-authenticated analytical lens selection and physical-back crop used for
+a still. A selected lens derives FOV and pupil; clear `lens_selection` explicitly
+to use direct FOV/aperture controls. A supplied FOV replaces the inherited back
+reference unless an explicit reference is supplied. Resolution and exposure
+seconds are common to every frame. No projection, per-frame resolution or tile
+window can be supplied as a pose.
+
+Sequences cannot be combined with orbit, tiles/oversampling, live view or device
+intersections. Existing `orbitFrames` 8/16/32 remains the parametric orbit mode.
+All frames run serially inside the same owned Spectral worker, using its existing
+native camera housing update, sensor and snapshot path. `status.total_frames`
+is the requested pose count, and completed `frames` retain each camera and image
+(and RGB HDR) receipt. Multi-frame sequences use the existing `orbit.avi` product
+name and AVI encoder. An AVI failure retains completed frame files and receipts.
+There is no pose editor or second queue/renderer in this change.
+
+Checks: `tests/test_meowdoku_camera_pose_sequences.py`,
+`node tests/camera_pose_sequence_check.mjs`, and Spectral's
+`tests/test_marble_camera_pose_sequences.py` (CPU doubles, not GPU evidence).

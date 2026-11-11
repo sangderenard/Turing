@@ -180,6 +180,15 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
       throw new RangeError("Device intersections require ordinary RGB still photos; custom, large and oversampled photos use server tiles.");
     config.tiled = options.tiled ?? {tile_size: 1024};
   }
+  if (options.cameraPoses !== undefined) {
+    if (!Array.isArray(options.cameraPoses) || options.cameraPoses.length < 1 || options.cameraPoses.length > 32)
+      throw new RangeError("Camera poses must contain 1..32 camera overrides.");
+    if (config.orbit_frames !== 1 || tiled || options.live || options.clientIntersections)
+      throw new RangeError("Camera poses cannot be combined with orbit, tiles, live view or device intersections.");
+    // The server resolves each override through the existing camera/lens/back
+    // authorities before admitting the job; keep input order unchanged.
+    config.camera_poses = structuredClone(options.cameraPoses);
+  }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
   if(config.camera.camera_back){
