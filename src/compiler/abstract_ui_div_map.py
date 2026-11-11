@@ -251,7 +251,9 @@ def _position(position: Any) -> dict[str, int]:
 
 
 def _room_model(room: Any, building_identity: str) -> dict[str, Any]:
+    declared = [dict(opening) for opening in getattr(room, "openings", ())]
     return {
+        **({"openings": declared} if declared else {}),
         "identity": room.identity,
         "kind": "room",
         "name": room.name,
@@ -318,7 +320,9 @@ def world_div_map_graph(world: AbstractUIWorld) -> dict[str, Any]:
     for region in world.regions:
         buildings = []
         for building in region.buildings:
+            declared = [dict(opening) for opening in getattr(building, "openings", ())]
             buildings.append({
+                **({"openings": declared} if declared else {}),
                 "identity": building.identity,
                 "kind": "building",
                 "name": building.name,
@@ -4350,6 +4354,12 @@ function portalApertureClass(splat) {
   return splat?.aperture_class || "person";
 }
 
+function portalDeclaredPair(splat) {
+  // A producer-declared pair is one specific doorway to one specific place: its ends link only to each
+  // other. Splats without one keep the derived spatial-Gaussian graph among themselves.
+  return splat?.pair || null;
+}
+
 function activePortalPlacementProfile() {
   const profiles = model.placement?.portal_contract?.modes || {};
   const mode = activeToolMode()?.name || "standard";
@@ -4366,9 +4376,13 @@ function rebuildPortalGraph() {
   graph.edges = [];
   inputs.forEach(source => {
     const candidates = outputs.filter(target =>
-      portalApertureClass(target) === portalApertureClass(source)).map(target => {
+      portalApertureClass(target) === portalApertureClass(source) &&
+      portalDeclaredPair(target) === portalDeclaredPair(source)).map(target => {
       const distance = Math.hypot(...target.center.map((value, axis) => value - source.center[axis]));
-      return {target, distance, raw: Math.exp(-(distance ** 2) / (2 * graph.sigma ** 2))};
+      // A declared pair is certain whatever the distance (an interior may sit anywhere); the spatial
+      // Gaussian, which underflows to zero beyond a few sigma, weighs only the derived graph.
+      return {target, distance, raw: portalDeclaredPair(source) ? 1 :
+        Math.exp(-(distance ** 2) / (2 * graph.sigma ** 2))};
     });
     const total = candidates.reduce((sum, candidate) => sum + candidate.raw, 0) || 1;
     candidates.forEach(candidate => {
@@ -4379,7 +4393,10 @@ function rebuildPortalGraph() {
         source.normal[axis] * -lift);
       const targetControl = candidate.target.center.map((value, axis) => value +
         candidate.target.normal[axis] * -lift);
-      const edge = {identity: `${graph.identity}/edges/${source.identity.split("/").at(-1)}-to-${candidate.target.identity.split("/").at(-1)}`,
+      const edge = {identity: portalDeclaredPair(source)
+          ? `${graph.identity}/edges/${encodeURIComponent(source.identity)}-to-${encodeURIComponent(candidate.target.identity)}`
+          : `${graph.identity}/edges/${source.identity.split("/").at(-1)}-to-${candidate.target.identity.split("/").at(-1)}`,
+        ...(portalDeclaredPair(source) ? {pair: portalDeclaredPair(source)} : {}),
         source: source.identity, target: candidate.target.identity,
         weight: candidate.raw / total, distance: candidate.distance,
         aperture_class: portalApertureClass(source), aperture_scale: handleScale,
@@ -4509,6 +4526,9 @@ function migrateLegacyPortalOpenings() {
         tangent: [transform.tangent[0], 0, transform.tangent[1]], bitangent: [0, 1, 0],
         radius: Math.max(0.18, Math.min(transform.width, transform.height) * 0.5),
         object_identity: host.identity, part_identity: opening.identity,
+        ...(opening.pair ? {pair: opening.pair} : {}),
+        ...(opening.aperture_class ? {aperture_class: opening.aperture_class} : {}),
+        ...(opening.reference ? {reference: opening.reference} : {}),
         triangle_memberships: [], division: {operation: "legacy-opening-to-radial-chart",
           domain: "triangle-barycentric-subdomains"}});
     });

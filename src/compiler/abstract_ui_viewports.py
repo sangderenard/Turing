@@ -315,7 +315,7 @@ def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
                     "identity": f"{building['identity']}/opening:entry",
                     "kind": "door", "side": "south", "offset": 0.0,
                     "width": 0.72, "height": 0.72,
-                }],
+                }, *(dict(opening) for opening in building.get("openings", ()))],   # producer-declared, after the minted entry
             }]
             for room in rooms:
                 position = room["position"]
@@ -338,7 +338,7 @@ def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
                         "identity": f"{room['identity']}/opening:door",
                         "kind": "door", "side": "south", "offset": 0.0,
                         "width": 0.42, "height": min(0.58, height * 0.78),
-                    }],
+                    }, *(dict(opening) for opening in room.get("openings", ()))],   # producer-declared, after the minted door
                 })
             building_records.extend(building_boxes)
             # Sibling separation grows faster than the depicted building span.
