@@ -83,6 +83,7 @@ from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] clien
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
+from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
@@ -981,78 +982,8 @@ def make_handler(sessions: Sessions):
         # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
         # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
         def _messages_route(self, path: str, method: str) -> None:
-            from urllib.parse import parse_qs
-            admin = path.startswith("/api/messages/admin/")
-            if not self._require("account_manage" if admin else "message"):
-                return
-            self._set_cookie = []
-            me = self._principal().user_id
-            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
-            body = {}
-            if method == "POST":
-                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-                    self.close_connection = True
-                    return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                body = self._body_json(16384)
-                if body is None:
-                    return
-            db = messaging_mod.connect(sessions.accounts_db)
-            try:
-                try:
-                    if method == "GET" and path == "/api/messages/conversations":
-                        if not self._is_secure():
-                            return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
-                        return self._json(messaging_mod.conversations(db, me))
-                    if method == "GET" and path == "/api/messages/contacts":
-                        return self._json(messaging_mod.contacts(db, me))
-                    if method == "GET" and path == "/api/messages/thread":
-                        before = query.get("before")
-                        return self._json(messaging_mod.thread(db, me, query.get("peer"), int(before) if before else None,
-                                                               subject_kind=query.get("subject_kind"), subject_ref=query.get("subject_ref")))
-                    if method == "GET" and path == "/api/messages/since":
-                        rows = messaging_mod.long_poll(db, me, int(query.get("after") or 0), float(query.get("wait") or 0),
-                                                       subject_kind=query.get("subject_kind"), subject_ref=query.get("subject_ref"))
-                        return self._json({"messages": rows, "latest": messaging_mod.latest_id(db, me)})
-                    if method == "GET" and path == "/api/messages/inbox":
-                        return self._json(messaging_mod.inbox(db, me))
-                    if method == "GET" and path == "/api/messages/admin/thread":
-                        before = query.get("before")
-                        return self._json(messaging_mod.admin_thread(db, me, query.get("a"), query.get("b"), int(before) if before else None))
-                    if method == "POST" and path == "/api/messages/contacts":
-                        action, name = body.get("action"), body.get("username")
-                        if action == "request":
-                            return self._json(messaging_mod.request_contact(db, me, name))
-                        if action in ("accept", "decline"):
-                            return self._json(messaging_mod.respond_contact(db, me, name, action == "accept"))
-                        if action == "block":
-                            return self._json(messaging_mod.block(db, me, name))
-                        if action == "remove":
-                            return self._json(messaging_mod.remove(db, me, name))
-                        return self._json({"error": "action must be request, accept, decline, block or remove"}, HTTPStatus.BAD_REQUEST)
-                    if method == "POST" and path == "/api/messages/send":
-                        if "conversation_handle" in body:
-                            if not self._is_secure():
-                                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
-                            if body.get("conversation_handle") is None or "to" in body:
-                                return self._json({"error": "provide a conversation_handle and no recipient name"}, HTTPStatus.BAD_REQUEST)
-                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body"), subject=body.get("subject"),
-                                                            msg_type=body.get("type"), conversation_handle=body.get("conversation_handle"),
-                                                            idempotency_key=body.get("idempotency_key")))
-                    if method == "POST" and path == "/api/messages/ack":
-                        return self._json(messaging_mod.ack(db, me, body.get("up_to")))
-                    if method == "POST" and path == "/api/messages/read":
-                        return self._json(messaging_mod.mark_read(db, me, body.get("peer"), int(body.get("up_to") or 0)))
-                    if method == "POST" and path == "/api/messages/admin/remove":
-                        return self._json(messaging_mod.admin_remove(db, me, int(body.get("id"))))
-                    if method == "POST" and path == "/api/messages/admin/suspend":
-                        return self._json(messaging_mod.admin_suspend(db, me, body.get("username"), bool(body.get("suspended"))))
-                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-                except messaging_mod.MessagingError as error:
-                    return self._json({"error": error.message}, error.status)
-                except (ValueError, TypeError):
-                    return self._json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
-            finally:
-                db.close()
+            return shared_rest.messages_route(self, path, method, messaging=messaging_mod,
+                                              accounts_db=sessions.accounts_db)
         # ---- end [MESSAGES]
 
         # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
@@ -1097,110 +1028,21 @@ def make_handler(sessions: Sessions):
         def _living_data_dm(self, path, method):
             from meowdoku.living_data_cursor import CursorError
             from meowdoku.living_data_query import QueryError, MAX_BODY
-            import re
-            self._set_cookie = []
-            if method == "POST":
-                self.close_connection = True
-            if self._is_viewer():
-                return self._refuse_viewer()
-            if not self._require("dev_ui"):
-                return
-            account = self._account()
-            if account is None:
-                return self._json({"error": "sign in to use static DM commands"}, 401)
-            try:
-                service = sessions.living_data_static
-                base = "/api/living-data/dm/worlds"
-                match = re.fullmatch(base + r"/([0-9a-f]{32})(?:/(commands|host|close)(?:/([A-Za-z0-9_-]{1,64}))?)?", path)
-                if self.path.partition("?")[2]:
-                    raise CursorError("DM routes accept no query parameters")
-                if method == "GET":
-                    if match and not match[2]:
-                        return self._json(service.status(account["id"], match[1]))
-                    if match and match[2] == "commands" and match[3]:
-                        return self._json(service.receipt(account["id"], match[1], match[3]))
-                    return self._json({"error": "not found"}, 404)
-                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                    return self._json({"error": "application/json required"}, 415)
-                body = self._body_json(MAX_BODY if path == base or (match and match[2] == "host") else 4096)
-                if body is None:
-                    return
-                if path == base:
-                    return self._json(service.register(account["id"], body), 201)
-                if not match or match[3]:
-                    return self._json({"error": "not found"}, 404)
-                if match[2] == "commands":
-                    result = service.command(account["id"], match[1], body)
-                    return self._json(result, 202 if result["state"] in ("queued", "rendering") else 200)
-                if match[2] == "host":
-                    return self._json(service.host(account["id"], match[1], body))
-                if match[2] == "close" and body == {}:
-                    return self._json(service.close(account["id"], match[1]))
-                return self._json({"error": "not found"}, 404)
-            except CursorError as error:
-                return self._json({"error": str(error)}, error.status)
-            except (QueryError, ValueError, RecursionError):
-                return self._json({"error": "invalid or excessive static DM request"}, 400)
+            return shared_rest.living_data_dm_route(
+                self, path, method, service=sessions.living_data_static,
+                CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
 
         def _living_data_cursor(self, path, method):
             from meowdoku.living_data_cursor import CursorError
             from meowdoku.living_data_query import QueryError, MAX_BODY
-            from urllib.parse import parse_qs
-            import re
-            self._set_cookie = []
-            if method == "POST":
-                self.close_connection = True
-            if self._is_viewer():
-                return self._refuse_viewer()
-            if not self._require("dev_ui"):
-                return
-            account = self._account()
-            if account is None:
-                return self._json({"error": "sign in to navigate Living Data"}, 401)
-            try:
-                match = re.fullmatch(r"/api/living-data/sessions/([0-9a-f]{32})(?:/(move|close))?", path)
-                service = sessions.living_data_cursors
-                if method == "GET":
-                    if not match or match[2]:
-                        return self._json({"error": "not found"}, 404)
-                    query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
-                    if set(query) - {"offset"} or any(len(v) != 1 for v in query.values()):
-                        raise CursorError("invalid status query")
-                    return self._json(service.status(account["id"], match[1], int(query.get("offset", ["0"])[0])))
-                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                    return self._json({"error": "application/json required"}, 415)
-                body = self._body_json(MAX_BODY if path == "/api/living-data/sessions" else 4096)
-                if body is None:
-                    return
-                if path == "/api/living-data/sessions":
-                    return self._json(service.create(account["id"], body), 201)
-                if not match or match[2] not in ("move", "close"):
-                    return self._json({"error": "not found"}, 404)
-                return self._json(getattr(service, match[2])(account["id"], match[1], body))
-            except CursorError as error:
-                return self._json({"error": str(error)}, error.status)
-            except (QueryError, ValueError, RecursionError):
-                return self._json({"error": "invalid or excessive graph navigation request"}, 400)
+            return shared_rest.living_data_cursor_route(
+                self, path, method, service=sessions.living_data_cursors,
+                CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
 
         # Read-only projection of a caller-supplied canonical Living Data map.
         def _living_data_query(self):
             from meowdoku import living_data_query
-            self._set_cookie = []
-            self.close_connection = True
-            if self._is_viewer():
-                return self._refuse_viewer()
-            if not self._require("dev_ui"):
-                return
-            if self._account() is None:
-                return self._json({"error": "sign in to query Living Data"}, 401)
-            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                return self._json({"error": "application/json required"}, 415)
-            try:
-                body = self._body_json(living_data_query.MAX_BODY)
-                if body is not None:
-                    return self._json(living_data_query.query(body))
-            except (living_data_query.QueryError, RecursionError):
-                return self._json({"error": "invalid or excessive Living Data query"}, 400)
+            return shared_rest.living_data_query_route(self, living_data_query=living_data_query)
 
         # ---- [WORLDMAP] GET /api/worldmap/index and /api/worldmap/map?repo=<owner__name>&commit=<40 hex> (worldmap.py; the page is web/worldmap.html).
         # dev_ui only, no-store; map.json is streamed (gzip when the client accepts it); the only request-derived parts are the two validated names.
