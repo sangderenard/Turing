@@ -9,6 +9,8 @@ from src.compiler.repo_world_scan import (
     REPO_WORLD_SCAN_VERSION,
     DirtyCloneError,
     RepoScanError,
+    github_clone_url,
+    scan_cloned_repository,
     scan_repository,
 )
 
@@ -131,3 +133,27 @@ def test_scan_refuses_uncommitted_and_untracked_changes(tmp_path):
 
     with pytest.raises(RepoScanError):
         scan_repository(repo / "pkg")
+
+
+def test_fresh_clone_scan_sees_only_what_the_remote_serves(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    committed = _git(repo, "rev-parse", "HEAD").strip()
+    # Local, uncommitted mess that must never reach the map.
+    (repo / "secret.txt").write_text("do not expose\n", encoding="utf-8")
+    (repo / "app.py").write_text("import pkg.util  # local edit\n", encoding="utf-8")
+
+    scan = scan_cloned_repository(repo.as_uri())
+
+    assert scan.commit == committed
+    assert "secret.txt" not in {r.path for r in scan.rooms}
+    assert _portal_table(scan)[:2] == [
+        ("app.py", 2, "pkg/core.py", "python-import"),
+        ("app.py", 3, "pkg/util.py", "python-import"),
+    ]
+    assert scan.to_data() == scan_cloned_repository(repo.as_uri()).to_data()
+
+    assert github_clone_url("sangderenard/turing") == "https://github.com/sangderenard/turing.git"
+    with pytest.raises(RepoScanError):
+        github_clone_url("C:/dev/Powershell/turing")
+    with pytest.raises(RepoScanError, match="clone"):
+        scan_cloned_repository(repo.as_uri(), ref="no-such-branch")

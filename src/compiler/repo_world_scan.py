@@ -23,7 +23,15 @@ produce identical records and a scan of a different commit never collides.
 The scanner refuses a tree with uncommitted or untracked changes: the record
 set describes a commit, never a working state.
 
-    python -m src.compiler.repo_world_scan <clone-path> [--json]
+The sanctioned input is a GitHub repository, not the owner's local tree: the
+local scratch checkout is messy and holds things that must not be exposed.
+:func:`scan_github_repository` makes a fresh shallow clone of
+``https://github.com/<owner>/<repo>.git`` in a temporary directory (Git LFS
+smudge disabled, so no large binaries are fetched), scans it, and deletes the
+clone.  Only what GitHub serves can reach the record set.
+
+    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--json]
+    python -m src.compiler.repo_world_scan --path <clone-path> [--json]   # fixtures
 """
 
 from __future__ import annotations
@@ -31,13 +39,16 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterable, Mapping
 
 REPO_WORLD_SCAN_VERSION = "repo-world-scan-v0"
+GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 PYTHON_SUFFIXES = (".py",)
 JAVASCRIPT_SUFFIXES = (".js", ".mjs")
@@ -471,15 +482,82 @@ def scan_repository(clone_path: str | Path) -> RepoWorldScan:
     )
 
 
+def github_clone_url(repository: str) -> str:
+    """``owner/repo`` -> the public HTTPS clone URL.  Nothing else is accepted."""
+
+    if not GITHUB_REPOSITORY.match(repository):
+        raise RepoScanError(
+            f"{repository!r} is not a GitHub repository spelled owner/repo"
+        )
+    return f"https://github.com/{repository}.git"
+
+
+def scan_cloned_repository(clone_url: str, *, ref: str | None = None) -> RepoWorldScan:
+    """Clone ``clone_url`` fresh into a temporary directory, scan it, delete it.
+
+    The clone is shallow (one commit) and Git LFS smudge is disabled, so the
+    scan reads only the tracked tree at that commit and no large binaries.
+    The clone never persists; the record set names the commit it came from.
+    """
+
+    env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1", GIT_TERMINAL_PROMPT="0")
+    with tempfile.TemporaryDirectory(prefix="repo-world-scan-") as tmp:
+        clone = Path(tmp) / "clone"
+        command = ["git", "clone", "--quiet", "--depth", "1", "--no-tags"]
+        if ref:
+            command += ["--branch", ref]
+        command += [clone_url, str(clone)]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True,
+                           encoding="utf-8", env=env)
+        except FileNotFoundError as exc:
+            raise RepoScanError("git is not on PATH") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RepoScanError(
+                f"git clone of {clone_url}"
+                f"{' at ' + ref if ref else ''} failed: {exc.stderr.strip()}"
+            ) from exc
+        return scan_repository(clone)
+
+
+def scan_github_repository(repository: str, *, ref: str | None = None) -> RepoWorldScan:
+    """Scan ``owner/repo`` as GitHub serves it, never a local working tree."""
+
+    return scan_cloned_repository(github_clone_url(repository), ref=ref)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in args
-    paths = [item for item in args if item != "--json"]
-    if len(paths) != 1:
-        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
-        return 2
+    args = [item for item in args if item != "--json"]
+    ref = None
+    if "--ref" in args:
+        index = args.index("--ref")
+        if index + 1 >= len(args):
+            print("--ref needs a branch or tag", file=sys.stderr)
+            return 2
+        ref = args[index + 1]
+        del args[index:index + 2]
+    local_path = None
+    if "--path" in args:
+        index = args.index("--path")
+        if index + 1 >= len(args):
+            print("--path needs a clone directory", file=sys.stderr)
+            return 2
+        local_path = args[index + 1]
+        del args[index:index + 2]
+    usage = "\n".join(__doc__.strip().splitlines()[-2:])
     try:
-        scan = scan_repository(paths[0])
+        if local_path is not None:
+            if args or ref:
+                print(usage, file=sys.stderr)
+                return 2
+            scan = scan_repository(local_path)
+        elif len(args) == 1:
+            scan = scan_github_repository(args[0], ref=ref)
+        else:
+            print(usage, file=sys.stderr)
+            return 2
     except RepoScanError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
@@ -500,7 +578,8 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "REPO_WORLD_SCAN_VERSION", "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",
-    "RepoWorldScan", "region_identity", "room_identity", "scan_repository",
+    "RepoWorldScan", "github_clone_url", "region_identity", "room_identity",
+    "scan_cloned_repository", "scan_github_repository", "scan_repository",
 ]
 
 

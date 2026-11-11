@@ -7,9 +7,13 @@ with source line), keyed by the commit hash. Refuses a tree with uncommitted
 or untracked changes (`DirtyCloneError`). Design and the gaps it exposes in
 the Living Data Map records are in `docs/REPO_WORLD_MAP_DESIGN.md`.
 
-Green: `python -m pytest tests/test_repo_world_scan.py -q` — 2 passed in
-1.5 s on a fixture repository built in `tmp_path` (9 files, 4 regions,
+Green: `python -m pytest tests/test_repo_world_scan.py -q` — 3 passed in
+2.1 s on a fixture repository built in `tmp_path` (9 files, 4 regions,
 8 portal pairs, 3 unresolved references, 1 unparsable Python file noted).
+The third test clones the fixture fresh through `scan_cloned_repository`
+after dirtying the working tree, and shows the scan sees only the committed
+tree. The GitHub entry (`scan_github_repository`, 2026-11-11) was not run
+against github.com here: it needs network and the owner's choice of repo.
 
 Also measured: `scan_repository('.')` on this clean commit afc9b4bb took 47 s
 and produced 243 regions, 5,500 rooms, 15,119 portal pairs (14,545 Python,

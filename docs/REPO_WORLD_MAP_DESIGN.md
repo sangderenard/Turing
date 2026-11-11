@@ -118,21 +118,24 @@ Identities are keyed by the commit: `repo:<H>/dir:<path>`,
 (asserted by the test); two commits never collide. The root directory is
 `dir:.`.
 
-The fresh clone is outside the module by design: the scanner takes a path,
-checks it is a repository top level and that `git status --porcelain
---untracked-files=all` is empty, and otherwise refuses with
-`DirtyCloneError`. The compile step is therefore
+The source is GitHub, not the owner's local filesystem. The local scratch
+tree is messy and holds things that must not be exposed, so the scanner's
+public entry is `scan_github_repository("owner/repo", ref=…)`: it makes a
+fresh shallow clone of `https://github.com/<owner>/<repo>.git` in a
+temporary directory, scans it, and deletes the clone. Only what GitHub
+serves can reach the record set. The compile step is one command:
 
 ```bash
-git clone --depth 1 https://github.com/<owner>/<repo>.git <tmp>/clone
+python -m src.compiler.repo_world_scan sangderenard/turing --ref main --json
 ```
 
-```bash
-python -m src.compiler.repo_world_scan <tmp>/clone --json
-```
-
-and the record set names the commit the clone is at. The local scratch tree
-cannot be scanned while it has uncommitted work, which is the owner's rule.
+The record set names the commit the clone was at. Underneath,
+`scan_repository(path)` still checks that the path is a repository top level
+and that `git status --porcelain --untracked-files=all` is empty, refusing
+with `DirtyCloneError` otherwise; that guard is what makes the fresh clone
+the only thing the scan can describe. The `--path` form exists for fixture
+tests, not for the owner's checkout. Git LFS smudge is disabled during the
+clone so no large binaries are fetched; the scan reads text sources only.
 
 ### Reference extraction
 
