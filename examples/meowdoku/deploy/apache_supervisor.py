@@ -386,6 +386,14 @@ class Instance:
                 flags += ["--studio-nodus-port", str(port), "--studio-nodus-prefix", studio]
             else:
                 self.sup.log(f"{self.name}: studio_prefix {studio!r}: the host declares no such contract port; pictures stay off")
+        cron = self.spec.get("cron_prefix")         # [CRON] the declared cron prefix whose tasks this instance performs
+        if cron:
+            port = getattr(source, "contract_ports", {}).get(cron)
+            if port:
+                self.sup.log(f"{self.name}: scheduled tasks come from {source_name!r} contract port {port} ({cron})")
+                flags += ["--cron-port", str(port)]
+            else:
+                self.sup.log(f"{self.name}: cron_prefix {cron!r}: the host declares no such contract port; no scheduled tasks")
         return flags
 
     def poll(self):

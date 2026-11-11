@@ -1,0 +1,10 @@
+# The live service's schedule, read by the Nodus cron tool (nodus include/cron_tool.h).
+# Installed as <state>/jobs/cron/cron.table when that file does not exist yet; edit the installed copy.
+#
+#   <name> <minute> <hour> <day-of-month> <month> <day-of-week> [missed=skip|once|all] [max_late=SECONDS] [max_catch_up=N]
+#
+# Times are UTC. After a gap, "once" runs a missed task one time for the whole gap; "skip" never runs missed
+# occurrences; "all" runs each one (the most recent max_catch_up of them).
+
+# Check that the published hard copy of the manual still matches the manual; rebuild it when it does not.
+manual.hardcopy 17 * * * * missed=once

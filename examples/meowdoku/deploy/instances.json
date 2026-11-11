@@ -19,12 +19,15 @@
         "--studio-assets",
         "C:/dev/Powershell/srv/state/content/studio_agent/assets.json",
         "--studio-defaults",
-        "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json"
+        "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json",
+        "--cron-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/cron"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
-      "studio_prefix": "studio.product"
+      "studio_prefix": "studio.product",
+      "cron_prefix": "cron"
     },
     {
       "name": "meowdoku-dev",
@@ -63,7 +66,9 @@
         "--compile-host",
         "gui.proof:7001:C:/dev/Powershell/srv/state/jobs/nodus-compile",
         "--compile-python",
-        "C:/dev/Powershell/srv/python/python.exe"
+        "C:/dev/Powershell/srv/python/python.exe",
+        "--cron",
+        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron"
       ],
       "leases": [],
       "nodus": {
@@ -71,7 +76,8 @@
         "canvas": "build/meowdoku/canvas/messenger.canvas",
         "acquire": [
           "gui.proof:4:54000",
-          "studio.product:4:7200"
+          "studio.product:4:7200",
+          "cron:4:36000"
         ],
         "rate": 60,
         "console_port": 47612,

@@ -2973,6 +2973,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
     parser.add_argument("--studio-defaults", default=None,
                         help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
+    parser.add_argument("--cron-port", type=int, default=None,
+                        help="[CRON] the local Nodus host's 127.0.0.1 contract port of the cron prefix; this server performs its tasks")
+    parser.add_argument("--cron-jobs-dir", default=None,
+                        help="[CRON] the cron tool's directory (cron.table, the ledger and one request file per run)")
     parser.add_argument("--no-mathlab", action="store_true",
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument("--no-idle-train", action="store_true",
@@ -3039,6 +3043,24 @@ def main(argv: list[str] | None = None) -> int:
             saved_objects_for=sessions.marble_objects.for_account,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
+    from meowdoku import rest_api as shared_rest_loader, scheduled_tasks                   # [CRON]
+    if shared_rest_loader.manual is not None:
+        from meowdoku.living_data_query import GraphView
+        try:   # the hard copy exists from the first start; the cron tool only keeps it fresh
+            _changed, sentence = scheduled_tasks.refresh_hard_copy(
+                sessions.web_dir, name=scheduled_tasks.MANUAL_FOLDER, document=shared_rest_loader.manual.as_map(),
+                site=shared_rest_loader.site, graph_view=GraphView)
+            print(f"[cron] at start: {sentence}", flush=True)
+        except Exception as error:
+            print(f"[cron] the manual hard copy could not be written at start: {type(error).__name__}: {error}", flush=True)
+        if args.cron_port and args.cron_jobs_dir:
+            from meowdoku import studio_product_nodus
+            sessions.scheduled_tasks = scheduled_tasks.start(
+                port=args.cron_port, jobs_dir=args.cron_jobs_dir, web_dir=sessions.web_dir,
+                native=studio_product_nodus.nodus_modules()[0], nodus_tools=studio_product_nodus.DEFAULT_NODUS_TOOLS,
+                manual=shared_rest_loader.manual, site=shared_rest_loader.site, graph_view=GraphView,
+                log=lambda text: print(text, flush=True))
+            print(f"[cron] this server performs scheduled tasks from Nodus port {args.cron_port}", flush=True)
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)

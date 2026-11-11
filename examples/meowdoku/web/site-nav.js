@@ -217,6 +217,7 @@ async function main() {
     link("Home", "/"),
     link("Profile and servers", "/profile.html"),
     link("Browse the site", "/browse"),
+    link("Help: the manual", "/manual/", caps.has("view_site")),
     link("Repository world map", "/worldmap.html", caps.has("dev_ui")),
     link("Math lab", "/mathlab.html", caps.has("compile_submit")),
     link("Source divider", "/divider.html", caps.has("compile_submit")),
