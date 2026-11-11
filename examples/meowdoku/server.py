@@ -1046,6 +1046,48 @@ def make_handler(sessions: Sessions):
                     db.close()
         # ---- end [PROFILE]
 
+        # ---- [CONTROL] /api/admin/instances: force a shutdown, restart or start of an instance (instance_control.py).
+        # GET lists the instances and the recent requests; POST {instance, action, reason?} records a request that the
+        # supervisor performs within a second or two, whether or not the instance is responsive.  Capability: account_manage
+        # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        def _instance_control(self, method: str) -> None:
+            import sqlite3
+            from meowdoku import instance_control
+            self._classify()
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            principal = self._principal()
+            if principal.user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            caps = self._caps()
+            if "account_manage" not in caps and "lifecycle_admin" not in caps:
+                return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
+            body = None
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                body = self._body_json(2048)
+                if body is None:
+                    return
+            db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
+            try:
+                known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
+                if method == "GET":
+                    return self._json({"instances": known, "requests": instance_control.recent(db)})
+                made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
+                                                user_id=principal.user_id, username=principal.username,
+                                                reason=body.get("reason"), known=[i["name"] for i in known])
+                print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
+                return self._json({"request": made}, HTTPStatus.ACCEPTED)
+            except instance_control.ControlError as error:
+                return self._json({"error": error.message}, error.status)
+            except profile_mod.ProfileError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+        # ---- end [CONTROL]
+
         def _living_data_dm(self, path, method):
             from meowdoku.living_data_cursor import CursorError
             from meowdoku.living_data_query import QueryError, MAX_BODY
@@ -1819,6 +1861,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path, "GET")
             if path.startswith("/api/show/pictures/"):
                 return self._picture_route(path, "GET")
+            if path == "/api/admin/instances":
+                return self._instance_control("GET")
             if path == "/site" or path.startswith("/site/"):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
@@ -2290,6 +2334,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_query()
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
+            if path0 == "/api/admin/instances":
+                return self._instance_control("POST")
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]

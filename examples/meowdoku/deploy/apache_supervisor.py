@@ -469,6 +469,45 @@ class Instance:
         with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
             r.read()
 
+    # ---- [CONTROL] forced by an admin's request (instance_control.py); the supervisor does not ask the instance's leave
+    def force_stop(self, wait=15.0) -> str:
+        """Ask the process to stop, wait, then kill it. Leaves the instance ``stopped``; returns what happened."""
+        if self.state in ("skipped", "external"):
+            return f"not managed here ({self.state})"
+        if self.proc is None or self.proc.poll() is not None:
+            self.state = "stopped"
+            self.record(stopped=time.time())
+            return "was not running"
+        pid = self.proc.pid
+        self.state = "stopping"
+        self.request_stop()
+        end = time.monotonic() + wait
+        while time.monotonic() < end and self.proc.poll() is None:
+            time.sleep(0.2)
+        killed = self.proc.poll() is None
+        if killed:
+            self.proc.kill()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                pass
+        self.remove_console_token()
+        self.return_leases()
+        self.state = "stopped"
+        self.record(stopped=time.time())
+        return f"pid {pid} " + ("did not stop when asked and was killed" if killed else "stopped")
+
+    def force_start(self) -> str:
+        if self.state in ("skipped", "external"):
+            return f"not managed here ({self.state})"
+        if self.proc is not None and self.proc.poll() is None:
+            return f"already running (pid {self.proc.pid})"
+        self.starts, self.backoff = [], 1.0              # an admin's start is not one of the crash restarts
+        self.federation_args = self.resolve_federation()
+        self.take_leases()
+        self.launch()
+        return f"started pid {self.proc.pid}"
+
     def finish_stop(self):
         if self.proc is not None and self.proc.poll() is None:
             self.sup.log(f"{self.name}: did not exit in {STOP_WAIT:.0f}s; terminating")
@@ -574,6 +613,10 @@ class Supervisor:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
             while not self.stop.wait(1.0):
+                try:
+                    self.handle_requests()
+                except Exception as error:
+                    self.log(f"request handling error: {error!r}")
                 for inst in self.instances:
                     try:
                         inst.poll()
@@ -584,6 +627,39 @@ class Supervisor:
             self.log("another supervisor owns the instances; this process only logs")
             self.stop.wait()
         return 0
+
+    def handle_requests(self):
+        """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a
+        federation are started first and stopped last, as at the start and stop of the whole stack."""
+        from meowdoku import instance_control
+        light = sqlite3.connect(self.db_path, timeout=5)          # once a second: a plain read, not the full schema check
+        try:
+            todo = instance_control.pending(light)
+        finally:
+            light.close()
+        if not todo:
+            return
+        sources = {i.spec.get("federation_from") for i in self.instances}
+        first_to_start = sorted(self.instances, key=lambda i: i.name not in sources)
+        for item in todo:
+            targets = [i for i in first_to_start if item["instance"] in (instance_control.ALL, i.name)]
+            if not targets:
+                state, detail = "refused", "no such instance under this supervisor"
+            else:
+                done = []
+                try:
+                    if item["action"] in ("restart", "shutdown"):
+                        for inst in reversed(targets):
+                            done.append(f"{inst.name}: {inst.force_stop()}")
+                    if item["action"] in ("restart", "start"):
+                        for inst in targets:
+                            done.append(f"{inst.name}: {inst.force_start()}")
+                    state, detail = "done", "; ".join(done)
+                except Exception as error:
+                    state, detail = "refused", "; ".join(done + [f"failed: {error!r}"])
+            self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {detail}")
+            with connect(self.db_path) as db:
+                instance_control.finish(db, item["id"], state, detail)
 
     def shutdown(self):
         self.log("stopping instances")
