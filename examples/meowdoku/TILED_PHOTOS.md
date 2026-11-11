@@ -22,7 +22,9 @@ The HTTP/agent caller only supplies settings and polls the existing job.
 - GPU textures are tile-sized. Full-image raw/profiled HDR assembly is disk-backed,
   exact global 99th percentile is computed on a disk-backed luminance array,
   and PNG/NPZ encoding and authorized downloads are streamed. Admission reserves
-  a conservative 100 bytes per internal pixel plus 64 MiB before launching a GPU owner.
+  the internal sensor, final HDR/PNG, peak scratch stores and 512 MiB headroom
+  before launching a GPU owner. Supersampling does not reserve final-size
+  output buffers at the larger internal resolution.
 - RGB still photographs are supported. Live, orbit and device intersections
   remain explicit incompatible modes. The UI turns off device participation
   for tiles. Interactive HDR retouch is unavailable for tiled products; download
