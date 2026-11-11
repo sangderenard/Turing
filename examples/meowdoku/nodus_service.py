@@ -15,6 +15,7 @@ nothing about pixels or layout.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import socket
@@ -369,7 +370,16 @@ def share(db, paths, accounts_db, me: int, instance, to, note, *, cache=CACHE, t
     body = (text + "\n\n" if text else "") + summary_line(d)
     conn = messaging.connect(accounts_db)
     try:
-        sent = messaging.send(conn, me, to, body, subject={"kind": "topic", "ref": ref}, msg_type="note")
+        # The handle form the shared messenger API requires of every client: a sender-bound handle for the existing
+        # relationship plus an idempotency key, so a retried share is the same message, never a second one.
+        picker = messaging.conversations(conn, me)
+        handle = next((contact.get("conversation_handle") for contact in picker["contacts"]
+                       if contact.get("username") == to.strip()), None)
+        if handle is None:
+            raise messaging.MessagingError("you cannot message this user", 403)
+        key = hashlib.sha256("".join(("nodus-share", str(me), to.strip(), ref, text)).encode()).hexdigest()
+        sent = messaging.send(conn, me, None, body, subject={"kind": "topic", "ref": ref}, msg_type="note",
+                              conversation_handle=handle, idempotency_key=key)
     except messaging.MessagingError as error:
         raise NodusError(error.message, error.status) from None
     finally:
