@@ -56,7 +56,11 @@ export function studioFlatSamplerPacket() {
 }
 
 export function validateStudioSubjectPacket(packet,samplers) {
-  if(!['turing.studio-class-world-import.v1','turing.studio-subject-appearance.v1'].includes(packet?.schema)||packet.scene?.channel!=='studio')
+  if(packet?.schema==='turing.living-data-studio-composition.v1'&&
+    (packet.provenance?.schema!==packet.schema||!packet.provenance.rig_identity?.startsWith('studio-scene:')||
+      !/^[a-f0-9]{64}$/.test(packet.provenance.source_sha256)||!packet.provenance.world_identity))
+    throw Error('Explicit Living Data composition provenance is required.');
+  if(!['turing.studio-class-world-import.v1','turing.studio-subject-appearance.v1','turing.living-data-studio-composition.v1'].includes(packet?.schema)||packet.scene?.channel!=='studio')
     throw Error('An exact Studio world packet is required.');
   const {render,scene}=packet;
   for(const stage of ['vertex','fragment'])if(typeof render?.shaders?.[stage]!=='string'||

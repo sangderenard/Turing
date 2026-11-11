@@ -69,6 +69,7 @@ from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_fr
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
+from meowdoku import issue_tickets as issue_tickets_mod  # Account-owned SQL incidents, separate from workspace reviews.
 from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
@@ -366,6 +367,10 @@ class Sessions:
         self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer")
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
+        from meowdoku.living_data_cursor import CursorStore
+        self.living_data_cursors = CursorStore()
+        from meowdoku.living_data_static import StaticWorlds
+        self.living_data_static = StaticWorlds()
         self.tickets = tickets_mod.Store(self.state.tickets_dir)
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
@@ -899,6 +904,68 @@ def make_handler(sessions: Sessions):
             return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
         # ---- end [DIVIDER]
 
+        # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
+        def _issues_route(self, path: str, method: str) -> None:
+            from http.cookies import SimpleCookie, CookieError
+            from urllib.parse import parse_qs
+            import sqlite3
+            self._set_cookie = []
+            # Never reuse an issue POST connection after a rejected/unread body.
+            # do_POST also drains bounded remaining bytes for the shared proxy.
+            if method == "POST":
+                self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("view_site"):
+                return
+            try:
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                if self._account() is None:
+                    raise issue_tickets_mod.IssueError("sign in to use issue tickets", 401)
+                service = issue_tickets_mod.Service(sessions.accounts)
+                if method == "GET":
+                    query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if path == "/api/issues":
+                        if set(query) - {"scope", "status", "offset"} or any(len(v) != 1 for v in query.values()):
+                            raise issue_tickets_mod.IssueError("invalid list query")
+                        return self._json(service.list(token, scope=query.get("scope", ["mine"])[0],
+                            status=query.get("status", ["all"])[0], offset=int(query.get("offset", ["0"])[0])))
+                    if set(query) - {"before_version"} or any(len(v) != 1 for v in query.values()):
+                        raise issue_tickets_mod.IssueError("unexpected ticket query")
+                    before = int(query["before_version"][0]) if "before_version" in query else None
+                    return self._json(service.get(token, path.removeprefix("/api/issues/"), before_version=before))
+                if path != "/api/issues" and not path.endswith("/status"):
+                    raise issue_tickets_mod.IssueError("not found", 404)
+                origin = self.headers.get("Origin")
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if origin and origin != expected_origin:
+                    raise issue_tickets_mod.IssueError("cross-origin issue updates are not allowed", 403)
+                if self.headers.get("Sec-Fetch-Site") == "cross-site" or self.headers.get("X-Meowdoku-Issue") != "1":
+                    raise issue_tickets_mod.IssueError("missing same-origin issue header", 403)
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    raise issue_tickets_mod.IssueError("expected application/json", 415)
+                if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                    self.close_connection = True
+                    raise issue_tickets_mod.IssueError("one Content-Length is required")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= issue_tickets_mod.MAX_BODY:
+                    self.close_connection = True
+                    raise issue_tickets_mod.IssueError("issue request exceeds the size limit", 413)
+                payload = json.loads(self.rfile.read(length), parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                if path == "/api/issues":
+                    result = service.create(token, payload, server_instance=sessions.instance, server_log_seq=logring_mod.RING.seq)
+                    return self._json(result, HTTPStatus.CREATED if result["created"] else HTTPStatus.OK)
+                ticket_id = path.removeprefix("/api/issues/").removesuffix("/status")
+                return self._json(service.update(token, ticket_id, payload))
+            except issue_tickets_mod.IssueError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, TypeError, CookieError, RecursionError):
+                return self._json({"error": "invalid issue request"}, HTTPStatus.BAD_REQUEST)
+            except (sqlite3.Error, issue_tickets_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "issue storage is unavailable; no success is confirmed"}, HTTPStatus.SERVICE_UNAVAILABLE)
+        # ---- end [ISSUES]
+
         # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
         # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
         def _messages_route(self, path: str, method: str) -> None:
@@ -1003,6 +1070,114 @@ def make_handler(sessions: Sessions):
                 if db is not None:
                     db.close()
         # ---- end [PROFILE]
+
+        def _living_data_dm(self, path, method):
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError, MAX_BODY
+            import re
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("dev_ui"):
+                return
+            account = self._account()
+            if account is None:
+                return self._json({"error": "sign in to use static DM commands"}, 401)
+            try:
+                service = sessions.living_data_static
+                base = "/api/living-data/dm/worlds"
+                match = re.fullmatch(base + r"/([0-9a-f]{32})(?:/(commands|host|close)(?:/([A-Za-z0-9_-]{1,64}))?)?", path)
+                if self.path.partition("?")[2]:
+                    raise CursorError("DM routes accept no query parameters")
+                if method == "GET":
+                    if match and not match[2]:
+                        return self._json(service.status(account["id"], match[1]))
+                    if match and match[2] == "commands" and match[3]:
+                        return self._json(service.receipt(account["id"], match[1], match[3]))
+                    return self._json({"error": "not found"}, 404)
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    return self._json({"error": "application/json required"}, 415)
+                body = self._body_json(MAX_BODY if path == base or (match and match[2] == "host") else 4096)
+                if body is None:
+                    return
+                if path == base:
+                    return self._json(service.register(account["id"], body), 201)
+                if not match or match[3]:
+                    return self._json({"error": "not found"}, 404)
+                if match[2] == "commands":
+                    result = service.command(account["id"], match[1], body)
+                    return self._json(result, 202 if result["state"] in ("queued", "rendering") else 200)
+                if match[2] == "host":
+                    return self._json(service.host(account["id"], match[1], body))
+                if match[2] == "close" and body == {}:
+                    return self._json(service.close(account["id"], match[1]))
+                return self._json({"error": "not found"}, 404)
+            except CursorError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (QueryError, ValueError, RecursionError):
+                return self._json({"error": "invalid or excessive static DM request"}, 400)
+
+        def _living_data_cursor(self, path, method):
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError, MAX_BODY
+            from urllib.parse import parse_qs
+            import re
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("dev_ui"):
+                return
+            account = self._account()
+            if account is None:
+                return self._json({"error": "sign in to navigate Living Data"}, 401)
+            try:
+                match = re.fullmatch(r"/api/living-data/sessions/([0-9a-f]{32})(?:/(move|close))?", path)
+                service = sessions.living_data_cursors
+                if method == "GET":
+                    if not match or match[2]:
+                        return self._json({"error": "not found"}, 404)
+                    query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if set(query) - {"offset"} or any(len(v) != 1 for v in query.values()):
+                        raise CursorError("invalid status query")
+                    return self._json(service.status(account["id"], match[1], int(query.get("offset", ["0"])[0])))
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    return self._json({"error": "application/json required"}, 415)
+                body = self._body_json(MAX_BODY if path == "/api/living-data/sessions" else 4096)
+                if body is None:
+                    return
+                if path == "/api/living-data/sessions":
+                    return self._json(service.create(account["id"], body), 201)
+                if not match or match[2] not in ("move", "close"):
+                    return self._json({"error": "not found"}, 404)
+                return self._json(getattr(service, match[2])(account["id"], match[1], body))
+            except CursorError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (QueryError, ValueError, RecursionError):
+                return self._json({"error": "invalid or excessive graph navigation request"}, 400)
+
+        # Read-only projection of a caller-supplied canonical Living Data map.
+        def _living_data_query(self):
+            from meowdoku import living_data_query
+            self._set_cookie = []
+            self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("dev_ui"):
+                return
+            if self._account() is None:
+                return self._json({"error": "sign in to query Living Data"}, 401)
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                return self._json({"error": "application/json required"}, 415)
+            try:
+                body = self._body_json(living_data_query.MAX_BODY)
+                if body is not None:
+                    return self._json(living_data_query.query(body))
+            except (living_data_query.QueryError, RecursionError):
+                return self._json({"error": "invalid or excessive Living Data query"}, 400)
 
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
@@ -1235,6 +1410,8 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith("/api/issues") and self.close_connection:
+                self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
             if not getattr(self, "path", "").startswith(("/api/", "/browse")):    # [LISTING] /browse sets its own no-store
@@ -1635,6 +1812,12 @@ def make_handler(sessions: Sessions):
                 return
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
                 return self._log_get()
+            if path.startswith("/api/living-data/dm/"):
+                return self._living_data_dm(path, "GET")
+            if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
+                return self._living_data_cursor(path, "GET")
+            if path == "/api/issues" or path.startswith("/api/issues/"):
+                return self._issues_route(path, "GET")
             if path == "/api/tickets":
                 if not self._require("dev_ui"):
                     return
@@ -2080,6 +2263,14 @@ def make_handler(sessions: Sessions):
             if self._tier == "shader":
                 if self._shader_request(path0, "POST"):
                     return
+            if path0.startswith("/api/living-data/dm/"):
+                return self._living_data_dm(path0, "POST")
+            if path0 == "/api/living-data/sessions" or path0.startswith("/api/living-data/sessions/"):
+                return self._living_data_cursor(path0, "POST")
+            if path0 == "/api/living-data/query":
+                return self._living_data_query()
+            if path0 == "/api/issues" or path0.startswith("/api/issues/"):
+                return self._issues_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
             if path0.startswith("/api/profile/"):              # [PROFILE]

@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Standalone Studio</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+<canvas id="studio"></canvas>
+<script type="module">
+import {createStandaloneStudioScene} from './standalone_studio.js';
+let renderer=null,loading=false;
+// Local caller supplies already-read scene data. No URL fetch or controls.
+window.standaloneStudio=Object.freeze({
+ async load(sceneAsset){
+  if(renderer||loading)throw Error('This static canvas already has a scene or load in progress; reload to replace it');
+  loading=true;
+  try{renderer=await createStandaloneStudioScene({canvas:document.getElementById('studio'),sceneAsset});}
+  finally{loading=false;}
+ },
+ render(camera){if(!renderer)throw Error('Load a verified Studio scene first');return renderer.render(camera);},
+});
+</script>

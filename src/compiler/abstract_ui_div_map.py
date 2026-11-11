@@ -311,12 +311,8 @@ def _introspective_performance_labels(
     return tuple(labels), parents
 
 
-def world_div_map_model(
-    world: AbstractUIWorld,
-    *,
-    entity_mezzanine: EntityMezzanine | None = None,
-) -> dict[str, Any]:
-    """Return the JSON-safe data graph consumed by the div renderer."""
+def world_div_map_graph(world: AbstractUIWorld) -> dict[str, Any]:
+    """Serialize the canonical authored layout without compiling a runtime."""
 
     regions = []
     for region in world.regions:
@@ -365,6 +361,20 @@ def world_div_map_model(
             for track in world.tracks
         ],
     }
+    return model
+
+
+def world_div_map_model(
+    world: AbstractUIWorld,
+    *,
+    entity_mezzanine: EntityMezzanine | None = None,
+    static_only: bool = False,
+) -> dict[str, Any]:
+    """Return the JSON-safe data graph consumed by the div renderer."""
+
+    if static_only and entity_mezzanine is not None:
+        raise ValueError("A static map cannot attach an entity/game mezzanine")
+    model = world_div_map_graph(world)
     if entity_mezzanine is not None:
         model["entity_mezzanine"] = entity_mezzanine_model(entity_mezzanine)
         model["navigation"] = navigation_model(
@@ -462,6 +472,31 @@ def world_div_map_model(
         "night_palette_role": "sky-night",
         "phong_binding": "shared-celestial-directions-as-view-space-emitter-positions",
     }
+    if static_only:
+        # Static inspection uses the exact same geometry and rendering producers.
+        # Stop before any vehicle, audio, physics, or state-loop compilation.
+        scene_mesh = compile_scene_mesh_wasm()
+        software_mesh = compile_software_mesh_wasm()
+        world_transform = compile_world_transform_wasm()
+        model["scene_mesh"] = scene_mesh.to_model()
+        model["software_mesh"] = software_mesh.to_model()
+        model["world"] = world_graph_model(world.identity, geometry, plugins=(
+            wasm_artifact_plugin(
+                f"{world.identity}/plugins/parametric-box",
+                "instantiate-parametric-box-vertices", scene_mesh,
+                source=SCENE_MESH_SOURCE, capability="geometry"),
+            world_transform,
+            wasm_artifact_plugin(
+                f"{world.identity}/plugins/perspective-project",
+                "project-world-vertices", software_mesh,
+                source=SOFTWARE_MESH_PROJECT_SOURCE, capability="presentation"),
+        ))
+        for field, index in (("scene_mesh", 0), ("software_mesh", 2)):
+            model[field]["module"] = model["world"]["plugins"][index]["module"]
+            model[field].pop("binary_base64", None)
+        model["action_mezzanine"] = system_action_mezzanine_model(world.identity)
+        return model
+
     if pointer_identity is not None:
         tool_object = form_tool(f"{world.identity}/tools/form")
         depth_tool_object = depth_map_tool(f"{world.identity}/tools/depth-map")
@@ -11026,6 +11061,26 @@ function renderShaderViewport() {
   shaderViewer.shaderSelect = shaderSelect;
   shaderViewer.shaderOnlyToggle = shaderOnlyToggle;
   shaderViewer.telemetry = viewerTelemetry;
+  // Optional shared site header: expose this shell's real policy and callbacks,
+  // never attach a second keyboard/pointer/gamepad engine. Standalone projections
+  // remain self-contained when the host page has not opted into site-nav.js.
+  const registerHeaderControls = () => {
+    const header = window.MeowdokuSiteNav;
+    if (!header?.registerControlSuite || shaderViewer.headerControlsDispose) return;
+    shaderViewer.headerControlsDispose = header.registerControlSuite({
+      identity: viewer.control_policy.identity,
+      label: "Viewport controls",
+      policy: viewer.control_policy,
+      sample: action => viewportInputValue(action, viewportGamepad()),
+      onOpen: () => setViewportControlHighlight(false),
+      actions: [
+        {label: "Capture viewport controls", close: true, run: () => requestViewportControls()},
+        {label: "Toggle shader-only view", run: () => setShaderOnlyMode(!shaderViewer.shaderOnly)},
+      ],
+    });
+  };
+  registerHeaderControls();
+  window.addEventListener("site-controls-ready", registerHeaderControls, {once: true});
   port.addEventListener("click", event => {
     if (event.target.closest("input,select,.placement-panel,.hotbar,.device-monitor,.mobile-controls")) return;
     if (!controlFocus.dialogue) requestViewportControls();
@@ -11251,21 +11306,25 @@ def project_world_to_div_map(
     *,
     title: str = "Mechanical Creature · living meta-object map",
     entity_mezzanine: EntityMezzanine | None = None,
+    static_only: bool = False,
 ) -> AbstractUI:
     """Compile a world into one portable HTML/CSS/JavaScript document."""
 
-    active_mezzanine = entity_mezzanine or spawn_world_player(
+    if static_only and entity_mezzanine is not None:
+        raise ValueError("A static map cannot attach an entity/game mezzanine")
+    active_mezzanine = None if static_only else entity_mezzanine or spawn_world_player(
         system_root=world.identity,
     )
-    model = world_div_map_model(world, entity_mezzanine=active_mezzanine)
+    model = world_div_map_model(world, entity_mezzanine=active_mezzanine, static_only=static_only)
     # Escaping '<' prevents model strings from terminating the data script.
     model_json = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
     model_json = model_json.replace("<", "\\u003c")
     safe_heading = html.escape(title, quote=False)
+    projection_label = "Static AbstractUI projection" if static_only else "MechanicalCreature / AbstractUI projection"
     structure = f"""<div class="shell">
   <div class="map-scroll">
     <div class="mast">
-      <div><div class="eyebrow">MechanicalCreature / AbstractUI projection</div><div class="title">{safe_heading}</div>
+      <div><div class="eyebrow">{projection_label}</div><div class="title">{safe_heading}</div>
       <div class="legend"><span>program data</span><span class="js">executing source</span></div></div>
       <div class="status" id="map-status">constructing the living map…</div>
     </div>
@@ -11319,6 +11378,17 @@ def project_world_to_div_map(
             (f"{prefix}:html", f"{prefix}:model"),
         ),
     )
+    if static_only:
+        # A public static projection is safe to open without an additional staging step.
+        # Reuse the exact-source adapter; shader and mesh code remain unchanged.
+        from dataclasses import replace
+        import hashlib
+        from .abstract_ui_static_host import patch_static_host
+        script = packets[-1].source.encode("utf8")
+        adapted, _ = patch_static_host(
+            script, expected_source_sha256=hashlib.sha256(script).hexdigest(),
+        )
+        packets = (*packets[:-1], replace(packets[-1], source=adapted.decode("utf8")))
     return AbstractUI(prefix, model, packets, title)
 
 
@@ -11349,4 +11419,5 @@ __all__ = [
     "project_class_to_div_map",
     "project_world_to_div_map",
     "world_div_map_model",
+    "world_div_map_graph",
 ]

@@ -560,6 +560,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("browse.html", "browse.js"):                                                            # [LISTING] the /browse page (server.py /browse/*, listing.py)
         shutil.copyfile(HERE / "web" / name, out / name)
+    for name in ("issues.html", "issues.js"):
+        shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
     print(f"[export] emoji atlas {atlas['size'][0]}x{atlas['size'][1]}: {[k['name'] for k in atlas['kinds']]}", flush=True)
