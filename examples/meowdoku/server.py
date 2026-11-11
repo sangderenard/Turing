@@ -84,6 +84,8 @@ from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilit
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
+from meowdoku.rest_api import reports as shared_reports
+from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
@@ -938,6 +940,13 @@ def make_handler(sessions: Sessions):
             return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
         # ---- end [DIVIDER]
 
+        def _reports_route(self, path: str, method: str) -> None:
+            return shared_reports.route(self, path, method,
+                service_type=experience_reports_mod.Service, accounts=sessions.accounts,
+                account_cookie=ACCOUNT_COOKIE, ReportError=experience_reports_mod.ReportError,
+                SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
+                max_body=experience_reports_mod.MAX_BODY)
+
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
             from http.cookies import SimpleCookie, CookieError
@@ -1461,7 +1470,7 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
-            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith("/api/issues") and self.close_connection:
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports")) and self.close_connection:
                 self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
@@ -1875,6 +1884,8 @@ def make_handler(sessions: Sessions):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
+            if path == "/api/reports" or path.startswith("/api/reports/"):
+                return self._reports_route(path, "GET")
             if path == "/api/tickets":
                 if not self._require("dev_ui"):
                     return
@@ -2348,6 +2359,8 @@ def make_handler(sessions: Sessions):
                 return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
+            if path0 == "/api/reports" or path0.startswith("/api/reports/"):
+                return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]

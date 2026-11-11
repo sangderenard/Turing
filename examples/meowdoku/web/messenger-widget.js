@@ -9,10 +9,23 @@
 // Without data-messenger="allow" on that script tag the module does nothing (one console line).  When the visitor lacks the
 // `message` capability (GET /api/whoami) it renders nothing at all.  Closed: only a small launcher button with an unread badge
 // (a light unread check every 60 s).  Open: contact list, add-contact field, incoming requests, one conversation at a time, and a
-// long poll that runs only while open.  All DOM is built with createElement/textContent (bodies are plain text: no links, images,
+// long poll that runs only while open.  All DOM is built with createElement/textContent (bodies are plain text: no links,
 // embeds or markup, and nothing is fetched or navigated from message content); all styles live in a closed Shadow DOM.
 // Global surface: window.MeowdokuMessenger = {open, close, version}.
-const VERSION = "1";
+const VERSION = "2";
+const MAX_IMAGE_BYTES = 2097152;
+function safeImageURL(image, id) {
+  return image && image.locked === false && image.mime === "image/png" &&
+    image.url === "/api/messages/image?id=" + id ? image.url : null;
+}
+async function pngAttachment(file) {
+  if (!file || file.size > MAX_IMAGE_BYTES) throw new Error("Choose a PNG up to 2 MiB.");
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length > MAX_IMAGE_BYTES || ![137,80,78,71,13,10,26,10].every((v,i) => bytes[i] === v)) throw new Error("Choose a PNG file.");
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return { data: btoa(binary) };
+}
 
 function allowed() {
   const here = import.meta.url;
@@ -45,6 +58,7 @@ input { background: #0b0e14; color: #e8ecf4; border: 1px solid #556; border-radi
 .msg { max-width: 85%; margin: 4px 0; padding: 5px 8px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; background: #232b3d; }
 .msg.mine { margin-left: auto; background: #2d4a86; }
 .msg.removed { font-style: italic; opacity: .7; }
+.attachment { display:block; width:100%; max-width:280px; height:180px; object-fit:contain; }
 .when { display: block; color: #9aa4b8; font-size: 11px; }
 h3 { margin: 8px 0 2px; font-size: 12px; text-transform: uppercase; color: #9aa4b8; }
 `;
@@ -140,6 +154,7 @@ async function start() {
 
   function renderBody() {
     if (!state.panel) return;
+    state.view = null;
     clear(bodyEl); clear(footEl);
     state.panel.back.toggleAttribute("hidden", !state.peer);
     if (state.peer) return renderThread();
@@ -178,6 +193,7 @@ async function start() {
   }
 
   // ---- one conversation ---------------------------------------------------------------------------------------------------------
+  const drafts = new Map();
   const pendingSends = new Map(); // Preserve retry identity across Back/Close within this page.
   let threadEl, olderBtn, oldest = null, newest = 0;
   function msgNode(m) {
@@ -209,34 +225,109 @@ async function start() {
   }
   async function renderThread() {
     const peer = state.peer;
+    const view = { nodes: new Map(), imageState: null, refreshing: false, toggling: false };
+    state.view = view;
+    const active = () => state.open && state.peer === peer && state.view === view;
+    const viewNote = text => { if (active()) note(text); };
     const info = state.contacts && state.contacts.contacts.find((x) => x.username === peer);
     titleEl.textContent = info ? label(info) : peer;
     threadEl = el("div");
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);
     const input = el("input", { type: "text", placeholder: "Message (Enter sends)", "aria-label": "Message to " + peer, maxlength: "4000", autocomplete: "off" });
+    const draft = drafts.get(peer) || { body: "", image: null };
+    drafts.set(peer, draft);
+    input.value = draft.body;
+    let image = draft.image;
+    let choosing = false;
+    const imageStatus = el("div", { class: "note", text: "Images: loading chat setting..." });
+    const toggle = el("button", { type: "button", text: "Enable images" });
+    toggle.disabled = true;
+    const chooser = el("input", { type: "file", accept: "image/png", "aria-label": "Attach PNG (up to 2 MiB)" });
+    chooser.disabled = true;
+    const selected = el("span", { class: "note", text: image ? "PNG attached" : "" });
+    const removeImage = el("button", { type: "button", text: "Clear image" });
+    const updateControls = () => {
+      const setting = view.imageState;
+      const busy = !!pendingSends.get(peer) || choosing || view.toggling;
+      toggle.disabled = !setting || busy || view.refreshing;
+      chooser.disabled = !setting || !setting.enabled || busy;
+      removeImage.disabled = busy || !image;
+      toggle.textContent = setting && setting.enabled ? "Disable images" : "Enable images";
+      selected.textContent = image ? "PNG attached" : "";
+      imageStatus.textContent = "Images are server-readable. Both people must opt in. " +
+        (!setting ? "Setting unavailable." : setting.available ? "Unlocked for this chat." : setting.enabled ? "Waiting for the other person to enable images." : "Off for you.");
+    };
+    view.refreshImages = async (refreshMessages = false) => {
+      if (!active() || view.refreshing || view.toggling) return;
+      view.refreshing = true; updateControls();
+      try {
+        const setting = await api("/api/messages/images?peer=" + encodeURIComponent(peer));
+        if (!active()) return;
+        const changed = JSON.stringify(setting) !== JSON.stringify(view.imageState);
+        view.imageState = setting;
+        updateControls();
+        if (changed || refreshMessages) await refreshLoaded(view, peer);
+      } catch (e) { viewNote(e.message); }
+      finally { view.refreshing = false; if (active()) updateControls(); }
+    };
+    toggle.addEventListener("click", async () => {
+      if (!active() || view.refreshing || view.toggling || !view.imageState || pendingSends.has(peer) || choosing) return;
+      const enabled = !view.imageState.enabled;
+      view.toggling = true; updateControls();
+      try {
+        const list = await api("/api/messages/conversations");
+        if (!active()) return;
+        const relationship = list.contacts.find(x => x.username === peer);
+        if (!relationship) throw new Error("You cannot message this user.");
+        await api("/api/messages/images", { conversation_handle: relationship.conversation_handle, enabled });
+      } catch (e) { viewNote(e.message); }
+      finally {
+        view.toggling = false;
+        if (active()) { await view.refreshImages(true); updateControls(); }
+      }
+    });
+    chooser.addEventListener("change", async () => {
+      if (chooser.disabled || !active()) return;
+      const file = chooser.files && chooser.files[0];
+      if (!file) return;
+      choosing = true; updateControls();
+      try { const attachment = await pngAttachment(file); if (active()) { image = attachment; draft.image = image; } }
+      catch (e) { viewNote(e.message); }
+      finally { choosing = false; chooser.value = ""; if (active()) updateControls(); }
+    });
+    removeImage.addEventListener("click", () => {
+      if (removeImage.disabled) return;
+      image = null; draft.image = null; updateControls();
+    });
+    input.addEventListener("input", () => { draft.body = input.value; });
+    footEl.appendChild(imageStatus);
+    footEl.appendChild(el("div", { class: "row" }, toggle, chooser));
+    footEl.appendChild(el("div", { class: "row" }, selected, removeImage));
     let sending = false;
     let pending = pendingSends.get(peer) || null;
-    if (pending) input.value = pending.body;
+    if (pending) { input.value = pending.body; image = pending.image || null; draft.image = image; }
+    updateControls();
     const send = async () => {
       const text = input.value;
-      if (sending || !text.trim()) return;
-      if (location.protocol !== "https:") { note("Messaging requires HTTPS."); return; }
+      if (sending || choosing || view.toggling || !text.trim()) return;
+      if (location.protocol !== "https:") { viewNote("Messaging requires HTTPS."); return; }
       // A reopened pane can still hold the operation that completed in the old
       // pane. Clear that stale composer instead of treating it as a new send.
-      if (pending && pending.completed && pending.body === text) { pending = null; input.value = ""; note("Sent."); return; }
+      if (pending && pending.completed && pending.body === text && pending.image === image) { pending = null; input.value = ""; image = null; draft.body = ""; draft.image = null; updateControls(); viewNote("Sent."); return; }
       pending = pendingSends.get(peer) || null;
-      if (pending && pending.inFlight) { note("This message is still sending."); return; }
-      if (pending && pending.body !== text) {
-        note("The previous message has an uncertain outcome. Retry its original text before sending another message.");
+      if (pending && pending.inFlight) { viewNote("This message is still sending."); return; }
+      if (pending && (pending.body !== text || pending.image !== image)) {
+        viewNote("The previous message has an uncertain outcome. Retry its original text and image before sending another message.");
         return;
       }
-      if (!pending) pending = { body: text, idempotency_key: crypto.randomUUID(), inFlight: false, completed: false, uncertain: false };
+      if (!pending && image && (!view.imageState || !view.imageState.enabled)) { viewNote("Enable images in this chat first."); return; }
+      if (!pending) pending = { body: text, image, idempotency_key: crypto.randomUUID(), inFlight: false, completed: false, uncertain: false };
       pendingSends.set(peer, pending);
       pending.inFlight = true;
       const operation = pending;
       sending = true;
-      input.disabled = true;
+      input.disabled = true; updateControls();
       try {
         for (let attempt = 0; attempt < 2; attempt++) {
           const conversations = await api("/api/messages/conversations");
@@ -244,7 +335,7 @@ async function start() {
           if (!relationship) throw new Error("You cannot message this user.");
           try {
             const receipt = await api("/api/messages/send", { body: pending.body, idempotency_key: pending.idempotency_key,
-              conversation_handle: relationship.conversation_handle });
+              conversation_handle: relationship.conversation_handle, ...(pending.image ? {image: pending.image} : {}) });
             if (!receipt || receipt.ok !== true || !Number.isInteger(receipt.id) || receipt.id <= 0 ||
                 typeof receipt.created !== "number" || !Number.isFinite(receipt.created)) {
               throw new Error("Invalid send receipt; message outcome may be uncertain.");
@@ -253,7 +344,8 @@ async function start() {
             if (pendingSends.get(peer) === pending) pendingSends.delete(peer);
             pending = null;
             input.value = "";
-            note("");
+            image = null; draft.body = ""; draft.image = null;
+            viewNote("");
             break;
           } catch (e) {
             operation.uncertain = operation.uncertain || !e.status || e.status >= 500;
@@ -265,40 +357,59 @@ async function start() {
         if (!operation.uncertain && e.status >= 400 && e.status < 500) {
           if (pendingSends.get(peer) === operation) pendingSends.delete(peer);
           pending = null;
-          note(e.message); // Definitive rejection: the text can be corrected normally.
+          viewNote(e.message); // Definitive rejection: the text can be corrected normally.
         } else {
-          note(e.message + " Retry unchanged text to safely retry this message.");
+          viewNote(e.message + " Retry unchanged text and image to safely retry this message.");
         }
       }
-      finally { operation.inFlight = false; sending = false; input.disabled = false; }
+      finally { operation.inFlight = false; sending = false; input.disabled = false; if (active()) updateControls(); }
     };
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); } });
     footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Send", on: { click: send } })));
     state.seen = new Set();
     await loadThread(false);
-    input.focus();
+    if (active()) { input.focus(); await view.refreshImages(); }
   }
   async function loadThread(older) {
     const peer = state.peer;
+    const view = state.view;
     try {
       const q = "/api/messages/thread?peer=" + encodeURIComponent(peer) + (older && oldest ? "&before=" + oldest : "");
       const r = await api(q);
-      if (peer !== state.peer) return;
+      if (!state.open || peer !== state.peer || view !== state.view) return;
       const frag = document.createDocumentFragment();
-      for (const m of r.messages) { if (!state.seen.has(m.id)) { state.seen.add(m.id); frag.appendChild(msgNode(m)); } }
+      for (const m of r.messages) { if (!state.seen.has(m.id)) { state.seen.add(m.id); const node = msgNode(m); view.nodes.set(m.id, node); frag.appendChild(node); } }
       if (older) threadEl.insertBefore(frag, threadEl.firstChild); else threadEl.appendChild(frag);
-      if (r.messages.length) { oldest = r.messages[0].id; newest = Math.max(newest, r.messages[r.messages.length - 1].id); }
+      if (r.messages.length) { oldest = oldest === null ? r.messages[0].id : Math.min(oldest, r.messages[0].id); newest = Math.max(newest, r.messages[r.messages.length - 1].id); }
       olderBtn.toggleAttribute("hidden", !r.more);
       if (!older) bodyEl.scrollTop = bodyEl.scrollHeight;
       if (newest) { await api("/api/messages/read", { peer, up_to: newest }); loadContacts().catch(() => {}); }
-    } catch (e) { note(e.message); }
+    } catch (e) { if (state.view === view && state.open) note(e.message); }
+  }
+  // Refresh every already-loaded page, including older locked messages, in place.
+  async function refreshLoaded(view, peer) {
+    const ids = [...view.nodes.keys()];
+    if (!ids.length) return;
+    const floor = Math.min(...ids);
+    let before = null;
+    do {
+      const r = await api("/api/messages/thread?peer=" + encodeURIComponent(peer) + (before ? "&before=" + before : ""));
+      if (!state.open || state.view !== view || state.peer !== peer) return;
+      for (const m of r.messages) {
+        const old = view.nodes.get(m.id);
+        if (old) { const node = msgNode(m); old.replaceWith(node); view.nodes.set(m.id, node); }
+      }
+      const next = r.messages.length ? r.messages[0].id : null;
+      if (!r.more || next === null || next <= floor || (before !== null && next >= before)) break;
+      before = next;
+    } while (true);
   }
   function incoming(m) {
     const peer = m.from === who.username ? m.to : m.from;
     if (state.peer === peer && threadEl) {
       if (state.seen.has(m.id)) return;
       state.seen.add(m.id);
-      threadEl.appendChild(msgNode(m));
+      const node = msgNode(m); state.view.nodes.set(m.id, node); threadEl.appendChild(node);
       newest = Math.max(newest, m.id);
       bodyEl.scrollTop = bodyEl.scrollHeight;
       if (m.from === peer) api("/api/messages/read", { peer, up_to: m.id }).then(() => loadContacts()).catch(() => {});
@@ -312,6 +423,8 @@ async function start() {
         const r = await fetch("/api/messages/since?after=" + state.after + "&wait=25", { credentials: "same-origin", cache: "no-store", signal });
         if (!r.ok) throw new Error("HTTP " + r.status);
         const data = await r.json();
+        if (signal.aborted) return;
+        if (state.view && state.view.refreshImages) state.view.refreshImages();
         if (state.after < 0) { state.after = data.latest || 0; continue; }
         let refresh = false;
         for (const m of data.messages) { state.after = Math.max(state.after, m.id); incoming(m); if (m.to === who.username) refresh = true; }
@@ -344,7 +457,7 @@ async function start() {
     if (state.abort) state.abort.abort();
     state.abort = null;
     if (state.panel) state.panel.remove();
-    state.panel = null; state.peer = null; threadEl = null;
+    state.panel = null; state.peer = null; state.view = null; threadEl = null;
   }
 
   window.MeowdokuMessenger = Object.freeze({ open, close, version: VERSION });
