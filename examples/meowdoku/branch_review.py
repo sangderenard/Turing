@@ -312,11 +312,14 @@ def in_review(db, repository, branch) -> bool:
                       "AND landed_at IS NULL", (repository, branch)).fetchone() is not None
 
 
-def record_removed(db, repository, branch, head, reason, now=None) -> None:
+def record_removed(db, repository, branch, head, reason, now=None, *, keep_owner=False) -> None:
+    """The notice of removal: what was removed from this computer, the commit it was at, and why. ``keep_owner``
+    is for a branch that lives on, on the remote: its registration stays."""
     ensure(db)
     db.execute("INSERT INTO branch_removed VALUES (?,?,?,?,?)",
                (repository, branch, head, time.time() if now is None else now, str(reason)[:500]))
-    db.execute("DELETE FROM branch_owners WHERE repository = ? AND branch = ?", (repository, branch))
+    if not keep_owner:
+        db.execute("DELETE FROM branch_owners WHERE repository = ? AND branch = ?", (repository, branch))
 
 
 def advice(policy, repository, head=None) -> str:

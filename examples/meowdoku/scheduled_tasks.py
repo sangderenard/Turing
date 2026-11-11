@@ -196,6 +196,8 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                 db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
                 try:
                     done = getattr(gate, which)(policy, db, apply=bool(policy["apply"]))
+                    if which == "clean":         # side worktrees first leave, then their branches fall under the same rules
+                        done = gate.clean_worktrees(policy, db, apply=bool(policy["apply"])) + done
                 finally:
                     db.close()
                 counts = {}

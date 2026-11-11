@@ -31,6 +31,13 @@ branch is still removed, and the entry carries ``remote_skipped`` with the rule;
 that is not GitHub, or a question GitHub does not answer, is not a refusal: the removal is tried and any refusal is
 reported as a failure.
 
+``clean_worktrees`` keeps side worktrees off this computer. A repository's own checkout is the reference core; every
+other worktree of it is removed once it has been idle for ``worktree_idle_days``, holds no uncommitted or untracked
+file, is not locked, and its commit is on the remote. Its local branch goes with it when the remote holds the same
+branch at the same commit. Nothing is lost: the notice of removal (``branch_removed``) names the path, the branch and
+the commit, and the remote keeps the branch. A worktree that fails any of those tests is kept and the reason said.
+Ignored files in a removed worktree (caches, build output) are deleted with it.
+
 ``lock`` is "mock" or "enforce". In mock the push check says what it would have refused, prints the advice
 (``branch_review.advice``) and lets the push through. A branch with a commit of its own is never removed, whatever its age;
 it is reported as unmerged. Removal is by expected commit, locally and on the remote, so a branch that moved
@@ -65,6 +72,7 @@ except ImportError:  # run as a plain script, or loaded by path
 
 HOOK_MARK = "# speaktome branch gate"
 DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
+            "worktree_idle_days": 1,
             "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
@@ -187,6 +195,81 @@ def remove_branch(path, branch, head, *, remote, delete_remote, local, skipped=N
         git(path, "config", "--remove-section", f"branch.{branch}", check=False)
         done.append("removed locally")
     return "; ".join(done)
+
+
+def side_worktrees(path, remote="origin") -> list:
+    """Every worktree of a repository except its own checkout, with what removing it would lose."""
+    entries, current = [], None
+    for line in git(path, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            current = {"path": line[9:], "branch": None, "head": None, "locked": False}
+            entries.append(current)
+        elif line.startswith("HEAD "):
+            current["head"] = line[5:]
+        elif line.startswith("branch refs/heads/"):
+            current["branch"] = line[18:]
+        elif line.startswith("locked"):
+            current["locked"] = True
+    out = []
+    for entry in entries[1:]:
+        entry["exists"] = Path(entry["path"]).is_dir()
+        entry["on_remote"] = bool(entry["head"]) and bool(git(path, "branch", "-r", "--contains", entry["head"], check=False))
+        entry["same_on_remote"] = bool(entry["branch"]) and git(
+            path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{entry['branch']}", check=False) == entry["head"]
+        entry["dirty"], entry["touched"] = 0, None
+        if entry["exists"]:
+            entry["dirty"] = len(git(entry["path"], "status", "--porcelain", check=False).splitlines())
+            gitdir = Path(git(entry["path"], "rev-parse", "--absolute-git-dir", check=False) or entry["path"])
+            stamps = [(gitdir / name).stat().st_mtime for name in ("index", "HEAD", "logs/HEAD") if (gitdir / name).exists()]
+            entry["touched"] = max(stamps) if stamps else None
+        out.append(entry)
+    return out
+
+
+def clean_worktrees(policy, db, *, apply, now=None, log=print) -> list:
+    now = time.time() if now is None else now
+    idle = float(policy["worktree_idle_days"]) * 86400.0
+    actions = []
+    for name, declared in sorted(policy["repositories"].items()):
+        path = declared["path"]
+        if not Path(path, ".git").exists():
+            continue
+        for tree in side_worktrees(path, policy["remote"]):
+            label = tree["branch"] or f"(detached at {(tree['head'] or '')[:12]})"
+            entry = {"repository": name, "branch": label, "head": tree["head"], "worktree": tree["path"]}
+            if not tree["exists"]:
+                if apply:
+                    git(path, "worktree", "prune", check=False)
+                entry.update(action="pruned" if apply else "would prune", reason="its folder is gone; only the record was left")
+            elif tree["locked"]:
+                entry.update(action="keep", reason="locked")
+            elif tree["touched"] is None or now - tree["touched"] < idle:
+                entry.update(action="keep", reason=f"used within the last {policy['worktree_idle_days']:g} day(s)")
+            elif tree["dirty"]:
+                entry.update(action="keep", reason=f"holds {tree['dirty']} uncommitted or untracked file(s)")
+            elif not tree["on_remote"]:
+                entry.update(action="keep", reason="its commit is not on the remote")
+            elif not apply:
+                entry.update(action="would remove", reason="idle, clean, and its commit is on the remote")
+            else:
+                try:
+                    git(path, "worktree", "remove", tree["path"])
+                    detail = f"worktree {tree['path']} removed; the commit is on the remote"
+                    drop = (tree["same_on_remote"] and not protected(policy, name, tree["branch"])
+                            and not branch_review.in_review(db, name, tree["branch"]))
+                    if drop:
+                        git(path, "update-ref", "-d", f"refs/heads/{tree['branch']}", tree["head"])
+                        git(path, "config", "--remove-section", f"branch.{tree['branch']}", check=False)
+                        detail += f" as {policy['remote']}/{tree['branch']}; local branch removed"
+                    branch_review.record_removed(db, name, label, tree["head"], detail, now, keep_owner=True)
+                    entry.update(action="removed", reason=detail)
+                except GateError as error:
+                    entry.update(action="failed", reason=str(error))
+            actions.append(entry)
+    for entry in actions:
+        if entry["action"] != "keep":
+            log(f"[worktrees] {entry['repository']} {entry['branch']}: {entry['action']} ({entry['reason']})")
+    return actions
 
 
 def clean(policy, db, *, apply, now=None, log=print) -> list:
@@ -370,7 +453,7 @@ def main(argv=None) -> int:
     parser.add_argument("--db", required=True, help="the accounts database")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
-    for name in ("land", "clean"):
+    for name in ("land", "clean", "worktrees"):
         sub.add_parser(name).add_argument("--apply", action="store_true")
     submit = sub.add_parser("submit")
     submit.add_argument("repository")
@@ -416,7 +499,7 @@ def main(argv=None) -> int:
                     print(f"{review['standing']:10} {review['repository']:18} {review['branch']} {review['head'][:12]} by {review['owner_name']}")
                 return 0
             apply = bool(args.apply or policy["apply"])
-            done = (land if args.command == "land" else clean)(policy, db, apply=apply)
+            done = {"land": land, "clean": clean, "worktrees": clean_worktrees}[args.command](policy, db, apply=apply)
             print(json.dumps({"applied": apply, "count": len(done),
                               "remote_skipped": sum(1 for e in done if e.get("remote_skipped")),
                               "by_action": {a: sum(1 for e in done if e["action"] == a) for a in sorted({e["action"] for e in done})}}))

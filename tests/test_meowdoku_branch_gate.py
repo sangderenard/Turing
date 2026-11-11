@@ -405,6 +405,35 @@ def test_a_remote_rule_against_deletion_is_asked_first_and_the_skip_is_reported(
     assert branch_gate.deletion_forbidden(work, "origin", "anything") is None, "no answer is not a refusal"
 
 
+def test_side_worktrees_leave_this_computer_with_a_notice_when_nothing_would_be_lost(world):
+    import time
+    work, db, policy = world["work"], world["db"], world["policy"]
+    trees = work.parent / "trees"
+    heads = {}
+    for name in ("pushed", "dirty", "unpushed"):
+        run(work, "worktree", "add", "-q", "-b", name, str(trees / name), "main")
+        heads[name] = commit(trees / name, f"{name}.txt")
+    run(work, "push", "-q", "origin", "pushed", "dirty")
+    (trees / "dirty" / "scratch.txt").write_text("not committed", encoding="utf-8")
+    run(work, "worktree", "add", "-q", "--detach", str(trees / "detached"), "main")
+    today = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, log=lambda line: None)}
+    assert {e["action"] for e in today.values()} == {"keep"} and "used within" in today["pushed"]["reason"]
+    later = time.time() + 2 * DAY
+    dry = {e["branch"]: e["action"] for e in branch_gate.clean_worktrees(policy, db, apply=False, now=later, log=lambda line: None)}
+    assert dry["pushed"] == "would remove" and (trees / "pushed").is_dir()
+    done = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, now=later, log=lambda line: None)}
+    assert done["pushed"]["action"] == "removed" and not (trees / "pushed").exists()
+    assert remote_has(world, "pushed") == heads["pushed"], "the remote keeps the branch"
+    assert "pushed" not in run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
+    assert done["dirty"]["action"] == "keep" and "uncommitted" in done["dirty"]["reason"] and (trees / "dirty" / "scratch.txt").exists()
+    assert done["unpushed"]["action"] == "keep" and "not on the remote" in done["unpushed"]["reason"]
+    detached = next(e for name, e in done.items() if name.startswith("(detached"))
+    assert detached["action"] == "removed" and not (trees / "detached").exists()
+    notice = db.execute("SELECT head, reason FROM branch_removed WHERE branch = 'pushed'").fetchone()
+    assert notice[0] == heads["pushed"] and "origin/pushed" in notice[1] and str(trees / "pushed").replace("\\", "/") in notice[1].replace("\\", "/")
+    assert (work / "base.txt").exists(), "the repository's own checkout is never touched"
+
+
 def test_the_gate_pushes_a_branch_its_author_never_pushed(world):
     db, policy = world["db"], world["policy"]
     head = branch(world, "local-only", push=False)
@@ -422,5 +451,6 @@ def test_the_shipped_policy_names_real_repositories_and_mocks_the_lock():
     shipped = branch_gate.load_policy(Path(__file__).resolve().parents[1] / "examples" / "meowdoku" / "deploy" / "branch_policy.json")
     assert shipped["lock"] == "mock" and {"turing", "speaktome", "nodus"} <= set(shipped["repositories"])
     assert shipped["unregistered_days"] == 30 and shipped["registered_days"] == 365 and shipped["grace_days"] == 1
+    assert shipped["worktree_idle_days"] == 1
     assert branch_gate.protected(shipped, "turing", "main") and branch_gate.protected(shipped, "turing", "snapshot/x")
     assert not branch_gate.protected(shipped, "turing", "codex/anything")
