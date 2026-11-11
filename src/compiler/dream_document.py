@@ -64,8 +64,22 @@ DREAM_LANGUAGE_TRANSLATIONS: Mapping[str, DreamLanguageTranslation] = (
             "cpp-shell", "cpp_shell_desugar.desugar_cpp_shell",
             "process-graph-aot", False,
         ),
+        # A natural-language description standing in for code (owner's
+        # direction, 2026-11-11).  It is irreducible: no parser, no graph
+        # beyond its lines.  Its execution target is the open work table,
+        # where it waits until a block that `satisfies` it is written.
+        "prose": DreamLanguageTranslation(
+            "stand-in", "DreamDocument.work_table", "work-table", False,
+        ),
     })
 )
+
+STAND_IN_LANGUAGE = "prose"
+STAND_IN_ROUTE = "stand-in"
+# Header keys a block uses to contribute code for a stand-in.  They ride in
+# ``DreamBlock.decorations`` like every other undeclared sentinel key.
+SATISFIES_KEY = "satisfies"
+AUTHOR_KEY = "author"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +229,7 @@ def _ssa_module_graph_mapping(module: Any, *, route: str) -> dict[str, Any]:
     }
 
 
-def _source_section_graph(block: "DreamBlock") -> dict[str, Any]:
+def _source_section_graph(block: "DreamBlock", *, route: str = "source") -> dict[str, Any]:
     lines = block.payload.splitlines()
     nodes = [{
         "id": "section",
@@ -238,7 +252,7 @@ def _source_section_graph(block: "DreamBlock") -> dict[str, Any]:
         previous = identity
     return {
         "schema": "turing.dream-section-graph.v1",
-        "route": "source",
+        "route": route,
         "nodes": nodes,
         "edges": edges,
         "roots": ["section"],
@@ -437,6 +451,100 @@ class DreamParallelDeployment:
 
 
 @dataclass(frozen=True, slots=True)
+class DreamContribution:
+    """One child of a stand-in: a block written from its description.
+
+    The block carries ``satisfies = <stand-in id>`` and ``author = <name>``.
+    A prose child is a refinement of the description and leaves the parent
+    open; any other language is code and satisfies it.
+    """
+
+    block: str
+    language: str
+    author: str
+    content_hash: str
+    kind: str  # "code" | "refinement"
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "block": self.block, "language": self.language, "author": self.author,
+            "content_hash": self.content_hash, "kind": self.kind,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DreamStandIn:
+    """A prose block on the work table, with the tree beneath it.
+
+    ``state`` is ``open`` until at least one code contribution exists, then
+    ``satisfied``.  ``owner`` is who holds the room this stand-in claims: the
+    author of the first code contribution once satisfied, otherwise the
+    describer (``described_by``), otherwise nobody.
+    """
+
+    block: str
+    content_hash: str
+    described_by: str | None
+    contributions: tuple[DreamContribution, ...] = ()
+
+    @property
+    def state(self) -> str:
+        return "satisfied" if any(c.kind == "code" for c in self.contributions) else "open"
+
+    @property
+    def owner(self) -> str | None:
+        for contribution in self.contributions:
+            if contribution.kind == "code":
+                return contribution.author
+        return self.described_by
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "block": self.block, "content_hash": self.content_hash,
+            "described_by": self.described_by, "state": self.state,
+            "owner": self.owner,
+            "contributions": [c.to_data() for c in self.contributions],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DreamWorkTable:
+    """Every stand-in of one document and the satisfaction tree.
+
+    ``edges`` are ``description -> contribution`` with role ``satisfied-by``
+    (code) or ``refined-by`` (prose); together with the blocks they make the
+    document a tree rooted at each top-level stand-in.
+    """
+
+    stand_ins: tuple[DreamStandIn, ...]
+
+    def entry(self, block: str) -> DreamStandIn:
+        for item in self.stand_ins:
+            if item.block == block:
+                return item
+        raise KeyError(block)
+
+    @property
+    def open(self) -> tuple[DreamStandIn, ...]:
+        return tuple(item for item in self.stand_ins if item.state == "open")
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "schema": "turing.dream-work-table.v1",
+            "stand_ins": [item.to_data() for item in self.stand_ins],
+            "edges": [
+                {
+                    "from": item.block, "to": contribution.block,
+                    "role": "satisfied-by" if contribution.kind == "code" else "refined-by",
+                    "author": contribution.author,
+                }
+                for item in self.stand_ins
+                for contribution in item.contributions
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class DreamDocument:
     blocks: tuple[DreamBlock, ...]
     parallel: tuple[DreamParallelDeployment, ...] = ()
@@ -447,6 +555,7 @@ class DreamDocument:
         if len(set(identities)) != len(identities):
             raise DreamDocumentError("dream block identities must be unique")
         known = set(identities)
+        self._check_stand_ins()
         deployed: set[str] = set()
         for group in self.parallel:
             if not group.members or len(set(group.members)) != len(group.members):
@@ -466,6 +575,69 @@ class DreamDocument:
             if block.identity == identity:
                 return block
         raise KeyError(identity)
+
+    def _check_stand_ins(self) -> None:
+        """Refuse a malformed satisfaction binding at parse time.
+
+        ``satisfies`` must name a prose block of this document, never the
+        block itself; a satisfying block must name its ``author``; and prose
+        refinements must not form a cycle, so the work table is a tree.
+        """
+
+        prose = {b.identity for b in self.blocks if b.language == STAND_IN_LANGUAGE}
+        for block in self.blocks:
+            target = block.decorations.get(SATISFIES_KEY)
+            if target is None:
+                continue
+            target = target.strip()
+            if target not in prose:
+                raise DreamDocumentError(
+                    f"block {block.identity!r} satisfies {target!r}, which is not a "
+                    f"{STAND_IN_LANGUAGE} block of this document"
+                )
+            if target == block.identity:
+                raise DreamDocumentError(f"block {block.identity!r} cannot satisfy itself")
+            if not block.decorations.get(AUTHOR_KEY, "").strip():
+                raise DreamDocumentError(
+                    f"block {block.identity!r} satisfies {target!r} but names no author"
+                )
+        parent = {
+            b.identity: b.decorations[SATISFIES_KEY].strip()
+            for b in self.blocks
+            if b.language == STAND_IN_LANGUAGE and SATISFIES_KEY in b.decorations
+        }
+        for start in parent:
+            seen = {start}
+            node = parent.get(start)
+            while node is not None:
+                if node in seen:
+                    raise DreamDocumentError(
+                        f"stand-in refinements form a cycle through {start!r}"
+                    )
+                seen.add(node)
+                node = parent.get(node)
+
+    def work_table(self) -> DreamWorkTable:
+        """The open work table: every prose stand-in and what satisfies it."""
+
+        stand_ins = []
+        for block in self.blocks:
+            if block.language != STAND_IN_LANGUAGE:
+                continue
+            contributions = tuple(
+                DreamContribution(
+                    other.identity, other.language,
+                    other.decorations[AUTHOR_KEY].strip(), other.content_hash,
+                    "refinement" if other.language == STAND_IN_LANGUAGE else "code",
+                )
+                for other in self.blocks
+                if other.decorations.get(SATISFIES_KEY, "").strip() == block.identity
+            )
+            author = block.decorations.get(AUTHOR_KEY, "").strip() or None
+            stand_ins.append(DreamStandIn(
+                block.identity, block.content_hash, author, contributions,
+            ))
+        return DreamWorkTable(tuple(stand_ins))
 
     def card_graph(self) -> dict[str, Any]:
         """Project blocks into the existing lazy card/read-head graph ABI."""
@@ -603,6 +775,14 @@ class DreamDocument:
             install_c_role_schemas(graph)
             graph.build_graph(tree)
             mapping = _process_graph_mapping(graph, route="cpp-shell")
+        elif translation.route == STAND_IN_ROUTE:
+            mapping = _source_section_graph(block, route=STAND_IN_ROUTE)
+            entry = self.work_table().entry(block.identity)
+            if entry.state == "open":
+                shortfalls.append(
+                    f"stand-in {block.identity!r} is open on the work table: "
+                    "no block satisfies it yet"
+                )
         else:
             mapping = _source_section_graph(block)
         if not translation.executable:

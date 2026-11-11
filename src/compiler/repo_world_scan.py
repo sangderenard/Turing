@@ -18,6 +18,12 @@ and JavaScript ES-module static imports (``import … from``, bare
 target is not a tracked file is kept as an *unresolved reference* so nothing
 disappears silently; it is not a portal because a portal needs two rooms.
 
+A tracked ``.dream`` document is a room like any file, and every prose
+stand-in inside it (``language = prose``, see ``DreamDocument.work_table``)
+mints one more room: a *claimed room*, owned by the stand-in's author before
+any content exists, ``open`` until a block in the document satisfies it.
+That is the room system's side of the owner's work table.
+
 Every identity is keyed by the commit hash, so two scans of the same commit
 produce identical records and a scan of a different commit never collides.
 The scanner refuses a tree with uncommitted or untracked changes: the record
@@ -47,7 +53,9 @@ import sys
 import tempfile
 from typing import Any, Iterable, Mapping
 
-from .dream_document import DREAM_LANGUAGE_TRANSLATIONS
+from .dream_document import (
+    DREAM_LANGUAGE_TRANSLATIONS, DreamDocumentError, parse_dream_document,
+)
 
 REPO_WORLD_SCAN_VERSION = "repo-world-scan-v0"
 GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -66,6 +74,11 @@ LANGUAGE_SUFFIXES: Mapping[str, tuple[str, ...]] = {
     "wgsl": (".wgsl",),
     # "sympy" is a Python-hosted language with no file suffix of its own.
 }
+# A dream document is a container of language blocks, not a language; its
+# room keeps language "dream-document" and its stand-ins become claimed rooms.
+DOCUMENT_SUFFIXES: Mapping[str, tuple[str, ...]] = {
+    "dream-document": (".dream",),
+}
 LINKING_READERS: Mapping[str, str] = {
     "python": "python-import",        # ast.Import / ast.ImportFrom
     "javascript": "es-module-import",  # static ES-module import/export-from
@@ -73,6 +86,9 @@ LINKING_READERS: Mapping[str, str] = {
 _SUFFIX_LANGUAGE = {
     suffix: language for language, suffixes in LANGUAGE_SUFFIXES.items() for suffix in suffixes
 }
+_SUFFIX_LANGUAGE.update({
+    suffix: name for name, suffixes in DOCUMENT_SUFFIXES.items() for suffix in suffixes
+})
 _unknown_to_table = set(LANGUAGE_SUFFIXES) - set(DREAM_LANGUAGE_TRANSLATIONS)
 if _unknown_to_table:
     raise RuntimeError(
@@ -194,6 +210,41 @@ class RepoPortalPair:
 
 
 @dataclass(frozen=True, slots=True)
+class RepoRoomClaim:
+    """A room claimed by a stand-in before its content exists.
+
+    Minted from one prose block of a tracked ``.dream`` document.  The claim
+    is contained by the document's region beside the document's own room and
+    says who owns it (``owner``: the first code contributor once satisfied,
+    else the describer) and whether the stand-in is still ``open``.  The room
+    is unaltered: the scanner writes no content, geometry or portals for it.
+    """
+
+    identity: str
+    document_room: str
+    region: str
+    stand_in: str          # the prose block's id inside the document
+    content_hash: str      # the description's sha256, the card cache_key
+    state: str             # "open" | "satisfied"
+    owner: str | None
+    described_by: str | None
+    contributions: tuple[Mapping[str, Any], ...] = ()
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity, "kind": "claimed-room",
+            "document_room": self.document_room, "region": self.region,
+            "stand_in": self.stand_in, "content_hash": self.content_hash,
+            "state": self.state, "owner": self.owner, "described_by": self.described_by,
+            "contributions": [dict(item) for item in self.contributions],
+            "dependencies": [
+                {"relationship": "contained-by", "target": self.region},
+                {"relationship": "claimed-from", "target": self.document_room},
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RepoUnresolvedReference:
     """A reference whose target is not a tracked file (stdlib, package, typo)."""
 
@@ -220,6 +271,7 @@ class RepoWorldScan:
     portals: tuple[RepoPortalPair, ...]
     unresolved: tuple[RepoUnresolvedReference, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
+    claims: tuple[RepoRoomClaim, ...] = ()
 
     @property
     def root_region(self) -> RepoRegion:
@@ -236,6 +288,7 @@ class RepoWorldScan:
             "rooms": [item.to_data() for item in self.rooms],
             "portals": [item.to_data() for item in self.portals],
             "unresolved_references": [item.to_data() for item in self.unresolved],
+            "claims": [item.to_data() for item in self.claims],
             "notes": list(self.notes),
         }
 
@@ -291,6 +344,10 @@ def room_identity(commit: str, path: str) -> str:
 
 def _pair_identity(commit: str, source: str, line: int, target: str) -> str:
     return f"repo:{commit}/portal:{source}:{line}->{target}"
+
+
+def claim_identity(commit: str, document: str, stand_in: str) -> str:
+    return f"repo:{commit}/claim:{document}#{stand_in}"
 
 
 # --- tree ----------------------------------------------------------------------
@@ -456,6 +513,26 @@ def _javascript_references(path: str, text: str, tracked: frozenset[str]) -> lis
     return refs
 
 
+def _dream_claims(
+    commit: str, path: str, raw: bytes, room: RepoRoom,
+) -> tuple[list[RepoRoomClaim], str | None]:
+    """Claimed rooms for every stand-in of one tracked dream document."""
+
+    try:
+        document = parse_dream_document(raw)
+    except DreamDocumentError as error:
+        return [], f"{path}: dream document not parsed ({error})"
+    claims = []
+    for entry in document.work_table().stand_ins:
+        claims.append(RepoRoomClaim(
+            claim_identity(commit, path, entry.block), room.identity, room.region,
+            entry.block, entry.content_hash, entry.state, entry.owner,
+            entry.described_by,
+            tuple(contribution.to_data() for contribution in entry.contributions),
+        ))
+    return claims, None
+
+
 def _read(clone: Path, path: str) -> str:
     return (clone / path).read_text(encoding="utf-8", errors="replace")
 
@@ -486,9 +563,18 @@ def scan_repository(clone_path: str | Path) -> RepoWorldScan:
 
     references: list[_Reference] = []
     notes: list[str] = []
+    claims: list[RepoRoomClaim] = []
+    room_by_path = {room.path: room for room in rooms}
     for path in files:
         language = _language(path)
-        if language == "python":
+        if language == "dream-document":
+            found, note = _dream_claims(
+                commit, path, (clone / path).read_bytes(), room_by_path[path],
+            )
+            claims.extend(found)
+            if note:
+                notes.append(note)
+        elif language == "python":
             refs, note = _python_references(path, _read(clone, path), tracked)
             references.extend(refs)
             if note:
@@ -526,6 +612,7 @@ def scan_repository(clone_path: str | Path) -> RepoWorldScan:
 
     return RepoWorldScan(
         commit, origin, regions, rooms, tuple(portals), tuple(unresolved), tuple(notes),
+        tuple(claims),
     )
 
 
@@ -613,7 +700,11 @@ def main(argv: list[str] | None = None) -> int:
         print()
         return 0
     print(f"commit {scan.commit}")
-    print(f"regions {len(scan.regions)}  rooms {len(scan.rooms)}  portal pairs {len(scan.portals)}  unresolved {len(scan.unresolved)}")
+    print(f"regions {len(scan.regions)}  rooms {len(scan.rooms)}  portal pairs {len(scan.portals)}  "
+          f"unresolved {len(scan.unresolved)}  claimed rooms {len(scan.claims)}")
+    for claim in scan.claims:
+        print(f"  claim {claim.document_room.split('/file:', 1)[1]}#{claim.stand_in} "
+              f"{claim.state} owner={claim.owner}")
     for portal in scan.portals:
         print(f"  {portal.source_room.split('/file:', 1)[1]}:{portal.source_line} -> "
               f"{portal.target_room.split('/file:', 1)[1]}  [{portal.reference_kind} {portal.specifier}]")
@@ -626,7 +717,8 @@ __all__ = [
     "LANGUAGE_SUFFIXES", "LINKING_READERS", "REPO_WORLD_SCAN_VERSION",
     "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair", "language_table",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",
-    "RepoWorldScan", "github_clone_url", "region_identity", "room_identity",
+    "RepoWorldScan", "RepoRoomClaim", "claim_identity",
+    "github_clone_url", "region_identity", "room_identity",
     "scan_cloned_repository", "scan_github_repository", "scan_repository",
 ]
 

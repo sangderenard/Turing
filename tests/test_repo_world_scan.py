@@ -93,7 +93,8 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
     # Languages come from the compiler's own table; C++ is known but unlinked.
     assert rooms["native/geom.cpp"].language == "cpp"
     languages = {row["language"]: row for row in scan.to_data()["languages"]}
-    assert set(languages) == {"python", "sympy", "javascript", "glsl", "wgsl", "cpp"}
+    assert set(languages) == {"python", "sympy", "javascript", "glsl", "wgsl", "cpp", "prose"}
+    assert languages["prose"]["route"] == "stand-in" and languages["prose"]["suffixes"] == []
     assert languages["cpp"]["route"] == "cpp-shell" and languages["cpp"]["linking"] is None
     assert languages["python"]["linking"] == "python-import"
     assert languages["javascript"]["linking"] == "es-module-import"

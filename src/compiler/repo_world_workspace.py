@@ -270,7 +270,8 @@ def main(argv: list[str] | None = None) -> int:
                 print()
                 return 0
             for path, scan in result.scans:
-                print(f"{path:30s} {scan.commit[:12]}  regions {len(scan.regions):5d}  rooms {len(scan.rooms):6d}  portals {len(scan.portals):6d}")
+                print(f"{path:30s} {scan.commit[:12]}  regions {len(scan.regions):5d}  rooms {len(scan.rooms):6d}  "
+                      f"portals {len(scan.portals):6d}  claims {len(scan.claims):4d}")
             for note in result.notes:
                 print(f"  note: {note}")
             return 0

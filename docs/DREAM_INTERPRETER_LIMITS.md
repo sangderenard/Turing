@@ -162,35 +162,62 @@ strict=True)`. Polynomials, trig, `Matrix(...).det()`, `Sum`, `Derivative`,
 - The `source` route is the only route that never fails; it is also the one
   that knows nothing.
 
-## Natural-language stand-ins (owner's direction, 2026-11-11, not built)
+## Natural-language stand-ins (owner's direction, built 2026-11-11)
 
 The owner's intent: a dream block may be a natural-language description
 standing in for code. It is irreducible, so it goes to an open work table.
 When someone writes the code from the description, the stand-in is
 satisfied; the code has an author; the document becomes a tree whose child
 of the description is that contribution. This feeds back to the room system:
-in both the filesystem map and the code map the stand-in already owns a room,
+in both the filesystem map and the code map the stand-in owns a room,
 claimed but unaltered, so ownership belongs to the author from the moment
 the description exists.
 
-What exists for it today: the `source` route keeps any undeclared language
-as an irreducible line graph with a visible shortfall, so a
-`language = prose` block already survives parsing and lands in the section
-graphs with its text intact. The world scan (`repo_world_scan.py`) mints a
-room per file and the scan's `languages` table says which languages have no
-reader. What does not exist: a declared `prose` language in
-`DREAM_LANGUAGE_TRANSLATIONS`; a work-table record (identity, description
-block, state open/satisfied, author, satisfying block); the satisfaction edge
-from description to contribution and the tree it implies; and the room-claim
-record that says a room is owned by an author before its content exists.
-None of these are started here; the limits above come first, and the
-portal/room records in `REPO_WORLD_MAP_DESIGN.md` are where the claim would
-be declared.
+What is built, pinned by `tests/test_dream_work_table.py` (5 passed):
+
+- **`prose` is a declared language** in `DREAM_LANGUAGE_TRANSLATIONS`:
+  route `stand-in`, execution target `work-table`, not executable. The
+  block's graph is the irreducible line graph (`SourceSection` /
+  `SourceLine`, route `stand-in`). While it is open the compilation carries
+  the shortfall `stand-in '<id>' is open on the work table`.
+- **Binding is two sentinel keys**, carried in `decorations` like any
+  undeclared key: `satisfies = <stand-in id>` and `author = <name>`. The
+  describing block may carry `author` too (the describer). `parse_dream_document`
+  refuses, at parse time: `satisfies` naming anything but a prose block of
+  the same document, a block satisfying itself, a satisfying block with no
+  `author`, and a cycle of prose refinements.
+- **The work table** is `DreamDocument.work_table()` -> `DreamWorkTable`
+  (`stand_ins`, `open`, `entry(id)`, `to_data()` with schema
+  `turing.dream-work-table.v1`). Each `DreamStandIn` has `block`,
+  `content_hash`, `described_by`, `contributions`, and two derived facts:
+  `state` (`open` until a code contribution exists, then `satisfied`) and
+  `owner` (the first code contributor once satisfied, else the describer,
+  else nobody). A `DreamContribution` is `code` for any language but prose
+  and `refinement` for a prose child, which is itself a stand-in and leaves
+  its parent open. The tree is the `edges` list: `satisfied-by` and
+  `refined-by`, each with the author.
+- **The room claim** is minted by the world scan (`repo_world_scan.py`): a
+  tracked `.dream` file is a room with language `dream-document`
+  (`DOCUMENT_SUFFIXES`, separate from `LANGUAGE_SUFFIXES` because a document
+  is not a language), and every stand-in in it mints a `RepoRoomClaim`
+  (`kind: claimed-room`, identity `repo:<H>/claim:<path>#<block>`),
+  contained by the document's region and `claimed-from` the document's
+  room, carrying `state`, `owner`, `described_by`, `content_hash` and the
+  contributions. The scanner writes no content, geometry or portals for it.
+  A `.dream` file that does not frame is a note, not a failure.
+
+What is not built: the claim is a scan record only; nothing in
+`abstract_ui_*` consumes it (the same gaps A-D in
+`REPO_WORLD_MAP_DESIGN.md` that keep every scan record out of the world
+builder). The code map's room for a satisfied stand-in is the contribution
+block's record inside the document, not a separate file room; when the code
+is later moved into its own file nothing yet links that file's room back to
+the claim. A stand-in cannot yet be satisfied from a *different* document.
 
 ## Status
 
-Green: `tests/test_dream_interpreter_limits.py` (8), `tests/test_dream_document.py`
-(16), `tests/test_cpp_shell_desugar.py` (7). Red on main and here:
+Green: `tests/test_dream_interpreter_limits.py` (8), `tests/test_dream_work_table.py`
+(5), `tests/test_dream_document.py` (16), `tests/test_cpp_shell_desugar.py` (7). Red on main and here:
 `tests/test_dream_cpp_pipeline.py` at the operand-position gate, as
 described. Not run: the shell emission against a browser, any shader
 deployer, the full suite.

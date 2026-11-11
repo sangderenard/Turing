@@ -228,6 +228,25 @@ boundary*, not the pair. The pair is the fact; the ends are its two faces.
 today: a realisation policy of one backend, consulted when the page draws an
 end, never written into the record.
 
+## 3a. The room claim (2026-11-11)
+
+A prose stand-in in a tracked `.dream` document owns a room before any
+content exists. The scan mints `RepoRoomClaim` for each one:
+
+| Need | Field | Filled by |
+|---|---|---|
+| identity, stable for a commit | `repo:<H>/claim:<path>#<block>` | scanner |
+| where it sits | `region` (the document's region), `document_room` (`claimed-from`) | scanner |
+| who owns it | `owner`: first code contributor once satisfied, else the describer (`described_by`), else none | `DreamDocument.work_table()` |
+| whether work remains | `state`: `open` / `satisfied`; `contributions` with block, language, author, hash | `DreamDocument.work_table()` |
+| the description's identity | `content_hash` (the card `cache_key`) | dream parser |
+| content, geometry, portals | *none*: the room is claimed but unaltered | later, by whoever fills the room |
+
+A `.dream` file is a room with language `dream-document`
+(`DOCUMENT_SUFFIXES`); it is a container of language blocks, not a language,
+so it is not in `LANGUAGE_SUFFIXES` and gets no portals of its own. Gap D
+covers the claim too: no `abstract_ui_*` record consumes it yet.
+
 ## 4. Reused unchanged
 
 - `AbstractUIWorld` as the container, `objects()`, `world_div_map_model`

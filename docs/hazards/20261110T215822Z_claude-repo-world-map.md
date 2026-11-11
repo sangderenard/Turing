@@ -62,6 +62,19 @@ sees `export`ed and destructured declarations; (4) `.gitattributes`:
 Real Python-route limits: `raise`, `try`, `with` refused by the declared
 exception/resource gap; everything else probed admits.
 
+2026-11-11, stand-ins (owner: "Yes, start it"): `prose` declared in
+`DREAM_LANGUAGE_TRANSLATIONS` (route `stand-in`, target `work-table`);
+`satisfies`/`author` sentinel keys; `DreamDocument.work_table()` with
+`DreamStandIn`/`DreamContribution`/`DreamWorkTable` (state open/satisfied,
+owner = first code contributor else describer, refinement children keep the
+parent open, cycles and unauthored contributions refused at parse time);
+world scan mints `RepoRoomClaim` (`claimed-room`) per stand-in of a tracked
+`.dream` file (`DOCUMENT_SUFFIXES`, language `dream-document`). Decision
+taken without the owner: ownership passes to the code author on
+satisfaction, the describer holds it before. `tests/test_dream_work_table.py`
+5 passed; with the scanner, workspace, limits and dream-document suites: 34
+passed in 9.2 s. Nothing in `abstract_ui_*` consumes the claim (gap D).
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 
