@@ -181,3 +181,5 @@ Admin endpoints (capability `account_manage`, audited in `msg_audit`): `GET /api
 Types: note, status, question, handoff, approval_request, answer. Subject kinds: lease, job, ticket, file, topic.
 Admin/operator diagnostics without local rights: `GET /api/profile/instances`, `/api/profile/leases`, `/api/profile/diagnostics?name=<instance>`
 (page: /profile.html). Backups: `deploy\Backup-State.ps1` (see BACKUPS_2026-11-10.md).
+
+Messenger HTTP contract: [MESSENGER_REST_API.md](MESSENGER_REST_API.md), including session-token authentication, HTTPS requirements, and inbox/read/ack semantics.

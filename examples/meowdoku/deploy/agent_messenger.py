@@ -14,14 +14,18 @@
 The password is read from --password-file, else <state>/secrets/operator_credentials/<user>.secret (state = --state-dir, else
 MEOWDOKU_STATE_DIR).  It is sent only to POST /api/account/login and never printed.  TLS is verified with the system store; the one
 exception is --insecure-test-ca <cafile>, which trusts that single CA file (for a test CA) instead.  Messaging is server-mediated and
-operator-readable.  Exit codes: 0 ok, 1 error, 3 wait timed out.
+operator-readable. Sends resolve a relationship handle over HTTPS and never include the recipient's name in the send payload.
+Use --idempotency-key with identical content to retry an uncertain send. Exit codes: 0 ok, 1 error, 3 wait timed out.
 """
 from __future__ import annotations
 
 import argparse
 import http.cookiejar
+import http.client
 import json
+import math
 import os
+import secrets
 import ssl
 import sys
 import time
@@ -31,14 +35,24 @@ import urllib.request
 
 
 class ClientError(Exception):
-    pass
+    def __init__(self, message, status=None, uncertain=False):
+        super().__init__(message)
+        self.status, self.uncertain = status, uncertain
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ClientError("API redirect refused; use the verified HTTPS origin directly")
 
 
 class Client:
     def __init__(self, base: str, user: str, password: str, context: ssl.SSLContext | None = None):
         self.base = base.rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ClientError("--base must be an HTTPS origin without credentials, query or fragment")
         self.user = user
-        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())]
+        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), _NoRedirect()]
         if self.base.startswith("https://"):
             handlers.append(urllib.request.HTTPSHandler(context=context or ssl.create_default_context()))
         self.opener = urllib.request.build_opener(*handlers)
@@ -54,11 +68,16 @@ class Client:
         except urllib.error.HTTPError as error:
             try:
                 message = json.loads(error.read()).get("error", "")
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, http.client.HTTPException, OSError):
                 message = ""
-            raise ClientError(f"HTTP {error.code} {path.split('?')[0]}: {message}") from None
+            raise ClientError(f"HTTP {error.code} {path.split('?')[0]}: {message}", status=error.code,
+                              uncertain=error.code >= 500) from None
+        except (ValueError, UnicodeError):
+            raise ClientError("invalid JSON response; request outcome may be uncertain", uncertain=True) from None
+        except http.client.HTTPException:
+            raise ClientError("incomplete HTTP response; request outcome may be uncertain", uncertain=True) from None
         except (urllib.error.URLError, OSError) as error:
-            raise ClientError(f"cannot reach {self.base}: {getattr(error, 'reason', error)}") from None
+            raise ClientError(f"cannot reach {self.base}: {getattr(error, 'reason', error)}", uncertain=True) from None
 
     def _login(self, password: str) -> None:
         self.call("/api/account/login", {"username": self.user, "password": password})
@@ -96,7 +115,7 @@ def run(client: Client, args) -> int:
         print(json.dumps(client.call("/api/messages/contacts", {"username": args.username, "action": action})))
     elif cmd == "send":
         text = sys.stdin.read() if args.text == "-" else args.text
-        payload = {"to": args.username, "body": text}
+        payload = {"body": text, "idempotency_key": getattr(args, "idempotency_key", None) or secrets.token_urlsafe(24)}
         if args.type:
             payload["type"] = args.type
         if args.subject:
@@ -104,7 +123,39 @@ def run(client: Client, args) -> int:
             if not sep:
                 raise ClientError("--subject must be KIND:REF")
             payload["subject"] = {"kind": kind, "ref": ref}
-        print(json.dumps(client.call("/api/messages/send", payload)))
+        # Recipient selection stays local. A fresh short-lived handle carries the
+        # relationship, and the same operation key survives a lost HTTP response.
+        uncertain_send = False
+        for attempt in range(2):
+            sending_request = False
+            try:
+                response = client.call("/api/messages/conversations")
+                if (not isinstance(response, dict) or not isinstance(response.get("contacts"), list)
+                        or any(not isinstance(c, dict) or not isinstance(c.get("username"), str)
+                               or not isinstance(c.get("conversation_handle"), str) or not c["conversation_handle"]
+                               for c in response["contacts"])):
+                    raise ClientError("invalid conversations response; request outcome may be uncertain", uncertain=True)
+                conversations = response["contacts"]
+                peer = next((c for c in conversations if c["username"].casefold() == args.username.strip().casefold()), None)
+                if peer is None:
+                    raise ClientError("you cannot message this user")
+                payload["conversation_handle"] = peer["conversation_handle"]
+                sending_request = True
+                result = client.call("/api/messages/send", payload)
+                if (not isinstance(result, dict) or result.get("ok") is not True
+                        or type(result.get("id")) is not int or result["id"] <= 0
+                        or type(result.get("created")) not in (int, float) or not math.isfinite(result["created"])):
+                    raise ClientError("invalid send receipt; request outcome may be uncertain", uncertain=True)
+                print(json.dumps(result))
+                break
+            except ClientError as error:
+                uncertain_send = uncertain_send or (sending_request and error.uncertain)
+                if attempt == 0 and (error.uncertain or error.status == 403):
+                    continue
+                if uncertain_send or error.uncertain:
+                    raise ClientError(f"send outcome uncertain; retry with --idempotency-key {payload['idempotency_key']} and the identical recipient and text",
+                                      uncertain=True) from None
+                raise
     elif cmd == "pending":
         for message in client.call("/api/messages/inbox")["messages"]:
             _emit(message)
@@ -159,6 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", help="the message, or - to read it from stdin")
     s.add_argument("--type", choices=("note", "status", "question", "handoff", "approval_request", "answer"))
     s.add_argument("--subject", metavar="KIND:REF")
+    s.add_argument("--idempotency-key", help="reuse the reported operation key when retrying an uncertain send with identical content")
     sub.add_parser("pending")
     sub.add_parser("ack").add_argument("id", type=int)
     r = sub.add_parser("read")

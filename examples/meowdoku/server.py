@@ -494,9 +494,20 @@ def make_handler(sessions: Sessions):
 
         def _account(self) -> dict | None:
             """The logged-in account for this request (accounts.py), or None.
-            Reads ACCOUNT_COOKIE only -- never issues one itself; that only
-            happens on a successful /api/account/signup or /api/account/login."""
+            Cookie authentication is unchanged. Messenger REST also accepts the same
+            session token as Bearer, over verified HTTPS transport only. No token is minted here."""
             from http.cookies import SimpleCookie
+            if self.path.partition("?")[0].startswith("/api/messages/"):
+                authorization = self.headers.get_all("Authorization", [])
+                if authorization:
+                    # Explicit credentials win, including invalid ones: never silently
+                    # fall back to an ambient browser cookie for another account.
+                    if len(authorization) != 1 or not self._is_secure():
+                        return None
+                    parts = authorization[0].split()
+                    if len(parts) != 2 or parts[0].lower() != "bearer":
+                        return None
+                    return sessions.accounts.user_for_token(parts[1])
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
             return sessions.accounts.user_for_token(token)
@@ -988,6 +999,10 @@ def make_handler(sessions: Sessions):
             db = messaging_mod.connect(sessions.accounts_db)
             try:
                 try:
+                    if method == "GET" and path == "/api/messages/conversations":
+                        if not self._is_secure():
+                            return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+                        return self._json(messaging_mod.conversations(db, me))
                     if method == "GET" and path == "/api/messages/contacts":
                         return self._json(messaging_mod.contacts(db, me))
                     if method == "GET" and path == "/api/messages/thread":
@@ -1015,7 +1030,14 @@ def make_handler(sessions: Sessions):
                             return self._json(messaging_mod.remove(db, me, name))
                         return self._json({"error": "action must be request, accept, decline, block or remove"}, HTTPStatus.BAD_REQUEST)
                     if method == "POST" and path == "/api/messages/send":
-                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body"), subject=body.get("subject"), msg_type=body.get("type")))
+                        if "conversation_handle" in body:
+                            if not self._is_secure():
+                                return self._json({"error": "HTTPS required"}, HTTPStatus.FORBIDDEN)
+                            if body.get("conversation_handle") is None or "to" in body:
+                                return self._json({"error": "provide a conversation_handle and no recipient name"}, HTTPStatus.BAD_REQUEST)
+                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body"), subject=body.get("subject"),
+                                                            msg_type=body.get("type"), conversation_handle=body.get("conversation_handle"),
+                                                            idempotency_key=body.get("idempotency_key")))
                     if method == "POST" and path == "/api/messages/ack":
                         return self._json(messaging_mod.ack(db, me, body.get("up_to")))
                     if method == "POST" and path == "/api/messages/read":

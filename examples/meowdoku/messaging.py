@@ -25,6 +25,9 @@ MAX_WAITERS_PER_ACCOUNT each).
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import secrets
 import sqlite3
 import sys
 import threading
@@ -46,6 +49,8 @@ MAX_WAIT_S = 25.0
 SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic")
 MSG_TYPES = ("note", "status", "question", "handoff", "approval_request", "answer")
 MAX_SUBJECT_REF = 200
+HANDLE_TTL = 60
+HANDLE_ACTION = "send"
 
 DDL = ("CREATE TABLE IF NOT EXISTS msg_contacts (user_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
        "state TEXT NOT NULL CHECK(state IN ('requested','accepted','blocked')), created REAL NOT NULL, updated REAL NOT NULL, "
@@ -88,6 +93,14 @@ def connect(db_path) -> sqlite3.Connection:
             except sqlite3.OperationalError as error:       # another process on the same database added it first
                 if "duplicate column" not in str(error).lower():
                     raise
+    _schema_version.declare(db, "messaging_rest", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS msg_handles (digest TEXT PRIMARY KEY, sender_id INTEGER NOT NULL, "
+               "peer_id INTEGER NOT NULL, action TEXT NOT NULL, expires REAL NOT NULL, "
+               "sender_updated REAL NOT NULL, peer_updated REAL NOT NULL)")
+    db.execute("CREATE INDEX IF NOT EXISTS msg_handles_pair ON msg_handles(sender_id, peer_id, expires)")
+    db.execute("CREATE TABLE IF NOT EXISTS msg_send_keys (sender_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
+               "request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, message_id INTEGER NOT NULL, "
+               "PRIMARY KEY(sender_id, peer_id, request_key))")
     return db
 
 
@@ -140,7 +153,13 @@ def _state(db, user_id, peer_id):
     return row["state"] if row else None
 
 
+def _revoke_relationship_handles(db, a, b):
+    db.execute("DELETE FROM msg_handles WHERE (sender_id=? AND peer_id=?) OR (sender_id=? AND peer_id=?)", (a, b, b, a))
+
+
 def _put(db, user_id, peer_id, state, now):
+    # Invalidate capabilities with the contact write, even if wall-clock timestamps repeat.
+    _revoke_relationship_handles(db, user_id, peer_id)
     db.execute("INSERT INTO msg_contacts (user_id, peer_id, state, created, updated) VALUES (?,?,?,?,?) "
                "ON CONFLICT(user_id, peer_id) DO UPDATE SET state = excluded.state, updated = excluded.updated",
                (user_id, peer_id, state, now, now))
@@ -191,6 +210,7 @@ def respond_contact(db, me: int, peer_username, accept: bool, now: float | None 
         if accept:
             _put(db, me, pid, "accepted", now)
         else:
+            _revoke_relationship_handles(db, me, pid)
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ?", (me, pid))
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ? AND state = 'accepted'", (pid, me))
         db.execute("COMMIT")
@@ -204,7 +224,13 @@ def block(db, me: int, peer_username, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     peer = _peer(db, peer_username)
     if peer is not None and peer[0] != me:
-        _put(db, me, peer[0], "blocked", now)
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _put(db, me, peer[0], "blocked", now)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     return {"ok": True, "result": "blocked"}
 
 
@@ -214,6 +240,7 @@ def remove(db, me: int, peer_username) -> dict:
     if peer is not None and peer[0] != me:
         db.execute("BEGIN IMMEDIATE")
         try:
+            _revoke_relationship_handles(db, me, peer[0])
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ?", (me, peer[0]))
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ? AND state != 'blocked'", (peer[0], me))
             db.execute("COMMIT")
@@ -245,6 +272,55 @@ def contacts(db, me: int) -> dict:
         elif theirs == "requested":
             out["outgoing"].append({"username": row["username"]})
     return out
+
+
+def _relationship_stamp(db, me, peer):
+    rows = db.execute("SELECT user_id, state, updated FROM msg_contacts WHERE "
+                      "(user_id=? AND peer_id=?) OR (user_id=? AND peer_id=?)", (me, peer, peer, me)).fetchall()
+    stamps = {r["user_id"]: r["updated"] for r in rows if r["state"] == "accepted"}
+    return (stamps[me], stamps[peer]) if me in stamps and peer in stamps else None
+
+
+def conversations(db, me: int, now=None) -> dict:
+    """Issue sender-bound, short-lived send handles from existing relationships.
+
+    Only digests are retained. Names label the returned picker; callers do not
+    send a recipient identifier to obtain a handle or to submit its message.
+    """
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        now = time.time() if now is None else now
+        if _suspended(db, me):
+            raise MessagingError("messaging unavailable", 403)
+        out = contacts(db, me)
+        db.execute("DELETE FROM msg_handles WHERE expires <= ?", (now,))
+        for contact in out["contacts"]:
+            peer = _peer(db, contact["username"])[0]
+            stamp = _relationship_stamp(db, me, peer)
+            token = secrets.token_urlsafe(32)
+            expiry = now + HANDLE_TTL
+            # Bound outstanding credentials per relationship while allowing tabs
+            # and concurrent clients to retain separate handles.
+            db.execute("DELETE FROM msg_handles WHERE digest IN (SELECT digest FROM msg_handles "
+                       "WHERE sender_id=? AND peer_id=? ORDER BY expires DESC LIMIT -1 OFFSET 9)", (me, peer))
+            db.execute("INSERT INTO msg_handles VALUES (?,?,?,?,?,?,?)",
+                       (hashlib.sha256(token.encode()).hexdigest(), me, peer, HANDLE_ACTION, expiry, *stamp))
+            contact.update(conversation_handle=token, expires_at=expiry)
+        db.execute("COMMIT")
+        return out
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def _handle_peer(db, me, token, now):
+    if not isinstance(token, str) or not 32 <= len(token) <= 128:
+        raise MessagingError("conversation handle unavailable; refresh conversations", 403)
+    row = db.execute("SELECT * FROM msg_handles WHERE digest=? AND sender_id=? AND action=? AND expires>?",
+                     (hashlib.sha256(token.encode()).hexdigest(), me, HANDLE_ACTION, now)).fetchone()
+    if row is None or _relationship_stamp(db, me, row["peer_id"]) != (row["sender_updated"], row["peer_updated"]):
+        raise MessagingError("conversation handle unavailable; refresh conversations", 403)
+    return row["peer_id"]
 
 
 # ---- messages -------------------------------------------------------------------------------------------------------------------
@@ -312,18 +388,36 @@ def _names(db, rows) -> dict:
     return {r["id"]: r["username"] for r in db.execute(f"SELECT id, username FROM users WHERE id IN ({marks})", tuple(ids))}
 
 
-def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None, subject=None, msg_type=None) -> dict:
-    now = time.time() if now is None else now
+def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None, subject=None, msg_type=None,
+         conversation_handle=None, idempotency_key=None) -> dict:
     text = _clean(body)
     skind, sref = _subject(subject)
     mtype = _type(msg_type)
-    peer = _peer(db, peer_username)
-    if _suspended(db, me) or peer is None or peer[0] == me or not _mutual(db, me, peer[0]):
-        raise MessagingError("you cannot message this user", 403)
+    using_handle = conversation_handle is not None
+    if using_handle and (peer_username is not None or not isinstance(idempotency_key, str)
+                         or not 16 <= len(idempotency_key) <= 128):
+        raise MessagingError("handle sends require an idempotency_key (16-128 characters) and no recipient name", 400)
+    fingerprint = hashlib.sha256(json.dumps([text, skind, sref, mtype], ensure_ascii=False,
+                                           separators=(",", ":")).encode()).hexdigest()
     db.execute("BEGIN IMMEDIATE")
     try:
-        if not _mutual(db, me, peer[0]):
+        now = time.time() if now is None else now
+        if using_handle:
+            peer_id = _handle_peer(db, me, conversation_handle, now)
+        else:
+            peer = _peer(db, peer_username)
+            peer_id = peer[0] if peer is not None else None
+        if _suspended(db, me) or peer_id is None or peer_id == me or not _mutual(db, me, peer_id):
             raise MessagingError("you cannot message this user", 403)
+        if using_handle:
+            prior = db.execute("SELECT k.fingerprint, m.id, m.created FROM msg_send_keys k "
+                               "JOIN msg_messages m ON m.id=k.message_id WHERE k.sender_id=? AND k.peer_id=? AND k.request_key=?",
+                               (me, peer_id, idempotency_key)).fetchone()
+            if prior is not None:
+                if prior["fingerprint"] != fingerprint:
+                    raise MessagingError("idempotency key already used for different content", 409)
+                db.execute("COMMIT")
+                return {"ok": True, "id": prior["id"], "created": prior["created"]}
         minute = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 60)).fetchone()[0]
         day = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 86400)).fetchone()[0]
         if minute >= MAX_PER_MINUTE:
@@ -331,7 +425,9 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
         if day >= MAX_PER_DAY:
             raise MessagingError(f"at most {MAX_PER_DAY} messages per day", 429)
         mid = db.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created, subject_kind, subject_ref, msg_type) "
-                         "VALUES (?,?,?,?,?,?,?)", (me, peer[0], text, now, skind, sref, mtype)).lastrowid
+                         "VALUES (?,?,?,?,?,?,?)", (me, peer_id, text, now, skind, sref, mtype)).lastrowid
+        if using_handle:
+            db.execute("INSERT INTO msg_send_keys VALUES (?,?,?,?,?)", (me, peer_id, idempotency_key, fingerprint, mid))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")

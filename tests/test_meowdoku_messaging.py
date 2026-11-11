@@ -256,11 +256,27 @@ def test_suspended_sender_is_refused(server):
     assert _send(server, ca, "ben", "back")[0] == 200
 
 
-def test_agent_client_drives_the_flow(server, capsys, tmp_path):
+def test_agent_client_drives_the_flow(server, capsys, tmp_path, monkeypatch):
     _user(server, "claude"), _user(server, "codex")
     secret = tmp_path / "pw.secret"
     secret.write_text(PASSWORD + "\n", encoding="utf-8")
-    base = f"http://127.0.0.1:{server.port}"
+    base = "https://messenger.test"
+    monkeypatch.setattr(srv.proxy_trust_mod, "TRUSTED_PROXIES", {"127.0.0.1"})
+
+    class FixtureClient(agent_messenger.Client):
+        # CLI flow against the real handler via its trusted TLS-termination path.
+        # Actual network TLS verification remains the standard urllib SSL layer.
+        def __init__(self, base, user, password, context=None):
+            self.user = user
+            self.token = _login(server, user).split("=", 1)[1]
+
+        def call(self, path, body=None, timeout=40):
+            status, result = _rest_call(server, path, self.token, secure=True, body=body)
+            if status >= 400:
+                raise agent_messenger.ClientError(result.get("error", "request failed"))
+            return result
+
+    monkeypatch.setattr(agent_messenger, "Client", FixtureClient)
 
     def run(user, *argv):
         code = agent_messenger.main(["--base", base, "--user", user, "--password-file", str(secret), *argv])
@@ -360,3 +376,166 @@ def test_inbox_ack_round_trip_monotonic_and_hidden_from_sender(server):
     assert _call(server.port, "/api/messages/inbox", cookie=ca)[1]["cursor"] == 0
     assert [m["id"] for m in _call(server.port, "/api/messages/inbox", cookie=ca)[1]["messages"]] == [mine]
 
+
+
+def _rest_call(server, path, token, *, secure=False, cookie="", body=None):
+    # Exercise the existing trusted TLS-termination path, not a real TLS socket.
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=40)
+    headers = {"Authorization": "Bearer " + token, "Cookie": cookie}
+    if secure:
+        headers.update({"X-Forwarded-For": "192.0.2.44", "X-Forwarded-Proto": "https"})
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    conn.request("POST" if body is not None else "GET", path,
+                 body=json.dumps(body) if body is not None else None, headers=headers)
+    response = conn.getresponse()
+    result = response.status, json.loads(response.read())
+    conn.close()
+    return result
+
+
+def test_rest_bearer_reuses_sessions_and_requires_secure_transport(server, monkeypatch):
+    monkeypatch.setattr(srv.proxy_trust_mod, "TRUSTED_PROXIES", {"127.0.0.1"})
+    ca, cb = _user(server, "ann"), _user(server, "ben")
+    _friends(server, "ann", ca, "ben", cb)
+    ta, tb = ca.split("=", 1)[1], cb.split("=", 1)[1]
+    path = "/api/messages/inbox"
+    assert _rest_call(server, path, ta, cookie=ca)[0] == 403
+    assert _rest_call(server, path, "invalid", secure=True, cookie=ca)[0] == 403
+    status, sent = _rest_call(server, "/api/messages/send", ta, secure=True,
+                              cookie=cb, body={"to": "ben", "body": "REST token test"})
+    assert status == 200
+    box = _rest_call(server, path, tb, secure=True)[1]
+    assert [m["from"] for m in box["messages"]] == ["ann"]
+    assert _rest_call(server, "/api/messages/read", tb, secure=True,
+                      body={"peer": "ann", "up_to": sent["id"]})[1]["marked"] == 1
+    assert len(_rest_call(server, path, tb, secure=True)[1]["messages"]) == 1
+    assert _rest_call(server, "/api/messages/ack", tb, secure=True,
+                      body={"up_to": sent["id"]})[1]["cursor"] == sent["id"]
+    assert _rest_call(server, path, tb, secure=True)[1]["messages"] == []
+    assert _rest_call(server, "/api/messages/admin/thread?a=ann&b=ben", ta, secure=True)[0] == 403
+    # The header does not become a site-wide login mechanism.
+    assert _rest_call(server, "/api/account/me", ta, secure=True)[1]["account"] is None
+    server.sessions.accounts.logout(ta)
+    assert _rest_call(server, path, ta, secure=True)[0] == 403
+
+
+def test_rest_bearer_ignores_untrusted_forwarding_and_expired_tokens(server, monkeypatch):
+    ca = _user(server, "ann")
+    token = ca.split("=", 1)[1]
+    monkeypatch.setattr(srv.proxy_trust_mod, "TRUSTED_PROXIES", set())
+    assert _rest_call(server, "/api/messages/inbox", token, secure=True)[0] == 403
+    monkeypatch.setattr(srv.proxy_trust_mod, "TRUSTED_PROXIES", {"127.0.0.1"})
+    server.sessions.accounts._conn.execute("UPDATE sessions SET expires_at=0 WHERE token=?", (token,))
+    server.sessions.accounts._conn.commit()
+    assert _rest_call(server, "/api/messages/inbox", token, secure=True)[0] == 403
+
+
+def test_conversation_handle_http_contract_and_private_storage(server, monkeypatch, capsys):
+    monkeypatch.setattr(srv.proxy_trust_mod, "TRUSTED_PROXIES", {"127.0.0.1"})
+    ca, cb, cc = _user(server, "ann"), _user(server, "ben"), _user(server, "cyd")
+    _friends(server, "ann", ca, "ben", cb)
+    ta, tb, tc = (c.split("=", 1)[1] for c in (ca, cb, cc))
+    path = "/api/messages/conversations"
+    assert _call(server.port, path)[0] == 403
+    assert _call(server.port, path, cookie=ca)[0] == 403
+    status, result = _rest_call(server, path, ta, secure=True)
+    assert status == 200 and len(result["contacts"]) == 1
+    item = result["contacts"][0]
+    handle = item["conversation_handle"]
+    assert item["username"] == "ben" and len(handle) >= 40
+    payload = {"conversation_handle": handle, "body": "hello", "idempotency_key": "unique-request-0001"}
+    assert _rest_call(server, "/api/messages/send", tc, secure=True, body=payload)[0] == 403
+    assert _rest_call(server, "/api/messages/send", ta, body=payload)[0] == 403
+    assert _rest_call(server, "/api/messages/send", ta, secure=True, body={**payload, "to": "ben"})[0] == 400
+    first = _rest_call(server, "/api/messages/send", ta, secure=True, body=payload)
+    assert first[0] == 200
+    assert _rest_call(server, "/api/messages/send", ta, secure=True, body=payload) == first
+    assert _rest_call(server, "/api/messages/send", ta, secure=True, body={**payload, "body": "changed"})[0] == 409
+    fresh = _rest_call(server, path, ta, secure=True)[1]["contacts"][0]["conversation_handle"]
+    assert _rest_call(server, "/api/messages/send", ta, secure=True, body={**payload, "conversation_handle": fresh}) == first
+    assert len(_rest_call(server, "/api/messages/inbox", tb, secure=True)[1]["messages"]) == 1
+    db = messaging.connect(server.sessions.accounts_db)
+    try:
+        assert handle not in json.dumps([tuple(r) for r in db.execute("SELECT * FROM msg_handles")])
+        assert db.execute("SELECT COUNT(*) FROM msg_messages").fetchone()[0] == 1
+        # Revocation wins even for an otherwise idempotent replay.
+        messaging.block(db, server.sessions.accounts.login("ben", PASSWORD)["id"], "ann")
+        assert _rest_call(server, "/api/messages/send", ta, secure=True, body=payload)[0] == 403
+    finally:
+        db.close()
+    captured = capsys.readouterr()
+    assert handle not in captured.out + captured.err
+
+
+def test_handles_expire_revoke_and_race_without_duplicates(server):
+    ca, cb = _user(server, "ann"), _user(server, "ben")
+    _friends(server, "ann", ca, "ben", cb)
+    db = messaging.connect(server.sessions.accounts_db)
+    me = server.sessions.accounts.login("ann", PASSWORD)["id"]
+    peer = server.sessions.accounts.login("ben", PASSWORD)["id"]
+    try:
+        handle = messaging.conversations(db, me, now=100)["contacts"][0]["conversation_handle"]
+        with pytest.raises(messaging.MessagingError) as error:
+            messaging.send(db, me, None, "old", now=160, conversation_handle=handle, idempotency_key="request-expired-001")
+        assert error.value.status == 403
+        handle = messaging.conversations(db, me)["contacts"][0]["conversation_handle"]
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def concurrent_send():
+            connection = messaging.connect(server.sessions.accounts_db)
+            try:
+                barrier.wait(timeout=5)
+                results.append(messaging.send(connection, me, None, "once", conversation_handle=handle,
+                                              idempotency_key="concurrent-request-001"))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
+        workers = [threading.Thread(target=concurrent_send) for _ in range(2)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(timeout=10)
+        assert not errors and len(results) == 2 and results[0] == results[1]
+        assert db.execute("SELECT COUNT(*) FROM msg_messages").fetchone()[0] == 1
+        messaging.remove(db, me, "ben")
+        messaging.request_contact(db, me, "ben")
+        messaging.respond_contact(db, peer, "ann", True)
+        with pytest.raises(messaging.MessagingError):
+            messaging.send(db, me, None, "old relation", conversation_handle=handle, idempotency_key="old-relation-0001")
+        fresh = messaging.conversations(db, me)["contacts"][0]["conversation_handle"]
+        messaging.admin_suspend(db, me, "ann", True)
+        with pytest.raises(messaging.MessagingError):
+            messaging.send(db, me, None, "suspended", conversation_handle=fresh, idempotency_key="suspended-send-001")
+    finally:
+        db.close()
+
+def test_handle_expiry_after_lock_and_same_timestamp_regrant(server, monkeypatch):
+    ca, cb = _user(server, "ann"), _user(server, "ben")
+    _friends(server, "ann", ca, "ben", cb)
+    me = server.sessions.accounts.login("ann", PASSWORD)["id"]
+    peer = server.sessions.accounts.login("ben", PASSWORD)["id"]
+    db = messaging.connect(server.sessions.accounts_db)
+    try:
+        db.execute("UPDATE msg_contacts SET updated=1")
+        handle = messaging.conversations(db, me, now=100)["contacts"][0]["conversation_handle"]
+        messaging.remove(db, me, "ben")
+        messaging.request_contact(db, me, "ben", now=1)
+        messaging.respond_contact(db, peer, "ann", True, now=1)
+        with pytest.raises(messaging.MessagingError):
+            messaging.send(db, me, None, "revoked", now=101, conversation_handle=handle, idempotency_key="regrant-request-001")
+        handle = messaging.conversations(db, me, now=100)["contacts"][0]["conversation_handle"]
+        clock = [100]
+        monkeypatch.setattr(messaging, "time", SimpleNamespace(time=lambda: clock[0]))
+        class LockDelay:
+            def execute(self, sql, *args):
+                result = db.execute(sql, *args)
+                if sql == "BEGIN IMMEDIATE":
+                    clock[0] = 160  # deterministic simulation of time spent waiting for the lock
+                return result
+        with pytest.raises(messaging.MessagingError) as error:
+            messaging.send(LockDelay(), me, None, "expired while waiting", conversation_handle=handle,
+                           idempotency_key="lock-delay-request-001")
+        assert error.value.status == 403
+        assert db.execute("SELECT COUNT(*) FROM msg_messages").fetchone()[0] == 0
+    finally:
+        db.close()

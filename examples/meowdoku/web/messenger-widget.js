@@ -62,7 +62,7 @@ function el(tag, props, ...kids) {
 }
 
 async function api(path, body) {
-  const init = { credentials: "same-origin", cache: "no-store" };
+  const init = { credentials: "same-origin", cache: "no-store", redirect: "error" };
   if (body !== undefined) {
     init.method = "POST";
     init.headers = { "Content-Type": "application/json" };
@@ -70,8 +70,17 @@ async function api(path, body) {
   }
   const res = await fetch(path, init);
   let data = null;
-  try { data = await res.json(); } catch (e) { /* not JSON */ }
-  if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+  try { data = await res.json(); } catch (e) {
+    if (res.ok) throw new Error("Invalid JSON response; message outcome may be uncertain.");
+  }
+  if (!res.ok) {
+    const error = new Error((data && data.error) || ("HTTP " + res.status));
+    error.status = res.status;
+    throw error;
+  }
+  if (res.ok && (!data || typeof data !== "object" || Array.isArray(data))) {
+    throw new Error("Invalid API response; message outcome may be uncertain.");
+  }
   return data;
 }
 
@@ -169,6 +178,7 @@ async function start() {
   }
 
   // ---- one conversation ---------------------------------------------------------------------------------------------------------
+  const pendingSends = new Map(); // Preserve retry identity across Back/Close within this page.
   let threadEl, olderBtn, oldest = null, newest = 0;
   function msgNode(m) {
     const mine = m.from === who.username;
@@ -190,12 +200,62 @@ async function start() {
     olderBtn = el("button", { type: "button", class: "small", text: "Load older", hidden: "", on: { click: () => loadThread(true) } });
     bodyEl.appendChild(olderBtn); bodyEl.appendChild(threadEl);
     const input = el("input", { type: "text", placeholder: "Message (Enter sends)", "aria-label": "Message to " + peer, maxlength: "4000", autocomplete: "off" });
+    let sending = false;
+    let pending = pendingSends.get(peer) || null;
+    if (pending) input.value = pending.body;
     const send = async () => {
       const text = input.value;
-      if (!text.trim()) return;
-      input.value = "";
-      try { await api("/api/messages/send", { to: peer, body: text }); note(""); }
-      catch (e) { input.value = text; note(e.message); }
+      if (sending || !text.trim()) return;
+      if (location.protocol !== "https:") { note("Messaging requires HTTPS."); return; }
+      // A reopened pane can still hold the operation that completed in the old
+      // pane. Clear that stale composer instead of treating it as a new send.
+      if (pending && pending.completed && pending.body === text) { pending = null; input.value = ""; note("Sent."); return; }
+      pending = pendingSends.get(peer) || null;
+      if (pending && pending.inFlight) { note("This message is still sending."); return; }
+      if (pending && pending.body !== text) {
+        note("The previous message has an uncertain outcome. Retry its original text before sending another message.");
+        return;
+      }
+      if (!pending) pending = { body: text, idempotency_key: crypto.randomUUID(), inFlight: false, completed: false, uncertain: false };
+      pendingSends.set(peer, pending);
+      pending.inFlight = true;
+      const operation = pending;
+      sending = true;
+      input.disabled = true;
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const conversations = await api("/api/messages/conversations");
+          const relationship = conversations.contacts.find((x) => x.username === peer);
+          if (!relationship) throw new Error("You cannot message this user.");
+          try {
+            const receipt = await api("/api/messages/send", { body: pending.body, idempotency_key: pending.idempotency_key,
+              conversation_handle: relationship.conversation_handle });
+            if (!receipt || receipt.ok !== true || !Number.isInteger(receipt.id) || receipt.id <= 0 ||
+                typeof receipt.created !== "number" || !Number.isFinite(receipt.created)) {
+              throw new Error("Invalid send receipt; message outcome may be uncertain.");
+            }
+            pending.completed = true;
+            if (pendingSends.get(peer) === pending) pendingSends.delete(peer);
+            pending = null;
+            input.value = "";
+            note("");
+            break;
+          } catch (e) {
+            operation.uncertain = operation.uncertain || !e.status || e.status >= 500;
+            if (attempt === 0 && (!e.status || e.status === 403 || e.status >= 500)) continue;
+            throw e;
+          }
+        }
+      } catch (e) {
+        if (!operation.uncertain && e.status >= 400 && e.status < 500) {
+          if (pendingSends.get(peer) === operation) pendingSends.delete(peer);
+          pending = null;
+          note(e.message); // Definitive rejection: the text can be corrected normally.
+        } else {
+          note(e.message + " Retry unchanged text to safely retry this message.");
+        }
+      }
+      finally { operation.inFlight = false; sending = false; input.disabled = false; }
     };
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); } });
     footEl.appendChild(el("div", { class: "row" }, input, el("button", { type: "button", text: "Send", on: { click: send } })));
