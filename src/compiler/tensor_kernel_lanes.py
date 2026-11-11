@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from .artifact_locations import compiler_artifact_root
 
 HONORED_LANES = ("repository", "eigen")
 
@@ -129,7 +130,7 @@ def eigen_object() -> tuple[str, str]:
     source = _SOURCE.read_text(encoding="utf-8")
     flags = _flags(include)
     key = hashlib.sha256("\0".join((source, *flags, str(include))).encode("utf-8")).hexdigest()[:16]
-    directory = Path(__file__).resolve().parents[2] / "build" / "tensor_kernel_lanes"
+    directory = compiler_artifact_root() / "build" / "tensor_kernel_lanes"
     directory.mkdir(parents=True, exist_ok=True)
     obj = directory / f"eigen_kernels_{key}.obj"
     if not obj.is_file():

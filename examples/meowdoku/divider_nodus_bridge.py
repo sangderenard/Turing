@@ -31,7 +31,6 @@ reported.  Nothing here compiles, imports or runs the piece.
 """
 from __future__ import annotations
 
-import argparse
 import ast
 import hashlib
 import importlib.util
@@ -78,6 +77,7 @@ class NodusCompileRoute:
     backend: str | None = None                  # driver backend; default = the claimed attempt's backend (must be c|llvm|fortran)
     extraction_contract: Path | None = None     # default source_divider.EXTRACTION_CONTRACT
     turing_root: Path | None = None             # default this repository
+    artifacts: object | None = None            # site-bound compile_artifacts.Artifacts; required before dispatch
 
     def __post_init__(self):
         self.jobs_dir = Path(self.jobs_dir)
@@ -126,7 +126,7 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def allocate_contract_id(identity: dict, jobs_dir: Path) -> int:
+def allocate_contract_id(identity: dict, jobs_dir: Path, *, before_write=None) -> int:
     """Stable 63-bit id for (job, piece, backend, generation); see the module docstring for the derivation and the collision rule."""
     jobs_dir = Path(jobs_dir)
     key = "\0".join(str(identity[k]) for k in ("job_id", "piece_id", "backend", "generation"))
@@ -139,8 +139,12 @@ def allocate_contract_id(identity: dict, jobs_dir: Path) -> int:
             except (OSError, ValueError):
                 owner = None
             if owner == identity:
+                if before_write is not None:
+                    before_write(candidate)
                 return candidate
-        elif not (jobs_dir / f"{candidate}.request.json").exists() and not (jobs_dir / str(candidate)).exists():
+        elif not any(jobs_dir.glob(f'{candidate}.*')) and not (jobs_dir / str(candidate)).exists():
+            if before_write is not None:
+                before_write(candidate)
             _write_atomic(sidecar, json.dumps(identity))
             return candidate
         candidate = (candidate + 1 & _MASK63) or 1
@@ -218,7 +222,7 @@ def _write_contract(base: Path, path: Path, abi_values: list) -> None:
 
 
 def request_for_piece(db, piece_row: dict, *, jobs_dir, source_root=None, driver_backend=None, extraction_contract=None,
-                      turing_root=None):
+                      turing_root=None, artifacts=None):
     """Write the driver request for one CLAIMED piece -> (contract_id, request_path), or record a refusal and return None.
 
     ``piece_row`` is the claim_next dict (job_id, piece_id, backend, generation, worker_id, names, file).  The request has the keys
@@ -232,7 +236,9 @@ def request_for_piece(db, piece_row: dict, *, jobs_dir, source_root=None, driver
     jobs_dir = Path(jobs_dir)
     backend = driver_backend or piece_row["backend"]
     reason = None
-    if backend not in DRIVER_BACKENDS:
+    if driver_backend is not None and driver_backend != piece_row['backend']:
+        reason, error_type = ('configured Nodus backend does not match the queued attempt backend', 'BackendNotServed')
+    elif backend not in DRIVER_BACKENDS:
         reason, error_type = f"the Nodus driver compiles {DRIVER_BACKENDS}; the attempt backend is {backend!r}", "BackendNotServed"
     else:
         try:
@@ -243,16 +249,25 @@ def request_for_piece(db, piece_row: dict, *, jobs_dir, source_root=None, driver
         sd.refuse(db, piece_row["job_id"], piece_row["piece_id"], piece_row["backend"], piece_row["worker_id"],
                   piece_row["generation"], state="refused", stage=f"{BACKEND_NAME}: request", error_type=error_type, error=reason)
         return None
-    contract_id = allocate_contract_id(_identity(piece_row), jobs_dir)
+    if artifacts is None:
+        raise ValueError('site compile requires the account workspace artifact ledger')
+    artifacts.bind(db, jobs_dir)
+    context = {}
+
+    def reserve(contract_id):
+        context.update(artifacts.admit(piece_row, contract_id, hashlib.sha256(text.encode('utf-8')).hexdigest()))
+
+    contract_id = allocate_contract_id(_identity(piece_row), jobs_dir, before_write=reserve)
     request = {"row_entry": entry, "columns": columns, "backend": backend, "output_dir": str(jobs_dir.resolve() / str(contract_id)),
                "extraction_contract": str(Path(extraction_contract or sd.EXTRACTION_CONTRACT).resolve()),
                "turing_root": str(Path(turing_root or ROOT).resolve()), "product_name": f"div_{contract_id}",
-               "source_text": text, "allow_uncompiled": False}
+               "source_text": text, "allow_uncompiled": False, "site_artifact_context": context}
     contract_path = jobs_dir / f"{contract_id}.extraction-contract.yaml"
     _write_contract(Path(extraction_contract or sd.EXTRACTION_CONTRACT), contract_path, abi)
     request["extraction_contract"] = str(contract_path.resolve())
     path = jobs_dir / f"{contract_id}.request.json"
     _write_atomic(path, json.dumps(request, indent=1))
+    artifacts.reconcile(contract_id)
     return contract_id, path
 
 
@@ -295,7 +310,7 @@ def _wait_readable(peer, seconds):
 
 
 def submit_and_wait(route: NodusCompileRoute, contract_id: int, *, timeout_s: float, poll_s: float = 0.2,
-                    peer_factory=None) -> CompileOutcome:
+                    peer_factory=None, monitor=None) -> CompileOutcome:
     """Submit ONE contract (id, service_id, revision 1, payload 0) and wait for its Route (the Result).  Sleeps in select, never spins.
 
     ``peer_factory(route, producer) -> peer`` (default: nodus EnginePeer over connect_loopback) is the test seam.  A timeout,
@@ -314,8 +329,12 @@ def submit_and_wait(route: NodusCompileRoute, contract_id: int, *, timeout_s: fl
         if not peer.submit(contract):
             return CompileOutcome(None, "SubmitRefused", False, None, {"error": "peer did not queue the submit"})
         deadline = started + float(timeout_s)
+        next_measurement = started
         while producer.result is None:
             peer.poll()
+            if monitor is not None and time.monotonic() >= next_measurement:
+                monitor()
+                next_measurement = time.monotonic() + 5.0
             if getattr(peer, "error", None) is not None or getattr(peer, "closed", False):
                 return CompileOutcome(None, "PeerClosed", False, None,
                                       {"error": repr(getattr(peer, "error", None)), "admitted": producer.admitted_seen})
@@ -378,6 +397,10 @@ def run_one(db, route: NodusCompileRoute, *, lease_owner: str, timeout_s: float 
     Returns {"state": "busy"} without claiming when ``lease_owner`` still holds an unexpired lease (single in flight).  Otherwise a
     dict: job_id, piece_id, backend, generation, contract_id, status, recorded (the attempt state written, or None when the lease
     was deliberately left in place), detail."""
+    if route.artifacts is None:
+        raise ValueError('compiler dispatch is site-only and requires its account workspace artifact ledger')
+    route.artifacts.bind(db, route.jobs_dir)
+    route.artifacts.monitor()
     sd.reclaim_expired(db)
     live = db.execute("SELECT job_id, piece_id, backend FROM divider_attempts WHERE state='leased' AND lease_owner=? AND "
                       "lease_deadline > ?", (lease_owner, time.time())).fetchone()
@@ -387,16 +410,32 @@ def run_one(db, route: NodusCompileRoute, *, lease_owner: str, timeout_s: float 
     if claim is None:
         return None
     base = {"job_id": claim["job_id"], "piece_id": claim["piece_id"], "backend": claim["backend"], "generation": claim["generation"]}
-    built = request_for_piece(db, claim, jobs_dir=route.jobs_dir, source_root=route.source_root, driver_backend=route.backend,
-                              extraction_contract=route.extraction_contract, turing_root=route.turing_root)
+    try:
+        built = request_for_piece(db, claim, jobs_dir=route.jobs_dir, source_root=route.source_root, driver_backend=route.backend,
+                                  extraction_contract=route.extraction_contract, turing_root=route.turing_root,
+                                  artifacts=route.artifacts)
+    except Exception as error:
+        # No request is dispatched on accounting, identity or filesystem failure.
+        # A partial preparation keeps its reservation for reconciliation.
+        sd.refuse(db, claim['job_id'], claim['piece_id'], claim['backend'], claim['worker_id'], claim['generation'],
+                  state='error', stage='artifact admission', error_type=type(error).__name__, error=str(error)[:300])
+        return {**base, 'state': 'error', 'contract_id': None, 'status': None, 'recorded': 'error',
+                'detail': {'error_type': type(error).__name__, 'error': str(error)[:300]}}
     if built is None:
         row = _attempt_row(db, claim)
         return {**base, "state": "refused", "contract_id": None, "status": None, "recorded": row["state"],
                 "detail": {"error_type": row["error_type"], "error": row["error"]}}
     contract_id, request_path = built
     started = time.monotonic()
-    outcome = submit_and_wait(route, contract_id, timeout_s=timeout_s, poll_s=poll_s, peer_factory=peer_factory)
+    route.artifacts.status(contract_id, 'submitted')
+    try:
+        outcome = submit_and_wait(route, contract_id, timeout_s=timeout_s, poll_s=poll_s, peer_factory=peer_factory,
+                                  monitor=lambda: route.artifacts.reconcile(contract_id))
+    except BaseException:
+        route.artifacts.status(contract_id, 'unfinished')
+        raise
     recorded = _record(db, claim, outcome, time.monotonic() - started) if outcome.status_code is not None else None
+    route.artifacts.status(contract_id, recorded or 'unfinished', finished=recorded in ('complete', 'refused', 'error'))
     return {**base, "state": recorded or "unfinished", "contract_id": contract_id, "request": str(request_path),
             "status": outcome.status_name, "status_code": outcome.status_code, "recorded": recorded,
             "result_path": str(outcome.result_path) if outcome.result_path else None, "detail": outcome.detail}
@@ -411,7 +450,7 @@ def run_pending(db, paths, route: NodusCompileRoute, *, max_pieces: int = 1, lea
     if route.source_root == route.jobs_dir and state.jobs_dir != route.jobs_dir:
         route = NodusCompileRoute(route.host, route.port, route.service_id, route.jobs_dir, route.nodus_tools,
                                   source_root=state.jobs_dir, backend=route.backend, extraction_contract=route.extraction_contract,
-                                  turing_root=route.turing_root)
+                                  turing_root=route.turing_root, artifacts=route.artifacts)
     results = []
     for _ in range(int(max_pieces)):
         result = run_one(db, route, lease_owner=lease_owner, timeout_s=timeout_s, **kwargs)
@@ -428,6 +467,8 @@ def make_hook(paths, route: NodusCompileRoute, *, max_pieces: int = 1, **kwargs)
     accounts.db connection per call; the queue is global, so job_id is not used.  It BLOCKS the calling request thread for up to the
     timeout: install it only where that is acceptable."""
     state = StatePaths.coerce(paths)
+    if route.artifacts is None:
+        raise ValueError('site compile hook requires its account workspace artifact ledger')
 
     def hook(job_id=None):
         db = sd.connect(state.accounts_db)
@@ -440,30 +481,10 @@ def make_hook(paths, route: NodusCompileRoute, *, max_pieces: int = 1, **kwargs)
 
 # ------------------------------------------------------------------------------------------------------------------------ CLI
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("run-once", help="claim one queued piece, compile it through the Nodus host, record the attempt")
-    p.add_argument("--db", required=True, help="accounts db (source_divider tables)")
-    p.add_argument("--jobs-dir", required=True, help="the compile host's jobs dir (<id>.request.json lives here)")
-    p.add_argument("--port", type=int, required=True)
-    p.add_argument("--service-id", type=int, required=True)
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p.add_argument("--nodus-tools", default=None)
-    p.add_argument("--source-root", default=None, help="the divider's jobs dir holding <job_id>/source (default: --jobs-dir)")
-    p.add_argument("--backend", choices=DRIVER_BACKENDS, default=None)
-    p.add_argument("--lease-owner", default="divider-nodus-bridge")
-    args = parser.parse_args(argv)
-    route = NodusCompileRoute(args.host, args.port, args.service_id, Path(args.jobs_dir),
-                              Path(args.nodus_tools) if args.nodus_tools else DEFAULT_NODUS_TOOLS,
-                              source_root=Path(args.source_root) if args.source_root else None, backend=args.backend)
-    db = sd.connect(args.db)
-    try:
-        result = run_one(db, route, lease_owner=args.lease_owner, timeout_s=args.timeout)
-    finally:
-        db.close()
-    print(json.dumps(result if result is not None else {"state": "idle"}, default=str))
-    return 0
+    # The site's authenticated page/API is the sole submission surface. A
+    # caller-selected --db/--owner CLI is not an authenticated site identity.
+    print('Compiler dispatch is site-only. Use the signed-in Source divider page/API.', file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

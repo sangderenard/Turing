@@ -235,17 +235,36 @@ class Store:
             return dict(row)
 
     def reserve(self, actor_id, byte_count, *, base_revision):
+        with self._transaction() as db:
+            return self._reserve(db, actor_id, byte_count, base_revision=base_revision)
+
+    def _reserve(self, db, actor_id, byte_count, *, base_revision):
+        """Reserve inside a trusted service's existing transaction (same ledger)."""
         byte_count = _bytes(byte_count)
         if byte_count == 0:
             raise ValueError('reservation must be positive')
         _digest(base_revision)
-        with self._transaction() as db:
-            self._user(db, actor_id)
-            self._admit(db, actor_id, byte_count)
-            key, now = uuid.uuid4().hex, time.time()
-            db.execute("INSERT INTO workspace_leases (workspace_id,volume_id,owner_id,base_revision,reserved_bytes,state,created_at,updated_at) VALUES (?,?,?,?,?,'reserved',?,?)",
-                       (key, self.volume_id, actor_id, base_revision, byte_count, now, now))
-            return key
+        self._user(db, actor_id)
+        self._admit(db, actor_id, byte_count)
+        key, now = uuid.uuid4().hex, time.time()
+        db.execute("INSERT INTO workspace_leases (workspace_id,volume_id,owner_id,base_revision,reserved_bytes,state,created_at,updated_at) VALUES (?,?,?,?,?,'reserved',?,?)",
+                   (key, self.volume_id, actor_id, base_revision, byte_count, now, now))
+        return key
+
+    def _record_live_usage(self, db, actor_id, workspace_id, measured_bytes):
+        """Trusted service transaction: mutable usage is NOT a sealed revision.
+
+        Used by a running compile's monitor. Review submission still requires
+        record_usage's separately sealed revision and generation contract.
+        """
+        _bytes(measured_bytes)
+        row = self._owned(db, actor_id, workspace_id)
+        if row['state'] not in ('reserved', 'active', 'releasing'):
+            raise Refused('workspace is not writable')
+        if measured_bytes < self._retained_bytes(db, workspace_id):
+            raise Refused('retained review snapshots must remain accounted')
+        db.execute("UPDATE workspace_leases SET measured_bytes=?,revision=NULL,generation=generation+1,state=CASE WHEN state='reserved' THEN 'active' ELSE state END,updated_at=? WHERE workspace_id=?",
+                   (measured_bytes, time.time(), workspace_id))
 
     def get(self, actor_id, workspace_id):
         with self._transaction() as db:
@@ -531,7 +550,7 @@ class SessionAccess:
                                   decision=decision, note=note)
 
 
-def for_state(state_paths, accounts, *, capacity_bytes, user_quota_bytes, free_floor_bytes):
+def for_state(state_paths, accounts, *, capacity_bytes, user_quota_bytes, free_floor_bytes, workspace_root=None):
     """Bind to the existing StatePaths without invoking ensure() or any ACL work.
 
     The state-root owner must provision content/workspaces first. This function
@@ -541,7 +560,7 @@ def for_state(state_paths, accounts, *, capacity_bytes, user_quota_bytes, free_f
     db_path = Path(state_paths.accounts_db).resolve(strict=True)
     if _accounts_database(accounts) != db_path:
         raise Refused('Accounts does not belong to this state root')
-    root = Path(state_paths.content_dir) / 'workspaces'
+    root = Path(workspace_root) if workspace_root is not None else Path(state_paths.content_dir) / 'workspaces'
     # Refuse a root symlink/junction: the state owner's provisioned directory is
     # the boundary. This does not replace sandboxing of future mutable contents.
     if root.is_symlink() or (root.exists() and root.resolve() != root.absolute()):

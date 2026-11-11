@@ -927,7 +927,9 @@ def make_handler(sessions: Sessions):
                         raise divider_intake_mod.DividerError("Content-Length is required", 411)
                     if length > cap:                                  # refused BEFORE the body is read
                         raise divider_intake_mod.DividerError(f"body exceeds {cap} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length))
+                    hook = getattr(sessions, 'divider_hook', None)
+                    backends = getattr(hook, 'backends', ('wasm',))
+                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length), backends=backends)
                 else:
                     raise divider_intake_mod.DividerError("expected application/octet-stream or application/json", 415)
             except divider_intake_mod.DividerError as error:
@@ -2975,6 +2977,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
     parser.add_argument("--no-mathlab", action="store_true",
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
+    parser.add_argument('--site-compiler-config', default=None,
+                        help='operator JSON configuring the authenticated divider Nodus worker and external user workspace budgets')
     parser.add_argument("--no-idle-train", action="store_true",
                         help="do not run the background trainer that studies recorded play when the server is idle")
     parser.add_argument("--accounts-db", default=None,      # [ROUTE]
@@ -3039,6 +3043,10 @@ def main(argv: list[str] | None = None) -> int:
             saved_objects_for=sessions.marble_objects.for_account,
             claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
         print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
+    site_compiler = None
+    if args.site_compiler_config:
+        from meowdoku.site_compiler import configure as configure_site_compiler
+        site_compiler = configure_site_compiler(sessions, args.site_compiler_config, federation_port=args.federation_port)
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)
@@ -3052,6 +3060,8 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=lc.run, name="lifecycle", daemon=True).start()
     if not args.no_mathlab:                                          # [MATHLAB] ONE worker; running jobs from a previous run are requeued once
         sessions.mathlab_worker = math_jobs_mod.Worker(sessions.accounts_db, state).start()
+    if site_compiler is not None:
+        site_compiler.start()
     scheme = "http"
     if args.tls_cert:
         import ssl
@@ -3085,6 +3095,8 @@ def main(argv: list[str] | None = None) -> int:
         lc.stopping = True
         if sessions.mathlab_worker is not None:
             sessions.mathlab_worker.stop()
+        if site_compiler is not None:
+            site_compiler.stop()
         sessions.marble_photos.close()
         if not lc.exit_code:
             lc.save_all()                                   # LIFECYCLE: a Ctrl-C keeps the sessions too

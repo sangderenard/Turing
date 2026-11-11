@@ -63,6 +63,15 @@ function renderDetail(job) {
   const note = $('dnote');
   note.hidden = !job.note;
   note.textContent = job.note || '';
+  const storage = $('dstorage');
+  const runs = job.storage || [];
+  storage.hidden = !runs.length;
+  storage.textContent = runs.map((run) => {
+    const measured = run.measured_at == null ? 'not measured yet' : `${run.measured_bytes.toLocaleString()} bytes measured`;
+    const review = run.review_due ? 'retention review due' : `review after ${new Date(run.review_after * 1000).toLocaleString()}`;
+    return `Compile ${run.contract_id}: ${measured}, ${run.charged_bytes.toLocaleString()} bytes reserved/charged; ${run.status}; ${review}`
+      + (run.measurement_error ? '; measurement needs attention' : '');
+  }).join('. ') + (runs.length ? '. Files belong to this account. Review dates never delete files automatically.' : '');
   const body = $('pieces').querySelector('tbody');
   body.replaceChildren();
   for (const piece of job.pieces_detail) {

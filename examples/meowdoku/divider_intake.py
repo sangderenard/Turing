@@ -292,6 +292,8 @@ def get_job(paths, job_id: str, owner_key: str, admin: bool = False):
         if not _visible(row, owner_key, admin):
             return None
         job = _job_row(db, row)
+        from meowdoku.compile_artifacts import job_storage
+        job['storage'] = job_storage(db, job_id, row['owner_key'])
         attempts = {}
         for a in db.execute("SELECT * FROM divider_attempts WHERE job_id=? ORDER BY piece_id, backend", (job_id,)):
             attempts.setdefault(a["piece_id"], []).append(

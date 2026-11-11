@@ -17,6 +17,8 @@ sys.path[:0] = [str(ROOT), str(ROOT / "examples")]
 from meowdoku import divider_nodus_bridge as br  # noqa: E402
 from meowdoku import source_divider as sd  # noqa: E402
 from meowdoku.state_paths import StatePaths  # noqa: E402
+from meowdoku.compile_artifacts import Artifacts
+from meowdoku.workspace_accounting import Store
 
 TOOLS = br.DEFAULT_NODUS_TOOLS
 FRAME = struct.Struct("<II8Q")                    # the layout in contract_service_peer.py
@@ -105,14 +107,19 @@ class FakeHost:
 def _setup(tmp_path, text=ONE, backends=("c",), name="m.py"):
     state = StatePaths(tmp_path / "state")
     db = sd.connect(state.accounts_db)
-    job = sd.submit(db, state, sd.intake_text(state, name, text), owner_key="k", backends=backends)
+    db.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY)")
+    db.execute("INSERT OR IGNORE INTO users VALUES(1)")
+    job = sd.submit(db, state, sd.intake_text(state, name, text), owner_key="account:1", backends=backends)
     return state, db, job
 
 
 def _route(tmp_path, state, host=None, port=1):
-    jobs = tmp_path / "compile"
-    jobs.mkdir(exist_ok=True)
-    return br.NodusCompileRoute("127.0.0.1", host.port if host else port, 7, jobs, TOOLS, source_root=state.jobs_dir)
+    jobs = state.content_dir / "workspaces"
+    jobs.mkdir(parents=True, exist_ok=True)
+    store = Store(state.accounts_db, jobs, capacity_bytes=100_000_000, user_quota_bytes=50_000_000, free_floor_bytes=0)
+    artifacts = Artifacts(state, store, reservation_bytes=1_000_000, review_after_s=3600)
+    return br.NodusCompileRoute("127.0.0.1", host.port if host else port, 7, jobs, TOOLS,
+                                source_root=state.jobs_dir, artifacts=artifacts)
 
 
 def _attempt(db, job, piece_id=0, backend="c"):
@@ -296,26 +303,30 @@ def test_connect_failure_leaves_lease(tmp_path):
     assert _attempt(db, job)["state"] == "leased"
 
 
-def test_cli_run_once_prints_json(tmp_path):
+def test_configured_backend_never_relabels_an_existing_attempt(tmp_path):
+    state, db, job = _setup(tmp_path, backends=('llvm',))
+    route = _route(tmp_path, state)
+    route.backend = 'c'
+    result = br.run_one(db, route, lease_owner='w', timeout_s=1)
+    assert result['recorded'] == 'refused'
+    assert result['detail']['error_type'] == 'BackendNotServed'
+    assert _attempt(db, job, backend='llvm')['state'] == 'refused'
+    assert not list(route.jobs_dir.glob('*.request.json'))
+
+
+def test_cli_dispatch_refused_without_contacting_host(tmp_path):
     state, db, job = _setup(tmp_path)
     jobs = tmp_path / "compile"
     jobs.mkdir()
-    host = FakeHost(jobs, status=2)
+    host = FakeHost(jobs)
     try:
-        proc = subprocess.run(
-            [sys.executable, str(ROOT / "examples" / "meowdoku" / "divider_nodus_bridge.py"), "run-once", "--db", str(state.accounts_db),
-             "--jobs-dir", str(jobs), "--source-root", str(state.jobs_dir), "--port", str(host.port), "--service-id", "7",
-             "--timeout", "10", "--nodus-tools", str(TOOLS)], capture_output=True, text=True, timeout=90)
+        proc = subprocess.run([sys.executable, str(ROOT / "examples/meowdoku/divider_nodus_bridge.py"),
+                               "run-once", "--db", str(state.accounts_db), "--jobs-dir", str(jobs),
+                               "--port", str(host.port), "--service-id", "7"], capture_output=True, text=True, timeout=30)
     finally:
         host.close()
-    assert proc.returncode == 0, proc.stderr
-    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    payload = json.loads(lines[-1])
-    assert payload["status"] == "CompiledNotAdopted" and payload["recorded"] == "complete"
-    idle = subprocess.run(
-        [sys.executable, str(ROOT / "examples" / "meowdoku" / "divider_nodus_bridge.py"), "run-once", "--db", str(state.accounts_db),
-         "--jobs-dir", str(jobs), "--port", "1", "--service-id", "7"], capture_output=True, text=True, timeout=90)
-    assert json.loads(idle.stdout.splitlines()[-1]) == {"state": "idle"}
+    assert proc.returncode == 2 and "site-only" in proc.stderr
+    assert host.connections == 0 and _attempt(db, job)["state"] == "queued"
 
 
 def test_scalar_pieces_refused_and_no_rank_zero_request_is_ever_produced(tmp_path):

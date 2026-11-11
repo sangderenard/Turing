@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from .artifact_locations import compiler_artifact_root
 from typing import Any, Callable, Mapping
 
 import networkx as nx
@@ -186,7 +187,7 @@ def _native_metadata_copy_runner(artifact, abi):
 
 def _metadata_copy_install_directory(directory=None):
     return (Path(directory) if directory is not None else
-            Path(__file__).resolve().parents[2] / 'build/compiler_foundations/metadata_copy').resolve()
+            compiler_artifact_root() / 'build/compiler_foundations/metadata_copy').resolve()
 
 
 def _metadata_copy_install_key(store):
@@ -927,7 +928,7 @@ def compile_and_register_storage_effects_accelerator(
 
 def _storage_effect_install_directory(directory=None):
     return (Path(directory) if directory is not None else
-            Path(__file__).resolve().parents[2] / 'build/compiler_foundations/storage_effects').resolve()
+            compiler_artifact_root() / 'build/compiler_foundations/storage_effects').resolve()
 
 
 def _storage_effect_install_key(store):

@@ -1,5 +1,12 @@
 # Divider -> Nodus compile host bridge (2026-11-10)
 
+> Updated 2026-11-11: site-only account/workspace wiring is now implemented in
+> isolated source, not deployed. The direct bridge CLI below is retired; it now
+> refuses dispatch. Read [the current storage/wiring contract](../../../docs/SITE_COMPILER_ARTIFACTS_2026-11-11.md).
+> Runtime dispatch requires the existing account workspace ledger, external
+> user-space jobs root and configured site worker. Earlier launch snippets and
+> the “not applied” wiring section below are historical, not current instructions.
+
 `examples/meowdoku/divider_nodus_bridge.py` drains `source_divider`'s lease queue one piece at a time through a Nodus contract port
 into the Nodus `TuringCompileHost` (`nodus/include/turing_compile_host_tool.h`). Tests: `tests/test_meowdoku_divider_nodus_bridge.py`
 (fake endpoint on an ephemeral loopback port, real 72-byte frames, no Nodus build, no compiler).

@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+from .artifact_locations import compiler_artifact_root
 import re
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -258,7 +259,7 @@ def compile_ast_fortran_io_shell(
             ).encode("utf-8")
         ).hexdigest()[:16]
         directory = (
-            Path(__file__).resolve().parents[2]
+            compiler_artifact_root()
             / ".turing-cache" / "native_shells" / f"{entrypoint}_{digest}"
         )
     output_directory = Path(directory).resolve()
