@@ -74,6 +74,72 @@ def test_the_manual_itself_bakes(tmp_path):
     assert changed and (tmp_path / "manual" / "index.html").is_file(), sentence
 
 
+def test_a_backup_leaves_named_folders_out_and_keeps_a_small_window(tmp_path):
+    from meowdoku import state_backup
+    state = tmp_path / "state"
+    (state / "sql").mkdir(parents=True)
+    (state / "content" / "marble_photos" / "job").mkdir(parents=True)
+    (state / "content" / "marble_photos" / "job" / "big.bin").write_bytes(b"x" * 4096)
+    (state / "content" / "marble_photos_index.txt").write_text("not inside the excluded folder", encoding="utf-8")
+    (state / "content" / "profiles.json").write_text("{}", encoding="utf-8")
+    (state / "jobs" / "cron").mkdir(parents=True)
+    (state / "jobs" / "cron" / "cron.table").write_text("x * * * * *\n", encoding="utf-8")
+    out = tmp_path / "backups"
+    sentences = []
+    for _round in range(3):
+        sentences.append(scheduled_tasks.backup_state(state, out, keep=2, exclude=("content/marble_photos",),
+                                                      state_backup=state_backup))
+        time.sleep(1.1)                                  # snapshots are named by the second
+    kept = sorted(p.name for p in out.iterdir() if p.is_dir())
+    assert len(kept) == 2, "only the window asked for is kept"
+    newest = out / kept[-1]
+    names = sorted(p.relative_to(newest).as_posix() for p in newest.rglob("*") if p.is_file())
+    assert "content/profiles.json" in names and "jobs/cron/cron.table" in names
+    assert "content/marble_photos_index.txt" in names, "a name that merely begins like the folder is not left out"
+    assert not any(name.startswith("content/marble_photos/") for name in names)
+    manifest = json.loads((newest / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["excluded"] == ["content/marble_photos"]
+    assert "left out: content/marble_photos" in sentences[-1] and "1 old removed, keeping 2" in sentences[-1]
+    assert state_backup.verify(newest)["ok"]
+
+
+def test_a_task_is_offered_only_when_what_it_needs_was_given():
+    class Statuses:
+        DONE, UNCHANGED = 1, 2
+    assert scheduled_tasks.handlers(Statuses) == {}
+    assert sorted(scheduled_tasks.handlers(Statuses, web_dir="w", manual=object(), site=None, graph_view=None)) == ["manual.hardcopy"]
+    both = scheduled_tasks.handlers(Statuses, web_dir="w", manual=object(), site=None, graph_view=None,
+                                    backup={"state_dir": "s", "backup_dir": "b", "keep": 3, "exclude": (), "module": None})
+    assert sorted(both) == ["manual.hardcopy", "state.backup"]
+
+
+def test_the_worker_bakes_at_its_own_start_and_idles_without_a_cron_port(tmp_path):
+    if rest_api.manual is None:
+        pytest.skip("the SpeakToMe checkout has no manual")
+    web = tmp_path / "web"
+    web.mkdir()
+    worker = subprocess.Popen([sys.executable, str(ROOT / "examples" / "meowdoku" / "deploy" / "task_worker.py"),
+                               "--state-dir", str(tmp_path / "state"), "--web-dir", str(web),
+                               "--cron-jobs-dir", str(tmp_path / "jobs"), "--federation-port", "1",
+                               "--federation-canvas", "ignored"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        first = worker.stdout.readline()
+        second = worker.stdout.readline()
+        assert "[worker] at start: the manual hard copy was rebuilt" in first, first
+        assert "no cron port was given" in second, second
+        assert (web / "manual" / "index.html").is_file()
+        time.sleep(1.5)
+        assert worker.poll() is None, "it idles; it does not exit and get restarted in a loop"
+    finally:
+        worker.kill()
+        worker.wait(timeout=10)
+
+
+def test_the_web_server_no_longer_bakes_or_hosts_scheduled_tasks():
+    source = (ROOT / "examples" / "meowdoku" / "server.py").read_text(encoding="utf-8")
+    assert "scheduled_tasks" not in source and "--cron-port" not in source
+
+
 def test_the_cron_tool_asks_and_this_host_performs_when_the_library_is_named(tmp_path):
     if not os.environ.get("NODUS_HEADLESS_TEST_DLL") or rest_api.manual is None:
         pytest.skip("Set NODUS_HEADLESS_TEST_DLL (and PATH for its dependencies) to test the real cron round trip")

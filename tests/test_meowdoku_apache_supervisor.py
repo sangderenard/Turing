@@ -75,7 +75,7 @@ def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "task-worker"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):

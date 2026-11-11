@@ -19,15 +19,12 @@
         "--studio-assets",
         "C:/dev/Powershell/srv/state/content/studio_agent/assets.json",
         "--studio-defaults",
-        "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json",
-        "--cron-jobs-dir",
-        "C:/dev/Powershell/srv/state/jobs/cron"
+        "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
       "site": "stable",
-      "studio_prefix": "studio.product",
-      "cron_prefix": "cron"
+      "studio_prefix": "studio.product"
     },
     {
       "name": "meowdoku-dev",
@@ -88,6 +85,33 @@
         ]
       },
       "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "task-worker",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-task-worker",
+      "federation_from": "nodus-messenger",
+      "cron_prefix": "cron",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/deploy/task_worker.py",
+        "--state-dir",
+        "C:/dev/Powershell/srv/state",
+        "--web-dir",
+        "C:/dev/Powershell/turing/build/meowdoku/web",
+        "--cron-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/cron",
+        "--backup-dir",
+        "C:/dev/Powershell/srv/backups",
+        "--backup-keep",
+        "3",
+        "--backup-exclude",
+        "content/marble_photos"
+      ]
     }
   ],
   "state_dir": "C:/dev/Powershell/srv/state"
