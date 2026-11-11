@@ -35,6 +35,13 @@ regions, 13,270 rooms, 18,467 portal pairs, 37,169 unresolved references,
 root repository's `nogodsnomasters` branch on GitHub has 867 regions and
 2,677 rooms, far more than the root AGENTS.md says it tracks.
 
+2026-11-11, later: scan languages now come from the compiler's
+`DREAM_LANGUAGE_TRANSLATIONS`; each scan publishes a `languages` table with
+the route and linking state per language (python, javascript linked; cpp,
+glsl, wgsl, sympy known but no reader, so no portals). Fixture gained two C++
+files. `tests/test_repo_world_scan.py` + `tests/test_repo_world_workspace.py`:
+5 passed in 5.3 s.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

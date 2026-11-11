@@ -47,11 +47,38 @@ import sys
 import tempfile
 from typing import Any, Iterable, Mapping
 
+from .dream_document import DREAM_LANGUAGE_TRANSLATIONS
+
 REPO_WORLD_SCAN_VERSION = "repo-world-scan-v0"
 GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-PYTHON_SUFFIXES = (".py",)
-JAVASCRIPT_SUFFIXES = (".js", ".mjs")
+# The known languages are the compiler's own table, DREAM_LANGUAGE_TRANSLATIONS
+# (each with its translation route).  This module adds two things that table
+# does not carry: which file suffixes name each language, and which languages
+# have a cross-file reference reader ("linking") here.  A language in the table
+# without a reader is known and translatable but its rooms get no portals yet;
+# that is declared per language in RepoWorldScan.languages, never implied.
+LANGUAGE_SUFFIXES: Mapping[str, tuple[str, ...]] = {
+    "python": (".py",),
+    "javascript": (".js", ".mjs"),
+    "cpp": (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"),
+    "glsl": (".glsl", ".vert", ".frag", ".geom", ".comp", ".tesc", ".tese"),
+    "wgsl": (".wgsl",),
+    # "sympy" is a Python-hosted language with no file suffix of its own.
+}
+LINKING_READERS: Mapping[str, str] = {
+    "python": "python-import",        # ast.Import / ast.ImportFrom
+    "javascript": "es-module-import",  # static ES-module import/export-from
+}
+_SUFFIX_LANGUAGE = {
+    suffix: language for language, suffixes in LANGUAGE_SUFFIXES.items() for suffix in suffixes
+}
+_unknown_to_table = set(LANGUAGE_SUFFIXES) - set(DREAM_LANGUAGE_TRANSLATIONS)
+if _unknown_to_table:
+    raise RuntimeError(
+        f"LANGUAGE_SUFFIXES names languages the compiler table does not: {sorted(_unknown_to_table)}"
+    )
+
 _JS_RESOLUTION_SUFFIXES = ("", ".js", ".mjs", "/index.js", "/index.mjs")
 
 # ES-module static import forms.  The specifier is always the last string
@@ -204,6 +231,7 @@ class RepoWorldScan:
             "identity": f"repo:{self.commit}",
             "commit": self.commit,
             "origin": self.origin,
+            "languages": language_table(),
             "regions": [item.to_data() for item in self.regions],
             "rooms": [item.to_data() for item in self.rooms],
             "portals": [item.to_data() for item in self.portals],
@@ -268,12 +296,31 @@ def _pair_identity(commit: str, source: str, line: int, target: str) -> str:
 # --- tree ----------------------------------------------------------------------
 
 def _language(path: str) -> str:
-    suffix = PurePosixPath(path).suffix
-    if suffix in PYTHON_SUFFIXES:
-        return "python"
-    if suffix in JAVASCRIPT_SUFFIXES:
-        return "javascript"
-    return "other"
+    """The compiler's language name for a file, or "other" when no known
+    language claims its suffix."""
+
+    return _SUFFIX_LANGUAGE.get(PurePosixPath(path).suffix.lower(), "other")
+
+
+def language_table() -> list[dict[str, Any]]:
+    """Known languages with their compiler route and this scan's linking state."""
+
+    rows = []
+    for name, translation in DREAM_LANGUAGE_TRANSLATIONS.items():
+        reader = LINKING_READERS.get(name)
+        rows.append({
+            "language": name,
+            "route": translation.route,
+            "translation_table": translation.translation_table,
+            "execution_target": translation.execution_target,
+            "suffixes": list(LANGUAGE_SUFFIXES.get(name, ())),
+            "linking": reader,
+            "linking_state": (
+                "cross-file references read" if reader
+                else "known language, no cross-file reference reader yet: rooms get no portals"
+            ),
+        })
+    return rows
 
 
 def _build_tree(commit: str, files: Iterable[str]) -> tuple[tuple[RepoRegion, ...], tuple[RepoRoom, ...]]:
@@ -576,7 +623,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "REPO_WORLD_SCAN_VERSION", "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair",
+    "LANGUAGE_SUFFIXES", "LINKING_READERS", "REPO_WORLD_SCAN_VERSION",
+    "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair", "language_table",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",
     "RepoWorldScan", "github_clone_url", "region_identity", "room_identity",
     "scan_cloned_repository", "scan_github_repository", "scan_repository",

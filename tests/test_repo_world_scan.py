@@ -44,6 +44,8 @@ def _fixture_repo(root: Path) -> Path:
     _write(repo, "web/lib/helper.js", "export const draw = 1;\nexport const x = 2;\n")
     _write(repo, "web/lib/side.js", "import '../main.js';\n")
     _write(repo, "README.md", "fixture\n")
+    _write(repo, "native/geom.cpp", '#include "geom.hpp"\n')
+    _write(repo, "native/geom.hpp", "struct G {};\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "fixture")
     return repo
@@ -70,7 +72,7 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
 
     # Folder -> region / subregion, parented through the directory tree.
     regions = {r.path: r for r in scan.regions}
-    assert set(regions) == {".", "pkg", "web", "web/lib"}
+    assert set(regions) == {".", "native", "pkg", "web", "web/lib"}
     assert regions["."].parent is None
     assert regions["pkg"].parent == regions["."].identity
     assert regions["web/lib"].parent == regions["web"].identity
@@ -82,10 +84,21 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
     assert set(rooms) == {
         "README.md", "app.py", "pkg/__init__.py", "pkg/broken.py", "pkg/core.py",
         "pkg/util.py", "web/lib/helper.js", "web/lib/side.js", "web/main.js",
+        "native/geom.cpp", "native/geom.hpp",
     }
     assert rooms["pkg/core.py"].region == regions["pkg"].identity
     assert rooms["web/lib/side.js"].region == regions["web/lib"].identity
     assert rooms["README.md"].language == "other"
+
+    # Languages come from the compiler's own table; C++ is known but unlinked.
+    assert rooms["native/geom.cpp"].language == "cpp"
+    languages = {row["language"]: row for row in scan.to_data()["languages"]}
+    assert set(languages) == {"python", "sympy", "javascript", "glsl", "wgsl", "cpp"}
+    assert languages["cpp"]["route"] == "cpp-shell" and languages["cpp"]["linking"] is None
+    assert languages["python"]["linking"] == "python-import"
+    assert languages["javascript"]["linking"] == "es-module-import"
+    assert not any(p.source_room.endswith(".cpp") for p in scan.portals)
+    assert not any(u.source_room.endswith(".cpp") for u in scan.unresolved)
 
     # Cross-file reference -> one portal pair with the source line.
     assert _portal_table(scan) == [

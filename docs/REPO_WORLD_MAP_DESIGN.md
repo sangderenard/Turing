@@ -188,6 +188,25 @@ imports (a function in A calling a function in B) are not references in
 this version; the owner's "calls out of / into a file" is served at module
 granularity first.
 
+### Known languages and the linking state (2026-11-11)
+
+The scan's language vocabulary is the compiler's own table,
+`DREAM_LANGUAGE_TRANSLATIONS` in `src/compiler/dream_document.py` (python,
+sympy, javascript, glsl, wgsl, cpp, each with its translation route). The
+scanner adds only what that table does not carry, in two named tables in
+`repo_world_scan.py`: `LANGUAGE_SUFFIXES` (which file suffixes name each
+language) and `LINKING_READERS` (which languages have a cross-file reference
+reader here). A startup check refuses a suffix table that names a language
+the compiler table does not. Every scan publishes `languages`, one row per
+known language with its route and `linking` state, so the record set itself
+says that C++ rooms are a known, translatable language with no reader yet
+and therefore no portals. That is why geometry, fftfree and nodus show no
+portals in §7a: not a property of those codebases, a declared absence of a
+C++ linker (`#include` reader) in the scan. When one is written it goes into
+`LINKING_READERS`, and the translation matrix in the root
+`TRANSLATION_MATRIX_SIGNOFF_2026-08-12.md` is the place that records which
+routes exist for the language once linked.
+
 ## 3. The general portal record
 
 A portal must not be owned by the game page. The scan's
