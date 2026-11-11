@@ -1046,7 +1046,9 @@ def make_handler(sessions: Sessions):
                     db.close()
         # ---- end [PROFILE]
 
-        # ---- [CONTROL] /api/admin/instances: force a shutdown, restart or start of an instance (instance_control.py).
+        # ---- [CONTROL] /api/control/instances: force a shutdown, restart or start of an instance (instance_control.py).
+        # Not under /api/admin: the proxy refuses that whole prefix, which belongs to the loopback token endpoints.  This one
+        # is authorized by the signed-in account's role, so it is reachable wherever the account is.
         # GET lists the instances and the recent requests; POST {instance, action, reason?} records a request that the
         # supervisor performs within a second or two, whether or not the instance is responsive.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
@@ -1861,7 +1863,7 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path, "GET")
             if path.startswith("/api/show/pictures/"):
                 return self._picture_route(path, "GET")
-            if path == "/api/admin/instances":
+            if path == "/api/control/instances":
                 return self._instance_control("GET")
             if path == "/site" or path.startswith("/site/"):
                 return self._site_get(path)
@@ -2334,7 +2336,7 @@ def make_handler(sessions: Sessions):
                 return self._living_data_query()
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
-            if path0 == "/api/admin/instances":
+            if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
