@@ -264,6 +264,10 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <p class="wide" id="photo-geometry-diagnostic" role="status" aria-live="polite">Geometry counts will be reported by the next photo or live scene.</p>
     <details id="photo-lens-controls" class="wide"><summary>Lens collection · focus, focal length &amp; aperture</summary><div class="grid">
       <label class="wide">Analytical lens<select id="photo-lens"><option value="unchanged" selected>Original camera settings (no overrides)</option><option value="custom">Custom analytical lens</option></select></label>
+      <label class="wide">Camera back geometry<select id="photo-camera-back" aria-describedby="photo-back-status"><option value="reference" selected>Original 24 mm reference height</option><option value="custom">Custom physical back</option></select></label>
+      <label>Back width (mm)<input id="photo-back-width-mm" type="number" min="1" max="300" step="any" value="36" disabled></label>
+      <label>Back height (mm)<input id="photo-back-height-mm" type="number" min="1" max="300" step="any" value="24" disabled></label>
+      <p id="photo-back-status" class="wide" role="status" aria-live="polite">Physical geometry only. Output sizes and tiling remain independent.</p>
       <label>Axial focus distance (mm)<input id="photo-focus-mm" type="number" min="1" max="10000" step="any" value="110" disabled><input id="photo-focus-slider" aria-label="Axial focus distance, logarithmic slider" type="range" min="0" max="4" step="0.001" value="2.041392685" disabled></label>
       <label>Focal length / zoom (mm)<input id="photo-focal-mm" type="number" min="10.069" max="500" step="any" value="75.76501818" disabled><input id="photo-focal-slider" aria-label="Focal length and zoom" type="range" min="10.07" max="500" step="any" value="75.76501818" disabled></label>
       <label>Aperture (f-number)<input id="photo-f-number" type="number" min="1" max="64" step="any" value="18.94125455" disabled><input id="photo-aperture-slider" aria-label="Aperture f-number, logarithmic slider" type="range" min="0" max="6" step="0.001" value="4.24346" disabled></label>

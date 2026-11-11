@@ -1632,7 +1632,7 @@ function frame(now=0) {
     let dofCamera=dofCameraFromView(view,{unitM:subject.unitM,targetDistance:cameraDistance,
       fovDegrees:simOn?360/7:subject.fovDegrees});
     let opticsError=null;
-    try {dofCamera=photo.applyLensCamera(dofCamera);lastDofOptics={fov_degrees:dofCamera.fov_degrees,
+    try {dofCamera=photo.applyLensCamera(dofCamera,w/h);lastDofOptics={fov_degrees:dofCamera.fov_degrees,
       focus_distance_m:dofCamera.focus_distance_m,aperture_radius_m:dofCamera.aperture_radius_m};}
     catch(error){opticsError=error.message;if(lastDofOptics)dofCamera={...dofCamera,...lastDofOptics};}
     const viewFovDegrees=dofCamera.fov_degrees;
