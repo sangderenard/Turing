@@ -24,6 +24,13 @@ branch is never cleaned later.
 ``branch_merged_seen`` is the cleaner's ledger: when a branch was first seen fully merged at a commit. The grace
 period of the cleaner counts from that moment, so nothing is removed the first time it is looked at.
 
+A branch is registered to an account by checking it out from the server (``register``) or by submitting it
+(``branch_owners``). A registered branch is its owner's to keep tidy and is given a long life by the cleaner; a branch
+registered to nobody is given a short one. ``branch_removed`` records every branch the cleaner removed and the commit
+it was at, so a removal can be undone while Git still holds the commit.
+
+``advice`` is the one text that says how a change is made here. The lock prints it, in mock and in earnest.
+
 Who a caller is comes from the authenticated host, never from a request. Who is an admin is the ``account_roles``
 table of the same database.
 """
@@ -51,6 +58,10 @@ DDL = (
     "PRIMARY KEY(review_id, user_id))",
     "CREATE TABLE IF NOT EXISTS branch_merged_seen (repository TEXT NOT NULL, branch TEXT NOT NULL, head TEXT NOT NULL, "
     "seen_at REAL NOT NULL, PRIMARY KEY(repository, branch))",
+    "CREATE TABLE IF NOT EXISTS branch_owners (repository TEXT NOT NULL, branch TEXT NOT NULL, user_id INTEGER NOT NULL, "
+    "username TEXT, registered_at REAL NOT NULL, PRIMARY KEY(repository, branch))",
+    "CREATE TABLE IF NOT EXISTS branch_removed (repository TEXT NOT NULL, branch TEXT NOT NULL, head TEXT NOT NULL, "
+    "removed_at REAL NOT NULL, reason TEXT NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail")
@@ -158,6 +169,7 @@ def submit(db, *, user_id, username, repository, branch, base, head, timeout_s, 
         db.execute("INSERT INTO branch_reviews (id, repository, branch, base, head, owner_id, owner_name, created_at, "
                    "accept_after, delete_branch) VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (review_id, repository, branch, base, head, user_id, username, now, now + float(timeout_s), int(delete_branch)))
+        db.execute("INSERT OR IGNORE INTO branch_owners VALUES (?,?,?,?,?)", (repository, branch, user_id, username, now))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -258,6 +270,72 @@ def forget_merged(db, repository, branch) -> None:
     db.execute("DELETE FROM branch_merged_seen WHERE repository = ? AND branch = ?", (repository, branch))
 
 
+def _branch(value, what="branch") -> str:
+    if not isinstance(value, str) or not BRANCH.match(value) or ".." in value or value.endswith(("/", ".lock")):
+        raise ReviewError(f"{what} must be a plain branch name")
+    return value
+
+
+def register(db, *, user_id, username, repository, branch, known, now=None) -> dict:
+    """Check a branch out from the server: it is this account's from now on. The first to ask holds it."""
+    ensure(db)
+    _account(user_id)
+    if repository not in known:
+        raise ReviewError("repository must be one the policy names: " + ", ".join(sorted(known)), 404)
+    _branch(branch)
+    now = time.time() if now is None else now
+    db.execute("INSERT OR IGNORE INTO branch_owners VALUES (?,?,?,?,?)", (repository, branch, user_id, username, now))
+    held = owner(db, repository, branch)
+    if held["user_id"] != user_id:
+        raise ReviewError(f"that branch is registered to {held['username']}; choose another name", 409)
+    return held
+
+
+def owner(db, repository, branch) -> dict | None:
+    ensure(db)
+    row = db.execute("SELECT user_id, username, registered_at FROM branch_owners WHERE repository = ? AND branch = ?",
+                     (repository, branch)).fetchone()
+    return None if row is None else {"repository": repository, "branch": branch, "user_id": row[0], "username": row[1],
+                                     "registered_at": row[2]}
+
+
+def branches_of(db, user_id) -> list:
+    ensure(db)
+    return [{"repository": r[0], "branch": r[1], "registered_at": r[2]} for r in db.execute(
+        "SELECT repository, branch, registered_at FROM branch_owners WHERE user_id = ? ORDER BY registered_at DESC", (user_id,))]
+
+
+def in_review(db, repository, branch) -> bool:
+    """A change of this branch is open or approved and has not landed yet."""
+    ensure(db)
+    return db.execute("SELECT 1 FROM branch_reviews WHERE repository = ? AND branch = ? AND status IN ('open','approved') "
+                      "AND landed_at IS NULL", (repository, branch)).fetchone() is not None
+
+
+def record_removed(db, repository, branch, head, reason, now=None) -> None:
+    ensure(db)
+    db.execute("INSERT INTO branch_removed VALUES (?,?,?,?,?)",
+               (repository, branch, head, time.time() if now is None else now, str(reason)[:500]))
+    db.execute("DELETE FROM branch_owners WHERE repository = ? AND branch = ?", (repository, branch))
+
+
+def advice(policy, repository, head=None) -> str:
+    """How a change is made here, in a few lines. The lock says this and nothing else."""
+    declared = policy["repositories"][repository]
+    default, mock = declared["default"], policy.get("lock") != "enforce"
+    first = f"review gate{' (mock: allowed this time)' if mock else ''}: {default} of {repository} takes only reviewed commits"
+    first += f", and {head[:12]} has no accepted review." if head else "."
+    return "\n".join([
+        first,
+        "Do it through the speaktome-api MCP (python -m speaktome_mcp.api), not by pushing:",
+        f"  1. reviews_checkout repository={repository} branch=<your-branch>     the branch is registered to you",
+        f"  2. git switch -c <your-branch> {default}     then commit there; do not push",
+        f"  3. reviews_submit repository={repository} branch=<your-branch> head=<full commit id>",
+        f"An admin approves it, or it is accepted after {policy['review_timeout_hours']:g} h with no objection. "
+        "The admin tool then pushes and lands it; nobody else talks to GitHub.",
+    ])
+
+
 def http_route(self, path, method, *, policy, accounts_db):
     """The reviews over REST. ``self`` is the host's request handler; ``policy`` the loaded branch policy.
 
@@ -266,7 +344,8 @@ def http_route(self, path, method, *, policy, accounts_db):
         POST /api/reviews/remark          {id, verdict, note?}                                a peer
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
         POST /api/reviews/withdraw        {id}                                                the author
-        GET  /api/reviews/standing?repository=NAME&head=COMMIT      open: {"accepted": true | false}
+        POST /api/reviews/checkout        {repository, branch}      register a branch to yourself; answers the steps
+        GET  /api/reviews/standing?repository=NAME&head=COMMIT      open: {"accepted", "lock", "advice"}
 
     ``standing`` is what the required check on GitHub asks. It answers one yes or no about one commit and nothing
     else, so it needs no account. Everything else takes the caller from the authenticated session.
@@ -284,8 +363,9 @@ def http_route(self, path, method, *, policy, accounts_db):
             repository, head = (query.get("repository") or [""])[0], (query.get("head") or [""])[0]
             if repository not in known or not HEAD.match(head):
                 return self._json({"error": "repository and a full commit id are required"}, 400)
-            return self._json({"repository": repository, "head": head,
-                               "accepted": accepted_head(db, repository, known[repository]["default"], head)})
+            accepted = accepted_head(db, repository, known[repository]["default"], head)
+            return self._json({"repository": repository, "head": head, "accepted": accepted, "lock": policy.get("lock", "mock"),
+                               "advice": "" if accepted else advice(policy, repository, head)})
         principal = self._principal()
         if principal.user_id is None:
             return self._json({"error": "sign in first"}, 401)
@@ -293,7 +373,8 @@ def http_route(self, path, method, *, policy, accounts_db):
             return self._json({"error": "this needs dev_ui"}, 403)
         who = {"user_id": principal.user_id, "username": principal.username}
         if method == "GET" and path == "/api/reviews":
-            return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)}})
+            return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
+                               "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock")})
         if method != "POST":
             return self._json({"error": "not found"}, 404)
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
@@ -314,6 +395,11 @@ def http_route(self, path, method, *, policy, accounts_db):
             base = known[repository]["default"] if isinstance(repository, str) and repository in known else ""
             made = submit(db, **who, repository=repository, branch=body.get("branch"), base=base, head=body.get("head"),
                           timeout_s=hours * 3600.0, delete_branch=not keep, known=list(known))
+        elif path == "/api/reviews/checkout":
+            held = register(db, **who, repository=body.get("repository"), branch=body.get("branch"), known=list(known))
+            print(f"[reviews] {principal.username} checkout {held['repository']} {held['branch']}", flush=True)
+            return self._json({"branch": held, "base": known[held["repository"]]["default"],
+                               "steps": advice(policy, held["repository"]).splitlines()[2:]})
         elif path == "/api/reviews/remark":
             made = remark(db, body.get("id"), **who, verdict=body.get("verdict"), note=body.get("note", ""))
         elif path == "/api/reviews/decide":

@@ -18,7 +18,15 @@ its review. The live source is what the repository's own checkout has checked ou
 from), or its default branch on the remote. The deadline is ``grace_days`` after the cleaner first saw the branch
 in that state; a branch whose last commit is already older than ``stale_days`` has no deadline left to wait for
 and is removed at the first look. The remote copy goes only when its commits are on the remote too (on the default
-branch or on the pushed live branch); otherwise it is kept and said so. A branch with a commit of its own is never removed, whatever its age;
+branch or on the pushed live branch); otherwise it is kept and said so.
+
+A branch with commits of its own is removed by age alone, and the age depends on whose it is: one registered to an
+account (``branch_review.register``, or by submitting it) lives ``registered_days`` after its last commit, one
+registered to nobody ``unregistered_days``. A branch under review is never removed. Every removal is written to
+``branch_removed`` with the commit the branch was at.
+
+``lock`` is "mock" or "enforce". In mock the push check says what it would have refused, prints the advice
+(``branch_review.advice``) and lets the push through. A branch with a commit of its own is never removed, whatever its age;
 it is reported as unmerged. Removal is by expected commit, locally and on the remote, so a branch that moved
 between the look and the removal is left alone.
 
@@ -48,7 +56,8 @@ except ImportError:  # run as a plain script, or loaded by path
     import branch_review  # type: ignore
 
 HOOK_MARK = "# speaktome branch gate"
-DEFAULTS = {"grace_days": 14, "stale_days": 30, "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
+DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
+            "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
 
@@ -152,33 +161,44 @@ def clean(policy, db, *, apply, now=None, log=print) -> list:
         git(path, "fetch", "--quiet", policy["remote"], check=False)      # a stale view only delays a removal
         for row in branches(path, declared["default"], policy["remote"]):
             entry = {"repository": name, "branch": row["branch"], "head": row["head"]}
+            contained = row["merged"] or row["live"]
+            age = now - row["tip_time"]
+            if not contained:
+                branch_review.forget_merged(db, name, row["branch"])
             if protected(policy, name, row["branch"]):
                 entry.update(action="keep", reason="protected by the policy")
-            elif not (row["merged"] or row["live"]):
-                branch_review.forget_merged(db, name, row["branch"])
-                entry.update(action="keep", reason="has commits that are not in the live source")
-            elif branch_review.kept(db, name, row["branch"]):
-                entry.update(action="keep", reason="kept by its review")
             elif row["worktree"] is not None:
                 entry.update(action="keep", reason="checked out in a worktree, so in use")
+            elif branch_review.kept(db, name, row["branch"]):
+                entry.update(action="keep", reason="kept by its review")
+            elif branch_review.in_review(db, name, row["branch"]):
+                entry.update(action="keep", reason="under review")
             else:
-                since = branch_review.merged_since(db, name, row["branch"], row["head"], now)
-                age = now - row["tip_time"]
-                left = 0.0 if age >= stale else since + grace - now
-                why = (f"in the live source and its last commit is {age / 86400.0:.0f} days old" if age >= stale
-                       else "in the live source for the whole grace period")
+                if contained:
+                    since = branch_review.merged_since(db, name, row["branch"], row["head"], now)
+                    left = 0.0 if age >= stale else since + grace - now
+                    why = (f"in the live source and its last commit is {age / 86400.0:.0f} days old" if age >= stale
+                           else "in the live source for the whole grace period")
+                    waiting, remote_too = f"in the live source; {left / 86400.0:.1f} days of grace left", row["on_remote"]
+                else:
+                    holder = branch_review.owner(db, name, row["branch"])
+                    left = float(policy["registered_days" if holder else "unregistered_days"]) * 86400.0 - age
+                    whose = f"registered to {holder['username']}" if holder else "registered to nobody"
+                    why = f"has commits of its own, is {whose}, and its last commit is {age / 86400.0:.0f} days old"
+                    waiting, remote_too = f"has commits of its own; {whose}; {left / 86400.0:.0f} days left", True
                 if left > 0:
-                    entry.update(action="wait", reason=f"in the live source; {left / 86400.0:.1f} days of grace left")
+                    entry.update(action="wait" if contained else "keep", reason=waiting)
                 elif not apply:
-                    entry.update(action="would remove", reason=why if row["on_remote"] else why + "; the remote copy would be kept")
+                    entry.update(action="would remove", reason=why if remote_too else why + "; the remote copy would be kept")
                 else:
                     try:
                         detail = remove_branch(path, row["branch"], row["head"], remote=policy["remote"],
-                                               delete_remote=policy["delete_remote"] and row["on_remote"], local="free")
-                        if not row["on_remote"] and row["remote_head"]:
+                                               delete_remote=policy["delete_remote"] and remote_too, local="free")
+                        if not remote_too and row["remote_head"]:
                             detail += "; remote copy kept: the live branch holding it is not on the remote"
                         branch_review.forget_merged(db, name, row["branch"])
-                        entry.update(action="removed", reason=detail)
+                        branch_review.record_removed(db, name, row["branch"], row["head"], why, now)
+                        entry.update(action="removed", reason=f"{why}; {detail}")
                     except GateError as error:
                         entry.update(action="failed", reason=str(error))
             actions.append(entry)
@@ -202,7 +222,10 @@ def land(policy, db, *, apply, now=None, log=print) -> list:
                 raise GateError("the review's base is not the repository's default branch")
             git(path, "fetch", "--quiet", remote)
             if git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{review['branch']}", check=False) != review["head"]:
-                raise GateError("the branch on the remote is not at the reviewed commit; submit the commit it is at")
+                if git(path, "rev-parse", "-q", "--verify", f"refs/heads/{review['branch']}", check=False) != review["head"]:
+                    raise GateError("the branch is not at the reviewed commit, here or on the remote; submit the commit it is at")
+                if apply:                        # the author never pushed: this tool does the talking to GitHub
+                    git(path, "push", remote, f"{review['head']}:refs/heads/{review['branch']}")
             base = f"refs/remotes/{remote}/{review['base']}"
             if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", base, review["head"]],
                               capture_output=True).returncode != 0:
@@ -323,14 +346,17 @@ def main(argv=None) -> int:
             if args.command == "check-push":
                 name = args.repository or repository_of(policy, os.getcwd())
                 refused = check_push(policy, db, name, sys.stdin.read().splitlines()) if name else []
+                mock = policy["lock"] != "enforce"
                 for line in refused:
-                    print(f"refused: {line}", file=sys.stderr)
-                return 1 if refused else 0
+                    print(f"{'would be refused' if mock else 'refused'}: {line}", file=sys.stderr)
+                if refused:
+                    print(branch_review.advice(policy, name), file=sys.stderr)
+                return 0 if mock or not refused else 1
             if args.command == "submit":
                 declared = policy["repositories"].get(args.repository)
                 if declared is None:
                     raise GateError("the policy does not name that repository")
-                head = git(declared["path"], "rev-parse", "--verify", f"refs/remotes/{policy['remote']}/{args.branch}^{{commit}}")
+                head = git(declared["path"], "rev-parse", "--verify", f"refs/heads/{args.branch}^{{commit}}")
                 user = _user(db, args.username)
                 hours = policy["review_timeout_hours"] if args.timeout_hours is None else args.timeout_hours
                 made = branch_review.submit(db, user_id=user[0], username=user[1], repository=args.repository, branch=args.branch,

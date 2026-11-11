@@ -43,7 +43,7 @@ def world(tmp_path):
     db.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL)")
     db.executemany("INSERT INTO users VALUES (?,?)", [(ADMIN, "admin"), (ANN, "ann"), (BOB, "bob")])
     db.execute("INSERT INTO account_roles VALUES (?, 'admin')", (ADMIN,))
-    policy = {**branch_gate.DEFAULTS, "grace_days": 14, "protected": ["snapshot/*"],
+    policy = {**branch_gate.DEFAULTS, "grace_days": 14, "protected": ["snapshot/*"], "lock": "enforce",
               "repositories": {"work": {"path": str(work), "default": "main"}}}
     policy_file = tmp_path / "policy.json"
     policy_file.write_text(json.dumps({k: v for k, v in policy.items()}), encoding="utf-8")
@@ -153,6 +153,14 @@ def test_an_old_branch_already_in_the_live_source_has_no_deadline_left(world):
     local_only = branch(world, "in-live-only")
     run(work, "merge", "-q", "--ff-only", "in-live-only")          # in what is checked out here, not on the remote
     unmerged = branch(world, "old-but-its-own")
+    nobodys = branch(world, "old-and-nobodys")
+    reviewed = branch(world, "old-under-review")
+    submit(world, "old-under-review", reviewed, timeout_s=30 * DAY, now=time.time())
+    held = branch_review.register(db, user_id=ANN, username="ann", repository="work", branch="old-but-its-own", known=["work"])
+    assert held["username"] == "ann" and branch_review.branches_of(db, ANN)[0]["branch"] in ("old-but-its-own", "old-under-review")
+    with pytest.raises(branch_review.ReviewError) as taken:
+        branch_review.register(db, user_id=BOB, username="bob", repository="work", branch="old-but-its-own", known=["work"])
+    assert taken.value.status == 409
     fresh = actions(branch_gate.clean(policy, db, apply=True, log=lambda line: None))
     assert fresh["long-done"] == "wait" and fresh["in-live-only"] == "wait", "a recent commit waits out the grace period"
     later = time.time() + 31 * DAY                                  # the same commits, now older than stale_days
@@ -164,9 +172,18 @@ def test_an_old_branch_already_in_the_live_source_has_no_deadline_left(world):
     assert done["in-live-only"]["action"] == "removed" and "remote copy kept" in done["in-live-only"]["reason"]
     assert remote_has(world, "in-live-only") == local_only, "its commits are not on the remote anywhere else"
     assert done["old-but-its-own"]["action"] == "keep" and remote_has(world, "old-but-its-own") == unmerged
+    assert "registered to ann" in done["old-but-its-own"]["reason"], "a registered branch lives registered_days"
+    assert done["old-and-nobodys"]["action"] == "removed" and "registered to nobody" in done["old-and-nobodys"]["reason"]
+    assert remote_has(world, "old-and-nobodys") is None, "a month without an owner and it is gone, here and on the remote"
+    assert done["old-under-review"]["action"] == "keep" and done["old-under-review"]["reason"] == "under review"
     names = run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
     assert "long-done" not in names and "in-live-only" not in names and "old-but-its-own" in names
     assert merged != local_only
+    record = db.execute("SELECT head, reason FROM branch_removed WHERE branch = 'old-and-nobodys'").fetchone()
+    assert record[0] == nobodys and "registered to nobody" in record[1], "the removal names the commit, so it can be undone"
+    year = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=time.time() + 366 * DAY, log=lambda line: None)}
+    assert year["old-but-its-own"]["action"] == "removed" and remote_has(world, "old-but-its-own") is None
+    assert branch_review.owner(db, "work", "old-but-its-own") is None
 
 
 def test_a_branch_that_moved_after_it_was_seen_merged_starts_its_grace_again(world):
@@ -306,7 +323,13 @@ def test_reviews_over_rest_take_identity_from_the_session_only(world):
 
     head = "a" * 40
     standing = f"/api/reviews/standing?repository=work&head={head}"
-    assert ask("GET", standing) == (200, {"repository": "work", "head": head, "accepted": False}), "open: no account"
+    status, answer = ask("GET", standing)
+    assert status == 200 and answer["accepted"] is False and answer["lock"] == "enforce", "open: no account"
+    assert "reviews_checkout repository=work" in answer["advice"] and "speaktome_mcp.api" in answer["advice"]
+    assert len(answer["advice"].splitlines()) <= 7, "the lock explains itself in a few lines"
+    status, mine = ask("POST", "/api/reviews/checkout", user=ANN, username="ann", body={"repository": "work", "branch": "feature"})
+    assert status == 200 and mine["branch"]["username"] == "ann" and mine["base"] == "main" and len(mine["steps"]) == 4
+    assert ask("POST", "/api/reviews/checkout", user=BOB, username="bob", body={"repository": "work", "branch": "feature"})[0] == 409
     assert ask("GET", "/api/reviews/standing?repository=work&head=abc")[0] == 400
     assert ask("GET", "/api/reviews")[0] == 401
     assert ask("GET", "/api/reviews", user=ANN, username="ann", capabilities=())[0] == 403
@@ -321,9 +344,10 @@ def test_reviews_over_rest_take_identity_from_the_session_only(world):
     status, done = ask("POST", "/api/reviews/decide", user=ADMIN, username="admin",
                        body={"id": review["id"], "head": head, "decision": "approved", "note": "read it"})
     assert status == 200 and done["review"]["standing"] == "approved"
-    assert ask("GET", standing)[1]["accepted"] is True
+    assert ask("GET", standing)[1]["accepted"] is True and ask("GET", standing)[1]["advice"] == ""
     listed = ask("GET", "/api/reviews", user=BOB, username="bob")[1]
     assert listed["repositories"] == {"work": "main"} and listed["reviews"][0]["id"] == review["id"]
+    assert listed["your_branches"] == [] and ask("GET", "/api/reviews", user=ANN, username="ann")[1]["your_branches"][0]["branch"] == "feature"
     assert ask("POST", "/api/reviews", user=ANN, username="ann", body={"repository": "nowhere", "branch": "x", "head": head})[0] == 404
     assert ask("POST", "/api/reviews/nothing", user=ANN, username="ann", body={})[0] == 404
 
@@ -343,8 +367,33 @@ def test_the_task_worker_offers_land_and_clean_and_reports_while_apply_is_off(wo
     assert status == 3 and detail == []
 
 
-def test_the_shipped_policy_names_real_repositories_and_reports_only():
+def test_the_mock_lock_says_what_it_would_refuse_and_lets_the_push_through(world, capfd):
+    work, policy = world["work"], dict(world["policy"], lock="mock")
+    world["policy_file"].write_text(json.dumps(policy), encoding="utf-8")
+    branch_gate.install_hooks(policy, world["policy_file"], world["db_file"], log=lambda line: None)
+    head = commit(work, "direct.txt")
+    pushed = subprocess.run(["git", "-C", str(work), "push", "origin", "main"], capture_output=True, text=True)
+    assert pushed.returncode == 0 and remote_has(world, "main") == head
+    assert "would be refused" in pushed.stderr and "mock: allowed this time" in pushed.stderr
+    assert "reviews_checkout repository=work" in pushed.stderr and "reviews_submit" in pushed.stderr
+
+
+def test_the_gate_pushes_a_branch_its_author_never_pushed(world):
+    db, policy = world["db"], world["policy"]
+    head = branch(world, "local-only", push=False)
+    assert remote_has(world, "local-only") is None
+    made = submit(world, "local-only", head, timeout_s=0, delete_branch=False)
+    dry = branch_gate.land(policy, db, apply=False, now=1000.0, log=lambda line: None)
+    assert dry[0]["action"] == "would land" and remote_has(world, "local-only") is None
+    done = branch_gate.land(policy, db, apply=True, now=1000.0, log=lambda line: None)
+    assert done[0]["action"] == "landed" and remote_has(world, "main") == head and remote_has(world, "local-only") == head
+    assert branch_review.owner(db, "work", "local-only")["username"] == "ann", "submitting registers the branch to its author"
+    assert branch_review.get(db, made["id"])["standing"] == "landed"
+
+
+def test_the_shipped_policy_names_real_repositories_and_mocks_the_lock():
     shipped = branch_gate.load_policy(Path(__file__).resolve().parents[1] / "examples" / "meowdoku" / "deploy" / "branch_policy.json")
-    assert shipped["apply"] is False and {"turing", "speaktome", "nodus"} <= set(shipped["repositories"])
+    assert shipped["lock"] == "mock" and {"turing", "speaktome", "nodus"} <= set(shipped["repositories"])
+    assert shipped["unregistered_days"] == 30 and shipped["registered_days"] == 365 and shipped["grace_days"] == 1
     assert branch_gate.protected(shipped, "turing", "main") and branch_gate.protected(shipped, "turing", "snapshot/x")
     assert not branch_gate.protected(shipped, "turing", "codex/anything")
