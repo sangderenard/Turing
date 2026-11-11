@@ -3,7 +3,8 @@
 A job is one intaken source tree (``<state>/jobs/<job_id>/source/``, .py files only).  It is never imported or executed here, only
 read as text and ``ast.parse``d.  Pipeline:
 
-  intake_file / intake_zip / intake_text / intake_git  ->  source tree
+  intake_file / intake_zip / intake_text / intake_git / intake_dream  ->  source tree (a dream document's python
+                blocks become one file each; its other blocks are carried into the record unchanged)
   plan          per file, ``project_compilation_product.authored_compilation_growth_plan`` (cheap AST TRIAGE, not the resolved
                 FunctionTable plan: the real cut decisions are made later by the compiler) -> pieces, dependencies first.  A
                 piece is one unit (an SCC of the call graph): file, qualified names, dependency piece ids, AST node count,
@@ -19,6 +20,10 @@ read as text and ``ast.parse``d.  Pipeline:
   work          claim one, run, record, repeat.  Single in flight.
   recompose     ``summary`` (verdict table) and ``write_recomposition`` (recomposition.json: per authored function ``python`` or
                 its available lowerings).  NO CODE IS REWRITTEN in this slice; the file is the data a later rewrite would read.
+  record        ``write_dream_record`` (record.dream, a ``turing.dream-document.v1``): the job's enduring record.  One
+                python block per piece holding its exact lexical closure, so every part builds on its own; one block per
+                completed lowering in that backend's language, byte for byte; refusals on the piece's header.  The
+                record can be given back to ``intake_dream``: dream in, dream out.
 
 Backends (SOURCE emission only, no native toolchain build here): ``wasm`` (binary + api), ``js`` (module + api), ``c``, ``llvm``,
 ``fortran`` through the same emitter calls the Nodus row compiler uses.  Success is state ``complete`` with the note
@@ -57,6 +62,10 @@ from meowdoku import schema_version as _schema_version  # noqa: E402
 from meowdoku.state_paths import StatePaths             # noqa: E402
 
 SCHEMA_RECOMPOSITION = "turing.divider-recomposition.v1"
+SCHEMA_DREAM_RECORD = "turing.divider-dream-record.v1"
+# The language a backend's product is written in, as a dream block names it. wasm is a binary: its block is carried
+# byte for byte under the latin-1 encoding, which maps every byte to one character and back.
+DREAM_LANGUAGE = {"js": "javascript", "c": "c", "llvm": "llvm", "fortran": "fortran", "wasm": "wasm"}
 SCHEMA_PLAN = "turing.divider-plan-triage.v1"
 BACKENDS = ("wasm", "js", "c", "llvm", "fortran")
 NOT_BUILT = ("c", "llvm", "fortran")
@@ -149,6 +158,52 @@ def intake_text(state, name: str, text: str, *, job_id=None) -> Intake:
     if len(data) > MAX_FILE:
         raise IntakeError("text exceeds the per-file cap")
     _store(intake, rel, data)
+    return intake
+
+
+DREAM_PRODUCT_ROLES = ("lowering", "job-record")      # blocks an earlier pass of the divider wrote; never taken as source
+
+
+def intake_dream(state, path, *, job_id=None) -> Intake:
+    """A dream document as the source of a job.
+
+    Every python block becomes one source file ``<block id>.py``; a block is then divided on its own, because pieces
+    are cut within one file. Blocks in other languages are not divided: the document is kept as ``intake.dream`` and
+    ``write_dream_record`` carries those blocks into the record unchanged. Blocks that an earlier pass of the divider
+    produced (role lowering or job-record) are dropped, so a record can be fed back in.
+    """
+    from src.compiler.dream_document import DreamDocumentError, parse_dream_document
+    path = Path(path)
+    if not path.is_file():
+        raise IntakeError(f"not a file: {path}")
+    if path.stat().st_size > MAX_TOTAL:
+        raise IntakeError("the dream document exceeds the total cap")
+    raw = path.read_bytes()
+    try:
+        document = parse_dream_document(raw)
+    except DreamDocumentError as error:
+        raise IntakeError(f"not a dream document: {error}") from error
+    intake = _new_job(state, job_id, f"dream:{path.name}")
+    for block in document.blocks:
+        role = block.decorations.get("role")
+        if role in DREAM_PRODUCT_ROLES:
+            intake.skipped.append((block.identity, f"product of an earlier pass ({role})"))
+            continue
+        if block.language != "python":
+            if block.identity == "record" or block.identity.startswith("piece-"):
+                raise IntakeError(f"block {block.identity!r} uses an identity the record reserves")
+            intake.skipped.append((block.identity, f"carried unchanged ({block.language})"))
+            continue
+        rel = _safe_relative(f"{block.identity}.py")
+        if rel is None or "/" in rel:
+            raise IntakeError(f"block identity {block.identity!r} cannot name a source file")
+        data = block.payload.encode("utf-8")
+        if len(data) > MAX_FILE:
+            raise IntakeError(f"block {block.identity!r} exceeds the per-file cap")
+        _store(intake, rel, data)
+    if not intake.kept:
+        raise IntakeError("the dream document has no python block to divide")
+    (intake.job_dir / "intake.dream").write_bytes(raw)
     return intake
 
 
@@ -726,6 +781,143 @@ def write_recomposition(db, state, job_id: str) -> Path:
     return path
 
 
+def _dream_value(text, limit=240) -> str:
+    """A fact as one restricted-ASCII header value (the scanner accepts nothing else in a header)."""
+    flat = " ".join(str(text).split())
+    flat = "".join(ch if 0x20 <= ord(ch) < 0x7F else "?" for ch in flat).replace("@end*/", "@end*?")
+    return flat[:limit].strip()
+
+
+def _buildable_part(text: str, names) -> tuple:
+    """The text of one piece that builds on its own: the exact lexical closure of its functions.
+
+    ``partition_authored_source`` (the cut ``run_attempt`` compiles) keeps every retained line at its original line
+    number and blanks the rest.  The closures of the piece's names are joined line by line, and the blank lines before
+    the first and after the last retained line are dropped.  Returns (payload, first line, how it was cut)."""
+    from src.compiler.project_compilation_product import partition_authored_source
+    lines = None
+    for name in names:
+        try:
+            closure, _retained = partition_authored_source(text, name)
+        except (ValueError, SyntaxError, RecursionError) as error:
+            return "", 0, f"no closure: {type(error).__name__}: {_first_line(error)}"
+        mine = closure.splitlines()
+        if lines is None:
+            lines = mine
+        else:
+            if len(mine) > len(lines):
+                lines += [""] * (len(mine) - len(lines))
+            for index, line in enumerate(mine):
+                if line.strip():
+                    lines[index] = line
+    kept = [index for index, line in enumerate(lines or []) if line.strip()]
+    if not kept:
+        return "", 0, "no closure: nothing was retained"
+    return "\n".join(lines[kept[0]:kept[-1] + 1]), kept[0] + 1, "exact lexical closure"
+
+
+def write_dream_record(db, state, job_id: str) -> Path:
+    """``<job>/record.dream`` (``turing.dream-document.v1``): the enduring record of the job, part by part.
+
+    One python block per piece, in the divider's order (dependencies first).  A block holds the exact lexical closure
+    of its piece, the same cut ``run_attempt`` compiles, so EVERY PART BUILDS ON ITS OWN: nothing in a block refers to
+    another block's text.  Its ``outputs`` are the functions the piece is for and its ``inputs`` those of the pieces it
+    depends on (their definitions are inside the closure; the ports record the division).  After each piece, one
+    block per lowering that completed, in the language of that backend, holding the emitted product byte for byte
+    (``lowers`` names the piece).  What was tried and refused is written on the piece's header.  When the job came
+    from a dream document, its blocks in other languages follow, unchanged.  A last ``record`` block states the job
+    as data.  The file is read back by ``load_dream_document``, which checks every block against its ``sha256``
+    sentinel, and can be given back to ``intake_dream``.
+    """
+    from types import MappingProxyType
+    from src.compiler.dream_document import (DreamBlock, DreamDocument, load_dream_document, parse_dream_document,
+                                             render_dream_document)
+    state = StatePaths.coerce(state)
+    job_dir = state.jobs_dir / job_id
+    came_in = job_dir / "intake.dream"
+    source_document = parse_dream_document(came_in.read_bytes()) if came_in.is_file() else None
+    report = summary(db, job_id)
+    owner = {}                                          # piece id -> its names, for the inputs of the pieces after it
+    for p in report["pieces"]:
+        owner[p["piece_id"]] = list(p["names"])
+    sources, blocks, lowered_blocks = {}, [], 0
+    for p in report["pieces"]:
+        identity = f"piece-{p['piece_id']}"
+        if p["file"] not in sources:
+            text = _read_source(job_dir / "source" / p["file"]) or ""
+            sources[p["file"]] = (text, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        text, file_digest = sources[p["file"]]
+        payload, first_line, cut_note = _buildable_part(text, p["names"])
+        facts = {"file": _dream_value(p["file"]), "source_sha256": file_digest, "first_line": str(first_line),
+                 "cut": _dream_value(cut_note), "ast_nodes": str(p["nodes"]), "annotated": "yes" if p["annotated"] else "no",
+                 "depends": ", ".join(f"piece-{d}" for d in p["deps"]) or "none",
+                 "verdict": f"lowered ({p['best']})" if p["best"] else "stays python",
+                 "role": "part"}
+        if source_document is not None:
+            facts["source_block"] = _dream_value(PurePosixPath(p["file"]).stem)
+        if p["python_reason"]:
+            facts["reason"] = _dream_value(p["python_reason"])
+        for backend, attempt in sorted(p["attempts"].items()):
+            said = attempt["state"] + (f" {attempt['error_type']}@{attempt['stage']}" if attempt["error_type"] else "")
+            if attempt["error"]:
+                said += f": {attempt['error']}"
+            facts[f"attempt.{backend}"] = _dream_value(said)
+        inputs = tuple(name for d in p["deps"] for name in owner.get(d, ()))
+        blocks.append(DreamBlock(identity=identity, kind="segment", language="python", payload=payload, encoding="utf-8",
+                                 inputs=inputs, outputs=tuple(p["names"]), decorations=MappingProxyType(facts)))
+        for backend in sorted(p["attempts"], key=_rank):
+            base = job_dir / "products" / str(p["piece_id"]) / backend
+            attempt_file = base / "attempt.json"
+            if backend not in DREAM_LANGUAGE or not attempt_file.exists():
+                continue
+            for e in json.loads(attempt_file.read_text(encoding="utf-8"))["entries"]:
+                product = base / str(e.get("product") or "")
+                if e["state"] != "complete" or not product.is_file():
+                    continue
+                raw = product.read_bytes()
+                binary = backend == "wasm"
+                try:
+                    body = raw.decode("latin-1" if binary else "utf-8")
+                except UnicodeDecodeError:
+                    binary, body = True, raw.decode("latin-1")
+                lowered = {"role": "lowering", "lowers": identity, "backend": backend, "entry": _dream_value(e["name"]),
+                           "product": _dream_value(product.name), "carried": "bytes" if binary else "text"}
+                if e.get("note"):
+                    lowered["note"] = _dream_value(e["note"])
+                blocks.append(DreamBlock(identity=f"{identity}.{backend}.{_stem(e['name'])}", kind="segment",
+                                         language=DREAM_LANGUAGE[backend], payload=body,
+                                         encoding="latin-1" if binary else "utf-8", inputs=(e["name"],),
+                                         decorations=MappingProxyType(lowered)))
+                lowered_blocks += 1
+    carried, dropped_groups, parallel = [], [], ()
+    if source_document is not None:
+        carried = [b for b in source_document.blocks
+                   if b.language != "python" and b.decorations.get("role") not in DREAM_PRODUCT_ROLES]
+        blocks.extend(carried)                           # not divided: exactly as they came in
+        names = {b.identity for b in carried}
+        parallel = tuple(g for g in source_document.parallel if set(g.members) <= names)
+        dropped_groups = [g.identity for g in source_document.parallel if not set(g.members) <= names]
+    job = report["job"]
+    stated = {"schema": SCHEMA_DREAM_RECORD, "job_id": job_id, "label": job.get("label"), "origin": job.get("origin"),
+              "created": job.get("created"), "backends": [b for b in str(job.get("backends") or "").split(",") if b],
+              "pieces": len(report["pieces"]), "lowered_pieces": report["lowered_pieces"],
+              "python_pieces": report["python_pieces"], "lowering_blocks": lowered_blocks,
+              "attempt_counts": report["attempt_counts"], "written": time.time(),
+              "files": {name: digest for name, (_t, digest) in sorted(sources.items())},
+              "came_from_dream": source_document is not None, "carried_blocks": [b.identity for b in carried],
+              # a parallel group whose members were divided no longer names blocks of this document
+              "parallel_groups_dropped": dropped_groups}
+    blocks.append(DreamBlock(identity="record", kind="segment", language="json", encoding="utf-8",
+                             payload=json.dumps(stated, indent=1, sort_keys=True),
+                             decorations=MappingProxyType({"role": "job-record"})))
+    path = job_dir / "record.dream"
+    scratch = path.with_suffix(".dream.tmp")
+    scratch.write_bytes(render_dream_document(DreamDocument(tuple(blocks), parallel)))
+    load_dream_document(scratch)                        # the record must read back, hashes and all, before it replaces the last one
+    os.replace(scratch, path)
+    return path
+
+
 # -------------------------------------------------------------------------------------------------------------------- CLI
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -744,6 +936,7 @@ def main(argv=None) -> int:
     group.add_argument("--zip")
     group.add_argument("--text")
     group.add_argument("--git")
+    group.add_argument("--dream", help="a dream document; its python blocks are divided, the rest carried into the record")
     sp.add_argument("--name", default="source.py", help="file name for --text")
     sp.add_argument("--allow-network", action="store_true", help="required for --git (operator action)")
     sp.add_argument("--backends", default="wasm")
@@ -766,6 +959,8 @@ def main(argv=None) -> int:
             intake = intake_zip(state, args.zip)
         elif args.git:
             intake = intake_git(state, args.git, allow_network=args.allow_network)
+        elif args.dream:
+            intake = intake_dream(state, args.dream)
         else:
             intake = intake_text(state, args.name, args.text)
         job = submit(db, state, intake, owner_key=args.owner, backends=[b for b in args.backends.split(",") if b], label=args.label)
@@ -785,6 +980,7 @@ def main(argv=None) -> int:
             print(f"{p['piece_id']:3d} {','.join(p['names'])}: best={p['best']} {p['python_reason'] or ''}")
     elif args.command == "recompose":
         print(write_recomposition(db, state, args.job))
+        print(write_dream_record(db, state, args.job))
     return 0
 
 
