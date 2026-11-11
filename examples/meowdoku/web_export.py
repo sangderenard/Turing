@@ -562,6 +562,13 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copyfile(HERE / "web" / name, out / name)
     for name in ("issues.html", "issues.js"):
         shutil.copyfile(HERE / "web" / name, out / name)
+    # Studio imports these authored modules transitively. A partial publication
+    # leaves the whole ES module graph (including loading_panel.js) unstarted.
+    for name in ("marble_imported_object.js", "marble_lighting_racks.js", "marble_lighting_rack_controls.js", "marble_lighting_rack_override.js",
+                 "marble_backdrop_supports.js", "marble_kicker_guide.js", "marble_kicker_guide_controls.js", "marble_light_ceiling_support.js",
+                 "marble_light_stand_settings.js", "marble_light_stands.js", "marble_light_tools.js", "marble_scene_materials.js",
+                 "marble_shop_light_controls.js", "marble_shop_lights.js", "marble_wide_light_supports.js"):
+        shutil.copyfile(HERE / "web" / name, out / name)
     assets = export_assets(out)
     atlas = export_emoji_atlas(out, assets["meshes"])
     print(f"[export] emoji atlas {atlas['size'][0]}x{atlas['size'][1]}: {[k['name'] for k in atlas['kinds']]}", flush=True)

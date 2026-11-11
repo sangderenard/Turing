@@ -23,7 +23,7 @@ import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhys
   verifySavedMarbleObject } from "./marble_object.js";
 import { initCalibration } from "./marble_calibration.js";
 import { backdropFaces } from "./marble_backdrop.js";
-import { setupStudioLighting } from "./marble_studio_lighting.js";
+import { setupStudioLighting, LIGHTING_PROFILE_FIELDS } from "./marble_studio_lighting.js";
 import { STUDIO_LIGHTS } from "./marble_light_strengths.js";
 import { studioRoomBounds } from "./marble_room.js";
 import { defaultStudioTable, tableFloorDrop } from "./marble_studio_table.js";

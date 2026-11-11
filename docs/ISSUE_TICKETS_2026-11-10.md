@@ -57,9 +57,10 @@ text. Failed submissions retain the draft and an unchanged retry key. Status
 updates use optimistic versions rather than silently overwriting another edit.
 
 The shared `site-nav.js` banner includes Tickets and Report issue for signed-in
-visitors. Report issue delegates to the game's existing runtime-capture form
-when present, otherwise opens the basic issue form. The game form now submits
-to the SQL API and its ticket link opens `issues.html`. Shared banner opt-ins
+visitors. As of 2026-11-11, the shared Report issue button always opens the
+basic SQL issue form. A frozen deployed game may still contain the legacy report
+handler, so the header does not delegate to that handler. The updated source
+game form itself submits to the SQL API and its ticket link opens `issues.html`. Shared banner opt-ins
 were added to Marble Studio, jobs, loading Studio and log pages. Generic control
 suite registration is documented separately in `SITE_CONTROL_SUITES.md`.
 
