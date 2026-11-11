@@ -13,6 +13,7 @@ from meowdoku import branch_gate, branch_review  # noqa: E402
 
 DAY = 86400.0
 ADMIN, ANN, BOB = 1, 2, 3
+CLEANER = branch_gate.DEFAULTS["cleaner"]
 
 
 def run(path, *args):
@@ -43,6 +44,8 @@ def world(tmp_path):
     db.execute("CREATE TABLE account_roles (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL)")
     db.executemany("INSERT INTO users VALUES (?,?)", [(ADMIN, "admin"), (ANN, "ann"), (BOB, "bob")])
     db.execute("INSERT INTO account_roles VALUES (?, 'admin')", (ADMIN,))
+    db.execute("INSERT INTO users VALUES (9, ?)", (CLEANER,))
+    db.execute("INSERT INTO account_roles VALUES (9, 'service')")
     policy = {**branch_gate.DEFAULTS, "grace_days": 14, "protected": ["snapshot/*"], "lock": "enforce",
               "repositories": {"work": {"path": str(work), "default": "main"}}}
     policy_file = tmp_path / "policy.json"
@@ -130,12 +133,12 @@ def test_a_merged_branch_is_removed_only_after_the_grace_period(world):
     unmerged = branch(world, "in-progress")
     run(work, "branch", "snapshot/keep", "main")
     run(work, "worktree", "add", "-q", "-b", "elsewhere", str(work.parent / "tree"), "main")
-    first = actions(branch_gate.clean(policy, db, apply=True, now=5000.0, log=lambda line: None))
+    first = actions(branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=5000.0, log=lambda line: None))
     assert first == {"main": "keep", "done-work": "wait", "in-progress": "keep", "snapshot/keep": "keep", "elsewhere": "keep"}
     assert remote_has(world, "done-work") == merged, "nothing is removed the first time it is looked at"
     dry = actions(branch_gate.clean(policy, db, apply=False, now=5000.0 + 15 * DAY, log=lambda line: None))
     assert dry["done-work"] == "would remove" and remote_has(world, "done-work") == merged
-    done = branch_gate.clean(policy, db, apply=True, now=5000.0 + 15 * DAY, log=lambda line: None)
+    done = branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=5000.0 + 15 * DAY, log=lambda line: None)
     assert actions(done)["done-work"] == "removed" and actions(done)["in-progress"] == "keep"
     assert remote_has(world, "done-work") is None and remote_has(world, "in-progress") == unmerged
     names = run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
@@ -161,13 +164,13 @@ def test_an_old_branch_already_in_the_live_source_has_no_deadline_left(world):
     with pytest.raises(branch_review.ReviewError) as taken:
         branch_review.register(db, user_id=BOB, username="bob", repository="work", branch="old-but-its-own", known=["work"])
     assert taken.value.status == 409
-    fresh = actions(branch_gate.clean(policy, db, apply=True, log=lambda line: None))
+    fresh = actions(branch_gate.clean(policy, db, apply=True, actor=CLEANER, log=lambda line: None))
     assert fresh["long-done"] == "wait" and fresh["in-live-only"] == "wait", "a recent commit waits out the grace period"
     later = time.time() + 31 * DAY                                  # the same commits, now older than stale_days
     dry = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=False, now=later, log=lambda line: None)}
     assert dry["long-done"]["action"] == "would remove" and "days old" in dry["long-done"]["reason"]
     assert "remote copy would be kept" in dry["in-live-only"]["reason"]
-    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=later, log=lambda line: None)}
+    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)}
     assert done["long-done"]["action"] == "removed" and remote_has(world, "long-done") is None
     assert done["in-live-only"]["action"] == "removed" and "remote copy kept" in done["in-live-only"]["reason"]
     assert remote_has(world, "in-live-only") == local_only, "its commits are not on the remote anywhere else"
@@ -181,7 +184,7 @@ def test_an_old_branch_already_in_the_live_source_has_no_deadline_left(world):
     assert merged != local_only
     record = db.execute("SELECT head, reason FROM branch_removed WHERE branch = 'old-and-nobodys'").fetchone()
     assert record[0] == nobodys and "registered to nobody" in record[1], "the removal names the commit, so it can be undone"
-    year = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=time.time() + 366 * DAY, log=lambda line: None)}
+    year = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=time.time() + 366 * DAY, log=lambda line: None)}
     assert year["old-but-its-own"]["action"] == "removed" and remote_has(world, "old-but-its-own") is None
     assert branch_review.owner(db, "work", "old-but-its-own") is None
 
@@ -191,11 +194,11 @@ def test_a_branch_that_moved_after_it_was_seen_merged_starts_its_grace_again(wor
     branch(world, "done-work")
     run(work, "merge", "-q", "--ff-only", "done-work")
     run(work, "push", "-q", "origin", "main")
-    branch_gate.clean(policy, db, apply=True, now=5000.0, log=lambda line: None)
+    branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=5000.0, log=lambda line: None)
     run(work, "checkout", "-q", "done-work")
     commit(work, "more.txt")
     run(work, "checkout", "-q", "main")
-    later = actions(branch_gate.clean(policy, db, apply=True, now=5000.0 + 15 * DAY, log=lambda line: None))
+    later = actions(branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=5000.0 + 15 * DAY, log=lambda line: None))
     assert later["done-work"] == "keep", "it has a commit of its own again"
 
 
@@ -223,7 +226,7 @@ def test_a_kept_branch_stays_and_is_never_cleaned(world):
     assert done[0]["action"] == "landed" and remote_has(world, "feature") == head
     assert "kept" in branch_review.get(db, made["id"])["landed_detail"]
     for now in (2000.0, 2000.0 + 99 * DAY):
-        assert actions(branch_gate.clean(policy, db, apply=True, now=now, log=lambda line: None))["feature"] == "keep"
+        assert actions(branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=now, log=lambda line: None))["feature"] == "keep"
     assert remote_has(world, "feature") == head
 
 
@@ -396,7 +399,7 @@ def test_a_remote_rule_against_deletion_is_asked_first_and_the_skip_is_reported(
     later = time.time() + 31 * DAY
     dry = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=False, now=later, log=lambda line: None)}
     assert dry["ruled"]["action"] == "would remove" and "ruleset 7" in dry["ruled"]["remote_skipped"]
-    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, now=later, log=lambda line: None)}
+    done = {e["branch"]: e for e in branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)}
     assert done["ruled"]["action"] == "removed" and "forbids deleting it" in done["ruled"]["remote_skipped"]
     assert remote_has(world, "ruled") == merged, "the remote copy is left where the rule forbids removing it"
     assert "ruled" not in run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
@@ -416,12 +419,12 @@ def test_side_worktrees_leave_this_computer_with_a_notice_when_nothing_would_be_
     run(work, "push", "-q", "origin", "pushed", "dirty")
     (trees / "dirty" / "scratch.txt").write_text("not committed", encoding="utf-8")
     run(work, "worktree", "add", "-q", "--detach", str(trees / "detached"), "main")
-    today = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, log=lambda line: None)}
+    today = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda line: None)}
     assert {e["action"] for e in today.values()} == {"keep"} and "used within" in today["pushed"]["reason"]
     later = time.time() + 2 * DAY
     dry = {e["branch"]: e["action"] for e in branch_gate.clean_worktrees(policy, db, apply=False, now=later, log=lambda line: None)}
     assert dry["pushed"] == "would remove" and (trees / "pushed").is_dir()
-    done = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, now=later, log=lambda line: None)}
+    done = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)}
     assert done["pushed"]["action"] == "removed" and not (trees / "pushed").exists()
     assert remote_has(world, "pushed") == heads["pushed"], "the remote keeps the branch"
     assert "pushed" not in run(work, "for-each-ref", "refs/heads", "--format=%(refname:short)").split()
@@ -432,6 +435,53 @@ def test_side_worktrees_leave_this_computer_with_a_notice_when_nothing_would_be_
     notice = db.execute("SELECT head, reason FROM branch_removed WHERE branch = 'pushed'").fetchone()
     assert notice[0] == heads["pushed"] and "origin/pushed" in notice[1] and str(trees / "pushed").replace("\\", "/") in notice[1].replace("\\", "/")
     assert (work / "base.txt").exists(), "the repository's own checkout is never touched"
+
+
+def test_only_the_cleanup_account_removes_from_the_core_and_it_signs_the_notice(world):
+    import time
+    work, db, policy = world["work"], world["db"], world["policy"]
+    merged = branch(world, "finished")
+    run(work, "merge", "-q", "--ff-only", "finished")
+    run(work, "push", "-q", "origin", "main")
+    later = time.time() + 31 * DAY
+    for actor in (None, "admin", "ann", "svc-task-worker"):
+        with pytest.raises(branch_gate.GateError) as refused:
+            branch_gate.clean(policy, db, apply=True, actor=actor, now=later, log=lambda line: None)
+        assert CLEANER in str(refused.value)
+        with pytest.raises(branch_gate.GateError):
+            branch_gate.clean_worktrees(policy, db, apply=True, actor=actor, now=later, log=lambda line: None)
+    assert remote_has(world, "finished") == merged, "a refused run removed nothing"
+    looked = actions(branch_gate.clean(policy, db, apply=False, actor="ann", now=later, log=lambda line: None))
+    assert looked["finished"] == "would remove", "anyone may look"
+    db.execute("DELETE FROM account_roles WHERE user_id = 9")
+    with pytest.raises(branch_gate.GateError) as missing:
+        branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)
+    assert "does not exist as a service account" in str(missing.value)
+    db.execute("INSERT INTO account_roles VALUES (9, 'service')")
+    done = actions(branch_gate.clean(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None))
+    assert done["finished"] == "removed" and remote_has(world, "finished") is None
+    notice = branch_review.removed(db)[0]
+    assert notice["branch"] == "finished" and notice["head"] == merged and notice["removed_by"] == CLEANER
+
+
+def test_improper_saves_are_noticed_and_nothing_is_removed(world):
+    work, policy = world["work"], world["policy"]
+    (work / "base.txt").write_text("edited in place", encoding="utf-8")
+    (work / "scratch.bin").write_bytes(b"x" * 2048)
+    (work / "note.txt").write_text("left behind", encoding="utf-8")
+    found = branch_gate.improper_saves(policy, large_bytes=1024)[0]
+    assert found["repository"] == "work" and found["branch"] == "main" and found["changed"] == ["base.txt"]
+    assert sorted(found["untracked"]) == ["note.txt", "scratch.bin"]
+    assert found["large_untracked"] == [{"file": "scratch.bin", "bytes": 2048}]
+    assert (work / "scratch.bin").exists() and (work / "note.txt").exists()
+
+
+def test_a_policy_written_for_a_newer_version_is_still_read(world):
+    newer = json.loads(world["policy_file"].read_text(encoding="utf-8"))
+    newer["a_key_from_the_future"] = True
+    world["policy_file"].write_text(json.dumps(newer), encoding="utf-8")
+    read = branch_gate.load_policy(world["policy_file"])
+    assert read["unknown"] == ["a_key_from_the_future"] and read["repositories"] and "a_key_from_the_future" not in read
 
 
 def test_the_gate_pushes_a_branch_its_author_never_pushed(world):

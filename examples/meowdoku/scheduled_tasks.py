@@ -195,9 +195,11 @@ def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None
                 policy = gate.load_policy(branches["policy"])
                 db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
                 try:
-                    done = getattr(gate, which)(policy, db, apply=bool(policy["apply"]))
-                    if which == "clean":         # side worktrees first leave, then their branches fall under the same rules
-                        done = gate.clean_worktrees(policy, db, apply=bool(policy["apply"])) + done
+                    if which == "clean":         # the worker performs the cleaning as the policy's cleanup account, and
+                        acting = {"apply": bool(policy["apply"]), "actor": policy["cleaner"]}    # as no other
+                        done = gate.clean_worktrees(policy, db, **acting) + gate.clean(policy, db, **acting)
+                    else:
+                        done = getattr(gate, which)(policy, db, apply=bool(policy["apply"]))
                 finally:
                     db.close()
                 counts = {}

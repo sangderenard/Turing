@@ -76,6 +76,24 @@ class ReviewError(Exception):
 def ensure(db) -> None:
     for statement in DDL:
         db.execute(statement)
+    if "removed_by" not in {row[1] for row in db.execute("PRAGMA table_info(branch_removed)")}:
+        db.execute("ALTER TABLE branch_removed ADD COLUMN removed_by TEXT")      # notices made before the cleanup account
+
+
+def is_service(db, username) -> bool:
+    """A service account of this name exists: the only kind of account that may be the cleaner."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'account_roles'").fetchone():
+        return False
+    return db.execute("SELECT 1 FROM users u JOIN account_roles r ON r.user_id = u.id WHERE u.username = ? COLLATE NOCASE "
+                      "AND r.role = 'service'", (str(username),)).fetchone() is not None
+
+
+def removed(db, limit: int = 200) -> list:
+    """The notices of removal, newest first."""
+    ensure(db)
+    return [{"repository": r[0], "branch": r[1], "head": r[2], "removed_at": r[3], "reason": r[4], "removed_by": r[5]}
+            for r in db.execute("SELECT repository, branch, head, removed_at, reason, removed_by FROM branch_removed "
+                                "ORDER BY removed_at DESC LIMIT ?", (int(limit),))]
 
 
 def _account(user_id) -> int:
@@ -312,12 +330,12 @@ def in_review(db, repository, branch) -> bool:
                       "AND landed_at IS NULL", (repository, branch)).fetchone() is not None
 
 
-def record_removed(db, repository, branch, head, reason, now=None, *, keep_owner=False) -> None:
+def record_removed(db, repository, branch, head, reason, now=None, *, keep_owner=False, removed_by=None) -> None:
     """The notice of removal: what was removed from this computer, the commit it was at, and why. ``keep_owner``
     is for a branch that lives on, on the remote: its registration stays."""
     ensure(db)
-    db.execute("INSERT INTO branch_removed VALUES (?,?,?,?,?)",
-               (repository, branch, head, time.time() if now is None else now, str(reason)[:500]))
+    db.execute("INSERT INTO branch_removed (repository, branch, head, removed_at, reason, removed_by) VALUES (?,?,?,?,?,?)",
+               (repository, branch, head, time.time() if now is None else now, str(reason)[:500], removed_by))
     if not keep_owner:
         db.execute("DELETE FROM branch_owners WHERE repository = ? AND branch = ?", (repository, branch))
 
@@ -348,6 +366,7 @@ def http_route(self, path, method, *, policy, accounts_db):
         POST /api/reviews/decide          {id, head, decision, note?}                         an admin
         POST /api/reviews/withdraw        {id}                                                the author
         POST /api/reviews/checkout        {repository, branch}      register a branch to yourself; answers the steps
+        GET  /api/reviews/removed         the notices of removal: what left this computer, at which commit, by whom
         GET  /api/reviews/standing?repository=NAME&head=COMMIT      open: {"accepted", "lock", "advice"}
 
     ``standing`` is what the required check on GitHub asks. It answers one yes or no about one commit and nothing
@@ -375,6 +394,8 @@ def http_route(self, path, method, *, policy, accounts_db):
         if "dev_ui" not in self._caps():
             return self._json({"error": "this needs dev_ui"}, 403)
         who = {"user_id": principal.user_id, "username": principal.username}
+        if method == "GET" and path == "/api/reviews/removed":
+            return self._json({"removed": removed(db), "cleaner": policy.get("cleaner")})
         if method == "GET" and path == "/api/reviews":
             return self._json({"reviews": listing(db), "repositories": {name: known[name]["default"] for name in sorted(known)},
                                "your_branches": branches_of(db, principal.user_id), "lock": policy.get("lock", "mock")})

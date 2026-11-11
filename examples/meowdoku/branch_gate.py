@@ -38,6 +38,17 @@ branch at the same commit. Nothing is lost: the notice of removal (``branch_remo
 the commit, and the remote keeps the branch. A worktree that fails any of those tests is kept and the reason said.
 Ignored files in a removed worktree (caches, build output) are deleted with it.
 
+One account removes from the core, and no other: the policy's ``cleaner`` (a service account, shown to people under
+``cleaner_display_name``). ``clean`` and ``clean_worktrees`` remove nothing unless they are told to act as that account
+and it exists in SQL as a service account; every notice of removal is signed with it. Looking, without ``apply``, is
+open to anyone. ``cleaner`` (the command) makes the account through the supervisor's own ``ensure_service_user``: a
+random password that is stored nowhere, so nobody signs in as it. Until the core's files are closed to every other
+account by the operating system this is a declared rule, not a wall.
+
+``improper_saves`` is the cleaner's other job: it reads each repository's own checkout and reports what was saved there
+outside a commit (changed and untracked files, and the large untracked ones that look like temporary binaries or
+data). It removes nothing.
+
 ``lock`` is "mock" or "enforce". In mock the push check says what it would have refused, prints the advice
 (``branch_review.advice``) and lets the push through. A branch with a commit of its own is never removed, whatever its age;
 it is reported as unmerged. Removal is by expected commit, locally and on the remote, so a branch that moved
@@ -72,7 +83,7 @@ except ImportError:  # run as a plain script, or loaded by path
 
 HOOK_MARK = "# speaktome branch gate"
 DEFAULTS = {"grace_days": 14, "stale_days": 30, "unregistered_days": 30, "registered_days": 365, "lock": "mock",
-            "worktree_idle_days": 1,
+            "worktree_idle_days": 1, "cleaner": "svc-pale-rider", "cleaner_display_name": "Pale Rider",
             "review_timeout_hours": 24, "delete_after_landing": True, "delete_remote": True,
             "apply": False, "remote": "origin", "protected": [], "repositories": {}}
 
@@ -92,10 +103,10 @@ def git(path, *args, check=True, stdin=None) -> str:
 def load_policy(path) -> dict:
     with open(path, encoding="utf-8") as handle:
         given = json.load(handle)
-    unknown = set(given) - set(DEFAULTS) - {"about"}
-    if unknown:
-        raise GateError("the policy has keys this tool does not know: " + ", ".join(sorted(unknown)))
-    policy = {**DEFAULTS, **{k: v for k, v in given.items() if k != "about"}}
+    # A key this version does not know is carried in "unknown" and otherwise ignored: a running server must keep
+    # reading a policy file written for a newer version (refusing it took the review routes down once).
+    unknown = sorted(set(given) - set(DEFAULTS) - {"about"})
+    policy = {**DEFAULTS, **{k: v for k, v in given.items() if k in DEFAULTS}, "unknown": unknown}
     for name, repository in policy["repositories"].items():
         if not isinstance(repository, dict) or not {"path", "default"} <= set(repository):
             raise GateError(f"repository {name} needs a path and a default branch")
@@ -226,7 +237,45 @@ def side_worktrees(path, remote="origin") -> list:
     return out
 
 
-def clean_worktrees(policy, db, *, apply, now=None, log=print) -> list:
+def cleaner(policy, db, actor, apply) -> str | None:
+    """The account a removal is signed with. Refuses an ``apply`` by anyone but the policy's cleaner."""
+    if not apply:
+        return None
+    declared = policy["cleaner"]
+    if actor != declared:
+        raise GateError(f"only {declared} removes from the core; this run acts as {actor or 'nobody'}")
+    if not branch_review.is_service(db, declared):
+        raise GateError(f"the cleanup account {declared} does not exist as a service account; run the cleaner command first")
+    return declared
+
+
+def improper_saves(policy, *, large_bytes=1 << 20) -> list:
+    """What each repository's own checkout holds outside a commit. Read-only."""
+    out = []
+    for name, declared in sorted(policy["repositories"].items()):
+        path = Path(declared["path"])
+        if not (path / ".git").exists():
+            continue
+        changed, untracked, large = [], [], []
+        status = subprocess.run(["git", "-C", str(path), "status", "--porcelain"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace").stdout          # unstripped: column one may be a space
+        for line in status.splitlines():
+            file = line[3:].strip('"')
+            if line.startswith("??"):
+                untracked.append(file)
+                target = path / file
+                size = target.stat().st_size if target.is_file() else 0
+                if size >= large_bytes:
+                    large.append({"file": file, "bytes": size})
+            else:
+                changed.append(file)
+        out.append({"repository": name, "branch": git(path, "branch", "--show-current", check=False),
+                    "changed": changed, "untracked": untracked, "large_untracked": large})
+    return out
+
+
+def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> list:
+    signer = cleaner(policy, db, actor, apply)
     now = time.time() if now is None else now
     idle = float(policy["worktree_idle_days"]) * 86400.0
     actions = []
@@ -261,7 +310,7 @@ def clean_worktrees(policy, db, *, apply, now=None, log=print) -> list:
                         git(path, "update-ref", "-d", f"refs/heads/{tree['branch']}", tree["head"])
                         git(path, "config", "--remove-section", f"branch.{tree['branch']}", check=False)
                         detail += f" as {policy['remote']}/{tree['branch']}; local branch removed"
-                    branch_review.record_removed(db, name, label, tree["head"], detail, now, keep_owner=True)
+                    branch_review.record_removed(db, name, label, tree["head"], detail, now, keep_owner=True, removed_by=signer)
                     entry.update(action="removed", reason=detail)
                 except GateError as error:
                     entry.update(action="failed", reason=str(error))
@@ -272,7 +321,8 @@ def clean_worktrees(policy, db, *, apply, now=None, log=print) -> list:
     return actions
 
 
-def clean(policy, db, *, apply, now=None, log=print) -> list:
+def clean(policy, db, *, apply, actor=None, now=None, log=print) -> list:
+    signer = cleaner(policy, db, actor, apply)
     now = time.time() if now is None else now
     grace, stale = float(policy["grace_days"]) * 86400.0, float(policy["stale_days"]) * 86400.0
     actions = []
@@ -327,7 +377,7 @@ def clean(policy, db, *, apply, now=None, log=print) -> list:
                         if not remote_too and row["remote_head"]:
                             detail += "; remote copy kept: the live branch holding it is not on the remote"
                         branch_review.forget_merged(db, name, row["branch"])
-                        branch_review.record_removed(db, name, row["branch"], row["head"], why, now)
+                        branch_review.record_removed(db, name, row["branch"], row["head"], why, now, removed_by=signer)
                         entry.update(action="removed", reason=f"{why}; {detail}")
                     except GateError as error:
                         entry.update(action="failed", reason=str(error))
@@ -451,6 +501,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--policy", required=True)
     parser.add_argument("--db", required=True, help="the accounts database")
+    parser.add_argument("--as", dest="actor", default=None, help="the account this run acts as (removals need the policy's cleaner)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     for name in ("land", "clean", "worktrees"):
@@ -462,6 +513,8 @@ def main(argv=None) -> int:
     submit.add_argument("--timeout-hours", type=float)
     submit.add_argument("--keep", action="store_true", help="keep the branch after it lands")
     sub.add_parser("check-push").add_argument("repository", nargs="?")
+    sub.add_parser("cleaner", help="make the policy's cleanup account, as the supervisor makes service accounts")
+    sub.add_parser("inspect", help="report what the core holds outside a commit")
     sub.add_parser("install-hook")
     sub.add_parser("remove-hook")
     args = parser.parse_args(argv)
@@ -469,6 +522,19 @@ def main(argv=None) -> int:
         policy = load_policy(args.policy)
         if args.command in ("install-hook", "remove-hook"):
             install_hooks(policy, args.policy, args.db, remove=args.command == "remove-hook")
+            return 0
+        if args.command == "inspect":
+            print(json.dumps(improper_saves(policy), indent=1))
+            return 0
+        if args.command == "cleaner":
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("apache_supervisor", Path(__file__).resolve().parent / "deploy" / "apache_supervisor.py")
+            supervisor = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(supervisor)
+            uid = supervisor.ensure_service_user(policy["cleaner"], args.db)
+            with sqlite3.connect(args.db, timeout=10) as made:
+                made.execute("UPDATE users SET display_name = ? WHERE id = ?", (policy["cleaner_display_name"], uid))
+            print(json.dumps({"cleaner": policy["cleaner"], "shown_as": policy["cleaner_display_name"], "role": "service"}))
             return 0
         db = sqlite3.connect(args.db, timeout=10, isolation_level=None)
         try:
@@ -499,7 +565,8 @@ def main(argv=None) -> int:
                     print(f"{review['standing']:10} {review['repository']:18} {review['branch']} {review['head'][:12]} by {review['owner_name']}")
                 return 0
             apply = bool(args.apply or policy["apply"])
-            done = {"land": land, "clean": clean, "worktrees": clean_worktrees}[args.command](policy, db, apply=apply)
+            extra = {} if args.command == "land" else {"actor": args.actor}
+            done = {"land": land, "clean": clean, "worktrees": clean_worktrees}[args.command](policy, db, apply=apply, **extra)
             print(json.dumps({"applied": apply, "count": len(done),
                               "remote_skipped": sum(1 for e in done if e.get("remote_skipped")),
                               "by_action": {a: sum(1 for e in done if e["action"] == a) for a in sorted({e["action"] for e in done})}}))
