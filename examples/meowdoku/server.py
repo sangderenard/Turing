@@ -1063,6 +1063,16 @@ def make_handler(sessions: Sessions):
         # supervisor performs within a second or two, or after ``delay`` seconds (a countdown it announces to every admin
         # through Nodus); POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        def _reviews_route(self, path: str, method: str) -> None:
+            """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
+            from meowdoku import branch_gate, branch_review
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
         def _instance_control(self, method: str, cancel: bool = False) -> None:
             import sqlite3
             from meowdoku import instance_control
@@ -1900,6 +1910,8 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path, "GET")
             if path == "/api/index" and shared_catalog is not None:   # [INDEX] the declared catalog of this API
                 return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
@@ -2356,6 +2368,8 @@ def make_handler(sessions: Sessions):
                 return self._living_data_query()
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
+            if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path0, "POST")
             if path0 == "/api/control/instances":
                 return self._instance_control("POST")
             if path0 == "/api/control/instances/cancel":

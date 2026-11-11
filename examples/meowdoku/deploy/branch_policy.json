@@ -1,0 +1,17 @@
+{
+  "about": "Read by branch_gate.py, by the server's /api/reviews routes and by the task worker's reviews.land and branches.clean tasks. apply=false: the two tasks only report what they would do. grace_days counts from when the cleaner first saw a branch fully merged. review_timeout_hours: an open change nobody objects to is accepted after this long. delete_after_landing: the default for a submitted change (the author may ask to keep the branch). protected: branch name patterns never cleaned, in every repository; a repository may add its own.",
+  "apply": false,
+  "grace_days": 14,
+  "review_timeout_hours": 24,
+  "delete_after_landing": true,
+  "delete_remote": true,
+  "remote": "origin",
+  "protected": ["snapshot/*", "wip/*"],
+  "repositories": {
+    "workspace": {"path": "C:/dev/Powershell", "default": "nogodsnomasters", "protected": ["codex/live-string-core-demo"]},
+    "turing": {"path": "C:/dev/Powershell/turing", "default": "main"},
+    "nodus": {"path": "C:/dev/Powershell/nodus", "default": "nogodsnomasters"},
+    "speaktome": {"path": "C:/dev/Powershell/speaktome", "default": "nogodsnomasters", "protected": ["codex/direct-x86-vocabulary-report"]},
+    "spectral-analyzer": {"path": "C:/dev/Powershell/spectral-analyzer", "default": "nogodsnomasters"}
+  }
+}

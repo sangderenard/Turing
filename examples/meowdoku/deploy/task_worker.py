@@ -52,6 +52,8 @@ def main(argv=None) -> int:
     parser.add_argument("--accounts-db", default=None, help="the accounts database; with --system-account, system.broadcast is offered")
     parser.add_argument("--system-account", default=None,
                         help="the account system events are sent as (the Nodus host's service account, shown as Nodus)")
+    parser.add_argument("--branch-policy", default=None,
+                        help="the branch policy file; with --accounts-db, reviews.land and branches.clean are offered")
     parser.add_argument("--federation-port", default=None, help=argparse.SUPPRESS)      # the supervisor passes these to any
     parser.add_argument("--federation-canvas", default=None, help=argparse.SUPPRESS)    # instance that names a Nodus host
     args = parser.parse_args(argv)
@@ -70,6 +72,10 @@ def main(argv=None) -> int:
         needs["backup"] = {"state_dir": args.state_dir, "backup_dir": args.backup_dir, "keep": max(1, args.backup_keep),
                            "exclude": tuple(args.backup_exclude), "text_only": args.backup_text_only,
                            "module": state_backup}
+
+    if args.branch_policy and args.accounts_db:
+        from meowdoku import branch_gate
+        needs["branches"] = {"policy": args.branch_policy, "accounts_db": args.accounts_db, "module": branch_gate}
 
     native, tools = studio_product_nodus.nodus_modules()[0], studio_product_nodus.DEFAULT_NODUS_TOOLS
     if args.accounts_db and args.system_account:

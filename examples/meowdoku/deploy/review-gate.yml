@@ -1,0 +1,49 @@
+# The required check of a default branch: a commit may become its tip only when the service's SQL holds an
+# accepted review of exactly that commit (branch_review.py: approved by an admin, or accepted by time-out with no
+# objection). Copy this file to .github/workflows/review-gate.yml on the DEFAULT branch of a repository and set
+# REPOSITORY to that repository's name in deploy/branch_policy.json. Then make "review-gate" a required status
+# check of the default branch, with administrators included (deploy/Protect-DefaultBranch.ps1).
+#
+# pull_request_target runs the workflow file of the BASE branch, so a branch cannot edit its own check. The job
+# checks out nothing and runs no code from the change: it asks one question about one commit id.
+#
+# How a change lands: push the branch, open a pull request against the default branch (that reports this check on
+# the branch's commit), submit the commit for review (POST /api/reviews), and once it is accepted re-run this check;
+# then the fast-forward push of that commit to the default branch is admitted by GitHub. branch_gate.py land does
+# the last two steps.
+name: review-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The full commit id to ask about (default: this ref's commit)
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REPOSITORY: REPLACE_WITH_POLICY_NAME
+  SERVICE: https://stichka.duckdns.org:8766
+
+jobs:
+  review-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the service whether this commit has an accepted review
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+        run: |
+          set -eu
+          case "$HEAD" in *[!0-9a-f]*|"") echo "not a commit id"; exit 1;; esac
+          answer=$(curl --fail --silent --show-error --max-time 30 \
+            "$SERVICE/api/reviews/standing?repository=$REPOSITORY&head=$HEAD")
+          echo "$answer"
+          echo "$answer" | grep -q '"accepted": *true' || {
+            echo "::error::Commit $HEAD has no accepted review. Submit it for review; an admin approves it, or it is accepted when its time-out passes with no objection."
+            exit 1
+          }

@@ -42,7 +42,7 @@ AUDIENCE_TERMS = {"admin": ("role:admin",), "everyone": ("kind:person",)}     # 
 SYSTEM_DISPLAY_NAME = "Nodus"
 USERLIST_ENGINE_ID = 7203
 # Which table performs which task: scheduled and system tasks on the cron prefix, the user list on its own.
-PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast"),
+PREFIX_TASKS = {"cron": ("manual.hardcopy", "state.backup", "system.broadcast", "reviews.land", "branches.clean"),
                 "userlist": ("identity.search", "identity.represent")}
 
 
@@ -177,13 +177,36 @@ def load_cron_host(nodus_tools):
     return sys.modules[name]
 
 
-def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None) -> dict:
+def handlers(cron_host, *, web_dir=None, manual=None, site=None, graph_view=None, backup=None, system=None,
+             branches=None) -> dict:
     """The tasks this process can perform, by name. A task appears only when what it needs was given.
 
     `system` is `{"accounts_db", "username", "module", "userlist"?}` (module = messaging): the account system events
     are sent as, and optionally the userlist table to ask for an audience ({"port", "jobs_dir", "native", "task_request"}).
-    `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup)."""
+    `backup` is `{"state_dir", "backup_dir", "keep", "exclude", "text_only", "module"}` (module = state_backup).
+    `branches` is `{"policy", "accounts_db", "module"}` (module = branch_gate): reviewed changes are landed and merged
+    branches cleaned by that module's rules; while the policy's `apply` is false both tasks only report."""
     table = {}
+    if branches is not None:
+        def branch_task(which):
+            def task(request):
+                import sqlite3
+                gate = branches["module"]
+                policy = gate.load_policy(branches["policy"])
+                db = sqlite3.connect(branches["accounts_db"], timeout=10, isolation_level=None)
+                try:
+                    done = getattr(gate, which)(policy, db, apply=bool(policy["apply"]))
+                finally:
+                    db.close()
+                counts = {}
+                for entry in done:
+                    counts[entry["action"]] = counts.get(entry["action"], 0) + 1
+                acted = any(entry["action"] in ("landed", "removed") for entry in done)
+                said = ", ".join(f"{count} {action}" for action, count in sorted(counts.items())) or "nothing to do"
+                return (cron_host.DONE if acted else cron_host.UNCHANGED), said, [e for e in done if e["action"] not in ("keep", "wait")]
+            return task
+        table["reviews.land"] = branch_task("land")
+        table["branches.clean"] = branch_task("clean")
     if web_dir is not None and manual is not None:
         def manual_hardcopy(request):
             changed, sentence = refresh_hard_copy(web_dir, name=MANUAL_FOLDER, document=manual.as_map(), site=site,

@@ -116,7 +116,9 @@
         "--system-account",
         "svc-nodus-messenger",
         "--userlist-jobs-dir",
-        "C:/dev/Powershell/srv/state/jobs/userlist"
+        "C:/dev/Powershell/srv/state/jobs/userlist",
+        "--branch-policy",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
       ],
       "userlist_prefix": "userlist"
     }
