@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "first_port": 47700,
+  "last_port": 47763,
+  "addresses_per_account": 8,
+  "max_body": 60000,
+  "rate_per_minute": 600,
+  "kept_per_address": 1000
+}

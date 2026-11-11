@@ -121,6 +121,23 @@
         "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
       ],
       "userlist_prefix": "userlist"
+    },
+    {
+      "name": "relay",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "0.0.0.0",
+      "account": "svc-relay",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/relay.py",
+        "--db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--config",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/relay.json"
+      ]
     }
   ],
   "state_dir": "C:/dev/Powershell/srv/state",
