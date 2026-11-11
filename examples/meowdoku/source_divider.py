@@ -20,6 +20,10 @@ read as text and ``ast.parse``d.  Pipeline:
   work          claim one, run, record, repeat.  Single in flight.
   recompose     ``summary`` (verdict table) and ``write_recomposition`` (recomposition.json: per authored function ``python`` or
                 its available lowerings).  NO CODE IS REWRITTEN in this slice; the file is the data a later rewrite would read.
+  goal          ``write_goal_document`` (goal.goal, a ``speaktome.goal-document.v1``): the units LINKED.  Each unit
+                holds its own text only; ``link`` rows name what it takes from other units; ``api`` / ``build`` / ``abi``
+                tables say what it offers, which lowerings exist and how they are called; the document's ``target``
+                table says for which language every unit is built (the goal achieved).
   record        ``write_dream_record`` (record.dream, a ``turing.dream-document.v1``): the job's enduring record.  One
                 python block per piece holding its exact lexical closure, so every part builds on its own; one block per
                 completed lowering in that backend's language, byte for byte; refusals on the piece's header.  The
@@ -918,6 +922,173 @@ def write_dream_record(db, state, job_id: str) -> Path:
     return path
 
 
+def _top_defined(node) -> set:
+    """The module-level names one top-level statement defines."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return {(alias.asname or alias.name).split(".")[0] for alias in node.names}
+    targets = []
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    return {n.id for target in targets for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+
+def _own_text(closure: str, own: set, provided: set) -> tuple:
+    """A unit's own text, cut from its closure: its definitions and what THEY reach, without what other units provide.
+
+    The closure (the compiler's cut) holds the unit's definitions, the definitions of everything it calls, and the
+    module-level statements any of those need.  Here the top-level statements are walked from the unit's own
+    definitions by the names they reference: a statement is kept when a kept statement names something it defines.
+    A definition another unit provides is never kept; it becomes a link.  So a constant only a callee uses leaves
+    with the callee, and a constant both use stays in each.  ``own`` and ``provided`` are module-level names.
+    Returns (text, names kept, names the kept statements reference); the closure unchanged if it does not parse."""
+    try:
+        body = ast.parse(closure).body
+    except (SyntaxError, ValueError, RecursionError):
+        return closure, set(own), set()
+    defined = [_top_defined(node) for node in body]
+    kept = {index for index, names in enumerate(defined) if names & own}
+    kept |= {index for index, node in enumerate(body) if isinstance(node, ast.ImportFrom) and node.module == "__future__"}
+    referenced = set()
+
+    def absorb(index):
+        referenced.update(n.id for n in ast.walk(body[index]) if isinstance(n, ast.Name))
+    for index in kept:
+        absorb(index)
+    grew = True
+    while grew:
+        grew = False
+        for index, names in enumerate(defined):
+            if index in kept or not (names & referenced):
+                continue
+            if isinstance(body[index], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and names & provided:
+                continue                             # another unit provides it: a link, not a copy
+            kept.add(index)
+            absorb(index)
+            grew = True
+    lines = closure.splitlines()
+    parts = []
+    for index in sorted(kept):
+        node = body[index]
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        parts.append("\n".join(lines[first - 1:node.end_lineno]))
+    kept_names = set().union(*(defined[index] for index in kept)) if kept else set()
+    return "\n\n".join(parts), kept_names, referenced
+
+
+def _api_rows(nodes: dict, names) -> list:
+    """The authored API of a unit: one row per formal and one for the result of each entry, annotations as written."""
+    rows = []
+    for name in names:
+        if name not in nodes:
+            continue
+        node = nodes[name][0]
+        a = node.args
+        formals = list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs) + [x for x in (a.vararg, a.kwarg) if x]
+        for formal in formals:
+            rows.append({"entry": name, "name": formal.arg, "role": "parameter",
+                         "type": ast.unparse(formal.annotation) if formal.annotation is not None else ""})
+        rows.append({"entry": name, "name": "return", "role": "result",
+                     "type": ast.unparse(node.returns) if node.returns is not None else ""})
+    return rows
+
+
+def write_goal_document(db, state, job_id: str) -> Path:
+    """``<job>/goal.goal`` (``speaktome.goal-document.v1``): the job's units, linked.
+
+    The record (``record.dream``) holds every part with what it calls copied inside it, which is what lets a part be
+    built alone.  The Goal document is the other form: each unit holds only its OWN definitions; what it needs from
+    another unit is a row of its ``link`` table; its ``api`` table is the authored signature of each entry; its
+    ``build`` table lists the lowerings that exist (by product hash and by their block in the record) and its ``abi``
+    table how each is called, from the product's own api description when the backend wrote one.  The document's
+    ``target`` table says, per language, whether every unit is built for it: that is the goal achieved.  Nothing is
+    compiled, linked or run here; the links are the ones the triage already resolved (``deps``), by piece id."""
+    from types import MappingProxyType
+    from meowdoku import rest_api
+    goal = rest_api.goal
+    if goal is None:
+        raise RuntimeError("the SpeakToMe checkout has no speaktome_goal package")
+    state = StatePaths.coerce(state)
+    job_dir = state.jobs_dir / job_id
+    report = summary(db, job_id)
+    owner = {p["piece_id"]: list(p["names"]) for p in report["pieces"]}
+    sources, units = {}, []
+    for p in report["pieces"]:
+        identity = f"piece-{p['piece_id']}"
+        if p["file"] not in sources:
+            text = _read_source(job_dir / "source" / p["file"]) or ""
+            try:
+                nodes = _function_nodes(ast.parse(text))
+            except (SyntaxError, ValueError, RecursionError):
+                nodes = {}
+            sources[p["file"]] = (text, nodes)
+        text, nodes = sources[p["file"]]
+        closure, first_line, cut_note = _buildable_part(text, p["names"])
+        provided = {name: d for d in p["deps"] for name in owner.get(d, ())}
+        top = lambda qualified: qualified.split(".", 1)[0]          # C.m and f.<locals>.g live in C and f
+        own, kept_names, used = _own_text(closure, {top(n) for n in p["names"]}, {top(n) for n in provided})
+        links = []
+        for name, d in provided.items():
+            if top(name) in kept_names:             # its definition could not be separated: still inside this text
+                links.append({"name": name, "unit": f"piece-{d}", "entry": name, "how": "carried"})
+            elif top(name) in used:                 # the text only names it
+                links.append({"name": name, "unit": f"piece-{d}", "entry": name, "how": "reference"})
+        builds, abi = [], []
+        for backend in sorted(p["attempts"], key=_rank):
+            base = job_dir / "products" / str(p["piece_id"]) / backend
+            attempt_file = base / "attempt.json"
+            if backend not in DREAM_LANGUAGE or not attempt_file.exists():
+                continue
+            for e in json.loads(attempt_file.read_text(encoding="utf-8"))["entries"]:
+                if e["state"] != "complete":
+                    continue
+                target = DREAM_LANGUAGE[backend]
+                builds.append({"target": target, "entry": e["name"], "symbol": str(e.get("entry") or ""),
+                               "product": str(e.get("product") or ""), "sha256": e["sha256"],
+                               "record": f"{identity}.{backend}.{_stem(e['name'])}", "note": str(e.get("note") or "")})
+                described = base / str(e.get("api") or "")
+                if e.get("api") and described.is_file():
+                    try:
+                        import yaml
+                        api_doc = yaml.safe_load(described.read_text(encoding="utf-8")) or {}
+                    except Exception:               # no yaml here, or an unreadable description: the build is still listed
+                        api_doc = {}
+                    for point in api_doc.get("entry_points") or []:
+                        for formal in point.get("parameters") or []:
+                            abi.append({"target": target, "entry": e["name"], "name": str(formal.get("name") or ""),
+                                        "role": str(formal.get("role") or ""), "dtype": str(formal.get("dtype") or ""),
+                                        "passing": str(formal.get("passing") or ""),
+                                        "source": str(formal.get("source_name") or "")})
+        facts = {"file": p["file"], "first_line": str(first_line), "cut": cut_note,
+                 "annotated": "yes" if p["annotated"] else "no",
+                 "verdict": f"lowered ({p['best']})" if p["best"] else "stays python"}
+        if p["python_reason"]:
+            facts["reason"] = p["python_reason"]
+        for backend, attempt in sorted(p["attempts"].items()):
+            said = attempt["state"] + (f" {attempt['error_type']}@{attempt['stage']}" if attempt["error_type"] else "")
+            facts[f"attempt.{backend}"] = said
+        units.append(goal.Unit(identity=identity, language="python", text=own, state="lowered" if builds else "source",
+                               facts=MappingProxyType(facts), api=goal._rows(_api_rows(nodes, p["names"])),
+                               link=goal._rows(links), build=goal._rows(builds), abi=goal._rows(abi)))
+    job = report["job"]
+    record = job_dir / "record.dream"
+    stated = {"source": f"divider job {job_id}" + (f" ({job.get('origin')})" if job.get("origin") else ""),
+              "units_record": f"record.dream sha256 {hashlib.sha256(record.read_bytes()).hexdigest()}" if record.is_file() else "",
+              "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if job.get("label"):
+        stated["label"] = str(job["label"])
+    document = goal.GoalDocument(f"job-{job_id}", tuple(units), MappingProxyType(stated))
+    path = job_dir / "goal.goal"
+    scratch = path.with_suffix(".goal.tmp")
+    scratch.write_bytes(goal.render(document))
+    goal.load(scratch)                                  # it must read back, hashes and tables, before it replaces the last one
+    os.replace(scratch, path)
+    return path
+
+
 # -------------------------------------------------------------------------------------------------------------------- CLI
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -981,6 +1152,7 @@ def main(argv=None) -> int:
     elif args.command == "recompose":
         print(write_recomposition(db, state, args.job))
         print(write_dream_record(db, state, args.job))
+        print(write_goal_document(db, state, args.job))
     return 0
 
 

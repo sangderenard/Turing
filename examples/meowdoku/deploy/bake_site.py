@@ -2,6 +2,7 @@
 
     python examples/meowdoku/deploy/bake_site.py --map manual --out DIR
     python examples/meowdoku/deploy/bake_site.py --map-file some.map.json --name world --out DIR
+    python examples/meowdoku/deploy/bake_site.py --goal-file job/goal.goal --out DIR
 
 The pages are the ones GET /site/<map>/ serves on first look (speaktome_api.site, the same renderer); baking writes
 all of them ahead of time, with relative links, so the folder can be opened from disk, copied into a public web
@@ -28,6 +29,7 @@ def main(argv=None) -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--map", choices=("manual",))
     source.add_argument("--map-file")
+    source.add_argument("--goal-file", help="a Goal document (speaktome.goal-document.v1); it is a graph of itself")
     parser.add_argument("--name", default=None, help="the map's short name (default: the --map value)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
@@ -35,9 +37,13 @@ def main(argv=None) -> int:
         if rest_api.manual is None:
             parser.error("the SpeakToMe checkout has no speaktome_man package")
         document = rest_api.manual.as_map()
+    elif args.goal_file:
+        if rest_api.goal is None:
+            parser.error("the SpeakToMe checkout has no speaktome_goal package")
+        document = rest_api.goal.as_map(rest_api.goal.load(args.goal_file))
     else:
         document = json.loads(Path(args.map_file).read_text(encoding="utf-8"))
-    name = args.name or args.map
+    name = args.name or args.map or ("goal" if args.goal_file else None)
     if not name:
         parser.error("--map-file needs --name")
     with tempfile.TemporaryDirectory() as scratch:      # the cache is not wanted here; only the baked folder is

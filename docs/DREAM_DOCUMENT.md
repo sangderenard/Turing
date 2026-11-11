@@ -149,6 +149,12 @@ This record is the COMPILED UNITS stage. It is not the Goal document the owner n
 each buildable alone, and they have not had their linking done (a part that calls another carries that other's text
 inside its own closure). See the SpeakToMe repository, `AGENTS/conceptual_flags/Goal_Document.md`.
 
+The Goal document is written beside it as `<job>/goal.goal` by `write_goal_document`, in the format
+`speaktome.goal-document.v1` (SpeakToMe `speaktome_goal/`, manual page `goal(5)`). There a unit holds only its own
+text; what it takes from another unit is a row of its `link` table; `api`, `build` and `abi` tables say what it
+offers, which lowerings exist and how they are called; each `build` row names the block of this record that holds
+the product's bytes. The record keeps the bytes; the Goal document keeps the joins.
+
 - In: `intake_dream`. Each python block becomes one source file and is divided on its own. Blocks in other languages
   are not divided; they are carried into the record unchanged. Blocks an earlier pass produced (`role = lowering` or
   `role = job-record`) are dropped, so a record can be fed back in.

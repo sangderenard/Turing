@@ -53,3 +53,5 @@ from speaktome_api import site  # noqa: E402  (after the version check, so an ol
 
 # The manual is a map (speaktome_man.as_map); an older checkout without it still serves everything else.
 manual = _load("speaktome_man") if (REPOSITORY / "speaktome_man" / "__init__.py").is_file() else None
+# The Goal document format (speaktome_goal): what the part-by-part builder's units are processed into.
+goal = _load("speaktome_goal") if (REPOSITORY / "speaktome_goal" / "__init__.py").is_file() else None

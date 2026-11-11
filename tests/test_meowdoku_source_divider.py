@@ -171,12 +171,67 @@ def test_every_part_of_the_record_holds_its_own_closure(tmp_path):
     assert step.decorations["first_line"] == "4", "the line the closure starts at in the source"
 
 
+def test_the_goal_document_holds_each_units_own_text_and_its_links(tmp_path):
+    """No compile here. The Goal document is the linked form: a unit names what it takes, it does not copy it."""
+    from meowdoku import rest_api
+    if rest_api.goal is None:
+        import pytest
+        pytest.skip("the SpeakToMe checkout has no speaktome_goal package")
+    state, db, job = _job(tmp_path, CHAIN)
+    path = sd.write_goal_document(db, state, job)
+    assert path.name == "goal.goal"
+    document = rest_api.goal.load(path)
+    units = {u.entries()[0]: u for u in document.units}
+    step, double = units["step"], units["double"]
+    assert "def double" not in step.text and "def step" in step.text, "the unit holds its own definition only"
+    assert "RATE" not in step.text and "RATE = 2.0" in double.text, "a constant stays with the unit that uses it"
+    assert [dict(r) for r in step.link] == [{"name": "double", "unit": double.identity, "entry": "double", "how": "reference"}]
+    assert double.link == () and units["unused"].link == ()
+    assert [dict(r) for r in step.api] == [{"entry": "step", "name": "x", "role": "parameter", "type": "float"},
+                                           {"entry": "step", "name": "return", "role": "result", "type": "float"}]
+    assert all(u.state == "source" and u.build == () for u in document.units), "nothing was lowered in this test"
+    assert document.achieved() == () and document.targets() == ()
+    graph = {n["identity"]: n for n in rest_api.goal.as_graph(document)}
+    root = f"goal:job-{job}"
+    assert {"target": f"{root}/unit/{double.identity}", "relationship": "links-to"} in graph[f"{root}/unit/{step.identity}"]["dependencies"]
+
+
+def test_a_unit_keeps_what_its_own_definitions_reach_and_nothing_else(tmp_path):
+    from meowdoku import rest_api
+    if rest_api.goal is None:
+        import pytest
+        pytest.skip("the SpeakToMe checkout has no speaktome_goal package")
+    shared = CHAIN.replace("y = double(x) + 1.0", "y = double(x) + RATE").replace("RATE = 2.0", "BASE = 1.0\nRATE = BASE * 2.0")
+    state, db, job = _job(tmp_path, shared)
+    units = {u.entries()[0]: u for u in rest_api.goal.load(sd.write_goal_document(db, state, job)).units}
+    for name in ("step", "double"):
+        assert "RATE = BASE * 2.0" in units[name].text and "BASE = 1.0" in units[name].text, "a constant both use stays in each"
+    assert "def double" not in units["step"].text and "import math" not in units["step"].text
+    namespace = {"double": lambda x: x}                  # what the link provides, supplied by the reader
+    exec(compile(units["step"].text, "<step>", "exec"), namespace)
+    assert namespace["step"](3.0) == 5.0
+
+
 def test_a_record_goes_back_in_and_its_parts_build_one_by_one(tmp_path):
     """Dream in, dream out: the second pass sees every part as its own file and reaches the same products."""
     from src.compiler.dream_document import DreamBlock, DreamDocument, load_dream_document, render_dream_document
     state, db, job = _job(tmp_path, CHAIN, backends=("wasm",))
     assert sd.work(db, state, "first") == 3
     first = load_dream_document(sd.write_dream_record(db, state, job))
+    # With every unit lowered, the Goal document says the goal is achieved for that language, and how each is called.
+    from meowdoku import rest_api
+    if rest_api.goal is not None:
+        goal_document = rest_api.goal.load(sd.write_goal_document(db, state, job))
+        assert goal_document.achieved() == ("wasm",)
+        assert [dict(r) for r in goal_document.targets()] == [{"target": "wasm", "units": "3", "lowered": "3", "achieved": "yes"}]
+        built = {u.entries()[0]: u for u in goal_document.units}
+        record_blocks = {b.identity: b.content_hash for b in first.blocks}
+        for unit in built.values():
+            row = dict(unit.build[0])
+            assert record_blocks[row["record"]] == row["sha256"], "a build row names its block in the units record"
+            assert unit.abi and unit.abi[0]["source"] == "x" and unit.abi[0]["target"] == "wasm"
+        assert built["step"].link[0]["unit"] == built["double"].identity
+        assert goal_document.facts["units_record"].startswith("record.dream sha256 ")
     # A block in another language rides along untouched.
     shader = DreamBlock(identity="colors", kind="shader", language="glsl", stage="compute", encoding="utf-8",
                         payload="void main() {}", outputs=("colors",))
