@@ -48,7 +48,7 @@ export async function buildStudioAgentProduct(request,{assets,defaults}={}){
     return {contentType:'application/json',bytes:new TextEncoder().encode(finiteJSON({...scene,geometry:prepared.geometry}))};
   }
   const photo=request.photo??{};
-  fields(photo,['resolution','width','height','seconds','orbitFrames','transport','gamma','maxBounces','bounceMode','triangleBudget','sphereCoverage','filmResponse','tiled','oversampling'],'photo');
+  fields(photo,['resolution','width','height','seconds','orbitFrames','cameraPoses','transport','gamma','maxBounces','bounceMode','triangleBudget','sphereCoverage','filmResponse','tiled','oversampling'],'photo');
   const bytes=new Uint8Array(packMarblePhoto(prepared.geometry,null,{...photo,...scene,objectSnapshot:prepared.value}));
   return {contentType:'application/octet-stream',bytes};
 }

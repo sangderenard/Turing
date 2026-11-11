@@ -114,6 +114,35 @@ def _film_response(value: object) -> dict:
     return result
 
 
+# Sequence entries are camera overrides, not projections or sensor windows.
+_CAMERA_POSE_FIELDS = frozenset((
+    "eye_m", "target_m", "fov_degrees", "aperture_radius_m", "focus_distance_m",
+    "aperture_blades", "aperture_rotation_radians", "lens_selection",
+    "camera_back", "back_reference_fov_degrees",
+))
+
+
+def _camera_config(camera_in: dict, resolution: int, spectral_root: Path) -> dict:
+    """Use the same bounded analytical controls for a still or every pose."""
+    camera = {
+        "resolution": resolution,
+        "eye_m": _finite_vectors(camera_in.get("eye_m", [0, 0, .07]), 3, "camera.eye_m"),
+        "target_m": _finite_vectors(camera_in.get("target_m", [0, 0, .18]), 3, "camera.target_m"),
+        "fov_degrees": _number(camera_in.get("fov_degrees", 36), .001 if camera_in.get("camera_back") is not None else FOV_MIN_DEGREES, 100, "camera.fov_degrees"),
+        "aperture_radius_m": _number(camera_in.get("aperture_radius_m", .002), 1e-5, PUPIL_RADIUS_MAX_M, "camera.aperture_radius_m"),
+        "focus_distance_m": _number(camera_in.get("focus_distance_m", .11), FOCUS_MIN_M, FOCUS_MAX_M, "camera.focus_distance_m"),
+        "aperture_blades": int(_number(camera_in.get("aperture_blades", 0), 0, 16, "camera.aperture_blades")),
+        "aperture_rotation_radians": _number(camera_in.get("aperture_rotation_radians", 0), -7, 7, "camera.aperture_rotation_radians"),
+    }
+    if "width" in camera_in or "height" in camera_in:
+        camera.update(width=camera_in["width"], height=camera_in["height"])
+    try:
+        camera = apply_lens_selection(camera, camera_in.get("lens_selection"), spectral_root)
+    except (ValueError, OSError) as error:
+        raise PhotoError(str(error)) from None
+    return camera
+
+
 def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tuple[dict, float]:
     if value.get("object_digest") != saved["digest"]:
         raise PhotoError("photo request does not name the saved object")
@@ -162,25 +191,18 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             _tile_contract(str(spectral_root)).tile_plan(value)
         except ValueError as error:
             raise PhotoError(str(error)) from error
-    orbit_frames = int(_number(value.get("orbit_frames", 1), 1, 32, "orbit_frames"))
-    if orbit_frames not in (1, 8, 16, 32):
+    orbit_frames = value.get("orbit_frames", 1)
+    if type(orbit_frames) is not int or orbit_frames not in (1, 8, 16, 32):
         raise PhotoError("orbit_frames must be 1, 8, 16, or 32")
-    camera = {
-        "resolution": resolution,
-        "eye_m": _finite_vectors(camera_in.get("eye_m", [0, 0, .07]), 3, "camera.eye_m"),
-        "target_m": _finite_vectors(camera_in.get("target_m", [0, 0, .18]), 3, "camera.target_m"),
-        "fov_degrees": _number(camera_in.get("fov_degrees", 36), .001 if camera_in.get("camera_back") is not None else FOV_MIN_DEGREES, 100, "camera.fov_degrees"),
-        "aperture_radius_m": _number(camera_in.get("aperture_radius_m", .002), 1e-5, PUPIL_RADIUS_MAX_M, "camera.aperture_radius_m"),
-        "focus_distance_m": _number(camera_in.get("focus_distance_m", .11), FOCUS_MIN_M, FOCUS_MAX_M, "camera.focus_distance_m"),
-        "aperture_blades": int(_number(camera_in.get("aperture_blades", 0), 0, 16, "camera.aperture_blades")),
-        "aperture_rotation_radians": _number(camera_in.get("aperture_rotation_radians", 0), -7, 7, "camera.aperture_rotation_radians"),
-    }
-    if custom_size:
-        camera.update(width=camera_in["width"], height=camera_in["height"])
-    try:
-        camera = apply_lens_selection(camera, camera_in.get("lens_selection"), spectral_root)
-    except (ValueError, OSError) as error:
-        raise PhotoError(str(error)) from None
+    poses_in = value.get("camera_poses")
+    if "camera_poses" in value:
+        if not isinstance(poses_in, list) or not 1 <= len(poses_in) <= 32:
+            raise PhotoError("camera_poses must contain 1..32 camera overrides")
+        if orbit_frames != 1 or tiled or "live" in value or value.get("client_intersections", False):
+            raise PhotoError("camera_poses cannot be combined with orbit, tiles, live view or client intersections")
+        if "projection" in camera_in:
+            raise PhotoError("camera_poses use only the existing analytical camera projection")
+    camera = _camera_config(camera_in, resolution, spectral_root)
     checker = {
         "center_m": _finite_vectors(checker_in.get("center_m", [0, 0, .30]), 3, "checker.center_m"),
         "width_m": _number(checker_in.get("width_m", .15), .02, 1, "checker.width_m"),
@@ -351,6 +373,28 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                                              camera_in.get("back_reference_fov_degrees"))
     except ValueError as error:
         raise PhotoError(str(error)) from None
+    if poses_in is not None:
+        cameras = []
+        for index, pose in enumerate(poses_in):
+            if not isinstance(pose, dict) or set(pose) - _CAMERA_POSE_FIELDS:
+                raise PhotoError(f"camera_poses[{index}] has unsupported camera fields")
+            pose_in = {**camera_in, **pose}
+            # An explicit FOV is a new reference, not the inherited back's
+            # already-cropped field. A removed back restores its reference.
+            if "fov_degrees" in pose and "back_reference_fov_degrees" not in pose:
+                pose_in.pop("back_reference_fov_degrees", None)
+            elif pose.get("camera_back", True) is None and "fov_degrees" not in pose:
+                pose_in["fov_degrees"] = camera_in.get("back_reference_fov_degrees", camera["fov_degrees"])
+            try:
+                resolved = _camera_config(pose_in, resolution, spectral_root)
+                if float(np.linalg.norm(np.asarray(resolved["target_m"], np.float32) - np.asarray(resolved["eye_m"], np.float32))) <= 1e-6:
+                    raise ValueError("camera eye and target must differ at sensor precision")
+                resolved = apply_camera_back(resolved, pose_in.get("camera_back"), aspect,
+                                             pose_in.get("back_reference_fov_degrees"))
+            except ValueError as error:
+                raise PhotoError(f"camera_poses[{index}]: {error}") from None
+            cameras.append(resolved)
+        config["camera_poses"] = cameras
     return config, seconds
 
 
