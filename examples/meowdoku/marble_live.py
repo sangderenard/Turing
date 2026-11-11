@@ -7,6 +7,8 @@ import time
 from .marble_photo import PhotoError, _number, _finite_vectors, _DIGEST
 from .marble_lens_contract import FOV_MIN_DEGREES, PUPIL_RADIUS_MAX_M, FOCUS_MIN_M, FOCUS_MAX_M, apply_lens_selection
 
+from .marble_camera_back import apply_camera_back
+
 LEASE_SECONDS = 30
 MAX_HISTORY_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_RAY_BATCH_SIZE = 8192
@@ -124,7 +126,7 @@ def update_live(jobs, digest, value):
             for key in ("eye_m", "target_m"):
                 if key in updates:
                     camera[key] = _finite_vectors(updates[key], 3, "camera." + key)
-            for key, bounds in {"fov_degrees": (FOV_MIN_DEGREES,100), "focus_distance_m": (FOCUS_MIN_M,FOCUS_MAX_M),
+            for key, bounds in {"fov_degrees": (.001 if updates.get("camera_back", camera.get("camera_back")) is not None else FOV_MIN_DEGREES,100), "focus_distance_m": (FOCUS_MIN_M,FOCUS_MAX_M),
                                 "aperture_radius_m": (1e-5,PUPIL_RADIUS_MAX_M)}.items():
                 if key in updates:
                     camera[key] = _number(updates[key], *bounds, "camera." + key)
@@ -142,6 +144,11 @@ def update_live(jobs, digest, value):
             # Resizing the sensor is a new immutable scene job, not a control edit.
             if (settings["width"], settings["height"]) != (current["live"]["width"], current["live"]["height"]):
                 raise PhotoError("live viewport size changed; restart the live view", 409)
+            try:
+                camera = apply_camera_back(camera, updates.get("camera_back", camera.get("camera_back")),
+                                           settings["aspect"], updates.get("back_reference_fov_degrees"))
+            except ValueError as error:
+                raise PhotoError(str(error)) from None
             next_control.update(camera=camera, live=settings, revision=revision)
         next_control["expires_at"] = time.time() + LEASE_SECONDS
         temporary = directory / "live-control.json.tmp"
