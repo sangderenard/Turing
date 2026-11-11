@@ -42,6 +42,26 @@ glsl, wgsl, sympy known but no reader, so no portals). Fixture gained two C++
 files. `tests/test_repo_world_scan.py` + `tests/test_repo_world_workspace.py`:
 5 passed in 5.3 s.
 
+2026-11-11, dream interpreter (owner: "you touched it, it's yours"): measured
+every language route of `src/compiler/dream_document.py` block by block;
+report in `docs/DREAM_INTERPRETER_LIMITS.md`, pinned by
+`tests/test_dream_interpreter_limits.py` (8 passed). Baseline before edits:
+`tests/test_dream_document.py` 16 passed, `tests/test_dream_cpp_pipeline.py`
+FAILED on this autocrlf checkout with pycparser `Illegal character '\r'`;
+with the committed LF bytes it fails instead at
+`topological_reducer._set_operands:3697` "no operand-position scope" (gate
+from 8af44b07, 2026-10-17). That C-route failure is on main for every C
+block that parses and is NOT fixed here (operand-position-writer migration).
+Repaired: (1) `compile_sections` opens an identity book per block — a `with`
+refusal poisoned every later Python block in the process with a
+`native_exception_control_gap disagreement`; (2) desugarer drops `#include`,
+refuses other directives, rewrites `C c(3);` to `C c = C__new(3);`, and no
+longer emits `None__method` for an unknown receiver; (3) JavaScript route
+sees `export`ed and destructured declarations; (4) `.gitattributes`:
+`*.dream text eol=lf`. After edits: 31 passed, 1 failed (the C-route gate).
+Real Python-route limits: `raise`, `try`, `with` refused by the declared
+exception/resource gap; everything else probed admits.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

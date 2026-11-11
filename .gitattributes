@@ -4,3 +4,10 @@
 # stopped before the first test.  These files are shell input and require LF.
 tools/gate/*.sh text eol=lf
 tools/gate/*.txt text eol=lf
+
+# Dream documents hash their payload bytes (sha256 sentinel, card cache_key) and
+# the C++-shell route hands the text to pycparser, which refuses a carriage
+# return.  Measured 2026-11-11: an autocrlf checkout turned every .dream example
+# into CRLF, changed every content hash, and failed tests/test_dream_cpp_pipeline.py
+# with "Illegal character '\r'".  Dream sources are LF on disk.
+*.dream text eol=lf

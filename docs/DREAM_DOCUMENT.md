@@ -130,3 +130,9 @@ The emitter validates tape dependencies while rebuilding the executor, then
 embeds and publishes its newest `TMSNAP01` buffer on page load. This makes a
 self-contained examination artifact. It does not claim that the browser can
 continue the guest until a compiled machine-program host is attached.
+
+## Measured limits
+
+What each language route reaches today, what it refuses, and where the C++
+route stops, is measured and pinned in `DREAM_INTERPRETER_LIMITS.md` and
+`tests/test_dream_interpreter_limits.py` (2026-11-11).
