@@ -87,6 +87,7 @@ from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe ow
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
+from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
 from meowdoku import divider_intake as divider_intake_mod  # noqa: E402  [DIVIDER] source-divider intake and status (no worker)
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
@@ -1076,6 +1077,65 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
         # ---- end [WORLDMAP]
 
+        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
+        # web/nodus.html).  Read-only view of a running Nodus canvas host's console: capability dev_ui; share also needs `message`.  No action reaches a canvas.
+        def _nodus_db(self):
+            import sqlite3
+            return sqlite3.connect(Path(sessions.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
+
+        def _nodus_get(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            if not self._require("dev_ui"):
+                return
+            self._set_cookie = []
+            name = path[len("/api/nodus/"):]
+            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract"):
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            try:
+                db = self._nodus_db()
+            except Exception:
+                return self._json({"error": "the supervisor records are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                if name == "instances":
+                    return self._json({"instances": nodus_mod.instances(db, sessions.state)})
+                inst = query.get("instance") or None
+                if name == "abstract":
+                    g = nodus_mod.graph(db, sessions.state, inst)
+                    g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
+                    return self._json({"instance": g["instance"], "revision": g.get("revision"),
+                                       "nodes": nodus_mod.as_generic_graph(g, g["instance"])})
+                return self._json(getattr(nodus_mod, name)(db, sessions.state, inst))
+            except nodus_mod.NodusError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+
+        def _nodus_post(self, path: str) -> None:
+            if path != "/api/nodus/share":
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            if not self._require("dev_ui") or not self._require("message"):
+                return
+            self._set_cookie = []
+            if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                self.close_connection = True
+                return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            body = self._body_json(4096)
+            if body is None:
+                return
+            try:
+                db = self._nodus_db()
+            except Exception:
+                return self._json({"error": "the supervisor records are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                return self._json(nodus_mod.share(db, sessions.state, sessions.accounts_db, self._principal().user_id,
+                                                  body.get("instance") or None, body.get("to"), body.get("note", "")))
+            except nodus_mod.NodusError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+        # ---- end [NODUS]
+
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
         _MATHLAB_FILES = ("law.at.py", "law.numpy.py", "law.abi.json", "law.wgsl.abi.json", "law.api.yaml")
@@ -1734,6 +1794,8 @@ def make_handler(sessions: Sessions):
                 return self._profile_route(path, "GET")
             if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
                 return self._worldmap_get(path)
+            if path.startswith("/api/nodus/"):                    # [NODUS]
+                return self._nodus_get(path)
             if path.startswith("/api/mathlab/"):                  # [MATHLAB]
                 return self._mathlab_get(path)
             if path.startswith("/api/divider/"):                  # [DIVIDER]
@@ -2172,6 +2234,8 @@ def make_handler(sessions: Sessions):
                 return self._issues_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
+            if path0.startswith("/api/nodus/"):                # [NODUS]
+                return self._nodus_post(path0)
             if path0.startswith("/api/profile/"):              # [PROFILE]
                 return self._profile_route(path0, "POST")
             if path0.startswith("/api/mathlab/"):              # [MATHLAB]

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nodus graph</title>
+<style>
+  :root { color-scheme: dark; --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:78rem; margin:0 auto; padding:1rem 16px 4rem; }
+  a { color:var(--acc); }
+  h1 { font-size:1.3rem; margin:.4rem 0; } h2 { font-size:1.05rem; margin:1.2rem 0 .4rem; }
+  code, pre, .mono { font:13px ui-monospace, Consolas, monospace; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.6rem 1rem; }
+  .bar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin:.6rem 0; }
+  select, input, button { font:inherit; padding:.35rem .7rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); max-width:100%; }
+  button { cursor:pointer; }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; background:var(--card); }
+  th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  .mut { color:var(--mut); } .bad { color:#ff8a80; } [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="/browse">Back to browse</a></nav>
+  <h1>Nodus graph</h1>
+  <p class="mut">This page shows the graph of the system. It does not draw the canvas.</p>
+  <p id="status" class="mut" role="status">Loading...</p>
+  <div class="bar"><label for="instance">Instance</label><select id="instance"></select></div>
+  <section id="digest" class="card mono"></section>
+
+  <h2>Modules</h2>
+  <div class="scroll"><table id="modules"><thead><tr><th>Module</th><th>Rows (tools, in order)</th><th>Exec mode</th><th>Place</th></tr></thead><tbody></tbody></table></div>
+
+  <h2>Edges</h2>
+  <div class="scroll"><table id="edges"><thead><tr><th>From</th><th>To</th><th>Token bytes</th><th>Slots</th><th>Fill</th></tr></thead><tbody></tbody></table></div>
+
+  <h2>Contract ports</h2>
+  <div class="scroll"><table id="ports"><thead><tr><th>Prefix</th><th>Capacity</th><th>Listen port</th><th>Loan ticks</th><th>Edge</th></tr></thead><tbody></tbody></table></div>
+  <h2>Compile hosts</h2>
+  <div class="scroll"><table id="hosts"><thead><tr><th>Prefix</th><th>Host</th><th>Accepted</th><th>Completed</th><th>Refused</th><th>Acknowledged</th><th>In flight</th></tr></thead><tbody></tbody></table></div>
+
+  <h2>Tools</h2>
+  <div class="bar"><input id="filter" type="search" placeholder="Filter tools" aria-label="Filter tools"><span id="toolcount" class="mut"></span></div>
+  <div class="scroll"><table id="tools"><thead><tr><th>Name</th><th>Plugin</th><th>Source</th><th>Description</th></tr></thead><tbody></tbody></table></div>
+
+  <h2>Generic graph</h2>
+  <p id="generic" class="mut"></p>
+  <div class="bar"><button id="copy" type="button">Copy the JSON</button><span id="copied" class="mut"></span></div>
+
+  <section id="share" hidden>
+    <h2>Share with a contact</h2>
+    <form id="shareform" class="bar">
+      <input id="to" placeholder="Contact username" aria-label="Contact username" required>
+      <input id="note" placeholder="Note (up to 500 characters)" aria-label="Note" maxlength="500" size="40">
+      <button type="submit">Send the digest</button>
+      <span id="shared" class="mut" role="status"></span>
+    </form>
+    <p class="mut">Sends one plain-text message with the digest summary to a mutual contact. Nothing else is shared.</p>
+  </section>
+</main>
+<script type="module" src="/nodus.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+</body>
+</html>

@@ -54,13 +54,18 @@
       "route": "",
       "bind": "127.0.0.1",
       "account": "svc-nodus-messenger",
-      "args": [],
+      "args": [
+        "--compile-host",
+        "gui.proof:7001:C:/dev/Powershell/srv/state/jobs/nodus-compile",
+        "--compile-python",
+        "C:/dev/Powershell/srv/python/python.exe"
+      ],
       "leases": [],
       "nodus": {
         "tool": "C:/dev/Powershell/nodus/tools/run_canvas.py",
         "canvas": "build/meowdoku/canvas/messenger.canvas",
         "acquire": [
-          "gui.proof:4"
+          "gui.proof:4:54000"
         ],
         "rate": 60,
         "console_port": 47612,
