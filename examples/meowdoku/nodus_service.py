@@ -349,6 +349,61 @@ def as_generic_graph(graph_json, instance) -> list:
     return nodes
 
 
+def as_living_map(graph_json, instance) -> dict:
+    """The GRAPH reply as the EXISTING ``abstract-ui-div-map-v0`` object the Living Data endpoints accept (/api/living-data/{query,sessions}).
+
+    Same form the Karate Club test builds for an arbitrary graph (tests/test_living_data_cursor.py karate_map): the canvas is the map's own
+    identity, every other node is a flat entry of ``regions`` (identity, kind, name), and each relationship is a ``tracks`` record
+    ``{source, target, relationship}``.  Targets the LAYOUT layer (the default): it reads regions plus tracks, which is what a graph with no
+    world.objects and no physical positions is; the world layer would read object records and implies bodies this canvas does not have.
+    Identities are exactly those ``as_generic_graph`` produces (this function derives from its output): canvas, module, row, contract-port.
+    Edges and contacts are not nodes here; an edge becomes a walkable ``feeds`` track from the module at its ``from`` end to the module at
+    its ``to`` end (a walker standing on the target sees it as an ``incoming feeds`` exit, so direction is the edge's own).  Relationships:
+    ``contained-by`` (module/row/port -> its parent, as in the generic graph; the reverse is how a walker goes down), ``feeds``,
+    and ``bound-on`` (contract port -> each module at an end of the edge it is bound to).
+    """
+    nodes = as_generic_graph(graph_json, instance)
+    by_id = {n["identity"]: n for n in nodes}
+    root = next(n["identity"] for n in nodes if n["kind"] == "canvas")
+
+    def parent(identity):
+        return next((d["target"] for d in by_id[identity]["dependencies"] if d["relationship"] == "contained-by"), None)
+
+    def ends(edge_id):
+        """(from module, to module) of a generic-graph edge node, through its contacts' contained-by."""
+        found = {d["relationship"]: parent(d["target"]) for d in by_id[edge_id]["dependencies"] if d["relationship"] != "contained-by"}
+        return found.get("from-contact"), found.get("to-contact")
+
+    regions, tracks = [], []
+
+    def track(source, target, relationship):
+        tracks.append({"source": source, "target": target, "relationship": relationship})
+
+    for n in nodes:
+        if n["kind"] not in ("module", "row", "contract-port"):
+            continue
+        name = n["name"]
+        if n["kind"] == "row":
+            index = n["identity"].rsplit("/r", 1)[1]
+            name = f"row {index}: {name}" if name != f"row {index}" else name
+        regions.append({"identity": n["identity"], "kind": n["kind"], "name": name, "buildings": []})
+        track(n["identity"], parent(n["identity"]), "contained-by")
+    for n in nodes:
+        if n["kind"] == "edge":
+            source, target = ends(n["identity"])
+            if source and target:
+                track(source, target, "feeds")
+        elif n["kind"] == "contract-port":
+            for d in n["dependencies"]:
+                if d["relationship"] == "bound-to" and by_id[d["target"]]["kind"] == "edge":
+                    for module in ends(d["target"]):
+                        if module:
+                            track(n["identity"], module, "bound-on")
+    canvas = by_id[root]
+    return {"schema": "abstract-ui-div-map-v0", "identity": root, "kind": "canvas", "name": canvas["name"],
+            "regions": regions, "tracks": tracks}
+
+
 # ---- sharing --------------------------------------------------------------------------------------------------------------------
 def summary_line(d) -> str:
     d = d if isinstance(d, dict) else {}

@@ -1090,7 +1090,7 @@ def make_handler(sessions: Sessions):
             self._set_cookie = []
             name = path[len("/api/nodus/"):]
             query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
-            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract"):
+            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map"):
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             try:
                 db = self._nodus_db()
@@ -1105,6 +1105,11 @@ def make_handler(sessions: Sessions):
                     g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
                     return self._json({"instance": g["instance"], "revision": g.get("revision"),
                                        "nodes": nodus_mod.as_generic_graph(g, g["instance"])})
+                if name == "map":      # the graph as the Living Data map (nodus_service.as_living_map); enter at "at" via /api/living-data/sessions
+                    g = nodus_mod.graph(db, sessions.state, inst)
+                    g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
+                    living = nodus_mod.as_living_map(g, g["instance"])
+                    return self._json({"instance": g["instance"], "revision": g.get("revision"), "at": living["identity"], "map": living})
                 return self._json(getattr(nodus_mod, name)(db, sessions.state, inst))
             except nodus_mod.NodusError as error:
                 return self._json({"error": error.message}, error.status)

@@ -58,3 +58,25 @@ Polling faster than the cache TTL costs nothing extra at the console.
 ## Not provided
 No actions (nothing here can change a canvas, start, stop or edit anything), no pixels or layout, no token or token path, no links.
 Hosts without the v2 verbs answer 501; `instances` still works.
+
+## Walking the live canvas
+`GET /api/nodus/map?instance=` (capability `dev_ui`, no-store) returns `{instance, revision, at, map}`: the graph as the existing
+`abstract-ui-div-map-v0` object (`nodus_service.as_living_map`, layout layer: regions plus tracks, as the Karate Club test builds it), with the
+same identities as `abstract`. Relationships: `contained-by` (module/row/port to its parent; the walker going down sees it as incoming),
+`feeds` (module to the module at the other end of an edge; incoming on the target is the way back), `bound-on` (contract port to the modules at
+the ends of its edge). The Living Data cursor endpoints (need `dev_ui` and a signed-in account) do the walking:
+
+| verb | endpoint |
+|---|---|
+| look | `POST /api/living-data/query` |
+| enter | `POST /api/living-data/sessions` (map and `at` from `/api/nodus/map`) |
+| where | `GET /api/living-data/sessions/{id}` |
+| go | `POST /api/living-data/sessions/{id}/move` |
+| leave | `POST /api/living-data/sessions/{id}/close` |
+
+Walker: `python deploy/agent_walker.py --base https://HOST:8766 --user NAME [--password-file F | --state-dir D] enter [--instance N] [--at ID]`,
+then `where`, `go N` or `go --to ID [--relationship R --direction D]`, `look [--radius K]`, `leave`; `--json` prints the raw response. The
+cursor id and map are kept in a temp-directory file keyed by base URL and user. The web page has the same walk in its "Walk" panel.
+
+This is NOT: the cursor is graph position only. Nothing on the canvas is invoked, held or changed; no time advances. It does not survive a
+server restart, and there is one cursor per account (`leave` before entering again).

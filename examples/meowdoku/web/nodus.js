@@ -179,6 +179,97 @@ async function share(event) {
   }
 }
 
+// ---- Walk: the account's Living Data graph cursor over the canvas (/api/nodus/map, /api/living-data/sessions...).  Graph position only.
+const walk = { id: null, revision: null, map: null };
+const rid = (prefix) => prefix + "-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+async function send(path, body) {
+  try {
+    const response = await fetch(path, {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await response.json(); } catch (_) { /* not JSON */ }
+    return { status: response.status, body: data };
+  } catch (_) {
+    return { status: 0, body: null };
+  }
+}
+
+export function exitLabel(number, item, names) {
+  return number + ". " + item.relationship + " " + item.direction + " -> " + ((names && names[item.to]) || item.to) + " [" + item.to + "]";
+}
+
+function walkNames() {
+  const names = {};
+  const m = walk.map;
+  if (m) { names[m.identity] = m.name || m.identity; for (const r of m.regions || []) names[r.identity] = r.name || r.identity; }
+  return names;
+}
+
+function walkSay(text) { $("walkstatus").textContent = text; }
+
+function drawWalk(cursor) {
+  const inside = Boolean(cursor);
+  $("walkenter").hidden = inside;
+  $("walkleave").hidden = !inside;
+  $("walkhere").hidden = !inside;
+  const box = $("walkexits");
+  box.replaceChildren();
+  if (!inside) return;
+  walk.id = cursor.session_id;
+  walk.revision = cursor.revision;
+  $("walkhere").textContent = cursor.text;
+  const names = walkNames();
+  (cursor.exits || []).forEach((item, i) => {
+    const b = el("button", exitLabel(i + 1, item, names));
+    b.type = "button";
+    b.addEventListener("click", () => walkGo(item));
+    box.append(b);
+  });
+}
+
+async function walkEnter() {
+  walkSay("Entering...");
+  const found = await get(q("/api/nodus/map"));
+  if (found.status !== 200) { walkSay(explain(found, "map")); return; }
+  const res = await send("/api/living-data/sessions", { map: found.body.map, at: found.body.at, request_id: rid("walk") });
+  if (res.status !== 201) {
+    walkSay(res.status === 409 ? "This account already has a cursor from another session; it cannot be closed from here." : explain(res, "enter"));
+    return;
+  }
+  walk.map = found.body.map;
+  walkSay("");
+  drawWalk(res.body);
+}
+
+async function walkGo(item) {
+  const res = await send("/api/living-data/sessions/" + walk.id + "/move",
+    { to: item.to, relationship: item.relationship, direction: item.direction, expected_revision: walk.revision, request_id: rid("move") });
+  if (res.status === 200) { walkSay(""); drawWalk(res.body); return; }
+  walkSay((res.body && res.body.error) || "Move failed (" + res.status + ").");
+  const now = await get("/api/living-data/sessions/" + walk.id);
+  if (now.status === 200) drawWalk(now.body); else drawWalk(null);
+}
+
+async function walkLeave() {
+  const res = await send("/api/living-data/sessions/" + walk.id + "/close", { expected_revision: walk.revision });
+  walkSay(res.status === 200 || res.status === 404 ? "Left." : (res.body && res.body.error) || "Failed (" + res.status + ").");
+  if (res.status === 200 || res.status === 404) { walk.id = null; drawWalk(null); }
+}
+
+async function setupWalk() {
+  const res = await get("/api/whoami");
+  const who = res.status === 200 && res.body ? res.body : null;
+  if (!who || !(who.capabilities || []).includes("dev_ui")) return;
+  $("walk").hidden = false;
+  if (!who.signed_in) { $("walknote").hidden = false; return; }
+  $("walkbar").hidden = false;
+  $("walkenter").addEventListener("click", walkEnter);
+  $("walkleave").addEventListener("click", walkLeave);
+}
+
 async function copyJson() {
   const text = JSON.stringify((state.abstract && state.abstract.nodes) || [], null, 1);
   try { await navigator.clipboard.writeText(text); $("copied").textContent = "Copied."; }
@@ -191,6 +282,7 @@ async function main() {
   $("copy").addEventListener("click", copyJson);
   $("shareform").addEventListener("submit", share);
   if (await whoamiHasMessage()) $("share").hidden = false;
+  await setupWalk();
   await loadInstances();
   setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 2000);
 }

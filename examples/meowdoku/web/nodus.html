@@ -50,6 +50,19 @@
   <p id="generic" class="mut"></p>
   <div class="bar"><button id="copy" type="button">Copy the JSON</button><span id="copied" class="mut"></span></div>
 
+  <section id="walk" hidden>
+    <h2>Walk</h2>
+    <p id="walknote" class="mut" hidden>Sign in to walk the graph: a cursor belongs to an account.</p>
+    <div id="walkbar" class="bar" hidden>
+      <button id="walkenter" type="button">Enter</button>
+      <button id="walkleave" type="button" hidden>Leave</button>
+      <span id="walkstatus" class="mut" role="status"></span>
+    </div>
+    <p id="walkhere" class="card" hidden></p>
+    <div id="walkexits" class="bar"></div>
+    <p class="mut">The cursor is graph position only: nothing on the canvas is invoked, held or changed. One cursor per account; a server restart ends it.</p>
+  </section>
+
   <section id="share" hidden>
     <h2>Share with a contact</h2>
     <form id="shareform" class="bar">
