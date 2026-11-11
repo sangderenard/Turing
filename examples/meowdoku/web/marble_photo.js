@@ -1,3 +1,4 @@
+import {cameraWithBack} from "./marble_camera_back.js";
 import {FOCAL_MAX_M, fovFromFocal} from "./marble_lens_controls.js";
 // Upload the exact saved Studio triangles to the Spectral thin-lens worker.
 // The server verifies this mesh against the saved object's geometry receipt.
@@ -181,6 +182,13 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
+  if(config.camera.camera_back){
+    let aspect=(config.camera.width??config.camera.resolution)/(config.camera.height??config.camera.resolution);
+    // Live's existing shader uses the viewport aspect; its integer pixel grid
+    // is only a sampling lattice, displayed back into that same viewport.
+    if(options.live)aspect=options.live.aspect??1;
+    config.camera=cameraWithBack(config.camera,config.camera.camera_back,aspect);
+  }
   if (options.clientIntersections) {
     if (!clientIntersectionEligible({transport:config.transport, orbitFrames:config.orbit_frames, resolution:config.camera.resolution, live:options.live})) throw new Error("Device intersections require RGB transport, one frame, and a listed resolution.");
     config.client_intersections = true;

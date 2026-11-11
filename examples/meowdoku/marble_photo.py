@@ -33,6 +33,8 @@ from PIL.PngImagePlugin import PngInfo
 
 from .marble_lens_contract import FOV_MIN_DEGREES, PUPIL_RADIUS_MAX_M, FOCUS_MIN_M, FOCUS_MAX_M, FOCUS_SEMANTICS, SPECTRAL_ROOT, apply_lens_selection
 
+from .marble_camera_back import apply_camera_back
+
 MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 MAX_TRIANGLES = 500_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -167,7 +169,7 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         "resolution": resolution,
         "eye_m": _finite_vectors(camera_in.get("eye_m", [0, 0, .07]), 3, "camera.eye_m"),
         "target_m": _finite_vectors(camera_in.get("target_m", [0, 0, .18]), 3, "camera.target_m"),
-        "fov_degrees": _number(camera_in.get("fov_degrees", 36), FOV_MIN_DEGREES, 100, "camera.fov_degrees"),
+        "fov_degrees": _number(camera_in.get("fov_degrees", 36), .001 if camera_in.get("camera_back") is not None else FOV_MIN_DEGREES, 100, "camera.fov_degrees"),
         "aperture_radius_m": _number(camera_in.get("aperture_radius_m", .002), 1e-5, PUPIL_RADIUS_MAX_M, "camera.aperture_radius_m"),
         "focus_distance_m": _number(camera_in.get("focus_distance_m", .11), FOCUS_MIN_M, FOCUS_MAX_M, "camera.focus_distance_m"),
         "aperture_blades": int(_number(camera_in.get("aperture_blades", 0), 0, 16, "camera.aperture_blades")),
@@ -341,6 +343,14 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             raise PhotoError("invalid live view session")
         settings["session_id"] = session
         config["live"] = settings
+    # Optics use the complete image, never a tile's temporary allocation.
+    # Live's established shader contract uses the displayed viewport aspect.
+    aspect = config["live"]["aspect"] if "live" in config else camera.get("width", resolution) / camera.get("height", resolution)
+    try:
+        config["camera"] = apply_camera_back(camera, camera_in.get("camera_back"), aspect,
+                                             camera_in.get("back_reference_fov_degrees"))
+    except ValueError as error:
+        raise PhotoError(str(error)) from None
     return config, seconds
 
 
