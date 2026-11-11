@@ -4541,6 +4541,8 @@ function migrateLegacyPortalOpenings() {
         object_identity: host.identity, part_identity: opening.identity,
         ...(opening.pair ? {pair: opening.pair} : {}),
         ...(opening.transition ? {transition: opening.transition} : {}),
+        ...(opening.island ? {island: opening.island} : {}),
+        ...(opening.href ? {href: opening.href} : {}),
         ...(opening.aperture_class ? {aperture_class: opening.aperture_class} : {}),
         ...(opening.reference ? {reference: opening.reference} : {}),
         triangle_memberships: [], division: {operation: "legacy-opening-to-radial-chart",
@@ -8290,6 +8292,11 @@ function traversePortalBody(identity, position, velocity, radius = 0.001) {
     const localV = crossingOffset.reduce((sum, value, axis) => sum + value * source.bitangent[axis], 0);
     if (Math.hypot(localU, localV) > source.radius + radius) continue;
     const graphEdge = choosePortalGraphEdge(source.identity);
+    if (!graphEdge && source.island) {
+      if (leaveThroughIslandDoor(identity, source))
+        portalRuntime.cooldowns.set(identity, now + 8 * portalRuntime.cooldownMilliseconds);
+      continue;
+    }
     if (!graphEdge) { setPlacementStatus("IN splat has no OUT distribution yet"); continue; }
     portalRuntime.transits.set(identity, {edge: graphEdge.identity, source: source.identity,
       target: graphEdge.target, started: now,
@@ -8308,11 +8315,57 @@ function traversePortalBody(identity, position, velocity, radius = 0.001) {
   return false;
 }
 
+function islandArrivalPair() {
+  // #arrive=<pair>: the door this island was entered through, written by the island that was left.
+  try {
+    return new URLSearchParams(String(location.hash || "").replace(/^#/, "")).get("arrive") || null;
+  } catch (_) { return null; }
+}
+
+function completeIslandArrival(identity, position, velocity, radius) {
+  const pair = portalRuntime.arrival;
+  portalRuntime.arrival = null;
+  const target = pair && portalRuntime.splats.find(splat =>
+    splat.port_role === "out" && splat.pair === pair);
+  if (!target) return false;
+  const clearance = Math.max(0.09, radius + 0.035);
+  position.forEach((_, axis) => { position[axis] = target.center[axis] + target.normal[axis] * clearance; });
+  if (velocity) velocity.forEach((_, axis) => { velocity[axis] = 0; });
+  if (identity === viewportControls.policy?.actor) {
+    viewportControls.yaw = Math.atan2(target.normal[2], target.normal[0]);
+    cancelEntityNavigation(identity);
+  }
+  portalRuntime.lastPositions.set(identity, [...position]);
+  portalRuntime.cooldowns.set(identity, performance.now() + portalRuntime.cooldownMilliseconds);
+  synchronizePortalBody(identity, position, velocity);
+  return true;
+}
+
+function leaveThroughIslandDoor(identity, source) {
+  // The far end of this door is in another island: its own world, in its own document. Only the walker
+  // leaves; anything else stays in this island. A listener may cancel the navigation and load it itself.
+  if (identity !== viewportControls.policy?.actor) return false;
+  const detail = {island: source.island, pair: source.pair, source: source.identity,
+    href: source.href || null};
+  abstractUISystemTimer.issue({actor: identity, type: "leave-through-island-door",
+    source: source.identity, destination: source.island,
+    backing_graph: portalRuntime.graph.identity, issued_at: performance.now()});
+  let proceed = true;
+  try {
+    proceed = window.dispatchEvent(new CustomEvent("abstract-ui-island-door", {detail, cancelable: true}));
+  } catch (_) {}
+  if (proceed && source.href) location.assign(`${source.href}#arrive=${encodeURIComponent(source.pair)}`);
+  return true;
+}
+
 function updatePortalTraversals() {
   const playerIdentity = viewportControls.policy?.actor;
   if (playerIdentity && viewportControls.position) {
     const body = stateLoopRuntime.bodies.get(playerIdentity);
     const velocity = body?.velocity || [0, physicsRuntime.verticalVelocity, 0];
+    if (portalRuntime.arrival === undefined) portalRuntime.arrival = islandArrivalPair();
+    if (portalRuntime.arrival) completeIslandArrival(playerIdentity, viewportControls.position, velocity,
+      Number(model.viewer.camera.collision_radius || 0.001));
     if (traversePortalBody(playerIdentity, viewportControls.position, velocity,
         Number(model.viewer.camera.collision_radius || 0.001))) {
       const actor = entityState.get(playerIdentity);

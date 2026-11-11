@@ -159,3 +159,48 @@ def test_a_sheet_cannot_claim_a_doorway_that_was_never_cut():
     broken = replace(world, regions=(replace(region, buildings=(bad, *region.buildings[1:])), *world.regions[1:]))
     with pytest.raises(ValueError, match="not an opening minted"):
         document_geometry(world_div_map_model(broken, static_only=True))
+
+
+# ---- a door between islands: two worlds, each declaring its own half ----
+
+from src.compiler.abstract_ui_doorways import declare_island_door, declare_island_passage
+
+
+def test_an_island_door_is_declared_in_two_worlds_that_meet_on_the_pair():
+    outside = _world()
+    lot = outside.regions[0].buildings[0].identity
+    island = replace(build_introspective_world(Interior, seed="declared-openings-test"),
+                     identity="island:owner/name/src/x.py")
+    passage_region = island.regions[0].identity
+    door = door_identity(lot, island.identity)
+
+    outside_with = declare_island_door(outside, lot, island.identity, href="/islands/x.html")
+    island_with = declare_island_passage(island, passage_region, lot=lot, outside=outside.identity,
+                                         href="/outside.html")
+
+    lot_ends = _boxes(world_div_map_model(outside_with, static_only=True))[lot]["openings"][1:]
+    passage_ends = _boxes(world_div_map_model(island_with, static_only=True))[passage_region]["openings"][1:]
+    by_identity = {end["identity"]: end for end in lot_ends + passage_ends}
+    assert set(by_identity) == {f"{door}/enter:in", f"{door}/exit:out", f"{door}/enter:out", f"{door}/exit:in"}
+    # each pair has its `in` in one world and its `out` in the other
+    assert {end["identity"] for end in lot_ends} == {f"{door}/enter:in", f"{door}/exit:out"}
+    assert by_identity[f"{door}/enter:in"]["pair"] == by_identity[f"{door}/enter:out"]["pair"]
+    assert by_identity[f"{door}/exit:in"]["pair"] == by_identity[f"{door}/exit:out"]["pair"]
+    # an `in` end names the island its partner lives in; an `out` end names nothing
+    assert by_identity[f"{door}/enter:in"]["island"] == island.identity
+    assert by_identity[f"{door}/enter:in"]["href"] == "/islands/x.html"
+    assert by_identity[f"{door}/exit:in"]["island"] == outside.identity
+    assert by_identity[f"{door}/exit:in"]["href"] == "/outside.html"
+    for name in ("exit:out", "enter:out"):
+        assert "island" not in by_identity[f"{door}/{name}"] and "href" not in by_identity[f"{door}/{name}"]
+    assert all(end["facing"] == "inward" for end in passage_ends)
+    assert all(end["transition"] == "door" and "side" in end and "width" in end for end in by_identity.values())
+
+    with pytest.raises(ValueError):
+        declare_island_door(outside_with, lot, island.identity)
+    with pytest.raises(ValueError):
+        declare_island_door(outside, lot, outside.identity)
+    with pytest.raises(KeyError):
+        declare_island_passage(island, "region:nowhere", lot=lot, outside=outside.identity)
+    with pytest.raises(ValueError):
+        declare_island_passage(island_with, passage_region, lot=lot, outside=outside.identity)
