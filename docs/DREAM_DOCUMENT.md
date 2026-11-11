@@ -145,6 +145,10 @@ pair together and keeps the byte. Any bytes can be carried as a block under `enc
 
 The source divider (`examples/meowdoku/source_divider.py`) takes a dream document in and writes one out.
 
+This record is the COMPILED UNITS stage. It is not the Goal document the owner named on 2026-11-11: the units are
+each buildable alone, and they have not had their linking done (a part that calls another carries that other's text
+inside its own closure). See the SpeakToMe repository, `AGENTS/conceptual_flags/Goal_Document.md`.
+
 - In: `intake_dream`. Each python block becomes one source file and is divided on its own. Blocks in other languages
   are not divided; they are carried into the record unchanged. Blocks an earlier pass produced (`role = lowering` or
   `role = job-record`) are dropped, so a record can be fed back in.
