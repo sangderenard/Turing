@@ -75,7 +75,9 @@ SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
 # GET routing only: the photo handlers still require photo_read and check ownership.
 PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/marble_photo",
                    "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation")
-SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim") + PHOTO_READ_APIS
+# /api/reviews/standing answers accepted true/false for one commit id and how to get a review; the review-gate
+# check on GitHub asks it from outside with no account (branch_review.http_route). It reads no identity and no row's text.
+SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim", "/api/reviews/standing") + PHOTO_READ_APIS
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.
 EDIT_ACTIONS = frozenset({"demo_learning", "arena_save", "arena_stop", "arena_resume", "lichess_pause", "lichess_resume", "pilot_arch"})
