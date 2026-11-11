@@ -1,26 +1,25 @@
-"""Clone the whole workspace from GitHub in its on-disk layout, then scan it.
+"""Scan the whole workspace from GitHub in its on-disk layout.
 
 The owner's workspace is one root repository (``nogodsnomasters``) whose
 child directories are independent repositories with their own GitHub
-remotes.  The world map must come from GitHub, never from the local disk, so
-this module has three steps:
+remotes.  The world map must come from GitHub, never from the local disk.
 
-1. ``discover``  reads ONLY git metadata of the local tree (which directories
-   are repositories, each one's remote URL and current branch) and writes a
-   manifest.  No file contents are read.  Git worktrees (a ``.git`` file, not
-   a directory) are skipped: they are views of another entry.  A repository
-   without a remote is skipped with a note: GitHub cannot serve it.
-2. ``clone``     recreates the layout under a fresh destination directory
-   from the manifest with shallow clones (one commit each, Git LFS smudge
-   disabled), root first, children inside it.  Nothing is copied from disk.
-3. ``scan``      runs :func:`repo_world_scan.scan_repository` on every clone
-   and returns one workspace record set: each repository's scan plus a
-   ``mounts`` table saying which root-repository region each child
-   repository's root region sits inside.
+The manifest (which directories are repositories, each one's GitHub URL and
+branch) is a personal asset: it describes the owner's disk.  It is never
+committed here.  ``discover`` reads ONLY git metadata of the local tree (no
+file contents; git worktrees and remote-less repositories are skipped with a
+note) and the result either stays in memory for one scan or is written where
+the call names.  ``scan`` streams every repository from its remote
+(:func:`repo_world_scan.scan_remote_repository`: nothing is cloned, nothing
+lands on disk) and returns one workspace record set: each repository's scan
+plus a ``mounts`` table saying which root-repository region each child
+repository's root region sits inside.  ``clone`` exists only for a call that
+asks for the layout on disk; the scan never uses it.
 
-    python -m src.compiler.repo_world_workspace discover C:/dev/Powershell docs/repo_world_workspace.json
-    python -m src.compiler.repo_world_workspace clone docs/repo_world_workspace.json <dest>
-    python -m src.compiler.repo_world_workspace scan docs/repo_world_workspace.json [--json]
+    python -m src.compiler.repo_world_workspace scan --discover C:/dev/Powershell [--json | --out <file>]
+    python -m src.compiler.repo_world_workspace discover C:/dev/Powershell <manifest.json>
+    python -m src.compiler.repo_world_workspace scan <manifest.json> [--json | --out <file>]
+    python -m src.compiler.repo_world_workspace clone <manifest.json> <dest>
 """
 
 from __future__ import annotations
@@ -32,11 +31,11 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
-import tempfile
 from typing import Any, Iterable
 
 from .repo_world_scan import (
-    RepoScanError, RepoWorldScan, region_identity, scan_repository,
+    RepoScanError, RepoWorldScan, region_identity, scan_remote_repository,
+    scan_repository,
 )
 
 REPO_WORLD_WORKSPACE_VERSION = "repo-world-workspace-v0"
@@ -236,20 +235,46 @@ def scan_workspace_clone(destination: str | Path, manifest: WorkspaceManifest, n
     return WorkspaceScan(tuple(scans), tuple(collected))
 
 
-def scan_workspace(manifest: WorkspaceManifest) -> WorkspaceScan:
-    """Clone the manifest into a temporary directory, scan everything, delete it."""
+def scan_workspace(manifest: WorkspaceManifest, *, strict: bool = False) -> WorkspaceScan:
+    """Stream every repository of the manifest from its remote and scan it.
 
-    with tempfile.TemporaryDirectory(prefix="repo-world-workspace-") as tmp:
-        dest = Path(tmp) / "workspace"
-        notes = clone(manifest, dest)
-        return scan_workspace_clone(dest, manifest, notes)
+    Nothing is cloned and nothing is written: each repository's tree passes
+    through :func:`scan_remote_repository` once.  A repository the remote will
+    not serve is a note (or, with ``strict``, the error).
+    """
+
+    scans = []
+    notes: list[str] = []
+    for item in sorted(manifest.repositories, key=lambda r: (r.path != ".", r.path)):
+        try:
+            scans.append((item.path, scan_remote_repository(item.clone_url, ref=item.ref)))
+        except RepoScanError as exc:
+            if strict:
+                raise
+            notes.append(f"{item.path}: not scanned: {exc}")
+    return WorkspaceScan(tuple(scans), tuple(notes))
+
+
+def scan_workspace_root(workspace_root: str | Path, *, exclude: Iterable[str] = (),
+                        strict: bool = False) -> WorkspaceScan:
+    """Discover the layout and scan it in one call; the manifest never lands on disk."""
+
+    return scan_workspace(discover(workspace_root, exclude=exclude), strict=strict)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in args
     args = [a for a in args if a != "--json"]
-    usage = "\n".join(__doc__.strip().splitlines()[-3:])
+    out_path = None
+    if "--out" in args:
+        index = args.index("--out")
+        if index + 1 >= len(args):
+            print("--out needs a file path", file=sys.stderr)
+            return 2
+        out_path = args[index + 1]
+        del args[index:index + 2]
+    usage = "\n".join(__doc__.strip().splitlines()[-4:])
     try:
         if len(args) == 3 and args[0] == "discover":
             manifest = discover(args[1])
@@ -263,8 +288,20 @@ def main(argv: list[str] | None = None) -> int:
             for note in notes:
                 print(f"  failed {note}")
             return 1 if notes else 0
-        if len(args) == 2 and args[0] == "scan":
-            result = scan_workspace(WorkspaceManifest.read(args[1]))
+        if args[:1] == ["scan"] and len(args) in (2, 3):
+            if len(args) == 3 and args[1] == "--discover":
+                result = scan_workspace_root(args[2])
+            elif len(args) == 2:
+                result = scan_workspace(WorkspaceManifest.read(args[1]))
+            else:
+                print(usage, file=sys.stderr)
+                return 2
+            if out_path is not None:
+                Path(out_path).write_text(json.dumps(result.to_data(), indent=2) + "\n", encoding="utf-8")
+                print(f"{len(result.scans)} repositories -> {out_path}")
+                for note in result.notes:
+                    print(f"  note: {note}")
+                return 0
             if as_json:
                 json.dump(result.to_data(), sys.stdout, indent=2)
                 print()
@@ -285,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "MANIFEST_VERSION", "REPO_WORLD_WORKSPACE_VERSION", "WorkspaceManifest",
     "WorkspaceRepository", "WorkspaceScan", "clone", "discover", "github_https_url",
-    "scan_workspace", "scan_workspace_clone",
+    "scan_workspace", "scan_workspace_clone", "scan_workspace_root",
 ]
 
 

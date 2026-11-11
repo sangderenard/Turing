@@ -31,13 +31,19 @@ set describes a commit, never a working state.
 
 The sanctioned input is a GitHub repository, not the owner's local tree: the
 local scratch checkout is messy and holds things that must not be exposed.
-:func:`scan_github_repository` makes a fresh shallow clone of
-``https://github.com/<owner>/<repo>.git`` in a temporary directory (Git LFS
-smudge disabled, so no large binaries are fetched), scans it, and deletes the
-clone.  Only what GitHub serves can reach the record set.
+The source is a transient intermediary that passes through one operation
+(this scan) and is never kept, so it never touches the disk:
+:func:`scan_github_repository` streams the commit's tarball from the GitHub
+API through :mod:`tarfile`, keeping in memory only the paths and the text of
+the files a reader links (Python, JavaScript, dream documents);
+:func:`scan_remote_repository` does the same for any other git URL through
+``git archive --remote``.  Only what the remote serves can reach the record
+set.  The record set itself is returned to the caller; what the caller does
+with it is the call's own declaration (``--json`` to stdout, ``--out`` to a
+path the call names, or a user-space store the service owns).
 
-    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--json]
-    python -m src.compiler.repo_world_scan --path <clone-path> [--json]   # fixtures
+    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--json | --out <file>]
+    python -m src.compiler.repo_world_scan --path <checkout> [--json | --out <file>]   # fixtures
 """
 
 from __future__ import annotations
@@ -45,13 +51,14 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
-import tempfile
-from typing import Any, Iterable, Mapping
+import tarfile
+from typing import Any, Callable, Iterable, Mapping
+import urllib.error
+import urllib.request
 
 from .dream_document import (
     DREAM_LANGUAGE_TRANSLATIONS, DreamDocumentError, parse_dream_document,
@@ -59,6 +66,11 @@ from .dream_document import (
 
 REPO_WORLD_SCAN_VERSION = "repo-world-scan-v0"
 GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+GITHUB_CLONE_URL = re.compile(
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+GITHUB_API = "https://api.github.com"
+_USER_AGENT = "turing-repo-world-scan"
 
 # The known languages are the compiler's own table, DREAM_LANGUAGE_TRANSLATIONS
 # (each with its translation route).  This module adds two things that table
@@ -533,54 +545,52 @@ def _dream_claims(
     return claims, None
 
 
-def _read(clone: Path, path: str) -> str:
-    return (clone / path).read_text(encoding="utf-8", errors="replace")
+# Languages whose file bytes the scan reads at all; every other tracked file
+# is a room by name only and its bytes are never loaded.
+_READ_LANGUAGES = frozenset({"python", "javascript", "dream-document"})
+
+
+def _text(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="replace")
 
 
 # --- entry ---------------------------------------------------------------------
 
-def scan_repository(clone_path: str | Path) -> RepoWorldScan:
-    """Scan one clean clone into regions, rooms and portal pairs.
+def scan_files(
+    commit: str, origin: str | None, files: Iterable[str],
+    read: Callable[[str], bytes], notes: Iterable[str] = (),
+) -> RepoWorldScan:
+    """The scan itself, over a tree given as tracked paths and a byte reader.
 
-    Raises :class:`DirtyCloneError` when the tree has uncommitted or untracked
-    changes and :class:`RepoScanError` when the path is not a repository root.
+    Every entry point ends here.  ``read`` is called only for files in
+    :data:`_READ_LANGUAGES`; the reader may therefore hold just those bytes.
     """
 
-    clone = Path(clone_path)
-    if not clone.is_dir():
-        raise RepoScanError(f"{clone} is not a directory")
-    _require_clean_clone(clone)
-    commit = _git(clone, "rev-parse", "HEAD").strip()
-    origin_raw = subprocess.run(
-        ["git", "-C", str(clone), "config", "--get", "remote.origin.url"],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    origin = origin_raw.stdout.strip() or None
-
-    files = _tracked_files(clone)
+    files = tuple(sorted(files))
     tracked = frozenset(files)
     regions, rooms = _build_tree(commit, files)
 
     references: list[_Reference] = []
-    notes: list[str] = []
+    notes = list(notes)
     claims: list[RepoRoomClaim] = []
     room_by_path = {room.path: room for room in rooms}
     for path in files:
         language = _language(path)
+        if language not in _READ_LANGUAGES:
+            continue
+        raw = read(path)
         if language == "dream-document":
-            found, note = _dream_claims(
-                commit, path, (clone / path).read_bytes(), room_by_path[path],
-            )
+            found, note = _dream_claims(commit, path, raw, room_by_path[path])
             claims.extend(found)
             if note:
                 notes.append(note)
         elif language == "python":
-            refs, note = _python_references(path, _read(clone, path), tracked)
+            refs, note = _python_references(path, _text(raw), tracked)
             references.extend(refs)
             if note:
                 notes.append(note)
         elif language == "javascript":
-            references.extend(_javascript_references(path, _read(clone, path), tracked))
+            references.extend(_javascript_references(path, _text(raw), tracked))
 
     portals: list[RepoPortalPair] = []
     unresolved: list[RepoUnresolvedReference] = []
@@ -616,6 +626,62 @@ def scan_repository(clone_path: str | Path) -> RepoWorldScan:
     )
 
 
+def scan_repository(clone_path: str | Path) -> RepoWorldScan:
+    """Scan one clean checkout on disk (fixtures and explicit clones).
+
+    Raises :class:`DirtyCloneError` when the tree has uncommitted or untracked
+    changes and :class:`RepoScanError` when the path is not a repository root.
+    """
+
+    clone = Path(clone_path)
+    if not clone.is_dir():
+        raise RepoScanError(f"{clone} is not a directory")
+    _require_clean_clone(clone)
+    commit = _git(clone, "rev-parse", "HEAD").strip()
+    origin_raw = subprocess.run(
+        ["git", "-C", str(clone), "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    origin = origin_raw.stdout.strip() or None
+    return scan_files(
+        commit, origin, _tracked_files(clone), lambda path: (clone / path).read_bytes(),
+    )
+
+
+def scan_tar_stream(
+    commit: str, origin: str | None, stream: Any, *, mode: str = "r|",
+    strip_components: int = 0,
+) -> RepoWorldScan:
+    """Scan a tar archive of one commit as it streams past, keeping no file.
+
+    One pass: every regular file becomes a room by name; only the bytes of
+    files a reader links are held, and only until the scan returns.  Nothing
+    is written anywhere.  ``strip_components`` drops the leading directory a
+    GitHub tarball wraps the tree in.  Symbolic links and other non-regular
+    members are noted, not scanned.
+    """
+
+    paths: list[str] = []
+    contents: dict[str, bytes] = {}
+    notes: list[str] = []
+    with tarfile.open(fileobj=stream, mode=mode) as archive:
+        for member in archive:
+            parts = PurePosixPath(member.name).parts[strip_components:]
+            if not parts:
+                continue
+            path = "/".join(parts)
+            if member.isdir():
+                continue
+            if not member.isfile():
+                notes.append(f"{path}: not a regular file in the archive, not scanned")
+                continue
+            paths.append(path)
+            if _language(path) in _READ_LANGUAGES:
+                handle = archive.extractfile(member)
+                contents[path] = handle.read() if handle is not None else b""
+    return scan_files(commit, origin, paths, contents.__getitem__, notes)
+
+
 def github_clone_url(repository: str) -> str:
     """``owner/repo`` -> the public HTTPS clone URL.  Nothing else is accepted."""
 
@@ -626,44 +692,102 @@ def github_clone_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
-def scan_cloned_repository(clone_url: str, *, ref: str | None = None) -> RepoWorldScan:
-    """Clone ``clone_url`` fresh into a temporary directory, scan it, delete it.
-
-    The clone is shallow (one commit) and Git LFS smudge is disabled, so the
-    scan reads only the tracked tree at that commit and no large binaries.
-    The clone never persists; the record set names the commit it came from.
-    """
-
-    env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1", GIT_TERMINAL_PROMPT="0")
-    with tempfile.TemporaryDirectory(prefix="repo-world-scan-") as tmp:
-        clone = Path(tmp) / "clone"
-        command = ["git", "clone", "--quiet", "--depth", "1", "--no-tags"]
-        if ref:
-            command += ["--branch", ref]
-        command += [clone_url, str(clone)]
-        try:
-            subprocess.run(command, check=True, capture_output=True, text=True,
-                           encoding="utf-8", env=env)
-        except FileNotFoundError as exc:
-            raise RepoScanError("git is not on PATH") from exc
-        except subprocess.CalledProcessError as exc:
-            raise RepoScanError(
-                f"git clone of {clone_url}"
-                f"{' at ' + ref if ref else ''} failed: {exc.stderr.strip()}"
-            ) from exc
-        return scan_repository(clone)
+def _github_json(path: str) -> Any:
+    request = urllib.request.Request(
+        f"{GITHUB_API}/{path}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": _USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise RepoScanError(f"GitHub API {path}: HTTP {exc.code} {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RepoScanError(f"GitHub API {path}: {exc.reason}") from exc
 
 
 def scan_github_repository(repository: str, *, ref: str | None = None) -> RepoWorldScan:
-    """Scan ``owner/repo`` as GitHub serves it, never a local working tree."""
+    """Scan ``owner/repo`` as GitHub serves it, streamed, never on disk.
 
-    return scan_cloned_repository(github_clone_url(repository), ref=ref)
+    The commit is resolved first (``ref`` or the default branch), then that
+    exact commit's tarball is streamed from the API and scanned as it passes.
+    What the API excludes (``export-ignore`` paths) the scan never sees.
+    """
+
+    if not GITHUB_REPOSITORY.match(repository):
+        raise RepoScanError(f"{repository!r} is not a GitHub repository spelled owner/repo")
+    if ref is None:
+        ref = _github_json(f"repos/{repository}")["default_branch"]
+    commit = _github_json(f"repos/{repository}/commits/{ref}")["sha"]
+    request = urllib.request.Request(
+        f"{GITHUB_API}/repos/{repository}/tarball/{commit}",
+        headers={"User-Agent": _USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return scan_tar_stream(
+                commit, github_clone_url(repository), response, mode="r|gz",
+                strip_components=1,
+            )
+    except urllib.error.HTTPError as exc:
+        raise RepoScanError(f"GitHub tarball of {repository}@{commit[:12]}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RepoScanError(f"GitHub tarball of {repository}: {exc.reason}") from exc
+
+
+def scan_remote_repository(url: str, *, ref: str | None = None) -> RepoWorldScan:
+    """Scan any git URL as the remote serves it, streamed, never on disk.
+
+    A GitHub URL goes through :func:`scan_github_repository`.  Any other URL
+    (a ``file://`` fixture, another host) is resolved with ``git ls-remote``
+    and streamed with ``git archive --remote``; GitHub does not serve
+    ``upload-archive``, which is why it has its own lane.
+    """
+
+    github = GITHUB_CLONE_URL.match(url.strip())
+    if github:
+        return scan_github_repository(f"{github['owner']}/{github['repo']}", ref=ref)
+    name = ref or "HEAD"
+    try:
+        listing = subprocess.run(
+            ["git", "ls-remote", "--", url, name], capture_output=True, text=True,
+            encoding="utf-8", check=True,
+        ).stdout
+    except FileNotFoundError as exc:
+        raise RepoScanError("git is not on PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RepoScanError(f"git ls-remote {url}: {exc.stderr.strip()}") from exc
+    if not listing.strip():
+        raise RepoScanError(f"{url} serves no ref named {name!r}")
+    commit = listing.split()[0]
+    process = subprocess.Popen(
+        ["git", "archive", f"--remote={url}", "--format=tar", name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    try:
+        scan = scan_tar_stream(commit, url, process.stdout, mode="r|")
+    finally:
+        process.stdout.close()
+        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+        returncode = process.wait()
+    if returncode != 0:
+        raise RepoScanError(f"git archive --remote={url} {name}: {stderr.strip()}")
+    return scan
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in args
     args = [item for item in args if item != "--json"]
+    out_path = None
+    if "--out" in args:
+        index = args.index("--out")
+        if index + 1 >= len(args):
+            print("--out needs a file path", file=sys.stderr)
+            return 2
+        out_path = args[index + 1]
+        del args[index:index + 2]
     ref = None
     if "--ref" in args:
         index = args.index("--ref")
@@ -695,6 +819,10 @@ def main(argv: list[str] | None = None) -> int:
     except RepoScanError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
+    if out_path is not None:
+        Path(out_path).write_text(json.dumps(scan.to_data(), indent=2) + "\n", encoding="utf-8")
+        print(f"commit {scan.commit} -> {out_path}")
+        return 0
     if as_json:
         json.dump(scan.to_data(), sys.stdout, indent=2, sort_keys=False)
         print()
@@ -718,8 +846,8 @@ __all__ = [
     "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair", "language_table",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",
     "RepoWorldScan", "RepoRoomClaim", "claim_identity",
-    "github_clone_url", "region_identity", "room_identity",
-    "scan_cloned_repository", "scan_github_repository", "scan_repository",
+    "github_clone_url", "region_identity", "room_identity", "scan_files",
+    "scan_github_repository", "scan_remote_repository", "scan_repository", "scan_tar_stream",
 ]
 
 

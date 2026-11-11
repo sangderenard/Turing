@@ -120,54 +120,76 @@ Identities are keyed by the commit: `repo:<H>/dir:<path>`,
 
 The source is GitHub, not the owner's local filesystem. The local scratch
 tree is messy and holds things that must not be exposed, so the scanner's
-public entry is `scan_github_repository("owner/repo", ref=…)`: it makes a
-fresh shallow clone of `https://github.com/<owner>/<repo>.git` in a
-temporary directory, scans it, and deletes the clone. Only what GitHub
-serves can reach the record set. The compile step is one command:
+public entry is `scan_github_repository("owner/repo", ref=…)`. Only what
+GitHub serves can reach the record set. The compile step is one command:
 
 ```bash
 python -m src.compiler.repo_world_scan sangderenard/turing --ref main --json
 ```
 
-The record set names the commit the clone was at. Underneath,
-`scan_repository(path)` still checks that the path is a repository top level
-and that `git status --porcelain --untracked-files=all` is empty, refusing
-with `DirtyCloneError` otherwise; that guard is what makes the fresh clone
-the only thing the scan can describe. The `--path` form exists for fixture
-tests, not for the owner's checkout. Git LFS smudge is disabled during the
-clone so no large binaries are fetched; the scan reads text sources only.
+**Transient intermediaries never touch the disk (owner's direction,
+2026-11-11).** The source tree is used for exactly one operation, this
+scan, and is kept for nothing else, so it is streamed, not cloned:
+`scan_github_repository` resolves the commit through the GitHub API, then
+streams that commit's tarball through `tarfile` and scans it as it passes
+(`scan_tar_stream`). Only the paths and the bytes of files a reader links
+(Python, JavaScript, dream documents) are held, and only until the scan
+returns; every other file is a room by name and its bytes are never read.
+`scan_remote_repository(url)` does the same for any other git URL with
+`git ls-remote` + `git archive --remote` (GitHub does not serve
+`upload-archive`, hence two lanes); fixture tests use it over `file://`.
+What a remote excludes from archives (`export-ignore`) the scan never sees.
+Every lane ends in `scan_files(commit, origin, paths, read)`, so the stream
+lanes and the on-disk lane produce identical records for one commit (tested).
+
+`scan_repository(path)` remains for a checkout that already exists on disk
+(fixtures, or a clone a call asked for): it checks the path is a repository
+top level and that `git status --porcelain --untracked-files=all` is empty,
+refusing with `DirtyCloneError` otherwise. The `--path` form is for fixture
+tests, not for the owner's checkout.
+
+**The record set's retention is the call's declaration.** The scan returns
+records in memory. The CLI writes them only where told: `--json` to stdout,
+`--out <file>` to the path the call names. A user-space sink (the service's
+per-account workspace store, `examples/meowdoku/workspace_accounting.py` on
+main, whose `seal_and_submit(actor_id, workspace_id, files)` takes exactly a
+`{name: bytes}` map) is the service's call to make with an authenticated
+actor; the scanner does not import the service and does not pick a sink.
 
 ### The whole workspace, in its on-disk layout
 
 The owner's workspace is one root repository (`nogodsnomasters`) whose child
 directories are independent repositories. `src/compiler/repo_world_workspace.py`
-clones all of it from GitHub in that layout:
+scans all of it from GitHub in that layout:
 
 1. `discover` reads only git metadata of the local tree (which top-level
    directories are repositories, each one's remote URL normalised to GitHub
-   HTTPS, its current branch) and writes `docs/repo_world_workspace.json`.
-   No file contents are read. Git worktrees (a `.git` file) are skipped as
-   views of another entry; a repository with no remote is skipped with a
-   note. The committed manifest is the owner's to edit; its `ref` per entry
-   is what GitHub is asked for.
-2. `clone` recreates the layout under an empty destination with shallow
-   clones, root first, children inside it. Nothing is copied from disk.
-3. `scan` clones into a temporary directory, runs `scan_repository` on every
-   clone and emits one workspace record: each repository's scan plus a
-   `mounts` table saying which root-repository region each child
-   repository's root region (`dir:.`) is contained by.
+   HTTPS, its current branch). No file contents are read. Git worktrees (a
+   `.git` file) are skipped as views of another entry; a repository with no
+   remote is skipped with a note. The manifest is a **personal asset**: it
+   describes the owner's disk, so it is not committed to this repository
+   (the copy committed on 2026-11-11 was removed the same day). It stays in
+   memory for one scan (`scan --discover <root>`, `scan_workspace_root`) or
+   is written where the call names (`discover <root> <file>`).
+2. `scan` streams every repository from its remote with
+   `scan_remote_repository` (nothing cloned, nothing on disk) and emits one
+   workspace record: each repository's scan plus a `mounts` table saying
+   which root-repository region each child repository's root region
+   (`dir:.`) is contained by. A remote that will not serve is a note, or the
+   error with `strict`.
+3. `clone` recreates the layout under an empty destination with shallow
+   clones, root first, children inside it, for a call that asks for the
+   layout on disk. The scan never uses it.
 
 ```bash
-python -m src.compiler.repo_world_workspace scan docs/repo_world_workspace.json --json
+python -m src.compiler.repo_world_workspace scan --discover C:/dev/Powershell --json
 ```
 
-Manifest state at 2026-11-11: 15 repositories, 51 worktrees skipped. The
-root entry's ref was set to `nogodsnomasters` (the branch the root AGENTS.md
-names) rather than the session branch the checkout was on; `speaktome` is
-recorded on its session branch `codex/direct-x86-vocabulary-report`, which
-may not be the branch GitHub should serve. `pcb` points at the
-`electrofluid` repository, which may be private; a failed clone is a note,
-not a crash, unless `strict` is set.
+Layout as discovered 2026-11-11: 15 repositories, 51 worktrees skipped.
+`speaktome` sat on a session branch (`codex/direct-x86-vocabulary-report`),
+which may not be the branch GitHub should serve; `pcb` points at the
+`electrofluid` repository. The refs the scan asks for are whatever the
+discovered checkouts are on, unless a written manifest is edited first.
 
 ### Reference extraction
 
@@ -309,9 +331,10 @@ Nothing in `abstract_ui_*.py` was edited on this branch.
 
 ## 7a. Measurement of the whole workspace from GitHub (observed, 2026-11-11)
 
-`scan_workspace(docs/repo_world_workspace.json)`: all 15 repositories cloned
-and scanned from github.com, no failed clones (including `pcb` → electrofluid
-and `speaktome` on its session branch), 14 mounts, 235 s end to end.
+`scan_workspace(manifest)` (clone lane, since replaced by the stream lane):
+all 15 repositories cloned and scanned from github.com, no failed clones
+(including `pcb` → electrofluid and `speaktome` on its session branch), 14
+mounts, 235 s end to end.
 
 | repository | commit | regions | rooms | portal pairs | unresolved |
 |---|---|---|---|---|---|
@@ -340,6 +363,13 @@ worth reading before the world builder lays it out. C++ repositories
 ES-module imports are extracted (gap G).
 
 ## 7. Measurement on this repository (observed, 2026-11-10)
+
+Stream lane, 2026-11-11: `python -m src.compiler.repo_world_scan
+sangderenard/turing --ref main` streamed main at `5abc1165` from the GitHub
+API with nothing on disk in 34 s: 245 regions, 5,862 rooms, 15,378 portal
+pairs, 17,944 unresolved, 0 claimed rooms (no tracked `.dream` has a prose
+block yet). The clone lane it replaces took 47 s for the scan alone on an
+older commit (below), plus the clone.
 
 | quantity | value |
 |---|---|

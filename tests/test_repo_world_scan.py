@@ -1,6 +1,8 @@
 """Targeted test: a small fixture repository scanned into neutral world records."""
 
+import io
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,9 @@ from src.compiler.repo_world_scan import (
     DirtyCloneError,
     RepoScanError,
     github_clone_url,
-    scan_cloned_repository,
+    scan_remote_repository,
     scan_repository,
+    scan_tar_stream,
 )
 
 
@@ -149,25 +152,75 @@ def test_scan_refuses_uncommitted_and_untracked_changes(tmp_path):
         scan_repository(repo / "pkg")
 
 
-def test_fresh_clone_scan_sees_only_what_the_remote_serves(tmp_path):
+def test_remote_stream_scan_sees_only_what_the_remote_serves_and_touches_no_disk(tmp_path, monkeypatch):
     repo = _fixture_repo(tmp_path)
     committed = _git(repo, "rev-parse", "HEAD").strip()
     # Local, uncommitted mess that must never reach the map.
     (repo / "secret.txt").write_text("do not expose\n", encoding="utf-8")
     (repo / "app.py").write_text("import pkg.util  # local edit\n", encoding="utf-8")
+    # The source is a transient intermediary: nothing may be written anywhere.
+    import tempfile
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a temp dir was made"))
+    monkeypatch.setattr(tempfile, "mkstemp", lambda *a, **k: pytest.fail("a temp file was made"))
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
 
-    scan = scan_cloned_repository(repo.as_uri())
+    scan = scan_remote_repository(repo.as_uri())
 
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
     assert scan.commit == committed
+    assert scan.origin == repo.as_uri()
     assert "secret.txt" not in {r.path for r in scan.rooms}
     assert _portal_table(scan)[:2] == [
         ("app.py", 2, "pkg/core.py", "python-import"),
         ("app.py", 3, "pkg/util.py", "python-import"),
     ]
-    assert scan.to_data() == scan_cloned_repository(repo.as_uri()).to_data()
+    # The stream lane and the on-disk lane describe the same commit identically;
+    # only `origin` differs (the checkout has no remote, the stream names its URL).
+    _git(repo, "checkout", "--", "app.py")
+    (repo / "secret.txt").unlink()
+    streamed, on_disk = scan.to_data(), scan_repository(repo).to_data()
+    assert streamed.pop("origin") == repo.as_uri() and on_disk.pop("origin") is None
+    assert streamed == on_disk
 
     assert github_clone_url("sangderenard/turing") == "https://github.com/sangderenard/turing.git"
     with pytest.raises(RepoScanError):
         github_clone_url("C:/dev/Powershell/turing")
-    with pytest.raises(RepoScanError, match="clone"):
-        scan_cloned_repository(repo.as_uri(), ref="no-such-branch")
+    with pytest.raises(RepoScanError, match="no ref named"):
+        scan_remote_repository(repo.as_uri(), ref="no-such-branch")
+
+
+def test_github_shaped_tarball_streams_through_the_same_scan():
+    # The GitHub API tarball wraps the tree in one directory and may carry a
+    # pax header and symlinks; only regular files become rooms and only
+    # linkable files are ever read.
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        def add(name, data=None, kind=tarfile.REGTYPE):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            if kind == tarfile.SYMTYPE:
+                info.linkname = "a.py"
+                archive.addfile(info)
+                return
+            if kind == tarfile.DIRTYPE:
+                archive.addfile(info)
+                return
+            raw = data.encode("utf-8")
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
+        add("owner-repo-abc1234", kind=tarfile.DIRTYPE)
+        add("owner-repo-abc1234/a.py", "import b\n")
+        add("owner-repo-abc1234/b.py", "x = 1\n")
+        add("owner-repo-abc1234/link.py", kind=tarfile.SYMTYPE)
+        add("owner-repo-abc1234/blob.bin", "\x00binary never read")
+        add("owner-repo-abc1234/sub/wish.dream",
+            "/*@turing.segment.v1\nid = w\nlanguage = prose\nauthor = a\n@end*/\nA thing.\n/*@turing.end*/\n")
+
+    buffer.seek(0)
+    scan = scan_tar_stream("c" * 40, "https://github.com/owner/repo.git", buffer,
+                           mode="r|gz", strip_components=1)
+    assert {r.path for r in scan.rooms} == {"a.py", "b.py", "blob.bin", "sub/wish.dream"}
+    assert {r.path for r in scan.regions} == {".", "sub"}
+    assert _portal_table(scan) == [("a.py", 1, "b.py", "python-import")]
+    assert [c.stand_in for c in scan.claims] == ["w"]
+    assert any("link.py" in note for note in scan.notes)

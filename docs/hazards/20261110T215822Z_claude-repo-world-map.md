@@ -75,6 +75,23 @@ satisfaction, the describer holds it before. `tests/test_dream_work_table.py`
 5 passed; with the scanner, workspace, limits and dream-document suites: 34
 passed in 9.2 s. Nothing in `abstract_ui_*` consumes the claim (gap D).
 
+2026-11-11, transient intermediaries (owner: "personal assets and
+transient intermediaries ... store in user space or get cleaned up according
+to whatever the call was, avoiding even going to disk"): the scan no longer
+clones. `scan_github_repository` resolves the commit via the GitHub API and
+streams the tarball through `tarfile` (`scan_tar_stream`, one pass, only
+linkable files' bytes held); `scan_remote_repository` streams any other git
+URL via `git ls-remote` + `git archive --remote`; all lanes end in
+`scan_files`. `scan_cloned_repository` is gone. `scan_workspace` streams each
+repository (no temp dir); `scan_workspace_root` discovers and scans with no
+manifest on disk; the committed `docs/repo_world_workspace.json` (the owner's
+disk layout, a personal asset) was removed. Retention is the call's: `--json`
+stdout, `--out <file>`; a user-space sink is the service's call
+(`workspace_accounting.seal_and_submit` on main, not on this base, not wired).
+Tests: 11 passed (scan, workspace, work table) in 7.5 s; the stream test
+asserts no temp dir/file and an unchanged tmp_path. Live: lfsavoider streamed
+in 1.3 s; turing main streamed as recorded in the design note §7.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

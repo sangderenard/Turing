@@ -9,10 +9,12 @@ import pytest
 from src.compiler.repo_world_workspace import (
     MANIFEST_VERSION,
     WorkspaceManifest,
+    WorkspaceRepository,
     clone,
     discover,
     github_https_url,
     scan_workspace,
+    scan_workspace_root,
 )
 
 
@@ -75,6 +77,8 @@ def test_workspace_is_discovered_cloned_in_layout_and_scanned(tmp_path):
 
     result = scan_workspace(manifest)
     data = result.to_data()
+    # Discovering and scanning in one call gives the same records with no manifest on disk.
+    assert scan_workspace_root(ws).to_data() == data
     paths = [entry["path"] for entry in data["repositories"]]
     assert paths == [".", "child"]
     child = data["repositories"][1]
@@ -87,6 +91,14 @@ def test_workspace_is_discovered_cloned_in_layout_and_scanned(tmp_path):
         "parent_region": f"repo:{root_commit}/dir:.", "relationship": "contained-by",
     }]
     assert result.notes == ()
+
+    # A remote that will not serve is a note, never a crash, unless asked.
+    broken = WorkspaceManifest(manifest.repositories + (
+        WorkspaceRepository("gone", (origins / "missing.git").as_uri(), None),
+    ))
+    assert [n.split(":")[0] for n in scan_workspace(broken).notes] == ["gone"]
+    with pytest.raises(Exception, match="gone|missing"):
+        scan_workspace(broken, strict=True)
 
 
 def test_github_urls_normalize_to_public_https():
