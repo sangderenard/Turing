@@ -51,22 +51,34 @@ def test_http_account_switch_same_browser(tmp_path):
     b=sessions.accounts.signup('job_owner_b','test-password-two')
     ta=sessions.accounts.create_session(a['id']);tb=sessions.accounts.create_session(b['id'])
     digest='e'*64;job(sessions.marble_photos.directory,digest)
+    directory=sessions.marble_photos.directory/digest
+    config={'orbit_frames':8}
+    (directory/'config.json').write_text(json.dumps(config))
+    frames=[{'index':i,'image':f'preview-{i:06d}.png','hdr':None} for i in range(8)]
+    for frame in frames:(directory/frame['image']).write_bytes(b'completed frame')
+    (directory/'status.json').write_text(json.dumps({'digest':digest,'state':'complete','frames':frames}))
+    lib.write_collation(directory,lib.collation_manifest(digest,config))
     lib.claim(sessions.marble_photos.directory,digest,['account:'+str(a['id'])])
     # Deliberately stale legacy association must not defeat indexed ownership.
     sessions.accounts.claim(b['id'],'marble_photo',digest)
     httpd=ThreadingHTTPServer(('127.0.0.1',0),server.make_handler(sessions))
     thread=threading.Thread(target=httpd.serve_forever,daemon=True);thread.start()
     browser=''
-    def get(path,token):
+    def get(path,token,method='GET',body=b''):
         nonlocal browser
         c=http.client.HTTPConnection('127.0.0.1',httpd.server_port,timeout=5)
-        c.request('GET',path,headers={'Cookie':'; '.join(v for v in [browser,server.ACCOUNT_COOKIE+'='+token] if v)})
-        r=c.getresponse();data=json.loads(r.read());status=r.status
+        c.request(method,path,body=body,headers={'Content-Type':'application/json','Cookie':'; '.join(v for v in [browser,server.ACCOUNT_COOKIE+'='+token] if v)})
+        r=c.getresponse();raw=r.read();data=json.loads(raw) if r.getheader('Content-Type','').startswith('application/json') else raw;status=r.status
         browser='; '.join(v.split(';')[0] for k,v in r.getheaders() if k.lower()=='set-cookie') or browser
         c.close();return status,data
     try:
         assert get('/api/marble_photo/jobs',ta)[1]['entries'][0]['digest']==digest
+        assert get('/api/marble_photo/jobs',ta)[1]['entries'][0]['collation']['completed']==8
+        artifact=f'/api/marble_photo/image?digest={digest}&name=preview-000000.png'
+        assert get(artifact,ta)==(200,b'completed frame')
         assert get('/api/marble_photo/jobs',tb)[1]['entries']==[]
+        assert get(artifact,tb)[0]==403
+        assert get('/api/marble_photo/cancel',tb,'POST',json.dumps({'digest':digest}))[0]==403
         assert get('/api/marble_photo?digest='+digest,tb)[0]==403
         assert get('/api/account/assets',tb)[1]['marble_photos']==[]
         assert get('/api/marble_photo/jobs','')[1]['entries']==[]
