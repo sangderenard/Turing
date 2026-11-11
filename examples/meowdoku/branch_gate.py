@@ -269,8 +269,7 @@ def check_push(policy, db, repository, lines, now=None) -> list:
         if set(sha) == {"0"}:
             refused.append(f"{declared['default']} is never deleted")
         elif not branch_review.accepted_head(db, repository, declared["default"], sha, now):
-            refused.append(f"{declared['default']} moves only to a reviewed commit, and {sha[:12]} has no accepted review. "
-                           "Push your branch and submit it for review instead.")
+            refused.append(f"{sha[:12]} has no accepted review")
     return refused
 
 
