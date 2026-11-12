@@ -1,3 +1,4 @@
+import {cameraMovements} from './marble_camera_movements.js';
 import {CAMERA_BACK_PRESETS, cameraBack, cameraWithBack, sensorGate} from "./marble_camera_back.js";
 // Controls for the existing analytical camera, never a compound-renderer switch.
 export const FOCUS_MIN_M = .001;
@@ -67,7 +68,7 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
   const settings = () => ({key: select.value, focusMm: +focus.value, focalMm: +focal.value, fNumber: +aperture.value, back:selectedBack()});
   const minimumFocus = () => profiles.find(p=>p.key===select.value)?.controls.focus_distance.minimum ?? FOCUS_MIN_M;
   const applyCamera = (camera, aspect=1) => {
-    const result = cameraWithLens(camera, settings(), profiles, aspect), diagnostic = $("photo-focus-diagnostic");
+    const result = cameraMovements(cameraWithLens(camera, settings(), profiles, aspect), {shift:['x','y'].map(a=>Number($(`photo-shift-${a}`)?.value??0)),tiltDegrees:['x','y'].map(a=>Number($(`photo-tilt-${a}`)?.value??0))}), diagnostic = $("photo-focus-diagnostic");
     const d = cameraFocusDiagnostic(result);
     if (diagnostic && d) {
       const text = `Camera target ${(d.distanceM*1000).toFixed(2)} mm away; axial focus ${(d.focusM*1000).toFixed(2)} mm. ` +
@@ -118,6 +119,7 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
     if (failure) status.textContent += " " + failure;
     doc.dispatchEvent?.(new (doc.defaultView?.Event ?? Event)("studio-lens-change"));
   };
+  for(const id of ['photo-shift-x','photo-shift-y','photo-tilt-x','photo-tilt-y'])$(id)?.addEventListener('input',sync);
   for(const el of [backSelect,backWidth,backHeight])el?.addEventListener(el===backSelect?"change":"input",sync);
   select.addEventListener("change", () => {
     const c = profiles.find(p => p.key === select.value);

@@ -28,6 +28,10 @@ export function dofCameraFromView(view,{unitM,targetDistance,fovDegrees,aperture
     fov_degrees:fovDegrees,focus_distance_m:targetDistance*unitM,aperture_radius_m:apertureRadiusM};
 }
 
+export function dofFocusAt(uv,p,camera,aspect=1) {
+  const shift=camera.tilt_shift??[0,0],tilt=camera.lens_tilt??[0,0],t=Math.tan(camera.fov_degrees*Math.PI/360);
+  return p.focus/Math.max(.005,1-(2*uv[0]-1+shift[0])*t*aspect*Math.tan(tilt[1])-(2*uv[1]-1+shift[1])*t*Math.tan(tilt[0]));
+}
 const VERTEX=`#version 300 es
 void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.0-1.0,0.0,1.0);}`;
 const FRAGMENT=`#version 300 es
@@ -36,16 +40,18 @@ uniform sampler2D uColor;
 uniform highp sampler2D uDepth;
 uniform vec2 uSize;
 uniform vec2 uClip;
+uniform vec4 uPlane; // tan(tiltY), tan(tiltX), tan(fov/2)*aspect, tan(fov/2)
+uniform vec2 uShift;
 uniform vec4 uOptics; // physical unit, focus metres, aperture*pixelScale, radius cap
 out vec4 color;
 float axial(vec2 uv){float d=texture(uDepth,uv).r;return uClip.x*uClip.y/(uClip.y-d*(uClip.y-uClip.x))*uOptics.x;}
-float coc(float z){return clamp(uOptics.z*(1.0/uOptics.y-1.0/z),-uOptics.w,uOptics.w);}
+float coc(float z,vec2 uv){float d=max(.005,1.0-dot((2.0*uv-1.0+uShift)*uPlane.zw,uPlane.xy));return clamp(uOptics.z*(d/uOptics.y-1.0/z),-uOptics.w,uOptics.w);}
 vec3 linearColor(vec3 s){return mix(s/12.92,pow((s+0.055)/1.055,vec3(2.4)),step(vec3(0.04045),s));}
 vec3 displayColor(vec3 s){return mix(s*12.92,1.055*pow(max(s,vec3(0)),vec3(1.0/2.4))-0.055,step(vec3(0.0031308),s));}
 void main(){
   vec2 uv=gl_FragCoord.xy/uSize;
   vec4 center=texture(uColor,uv);
-  float z=axial(uv),c=coc(z),r=abs(c);
+  float z=axial(uv),c=coc(z,uv),r=abs(c);
   if(r<0.5){color=center;return;}
   vec3 sum=linearColor(center.rgb);float total=1.0;
   // Stable per-pixel rotation breaks ring/banding artifacts without temporal
@@ -55,7 +61,7 @@ void main(){
     float fraction=(float(i)+0.5)/48.0,dist=r*sqrt(fraction),angle=rotation+float(i)*2.39996322973;
     vec2 q=uv+vec2(cos(angle),sin(angle))*dist/uSize;
     if(any(lessThan(q,vec2(0)))||any(greaterThan(q,vec2(1))))continue;
-    float qz=axial(q),qc=coc(qz);
+    float qz=axial(q),qc=coc(qz,q);
     // Reject background samples through a nearer foreground silhouette.
     // A nearer sample contributes only if its own blur disk reaches this pixel.
     // This avoids color leaking over in-focus foreground edges; it cannot
@@ -146,6 +152,9 @@ export function createStudioDof(gl,{samples=4,maxRadius=64}={}) {
         for(const [i,key,uniform] of [[0,"color","uColor"],[1,"depth","uDepth"]]){gl.activeTexture(gl.TEXTURE0+units[i]);gl.bindTexture(gl.TEXTURE_2D,target[key]);gl.bindSampler(units[i],null);gl.uniform1i(gl.getUniformLocation(p,uniform),units[i]);}
         gl.uniform2f(gl.getUniformLocation(p,"uSize"),target.w,target.h);gl.uniform2f(gl.getUniformLocation(p,"uClip"),near,far);
         gl.uniform4f(gl.getUniformLocation(p,"uOptics"),unitM,params.focus,params.aperture*params.pixelScale,maxRadius);
+        const tilt=camera.lens_tilt??[0,0],shift=camera.tilt_shift??[0,0],t=Math.tan(camera.fov_degrees*Math.PI/360);
+        gl.uniform4f(gl.getUniformLocation(p,"uPlane"),Math.tan(tilt[1]),Math.tan(tilt[0]),t*target.w/target.h,t);
+        gl.uniform2f(gl.getUniformLocation(p,"uShift"),...shift);
         gl.drawArrays(gl.TRIANGLES,0,3);
         return {samples:original.multisample?target.samples:0,diskSamples:48,maxRadius,depthMode:"opaque",colorMode:"display-linearized",...params};
       }finally{

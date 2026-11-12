@@ -1,3 +1,4 @@
+import {shiftedProjection,studioCameraPose} from './marble_camera_movements.js';
 import {STUDIO_SCENE_PART_GROUP,computeStudioFixtureRoles,buildStudioFixtureFaces,createStudioSceneGeometry,buildStudioPhotoFixtures,initializeStudioFixtureRows} from './studio_scene_builder.js';
 // Reuse the server loading panel; its boot hold covers Studio asset/GPU setup.
 import "./loading_panel.js";
@@ -281,6 +282,13 @@ function phongExteriorFaces() {
 let standOpaque=null,standGlass=null,standTransparentFaces=[],standMeshKey=null;
 let shopOpaque=null,shopGlass=null,shopTransparentFaces=[],shopMeshKey=null,shopGeometry=null;
 let studioOrbitTarget=[0,0,0];
+let freeCameraEye=null;
+function controlledStudioPose(target=studioOrbitTarget) {
+  const raw=$('studio-camera-height')?.value;
+  return studioCameraPose({yaw,pitch,distance,target,freeEye:freeCameraEye,
+    height:raw&&Number.isFinite(Number(raw))?Math.max(.05,Math.min(100,Number(raw))):null,
+    floor:studioRoomBounds(studioRoomScale(),studioFloorDrop()).floorY});
+}
 let lastPreviewSubjectTransform=null;
 const sim = { base:null, runtime:null, spec:null, epoch:0, map:null, cageOpaque:null, cageGlass:null,
   status:"Particle simulation loads when selected", nextFlipStep:0, flipSeconds:0, motionKey:"" };
@@ -847,6 +855,11 @@ function studioPhotoCamera(saved = true,{usePhotoCamera=true}={}) {
   // A saved Exposure stays independent of unfinished Studio radius/profile edits.
   const photoTransform=studioSubjectTransform(saved,"exposure");
   const linked=linkedPhotoOrbit({yaw,pitch,distance,photoTransform});
+  if(freeCameraEye || $('studio-camera-height')?.value){
+    const pose=controlledStudioPose(photoTransform.subjectCenter);
+    for(const [name,point] of [['eye_m',pose.eye],['target_m',pose.target]])
+      linked.camera[name]=point.map((v,i)=>OBJECT_CENTER[i]+v*photoTransform.unitM);
+  }
   const scene=usePhotoCamera?photographicCameraBinding.resolve(linked):linked;
   scene.camera = photo.applyLensCamera(scene.camera);
   return scene;
@@ -1316,7 +1329,19 @@ function controls() {
       liveRay?.cameraChanged();
     } catch (error) {photo.status(error.message);}
   });
+  $('studio-orbit-lock').addEventListener('change',()=>{
+    if($('studio-orbit-lock').checked)freeCameraEye=null;
+    else {
+      const pose=controlledStudioPose(),delta=pose.eye.map((v,i)=>v-pose.target[i]),d=Math.hypot(...delta);
+      freeCameraEye=pose.eye;yaw=Math.atan2(-delta[0],delta[2]);pitch=Math.asin(delta[1]/d);
+    }
+    $('photo-camera').value='studio';liveRay?.cameraChanged();
+  });
+  $('studio-camera-height').addEventListener('input',()=>{
+    $('photo-camera').value='studio';liveRay?.cameraChanged();
+  });
   $("frame-marble").addEventListener("click", () => {
+    freeCameraEye=null;$('studio-orbit-lock').checked=true;$('studio-camera-height').value='';
     try {
       if(isMarbleChase()){chaseCamera.recenter(performance.now()/1000);driveGravity();return;}
       const subject = studioSubjectTransform(false, "studio");
@@ -1411,7 +1436,7 @@ function controls() {
     }else if(cameraGesture==="orbit"&&cameraPointers.size===1&&last){
       const dx=(event.clientX-last[0])*.008,dy=(event.clientY-last[1])*.008;
       if(isMarbleChase())chaseCamera.orbit(dx,dy,performance.now()/1000);
-      else {yaw+=dx;pitch+=dy;liveRay?.cameraChanged();}
+      else {yaw+=dx;pitch=Math.max(-Math.PI/2+.001,Math.min(Math.PI/2-.001,pitch+dy));liveRay?.cameraChanged();}
       last=[event.clientX,event.clientY];
     }
     event.preventDefault();
@@ -1507,7 +1532,7 @@ function frame(now=0) {
       sampleSeconds:sim.runtime.shown*sim.runtime.snap*sim.runtime.manifest.law.dt,nowSeconds:sceneNow/1000,
       epoch:sim.epoch,steering:drive.active,autoHeading:$("preview-camera").value==="marble"}):null;
     if(chase)cameraDistance=chase.distance;
-    const view=chase?chaseViewMatrix(chase):simOn?baseView:multiply(baseView,translate3(...studioOrbitTarget.map(v=>-v)));
+    const view=chase?chaseViewMatrix(chase):simOn?baseView:chaseViewMatrix(controlledStudioPose());
     const mv=multiply(view,simOn?object:multiply(object,preview));
     gl.useProgram(P);
     let dofCamera=dofCameraFromView(view,{unitM:subject.unitM,targetDistance:cameraDistance,
@@ -1521,8 +1546,8 @@ function frame(now=0) {
     const viewFar=simOn?30:clip.far,viewNear=chase?Math.min(.01,chase.radius*.2):simOn ? .01 : clip.near;
     let drawingProgram=P;
     const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(drawingProgram,"uMV"),false,matrix);
-      gl.uniformMatrix4fv(loc(drawingProgram,"uMVP"),false,multiply(perspective(w/h,viewFovDegrees,
-        viewFar,viewNear),matrix)); };
+      gl.uniformMatrix4fv(loc(drawingProgram,"uMVP"),false,multiply(shiftedProjection(perspective(w/h,viewFovDegrees,
+        viewFar,viewNear),dofCamera),matrix)); };
     const opaqueDraws=[],transparentDraws=[];
     let scalarFieldActive=false;
     const setFieldCategory=category=>{
