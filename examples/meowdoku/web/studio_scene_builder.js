@@ -422,11 +422,17 @@ export function packStudioPhotoParts({parts,materials,subject,rayOriginM,lightin
     const fixture=lighting.shopLights?.fixtures?.find(value=>value.id===row.fixtureId);
     const material=materialIndex.get(row.materialId);
     return fixture?.enabled&&fixture.exposureMode==='burst'&&material!==undefined?
-      [{material,receiver:`shop:${material}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
+      [{material,receiver:`shop:${fixture.id}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
+  });
+  const shop_receiver_candidates=shopRows.flatMap(row=>{
+    const fixture=lighting.shopLights?.fixtures?.find(value=>value.id===row.fixtureId);
+    const material=materialIndex.get(row.materialId);
+    return fixture?.enabled&&material!==undefined?
+      [{material,receiver:`shop:${fixture.id}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
   });
   const response_lineage=lightFieldInformation===RESPONSE_INFORMATION?fixtureResponseLineage(parts):null;
   return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles,
-    ...(timedExposure?{shop_material_ids,trigger_emitters}:{}),...(response_lineage?{response_lineage}:{})};
+    ...(timedExposure?{shop_material_ids,trigger_emitters,shop_receiver_candidates}:{}),...(response_lineage?{response_lineage}:{})};
 }
 export function initializeStudioFixtureRows(data,pbrStride,FIXTURE_MAT_BASE) {
     const base=(slot)=>(FIXTURE_MAT_BASE+slot)*pbrStride;

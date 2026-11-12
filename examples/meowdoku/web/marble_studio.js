@@ -15,6 +15,7 @@ import { bindMarbleDriveInput } from "./marble_drive_input.js";
 import { MarbleChaseCamera, chaseViewMatrix } from "./marble_chase_camera.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
+import {mountMarbleTriggerGrid} from "./marble_trigger_grid.js";
 import { createLiveRayView } from "./marble_live.js";
 import {createStudioLightField} from "./marble_light_field.js";
 import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
@@ -51,6 +52,7 @@ import {PhotographicCameraBinding,mountPhotographicCameraBinding,linkedPhotoOrbi
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
+let triggerGrid = null;
 let opticalControls = null;
 let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null;
 // A late-bound facade lets existing photo controls start before WebGL setup.
@@ -62,7 +64,7 @@ document.addEventListener("studio-lens-change", () => liveRay?.cameraChanged());
 let studioSceneRevision=0,lastStudioFrame=null;
 // Conservative edit revision catches an edit and reversal during a hidden
 // bake. Exact captured data is still compared before ownership transfers.
-for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories'))studioSceneRevision++;},true);
+for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories, #camera-trigger-grid'))studioSceneRevision++;},true);
 let suppliedSubjectAsset=null;
 let objectAutosave=null, savedObjectSnapshot=null, objectKey="", objectEditQueued=false, applyingObject=false, objectLoadIntent=0;
 // Keep the ray-traced photo's "Current Studio orbit and zoom" camera option
@@ -82,7 +84,7 @@ const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
   nextTick(callback){exposureClock.waiters.push(callback);},
   completeTick(){for(const callback of this.waiters.splice(0))callback();}};
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock);
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock,()=>triggerGrid?.graph());
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -1085,7 +1087,7 @@ function controls() {
   const skipPhotoInvalidation=new Set(["object-name","saved-object","obj-asset","obj-file","obj-mtl","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
-    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls'))return;
+    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls, #camera-trigger-grid'))return;
     if(event.target.closest?.('#photo-camera-binding'))return;
     if(applyingObject||event.target.closest("#optical-material-controls")||event.target.closest("#room-profile-overrides")||event.target.closest("#live-ray-controls")||event.target.id==="object-autosave")return;
     if(event.target.id==="object-name"){objectEdited();return;}
@@ -1519,8 +1521,19 @@ function frame(now=0) {
     // via computeFixtureRoles()/ROOM_FIXTURES so the ray-traced photo
     // bridge renders the identical rig, not an independently-guessed one.
     const {fixtureRoles, roleColor, roleStrength}=computeFixtureRoles(simOn&&particleWorld?particleWorld:[object[12],object[13],object[14]]);
+    const manualFlash=triggerGrid?.levels(performance.now());
+    if(manualFlash)for(let i=0;i<roleStrength.length;i++)if(manualFlash.active.has(`studio:${i}`))
+      roleStrength[i]*=manualFlash.gains[`studio:${i}`]??0;
     rebuildStandMeshes(fixtureRoles);
-    writeShopLightEmitterRows(tables.pbr.data,tables.pbr.table.floats_per_record,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,shopLightState(),{profiles:shopEmissionProfiles});
+    const previewShops=structuredClone(shopLightState());
+    if(manualFlash){
+      previewShops.fixtures.forEach((fixture,i)=>{
+        const receiver=`shop:${fixture.id}`;
+        if(manualFlash.active.has(receiver))fixture.dimmer*=manualFlash.gains[receiver]??0;
+        else if(manualFlash.shopCutoff)fixture.dimmer=0;
+      });
+    }
+    writeShopLightEmitterRows(tables.pbr.data,tables.pbr.table.floats_per_record,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,previewShops,{profiles:shopEmissionProfiles});
     const displayedShop=rebuildShopMeshes();
     // Real emitter registration (the same process spectral-analyzer's own
     // camera uses to derive lights from emissive material groups:
@@ -1803,6 +1816,9 @@ async function boot() {
       onGoboChange:()=>rebuildTable(),
       onRoomChange:()=>{dispose(checkerMesh);checkerMesh=checkerboard();rebuildTable();},
     });
+    triggerGrid=mountMarbleTriggerGrid({doc:document,getReceivers:()=>[
+      ...STUDIO_LIGHTS.map((_,i)=>`studio:${i}`),
+      ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`)]});
     copyCoating(); copyPaint(); checkerMesh=checkerboard(); backdropMesh=backdropRoll();rebuildTable();
     if ($("backdrop-layers-out")) $("backdrop-layers-out").value=$("backdrop-layers").value;
     if ($("room-scale-out")) $("room-scale-out").value=$("room-scale").value;
