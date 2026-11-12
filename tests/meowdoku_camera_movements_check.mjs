@@ -19,3 +19,9 @@ const raised=studioCameraPose({...base,height:6,floor:-5});assert.equal(raised.e
 const v=chaseViewMatrix(free);for(let i=0;i<3;i++)near(v[i]*free.eye[0]+v[4+i]*free.eye[1]+v[8+i]*free.eye[2]+v[12+i],0);
 assert.throws(()=>cameraMovements({}, {tiltDegrees:[31,0]}));
 console.log('PASS shared camera movements: native ray/projection parity, tilted focal plane, fixed-eye pointing, floor-relative height, unchanged orbit, bounds. CPU only.');
+
+const {rangefinderRay}=await import('../examples/meowdoku/web/marble_rangefinder.js');
+const view=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
+const found=rangefinderRay({state:{schema:'turing.studio-visible-scene.v1',channel:'studio',camera:{view,fovDegrees:40,aspect:1.5,tilt_shift:c.tilt_shift},frame:{unitM:1,rayOriginM:[0,0,0]}}},.5,.5);
+near(found.ray[4]/-found.ray[6],.25*Math.tan(40*Math.PI/360)*1.5);
+near(found.ray[5]/-found.ray[6],-.1*Math.tan(40*Math.PI/360));

@@ -30,7 +30,9 @@ export function rangefinderRay(capture,u,v) {
   // A rigid view is required; do not silently treat scaled/sheared cameras as rigid.
   if(Math.max(Math.abs(dot(right,up)),Math.abs(dot(right,forward)),Math.abs(dot(up,forward)))>1e-5)
     throw Error('Rangefinder needs an orthogonal camera basis.');
-  const extent=Math.tan(camera.fovDegrees*Math.PI/360),x=(2*u-1)*extent*camera.aspect,y=(1-2*v)*extent;
+  const shift=camera.tilt_shift??[0,0];
+  if(!finite(shift,2))throw Error('Invalid camera principal point.');
+  const extent=Math.tan(camera.fovDegrees*Math.PI/360),x=(2*u-1+shift[0])*extent*camera.aspect,y=(1-2*v+shift[1])*extent;
   const direction=unit(forward.map((a,i)=>a+x*right[i]+y*up[i]));
   const ray=Float32Array.from([...eye,0,...direction,1e6]);
   if(!Array.from(ray).every(Number.isFinite))throw Error('Rangefinder ray exceeds native float precision.');

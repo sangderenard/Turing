@@ -36,7 +36,7 @@ export function stageProgrammerFaces(bounds,table,ids,onPart) {
 
 export function pickStageProgrammer(frame,bounds,table,u,v) {
   const {ray}=rangefinderRay({state:{schema:'turing.studio-visible-scene.v1',channel:'studio',
-    camera:{view:frame.view,fovDegrees:frame.fovDegrees,aspect:frame.aspect},
+    camera:{view:frame.view,fovDegrees:frame.fovDegrees,aspect:frame.aspect,tilt_shift:frame.tilt_shift},
     frame:{rayOriginM:[0,0,0],unitM:1}}},u,v);
   const {x,z,top,buttonY}=stageProgrammerLayout(bounds,table);
   const intersect=y=>{const t=(y-ray[1])/ray[5];return t>0&&Number.isFinite(t)?[ray[0]+t*ray[4],ray[2]+t*ray[6]]:null;};

@@ -1075,7 +1075,7 @@ function captureCurrentStudioScene() {
     subject:{id:"subject",faces:[...lastGeometry.interior,...lastGeometry.glass],model:displayed.model,
       radius:displayed.subject.subjectRadius,motion:displayed.motion,
       phong:{interiorCount:lastGeometry.interior.length,glassCount:lastGeometry.glass.length,bubbles:structuredClone(lastGeometry.bubbles??[])}},
-    camera:{view:displayed.view,fovDegrees:displayed.fovDegrees,aspect:displayed.aspect},
+    camera:{view:displayed.view,fovDegrees:displayed.fovDegrees,aspect:displayed.aspect,tilt_shift:displayed.tilt_shift},
     authoring:{object:captureObjectSnapshot(),lighting:displayed.lighting}})};
 }
 function syncMaterial() {
@@ -1757,7 +1757,7 @@ function frame(now=0) {
       velocityM:mode==="off"?[-r*omega[2],0,r*omega[0]]:null,
       angularVelocity:mode==="off"?[...omega]:null};
     lastStudioFrame={revision:studioSceneRevision,engine:simOn?"particle":"visual",geometry:lastGeometry,lighting,
-      subject,model:simOn?null:multiply(object,preview),view,fovDegrees:viewFovDegrees,aspect:w/h,fixtureRoles,roleColor,roleStrength,
+      subject,model:simOn?null:multiply(object,preview),view,fovDegrees:viewFovDegrees,aspect:w/h,tilt_shift:dofCamera.tilt_shift,fixtureRoles,roleColor,roleStrength,
       orbit:{yaw,pitch,distance,target:[...studioOrbitTarget]},
       room:studioControlValue("checker","studio")?studioRoomBounds(studioRoomScale("studio"),studioFloorDrop("studio")):null,motion};
     if(dofActive)try {
