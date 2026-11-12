@@ -5,6 +5,7 @@ import {ensureObjAsset, importedMechanics} from "./marble_imported_object.js";
 // A close-up on the same exported Pluck Phong shader and MaterialDatabase
 // tables used by the game. All edits are local to this preview.
 import { marbleMass } from "./marble_mass.js";
+import {cutConvexShell} from "./gem_cutter.js";
 import { bubbleCount, validateBubbleHost, validateBubbleInclusions, validateBubbleRadius, phongInterior } from "./marble_bubbles.js";
 import { rollingStep, rotationMatrix } from "./marble_roll.js";
 import { ComputeRuntime } from "./compute.js";
@@ -257,6 +258,22 @@ let tables, ids, P, interior, glass, glassOpaque, checkerMesh, backdropMesh, coa
 let FIXTURE_MAT_BASE=0, FIXTURE_HOUSING_MAT=0, FIXTURE_LABEL_MAT=0, fixtureMeshes=null, glyphMeshes={};
 let opaqueSaved = null;
 let tableOpaque=null, tableTransparentFaces=[], marbleTransparentFaces=[], sceneGlass=null, sceneGlassKey=null, savedPhotoRadius=null;
+let gemPreviewCache=null;
+function phongExteriorFaces() {
+  const style=$("phong-gem-cut")?.value??"off";
+  if(style==="off")return lastGeometry.glass;
+  if($("base-shape").value!=="marble") {
+    $("phong-gem-cut").value="off";
+    $("phong-gem-status").value="Gem study reset: choose Marble for the convex-shell trial.";
+    return lastGeometry.glass;
+  }
+  const strength=Number($("phong-gem-strength").value)/100;
+  if(gemPreviewCache?.geometry===lastGeometry&&gemPreviewCache.style===style&&gemPreviewCache.strength===strength)
+    return gemPreviewCache.faces;
+  const faces=cutConvexShell(lastGeometry.glass,{style,strength,capMaterial:ids[$("shell").value]});
+  gemPreviewCache={geometry:lastGeometry,style,strength,faces};
+  return faces;
+}
 let standOpaque=null,standGlass=null,standTransparentFaces=[],standMeshKey=null;
 let shopOpaque=null,shopGlass=null,shopTransparentFaces=[],shopMeshKey=null,shopGeometry=null;
 let studioOrbitTarget=[0,0,0];
@@ -553,6 +570,7 @@ function setupObjSubjects(run) {
 }
 function repartitionExterior(force=false) {
   if(!lastGeometry)return;
+  const previewOutside=phongExteriorFaces(),gemCut=$("phong-gem-cut")?.value!=="off";
   tagSubjectResponseFaces(lastGeometry,lightField?.responseInformationRequested===true);
   if(tableOpaque) rebuildTable();
   const classes=new Map();
@@ -564,8 +582,8 @@ function repartitionExterior(force=false) {
   exteriorClass=classes;
   dispose(interior);dispose(glass);dispose(glassOpaque);
   const opaque=[],transparent=[],insideOpaque=[];
-  for(const face of phongInterior(lastGeometry)) (classes.get(face[3])?insideOpaque:transparent).push(face);
-  for(const face of lastGeometry.glass) (classes.get(face[3])?opaque:transparent).push(face);
+  if(!gemCut)for(const face of phongInterior(lastGeometry)) (classes.get(face[3])?insideOpaque:transparent).push(face);
+  for(const face of previewOutside) (classes.get(face[3])?opaque:transparent).push(face);
   interior=mesh(insideOpaque);glassOpaque=mesh(opaque);glass=transparentMesh(transparent);
   marbleTransparentFaces=transparent; sceneGlassKey=null;
 }
@@ -1088,6 +1106,20 @@ function controls() {
   for(const id of ["reroll","reset-material"]) $(id).addEventListener("click",()=>{photo.stale();objectEdited();},true);
   $("photo-start").addEventListener("click",()=>photo.start(lastGeometry)
     .catch((error)=>photo.status(error.message||String(error))));
+  const gemMode=$("phong-gem-cut"),gemStrength=$("phong-gem-strength"),gemStatus=$("phong-gem-status");
+  const updateGem=()=>{
+    $("phong-gem-strength-out").value=`${gemStrength.value}%`;
+    try {
+      if(gemMode.value!=="off"&&$("base-shape").value!=="marble")
+        throw new Error("Choose Marble as the base shape for this first convex-shell trial.");
+      repartitionExterior(true);
+      gemStatus.value=gemMode.value==="off"?"Original Phong shell shown.":
+        `${gemMode.selectedOptions[0].textContent} · ${gemPreviewCache.faces.length.toLocaleString()} closed-shell triangles. Preview only; saved object and ray exposures keep the original geometry.`;
+    } catch(error) {gemMode.value="off";repartitionExterior(true);gemStatus.value=error.message;}
+  };
+  gemMode.addEventListener("change",updateGem);
+  gemStrength.addEventListener("change",updateGem);
+  gemStrength.addEventListener("input",()=>{$("phong-gem-strength-out").value=`${gemStrength.value}%`;});
   const diceCost=()=>{const kind=$("base-shape").value,
     factor={d4:12,d6:24,d8:24,d10:40,d12:60,d20:60}[kind]||0;
     $("dice-detail-cost").value=kind==="marble"?"Die detail applies to polyhedra":

@@ -227,6 +227,10 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
   </div>
   <h2>Phong photos &amp; video</h2><div class="grid" id="phong-capture-controls">
+    <label>Gem cut study<select id="phong-gem-cut"><option value="off">Original shell</option><option value="brilliant">Brilliant facet study</option><option value="step">Step facet study</option></select></label>
+    <label>Cut depth <output id="phong-gem-strength-out">100%</output><input id="phong-gem-strength" type="range" min="25" max="100" step="5" value="100"></label>
+    <output id="phong-gem-status" class="wide" role="status">Original Phong shell shown.</output>
+    <p class="wide">Trial on the convex marble shell: each facet is a real planar cut with a closed cap. The Phong preview and its PNG/video capture show the cut. The saved object, ray exposures, mass, and particle contacts keep the original shell. Use an opaque shell to study facet highlights clearly.</p>
     <button type="button" id="phong-capture-photo" disabled>Take Phong PNG</button>
     <label>Video frame rate<select id="phong-capture-fps"><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
     <button type="button" id="phong-capture-start" disabled>Record Phong video</button><button type="button" id="phong-capture-stop" disabled>Stop recording</button>
