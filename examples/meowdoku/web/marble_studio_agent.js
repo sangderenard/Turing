@@ -50,7 +50,7 @@ export async function buildStudioAgentProduct(request,{assets,defaults}={}){
   }
   const photo=request.photo??{};
   fields(photo,['resolution','width','height','seconds','samplesPerOutputPixel','orbitFrames','cameraPoses','transport','gamma','maxBounces','bounceMode','triangleBudget','sphereCoverage','filmResponse','tiled','oversampling','receiveLightField',
-    'exposureSubsteps','exposureIso','highlightClipPercent','lightTimeline','cameraTriggerGraph','cameraTriggerTiming'],'photo');
+    'exposureSubsteps','exposureIso','highlightClipPercent','lightTimeline','cameraTriggerGraph','cameraTriggerGenerators','cameraTriggerTiming'],'photo');
   const seconds=photo.seconds??30,substeps=photo.exposureSubsteps??Math.ceil(seconds*60);
   if(!Number.isFinite(seconds)||seconds<=0||!Number.isInteger(substeps)||substeps<Math.ceil(seconds*10)||substeps>216000)
     throw Error('Exposure substeps must give a model tick of at most 0.1 seconds.');
@@ -73,13 +73,20 @@ export async function buildStudioAgentProduct(request,{assets,defaults}={}){
     const next=buildStudioScene({lighting,objectSnapshot:prepared.value,
       materials:studioSceneMaterials(assets,prepared.value,lighting),camera,rayOriginM:OBJECT_CENTER,
       shopEmissionProfiles:assets.emitterProfiles,timedExposure:true}).fixtures;
-    if(JSON.stringify([next.vertices,next.material_ids])!==JSON.stringify([base.vertices,base.material_ids]))
-      throw Error('lightTimeline changed fixture geometry');
     states.push({tick:entry.tick,fixtures:next});
   }
-  const exposureStateFrames=states.map((item,i)=>({t0:item.tick*seconds/substeps,
-    t1:states[i+1]?states[i+1].tick*seconds/substeps:seconds,pbr:item.fixtures.pbr,
-    emitter_profiles:item.fixtures.emitter_profiles??{version:1,records:[]}}));
+  // Match recordStudioExposureFrames: a state slice always carries emitter
+  // material state, while geometry is sent only when the actual source faces
+  // changed. The first slice inherits the base fixture geometry.
+  let previousGeometry=JSON.stringify([base.vertices,base.material_ids]);
+  const exposureStateFrames=states.map((item,i)=>{
+    const fixture=item.fixtures,geometry=JSON.stringify([fixture.vertices,fixture.material_ids]);
+    const changed=geometry!==previousGeometry;previousGeometry=geometry;
+    return {t0:item.tick*seconds/substeps,
+      t1:states[i+1]?states[i+1].tick*seconds/substeps:seconds,pbr:fixture.pbr,
+      emitter_profiles:fixture.emitter_profiles??{version:1,records:[]},
+      ...(changed?{vertices:fixture.vertices,material_ids:fixture.material_ids}:{})};
+  });
   const {lightTimeline:ignoredTimeline,...photoOptions}=photo;
   const bytes=new Uint8Array(packMarblePhoto(prepared.geometry,null,{...photoOptions,...scene,
     ...(timedEligible?{exposureStateFrames}:{}),objectSnapshot:prepared.value}));

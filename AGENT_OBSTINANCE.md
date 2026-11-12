@@ -1,5 +1,18 @@
 # Agent Obstinance
 
+## 2026-11-12 - treating a light program recording as static geometry
+
+The owner requested Studio/Fountain style state recording with material power
+encoded slice by slice, then explicitly pointed to the existing exposure
+substep recorder for geometry updates. I started a standalone renderer update
+that assumed one fixed geometry asset. I chose the already familiar static
+scene asset instead of tracing `recordStudioExposureFrames` first. This spent
+time on an incompatible seam and required removing the code. The REST Studio
+product also rejected a changed fixture mesh; it now includes changed
+vertices/material IDs only in the affected slice, as the existing recorder
+does. Reading the existing recorder and its backend frame contract before
+designing playback would have prevented the detour.
+
 ## 2026-11-11 - replacing Phong before field information was available
 
 The user requested a secondary material shader fed by the actual ray-traced

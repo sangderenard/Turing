@@ -43,6 +43,16 @@ assert(Math.abs(timedConfig.exposure_state_frames[1].t0-.05)<1e-12);
 assert.equal(timedConfig.exposure_iso,200);
 assert.equal(timedConfig.highlight_clip_percent,25);
 assert.notDeepEqual(timedConfig.exposure_state_frames[0].pbr,timedConfig.exposure_state_frames[1].pbr);
+assert(!('vertices' in timedConfig.exposure_state_frames[1]),'Material-only change must keep the prior triangles');
+const movedLighting=structuredClone(settings.lighting);
+movedLighting.poses.poses[0].pos[0]+=1;
+const movedRay=await buildStudioAgentProduct({...request,operation:'ray-payload',photo:{resolution:128,seconds:.1,
+  exposureSubsteps:6,lightTimeline:[{tick:3,lighting:movedLighting}]}},{assets});
+const movedView=new DataView(movedRay.bytes.buffer,movedRay.bytes.byteOffset,movedRay.bytes.byteLength);
+const movedConfig=JSON.parse(new TextDecoder().decode(movedRay.bytes.slice(16,16+movedView.getUint32(4,true))));
+assert(!('vertices' in movedConfig.exposure_state_frames[0]),'Initial slice inherits fixture geometry');
+assert.notDeepEqual(movedConfig.exposure_state_frames[1].vertices,movedConfig.fixtures.vertices);
+assert.equal(movedConfig.exposure_state_frames[1].material_ids.length,movedConfig.fixtures.material_ids.length);
 assert.equal(config.object_snapshot.geometry_sha256,scene.objectSnapshot.geometry_sha256);
 assert.equal(config.exposure_seconds,.1);assert.equal(config.camera.resolution,128);
 const fieldRay=await buildStudioAgentProduct({...request,operation:'ray-payload',photo:{resolution:128,seconds:.1,maxBounces:1,receiveLightField:true}},{assets});

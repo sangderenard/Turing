@@ -4417,16 +4417,25 @@ def _expand_unresolved_ast_parents(
 
     index_lexical_scopes(module, module)
 
-    def lexical_definition(call, owner):
+    def lexical_definition(call, owner, *, constructions=False):
+        """The unique in-scope definition a bare-name call names, or None.
+
+        ``constructions`` also admits a class the submitted text defines: a
+        call of its name constructs it (``activate_construction_methods``).
+        """
         if not isinstance(call.func, ast.Name):
             return None
         name = call.func.id
         scope = owner or module
+        kinds = (
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            if constructions else (ast.FunctionDef, ast.AsyncFunctionDef)
+        )
         while scope is not None:
             # Class namespaces are not closures of their methods.
             if not isinstance(scope, ast.ClassDef):
                 candidates = [statement for statement in getattr(scope, "body", ())
-                              if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                              if isinstance(statement, kinds)
                               and statement.name == name]
                 pending = list(getattr(scope, "body", ()))
                 shadowed = False
@@ -4681,9 +4690,22 @@ def _expand_unresolved_ast_parents(
                 requeue_definition(identity_target, demand=call_demand(node))
             continue
         if not callable(identity_target):
-            definition = lexical_definition(node, owner_definition)
+            # Program: the AbstractTensor YoungMan, whose entry calls
+            # ``YoungManAlgorithm(...)``, a class only the submitted text
+            # defines.  Wrong record: with no Python object the call was
+            # "unresolved ... dynamic_or_primitive", so no construction method
+            # was ever pursued; every method of the class carried no receipt
+            # (its ``open``/``pickle`` calls were never lowered) and stayed
+            # inactive, and deployment refused ``define_offsets``' raise
+            # status ("process operation did not become control IR").  Rule:
+            # a bare-name call of a submitted-text class is a construction,
+            # admitted as the resolved branch admits one: the class, then its
+            # construction methods.
+            definition = lexical_definition(node, owner_definition, constructions=True)
             if definition is not None and id(definition) not in activated_definitions:
                 requeue_definition(definition, demand=call_demand(node))
+            if isinstance(definition, ast.ClassDef):
+                activate_construction_methods(definition)
             for element in static_loop_target_callables(
                 node, owner_definition, call_bindings,
             ):

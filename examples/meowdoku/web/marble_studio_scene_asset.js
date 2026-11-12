@@ -46,7 +46,7 @@ function validateScene(packet,samplers) {
     assert(typeof p.id==='string'&&p.id&&!ids.has(p.id)&&typeof p.bodyId==='string'&&p.bodyId,'Unique source part/body IDs are required.');
     ids.add(p.id);
     assert(p.firstTriangle===offset&&p.triangleCount===p.faces?.length,'Studio part source ranges changed.');
-    assert(/^(room|backdrop|backdrop-holder|table|gobo|fixture|stand|shop)\//.test(p.id),`Unsupported Studio draw owner: ${p.id}.`);
+    assert(/^(room|backdrop|backdrop-holder|table|programmer|gobo|fixture|stand|shop)\//.test(p.id),`Unsupported Studio draw owner: ${p.id}.`);
     validateStudioSubjectPacket(packetFor(packet,p.faces,p.id),samplers);
     if(scene.triangleSources)for(let j=0;j<p.faces.length;j++) {
       const s=scene.triangleSources[offset+j];
