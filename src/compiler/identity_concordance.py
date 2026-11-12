@@ -1732,8 +1732,9 @@ class CorrelationTable:
     def _source_parameter_memory_contract_findings(module: Any) -> list[Finding]:
         """Check the one selected contract against authored and formal cells."""
         from .concordance_declarations import (
-            CLASS_DECLARATION, NAME_BINDING, PARAMETER_ANNOTATION,
-            SOURCE_FORMAL_ORDER, SOURCE_PARAMETER_MEMORY_CONTRACT,
+            CLASS_DECLARATION, CLASS_METHOD_DECLARATION, NAME_BINDING,
+            PARAMETER_ANNOTATION, SOURCE_FORMAL_ORDER,
+            SOURCE_PARAMETER_MEMORY_CONTRACT,
         )
         from ..transmogrifier.function_table import (
             ParameterContract, ParameterStorage,
@@ -1793,6 +1794,21 @@ class CorrelationTable:
                 if source.row == (row[0][0], annotation_text)
                 and source in direct_annotation_causes
             )
+            # A method's receiver has no annotation: its contract derives from
+            # the method's declaration in its class (topological_reducer
+            # _known_parameter_memory_contracts) and that class's declaration.
+            receiver_declarations = tuple(
+                source for source in initial_sources
+                if annotation is None
+                and source.page == CLASS_METHOD_DECLARATION
+                and source.row[0] == row[0][0]
+                and str(row[0][1]).rsplit(".", 1)[-1] == source.row[2]
+            )
+            if receiver_declarations:
+                exact_class_sources = tuple(
+                    source for source in class_sources
+                    if source.row == tuple(receiver_declarations[0].row[:2])
+                )
             binding_matches = (
                 len(bindings) == 1
                 and len(used_inputs) == 1
@@ -1815,7 +1831,8 @@ class CorrelationTable:
             valid = bool(
                 valid and binding_matches and prior
                 and contract.storage is ParameterStorage.RECORD
-                and annotation is not None and annotation in initial_sources
+                and (annotation is not None and annotation in initial_sources
+                     or len(receiver_declarations) == 1)
                 and len(exact_class_sources) == 1
                 and installed == (contract,)
             )
@@ -3096,6 +3113,16 @@ class CorrelationTable:
             class_fact = (book.page(SOURCE_VALUE_CLASS).cell(
                 actual_class.row, actual_class.column,
             ) if actual_class.page == SOURCE_VALUE_CLASS else None)
+            # A method's receiver: no annotation, and the contract derives
+            # from the method's declaration in the same class instead.
+            from .concordance_declarations import (
+                CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
+            )
+            receiver_proof = annotation is None and any(
+                source.page == _CLASS_METHOD_DECLARATION
+                and tuple(source.row[:2]) == tuple(declaration.row)
+                for source in memory_sources
+            )
             valid = (
                 binding in sources
                 and all(cell in sources for cell in (
@@ -3105,12 +3132,12 @@ class CorrelationTable:
                 and binding_fact[0] == actual
                 and binding_fact[4] == formal_binding
                 and memory.row == (row[2], binding_fact[2])
-                and annotation in memory_sources
+                and (annotation in memory_sources or receiver_proof)
                 and any(source.page == SOURCE_PARAMETER_MEMORY_CONTRACT
                         for source in memory_sources)
                 and formal_binding in memory_sources
                 and declaration in memory_sources
-                and declaration in annotation_sources
+                and (declaration in annotation_sources or receiver_proof)
                 and declaration.page == CLASS_DECLARATION
                 and declaration.row[0] == row[0][0]
                 and actual_class.row == (row[0], actual.row[-1])

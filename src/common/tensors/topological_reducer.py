@@ -2319,8 +2319,9 @@ def _known_parameter_memory_contracts(
     bindings = dict(getattr(definition, "_python_bindings", {}) or {})
     storage_by_name: dict[str, ParameterStorage] = {}
     from ...compiler.concordance_declarations import (
-        CLASS_DECLARATION, PARAMETER_ANNOTATION,
+        CLASS_DECLARATION, CLASS_METHOD_DECLARATION, PARAMETER_ANNOTATION,
     )
+    from ...transmogrifier.graph.python_special_cases import method_receiver_formal
     definition_span = _post_source_span(definition)
     annotation_owner = (
         tuple(definition_span.row[:2]) if definition_span is not None else None
@@ -2363,6 +2364,25 @@ def _known_parameter_memory_contracts(
                 source_evidence[name] = (annotation_cell, declared_class_cell)
         elif index == 0 and method_owner is not None:
             storage_by_name[name] = ParameterStorage.RECORD
+            # Program: the AbstractTensor YoungMan, whose ``__init__`` writes
+            # ``self.precision`` and then calls methods on ``self`` that read
+            # it.  Wrong record: the receiver's RECORD/ALIAS contract had no
+            # evidence, so it was never posted and no call could prove that
+            # ``self`` is the caller's object.  Rule: a method's receiver is
+            # proven by the method's declaration in its class (Python binds
+            # the instance there); that declaration and the class declaration
+            # stand where an annotation stands for an annotated record.
+            if (source_evidence is not None and annotation_owner is not None
+                    and method_receiver_formal(definition) == name):
+                method_cell = book.latest_ref(
+                    CLASS_METHOD_DECLARATION,
+                    (annotation_owner[0], str(method_owner), str(definition.name)),
+                )
+                owner_class_cell = book.latest_ref(
+                    CLASS_DECLARATION, (annotation_owner[0], str(method_owner)),
+                )
+                if method_cell is not None and owner_class_cell is not None:
+                    source_evidence[name] = (method_cell, owner_class_cell)
     if not storage_by_name:
         return ()
     return tuple(
@@ -9656,6 +9676,39 @@ def _normalize_lexical_values(
             class_identity = primitive_class_identities.get(
                 str(annotation_fact)
             )
+        receiver_class_proof: tuple = ()
+        if (class_identity is None and method_owner is not None
+                and name == receiver_formal):
+            # Program: the AbstractTensor YoungMan; ``__init__`` writes
+            # ``self.precision`` and calls methods on ``self`` that read it.
+            # Wrong record: an unannotated receiver had no value class, so no
+            # call could prove the callee's ``self`` is the caller's object
+            # (SOURCE_CALL_OBJECT_ALIAS needs the actual's class).  Rule: a
+            # method's receiver is an instance of the class that declares the
+            # method -- proven by that CLASS_METHOD_DECLARATION and the class
+            # declaration -- when no class in the program derives from it (a
+            # subclass instance may arrive as ``self``).
+            from ...compiler.concordance_declarations import (
+                CLASS_DECLARATION as _CLASS_DECLARATION,
+                CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
+                CLASS_SUBTYPE as _CLASS_SUBTYPE,
+            )
+            receiver_book = current_identity_book()
+            receiver_module = tuple(value_class_scope)[0]
+            method_cell = receiver_book.latest_ref(
+                _CLASS_METHOD_DECLARATION,
+                (receiver_module, str(method_owner), str(statement.name)),
+            )
+            owner_class_cell = receiver_book.latest_ref(
+                _CLASS_DECLARATION, (receiver_module, str(method_owner)),
+            )
+            subclassed = any(
+                str(row[1]) in {str(method_owner), f"{receiver_module}.{method_owner}"}
+                for row in receiver_book.page(_CLASS_SUBTYPE).rows()
+            )
+            if method_cell is not None and owner_class_cell is not None and not subclassed:
+                class_identity = str(method_owner)
+                receiver_class_proof = (method_cell, owner_class_cell)
         if class_identity is not None:
             # A typed parameter already IS an instance of its declared class.
             # ``class_ref`` has the narrower, executable meaning "this node
@@ -9780,13 +9833,16 @@ def _normalize_lexical_values(
                     if numeric_descriptor is not None else 1
                 ),
                 source=(
-                    f"program ABI record binding {name}"
+                    f"method receiver {name}"
+                    if receiver_class_proof
+                    else f"program ABI record binding {name}"
                     if name in parameter_contract_declared
                     else f"parameter annotation {name}"
                 ),
                 provenance=_Derived(tuple(
                     cell for cell in (
                         annotation_cell, input_cell, argument_span,
+                        *receiver_class_proof,
                         *(
                             (contract_class_declaration_cell(
                                 class_identity),)
@@ -29918,11 +29974,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         {source for source, _stage in
                          binding_book.edges_into(annotation_cell)}
                     )
+                    # A method's receiver has no annotation: its contract
+                    # derives from the method's declaration in its class
+                    # (_known_parameter_memory_contracts), which names the
+                    # class as an annotation would.
+                    from ...compiler.concordance_declarations import (
+                        CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
+                    )
+                    receiver_declarations = (
+                        tuple(source for source in memory_sources
+                              if source.page == _CLASS_METHOD_DECLARATION)
+                        if annotation_cell is None else ()
+                    )
+                    if receiver_declarations:
+                        annotation_cell = receiver_declarations[0]
                     class_declarations = tuple(
                         source for source in memory_sources
                         if source.page == CLASS_DECLARATION
                         and source.row == (caller_scope[0], concorded[0])
-                        and source in annotation_sources
+                        and (source in annotation_sources or any(
+                            declared.row[:2] == source.row
+                            for declared in receiver_declarations
+                        ))
                     ) if isinstance(concorded, tuple) and concorded else ()
                     contract = (
                         memory_fact[0] if isinstance(memory_fact, tuple)
