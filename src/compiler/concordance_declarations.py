@@ -684,6 +684,12 @@ SOURCE_EXCEPTION_OPERATION = declare_page("source_exception_operation", (
 C_EXCEPTION_OPERATION = declare_page("c_exception_operation", (
     RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)  # (semantic operator, input ids, materialization policy)
+# The LLVM lane's materialization of the same SSA exception operators, keyed
+# and valued exactly as C_EXCEPTION_OPERATION: both lanes link the one
+# turing_validation_runtime packet ABI, so the policy vocabulary is shared.
+LLVM_EXCEPTION_OPERATION = declare_page("llvm_exception_operation", (
+    RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
+), tuple)  # (semantic operator, input ids, materialization policy)
 C_OPERATOR_SAFETY = declare_page("c_operator_safety", (
     RowField("result", K.PAGE_REF), RowField("function", K.NAME),
 ), tuple)  # (operator, exact input ids, fundamental failure arms, compile policy)

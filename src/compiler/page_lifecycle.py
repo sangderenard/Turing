@@ -280,6 +280,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "source_exception_node": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "source_exception_operation": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "c_exception_operation": PageLifecycle(EMISSION, EMISSION, EMISSION),
+    "llvm_exception_operation": PageLifecycle(EMISSION, EMISSION, EMISSION),
     "c_operator_safety": PageLifecycle(EMISSION, EMISSION, EMISSION),
     "thread_capture_contract": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "thread_capture_columns": PageLifecycle(LOWERING, REPAIRS, REPAIRS),

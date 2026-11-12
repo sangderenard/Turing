@@ -3667,7 +3667,8 @@ class CorrelationTable:
     def _operator_safety_findings(module: Any) -> list[Finding]:
         from .concordance_declarations import (
             COMPILE_POLICY, C_OPERATOR_SAFETY, SOURCE_EXCEPTION_OPERATION,
-            SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, SOURCE_EXCEPTION_INGESTION,
+            SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, LLVM_EXCEPTION_OPERATION,
+            SOURCE_EXCEPTION_INGESTION,
             SOURCE_EXCEPTION_NORMAL_BINDING, SOURCE_EXCEPTION_NODE,
             SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_NODE, NAME_BINDING,
             LEXICAL_READ_BINDING, INGESTION_VALUE, SOURCE_SPAN,
@@ -4015,46 +4016,51 @@ class CorrelationTable:
                                                 instruction.failure_arms_for(book), instruction.attributes["operator_safety_policy"])):
                 found.append(Finding("c-operator-safety", str(row[1]), None,
                                      "C division arms disagree with the SSA operator definition"))
-        for row in book.page(C_EXCEPTION_OPERATION).rows():
-            source, name, _result = row
-            data = book.page(C_EXCEPTION_OPERATION).latest(row)
-            function = module.functions.get(name)
-            accepted = (
-                function is not None and accepted_ssa_component(function)
-            )
-            source_book, digest = (
-                _frame_owner_book(function) if accepted else (book, None)
-            )
-            source_fact = (
-                None if source.page != SOURCE_EXCEPTION_OPERATION else
-                source_book.page(SOURCE_EXCEPTION_OPERATION).cell(
-                    source.row, source.column,
+        # The C and LLVM lanes materialize the same SSA exception operators
+        # against the same source fact; each policy row is read the same way.
+        for exception_page, finding_kind, lane in (
+                (C_EXCEPTION_OPERATION, "c-exception-provenance", "C"),
+                (LLVM_EXCEPTION_OPERATION, "llvm-exception-provenance", "LLVM")):
+            for row in book.page(exception_page).rows():
+                source, name, _result = row
+                data = book.page(exception_page).latest(row)
+                function = module.functions.get(name)
+                accepted = (
+                    function is not None and accepted_ssa_component(function)
                 )
-            )
-            import_ref = (
-                book.latest_ref(IMPORTED_CELL, (digest, source.key))
-                if source_book is not book and source_fact is not None else None
-            )
-            imported = (
-                None if import_ref is None else
-                book.page(IMPORTED_CELL).cell(import_ref.row, import_ref.column)
-            )
-            expected_cause = source if source_book is book else import_ref
-            policy_ref = book.latest_ref(C_EXCEPTION_OPERATION, row)
-            causes = (
-                set() if policy_ref is None else
-                {cell for cell, _stage in book.edges_into(policy_ref)}
-            )
-            if (source_fact is None
-                    or PROCESS_OPERATORS.get(source_fact[0]) != data[0]
-                    or expected_cause is None or expected_cause not in causes
-                    or (source_book is not book and (
-                        not isinstance(imported, ImportedCell)
-                        or imported.source != source
-                        or imported.fact != source_fact
-                        or imported.owner is not source_book))):
-                found.append(Finding("c-exception-provenance", str(name), None,
-                                     "C exception operation disagrees with its source identity"))
+                source_book, digest = (
+                    _frame_owner_book(function) if accepted else (book, None)
+                )
+                source_fact = (
+                    None if source.page != SOURCE_EXCEPTION_OPERATION else
+                    source_book.page(SOURCE_EXCEPTION_OPERATION).cell(
+                        source.row, source.column,
+                    )
+                )
+                import_ref = (
+                    book.latest_ref(IMPORTED_CELL, (digest, source.key))
+                    if source_book is not book and source_fact is not None else None
+                )
+                imported = (
+                    None if import_ref is None else
+                    book.page(IMPORTED_CELL).cell(import_ref.row, import_ref.column)
+                )
+                expected_cause = source if source_book is book else import_ref
+                policy_ref = book.latest_ref(exception_page, row)
+                causes = (
+                    set() if policy_ref is None else
+                    {cell for cell, _stage in book.edges_into(policy_ref)}
+                )
+                if (source_fact is None
+                        or PROCESS_OPERATORS.get(source_fact[0]) != data[0]
+                        or expected_cause is None or expected_cause not in causes
+                        or (source_book is not book and (
+                            not isinstance(imported, ImportedCell)
+                            or imported.source != source
+                            or imported.fact != source_fact
+                            or imported.owner is not source_book))):
+                    found.append(Finding(finding_kind, str(name), None,
+                                         f"{lane} exception operation disagrees with its source identity"))
         return found
 
     @staticmethod
