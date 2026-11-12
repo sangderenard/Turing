@@ -40,6 +40,34 @@ A shader block is intrinsically an in-place device deployment. It does not
 need a separate language-switch or launch directive. The runtime raises the
 GPU-active indicator when entering the block and clears it on departure.
 
+A natural-language stand-in and the block that satisfies it:
+
+```text
+/*@turing.segment.v1
+id = want-larger
+language = prose
+author = albert
+@end*/
+A function returning the larger of two numbers.
+/*@turing.end*/
+/*@turing.segment.v1
+id = larger
+language = python
+satisfies = want-larger
+author = claude
+@end*/
+def larger(a, b):
+    return a if a >= b else b
+/*@turing.end*/
+```
+
+A `prose` block is irreducible: it sits open on the document's work table
+(`DreamDocument.work_table()`) until a block names it in `satisfies`. A
+satisfying block must name its `author`; a prose child is a refinement and
+leaves its parent open, any other language satisfies it and its author then
+owns the room the stand-in claims in the repository world map. See
+`DREAM_INTERPRETER_LIMITS.md`, "Natural-language stand-ins".
+
 Parallel deployment is structure rather than locking syntax:
 
 ```text
@@ -131,6 +159,11 @@ embeds and publishes its newest `TMSNAP01` buffer on page load. This makes a
 self-contained examination artifact. It does not claim that the browser can
 continue the guest until a compiled machine-program host is attached.
 
+## Measured limits
+
+What each language route reaches today, what it refuses, and where the C++
+route stops, is measured and pinned in `DREAM_INTERPRETER_LIMITS.md` and
+`tests/test_dream_interpreter_limits.py` (2026-11-11).
 ## Writing a document
 
 `render_dream_document(document) -> bytes` is the exact inverse of `parse_dream_document`:

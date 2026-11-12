@@ -1,6 +1,8 @@
 """Targeted test: a small fixture repository scanned into neutral world records."""
 
+import io
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,11 @@ from src.compiler.repo_world_scan import (
     REPO_WORLD_SCAN_VERSION,
     DirtyCloneError,
     RepoScanError,
+    github_clone_url,
+    scan_remote_repository,
     declared_import_roots,
     scan_repository,
+    scan_tar_stream,
 )
 
 
@@ -44,6 +49,8 @@ def _fixture_repo(root: Path) -> Path:
     _write(repo, "web/lib/helper.js", "export const draw = 1;\nexport const x = 2;\n")
     _write(repo, "web/lib/side.js", "import '../main.js';\n")
     _write(repo, "README.md", "fixture\n")
+    _write(repo, "native/geom.cpp", '#include "geom.hpp"\n')
+    _write(repo, "native/geom.hpp", "struct G {};\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "fixture")
     return repo
@@ -70,7 +77,7 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
 
     # Folder -> region / subregion, parented through the directory tree.
     regions = {r.path: r for r in scan.regions}
-    assert set(regions) == {".", "pkg", "web", "web/lib"}
+    assert set(regions) == {".", "native", "pkg", "web", "web/lib"}
     assert regions["."].parent is None
     assert regions["pkg"].parent == regions["."].identity
     assert regions["web/lib"].parent == regions["web"].identity
@@ -82,15 +89,38 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
     assert set(rooms) == {
         "README.md", "app.py", "pkg/__init__.py", "pkg/broken.py", "pkg/core.py",
         "pkg/util.py", "web/lib/helper.js", "web/lib/side.js", "web/main.js",
+        "native/geom.cpp", "native/geom.hpp",
     }
     assert rooms["pkg/core.py"].region == regions["pkg"].identity
     assert rooms["web/lib/side.js"].region == regions["web/lib"].identity
     assert rooms["README.md"].language == "other"
 
+    # Languages come from the compiler's own table; C++ is known but unlinked.
+    assert rooms["native/geom.cpp"].language == "cpp"
+    languages = {row["language"]: row for row in scan.to_data()["languages"]}
+    # Compiler languages first (with a route), then extractor-only languages (none).
+    assert set(languages) == {
+        "python", "sympy", "javascript", "glsl", "wgsl", "cpp", "prose",
+        "c", "cmake", "html", "powershell", "shell",
+    }
+    assert languages["prose"]["route"] == "stand-in" and languages["prose"]["suffixes"] == []
+    # C++ is a compiler language, linked by the C include extractor plugin.
+    assert languages["cpp"]["route"] == "cpp-shell"
+    assert languages["cpp"]["linking"] == "src.compiler.repo_world_refs_c"
+    assert languages["html"]["route"] is None
+    assert languages["html"]["linking"] == "src.compiler.repo_world_refs_html"
+    assert languages["python"]["linking"] == "python-import"
+    assert languages["javascript"]["linking_readers"] == [
+        "es-module-import", "src.compiler.repo_world_refs_js_dynamic",
+    ]
+    assert scan.to_data()["extractor_languages"] == ["c", "javascript", "python"]
+    assert scan.to_data()["import_roots"] == [""]
+
     # Cross-file reference -> one portal pair with the source line.
     assert _portal_table(scan) == [
         ("app.py", 2, "pkg/core.py", "python-import"),
         ("app.py", 3, "pkg/util.py", "python-import"),
+        ("native/geom.cpp", 1, "native/geom.hpp", "c-include"),
         ("pkg/core.py", 1, "pkg/util.py", "python-import"),
         ("pkg/core.py", 2, "pkg/util.py", "python-import"),
         ("web/lib/side.js", 1, "web/main.js", "es-module-import"),
@@ -135,6 +165,78 @@ def test_scan_refuses_uncommitted_and_untracked_changes(tmp_path):
         scan_repository(repo / "pkg")
 
 
+def test_remote_stream_scan_sees_only_what_the_remote_serves_and_touches_no_disk(tmp_path, monkeypatch):
+    repo = _fixture_repo(tmp_path)
+    committed = _git(repo, "rev-parse", "HEAD").strip()
+    # Local, uncommitted mess that must never reach the map.
+    (repo / "secret.txt").write_text("do not expose\n", encoding="utf-8")
+    (repo / "app.py").write_text("import pkg.util  # local edit\n", encoding="utf-8")
+    # The source is a transient intermediary: nothing may be written anywhere.
+    import tempfile
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: pytest.fail("a temp dir was made"))
+    monkeypatch.setattr(tempfile, "mkstemp", lambda *a, **k: pytest.fail("a temp file was made"))
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    scan = scan_remote_repository(repo.as_uri())
+
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+    assert scan.commit == committed
+    assert scan.origin == repo.as_uri()
+    assert "secret.txt" not in {r.path for r in scan.rooms}
+    assert _portal_table(scan)[:2] == [
+        ("app.py", 2, "pkg/core.py", "python-import"),
+        ("app.py", 3, "pkg/util.py", "python-import"),
+    ]
+    # The stream lane and the on-disk lane describe the same commit identically;
+    # only `origin` differs (the checkout has no remote, the stream names its URL).
+    _git(repo, "checkout", "--", "app.py")
+    (repo / "secret.txt").unlink()
+    streamed, on_disk = scan.to_data(), scan_repository(repo).to_data()
+    assert streamed.pop("origin") == repo.as_uri() and on_disk.pop("origin") is None
+    assert streamed == on_disk
+
+    assert github_clone_url("sangderenard/turing") == "https://github.com/sangderenard/turing.git"
+    with pytest.raises(RepoScanError):
+        github_clone_url("C:/dev/Powershell/turing")
+    with pytest.raises(RepoScanError, match="no ref named"):
+        scan_remote_repository(repo.as_uri(), ref="no-such-branch")
+
+
+def test_github_shaped_tarball_streams_through_the_same_scan():
+    # The GitHub API tarball wraps the tree in one directory and may carry a
+    # pax header and symlinks; only regular files become rooms and only
+    # linkable files are ever read.
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        def add(name, data=None, kind=tarfile.REGTYPE):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            if kind == tarfile.SYMTYPE:
+                info.linkname = "a.py"
+                archive.addfile(info)
+                return
+            if kind == tarfile.DIRTYPE:
+                archive.addfile(info)
+                return
+            raw = data.encode("utf-8")
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
+        add("owner-repo-abc1234", kind=tarfile.DIRTYPE)
+        add("owner-repo-abc1234/a.py", "import b\n")
+        add("owner-repo-abc1234/b.py", "x = 1\n")
+        add("owner-repo-abc1234/link.py", kind=tarfile.SYMTYPE)
+        add("owner-repo-abc1234/blob.bin", "\x00binary never read")
+        add("owner-repo-abc1234/sub/wish.dream",
+            "/*@turing.segment.v1\nid = w\nlanguage = prose\nauthor = a\n@end*/\nA thing.\n/*@turing.end*/\n")
+
+    buffer.seek(0)
+    scan = scan_tar_stream("c" * 40, "https://github.com/owner/repo.git", buffer,
+                           mode="r|gz", strip_components=1)
+    assert {r.path for r in scan.rooms} == {"a.py", "b.py", "blob.bin", "sub/wish.dream"}
+    assert {r.path for r in scan.regions} == {".", "sub"}
+    assert _portal_table(scan) == [("a.py", 1, "b.py", "python-import")]
+    assert [c.stand_in for c in scan.claims] == ["w"]
+    assert any("link.py" in note for note in scan.notes)
 
 class _Fake:
     LANGUAGE = "fakelang"

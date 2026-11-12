@@ -118,21 +118,91 @@ Identities are keyed by the commit: `repo:<H>/dir:<path>`,
 (asserted by the test); two commits never collide. The root directory is
 `dir:.`.
 
-The fresh clone is outside the module by design: the scanner takes a path,
-checks it is a repository top level and that `git status --porcelain
---untracked-files=all` is empty, and otherwise refuses with
-`DirtyCloneError`. The compile step is therefore
+The source is GitHub, not the owner's local filesystem. The local scratch
+tree is messy and holds things that must not be exposed, so the scanner's
+public entry is `scan_github_repository("owner/repo", ref=…)`. Only what
+GitHub serves can reach the record set. The compile step is one command:
 
 ```bash
-git clone --depth 1 https://github.com/<owner>/<repo>.git <tmp>/clone
+python -m src.compiler.repo_world_scan sangderenard/turing --ref main --json
 ```
+
+**Transient intermediaries never touch the disk (owner's direction,
+2026-11-11).** The source tree is used for exactly one operation, this
+scan, and is kept for nothing else, so it is streamed, not cloned:
+`scan_github_repository` resolves the commit through the GitHub API, then
+streams that commit's tarball through `tarfile` and scans it as it passes
+(`scan_tar_stream`). Only the paths and the bytes of files a reader links
+(Python, JavaScript, dream documents) are held, and only until the scan
+returns; every other file is a room by name and its bytes are never read.
+`scan_remote_repository(url)` does the same for any other git URL with
+`git ls-remote` + `git archive --remote` (GitHub does not serve
+`upload-archive`, hence two lanes); fixture tests use it over `file://`.
+What a remote excludes from archives (`export-ignore`) the scan never sees.
+Every lane ends in `scan_files(commit, origin, paths, read)`, so the stream
+lanes and the on-disk lane produce identical records for one commit (tested).
+
+`scan_repository(path)` remains for a checkout that already exists on disk
+(fixtures, or a clone a call asked for): it checks the path is a repository
+top level and that `git status --porcelain --untracked-files=all` is empty,
+refusing with `DirtyCloneError` otherwise. The `--path` form is for fixture
+tests, not for the owner's checkout.
+
+**The record set's retention is the call's declaration.** The scan returns
+records in memory. The CLI writes them only where told: `--json` to stdout,
+`--out <file>` to the path the call names. The user-space declaration is
+`src/compiler/repo_world_sink.py` (2026-11-11): `scan_bundle(scan)` is the
+personal part of a scan (`summary.json` with commit, origin, counts,
+languages, notes; `claims.json` with every claimed room), `work_table_bundle
+(document)` is a dream document's stand-ins and satisfaction tree, and
+`submit(store, actor_id, bundle)` seals the bundle into the actor's account
+workspace through the service's existing store
+(`examples/meowdoku/workspace_accounting.Store`: lease, quota, sealed review
+snapshot, admin review), reserving a lease sized from the bundle when none is
+given. `actor_id` is a `users.id` row of the accounts database and the store
+authenticates it; the sink decides nothing about identity. The bundle's
+`base_revision` is the sha256 of its paths and bytes, so the lease names the
+record it holds. The store's bundle cap is 1 MiB and 128 files, so the full
+record set (`scan.json`, tens of MB for a real repository) goes in only when
+the call asks (`full=True`) and fits; otherwise the store refuses before
+anything is kept. `read_bundle` returns the owner's bytes. There is no CLI
+and no HTTP route: the actor is a session the service authenticates
+(`SessionAccess`), and the service has no workspace route yet.
+
+### The whole workspace, in its on-disk layout
+
+The owner's workspace is one root repository (`nogodsnomasters`) whose child
+directories are independent repositories. `src/compiler/repo_world_workspace.py`
+scans all of it from GitHub in that layout:
+
+1. `discover` reads only git metadata of the local tree (which top-level
+   directories are repositories, each one's remote URL normalised to GitHub
+   HTTPS, its current branch). No file contents are read. Git worktrees (a
+   `.git` file) are skipped as views of another entry; a repository with no
+   remote is skipped with a note. The manifest is a **personal asset**: it
+   describes the owner's disk, so it is not committed to this repository
+   (the copy committed on 2026-11-11 was removed the same day). It stays in
+   memory for one scan (`scan --discover <root>`, `scan_workspace_root`) or
+   is written where the call names (`discover <root> <file>`).
+2. `scan` streams every repository from its remote with
+   `scan_remote_repository` (nothing cloned, nothing on disk) and emits one
+   workspace record: each repository's scan plus a `mounts` table saying
+   which root-repository region each child repository's root region
+   (`dir:.`) is contained by. A remote that will not serve is a note, or the
+   error with `strict`.
+3. `clone` recreates the layout under an empty destination with shallow
+   clones, root first, children inside it, for a call that asks for the
+   layout on disk. The scan never uses it.
 
 ```bash
-python -m src.compiler.repo_world_scan <tmp>/clone --json
+python -m src.compiler.repo_world_workspace scan --discover C:/dev/Powershell --json
 ```
 
-and the record set names the commit the clone is at. The local scratch tree
-cannot be scanned while it has uncommitted work, which is the owner's rule.
+Layout as discovered 2026-11-11: 15 repositories, 51 worktrees skipped.
+`speaktome` sat on a session branch (`codex/direct-x86-vocabulary-report`),
+which may not be the branch GitHub should serve; `pcb` points at the
+`electrofluid` repository. The refs the scan asks for are whatever the
+discovered checkouts are on, unless a written manifest is edited first.
 
 ### Reference extraction
 
@@ -148,10 +218,47 @@ cannot be scanned while it has uncommitted work, which is the owner's rule.
   Bare specifiers are unresolved by rule. Dynamic `import()`, CommonJS
   `require`, and multi-line import statements are not read.
 
-Both extractors are declared; nothing else is inferred. Calls other than
-imports (a function in A calling a function in B) are not references in
+Both built-in extractors are declared; nothing else is inferred. Calls other
+than imports (a function in A calling a function in B) are not references in
 this version; the owner's "calls out of / into a file" is served at module
 granularity first.
+
+**Extractor plugins and import roots (main, 526cae74, joined 2026-11-12).**
+Six more extractors are plugin modules named in `EXTRACTOR_MODULES` (C
+includes, CMake, HTML, dynamic JavaScript, PowerShell, shell), each a module
+with `LANGUAGE`, `SUFFIXES`, optional `FILENAMES` and
+`references(path, text, tracked)`; a plugin that fails to import, raises, or
+returns an untracked target is a scan error, never skipped. Python absolute
+names resolve against the repository root and each declared import root
+(`import_roots=`, CLI `--import-root`, or the declarations the tree itself
+carries in `pyproject.toml`, `repo_world.toml`, `pytest.ini`, `setup.cfg`,
+`tox.ini`: `DECLARATION_FILES`); roots are never guessed. The stream lanes
+read the declarations from the stream (`import_roots=None`). Pair identity
+keys (source, line, target); two kinds on one line to one target are one
+pair. Record schema `repo-world-scan-v1`, with `extractor_languages` and
+`import_roots` beside the branch's `languages` and `claims`.
+
+### Known languages and the linking state (2026-11-11)
+
+The scan's language vocabulary is the compiler's own table,
+`DREAM_LANGUAGE_TRANSLATIONS` in `src/compiler/dream_document.py` (python,
+sympy, javascript, glsl, wgsl, cpp, each with its translation route). The
+scanner adds only what that table does not carry, in two named tables in
+`repo_world_scan.py`: `LANGUAGE_SUFFIXES` (which file suffixes name each
+language) and `LINKING_READERS` (which languages have a built-in cross-file
+reference reader). A startup check refuses a suffix table that names a
+language the compiler table does not. Every scan publishes `languages`, one
+row per known language with its route and its `linking_readers` (the
+built-in reader plus every extractor plugin whose suffixes overlap the
+language's), followed by one row per extractor-only language (c, cmake,
+html, powershell, shell: a reader, no compiler route). Since the join with
+main's extractor registry, C++ rooms are linked by the C include plugin
+(`c-include` pairs), so the empty C++ portal columns in §7a are historical:
+they were measured before that reader existed. A file's `language` is the
+compiler's name when a known suffix claims it (`.cpp` is `cpp`, not the
+plugin's `c`), else the first matching extractor's `LANGUAGE`. The
+translation matrix in the root `TRANSLATION_MATRIX_SIGNOFF_2026-08-12.md`
+remains the place that records which routes exist for a language once linked.
 
 ## 3. The general portal record
 
@@ -173,6 +280,25 @@ boundary*, not the pair. The pair is the fact; the ends are its two faces.
 `portal_contract` (apertures, tube graph, Gaussian splats) remains what it is
 today: a realisation policy of one backend, consulted when the page draws an
 end, never written into the record.
+
+## 3a. The room claim (2026-11-11)
+
+A prose stand-in in a tracked `.dream` document owns a room before any
+content exists. The scan mints `RepoRoomClaim` for each one:
+
+| Need | Field | Filled by |
+|---|---|---|
+| identity, stable for a commit | `repo:<H>/claim:<path>#<block>` | scanner |
+| where it sits | `region` (the document's region), `document_room` (`claimed-from`) | scanner |
+| who owns it | `owner`: first code contributor once satisfied, else the describer (`described_by`), else none | `DreamDocument.work_table()` |
+| whether work remains | `state`: `open` / `satisfied`; `contributions` with block, language, author, hash | `DreamDocument.work_table()` |
+| the description's identity | `content_hash` (the card `cache_key`) | dream parser |
+| content, geometry, portals | *none*: the room is claimed but unaltered | later, by whoever fills the room |
+
+A `.dream` file is a room with language `dream-document`
+(`DOCUMENT_SUFFIXES`); it is a container of language blocks, not a language,
+so it is not in `LANGUAGE_SUFFIXES` and gets no portals of its own. Gap D
+covers the claim too: no `abstract_ui_*` record consumes it yet.
 
 ## 4. Reused unchanged
 
@@ -234,7 +360,55 @@ Nothing in `abstract_ui_*.py` was edited on this branch.
   scanner needs the repository's declared import roots as an input; it must
   not guess them from directory names.
 
+## 7a. Measurement of the whole workspace from GitHub (observed, 2026-11-11)
+
+`scan_workspace(manifest)` (clone lane, since replaced by the stream lane):
+all 15 repositories cloned and scanned from github.com, no failed clones
+(including `pcb` → electrofluid and `speaktome` on its session branch), 14
+mounts, 235 s end to end.
+
+| repository | commit | regions | rooms | portal pairs | unresolved |
+|---|---|---|---|---|---|
+| `.` (nogodsnomasters) | 937de5dd | 867 | 2,677 | 35 | 5,124 |
+| amp | 2b61525d | 84 | 262 | 74 | 637 |
+| fftfree | cb884533 | 7 | 44 | 0 | 111 |
+| geometry | 97128724 | 14 | 172 | 0 | 0 |
+| lfsavoider | c7412218 | 2 | 28 | 0 | 0 |
+| meta-nn | 93fc1dc9 | 13 | 191 | 411 | 1,035 |
+| nodus | fe678e9e | 43 | 486 | 40 | 600 |
+| pcb | b6c64e6e | 5 | 48 | 73 | 125 |
+| pigeon | c8f4854c | 1 | 13 | 17 | 95 |
+| socratic | 6054198b | 11 | 142 | 217 | 1,018 |
+| speaktome | 86721ddb | 210 | 2,388 | 712 | 4,666 |
+| spectral-analyzer | edddb335 | 103 | 1,029 | 1,557 | 6,175 |
+| tensor-calculator | 34f9fec6 | 4 | 6 | 0 | 0 |
+| turing | d2a7f022 | 245 | 5,772 | 15,331 | 17,583 |
+| wheelhouse | 0c4c7a37 | 2 | 12 | 0 | 0 |
+| **total** | | **1,611** | **13,270** | **18,467** | **37,169** |
+
+Workspace JSON: 56.7 MB. The root repository alone holds 867 regions and
+2,677 rooms on GitHub's `nogodsnomasters` branch, far more than the
+coordination files the root AGENTS.md describes; what it tracks there is
+worth reading before the world builder lays it out. C++ repositories
+(geometry, fftfree, nodus) show few or no portals because only Python and
+ES-module imports are extracted (gap G).
+
 ## 7. Measurement on this repository (observed, 2026-11-10)
+
+Joined scanner, 2026-11-12 (stream lane + main's extractors and import
+roots): turing main `7813a6a3` streamed from GitHub in 39 s, nothing on disk:
+245 regions, 5,881 rooms, 16,509 portal pairs across 13 reference kinds
+(15,591 python-import, 720 es-module-import, 82 js-url, 50 html-script, 10
+c-include, …), 16,850 unresolved, 0 claimed rooms. The declared import root
+`examples` was read from the stream's `repo_world.toml`, and the `meowdoku.*`
+unresolved count (998 in gap H) is now 0.
+
+Stream lane, 2026-11-11: `python -m src.compiler.repo_world_scan
+sangderenard/turing --ref main` streamed main at `5abc1165` from the GitHub
+API with nothing on disk in 34 s: 245 regions, 5,862 rooms, 15,378 portal
+pairs, 17,944 unresolved, 0 claimed rooms (no tracked `.dream` has a prose
+block yet). The clone lane it replaces took 47 s for the scan alone on an
+older commit (below), plus the clone.
 
 | quantity | value |
 |---|---|

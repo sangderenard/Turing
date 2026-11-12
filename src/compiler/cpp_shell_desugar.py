@@ -37,7 +37,26 @@ _UNSUPPORTED_MARKERS = (
     (re.compile(r"\bvirtual\b"), "virtual functions"),
     (re.compile(r"\btry\b|\bcatch\s*\(|\bthrow\b"), "exceptions"),
     (re.compile(r"\bnamespace\b"), "namespaces"),
+    # ``#include`` lines are removed before this check (see ``_strip_includes``);
+    # any other directive would have to be honoured to be faithful, and the
+    # shell has no preprocessor, so it is refused rather than dropped.
+    (re.compile(r"(?m)^\s*#\s*\w+"), "preprocessor directives other than #include"),
 )
+
+
+def _strip_includes(source: str) -> str:
+    """Remove ``#include`` lines.
+
+    The same light massaging ``machine_code_lifting.c_function_token_multigraph``
+    does before pycparser ("preprocessor lines ... are removed only so the
+    same compilable fixture can enter the portable parser").  The shell has
+    no header search, so an include can only be dropped; whatever it would
+    have declared must appear in the block itself.  Measured 2026-11-11:
+    before this, ``#include <string>`` made pycparser fail with "Directives
+    not supported yet" on the shipped mixed_python_cpp_counters example.
+    """
+
+    return re.sub(r"(?m)^\s*#\s*include\b[^\n]*$", "", source)
 
 
 def _strip_comments(source: str) -> str:
@@ -275,16 +294,39 @@ def _rewrite_call_sites(source: str, classes: dict[str, _ClassInfo]) -> str:
     variable_class: dict[str, str] = {}
     for class_name in classes:
         for match in re.finditer(
-            rf"\b{re.escape(class_name)}\s+(\w+)\s*[=;]", source,
+            rf"\b{re.escape(class_name)}\s+(\w+)\s*[=;(]", source,
         ):
             variable_class[match.group(1)] = class_name
+
+    # ``ClassName obj(args);`` is the shell's constructor call.  The class's
+    # constructor already desugars to ``ClassName__new`` returning the struct
+    # by value, so the declaration becomes ``ClassName obj = ClassName__new(args);``.
+    # Measured 2026-11-11: before this, ``C c(3);`` reached pycparser unchanged
+    # and failed to parse although constructors are in the documented scope.
+    def replace_construction(match: re.Match) -> str:
+        class_name, var_name, args = match.group(1), match.group(2), match.group(3)
+        info = classes.get(class_name)
+        if info is None or not any(m.is_constructor for m in info.methods):
+            return match.group(0)
+        return f"{class_name} {var_name} = {class_name}__new({args});"
+
+    if classes:
+        names = "|".join(re.escape(name) for name in classes)
+        source = re.sub(
+            rf"\b({names})\s+(\w+)\s*\(([^()]*)\)\s*;", replace_construction, source,
+        )
 
     def replace_call(match: re.Match) -> str:
         var_name, method_name, args = match.group(1), match.group(2), match.group(3)
         class_name = variable_class.get(var_name)
-        if class_name is None or method_name not in {
+        # A receiver whose class is unknown is left exactly as written.  The
+        # earlier form of this test mis-grouped ``or … if … else`` and emitted
+        # ``None__method(&obj)`` for such a receiver (measured 2026-11-11).
+        if class_name is None or class_name not in classes:
+            return match.group(0)
+        if method_name not in {
             m.name for m in classes[class_name].methods if not m.is_constructor
-        } if class_name in classes else False:
+        }:
             return match.group(0)
         prefix = f"&{var_name}" if args.strip() == "" else f"&{var_name}, {args}"
         return f"{class_name}__{method_name}({prefix})"
@@ -295,7 +337,7 @@ def _rewrite_call_sites(source: str, classes: dict[str, _ClassInfo]) -> str:
 def desugar_cpp_shell(source: str) -> str:
     """Rewrite ``source`` (the narrow C++-like shell) into real C text."""
 
-    stripped = _strip_comments(source)
+    stripped = _strip_includes(_strip_comments(source))
     _check_supported(stripped)
 
     # Pass 1: parse every class before emitting any of them, so a derived

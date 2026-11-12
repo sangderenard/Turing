@@ -34,20 +34,42 @@ Import roots: Python absolute names resolve against the repository root and
 each declared import root (a tracked directory, repo-relative POSIX).  Roots
 are an input, never guessed from directory names: the ``import_roots``
 argument, CLI ``--import-root DIR`` (repeatable), and
-:func:`declared_import_roots`, which reads only declarations inside the clone:
+:func:`declared_import_roots`, which reads only declarations inside the tree:
 pyproject.toml ``[tool.pytest.ini_options] pythonpath``,
 ``[tool.setuptools.packages.find] where``, ``[tool.setuptools] package-dir``
 values; ``pythonpath`` in pytest.ini / setup.cfg (``[tool:pytest]``) /
 tox.ini; and a repo-owned ``repo_world.toml`` with ``import_roots = ["dir"]``.
 The earliest root wins when a name resolves under several; a scan note counts
 those ambiguities.  Relative imports resolve from the file's own directory.
+The stream lanes read the declarations from the stream itself
+(``import_roots=None`` means "the declared roots").
+
+A tracked ``.dream`` document is a room like any file, and every prose
+stand-in inside it (``language = prose``, see ``DreamDocument.work_table``)
+mints one more room: a *claimed room*, owned by the stand-in's author before
+any content exists, ``open`` until a block in the document satisfies it.
+That is the room system's side of the owner's work table.
 
 Every identity is keyed by the commit hash, so two scans of the same commit
 produce identical records and a scan of a different commit never collides.
 The scanner refuses a tree with uncommitted or untracked changes: the record
 set describes a commit, never a working state.
 
-    python -m src.compiler.repo_world_scan <clone-path> [--json] [--import-root DIR ...]
+The sanctioned input is a GitHub repository, not the owner's local tree: the
+local scratch checkout is messy and holds things that must not be exposed.
+The source is a transient intermediary that passes through one operation
+(this scan) and is never kept, so it never touches the disk:
+:func:`scan_github_repository` streams the commit's tarball from the GitHub
+API through :mod:`tarfile`, keeping in memory only the paths and the text of
+the files a reader links (Python, JavaScript, dream documents);
+:func:`scan_remote_repository` does the same for any other git URL through
+``git archive --remote``.  Only what the remote serves can reach the record
+set.  The record set itself is returned to the caller; what the caller does
+with it is the call's own declaration (``--json`` to stdout, ``--out`` to a
+path the call names, or a user-space store the service owns).
+
+    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--import-root DIR ...] [--json | --out <file>]
+    python -m src.compiler.repo_world_scan --path <checkout> [--import-root DIR ...] [--json | --out <file>]
 """
 
 from __future__ import annotations
@@ -57,19 +79,25 @@ import configparser
 from dataclasses import dataclass, field
 import importlib
 import json
-import posixpath
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import subprocess
 import sys
+import tarfile
 import tomllib
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+import urllib.error
+import urllib.request
+
+from .dream_document import (
+    DREAM_LANGUAGE_TRANSLATIONS, DreamDocumentError, parse_dream_document,
+)
 
 REPO_WORLD_SCAN_VERSION = "repo-world-scan-v1"
 
 # Fully qualified names of extractor plugin modules (contract in the module
-# docstring).  Filled in once the plugins exist; an entry that fails to import
-# is a RepoScanError, never skipped.
+# docstring).  An entry that fails to import is a RepoScanError, never skipped.
 EXTRACTOR_MODULES: tuple[str, ...] = (
     "src.compiler.repo_world_refs_c",
     "src.compiler.repo_world_refs_cmake",
@@ -79,8 +107,55 @@ EXTRACTOR_MODULES: tuple[str, ...] = (
     "src.compiler.repo_world_refs_shell",
 )
 
-PYTHON_SUFFIXES = (".py",)
-JAVASCRIPT_SUFFIXES = (".js", ".mjs")
+# Files whose declarations name Python import roots; read from the tree
+# (on disk or in the stream) and never from anywhere else.
+DECLARATION_FILES: tuple[str, ...] = (
+    "pyproject.toml", "repo_world.toml", "pytest.ini", "setup.cfg", "tox.ini",
+)
+GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+GITHUB_CLONE_URL = re.compile(
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+GITHUB_API = "https://api.github.com"
+_USER_AGENT = "turing-repo-world-scan"
+
+# The known languages are the compiler's own table, DREAM_LANGUAGE_TRANSLATIONS
+# (each with its translation route).  This module adds two things that table
+# does not carry: which file suffixes name each language, and which languages
+# have a cross-file reference reader ("linking") here.  A language in the table
+# without a reader is known and translatable but its rooms get no portals yet;
+# that is declared per language in RepoWorldScan.languages, never implied.
+LANGUAGE_SUFFIXES: Mapping[str, tuple[str, ...]] = {
+    "python": (".py",),
+    "javascript": (".js", ".mjs"),
+    "cpp": (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"),
+    "glsl": (".glsl", ".vert", ".frag", ".geom", ".comp", ".tesc", ".tese"),
+    "wgsl": (".wgsl",),
+    # "sympy" is a Python-hosted language with no file suffix of its own.
+}
+# A dream document is a container of language blocks, not a language; its
+# room keeps language "dream-document" and its stand-ins become claimed rooms.
+DOCUMENT_SUFFIXES: Mapping[str, tuple[str, ...]] = {
+    "dream-document": (".dream",),
+}
+LINKING_READERS: Mapping[str, str] = {
+    "python": "python-import",        # ast.Import / ast.ImportFrom
+    "javascript": "es-module-import",  # static ES-module import/export-from
+}
+# Plugin extractors add readers for more languages; language_table() reports
+# them per scan from the extractors actually in use.
+_SUFFIX_LANGUAGE = {
+    suffix: language for language, suffixes in LANGUAGE_SUFFIXES.items() for suffix in suffixes
+}
+_SUFFIX_LANGUAGE.update({
+    suffix: name for name, suffixes in DOCUMENT_SUFFIXES.items() for suffix in suffixes
+})
+_unknown_to_table = set(LANGUAGE_SUFFIXES) - set(DREAM_LANGUAGE_TRANSLATIONS)
+if _unknown_to_table:
+    raise RuntimeError(
+        f"LANGUAGE_SUFFIXES names languages the compiler table does not: {sorted(_unknown_to_table)}"
+    )
+
 _JS_RESOLUTION_SUFFIXES = ("", ".js", ".mjs", "/index.js", "/index.mjs")
 
 # ES-module static import forms.  The specifier is always the last string
@@ -196,6 +271,41 @@ class RepoPortalPair:
 
 
 @dataclass(frozen=True, slots=True)
+class RepoRoomClaim:
+    """A room claimed by a stand-in before its content exists.
+
+    Minted from one prose block of a tracked ``.dream`` document.  The claim
+    is contained by the document's region beside the document's own room and
+    says who owns it (``owner``: the first code contributor once satisfied,
+    else the describer) and whether the stand-in is still ``open``.  The room
+    is unaltered: the scanner writes no content, geometry or portals for it.
+    """
+
+    identity: str
+    document_room: str
+    region: str
+    stand_in: str          # the prose block's id inside the document
+    content_hash: str      # the description's sha256, the card cache_key
+    state: str             # "open" | "satisfied"
+    owner: str | None
+    described_by: str | None
+    contributions: tuple[Mapping[str, Any], ...] = ()
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity, "kind": "claimed-room",
+            "document_room": self.document_room, "region": self.region,
+            "stand_in": self.stand_in, "content_hash": self.content_hash,
+            "state": self.state, "owner": self.owner, "described_by": self.described_by,
+            "contributions": [dict(item) for item in self.contributions],
+            "dependencies": [
+                {"relationship": "contained-by", "target": self.region},
+                {"relationship": "claimed-from", "target": self.document_room},
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RepoUnresolvedReference:
     """A reference whose target is not a tracked file (stdlib, package, typo)."""
 
@@ -222,8 +332,10 @@ class RepoWorldScan:
     portals: tuple[RepoPortalPair, ...]
     unresolved: tuple[RepoUnresolvedReference, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
-    extractor_languages: tuple[str, ...] = ()
+    claims: tuple[RepoRoomClaim, ...] = ()
+    extractor_languages: tuple[str, ...] = ("javascript", "python")
     import_roots: tuple[str, ...] = ("",)
+    languages: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def root_region(self) -> RepoRegion:
@@ -235,13 +347,15 @@ class RepoWorldScan:
             "identity": f"repo:{self.commit}",
             "commit": self.commit,
             "origin": self.origin,
+            "languages": [dict(row) for row in self.languages] or language_table(),
+            "extractor_languages": list(self.extractor_languages),
+            "import_roots": list(self.import_roots),
             "regions": [item.to_data() for item in self.regions],
             "rooms": [item.to_data() for item in self.rooms],
             "portals": [item.to_data() for item in self.portals],
             "unresolved_references": [item.to_data() for item in self.unresolved],
+            "claims": [item.to_data() for item in self.claims],
             "notes": list(self.notes),
-            "extractor_languages": list(self.extractor_languages),
-            "import_roots": list(self.import_roots),
         }
 
 
@@ -298,6 +412,10 @@ def _pair_identity(commit: str, source: str, line: int, target: str) -> str:
     return f"repo:{commit}/portal:{source}:{line}->{target}"
 
 
+def claim_identity(commit: str, document: str, stand_in: str) -> str:
+    return f"repo:{commit}/claim:{document}#{stand_in}"
+
+
 # --- tree ----------------------------------------------------------------------
 
 def _extractor_matches(extractor: Any, path: str) -> bool:
@@ -306,16 +424,71 @@ def _extractor_matches(extractor: Any, path: str) -> bool:
             or pure.name in tuple(getattr(extractor, "FILENAMES", ())))
 
 
+def _extractor_name(extractor: Any) -> str:
+    return str(getattr(extractor, "__name__", None) or getattr(extractor, "LANGUAGE", repr(extractor)))
+
+
 def _language(path: str, extractors: Sequence[Any] = ()) -> str:
-    suffix = PurePosixPath(path).suffix
-    if suffix in PYTHON_SUFFIXES:
-        return "python"
-    if suffix in JAVASCRIPT_SUFFIXES:
-        return "javascript"
+    """The compiler's language name for a file when a known language claims
+    its suffix; else the first matching extractor's ``LANGUAGE``; else "other"."""
+
+    known = _SUFFIX_LANGUAGE.get(PurePosixPath(path).suffix.lower())
+    if known is not None:
+        return known
     for extractor in extractors:
         if _extractor_matches(extractor, path):
             return str(extractor.LANGUAGE)
     return "other"
+
+
+def language_table(extractors: Sequence[Any] = ()) -> list[dict[str, Any]]:
+    """Known languages with their compiler route and their linking state.
+
+    A compiler language is linked by a built-in reader (``LINKING_READERS``)
+    or by any extractor whose suffixes overlap the language's.  Languages
+    that only an extractor knows (html, cmake, …) are listed after them with
+    no route.
+    """
+
+    def readers_for(suffixes: Iterable[str]) -> list[str]:
+        wanted = set(suffixes)
+        return sorted(
+            _extractor_name(extractor) for extractor in extractors
+            if wanted & set(getattr(extractor, "SUFFIXES", ()))
+        )
+
+    rows = []
+    for name, translation in DREAM_LANGUAGE_TRANSLATIONS.items():
+        suffixes = LANGUAGE_SUFFIXES.get(name, ())
+        readers = ([LINKING_READERS[name]] if name in LINKING_READERS else []) + readers_for(suffixes)
+        rows.append({
+            "language": name,
+            "route": translation.route,
+            "translation_table": translation.translation_table,
+            "execution_target": translation.execution_target,
+            "suffixes": list(suffixes),
+            "linking": readers[0] if readers else None,
+            "linking_readers": readers,
+            "linking_state": (
+                "cross-file references read" if readers
+                else "known language, no cross-file reference reader yet: rooms get no portals"
+            ),
+        })
+    known = set(DREAM_LANGUAGE_TRANSLATIONS)
+    for extractor in extractors:
+        name = str(getattr(extractor, "LANGUAGE", "")) or _extractor_name(extractor)
+        if name in known:
+            continue
+        known.add(name)
+        rows.append({
+            "language": name, "route": None, "translation_table": None,
+            "execution_target": None,
+            "suffixes": list(getattr(extractor, "SUFFIXES", ())),
+            "linking": _extractor_name(extractor),
+            "linking_readers": [_extractor_name(extractor)],
+            "linking_state": "extractor-only language: cross-file references read, no compiler route",
+        })
+    return rows
 
 
 def _build_tree(commit: str, files: Iterable[str], extractors: Sequence[Any] = ()) -> tuple[tuple[RepoRegion, ...], tuple[RepoRoom, ...]]:
@@ -470,8 +643,24 @@ def _javascript_references(path: str, text: str, tracked: frozenset[str]) -> lis
     return refs
 
 
-def _read(clone: Path, path: str) -> str:
-    return (clone / path).read_text(encoding="utf-8", errors="replace")
+def _dream_claims(
+    commit: str, path: str, raw: bytes, room: RepoRoom,
+) -> tuple[list[RepoRoomClaim], str | None]:
+    """Claimed rooms for every stand-in of one tracked dream document."""
+
+    try:
+        document = parse_dream_document(raw)
+    except DreamDocumentError as error:
+        return [], f"{path}: dream document not parsed ({error})"
+    claims = []
+    for entry in document.work_table().stand_ins:
+        claims.append(RepoRoomClaim(
+            claim_identity(commit, path, entry.block), room.identity, room.region,
+            entry.block, entry.content_hash, entry.state, entry.owner,
+            entry.described_by,
+            tuple(contribution.to_data() for contribution in entry.contributions),
+        ))
+    return claims, None
 
 
 # --- import roots --------------------------------------------------------------
@@ -506,14 +695,16 @@ def _as_list(value: Any) -> list[str]:
     return [str(item) for item in value]
 
 
-def _read_declared_roots(clone: Path, tracked: frozenset[str]) -> list[str]:
+def _read_declared_roots(tracked: frozenset[str], read: Callable[[str], bytes]) -> list[str]:
+    """Raw root declarations from the tracked declaration files, via ``read``."""
+
     raw: list[str] = []
 
     def toml_of(name: str) -> dict[str, Any]:
         if name not in tracked:
             return {}
         try:
-            return tomllib.loads(_read(clone, name))
+            return tomllib.loads(_text(read(name)))
         except tomllib.TOMLDecodeError as exc:
             raise RepoScanError(f"{name}: not valid TOML ({exc})") from exc
 
@@ -532,7 +723,7 @@ def _read_declared_roots(clone: Path, tracked: frozenset[str]) -> list[str]:
             continue
         parser = configparser.ConfigParser(interpolation=None)
         try:
-            parser.read_string(_read(clone, name))
+            parser.read_string(_text(read(name)))
         except configparser.Error as exc:
             raise RepoScanError(f"{name}: not valid INI ({exc})") from exc
         if parser.has_option(section, "pythonpath"):
@@ -540,22 +731,26 @@ def _read_declared_roots(clone: Path, tracked: frozenset[str]) -> list[str]:
     return raw
 
 
-def declared_import_roots(clone_path: str | Path) -> tuple[str, ...]:
-    """Import roots declared inside the clone, in declaration order.
-
-    Only tracked directories are returned; the repository root ("") is not
-    included here (``scan_repository`` always puts it first).
-    """
-
-    clone = Path(clone_path)
-    tracked = frozenset(_tracked_files(clone))
+def _declared_roots(tracked: frozenset[str], read: Callable[[str], bytes]) -> tuple[str, ...]:
     directories = _tracked_directories(tracked)
     roots: list[str] = []
-    for raw in _read_declared_roots(clone, tracked):
+    for raw in _read_declared_roots(tracked, read):
         root = _normalize_root(raw)
         if root and root in directories and root not in roots:
             roots.append(root)
     return tuple(roots)
+
+
+def declared_import_roots(clone_path: str | Path) -> tuple[str, ...]:
+    """Import roots declared inside a checkout, in declaration order.
+
+    Only tracked directories are returned; the repository root ("") is not
+    included here (the scan always puts it first).
+    """
+
+    clone = Path(clone_path)
+    tracked = frozenset(_tracked_files(clone))
+    return _declared_roots(tracked, lambda path: (clone / path).read_bytes())
 
 
 def _validated_roots(import_roots: Sequence[str], tracked: frozenset[str]) -> tuple[str, ...]:
@@ -582,10 +777,6 @@ def default_extractors() -> tuple[Any, ...]:
     return tuple(modules)
 
 
-def _extractor_name(extractor: Any) -> str:
-    return str(getattr(extractor, "__name__", None) or getattr(extractor, "LANGUAGE", repr(extractor)))
-
-
 def _plugin_references(
     extractor: Any, path: str, text: str, tracked: frozenset[str],
 ) -> list[_Reference]:
@@ -608,59 +799,81 @@ def _plugin_references(
     return refs
 
 
+# Languages whose file bytes the built-in readers need; every other tracked
+# file is a room by name only unless an extractor matches it or it declares
+# import roots (DECLARATION_FILES).
+_READ_LANGUAGES = frozenset({"python", "javascript", "dream-document"})
+
+
+def _reads(path: str, extractors: Sequence[Any]) -> bool:
+    """Whether the scan needs this file's bytes at all."""
+
+    if _language(path) in _READ_LANGUAGES or PurePosixPath(path).name in DECLARATION_FILES:
+        return True
+    return any(_extractor_matches(extractor, path) for extractor in extractors)
+
+
+def _text(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="replace")
+
+
 # --- entry ---------------------------------------------------------------------
 
-def scan_repository(
-    clone_path: str | Path, *, extractors: Sequence[Any] | None = None,
-    import_roots: Sequence[str] = (),
+def scan_files(
+    commit: str, origin: str | None, files: Iterable[str],
+    read: Callable[[str], bytes], notes: Iterable[str] = (), *,
+    extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = (),
 ) -> RepoWorldScan:
-    """Scan one clean clone into regions, rooms and portal pairs.
+    """The scan itself, over a tree given as tracked paths and a byte reader.
 
-    ``extractors`` are plugin modules (None: :func:`default_extractors`);
-    ``import_roots`` are extra repo-relative Python import roots (validated
-    tracked directories; the repository root is always first).
-
-    Raises :class:`DirtyCloneError` when the tree has uncommitted or untracked
-    changes and :class:`RepoScanError` when the path is not a repository root.
+    Every entry point ends here.  ``read`` is called only for files
+    :func:`_reads` says the scan needs; a streaming reader may hold just
+    those bytes.  ``extractors`` are plugin modules (None: the default
+    registry).  ``import_roots`` are extra Python import roots: a sequence is
+    validated against the tracked directories; ``None`` means the roots the
+    tree itself declares (:data:`DECLARATION_FILES`).  The repository root is
+    always first.
     """
 
-    clone = Path(clone_path)
-    if not clone.is_dir():
-        raise RepoScanError(f"{clone} is not a directory")
-    _require_clean_clone(clone)
-    plugins = tuple(default_extractors() if extractors is None else extractors)
-    commit = _git(clone, "rev-parse", "HEAD").strip()
-    origin_raw = subprocess.run(
-        ["git", "-C", str(clone), "config", "--get", "remote.origin.url"],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    origin = origin_raw.stdout.strip() or None
-
-    files = _tracked_files(clone)
+    files = tuple(sorted(files))
     tracked = frozenset(files)
+    plugins = tuple(default_extractors() if extractors is None else extractors)
+    if import_roots is None:
+        import_roots = _declared_roots(tracked, read)
     roots = _validated_roots(import_roots, tracked)
     regions, rooms = _build_tree(commit, files, plugins)
 
     references: list[_Reference] = []
-    notes: list[str] = []
+    notes = list(notes)
     ambiguities: list[str] = []
     languages_used: set[str] = {"python", "javascript"}
+    claims: list[RepoRoomClaim] = []
+    room_by_path = {room.path: room for room in rooms}
     for path in files:
+        if not _reads(path, plugins):
+            continue
         language = _language(path)
+        raw = read(path)
         text: str | None = None
-        if language == "python":
-            text = _read(clone, path)
+        if language == "dream-document":
+            found, note = _dream_claims(commit, path, raw, room_by_path[path])
+            claims.extend(found)
+            if note:
+                notes.append(note)
+        elif language == "python":
+            text = _text(raw)
             refs, note = _python_references(path, text, tracked, roots, ambiguities)
             references.extend(refs)
             if note:
                 notes.append(note)
         elif language == "javascript":
-            text = _read(clone, path)
+            text = _text(raw)
             references.extend(_javascript_references(path, text, tracked))
         for extractor in plugins:
             if _extractor_matches(extractor, path):
                 if text is None:
-                    text = _read(clone, path)
+                    text = _text(raw)
                 references.extend(_plugin_references(extractor, path, text, tracked))
                 languages_used.add(str(extractor.LANGUAGE))
     if ambiguities:
@@ -699,44 +912,260 @@ def scan_repository(
 
     return RepoWorldScan(
         commit, origin, regions, rooms, tuple(portals), tuple(unresolved), tuple(notes),
-        tuple(sorted(languages_used)), roots,
+        tuple(claims), tuple(sorted(languages_used)), roots,
+        tuple(language_table(plugins)),
     )
+
+
+def scan_repository(
+    clone_path: str | Path, *, extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = (),
+) -> RepoWorldScan:
+    """Scan one clean checkout on disk (fixtures and explicit clones).
+
+    ``extractors`` and ``import_roots`` as in :func:`scan_files`.  Raises
+    :class:`DirtyCloneError` when the tree has uncommitted or untracked
+    changes and :class:`RepoScanError` when the path is not a repository root.
+    """
+
+    clone = Path(clone_path)
+    if not clone.is_dir():
+        raise RepoScanError(f"{clone} is not a directory")
+    _require_clean_clone(clone)
+    commit = _git(clone, "rev-parse", "HEAD").strip()
+    origin_raw = subprocess.run(
+        ["git", "-C", str(clone), "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    origin = origin_raw.stdout.strip() or None
+    return scan_files(
+        commit, origin, _tracked_files(clone), lambda path: (clone / path).read_bytes(),
+        extractors=extractors, import_roots=import_roots,
+    )
+
+
+def scan_tar_stream(
+    commit: str, origin: str | None, stream: Any, *, mode: str = "r|",
+    strip_components: int = 0, extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = None,
+) -> RepoWorldScan:
+    """Scan a tar archive of one commit as it streams past, keeping no file.
+
+    One pass: every regular file becomes a room by name; only the bytes of
+    files a reader links are held, and only until the scan returns.  Nothing
+    is written anywhere.  ``strip_components`` drops the leading directory a
+    GitHub tarball wraps the tree in.  Symbolic links and other non-regular
+    members are noted, not scanned.
+    """
+
+    plugins = tuple(default_extractors() if extractors is None else extractors)
+    paths: list[str] = []
+    contents: dict[str, bytes] = {}
+    notes: list[str] = []
+    with tarfile.open(fileobj=stream, mode=mode) as archive:
+        for member in archive:
+            parts = PurePosixPath(member.name).parts[strip_components:]
+            if not parts:
+                continue
+            path = "/".join(parts)
+            if member.isdir():
+                continue
+            if not member.isfile():
+                notes.append(f"{path}: not a regular file in the archive, not scanned")
+                continue
+            paths.append(path)
+            if _reads(path, plugins):
+                handle = archive.extractfile(member)
+                contents[path] = handle.read() if handle is not None else b""
+    return scan_files(
+        commit, origin, paths, contents.__getitem__, notes,
+        extractors=plugins, import_roots=import_roots,
+    )
+
+
+def github_clone_url(repository: str) -> str:
+    """``owner/repo`` -> the public HTTPS clone URL.  Nothing else is accepted."""
+
+    if not GITHUB_REPOSITORY.match(repository):
+        raise RepoScanError(
+            f"{repository!r} is not a GitHub repository spelled owner/repo"
+        )
+    return f"https://github.com/{repository}.git"
+
+
+def _github_json(path: str) -> Any:
+    request = urllib.request.Request(
+        f"{GITHUB_API}/{path}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": _USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise RepoScanError(f"GitHub API {path}: HTTP {exc.code} {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RepoScanError(f"GitHub API {path}: {exc.reason}") from exc
+
+
+def scan_github_repository(
+    repository: str, *, ref: str | None = None,
+    extractors: Sequence[Any] | None = None, import_roots: Sequence[str] | None = None,
+) -> RepoWorldScan:
+    """Scan ``owner/repo`` as GitHub serves it, streamed, never on disk.
+
+    The commit is resolved first (``ref`` or the default branch), then that
+    exact commit's tarball is streamed from the API and scanned as it passes.
+    What the API excludes (``export-ignore`` paths) the scan never sees.
+    """
+
+    if not GITHUB_REPOSITORY.match(repository):
+        raise RepoScanError(f"{repository!r} is not a GitHub repository spelled owner/repo")
+    if ref is None:
+        ref = _github_json(f"repos/{repository}")["default_branch"]
+    commit = _github_json(f"repos/{repository}/commits/{ref}")["sha"]
+    request = urllib.request.Request(
+        f"{GITHUB_API}/repos/{repository}/tarball/{commit}",
+        headers={"User-Agent": _USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return scan_tar_stream(
+                commit, github_clone_url(repository), response, mode="r|gz",
+                strip_components=1, extractors=extractors, import_roots=import_roots,
+            )
+    except urllib.error.HTTPError as exc:
+        raise RepoScanError(f"GitHub tarball of {repository}@{commit[:12]}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RepoScanError(f"GitHub tarball of {repository}: {exc.reason}") from exc
+
+
+def scan_remote_repository(
+    url: str, *, ref: str | None = None,
+    extractors: Sequence[Any] | None = None, import_roots: Sequence[str] | None = None,
+) -> RepoWorldScan:
+    """Scan any git URL as the remote serves it, streamed, never on disk.
+
+    A GitHub URL goes through :func:`scan_github_repository`.  Any other URL
+    (a ``file://`` fixture, another host) is resolved with ``git ls-remote``
+    and streamed with ``git archive --remote``; GitHub does not serve
+    ``upload-archive``, which is why it has its own lane.
+    """
+
+    github = GITHUB_CLONE_URL.match(url.strip())
+    if github:
+        return scan_github_repository(
+            f"{github['owner']}/{github['repo']}", ref=ref,
+            extractors=extractors, import_roots=import_roots,
+        )
+    name = ref or "HEAD"
+    try:
+        listing = subprocess.run(
+            ["git", "ls-remote", "--", url, name], capture_output=True, text=True,
+            encoding="utf-8", check=True,
+        ).stdout
+    except FileNotFoundError as exc:
+        raise RepoScanError("git is not on PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RepoScanError(f"git ls-remote {url}: {exc.stderr.strip()}") from exc
+    if not listing.strip():
+        raise RepoScanError(f"{url} serves no ref named {name!r}")
+    commit = listing.split()[0]
+    process = subprocess.Popen(
+        ["git", "archive", f"--remote={url}", "--format=tar", name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    try:
+        scan = scan_tar_stream(
+            commit, url, process.stdout, mode="r|",
+            extractors=extractors, import_roots=import_roots,
+        )
+    finally:
+        process.stdout.close()
+        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+        returncode = process.wait()
+    if returncode != 0:
+        raise RepoScanError(f"git archive --remote={url} {name}: {stderr.strip()}")
+    return scan
+
+
+def _github_with_flag_roots(repository: str, ref: str | None, flag_roots: list[str]) -> RepoWorldScan:
+    """Declared roots from the stream plus the flags: scan once with the union."""
+
+    declared = scan_github_repository(repository, ref=ref, import_roots=None).import_roots
+    roots = [root for root in declared if root] + flag_roots
+    return scan_github_repository(repository, ref=ref, import_roots=roots)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in args
     args = [item for item in args if item != "--json"]
-    paths: list[str] = []
+    out_path = None
+    if "--out" in args:
+        index = args.index("--out")
+        if index + 1 >= len(args):
+            print("--out needs a file path", file=sys.stderr)
+            return 2
+        out_path = args[index + 1]
+        del args[index:index + 2]
     flag_roots: list[str] = []
-    index = 0
-    while index < len(args):
-        if args[index] == "--import-root":
-            if index + 1 >= len(args):
-                print("--import-root needs a directory", file=sys.stderr)
-                return 2
-            flag_roots.append(args[index + 1])
-            index += 2
-        else:
-            paths.append(args[index])
-            index += 1
-    if len(paths) != 1:
-        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
-        return 2
+    while "--import-root" in args:
+        index = args.index("--import-root")
+        if index + 1 >= len(args):
+            print("--import-root needs a directory", file=sys.stderr)
+            return 2
+        flag_roots.append(args[index + 1])
+        del args[index:index + 2]
+    ref = None
+    if "--ref" in args:
+        index = args.index("--ref")
+        if index + 1 >= len(args):
+            print("--ref needs a branch or tag", file=sys.stderr)
+            return 2
+        ref = args[index + 1]
+        del args[index:index + 2]
+    local_path = None
+    if "--path" in args:
+        index = args.index("--path")
+        if index + 1 >= len(args):
+            print("--path needs a clone directory", file=sys.stderr)
+            return 2
+        local_path = args[index + 1]
+        del args[index:index + 2]
+    usage = "\n".join(__doc__.strip().splitlines()[-2:])
     try:
-        scan = scan_repository(
-            paths[0],
-            import_roots=(*declared_import_roots(paths[0]), *flag_roots),
-        )
+        if local_path is not None:
+            if args or ref:
+                print(usage, file=sys.stderr)
+                return 2
+            scan = scan_repository(
+                local_path, import_roots=(*declared_import_roots(local_path), *flag_roots),
+            )
+        elif len(args) == 1:
+            # The stream lane reads the declared roots from the stream; flags add to them.
+            scan = (scan_github_repository(args[0], ref=ref) if not flag_roots
+                    else _github_with_flag_roots(args[0], ref, flag_roots))
+        else:
+            print(usage, file=sys.stderr)
+            return 2
     except RepoScanError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
+    if out_path is not None:
+        Path(out_path).write_text(json.dumps(scan.to_data(), indent=2) + "\n", encoding="utf-8")
+        print(f"commit {scan.commit} -> {out_path}")
+        return 0
     if as_json:
         json.dump(scan.to_data(), sys.stdout, indent=2, sort_keys=False)
         print()
         return 0
     print(f"commit {scan.commit}")
-    print(f"regions {len(scan.regions)}  rooms {len(scan.rooms)}  portal pairs {len(scan.portals)}  unresolved {len(scan.unresolved)}")
+    print(f"regions {len(scan.regions)}  rooms {len(scan.rooms)}  portal pairs {len(scan.portals)}  "
+          f"unresolved {len(scan.unresolved)}  claimed rooms {len(scan.claims)}")
+    for claim in scan.claims:
+        print(f"  claim {claim.document_room.split('/file:', 1)[1]}#{claim.stand_in} "
+              f"{claim.state} owner={claim.owner}")
     for portal in scan.portals:
         print(f"  {portal.source_room.split('/file:', 1)[1]}:{portal.source_line} -> "
               f"{portal.target_room.split('/file:', 1)[1]}  [{portal.reference_kind} {portal.specifier}]")
@@ -746,9 +1175,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "REPO_WORLD_SCAN_VERSION", "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair",
+    "DECLARATION_FILES", "EXTRACTOR_MODULES", "declared_import_roots", "default_extractors",
+    "LANGUAGE_SUFFIXES", "LINKING_READERS", "REPO_WORLD_SCAN_VERSION",
+    "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair", "language_table",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",
-    "RepoWorldScan", "EXTRACTOR_MODULES", "declared_import_roots", "default_extractors", "region_identity", "room_identity", "scan_repository",
+    "RepoWorldScan", "RepoRoomClaim", "claim_identity",
+    "github_clone_url", "region_identity", "room_identity", "scan_files",
+    "scan_github_repository", "scan_remote_repository", "scan_repository", "scan_tar_stream",
 ]
 
 
