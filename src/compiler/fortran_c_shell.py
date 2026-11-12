@@ -66185,13 +66185,69 @@ def _lower_ast_source_to_ssa_impl(
     # be posted.  Publish those retained statement identities at the end of
     # source ingestion.  The later projection row can then derive from the
     # exact statement it already records instead of posting an empty Derived.
-    from ..transmogrifier.graph.graph_express2 import post_source_span
+    from ..transmogrifier.graph.graph_express2 import (
+        _source_definition_identity, post_source_span,
+    )
 
-    for receipt in assignment_receipts:
-        for projection_statement in getattr(
-            receipt, "projection_statements", (),
-        ):
-            if post_source_span(None, projection_statement) is None:
+    # Program: the AbstractTensor YoungMan's ``CompositeGeometry.
+    # configure_geometry``: an ``if/elif ... else: raise`` chain, then
+    # ``offsets, tile_size = self.define_offsets(...)``.  Wrong record:
+    # exception ingestion rebuilt the function on a deep copy
+    # (source_exception_ingestion ``_copy_source``), so the receipt's
+    # generated ``offsets = __turing_assignment_value_0[0]`` was no longer in
+    # the program; posted owner-less from its stale stamp (``body[4]``, taken
+    # before two exception statements were inserted at the top), it revised
+    # the source_span row of the If now at ``body[4]``, the If's control
+    # activity landed on a revision no graph node derives from, and control
+    # ingestion refused "source control owner has no exact process-graph
+    # identity".  Rule: a receipt's statement follows the recorded copy
+    # relation (``_turing_source_copy``) to the statement that is in its
+    # owner's body -- the owner found by the stamp's (module, qualname),
+    # which no body rewrite changes -- the receipt is rebound to it, and its
+    # span is posted from the tree as it is now.  A statement in no body is
+    # refused, never posted from a stale stamp.
+    from ..transmogrifier.graph.graph_express2 import _source_span_path
+
+    definitions_by_identity = {}
+    for candidate in ast.walk(tree):
+        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            candidate_identity = _source_definition_identity(candidate)
+            if candidate_identity is not None:
+                definitions_by_identity.setdefault(tuple(candidate_identity), candidate)
+
+    def live_projection_statement(statement):
+        stamped = getattr(statement, "_turing_source_span_row", None)
+        owner = (
+            definitions_by_identity.get(tuple(stamped[:2]))
+            if stamped is not None else None
+        )
+        if owner is None:
+            return statement, None
+        current, seen = statement, set()
+        while _source_span_path(owner, current) is None:
+            successor = getattr(current, "_turing_source_copy", None)
+            if successor is None or id(current) in seen:
+                raise ValueError(
+                    "assignment projection statement is in no body of its "
+                    f"owner {stamped[:2]!r}: {ast.unparse(statement)!r}"
+                )
+            seen.add(id(current))
+            current = successor
+        return current, owner
+
+    for index, receipt in enumerate(tuple(assignment_receipts)):
+        statements = tuple(getattr(receipt, "projection_statements", ()))
+        if not statements:
+            continue
+        resolved = tuple(live_projection_statement(item) for item in statements)
+        if any(live is not original for (live, _owner), original in zip(resolved, statements)):
+            import dataclasses as _dataclasses
+
+            assignment_receipts[index] = _dataclasses.replace(
+                receipt, projection_statements=tuple(live for live, _owner in resolved),
+            )
+        for live, owner in resolved:
+            if post_source_span(owner, live) is None:
                 raise ValueError(
                     "assignment projection statement has no source identity"
                 )
