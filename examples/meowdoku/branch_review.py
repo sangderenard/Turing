@@ -62,6 +62,8 @@ DDL = (
     "username TEXT, registered_at REAL NOT NULL, PRIMARY KEY(repository, branch))",
     "CREATE TABLE IF NOT EXISTS branch_removed (repository TEXT NOT NULL, branch TEXT NOT NULL, head TEXT NOT NULL, "
     "removed_at REAL NOT NULL, reason TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS worktree_verdicts (path TEXT PRIMARY KEY, verdict TEXT NOT NULL CHECK(verdict IN "
+    "('trash','archive','keep')), note TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL, decided_at REAL NOT NULL)",
 )
 _COLUMNS = ("id", "repository", "branch", "base", "head", "owner_id", "owner_name", "created_at", "accept_after",
             "delete_branch", "status", "reviewed_at", "reviewer_id", "reviewer_name", "note", "landed_at", "landed_detail")
@@ -328,6 +330,36 @@ def in_review(db, repository, branch) -> bool:
     ensure(db)
     return db.execute("SELECT 1 FROM branch_reviews WHERE repository = ? AND branch = ? AND status IN ('open','approved') "
                       "AND landed_at IS NULL", (repository, branch)).fetchone() is not None
+
+
+TREE_VERDICTS = ("trash", "archive", "keep")
+
+
+def _tree_key(path) -> str:
+    return str(path).replace("\\", "/").rstrip("/").casefold()
+
+
+def set_verdict(db, path, verdict, *, decided_by, note="", now=None) -> dict:
+    """A reviewer's decision about one side worktree that holds uncommitted work.
+
+    trash: its uncommitted work is abandoned and goes with it.  archive: commit that work to its branch (or to a new
+    archive branch for a detached tree), push it, then remove the tree.  keep: leave it alone."""
+    ensure(db)
+    if verdict not in TREE_VERDICTS:
+        raise ReviewError("verdict must be trash, archive or keep")
+    if not isinstance(decided_by, str) or not decided_by:
+        raise ReviewError("a reviewer is required", 401)
+    now = time.time() if now is None else now
+    db.execute("INSERT INTO worktree_verdicts VALUES (?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET verdict = excluded.verdict, "
+               "note = excluded.note, decided_by = excluded.decided_by, decided_at = excluded.decided_at",
+               (_tree_key(path), verdict, _note(note), decided_by, now))
+    return verdict_for(db, path)
+
+
+def verdict_for(db, path) -> dict | None:
+    ensure(db)
+    row = db.execute("SELECT verdict, note, decided_by, decided_at FROM worktree_verdicts WHERE path = ?", (_tree_key(path),)).fetchone()
+    return None if row is None else {"path": _tree_key(path), "verdict": row[0], "note": row[1], "decided_by": row[2], "decided_at": row[3]}
 
 
 def record_removed(db, repository, branch, head, reason, now=None, *, keep_owner=False, removed_by=None) -> None:

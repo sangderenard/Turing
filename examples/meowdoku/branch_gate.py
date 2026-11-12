@@ -37,6 +37,9 @@ really moved, read from the reflog entry, never from file times), holds no uncom
 file, is not locked, and its commit is on the remote. Its local branch goes with it when the remote holds the same
 branch at the same commit. Nothing is lost: the notice of removal (``branch_removed``) names the path, the branch and
 the commit, and the remote keeps the branch. A worktree that fails any of those tests is kept and the reason said.
+A worktree that holds uncommitted work is never judged by a rule: it waits for a reviewer's verdict
+(``branch_review.set_verdict``; the ``verdict`` command): trash discards that work with the tree, archive commits and
+pushes it first, keep leaves it. The notice records the reviewer and what was discarded or where it was archived.
 Ignored files in a removed worktree (caches, build output) are deleted with it.
 
 One account removes from the core, and no other: the policy's ``cleaner`` (a service account, shown to people under
@@ -316,6 +319,45 @@ def improper_saves(policy, *, large_bytes=1 << 20) -> list:
     return out
 
 
+def _reviewed_dirty_tree(policy, db, path, name, label, tree, *, apply, signer, now) -> dict:
+    """What happens to a side worktree that holds uncommitted work: nothing, unless a reviewer has said so."""
+    held = f"holds {tree['dirty']} uncommitted or untracked file(s)"
+    verdict = branch_review.verdict_for(db, tree["path"])
+    if verdict is None:
+        return {"action": "keep", "reason": held + "; waiting for a reviewer's verdict"}
+    who = f"reviewed by {verdict['decided_by']}" + (f": {verdict['note']}" if verdict["note"] else "")
+    if verdict["verdict"] == "keep":
+        return {"action": "keep", "reason": f"{held}; kept, {who}"}
+    if not apply:
+        return {"action": "would remove", "reason": f"{held}; {verdict['verdict']}, {who}"}
+    try:
+        detail = f"worktree {tree['path']} removed"
+        head = tree["head"]
+        if verdict["verdict"] == "archive":
+            branch = tree["branch"] or f"archive/{Path(tree['path']).name}-{(tree['head'] or '')[:8]}"
+            if not tree["branch"]:
+                git(tree["path"], "switch", "-q", "-c", branch)
+            git(tree["path"], "add", "-A")
+            git(tree["path"], "commit", "-q", "--no-verify", "-m",
+                f"Archive of uncommitted work at removal ({verdict['decided_by']})")
+            head = git(tree["path"], "rev-parse", "HEAD")
+            git(tree["path"], "push", policy["remote"], f"{head}:refs/heads/{branch}")
+            detail += f"; its uncommitted work is commit {head[:12]} on {policy['remote']}/{branch}"
+        else:
+            stat = git(tree["path"], "--no-optional-locks", "diff", "--shortstat", check=False) or "untracked files only"
+            detail += f"; abandoned uncommitted work discarded ({stat.strip()})"
+        git(path, "worktree", "remove", "--force", tree["path"])
+        if tree["branch"] and not protected(policy, name, tree["branch"]) and not branch_review.in_review(db, name, tree["branch"]):
+            remote_head = git(path, "rev-parse", "-q", "--verify", f"refs/remotes/{policy['remote']}/{tree['branch']}", check=False)
+            if remote_head == head or verdict["verdict"] == "archive":
+                git(path, "update-ref", "-d", f"refs/heads/{tree['branch']}", check=False)
+                detail += "; local branch removed"
+        branch_review.record_removed(db, name, label, head, f"{detail}; {who}", now, keep_owner=True, removed_by=signer)
+        return {"action": "removed", "reason": f"{detail}; {who}"}
+    except GateError as error:
+        return {"action": "failed", "reason": str(error)}
+
+
 def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> list:
     signer = cleaner(policy, db, actor, apply)
     now = time.time() if now is None else now
@@ -337,7 +379,7 @@ def clean_worktrees(policy, db, *, apply, actor=None, now=None, log=print) -> li
             elif tree["touched"] is None or now - tree["touched"] < idle:
                 entry.update(action="keep", reason=f"used within the last {policy['worktree_idle_days']:g} day(s)")
             elif tree["dirty"]:
-                entry.update(action="keep", reason=f"holds {tree['dirty']} uncommitted or untracked file(s)")
+                entry.update(_reviewed_dirty_tree(policy, db, path, name, label, tree, apply=apply, signer=signer, now=now))
             elif not tree["on_remote"]:
                 entry.update(action="keep", reason="its commit is not on the remote")
             elif not apply:
@@ -557,6 +599,10 @@ def main(argv=None) -> int:
     sub.add_parser("check-push").add_argument("repository", nargs="?")
     sub.add_parser("cleaner", help="make the policy's cleanup account, as the supervisor makes service accounts")
     sub.add_parser("inspect", help="report what the core holds outside a commit")
+    decide = sub.add_parser("verdict", help="record a reviewer's verdict on a worktree that holds uncommitted work")
+    decide.add_argument("path")
+    decide.add_argument("decision", choices=("trash", "archive", "keep"))
+    decide.add_argument("--note", default="")
     sub.add_parser("notices", help="write the notices of removal to the notices file").add_argument("--commit", action="store_true")
     sub.add_parser("install-hook")
     sub.add_parser("remove-hook")
@@ -581,6 +627,12 @@ def main(argv=None) -> int:
             return 0
         db = sqlite3.connect(args.db, timeout=10, isolation_level=None)
         try:
+            if args.command == "verdict":
+                if not args.actor:
+                    raise GateError("a verdict needs --as <reviewer>")
+                _user(db, args.actor)
+                print(json.dumps(branch_review.set_verdict(db, args.path, args.decision, decided_by=args.actor, note=args.note)))
+                return 0
             if args.command == "notices":
                 print(publish_notices(policy, db, commit=args.commit))
                 return 0

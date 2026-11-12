@@ -489,6 +489,39 @@ def test_a_policy_written_for_a_newer_version_is_still_read(world):
     assert read["unknown"] == ["a_key_from_the_future"] and read["repositories"] and "a_key_from_the_future" not in read
 
 
+def test_a_dirty_worktree_waits_for_a_reviewers_verdict(world):
+    import time
+    work, db, policy = world["work"], world["db"], world["policy"]
+    trees = work.parent / "trees"
+    heads = {}
+    for name in ("abandoned", "valuable", "undecided", "spared"):
+        run(work, "worktree", "add", "-q", "-b", name, str(trees / name), "main")
+        heads[name] = commit(trees / name, f"{name}.txt")
+        run(work, "push", "-q", "origin", name)
+        (trees / name / "scratch.txt").write_text(f"uncommitted in {name}", encoding="utf-8")
+    later = time.time() + 2 * DAY
+    branch_review.set_verdict(db, trees / "abandoned", "trash", decided_by="admin", note="old probe")
+    branch_review.set_verdict(db, trees / "valuable", "archive", decided_by="admin")
+    branch_review.set_verdict(db, trees / "spared", "keep", decided_by="admin", note="still in use")
+    with pytest.raises(branch_review.ReviewError):
+        branch_review.set_verdict(db, trees / "undecided", "burn", decided_by="admin")
+    dry = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=False, now=later, log=lambda line: None)}
+    assert dry["abandoned"]["action"] == "would remove" and dry["valuable"]["action"] == "would remove"
+    assert dry["undecided"]["action"] == "keep" and "waiting for a reviewer" in dry["undecided"]["reason"]
+    assert dry["spared"]["action"] == "keep" and "still in use" in dry["spared"]["reason"]
+    done = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)}
+    assert done["abandoned"]["action"] == "removed" and not (trees / "abandoned").exists()
+    assert "discarded" in done["abandoned"]["reason"] and "reviewed by admin: old probe" in done["abandoned"]["reason"]
+    assert remote_has(world, "abandoned") == heads["abandoned"], "only the uncommitted work went; the branch is on the remote"
+    assert done["valuable"]["action"] == "removed" and not (trees / "valuable").exists()
+    archived = remote_has(world, "valuable")
+    assert archived != heads["valuable"] and "scratch.txt" in run(world["remote"], "show", "--stat", "--format=", archived)
+    assert (trees / "undecided" / "scratch.txt").exists() and (trees / "spared" / "scratch.txt").exists()
+    notices = {n["branch"]: n for n in branch_review.removed(db)}
+    assert notices["abandoned"]["removed_by"] == CLEANER and "reviewed by admin" in notices["abandoned"]["reason"]
+    assert notices["valuable"]["head"] == archived
+
+
 def test_the_gate_pushes_a_branch_its_author_never_pushed(world):
     db, policy = world["db"], world["policy"]
     head = branch(world, "local-only", push=False)
