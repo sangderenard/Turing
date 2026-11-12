@@ -1559,7 +1559,10 @@ class PhotoJobs:
 
     def _status_locked(self, digest: str, *, retained_artifact: bool = False) -> dict:
         self._cleanup_client_bridge_locked()
-        path = self.job_directory(digest) / "status.json"
+        directory = self.job_directory(digest)
+        if not directory.is_dir():
+            raise PhotoError("photo job is unavailable", 404)
+        path = directory / "status.json"
         try:
             status = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

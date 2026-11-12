@@ -679,7 +679,7 @@ export function mountCalibrationWatch(doc,container,{fixedLane=null,laneCount=2}
   }
   if(fixedLane!==null){selector.value=String(fixedLane);selector.hidden=true;}
   const falseColorLabel=doc.createElement('label');
-  const falseColor=doc.createElement('input');falseColor.type='checkbox';falseColor.checked=true;
+  const falseColor=doc.createElement('input');falseColor.type='checkbox';falseColor.checked=true;falseColor.disabled=true;
   falseColorLabel.append(falseColor,' Show spectral false color');
   const lookStatus=doc.createElement('small');lookStatus.style.cssText='display:block;min-height:1.3em';
   const info=doc.createElement('p'),plot=doc.createElement('div');
@@ -696,6 +696,7 @@ export function mountCalibrationWatch(doc,container,{fixedLane=null,laneCount=2}
     if(!current)return;
     const lane=fixedLane??Number(selector.value),record=current.sensor_lanes?.find(item=>item.index===lane);
     falseColorLabel.hidden=lane!==0;
+    falseColor.disabled=lane!==0||!record?.image;
     if(record?.image){
       const alternate=lane===0&&!falseColor.checked&&current.retouch_params?.spectral_look==='visible_reference'
         ?current.retouched_image:null;
