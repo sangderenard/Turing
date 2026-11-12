@@ -63,7 +63,7 @@ To use Studio's actual tabletop backdrop wall as the source mesh, export its mat
 ```powershell
 node tools/export_backdrop_fabric.mjs build/meowdoku/web/assets.json C:\Users\alber\nodus-build\spring-row\studio_backdrop_mesh.csv
 & 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\studio_backdrop_udp.csv' 'C:\Users\alber\nodus-build\spring-row\studio_backdrop_mesh.csv' freeze
-python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\studio_backdrop_udp.csv C:\Users\alber\nodus-build\spring-row\studio_backdrop_fabric.gif --pins 72,80
+python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\studio_backdrop_udp.csv C:\Users\alber\nodus-build\spring-row\studio_backdrop_fabric.gif --pins 72,80 --assets build/meowdoku/web/assets.json --material fabric_muslin_white
 ```
 
 `marble_backdrop_fabric.js` samples the two wall triangles from `backdropFaces` into 81 nodes and 128 triangles without changing their material ID. The same helper packs the fixed Nodus row configuration and accepts returned positions when the Studio scene is rebuilt. The live Studio server does not yet connect a canvas fabric row or subscribe to its UDP stream, so its fabric control currently changes the mesh and saved surface behavior, while the live motion/freeze path is proven by the local native demo. Ellipse, grid, artwork and curved sweep fabric are outside this first wall-mesh lane; cardstock retains those existing shapes.

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 
-def render(source: Path, target: Path, pins: tuple[int,int] = (0,8)) -> None:
+def render(source: Path, target: Path, pins: tuple[int,int] = (0,8),
+           material: tuple[str, tuple[float,float,float]] | None = None) -> None:
     frames: dict[int, dict[int, tuple[float, float, float]]] = {}
     frozen_frames: set[int] = set()
     with source.open(newline="", encoding="utf-8") as stream:
@@ -37,13 +39,23 @@ def render(source: Path, target: Path, pins: tuple[int,int] = (0,8)) -> None:
             x, y, z = positions[node]
             return (round(left+(x+.30*z-low_x)*scale),round(88+(-y+.18*z-low_y)*scale))
 
+        if material:
+            _,albedo=material
+            encoded=tuple(round(255*(12.92*v if v<=.0031308 else 1.055*v**(1/2.4)-.055))
+                          for v in albedo)
+            for y in range(8):
+                for x in range(8):
+                    i=y*9+x
+                    shade=.76+.08*((x+y)%2)
+                    fill=tuple(round(min(255,max(0,c*shade))) for c in encoded)
+                    draw.polygon([project(n) for n in (i,i+1,i+10,i+9)],fill=fill)
         for node in range(81):
             x, y = node % 9, node // 9
             for adjacent in ((node + 1,) if x < 8 else ()) + ((node + 9,) if y < 8 else ()):
-                draw.line((project(node), project(adjacent)), fill="#34c9da", width=2)
+                draw.line((project(node), project(adjacent)), fill="#34c9da" if not material else '#456e79', width=2)
         for node in range(81):
             px, py = project(node)
-            draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill="#b4ffff")
+            draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill="#b4ffff" if not material else '#7aabb2')
         for node in pins:
             px, py = project(node)
             draw.ellipse((px - 6, py - 6, px + 6, py + 6), fill="#ffc56c")
@@ -51,7 +63,8 @@ def render(source: Path, target: Path, pins: tuple[int,int] = (0,8)) -> None:
         draw.text((24, 42), f"fabric 20261112  |  UDP frame {frame + 1:03d}  |  t = {frame * .01:.2f} s", font=font, fill="#8ab3c5")
         if frame in frozen_frames:
             draw.text((615, 42), 'FROZEN', font=font, fill='#ffc56c')
-        draw.text((24, 513), "9 x 9 spring sheet  /  top corners pinned  /  81 identity-vector pairs per frame", font=font, fill="#8ab3c5")
+        finish=f'  /  {material[0]}' if material else ''
+        draw.text((24, 513), f"9 x 9 spring sheet  /  top corners pinned  /  81 UDP pairs{finish}", font=font, fill="#8ab3c5")
         images.append(image)
     target.parent.mkdir(parents=True, exist_ok=True)
     images[0].save(target, save_all=True, append_images=images[1:], duration=60, loop=0, optimize=True)
@@ -62,11 +75,21 @@ def main() -> None:
     parser.add_argument("source", type=Path)
     parser.add_argument("target", type=Path)
     parser.add_argument("--pins", default="0,8", help="two pinned node IDs, e.g. 72,80 for a Studio wall")
+    parser.add_argument('--assets',type=Path,help='Studio exported assets.json for material color')
+    parser.add_argument('--material',help='name of a material in --assets')
     args = parser.parse_args()
     pins=tuple(int(value) for value in args.pins.split(','))
     if len(pins)!=2 or any(node<0 or node>=81 for node in pins):
         parser.error('--pins needs two node IDs from 0 to 80')
-    render(args.source, args.target, pins)
+    material=None
+    if args.material:
+        if not args.assets:
+            parser.error('--material requires --assets')
+        assets=json.loads(args.assets.read_text(encoding='utf-8'))
+        index=assets['material_index'][args.material]
+        table=assets['materials']['pbr'];stride=table['floats_per_record']
+        material=(args.material,tuple(float(v) for v in table['data'][index*stride:index*stride+3]))
+    render(args.source, args.target, pins, material)
     print(args.target)
 
 
