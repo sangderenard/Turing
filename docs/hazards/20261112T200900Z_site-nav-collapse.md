@@ -16,3 +16,10 @@ Standalone Edge and Chrome both exited before DOM output with crashpad errors
 (the historical fixture also records this executor issue). Actual layout remains
 pending connected-browser verification. No Studio render, GPU link, server
 restart, live publication or authentication change was performed.
+
+Follow-up: connected Chrome ran the shader-free fixture successfully for operator
+at desktop and 390px, and guest at 390px. The fixture reported PASS for header
+clearance, collapse/restore accessibility, account close/reopen and route state.
+Screenshots visually confirm wrapped narrow layout, page content below the bar,
+and the retained Show site menu button after collapse. Temporary viewport reset,
+test tab closed. No production page or GPU program was loaded.
