@@ -96,6 +96,7 @@ from .ast_control_normalization import (
     _normalize_set_constructor as _normalize_set_constructor,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
+    _filter_torch_device_placement as _filter_torch_device_placement,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
     _single_exit_tuple_arity as _single_exit_tuple_arity,
 )
@@ -65587,6 +65588,12 @@ def _lower_ast_source_to_ssa_impl(
             "ssa-source: normalized "
             f"{len(none_default_receipts)} scalar None-default guard(s)"
         )
+    device_placement_receipts = list(_filter_torch_device_placement(tree))
+    if device_placement_receipts:
+        report(
+            "ssa-source: torch device filter removed "
+            f"{len(device_placement_receipts)} device placement(s)"
+        )
 
     tail_recursion_receipts = _normalize_direct_tail_recursion(tree)
     if tail_recursion_receipts:
@@ -66152,6 +66159,11 @@ def _lower_ast_source_to_ssa_impl(
         source_ast_normalizers=(
             normalize_discovered_short_circuit,
             _normalize_none_default_assignments,
+            # Pursued definitions get the same torch device filter as the
+            # entry tree (the deployment section is to own placement).
+            lambda discovered: device_placement_receipts.extend(
+                _filter_torch_device_placement(discovered)
+            ),
             _normalize_direct_tail_recursion,
             normalize_discovered_destructuring,
         ),

@@ -469,6 +469,71 @@ def _normalize_direct_tail_recursion(
     return tuple(receipts)
 
 
+#: Tensor operations that only move a value to a device (operator_catalog's
+#: TYPE_AND_DEVICE_OPERATORS that name no dtype).
+_DEVICE_ONLY_TENSOR_OPERATIONS = frozenset({"cpu", "cuda", "to_device"})
+
+
+def _filter_torch_device_placement(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """The torch device filter: device placement leaves the source program.
+
+    Device placement (``device=`` on a tensor operation, ``x.to(device=d)``,
+    ``x.cpu()``, ``x.cuda()``, ``x.to_device(d)``) is meant to become the
+    deployment section's responsibility -- compartmentalizing those actions
+    into VRAM memory loaders and shaders for their numeric sections -- but no
+    parser that advanced exists yet (owner, 2026-11-12).  Until it does, the
+    repository compiler drops placement: a ``device`` keyword of a catalog
+    tensor operation (``tensor_operation_name``, the operator catalog, never
+    an arbitrary call) is removed, and a call that only places a value
+    (``x.cpu()``, ``x.cuda()``, ``x.to_device(d)``, ``x.to(device=d)`` with
+    nothing else) is its receiver.  ``x.to(dtype=p)`` and ``x.to(p)`` keep
+    their dtype; a positional ``x.to(d)`` is left as authored, since its one
+    argument may be a dtype.
+
+    Program: the AbstractTensor YoungMan's ``_load_map``,
+    ``AbstractTensor.tensor(...).to(device=self.device, dtype=self.precision)``:
+    ``self.device`` (the string ``"cpu"``) had no dtype in the planner region
+    and the compile stopped there.
+    """
+
+    from ..transmogrifier.graph.node_special_cases import tensor_operation_name
+
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Call(self, call):  # noqa: N802
+            call = self.generic_visit(call)
+            operation = tensor_operation_name(call)
+            if operation is None:
+                return call
+            dropped = [keyword for keyword in call.keywords if keyword.arg == "device"]
+            if dropped:
+                call.keywords = [keyword for keyword in call.keywords if keyword.arg != "device"]
+            receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+            placement_only = receiver is not None and (
+                (operation in _DEVICE_ONLY_TENSOR_OPERATIONS and not call.keywords
+                 and (operation == "to_device" or not call.args))
+                or (operation == "to" and dropped and not call.args and not call.keywords)
+            )
+            if not dropped and not placement_only:
+                return call
+            receipts.append({
+                "operation": operation,
+                "line": int(getattr(call, "lineno", -1)),
+                "column": int(getattr(call, "col_offset", -1)),
+                "dropped_device_keyword": bool(dropped),
+                "placement_call_is_its_receiver": bool(placement_only),
+            })
+            return receiver if placement_only else call
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_none_default_assignments(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
