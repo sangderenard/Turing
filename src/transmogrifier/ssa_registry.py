@@ -22,6 +22,7 @@ class Handler(Enum):
     ExceptionRaise = "ExceptionRaise"
     ExceptionIndexType = "ExceptionIndexType"
     ExceptionLength = "ExceptionLength"
+    ExceptionPending = "ExceptionPending"
     Add           = "Add"
     Sub           = "Sub"
     Mul           = "Mul"

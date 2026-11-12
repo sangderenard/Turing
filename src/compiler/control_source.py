@@ -592,6 +592,25 @@ class ValidationBlock(TiledObject):
     diagnostic_value_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class FailureExitBlock(TiledObject):
+    """A protected failure site's exit test after the region holding it.
+
+    The operator reports its failure to the native error slot and its region
+    returns.  This block tests the slot and, on failure, leaves for the end of
+    the protected guard's body (``guard_node_id``), carrying ``bindings``:
+    the (name, value id) versions visible before the site statement
+    (``source_failure_site``).  The body's ExceptionTake then reads the slot.
+    """
+
+    site_cell: Any
+    guard_node_id: int
+    bindings: tuple[tuple[str, int], ...] = ()
+    # The failing operator's graph node: its region is the one this test
+    # follows, and that region's activity position is the test's position.
+    operator_node_id: int | None = None
+
+
 def validation_diagnostic_value_ids(
     statement: ast.Raise,
     node_for_expression: Callable[[ast.AST], int | None],
@@ -753,6 +772,7 @@ ControlBlock = (
     | ExternalReferenceCallBlock
     | NativeTryBlock
     | ValidationBlock
+    | FailureExitBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
     | ScalarFieldWriteBlock
@@ -5098,6 +5118,85 @@ def place_validations_after_region_producers(
         )
     if prelude:
         root = SequenceBlock((*prelude, root))
+    return replace(program, root=root)
+
+
+def place_failure_exits_after_regions(
+    program: ControlProgram,
+    pending_by_region: Mapping[int, Iterable[FailureExitBlock]],
+) -> ControlProgram:
+    """Splice each failure-exit test directly after its operator's region.
+
+    The same splice as ``place_validations_after_region_producers``: the
+    region marker's StatementBlock is cut after the marker and the tests
+    follow it, at whatever loop or conditional nesting holds the marker.
+    """
+
+    pending = {int(region): tuple(blocks)
+               for region, blocks in pending_by_region.items()}
+    placed: set[int] = set()
+
+    def marker(line: str) -> int | None:
+        prefix, suffix = "__scheduled_region_", "__"
+        if not (line.startswith(prefix) and line.endswith(suffix)):
+            return None
+        try:
+            return int(line[len(prefix):-len(suffix)])
+        except ValueError:
+            return None
+
+    def visit(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, StatementBlock):
+            expanded: list[ControlBlock] = []
+            residual: list[str] = []
+            for line in block.lines:
+                residual.append(line)
+                region = marker(line)
+                if region is None or region not in pending:
+                    continue
+                if region in placed:
+                    raise ValueError(
+                        "scheduled region marker occurs more than once while "
+                        f"placing failure exits: region={region}"
+                    )
+                expanded.append(StatementBlock(tuple(residual)))
+                residual = []
+                expanded.extend(pending[region])
+                placed.add(region)
+            if residual:
+                expanded.append(StatementBlock(tuple(residual)))
+            return expanded[0] if len(expanded) == 1 else SequenceBlock(tuple(expanded))
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(map(visit, block.blocks)))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block, body=visit(block.body),
+                orelse=(visit(block.orelse) if block.orelse is not None else None),
+            )
+        if isinstance(block, LoopBlock):
+            return replace(block, body=visit(block.body))
+        if isinstance(block, WhileBlock):
+            return replace(block, condition=visit(block.condition),
+                           body=visit(block.body))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, visit(body)) for value, body in block.cases),
+                default=(visit(block.default) if block.default is not None else None),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(visit, block.lanes)))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        return block
+
+    root = visit(program.root)
+    missing = set(pending) - placed
+    if missing:
+        raise ValueError(
+            "failure-site regions are absent from the scheduled control "
+            f"tree: regions={sorted(missing)!r}"
+        )
     return replace(program, root=root)
 
 

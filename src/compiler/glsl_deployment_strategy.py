@@ -911,6 +911,107 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     return tuple(blocks)
 
 
+def _place_failure_exit_blocks(
+    control: ControlProgram,
+    process_graph: Any,
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Sequence[Any],
+) -> ControlProgram:
+    """Place each protected failure site's exit test after its region.
+
+    Reads ``source_failure_site`` (the reducer's record) and joins it to
+    this graph by ingested identity: each node's identity cell is followed
+    to its ingestion origin, the record's operator, binding and guard cells
+    are matched there, and the region whose deployment holds the operator is
+    the one the test follows.  A site whose operators are not in this graph
+    belongs to another function.  An operator in two regions, a guard or a
+    binding with no unique node here is refused, never guessed.
+    """
+
+    from .concordance_declarations import SOURCE_FAILURE_SITE, SOURCE_SPAN
+    from .concorded_literals import origin_cell
+    from .control_source import FailureExitBlock, place_failure_exits_after_regions
+    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+
+    book = current_identity_book()
+    page = book.pages.get(SOURCE_FAILURE_SITE.name)
+    if page is None:
+        return control
+    rows = tuple(page.rows())
+    if not rows or not any(sub is not None for sub in dispatch_subgraphs):
+        # No scheduled region exists in this shell (a pass before regions
+        # are cut): there is no marker a test could follow.
+        return control
+    by_origin: dict[Any, set[int]] = {}
+    guards: dict[Any, set[int]] = {}
+    for node_id, data in process_graph.G.nodes(data=True):
+        cell = node_identity_cell(process_graph, int(node_id))
+        if cell is not None:
+            try:
+                origin = origin_cell(book, cell)
+            except ValueError:
+                origin = None
+            if origin is not None:
+                by_origin.setdefault(origin, set()).add(int(node_id))
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.If):
+            row = source_span_row(None, expression)
+            occurrence = None if row is None else book.latest_ref(SOURCE_SPAN, row)
+            if occurrence is not None:
+                guards.setdefault(occurrence, set()).add(int(node_id))
+    # Every scheduled region marker may hold a site: a kept loop's body
+    # region is owned by its loop control, not by the runtime region list.
+    del retained_regions
+    region_of: dict[int, set[int]] = {}
+    for region_index, subgraph in enumerate(dispatch_subgraphs):
+        if subgraph is None:
+            continue
+        for node_id in subgraph.G.graph.get("deployment_nodes", ()):
+            region_of.setdefault(int(node_id), set()).add(int(region_index))
+    pending: dict[int, list[FailureExitBlock]] = {}
+    for row in rows:
+        site = book.latest_ref(SOURCE_FAILURE_SITE, row)
+        operators, named, _loops, guard = page.latest(row)
+        nodes = set().union(*(
+            by_origin.get(origin_cell(book, cell), set()) for cell in operators
+        ))
+        if not nodes:
+            continue
+        guard_nodes = guards.get(guard, set())
+        if len(guard_nodes) != 1:
+            raise ValueError(
+                f"failure site {row[0]} has no unique protected guard here: "
+                f"{sorted(guard_nodes)!r}"
+            )
+        regions = set().union(*(region_of.get(node, set()) for node in nodes))
+        if len(regions) != 1:
+            raise ValueError(
+                f"failure site {row[0]} operators are not in one scheduled "
+                f"region: regions={sorted(regions)!r} operators={sorted(nodes)!r} "
+                f"dispatch_regions={len(dispatch_subgraphs)} holding_graphs="
+                f"{[index for index, sub in enumerate(dispatch_subgraphs) if sub is not None and nodes & set(map(int, sub.G))]!r} "
+                f"operator_types={[process_graph.G.nodes[n].get('type') for n in sorted(nodes)]!r}"
+            )
+        bindings = []
+        for name, cell in named:
+            candidates = by_origin.get(origin_cell(book, cell), set())
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"failure site {row[0]} binding {name!r} has no unique "
+                    f"value here: {sorted(candidates)!r}"
+                )
+            bindings.append((str(name), next(iter(candidates))))
+        pending.setdefault(regions.pop(), []).append(FailureExitBlock(
+            site, next(iter(guard_nodes)), tuple(bindings),
+            operator_node_id=min(nodes),
+        ))
+    if not pending:
+        return control
+    return place_failure_exits_after_regions(control, pending)
+
+
 def _place_validation_blocks(
     control: ControlProgram,
     validations: Iterable[ValidationBlock],
@@ -15218,6 +15319,7 @@ def _control_partition_keys(
             for member in ast.walk(expression)
         )
     )
+    failure_frontiers_by_node = _failure_site_frontiers(graph)
     # Invert every owner->members relation into member->owners once, in owner
     # order, so each node's key is a set of dict lookups rather than a rescan of
     # every plan/callsite/comprehension/frontier. The old per-node membership
@@ -15270,9 +15372,66 @@ def _control_partition_keys(
             tuple(branch_frontiers_by_node.get(int(node_id), ())),
             tuple(condition_owners_by_node.get(int(node_id), ())),
             process_frontiers[int(node_id)],
+            tuple(failure_frontiers_by_node.get(int(node_id), ())),
         )
         for node_id in node_ids
     }
+
+
+def _failure_site_frontiers(graph: Any) -> dict[int, list[Any]]:
+    """Separate the work after each protected failure site from the site.
+
+    Program: ``try: x = 12 // n; total = total + 5``.  Wrong record: one
+    numerical region held both statements, so the failing division's region
+    ran ``total + 5`` before control could test the failure.  Rule: a node
+    of the same function that lies after a failure site's statement and
+    inside that site's protected guard is keyed by the site, as
+    ``loop_control_frontiers`` keys the work after a ``break`` arm.  The
+    site's region then ends at its statement and the failure-exit block
+    follows that region (``_place_failure_exit_blocks``).
+    """
+
+    from .concordance_declarations import SOURCE_FAILURE_SITE, SOURCE_SPAN
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    page = book.pages.get(SOURCE_FAILURE_SITE.name)
+    if page is None:
+        return {}
+    spans = book.page(SOURCE_SPAN)
+
+    def position(cell, end):
+        fact = spans.cell(cell.row, cell.column)
+        return ((int(fact.end_lineno), int(fact.end_col_offset)) if end
+                else (int(fact.lineno), int(fact.col_offset)))
+
+    sites = []
+    for row in page.rows():
+        site = book.latest_ref(SOURCE_FAILURE_SITE, row)
+        guard = page.latest(row)[3]
+        sites.append((row[0], site, position(row[0], True),
+                      position(guard, True)))
+    if not sites:
+        return {}
+    frontiers: dict[int, list[Any]] = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.AST) or getattr(
+            expression, "lineno", None,
+        ) is None:
+            continue
+        span_row = source_span_row(None, expression)
+        occurrence = (None if span_row is None
+                      else book.latest_ref(SOURCE_SPAN, span_row))
+        if occurrence is None:
+            continue
+        start = position(occurrence, False)
+        for statement, site, site_end, guard_end in sites:
+            if (occurrence.row[:2] == statement.row[:2]
+                    and site_end < start < guard_end):
+                frontiers.setdefault(int(node_id), []).append(site)
+    return frontiers
 
 
 def _host_callback_order_edges(graph: Any) -> frozenset[tuple[int, int]]:
@@ -39039,6 +39198,12 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 runtime_regions,
                 target.dispatch_subgraphs,
             )
+            shell_control = _place_failure_exit_blocks(
+                shell_control,
+                target.process_graph,
+                runtime_regions,
+                target.dispatch_subgraphs,
+            )
             target.shell_control_program = replace(
                 shell_control,
                 deployment_regions=tuple(dict.fromkeys((
@@ -40877,6 +41042,12 @@ class ProcessGraphGLSLDeployment(TiledObject):
             shell_control = _place_validation_blocks(
                 shell_control,
                 validations,
+                runtime_regions,
+                self.dispatch_subgraphs,
+            )
+            shell_control = _place_failure_exit_blocks(
+                shell_control,
+                self.process_graph,
                 runtime_regions,
                 self.dispatch_subgraphs,
             )

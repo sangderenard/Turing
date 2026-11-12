@@ -17876,7 +17876,126 @@ def _normalize_lexical_values(
             )
             pending_closure_environments.append((address, name, cell))
 
+    def record_failure_site(
+        body_statement: ast.stmt, bindings: dict[str, int],
+    ) -> None:
+        """Post where a failing operator leaves its protected body.
+
+        Program: ``try: for i in range(4): total = total + 12 // (i - n)``.
+        Wrong record: the division filled the native error slot, the loop
+        ran on with a placeholder quotient, and only the body's trailing
+        ExceptionTake saw the failure (179 for Python's 150).  Rule: a
+        statement inside a protected exception guard that holds an operator
+        whose SSA kind has fundamental failure arms is a failure site.  Its
+        row records, as a ``break`` site does, the lexical (name, value)
+        bindings visible before the statement: the versions every exit from
+        the site carries.  It names the loops inside the guard that hold it,
+        innermost first (each is kept iterative: an evaporated copy has no
+        place to branch from), and the guard itself (where the exit lands,
+        before the body's ExceptionTake).  Whether the arm
+        is enabled stays the operator instruction's compile policy.
+        """
+
+        from ...compiler.concordance_declarations import (
+            SOURCE_ACTIVITY_NODE, SOURCE_EXCEPTION_GUARD, SOURCE_FAILURE_SITE,
+            SOURCE_OPERATOR_KIND,
+        )
+        from ...compiler.concorded_literals import origin_cell
+        from ...transmogrifier.graph.graph_express2 import post_source_span
+        from ...transmogrifier.operator_safety import OPERATOR_FAILURE_ARMS
+
+        # The statement's own expressions: a compound statement's header,
+        # never the statements of its bodies (each is its own site).
+        if isinstance(body_statement, (ast.If, ast.While)):
+            roots = (body_statement.test,)
+        elif isinstance(body_statement, (ast.For, ast.AsyncFor)):
+            roots = (body_statement.iter,)
+        elif isinstance(body_statement, (
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+            ast.With, ast.AsyncWith, ast.Try,
+        )):
+            return
+        else:
+            roots = (body_statement,)
+        book = current_identity_book()
+        operators = []
+        for root in roots:
+            pending = [root]
+            while pending:
+                node = pending.pop()
+                if isinstance(node, (ast.Lambda, ast.FunctionDef,
+                                     ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                pending.extend(ast.iter_child_nodes(node))
+                if not isinstance(node, ast.BinOp) or id(node) not in graph.G:
+                    continue
+                node_cell = node_identity_cell(graph, id(node))
+                if node_cell is None:
+                    continue
+                kind = book.latest_ref(
+                    SOURCE_OPERATOR_KIND, (origin_cell(book, node_cell),),
+                )
+                if kind is None or not OPERATOR_FAILURE_ARMS.get(str(
+                    book.page(SOURCE_OPERATOR_KIND).cell(kind.row, kind.column)
+                )):
+                    continue
+                operators.append((node_cell, kind))
+        if not operators:
+            return
+        occurrence = post_source_span(None, body_statement)
+        activity = book.latest_ref(
+            SOURCE_ACTIVITY_NODE, (value_class_scope, occurrence, 'enter'),
+        )
+        if activity is None:
+            return
+        activity_page = book.page(SOURCE_ACTIVITY_NODE)
+        _kind, owners = activity_page.cell(activity.row, activity.column)
+        guard = guard_cell = None
+        loops = []
+        for owner, arm in reversed(tuple(owners)):
+            declared = book.latest_ref(SOURCE_EXCEPTION_GUARD, (owner,))
+            if declared is not None and arm == 'body' and book.page(
+                SOURCE_EXCEPTION_GUARD,
+            ).cell(declared.row, declared.column)[1]:
+                guard, guard_cell = owner, declared
+                break
+            owner_fact = activity_page.latest((value_class_scope, owner, 'enter'))
+            if (arm == 'body' and owner_fact is not None
+                    and owner_fact[0] in {'For', 'AsyncFor', 'While'}):
+                loops.append(owner)
+        if guard is None:
+            return
+        named_cells = tuple(
+            (str(name), node_identity_cell(graph, int(value)))
+            for name, value in sorted(bindings.items())
+            if isinstance(value, int) and not isinstance(value, bool)
+            and int(value) in graph.G
+        )
+        if any(cell is None for _name, cell in named_cells):
+            raise ValueError(
+                f"failure site {occurrence} has a binding with no identity"
+            )
+        book.post(
+            SOURCE_FAILURE_SITE, (occurrence,),
+            (tuple(cell for cell, _kind in operators), named_cells,
+             tuple(loops), guard),
+            stage=_REDUCTION,
+            provenance=_Derived(tuple(dict.fromkeys((
+                occurrence, activity, guard_cell,
+                *(cell for pair in operators for cell in pair),
+                *(cell for _name, cell in named_cells),
+            )))),
+            mode=_Mode.CONCORD,
+        )
+
     def reduce_statement_body(body_statement: ast.stmt) -> int | None:
+        # Recorded before reduction: the bindings are the versions visible
+        # before the statement, and its operators still have their ingested
+        # identities.
+        record_failure_site(body_statement, dict(environment))
+        return _reduce_statement_body(body_statement)
+
+    def _reduce_statement_body(body_statement: ast.stmt) -> int | None:
         from ...compiler.exception_graph import require_exception_control
         if not isinstance(body_statement, (ast.With, ast.AsyncWith)):
             require_exception_control(graph, id(body_statement))

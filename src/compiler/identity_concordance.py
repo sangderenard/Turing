@@ -4055,6 +4055,46 @@ class CorrelationTable:
                         or imported.owner is not source_book))):
                 found.append(Finding("c-exception-provenance", str(name), None,
                                      "C exception operation disagrees with its source identity"))
+        # A protected failure site (reducer) is caused by its statement, its
+        # protected guard declaration and each failable operator's kind; its
+        # bindings are cells the post cites.  Each C exit test names a site
+        # and the ExceptionPending instruction it materialized.
+        from .concordance_declarations import (
+            C_FAILURE_EXIT, SOURCE_EXCEPTION_GUARD, SOURCE_FAILURE_SITE,
+            SOURCE_OPERATOR_KIND,
+        )
+        from .concorded_literals import origin_cell
+        for row in book.page(SOURCE_FAILURE_SITE).rows():
+            site = book.latest_ref(SOURCE_FAILURE_SITE, row)
+            operators, named, _loops, guard = fact(site)
+            sources = {source for source, _stage in book.edges_into(site)}
+            guard_ref = book.latest_ref(SOURCE_EXCEPTION_GUARD, (guard,))
+            kinds = [book.latest_ref(SOURCE_OPERATOR_KIND, (origin_cell(book, cell),))
+                     for cell in operators]
+            if (row[0].page != SOURCE_SPAN or row[0] not in sources
+                    or guard_ref is None or guard_ref not in sources
+                    or not fact(guard_ref)[1] or not operators
+                    or any(kind is None or kind not in sources
+                           or not OPERATOR_FAILURE_ARMS.get(str(fact(kind)))
+                           for kind in kinds)
+                    or any(cell not in sources for _name, cell in named)):
+                found.append(Finding("failure-site-provenance", str(row[0].row), None,
+                                     "failure site disagrees with its guard, operators or bindings"))
+        pending_tests = {
+            (instruction.attributes.get("failure_site_cell"), str(name), int(instruction.res.id))
+            for name, function in (getattr(module, "functions", {}) or {}).items()
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "ExceptionPending"
+        }
+        for row in book.page(C_FAILURE_EXIT).rows():
+            policy_ref = book.latest_ref(C_FAILURE_EXIT, row)
+            site, name, result = row
+            if (site.page != SOURCE_FAILURE_SITE
+                    or (site, str(name), int(result)) not in pending_tests
+                    or site not in {cell for cell, _stage in book.edges_into(policy_ref)}):
+                found.append(Finding("c-failure-exit-provenance", str(name), None,
+                                     "C failure exit disagrees with its failure site"))
         return found
 
     @staticmethod

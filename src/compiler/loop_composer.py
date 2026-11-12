@@ -1180,6 +1180,37 @@ def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
     )
 
 
+def _failure_site_loops() -> frozenset[Any]:
+    """Source occurrences of the loops that hold a protected failure site."""
+
+    from .concordance_declarations import SOURCE_FAILURE_SITE
+    from .identity_concordance import current_identity_book
+
+    page = current_identity_book().pages.get(SOURCE_FAILURE_SITE.name)
+    if page is None:
+        return frozenset()
+    return frozenset(
+        loop for row in page.rows() for loop in page.latest(row)[2]
+    )
+
+
+def _loop_occurrence(graph: Any, loop_id: int) -> Any:
+    """The source occurrence cell of one loop node, or None."""
+
+    from .concordance_declarations import SOURCE_SPAN
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.graph.graph_express2 import source_span_row
+
+    if int(loop_id) not in graph.G:
+        return None
+    expression = graph.G.nodes[int(loop_id)].get("expr_obj")
+    if not isinstance(expression, ast.AST):
+        return None
+    row = source_span_row(None, expression)
+    return (None if row is None
+            else current_identity_book().latest_ref(SOURCE_SPAN, row))
+
+
 def evaporate_unrolled_loops(
     graph: Any,
     plans: Iterable[LoopPlan],
@@ -1233,6 +1264,7 @@ def evaporate_unrolled_loops(
     ) + 1
     handled_loop_ids: set[int] = set()
     effect_live_call_clones: set[int] = set()
+    failure_site_loops = _failure_site_loops()
 
     def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
         clone_id = next_process_value_id(graph)
@@ -1481,6 +1513,17 @@ def evaporate_unrolled_loops(
                 file=sys.stderr, flush=True,
             )
         if blocked_by_control or blocked_by_constructor:
+            continue
+        # Program: ``try: for i in range(4): total = total + 12 // (i - n)``.
+        # Wrong record: evaporation copied the body into one straight-line
+        # region, so the failing division had no place to branch from and
+        # the later iterations ran on (179 for Python's 150).  Rule: a loop
+        # that holds a failure site (``source_failure_site``, posted by the
+        # reducer) keeps its iterative control; the site's exit leaves it.
+        if any(
+            _loop_occurrence(graph, member.loop.node_id) in failure_site_loops
+            for member in selected_plans
+        ):
             continue
         # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The

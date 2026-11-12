@@ -6023,6 +6023,20 @@ class ProcessGraph(TiledObject):
             from ...compiler.concordance_declarations import SOURCE_EXCEPTION_NODE
             book.post(SOURCE_EXCEPTION_NODE, (identity,), conversion, stage=INGESTION,
                       provenance=Derived((identity, conversion)), mode=Mode.CONCORD)
+            guard = getattr(node, "_turing_exception_guard", None)
+            if guard is not None:
+                # Exception ingestion's FailureArms.guard declared this If
+                # the guard of one exception record's activity. The reducer
+                # reads the declaration by the If's occurrence (the key its
+                # SOURCE_ACTIVITY_NODE owners carry) to find the protected
+                # body a failing operator leaves.
+                from ...compiler.concordance_declarations import SOURCE_EXCEPTION_GUARD
+                error, protected, return_flag = guard
+                book.post(SOURCE_EXCEPTION_GUARD, (span,), (
+                    str(error), bool(protected),
+                    None if return_flag is None else str(return_flag),
+                ), stage=INGESTION, provenance=Derived((identity, span, conversion)),
+                    mode=Mode.CONCORD)
         authored_raise = getattr(node, "_turing_authored_raise_cell", None)
         if authored_raise is not None:
             from ...compiler.concordance_declarations import (

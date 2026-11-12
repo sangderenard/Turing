@@ -681,8 +681,20 @@ SOURCE_EXCEPTION_OPERATION = declare_page("source_exception_operation", (
 ), tuple)  # (operation, exception type, message, code, explicit cause identity,
             #  cause argument position, suppress implicit context,
             #  process-operation origin cell)
+SOURCE_EXCEPTION_GUARD = declare_page("source_exception_guard", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # (record name, protected, return-flag name or None): exception
+            #  ingestion's declared guard If, keyed by its source occurrence
+SOURCE_FAILURE_SITE = declare_page("source_failure_site", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # (operator occurrences, exact lexical (name, value cell) bindings
+            #  before the statement, loop occurrences inside the guard,
+            #  innermost first, protected guard occurrence)
 C_EXCEPTION_OPERATION = declare_page("c_exception_operation", (
     RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
+), tuple)  # (semantic operator, input ids, materialization policy)
+C_FAILURE_EXIT = declare_page("c_failure_exit", (
+    RowField("site", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)  # (semantic operator, input ids, materialization policy)
 C_OPERATOR_SAFETY = declare_page("c_operator_safety", (
     RowField("result", K.PAGE_REF), RowField("function", K.NAME),
@@ -3497,6 +3509,9 @@ class SSABlockKind(Enum):
     RESOURCE_EXIT_NEXT = "resource_exit_next"
     VALIDATION_PASS = "validation_pass"
     VALIDATION_FAIL = "validation_fail"
+    FAILURE_EXIT = "failure_exit"
+    FAILURE_CONTINUE = "failure_continue"
+    FAILURE_JOIN = "failure_join"
     STATE_CASE = "state_case"
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"

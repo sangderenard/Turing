@@ -16359,7 +16359,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     )
     from .control_activity import ActivitySchedule, memberships as activity_memberships
     from .control_source import (ValidationBlock, SequenceMutationBlock, ScalarFieldWriteBlock,
-                                 SequenceQueryBlock, LoopControlBlock)
+                                 SequenceQueryBlock, LoopControlBlock, FailureExitBlock)
     graph_obj = graph.G
     activity = ActivitySchedule(graph)
     memberships = {node: set(owners) for node, owners in activity_memberships(graph).items()}
@@ -16417,6 +16417,16 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             return activity.position(block.source_scope_id, 'enter')
         if isinstance(block, ValidationBlock):
             return node_position(block.predicate_value_id)
+        if isinstance(block, FailureExitBlock):
+            # The test directly follows the region holding its operator:
+            # that region's position, the stable sort keeping it after the
+            # marker.
+            holding = [index for index, region in enumerate(dispatch_subgraphs)
+                       if block.operator_node_id is not None
+                       and int(block.operator_node_id) in set(map(int, region.G.graph.get('deployment_nodes', ())))]
+            if len(holding) != 1:
+                raise FortranEmissionError('failure exit has no unique operator region')
+            return region_positions[holding[0]]
         if isinstance(block, SequenceBlock):
             return min((block_position(child) for child in block.blocks), default=(-1, 0, 0))
         raise FortranEmissionError(f'control block has no activity contract: {type(block).__name__}')
@@ -16775,7 +16785,7 @@ def _control_block_consumes_values(block: Any, value_ids: Iterable[int]) -> bool
     from .control_source import (
         CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
         ScalarFieldWriteBlock, SequenceMutationBlock, SequenceQueryBlock, ValidationBlock,
-        WhileBlock,
+        WhileBlock, FailureExitBlock,
     )
 
     wanted = set(map(int, value_ids))
@@ -16803,6 +16813,9 @@ def _control_block_consumes_values(block: Any, value_ids: Iterable[int]) -> bool
                 block.predicate_expression
             ).intersection(wanted))
         )
+    if isinstance(block, FailureExitBlock):
+        # The exit edge carries the versions visible at its site.
+        return any(int(value_id) in wanted for _name, value_id in block.bindings)
     if isinstance(block, SequenceMutationBlock):
         mutation = block.mutation
         return bool(

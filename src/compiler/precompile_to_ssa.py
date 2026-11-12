@@ -157,6 +157,7 @@ from .control_source import (
     DispatchBlock,
     ResourceScopeBlock,
     ExternalReferenceCallBlock,
+    FailureExitBlock,
     LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
@@ -9138,6 +9139,128 @@ class _ControlSSABuilder(TiledObject):
             if merged_names and binding_names.get(int(source_id), set()) - merged_names
         )
 
+    def _lower_failure_exit(self, block: FailureExitBlock) -> None:
+        """Test the native error slot after a failure site's region.
+
+        Program: ``try: for i in range(4): total = total + 12 // (i - n)``.
+        Wrong record: nothing after the division read the slot, so the loop
+        ran its later iterations and its ``else`` (179 for Python's 150).
+        Rule: on failure, branch out of every construct between the site
+        and its protected guard, to the end of the guard's body, carrying
+        the versions visible before the site statement.  The guard's
+        conditional joins them (``_join_failure_exits``).
+        """
+
+        exits = self.__dict__.get("_failure_exit_edges", {})
+        collector = exits.get(int(block.guard_node_id))
+        if collector is None:
+            raise ValueError(
+                f"failure exit {block.site_cell} is lowered outside its "
+                f"protected guard {block.guard_node_id}"
+            )
+        # The versions at the site, as this builder holds them here; a name
+        # not yet bound here is not read (no provisional formal is minted).
+        carried = {
+            str(name): self.external_values.get(int(value_id))
+            for name, value_id in block.bindings
+        }
+        pending = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(block.site_cell,),
+        )
+        self.emit(Handler.ExceptionPending, [], pending, attributes={
+            "failure_site_cell": block.site_cell,
+            "effectful": True,
+            "ordered_effect": True,
+        })
+        failed = self.new_block("failure_exit")
+        passed = self.new_block("failure_continue")
+        self.conditional_branch(pending, failed, passed)
+        collector.append((failed, carried, block.site_cell))
+        self.current = passed
+
+    def _join_failure_exits(
+        self,
+        conditional: ConditionalBlock,
+        exits: tuple,
+        carried_snapshots: dict,
+        snapshot_cells: dict,
+        *,
+        path: str,
+    ) -> None:
+        """Join a guard arm's normal end and its failure exits.
+
+        Each carried alias the arm rebinds takes, on a failure edge, the
+        version its name had at that site; the Phi is bound to the alias's
+        arm id, so the guard's own merge reads it as the arm's value.  A
+        guard whose merge carries anything other than names (results,
+        sequences, fields, optional glyphs) refuses until that carry is
+        joined too.
+        """
+
+        if (conditional.result_aliases or conditional.carried_sequence_aliases
+                or any(cell is not None for cell in conditional.carried_field_cells)
+                or conditional.optional_glyph_carry_cells):
+            raise ValueError(
+                f"{path}: a protected guard with failure exits carries a "
+                "non-name merge the failure join does not represent"
+            )
+        binding_names = self.__dict__.get("_conditional_binding_names")
+        if binding_names is None:
+            binding_names = {}
+            page = self._book().pages.get(NAME_BINDING.name)
+            if page is not None and self.lexical_read_scope is not None:
+                for row in page.scope_rows(self.lexical_read_scope):
+                    fact = page.latest(row)
+                    value_id = getattr(fact, "value_id", None)
+                    if value_id is not None:
+                        binding_names.setdefault(int(value_id), set()).add(row[1])
+            self._conditional_binding_names = binding_names
+        normal = self.current
+        joined = []
+        for true_id, _false_id, initial_id, merged_id in conditional.carried_aliases:
+            if int(true_id) == int(initial_id):
+                continue
+            normal_value, _source = self._carried_name_arm(
+                true_id, initial_id, carried_snapshots[int(initial_id)],
+                snapshot_cells.get(int(initial_id)), path=path,
+            )
+            names = binding_names.get(int(merged_id), set())
+            failure_values = []
+            for _block, carried, site in exits:
+                values = {id(carried[name]): carried[name] for name in names
+                          if carried.get(name) is not None}
+                if len(values) != 1:
+                    raise ValueError(
+                        f"{path}: failure site {site} has no unique version "
+                        f"of {sorted(names)!r} for carried alias {int(merged_id)}"
+                    )
+                failure_values.append(next(iter(values.values())))
+            joined.append((int(true_id), normal_value, failure_values))
+        join = self.new_block("failure_join")
+        self.branch(join)
+        for failed, _carried, _site in exits:
+            self.current = failed
+            self.branch(join)
+        self.current = join
+        for true_id, normal_value, failure_values in joined:
+            phi = self.fresh_value(
+                dtype=normal_value.dtype, transform=CONTROL_PREDICATE,
+                operands=(normal_value, *failure_values,
+                          *(site for _block, _carried, site in exits)),
+            )
+            phi.shape = tuple(normal_value.shape or ())
+            self.emit(Handler.Phi, [normal_value, *failure_values], phi,
+                      attributes={
+                          "incoming_blocks": (
+                              normal.name,
+                              *(failed.name for failed, _c, _s in exits),
+                          ),
+                          "binding": "failure_exit_join",
+                      })
+            self._bind(true_id, phi, BindingKind.CONDITIONAL_MERGE,
+                       normal_value, *failure_values)
+
     def _carried_name_arm(
         self,
         arm_id: Any,
@@ -12761,6 +12884,9 @@ class _ControlSSABuilder(TiledObject):
                 )
                 self.branch(passed)
                 self.current = passed
+            return
+        if isinstance(block, FailureExitBlock):
+            self._lower_failure_exit(block)
             return
         if isinstance(block, ValidationBlock):
             self.validation_contracts.append({
@@ -20129,6 +20255,11 @@ class _ControlSSABuilder(TiledObject):
         # (``if retries < 2: dt = dt * 0.5; continue`` -- the arm published
         # ``dt`` = ``dt * 0.5`` and the fall-through call read it.)
         values_before_body = dict(self.external_values)
+        failure_exits = self.__dict__.setdefault("_failure_exit_edges", {})
+        guard_key = (None if conditional.source_node_id is None
+                     else int(conditional.source_node_id))
+        if guard_key is not None:
+            failure_exits[guard_key] = []
         self.lower(conditional.body, path=f"{path}.body")
         for value_id, expression in conditional.body_value_expressions:
             # Bind the reducer's exact arm identity. ``result_override``
@@ -20139,6 +20270,13 @@ class _ControlSSABuilder(TiledObject):
                 cause=(conditional_cell,),
             )
             self.lower_control_expression(expression, result_override=result)
+        exits = (() if guard_key is None
+                 else tuple(failure_exits.pop(guard_key, ())))
+        if exits:
+            self._join_failure_exits(
+                conditional, exits, carried_snapshots, snapshot_cells,
+                path=f"{path}.body",
+            )
         body_reachable, body_continuation_cell = self._arm_continuation(true_block)
         body_falls_through = body_reachable and (
             not self.current.successors or merge_block.name in self.current.successors
