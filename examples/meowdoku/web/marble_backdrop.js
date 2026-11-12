@@ -217,7 +217,7 @@ export function createBackdropLayerControls(container, materialNames, onChange =
     shapeLabel.append(shape); panel.append(shapeLabel);
     const behaviorLabel=doc.createElement('label'),behavior=doc.createElement('select');
     behaviorLabel.textContent='Surface behavior';behavior.id=`backdrop-layer-${index}-surfaceBehavior`;
-    for(const [value,name] of [['cardstock','Cardstock (rigid)'],['fabric','Fabric (spring mesh)']]){
+    for(const [value,name] of [['cardstock','Cardstock (rigid)'],['fabric','Fabric mesh (Nodus stream pending)']]){
       const option=doc.createElement('option');option.value=value;option.textContent=name;behavior.append(option);
     }
     behavior.addEventListener('change',()=>{
