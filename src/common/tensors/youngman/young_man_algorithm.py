@@ -1,9 +1,10 @@
 from src.common.tensors import AbstractTensor
+from src.common.tensors.abstraction_methods.random import RANDOM_KIND
 class CompositeGeometry:
-    def __init__(self, geometry="tetrahedron", precision=AbstractTensor.float64, device="cuda"):
+    def __init__(self, geometry="tetrahedron", precision="float64", device="cuda"):
         self.geometry = geometry
         self.precision = precision
-        self.device = AbstractTensor.device(device)
+        self.device = device
         self.network_geometry = None
     def load_network_override(self, new_edges, new_offsets):
         self.network_geometry = {"offsets": new_offsets, "edge_pairs":new_edges}
@@ -42,11 +43,11 @@ class CompositeGeometry:
         # Optionally apply micro jitter
         if micro_jitter:
             jitter_strength = 1e-8
-            jitter = AbstractTensor.randn_like(offsets) * jitter_strength
+            jitter = AbstractTensor.randn(offsets.shape, kind=RANDOM_KIND.PRNG) * jitter_strength
             offsets += jitter
 
         # Calculate tile size and centered offsets
-        tile_size = offsets.max(dim=0).values - offsets.min(dim=0).values
+        tile_size = offsets.max(dim=0) - offsets.min(dim=0)
         centroid = offsets.mean(dim=0)
         centered_offsets = offsets - centroid
 
@@ -61,27 +62,27 @@ class CompositeGeometry:
             edge_pairs = self.network_geometry["edge_pairs"].clone()
         elif self.geometry == "square":
             vertex_count = 4
-            edge_pairs = AbstractTensor.tensor([(0, 1), (1, 2), (2, 3), (3, 0)], dtype=AbstractTensor.int64, device=self.device)
+            edge_pairs = AbstractTensor.tensor([(0, 1), (1, 2), (2, 3), (3, 0)], dtype="int64", device=self.device)
         elif self.geometry == "cube":
             vertex_count = 8
             edge_pairs = AbstractTensor.tensor([
                 (0, 1), (1, 2), (2, 3), (3, 0),
                 (4, 5), (5, 6), (6, 7), (7, 4),
                 (0, 4), (1, 5), (2, 6), (3, 7)
-            ], dtype=AbstractTensor.int64, device=self.device)
+            ], dtype="int64", device=self.device)
         elif self.geometry == "tetrahedron":
             vertex_count = 4
             edge_pairs = AbstractTensor.tensor([
                 (0, 1), (0, 2), (0, 3),
                 (1, 2), (1, 3), (2, 3)
-            ], dtype=AbstractTensor.int64, device=self.device)
+            ], dtype="int64", device=self.device)
         elif self.geometry == "octahedron":
             vertex_count = 6
             edge_pairs = AbstractTensor.tensor([
                 (0, 2), (0, 3), (0, 4), (0, 5),
                 (1, 2), (1, 3), (1, 4), (1, 5),
                 (2, 4), (2, 5), (3, 4), (3, 5)
-            ], dtype=AbstractTensor.int64, device=self.device)
+            ], dtype="int64", device=self.device)
         elif self.geometry == "icosahedron":
             vertex_count = 12
             edge_pairs = AbstractTensor.tensor([
@@ -93,7 +94,7 @@ class CompositeGeometry:
                 (5, 10), (6, 8), (6, 11),
                 (7, 8), (7, 9), (8, 11),
                 (9, 10), (9, 11), (10, 11)
-            ], dtype=AbstractTensor.int64, device=self.device)
+            ], dtype="int64", device=self.device)
         else:
             raise ValueError(f"Unsupported geometry: {self.geometry}")
         offsets, tile_size = self.define_offsets(density, micro_jitter)
@@ -101,7 +102,7 @@ class CompositeGeometry:
             offsets[edge_pairs[:, 0]] - offsets[edge_pairs[:, 1]],
             dim=1
         )
-        return offsets.requires_grad_(True), AbstractTensor.tensor(vertex_count, device=self.device, dtype=self.precision), edge_pairs, edge_lengths, tile_size
+        return offsets.requires_grad_(True), AbstractTensor.get_tensor(vertex_count, device=self.device, dtype=self.precision), edge_pairs, edge_lengths, tile_size
 from src.common.tensors import AbstractTensor
 
 # -------------------------------
@@ -153,12 +154,12 @@ class Shape:
             name (str): Name of the shape ('cube', 'tetrahedron', etc.).
             device (str): Target device ('cpu' or 'cuda').
         """
-        self.device = AbstractTensor.device(device)
+        self.device = device
         if name not in SHAPE_DEFINITIONS:
             raise ValueError(f"Shape '{name}' is not defined.")
         shape_data = SHAPE_DEFINITIONS[name]
-        self.vertices = AbstractTensor.tensor(shape_data["vertices"], dtype=AbstractTensor.float64, device=self.device)
-        self.edges = AbstractTensor.tensor(shape_data["edges"], dtype=AbstractTensor.int64, device=self.device)
+        self.vertices = AbstractTensor.tensor(shape_data["vertices"], dtype="float64", device=self.device)
+        self.edges = AbstractTensor.tensor(shape_data["edges"], dtype="int64", device=self.device)
         self.bitmask = None  # For activation mapping
         self.interpolated_edges = None  # For interpolated values
 
@@ -216,7 +217,7 @@ class Shuttle:
             warp_resolution (str): Resolution for warp ('activation' or 'interpolation').
             device (str): Target device ('cpu' or 'cuda').
         """
-        self.device = AbstractTensor.device(device)
+        self.device = device
         self.weft = weft
         self.warp = warp
         self.scalar_field = scalar_field
@@ -251,7 +252,7 @@ class Shuttle:
         candidate_edge = self.edges[edge_idx]
         start, end = candidate_edge
         direction = self.vertices[end] - self.vertices[start]
-        chirality = AbstractTensor.dot(direction, AbstractTensor.tensor([0, 0, 1], dtype=AbstractTensor.float64, device=self.device))
+        chirality = AbstractTensor.dot(direction, AbstractTensor.tensor([0, 0, 1], dtype="float64", device=self.device))
         if chirality < 0:
             return (end, start)
         return (start, end)
@@ -320,7 +321,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 class YoungManAlgorithm:
-    def __init__(self, geometry="cube", density=1.0, save_dir="geometry_maps", device="cuda", precision=AbstractTensor.float64, jitter_enabled=False, jitter_seed=None, jitter_strength = (0.0, 0.0, 0.0), micro_jitter=False, enforce_req_grad=True):
+    def __init__(self, geometry="cube", density=1.0, save_dir="geometry_maps", device="cuda", precision="float64", jitter_enabled=False, jitter_seed=None, jitter_strength = (0.0, 0.0, 0.0), micro_jitter=False, enforce_req_grad=True):
         assert geometry in ["square", "cube", "tetrahedron", "octahedron", "icosahedron"], \
             "Unsupported geometry. Choose 'square', 'cube', 'tetrahedron', 'octahedron', or 'icosahedron'."
         self.jitter_enabled = jitter_enabled
@@ -334,7 +335,7 @@ class YoungManAlgorithm:
         self.density = density
         self.save_dir = save_dir
         self.precision = precision
-        self.device = AbstractTensor.device(device)
+        self.device = device
         self.translated_offsets = None
         self.historical_filter = []
         self.accumulated_force = None
@@ -371,7 +372,7 @@ class YoungManAlgorithm:
         self.jitter_seed = seed
         self.jitter_strength = (theta_range, phi_range, r_range)
         if seed is not None:
-            AbstractTensor.manual_seed(seed)
+            AbstractTensor.random.set_seed(seed)
         if once:
             self.current_jitter = self._generate_jitter()
 
@@ -440,14 +441,14 @@ class YoungManAlgorithm:
             # Normalize axis for batch processing
             #print(historical_rotation_axis.shape)
             
-            axis = historical_rotation_axis / historical_rotation_axis.norm(dim=1, keepdim=True)
+            axis = historical_rotation_axis / AbstractTensor.norm(historical_rotation_axis, dim=1, keepdim=True)
             #print(axis.shape)
              
             # Compute outer product for batch
-            outer_product = AbstractTensor.bmm(axis.unsqueeze(2), axis.unsqueeze(1))
+            outer_product = axis.unsqueeze(2) @ axis.unsqueeze(1)
 
             # Construct rotation matrices
-            rotation_matrix = AbstractTensor.eye(3, device=self.device, dtype=self.precision).unsqueeze(0).repeat(axis.size(0), 1, 1)
+            rotation_matrix = AbstractTensor.eye(3, device=self.device, dtype=self.precision).unsqueeze(0).repeat((axis.shape[0], 1, 1))
             #print(rotation_matrix.shape)
             
             prematrix = AbstractTensor.stack([
@@ -472,7 +473,7 @@ class YoungManAlgorithm:
             #print("Offsets shape after transpose:", offsets.shape)
 
             # Apply the rotation
-            rotated_offsets = AbstractTensor.bmm(rotation_matrix, offsets).transpose(1, 2)  # Shape: (20, V, 3)
+            rotated_offsets = (rotation_matrix @ offsets).transpose(1, 2)  # Shape: (20, V, 3)
 
         else:
             rotated_offsets = offsets.clone()
@@ -502,13 +503,13 @@ class YoungManAlgorithm:
             jitter_strength = (0,0,0)
 
         if jitter_seed is not None:
-            AbstractTensor.manual_seed(jitter_seed)
+            AbstractTensor.random.set_seed(jitter_seed)
 
         # Generate random spherical coordinates per batch
-        batch_size, num_vertices, _ = offsets.size()
-        theta = (AbstractTensor.rand(batch_size, device=self.device, dtype=self.precision) - 0.5) * 2 * jitter_strength[0]
-        phi = (AbstractTensor.rand(batch_size, device=self.device, dtype=self.precision) - 0.5) * 2 * jitter_strength[1]
-        r = (AbstractTensor.rand(batch_size, device=self.device, dtype=self.precision) - 0.5) * 2 * jitter_strength[2]
+        batch_size, num_vertices, _ = offsets.shape
+        theta = (AbstractTensor.random_tensor((batch_size,), device=self.device, kind=RANDOM_KIND.PRNG) - 0.5) * 2 * jitter_strength[0]
+        phi = (AbstractTensor.random_tensor((batch_size,), device=self.device, kind=RANDOM_KIND.PRNG) - 0.5) * 2 * jitter_strength[1]
+        r = (AbstractTensor.random_tensor((batch_size,), device=self.device, kind=RANDOM_KIND.PRNG) - 0.5) * 2 * jitter_strength[2]
         spherical_jitter = AbstractTensor.stack([r, theta, phi], dim=-1)
 
         # Calculate rotation matrices for each unit (batch)
@@ -521,7 +522,7 @@ class YoungManAlgorithm:
         ], dim=-1).reshape(batch_size, 3, 3)
 
         # Apply rotation to offsets
-        jittered_offsets = AbstractTensor.bmm(rotation_matrices, self.translated_offsets.transpose(1, 2)).transpose(1, 2)
+        jittered_offsets = (rotation_matrices @ self.translated_offsets.transpose(1, 2)).transpose(1, 2)
 
         # Convert r to Cartesian translation
         x_translation = r * AbstractTensor.sin(phi) * AbstractTensor.cos(theta)
@@ -549,7 +550,7 @@ class YoungManAlgorithm:
         """Save a map to a file for a specific geometry."""
         file_path = self._map_file_path(geometry, density, map_name)
         with open(file_path, 'wb') as f:
-            pickle.dump(map_data, f)
+            pickle.dump(map_data.numpy(), f)
         logging.info(f"Saved {map_name} for {geometry} to {file_path}.")
 
     def _load_map(self, geometry, density, map_name):
@@ -620,7 +621,7 @@ class YoungManAlgorithm:
             # Calculate active edges from the bitmask
             active_edges_count = sum(
                 (bitmask & (1 << v1)) != (bitmask & (1 << v2))
-                for v1, v2 in edge_pairs.to(dtype=AbstractTensor.int64)
+                for v1, v2 in edge_pairs.to(dtype="int64")
             )
 
             # Calculate active triangles from the triangle mask
@@ -685,7 +686,7 @@ class YoungManAlgorithm:
             AbstractTensor.Tensor: The jittered offsets.
         """
         # Generate random jitter of the same shape as offsets
-        jitter = AbstractTensor.randn_like(offsets) * jitter_strength
+        jitter = AbstractTensor.randn(offsets.shape, kind=RANDOM_KIND.PRNG) * jitter_strength
 
         # Apply the jitter to the offsets
         jittered_offsets = offsets + jitter
@@ -726,11 +727,11 @@ class YoungManAlgorithm:
                         - Negative values indicate a match in the reversed order in edge_pairs.
         """
         num_edges_to_lookup = len(edges_to_lookup)
-        signed_lookup = AbstractTensor.full((num_edges_to_lookup,), -1, dtype=AbstractTensor.int64, device=self.device)
+        signed_lookup = AbstractTensor.full((num_edges_to_lookup,), -1, dtype="int64", device=self.device)
 
         for i, edge in enumerate(edges_to_lookup):
-            edge_tensor = AbstractTensor.tensor(edge, dtype=AbstractTensor.int64, device=self.device)
-            reverse_edge_tensor = AbstractTensor.flip(edge_tensor, dims=[0])  # Reverse the edge
+            edge_tensor = AbstractTensor.tensor(edge, dtype="int64", device=self.device)
+            reverse_edge_tensor = edge_tensor[::-1]  # Reverse the edge
 
             # Find matches in edge_pairs
             forward_match = AbstractTensor.all(edge_pairs == edge_tensor, dim=1)
@@ -760,28 +761,28 @@ class YoungManAlgorithm:
         """
         num_edges = len(edge_pairs)  # Total number of edges in the geometry
         max_triangles = num_edges  # Maximum triangles correspond to edges
-        triangle_map = AbstractTensor.full((2 ** vertex_count.to(dtype=AbstractTensor.int64), num_edges, 2), -1, dtype=self.precision, device=self.device)
+        triangle_map = AbstractTensor.full((2 ** vertex_count.to(dtype="int64"), num_edges, 2), -1, dtype=self.precision, device=self.device)
         centroids = []
-        force_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype=AbstractTensor.int64), 3), dtype=self.precision, device=self.device)
-        torque_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype=AbstractTensor.int64), 3), dtype=self.precision, device=self.device)
+        force_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype="int64"), 3), dtype=self.precision, device=self.device)
+        torque_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype="int64"), 3), dtype=self.precision, device=self.device)
 
-        triangle_mask = AbstractTensor.zeros((2 ** vertex_count.to(dtype=AbstractTensor.int64), max_triangles), dtype=AbstractTensor.bool, device=self.device)
-        active_vertex_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype=AbstractTensor.int64), vertex_count.to(dtype=AbstractTensor.int64)), dtype=AbstractTensor.bool, device=self.device)  # Active vertices
+        triangle_mask = AbstractTensor.zeros((2 ** vertex_count.to(dtype="int64"), max_triangles), dtype="bool", device=self.device)
+        active_vertex_map = AbstractTensor.zeros((2 ** vertex_count.to(dtype="int64"), vertex_count.to(dtype="int64")), dtype="bool", device=self.device)  # Active vertices
         
 
-        for bitmask in range(2 ** vertex_count.to(dtype=AbstractTensor.int64)):
+        for bitmask in range(2 ** vertex_count.to(dtype="int64")):
             # Step 1: Identify active vertices for the current bitmask
-            active_vertex_mask = (bitmask & (1 << AbstractTensor.arange(vertex_count.to(dtype=AbstractTensor.int64), device=self.device))) > 0
+            active_vertex_mask = (AbstractTensor.get_tensor(bitmask) & (AbstractTensor.get_tensor(1) << AbstractTensor.arange(vertex_count.to(dtype="int64"), device=self.device))) > 0
             active_vertex_map[bitmask] = active_vertex_mask  # Store active vertex map
             active_vertices = vertex_offsets[active_vertex_mask]
             active_indices = AbstractTensor.nonzero(active_vertex_mask).flatten().tolist()
-            if active_vertices.size(0) == 0:  # All vertices inactive (bitmask=0)
+            if active_vertices.shape[0] == 0:  # All vertices inactive (bitmask=0)
                 # Apply upward perturbation force to break inactivity
                 force_map[bitmask] = AbstractTensor.tensor([-1.0, -1.0, -1.0], dtype=self.precision, device=self.device)
                 torque_map[bitmask] = AbstractTensor.tensor([0, 0, 0], dtype=self.precision, device=self.device)
                 
 
-            elif active_vertices.size(0) == vertex_count:  # All vertices active (full bitmask)
+            elif active_vertices.shape[0] == vertex_count:  # All vertices active (full bitmask)
                 # Apply downward perturbation force to deactivate some vertices
                 force_map[bitmask] = AbstractTensor.tensor([1.0, 1.0, 1.0], dtype=self.precision, device=self.device)
                 torque_map[bitmask] = AbstractTensor.tensor([0, 0, 0], dtype=self.precision, device=self.device)
@@ -789,7 +790,7 @@ class YoungManAlgorithm:
 
             # Step 2: Calculate centroid (optional)
             try:
-                if active_vertices.size(0) == 0:
+                if active_vertices.shape[0] == 0:
                     centroid = AbstractTensor.tensor([0.0,0.0,0.0], dtype=self.precision, device=self.device)
                 else:
                     centroid = active_vertices.mean(axis=0)
@@ -803,15 +804,15 @@ class YoungManAlgorithm:
                 #continue
 
             if centroid.all() == 0.0:
-                force_direction = AbstractTensor.rand(3, device=self.device, dtype=self.precision)
+                force_direction = AbstractTensor.random_tensor((3,), device=self.device, kind=RANDOM_KIND.PRNG)
             else:
-                force_direction = centroid / centroid.norm()  # Normalize direction
-            buoyant_force = force_direction * active_vertices.size(0)  # Scale by the number of active vertices
+                force_direction = centroid / AbstractTensor.norm(centroid)  # Normalize direction
+            buoyant_force = force_direction * active_vertices.shape[0]  # Scale by the number of active vertices
             force_map[bitmask] = buoyant_force
 
             # Step 4: Compute torque
             if centroid.all() == 0.0:
-                torque = AbstractTensor.rand(3, device=self.device, dtype=self.precision)
+                torque = AbstractTensor.random_tensor((3,), device=self.device, kind=RANDOM_KIND.PRNG)
             else:
                 torque = AbstractTensor.cross(centroid, buoyant_force)  # Cross product for torque
             torque_map[bitmask] = torque
@@ -819,8 +820,8 @@ class YoungManAlgorithm:
             # Step 3: Determine active-inactive edges
             active_edges = []
             for edge_idx, (v1, v2) in enumerate(edge_pairs):
-                v1 = v1.to(dtype=AbstractTensor.int64)
-                v2 = v2.to(dtype=AbstractTensor.int64)
+                v1 = int(v1)
+                v2 = int(v2)
                 v1_active = active_vertex_mask[v1]
                 v2_active = active_vertex_mask[v2]
                 if v1_active != v2_active:  # One active, one inactive
@@ -835,7 +836,7 @@ class YoungManAlgorithm:
                 # Use the first two edges to construct the plane axes
                 e1_vector = edge_midpoints[1] - plane_origin
                 e2_vector = edge_midpoints[0] - plane_origin
-                plane_x = e1_vector / e1_vector.norm()  # Normalize to unit vector
+                plane_x = e1_vector / AbstractTensor.norm(e1_vector)  # Normalize to unit vector
                 plane_y = AbstractTensor.cross(plane_x, e2_vector)  # Orthogonal axis
                 plane_y = plane_y / AbstractTensor.norm(plane_y)
 
@@ -851,7 +852,7 @@ class YoungManAlgorithm:
                     projected_edges.append((angle, edge))
 
                 # Step 4: Sort edges by their angle
-                projected_edges.sort(key=lambda x: x[0])
+                projected_edges.sort(key=lambda x: x[0].item() if hasattr(x[0], "item") else x[0])
                 sorted_edges = [edge for _, edge in projected_edges]
 
                 # Step 5: Form triangles from sorted edges
@@ -906,7 +907,7 @@ class YoungManAlgorithm:
             data_translated = data - translation_vectors
 
             # Reverse rotation (apply transpose of rotation matrix)
-            reversed_data = AbstractTensor.bmm(data_translated, rotation_matrices.transpose(1, 2))
+            reversed_data = (data_translated @ rotation_matrices.transpose(1, 2))
             return reversed_data
 
     def prepare_opengl_data(self, evaluation_result):
@@ -1090,7 +1091,7 @@ class YoungManAlgorithm:
         blended_vertices = AbstractTensor.cat([normalized_candidates, normalized_intersections], dim=1)
        
         # Use edge pairs from the current geometry and extract vertices for edges
-        edges = self.edge_pairs.to(dtype=AbstractTensor.int64)  # Access preloaded edge pairs
+        edges = self.edge_pairs.to(dtype="int64")  # Access preloaded edge pairs
         if len(normalized_candidates.shape) <= 3:
             normalized_candidates = normalized_candidates.unsqueeze(0)
         if len(normalized_intersections.shape) <= 3:
@@ -1100,14 +1101,8 @@ class YoungManAlgorithm:
         _, _, E, _ = normalized_intersections.shape  # Edges
 
         # Step 1: Gather edge endpoints using edge pairs
-        edge_start = AbstractTensor.gather(
-            normalized_candidates, 2,
-            edges[:, 0].view(1, 1, -1, 1).expand(B, T, -1, D)
-        )
-        edge_end = AbstractTensor.gather(
-            normalized_candidates, 2,
-            edges[:, 1].view(1, 1, -1, 1).expand(B, T, -1, D)
-        )
+        edge_start = normalized_candidates[:, :, edges[:, 0], :]
+        edge_end = normalized_candidates[:, :, edges[:, 1], :]
 
         # Step 2: Concatenate start and end points along the feature dimension
         edge_vertices = AbstractTensor.cat([edge_start, edge_end], dim=-1)  # Shape: (B, T, E, 2 * D)
@@ -1141,7 +1136,7 @@ class YoungManAlgorithm:
             "line_diagram": (line_vao, line_vbo_positions, line_vbo_colors, line_vbo_length),  # New line diagram
             "metadata": metadata,
         }
-    def anticipate(self, history, translation_limits=(0.0, 10.0), rotation_limits=(-AbstractTensor.pi, AbstractTensor.pi), tile_count=0):
+    def anticipate(self, history, translation_limits=(0.0, 10.0), rotation_limits=(-AbstractTensor.pi(), AbstractTensor.pi()), tile_count=0):
         """
         Converts historical forces and torques into jitter recommendations for translation and rotation.
 
@@ -1161,8 +1156,8 @@ class YoungManAlgorithm:
             zero_vector = AbstractTensor.zeros((tile_count, 3), device=self.device, dtype=self.precision)
             
             # Default rotation axis: Random normalized vector
-            rotation_axis = AbstractTensor.randn((tile_count, 3), device=self.device, dtype=self.precision)
-            rotation_axis /= rotation_axis.norm(dim=1, keepdim=True)
+            rotation_axis = AbstractTensor.randn((tile_count, 3), device=self.device, dtype=self.precision, kind=RANDOM_KIND.PRNG)
+            rotation_axis /= AbstractTensor.norm(rotation_axis, dim=1, keepdim=True)
 
             # Default rotation angle: Small random perturbation within limits
             #rotation_angle = AbstractTensor.rand(tile_count, device=self.device, dtype=self.precision) * (rotation_limits[1] - rotation_limits[0]) + rotation_limits[0]
@@ -1187,12 +1182,12 @@ class YoungManAlgorithm:
         #print(f"Non-zero integrated_torque: {non_zero_torque}")
 
         # Step 1: Convert force to translation jitter
-        translation_magnitude = integrated_force.norm()  # Magnitude of net force
+        translation_magnitude = AbstractTensor.norm(integrated_force)  # Magnitude of net force
         translation_clamped = AbstractTensor.clamp(translation_magnitude, translation_limits[0], translation_limits[1])
         translation_vector = integrated_force / translation_magnitude * translation_clamped if translation_magnitude > 0 else AbstractTensor.zeros((tile_count,3), device=self.device, dtype=self.precision)
         #print(f"translation_magnitude: {translation_magnitude}")
         # Step 2: Convert torque to rotation jitter
-        torque_magnitude = integrated_torque.norm()  # Magnitude of net torque
+        torque_magnitude = AbstractTensor.norm(integrated_torque)  # Magnitude of net torque
         rotation_angle = AbstractTensor.clamp(torque_magnitude, rotation_limits[0], rotation_limits[1])
         rotation_axis = integrated_torque / torque_magnitude if torque_magnitude > 0 else AbstractTensor.zeros((tile_count, 3), device=self.device, dtype=self.precision)
         #print("subsequent passes")
@@ -1227,7 +1222,7 @@ class YoungManAlgorithm:
 
         # Step 3: Compute edge intersections
         intersection_tensor, evaluation_candidate_dataset = self._compute_dense_intersections(
-            relevant_vertices[:, : self.vertex_count.to(dtype=AbstractTensor.int64), ...],
+            relevant_vertices[:, : self.vertex_count.to(dtype="int64"), ...],
             scalar_function,
             isovalue,
         )
@@ -1256,7 +1251,7 @@ class YoungManAlgorithm:
             self.historical_filter.append((tile_forces, tile_torques))
         else:
             self.historical_filter.append((tile_forces, tile_torques))
-        grid_centers = relevant_vertices[:, self.vertex_count.to(dtype=AbstractTensor.int64), ...]
+        grid_centers = relevant_vertices[:, self.vertex_count.to(dtype="int64"), ...]
         #print(self.centroids)
         #print(bitmasks.shape)
         #print(bitmasks)
@@ -1302,17 +1297,19 @@ class YoungManAlgorithm:
 
         # Deduplicate vertices if requested
         if deduplicate:
-            unique_vertices, inverse_indices = AbstractTensor.unique(all_vertices, dim=0, return_inverse=True)
+            unique_host, inverse_host = np.unique(all_vertices.detach().numpy(), axis=0, return_inverse=True)  # AbstractTensor has no unique: done on the host
+            unique_vertices = AbstractTensor.get_tensor(unique_host, device=all_vertices.device)
+            inverse_indices = AbstractTensor.get_tensor(inverse_host.reshape(-1), device=all_vertices.device)
             triangle_indices = inverse_indices.view(-1, 3)  # Map back to triangle form
         else:
             unique_vertices = all_vertices
-            triangle_indices = AbstractTensor.arange(all_vertices.size(0), device=all_vertices.device).view(-1, 3)
+            triangle_indices = AbstractTensor.arange(all_vertices.shape[0], device=all_vertices.device).view(-1, 3)
 
         # Compute triangle normals (fallback)
         v0, v1, v2 = triangles_tensor[:, 0, :], triangles_tensor[:, 1, :], triangles_tensor[:, 2, :]
         edge1, edge2 = v1 - v0, v2 - v0
         triangle_normals = AbstractTensor.cross(edge1, edge2, dim=1)
-        triangle_normals = triangle_normals / triangle_normals.norm(dim=1, keepdim=True)  # Normalize
+        triangle_normals = triangle_normals / AbstractTensor.norm(triangle_normals, dim=1, keepdim=True)  # Normalize
         triangle_normals = triangle_normals.repeat_interleave(3, dim=0)  # Match vertex structure
 
         # Initialize normals with triangle normals
@@ -1342,11 +1339,11 @@ class YoungManAlgorithm:
                     unique_vertices.requires_grad_(False)
 
                 # Normalize the computed vertex normals
-                vertex_normals = vertex_normals / vertex_normals.norm(dim=1, keepdim=True)
+                vertex_normals = vertex_normals / AbstractTensor.norm(vertex_normals, dim=1, keepdim=True)
             else:
                 # Batch computation for averaging triangle normals
                 vertex_normals = AbstractTensor.zeros_like(unique_vertices)
-                counts = AbstractTensor.zeros(unique_vertices.size(0), device=unique_vertices.device, dtype=self.precision)
+                counts = AbstractTensor.zeros(unique_vertices.shape[0], device=unique_vertices.device, dtype=self.precision)
 
                 # Expand triangle indices to (num_triangles * 3, 1)
                 flat_triangle_indices = triangle_indices.view(-1)
@@ -1388,7 +1385,7 @@ class YoungManAlgorithm:
         intersection_tensor = AbstractTensor.full((num_tiles, num_edges, 3), float('nan'), device=tiled_vertices.device, dtype=self.precision)
 
         # Extract vertex positions for all edges
-        v1_indices, v2_indices = zip(*self.edge_pairs.to(dtype=AbstractTensor.int64))  # Split edge pairs
+        v1_indices, v2_indices = zip(*self.edge_pairs.to(dtype="int64"))  # Split edge pairs
         v1_positions = tiled_vertices[:, v1_indices, :]  # Shape: (num_tiles, num_edges, dim)
         v2_positions = tiled_vertices[:, v2_indices, :]  # Shape: (num_tiles, num_edges, dim)
 
@@ -1482,8 +1479,8 @@ class YoungManAlgorithm:
         valid_centroids = centroids[valid_tiles]                            # [num_valid_triangles, 3]
 
         # Gather vertices for each edge pair
-        v1_indices = valid_triangles[:, 0].to(dtype=AbstractTensor.int64)
-        v2_indices = valid_triangles[:, 1].to(dtype=AbstractTensor.int64)
+        v1_indices = valid_triangles[:, 0].to(dtype="int64")
+        v2_indices = valid_triangles[:, 1].to(dtype="int64")
 
         v1 = valid_tile_intersection_tensors[AbstractTensor.arange(valid_triangles.shape[0]), v1_indices]  # [num_valid_triangles, 3]
         v2 = valid_tile_intersection_tensors[AbstractTensor.arange(valid_triangles.shape[0]), v2_indices]  # [num_valid_triangles, 3]
@@ -1560,20 +1557,10 @@ class YoungManAlgorithm:
         return processed_data, mask
     def setup_opengl_buffers(self, vertices, edges):
         # Ensure vertices tensor is contiguous and on CPU
-        if not vertices.is_contiguous():
-            vertices = vertices.contiguous()
-        if vertices.is_cuda:
-            vertices = vertices.cpu()
-
-        vertices = vertices.detach().numpy()
+        vertices = np.ascontiguousarray(vertices.cpu().detach().numpy())
         
         # Ensure edges tensor is contiguous and on CPU
-        if not edges.is_contiguous():
-            edges = edges.contiguous()
-        if edges.is_cuda:
-            edges = edges.cpu()
-
-        edges = edges.detach().numpy()
+        edges = np.ascontiguousarray(edges.cpu().detach().numpy())
 
         # Create buffers
         vao = glGenVertexArrays(1)
@@ -1652,17 +1639,17 @@ class YoungManAlgorithm:
         scalar_field = scalar_function(vector_field[..., 0], vector_field[..., 1], vector_field[..., 2])
         
         # Compute the number of vertices including the centroid
-        effective_vertices = AbstractTensor.round(self.vertex_count + 1).to(dtype=AbstractTensor.int64)
+        effective_vertices = AbstractTensor.round(self.vertex_count + 1).to(dtype="int64")
 
         # Create a centroid mask to exclude the centroid bit
         centroid_mask = (2 ** effective_vertices - 1)
-        centroid_mask &= ~(1 << (effective_vertices - 1))
+        centroid_mask &= ~(AbstractTensor.get_tensor(1) << (effective_vertices - 1))
 
         # Determine which vertices are above the isovalue
-        above_water = (scalar_field > isovalue).to(dtype=AbstractTensor.int64)
+        above_water = (scalar_field > isovalue).to(dtype="int64")
 
         # Compute bitmask values for all vertices
-        power_values = 2 ** AbstractTensor.arange(effective_vertices, device=self.device, dtype=AbstractTensor.int64)
+        power_values = 2 ** AbstractTensor.arange(effective_vertices, device=self.device, dtype="int64")
         bitmask = (above_water * power_values).sum(dim=1).to(self.device)
 
         # Apply the centroid mask to clear the centroid bit
@@ -1701,7 +1688,7 @@ class YoungManAlgorithm:
             grid_points = grid_points.repeat_interleave(oversampling_factor, dim=0)  # Shape: (N * oversampling_factor, D)
 
         # Step 2: Generate base offsets (vertex_offsets expanded to match grid points)
-        expanded_offsets = self.vertex_offsets.unsqueeze(0).expand(grid_points.size(0), -1, -1)  # Shape: (N * oversampling_factor, V, D)
+        expanded_offsets = self.vertex_offsets.unsqueeze(0).expand(grid_points.shape[0], -1, -1)  # Shape: (N * oversampling_factor, V, D)
         #print(f"expanded_offsets: {expanded_offsets.shape}")
         # Step 3: Apply jitter if enabled
         #if self.jitter_enabled:
@@ -1714,16 +1701,16 @@ class YoungManAlgorithm:
         #else:
         #    # If jitter is not enabled, use the base offsets without modification
         #    jittered_offsets = expanded_offsets
-        #    rotation_matrices = AbstractTensor.eye(3, device=self.device, dtype=self.precision).unsqueeze(0).expand(grid_points.size(0), -1, -1)
-        #    translation_vector = AbstractTensor.zeros(grid_points.size(0), 3, device=self.device, dtype=self.precision)
-        #    spherical_jitter = AbstractTensor.zeros(grid_points.size(0), 3, device=self.device, dtype=self.precision)
+        #    rotation_matrices = AbstractTensor.eye(3, device=self.device, dtype=self.precision).unsqueeze(0).expand(grid_points.shape[0], -1, -1)
+        #    translation_vector = AbstractTensor.zeros(grid_points.shape[0], 3, device=self.device, dtype=self.precision)
+        #    spherical_jitter = AbstractTensor.zeros(grid_points.shape[0], 3, device=self.device, dtype=self.precision)
 
 
         #    jitter_set = (rotation_matrices, translation_vector, spherical_jitter)
 
         # Step 4: Append the centroid offset to the offsets
         centroid_offset = AbstractTensor.zeros((1, 1, num_dimensions), device=self.device, dtype=self.precision)
-        centroid_offsets = centroid_offset.expand(grid_points.size(0), 1, num_dimensions)  # Shape: (N * oversampling_factor, 1, D)
+        centroid_offsets = centroid_offset.expand(grid_points.shape[0], 1, num_dimensions)  # Shape: (N * oversampling_factor, 1, D)
         final_offsets = AbstractTensor.cat([jittered_offsets, centroid_offsets], dim=1)  # Shape: (N * oversampling_factor, V+1, D)
 
         # Step 5: Tile the grid points with the offsets
