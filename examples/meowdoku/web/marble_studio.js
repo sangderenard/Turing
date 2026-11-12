@@ -16,6 +16,7 @@ import { MarbleChaseCamera, chaseViewMatrix } from "./marble_chase_camera.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
 import {mountMarbleTriggerGrid} from "./marble_trigger_grid.js";
+import {pickStageProgrammer} from './marble_stage_programmer.js';
 import { createLiveRayView } from "./marble_live.js";
 import {createStudioLightField} from "./marble_light_field.js";
 import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
@@ -628,7 +629,7 @@ function refreshSceneMaterialTargets() {
   const layer=$("layer"),chosen=layer.value;
   for(const group of layer.querySelectorAll('optgroup[data-scene-materials]'))group.remove();
   const roles=computeFixtureRoles(studioSubjectTransform(false,"exposure").subjectCenter,"exposure").fixtureRoles;
-  const targets={stage:[...tableFaces("exposure"),...lightStandFacesForStudio("exposure",roles)],
+  const targets={stage:[...tableFaces("exposure"),...programmerFaces("exposure"),...lightStandFacesForStudio("exposure",roles)],
     room:[...checkerboardFaces("exposure"),...backdropRollFaces("exposure"),...backdropSupportFacesForStudio("exposure"),...goboFaces("exposure"),...shopLightFacesForStudio("exposure")]};
   for(const [name,faces]of Object.entries(targets)) {
     const group=document.createElement('optgroup');group.dataset.sceneMaterials=name;group.label=name==='stage'?'Product stage materials':'Remaining room materials';
@@ -783,6 +784,31 @@ function studioBuilderOptions(channel="studio",saved=false) {
 function studioRoomScale(channel="studio") { return Number(studioControlValue("room-scale",channel) || 3); }
 function studioTableState(channel="studio") { return studioRenderState(channel)?.table ?? studioLighting?.table?.getState() ?? defaultStudioTable(); }
 function studioFloorDrop(channel="studio") { return tableFloorDrop(studioTableState(channel)); }
+function activateStageProgrammerKey(key) {
+  if(typeof key==='object'){
+    const slider=$(`lighting-rack-${key.bus}-dimmer`);slider.value=String(key.level);
+    slider.dispatchEvent(new Event('input',{bubbles:true}));return;
+  }
+  if(key==='flash'){$('camera-trigger-fire').click();return;}
+  if(key==='all-out'){$('lighting-rack-all-out').click();return;}
+  if(key==='shop'){
+    const slider=$('lighting-rack-shop-dimmer');slider.value='0.15';
+    slider.dispatchEvent(new Event('input',{bubbles:true}));return;
+  }
+  $('stage-programmer-open').click();
+}
+function mountStageProgrammer() {
+  const dialog=$('stage-programmer'),rack=studioLighting.rackControls.element,mixer=$('camera-trigger-grid');
+  const rackHome=document.createComment('stage programmer rack home'),mixerHome=document.createComment('stage programmer mixer home');
+  rack.after(rackHome);mixer.after(mixerHome);
+  const close=()=>{if(dialog.open)dialog.close();};
+  $('stage-programmer-open').addEventListener('click',()=>{
+    $('stage-programmer-rack').append(rack);$('stage-programmer-mixer').append(mixer);
+    mixer.open=true;dialog.showModal();
+  });
+  $('stage-programmer-close').addEventListener('click',close);
+  dialog.addEventListener('close',()=>{rackHome.before(rack);mixerHome.before(mixer);});
+}
 function studioSubjectTransform(saved = false, channel = saved ? "exposure" : "studio") {
   const radiusMm = saved && savedPhotoRadius !== null ? savedPhotoRadius * 1000 : Number($("radius-mm").value);
   return studioScaleTransform(studioRenderState(channel)?.scale ?? studioLighting?.scale?.getState() ?? defaultStudioScale(), radiusMm, studioTableState(channel).enabled);
@@ -841,6 +867,9 @@ function responsePartCallback(prefix,onPart) {
 function tableFaces(channel="studio",onPart) {
   return createStudioSceneGeometry(studioBuilderOptions(channel)).tableFaces(responsePartCallback('table',onPart));
 }
+function programmerFaces(channel="studio",onPart) {
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).programmerFaces(responsePartCallback('programmer',onPart));
+}
 function goboFaces(channel="studio",onPart) {
   return createStudioSceneGeometry(studioBuilderOptions(channel)).goboFaces(responsePartCallback('gobo',onPart));
 }
@@ -897,6 +926,7 @@ function rebuildTable() {
   // Free-standing gobos share the existing furniture partition and world-space
   // glass sort, including when their front and back use different materials.
   for(const face of [...withSceneCategory(tableFaces(),STUDIO_SCENE_PART_GROUP.table),
+    ...withSceneCategory(programmerFaces(),STUDIO_SCENE_PART_GROUP.programmer),
     ...withSceneCategory(goboFaces(),STUDIO_SCENE_PART_GROUP.gobo)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:tableTransparentFaces).push(face);
   tableOpaque=mesh(opaque); sceneGlassKey=null;
@@ -1019,7 +1049,7 @@ function captureCurrentStudioScene() {
   if(studioControlValue("checker","studio")) {
     checkerboardFaces("studio",collect("room"));backdropRollFaces("studio",collect("backdrop"));
   }
-  tableFaces("studio",collect("table"));goboFaces("studio",collect("gobo"));
+  tableFaces("studio",collect("table"));programmerFaces("studio",collect("programmer"));goboFaces("studio",collect("gobo"));
   buildFixtureFaces(displayed.fixtureRoles,FIXTURE_HOUSING_MAT,collect("fixture"));
   lightStandFacesForStudio("studio",displayed.fixtureRoles,collect("stand"));
   backdropSupportFacesForStudio("studio",collect("backdrop-holder"));
@@ -1100,11 +1130,11 @@ function controls() {
     if(studioLighting?.gobos.ownsControl(event.target.id))return;
     if(studioLighting?.scale.ownsControl(event.target.id))return;
     if(studioLighting?.surfaces.ownsControl(event.target.id))return;
-    if(event.target.closest("#studio-scene-controls, #lighting-profiles, #light-pose-controls, #backdrop-layer-controls")||["checker","window-glass"].includes(event.target.id)){
+    if(event.target.closest("#studio-scene-controls, #lighting-profiles, #stage-programmer-rack, #light-pose-controls, #backdrop-layer-controls")||["checker","window-glass"].includes(event.target.id)){
       liveRay?.sceneChanged();photo.sceneChanged();return;
     }
     else if(!event.target.closest("#photo-controls") && !skipPhotoInvalidation.has(event.target.id))objectEdited();
-    if(!event.target.closest("#photo-controls, #light-pose-controls, #lighting-profiles, #backdrop-layer-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
+    if(!event.target.closest("#photo-controls, #light-pose-controls, #lighting-profiles, #stage-programmer-rack, #backdrop-layer-controls") && !skipPhotoInvalidation.has(event.target.id)) photo.stale();
   };
   for(const id of ["reroll","reset-material"]) $(id).addEventListener("click",()=>{photo.stale();objectEdited();},true);
   $("photo-start").addEventListener("click",()=>photo.start(lastGeometry)
@@ -1360,6 +1390,13 @@ function controls() {
   };
   canvas.addEventListener("pointerdown",event=>{
     if(event.pointerType==="mouse"&&event.button!==0)return;
+    if(lastStudioFrame?.engine==='visual'&&studioControlValue('stage-programmer-enabled','studio')){
+      const rect=canvas.getBoundingClientRect();
+      const key=pickStageProgrammer(lastStudioFrame,
+        studioRoomBounds(studioRoomScale(),studioFloorDrop()),studioTableState(),
+        (event.clientX-rect.left)/rect.width,(event.clientY-rect.top)/rect.height);
+      if(key){event.preventDefault();activateStageProgrammerKey(key);return;}
+    }
     cameraPointers.set(event.pointerId,[event.clientX,event.clientY]);
     if(cameraPointers.size===1){cameraGesture="orbit";last=[event.clientX,event.clientY];chaseCamera.drag(true,performance.now()/1000);}
     else if(cameraPointers.size===2&&cameraGesture==="orbit"){cameraGesture="pinch";pinchSpan=cameraSpan();last=null;}
@@ -1820,6 +1857,10 @@ async function boot() {
     triggerGrid=mountMarbleTriggerGrid({doc:document,getReceivers:()=>[
       ...STUDIO_LIGHTS.map((_,i)=>`studio:${i}`),
       ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`)]});
+    mountStageProgrammer();
+    $('stage-programmer-enabled').addEventListener('change',()=>{
+      rebuildTable();photo.sceneChanged();liveRay?.sceneChanged();
+    });
     copyCoating(); copyPaint(); checkerMesh=checkerboard(); backdropMesh=backdropRoll();rebuildTable();
     if ($("backdrop-layers-out")) $("backdrop-layers-out").value=$("backdrop-layers").value;
     if ($("room-scale-out")) $("room-scale-out").value=$("room-scale").value;
