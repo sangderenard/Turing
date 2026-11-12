@@ -1867,7 +1867,7 @@ async function boot() {
           fixtureVertices:role=>buildFixtureFaces([role],FIXTURE_HOUSING_MAT).flatMap(face=>face.slice(0,3))});
         if(profile.lightStands.enabled&&profile.lightStands.backdropSupport){
           const faces=backdropFaces({count:Number(profile.controls['backdrop-layers']),material:profile.controls['backdrop-material'],
-            sweep:profile.controls['backdrop-sweep'],layers:profile.backdrops,wallZ:bounds.backZ,floorY:bounds.floorY},ids);
+            sweep:profile.controls['backdrop-sweep'],layers:profile.backdrops,wallZ:bounds.backZ,floorY:bounds.floorY,table:profile.table},ids);
           const layout=backdropSupportLayout(faces.flatMap(face=>face.slice(0,3)),bounds.floorY,{bounds,unitMm:subject.unitM*1000});
           if(!layout.available)warnings.push({lightId:'Backdrop holder',message:layout.reason});
         }

@@ -217,9 +217,9 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <label>Ceiling material B<select id="ceiling-material-b"></select></label>
     <label>Backdrop layers <output id="backdrop-layers-out"></output><input id="backdrop-layers" type="range" min="0" max="6" value="0"></label>
     <label>Default backdrop material<select id="backdrop-material"><option value="calibration">Calibration (colour chart)</option></select></label>
-    <label class="wide"><input id="backdrop-sweep" type="checkbox"> Sweep backdrop onto floor (cyclorama)</label>
+    <label class="wide"><input id="backdrop-sweep" type="checkbox"> Sweep backdrop onto floor or table top (cyclorama)</label>
     <div id="backdrop-layer-controls" class="wide"></div>
-    <p class="wide">Four walls share the wall materials above. Each active backdrop has its own material, shape, centre height and full width/height in Studio units. Circular mats do not sweep onto the floor. Editing a default rig mat switches to Advanced without resetting any layer. Hidden layers keep their settings. Lighting profiles save this room setup and the previous Advanced settings in this browser, separately from saved objects.</p>
+    <p class="wide">Each backdrop layer has its own height, stage distance, wall or table-back lock, pitch, sweep radius, size and aspect link. Table-back lock uses the enabled product table's rear edge and puts the sweep just above its top material. Circular mats do not sweep. Quick scale multiplies both dimensions. Lighting profiles save these settings in this browser.</p>
     <details id="studio-gobo-advanced" class="wide"><summary>Gobos</summary><div id="studio-gobo-controls"></div></details>
     </div></details>
     <p class="wide">The ten lights are visible emissive fixtures shared by preview, photo and live ray view. Two small snooted lights rest stage left and right on the table; a large rectangular egg-crate underlight sits below the product. Its light passes through a clear tabletop; opaque table materials block it in ray views. The Phong preview approximates direct lighting and does not trace occlusion through the table or grid.</p>
