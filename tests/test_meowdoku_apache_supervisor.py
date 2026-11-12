@@ -75,7 +75,7 @@ def test_shipped_instances_dry_run_lists_all():
     out = subprocess.run([sys.executable, str(SUP), "--once", "--dry-run"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     names = [i["name"] for i in json.loads(out.stdout)["instances"]]
-    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger"]
+    assert names == ["meowdoku-a", "meowdoku-dev", "nodus-messenger", "task-worker", "udp-router", "relay"]
 
 
 def test_lifecycle_account_lease_stdin_eof(tmp_path):
@@ -129,6 +129,24 @@ def test_restart_on_crash_once(tmp_path):
             proc.kill()
         proc.stdout.close(); proc.stderr.close()
     assert _rows(db, "SELECT state FROM service_instances")[0]["state"] == "stopped"
+
+
+def test_instance_env_reaches_only_its_child(tmp_path):
+    seen = (tmp_path / "seen.json").as_posix()
+    code = (f"import json,os,time\njson.dump({{k: os.environ.get(k) for k in ('NODUS_EXEC_ROWS', 'OTHER')}}, open({seen!r}, 'w'))\n"
+            "time.sleep(120)")
+    spec = dict(_spec(code), env={"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": 7})
+    db, state, inst = _setup(tmp_path, spec)
+    proc = subprocess.Popen(_cmd(db, state, inst), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        got = _wait(lambda: json.loads(Path(seen).read_text(encoding="utf-8")) if Path(seen).exists() else None)
+        assert got == {"NODUS_EXEC_ROWS": "C:/declared/rows.txt", "OTHER": "7"}
+        proc.stdin.close()
+        assert proc.wait(timeout=45) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close(); proc.stderr.close()
 
 
 def test_instance_python_field_selects_interpreter(tmp_path):

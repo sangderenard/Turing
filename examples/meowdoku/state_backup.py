@@ -82,8 +82,34 @@ def _walk(d: Path):
                 yield p
 
 
-def _plan(paths: StatePaths, include_logs: bool, include_secrets: bool):
-    """(kind, src, rel) for every candidate file."""
+def is_text_file(path: Path, sample: int = 65536) -> bool:
+    """Whether a file is text, read from its content: the first 64 KiB hold no NUL byte and decode as UTF-8.
+
+    This is the test the ``text_only`` policy uses. It asks the bytes, never the file's name or folder."""
+    with open(path, "rb") as handle:
+        chunk = handle.read(sample)
+    if b"\x00" in chunk:
+        return False
+    for trim in range(4):                      # a multi-byte character may be cut by the end of the sample
+        try:
+            chunk[:len(chunk) - trim].decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def _excluded(rel: str, exclude) -> bool:
+    return any(rel == folder or rel.startswith(folder + "/") for folder in exclude)
+
+
+def _plan(paths: StatePaths, include_logs: bool, include_secrets: bool, exclude=()):
+    """(kind, src, rel) for every candidate file; ``exclude`` names state-relative folders that are left out."""
+    exclude = tuple(str(folder).replace("\\", "/").strip("/") for folder in exclude if str(folder).strip("/\\"))
+    return [item for item in _plan_all(paths, include_logs, include_secrets) if not _excluded(item[2], exclude)]
+
+
+def _plan_all(paths: StatePaths, include_logs: bool, include_secrets: bool):
     items = []
     for p in _walk(paths.sql_dir):
         if p.name.endswith(("-wal", "-shm", "-journal")):
@@ -107,7 +133,9 @@ def _restrict(directory: Path) -> str:
     return operators_mod._restrict(directory)
 
 
-def snapshot(state_dir, out, keep=14, include_logs=False, include_secrets=False) -> dict:
+def snapshot(state_dir, out, keep=14, include_logs=False, include_secrets=False, exclude=(), text_only=False) -> dict:
+    """``text_only``: copy the databases and the text files, and leave every binary file out (counted in the manifest
+    as ``binary_left_out``). Large binary products are a different policy from the nightly record of the state."""
     t0 = time.time()
     state_dir, out = Path(state_dir).resolve(), Path(out).resolve()
     if not state_dir.is_dir():
@@ -126,10 +154,14 @@ def snapshot(state_dir, out, keep=14, include_logs=False, include_secrets=False)
             restrict_report = _restrict(work)
             if "restricted to the current user" not in restrict_report and "chmod 700" not in restrict_report:
                 raise BackupError(f"REFUSED: could not restrict the snapshot directory ({restrict_report})")
-        files, skipped = [], []
-        for kind, src, rel in _plan(paths, include_logs, include_secrets):
+        files, skipped, left_out = [], [], {"files": 0, "bytes": 0}
+        for kind, src, rel in _plan(paths, include_logs, include_secrets, exclude):
             dst = work / rel
             try:
+                if text_only and kind != "sqlite" and not is_text_file(src):
+                    left_out["files"] += 1
+                    left_out["bytes"] += src.stat().st_size
+                    continue
                 if kind == "sqlite":
                     _backup_db(src, dst)
                     facts = _sqlite_facts(dst)
@@ -154,6 +186,8 @@ def snapshot(state_dir, out, keep=14, include_logs=False, include_secrets=False)
             files.append(e)
         manifest = {"tool_version": TOOL_VERSION, "source_root": str(state_dir), "created_utc": stamp,
                     "include_logs": include_logs, "include_secrets": include_secrets, "secrets_restrict": restrict_report,
+                    "excluded": [str(folder).replace("\\", "/").strip("/") for folder in exclude],
+                    "text_only": bool(text_only), "binary_left_out": left_out,
                     "files": files, "skipped": skipped, "duration_s": round(time.time() - t0, 3)}
         (work / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         os.replace(work, final)
@@ -242,6 +276,9 @@ def main(argv=None) -> int:
     s.add_argument("--keep", type=int, default=14)
     s.add_argument("--include-logs", action="store_true")
     s.add_argument("--include-secrets", action="store_true")
+    s.add_argument("--text-only", action="store_true", help="databases and text files only; binary files are left out")
+    s.add_argument("--exclude", action="append", default=[], metavar="STATE-RELATIVE-FOLDER",
+                   help="leave this folder of the state root out of the snapshot (repeatable), e.g. content/marble_photos")
     v = sub.add_parser("verify")
     v.add_argument("--snapshot", required=True)
     r = sub.add_parser("restore")
@@ -254,7 +291,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "snapshot":
-            snapshot(a.state_dir, a.out, a.keep, a.include_logs, a.include_secrets)
+            snapshot(a.state_dir, a.out, a.keep, a.include_logs, a.include_secrets, exclude=tuple(a.exclude),
+                     text_only=a.text_only)
         elif a.cmd == "verify":
             res = verify(a.snapshot)
             print(f"verify ok={res['ok']} checked={res['checked']} bad={res['bad']}")

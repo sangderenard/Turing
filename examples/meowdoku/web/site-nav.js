@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 3;
+const VERSION = 4;
 
 function allowed() {
   const here = import.meta.url;
@@ -178,8 +178,8 @@ async function main() {
   if (!new URLSearchParams(location.search).has("viewer")) {
     wrap.append(el("a", { class: "chip", href: "/issues.html", text: "Tickets", title: "Your account's issue tickets" }));
     wrap.append(el("button", { class: "chip", type: "button", text: "Report issue", onclick: () => {
-      const gameButton = document.getElementById("report-ticket");
-      if (gameButton && document.getElementById("ticket-dialog")) { gameButton.click(); return; }
+      // Frozen game pages can still own the legacy /api/tickets form. The
+      // shared header always opens the account-owned SQL issue interface.
       location.assign("/issues.html?new=1&source=" + encodeURIComponent(location.pathname));
     } }));
   }
@@ -217,6 +217,7 @@ async function main() {
     link("Home", "/"),
     link("Profile and servers", "/profile.html"),
     link("Browse the site", "/browse"),
+    link("Help: the manual", "/manual/", caps.has("view_site")),
     link("Repository world map", "/worldmap.html", caps.has("dev_ui")),
     link("Math lab", "/mathlab.html", caps.has("compile_submit")),
     link("Source divider", "/divider.html", caps.has("compile_submit")),

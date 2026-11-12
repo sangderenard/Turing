@@ -9,6 +9,7 @@ const roles=SIZED_FIXTURES.map((f,i)=>({roleIndex:i,round:!f.rect,...(f.rect?{ha
 const old=applyFixtureSizes(roles,legacy),next=applyFixtureSizes(roles,fresh);
 for(const [i,f]of SIZED_FIXTURES.entries()){
  if(f.rect){const factor=f.id==='fill-upper'?8/.6:f.id==='fill-lower'?4/.6:f.id==='underlight'?fresh.lights[i].width:2;assert.equal(old[i].halfW,.3);assert.equal(next[i].halfW,.3*factor);assert.equal(next[i].halfH,.4*(f.id==='fill-lower'?2/.6:f.id==='underlight'?fresh.lights[i].height:factor));}
+ else if(f.snoot)assert.deepEqual([next[i].round,next[i].halfW,next[i].halfH],[false,.5,2]);
  else assert.equal(next[i].radius,.2);
  if(f.snoot){assert.equal(old[i].shroudLength,.2*2.2);assert.equal(next[i].gobo,true);}
 }
@@ -20,7 +21,7 @@ custom.lights[3].snoot=false;assert.equal(applyFixtureSizes(roles,custom)[3].gob
 assert.deepEqual(validateFixtureSizes(JSON.parse(JSON.stringify(custom))),custom);
 for(const bad of [NaN,Infinity,0,33,'2']){const s=structuredClone(fresh);s.lights[0].width=bad;assert.throws(()=>validateFixtureSizes(s));}
 assert.throws(()=>validateFixtureSizes({...fresh,lights:[...fresh.lights.slice(1),fresh.lights[1]]}));
-console.log('Fixture sizes: new doubled rectangular dimensions, unchanged legacy, anisotropic sizing, kicker physical snoot toggle/length and validation passed');
+console.log('Fixture sizes: new 1 x 4 kicker heads, unchanged legacy, anisotropic sizing, legacy snoot state and validation passed');
 
 const under=tableLightRoles()[2],gridState=defaultFixtureSizes(true);
 const baselineGrid=tableLightModifierFaces(under,99);

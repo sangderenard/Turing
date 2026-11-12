@@ -19,6 +19,16 @@ The request schema is `turing.studio-agent-request.v1`:
 - `photo`: optional existing photo-packer options for `ray-payload` only.
   Resolution, width/height, tiled planning and oversampling are forwarded to
   `packMarblePhoto`; that existing packer/backend own their supported bounds.
+  Optional `photo.samplesPerOutputPixel` (integer 1..65536) selects uniform
+  complete-pass sampling instead of the legacy wall-clock budget. It uses the
+  same tiled RGB still worker. Each sensor pixel receives
+  `ceil(samplesPerOutputPixel / oversampling²)` samples; requested and effective
+  final-pixel counts are recorded, including rounding up to one whole pass.
+  `seconds` remains unchanged when this option is absent; with this option it
+  is not a stop condition or a photographic shutter. Runtime is scene-dependent.
+  All tiles retain the shared forward field, linear sample-mean assembly,
+  full-image downsampling and one global display transform. Equal sample counts
+  remove the wall-time-induced work discontinuity, not differing scene variance.
 - `objAssets`: supplied existing OBJ asset records, if the object refers to one.
   An unresolved asset is refused; no arbitrary URL is fetched.
 

@@ -210,6 +210,16 @@ export const STUDIO_LIGHTING_FIELDS = {
     "type": "checkbox",
     "defaultValue": false
   },
+  "key-filter-left-off": {"type":"checkbox","defaultValue":false},
+  "key-filter-right-off": {"type":"checkbox","defaultValue":false},
+  "background-filter-off": {"type":"checkbox","defaultValue":false},
+  "kicker-left-filter-off": {"type":"checkbox","defaultValue":false},
+  "kicker-right-filter-off": {"type":"checkbox","defaultValue":false},
+  "fill-lower-filter-off": {"type":"checkbox","defaultValue":false},
+  "fill-upper-filter-off": {"type":"checkbox","defaultValue":false},
+  "table-left-filter-off": {"type":"checkbox","defaultValue":false},
+  "table-right-filter-off": {"type":"checkbox","defaultValue":false},
+  "under-filter-off": {"type":"checkbox","defaultValue":false},
   "room-scale": {
     "type": "range",
     "min": "1",

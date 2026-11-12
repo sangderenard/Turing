@@ -31,7 +31,7 @@ export function createLightingRackControls(container,{
     return input;
   }
   slider(element,'shop-dimmer','Shop lights',{read:s=>s.shopDimmer,write:(s,v)=>{s.shopDimmer=v;}});
-  slider(element,'house-dimmer','House lights',{read:s=>s.houseDimmer,write:(s,v)=>{s.houseDimmer=v;},fallback:0});
+  slider(element,'house-dimmer','Studio lights',{read:s=>s.houseDimmer,write:(s,v)=>{s.houseDimmer=v;},fallback:1});
   for(const initial of getState().buses){
     const id=initial.id,row=doc.createElement('fieldset'),legend=doc.createElement('legend');legend.textContent=labels[id]??id;row.append(legend);element.append(row);
     const bus=s=>{const found=s.buses.find(b=>b.id===id);if(!found)throw Error('Lighting bus is unavailable: '+id);return found;};

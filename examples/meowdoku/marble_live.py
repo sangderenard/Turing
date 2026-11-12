@@ -106,7 +106,7 @@ def update_live(jobs, digest, value):
         status = jobs._status_locked(digest)
         if digest != jobs.active_digest or jobs.process is None or jobs.process.poll() is not None:
             raise PhotoError("live ray view is no longer active", 409)
-        directory = jobs.directory / digest
+        directory = jobs.job_directory(digest)
         config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
         if "live" not in config:
             raise PhotoError("this job is a photograph, not a live ray view", 409)
@@ -141,6 +141,9 @@ def update_live(jobs, digest, value):
             if not isinstance(value.get("live", {}), dict):
                 raise PhotoError("live settings must be an object")
             settings = live_settings({**current["live"], **value.get("live", {})}, camera, client_intersections=config.get("client_intersections") is True)
+            sampling = config.get("emitter_sampling", {})
+            if sampling.get("refresh_each_sweep") and settings["ray_batch_size"] < sampling["ray_budget"]:
+                raise PhotoError("live ray_batch_size cannot be below emitter_sampling ray_budget")
             # Resizing the sensor is a new immutable scene job, not a control edit.
             if (settings["width"], settings["height"]) != (current["live"]["width"], current["live"]["height"]):
                 raise PhotoError("live viewport size changed; restart the live view", 409)

@@ -5,8 +5,9 @@ producer identity, not a renderer address or permission. This module creates no
 socket, listener, queue, scheduler, account or credential. Use Nodus EnginePeer
 and ServicePeer unchanged; the caller owns their polling and executor.
 
-The host's build_scene callback is PURE preparation. It may return a packed
-scene or a JSON-compatible blob descriptor, never create a ray job. Job birth
+The host's build_scene callback prepares a product. It may return a packed
+scene, a bounded explicitly configured captured-scene PNG, or a JSON-compatible
+blob descriptor, never create a ray job or durable artifact. Job birth
 belongs to the producer's authorized commit callback, after native validation.
 No credentials belong in either payload. FIFO receipt is not producer commit:
 the owner explicitly releases request/result payloads after reconciliation.

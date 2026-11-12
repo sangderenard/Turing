@@ -8,12 +8,12 @@ await assert.rejects(badApi('/api/messages/send',{}),/Invalid JSON/);
 assert.equal(requestOptions.redirect,'error');
 const start=src.indexOf('    let sending = false;');
 const code=src.slice(start,src.indexOf('    input.addEventListener',start))+'\nreturn send;';
-const make=new Function('input','location','crypto','pendingSends','peer','api','note',code);
+const make=new Function('input','location','crypto','pendingSends','peer','api','viewNote','draft','image','updateControls','active','choosing','view',code);
 const receipt={ok:true,id:1,created:1};
 let nextKey=0;
-function pane(map,api,value='hello') {
+function pane(map,api,value='hello',image=null) {
  const input={value,disabled:false}, notes=[];
- const send=make(input,{protocol:'https:'},{randomUUID:()=> 'op-'+(++nextKey)},map,'ben',api,m=>notes.push(m));
+ const send=make(input,{protocol:'https:'},{randomUUID:()=> 'op-'+(++nextKey)},map,'ben',api,m=>notes.push(m),{},image,()=>{},()=>true,false,{imageState:{enabled:true},toggling:false});
  return {input,send,notes};
 }
 // First response lost: one operation, fresh handles, double-click suppressed.
@@ -68,3 +68,41 @@ for (const uncertainFirst of [false,true]) {
   assert.equal(map.size,0);reject=false;ui.input.value='corrected';await ui.send();assert.equal(sends,2);assert.equal(ui.input.value,'');
  }
 }
+
+// Image bytes and operation identity survive retries and reopening.
+{
+ const map=new Map(), calls=[]; let reject=true;
+ const api=async(p,b)=>{if(p.endsWith('/conversations'))return {contacts:[{username:'ben',conversation_handle:'h'}]};calls.push(b);if(reject)throw Error('lost');return receipt;};
+ const attachment={data:'iVBORw0KGgo='};
+ const ui=pane(map,api,'image caption',attachment);await ui.send();
+ assert.equal(calls.length,2);assert.deepEqual(calls[0].image,attachment);
+ assert.equal(calls[0].idempotency_key,calls[1].idempotency_key);
+ reject=false;const reopened=pane(map,api,'');await reopened.send();
+ assert.deepEqual(calls[2].image,attachment);assert.equal(calls[2].idempotency_key,calls[0].idempotency_key);
+}
+const helpers=src.slice(src.indexOf('const MAX_IMAGE_BYTES'),src.indexOf('function allowed'));
+const {safeImageURL,pngAttachment}=new Function(helpers+';return {safeImageURL,pngAttachment};')();
+assert.equal(safeImageURL({locked:false,mime:'image/png',url:'/api/messages/image?id=3'},3),'/api/messages/image?id=3');
+for(const url of ['https://evil.test/x','//evil.test/x','data:image/png,x','/api/messages/image?id=4','/api/messages/image?id=3&x=1'])assert.equal(safeImageURL({locked:false,mime:'image/png',url},3),null);
+assert.equal(safeImageURL({locked:true,mime:'image/png',url:'/api/messages/image?id=3'},3),null);
+await assert.rejects(pngAttachment({size:2097153}),/2 MiB/);
+await assert.rejects(pngAttachment({size:8,arrayBuffer:async()=>new Uint8Array(8).buffer}),/PNG file/);
+assert.deepEqual(await pngAttachment({size:8,arrayBuffer:async()=>new Uint8Array([137,80,78,71,13,10,26,10]).buffer}),{data:'iVBORw0KGgo='});
+console.log('Image attachment retry and URL validation checks passed.');
+
+// Unlock replaces the same loaded messages, walking older pages; stale panes do not mutate.
+{
+ const code=src.slice(src.indexOf('  async function refreshLoaded('),src.indexOf('  function incoming('));
+ const replaced=[];
+ const node=m=>({m,replaceWith(n){replaced.push([m.id,n.m.image]);}});
+ const view={nodes:new Map([[1,node({id:1})],[50,node({id:50})]])};
+ const state={open:true,view,peer:'ben'};
+ const calls=[];
+ const api=async p=>{calls.push(p);return calls.length===1?{messages:[{id:50,image:{locked:false}}],more:true}:{messages:[{id:1,image:{locked:false}}],more:false};};
+ const refresh=new Function('state','api','msgNode',code+';return refreshLoaded;')(state,api,node);
+ await refresh(view,'ben');
+ assert.deepEqual(replaced,[[50,{locked:false}],[1,{locked:false}]]);
+ assert.match(calls[1],/before=50/);assert.equal(view.nodes.size,2);
+ state.view={};await refresh(view,'ben');assert.equal(replaced.length,2);
+}
+console.log('Older image reveal and stale-view checks passed.');

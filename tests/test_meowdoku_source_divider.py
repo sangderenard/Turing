@@ -111,6 +111,156 @@ def test_real_attempt_complete_and_recomposition(tmp_path):
     fn = {f["name"]: f for f in doc["functions"]}
     assert not fn["scale"]["python"] and fn["scale"]["lowerings"][0]["sha256"] == row["product_sha256"]
     assert fn["raw"]["python"] and fn["raw"]["reason"] == "needs-annotation"
+    # The enduring record: the same job as a dream document, part by part, read back through the compiler's own loader.
+    from src.compiler.dream_document import load_dream_document
+    path = sd.write_dream_record(db, state, job)
+    assert path.name == "record.dream"
+    record = load_dream_document(path)
+    parts = {b.outputs: b for b in record.blocks if b.decorations.get("role") == "part"}
+    scale, raw = parts[("scale",)], parts[("raw",)]
+    assert scale.language == "python" and scale.payload == FLOAT.rstrip("\n")
+    assert scale.decorations["cut"] == "exact lexical closure" and scale.decorations["first_line"] == "1"
+    assert scale.decorations["verdict"] == "lowered (wasm)" and scale.decorations["attempt.wasm"] == "complete"
+    assert raw.payload == "def raw(x):\n    return x" and raw.decorations["verdict"] == "stays python"
+    assert raw.decorations["reason"] == "needs-annotation" and raw.decorations["annotated"] == "no"
+    lowering = next(b for b in record.blocks if b.decorations.get("role") == "lowering")
+    assert lowering.language == "wasm" and lowering.decorations["lowers"] == scale.identity
+    assert lowering.content_hash == row["product_sha256"], "the product is carried byte for byte"
+    assert lowering.payload.encode("latin-1")[:4] == b"\x00asm"
+    stated = json.loads(record.block("record").payload)
+    assert stated["schema"] == "turing.divider-dream-record.v1" and stated["job_id"] == job
+    assert (stated["pieces"], stated["lowered_pieces"], stated["python_pieces"], stated["lowering_blocks"]) == (2, 1, 1, 1)
+    assert [b.identity for b in record.blocks][-1] == "record" and record.card_graph()["cards"]
+    assert sd.write_dream_record(db, state, job) == path, "writing it again replaces it"
+
+
+CHAIN = """
+import math
+
+RATE = 2.0
+
+def unused(x: float) -> float:
+    return x - 1.0
+
+def double(x: float) -> float:
+    return x * RATE
+
+def step(x: float) -> float:
+    y = double(x) + 1.0
+    return y
+"""
+
+
+def test_every_part_of_the_record_holds_its_own_closure(tmp_path):
+    """No compile here: the cut is the compiler's own partition, and a part that calls another carries that other."""
+    state, db, job = _job(tmp_path, CHAIN)
+    from src.compiler.dream_document import load_dream_document
+    record = load_dream_document(sd.write_dream_record(db, state, job))
+    parts = {b.outputs[0]: b for b in record.blocks if b.decorations.get("role") == "part"}
+    assert set(parts) == {"unused", "double", "step"}
+    step = parts["step"]
+    assert "def double" in step.payload and "RATE = 2.0" in step.payload and "def step" in step.payload
+    assert "def unused" not in step.payload and "import math" not in step.payload, "only what the part needs"
+    assert step.inputs == ("double",) and step.decorations["depends"] == parts["double"].identity
+    assert "def step" not in parts["double"].payload and "RATE = 2.0" in parts["double"].payload
+    for name, part in parts.items():
+        namespace = {}
+        exec(compile(part.payload, f"<{part.identity}>", "exec"), namespace)     # each part stands alone
+        assert callable(namespace[name])
+    assert step.payload.splitlines()[0] == "RATE = 2.0"
+    assert step.decorations["first_line"] == "4", "the line the closure starts at in the source"
+
+
+def test_the_goal_document_holds_each_units_own_text_and_its_links(tmp_path):
+    """No compile here. The Goal document is the linked form: a unit names what it takes, it does not copy it."""
+    from meowdoku import rest_api
+    if rest_api.goal is None:
+        import pytest
+        pytest.skip("the SpeakToMe checkout has no speaktome_goal package")
+    state, db, job = _job(tmp_path, CHAIN)
+    path = sd.write_goal_document(db, state, job)
+    assert path.name == "goal.goal"
+    document = rest_api.goal.load(path)
+    units = {u.entries()[0]: u for u in document.units}
+    step, double = units["step"], units["double"]
+    assert "def double" not in step.text and "def step" in step.text, "the unit holds its own definition only"
+    assert "RATE" not in step.text and "RATE = 2.0" in double.text, "a constant stays with the unit that uses it"
+    assert [dict(r) for r in step.link] == [{"name": "double", "unit": double.identity, "entry": "double", "how": "reference"}]
+    assert double.link == () and units["unused"].link == ()
+    assert [dict(r) for r in step.api] == [{"entry": "step", "name": "x", "role": "parameter", "type": "float"},
+                                           {"entry": "step", "name": "return", "role": "result", "type": "float"}]
+    assert all(u.state == "source" and u.build == () for u in document.units), "nothing was lowered in this test"
+    assert document.achieved() == () and document.targets() == ()
+    graph = {n["identity"]: n for n in rest_api.goal.as_graph(document)}
+    root = f"goal:job-{job}"
+    assert {"target": f"{root}/unit/{double.identity}", "relationship": "links-to"} in graph[f"{root}/unit/{step.identity}"]["dependencies"]
+
+
+def test_a_unit_keeps_what_its_own_definitions_reach_and_nothing_else(tmp_path):
+    from meowdoku import rest_api
+    if rest_api.goal is None:
+        import pytest
+        pytest.skip("the SpeakToMe checkout has no speaktome_goal package")
+    shared = CHAIN.replace("y = double(x) + 1.0", "y = double(x) + RATE").replace("RATE = 2.0", "BASE = 1.0\nRATE = BASE * 2.0")
+    state, db, job = _job(tmp_path, shared)
+    units = {u.entries()[0]: u for u in rest_api.goal.load(sd.write_goal_document(db, state, job)).units}
+    for name in ("step", "double"):
+        assert "RATE = BASE * 2.0" in units[name].text and "BASE = 1.0" in units[name].text, "a constant both use stays in each"
+    assert "def double" not in units["step"].text and "import math" not in units["step"].text
+    namespace = {"double": lambda x: x}                  # what the link provides, supplied by the reader
+    exec(compile(units["step"].text, "<step>", "exec"), namespace)
+    assert namespace["step"](3.0) == 5.0
+
+
+def test_a_record_goes_back_in_and_its_parts_build_one_by_one(tmp_path):
+    """Dream in, dream out: the second pass sees every part as its own file and reaches the same products."""
+    from src.compiler.dream_document import DreamBlock, DreamDocument, load_dream_document, render_dream_document
+    state, db, job = _job(tmp_path, CHAIN, backends=("wasm",))
+    assert sd.work(db, state, "first") == 3
+    first = load_dream_document(sd.write_dream_record(db, state, job))
+    # With every unit lowered, the Goal document says the goal is achieved for that language, and how each is called.
+    from meowdoku import rest_api
+    if rest_api.goal is not None:
+        goal_document = rest_api.goal.load(sd.write_goal_document(db, state, job))
+        assert goal_document.achieved() == ("wasm",)
+        assert [dict(r) for r in goal_document.targets()] == [{"target": "wasm", "units": "3", "lowered": "3", "achieved": "yes"}]
+        built = {u.entries()[0]: u for u in goal_document.units}
+        record_blocks = {b.identity: b.content_hash for b in first.blocks}
+        for unit in built.values():
+            row = dict(unit.build[0])
+            assert record_blocks[row["record"]] == row["sha256"], "a build row names its block in the units record"
+            assert unit.abi and unit.abi[0]["source"] == "x" and unit.abi[0]["target"] == "wasm"
+        assert built["step"].link[0]["unit"] == built["double"].identity
+        assert goal_document.facts["units_record"].startswith("record.dream sha256 ")
+    # A block in another language rides along untouched.
+    shader = DreamBlock(identity="colors", kind="shader", language="glsl", stage="compute", encoding="utf-8",
+                        payload="void main() {}", outputs=("colors",))
+    fed = tmp_path / "fed.dream"
+    fed.write_bytes(render_dream_document(DreamDocument(first.blocks + (shader,))))
+    intake = sd.intake_dream(state, fed)
+    assert sorted(intake.kept) == ["piece-0.py", "piece-1.py", "piece-2.py"]
+    reasons = dict(intake.skipped)
+    assert reasons["colors"] == "carried unchanged (glsl)" and "earlier pass" in reasons["record"]
+    second_job = sd.submit(db, state, intake, owner_key="t", backends=("wasm",))
+    sd.work(db, state, "second")
+    second = load_dream_document(sd.write_dream_record(db, state, second_job))
+
+    def lowered(document):
+        by_part = {b.identity: b for b in document.blocks if b.decorations.get("role") == "part"}
+        found = {}
+        for block in document.blocks:
+            if block.decorations.get("role") == "lowering":
+                found.setdefault(by_part[block.decorations["lowers"]].outputs[0], set()).add(block.content_hash)
+        return found
+    assert set(lowered(first)) == {"unused", "double", "step"}
+    # A part's closure also holds the functions it calls, so the second pass divides further; the functions the
+    # parts are FOR must all have built again, each from its own block alone, to the same bytes.
+    again = lowered(second)
+    for name, digests in lowered(first).items():
+        assert digests <= again.get(name, set()), f"{name} did not rebuild to the same product from its own part"
+    assert second.block("colors").payload == "void main() {}" and second.block("colors").stage == "compute"
+    stated = json.loads(second.block("record").payload)
+    assert stated["came_from_dream"] and stated["carried_blocks"] == ["colors"]
 
 
 def test_real_refusal_recorded_with_stage_and_type(tmp_path):

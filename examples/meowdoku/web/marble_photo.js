@@ -7,9 +7,75 @@ import {geometryPolicy, photoGeometryPolicy, createGeometryPolicyControls, showG
 import {createRodBundleWarning} from "./marble_optical_diagnostic.js";
 import {createStudioLensControls, FOCUS_MIN_M, FOCUS_MAX_M} from "./marble_lens_controls.js";
 import {createPhotoParticipation, clientIntersectionEligible} from "./marble_photo_participation.js";
+import {STUDIO_LIGHTS} from "./marble_light_strengths.js";
+import {icosphere} from "./particle_styles.js";
 const encoder = new TextEncoder();
 const hexDigest = /^[0-9a-f]{64}$/;
 export const OBJECT_CENTER = [0, 0, 0.18];
+
+export function geodesicFaceSensorCameras(camera) {
+  const target=camera?.target_m,eye=camera?.eye_m;
+  if(!Array.isArray(target)||!Array.isArray(eye)||target.length!==3||eye.length!==3||
+     !target.every(Number.isFinite)||!eye.every(Number.isFinite))
+    throw new RangeError('The geodesic sensor pattern needs a resolved main camera.');
+  const radius=Math.hypot(...eye.map((v,i)=>v-target[i]));
+  if(!(radius>0))throw new RangeError('Geodesic camera radius must be positive.');
+  const mesh=icosphere(0),positions=mesh.positions,indices=mesh.indices;
+  const cameras=[];
+  for(let j=0;j<indices.length;j+=3){
+    const direction=[0,1,2].map(axis=>{
+      let sum=0;for(let k=0;k<3;k++)sum+=positions[3*indices[j+k]+axis];return sum/3;
+    });
+    const length=Math.hypot(...direction);
+    cameras.push({...camera,eye_m:target.map((v,i)=>v+radius*direction[i]/length),target_m:[...target]});
+  }
+  if(cameras.length!==20)throw new Error('The source icosahedron did not supply twenty face centers.');
+  return cameras;
+}
+
+export async function recordStudioExposureFrames({sample, initialFixture, duration, substeps,
+  nextFrame=callback=>requestAnimationFrame(callback),
+  canceled=()=>false, progress=()=>{}}) {
+  if (!(duration > 0) || !Number.isFinite(duration)) throw new RangeError("Exposure duration must be positive and finite.");
+  substeps ??= Math.ceil(duration*60);
+  if (!Number.isInteger(substeps) || substeps < Math.ceil(duration*10) || substeps > 216000)
+    throw new RangeError("Exposure substeps must give a tick of at most 0.1 s and total at most 216000.");
+  let previousGeometry=JSON.stringify([initialFixture.vertices,initialFixture.material_ids]);
+  const frames=[];
+  const capture=t=>{
+    const fixture=sample();
+    if (!fixture) throw new Error("Studio did not provide a scene at the exposure tick.");
+    const geometry=JSON.stringify([fixture.vertices,fixture.material_ids]);
+    const key=JSON.stringify([geometry,fixture.pbr,fixture.emitter_profiles]);
+    if (frames.length && frames[frames.length-1].key===key) return;
+    if (frames.length>=4096) throw new Error("Exposure contains more than 4096 changing light states.");
+    const changedGeometry=geometry!==previousGeometry;
+    frames.push({t0:t,key,pbr:fixture.pbr,emitter_profiles:fixture.emitter_profiles,
+      ...(changedGeometry?{vertices:fixture.vertices,material_ids:fixture.material_ids}:{})});
+    previousGeometry=geometry;
+  };
+  capture(0);
+  let nextTick=0;
+  await new Promise((resolve,reject)=>{
+    const step=()=>{
+      if(canceled()){reject(new Error("Exposure capture canceled"));return;}
+      try {
+        // One completed Studio display tick advances one contracted exposure
+        // substep. A slow frame slows model time; no wall-clock catch-up drops
+        // intermediate light states or skips the sensor's frame queue.
+        if(nextTick+1<substeps)capture((nextTick+1)*duration/substeps);
+        nextTick++;
+      } catch(error){reject(error);return;}
+      const elapsed=Math.min(duration,nextTick*duration/substeps);
+      progress(elapsed,duration);
+      if(nextTick>=substeps)resolve();else nextFrame(step);
+    };
+    nextFrame(step);
+  });
+  return frames.map((frame,i)=>({t0:frame.t0,t1:i+1<frames.length?frames[i+1].t0:duration,
+    pbr:frame.pbr,emitter_profiles:frame.emitter_profiles,
+    ...(frame.vertices?{vertices:frame.vertices,material_ids:frame.material_ids}:{})}));
+}
 
 function bounceCount(value) {
   const count = Number(value);
@@ -148,6 +214,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   const config = {
     object_digest: objectDigest,
     exposure_seconds: options.seconds ?? 30,
+    exposure_substeps: options.exposureSubsteps ?? Math.ceil((options.seconds ?? 30)*60),
     oversampling: options.oversampling ?? 1,
     orbit_frames: options.orbitFrames ?? 1,
     transport: options.transport ?? "fixed:3",
@@ -164,8 +231,20 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
       fov_degrees: 18, aperture_radius_m: 0.002, focus_distance_m: 0.11,
       ...options.camera,
     },
+    camera_visible: options.cameraVisible ?? true,
     checker: options.checker ?? { center_m: [0, 0, 0.30], width_m: 0.15, checks: 4 },
   };
+  if(typeof config.camera_visible!=='boolean')throw new RangeError('Camera visibility must be boolean.');
+  if (options.exposureIso !== undefined || options.highlightClipPercent !== undefined) {
+    config.exposure_iso=options.exposureIso??100;
+    config.highlight_clip_percent=options.highlightClipPercent??25;
+  }
+  if (!Number.isFinite(config.exposure_seconds) || config.exposure_seconds<.1 || config.exposure_seconds>3600 ||
+      !Number.isInteger(config.exposure_substeps) || config.exposure_substeps<Math.ceil(config.exposure_seconds*10-1e-9) ||
+      config.exposure_substeps>216000) throw new RangeError("Exposure substeps must give dt <= 0.1 s and total at most 216000.");
+  if ((config.exposure_iso!==undefined && (!Number.isFinite(config.exposure_iso) || config.exposure_iso<25 || config.exposure_iso>6400)) ||
+      (config.highlight_clip_percent!==undefined && (!Number.isFinite(config.highlight_clip_percent) || config.highlight_clip_percent<0 || config.highlight_clip_percent>25)))
+    throw new RangeError("Simulated ISO must be 25–6400 and highlight clip 0–25%.");
   if (options.width !== undefined || options.height !== undefined) {
     if (![options.width, options.height].every(v => Number.isInteger(v) && v >= 128 && v <= 32768))
       throw new RangeError("Custom photo width and height must be integers from 128 to 32768.");
@@ -173,7 +252,12 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   if (!Number.isInteger(config.oversampling) || config.oversampling < 1 || config.oversampling > 4)
     throw new RangeError("Oversampling must be an integer multiplier from 1 to 4.");
-  const tiled = config.oversampling > 1 || options.tiled !== undefined || config.camera.width !== undefined || config.camera.height !== undefined ||
+  if (options.samplesPerOutputPixel !== undefined) {
+    if (!Number.isInteger(options.samplesPerOutputPixel) || options.samplesPerOutputPixel < 1 || options.samplesPerOutputPixel > 65536)
+      throw new RangeError("Samples per output pixel must be an integer from 1 to 65536.");
+    config.samples_per_output_pixel = options.samplesPerOutputPixel;
+  }
+  const tiled = config.oversampling > 1 || options.samplesPerOutputPixel !== undefined || options.tiled !== undefined || config.camera.width !== undefined || config.camera.height !== undefined ||
     ![128,256,512,768,1024,2048,4096].includes(config.camera.resolution);
   if (tiled) {
     if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || options.live || options.clientIntersections)
@@ -189,8 +273,74 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
     // authorities before admitting the job; keep input order unchanged.
     config.camera_poses = structuredClone(options.cameraPoses);
   }
+  if (options.sensorLanes !== undefined) {
+    if (!Array.isArray(options.sensorLanes) || options.sensorLanes.length<1 ||
+        options.sensorLanes.length>32 || Object.keys(options.sensorLanes[0]??{}).length)
+      throw new RangeError('Sensor lanes need 1..32 camera overrides, starting with the main camera.');
+    if (!['fixed:3','fixed:4','fixed:8'].includes(config.transport) || config.orbit_frames!==1 || tiled ||
+        options.live || options.clientIntersections || options.receiveLightField || options.cameraPoses)
+      throw new RangeError('Sensor lanes require one untiled RGB timed exposure.');
+    config.sensor_lanes=structuredClone(options.sensorLanes);
+  }
+  if(options.calibrationRegions!==undefined){
+    if(!config.sensor_lanes||!Array.isArray(options.calibrationRegions)||
+       options.calibrationRegions.length!==config.sensor_lanes.length)
+      throw new RangeError('Calibration regions need one map per sensor lane.');
+    config.calibration_regions=structuredClone(options.calibrationRegions);
+  }
   if (options.objectSnapshot) { delete config.object_digest; config.object_snapshot = options.objectSnapshot; }
   if (options.live) config.live = options.live;
+  if(options.surfaceTransport!==undefined) {
+    if(options.surfaceTransport!=='studio-pbr-mixture-v1')throw new RangeError('Unsupported surface transport.');
+    if(!['fixed:3','fixed:4','fixed:8'].includes(config.transport))throw new RangeError('Corrected opaque PBR transport requires RGB rays.');
+    config.surface_transport=options.surfaceTransport;
+  }
+  if(options.emitterSampling!==undefined) {
+    const sampling=options.emitterSampling;
+    if(!sampling||sampling.version!==1||Object.keys(sampling).some(k=>!['version','ray_budget','seed','refresh_each_sweep'].includes(k))||
+        !Number.isSafeInteger(sampling.ray_budget)||sampling.ray_budget<128||sampling.ray_budget>65536||
+        !Number.isSafeInteger(sampling.seed)||sampling.seed<0||sampling.seed>2147483647||typeof sampling.refresh_each_sweep!=='boolean')
+      throw new RangeError('Invalid canonical emitter sampling settings.');
+    if(sampling.refresh_each_sweep&&(!options.live||!options.receiveLightField||config.transport!=='fixed:3'))
+      throw new RangeError('Fresh source populations require Live RGB field reception.');
+    config.emitter_sampling=structuredClone(sampling);
+  }
+  if(options.lightFieldInternalMedia!==undefined) {
+    if(typeof options.lightFieldInternalMedia!=='boolean')throw new TypeError('lightFieldInternalMedia must be a boolean.');
+    if(options.lightFieldInternalMedia&&(!options.live||!options.receiveLightField||!options.emitterSampling?.refresh_each_sweep))
+      throw new RangeError('Internal medium field recording requires fresh Live field populations.');
+    if(options.lightFieldInternalMedia)config.light_field_internal_media=true;
+  }
+  if (options.receiveLightField !== undefined && typeof options.receiveLightField !== "boolean")
+    throw new TypeError("receiveLightField must be a boolean.");
+  if(options.lightFieldInformation!==undefined) {
+    if(options.lightFieldInformation!=='evaluated-responses-v1'||!options.receiveLightField)
+      throw new RangeError('Evaluated response copies require explicit field reception.');
+    config.light_field_information=options.lightFieldInformation;
+  }
+  if (options.receiveLightField) {
+    if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || tiled || options.cameraPoses)
+      throw new RangeError("Forward-field reception requires one ordinary RGB still or Live camera.");
+    config.receive_light_field = true;
+    const stencil=options.lightFieldStencil??12;
+    if(!Number.isInteger(stencil)||![6,12].includes(stencil))throw new RangeError('Light field stencil must be 6 or 12.');
+    config.light_field_stencil=stencil;
+    const grid=options.lightFieldGridSize??64;
+    if(!Number.isInteger(grid)||![32,64].includes(grid))throw new RangeError('Light field grid must be 32 or 64.');
+    config.light_field_grid_size=grid;
+    config.light_field_estimator='track-length-root-sweep-v1';
+    if(options.lightFieldRegion!==undefined) {
+      if(options.lightFieldRegion!=='subject')throw new RangeError('Only bounded subject recording is supported.');
+      const pitch=options.lightFieldCellSizeM??.0005,margin=options.lightFieldMarginM??.001;
+      if(typeof pitch!=='number'||!Number.isFinite(pitch)||pitch<.00005||pitch>.01)throw new RangeError('Subject cell size must be between 0.05 and 10 mm.');
+      if(typeof margin!=='number'||!Number.isFinite(margin)||margin<0||margin>.032)throw new RangeError('Subject margin must be between 0 and 32 mm.');
+      config.light_field_region='subject';config.light_field_cell_size_m=pitch;config.light_field_margin_m=margin;
+      delete config.light_field_grid_size; // Exact pitch and subject bounds determine the smallest supported cube.
+    } else if(options.lightFieldCellSizeM!==undefined||options.lightFieldMarginM!==undefined)
+      throw new RangeError('Physical cell size and margin require bounded subject recording.');
+  }
+  else if(options.lightFieldStencil!==undefined||options.lightFieldGridSize!==undefined||options.lightFieldRegion!==undefined||options.lightFieldCellSizeM!==undefined||options.lightFieldMarginM!==undefined)
+    throw new RangeError('Light field options require field reception.');
   if(config.camera.camera_back){
     let aspect=(config.camera.width??config.camera.resolution)/(config.camera.height??config.camera.resolution);
     // Live's existing shader uses the viewport aspect; its integer pixel grid
@@ -204,14 +354,28 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   }
   validatePhotoFocus(config.camera);
   if (options.lights) config.lights = options.lights;
-  if (config.transport === "fixed:3") config.film_response = normalizeFilmResponse(options.filmResponse);
+  if (['fixed:3','fixed:4','fixed:8'].includes(config.transport)) config.film_response = normalizeFilmResponse(options.filmResponse);
   else if (options.filmResponse !== undefined) throw new Error("Custom RGB film response requires RGB transport.");
   // Real emissive fixture geometry (the box/tube housings + glowing panel
   // faces), not a synthetic light-list approximation of them -- the
   // worker appends this to the scene the same way it appends the saved
   // marble mesh, so Spectral's own emissive-material detection lights the
   // photo from the actual fixtures, not a stand-in.
-  if (options.fixtures) config.fixtures = options.fixtures;
+  if (options.fixtures) {
+    if (options.fixtures.trigger_emitters?.length && options.exposureStateFrames === undefined)
+      throw new Error("Shop burst needs an ordinary timed Studio exposure.");
+    config.fixtures=options.fixtures;
+    if(!config.light_field_information&&Object.hasOwn(options.fixtures,'response_lineage')) {
+      const {response_lineage,...ordinaryFixtures}=options.fixtures;
+      config.fixtures=ordinaryFixtures;
+    }
+  }
+  if (options.exposureStateFrames !== undefined) config.exposure_state_frames = options.exposureStateFrames;
+  if (config.sensor_lanes && !config.exposure_state_frames)
+    throw new RangeError('Sensor lanes require captured state frames on the Studio timeline.');
+  if (options.cameraTriggerGraph !== undefined) config.camera_trigger_graph = structuredClone(options.cameraTriggerGraph);
+  if (options.cameraTriggerGenerators !== undefined) config.camera_trigger_generators = structuredClone(options.cameraTriggerGenerators);
+  if (options.cameraTriggerTiming !== undefined) config.camera_trigger_timing = structuredClone(options.cameraTriggerTiming);
   const json = encoder.encode(JSON.stringify(config));
   const n = faces.length;
   const buffer = new ArrayBuffer(16 + json.length + 76 * n);
@@ -237,7 +401,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   return buffer;
 }
 
-export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null) {
+export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null, fieldView = null, exposureClock = null, cameraTriggerGraph = null, cameraTriggerGenerators = null) {
   const $ = (id) => doc.getElementById(id);
   const lensControls = createStudioLensControls(doc);
   const participation = createPhotoParticipation(doc);
@@ -246,17 +410,19 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
   const filmResponse = $("photo-film-response") ? createFilmResponseControls($("photo-film-response"), $("photo-transport")) : null;
   const state = { objectDigest: null, jobDigest: null, lastDigest: null, timer: null, generation: 0,
     frames: [], selectedFrame: null, playTimer: null, frameImages: new Map(), displayToken: 0,
-    retouchDigest: null, displayGamma: 1, previewHdr: null, photoComplete: false, hasColorProfile: false,
+    retouchDigest: null, displayGamma: 1, previewHdr: null, photoComplete: false, hasColorProfile: false, spectralTransport: false,
     retouchRevision: 0, retouchDebounce: null, retouchPending: null, retouchInFlight: null,
     retouchError: null, statusRequest: 0, appliedStatusRequest: 0, nonSpecularTone: "exponential",
-    displayedPhoto: null, displayWhite: null,
+    displayedPhoto: null, displayWhite: null, bakedDisplay: null,
+    previewAvailable: false, previewMode: "open",
     retouchParams: { exposure: 0, gamma: 1, red: 1, green: 1, blue: 1, whitebalance: 0, tint: 0, intensity: 1,
-      display_look: "reference", normalization: "auto99", normalization_white: 1, normalization_percentile: 99, tone_curve: "exponential",
+      display_look: "reference", spectral_look: "compressed", normalization: "auto99", normalization_white: 1, normalization_percentile: 99, tone_curve: "exponential",
       saturation: 1, vibrance: 0, black_point: 0,
       firefly_filter: false, firefly_threshold: 8, firefly_strength: 1 } };
   const snapshotToggle = $("photo-auto-snapshot");
   const autoSnapshot = () => typeof prepareExposure === "function" && snapshotToggle?.checked;
   let starting = false;
+  let recordingCancel = null;
   const hdrObservers = new Set();
   const completedHdr = () => {
     const finalSelected = state.selectedFrame === null || state.frames.some(frame =>
@@ -266,7 +432,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
         !state.previewHdr || !finalSelected || !state.retouchDigest || state.retouchDigest !== state.lastDigest ||
         state.retouchDebounce || state.retouchPending || state.retouchInFlight || state.retouchError ||
         !shown || shown.digest !== state.lastDigest || shown.hdr !== state.previewHdr ||
-        shown.selectedFrame !== state.selectedFrame || $("photo-panel").hidden) return null;
+        shown.selectedFrame !== state.selectedFrame || state.previewMode !== "open" || $("photo-panel").hidden) return null;
     return {id:`${state.lastDigest}:${state.previewHdr}`,
       url:`/api/marble_photo/hdr?digest=${state.lastDigest}&name=${encodeURIComponent(state.previewHdr)}`,
       revision:JSON.stringify([state.generation,state.displayToken,state.selectedFrame,state.retouchRevision]),
@@ -299,9 +465,10 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     set("retouch-profile-condition", hasProfile ?
       `Response condition: ${number(profile.condition_number)}${profile.neutral_fallback ? "; neutral fallback active" : ""}.` : "Response condition: not recorded.");
     const matrix = profile?.sensor_to_linear_srgb;
+    const columns = state.spectralTransport ? 8 : 3;
     const validMatrix = Array.isArray(matrix) && matrix.length === 3 && matrix.every(row =>
-      Array.isArray(row) && row.length === 3 && row.every(x => typeof x === "number" && Number.isFinite(x)));
-    set("retouch-profile-matrix", validMatrix ? "Sensor to linear sRGB:\n" +
+      Array.isArray(row) && row.length === columns && row.every(x => typeof x === "number" && Number.isFinite(x)));
+    set("retouch-profile-matrix", validMatrix ? (state.spectralTransport ? "Eight-band sensor to false-colour display RGB:\n" : "Sensor to linear sRGB:\n") +
       matrix.map(row => row.map(number).join("  ")).join("\n") : "Sensor matrix: not recorded.");
     set("retouch-profile-limits", hasProfile ? profile.limits || "" : "");
     const warning = $("retouch-profile-warning");
@@ -320,7 +487,19 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
   const retouchFields = ["exposure", "gamma", "red", "green", "blue", "whitebalance", "tint", "intensity"];
   const colorFields = {saturation: [0, 2], vibrance: [-1, 1], black_point: [0, .5]};
   const filterFields = {firefly_threshold: [2, 64, 1], firefly_strength: [0, 1, 100]};
-  const displayFields = ["display_look", "normalization", "normalization_white", "normalization_percentile", "tone_curve", ...Object.keys(colorFields),
+  const spectralSelect = doc.createElement("select");
+  spectralSelect.id = "retouch-spectral-look";
+  for (const [value, label] of [["compressed", "Compressed full spectrum (365–940 nm)"],
+      ["nir_red", "Infrared red channel"], ["uv_violet", "Ultraviolet violet channel"],
+      ["visible_reference", "Visible lines only"]]) {
+    const option = doc.createElement("option"); option.value = value; option.textContent = label;
+    spectralSelect.append(option);
+  }
+  const spectralLabel = doc.createElement("label");
+  spectralLabel.textContent = "Eight-band false-colour view ";
+  spectralLabel.append(spectralSelect);
+  $("retouch-display-look")?.closest?.("label")?.after?.(spectralLabel);
+  const displayFields = ["display_look", "spectral_look", "normalization", "normalization_white", "normalization_percentile", "tone_curve", ...Object.keys(colorFields),
     "firefly_filter", ...Object.keys(filterFields)];
   const displayControl = (field) => $(`retouch-${field.replaceAll("_", "-")}`);
   const syncRetouchDisplayControls = (values = false) => {
@@ -344,7 +523,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
         const output = $(`${node.id}-out`);
         if (output) output.textContent = `${state.retouchParams[field]}%`;
       }
-      node.disabled = !state.hasColorProfile ||
+      node.disabled = !state.hasColorProfile || (field === "spectral_look" && !state.spectralTransport) ||
         (field === "normalization_white" && state.retouchParams.normalization !== "manual") ||
         (field === "normalization_percentile" && !["percentile", "specular"].includes(state.retouchParams.normalization)) ||
         (["tone_curve", "display_look"].includes(field) && state.retouchParams.normalization === "specular") ||
@@ -396,7 +575,9 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       }
       filter[field] = value;
     }
-    Object.assign(state.retouchParams, {display_look:look, normalization, normalization_white: white, normalization_percentile: percentile, tone_curve: tone, ...colors, ...filter});
+    const spectralLook = displayControl("spectral_look")?.value || "compressed";
+    if (!["compressed", "nir_red", "uv_violet", "visible_reference"].includes(spectralLook)) throw new Error("Choose an eight-band spectral view.");
+    Object.assign(state.retouchParams, {display_look:look, spectral_look:spectralLook, normalization, normalization_white: white, normalization_percentile: percentile, tone_curve: tone, ...colors, ...filter});
     if (normalization !== "specular") state.nonSpecularTone = tone;
     if (normalization === "specular" && displayControl("tone_curve")) displayControl("tone_curve").value = tone;
   };
@@ -411,9 +592,10 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     if (EventType) $("photo-retouch").dispatchEvent(new EventType("retouch-controls-change", { bubbles: true }));
   };
   const resetRetouchParams = (displayGamma = 1) => {
-    state.nonSpecularTone = "exponential";
-    state.retouchParams = { exposure: 0, gamma: displayGamma || 1, red: 1, green: 1, blue: 1,
-      whitebalance: 0, tint: 0, intensity: 1, display_look: "reference", normalization: "auto99", normalization_white: 1, normalization_percentile: 99, tone_curve: "exponential",
+    const baked=state.bakedDisplay;
+    state.nonSpecularTone = baked?.tone_curve??"exponential";
+    state.retouchParams = { exposure: baked?.exposure??0, gamma: displayGamma || 1, red: 1, green: 1, blue: 1,
+      whitebalance: 0, tint: 0, intensity: 1, display_look: "reference", spectral_look: baked?.spectral_look??"compressed", normalization: baked?.normalization??"auto99", normalization_white: 1, normalization_percentile: baked?.normalization_percentile??99, tone_curve: baked?.tone_curve??"exponential",
       saturation: 1, vibrance: 0, black_point: 0,
       firefly_filter: false, firefly_threshold: 8, firefly_strength: 1 };
   };
@@ -506,10 +688,35 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     $("photo-play").textContent = "Play orbit";
     notifyHdr();
   };
+  const syncPreview = () => {
+    const minimized = state.previewMode === "minimized";
+    $("photo-panel").hidden = !state.previewAvailable || state.previewMode === "closed";
+    $("photo-panel").classList.toggle("is-minimized", minimized);
+    $("photo-preview-minimize").textContent = minimized ? "Restore" : "Minimize";
+    $("photo-preview-minimize").setAttribute("aria-expanded", String(!minimized));
+    $("photo-preview-minimize").setAttribute("aria-label", minimized ? "Restore photo preview" : "Minimize photo preview");
+    $("photo-preview-show").hidden = !state.previewAvailable || state.previewMode !== "closed";
+  };
+  $("photo-preview-minimize").addEventListener("click", () => {
+    state.previewMode = state.previewMode === "minimized" ? "open" : "minimized";
+    syncPreview(); stopPlayback();
+  });
+  $("photo-preview-close").addEventListener("click", () => {
+    state.previewMode = "closed";
+    syncPreview(); stopPlayback();
+    $("photo-preview-show").focus();
+  });
+  $("photo-preview-show").addEventListener("click", () => {
+    state.previewMode = "open";
+    syncPreview(); notifyHdr();
+    $("photo-preview-minimize").focus();
+  });
+  syncPreview();
   const clearFrames = () => {
     stopPlayback(); state.frames = []; state.selectedFrame = null;
     state.frameImages.clear(); state.displayToken++; state.previewUrl = null; state.previewHdr = null; state.photoComplete = false;
     state.displayedPhoto = null;
+    state.bakedDisplay = null;
     $("photo-frames").replaceChildren(); $("photo-frames").hidden = true;
     $("photo-play").hidden = true; $("photo-animation").hidden = true;
     deactivateRetouch();
@@ -589,12 +796,14 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
   };
   const setButtons = () => {
     $("photo-start").disabled = starting || (!state.objectDigest && !autoSnapshot()) || !!state.jobDigest;
-    $("photo-cancel").disabled = !state.jobDigest;
+    $("photo-cancel").disabled = !state.jobDigest && !recordingCancel;
   };
   snapshotToggle?.addEventListener("change", setButtons);
   const cancel = async () => {
+    if (recordingCancel) { recordingCancel(); recordingCancel = null; setButtons(); status("Exposure capture canceled."); return; }
     participation.stop();
     const digest = state.jobDigest;
+    fieldView?.stop(digest);
     state.jobDigest = null; state.generation++; stopPolling(); stopPlayback(); setButtons();
     if (digest) {
       $("photo-hdr").hidden = true;
@@ -606,6 +815,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     }
   };
   const stale = (invalidateObject=true) => {
+    fieldView?.invalidate();
     if (!state.objectDigest && !state.jobDigest && !state.retouchDigest) return;
     if(invalidateObject)state.objectDigest = null;
     // Editing a recipe must not cancel its already captured still exposure.
@@ -644,13 +854,54 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       if (!response.ok) throw new Error(value.error || `photo status HTTP ${response.status}`);
       if (!current() || requestNumber < state.appliedStatusRequest) return;
       state.appliedStatusRequest = requestNumber;
+      void fieldView?.observe(value,digest);
       const opticalImageKey=`${digest}/${value.image??''}/${value.live_revision??''}`;
       rodWarning.observe(value,opticalImageKey);
+      if(value.live_display)state.bakedDisplay=value.live_display;
+      state.spectralTransport = String(value.transport || "").startsWith("fixed:8");
       syncRetouchProfile(value);
       state.previewHdr = value.hdr || null;
       state.photoComplete = value.state === "complete";
       if (value.display_gamma != null) state.displayGamma = value.display_gamma;
       renderFrames(value.frames || [], digest);
+      let laneGallery=$('photo-lane-gallery');
+      if(Array.isArray(value.sensor_lanes)&&value.sensor_lanes.length>1){
+        if(!laneGallery){
+          laneGallery=doc.createElement('details');laneGallery.id='photo-lane-gallery';
+          const summary=doc.createElement('summary');summary.textContent='Surround camera exposures';
+          const select=doc.createElement('select');select.setAttribute('aria-label','Surround camera position');
+          select.id='photo-lane-select';
+          const image=doc.createElement('img');image.id='photo-lane-image';
+          image.alt='Selected simultaneous camera exposure';
+          image.style.cssText='display:block;width:100%;aspect-ratio:1;object-fit:contain';
+          const full=doc.createElement('a');full.id='photo-lane-full';full.textContent='Open this camera image';
+          full.target='_blank';full.rel='noopener';
+          const hdr=doc.createElement('a');hdr.id='photo-lane-hdr';hdr.textContent='Download this camera HDR';
+          hdr.setAttribute('download','');
+          laneGallery.append(summary,select,image,full,doc.createTextNode(' '),hdr);
+          $('photo-panel').append(laneGallery);
+        }
+        const select=$('photo-lane-select'),selected=Number(select.value)||0;
+        if(select.options.length!==value.sensor_lanes.length){
+          select.replaceChildren(...value.sensor_lanes.map((lane,index)=>{
+            const option=doc.createElement('option');option.value=String(lane.index);
+            option.textContent=`Camera ${index+1} of ${value.sensor_lanes.length}`;return option;
+          }));select.value=String(selected);
+        }
+        const basename=path=>path?.split('/').at(-1);
+        const showLane=()=>{
+          const active=value.sensor_lanes.find(lane=>lane.index===Number(select.value))??value.sensor_lanes[0];
+          const url=(kind,path)=>`/api/marble_photo/${kind}?digest=${digest}&name=${encodeURIComponent(basename(path))}&lane=${active.index}`;
+          const image=$('photo-lane-image');
+          if(active.image){const source=url('image',active.image);
+            if(image.src!==new URL(source,doc.baseURI).href)image.src=source;
+            $('photo-lane-full').href=source;}
+          if(active.hdr){$('photo-lane-hdr').href=url('hdr',active.hdr);$('photo-lane-hdr').hidden=false;}
+          else $('photo-lane-hdr').hidden=true;
+        };
+        select.onchange=showLane;showLane();
+        laneGallery.hidden=false;
+      }else if(laneGallery)laneGallery.hidden=true;
       const selectedIsFinal = state.photoComplete && state.selectedFrame !== null && state.frames.some(frame =>
         frame.index === state.selectedFrame && frame.hdr && frame.hdr === value.hdr);
       const displayingExposure = state.selectedFrame === null || selectedIsFinal;
@@ -665,7 +916,8 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       const usingRetouch = !!value.retouched_image && displayingExposure;
       const displayName = usingRetouch ? value.retouched_image : value.image;
       if (displayName) {
-        $("photo-panel").hidden = false;
+        // Progressive updates must not reopen a preview the user dismissed.
+        state.previewAvailable = true; syncPreview();
         // Retouches normally receive a new filename. Keep epoch in the URL
         // for live workers that still publish successive snapshots by name.
         const imageUrl = usingRetouch
@@ -702,11 +954,13 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       status(state.retouchError || (value.tiled ? (value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
         value.state === "complete" ? `Tiled photo complete · ${value.tiled.output_width} × ${value.tiled.output_height} · ${value.tiled.completed_tiles} tiles` :
         value.state === "assembling" ? `Assembling ${value.tiled.output_width} × ${value.tiled.output_height} photo from linear HDR tiles…` :
-        `Tiled photo · ${value.tiled.completed_tiles}/${value.tiled.total_tiles} tiles complete · ${value.tiled.exposure_seconds_per_tile} s per tile`) : value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
+        `Tiled photo · ${value.tiled.completed_tiles}/${value.tiled.total_tiles} tiles complete · ${value.tiled.target_samples_per_output_pixel ? `${value.tiled.target_samples_per_output_pixel} samples per output pixel (requested ${value.tiled.requested_samples_per_output_pixel})` : `${value.tiled.exposure_seconds_per_tile} s per tile`}`) : value.state === "complete" ? `Photo complete · ${(value.frames || []).length || 1} frame(s) · ${value.frame_elapsed_seconds ?? $("photo-seconds").value} s final exposure` :
         value.state === "error" ? `Photo failed: ${value.error || "worker error"}` :
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
             value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
               `Exposing frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} on GPU · ${Math.round(value.frame_elapsed_seconds || 0)} s · ${(value.forward_ray_jobs || 0).toLocaleString()} ray jobs`));
+      if (value.stale_geometry_slices)
+        status(`${$("photo-status").textContent} · ${value.stale_geometry_slices} slice(s) used the previous triangles`);
       if (value.state === "complete" || value.state === "error" || value.state === "canceled") {
         state.jobDigest = null; stopPolling(); participation.stop(); setButtons(); notifyHdr(); return;
       }
@@ -733,20 +987,30 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     const policy = photoGeometryPolicy(doc);
     // Camera framing does not choose the scene: close-up exposures need the
     // same authored room and light fixtures, with their exposure-only gains.
-    const scene = currentCamera?.(Boolean(snapshotEnabled));
+    const scene = currentCamera?.(Boolean(snapshotEnabled),{timedExposure:true});
     const subjectCenter = scene?.object_center_m ?? OBJECT_CENTER;
     const sceneOptions = $("photo-camera").value === "studio" ? scene :
       {fixtures: scene?.fixtures, lights: scene?.lights, object_center_m: subjectCenter,
         camera: {eye_m: subjectCenter.map((v,i)=>[0,0,.07][i]+(v-OBJECT_CENTER[i])), target_m: subjectCenter}};
     if (state.jobDigest) throw new Error("An exposure is already running. Wait for it to finish or use Cancel exposure.");
     const objectDigest = state.objectDigest;
+    const fieldTicket = fieldView?.capture({saved:!snapshotEnabled});
     const options = {
+      ...($('ray-surface-transport')?.checked?{surfaceTransport:'studio-pbr-mixture-v1'}:{}),
+      receiveLightField:!!fieldTicket,
+      ...(fieldTicket?.information?{lightFieldInformation:fieldTicket.information}:{}),
+      ...(fieldTicket?{lightFieldStencil:fieldTicket.stencil,lightFieldGridSize:fieldTicket.gridSize}:{}),
+      ...(fieldTicket?.region==='subject'?{lightFieldRegion:'subject',lightFieldCellSizeM:fieldTicket.cellSizeM,lightFieldMarginM:fieldTicket.marginM}:{}),
       resolution: $("photo-resolution").value === "custom" ? 256 : +$("photo-resolution").value,
       ...($("photo-resolution").value === "custom" ? {width:+$("photo-width").value, height:+$("photo-height").value} : {}),
       seconds: +$("photo-seconds").value,
+      exposureSubsteps: +$("photo-substeps").value,
+      exposureIso: +$("photo-iso").value,
+      highlightClipPercent: +$("photo-highlight-clip").value,
       oversampling: +($("photo-oversampling")?.value || 1),
       ...($("photo-tile-size")?.value && $("photo-tile-size").value !== "auto" ? {tiled:{tile_size:+$("photo-tile-size").value}} : {}),
       orbitFrames: +$("photo-orbit-frames").value,
+      cameraVisible: $("photo-camera-visible")?.checked ?? true,
       transport: $("photo-transport").value,
       filmResponse: responseForExposure,
       clientIntersections: participation.requested(),
@@ -756,15 +1020,59 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       ...policy,
       ...sceneOptions,
     };
+    const routing=cameraTriggerGraph?.();
+    if(routing?.edges?.some(edge=>Math.abs(edge.w)>1e-12)){
+      options.cameraTriggerGraph=routing;
+      options.cameraTriggerGenerators=cameraTriggerGenerators?.();
+      const receivers=new Set((routing.edges??[]).filter(edge=>Math.abs(edge.w)>1e-12).map(edge=>edge.dst));
+      const triggered=Array.from({length:STUDIO_LIGHTS.length},(_,material)=>material)
+        .filter(material=>receivers.has(`studio:${material}`)).map(material=>({material,
+          receiver:`studio:${material}`,frame_gain:true}));
+      const shop=options.fixtures.shop_receiver_candidates?.filter(item=>receivers.has(item.receiver))??[];
+      if(triggered.length||shop.length){
+        const byReceiver=new Map([...(options.fixtures.trigger_emitters??[]),...shop,...triggered]
+          .map(item=>[item.receiver,item]));
+        options.fixtures={...options.fixtures,trigger_emitters:[...byReceiver.values()]};
+      }
+    }
     // Freeze the selected lens at the click, before asynchronous snapshot hashing.
     options.camera = lensControls.applyCamera({fov_degrees:18, aperture_radius_m:.002,
       focus_distance_m:.11, ...options.camera});
+    if($("photo-camera-pattern")?.value==="geodesic-faces"){
+      const cameras=geodesicFaceSensorCameras(options.camera);
+      options.camera=cameras[0];
+      options.sensorLanes=[{},...cameras.slice(1).map(({eye_m,target_m})=>({eye_m,target_m}))];
+    }
     // Capture the detached object synchronously at this click. Preparation can
     // hash asynchronously; later edits do not change this exposure's source.
     if (snapshotEnabled) {
       status("Preparing an exposure-only snapshot (library and autosave unchanged)…");
       const prepared = await prepareExposure();
       geometry = prepared.geometry; options.objectSnapshot = prepared.value;
+    }
+    if(options.fixtures?.shop_material_ids){
+      options.fixtures={...options.fixtures,emissive_material_ids:[...new Set([
+        ...Array.from({length:STUDIO_LIGHTS.length},(_,i)=>i),
+        ...(options.fixtures.emitter_profiles?.records??[]).map(record=>record.material),
+        ...options.fixtures.shop_material_ids])]};
+    }
+    if (options.fixtures?.material_engines && options.fixtures.pbr?.length >= (STUDIO_LIGHTS.length+1)*16 &&
+        !options.live && !options.tiled && options.oversampling === 1 &&
+        options.width === undefined && options.height === undefined &&
+        !options.cameraPoses && !options.clientIntersections && !options.receiveLightField &&
+        options.orbitFrames === 1) {
+      let canceled = false;
+      recordingCancel = () => { canceled = true; };
+      setButtons();
+      try {
+        exposureClock?.begin(options.seconds/options.exposureSubsteps);
+        options.exposureStateFrames=await recordStudioExposureFrames({
+          sample:()=>currentCamera?.(Boolean(snapshotEnabled),{timedExposure:true})?.fixtures,
+          initialFixture:options.fixtures,duration:options.seconds,canceled:()=>canceled,
+          substeps:options.exposureSubsteps,
+          ...(exposureClock?{nextFrame:exposureClock.nextTick}:{}),
+          progress:(elapsed,duration)=>status(`Capturing changing Studio lights · ${elapsed.toFixed(1)} / ${duration} s`)});
+      } finally { exposureClock?.end(); recordingCancel = null; setButtons(); }
     }
     const body = packMarblePhoto(geometry, objectDigest, options);
     $("photo-hdr").hidden = true;
@@ -778,7 +1086,8 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     if (!response.ok) throw new Error(value.error || `photo HTTP ${response.status}`);
     if (!hexDigest.test(value.digest)) throw new Error("photo server returned no digest");
     state.jobDigest = state.lastDigest = value.digest; const generation = ++state.generation;
-    $("photo-panel").hidden = false;
+    fieldView?.connect(value.digest,fieldTicket);
+    state.previewAvailable = true; state.previewMode = "open"; syncPreview();
     $("photo-caption").textContent = "Preparing thin-lens photograph…";
     setButtons(); poll(value.digest, generation);
     try { participation.connect(value, options.clientIntersections); }
@@ -788,6 +1097,11 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
   $("photo-cancel").addEventListener("click", () => cancel().catch((error) => status(error.message || String(error))));
   $("photo-gamma").addEventListener("input", () => {
     $("photo-gamma-out").textContent = (+$("photo-gamma").value / 100).toFixed(2);
+  });
+  let exposureSubstepsEdited=false;
+  $("photo-substeps").addEventListener("input",()=>{exposureSubstepsEdited=true;});
+  $("photo-seconds").addEventListener("change",()=>{
+    if(!exposureSubstepsEdited)$("photo-substeps").value=String(Math.ceil(60*Number($("photo-seconds").value)));
   });
   for (const field of retouchFields) {
     $(`retouch-${field}`).addEventListener("input", () => {

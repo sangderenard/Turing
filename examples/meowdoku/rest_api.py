@@ -45,11 +45,19 @@ def _load(name: str):
 _load("speaktome_api")
 from speaktome_api import routes  # noqa: E402
 
-if routes.API_VERSION != 2:
-    raise ImportError("This Turing host requires SpeakToMe REST API_VERSION 2 (pictures and map pages); "
+if routes.API_VERSION != 3:
+    raise ImportError("This Turing host requires SpeakToMe REST API_VERSION 3 (chat images, pictures and map pages); "
                       "update the speaktome checkout it loads")
 
 from speaktome_api import site  # noqa: E402  (after the version check, so an older checkout is refused with that message)
+from speaktome_api import reports  # noqa: E402  account-owned guestbook; separate from incident tickets
 
+if reports.API_VERSION != 1:
+    raise ImportError("This Turing host requires SpeakToMe experience-report contract version 1")
+
+# The declared catalog of this API (speaktome_api.catalog), served at /api/index; an older checkout has none.
+catalog = importlib.import_module("speaktome_api.catalog") if (REPOSITORY / "speaktome_api" / "catalog.py").is_file() else None
 # The manual is a map (speaktome_man.as_map); an older checkout without it still serves everything else.
 manual = _load("speaktome_man") if (REPOSITORY / "speaktome_man" / "__init__.py").is_file() else None
+# The Goal document format (speaktome_goal): what the part-by-part builder's units are processed into.
+goal = _load("speaktome_goal") if (REPOSITORY / "speaktome_goal" / "__init__.py").is_file() else None

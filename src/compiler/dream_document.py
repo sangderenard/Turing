@@ -806,6 +806,77 @@ def load_dream_document(path: str | Path) -> DreamDocument:
     return parse_dream_document(Path(path).read_bytes())
 
 
+_RESERVED_HEADER_KEYS = frozenset({"id", "language", "encoding", "sha256", "stage", "inputs", "outputs", "members", "join"})
+
+
+def _header_text(key: str, value: str, *, block: str) -> bytes:
+    """One ``key = value`` header line, refused unless the scanner would read back exactly the same pair."""
+    text = f"{key} = {value}"
+    if (not key or key != key.strip() or "=" in key or value != value.strip() or not text.isascii()
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text) or "@end*/" in text):
+        raise DreamDocumentError(f"block {block!r}: header {key!r} cannot be written as one restricted-ASCII line")
+    return text.encode("ascii") + b"\n"
+
+
+def _header_names(names: tuple[str, ...], *, block: str, key: str) -> str:
+    for name in names:
+        if not name or name != name.strip() or "," in name:
+            raise DreamDocumentError(f"block {block!r}: {key} name {name!r} cannot be written")
+    return ", ".join(names)
+
+
+def render_dream_document(document: DreamDocument) -> bytes:
+    """The bytes of a dream document: the exact inverse of ``parse_dream_document``.
+
+    ``parse_dream_document(render_dream_document(d)) == d`` for every document this accepts, and it refuses, rather
+    than alters, anything the scanner would not read back unchanged (a payload containing the closing sentinel, a
+    header value that is not one restricted-ASCII line, a decoration named like a reserved key). Every block is
+    written with its ``sha256`` sentinel, so a later reader verifies the payload bytes. Blocks come first in their
+    order; parallel groups follow.
+    """
+    out = bytearray()
+    for block in document.blocks:
+        identity = block.identity
+        if block.kind not in ("segment", "shader"):
+            raise DreamDocumentError(f"block {identity!r} has unknown kind {block.kind!r}")
+        if not identity or not block.language:
+            raise DreamDocumentError(f"block {identity!r} requires an id and a language")
+        if block.kind == "shader" and block.stage not in {"compute", "fragment"}:
+            raise DreamDocumentError(f"shader {identity!r} requires compute or fragment stage")
+        try:
+            payload = block.payload.encode(block.encoding)
+        except (LookupError, UnicodeEncodeError) as error:
+            raise DreamDocumentError(f"block {identity!r} cannot be encoded as {block.encoding!r}") from error
+        if _CLOSE in payload:
+            raise DreamDocumentError(f"block {identity!r}: the payload contains the closing sentinel")
+        reserved = _RESERVED_HEADER_KEYS & set(block.decorations)
+        if reserved:
+            raise DreamDocumentError(f"block {identity!r}: decorations use reserved keys {sorted(reserved)!r}")
+        out += f"/*@turing.{block.kind}.v1\n".encode("ascii")
+        out += _header_text("id", identity, block=identity)
+        out += _header_text("language", block.language, block=identity)
+        if block.stage is not None:
+            out += _header_text("stage", block.stage, block=identity)
+        out += _header_text("encoding", block.encoding, block=identity)
+        if block.inputs:
+            out += _header_text("inputs", _header_names(block.inputs, block=identity, key="inputs"), block=identity)
+        if block.outputs:
+            out += _header_text("outputs", _header_names(block.outputs, block=identity, key="outputs"), block=identity)
+        out += _header_text("sha256", sha256(payload).hexdigest(), block=identity)
+        for key in sorted(block.decorations):
+            out += _header_text(key, str(block.decorations[key]), block=identity)
+        # The scanner drops one line break after the header and one before the closing sentinel. A payload that
+        # ends in a carriage return is closed with CRLF, so that the pair is dropped together and the byte is kept.
+        out += b"@end*/\n" + payload + (b"\r\n" if payload.endswith(b"\r") else b"\n") + _CLOSE + b"\n"
+    for group in document.parallel:
+        out += b"/*@turing.parallel.v1\n"
+        out += _header_text("id", group.identity, block=group.identity)
+        out += _header_text("members", _header_names(group.members, block=group.identity, key="members"), block=group.identity)
+        out += _header_text("join", group.join, block=group.identity)
+        out += b"@end*/\n"
+    return bytes(out)
+
+
 @dataclass(frozen=True, slots=True)
 class DreamExecutionRecord:
     block: str

@@ -9,12 +9,12 @@ class Element {
 }
 const walk=e=>[e,...e.children.flatMap(walk)];
 const doc={createElement:tag=>new Element(tag,doc)},container=new Element('div',doc);
-let state={version:1,buses:['upper-wall','middle-wall','edge','near-edge','center'].map(id=>({id,enabled:false,dropFeet:null,dimmer:null})),shopDimmer:1,houseDimmer:0,allOut:false,solo:null,craneX:0,craneZ:0};
+let state={version:1,buses:['upper-wall','middle-wall','edge','near-edge','center'].map(id=>({id,enabled:false,dropFeet:null,dimmer:null})),shopDimmer:.15,houseDimmer:1,allOut:false,solo:null,craneX:0,craneZ:0};
 let calls=0,reject=false,builds=0,maxDrop=12,received;
 const controls=createLightingRackControls(container,{getState:()=>state,setState:next=>{received=next;if(reject)throw Error('Blocked fixture clearance');calls++;state=structuredClone(next);},getMaxDropFeet:()=>maxDrop,onBuildRacks:()=>{builds++;}});
 const find=id=>walk(container).find(e=>e.id==='lighting-rack-'+id);
 const change=(id,value)=>{find(id).value=String(value);find(id).fire('input');};
-assert.equal(find('shop-dimmer').value,'1');assert.equal(find('house-dimmer').value,'0');assert.equal(find('edge-drop-clear').disabled,true);
+assert.equal(find('shop-dimmer').value,'0.15');assert.equal(find('house-dimmer').value,'1');assert.ok(walk(container).some(e=>e.tagName==='label'&&e.textContent.includes('Studio lights')));assert.equal(find('edge-drop-clear').disabled,true);
 const authored=structuredClone(state);change('shop-dimmer',.4);assert.equal(state.shopDimmer,.4);assert.deepEqual(state.buses,authored.buses);assert.notEqual(received,state);
 find('shop-dimmer-clear').fire('click');assert.equal(state.shopDimmer,null);assert.equal(find('shop-dimmer-out').textContent,'Individual settings');
 change('edge-dimmer',.7);assert.equal(state.buses[2].dimmer,.7);assert.equal(state.buses[1].dimmer,null);

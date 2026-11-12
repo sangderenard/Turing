@@ -10,7 +10,7 @@ const matrix=(m,name)=>{if(!finite(m)||m.length!==16)throw Error(`${name} needs 
 const affine=(m,name)=>{matrix(m,name);if(m[3]!==0||m[7]!==0||m[11]!==0||m[15]!==1)throw Error(`${name} must be affine.`);return m;};
 const mul=(a,b)=>{const m=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++)
   for(let k=0;k<4;k++)m[c*4+r]+=a[k*4+r]*b[c*4+k];return m;};
-function inverseAffine(m) {
+export function inverseAffine(m) {
   affine(m,'Reference view');
   const a=m[0],b=m[4],c=m[8],d=m[1],e=m[5],f=m[9],g=m[2],h=m[6],i=m[10];
   const det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);

@@ -1,0 +1,21 @@
+{
+  "about": "Read by branch_gate.py, by the server's /api/reviews routes and by the task worker's reviews.land and branches.clean tasks. apply=false: the two tasks only report what they would do. lock: mock (the push check and the GitHub check say what they would refuse, print the advice and pass) or enforce. A branch with commits of its own lives unregistered_days after its last commit when it is registered to nobody and registered_days when it is registered to an account. A branch is cleanable when all of it is in the live source: what the repository's checkout has checked out, or its default branch on the remote. grace_days counts from when the cleaner first saw it so; a branch whose last commit is older than stale_days does not wait. worktree_idle_days (default 1; not set here, because a running server that predates the key refuses a policy it does not know): a side worktree idle this long, clean, and with its commit on the remote is removed from this computer with a notice of removal (branch_removed); the repository's own checkout is never touched. review_timeout_hours: an open change nobody objects to is accepted after this long. delete_after_landing: the default for a submitted change (the author may ask to keep the branch). protected: branch name patterns never cleaned, in every repository; a repository may add its own.",
+  "apply": true,
+  "lock": "mock",
+  "grace_days": 1,
+  "stale_days": 1,
+  "unregistered_days": 30,
+  "registered_days": 365,
+  "review_timeout_hours": 24,
+  "delete_after_landing": true,
+  "delete_remote": true,
+  "remote": "origin",
+  "protected": ["snapshot/*", "wip/*"],
+  "repositories": {
+    "workspace": {"path": "C:/dev/Powershell", "default": "nogodsnomasters", "protected": ["codex/live-string-core-demo"]},
+    "turing": {"path": "C:/dev/Powershell/turing", "default": "main"},
+    "nodus": {"path": "C:/dev/Powershell/nodus", "default": "nogodsnomasters"},
+    "speaktome": {"path": "C:/dev/Powershell/speaktome", "default": "nogodsnomasters", "protected": ["codex/direct-x86-vocabulary-report"]},
+    "spectral-analyzer": {"path": "C:/dev/Powershell/spectral-analyzer", "default": "nogodsnomasters"}
+  }
+}

@@ -7,7 +7,7 @@ export const LIGHTING_BUSES=Object.freeze([
   {id:'edge',label:'Outer perimeter rack'}, {id:'near-edge',label:'Inner perimeter rack'},
   {id:'center',label:'Sliding center crane'},
 ].map(Object.freeze));
-export function defaultLightingRacks(){return {version:1,buses:LIGHTING_BUSES.map(({id})=>({id,enabled:false,dropFeet:null,dimmer:null})),shopDimmer:null,houseDimmer:null,allOut:false,solo:null,craneX:0,craneZ:0};}
+export function defaultLightingRacks(){return {version:1,buses:LIGHTING_BUSES.map(({id})=>({id,enabled:false,dropFeet:null,dimmer:null})),shopDimmer:.15,houseDimmer:1,allOut:false,solo:null,craneX:0,craneZ:0};}
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
 const dimmer=v=>v===null||(finite(v)&&v>=0&&v<=1);
 export function validateLightingRacks(value){

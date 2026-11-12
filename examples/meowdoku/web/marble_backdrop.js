@@ -1,5 +1,6 @@
 // The existing Studio backdrop roll, with independently sized material sheets.
 // Preview and photo use these same faces; the saved marble mesh is untouched.
+import {validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces} from './marble_studio_grid.js';
 export const MAX_BACKDROP_LAYERS = 6;
 export const MAX_BACKDROP_SIZE = 64;
 export const BACKDROP_CIRCLE_SEGMENTS = 96;
@@ -25,10 +26,15 @@ export function validateBackdropLayers(value, materialNames) {
       throw new RangeError("Unknown backdrop shape");
     if (layer.centerY !== undefined && (!Number.isFinite(layer.centerY) || Math.abs(layer.centerY) > 32))
       throw new RangeError("Backdrop centre height must be between -32 and 32");
+    const grid=validateStudioGrid(layer.grid,materialNames);
+    if(grid && layer.shape==='ellipse')throw new RangeError('A structured backdrop grid requires a rectangle');
+    const artwork=validateStudioArtwork(layer.artwork,materialNames);
+    if(artwork && (grid||layer.shape==='ellipse'))throw new RangeError('Surface artwork needs a solid rectangular backdrop');
     // Optional fields keep legacy rectangular profiles byte-for-byte in shape.
     return {material: layer.material, width: layer.width, height: layer.height,
       ...(layer.shape === undefined ? {} : {shape: layer.shape}),
-      ...(layer.centerY === undefined ? {} : {centerY: layer.centerY})};
+      ...(layer.centerY === undefined ? {} : {centerY: layer.centerY}),
+      ...(grid === undefined ? {} : {grid}),...(artwork===undefined?{}:{artwork})};
   });
 }
 
@@ -61,6 +67,24 @@ export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, flo
     const layer = valid[i], w = layer.width / 2, h = layer.height / 2;
     const mat = ids[layer.material || material], z = wallZ + step * (i + 1);
     const cy = layer.centerY ?? 0;
+    if(layer.grid) {
+      for(const cell of studioGridCells(layer.grid,layer.width,layer.height)) {
+        const w=cell.width/2,h=cell.height/2,x=cell.x,y=cy+cell.y,cellMat=ids[cell.material||layer.material||material];
+        if(!Number.isInteger(cellMat)||cellMat<0)throw new RangeError('Unknown grid material ID');
+        faces.push([[x-w,y-h,z],[x+w,y-h,z],[x+w,y+h,z],cellMat,[n,n,n]],
+          [[x-w,y-h,z],[x+w,y+h,z],[x-w,y+h,z],cellMat,[n,n,n]]);
+        onPart?.({id:`layer-${i}-${cell.id}-wall`,bodyId:`backdrop-layer-${i}-${cell.id}`,construction:'planar-sheet',closed:false,convex:true,faces:faces.slice(-2)});
+      }
+      const depth=1.2-(4-w)*0.3;
+      if(sweep && depth>0.1)for(const cell of studioGridCells(layer.grid,layer.width,depth)) {
+        const w=cell.width/2,h=cell.height/2,x=cell.x,z=wallZ+depth/2-cell.y,y=floorY+step*(i+1),up=[0,1,0];
+        const cellMat=ids[cell.material||layer.material||material];
+        faces.push([[x-w,y,z+h],[x+w,y,z+h],[x+w,y,z-h],cellMat,[up,up,up]],
+          [[x-w,y,z+h],[x+w,y,z-h],[x-w,y,z-h],cellMat,[up,up,up]]);
+        onPart?.({id:`layer-${i}-${cell.id}-sweep`,bodyId:`backdrop-layer-${i}-${cell.id}`,construction:'planar-sheet',closed:false,convex:true,faces:faces.slice(-2)});
+      }
+      continue;
+    }
     if (layer.shape === "ellipse") {
       // Real nested opaque mats, not a screen-space texture. Both render routes
       // consume these exact triangles and the existing physical depth order.
@@ -75,6 +99,8 @@ export function backdropFaces({count, material, sweep, layers, wallZ = -3.1, flo
         [[-w,cy-h,z],[w,cy+h,z],[-w,cy+h,z],mat,[n,n,n]]);
     }
     onPart?.({id:`layer-${i}-wall`,bodyId:`backdrop-layer-${i}`,construction:"planar-sheet",closed:false,convex:true,faces:faces.slice(first)});
+    if(layer.artwork)faces.push(...studioArtworkFaces(layer.artwork,layer.width,layer.height,ids,
+      ([x,y])=>[x,cy+y,z+.001],n,part=>onPart?.({...part,id:`layer-${i}-art-${part.id}`,bodyId:`backdrop-layer-${i}-art-${part.id}`})));
     if (sweep && layer.shape !== "ellipse") {
       // Keep the existing sweep proportions, now derived from this sheet's
       // authored size instead of an implicit layer-index inset.
@@ -112,7 +138,10 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       const option = doc.createElement("option"); option.value = value; option.textContent = text; shape.append(option);
     }
     shape.value = "rectangle";
-    shape.addEventListener("change", () => { layers[index].shape = shape.value; onChange(); });
+    shape.addEventListener("change", () => {
+      if((layers[index].grid||layers[index].artwork) && shape.value==='ellipse'){shape.value=layers[index].shape??'rectangle';return;}
+      layers[index].shape = shape.value; onChange();
+    });
     shapeLabel.append(shape); panel.append(shapeLabel);
     const sizes = {};
     for (const key of ["width", "height", "centerY"]) {
@@ -127,16 +156,22 @@ export function createBackdropLayerControls(container, materialNames, onChange =
       });
       sizeLabel.append(output, input); panel.append(sizeLabel); sizes[key] = {input, output};
     }
+    const grid=createStudioGridControls(panel,`backdrop-layer-${index}-grid`,names,value=>{
+      const next={...layers[index]};if(value===undefined)delete next.grid;else next.grid=value;
+      const candidate=layers.map((layer,i)=>i===index?next:layer);
+      layers=validateBackdropLayers(candidate,names);onChange();
+    });
     container.append(panel);
-    return {panel, select, shape, sizes};
+    return {panel, select, shape, sizes,grid};
   });
   return {
-    getState: () => layers.map((layer) => ({...layer})),
+    getState: () => validateBackdropLayers(layers,names),
     setState(value) {
       layers = validateBackdropLayers(value, names);
-      editors.forEach(({select, shape, sizes}, i) => {
+      editors.forEach(({select, shape, sizes,grid}, i) => {
         select.value = layers[i].material;
         shape.value = layers[i].shape ?? "rectangle";
+        grid.setState(layers[i].grid);
         for (const [key, {input, output}] of Object.entries(sizes)) {
           input.value = String(layers[i][key] ?? 0); output.value = (layers[i][key] ?? 0).toFixed(2);
         }

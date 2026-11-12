@@ -1,8 +1,9 @@
-"""Command-line client for Meowdoku messaging (stdlib only): how the agent accounts (claude, codex) talk through the server.
+"""Command-line client for Meowdoku messaging (Pillow required only for PNG attachments): how the agent accounts (claude, codex) talk through the server.
 
   python agent_messenger.py --base https://stichka.duckdns.org:8766 --user claude contacts
   ... add <username> | accept <username> | send <username> <text | -> | read <username> [--limit N]
-  ... send <username> <text | -> [--type note|status|question|handoff|approval_request|answer] [--subject KIND:REF]
+  ... images <username> [--enable|--disable]   opt in only for your side of this chat
+  ... send <username> <text | -> [--image PNG] [--type note|status|question|handoff|approval_request|answer] [--subject KIND:REF]
                                            KIND is lease|job|ticket|file|topic
   ... wait [--after ID | --from-cursor] [--timeout S]
                                            long-polls; prints incoming messages as JSON lines {id, from, to, created, body, subject, type};
@@ -20,6 +21,8 @@ Use --idempotency-key with identical content to retry an uncertain send. Exit co
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import http.cookiejar
 import http.client
 import json
@@ -101,8 +104,33 @@ def read_secret(user: str, password_file: str | None, state_dir: str | None) -> 
     return secret
 
 
+def read_image(path: str) -> dict:
+    """Bound before reading; Pillow verifies and decodes the actual PNG."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(2097153)
+        if len(data) > 2097152:
+            raise ClientError("PNG image exceeds 2 MiB")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ClientError("--image requires a PNG file")
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "PNG" or image.width * image.height > 16777216:
+                raise ClientError("PNG dimensions exceed 16 megapixels")
+            image.verify()
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+    except ClientError:
+        raise
+    except ImportError:
+        raise ClientError("PNG validation requires Pillow") from None
+    except Exception as error:
+        raise ClientError(f"cannot validate PNG: {error}") from None
+    return {"data": base64.b64encode(data).decode("ascii")}
+
+
 def _emit(message: dict) -> None:
-    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body", "subject", "type")}, ensure_ascii=False), flush=True)
+    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body", "subject", "type", "image") if k in message}, ensure_ascii=False), flush=True)
 
 
 def run(client: Client, args) -> int:
@@ -113,9 +141,21 @@ def run(client: Client, args) -> int:
     elif cmd in ("add", "accept"):
         action = "request" if cmd == "add" else "accept"
         print(json.dumps(client.call("/api/messages/contacts", {"username": args.username, "action": action})))
+    elif cmd == "images":
+        if args.enable or args.disable:
+            contacts = client.call("/api/messages/conversations")["contacts"]
+            peer = next((c for c in contacts if c["username"].casefold() == args.username.strip().casefold()), None)
+            if peer is None:
+                raise ClientError("you cannot message this user")
+            result = client.call("/api/messages/images", {"conversation_handle": peer["conversation_handle"], "enabled": args.enable})
+        else:
+            result = client.call("/api/messages/images?peer=" + q(args.username, safe=""))
+        print(json.dumps(result))
     elif cmd == "send":
         text = sys.stdin.read() if args.text == "-" else args.text
         payload = {"body": text, "idempotency_key": getattr(args, "idempotency_key", None) or secrets.token_urlsafe(24)}
+        if getattr(args, "image", None):
+            payload["image"] = read_image(args.image)
         if args.type:
             payload["type"] = args.type
         if args.subject:
@@ -153,7 +193,7 @@ def run(client: Client, args) -> int:
                 if attempt == 0 and (error.uncertain or error.status == 403):
                     continue
                 if uncertain_send or error.uncertain:
-                    raise ClientError(f"send outcome uncertain; retry with --idempotency-key {payload['idempotency_key']} and the identical recipient and text",
+                    raise ClientError(f"send outcome uncertain; retry with --idempotency-key {payload['idempotency_key']} and the identical recipient, text and image bytes",
                                       uncertain=True) from None
                 raise
     elif cmd == "pending":
@@ -211,6 +251,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", choices=("note", "status", "question", "handoff", "approval_request", "answer"))
     s.add_argument("--subject", metavar="KIND:REF")
     s.add_argument("--idempotency-key", help="reuse the reported operation key when retrying an uncertain send with identical content")
+    s.add_argument("--image", metavar="PNG", help="attach a PNG up to 2 MiB; enable images for this chat first")
+    image_parser = sub.add_parser("images", help="inspect or change your own per-chat image opt-in (server-readable)")
+    image_parser.add_argument("username")
+    image_flags = image_parser.add_mutually_exclusive_group()
+    image_flags.add_argument("--enable", action="store_true")
+    image_flags.add_argument("--disable", action="store_true")
     sub.add_parser("pending")
     sub.add_parser("ack").add_argument("id", type=int)
     r = sub.add_parser("read")

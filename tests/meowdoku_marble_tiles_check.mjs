@@ -3,6 +3,14 @@ import {packMarblePhoto} from '../examples/meowdoku/web/marble_photo.js';
 import {clientIntersectionEligible,createPhotoParticipation} from '../examples/meowdoku/web/marble_photo_participation.js';
 const config=options=>{const b=packMarblePhoto({interior:[],glass:[]},'a'.repeat(64),options);return JSON.parse(new TextDecoder().decode(new Uint8Array(b,16,new DataView(b).getUint32(4,true))));};
 assert.equal(config({resolution:4096}).tiled,undefined);
+assert.equal(config({resolution:4096}).samples_per_output_pixel,undefined);
+const sampled=config({resolution:512,samplesPerOutputPixel:64,oversampling:2});
+assert.equal(sampled.samples_per_output_pixel,64);
+assert.deepEqual(sampled.tiled,{tile_size:1024});
+assert.deepEqual(config({resolution:512,samplesPerOutputPixel:64}).tiled,{tile_size:1024});
+for(const value of [null,true,0,-1,1.5,Infinity,'64',65537])
+  assert.throws(()=>config({samplesPerOutputPixel:value}),/samples per output pixel/i);
+assert.throws(()=>config({samplesPerOutputPixel:64,clientIntersections:true}),/Device intersections require/);
 assert.deepEqual(config({resolution:8192}).tiled,{tile_size:1024});
 assert.deepEqual(config({resolution:8192,oversampling:2,tiled:{tile_size:4096}}).tiled,{tile_size:4096});
 const custom=config({width:8001,height:6001});

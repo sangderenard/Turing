@@ -84,6 +84,9 @@ from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilit
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
 from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
+from meowdoku.rest_api import reports as shared_reports
+from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
+from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
 from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
 from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
@@ -367,7 +370,8 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
-        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer")
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer",
+                                                        users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
         from meowdoku.living_data_cursor import CursorStore
@@ -960,6 +964,13 @@ def make_handler(sessions: Sessions):
             return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
         # ---- end [DIVIDER]
 
+        def _reports_route(self, path: str, method: str) -> None:
+            return shared_reports.route(self, path, method,
+                service_type=experience_reports_mod.Service, accounts=sessions.accounts,
+                account_cookie=ACCOUNT_COOKIE, ReportError=experience_reports_mod.ReportError,
+                SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
+                max_body=experience_reports_mod.MAX_BODY)
+
         # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
         def _issues_route(self, path: str, method: str) -> None:
             from http.cookies import SimpleCookie, CookieError
@@ -1067,6 +1078,84 @@ def make_handler(sessions: Sessions):
                 if db is not None:
                     db.close()
         # ---- end [PROFILE]
+
+        # ---- [CONTROL] /api/control/instances: force a shutdown, restart or start of an instance (instance_control.py).
+        # Not under /api/admin: the proxy refuses that whole prefix, which belongs to the loopback token endpoints.  This one
+        # is authorized by the signed-in account's role, so it is reachable wherever the account is.
+        # GET lists the instances and the recent requests; POST {instance, action, reason?, delay?} records a request that the
+        # supervisor performs within a second or two, or after ``delay`` seconds (a countdown it announces to every admin
+        # through Nodus); POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
+        # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        def _reviews_route(self, path: str, method: str) -> None:
+            """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
+            from meowdoku import branch_gate, branch_review
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
+        def _git_route(self, path: str, method: str) -> None:
+            """[GIT] Git in the core, regulated: declared read operations for accounts holding core_git (core_git.py)."""
+            from meowdoku import branch_gate, core_git
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return core_git.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
+        def _relay_route(self, path: str, method: str) -> None:
+            """[RELAY] datagrams and packages, address to address, for any signed-in account (relay.py)."""
+            from meowdoku import relay
+            self._classify()
+            declared = HERE / "deploy" / "relay.json"
+            return relay.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                    config=relay.load_config(declared if declared.is_file() else None))
+
+        def _instance_control(self, method: str, cancel: bool = False) -> None:
+            import sqlite3
+            from meowdoku import instance_control
+            self._classify()
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            principal = self._principal()
+            if principal.user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            caps = self._caps()
+            if "account_manage" not in caps and "lifecycle_admin" not in caps:
+                return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
+            body = None
+            if method == "POST":
+                if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                    return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                body = self._body_json(2048)
+                if body is None:
+                    return
+            db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
+            try:
+                known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
+                if method == "GET":
+                    return self._json({"instances": known, "requests": instance_control.recent(db)})
+                if cancel:                               # the interrupt: stop a request whose countdown is still running
+                    made = instance_control.cancel(db, body.get("id"), user_id=principal.user_id, username=principal.username)
+                    print(f"[control] {principal.username} interrupted request {made['id']}", flush=True)
+                    return self._json({"request": made})
+                made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
+                                                user_id=principal.user_id, username=principal.username,
+                                                reason=body.get("reason"), delay_s=body.get("delay", 0),
+                                                known=[i["name"] for i in known])
+                print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
+                return self._json({"request": made}, HTTPStatus.ACCEPTED)
+            except instance_control.ControlError as error:
+                return self._json({"error": error.message}, error.status)
+            except profile_mod.ProfileError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+        # ---- end [CONTROL]
 
         def _living_data_dm(self, path, method):
             from meowdoku.living_data_cursor import CursorError
@@ -1433,7 +1522,7 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
-            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith("/api/issues") and self.close_connection:
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports")) and self.close_connection:
                 self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
@@ -1841,10 +1930,14 @@ def make_handler(sessions: Sessions):
                 return self._living_data_cursor(path, "GET")
             if path.startswith("/api/show/pictures/"):
                 return self._picture_route(path, "GET")
+            if path == "/api/control/instances":
+                return self._instance_control("GET")
             if path == "/site" or path.startswith("/site/"):
                 return self._site_get(path)
             if path == "/api/issues" or path.startswith("/api/issues/"):
                 return self._issues_route(path, "GET")
+            if path == "/api/reports" or path.startswith("/api/reports/"):
+                return self._reports_route(path, "GET")
             if path == "/api/tickets":
                 if not self._require("dev_ui"):
                     return
@@ -1858,6 +1951,18 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path, "GET")
+            if path.startswith("/api/git/"):                      # [GIT]
+                return self._git_route(path, "GET")
+            if path.startswith("/api/relay/"):                    # [RELAY]
+                return self._relay_route(path, "GET")
+            if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
+                from meowdoku import file_index
+                self._classify()
+                return file_index.http_route(self, path, db_path=Path(sessions.accounts_db).with_name("file_index.db"))
+            if path == "/api/index" and shared_catalog is not None:   # [INDEX] the declared catalog of this API
+                return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
             if path.startswith("/api/profile/"):                  # [PROFILE]
@@ -1895,7 +2000,7 @@ def make_handler(sessions: Sessions):
                     return self._json(lens_catalog(sessions.marble_photos.spectral_root))
                 except (ValueError, OSError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
-            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
+            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation"):
                 if not self._require("photo_read"):
                     return
                 from urllib.parse import parse_qs
@@ -1903,34 +2008,47 @@ def make_handler(sessions: Sessions):
                 digest = (query.get("digest") or [""])[0]
                 try:
                     # Read-only visitors must not inherit the old submitter access to unindexed photos.
-                    self._job_authorize(digest, allow_legacy="photo_submit" in self._caps())
+                    self._job_authorize(digest, allow_legacy=path != "/api/marble_photo/field" and "photo_submit" in self._caps())
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
+                    lane_raw = (query.get("lane") or ["0"])[0]
+                    if not lane_raw.isdecimal() or len(lane_raw) > 2:
+                        raise marble_photo_mod.PhotoError("invalid sensor lane", 400)
+                    lane = int(lane_raw)
                     artifact = None
                     if path == "/api/marble_photo/animation":
                         body = sessions.marble_photos.animation(digest)
                         length = len(body)
                     else:
-                        artifact = sessions.marble_photos.open_artifact(digest, name, hdr=path.endswith("/hdr"))
-                        length = os.fstat(artifact.fileno()).st_size
+                        artifact = (sessions.marble_photos.open_field(digest, name) if path.endswith("/field") else
+                                    sessions.marble_photos.open_artifact(digest, name,
+                                        hdr=path.endswith("/hdr"), lane=lane))
+                        try:
+                            length = os.fstat(artifact.fileno()).st_size
+                        except BaseException:
+                            artifact.close()
+                            raise
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
-                self._set_cookie = []
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
-                                 "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
-                if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
-                    self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
-                self.send_header("Content-Length", str(length))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                if artifact is not None:
-                    with artifact:
+                try:
+                    self._set_cookie = []
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
+                                     "application/octet-stream" if path in ("/api/marble_photo/hdr", "/api/marble_photo/field") else "image/png")
+                    if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
+                        self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if artifact is not None:
                         while block := artifact.read(1024 * 1024):
                             self.wfile.write(block)
-                else:
-                    self.wfile.write(body)
+                    else:
+                        self.wfile.write(body)
+                finally:
+                    if artifact is not None:
+                        artifact.close()
                 return
             if path == "/api/obj_assets" or path.startswith("/api/obj_assets/"):
                 account = self._account()
@@ -2311,8 +2429,20 @@ def make_handler(sessions: Sessions):
                 return self._living_data_query()
             if path0 == "/api/show/pictures":
                 return self._picture_route(path0, "POST")
+            if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path0, "POST")
+            if path0.startswith("/api/git/"):                     # [GIT]
+                return self._git_route(path0, "POST")
+            if path0.startswith("/api/relay/"):                   # [RELAY]
+                return self._relay_route(path0, "POST")
+            if path0 == "/api/control/instances":
+                return self._instance_control("POST")
+            if path0 == "/api/control/instances/cancel":
+                return self._instance_control("POST", cancel=True)
             if path0 == "/api/issues" or path0.startswith("/api/issues/"):
                 return self._issues_route(path0, "POST")
+            if path0 == "/api/reports" or path0.startswith("/api/reports/"):
+                return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
             if path0.startswith("/api/nodus/"):                # [NODUS]
@@ -2426,6 +2556,43 @@ def make_handler(sessions: Sessions):
                     return
                 except (ValueError, TypeError) as error:
                     self.close_connection = True
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 == "/api/marble_camera/trigger_grid":
+                if self._is_viewer():
+                    return self._refuse_viewer()
+                if not self._require("photo_submit"):
+                    return
+                account = self._account()
+                if account is None:
+                    return self._json({"error": "Log in to edit camera routing"}, HTTPStatus.UNAUTHORIZED)
+                body = self._body_json(limit=262144)
+                if body is None:
+                    return
+                try:
+                    from meowdoku.trigger_grid_service import command
+                    return self._json(command(account["id"], body, sessions.marble_photos.spectral_root))
+                except (ValueError, TypeError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            if path0 == "/api/marble_photo/calibration_qr":
+                if not self._require("photo_read"):
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 4096:
+                    return self._json({"error": "invalid calibration registration request"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("invalid calibration registration request")
+                    digest, name, lane = body.get("digest"), body.get("name"), body.get("lane", 0)
+                    self._job_authorize(digest)
+                    with sessions.marble_photos.open_artifact(digest, name, lane=lane) as artifact:
+                        png = artifact.read(4 * 1024 * 1024 + 1)
+                    if len(png) > 4 * 1024 * 1024:
+                        raise ValueError("calibration image is too large")
+                    from meowdoku.marble_calibration_qr import register_calibration_qr
+                    return self._json(register_calibration_qr(png, body.get("modules"),
+                        full_card=name.startswith("marker-")))
+                except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 in ("/api/marble_photo", "/api/marble_photo/cancel", "/api/marble_photo/live", "/api/marble_photo/retouch", "/api/marble_photo/film_preview") and not self._is_viewer():
                 if not self._require("share_live" if path0 == "/api/marble_photo/live" else "photo_submit"):

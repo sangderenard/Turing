@@ -160,3 +160,43 @@ def test_truncated_error_body_keeps_http_status_and_uncertainty():
     with pytest.raises(client.ClientError) as e:
         c.call('/api/messages/send', {'body': 'hello'})
     assert e.value.status == 500 and e.value.uncertain
+
+
+def test_png_validation_and_image_retry(tmp_path):
+    from PIL import Image
+    path = tmp_path / 'image.png'
+    Image.new('RGB', (2, 2), 'red').save(path)
+    a = args()
+    a.image = str(path)
+    c = Fake()
+    assert client.run(c, a) == 0
+    sends = [b for p, b in c.calls if p.endswith('/send')]
+    assert sends[0]['image'] == sends[1]['image'] == client.read_image(str(path))
+    assert sends[0]['idempotency_key'] == sends[1]['idempotency_key']
+    assert not any(p.endswith('/images') for p, b in c.calls)
+    path.write_bytes(b'\x89PNG\r\n\x1a\nnot a real PNG')
+    with pytest.raises(client.ClientError, match='validate PNG'):
+        client.read_image(str(path))
+    path.write_bytes(b'x' * 2097153)
+    with pytest.raises(client.ClientError, match='2 MiB'):
+        client.read_image(str(path))
+
+
+@pytest.mark.parametrize('flag,enabled', [('--enable', True), ('--disable', False)])
+def test_image_opt_in_only_changes_current_user(flag, enabled):
+    class Images:
+        def __init__(self): self.calls = []
+        def call(self, path, body=None):
+            self.calls.append((path, body))
+            if path.endswith('/conversations'):
+                return {'contacts': [{'username': 'ben', 'conversation_handle': 'opaque'}]}
+            return {'enabled': enabled, 'peer_enabled': False, 'available': False}
+    a = client.build_parser().parse_args(['--base', 'https://example.test', '--user', 'ann', 'images', 'BEN', flag])
+    c = Images()
+    assert client.run(c, a) == 0
+    assert c.calls[-1] == ('/api/messages/images', {'conversation_handle': 'opaque', 'enabled': enabled})
+
+
+def test_emit_preserves_locked_image(capsys):
+    client._emit({'id': 5, 'body': 'caption', 'image': {'locked': True}})
+    assert json.loads(capsys.readouterr().out)['image'] == {'locked': True}

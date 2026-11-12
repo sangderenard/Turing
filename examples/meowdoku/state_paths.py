@@ -83,6 +83,10 @@ class StatePaths:
         return self.content_dir / "marble_photos"
 
     @property
+    def users_dir(self) -> Path:
+        return self.content_dir / "users"
+
+    @property
     def obj_assets_dir(self) -> Path:
         return self.content_dir / "obj_assets"
 
