@@ -50,6 +50,9 @@ INTEGRATION SPEC (server.py is not in this branch).  Build the principal once in
     ~1423 /api/action single EDIT_ACTIONS require_tier edit        same                                     owner_tools
     new   account admin endpoints (grant/revoke/list)              role management                          account_manage
 
+PHOTO READ.  All default tiers allow photo_read; photo GETs retain their identity checks.
+A read-only caller cannot read unindexed legacy photos. Rendering and mutations still require photo_submit/share_live.
+
 COMPILE SUBMIT.  ``compile_submit`` (POST /api/mathlab/jobs: spend the single math-lab worker's compile time) is granted by NO tier, only by
 the roles member, operator, service and admin, so a guest or an anonymous LAN visitor (tier edit) cannot submit.
 
@@ -85,7 +88,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
     _spec.loader.exec_module(_schema_version)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "message")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "message", "core_git")
 ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -96,7 +99,7 @@ DEFAULT_POLICY = {
         "shader": ["view_site", "photo_read"],
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
-        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "message")],
+        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "message", "core_git")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],
@@ -104,7 +107,8 @@ DEFAULT_POLICY = {
         # account that holds an instance's lowering leases may manage the library; no lifecycle_admin/account_manage.
         "service": ["studio_write", "photo_submit", "share_live", "library_manage", "federate", "compile_submit", "message"],
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
-        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit", "message"],
+        "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit", "message",
+                     "core_git"],      # core_git: Git in the core through core_git.py; no service account and no tier holds it
         "admin": list(CAPS),
         "guest": [],
     },

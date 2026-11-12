@@ -1,3 +1,4 @@
+import {CAMERA_BACK_PRESETS, cameraBack, cameraWithBack, sensorGate} from "./marble_camera_back.js";
 // Controls for the existing analytical camera, never a compound-renderer switch.
 export const FOCUS_MIN_M = .001;
 export const FOCUS_MAX_M = 10;
@@ -27,8 +28,9 @@ export function cameraFocusDiagnostic(camera) {
     warning:mismatch > .25 && pupilM > 0};
 }
 
-export function cameraWithLens(camera, settings, profiles = []) {
-  if (!settings || settings.key === "unchanged") return {...camera, lens_selection: null};
+export function cameraWithLens(camera, settings, profiles = [], aspect = 1) {
+  const back = settings?.back ?? null;
+  if (!settings || settings.key === "unchanged") return cameraWithBack({...camera, lens_selection: null}, back, aspect);
   const contract = settings.key === "custom" ? null : profiles.find(p => p.key === settings.key);
   if (settings.key !== "custom" && !contract) throw new Error("Lens collection unavailable; reload it or choose Custom analytical.");
   const f = finite(settings.focalMm / 1000, focalFromFov(100), FOCAL_MAX_M, "Focal length (m)");
@@ -42,11 +44,11 @@ export function cameraWithLens(camera, settings, profiles = []) {
   }
   const radius = f / (2 * n);
   finite(radius, .00001, PUPIL_RADIUS_MAX_M, "Pupil radius (m); increase f-number to reduce opening");
-  return {...camera, fov_degrees: fovFromFocal(f), aperture_radius_m: radius,
+  return cameraWithBack({...camera, fov_degrees: fovFromFocal(f), aperture_radius_m: radius,
     focus_distance_m: focus,
     lens_selection: {schema: SELECTION_SCHEMA, key: contract?.key ?? null,
       source_sha256: contract?.source_sha256 ?? null, focal_length_m: f,
-      f_number: n, sensor_height_m: SENSOR_HEIGHT_M}};
+      f_number: n, sensor_height_m: SENSOR_HEIGHT_M}}, back, aspect);
 }
 
 export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...args)} = {}) {
@@ -56,11 +58,16 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
   const select = $("photo-lens"), status = $("photo-lens-status");
   const focus = $("photo-focus-mm"), focal = $("photo-focal-mm"), aperture = $("photo-f-number");
   const focusSlider = $("photo-focus-slider"), focalSlider = $("photo-focal-slider"), apertureSlider = $("photo-aperture-slider");
+  const backMm = metres => Number((metres*1000).toFixed(3));
+  const backSelect=$("photo-camera-back"), backWidth=$("photo-back-width-mm"), backHeight=$("photo-back-height-mm");
+  if(backSelect)for(const p of CAMERA_BACK_PRESETS){const option=doc.createElement("option");option.value=p.key;
+    option.textContent=`${p.label} (${backMm(p.width_m)} × ${backMm(p.height_m)} mm)`;backSelect.append(option);}
+  const selectedBack=()=>cameraBack(backSelect?.value??"reference",+backWidth?.value,+backHeight?.value);
   let profiles = [], failure = "", lastValidFov = null;
-  const settings = () => ({key: select.value, focusMm: +focus.value, focalMm: +focal.value, fNumber: +aperture.value});
+  const settings = () => ({key: select.value, focusMm: +focus.value, focalMm: +focal.value, fNumber: +aperture.value, back:selectedBack()});
   const minimumFocus = () => profiles.find(p=>p.key===select.value)?.controls.focus_distance.minimum ?? FOCUS_MIN_M;
-  const applyCamera = camera => {
-    const result = cameraWithLens(camera, settings(), profiles), diagnostic = $("photo-focus-diagnostic");
+  const applyCamera = (camera, aspect=1) => {
+    const result = cameraWithLens(camera, settings(), profiles, aspect), diagnostic = $("photo-focus-diagnostic");
     const d = cameraFocusDiagnostic(result);
     if (diagnostic && d) {
       const text = `Camera target ${(d.distanceM*1000).toFixed(2)} mm away; axial focus ${(d.focusM*1000).toFixed(2)} mm. ` +
@@ -90,11 +97,19 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
     apertureSlider.value = String(Math.log2(+aperture.value));
     try {
       const result = applyCamera({focus_distance_m: .11, fov_degrees: 18});
-      lastValidFov = off ? null : result.fov_degrees;
-      status.textContent = off ? "Original framing, focus and pupil are unchanged. Choose Custom analytical or a source profile to enable controls." :
+      lastValidFov = off && !result.camera_back ? null : result.fov_degrees;
+      if(backSelect){
+        backWidth.disabled=backHeight.disabled=backSelect.value!=="custom";
+        const back=result.camera_back, gate=sensorGate(back);
+        if(back && back.key!=="custom"){backWidth.value=String(backMm(back.width_m));backHeight.value=String(backMm(back.height_m));}
+        $("photo-back-status").textContent=back ?
+          `${(back.width_m*1000).toFixed(2)} × ${(back.height_m*1000).toFixed(2)} mm back. Square output uses a centered ${(gate.width_m*1000).toFixed(2)} × ${(gate.height_m*1000).toFixed(2)} mm crop; other output aspects crop to fit without stretching. Pixel sizes, oversampling and tiling are independent.` :
+          "Original 24 mm reference height; width follows output aspect. Pixel sizes and render quality are unchanged.";
+      }
+      status.textContent = off ? (result.camera_back ? "Original lens focus and pupil; framing uses the selected back. Choose Custom analytical or a source profile to change lens settings." : "Original framing, focus and pupil are unchanged. Choose Custom analytical or a source profile to enable controls.") :
         `${contract ? "Authored profile approximation" : "Custom analytical camera"}: ${(+focal.value).toFixed(2)} mm, f/${(+aperture.value).toFixed(2)}, axial focus ${(+focus.value).toFixed(2)} mm. FOV ${result.fov_degrees.toFixed(2)}°; entrance-pupil radius ${(result.aperture_radius_m * 1000).toFixed(2)} mm. ` +
         (contract?.controls.focus_distance.minimum != null ? `Source minimum focus ${focusMin} mm; its original distance datum is unspecified. ` : "1 mm is a numerical limit, not a real lens close-focus promise. ") +
-        "24 mm reference sensor height; width follows image aspect. No calibrated distortion, vignetting or lens spectral transmission is applied. " +
+        (result.camera_back ? "Selected physical back is center-cropped to the output aspect. " : "24 mm reference sensor height; width follows image aspect. ") + "No calibrated distortion, vignetting or lens spectral transmission is applied. " +
         (contract && nMin > contract.controls.aperture.minimum ? `The source opens to f/${contract.controls.aperture.minimum}; this renderer's 31.25 mm pupil-radius limit requires f/${nMin.toFixed(2)} or higher. ` : "") +
         (contract?.source_profile?.specs_only ? "Specs-only mirror lens: minimum focus is unknown; central obstruction and annular bokeh are not modeled. " : "") +
         "10 m focus and f/64 are application travel limits; a source fixed aperture remains fixed.";
@@ -103,6 +118,7 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
     if (failure) status.textContent += " " + failure;
     doc.dispatchEvent?.(new (doc.defaultView?.Event ?? Event)("studio-lens-change"));
   };
+  for(const el of [backSelect,backWidth,backHeight])el?.addEventListener(el===backSelect?"change":"input",sync);
   select.addEventListener("change", () => {
     const c = profiles.find(p => p.key === select.value);
     if (c) {
@@ -137,8 +153,8 @@ export function createStudioLensControls(doc, {fetcher = (...args) => fetch(...a
       if (custom) {
         finite(distanceM, FOCUS_MIN_M, FOCUS_MAX_M, "Axial focus (m)");
         if (!camera) throw new Error("The actual camera is required to preserve framing and pupil.");
-        const f = focalFromFov(camera.fov_degrees), n = f/(2*camera.aperture_radius_m);
-        const next = {key:"custom",focusMm:distanceM*1000,focalMm:f*1000,fNumber:n};
+        const f = camera.lens_selection?.focal_length_m ?? focalFromFov(camera.back_reference_fov_degrees ?? camera.fov_degrees), n = f/(2*camera.aperture_radius_m);
+        const next = {key:"custom",focusMm:distanceM*1000,focalMm:f*1000,fNumber:n,back:selectedBack()};
         cameraWithLens(camera,next,profiles); // Validate before changing any UI state.
         select.value="custom";focal.value=String(next.focalMm);aperture.value=String(n);
         focus.value=String(next.focusMm);sync();return;

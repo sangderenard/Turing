@@ -75,6 +75,7 @@ def plan(legacy_base, root) -> list[Step]:
     skip_db = lambda p: p.name.startswith("job-library.sqlite")      # the database travels by the backup API, not as a byte copy
     add_dir("content", old.marble_objects_dir, new.marble_objects_dir)
     add_dir("content", old.marble_photos_dir, new.marble_photos_dir, skip_db)
+    add_dir("content", old.users_dir, new.users_dir)
     add_dir("content", old.obj_assets_dir, new.obj_assets_dir)
     add_dir("content", old.shares_dir, new.shares_dir)
     add_dir("content", old.tickets_dir, new.tickets_dir)

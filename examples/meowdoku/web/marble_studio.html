@@ -104,19 +104,19 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <div id="studio-scale-controls" class="wide grid"></div>
     <p class="wide">A (exposure) owns these lights and room settings. B (room) follows A unless a setting is unlocked for Phong only. Filters start white; zero strength switches a light off.</p>
     <label>Key Left strength <output id="light-strength-left-out"></output><input id="light-strength-left" type="range" min="0" max="4000" value="220"></label>
-    <label>Key Left filter<input id="key-filter-left" type="color" value="#ffffff"></label>
+    <label>Key Left filter<input id="key-filter-left" type="color" value="#ffffff"></label><label><input id="key-filter-left-off" type="checkbox"> Filter off</label>
     <label>Key Right strength <output id="light-strength-right-out"></output><input id="light-strength-right" type="range" min="0" max="4000" value="0"></label>
-    <label>Key Right filter<input id="key-filter-right" type="color" value="#ffffff"></label>
+    <label>Key Right filter<input id="key-filter-right" type="color" value="#ffffff"></label><label><input id="key-filter-right-off" type="checkbox"> Filter off</label>
     <label>Background strength <output id="light-bg-strength-out"></output><input id="light-bg-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Background filter<input id="background-filter" type="color" value="#ffffff"></label>
+    <label>Background filter<input id="background-filter" type="color" value="#ffffff"></label><label><input id="background-filter-off" type="checkbox"> Filter off</label>
     <label>Kicker Left strength <output id="light-kicker-left-strength-out"></output><input id="light-kicker-left-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Kicker Left filter<input id="kicker-left-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Left filter<input id="kicker-left-filter" type="color" value="#ffffff"></label><label><input id="kicker-left-filter-off" type="checkbox"> Filter off</label>
     <label>Kicker Right strength <output id="light-kicker-right-strength-out"></output><input id="light-kicker-right-strength" type="range" min="0" max="2000" value="15"></label>
-    <label>Kicker Right filter<input id="kicker-right-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Right filter<input id="kicker-right-filter" type="color" value="#ffffff"></label><label><input id="kicker-right-filter-off" type="checkbox"> Filter off</label>
     <label>Fill Lower strength <output id="light-fill-lower-strength-out"></output><input id="light-fill-lower-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Fill Lower filter<input id="fill-lower-filter" type="color" value="#ffffff"></label>
+    <label>Fill Lower filter<input id="fill-lower-filter" type="color" value="#ffffff"></label><label><input id="fill-lower-filter-off" type="checkbox"> Filter off</label>
     <label>Fill Upper strength <output id="light-fill-upper-strength-out"></output><input id="light-fill-upper-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Fill Upper filter<input id="fill-upper-filter" type="color" value="#ffffff"></label>
+    <label>Fill Upper filter<input id="fill-upper-filter" type="color" value="#ffffff"></label><label><input id="fill-upper-filter-off" type="checkbox"> Filter off</label>
     <label>Left key angle (degrees)<input id="key-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left key radial distance (Studio units)<input id="key-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-left-placement-status" class="wide" role="status"></output>
     <label>Right key angle (degrees)<input id="key-right-arc" type="number" min="-180" max="180" step="0.1"></label><label>Right key radial distance (Studio units)<input id="key-right-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-right-placement-status" class="wide" role="status"></output>
     <label>Left kicker angle (degrees)<input id="kicker-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left kicker radial distance (Studio units)<input id="kicker-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="kicker-left-placement-status" class="wide" role="status"></output>
@@ -127,13 +127,13 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output id="background-placement-status" class="wide" role="status"></output><p class="wide">Kicker inset sets the base radius from the straight subject-back wall line, then its angle sweeps that radius around the subject. Background inset is its distance in front of the back wall. Changing room size updates these readouts without moving saved lights.</p>
     <p class="wide">Key angle zero is the camera-side +Z line; kicker zero is the subject-back −Z line. Positive angles sweep toward each light’s own side; 45° is diagonal and 180° reaches the opposite/front line. Radius is distance from the subject axis. New rigs are fitted near their respective room walls; these views edit saved absolute poses, not automatic wall-following.</p>
     <label>Table stage left strength <output id="light-table-left-strength-out"></output><input id="light-table-left-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Table stage left filter<input id="table-left-filter" type="color" value="#ffffff"></label>
+    <label>Table stage left filter<input id="table-left-filter" type="color" value="#ffffff"></label><label><input id="table-left-filter-off" type="checkbox"> Filter off</label>
     <label>Stage left arc (degrees)<input id="table-left-arc" type="number" min="-180" max="180" step="0.1" value="-86.906" aria-describedby="stage-placement-help table-left-placement-status"></label>
     <label>Stage left elevation (degrees)<input id="table-left-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
     <label>Stage left radius (Studio units)<input id="table-left-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-left-placement-status"></label>
     <output class="wide" id="table-left-placement-status" role="status"></output>
     <label>Table stage right strength <output id="light-table-right-strength-out"></output><input id="light-table-right-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Table stage right filter<input id="table-right-filter" type="color" value="#ffffff"></label>
+    <label>Table stage right filter<input id="table-right-filter" type="color" value="#ffffff"></label><label><input id="table-right-filter-off" type="checkbox"> Filter off</label>
     <label>Stage right arc (degrees)<input id="table-right-arc" type="number" min="-180" max="180" step="0.1" value="86.906" aria-describedby="stage-placement-help table-right-placement-status"></label>
     <label>Stage right elevation (degrees)<input id="table-right-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
     <label>Stage right radius (Studio units)<input id="table-right-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-right-placement-status"></label>
@@ -159,7 +159,7 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output class="wide" id="top-fill-height-status" role="status"></output>
     </fieldset>
     <label>Gridded underlight strength <output id="light-under-strength-out"></output><input id="light-under-strength" type="range" min="0" max="2000" value="15"></label>
-    <label>Gridded underlight filter<input id="under-filter" type="color" value="#ffffff"></label>
+    <label>Gridded underlight filter<input id="under-filter" type="color" value="#ffffff"></label><label><input id="under-filter-off" type="checkbox"> Filter off</label>
     <label class="wide">Underlight height (Studio Y)<input id="underlight-height" type="number" min="-50" max="50" step="0.01" value="-1.60" aria-describedby="underlight-height-help underlight-height-status"></label>
     <p class="wide" id="underlight-height-help">More negative lowers the light. The table top is at Y = -1.00; the fresh underlight default is -1.60. This is the same Y position available in Advanced, saved with the lighting profile.</p>
     <output class="wide" id="underlight-height-status" role="status"></output>
@@ -212,19 +212,69 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output id="object-status" class="wide" role="status">Saved designs are shared with the particle simulator.</output>
   </div>
   <h2>Colour calibration</h2><div class="grid" id="calibration-controls">
+    <button id="calibration-exposure-preset" type="button" class="wide">Set up 500 mock lux exposure calibration</button>
+    <p class="wide">Adds a 64 mm reflective black, 18% grey and white ring card with a matte color cross behind the marble. The static sweep captures the main RGB view and a monochrome thin-lens meter pose beside the subject. Mock lux is a declared Studio scale at the card, not a measured lamp output. The log image presents unchanged linear sensor data; fitted curves remain candidates until verified. Dynamic scenes need paired readings at each timeline slice.</p>
     <label class="wide">Calibration recipe (YAML)<input id="calibration-yaml-upload" type="file" accept=".yaml,.yml,text/yaml"></label>
     <button id="calibration-run" disabled>Run calibration</button>
+    <button id="calibration-watch" type="button" disabled>Watch accumulating calibration</button>
+    <label>Watcher Studio duration<select id="calibration-watch-duration"><option value="12">12 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option></select></label>
+    <button id="calibration-watch-stop" type="button" disabled>Stop watcher</button>
+    <p class="wide">The watcher registers the chart once, then keeps one static Studio scene accumulating in disjoint RGB and monochrome sensor lanes for the selected duration (up to the photo contract's one-hour limit). Stop ends it early. Each sensor gets a separate static viewer page; the RGB page can switch spectral false color off to show visible bands without changing sensor data. Sparse linear chart readings update its response curve on each published slice. The secondary Phong field is optional. Timed captions are view-only and never enter the captured scene.</p>
     <output id="calibration-status" class="wide" role="status">Upload a calibration YAML to run an automatic single-light colour sweep.</output>
+    <div id="calibration-watch-view" class="wide" hidden></div>
     <div id="calibration-gallery" class="wide" hidden></div>
     <button id="calibration-download" class="wide" hidden>Download calibration dataset (JSON)</button>
     <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
   </div>
+  <h2>Phong photos &amp; video</h2><div class="grid" id="phong-capture-controls">
+    <button type="button" id="phong-capture-photo" disabled>Take Phong PNG</button>
+    <label>Video frame rate<select id="phong-capture-fps"><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
+    <button type="button" id="phong-capture-start" disabled>Record Phong video</button><button type="button" id="phong-capture-stop" disabled>Stop recording</button>
+    <output class="wide" id="phong-capture-status" role="status" aria-live="polite">Waiting for the first completed Phong frame.</output>
+    <a class="wide" id="phong-capture-png" hidden download>Download PNG</a><a class="wide" id="phong-capture-video" hidden download>Download video</a>
+    <p class="wide">Captures the displayed Phong canvas at its pixel size, including its active secondary passes and depth-of-field. Ray overlays and controls are excluded. No ray job or audio is started. Video runs at up to the selected frame rate and stops after two minutes, when the preview size changes, or when you leave this tab. Maximum 128 MiB. Download before closing the page.</p>
+  </div>
+  <h2>Ray field in Phong</h2><div class="grid" id="phong-light-field-controls">
+    <label class="wide"><input type="checkbox" id="ray-surface-transport"> Corrected opaque PBR transport for ray photos and Live</label>
+    <p class="wide">Uses the corrected diffuse/specular mixture for opaque PBR surfaces. Glass and native conductors keep their existing transport. Changing this setting starts a new Live job; it does not change lights or exposure.</p>
+    <label class="wide"><input type="checkbox" id="phong-light-field"> Receive the ray tracer's directional field bundle</label>
+    <label class="wide"><input type="checkbox" id="phong-field-responses"> Copy evaluated native responses into the scene field (required for secondary material passes; extra recording, opt-in)</label>
+    <label>Direction stencil <select id="phong-field-stencil"><option value="6">6 axis directions</option><option value="12" selected>12 geodesic directions</option></select></label>
+    <label>Recording region <select id="phong-field-region"><option value="scene" selected>Whole scene</option><option value="subject">Bounded subject</option></select></label>
+    <label>Subject cell size (mm)<input type="number" id="phong-field-cell-mm" value="0.5" min="0.05" max="10" step="0.05" disabled></label>
+    <label>Subject margin (mm)<input type="number" id="phong-field-margin-mm" value="1" min="0" max="32" step="0.5" disabled></label>
+    <p class="wide">Bounded subject recording covers its full outer geometry plus the requested margin and at least one outside cell. The server chooses the smallest 32 or 64 cube at the exact cell size. If it does not fit, the request is rejected rather than coarsened. Stage and room geometry remain in ray transport.</p>
+    <label>Spatial divisions / scale <select id="phong-field-grid-size"><option value="32">32 divisions per axis</option><option value="64" selected>64 divisions per axis</option></select></label>
+    <output class="wide" id="phong-field-division-status">World-space cell dimensions appear when a field bundle arrives. 64 divisions use 8× the spatial storage of 32.</output>
+    <fieldset class="wide" id="phong-field-categories"><legend>Apply the field to selected geometry</legend>
+      <label><input type="checkbox" id="phong-field-subject"> Subject</label>
+      <label><input type="checkbox" id="phong-field-stage"> Stage</label>
+      <label><input type="checkbox" id="phong-field-room"> Room</label>
+    </fieldset>
+    <output class="wide" id="phong-field-category-status">No receiving categories selected. Ordinary primary shading remains active.</output>
+    <p class="wide">These opt-ins select which geometry receives the same global field. They do not remove occluders or emitters, allocate separate grids, or restart the ray job.</p>
+    <p class="wide">The 64 grid has eight times as many spatial cells as 32. New fields average full-coverage pump estimates after correcting each root's replay count; partial-coverage pumps are excluded. Legacy fields remain readable and are labelled unnormalized. This normalization does not remove three-band spectral color limitations.</p>
+    <label class="wide"><input type="checkbox" id="phong-field-spatial-linear" checked> Energy-weighted spatial reconstruction (where supported)</label>
+    <label class="wide"><input type="checkbox" id="phong-field-secondary" checked> Secondary material passes: volumetric, reflectance, glass</label>
+    <label class="wide"><input type="checkbox" id="phong-field-specular" disabled> Separate Phong specular override (native downstream response is not split for this option)</label>
+    <output class="wide" id="phong-light-field-status" role="status">Off. Opt in before starting an RGB still or Live job.</output>
+    <output class="wide" id="phong-secondary-status" role="status">Secondary application requires matching, application-ready native responses. Typed-only data leaves ordinary Phong visible.</output>
+    <p class="wide">The response option retains native camera, forward, reactive and volume data with their original meanings and scene identities. Directional energy and scalar deposits are not treated as completed material radiance. The three material pass slots and sorted glass layers are retained, but no pass replaces Phong without a matching evaluated response and sampling availability. Missing, discarded or unsupported data means no information, not black. Legacy scalar mode is a separate glow preview, not completed secondary material shading. Use the static, unrolled pose with Room B linked to Exposure A. Scene and camera edits reject stale data.</p>
+  </div>
   <h2>Live ray-traced camera</h2><div class="grid" id="live-ray-controls">
-    <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Replace the camera with live rays</label>
+    <label>Live display <select id="live-display-mode"><option value="overlay" selected>Ray-traced image overlay</option><option value="field-feed">Phong with continuous light-field feed (no ray overlay)</option></select></label>
+    <p class="wide">Field-feed mode keeps Phong and the selected field responses visible while the same live ray worker streams field bundles. It skips downloading the image overlay; the worker still computes sensor samples. Choose the receiving categories above.</p>
+    <label class="wide"><input type="checkbox" id="live-emitter-sampling"> Configure canonical emitter sampling</label>
+    <label>Source population ray budget<input type="number" id="live-emitter-ray-budget" min="128" max="65536" step="1" value="4096" disabled></label>
+    <label>Initial angular sampling seed<input type="number" id="live-emitter-seed" min="0" max="2147483647" step="1" value="42" disabled></label>
+    <label class="wide"><input type="checkbox" id="live-emitter-refresh" checked disabled> Refresh emitter angular samples each sweep</label>
+    <label class="wide"><input type="checkbox" id="live-field-internal-media"> Record traced paths inside optical media in the field (requires fresh Live populations)</label>
+    <p class="wide">Field-feed mode enables these controls. Fresh angular source populations are integrated into successive cumulative field updates. The seed changes canonical angular disk samples; emitter positions and the spectral band cycle stay fixed. The actual rounded source count must fit the forward-ray batch below. Changing sampling settings starts a replacement live job. No gain or targeting bias is added.</p>
+    <label class="wide"><input type="checkbox" id="live-rays" aria-describedby="live-status"> Run live rays in the selected display mode</label>
     <output class="wide" id="live-status" role="status" aria-live="polite" style="white-space:normal;overflow-wrap:anywhere">Enable live rays to save the current static design, or save/load one manually.</output>
     <label>Ray history per pixel <output id="live-history-out">16</output><input id="live-history" type="range" min="1" max="2722" step="1" value="16"><input id="live-history-count" type="number" min="1" max="2722" step="1" value="16" aria-label="Exact live ray history per pixel"></label>
     <label>Forward rays per sensor sweep<input id="live-ray-batch" type="number" min="128" max="65536" step="1" value="8192" aria-describedby="live-batch-help"></label>
-    <p class="wide" id="live-batch-help">Actual total forward rays across the scene: 128–65,536. Lower batches respond faster; higher batches add more light-field samples. Changes apply at the next sensor-sweep boundary and reset accumulated history. The additive light field can also become brighter with a larger batch.</p>
+    <p class="wide" id="live-batch-help">Actual total forward rays across the scene: 128–65,536. Lower batches respond faster; higher batches add samples. This is distinct from the source population budget above. A complete normalized update must cover every actual source root. Changes apply at a sensor-sweep boundary and reset accumulated history; batch size is not a brightness control.</p>
     <label>Live longest edge<select id="live-resolution"><option value="128">128 pixels</option><option value="256" selected>256 pixels</option><option value="512">512 pixels</option><option value="768">768 pixels (cooperative)</option><option value="1024">1024 pixels (cooperative)</option><option value="2048">2048 pixels (cooperative)</option><option value="4096">4096 pixels (cooperative)</option></select></label>
     <output class="wide" id="live-history-memory" aria-live="polite"></output>
     <label class="wide"><input id="live-checkpoint" type="checkbox" checked> Keep evicted rays in a linear checkpoint</label>
@@ -254,7 +304,7 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output class="wide" id="live-client-status" role="status"></output><div class="wide" id="live-client-participation"></div>
     <label class="wide"><input id="photo-client-intersections" type="checkbox"> Use this device for this exposure’s triangle intersections (experimental)</label>
     <div id="photo-client-participation" class="wide"></div>
-    <details class="wide" open><summary>My jobs</summary><section id="marble-jobs"></section></details>
+    <details class="wide" open><summary>My assets and render jobs</summary><p>Finished stills and orbit animations from Studio, REST and MCP appear here for your signed-in account. Loading screen recordings have their own <a href="studio.html">Loading Studio</a>.</p><section id="marble-jobs" data-preview="true"></section></details>
   </div></section>
   <h2>Thin-lens photograph</h2><div class="grid" id="photo-controls">
     <strong class="wide">Exposure geometry · photos and live rays</strong>
@@ -264,6 +314,10 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <p class="wide" id="photo-geometry-diagnostic" role="status" aria-live="polite">Geometry counts will be reported by the next photo or live scene.</p>
     <details id="photo-lens-controls" class="wide"><summary>Lens collection · focus, focal length &amp; aperture</summary><div class="grid">
       <label class="wide">Analytical lens<select id="photo-lens"><option value="unchanged" selected>Original camera settings (no overrides)</option><option value="custom">Custom analytical lens</option></select></label>
+      <label class="wide">Camera back geometry<select id="photo-camera-back" aria-describedby="photo-back-status"><option value="reference" selected>Original 24 mm reference height</option><option value="custom">Custom physical back</option></select></label>
+      <label>Back width (mm)<input id="photo-back-width-mm" type="number" min="1" max="300" step="any" value="36" disabled></label>
+      <label>Back height (mm)<input id="photo-back-height-mm" type="number" min="1" max="300" step="any" value="24" disabled></label>
+      <p id="photo-back-status" class="wide" role="status" aria-live="polite">Physical geometry only. Output sizes and tiling remain independent.</p>
       <label>Axial focus distance (mm)<input id="photo-focus-mm" type="number" min="1" max="10000" step="any" value="110" disabled><input id="photo-focus-slider" aria-label="Axial focus distance, logarithmic slider" type="range" min="0" max="4" step="0.001" value="2.041392685" disabled></label>
       <label>Focal length / zoom (mm)<input id="photo-focal-mm" type="number" min="10.069" max="500" step="any" value="75.76501818" disabled><input id="photo-focal-slider" aria-label="Focal length and zoom" type="range" min="10.07" max="500" step="any" value="75.76501818" disabled></label>
       <label>Aperture (f-number)<input id="photo-f-number" type="number" min="1" max="64" step="any" value="18.94125455" disabled><input id="photo-aperture-slider" aria-label="Aperture f-number, logarithmic slider" type="range" min="0" max="6" step="0.001" value="4.24346" disabled></label>
@@ -277,9 +331,20 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
       <p class="wide">These controls reuse the existing component-built shader. Focal length changes field of view; scrolling still moves the camera. Prime profiles have fixed focal length. Changes leave an active photograph unchanged.</p>
     </div></details>
     <label>Photo camera<select id="photo-camera"><option value="builtin" selected>Built-in close-up</option><option value="studio">Current Studio orbit and zoom</option></select></label>
-    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option></select></label>
-    <label>Light transport<select id="photo-transport"><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
-    <label>Exposure per frame<select id="photo-seconds"><option value="0.1">0.1 second</option><option value="0.25">0.25 second</option><option value="0.5">0.5 second</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="180">3 minutes</option><option value="600">10 minutes</option><option value="1200">20 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option></select></label>
+    <label>Camera pattern<select id="photo-camera-pattern"><option value="single" selected>One sensor</option><option value="geodesic-faces">Icosahedron · 20 face-center sensors</option></select></label>
+    <label><input id="photo-camera-visible" type="checkbox" checked> Show camera housing in exposure</label>
+    <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option><option value="8192">8192 × 8192 (tiled)</option><option value="16384">16384 × 16384 (tiled)</option><option value="32768">32768 × 32768 (tiled)</option><option value="custom">Custom size (tiled)</option></select></label>
+    <label>Light transport<select id="photo-transport"><option value="fixed:8">Eight bands · 365, 395, 450, 550, 590, 650, 850, 940 nm</option><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
+    <label>Oversampling<select id="photo-oversampling"><option value="1">1×</option><option value="2">2× each dimension</option><option value="3">3× each dimension</option><option value="4">4× each dimension</option></select></label>
+    <label>Tile size<select id="photo-tile-size"><option value="auto">Automatic (1024)</option><option value="512">512 × 512</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option></select></label>
+    <label>Custom width<input id="photo-width" type="number" min="128" max="32768" step="1" value="8192"></label>
+    <label>Custom height<input id="photo-height" type="number" min="128" max="32768" step="1" value="8192"></label>
+    <p class="hint">Custom, large, or oversampled sizes automatically use server tiles. Automatic tile size is 1024 pixels; choose another size above to override it. Oversampling multiplies both dimensions, then averages linear HDR samples to the requested output size. Internal dimensions are limited to 32768. Use RGB, one frame, and turn off device intersections. Exposure time applies to each tile; preparation and a complete sample pass can take longer. Large outputs require disk space. Tiled HDR retouch is download-only.</p>
+    <label>Exposure per frame / tile<select id="photo-seconds"><option value="0.1">0.1 second</option><option value="0.25">0.25 second</option><option value="0.5">0.5 second</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="180">3 minutes</option><option value="600">10 minutes</option><option value="1200">20 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option></select></label>
+    <label>Exposure substeps<input id="photo-substeps" type="number" min="1" max="216000" step="1" value="1800" aria-describedby="photo-substeps-help"></label>
+    <p id="photo-substeps-help" class="wide">One completed Studio tick advances one exposure substep. Model dt is shutter duration divided by substeps; at most 0.1 s per tick. Slow rendering slows the exposure clock. The photo job integrates the same number of sensor sweeps.</p>
+    <label>Simulated ISO<input id="photo-iso" type="number" min="25" max="6400" step="25" value="100"></label>
+    <label>Linear highlight clip, brightest pixels (%)<input id="photo-highlight-clip" type="number" min="0" max="25" step="1" value="25"></label>
     <label>Orbit frames<select id="photo-orbit-frames"><option value="1" selected>Still photo</option><option value="8">8 frames · full turn</option><option value="16">16 frames · full turn</option><option value="32">32 frames · full turn</option></select></label>
     <label>Display gamma <output id="photo-gamma-out">1.00</output><input id="photo-gamma" type="range" min="20" max="500" step="5" value="100"></label>
     <label>Bounce depth<select id="photo-bounce-mode"><option value="auto" selected>Auto (render cap 200)</option><option value="manual">Manual</option></select></label>
@@ -423,4 +488,5 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <button id="reset-material" class="wide">Restore catalogue material</button>
   </div>
   <p style="margin-top:14px">Save a design to keep its shape, materials and mechanical properties. Preview motion, lighting and thin-lens camera settings remain local to this page.</p>
-</aside></main><script type="module" src="marble_studio.js"></script><script type="module" src="marble_jobs.js"></script></body></html>
+</aside></main><script type="module" src="marble_studio.js"></script><script type="module" src="marble_jobs.js"></script><script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body></html>

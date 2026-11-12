@@ -22,7 +22,7 @@ export function studioRigToGame(sourceModel,targetModel) {
  * callback, after the exact appearance and real rendered icon are available.
  * Selection is always the user's original ammo picker action. */
 export async function installStudioCollection({assets,host=globalThis,onStatus=()=>{}}={}) {
-  if(!Array.isArray(assets)||!assets.length||assets.length>8)throw Error('Choose between one and eight Studio marble assets.');
+  if(!Array.isArray(assets)||assets.length>8)throw Error('Choose up to eight Studio marble assets.');
   if(host.mechanicalCreatureImportedAppearance)throw Error('The game already has an imported appearance adapter.');
   if(!host.mechanicalCreatureAmmo)throw Error('The original game ammunition hook is unavailable.');
   const entries=[],ids=new Set();

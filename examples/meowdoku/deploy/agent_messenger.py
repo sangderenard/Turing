@@ -1,22 +1,34 @@
-"""Command-line client for Meowdoku messaging (stdlib only): how the agent accounts (claude, codex) talk through the server.
+"""Command-line client for Meowdoku messaging (Pillow required only for PNG attachments): how the agent accounts (claude, codex) talk through the server.
 
   python agent_messenger.py --base https://stichka.duckdns.org:8766 --user claude contacts
   ... add <username> | accept <username> | send <username> <text | -> | read <username> [--limit N]
-  ... wait [--after ID] [--timeout S]      long-polls; prints incoming messages as JSON lines {id, from, to, created, body}; exit 0 on a
-                                           message, 3 on timeout
+  ... images <username> [--enable|--disable]   opt in only for your side of this chat
+  ... send <username> <text | -> [--image PNG] [--type note|status|question|handoff|approval_request|answer] [--subject KIND:REF]
+                                           KIND is lease|job|ticket|file|topic
+  ... wait [--after ID | --from-cursor] [--timeout S]
+                                           long-polls; prints incoming messages as JSON lines {id, from, to, created, body, subject, type};
+                                           exit 0 on a message, 3 on timeout; --from-cursor starts after the server-kept ack cursor
+  ... pending                              messages to me past my server-kept cursor, as JSON lines (does not advance the cursor)
+  ... ack <id>                             advance my server-kept cursor to <id> (the sender never sees it)
   ... inbox                                unread summary (per contact, plus pending requests)
 
 The password is read from --password-file, else <state>/secrets/operator_credentials/<user>.secret (state = --state-dir, else
 MEOWDOKU_STATE_DIR).  It is sent only to POST /api/account/login and never printed.  TLS is verified with the system store; the one
 exception is --insecure-test-ca <cafile>, which trusts that single CA file (for a test CA) instead.  Messaging is server-mediated and
-operator-readable.  Exit codes: 0 ok, 1 error, 3 wait timed out.
+operator-readable. Sends resolve a relationship handle over HTTPS and never include the recipient's name in the send payload.
+Use --idempotency-key with identical content to retry an uncertain send. Exit codes: 0 ok, 1 error, 3 wait timed out.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import http.cookiejar
+import http.client
 import json
+import math
 import os
+import secrets
 import ssl
 import sys
 import time
@@ -26,14 +38,24 @@ import urllib.request
 
 
 class ClientError(Exception):
-    pass
+    def __init__(self, message, status=None, uncertain=False):
+        super().__init__(message)
+        self.status, self.uncertain = status, uncertain
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ClientError("API redirect refused; use the verified HTTPS origin directly")
 
 
 class Client:
     def __init__(self, base: str, user: str, password: str, context: ssl.SSLContext | None = None):
         self.base = base.rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ClientError("--base must be an HTTPS origin without credentials, query or fragment")
         self.user = user
-        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())]
+        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), _NoRedirect()]
         if self.base.startswith("https://"):
             handlers.append(urllib.request.HTTPSHandler(context=context or ssl.create_default_context()))
         self.opener = urllib.request.build_opener(*handlers)
@@ -49,11 +71,16 @@ class Client:
         except urllib.error.HTTPError as error:
             try:
                 message = json.loads(error.read()).get("error", "")
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, http.client.HTTPException, OSError):
                 message = ""
-            raise ClientError(f"HTTP {error.code} {path.split('?')[0]}: {message}") from None
+            raise ClientError(f"HTTP {error.code} {path.split('?')[0]}: {message}", status=error.code,
+                              uncertain=error.code >= 500) from None
+        except (ValueError, UnicodeError):
+            raise ClientError("invalid JSON response; request outcome may be uncertain", uncertain=True) from None
+        except http.client.HTTPException:
+            raise ClientError("incomplete HTTP response; request outcome may be uncertain", uncertain=True) from None
         except (urllib.error.URLError, OSError) as error:
-            raise ClientError(f"cannot reach {self.base}: {getattr(error, 'reason', error)}") from None
+            raise ClientError(f"cannot reach {self.base}: {getattr(error, 'reason', error)}", uncertain=True) from None
 
     def _login(self, password: str) -> None:
         self.call("/api/account/login", {"username": self.user, "password": password})
@@ -77,8 +104,33 @@ def read_secret(user: str, password_file: str | None, state_dir: str | None) -> 
     return secret
 
 
+def read_image(path: str) -> dict:
+    """Bound before reading; Pillow verifies and decodes the actual PNG."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(2097153)
+        if len(data) > 2097152:
+            raise ClientError("PNG image exceeds 2 MiB")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ClientError("--image requires a PNG file")
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "PNG" or image.width * image.height > 16777216:
+                raise ClientError("PNG dimensions exceed 16 megapixels")
+            image.verify()
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+    except ClientError:
+        raise
+    except ImportError:
+        raise ClientError("PNG validation requires Pillow") from None
+    except Exception as error:
+        raise ClientError(f"cannot validate PNG: {error}") from None
+    return {"data": base64.b64encode(data).decode("ascii")}
+
+
 def _emit(message: dict) -> None:
-    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body")}, ensure_ascii=False), flush=True)
+    print(json.dumps({k: message[k] for k in ("id", "from", "to", "created", "body", "subject", "type", "image") if k in message}, ensure_ascii=False), flush=True)
 
 
 def run(client: Client, args) -> int:
@@ -89,9 +141,66 @@ def run(client: Client, args) -> int:
     elif cmd in ("add", "accept"):
         action = "request" if cmd == "add" else "accept"
         print(json.dumps(client.call("/api/messages/contacts", {"username": args.username, "action": action})))
+    elif cmd == "images":
+        if args.enable or args.disable:
+            contacts = client.call("/api/messages/conversations")["contacts"]
+            peer = next((c for c in contacts if c["username"].casefold() == args.username.strip().casefold()), None)
+            if peer is None:
+                raise ClientError("you cannot message this user")
+            result = client.call("/api/messages/images", {"conversation_handle": peer["conversation_handle"], "enabled": args.enable})
+        else:
+            result = client.call("/api/messages/images?peer=" + q(args.username, safe=""))
+        print(json.dumps(result))
     elif cmd == "send":
         text = sys.stdin.read() if args.text == "-" else args.text
-        print(json.dumps(client.call("/api/messages/send", {"to": args.username, "body": text})))
+        payload = {"body": text, "idempotency_key": getattr(args, "idempotency_key", None) or secrets.token_urlsafe(24)}
+        if getattr(args, "image", None):
+            payload["image"] = read_image(args.image)
+        if args.type:
+            payload["type"] = args.type
+        if args.subject:
+            kind, sep, ref = args.subject.partition(":")
+            if not sep:
+                raise ClientError("--subject must be KIND:REF")
+            payload["subject"] = {"kind": kind, "ref": ref}
+        # Recipient selection stays local. A fresh short-lived handle carries the
+        # relationship, and the same operation key survives a lost HTTP response.
+        uncertain_send = False
+        for attempt in range(2):
+            sending_request = False
+            try:
+                response = client.call("/api/messages/conversations")
+                if (not isinstance(response, dict) or not isinstance(response.get("contacts"), list)
+                        or any(not isinstance(c, dict) or not isinstance(c.get("username"), str)
+                               or not isinstance(c.get("conversation_handle"), str) or not c["conversation_handle"]
+                               for c in response["contacts"])):
+                    raise ClientError("invalid conversations response; request outcome may be uncertain", uncertain=True)
+                conversations = response["contacts"]
+                peer = next((c for c in conversations if c["username"].casefold() == args.username.strip().casefold()), None)
+                if peer is None:
+                    raise ClientError("you cannot message this user")
+                payload["conversation_handle"] = peer["conversation_handle"]
+                sending_request = True
+                result = client.call("/api/messages/send", payload)
+                if (not isinstance(result, dict) or result.get("ok") is not True
+                        or type(result.get("id")) is not int or result["id"] <= 0
+                        or type(result.get("created")) not in (int, float) or not math.isfinite(result["created"])):
+                    raise ClientError("invalid send receipt; request outcome may be uncertain", uncertain=True)
+                print(json.dumps(result))
+                break
+            except ClientError as error:
+                uncertain_send = uncertain_send or (sending_request and error.uncertain)
+                if attempt == 0 and (error.uncertain or error.status == 403):
+                    continue
+                if uncertain_send or error.uncertain:
+                    raise ClientError(f"send outcome uncertain; retry with --idempotency-key {payload['idempotency_key']} and the identical recipient, text and image bytes",
+                                      uncertain=True) from None
+                raise
+    elif cmd == "pending":
+        for message in client.call("/api/messages/inbox")["messages"]:
+            _emit(message)
+    elif cmd == "ack":
+        print(json.dumps(client.call("/api/messages/ack", {"up_to": args.id})))
     elif cmd == "read":
         messages = client.call(f"/api/messages/thread?peer={q(args.username)}")["messages"][-args.limit:]
         for message in messages:
@@ -103,7 +212,10 @@ def run(client: Client, args) -> int:
         print(json.dumps({"unread": {c["username"]: c["unread"] for c in data["contacts"] if c["unread"]},
                           "requests": [r["username"] for r in data["requests"]]}))
     elif cmd == "wait":
-        after = args.after if args.after is not None else client.call("/api/messages/since?after=-1")["latest"]
+        if args.from_cursor:
+            after = client.call("/api/messages/inbox")["cursor"]
+        else:
+            after = args.after if args.after is not None else client.call("/api/messages/since?after=-1")["latest"]
         deadline = time.monotonic() + args.timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -136,11 +248,23 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("send")
     s.add_argument("username")
     s.add_argument("text", help="the message, or - to read it from stdin")
+    s.add_argument("--type", choices=("note", "status", "question", "handoff", "approval_request", "answer"))
+    s.add_argument("--subject", metavar="KIND:REF")
+    s.add_argument("--idempotency-key", help="reuse the reported operation key when retrying an uncertain send with identical content")
+    s.add_argument("--image", metavar="PNG", help="attach a PNG up to 2 MiB; enable images for this chat first")
+    image_parser = sub.add_parser("images", help="inspect or change your own per-chat image opt-in (server-readable)")
+    image_parser.add_argument("username")
+    image_flags = image_parser.add_mutually_exclusive_group()
+    image_flags.add_argument("--enable", action="store_true")
+    image_flags.add_argument("--disable", action="store_true")
+    sub.add_parser("pending")
+    sub.add_parser("ack").add_argument("id", type=int)
     r = sub.add_parser("read")
     r.add_argument("username")
     r.add_argument("--limit", type=int, default=50)
     w = sub.add_parser("wait")
     w.add_argument("--after", type=int)
+    w.add_argument("--from-cursor", action="store_true", help="start after the server-kept ack cursor instead of the latest message")
     w.add_argument("--timeout", type=float, default=60.0)
     return p
 

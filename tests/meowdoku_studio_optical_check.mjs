@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import vm from 'node:vm';
 import {prepareObjectSnapshot,objectSnapshotKey} from '../examples/meowdoku/web/marble_object_snapshot.js';
 import {verifySavedMarbleObject,buildMarbleObjectGeometry,materialIdsForDesign} from '../examples/meowdoku/web/marble_object.js';
 import {OPTICAL_PROVENANCE,illustrativeOpticalRecord,opticalMaterialIds,restoreOpticalSurfaceRows} from '../examples/meowdoku/web/marble_optical_authoring.js';
@@ -31,7 +32,23 @@ for(const mode of ['legacy','glass_rod','injection_dye']) {
   const before=JSON.stringify(input),key=objectSnapshotKey(input);
   input.design.optical_authoring.materials[0].concentration=.25;
   assert.notEqual(key,objectSnapshotKey(input),'optical edit must participate in autosave identity');
-  const edited=JSON.stringify(input),{value}=await prepareObjectSnapshot(input);
+  const edited=JSON.stringify(input),prepared=await prepareObjectSnapshot(input),{value}=prepared;
+  assert.equal(prepared.authoringKey,objectSnapshotKey(input),'save retains raw authoring identity before canonical projection');
+  const host=fs.readFileSync(new URL('../examples/meowdoku/web/marble_studio.js',import.meta.url),'utf8');
+  const context=vm.createContext({
+    $:id=>({'preview-engine':{value:'visual'},'preview-motion':{value:'off'},'inertia-lock':{checked:true}}[id]),
+    rollState:null,studioLighting:{strengths:{getSolo:()=>null}},lastGeometry:geometry,
+    savedObjectSnapshot:prepared,objectKey:prepared.authoringKey,objectSnapshotKey,captureObjectSnapshot:()=>input,
+    studioBuilderLighting:()=>({}),computeFixtureRoles:()=>({}),studioSubjectTransform:()=>({unitM:.01,subjectCenter:[0,0,0]}),
+    yaw:0,pitch:0,distance:1,
+  });
+  vm.runInContext(host.slice(host.indexOf('function fieldSceneKey('),host.indexOf('let fieldMaterialProjection=')),context);
+  assert.doesNotThrow(()=>vm.runInContext('fieldSceneKey({saved:true})',context),'canonical optical save accepts its exact raw authoring state');
+  const opacity=input.materials.tables.pbr.data[7];input.materials.tables.pbr.data[7]=opacity+.01;
+  assert.throws(()=>vm.runInContext('fieldSceneKey({saved:true})',context),/Save the current object/,'raw edit is rejected even before queued objectKey updates');
+  input.materials.tables.pbr.data[7]=opacity;
+  context.savedObjectSnapshot={value,geometry};
+  assert.throws(()=>vm.runInContext('fieldSceneKey({saved:true})',context),/Save the current object/,'missing authoring receipt fails closed');
   assert.equal(JSON.stringify(input),edited,'snapshot never mutates input');
   await verifySavedMarbleObject(JSON.parse(JSON.stringify(value)));
   const repeated=await prepareObjectSnapshot(value);

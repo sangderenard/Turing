@@ -69,6 +69,7 @@ from meowdoku.realtime_socket import SnapshotEncoder, accept_key, frame, read_fr
 from meowdoku import share as share_mod  # noqa: E402  (share links and the view-only live stream)
 from meowdoku import lifecycle as lifecycle_mod  # noqa: E402  (restart announcements, session save/restore, launch record)
 from meowdoku import logring as logring_mod  # noqa: E402  [LOG] (size-capped text log ring behind /api/log)
+from meowdoku import issue_tickets as issue_tickets_mod  # Account-owned SQL incidents, separate from workspace reviews.
 from meowdoku import tickets as tickets_mod  # noqa: E402  [TICKETS] persisted client/server diagnostic reports
 from meowdoku import startup as startup_mod  # noqa: E402  [LOADING] (bind first; per-product readiness)
 from meowdoku import loading_anim as anim_mod  # noqa: E402  [LOADING] (the reduced loading animation's store and validator)
@@ -82,8 +83,16 @@ from meowdoku import proxy_trust as proxy_trust_mod  # noqa: E402  [PROXY] clien
 from meowdoku import authz as authz_mod  # noqa: E402  [AUTHZ] roles + capabilities over the origin tiers
 from meowdoku import lowering_library as lowering_mod  # noqa: E402  [LOWERINGS] catalogued, leased lowerings of each core
 from meowdoku import listing as listing_mod  # noqa: E402  [LISTING] /browse/<root>/...: the interactive directory listing
+from meowdoku.rest_api import routes as shared_rest   # noqa: E402  SpeakToMe owns shared HTTP contracts
+from meowdoku.rest_api import reports as shared_reports
+from meowdoku.rest_api import catalog as shared_catalog   # noqa: E402  the declared REST index (None on an older checkout)
+from meowdoku import experience_reports as experience_reports_mod
 from meowdoku import messaging as messaging_mod         # noqa: E402  [MESSAGES] user-to-user messaging tables and long poll
+from meowdoku import profile_dashboard as profile_mod    # noqa: E402  [PROFILE] read-only profile page: me, instances + git state, leases, log tails
+from meowdoku import worldmap as worldmap_mod      # noqa: E402  [WORLDMAP] repository world maps: index + map.json, read-only
+from meowdoku import nodus_service as nodus_mod    # noqa: E402  [NODUS] read-only view of a running Nodus canvas host's console
 from meowdoku import math_jobs as math_jobs_mod         # noqa: E402  [MATHLAB] the math-lab job table and its one worker
+from meowdoku import divider_intake as divider_intake_mod  # noqa: E402  [DIVIDER] source-divider intake and status (no worker)
 from meowdoku.state_paths import StatePaths  # noqa: E402  [STATE] every state path (--state-dir; default = the old build/meowdoku layout)
 
 WEB_DIR = ROOT / "build" / "meowdoku" / "web"
@@ -361,9 +370,22 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
-        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer")
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer",
+                                                        users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
+        from meowdoku.living_data_cursor import CursorStore
+        self.living_data_cursors = CursorStore()
+        from meowdoku.living_data_static import StaticWorlds
+        self.living_data_static = StaticWorlds()
+        self.studio_pictures = None             # [SHOW] set by main() when a Studio Nodus destination is configured
+        from meowdoku.living_data_query import GraphView
+        from meowdoku import rest_api as shared_rest_loader
+        # [SITE] a map as pages: rendered on first look and kept under products/site; the maps this host declares
+        self.site = shared_rest_loader.site.Site(self.state.products_dir / "site", GraphView)
+        self.site_maps = {"system": {"source": self.system_map, "capability": "dev_ui", "ttl": 5.0}}
+        if shared_rest_loader.manual is not None:
+            self.site_maps["manual"] = {"source": shared_rest_loader.manual.as_map, "capability": "view_site", "ttl": 3600.0}
         self.tickets = tickets_mod.Store(self.state.tickets_dir)
         self.anim_busy = threading.Lock()
         self.anim_hits: dict[str, list] = {}
@@ -382,6 +404,18 @@ class Sessions:
     # ---- [FEDERATE begin] what this instance promises a federating peer (see _contract_socket)
     federation_port: int | None = None          # --federation-port: the local Nodus host's 127.0.0.1 contract port (not read from the supervisor yet)
     federation_canvas: str | None = None        # --federation-canvas: the running Nodus instance's canvas file
+
+    def system_map(self) -> dict:
+        """[SITE] the running Nodus canvas as the Living Data map: the same document GET /api/nodus/map returns."""
+        import sqlite3
+        from meowdoku import nodus_service as nodus_mod
+        db = sqlite3.connect(Path(self.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            g = nodus_mod.graph(db, self.state, None)
+            g.setdefault("canvas", nodus_mod.digest(db, self.state, g["instance"]).get("canvas"))
+            return nodus_mod.as_living_map(g, g["instance"])
+        finally:
+            db.close()
 
     def federation_identity(self) -> dict:
         """{"graph_definition_digest", "api_digests", "port"} of the Nodus instance this server fronts: sha256 of its canvas file and the
@@ -486,9 +520,20 @@ def make_handler(sessions: Sessions):
 
         def _account(self) -> dict | None:
             """The logged-in account for this request (accounts.py), or None.
-            Reads ACCOUNT_COOKIE only -- never issues one itself; that only
-            happens on a successful /api/account/signup or /api/account/login."""
+            Cookie authentication is unchanged. Messenger REST also accepts the same
+            session token as Bearer, over verified HTTPS transport only. No token is minted here."""
             from http.cookies import SimpleCookie
+            if self.path.partition("?")[0].startswith("/api/messages/"):
+                authorization = self.headers.get_all("Authorization", [])
+                if authorization:
+                    # Explicit credentials win, including invalid ones: never silently
+                    # fall back to an ambient browser cookie for another account.
+                    if len(authorization) != 1 or not self._is_secure():
+                        return None
+                    parts = authorization[0].split()
+                    if len(parts) != 2 or parts[0].lower() != "bearer":
+                        return None
+                    return sessions.accounts.user_for_token(parts[1])
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
             return sessions.accounts.user_for_token(token)
@@ -821,65 +866,408 @@ def make_handler(sessions: Sessions):
                         "signed_in": self._principal().user_id is not None, "username": self._principal().username,
                         "origin_tier": self._origin_tier})
 
+        # ---- [DIVIDER] /api/divider/jobs...: the source divider's intake and status (divider_intake.py; the page is web/divider.html).
+        # Capability compile_submit.  A job is visible to its owner (and to account_manage) only; anyone else gets 404.  Nothing here
+        # compiles or fetches: a repo link is only recorded.  sessions.divider_hook (None unless an operator sets it) is called after a job
+        # is accepted and may run attempts; the server never starts a worker thread for the divider.
+        _DIVIDER_BODY_CAP = 20 * 1024 * 1024
+
+        def _divider_who(self):
+            self._set_cookie = []
+            return self._job_identity()[0][0], "account_manage" in self._caps()
+
+        def _divider_error(self, error) -> None:
+            self.close_connection = True
+            return self._json({"error": error.message}, error.status)
+
+        def _divider_get(self, path: str) -> None:
+            import re as _re
+            if not self._require("compile_submit"):
+                return
+            owner, admin = self._divider_who()
+            parts = path[len("/api/divider/"):].split("/")
+            if parts == ["jobs"]:
+                return self._json({"jobs": divider_intake_mod.list_jobs(sessions.state, owner, admin)})
+            if len(parts) == 2 and parts[0] == "jobs" and _re.fullmatch(r"[0-9a-f]{12}", parts[1] or ""):
+                job = divider_intake_mod.get_job(sessions.state, parts[1], owner, admin)
+                if job is None:
+                    return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                return self._json(job)
+            return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def _divider_post(self, path0: str) -> None:
+            import re as _re
+            if not self._require("compile_submit"):
+                return
+            owner, admin = self._divider_who()
+            match = _re.fullmatch(r"/api/divider/jobs/([0-9a-f]{12})/cancel", path0)
+            try:
+                if match:
+                    try:
+                        if int(self.headers.get("Content-Length") or 0) > 0:
+                            self.rfile.read(min(int(self.headers.get("Content-Length")), 4096))
+                    except (ValueError, OSError):
+                        pass
+                    job = divider_intake_mod.cancel_job(sessions.state, match.group(1), owner, admin)
+                    if job is None:
+                        return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
+                    return self._json(job)
+                if path0 != "/api/divider/jobs":
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype == "application/json":
+                    body = self._body_json(4096)
+                    if body is None:
+                        return
+                    job_id = divider_intake_mod.accept_repo_link(sessions.state, owner, body.get("repo"), body.get("ref"))
+                elif ctype == "application/octet-stream":
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        length = 0
+                    filename = self.headers.get("X-Filename") or ""
+                    cap = (divider_intake_mod.MAX_PY_BYTES if filename.lower().endswith(".py") else self._DIVIDER_BODY_CAP)
+                    if length <= 0:
+                        raise divider_intake_mod.DividerError("Content-Length is required", 411)
+                    if length > cap:                                  # refused BEFORE the body is read
+                        raise divider_intake_mod.DividerError(f"body exceeds {cap} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length))
+                else:
+                    raise divider_intake_mod.DividerError("expected application/octet-stream or application/json", 415)
+            except divider_intake_mod.DividerError as error:
+                return self._divider_error(error)
+            hook = getattr(sessions, "divider_hook", None)
+            if callable(hook):
+                hook(job_id)
+            return self._json(divider_intake_mod.get_job(sessions.state, job_id, owner, admin), HTTPStatus.CREATED)
+        # ---- end [DIVIDER]
+
+        def _reports_route(self, path: str, method: str) -> None:
+            return shared_reports.route(self, path, method,
+                service_type=experience_reports_mod.Service, accounts=sessions.accounts,
+                account_cookie=ACCOUNT_COOKIE, ReportError=experience_reports_mod.ReportError,
+                SchemaVersionError=experience_reports_mod.schema_version.SchemaVersionError,
+                max_body=experience_reports_mod.MAX_BODY)
+
+        # ---- [ISSUES] account-owned SQL incidents. Legacy diagnostic files and workspace reviews remain separate.
+        def _issues_route(self, path: str, method: str) -> None:
+            from http.cookies import SimpleCookie, CookieError
+            from urllib.parse import parse_qs
+            import sqlite3
+            self._set_cookie = []
+            # Never reuse an issue POST connection after a rejected/unread body.
+            # do_POST also drains bounded remaining bytes for the shared proxy.
+            if method == "POST":
+                self.close_connection = True
+            if self._is_viewer():
+                return self._refuse_viewer()
+            if not self._require("view_site"):
+                return
+            try:
+                jar = SimpleCookie(self.headers.get("Cookie", ""))
+                token = jar[ACCOUNT_COOKIE].value if ACCOUNT_COOKIE in jar else None
+                if self._account() is None:
+                    raise issue_tickets_mod.IssueError("sign in to use issue tickets", 401)
+                service = issue_tickets_mod.Service(sessions.accounts)
+                if method == "GET":
+                    query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if path == "/api/issues":
+                        if set(query) - {"scope", "status", "offset"} or any(len(v) != 1 for v in query.values()):
+                            raise issue_tickets_mod.IssueError("invalid list query")
+                        return self._json(service.list(token, scope=query.get("scope", ["mine"])[0],
+                            status=query.get("status", ["all"])[0], offset=int(query.get("offset", ["0"])[0])))
+                    if set(query) - {"before_version"} or any(len(v) != 1 for v in query.values()):
+                        raise issue_tickets_mod.IssueError("unexpected ticket query")
+                    before = int(query["before_version"][0]) if "before_version" in query else None
+                    return self._json(service.get(token, path.removeprefix("/api/issues/"), before_version=before))
+                if path != "/api/issues" and not path.endswith("/status"):
+                    raise issue_tickets_mod.IssueError("not found", 404)
+                origin = self.headers.get("Origin")
+                expected_origin = ("https://" if self._is_secure() else "http://") + self.headers.get("Host", "")
+                if origin and origin != expected_origin:
+                    raise issue_tickets_mod.IssueError("cross-origin issue updates are not allowed", 403)
+                if self.headers.get("Sec-Fetch-Site") == "cross-site" or self.headers.get("X-Meowdoku-Issue") != "1":
+                    raise issue_tickets_mod.IssueError("missing same-origin issue header", 403)
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    raise issue_tickets_mod.IssueError("expected application/json", 415)
+                if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                    self.close_connection = True
+                    raise issue_tickets_mod.IssueError("one Content-Length is required")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= issue_tickets_mod.MAX_BODY:
+                    self.close_connection = True
+                    raise issue_tickets_mod.IssueError("issue request exceeds the size limit", 413)
+                payload = json.loads(self.rfile.read(length), parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                if path == "/api/issues":
+                    result = service.create(token, payload, server_instance=sessions.instance, server_log_seq=logring_mod.RING.seq)
+                    return self._json(result, HTTPStatus.CREATED if result["created"] else HTTPStatus.OK)
+                ticket_id = path.removeprefix("/api/issues/").removesuffix("/status")
+                return self._json(service.update(token, ticket_id, payload))
+            except issue_tickets_mod.IssueError as error:
+                return self._json({"error": str(error)}, error.status)
+            except (ValueError, TypeError, CookieError, RecursionError):
+                return self._json({"error": "invalid issue request"}, HTTPStatus.BAD_REQUEST)
+            except (sqlite3.Error, issue_tickets_mod.schema_version.SchemaVersionError):
+                return self._json({"error": "issue storage is unavailable; no success is confirmed"}, HTTPStatus.SERVICE_UNAVAILABLE)
+        # ---- end [ISSUES]
+
         # ---- [MESSAGES] /api/messages/*: user-to-user messaging (messaging.py, web/messenger-widget.js).  Capability `message` (members and up, no tier);
         # the account id always comes from the session.  Server-mediated and operator-readable: admin/* needs account_manage and is audited.
         def _messages_route(self, path: str, method: str) -> None:
+            return shared_rest.messages_route(self, path, method, messaging=messaging_mod,
+                                              accounts_db=sessions.accounts_db)
+        # ---- end [MESSAGES]
+
+        # ---- [PROFILE] GET /api/profile/{me,instances,leases,diagnostics}: the read-only profile page (profile_dashboard.py, web/profile.html).
+        # me: any signed-in account.  The rest need account_manage OR lifecycle_admin (admin, operator).  No writes; POST is refused.
+        def _profile_route(self, path: str, method: str) -> None:
+            import sqlite3
             from urllib.parse import parse_qs
-            admin = path.startswith("/api/messages/admin/")
-            if not self._require("account_manage" if admin else "message"):
-                return
+            self._classify()
             self._set_cookie = []
-            me = self._principal().user_id
-            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
-            body = {}
+            if method != "GET":
+                self.close_connection = True
+                return self._json({"error": "read-only"}, HTTPStatus.METHOD_NOT_ALLOWED)
+            principal = self._principal()
+            if principal.user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.FORBIDDEN)
+            db = None
+            try:
+                if path == "/api/profile/me":
+                    db = sqlite3.connect(sessions.accounts_db, timeout=10)
+                    return self._json(profile_mod.me(db, principal, self._caps()))
+                if path not in ("/api/profile/instances", "/api/profile/leases", "/api/profile/diagnostics"):
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                caps = self._caps()
+                if "account_manage" not in caps and "lifecycle_admin" not in caps:
+                    return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
+                db = sqlite3.connect(sessions.accounts_db, timeout=10)
+                query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                if path == "/api/profile/instances":
+                    return self._json({"instances": profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)})
+                if path == "/api/profile/leases":
+                    return self._json({"leases": profile_mod.leases(db)})
+                return self._json(profile_mod.diagnostics(db, sessions.state, query.get("name"), int(query.get("lines") or 80)))
+            except profile_mod.ProfileError as error:
+                return self._json({"error": error.message}, error.status)
+            except (ValueError, TypeError):
+                return self._json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
+            finally:
+                if db is not None:
+                    db.close()
+        # ---- end [PROFILE]
+
+        # ---- [CONTROL] /api/control/instances: force a shutdown, restart or start of an instance (instance_control.py).
+        # Not under /api/admin: the proxy refuses that whole prefix, which belongs to the loopback token endpoints.  This one
+        # is authorized by the signed-in account's role, so it is reachable wherever the account is.
+        # GET lists the instances and the recent requests; POST {instance, action, reason?, delay?} records a request that the
+        # supervisor performs within a second or two, or after ``delay`` seconds (a countdown it announces to every admin
+        # through Nodus); POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
+        # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
+        def _reviews_route(self, path: str, method: str) -> None:
+            """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
+            from meowdoku import branch_gate, branch_review
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return branch_review.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
+        def _git_route(self, path: str, method: str) -> None:
+            """[GIT] Git in the core, regulated: declared read operations for accounts holding core_git (core_git.py)."""
+            from meowdoku import branch_gate, core_git
+            self._classify()
+            try:
+                policy = branch_gate.load_policy(HERE / "deploy" / "branch_policy.json")
+            except (OSError, ValueError, branch_gate.GateError):
+                return self._json({"error": "the branch policy is not readable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return core_git.http_route(self, path, method, policy=policy, accounts_db=sessions.accounts_db)
+
+        def _relay_route(self, path: str, method: str) -> None:
+            """[RELAY] datagrams and packages, address to address, for any signed-in account (relay.py)."""
+            from meowdoku import relay
+            self._classify()
+            declared = HERE / "deploy" / "relay.json"
+            return relay.http_route(self, path, method, accounts_db=sessions.accounts_db,
+                                    config=relay.load_config(declared if declared.is_file() else None))
+
+        def _instance_control(self, method: str, cancel: bool = False) -> None:
+            import sqlite3
+            from meowdoku import instance_control
+            self._classify()
+            self._set_cookie = []
+            if method == "POST":
+                self.close_connection = True
+            principal = self._principal()
+            if principal.user_id is None:
+                return self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            caps = self._caps()
+            if "account_manage" not in caps and "lifecycle_admin" not in caps:
+                return self._json({"error": "this needs account_manage or lifecycle_admin"}, HTTPStatus.FORBIDDEN)
+            body = None
             if method == "POST":
                 if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-                    self.close_connection = True
                     return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                body = self._body_json(16384)
+                body = self._body_json(2048)
                 if body is None:
                     return
-            db = messaging_mod.connect(sessions.accounts_db)
+            db = sqlite3.connect(sessions.accounts_db, timeout=10, isolation_level=None)
             try:
-                try:
-                    if method == "GET" and path == "/api/messages/contacts":
-                        return self._json(messaging_mod.contacts(db, me))
-                    if method == "GET" and path == "/api/messages/thread":
-                        before = query.get("before")
-                        return self._json(messaging_mod.thread(db, me, query.get("peer"), int(before) if before else None))
-                    if method == "GET" and path == "/api/messages/since":
-                        rows = messaging_mod.long_poll(db, me, int(query.get("after") or 0), float(query.get("wait") or 0))
-                        return self._json({"messages": rows, "latest": messaging_mod.latest_id(db, me)})
-                    if method == "GET" and path == "/api/messages/admin/thread":
-                        before = query.get("before")
-                        return self._json(messaging_mod.admin_thread(db, me, query.get("a"), query.get("b"), int(before) if before else None))
-                    if method == "POST" and path == "/api/messages/contacts":
-                        action, name = body.get("action"), body.get("username")
-                        if action == "request":
-                            return self._json(messaging_mod.request_contact(db, me, name))
-                        if action in ("accept", "decline"):
-                            return self._json(messaging_mod.respond_contact(db, me, name, action == "accept"))
-                        if action == "block":
-                            return self._json(messaging_mod.block(db, me, name))
-                        if action == "remove":
-                            return self._json(messaging_mod.remove(db, me, name))
-                        return self._json({"error": "action must be request, accept, decline, block or remove"}, HTTPStatus.BAD_REQUEST)
-                    if method == "POST" and path == "/api/messages/send":
-                        return self._json(messaging_mod.send(db, me, body.get("to"), body.get("body")))
-                    if method == "POST" and path == "/api/messages/read":
-                        return self._json(messaging_mod.mark_read(db, me, body.get("peer"), int(body.get("up_to") or 0)))
-                    if method == "POST" and path == "/api/messages/admin/remove":
-                        return self._json(messaging_mod.admin_remove(db, me, int(body.get("id"))))
-                    if method == "POST" and path == "/api/messages/admin/suspend":
-                        return self._json(messaging_mod.admin_suspend(db, me, body.get("username"), bool(body.get("suspended"))))
-                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-                except messaging_mod.MessagingError as error:
-                    return self._json({"error": error.message}, error.status)
-                except (ValueError, TypeError):
-                    return self._json({"error": "bad request"}, HTTPStatus.BAD_REQUEST)
+                known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
+                if method == "GET":
+                    return self._json({"instances": known, "requests": instance_control.recent(db)})
+                if cancel:                               # the interrupt: stop a request whose countdown is still running
+                    made = instance_control.cancel(db, body.get("id"), user_id=principal.user_id, username=principal.username)
+                    print(f"[control] {principal.username} interrupted request {made['id']}", flush=True)
+                    return self._json({"request": made})
+                made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
+                                                user_id=principal.user_id, username=principal.username,
+                                                reason=body.get("reason"), delay_s=body.get("delay", 0),
+                                                known=[i["name"] for i in known])
+                print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
+                return self._json({"request": made}, HTTPStatus.ACCEPTED)
+            except instance_control.ControlError as error:
+                return self._json({"error": error.message}, error.status)
+            except profile_mod.ProfileError as error:
+                return self._json({"error": error.message}, error.status)
             finally:
                 db.close()
-        # ---- end [MESSAGES]
+        # ---- end [CONTROL]
+
+        def _living_data_dm(self, path, method):
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError, MAX_BODY
+            return shared_rest.living_data_dm_route(
+                self, path, method, service=sessions.living_data_static,
+                CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
+
+        def _living_data_cursor(self, path, method):
+            from meowdoku.living_data_cursor import CursorError
+            from meowdoku.living_data_query import QueryError, MAX_BODY
+            return shared_rest.living_data_cursor_route(
+                self, path, method, service=sessions.living_data_cursors,
+                CursorError=CursorError, QueryError=QueryError, MAX_BODY=MAX_BODY)
+
+        # ---- [SHOW] /api/show/pictures: a picture of the Studio scene, asked for through the shared REST contract and made by
+        # the existing photo service (studio_pictures.py).  Account, owner keys and the authority recheck come from this request.
+        def _picture_route(self, path, method):
+            from meowdoku.studio_pictures import PictureError
+            from meowdoku.living_data_query import MAX_BODY
+            self._classify()
+            account, origin, tier = self._account(), self._origin, self._tier
+            keys = ["account:" + str(account["id"])] if account is not None else []
+
+            def recheck():
+                principal = authz_mod.principal_from(account, origin, tier, sessions.accounts_db)
+                return account is not None and "photo_submit" in authz_mod.capabilities(principal, sessions.authz_policy.get())
+            return shared_rest.picture_route(self, path, method, service=sessions.studio_pictures, owners=keys,
+                                             recheck=recheck, PictureError=PictureError, MAX_BODY=MAX_BODY)
+
+        # ---- [SITE] /site/<map>/...: a declared map as pages (speaktome_api.site); each map names its own capability.
+        def _site_get(self, path):
+            return shared_rest.site_route(self, path, site=sessions.site, maps=sessions.site_maps)
+
+        # Read-only projection of a caller-supplied canonical Living Data map.
+        def _living_data_query(self):
+            from meowdoku import living_data_query
+            return shared_rest.living_data_query_route(self, living_data_query=living_data_query)
+
+        # ---- [WORLDMAP] GET /api/worldmap/index and /api/worldmap/map?repo=<owner__name>&commit=<40 hex> (worldmap.py; the page is web/worldmap.html).
+        # dev_ui only, no-store; map.json is streamed (gzip when the client accepts it); the only request-derived parts are the two validated names.
+        def _worldmap_get(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            if not self._require("dev_ui"):
+                return
+            self._set_cookie = []
+            try:
+                if path == "/api/worldmap/index":
+                    return self._json(worldmap_mod.index(sessions.state))
+                if path != "/api/worldmap/map":
+                    return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                file = worldmap_mod.map_path(sessions.state, query.get("repo", ""), query.get("commit", ""))
+            except worldmap_mod.WorldMapError as error:
+                return self._json({"error": error.message}, error.status)
+            body = file.read_bytes()
+            gz = "gzip" in self.headers.get("Accept-Encoding", "").lower()
+            if gz:
+                import gzip
+                body = gzip.compress(body, 6)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Vary", "Accept-Encoding")
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        # ---- end [WORLDMAP]
+
+        # ---- [NODUS] GET /api/nodus/{instances,digest,graph,tools,activity,abstract}?instance=<name>, POST /api/nodus/share (nodus_service.py; the page is
+        # web/nodus.html).  Read-only view of a running Nodus canvas host's console: capability dev_ui; share also needs `message`.  No action reaches a canvas.
+        def _nodus_db(self):
+            import sqlite3
+            return sqlite3.connect(Path(sessions.accounts_db).as_uri() + "?mode=ro", uri=True, timeout=5)
+
+        def _nodus_get(self, path: str) -> None:
+            from urllib.parse import parse_qs
+            if not self._require("dev_ui"):
+                return
+            self._set_cookie = []
+            name = path[len("/api/nodus/"):]
+            query = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+            if name not in ("instances", "digest", "graph", "tools", "activity", "abstract", "map"):
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            try:
+                db = self._nodus_db()
+            except Exception:
+                return self._json({"error": "the supervisor records are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                if name == "instances":
+                    return self._json({"instances": nodus_mod.instances(db, sessions.state)})
+                inst = query.get("instance") or None
+                if name == "abstract":
+                    g = nodus_mod.graph(db, sessions.state, inst)
+                    g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
+                    return self._json({"instance": g["instance"], "revision": g.get("revision"),
+                                       "nodes": nodus_mod.as_generic_graph(g, g["instance"])})
+                if name == "map":      # the graph as the Living Data map (nodus_service.as_living_map); enter at "at" via /api/living-data/sessions
+                    g = nodus_mod.graph(db, sessions.state, inst)
+                    g.setdefault("canvas", nodus_mod.digest(db, sessions.state, g["instance"]).get("canvas"))
+                    living = nodus_mod.as_living_map(g, g["instance"])
+                    return self._json({"instance": g["instance"], "revision": g.get("revision"), "at": living["identity"], "map": living})
+                return self._json(getattr(nodus_mod, name)(db, sessions.state, inst))
+            except nodus_mod.NodusError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+
+        def _nodus_post(self, path: str) -> None:
+            if path != "/api/nodus/share":
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            if not self._require("dev_ui") or not self._require("message"):
+                return
+            self._set_cookie = []
+            if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+                self.close_connection = True
+                return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            body = self._body_json(4096)
+            if body is None:
+                return
+            try:
+                db = self._nodus_db()
+            except Exception:
+                return self._json({"error": "the supervisor records are unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            try:
+                return self._json(nodus_mod.share(db, sessions.state, sessions.accounts_db, self._principal().user_id,
+                                                  body.get("instance") or None, body.get("to"), body.get("note", "")))
+            except nodus_mod.NodusError as error:
+                return self._json({"error": error.message}, error.status)
+            finally:
+                db.close()
+        # ---- end [NODUS]
 
         # ---- [MATHLAB] POST/GET /api/mathlab/jobs...: the math lab's job endpoints (math_jobs.py; the page is web/mathlab.html).
         # Every endpoint needs compile_submit (members and up; no tier grants it).  A job is visible to its owner only (404 otherwise).
@@ -1112,6 +1500,8 @@ def make_handler(sessions: Sessions):
             self.wfile.write(body)
 
         def end_headers(self):
+            if getattr(self, "command", "") == "POST" and getattr(self, "path", "").split("?", 1)[0].startswith(("/api/issues", "/api/reports")) and self.close_connection:
+                self.send_header("Connection", "close")
             # A malformed request (e.g. TLS bytes on this http port) is answered
             # before the request line is parsed, so there may be no path yet.
             if not getattr(self, "path", "").startswith(("/api/", "/browse")):    # [LISTING] /browse sets its own no-store
@@ -1512,6 +1902,20 @@ def make_handler(sessions: Sessions):
                 return
             if path == "/api/log":                                # [LOG] the text ring: dev tier and above, never a view-only link
                 return self._log_get()
+            if path.startswith("/api/living-data/dm/"):
+                return self._living_data_dm(path, "GET")
+            if path == "/api/living-data/sessions" or path.startswith("/api/living-data/sessions/"):
+                return self._living_data_cursor(path, "GET")
+            if path.startswith("/api/show/pictures/"):
+                return self._picture_route(path, "GET")
+            if path == "/api/control/instances":
+                return self._instance_control("GET")
+            if path == "/site" or path.startswith("/site/"):
+                return self._site_get(path)
+            if path == "/api/issues" or path.startswith("/api/issues/"):
+                return self._issues_route(path, "GET")
+            if path == "/api/reports" or path.startswith("/api/reports/"):
+                return self._reports_route(path, "GET")
             if path == "/api/tickets":
                 if not self._require("dev_ui"):
                     return
@@ -1525,10 +1929,30 @@ def make_handler(sessions: Sessions):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
+            if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path, "GET")
+            if path.startswith("/api/git/"):                      # [GIT]
+                return self._git_route(path, "GET")
+            if path.startswith("/api/relay/"):                    # [RELAY]
+                return self._relay_route(path, "GET")
+            if path.startswith("/api/files/"):                    # [FILES] the cleanup account's flat index of the core (file_index.py)
+                from meowdoku import file_index
+                self._classify()
+                return file_index.http_route(self, path, db_path=Path(sessions.accounts_db).with_name("file_index.db"))
+            if path == "/api/index" and shared_catalog is not None:   # [INDEX] the declared catalog of this API
+                return shared_rest.index_route(self, path, catalog=shared_catalog)
             if path.startswith("/api/messages/"):                 # [MESSAGES]
                 return self._messages_route(path, "GET")
+            if path.startswith("/api/profile/"):                  # [PROFILE]
+                return self._profile_route(path, "GET")
+            if path.startswith("/api/worldmap/"):                 # [WORLDMAP]
+                return self._worldmap_get(path)
+            if path.startswith("/api/nodus/"):                    # [NODUS]
+                return self._nodus_get(path)
             if path.startswith("/api/mathlab/"):                  # [MATHLAB]
                 return self._mathlab_get(path)
+            if path.startswith("/api/divider/"):                  # [DIVIDER]
+                return self._divider_get(path)
             if path == "/api/lifecycle":                         # LIFECYCLE: the countdown, and this session's restorable copy
                 return self._lifecycle_get()
             if path == "/api/ready":                              # [LOADING] per-product readiness, polled by the page (loading_panel.js)
@@ -1554,7 +1978,7 @@ def make_handler(sessions: Sessions):
                     return self._json(lens_catalog(sessions.marble_photos.spectral_root))
                 except (ValueError, OSError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
-            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/animation"):
+            if path in ("/api/marble_photo", "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation"):
                 if not self._require("photo_read"):
                     return
                 from urllib.parse import parse_qs
@@ -1562,25 +1986,47 @@ def make_handler(sessions: Sessions):
                 digest = (query.get("digest") or [""])[0]
                 try:
                     # Read-only visitors must not inherit the old submitter access to unindexed photos.
-                    self._job_authorize(digest, allow_legacy="photo_submit" in self._caps())
+                    self._job_authorize(digest, allow_legacy=path != "/api/marble_photo/field" and "photo_submit" in self._caps())
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
-                    body = (sessions.marble_photos.hdr(digest, name) if path == "/api/marble_photo/hdr"
-                            else sessions.marble_photos.animation(digest) if path == "/api/marble_photo/animation"
-                            else sessions.marble_photos.image(digest, name))
+                    lane_raw = (query.get("lane") or ["0"])[0]
+                    if not lane_raw.isdecimal() or len(lane_raw) > 2:
+                        raise marble_photo_mod.PhotoError("invalid sensor lane", 400)
+                    lane = int(lane_raw)
+                    artifact = None
+                    if path == "/api/marble_photo/animation":
+                        body = sessions.marble_photos.animation(digest)
+                        length = len(body)
+                    else:
+                        artifact = (sessions.marble_photos.open_field(digest, name) if path.endswith("/field") else
+                                    sessions.marble_photos.open_artifact(digest, name,
+                                        hdr=path.endswith("/hdr"), lane=lane))
+                        try:
+                            length = os.fstat(artifact.fileno()).st_size
+                        except BaseException:
+                            artifact.close()
+                            raise
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
-                self._set_cookie = []
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
-                                 "application/octet-stream" if path == "/api/marble_photo/hdr" else "image/png")
-                if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
-                    self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self._set_cookie = []
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
+                                     "application/octet-stream" if path in ("/api/marble_photo/hdr", "/api/marble_photo/field") else "image/png")
+                    if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
+                        self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if artifact is not None:
+                        while block := artifact.read(1024 * 1024):
+                            self.wfile.write(block)
+                    else:
+                        self.wfile.write(body)
+                finally:
+                    if artifact is not None:
+                        artifact.close()
                 return
             if path == "/api/obj_assets" or path.startswith("/api/obj_assets/"):
                 account = self._account()
@@ -1953,10 +2399,38 @@ def make_handler(sessions: Sessions):
             if self._tier == "shader":
                 if self._shader_request(path0, "POST"):
                     return
+            if path0.startswith("/api/living-data/dm/"):
+                return self._living_data_dm(path0, "POST")
+            if path0 == "/api/living-data/sessions" or path0.startswith("/api/living-data/sessions/"):
+                return self._living_data_cursor(path0, "POST")
+            if path0 == "/api/living-data/query":
+                return self._living_data_query()
+            if path0 == "/api/show/pictures":
+                return self._picture_route(path0, "POST")
+            if path0 == "/api/reviews" or path0.startswith("/api/reviews/"):   # [REVIEWS]
+                return self._reviews_route(path0, "POST")
+            if path0.startswith("/api/git/"):                     # [GIT]
+                return self._git_route(path0, "POST")
+            if path0.startswith("/api/relay/"):                   # [RELAY]
+                return self._relay_route(path0, "POST")
+            if path0 == "/api/control/instances":
+                return self._instance_control("POST")
+            if path0 == "/api/control/instances/cancel":
+                return self._instance_control("POST", cancel=True)
+            if path0 == "/api/issues" or path0.startswith("/api/issues/"):
+                return self._issues_route(path0, "POST")
+            if path0 == "/api/reports" or path0.startswith("/api/reports/"):
+                return self._reports_route(path0, "POST")
             if path0.startswith("/api/messages/"):             # [MESSAGES]
                 return self._messages_route(path0, "POST")
+            if path0.startswith("/api/nodus/"):                # [NODUS]
+                return self._nodus_post(path0)
+            if path0.startswith("/api/profile/"):              # [PROFILE]
+                return self._profile_route(path0, "POST")
             if path0.startswith("/api/mathlab/"):              # [MATHLAB]
                 return self._mathlab_post(path0)
+            if path0.startswith("/api/divider/"):              # [DIVIDER]
+                return self._divider_post(path0)
             if path0 == "/api/clientlog":                      # CLIENT ERRORS: a page's uncaught error, printed here (phones have no console)
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
                 try:
@@ -2060,6 +2534,27 @@ def make_handler(sessions: Sessions):
                     return
                 except (ValueError, TypeError) as error:
                     self.close_connection = True
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 == "/api/marble_photo/calibration_qr":
+                if not self._require("photo_read"):
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 4096:
+                    return self._json({"error": "invalid calibration registration request"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("invalid calibration registration request")
+                    digest, name, lane = body.get("digest"), body.get("name"), body.get("lane", 0)
+                    self._job_authorize(digest)
+                    with sessions.marble_photos.open_artifact(digest, name, lane=lane) as artifact:
+                        png = artifact.read(4 * 1024 * 1024 + 1)
+                    if len(png) > 4 * 1024 * 1024:
+                        raise ValueError("calibration image is too large")
+                    from meowdoku.marble_calibration_qr import register_calibration_qr
+                    return self._json(register_calibration_qr(png, body.get("modules"),
+                        full_card=name.startswith("marker-")))
+                except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 in ("/api/marble_photo", "/api/marble_photo/cancel", "/api/marble_photo/live", "/api/marble_photo/retouch", "/api/marble_photo/film_preview") and not self._is_viewer():
                 if not self._require("share_live" if path0 == "/api/marble_photo/live" else "photo_submit"):
@@ -2623,6 +3118,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="[FEDERATE] the local Nodus host's 127.0.0.1 contract port that /ws/contract/<prefix> bridges to (with --federation-canvas)")
     parser.add_argument("--federation-canvas", default=None,
                         help="[FEDERATE] that Nodus instance's canvas file; its sha256 and web-dir api.yaml module:entry pairs are what a peer must promise")
+    parser.add_argument("--studio-nodus-port", type=int, default=None,
+                        help="[SHOW] the local Nodus host's 127.0.0.1 contract port of the Studio prefix (with --studio-assets)")
+    parser.add_argument("--studio-nodus-prefix", default="studio.product", help="[SHOW] the Studio contract prefix on that port")
+    parser.add_argument("--studio-assets", default=None, help="[SHOW] the trusted generated material catalog (JSON) for the Studio builder")
+    parser.add_argument("--studio-defaults", default=None,
+                        help="[SHOW] a baked Studio settings record (JSON); without it every picture request must carry its settings")
     parser.add_argument("--no-mathlab", action="store_true",
                         help="[MATHLAB] do not start the math lab's single compile worker (jobs can still be queued, none run)")
     parser.add_argument("--no-idle-train", action="store_true",
@@ -2679,6 +3180,16 @@ def main(argv: list[str] | None = None) -> int:
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
+    if args.studio_nodus_port and args.studio_assets:               # [SHOW] settings -> Nodus -> owned photo job
+        from meowdoku import studio_agent, studio_pictures
+        sessions.studio_pictures = studio_pictures.StudioPictures(
+            port=args.studio_nodus_port, prefix=args.studio_nodus_prefix,
+            products=studio_agent.StudioAgentProducts(Path(args.studio_assets),
+                                                      defaults=Path(args.studio_defaults) if args.studio_defaults else None),
+            store_dir=sessions.state.jobs_dir / "studio-product", photo_jobs=sessions.marble_photos,
+            saved_objects_for=sessions.marble_objects.for_account,
+            claim=lambda account_id, digest: sessions.accounts.claim(account_id, "marble_photo", digest))
+        print(f"[studio] pictures go through Nodus port {args.studio_nodus_port} ({args.studio_nodus_prefix})", flush=True)
     if args.access:
         sessions.access = access_mod.Access(Path(args.access))
     sessions.access.start()                                          # [ACCESS] policy file + the server's own public IP (background lookup)

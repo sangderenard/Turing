@@ -1,10 +1,7 @@
+import {STUDIO_SCENE_PART_GROUP,computeStudioFixtureRoles,buildStudioFixtureFaces,createStudioSceneGeometry,buildStudioPhotoFixtures,initializeStudioFixtureRows} from './studio_scene_builder.js';
 // Reuse the server loading panel; its boot hold covers Studio asset/GPU setup.
 import "./loading_panel.js";
 import {ensureObjAsset, importedMechanics} from "./marble_imported_object.js";
-import {wallRelativeFixtureDefaults} from "./marble_light_placement.js";
-import {applyLightTools,defaultLightTools} from "./marble_light_tools.js";
-import {applyFixtureSizes,defaultFixtureSizes} from "./marble_fixture_sizes.js";
-import {resolveLightingPoses} from "./marble_lighting.js";
 // A close-up on the same exported Pluck Phong shader and MaterialDatabase
 // tables used by the game. All edits are local to this preview.
 import { marbleMass } from "./marble_mass.js";
@@ -18,6 +15,10 @@ import { MarbleChaseCamera, chaseViewMatrix } from "./marble_chase_camera.js";
 import { previewMotionAngle } from "./marble_preview_motion.js";
 import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CENTER } from "./marble_photo.js";
 import { createLiveRayView } from "./marble_live.js";
+import {createStudioLightField} from "./marble_light_field.js";
+import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
+import {RESPONSE_INFORMATION,copyResponseIdentity,tagSubjectResponseFaces,tagPartResponseFaces,copiedResponseSources,bindResponseIdentity} from './marble_response_lineage.js';
+import {createStudioSecondaryField,secondaryFieldFragment} from "./marble_secondary_field.js";
 import { createObjectAutosave } from "./marble_autosave.js";
 import { prepareObjectSnapshot, objectSnapshotKey } from "./marble_object_snapshot.js";
 import { downloadMarbleObject } from "./marble_downloads.js";
@@ -25,25 +26,24 @@ import { MARBLE_OBJECT_VERSION, readDesign, applyDesign, readPhysical, applyPhys
   buildMarbleObjectGeometry, materialIdsForDesign, geometrySha256, analyticSpheresForDesign,
   verifySavedMarbleObject } from "./marble_object.js";
 import { initCalibration } from "./marble_calibration.js";
-import { backdropFaces, defaultBackdropLayers } from "./marble_backdrop.js";
-import { setupStudioLighting } from "./marble_studio_lighting.js";
+import { backdropFaces } from "./marble_backdrop.js";
+import { setupStudioLighting, LIGHTING_PROFILE_FIELDS } from "./marble_studio_lighting.js";
 import { STUDIO_LIGHTS } from "./marble_light_strengths.js";
-import { tableLightRoles, tableLightModifierFaces } from "./marble_table_lights.js";
-import { studioRoomBounds, studioRoomFaces } from "./marble_room.js";
-import { defaultStudioTable, tableFloorDrop, studioTableFaces, FLOOR_FIXTURE_INDICES } from "./marble_studio_table.js";
-import { studioGoboFaces } from "./marble_studio_gobos.js";
-import {studioLightStandFaces,lightStandPlacementWarnings} from "./marble_light_stand_settings.js";
-import {backdropSupportLayout,backdropSupportFaces} from "./marble_backdrop_supports.js";
-import {shopLightEmissionRecords,shopLightEmitterAllocations,writeShopLightEmitterRows,studioShopLightGeometry} from "./marble_shop_lights.js";
+import { studioRoomBounds } from "./marble_room.js";
+import { defaultStudioTable, tableFloorDrop } from "./marble_studio_table.js";
+import {lightStandPlacementWarnings} from "./marble_light_stand_settings.js";
+import {backdropSupportLayout} from "./marble_backdrop_supports.js";
+import {shopLightEmitterAllocations,writeShopLightEmitterRows,studioShopLightGeometry} from "./marble_shop_lights.js";
 import { defaultStudioScale, studioScaleTransform, studioFrameDistance, studioCameraClip, radiusFromSlider, sliderFromRadius } from "./marble_studio_scale.js";
 import { isOpaquePreviewMaterial, triangleCentres, transparentTriangleOrder } from "./marble_glass_preview.js";
 import { STUDIO_FIXED_MATERIAL_ROWS, STUDIO_RUNTIME_MATERIAL_ROWS, studioMaterialExtras, studioMaterialBase, savedMaterialRows } from "./marble_materials.js";
-import {sceneMaterialEngineContract,validateSceneMaterialEdits} from "./marble_scene_materials.js";
+import {validateSceneMaterialEdits} from "./marble_scene_materials.js";
 import {createOpticalMaterialControls} from "./marble_studio_optical.js";
 import {restoreOpticalSurfaceRows,prepareOpticalSnapshot} from "./marble_optical_authoring.js";
 import {packStudioScene,writeStudioFixtureRows} from "./marble_studio_scene.js";
 import {stageStudioPhong} from "./marble_studio_phong.js";
 import {createStudioDof,dofCameraFromView} from "./marble_studio_dof.js";
+import {mountPhongCapture} from "./marble_phong_capture.js";
 import {mountStudioCameraToolbox} from "./marble_camera_toolbox_mount.js";
 import {PhotographicCameraBinding,mountPhotographicCameraBinding,linkedPhotoOrbit,studioDisplayedSubjectCenter} from "./marble_camera_binding.js";
 
@@ -51,50 +51,37 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
 let opticalControls = null;
-let liveRay = null;
+let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null;
+// A late-bound facade lets existing photo controls start before WebGL setup.
+const fieldView={capture:context=>lightField?.capture(context),connect:(...args)=>lightField?.connect(...args),
+  observe:(...args)=>lightField?.observe(...args),invalidate:()=>lightField?.invalidate(),stop:digest=>lightField?.stop(digest),
+  revise:(...args)=>lightField?.revise(...args)};
 const photographicCameraBinding=new PhotographicCameraBinding();
 document.addEventListener("studio-lens-change", () => liveRay?.cameraChanged());
 let studioSceneRevision=0,lastStudioFrame=null;
 // Conservative edit revision catches an edit and reversal during a hidden
 // bake. Exact captured data is still compared before ownership transfers.
-for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox'))studioSceneRevision++;},true);
+for(const event of ["input","change","studio-lens-change"])document.addEventListener(event,e=>{if(!e.target?.closest?.('#camera-toolbox, #phong-capture-controls, #phong-field-categories'))studioSceneRevision++;},true);
 let suppliedSubjectAsset=null;
 let objectAutosave=null, savedObjectSnapshot=null, objectKey="", objectEditQueued=false, applyingObject=false, objectLoadIntent=0;
-// The three room fixtures that do NOT track the camera: fixed positions in
-// Studio's own world units, shared verbatim between the live Phong preview
-// (frame()) and the ray-traced "Current Studio orbit and zoom" photo bridge
-// below, so both are genuinely the same room instead of two independently
-// hand-tuned approximations of it. Key positions are mirrored left/right
-// off the same magnitude sliders (ROOM_FIXTURES holds only the fixtures
-// whose position isn't already slider-authored).
-const ROOM_FIXTURES = {
-  // Fresh rigs retreat 20% in XZ; explicit profile poses always override these.
-  background: [0, -0.95, -2.22],
-  kickerL: [-1.92, -0.95, -3.12],
-  kickerR: [ 1.92, -0.95, -3.12],
-  // Two independently-controlled fills, both fixed room objects (do NOT
-  // track the live camera -- a camera-tracking version put a huge panel
-  // directly in front of the lens; a version baked from the camera-eye
-  // axis instead floated mid-air next to the subject). Lower: on the
-  // floor, out toward the camera side, aimed up. Upper: overhead, aimed
-  // straight down -- a real two-point bounce-fill rig, each independently
-  // powered via its own slider.
-  fillLower: [0, -0.95, 1.6],
-  fillUpper: [0, 5.2, 0.3],
-};
 // Keep the ray-traced photo's "Current Studio orbit and zoom" camera option
 // actually the same scene as the Phong preview, not just the same angle.
 // Lighting is NOT sent as a separate hand-authored list: the server derives
 // real NEE sources directly from `fixtures`' own emissive PBR geometry
 // below (matching exposure_render_demo.py's canonical _build_tracer_scene
 // pattern for its "orbiters" emissive-sphere demo) -- one source of truth.
-const currentCameraOptions = (snapshot = false, {usePhotoCamera=true}={}) => ({
+const currentCameraOptions = (snapshot = false, {usePhotoCamera=true,timedExposure=false}={}) => ({
   ...studioPhotoCamera(!snapshot,{usePhotoCamera}),
   object_center_m: studioPhotoSubjectCenter(!snapshot),
-  fixtures: sceneForPhoto(!snapshot),
+  fixtures: sceneForPhoto(!snapshot,{timedExposure}),
 });
+const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
+  begin(dt){this.active=true;this.dt=dt;this.modelNow=sim.runtime?.last??performance.now()/1000;},
+  end(){this.active=false;this.waiters.length=0;if(sim.runtime)sim.runtime.last=performance.now()/1000;},
+  nextTick(callback){exposureClock.waiters.push(callback);},
+  completeTick(){for(const callback of this.waiters.splice(0))callback();}};
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()));
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock);
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -107,6 +94,7 @@ const photographicCameraControls=mountPhotographicCameraBinding({doc:document,bi
 // presented and cleared -- when the drawing buffer is preserved.
 const gl = canvas.getContext("webgl2", { antialias: true, alpha: false, preserveDrawingBuffer: true });
 const studioDof=gl?createStudioDof(gl):null;
+const phongCapture=mountPhongCapture({doc:document,canvas,gl});
 let lastDofOptics=null;
 function dofStatus(text){const out=$("studio-dof-status");if(out&&out.textContent!==text)out.textContent=text;}
 if (!gl) message.textContent = "WebGL 2 is required for this studio";
@@ -186,7 +174,15 @@ function mesh(faces) {
     else gl.vertexAttribPointer(index, 3, gl.FLOAT, false, 0, 0);
   }
   gl.bindVertexArray(null);
-  return { vao, buffers, count: pos.length/3 };
+  const categories=faces.map(face=>face.sceneCategory??null);
+  const resource={ vao, buffers, count: pos.length/3, categories, categoryRuns:fieldCategoryRuns(categories) };
+  const responseSources=copiedResponseSources(faces);
+  if(responseSources) {
+    resource.responseSources=responseSources;
+    // Receiver calls this only after checking the exact scene/camera revision.
+    resource.bindResponseLineage=lineage=>bindResponseIdentity(gl,resource,lineage);
+  }
+  return resource;
 }
 function dispose(mesh) {
   if (!mesh) return;
@@ -200,136 +196,20 @@ function transparentMesh(faces) {
   gl.bindVertexArray(null);
   return result;
 }
-function drawTransparent(result,modelView) {
+function drawTransparent(result,modelView,setCategory=null) {
   gl.bindVertexArray(result.vao);
   const axis=[modelView[2],modelView[6],modelView[10]];
   if(!result.sortAxis||axis.some((v,k)=>v!==result.sortAxis[k])) {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,result.indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,transparentTriangleOrder(result.centres,modelView),gl.DYNAMIC_DRAW);
+    const order=transparentTriangleOrder(result.centres,modelView);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,order,gl.DYNAMIC_DRAW);
+    result.sortedCategoryRuns=fieldCategoryRuns(result.categories,order);
     result.sortAxis=axis;
   }
-  gl.drawElements(gl.TRIANGLES,result.count,gl.UNSIGNED_INT,0);
+  if(setCategory)for(const run of result.sortedCategoryRuns) {
+    setCategory(run.category);gl.drawElements(gl.TRIANGLES,run.count,gl.UNSIGNED_INT,run.first*4);
+  } else gl.drawElements(gl.TRIANGLES,result.count,gl.UNSIGNED_INT,0);
 }
-// A flat quad facing `dir` (unit vector, the direction toward the subject),
-// as two triangles for mesh(). This is the actual visible shape of a light
-// fixture -- real geometry with a real emissive material, not a point.
-// `groupId` matches the real uLightGroupId registered for this fixture (see
-// frame()), so the fixture's own fragments skip its own registered light
-// (aGroupId == uLightGroupId[i] exclusion in the shader).
-function quadFace(center, dir, halfW, halfH, materialId, groupId=0) {
-  let worldUp=[0,1,0];
-  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
-  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const right=norm3(cross3(dir,worldUp));
-  const up=norm3(cross3(right,dir));
-  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
-  const c00=add(add(center,right,-halfW),up,-halfH), c10=add(add(center,right,halfW),up,-halfH);
-  const c11=add(add(center,right,halfW),up,halfH), c01=add(add(center,right,-halfW),up,halfH);
-  const n=[dir,dir,dir];
-  return [[c00,c10,c11,materialId,n,groupId],[c00,c11,c01,materialId,n,groupId]];
-}
-// A small round disc facing `dir`, as a triangle fan. Used for the
-// background and kicker fixtures, which are small round practicals sitting
-// on the floor, not big rectangular panels.
-function circleFace(center, dir, radius, materialId, segments=12, groupId=0) {
-  let worldUp=[0,1,0];
-  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
-  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const right=norm3(cross3(dir,worldUp));
-  const up=norm3(cross3(right,dir));
-  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
-  const n=[dir,dir,dir];
-  const faces=[];
-  for (let i=0;i<segments;i++) {
-    const a0=(i/segments)*Math.PI*2, a1=((i+1)/segments)*Math.PI*2;
-    const p0=add(add(center,right,Math.cos(a0)*radius),up,Math.sin(a0)*radius);
-    const p1=add(add(center,right,Math.cos(a1)*radius),up,Math.sin(a1)*radius);
-    faces.push([center,p0,p1,materialId,n,groupId]);
-  }
-  return faces;
-}
-// A real open-fronted box behind a quad light panel: a back wall plus four
-// side walls, so the housing reads as an actual 3D container the light
-// sits inside (like a softbox/barn-door body) -- not a flat disk floating
-// in the middle of the same emission lobe, which never blocks anything.
-function boxHousing(center, dir, halfW, halfH, depth, materialId, groupId=0) {
-  let worldUp=[0,1,0];
-  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
-  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const right=norm3(cross3(dir,worldUp));
-  const up=norm3(cross3(right,dir));
-  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
-  const back=add(center,dir,-depth);
-  const f00=add(add(center,right,-halfW),up,-halfH), f10=add(add(center,right,halfW),up,-halfH);
-  const f11=add(add(center,right,halfW),up,halfH), f01=add(add(center,right,-halfW),up,halfH);
-  const b00=add(add(back,right,-halfW),up,-halfH), b10=add(add(back,right,halfW),up,-halfH);
-  const b11=add(add(back,right,halfW),up,halfH), b01=add(add(back,right,-halfW),up,halfH);
-  const nDir=[dir,dir,dir], nRight=[right,right,right], nLeft=right.map((v)=>-v), nLeftT=[nLeft,nLeft,nLeft];
-  const nUp=[up,up,up], nDown=up.map((v)=>-v), nDownT=[nDown,nDown,nDown];
-  return [
-    [b00,b10,b11,materialId,nDir,groupId],[b00,b11,b01,materialId,nDir,groupId],             // back wall
-    [f10,b10,b11,materialId,nRight,groupId],[f10,b11,f11,materialId,nRight,groupId],         // right wall
-    [f01,b01,b00,materialId,nLeftT,groupId],[f01,b00,f00,materialId,nLeftT,groupId],         // left wall
-    [f11,b11,b01,materialId,nUp,groupId],[f11,b01,f01,materialId,nUp,groupId],               // top wall
-    [f00,b00,b10,materialId,nDownT,groupId],[f00,b10,f10,materialId,nDownT,groupId],         // bottom wall
-  ];
-}
-// A real open-fronted tube behind a round light disc: a circular back cap
-// plus a cylindrical side wall, the round-fixture equivalent of boxHousing.
-function tubeHousing(center, dir, radius, depth, materialId, groupId=0, segments=12) {
-  let worldUp=[0,1,0];
-  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
-  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const right=norm3(cross3(dir,worldUp));
-  const up=norm3(cross3(right,dir));
-  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
-  const back=add(center,dir,-depth);
-  const faces=[...circleFace(back, dir, radius, materialId, segments, groupId)];
-  for (let i=0;i<segments;i++) {
-    const a0=(i/segments)*Math.PI*2, a1=((i+1)/segments)*Math.PI*2;
-    const radial=(a)=>norm3(right.map((v,k)=>v*Math.cos(a)+up[k]*Math.sin(a)));
-    const rim=(c,a)=>add(add(c,right,Math.cos(a)*radius),up,Math.sin(a)*radius);
-    const f0=rim(center,a0), f1=rim(center,a1), r0=rim(back,a0), r1=rim(back,a1);
-    const n0=radial(a0), n1=radial(a1);
-    faces.push([f0,r0,r1,materialId,[n0,n0,n1],groupId],[f0,r1,f1,materialId,[n0,n1,n1],groupId]);
-  }
-  return faces;
-}
-// A snoot/gobo tube extending FORWARD from a light disc, open at both
-// ends. Physically, it narrows the disc's visible cone: a viewer close to
-// the `dir` axis (the subject this fixture is aimed at) still sees straight
-// down the open tube to the glowing disc, but a viewer off to the side
-// (the camera, watching from a much wider angle) has the opaque tube wall
-// between them and the disc -- exactly how a real snoot/barn-door hides a
-// kicker from camera while still letting it reach the subject.
-function snootTube(center, dir, radius, length, materialId, groupId=0, segments=12, exitRadius=radius) {
-  let worldUp=[0,1,0];
-  if (Math.abs(dir[1])>0.95) worldUp=[1,0,0];
-  const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const right=norm3(cross3(dir,worldUp));
-  const up=norm3(cross3(right,dir));
-  const add=(a,b,s)=>a.map((x,i)=>x+b[i]*s);
-  const tip=add(center,dir,length);
-  const faces=[];
-  for (let i=0;i<segments;i++) {
-    const a0=(i/segments)*Math.PI*2, a1=((i+1)/segments)*Math.PI*2;
-    const radial=(a)=>norm3(right.map((v,k)=>exitRadius===radius?-(v*Math.cos(a)+up[k]*Math.sin(a)):-(v*Math.cos(a)+up[k]*Math.sin(a))+(exitRadius-radius)/length*dir[k])); // inward-facing wall
-    const rim=(c,a,r=radius)=>add(add(c,right,Math.cos(a)*r),up,Math.sin(a)*r);
-    const f0=rim(center,a0), f1=rim(center,a1), r0=rim(tip,a0,exitRadius), r1=rim(tip,a1,exitRadius);
-    const n0=radial(a0), n1=radial(a1);
-    faces.push([f0,r0,r1,materialId,[n0,n0,n1],groupId],[f0,r1,f1,materialId,[n0,n1,n1],groupId]);
-  }
-  return faces;
-}
-// Debug-only: real extruded glyph geometry (the same digit/letter meshes
-// exported for chess/wordle tiles, assets.meshes) placed at a world
-// position, for marking fixture coordinates directly in the scene instead
-// of guessing from screenshots.
 function digitFaces(char, center, dir, scale, materialId) {
   const g=glyphMeshes[char];
   if (!g) return [];
@@ -583,7 +463,7 @@ async function loadObject() {
   } finally {applyingObject=false;}
   objectKey=objectSnapshotKey(captureObjectSnapshot());
   if(verified) {
-    acceptSavedObject({digest},{value,geometry});
+    acceptSavedObject({digest},{value,geometry,authoringKey:objectKey});
     objectStatus(`Loaded ${value.name} · verified ${geometry.triangleCount.toLocaleString()} triangles and mass moments`);
   } else {
     objectKey="";objectEdited();
@@ -673,6 +553,7 @@ function setupObjSubjects(run) {
 }
 function repartitionExterior(force=false) {
   if(!lastGeometry)return;
+  tagSubjectResponseFaces(lastGeometry,lightField?.responseInformationRequested===true);
   if(tableOpaque) rebuildTable();
   const classes=new Map();
   for(const face of [...lastGeometry.interior,...lastGeometry.glass]) if(!classes.has(face[3])) {
@@ -818,11 +699,65 @@ function studioControlValue(id, channel="studio") {
   const state=studioRenderState(channel);
   return state ? state.controls[id] : $(id)?.type==="checkbox" ? $(id).checked : $(id)?.value;
 }
-function surfaceMaterial(prefix,a,b,channel="studio") {
-  const pattern=studioControlValue(`${prefix}-pattern`,channel)||"solid";
-  const matA=ids[studioControlValue(`${prefix}-material-a`,channel)]??ids.stucco_plaster;
-  const matB=ids[studioControlValue(`${prefix}-material-b`,channel)]??matA;
-  return pattern==="checker"?((a+b)&1?matA:matB):matA;
+// Capture actual page values; the shared builders do not read controls.
+function studioBuilderLighting(channel="studio") {
+  return studioRenderState(channel)??{
+    controls:Object.fromEntries(LIGHTING_PROFILE_FIELDS.map(id=>[id,studioControlValue(id,channel)])),
+    poses:studioLighting?.poses?.getState?.(),backdrops:studioLighting?.backdrops?.getState(),
+    fixtureSizes:studioLighting?.fixtureSizes?.getState(),lightTools:studioLighting?.lightTools?.getState(),
+    table:studioTableState(channel),scale:studioLighting?.scale?.getState()??defaultStudioScale(),
+    gobos:studioLighting?.gobos?.getState(),lightStands:studioLighting?.lightStands?.getState(),shopLights:shopLightState(channel),
+  };
+}
+function fieldSceneKey({saved=false}={}) {
+  if($("preview-engine").value!=="visual"||$("preview-motion").value!=="off"||!$("inertia-lock").checked||
+      rollState?.orientation.some((v,i)=>v!==[1,0,0,0][i])||rollState?.position.some(v=>v!==0))
+    throw Error("Use the static, unrolled Studio pose to receive its ray field.");
+  if(!studioLighting||!lastGeometry)throw Error("Studio scene is not ready.");
+  if(saved&&(!savedObjectSnapshot||savedObjectSnapshot.authoringKey!==objectKey||
+      savedObjectSnapshot.authoringKey!==objectSnapshotKey(captureObjectSnapshot())))
+    throw Error("Save the current object before receiving its field.");
+  const a=studioBuilderLighting("exposure"),b=studioBuilderLighting("studio");
+  // Ignore only authoring metadata, not resolved geometry or materials. The
+  // strength records store both channels, so compare their actual rig too.
+  const normalize=value=>Array.isArray(value)?value.map(normalize):value&&typeof value==="object"?
+    Object.fromEntries(Object.keys(value).filter(k=>k!=="roomOverrides").sort().map(k=>[k,normalize(value[k])])):value;
+  const profile=value=>JSON.stringify(normalize(value));
+  if(profile(a)!==profile(b)||profile(computeFixtureRoles(undefined,"exposure"))!==profile(computeFixtureRoles(undefined,"studio")))
+    throw Error("Link Room B to Exposure A; their different scenes cannot share a field.");
+  const subject=studioSubjectTransform(saved,"exposure"),current=studioSubjectTransform(false,"studio");
+  if(profile(subject)!==profile(current))throw Error("The displayed subject size differs from the captured ray scene.");
+  return JSON.stringify([objectKey,profile(a),studioLighting.strengths.getSolo("exposure"),
+    yaw,pitch,distance,subject.unitM,subject.subjectCenter,
+    ...(lightField?.responseInformationRequested===true?[studioPhotoCamera(saved,{usePhotoCamera:false}).camera,photo.filmResponse()]:[])]);
+}
+let fieldMaterialProjection=null;
+function fieldMaterialRows() {
+  const data=new Float32Array(tables.pbr.data),stride=tables.pbr.table.floats_per_record;
+  const {roleColor,roleStrength}=computeFixtureRoles(undefined,"studio");
+  writeStudioFixtureRows(data,stride,FIXTURE_MAT_BASE,roleColor,roleStrength);
+  writeShopLightEmitterRows(data,stride,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,shopLightState("studio"),{profiles:shopEmissionProfiles});
+  // Lookup identity follows the same opt-in projection used by saved/ray
+  // snapshots. Never install these projected rows in the preview material
+  // texture. Keep raw rows too: edits hidden by that projection still stale a
+  // received field. Geometry membership is inspected only on a cache miss.
+  const previous=fieldMaterialProjection;
+  if(!previous||previous.key!==objectKey||previous.revision!==studioSceneRevision||previous.geometry!==lastGeometry||previous.stride!==stride||
+      previous.data.length!==data.length||data.some((v,i)=>!Object.is(v,previous.data[i]))) {
+    const design=readSubjectDesign(),optical=opticalControls?.capture(lastGeometry);
+    const pbr={data:Array.from(data),stride};
+    if(optical) {
+      prepareOpticalSnapshot({design:{...design,optical_authoring:optical},materials:{tables:{pbr}},
+        physical:{'radius-mm':Number($('radius-mm').value)}},lastGeometry,ids[design.shell]);
+    }
+    fieldMaterialProjection={key:objectKey,revision:studioSceneRevision,geometry:lastGeometry,stride,data,
+      lookupData:new Float32Array(pbr.data)};
+  }
+  return {data,stride,lookupData:fieldMaterialProjection.lookupData};
+}
+function studioBuilderOptions(channel="studio",saved=false) {
+  return {lighting:studioBuilderLighting(channel),subject:studioSubjectTransform(saved,channel),geometrySubject:studioSubjectTransform(false,channel),
+    materials:{ids,fixtureMaterialBase:FIXTURE_MAT_BASE,pbr:{data:tables.pbr.data,stride:tables.pbr.table.floats_per_record}}};
 }
 function studioRoomScale(channel="studio") { return Number(studioControlValue("room-scale",channel) || 3); }
 function studioTableState(channel="studio") { return studioRenderState(channel)?.table ?? studioLighting?.table?.getState() ?? defaultStudioTable(); }
@@ -878,23 +813,21 @@ function framePhotographicCamera() {
   const scene=photoCameraFromStudio(photoYaw,photoPitch,nextDistance,subject.unitM,subject.fovDegrees,subject.subjectCenter);
   scene.camera=photo.applyLensCamera(scene.camera);return scene;
 }
-function tableFaces(channel="studio",onPart) {
-  return studioTableFaces(studioTableState(channel),ids,studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)).floorY,onPart);
+function responsePartCallback(prefix,onPart) {
+  if(lightField?.responseInformationRequested!==true)return onPart;
+  return part=>{tagPartResponseFaces(part,`${prefix}/${part.id}`,true);onPart?.(part);};
 }
-function goboFaces(channel="studio",onPart) { return studioGoboFaces(studioRenderState(channel)?.gobos ?? studioLighting?.gobos?.getState(),ids,onPart); }
+function tableFaces(channel="studio",onPart) {
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).tableFaces(responsePartCallback('table',onPart));
+}
+function goboFaces(channel="studio",onPart) {
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).goboFaces(responsePartCallback('gobo',onPart));
+}
 function lightStandFacesForStudio(channel="studio",fixtureRoles,onPart) {
-  const state=studioRenderState(channel)?.lightStands??studioLighting?.lightStands?.getState();
-  if(!state?.enabled)return [];
-  const bounds=studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel));
-  return studioLightStandFaces(state,fixtureRoles,ids,bounds.floorY,{bounds,onPart,unitMm:studioSubjectTransform(false,channel).unitM*1000,
-    fixtureVertices:role=>buildFixtureFaces([role],FIXTURE_HOUSING_MAT).flatMap(face=>face.slice(0,3))});
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).lightStandFaces(fixtureRoles,responsePartCallback('stand',onPart));
 }
 function backdropSupportFacesForStudio(channel="studio",onPart) {
-  const state=studioRenderState(channel)?.lightStands??studioLighting?.lightStands?.getState();
-  if(!state?.enabled||!state.backdropSupport)return [];
-  const bounds=studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel));
-  return backdropSupportFaces(backdropRollFaces(channel).flatMap(face=>face.slice(0,3)),bounds.floorY,ids[state.material],onPart,
-    {bounds,unitMm:studioSubjectTransform(false,channel).unitM*1000});
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropHolderFaces(responsePartCallback('backdrop-holder',onPart));
 }
 function rebuildStandMeshes(fixtureRoles) {
   const state=studioRenderState("studio")?.lightStands??studioLighting?.lightStands?.getState();
@@ -905,7 +838,8 @@ function rebuildStandMeshes(fixtureRoles) {
     material===undefined?null:[read("pbr",material,5),read("pbr",material,7)]]);
   if(key===standMeshKey)return;
   const opaque=[],transparent=[];
-  for(const face of [...lightStandFacesForStudio("studio",fixtureRoles),...backdropSupportFacesForStudio("studio")])
+  for(const face of [...withSceneCategory(lightStandFacesForStudio("studio",fixtureRoles),STUDIO_SCENE_PART_GROUP.lightStand),
+    ...withSceneCategory(backdropSupportFacesForStudio("studio"),STUDIO_SCENE_PART_GROUP.backdropHolder)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:transparent).push(face);
   dispose(standOpaque);dispose(standGlass);standOpaque=mesh(opaque);standGlass=transparentMesh(transparent);
   standTransparentFaces=transparent;standMeshKey=key;sceneGlassKey=null;
@@ -915,9 +849,10 @@ function shopLightState(channel="studio") {
   return studioRenderState(channel)?.shopLights??studioLighting?.shopLights?.state();
 }
 function shopLightGeometryForStudio(channel="studio") {
-  const state=shopLightState(channel);
-  return studioShopLightGeometry(state,ids,shopLightEmitterAllocations(state,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS),{
-    bounds:studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)),unitMm:studioSubjectTransform(false,channel).unitM*1000});
+  const geometry=createStudioSceneGeometry(studioBuilderOptions(channel)).shopLightGeometry();
+  if(lightField?.responseInformationRequested===true)for(const part of geometry.parts)
+    tagPartResponseFaces(part,`shop/${part.id}`,true);
+  return geometry;
 }
 function shopLightFacesForStudio(channel="studio",onPart) {
   const geometry=shopLightGeometryForStudio(channel);
@@ -926,11 +861,11 @@ function shopLightFacesForStudio(channel="studio",onPart) {
 }
 function rebuildShopMeshes() {
   const state=shopLightState(),materials=[state?.backingMaterial,state?.topMaterial].map(name=>ids[name]);
-  const key=JSON.stringify([state,studioRoomScale(),studioFloorDrop(),studioSubjectTransform(false).unitM,
+  const key=JSON.stringify([state,studioRenderState()?.lightingRacks,studioRoomScale(),studioFloorDrop(),studioSubjectTransform(false).unitM,
     materials.map(id=>id===undefined?null:[read("pbr",id,5),read("pbr",id,7)])]);
   if(key===shopMeshKey)return shopGeometry;
   const geometry=shopLightGeometryForStudio(),opaque=[],transparent=[];
-  for(const face of geometry.faces)
+  for(const face of withSceneCategory(geometry.faces,STUDIO_SCENE_PART_GROUP.shopLight))
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:transparent).push(face);
   dispose(shopOpaque);dispose(shopGlass);shopOpaque=mesh(opaque);shopGlass=transparentMesh(transparent);
   shopTransparentFaces=transparent;shopMeshKey=key;shopGeometry=geometry;sceneGlassKey=null;
@@ -940,7 +875,8 @@ function rebuildTable() {
   dispose(tableOpaque); const opaque=[]; tableTransparentFaces=[];
   // Free-standing gobos share the existing furniture partition and world-space
   // glass sort, including when their front and back use different materials.
-  for(const face of [...tableFaces(),...goboFaces()])
+  for(const face of [...withSceneCategory(tableFaces(),STUDIO_SCENE_PART_GROUP.table),
+    ...withSceneCategory(goboFaces(),STUDIO_SCENE_PART_GROUP.gobo)])
     (isOpaquePreviewMaterial(read("pbr",face[3],5),read("pbr",face[3],7))?opaque:tableTransparentFaces).push(face);
   tableOpaque=mesh(opaque); sceneGlassKey=null;
 }
@@ -955,15 +891,16 @@ function transparentSet(model) {
         model[2]*n[0]+model[6]*n[1]+model[10]*n[2]];
       return p.map(v=>v/Math.hypot(...p));
     };
-    const faces=marbleTransparentFaces.map(([a,b,c,id,ns,gid=0])=>
-      [transformPoint(model,a),transformPoint(model,b),transformPoint(model,c),id,ns.map(normal),gid]);
-    dispose(sceneGlass); sceneGlass=transparentMesh([...tableTransparentFaces,...standTransparentFaces,...shopTransparentFaces,...faces]); sceneGlassKey=key;
+    const faces=marbleTransparentFaces.map(face=>{
+      const [a,b,c,id,ns,gid=0]=face;
+      return copyResponseIdentity(face,[transformPoint(model,a),transformPoint(model,b),transformPoint(model,c),id,ns.map(normal),gid]);
+    });
+    dispose(sceneGlass); sceneGlass=transparentMesh([...tableTransparentFaces,...standTransparentFaces,...shopTransparentFaces,...withSceneCategory(faces,'subject')]); sceneGlassKey=key;
   }
   return sceneGlass;
 }
 function checkerboardFaces(channel="studio",onSurface) {
-  return studioRoomFaces({scale:studioRoomScale(channel),floorDrop:studioFloorDrop(channel),windowOn:!!studioControlValue("window-glass",channel),
-    glassMaterial:ids.marble_clear_glass,material:(prefix,a,b)=>surfaceMaterial(prefix,a,b,channel),onSurface});
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).roomFaces(responsePartCallback('room',onSurface));
 }
 function checkerboard() { return mesh(checkerboardFaces()); }
 // A real backdrop roll: a stack of flat material panels mounted just in
@@ -975,10 +912,7 @@ function checkerboard() { return mesh(checkerboardFaces()); }
 // down across the wall/floor bevel and out along the floor, like a real
 // cyclorama, instead of hanging as a flat vertical sheet.
 function backdropRollFaces(channel="studio",onPart) {
-  return backdropFaces({count:Number(studioControlValue("backdrop-layers",channel)), material:studioControlValue("backdrop-material",channel),
-    sweep:studioControlValue("backdrop-sweep",channel), layers:studioRenderState(channel)?.backdrops ?? studioLighting?.backdrops.getState() ?? defaultBackdropLayers(),
-    wallZ:studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)).backZ,
-    floorY:studioRoomBounds(studioRoomScale(channel),studioFloorDrop(channel)).floorY},ids,onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropRollFaces(responsePartCallback('backdrop',onPart));
 }
 function backdropRoll() { return mesh(backdropRollFaces()); }
 // Pure (no WebGL calls) fixture-role builder, shared by the Phong frame()
@@ -986,69 +920,9 @@ function backdropRoll() { return mesh(backdropRollFaces()); }
 // built from the same validated profile. A owns exposure; B resolves explicit
 // Phong-only overrides. No Room override is read by the photo/live bridge.
 function computeFixtureRoles(subjectPosition = [0,0,0], strengthChannel = "studio", poseOverride = null, sizeOverride = null, toolsOverride = null) {
-  const keyMagX=Math.abs(+studioControlValue("light-x",strengthChannel)/100), keyY=+studioControlValue("light-y",strengthChannel)/100, keyZ=+studioControlValue("light-z",strengthChannel)/100;
-  const keyLeft=[-keyMagX, keyY, keyZ], keyRight=[keyMagX, keyY, keyZ];
-  const {background,kickerL,kickerR,fillLower,fillUpper}=ROOM_FIXTURES;
-  const keyFilterLeft=rgb(studioControlValue("key-filter-left",strengthChannel));
-  const keyFilterRight=rgb(studioControlValue("key-filter-right",strengthChannel));
-  const bgFilter=rgb(studioControlValue("background-filter",strengthChannel));
-  const kickerLeftFilter=rgb(studioControlValue("kicker-left-filter",strengthChannel));
-  const kickerRightFilter=rgb(studioControlValue("kicker-right-filter",strengthChannel));
-  const fillLowerFilter=rgb(studioControlValue("fill-lower-filter",strengthChannel));
-  const fillUpperFilter=rgb(studioControlValue("fill-upper-filter",strengthChannel));
-  // Roles: 0-1 keys (independently filtered, mirrored), 2 background,
-  // 3-4 kickers, 5-6 fills (floor+sky) -- every light has its own live
-  // filter colour, not a hardcoded role constant.
-  const roleColor=[keyFilterLeft,keyFilterRight,bgFilter,kickerLeftFilter,kickerRightFilter,fillLowerFilter,fillUpperFilter,
-    rgb(studioControlValue("table-left-filter",strengthChannel)),rgb(studioControlValue("table-right-filter",strengthChannel)),rgb(studioControlValue("under-filter",strengthChannel))];
-  const renderState=studioRenderState(strengthChannel), solo=studioLighting?.strengths.getSolo?.(strengthChannel);
-  const roleStrength=renderState ? STUDIO_LIGHTS.map(({id,strengthId})=>solo&&solo!==id?0:Number(renderState.controls[strengthId])/10) : studioLighting?.strengths.getStrengths(strengthChannel) ??
-    STUDIO_LIGHTS.map(({strengthId})=>+$(strengthId).value/10);
-  const keyShape=studioControlValue("key-shape",strengthChannel), keyIsHard=keyShape==="grid"||keyShape==="snoot";
-  const aimAt=(p)=>{const d=p.map((v)=>-v);const n=Math.max(1e-6,Math.hypot(...d));return d.map((v)=>v/n);};
-  // Kickers graze the subject's near edge (their own side) rather than
-  // hitting it face-on dead-centre -- a real rim/glancing kicker aim, not
-  // a second key light.
-  const aimGlance=(p,edgeX)=>{const d=[edgeX-p[0],0.1-p[1],-p[2]];const n=Math.max(1e-6,Math.hypot(...d));return d.map((v)=>v/n);};
-  // The background practical does NOT light the subject: it sits between
-  // the subject and the back wall, tilted up and back so its beam climbs
-  // the wall above it (a real uplight splash, not a flat horizontal aim).
-  const norm3=(v)=>{const n=Math.max(1e-9,Math.hypot(...v));return v.map((x)=>x/n);};
-  const backgroundDir=norm3([0,0.55,-1]);
-  const keyHalf=keyIsHard?0.10:0.38;
-  let fixtureRoles=[
-    {pos:keyLeft,    dir:aimAt(keyLeft),    halfW:keyHalf, halfH:keyHalf, mat:FIXTURE_MAT_BASE+0, roleIndex:0, round:false, shape:keyShape},
-    {pos:keyRight,   dir:aimAt(keyRight),   halfW:keyHalf, halfH:keyHalf, mat:FIXTURE_MAT_BASE+1, roleIndex:1, round:false, shape:keyShape},
-    {pos:background, dir:backgroundDir,     radius:0.30, mat:FIXTURE_MAT_BASE+2, roleIndex:2, round:true, shape:"bare", gobo:true, shroudLength:1.2, shroudRadius:0.375},
-    {pos:kickerL,    dir:aimGlance(kickerL,-0.32), radius:0.20, mat:FIXTURE_MAT_BASE+3, roleIndex:3, round:true, shape:"bare", gobo:true},
-    {pos:kickerR,    dir:aimGlance(kickerR, 0.32), radius:0.20, mat:FIXTURE_MAT_BASE+4, roleIndex:4, round:true, shape:"bare", gobo:true},
-    {pos:fillLower,  dir:aimAt(fillLower),  halfW:0.30, halfH:0.30, mat:FIXTURE_MAT_BASE+5, roleIndex:5, round:false, shape:"bare"},
-    {pos:fillUpper,  dir:aimAt(fillUpper),  halfW:0.30, halfH:0.30, mat:FIXTURE_MAT_BASE+6, roleIndex:6, round:false, shape:"bare"},
-    ...tableLightRoles(FIXTURE_MAT_BASE),
-  ];
-  const sizes=sizeOverride??renderState?.fixtureSizes??studioLighting?.fixtureSizes?.getState()??defaultFixtureSizes();
-  fixtureRoles=applyFixtureSizes(fixtureRoles,sizes);
-  fixtureRoles=applyLightTools(fixtureRoles,toolsOverride??renderState?.lightTools??studioLighting?.lightTools?.getState()??defaultLightTools(sizes),sizes,keyShape);
-  if (studioLighting || poseOverride) {
-    const poses=poseOverride ? resolveLightingPoses(poseOverride,STUDIO_LIGHTS.map(light=>light.id),subjectPosition) : renderState ? resolveLightingPoses(renderState.poses,STUDIO_LIGHTS.map(light=>light.id),subjectPosition) : studioLighting.poses.getPoses(subjectPosition);
-    for (const [i,role] of fixtureRoles.entries()) {
-      role.pos=poses[i].pos; role.dir=poses[i].dir;
-    }
-  } else if (studioTableState().enabled) {
-    // New-set defaults rest their real housings above the lowered floor.
-    // Loaded profiles always use their exact saved world-space poses instead.
-    const roomBounds=studioRoomBounds(studioRoomScale(),studioFloorDrop());
-    fixtureRoles=wallRelativeFixtureDefaults(fixtureRoles,roomBounds,role=>buildFixtureFaces([role],0).flatMap(face=>face.slice(0,3)),subjectPosition);
-    const floorY=roomBounds.floorY;
-    for(const index of FLOOR_FIXTURE_INDICES) {
-      const role=fixtureRoles[index];
-      if(role.defaultFloorHeight!==undefined){role.pos[1]=floorY+role.defaultFloorHeight;continue;}
-      const faces=buildFixtureFaces([role],0);
-      const low=Math.min(...faces.flatMap(face=>face.slice(0,3).map(p=>p[1])));
-      role.pos=role.pos.map((v,i)=>v+(i===1?floorY+0.02-low:0));
-    }
-  }
-  return {fixtureRoles, roleColor, roleStrength};
+  const lighting={...studioBuilderLighting(strengthChannel)};
+  if(poseOverride)lighting.poses=poseOverride;if(sizeOverride)lighting.fixtureSizes=sizeOverride;if(toolsOverride)lighting.lightTools=toolsOverride;
+  return computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase:FIXTURE_MAT_BASE,subjectPosition,solo:studioLighting?.strengths.getSolo?.(strengthChannel),emissionProfiles:shopEmissionProfiles});
 }
 // Pure (no WebGL calls) fixture mesh builder: the real 3D housing (box or
 // tube) plus the glowing panel/disc face for each role, shared by frame()'s
@@ -1056,79 +930,7 @@ function computeFixtureRoles(subjectPosition = [0,0,0], strengthChannel = "studi
 // which material ID the housing/label faces carry; frame() passes the live
 // FIXTURE_HOUSING_MAT, the photo bridge passes its own compact table index.
 function buildFixtureFaces(fixtureRoles, housingMat, onPart) {
-  const faces=[];
-  for (const role of fixtureRoles) {
-    const first=faces.length,components=[],componentGroups=[];
-    const roleId=STUDIO_LIGHTS[role.roleIndex].id,bodyId=`fixture-${roleId}`;
-    const describe=(id,start,count,sourceConstruction,intendedShape,arguments_)=>{
-      if(!onPart)return;
-      components.push({id,bodyId,firstTriangle:start-first,triangleCount:count,sourceConstruction,intendedShape,
-        ...(arguments_?{constructionArguments:arguments_}:{}),contactAdmission:"unverified"});
-    };
-    const size=role.round?role.radius:Math.max(role.halfW,role.halfH);
-    // A real 3D box/tube housing the light sits inside, slightly larger
-    // than the panel and with real depth/side walls -- reads as an
-    // actual containing body, not a bigger disk floating in the same
-    // emission lobe.
-    const depth=role.housingDepth??size*1.4;
-    // quadFace/circleFace historically wound opposite their explicit normals.
-    // Spectral derives emission direction from winding, not those normals:
-    // swap emitter vertices so all ten photo sources face their authored aim.
-    // Positions, materials, powers and the non-emissive housing stay unchanged.
-    if (role.round) {
-      const housingStart=faces.length;
-      faces.push(...tubeHousing(role.pos, role.dir, role.radius*1.25, depth, housingMat, role.mat));
-      describe("housing/back",housingStart,12,"circleFace","triangle-fan",
-        {center:role.pos.map((v,i)=>v+role.dir[i]*(-depth)),dir:role.dir,radius:role.radius*1.25,segments:12});
-      for(let i=0;i<12;i++)describe(`housing/wall-${i}`,housingStart+12+i*2,2,"tubeHousing/rim","quad-strip");
-      if(onPart)componentGroups.push({id:"housing",firstTriangle:housingStart-first,triangleCount:36,sourceConstruction:"tubeHousing",
-        intendedShape:"open-front-polygonal-tube",constructionArguments:{center:role.pos,dir:role.dir,radius:role.radius*1.25,depth,segments:12},
-        contactAdmission:"unverified"});
-      const emitter=circleFace(role.pos, role.dir, role.radius, role.mat, 12, role.mat);
-      const emitterStart=faces.length;
-      faces.push(...emitter.map(([a,b,c,m,n,g])=>[a,c,b,m,[n[0],n[2],n[1]],g]));
-      describe("emitter",emitterStart,12,"circleFace/reversed","triangle-fan",{center:role.pos,dir:role.dir,radius:role.radius,segments:12});
-      if (role.gobo) {
-        const shroudStart=faces.length,radius=role.shroudRadius??role.radius*1.1,length=role.shroudLength??size*2.2;
-        const offset=role.shroudOffset??0,exitRadius=role.shroudExitRadius??radius;
-        // An axial mount extension is a real opaque collar, not an open gap.
-        if(offset>0){
-          faces.push(...snootTube(role.pos,role.dir,radius,offset,housingMat,role.mat));
-          for(let i=0;i<12;i++)describe(`shroud/mount-wall-${i}`,shroudStart+i*2,2,"snootTube/rim","quad-strip");
-        }
-        const center=offset>0?role.pos.map((v,i)=>v+role.dir[i]*offset):role.pos,taperStart=faces.length;
-        faces.push(...snootTube(center,role.dir,radius,length,housingMat,role.mat,12,exitRadius));
-        for(let i=0;i<12;i++)describe(`shroud/wall-${i}`,taperStart+i*2,2,"snootTube/rim","quad-strip");
-        if(onPart)componentGroups.push({id:"shroud",firstTriangle:shroudStart-first,triangleCount:faces.length-shroudStart,sourceConstruction:"snootTube",
-          intendedShape:exitRadius===radius?"open-ended-polygonal-tube":"open-ended-polygonal-frustum",constructionArguments:{center:role.pos,dir:role.dir,radius,
-            length,offset,exitRadius,segments:12,toolId:role.shroudToolId},contactAdmission:"unverified"});
-      }
-    } else {
-      const housingStart=faces.length;
-      faces.push(...boxHousing(role.pos, role.dir, role.halfW*1.25, role.halfH*1.25, depth, housingMat, role.mat));
-      for(const [i,name]of ["back","right","left","top","bottom"].entries())
-        describe(`housing/${name}`,housingStart+i*2,2,"boxHousing/face","quad-sheet");
-      if(onPart)componentGroups.push({id:"housing",firstTriangle:housingStart-first,triangleCount:10,sourceConstruction:"boxHousing",
-        intendedShape:"open-front-box",constructionArguments:{center:role.pos,dir:role.dir,halfW:role.halfW*1.25,halfH:role.halfH*1.25,depth},
-        contactAdmission:"unverified"});
-      const emitter=quadFace(role.pos, role.dir, role.halfW, role.halfH, role.mat, role.mat);
-      const emitterStart=faces.length;
-      faces.push(...emitter.map(([a,b,c,m,n,g])=>[a,c,b,m,[n[0],n[2],n[1]],g]));
-      describe("emitter",emitterStart,2,"quadFace/reversed","quad-sheet",{center:role.pos,dir:role.dir,halfW:role.halfW,halfH:role.halfH});
-    }
-    const modifierStart=faces.length;
-    const modifierRole={...role};
-    for(const [name,key]of [['gridInteriorMaterial','gridInteriorMaterialId'],['gridOuterMaterial','gridOuterMaterialId'],['gridAccentMaterial','gridAccentMaterialId']]){
-      const material=role[name]??'housing';if(material!=='housing'&&!Number.isInteger(ids[material]))throw Error('Unavailable grid material '+material);modifierRole[key]=material==='housing'?housingMat:ids[material];
-    }
-    faces.push(...tableLightModifierFaces(modifierRole,housingMat,onPart?component=>components.push({...component,id:`modifier/${component.id}`,
-      bodyId,firstTriangle:modifierStart-first+component.firstTriangle}):undefined));
-    if(faces.length>modifierStart)if(onPart)componentGroups.push({id:"modifier",firstTriangle:modifierStart-first,triangleCount:faces.length-modifierStart,
-      sourceConstruction:"tableLightModifierFaces",intendedShape:role.tableStand?"base-and-post":"intersecting-grid-bars",contactAdmission:"unverified"});
-    onPart?.({id:roleId,bodyId,construction:"fixture-housing-emitter-modifier",closed:false,convex:false,
-      components,componentGroups,contactOwnership:"shared-body-union-required",faces:faces.slice(first)});
-  }
-  return faces;
+  return buildStudioFixtureFaces(fixtureRoles,housingMat,responsePartCallback('fixture',onPart),ids);
 }
 // The ray-traced photo's entire non-marble scene, as one buffer, captured
 // from the exact same pure face-builders frame() itself calls right now --
@@ -1150,40 +952,34 @@ function buildFixtureFaces(fixtureRoles, housingMat, onPart) {
 // world units; the only transform needed is the same linear unit/centre
 // conversion. The rig unit is independent of the saved object's physical
 // radius. Explicit legacy profiles retain their original photo conversion.
-export function sceneForPhoto(saved = true) {
-  const {fixtureRoles,roleColor,roleStrength}=computeFixtureRoles(studioSubjectTransform(saved,"exposure").subjectCenter,"exposure");
-  const parts=[];
-  const collect=(group,prefix,builder)=>{
-    const captured=[];const faces=builder(part=>captured.push({...part,group,label:`${prefix} ${part.id}`}));
-    if(captured.reduce((n,p)=>n+p.faces.length,0)!==faces.length)
-      throw new Error(`${prefix}: generated scene parts do not cover the actual triangles.`);
-    parts.push(...captured);return faces;
-  };
-  collect('stage','Light fixture',cb=>buildFixtureFaces(fixtureRoles,FIXTURE_HOUSING_MAT,cb));
-  collect('room','Room',cb=>checkerboardFaces("exposure",cb));
-  collect('room','Backdrop',cb=>backdropRollFaces("exposure",cb));
-  collect('room','Backdrop holder',cb=>backdropSupportFacesForStudio("exposure",cb));
-  collect('stage','Table',cb=>tableFaces("exposure",cb));
-  collect('room','Gobo',cb=>goboFaces("exposure",cb));
-  collect('stage','Light stand',cb=>lightStandFacesForStudio("exposure",fixtureRoles,cb));
-  collect('room','Shop light',cb=>shopLightFacesForStudio("exposure",cb));
-  // Use the canonical buffer and the same per-light emission writer as Phong.
-  // The compact upload only rekeys IDs. It never invents another material row.
-  const stride=tables.pbr.table.floats_per_record,data=tables.pbr.data.slice();
-  writeStudioFixtureRows(data,stride,FIXTURE_MAT_BASE,roleColor,roleStrength);
-  writeShopLightEmitterRows(data,stride,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,shopLightState("exposure"),{channel:"exposure",profiles:shopEmissionProfiles});
-  const used=[...new Set([...Array.from({length:STUDIO_LIGHTS.length+1},(_,i)=>FIXTURE_MAT_BASE+i),
-    ...parts.flatMap(p=>p.faces.map(f=>f[3]))])];
-  const materialIndex=new Map(used.map((id,i)=>[id,i]));
-  const pbr=used.flatMap(id=>Array.from(data.slice(id*stride,id*stride+16)));
-  const scale=studioPhotoScale(saved),toMeters=p=>OBJECT_CENTER.map((c,i)=>c+p[i]*scale),vertices=[],materialIds=[];
-  for(const part of parts)for(const [a,b,c,id]of part.faces) {
-    vertices.push(...toMeters(a),...toMeters(b),...toMeters(c));materialIds.push(materialIndex.get(id));
-  }
-  const material_engines=sceneMaterialEngineContract({engines:studioRenderState("exposure")?.sceneEngines,
-    parts,materialIndex,pbr:{data,stride},getOpticalRecord:id=>opticalControls?.sceneRecord(id)});
-  const emitter_profiles=shopLightEmissionRecords(shopLightState("exposure"),FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,materialIndex,shopEmissionProfiles);
-  return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles};
+let photoSceneCacheKey=null,photoSceneCacheValue=null;
+export function sceneForPhoto(saved = true,{timedExposure=false}={}) {
+  const builder=studioBuilderOptions("exposure",saved);
+  // The exposure clock may advance through many held ticks. Compare the
+  // compact scene inputs before invoking the canonical triangle builders.
+  const key=JSON.stringify([saved,timedExposure,builder.lighting,builder.subject,
+    builder.geometrySubject,builder.materials.pbr.data,shopEmissionProfiles,
+    studioLighting?.strengths.getSolo?.("exposure"),studioSceneRevision,
+    lightField?.responseInformationRequested===true]);
+  if(key===photoSceneCacheKey)return photoSceneCacheValue;
+  const value=buildStudioPhotoFixtures({...builder,rayOriginM:OBJECT_CENTER,shopEmissionProfiles,
+    timedExposure,
+    ...(lightField?.responseInformationRequested===true?{lightFieldInformation:RESPONSE_INFORMATION}:{}),
+    solo:studioLighting?.strengths.getSolo?.("exposure"),getOpticalRecord:id=>opticalControls?.sceneRecord(id)});
+  photoSceneCacheKey=key;photoSceneCacheValue=value;
+  return value;
+}
+let responseSourcesRequested=false;
+function refreshResponseSources() {
+  const requested=lightField?.responseInformationRequested===true;
+  if(requested===responseSourcesRequested)return;
+  responseSourcesRequested=requested;
+  // Reuse existing builders at an actual opt-in change. No response buffer is
+  // created here; a validated matching package is required before attribute 7.
+  repartitionExterior(true);
+  dispose(checkerMesh);checkerMesh=checkerboard();
+  dispose(backdropMesh);backdropMesh=backdropRoll();
+  standMeshKey=null;shopMeshKey=null;sceneGlassKey=null;
 }
 // Read-only capture for hidden native preparation. This deliberately does NOT
 // use sceneForPhoto: Exposure is a separate saved profile/canonical pose. No
@@ -1271,7 +1067,7 @@ function controls() {
   const skipPhotoInvalidation=new Set(["object-name","saved-object","obj-asset","obj-file","obj-mtl","layer","preview-engine","preview-camera","preview-motion",
     "preview-axis","preview-hz","preview-phase","preview-arc","inertia-lock","roll-force-x","roll-force-z"]);
   const designChanged=(event)=>{
-    if(event.target.closest?.('#camera-toolbox'))return;
+    if(event.target.closest?.('#camera-toolbox, #phong-light-field-controls, #phong-capture-controls'))return;
     if(event.target.closest?.('#photo-camera-binding'))return;
     if(applyingObject||event.target.closest("#optical-material-controls")||event.target.closest("#room-profile-overrides")||event.target.closest("#live-ray-controls")||event.target.id==="object-autosave")return;
     if(event.target.id==="object-name"){objectEdited();return;}
@@ -1564,11 +1360,14 @@ function controls() {
     .addEventListener(eventName,designChanged,true);
 }
 function frame(now=0) {
-  const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
+  const dt=exposureClock.active?exposureClock.dt:(lastFrame?Math.min(0.025,(now-lastFrame)/1000):0);
+  lastFrame=now;
+  if(exposureClock.active)exposureClock.modelNow+=dt;
+  const sceneNow=exposureClock.active?exposureClock.modelNow*1000:now;
   const simOn=$("preview-engine").value==="particle";
   if(simOn&&sim.runtime?.ready) {
     if(drive.active&&drive.yaw!==driveViewYaw())driveGravity();
-    sim.runtime.frame(now/1000);
+    sim.runtime.frame(sceneNow/1000);
     if($("preview-motion").value==="flip"&&sim.runtime.shown!=null&&sim.runtime.steps>=sim.nextFlipStep) {
       const hz=+$("preview-hz").value;
       const turn=sim.runtime.startCaseFlip(Math.min(0.7/hz,1/hz),1,$("preview-axis").value);
@@ -1584,11 +1383,24 @@ function frame(now=0) {
   }
   const w=Math.max(1,Math.round(canvas.clientWidth*devicePixelRatio)), h=Math.max(1,Math.round(canvas.clientHeight*devicePixelRatio));
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
-  let dofActive=false;
-  if(P&&interior&&$("studio-dof")?.checked)try{studioDof.begin(w,h);dofActive=true;}
+  let dofActive=false,secondaryActive=false;
+  const ordinaryPrimary=P;
+  const wantsSecondary=!!(P&&interior&&secondaryField&&lightField?.hasResponses&&lightField?.hasReceivers&&$("phong-field-secondary")?.checked);
+  if(P&&interior&&$("studio-dof")?.checked)try{studioDof.begin(w,h,{singleSample:wantsSecondary});dofActive=true;}
   catch(error){$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
   try {
-  gl.viewport(0,0,w,h); gl.clearColor(0.035,0.075,0.12,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(wantsSecondary) {
+    P=fieldPrimary;
+    try{secondaryActive=secondaryField.begin(w,h);}
+    catch(error){P=ordinaryPrimary;secondaryActive=false;
+      $("phong-secondary-status").textContent=`Native response application unavailable: ${error.message}`;}
+  }
+  gl.viewport(0,0,w,h);
+  // Inverse of the canonical display curve for the existing backdrop only.
+  // It must be linear before glass blends over it; no radiance is normalized.
+  if(secondaryActive)gl.clearColor(0.007880049518042097,0.014670364583228053,0.023430969800125,1);
+  else gl.clearColor(0.035,0.075,0.12,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   if (P && interior) {
     const follow=isMarbleChase();
     let cameraDistance=simOn?Math.max(distance,7):distance;
@@ -1600,7 +1412,7 @@ function frame(now=0) {
     const subjectPosition=studioDisplayedSubjectCenter(subject,rollState?.position??null);
     if(!simOn)studioOrbitTarget=[...subjectPosition];
     let object=multiply(translate3(...subjectPosition),multiply(roll,scale3(subject.subjectRadius)));
-    const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
+    const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,sceneNow/1000);
     const axis=$("preview-axis").value;
     const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
     let caseM=identity(),haveParticle=true,particleWorld=null,particleRadius=null,particleObjects=[];
@@ -1620,7 +1432,7 @@ function frame(now=0) {
     // The law position is in the case frame. Apply the same physical case
     // transform as the containing mesh before anchoring the camera to it.
     const chase=follow&&particleWorld?chaseCamera.update({position:particleWorld,radius:particleRadius,
-      sampleSeconds:sim.runtime.shown*sim.runtime.snap*sim.runtime.manifest.law.dt,nowSeconds:now/1000,
+      sampleSeconds:sim.runtime.shown*sim.runtime.snap*sim.runtime.manifest.law.dt,nowSeconds:sceneNow/1000,
       epoch:sim.epoch,steering:drive.active,autoHeading:$("preview-camera").value==="marble"}):null;
     if(chase)cameraDistance=chase.distance;
     const view=chase?chaseViewMatrix(chase):simOn?baseView:multiply(baseView,translate3(...studioOrbitTarget.map(v=>-v)));
@@ -1629,15 +1441,45 @@ function frame(now=0) {
     let dofCamera=dofCameraFromView(view,{unitM:subject.unitM,targetDistance:cameraDistance,
       fovDegrees:simOn?360/7:subject.fovDegrees});
     let opticsError=null;
-    try {dofCamera=photo.applyLensCamera(dofCamera);lastDofOptics={fov_degrees:dofCamera.fov_degrees,
+    try {dofCamera=photo.applyLensCamera(dofCamera,w/h);lastDofOptics={fov_degrees:dofCamera.fov_degrees,
       focus_distance_m:dofCamera.focus_distance_m,aperture_radius_m:dofCamera.aperture_radius_m};}
     catch(error){opticsError=error.message;if(lastDofOptics)dofCamera={...dofCamera,...lastDofOptics};}
     const viewFovDegrees=dofCamera.fov_degrees;
     const clip=studioCameraClip(subject,cameraDistance,studioRoomBounds(studioRoomScale(),studioFloorDrop()),studioOrbitTarget);
     const viewFar=simOn?30:clip.far,viewNear=chase?Math.min(.01,chase.radius*.2):simOn ? .01 : clip.near;
-    const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(P,"uMV"),false,matrix);
-      gl.uniformMatrix4fv(loc(P,"uMVP"),false,multiply(perspective(w/h,viewFovDegrees,
+    let drawingProgram=P;
+    const setTransform=(matrix)=>{ gl.uniformMatrix4fv(loc(drawingProgram,"uMV"),false,matrix);
+      gl.uniformMatrix4fv(loc(drawingProgram,"uMVP"),false,multiply(perspective(w/h,viewFovDegrees,
         viewFar,viewNear),matrix)); };
+    const opaqueDraws=[],transparentDraws=[];
+    let scalarFieldActive=false;
+    const setFieldCategory=category=>{
+      const enabled=fieldCategoryEnabled(lightField?.categoryMask??0,category);
+      integer(drawingProgram,"uFieldCategoryDisabled",Number(!enabled));
+      if(!secondaryActive)field(drawingProgram,"uFieldGain",Number(scalarFieldActive&&enabled));
+    };
+    const drawOwnedMesh=(resource,category=null)=>{
+      if(secondaryActive)lightField.bindResponseLineage(resource);
+      gl.bindVertexArray(resource.vao);
+      if(secondaryActive||scalarFieldActive)for(const run of resource.categoryRuns) {
+        setFieldCategory(run.category??category);gl.drawArrays(gl.TRIANGLES,run.first,run.count);
+      } else gl.drawArrays(gl.TRIANGLES,0,resource.count);
+    };
+    const drawOwnedTransparent=(resource,matrix,category=null)=>{
+      if(secondaryActive)lightField.bindResponseLineage(resource);
+      return drawTransparent(resource,matrix,secondaryActive||scalarFieldActive?group=>setFieldCategory(group??category):null);
+    };
+    const drawOpaqueMesh=(resource,matrix,emissionDirect=false,category=null)=>{
+      if(!resource?.count)return;
+      setTransform(matrix);drawOwnedMesh(resource,category);
+      if(secondaryActive)opaqueDraws.push({resource,matrix,emissionDirect,category});
+    };
+    const drawGlassMesh=(resource,matrix,sorted=true,category=null)=>{
+      if(!resource?.count)return;
+      if(secondaryActive){transparentDraws.push({resource,matrix,sorted,category});return;}
+      setTransform(matrix);if(sorted)drawOwnedTransparent(resource,matrix,category);
+      else drawOwnedMesh(resource,category);
+    };
     setTransform(mv);
     // Real room fixtures, each a fixed scene object nailed in place in the
     // room, exactly like the checkerboard backdrop/floor -- none of them
@@ -1694,6 +1536,7 @@ function frame(now=0) {
       gl.uniform2fv(loc(P,`uLightSpotCone[${i}]`),lightSpotCone[i]);
     }
     field(P,"uLightCalibration",1); field(P,"uExposure",1); field(P,"uFieldGain",0);
+    if(!secondaryActive&&lightField?.hasReceivers)scalarFieldActive=lightField.bind(P,view,subject.unitM,OBJECT_CENTER);
     field(P,"uAmbientFloorGain",0); // no invisible indirect-light floor: pure emitter lighting only
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
@@ -1704,21 +1547,17 @@ function frame(now=0) {
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
     gl.disable(gl.BLEND); gl.depthMask(true);
     if (!simOn && tableOpaque?.count) {
-      setTransform(view); gl.bindVertexArray(tableOpaque.vao);
-      gl.drawArrays(gl.TRIANGLES,0,tableOpaque.count); setTransform(mv);
+      drawOpaqueMesh(tableOpaque,view);setTransform(mv);
     }
     if(standOpaque?.count) {
-      setTransform(view);gl.bindVertexArray(standOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,standOpaque.count);setTransform(mv);
+      drawOpaqueMesh(standOpaque,view);setTransform(mv);
     }
     if (simOn&&sim.cageOpaque) {
-      setTransform(multiply(view,caseM));gl.bindVertexArray(sim.cageOpaque.vao);
-      gl.drawArrays(gl.TRIANGLES,0,sim.cageOpaque.count);setTransform(mv);
+      drawOpaqueMesh(sim.cageOpaque,multiply(view,caseM));setTransform(mv);
     } else if (!simOn&&studioControlValue("checker") && checkerMesh) {
-      setTransform(view); gl.bindVertexArray(checkerMesh.vao);
-      gl.drawArrays(gl.TRIANGLES,0,checkerMesh.count);
+      drawOpaqueMesh(checkerMesh,view,false,STUDIO_SCENE_PART_GROUP.room);
       if (backdropMesh && backdropMesh.count) {
-        gl.bindVertexArray(backdropMesh.vao);
-        gl.drawArrays(gl.TRIANGLES,0,backdropMesh.count);
+        drawOpaqueMesh(backdropMesh,view,false,STUDIO_SCENE_PART_GROUP.backdrop);
       }
       setTransform(mv);
     }
@@ -1759,32 +1598,41 @@ function frame(now=0) {
     // (fixed room constants, or the live camera axis for fill), exactly
     // like the checkerboard backdrop and the marble itself -- drawn with
     // the same `view` matrix, not an identity-transform shortcut.
-    setTransform(view); gl.bindVertexArray(fixtureMeshes.vao);
-    gl.drawArrays(gl.TRIANGLES,0,fixtureMeshes.count);
-    if(shopOpaque?.count){gl.bindVertexArray(shopOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,shopOpaque.count);}
+    drawOpaqueMesh(fixtureMeshes,view,true,STUDIO_SCENE_PART_GROUP.fixture);
+    if(shopOpaque?.count)drawOpaqueMesh(shopOpaque,view,true);
     integer(P,"uEnableEmissionDirect",0);
     setTransform(mv);
     if(haveParticle) for(const model of simOn?particleObjects:[object]) {
       const modelView=simOn?multiply(view,model):mv;
       setTransform(modelView);
       gl.disable(gl.BLEND);gl.depthMask(true);
-      gl.bindVertexArray(interior.vao); gl.drawArrays(gl.TRIANGLES,0,interior.count);
+      drawOpaqueMesh(interior,modelView,false,simOn?null:"subject");
       gl.disable(gl.BLEND);gl.depthMask(true);
-      gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);
+      drawOpaqueMesh(glassOpaque,modelView,false,simOn?null:"subject");
       gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
       if(!simOn&&(tableTransparentFaces.length||standTransparentFaces.length||shopTransparentFaces.length)) {
-        setTransform(view); drawTransparent(transparentSet(multiply(object,preview)),view);
-      } else drawTransparent(glass,modelView);
+        drawGlassMesh(transparentSet(multiply(object,preview)),view);
+      } else drawGlassMesh(glass,modelView,true,simOn?null:"subject");
     }
     if(simOn&&sim.cageGlass) {
       setTransform(multiply(view,caseM));gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
-      gl.bindVertexArray(sim.cageGlass.vao);gl.drawArrays(gl.TRIANGLES,0,sim.cageGlass.count);
+      drawGlassMesh(sim.cageGlass,multiply(view,caseM),false);
     }
     if(simOn&&standGlass?.count) {
-      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawTransparent(standGlass,view);
+      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawGlassMesh(standGlass,view);
     }
     if(simOn&&shopGlass?.count) {
-      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawTransparent(shopGlass,view);
+      setTransform(view);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);drawGlassMesh(shopGlass,view);
+    }
+    if(secondaryActive) {
+      secondaryField.finish({bind:shader=>lightField.bindSecondary(shader,view,subject.unitM,OBJECT_CENTER),
+        drawOpaque(shader){drawingProgram=shader;for(const {resource,matrix,emissionDirect,category}of opaqueDraws){
+          integer(shader,"uEnableEmissionDirect",Number(emissionDirect));setTransform(matrix);
+          drawOwnedMesh(resource,category);}},
+        drawTransparent(shader){drawingProgram=shader;integer(shader,"uEnableEmissionDirect",0);
+          for(const {resource,matrix,sorted,category}of transparentDraws){setTransform(matrix);
+            if(sorted)drawOwnedTransparent(resource,matrix,category);else drawOwnedMesh(resource,category);}}});
+      drawingProgram=P;gl.useProgram(P);setTransform(mv);
     }
     gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
     const lighting=studioRenderState("studio");
@@ -1807,10 +1655,14 @@ function frame(now=0) {
     }catch(error){studioDof.cancel();$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
     else if(!$("studio-dof")?.checked&&!$("studio-dof-status")?.textContent.startsWith("Phong DOF unavailable"))dofStatus("Phong DOF off. Photos and live rays retain their lens settings.");
   }
+    // Copies the finished primary/secondary/DOF output, never the ray overlay.
+    if(P&&interior)phongCapture.frame();
     if(message.textContent.startsWith('Studio preview unavailable: '))message.textContent='';
   } catch(error) {
+    phongCapture.fail(error);
     lastStudioFrame=null;message.textContent='Studio preview unavailable: '+(error.message||String(error));
-  } finally {if(dofActive)studioDof.cancel();}
+  } finally {secondaryField?.cancel();if(dofActive)studioDof.cancel();P=ordinaryPrimary;if(P)gl.useProgram(P);}
+  exposureClock.completeTick();
   requestAnimationFrame(frame);
 }
 async function boot() {
@@ -1829,6 +1681,12 @@ async function boot() {
       if (!Number.isInteger(ids[name])) throw Error(`material ${name} is absent from assets.json; export the catalogue`);
     const source=fragment.replace(/^(#version[^\n]*\n)/,"$1#define PLUCK_TRANSMISSION 1\n#define PLUCK_PREMULTIPLIED_GLASS 1\n");
     P=program(vertex,source);
+    try {
+      fieldPrimary=program(vertex,source);
+      secondaryField=createStudioSecondaryField({gl,primary:fieldPrimary,secondary:program(vertex,secondaryFieldFragment(source))});
+    }
+    catch(error){$("phong-field-secondary").checked=false;$("phong-field-secondary").disabled=true;
+      $("phong-secondary-status").textContent=`Secondary passes unavailable: ${error.message}`;}
     gl.useProgram(P);
     const extra=studioMaterialExtras(assets), authoredRows=studioMaterialBase(assets,extra);
     coatedId=extra.coated; paintAId=extra.paintA; paintBId=extra.paintB;
@@ -1845,25 +1703,8 @@ async function boot() {
     const pbrStride=tables.pbr.table.floats_per_record;
     FIXTURE_MAT_BASE=authoredRows;
     FIXTURE_HOUSING_MAT=FIXTURE_MAT_BASE+STUDIO_LIGHTS.length;
-    const base=(slot)=>(FIXTURE_MAT_BASE+slot)*pbrStride;
-    for (let slot=0;slot<STUDIO_LIGHTS.length;slot++) {
-      const b=base(slot);
-      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
-      tables.pbr.data[b+3]=1; tables.pbr.data[b+7]=1; // roughness, opacity
-    }
-    {
-      const b=base(STUDIO_LIGHTS.length);
-      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
-      tables.pbr.data[b+0]=0.03; tables.pbr.data[b+1]=0.03; tables.pbr.data[b+2]=0.035; // near-black albedo
-      tables.pbr.data[b+3]=0.8; tables.pbr.data[b+7]=1; // roughness, opacity; emission stays 0
-    }
+    initializeStudioFixtureRows(tables.pbr.data,pbrStride,FIXTURE_MAT_BASE);
     FIXTURE_LABEL_MAT=FIXTURE_MAT_BASE+STUDIO_LIGHTS.length+1;
-    {
-      const b=base(STUDIO_LIGHTS.length+1);
-      for (let i=0;i<pbrStride;i++) tables.pbr.data[b+i]=0;
-      tables.pbr.data[b+3]=1; tables.pbr.data[b+7]=1;
-      tables.pbr.data[b+8]=4; tables.pbr.data[b+9]=0.3; tables.pbr.data[b+10]=0.3; // bright red debug label, always visible
-    }
     tables.pbr.update();
     // The PBR table's emission colour is gated by the texstack table's own
     // per-material emit_gain (tx_emit_gain, texstack offset 8): zero by
@@ -1933,8 +1774,12 @@ async function boot() {
     copyCoating(); copyPaint(); checkerMesh=checkerboard(); backdropMesh=backdropRoll();rebuildTable();
     if ($("backdrop-layers-out")) $("backdrop-layers-out").value=$("backdrop-layers").value;
     if ($("room-scale-out")) $("room-scale-out").value=$("room-scale").value;
-    for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
-      uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10})) integer(P,name,unit);
+    for(const shader of [P,fieldPrimary].filter(Boolean)) {
+      gl.useProgram(shader);
+      for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
+        uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10})) integer(shader,name,unit);
+    }
+    gl.useProgram(P);
     flatArray(4,[0,255,128,255]); flatArray(5,[255,255,255,255]); flatArray(6,[128,255,255,255]); flatArray(7,[0,0,0,0]);
     const volume=gl.createTexture(); gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_3D,volume);
     gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
@@ -1943,6 +1788,8 @@ async function boot() {
     gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
     gl.texStorage3D(gl.TEXTURE_2D_ARRAY,1,gl.DEPTH_COMPONENT24,1,1,1);
     floatTexture({data:[0],floats_per_record:1},10);
+    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,getSceneMaterials:fieldMaterialRows,onChange:()=>{refreshResponseSources();liveRay?.sceneChanged();}});
+    refreshResponseSources();
     controls(); syncMaterial(); rebuild({invalidatePhoto:false});
     opticalControls=createOpticalMaterialControls({getContext:()=>({geometry:lastGeometry,
       design:readSubjectDesign(),shell:ids[$('shell').value],selectedMaterial:selected(),
@@ -1954,14 +1801,43 @@ async function boot() {
     refreshSceneMaterialTargets();
     objectLibraryControls();
     objectKey=objectSnapshotKey(captureObjectSnapshot());
-    liveRay=createLiveRayView({doc:document,canvas,getGeometry:()=>savedObjectSnapshot?.geometry??lastGeometry,
+    liveRay=createLiveRayView({doc:document,canvas,fieldView,getGeometry:()=>savedObjectSnapshot?.geometry??lastGeometry,
       getOpticalMode:()=>opticalControls?.mode??'legacy',
       ensureSaved:async()=>{if(objectAutosave.enabled)await saveObject();else if(objectAutosave.dirty)throw new Error("Save your object changes or enable autosave first.");},
       getScene:()=>currentCameraOptions(false,{usePhotoCamera:false}),getPose:()=>validatePhotoFocus(studioPhotoCamera(true,{usePhotoCamera:false}).camera),
       getFilmResponse:()=>photo.filmResponse()});
     frame();
     initCalibration(document, { saveObject, getGeometry: () => lastGeometry,
-      getCameraOptions: () => ({...currentCameraOptions(), filmResponse:photo.filmResponse()}), gl, canvas });
+      getCameraOptions: () => ({...currentCameraOptions(), filmResponse:photo.filmResponse()}),
+      getCalibrationCameraOptions:()=>{
+        const base={...currentCameraOptions(),filmResponse:photo.filmResponse()};
+        const card=studioLighting.gobos.getState().gobos.find(g=>g.enabled&&g.artwork?.rectangles?.[0]?.id.startsWith('exposure-'));
+        if(!card)throw Error('The exposure card is unavailable');
+        const subject=studioSubjectTransform(false,'exposure'),marble=studioPhotoSubjectCenter(false);
+        const cardCenter=OBJECT_CENTER.map((v,i)=>v+[card.x,card.y,card.z][i]*subject.unitM);
+        const target=cardCenter.map((v,i)=>(v+marble[i])/2);
+        const eye=[target[0],target[1],target[2]+.28];
+        return {...base,camera:{resolution:512,eye_m:eye,target_m:target,
+          fov_degrees:25,aperture_radius_m:.0005,focus_distance_m:.28}};
+      },
+      getSceneRevision:()=>studioSceneRevision,
+      assertStaticCalibrationScene:()=>{
+        if($('preview-motion').value!=='off'||!$('inertia-lock').checked||
+            rollState?.orientation.some((v,i)=>v!==[1,0,0,0][i])||rollState?.position.some(v=>v!==0))
+          throw Error('The two-camera calibration requires a static, unrolled Studio scene');
+      },
+      getGobos:()=>studioLighting.gobos.getState(),
+      getPeanutCameraOptions:(base)=>{
+        const card=studioLighting.gobos.getState().gobos.find(g=>g.enabled&&g.artwork?.rectangles?.[0]?.id.startsWith('exposure-'));
+        if(!card)throw Error('The exposure card is unavailable');
+        const subject=studioSubjectTransform(false,'exposure'),marble=studioPhotoSubjectCenter(false);
+        const target=OBJECT_CENTER.map((v,i)=>v+[card.x,card.y,card.z][i]*subject.unitM);
+        const eye=[marble[0]+Math.max(.03,subject.radiusM*2.5),marble[1],
+          Math.max(marble[2]+.09,target[2]+.15)];
+        return {...base,camera:{resolution:512,eye_m:eye,target_m:target,
+          fov_degrees:30,aperture_radius_m:.0005,
+          focus_distance_m:Math.hypot(...eye.map((v,i)=>v-target[i]))},filmResponse:undefined};
+      },gl, canvas });
   } catch (error) { message.textContent=String(error.message||error); console.error("[marble studio]",error); }
   finally { loading?.done(); loading?.release("boot"); }
 }

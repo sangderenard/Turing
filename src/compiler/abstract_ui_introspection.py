@@ -87,6 +87,9 @@ class AbstractUIRoom:
     parameters: tuple[str, ...] = ()
     intentions: tuple[UIIntention, ...] = ()
     implied_code: tuple[ImpliedCode, ...] = ()
+    # Openings the PRODUCER declares on this room's box, beyond the door the geometry mints: e.g. a portal end
+    # {identity, kind: "portal", port_role: in|out, pair, side, offset, width, height}.  Empty for class mode.
+    openings: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,7 @@ class AbstractUIBuilding:
     position: GridPosition
     rooms: tuple[AbstractUIRoom, ...]
     intention: UIIntention
+    openings: tuple[Mapping[str, Any], ...] = ()   # producer-declared, as on AbstractUIRoom
 
     def room(self, name: str) -> AbstractUIRoom:
         for candidate in self.rooms:
@@ -114,6 +118,7 @@ class AbstractUIRegion:
     position: GridPosition
     buildings: tuple[AbstractUIBuilding, ...]
     intention: UIIntention
+    openings: tuple[Mapping[str, Any], ...] = ()   # producer-declared, on the region's courtyard box
 
 
 @dataclass(frozen=True, slots=True)

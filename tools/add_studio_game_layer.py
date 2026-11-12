@@ -18,7 +18,7 @@ def patch_studio_game_layer(source: bytes, prefix: str = './') -> tuple[bytes, d
                f'import {{captureStudioProgramState,studioWorldPacket}} from "{prefix}marble_studio_world_packet.js";{nl}'
                f'let studioGameLayer=null;{nl}')
     frame_anchor = '    if(dofActive)try {'
-    frame_hook = ('    if(!simOn)studioGameLayer?.frame({revision:studioSceneRevision,gl,view,phase:"transparent",'
+    frame_hook = ('    if(!simOn)studioGameLayer?.frame({revision:studioSceneRevision,subjectPose:lastStudioFrame.model,gl,view,phase:"transparent",'
                   'projection:perspective(w/h,viewFovDegrees,viewFar,viewNear)});' + nl)
     opaque_anchor = '      gl.bindVertexArray(glassOpaque.vao);gl.drawArrays(gl.TRIANGLES,0,glassOpaque.count);'
     opaque_hook = (nl + '      if(!simOn)studioGameLayer?.draw({gl,view,phase:"opaque",'

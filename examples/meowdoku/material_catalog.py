@@ -130,4 +130,24 @@ MATERIAL_CATALOG = {
                                 spec_strength=0.98, shininess=512, grain=0.0),
     "polished_gold": _surface((1.00, 0.72, 0.29), roughness=0.005, metallic=1.0,
                               spec_strength=0.96, shininess=512, grain=0.0),
+    # Reflective reference paints. Registered after legacy ribbon rows by
+    # web_export so adding this target cannot renumber saved Studio materials.
+    "reference_gray18_matte": _surface((0.18, 0.18, 0.18), roughness=1.0,
+                                        spec_strength=0.0, shininess=1, grain=0.0),
+    "reference_red_matte": _surface((0.65, 0.025, 0.025), roughness=1.0,
+                                     spec_strength=0.0, shininess=1, grain=0.0),
+    "reference_green_matte": _surface((0.025, 0.65, 0.025), roughness=1.0,
+                                       spec_strength=0.0, shininess=1, grain=0.0),
+    "reference_blue_matte": _surface((0.025, 0.025, 0.65), roughness=1.0,
+                                      spec_strength=0.0, shininess=1, grain=0.0),
+    "reference_yellow_matte": _surface((0.65, 0.65, 0.025), roughness=1.0,
+                                        spec_strength=0.0, shininess=1, grain=0.0),
 }
+
+# The spectral calibration QR shares each chart cell's visible paint. These
+# rows have identical RGB/PBR/Phong values; only their native 850 nm emission
+# profile distinguishes them during the camera exposure.
+for _paint in ("white_plaster", "black_matte_paint", "reference_gray18_matte",
+               "reference_red_matte", "reference_green_matte",
+               "reference_blue_matte", "reference_yellow_matte"):
+    MATERIAL_CATALOG[_paint + "__nir850"] = dict(MATERIAL_CATALOG[_paint])

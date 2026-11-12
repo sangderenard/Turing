@@ -12,11 +12,37 @@ record set:
               the referencing file's room and an ``in`` end on the referenced
               file's room, with the source line that made the reference
 
-Only two reference extractors exist: Python imports read with :mod:`ast`,
+Two reference extractors are built in: Python imports read with :mod:`ast`,
 and JavaScript ES-module static imports (``import … from``, bare
-``import "…"``, ``export … from``) read line by line.  A reference whose
-target is not a tracked file is kept as an *unresolved reference* so nothing
-disappears silently; it is not a portal because a portal needs two rooms.
+``import "…"``, ``export … from``) read line by line.  More are plugins: a
+module-like object with ``LANGUAGE: str``, ``SUFFIXES: tuple[str, ...]``,
+optional ``FILENAMES: tuple[str, ...]`` and
+``references(path, text, tracked) -> [(line, kind, specifier, target|None,
+reason)]``.  The plugins are named in ``EXTRACTOR_MODULES`` (an entry that
+does not import is a :class:`RepoScanError`) or passed as ``extractors=``.
+Every extractor matching a file runs, in addition to the built-ins.  A plugin
+that raises, or returns a target that is not a tracked file, is a scan error.
+A reference whose target is not a tracked file is kept as an *unresolved
+reference* so nothing disappears silently; it is not a portal because a
+portal needs two rooms.
+
+Portal pair identity keys (source, line, target).  Two references of different
+kinds on one line to one target are therefore ONE pair; the first in sorted
+order (source, line, kind, specifier) is kept.
+
+Import roots: Python absolute names resolve against the repository root and
+each declared import root (a tracked directory, repo-relative POSIX).  Roots
+are an input, never guessed from directory names: the ``import_roots``
+argument, CLI ``--import-root DIR`` (repeatable), and
+:func:`declared_import_roots`, which reads only declarations inside the tree:
+pyproject.toml ``[tool.pytest.ini_options] pythonpath``,
+``[tool.setuptools.packages.find] where``, ``[tool.setuptools] package-dir``
+values; ``pythonpath`` in pytest.ini / setup.cfg (``[tool:pytest]``) /
+tox.ini; and a repo-owned ``repo_world.toml`` with ``import_roots = ["dir"]``.
+The earliest root wins when a name resolves under several; a scan note counts
+those ambiguities.  Relative imports resolve from the file's own directory.
+The stream lanes read the declarations from the stream itself
+(``import_roots=None`` means "the declared roots").
 
 A tracked ``.dream`` document is a room like any file, and every prose
 stand-in inside it (``language = prose``, see ``DreamDocument.work_table``)
@@ -42,21 +68,25 @@ set.  The record set itself is returned to the caller; what the caller does
 with it is the call's own declaration (``--json`` to stdout, ``--out`` to a
 path the call names, or a user-space store the service owns).
 
-    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--json | --out <file>]
-    python -m src.compiler.repo_world_scan --path <checkout> [--json | --out <file>]   # fixtures
+    python -m src.compiler.repo_world_scan owner/repo [--ref main] [--import-root DIR ...] [--json | --out <file>]
+    python -m src.compiler.repo_world_scan --path <checkout> [--import-root DIR ...] [--json | --out <file>]
 """
 
 from __future__ import annotations
 
 import ast
+import configparser
 from dataclasses import dataclass, field
+import importlib
 import json
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import subprocess
 import sys
 import tarfile
-from typing import Any, Callable, Iterable, Mapping
+import tomllib
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import urllib.error
 import urllib.request
 
@@ -64,7 +94,24 @@ from .dream_document import (
     DREAM_LANGUAGE_TRANSLATIONS, DreamDocumentError, parse_dream_document,
 )
 
-REPO_WORLD_SCAN_VERSION = "repo-world-scan-v0"
+REPO_WORLD_SCAN_VERSION = "repo-world-scan-v1"
+
+# Fully qualified names of extractor plugin modules (contract in the module
+# docstring).  An entry that fails to import is a RepoScanError, never skipped.
+EXTRACTOR_MODULES: tuple[str, ...] = (
+    "src.compiler.repo_world_refs_c",
+    "src.compiler.repo_world_refs_cmake",
+    "src.compiler.repo_world_refs_html",
+    "src.compiler.repo_world_refs_js_dynamic",
+    "src.compiler.repo_world_refs_powershell",
+    "src.compiler.repo_world_refs_shell",
+)
+
+# Files whose declarations name Python import roots; read from the tree
+# (on disk or in the stream) and never from anywhere else.
+DECLARATION_FILES: tuple[str, ...] = (
+    "pyproject.toml", "repo_world.toml", "pytest.ini", "setup.cfg", "tox.ini",
+)
 GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GITHUB_CLONE_URL = re.compile(
     r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -95,6 +142,8 @@ LINKING_READERS: Mapping[str, str] = {
     "python": "python-import",        # ast.Import / ast.ImportFrom
     "javascript": "es-module-import",  # static ES-module import/export-from
 }
+# Plugin extractors add readers for more languages; language_table() reports
+# them per scan from the extractors actually in use.
 _SUFFIX_LANGUAGE = {
     suffix: language for language, suffixes in LANGUAGE_SUFFIXES.items() for suffix in suffixes
 }
@@ -284,6 +333,9 @@ class RepoWorldScan:
     unresolved: tuple[RepoUnresolvedReference, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
     claims: tuple[RepoRoomClaim, ...] = ()
+    extractor_languages: tuple[str, ...] = ("javascript", "python")
+    import_roots: tuple[str, ...] = ("",)
+    languages: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def root_region(self) -> RepoRegion:
@@ -295,7 +347,9 @@ class RepoWorldScan:
             "identity": f"repo:{self.commit}",
             "commit": self.commit,
             "origin": self.origin,
-            "languages": language_table(),
+            "languages": [dict(row) for row in self.languages] or language_table(),
+            "extractor_languages": list(self.extractor_languages),
+            "import_roots": list(self.import_roots),
             "regions": [item.to_data() for item in self.regions],
             "rooms": [item.to_data() for item in self.rooms],
             "portals": [item.to_data() for item in self.portals],
@@ -364,35 +418,80 @@ def claim_identity(commit: str, document: str, stand_in: str) -> str:
 
 # --- tree ----------------------------------------------------------------------
 
-def _language(path: str) -> str:
-    """The compiler's language name for a file, or "other" when no known
-    language claims its suffix."""
+def _extractor_matches(extractor: Any, path: str) -> bool:
+    pure = PurePosixPath(path)
+    return (pure.suffix in tuple(getattr(extractor, "SUFFIXES", ()))
+            or pure.name in tuple(getattr(extractor, "FILENAMES", ())))
 
-    return _SUFFIX_LANGUAGE.get(PurePosixPath(path).suffix.lower(), "other")
+
+def _extractor_name(extractor: Any) -> str:
+    return str(getattr(extractor, "__name__", None) or getattr(extractor, "LANGUAGE", repr(extractor)))
 
 
-def language_table() -> list[dict[str, Any]]:
-    """Known languages with their compiler route and this scan's linking state."""
+def _language(path: str, extractors: Sequence[Any] = ()) -> str:
+    """The compiler's language name for a file when a known language claims
+    its suffix; else the first matching extractor's ``LANGUAGE``; else "other"."""
+
+    known = _SUFFIX_LANGUAGE.get(PurePosixPath(path).suffix.lower())
+    if known is not None:
+        return known
+    for extractor in extractors:
+        if _extractor_matches(extractor, path):
+            return str(extractor.LANGUAGE)
+    return "other"
+
+
+def language_table(extractors: Sequence[Any] = ()) -> list[dict[str, Any]]:
+    """Known languages with their compiler route and their linking state.
+
+    A compiler language is linked by a built-in reader (``LINKING_READERS``)
+    or by any extractor whose suffixes overlap the language's.  Languages
+    that only an extractor knows (html, cmake, …) are listed after them with
+    no route.
+    """
+
+    def readers_for(suffixes: Iterable[str]) -> list[str]:
+        wanted = set(suffixes)
+        return sorted(
+            _extractor_name(extractor) for extractor in extractors
+            if wanted & set(getattr(extractor, "SUFFIXES", ()))
+        )
 
     rows = []
     for name, translation in DREAM_LANGUAGE_TRANSLATIONS.items():
-        reader = LINKING_READERS.get(name)
+        suffixes = LANGUAGE_SUFFIXES.get(name, ())
+        readers = ([LINKING_READERS[name]] if name in LINKING_READERS else []) + readers_for(suffixes)
         rows.append({
             "language": name,
             "route": translation.route,
             "translation_table": translation.translation_table,
             "execution_target": translation.execution_target,
-            "suffixes": list(LANGUAGE_SUFFIXES.get(name, ())),
-            "linking": reader,
+            "suffixes": list(suffixes),
+            "linking": readers[0] if readers else None,
+            "linking_readers": readers,
             "linking_state": (
-                "cross-file references read" if reader
+                "cross-file references read" if readers
                 else "known language, no cross-file reference reader yet: rooms get no portals"
             ),
+        })
+    known = set(DREAM_LANGUAGE_TRANSLATIONS)
+    for extractor in extractors:
+        name = str(getattr(extractor, "LANGUAGE", "")) or _extractor_name(extractor)
+        if name in known:
+            continue
+        known.add(name)
+        rows.append({
+            "language": name, "route": None, "translation_table": None,
+            "execution_target": None,
+            "suffixes": list(getattr(extractor, "SUFFIXES", ())),
+            "linking": _extractor_name(extractor),
+            "linking_readers": [_extractor_name(extractor)],
+            "linking_state": "extractor-only language: cross-file references read, no compiler route",
         })
     return rows
 
 
-def _build_tree(commit: str, files: Iterable[str]) -> tuple[tuple[RepoRegion, ...], tuple[RepoRoom, ...]]:
+def _build_tree(commit: str, files: Iterable[str], extractors: Sequence[Any] = ()) -> tuple[tuple[RepoRegion, ...], tuple[RepoRoom, ...]]:
     directories: dict[str, RepoRegion] = {
         ".": RepoRegion(region_identity(commit, "."), ".", ".", None, 0),
     }
@@ -410,7 +509,7 @@ def _build_tree(commit: str, files: Iterable[str]) -> tuple[tuple[RepoRegion, ..
             parent = directory
         rooms.append(RepoRoom(
             room_identity(commit, path), path, parts[-1],
-            directories[parent].identity, _language(path),
+            directories[parent].identity, _language(path, extractors),
         ))
     regions = tuple(sorted(directories.values(), key=lambda r: (r.depth, r.path)))
     return regions, tuple(rooms)
@@ -428,19 +527,34 @@ class _Reference:
     reason: str = ""
 
 
-def _python_module_candidates(module: str) -> tuple[str, ...]:
+def _python_module_candidates(module: str, root: str = "") -> tuple[str, ...]:
     base = module.replace(".", "/")
+    if root:
+        base = f"{root}/{base}"
     return (f"{base}.py", f"{base}/__init__.py")
 
 
-def _resolve_python(module: str, tracked: frozenset[str]) -> str | None:
-    for candidate in _python_module_candidates(module):
-        if candidate in tracked:
-            return candidate
-    return None
+def _resolve_python(
+    module: str, tracked: frozenset[str], roots: Sequence[str] = ("",),
+    ambiguities: list[str] | None = None,
+) -> str | None:
+    """First hit in root order; a name found under several roots is counted."""
+
+    hits: list[str] = []
+    for root in roots:
+        for candidate in _python_module_candidates(module, root):
+            if candidate in tracked:
+                hits.append(candidate)
+                break
+    if len(hits) > 1 and ambiguities is not None:
+        ambiguities.append(module)
+    return hits[0] if hits else None
 
 
-def _python_references(path: str, text: str, tracked: frozenset[str]) -> tuple[list[_Reference], str | None]:
+def _python_references(
+    path: str, text: str, tracked: frozenset[str],
+    roots: Sequence[str] = ("",), ambiguities: list[str] | None = None,
+) -> tuple[list[_Reference], str | None]:
     try:
         tree = ast.parse(text, filename=path)
     except SyntaxError as exc:
@@ -450,7 +564,7 @@ def _python_references(path: str, text: str, tracked: frozenset[str]) -> tuple[l
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                target = _resolve_python(alias.name, tracked)
+                target = _resolve_python(alias.name, tracked, roots, ambiguities)
                 refs.append(_Reference(
                     path, node.lineno, "python-import", alias.name, target,
                     "" if target else "no tracked module at that absolute name",
@@ -474,13 +588,17 @@ def _python_references(path: str, text: str, tracked: frozenset[str]) -> tuple[l
                 spelled = module
             # ``from pkg import name`` names a submodule when pkg/name.py is
             # tracked; otherwise the reference is to the module ``pkg`` itself.
-            module_target = _resolve_python(module, tracked) if module else None
+            # Relative imports resolve from the file's own directory only.
+            import_roots = ("",) if node.level else roots
+            module_target = (
+                _resolve_python(module, tracked, import_roots, ambiguities) if module else None
+            )
             for alias in node.names:
                 if alias.name == "*":
                     target, specifier = module_target, spelled
                 else:
                     submodule = f"{module}.{alias.name}" if module else alias.name
-                    target = _resolve_python(submodule, tracked) or module_target
+                    target = _resolve_python(submodule, tracked, import_roots, ambiguities) or module_target
                     specifier = f"{spelled}:{alias.name}"
                 refs.append(_Reference(
                     path, node.lineno, "python-import", specifier, target,
@@ -545,9 +663,154 @@ def _dream_claims(
     return claims, None
 
 
-# Languages whose file bytes the scan reads at all; every other tracked file
-# is a room by name only and its bytes are never loaded.
+# --- import roots --------------------------------------------------------------
+
+def _normalize_root(raw: str) -> str:
+    text = str(raw).strip().replace("\\", "/")
+    if text.startswith("/") or (len(text) > 1 and text[1] == ":"):
+        raise RepoScanError(f"import root {raw!r} is not repository-relative")
+    norm = posixpath.normpath(text) if text else "."
+    if norm == "." or norm == "":
+        return ""
+    if norm == ".." or norm.startswith("../"):
+        raise RepoScanError(f"import root {raw!r} escapes the repository")
+    return norm
+
+
+def _tracked_directories(tracked: Iterable[str]) -> frozenset[str]:
+    directories: set[str] = set()
+    for path in tracked:
+        parent = PurePosixPath(path).parent
+        while str(parent) != ".":
+            directories.add(str(parent))
+            parent = parent.parent
+    return frozenset(directories)
+
+
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part for part in re.split(r"[\s,]+", value) if part]
+    return [str(item) for item in value]
+
+
+def _read_declared_roots(tracked: frozenset[str], read: Callable[[str], bytes]) -> list[str]:
+    """Raw root declarations from the tracked declaration files, via ``read``."""
+
+    raw: list[str] = []
+
+    def toml_of(name: str) -> dict[str, Any]:
+        if name not in tracked:
+            return {}
+        try:
+            return tomllib.loads(_text(read(name)))
+        except tomllib.TOMLDecodeError as exc:
+            raise RepoScanError(f"{name}: not valid TOML ({exc})") from exc
+
+    tool = toml_of("pyproject.toml").get("tool", {})
+    raw += _as_list(tool.get("pytest", {}).get("ini_options", {}).get("pythonpath"))
+    setuptools = tool.get("setuptools", {})
+    packages = setuptools.get("packages", {})
+    if isinstance(packages, dict):
+        raw += _as_list(packages.get("find", {}).get("where"))
+    package_dir = setuptools.get("package-dir", {})
+    if isinstance(package_dir, dict):
+        raw += _as_list(list(package_dir.values()))
+    raw += _as_list(toml_of("repo_world.toml").get("import_roots"))
+    for name, section in (("pytest.ini", "pytest"), ("setup.cfg", "tool:pytest"), ("tox.ini", "pytest")):
+        if name not in tracked:
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string(_text(read(name)))
+        except configparser.Error as exc:
+            raise RepoScanError(f"{name}: not valid INI ({exc})") from exc
+        if parser.has_option(section, "pythonpath"):
+            raw += _as_list(parser.get(section, "pythonpath"))
+    return raw
+
+
+def _declared_roots(tracked: frozenset[str], read: Callable[[str], bytes]) -> tuple[str, ...]:
+    directories = _tracked_directories(tracked)
+    roots: list[str] = []
+    for raw in _read_declared_roots(tracked, read):
+        root = _normalize_root(raw)
+        if root and root in directories and root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def declared_import_roots(clone_path: str | Path) -> tuple[str, ...]:
+    """Import roots declared inside a checkout, in declaration order.
+
+    Only tracked directories are returned; the repository root ("") is not
+    included here (the scan always puts it first).
+    """
+
+    clone = Path(clone_path)
+    tracked = frozenset(_tracked_files(clone))
+    return _declared_roots(tracked, lambda path: (clone / path).read_bytes())
+
+
+def _validated_roots(import_roots: Sequence[str], tracked: frozenset[str]) -> tuple[str, ...]:
+    directories = _tracked_directories(tracked)
+    roots = [""]
+    for raw in import_roots:
+        root = _normalize_root(raw)
+        if root and root not in directories:
+            raise RepoScanError(f"import root {raw!r} is not a tracked directory")
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+# --- extractors ----------------------------------------------------------------
+
+def default_extractors() -> tuple[Any, ...]:
+    modules = []
+    for name in EXTRACTOR_MODULES:
+        try:
+            modules.append(importlib.import_module(name))
+        except Exception as exc:
+            raise RepoScanError(f"extractor module {name!r} failed to import: {exc!r}") from exc
+    return tuple(modules)
+
+
+def _plugin_references(
+    extractor: Any, path: str, text: str, tracked: frozenset[str],
+) -> list[_Reference]:
+    name = _extractor_name(extractor)
+    try:
+        rows = list(extractor.references(path, text, tracked))
+    except Exception as exc:
+        raise RepoScanError(f"extractor {name} failed on {path}: {exc!r}") from exc
+    refs: list[_Reference] = []
+    for row in rows:
+        try:
+            line, kind, specifier, target, reason = row
+        except (TypeError, ValueError) as exc:
+            raise RepoScanError(f"extractor {name} returned a malformed row for {path}: {row!r}") from exc
+        if target is not None and target not in tracked:
+            raise RepoScanError(
+                f"extractor {name} returned untracked target {target!r} for {path}:{line}"
+            )
+        refs.append(_Reference(path, int(line), str(kind), str(specifier), target, str(reason or "")))
+    return refs
+
+
+# Languages whose file bytes the built-in readers need; every other tracked
+# file is a room by name only unless an extractor matches it or it declares
+# import roots (DECLARATION_FILES).
 _READ_LANGUAGES = frozenset({"python", "javascript", "dream-document"})
+
+
+def _reads(path: str, extractors: Sequence[Any]) -> bool:
+    """Whether the scan needs this file's bytes at all."""
+
+    if _language(path) in _READ_LANGUAGES or PurePosixPath(path).name in DECLARATION_FILES:
+        return True
+    return any(_extractor_matches(extractor, path) for extractor in extractors)
 
 
 def _text(raw: bytes) -> str:
@@ -558,44 +821,71 @@ def _text(raw: bytes) -> str:
 
 def scan_files(
     commit: str, origin: str | None, files: Iterable[str],
-    read: Callable[[str], bytes], notes: Iterable[str] = (),
+    read: Callable[[str], bytes], notes: Iterable[str] = (), *,
+    extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = (),
 ) -> RepoWorldScan:
     """The scan itself, over a tree given as tracked paths and a byte reader.
 
-    Every entry point ends here.  ``read`` is called only for files in
-    :data:`_READ_LANGUAGES`; the reader may therefore hold just those bytes.
+    Every entry point ends here.  ``read`` is called only for files
+    :func:`_reads` says the scan needs; a streaming reader may hold just
+    those bytes.  ``extractors`` are plugin modules (None: the default
+    registry).  ``import_roots`` are extra Python import roots: a sequence is
+    validated against the tracked directories; ``None`` means the roots the
+    tree itself declares (:data:`DECLARATION_FILES`).  The repository root is
+    always first.
     """
 
     files = tuple(sorted(files))
     tracked = frozenset(files)
-    regions, rooms = _build_tree(commit, files)
+    plugins = tuple(default_extractors() if extractors is None else extractors)
+    if import_roots is None:
+        import_roots = _declared_roots(tracked, read)
+    roots = _validated_roots(import_roots, tracked)
+    regions, rooms = _build_tree(commit, files, plugins)
 
     references: list[_Reference] = []
     notes = list(notes)
+    ambiguities: list[str] = []
+    languages_used: set[str] = {"python", "javascript"}
     claims: list[RepoRoomClaim] = []
     room_by_path = {room.path: room for room in rooms}
     for path in files:
-        language = _language(path)
-        if language not in _READ_LANGUAGES:
+        if not _reads(path, plugins):
             continue
+        language = _language(path)
         raw = read(path)
+        text: str | None = None
         if language == "dream-document":
             found, note = _dream_claims(commit, path, raw, room_by_path[path])
             claims.extend(found)
             if note:
                 notes.append(note)
         elif language == "python":
-            refs, note = _python_references(path, _text(raw), tracked)
+            text = _text(raw)
+            refs, note = _python_references(path, text, tracked, roots, ambiguities)
             references.extend(refs)
             if note:
                 notes.append(note)
         elif language == "javascript":
-            references.extend(_javascript_references(path, _text(raw), tracked))
+            text = _text(raw)
+            references.extend(_javascript_references(path, text, tracked))
+        for extractor in plugins:
+            if _extractor_matches(extractor, path):
+                if text is None:
+                    text = _text(raw)
+                references.extend(_plugin_references(extractor, path, text, tracked))
+                languages_used.add(str(extractor.LANGUAGE))
+    if ambiguities:
+        notes.append(
+            f"{len(ambiguities)} python import name(s) resolved under more than one "
+            f"import root; the earliest root was used"
+        )
 
     portals: list[RepoPortalPair] = []
     unresolved: list[RepoUnresolvedReference] = []
     seen_pairs: set[str] = set()
-    for ref in sorted(references, key=lambda r: (r.source, r.line, r.specifier)):
+    for ref in sorted(references, key=lambda r: (r.source, r.line, r.kind, r.specifier)):
         source_room = room_identity(commit, ref.source)
         if ref.target is None:
             unresolved.append(RepoUnresolvedReference(
@@ -610,7 +900,7 @@ def scan_files(
             continue
         pair_id = _pair_identity(commit, ref.source, ref.line, ref.target)
         if pair_id in seen_pairs:
-            # Two names imported on one line from one module are one portal.
+            # Two names (or two kinds) on one line to one target are one portal.
             continue
         seen_pairs.add(pair_id)
         target_room = room_identity(commit, ref.target)
@@ -622,14 +912,19 @@ def scan_files(
 
     return RepoWorldScan(
         commit, origin, regions, rooms, tuple(portals), tuple(unresolved), tuple(notes),
-        tuple(claims),
+        tuple(claims), tuple(sorted(languages_used)), roots,
+        tuple(language_table(plugins)),
     )
 
 
-def scan_repository(clone_path: str | Path) -> RepoWorldScan:
+def scan_repository(
+    clone_path: str | Path, *, extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = (),
+) -> RepoWorldScan:
     """Scan one clean checkout on disk (fixtures and explicit clones).
 
-    Raises :class:`DirtyCloneError` when the tree has uncommitted or untracked
+    ``extractors`` and ``import_roots`` as in :func:`scan_files`.  Raises
+    :class:`DirtyCloneError` when the tree has uncommitted or untracked
     changes and :class:`RepoScanError` when the path is not a repository root.
     """
 
@@ -645,12 +940,14 @@ def scan_repository(clone_path: str | Path) -> RepoWorldScan:
     origin = origin_raw.stdout.strip() or None
     return scan_files(
         commit, origin, _tracked_files(clone), lambda path: (clone / path).read_bytes(),
+        extractors=extractors, import_roots=import_roots,
     )
 
 
 def scan_tar_stream(
     commit: str, origin: str | None, stream: Any, *, mode: str = "r|",
-    strip_components: int = 0,
+    strip_components: int = 0, extractors: Sequence[Any] | None = None,
+    import_roots: Sequence[str] | None = None,
 ) -> RepoWorldScan:
     """Scan a tar archive of one commit as it streams past, keeping no file.
 
@@ -661,6 +958,7 @@ def scan_tar_stream(
     members are noted, not scanned.
     """
 
+    plugins = tuple(default_extractors() if extractors is None else extractors)
     paths: list[str] = []
     contents: dict[str, bytes] = {}
     notes: list[str] = []
@@ -676,10 +974,13 @@ def scan_tar_stream(
                 notes.append(f"{path}: not a regular file in the archive, not scanned")
                 continue
             paths.append(path)
-            if _language(path) in _READ_LANGUAGES:
+            if _reads(path, plugins):
                 handle = archive.extractfile(member)
                 contents[path] = handle.read() if handle is not None else b""
-    return scan_files(commit, origin, paths, contents.__getitem__, notes)
+    return scan_files(
+        commit, origin, paths, contents.__getitem__, notes,
+        extractors=plugins, import_roots=import_roots,
+    )
 
 
 def github_clone_url(repository: str) -> str:
@@ -706,7 +1007,10 @@ def _github_json(path: str) -> Any:
         raise RepoScanError(f"GitHub API {path}: {exc.reason}") from exc
 
 
-def scan_github_repository(repository: str, *, ref: str | None = None) -> RepoWorldScan:
+def scan_github_repository(
+    repository: str, *, ref: str | None = None,
+    extractors: Sequence[Any] | None = None, import_roots: Sequence[str] | None = None,
+) -> RepoWorldScan:
     """Scan ``owner/repo`` as GitHub serves it, streamed, never on disk.
 
     The commit is resolved first (``ref`` or the default branch), then that
@@ -727,7 +1031,7 @@ def scan_github_repository(repository: str, *, ref: str | None = None) -> RepoWo
         with urllib.request.urlopen(request) as response:
             return scan_tar_stream(
                 commit, github_clone_url(repository), response, mode="r|gz",
-                strip_components=1,
+                strip_components=1, extractors=extractors, import_roots=import_roots,
             )
     except urllib.error.HTTPError as exc:
         raise RepoScanError(f"GitHub tarball of {repository}@{commit[:12]}: HTTP {exc.code}") from exc
@@ -735,7 +1039,10 @@ def scan_github_repository(repository: str, *, ref: str | None = None) -> RepoWo
         raise RepoScanError(f"GitHub tarball of {repository}: {exc.reason}") from exc
 
 
-def scan_remote_repository(url: str, *, ref: str | None = None) -> RepoWorldScan:
+def scan_remote_repository(
+    url: str, *, ref: str | None = None,
+    extractors: Sequence[Any] | None = None, import_roots: Sequence[str] | None = None,
+) -> RepoWorldScan:
     """Scan any git URL as the remote serves it, streamed, never on disk.
 
     A GitHub URL goes through :func:`scan_github_repository`.  Any other URL
@@ -746,7 +1053,10 @@ def scan_remote_repository(url: str, *, ref: str | None = None) -> RepoWorldScan
 
     github = GITHUB_CLONE_URL.match(url.strip())
     if github:
-        return scan_github_repository(f"{github['owner']}/{github['repo']}", ref=ref)
+        return scan_github_repository(
+            f"{github['owner']}/{github['repo']}", ref=ref,
+            extractors=extractors, import_roots=import_roots,
+        )
     name = ref or "HEAD"
     try:
         listing = subprocess.run(
@@ -766,7 +1076,10 @@ def scan_remote_repository(url: str, *, ref: str | None = None) -> RepoWorldScan
     )
     assert process.stdout is not None
     try:
-        scan = scan_tar_stream(commit, url, process.stdout, mode="r|")
+        scan = scan_tar_stream(
+            commit, url, process.stdout, mode="r|",
+            extractors=extractors, import_roots=import_roots,
+        )
     finally:
         process.stdout.close()
         stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
@@ -774,6 +1087,14 @@ def scan_remote_repository(url: str, *, ref: str | None = None) -> RepoWorldScan
     if returncode != 0:
         raise RepoScanError(f"git archive --remote={url} {name}: {stderr.strip()}")
     return scan
+
+
+def _github_with_flag_roots(repository: str, ref: str | None, flag_roots: list[str]) -> RepoWorldScan:
+    """Declared roots from the stream plus the flags: scan once with the union."""
+
+    declared = scan_github_repository(repository, ref=ref, import_roots=None).import_roots
+    roots = [root for root in declared if root] + flag_roots
+    return scan_github_repository(repository, ref=ref, import_roots=roots)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -787,6 +1108,14 @@ def main(argv: list[str] | None = None) -> int:
             print("--out needs a file path", file=sys.stderr)
             return 2
         out_path = args[index + 1]
+        del args[index:index + 2]
+    flag_roots: list[str] = []
+    while "--import-root" in args:
+        index = args.index("--import-root")
+        if index + 1 >= len(args):
+            print("--import-root needs a directory", file=sys.stderr)
+            return 2
+        flag_roots.append(args[index + 1])
         del args[index:index + 2]
     ref = None
     if "--ref" in args:
@@ -810,9 +1139,13 @@ def main(argv: list[str] | None = None) -> int:
             if args or ref:
                 print(usage, file=sys.stderr)
                 return 2
-            scan = scan_repository(local_path)
+            scan = scan_repository(
+                local_path, import_roots=(*declared_import_roots(local_path), *flag_roots),
+            )
         elif len(args) == 1:
-            scan = scan_github_repository(args[0], ref=ref)
+            # The stream lane reads the declared roots from the stream; flags add to them.
+            scan = (scan_github_repository(args[0], ref=ref) if not flag_roots
+                    else _github_with_flag_roots(args[0], ref, flag_roots))
         else:
             print(usage, file=sys.stderr)
             return 2
@@ -842,6 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
+    "DECLARATION_FILES", "EXTRACTOR_MODULES", "declared_import_roots", "default_extractors",
     "LANGUAGE_SUFFIXES", "LINKING_READERS", "REPO_WORLD_SCAN_VERSION",
     "DirtyCloneError", "RepoPortalEnd", "RepoPortalPair", "language_table",
     "RepoRegion", "RepoRoom", "RepoScanError", "RepoUnresolvedReference",

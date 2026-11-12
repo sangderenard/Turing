@@ -1,3 +1,6 @@
+import {defaultLightingRacks,validateLightingRacks,layoutLightingRackFixtures} from './marble_lighting_racks.js';
+import {applyLightingRackOverrides} from './marble_lighting_rack_override.js';
+import {createLightingRackControls} from './marble_lighting_rack_controls.js';
 import {validateSceneEngines,validateSceneMaterialEdits} from "./marble_scene_materials.js";
 import {validateLightTools,migrateLightTools} from "./marble_light_tools.js";
 import {createKickerHeightGuides} from "./marble_kicker_guide_controls.js";
@@ -27,7 +30,10 @@ export const LIGHTING_PROFILE_FIELDS = ["key-shape", "light-x", "light-y", "ligh
   "light-fill-lower-strength", "fill-lower-filter", "floor-pattern", "floor-material-a", "floor-material-b",
   "light-table-left-strength", "table-left-filter", "light-table-right-strength", "table-right-filter", "light-under-strength", "under-filter",
   "wall-pattern", "wall-material-a", "wall-material-b", "ceiling-pattern", "ceiling-material-a", "ceiling-material-b",
-  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale"];
+  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale",
+  "key-filter-left-off","key-filter-right-off","background-filter-off","kicker-left-filter-off",
+  "kicker-right-filter-off","fill-lower-filter-off","fill-upper-filter-off","table-left-filter-off",
+  "table-right-filter-off","under-filter-off"];
 
 // Validate against the live catalogue and the actual controls, not a second
 // hand-maintained list of material IDs or slider bounds. No writes until valid.
@@ -42,7 +48,7 @@ function validateStudioLightingBase(value, fields, materialNames) {
     const el = fields[id];
     // Older profiles retain the former backdrop mounting distance.
     const v = value.controls[id] === undefined ?
-      (id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
+      (id.endsWith('-off') ? false : id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
     if (!el) throw new Error(`Lighting control unavailable: ${id}`);
     if (el.type === "checkbox") {
       if (typeof v !== "boolean") throw new Error(`Invalid ${id}`);
@@ -66,7 +72,7 @@ function validateStudioLightingBase(value, fields, materialNames) {
   const fixtureSizes=validateFixtureSizes(resolveUnderlightFit(validateFixtureSizes(value.fixtureSizes,false),table),value.lightTools===undefined);
   validateUnderlightFitPose(fixtureSizes,poses);
   const lightTools=validateLightTools(value.lightTools,fixtureSizes,controls["key-shape"],materialNames);
-  return {version: 1, controls, poses, backdrops, fixtureSizes,lightTools,
+  return {version: 1, controls, poses, backdrops, fixtureSizes,lightTools,lightingRacks:validateLightingRacks(value.lightingRacks),
     sceneEngines:validateSceneEngines(value.sceneEngines),...(value.materialEdits===undefined?{}:{materialEdits:validateSceneMaterialEdits(value.materialEdits,materialNames)}),lightStands:validateLightStands(value.lightStands,materialNames),shopLights:validateShopLights(value.shopLights,materialNames),
     table, scale: validateStudioScale(value.scale), gobos: validateStudioGobos(value.gobos, materialNames),
     strengths: validateLightStrengths(value.strengths, fields),
@@ -296,6 +302,7 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
   const validate = value => validateStudioLighting(value, fields, materialNames);
   const validateBase = value => validateStudioLightingBase(value, fields, materialNames);
   let roomOverrides={version:1,values:[]}, roomEditor=null, editorChannel='A', calibrationDepth=0;
+  let lightingRacks=defaultLightingRacks(),rackControls=null;
   const lightStands=createLightStandControls($("lighting-profiles"),materialNames,{onChange:()=>{onChange();syncPlacementWarnings();}});
   const shopLights=createShopLightControls($("lighting-profiles"),materialNames,{
     getRoomBounds:()=>studioRoomBounds(Number(fields["room-scale"].value),table?tableFloorDrop(table.getState()):0),
@@ -313,11 +320,13 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
       onChange();
     },
   });
-  // Fresh shop rigs start at half power in B only. Profile validation/loading
-  // never adds these defaults, so saved overrides and historical rigs survive.
-  roomOverrides.values=shopLights.state().fixtures.map(f=>({path:`shopLights/fixtures/@${f.id}/dimmer`,value:.5}));
+  // Fresh rigs use the existing maximum, explicitly uncalibrated emission units.
+  // Loading historical profiles retains their authored power and exposure mode.
+  const freshShops=shopLights.state();
+  for(const fixture of freshShops.fixtures){fixture.sourceLevel=400;fixture.exposureMode='continuous';}
+
   const capture = () => validate({sceneEngines:{version:1,stage:$("scene-stage-engine")?.value??'legacy',room:$("scene-room-engine")?.value??'legacy'},
-    materialEdits:captureMaterials(),fixtureSizes:fixtureSizes.getState(),lightTools:fixtureSizes.tools.getState(),lightStands:lightStands.getState(),shopLights:shopLights.state(),version: 1, poses: poses.getState(), backdrops: backdrops.getState(), strengths: strengths.getState(), surfaces: surfaces.getState(), table: table.getState(), scale: scale.getState(), gobos: gobos.getState(), roomOverrides,
+    lightingRacks,materialEdits:captureMaterials(),fixtureSizes:fixtureSizes.getState(),lightTools:fixtureSizes.tools.getState(),lightStands:lightStands.getState(),shopLights:shopLights.state(),version: 1, poses: poses.getState(), backdrops: backdrops.getState(), strengths: strengths.getState(), surfaces: surfaces.getState(), table: table.getState(), scale: scale.getState(), gobos: gobos.getState(), roomOverrides,
     controls: Object.fromEntries(Object.entries(fields).map(([id, el]) => [id,
       el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) : el.value]))});
   const selectChannel = channel => {
@@ -338,7 +347,7 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
       // Restore against the actual buffers before changing any lighting control.
       restoreMaterials(valid.materialEdits);
       for(const name of ['stage','room'])if($("scene-"+name+"-engine"))$("scene-"+name+"-engine").value=valid.sceneEngines[name];
-      roomOverrides=valid.roomOverrides;
+      roomOverrides=valid.roomOverrides;lightingRacks=valid.lightingRacks; rackControls?.sync();
       for (const [id, v] of Object.entries(valid.controls)) {
         const el = fields[id];
         if (el.type === "checkbox") el.checked = v; else el.value = String(v);
@@ -364,15 +373,20 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
       } finally {applying = false;}
     },
   });
-  const fixtureSizes=createFixtureSizeControls($("lighting-profiles"),()=>{
+  const fixtureSizes=createFixtureSizeControls($("lighting-profiles"),({headChanged}={})=>{
     // Removing a tool removes its Room overrides too, so reattachment cannot
     // resurrect hidden settings. Surviving stable IDs retain their overrides.
-    const ids=new Set(fixtureSizes.tools.getState().attachments.map(tool=>tool.id));
+    const attachments=fixtureSizes.tools.getState().attachments,ids=new Set(attachments.map(tool=>tool.id));
+    if(headChanged){
+      const replaced=new Set(attachments.filter(tool=>tool.lightId===headChanged).map(tool=>tool.id));
+      roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>!item.path.startsWith(`fixtureSizes/lights/@${headChanged}/`)&&![...replaced].some(id=>item.path.startsWith(`lightTools/attachments/@${id}/`)))};
+    }
     if(fixtureSizes.getState().underlightFit)roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>!/^fixtureSizes\/lights\/@underlight\/(width|height)$/.test(item.path))};
     roomOverrides={...roomOverrides,values:roomOverrides.values.filter(item=>{const match=/^lightTools\/attachments\/@([^/]+)\//.exec(item.path);return !match||ids.has(match[1]);})};
     onChange();syncPoseShortcuts();syncPlacementWarnings();
   },(next,before,id,tools)=>validateFixturePose(poses.getState(),id,next,tools),{
     materialNames,getTable:()=>table?.getState(),getKeyShape:()=>fields['key-shape'].value,
+    getUnitMm:()=>studioScaleTransform(scale?.getState()??defaultStudioScale(),Number($("radius-mm").value),table?.getState().enabled??true).unitM*1000,
     validateChange:(next,before,id)=>validateFixturePose(poses.getState(),id,fixtureSizes.getState(),next),
   });
   keyShapeStatus=doc.createElement('output');keyShapeStatus.id='key-shape-status';
@@ -444,7 +458,18 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
     {onChange, onRoomChange, onBackdropChange, syncBackdropVisibility, getRoomFloorDrop:()=>tableFloorDrop(table.getState())});
   const gobos = createStudioGoboControls($("studio-gobo-controls"), materialNames, () => {
     onGoboChange(); onChange();
-  });
+  },{referencePlacement:()=>{
+    const subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),table.getState().enabled);
+    const half=32/(subject.unitM*1000);
+    return {unitMm:subject.unitM*1000,center:[0,table.getState().enabled?-1+half:subject.subjectCenter[1],-subject.subjectRadius-.14]};
+  },exposurePlacement:()=>{
+    const subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),table.getState().enabled);
+    const half=32/(subject.unitM*1000);
+    return {unitMm:subject.unitM*1000,
+      center:[half+subject.subjectRadius+.02,
+        table.getState().enabled?-1+half:subject.subjectCenter[1],
+        -subject.subjectRadius-.14]};
+  }});
   const kickerGuides=lightGuideRole?createKickerHeightGuides(fixtureSizes.element,{
     getSnapshots:()=>{
       const tableState=table.getState(),subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),tableState.enabled);
@@ -497,6 +522,30 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
       roomOverrides=value;onRoomChange();onBackdropChange();onGoboChange();
     },
   });
+  applying=true;try{shopLights.setState(freshShops);}finally{applying=false;}
+  const rackEnvironment=()=>({bounds:studioRoomBounds(Number(fields['room-scale'].value),tableFloorDrop(table.getState())),unitMm:studioScaleTransform(scale.getState(),Number($('radius-mm').value),table.getState().enabled).unitM*1000});
+  const resolveRackProfile=(profile,next)=>{
+    const environment={bounds:studioRoomBounds(profile.controls['room-scale'],tableFloorDrop(profile.table)),unitMm:studioScaleTransform(profile.scale,Number($('radius-mm').value),profile.table.enabled).unitM*1000};
+    const resolved=structuredClone(profile);
+    // Generated modules follow their rack when room dimensions or carriage
+    // positions change. Authored modules remain untouched.
+    if(next.buses.some(b=>b.enabled))resolved.shopLights=layoutLightingRackFixtures(resolved.shopLights,next,environment);
+    return applyLightingRackOverrides(resolved,next);
+  };
+  const checkRacks=next=>{
+    for(const candidate of [capture(),resolveRoomProfile(capture(),roomOverrides,validateBase)])validateShopPlacement(resolveRackProfile(candidate,next));
+  };
+  rackControls=createLightingRackControls($('light-solo-clear')?.parentElement??$('lighting-profiles'),{
+    getState:()=>lightingRacks,
+    getMaxDropFeet:()=>{const {bounds,unitMm}=rackEnvironment();return Math.max(0,(bounds.ceilingY-bounds.floorY)*unitMm/304.8-.28);},
+    setState:next=>{next=validateLightingRacks(next);checkRacks(next);lightingRacks=next;onChange();onRoomChange();},
+    onBuildRacks:()=>{
+      const next=validateLightingRacks(lightingRacks);next.buses.forEach(b=>b.enabled=true);
+      const shops=layoutLightingRackFixtures(shopLights.state(),next,rackEnvironment());
+      const profile=capture();profile.shopLights=shops;validateShopPlacement(applyLightingRackOverrides(profile,next));
+      shopLights.setState(shops);lightingRacks=next;rackControls.sync();onChange();onRoomChange();
+    },
+  });
   shopLights.refreshPlacement();
   for(const kind of ['input','change'])doc.addEventListener?.(kind,event=>{
     if(/^(room-scale|studio-unit-mm|studio-scale-mode|radius-mm|studio-table-)/.test(event.target?.id??''))shopLights.refreshPlacement();
@@ -506,9 +555,9 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
     calibrationDepth=Math.max(0,calibrationDepth+delta);onRoomChange();onBackdropChange();onGoboChange();
   });
   return {poses, backdrops, strengths, surfaces, table, gobos, scale, fixtureSizes, lightTools:fixtureSizes.tools, lightStands, shopLights, syncBackdropVisibility,
-    invalidateRenderState,
+    rackControls,invalidateRenderState,
     renderState:(channel='studio')=>{
-      if(!renderCache){const base=capture();renderCache={exposure:base,studio:calibrationDepth?base:resolveRoomProfile(base,roomOverrides,validateBase)};}
+      if(!renderCache){const base=capture(),exposure=resolveRackProfile(base,lightingRacks);renderCache={exposure,studio:calibrationDepth?exposure:resolveRackProfile(resolveRoomProfile(base,roomOverrides,validateBase),lightingRacks)};}
       return renderCache[channel==='exposure'?'exposure':'studio'];
     },
     roomOverrides:roomEditor,

@@ -26,7 +26,7 @@ export function wallRelativeFixtureDefaults(roles,bounds,vertices,subject=[0,0,0
   const role=result[index],rear=index>=2&&index<=4;
   const angle=index<=1?25:index===3||index===4?45:0,side=index===0||index===3?-1:1;
   const radius=(rear?subject[2]-bounds.backZ:bounds.frontZ-subject[2])-.05;
-  if(index===3||index===4)role.defaultFloorHeight=-1-bounds.floorY+role.radius+.02;
+  if((index===3||index===4)&&role.round)role.defaultFloorHeight=-1-bounds.floorY+role.radius+.02;
   const originalY=role.defaultFloorHeight===undefined?role.pos[1]:bounds.floorY+role.defaultFloorHeight;
   const place=t=>{role.pos=[subject[0]+side*radius*t*Math.sin(angle*radians),originalY,subject[2]+(rear?-1:1)*radius*t*Math.cos(angle*radians)];
     if(index!==2)aim(role);

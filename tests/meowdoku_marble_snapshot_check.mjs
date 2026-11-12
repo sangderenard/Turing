@@ -27,6 +27,7 @@ const queued=structuredClone(snapshot),queuedOriginal=structuredClone(queued);
 const preparing=prepareObjectSnapshot(queued);
 queued.name="Newer edit";queued.physical["radius-mm"]=25;queued.materials.tables.enamel.data[extra.coated*8]=900;
 const prepared=await preparing;
+assert(prepared.authoringKey===objectSnapshotKey(queuedOriginal),"authoring receipt belongs to immutable capture, not edits made during preparation");
 assert(prepared.value.name===queuedOriginal.name,"async snapshot cannot mix a later name");
 assert(prepared.value.physical["radius-mm"]===10,"async snapshot cannot mix a later physical radius");
 assert(prepared.value.derived.massKg===(await prepareObjectSnapshot(queuedOriginal)).value.derived.massKg,"snapshot mass uses its own immutable material/physical data");

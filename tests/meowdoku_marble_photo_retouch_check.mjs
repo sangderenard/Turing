@@ -35,6 +35,8 @@ function harness(initial = complete()) {
     defaultView: {location: {search: `?photo=${A}`}, Event}};
   element('photo-transport').value = 'fixed:3'; element('photo-gamma').value = '100';
   element('photo-orbit-frames').value = '1'; element('photo-bounces').value = '4';
+  element('photo-tile-size').value = 'auto';
+  element('photo-oversampling').value = '1';
   element('photo-resolution').value = '256'; element('photo-bounce-mode').value = 'manual';
   element('photo-triangle-budget').value = '250000'; element('photo-sphere-coverage').value = 'mesh';
   globalThis.Image = class {

@@ -233,7 +233,7 @@ export function createFilmSciencePreview(container, transport, getResponse, {deb
   const schedule = (immediate = false) => {
     if (disposed) return;
     invalidate();
-    const rgb = transport.value === 'fixed:3'; refresh.disabled = !rgb;
+    const rgb = ['fixed:3','fixed:8'].includes(transport.value); refresh.disabled = !rgb;
     if (!rgb) { status.textContent = 'Direct colour preview is inactive in monochrome. RGB settings are retained.'; return; }
     let response;
     try { response = getResponse(); }

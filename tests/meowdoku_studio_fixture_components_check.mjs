@@ -1,3 +1,4 @@
+import * as sceneBuilder from '../examples/meowdoku/web/studio_scene_builder.js';
 import {applyLightTools,defaultLightTools,migrateLightTools} from '../examples/meowdoku/web/marble_light_tools.js';
 import {applyFixtureSizes,defaultFixtureSizes} from "../examples/meowdoku/web/marble_fixture_sizes.js";
 // Metadata-only fixture refinements against the incumbent primitive sequence.
@@ -21,10 +22,8 @@ for(const m of html.matchAll(/<select\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/selec
 const context=vm.createContext({applyLightTools,defaultLightTools:migrateLightTools,wallRelativeFixtureDefaults:roles=>roles,applyFixtureSizes,defaultFixtureSizes:()=>defaultFixtureSizes(true),$:id=>controls[id],STUDIO_LIGHTS,FIXTURE_MAT_BASE:10,studioLighting:null,
   studioTableState:()=>defaultStudioTable(),studioRoomBounds,studioRoomScale:()=>3,studioFloorDrop:()=>3,
   FLOOR_FIXTURE_INDICES,tableLightRoles,tableLightModifierFaces,rgb:value=>[1,3,5].map(k=>parseInt(value.slice(k,k+2),16)/255)});
-vm.runInContext(source.slice(source.indexOf('const ROOM_FIXTURES ='),source.indexOf('const currentCameraOptions =')),context);
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),context);
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),context);
-vm.runInContext(source.slice(source.indexOf('function computeFixtureRoles('),source.indexOf('export function sceneForPhoto(')),context);
+Object.assign(context,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,context.ids??{})});
+context.computeFixtureRoles=()=>sceneBuilder.computeStudioFixtureRoles({lighting:{controls:Object.fromEntries(Object.entries(controls).map(([id,el])=>[id,el.value])),fixtureSizes:defaultFixtureSizes(true),lightTools:migrateLightTools(defaultFixtureSizes(true)),table:defaultStudioTable()},ids:{},fixtureMaterialBase:10});
 // The pre-metadata rendering sequence, using the same unchanged primitives.
 vm.runInContext(`function legacyFixtureFaces(roles,material){const faces=[];for(const role of roles){
  const size=role.round?role.radius:Math.max(role.halfW,role.halfH),depth=role.housingDepth??size*1.4;

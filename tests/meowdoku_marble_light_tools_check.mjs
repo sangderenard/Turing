@@ -1,3 +1,4 @@
+import * as sceneBuilder from '../examples/meowdoku/web/studio_scene_builder.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -7,8 +8,8 @@ import {tableLightRoles,tableLightModifierFaces} from '../examples/meowdoku/web/
 import {STUDIO_LIGHTS} from '../examples/meowdoku/web/marble_light_strengths.js';
 const source=fs.readFileSync(new URL('../examples/meowdoku/web/marble_studio.js',import.meta.url),'utf8');
 const context=vm.createContext({STUDIO_LIGHTS,tableLightModifierFaces});
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),context);
-vm.runInContext(source.slice(source.indexOf('function buildFixtureFaces('),source.indexOf('export function sceneForPhoto(')),context);
+Object.assign(context,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,context.ids??{})});
+Object.assign(context,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,context.ids??{})});
 const bases=[
  {halfW:.38,halfH:.38},{halfW:.38,halfH:.38},
  {round:true,radius:.3,gobo:true,shroudLength:1.2,shroudRadius:.375},

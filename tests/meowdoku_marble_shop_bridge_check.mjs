@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import {installStudioSceneBuilders,installScenePacking} from './meowdoku_scene_packer_harness.mjs';
+import {buildStudioPhotoFixtures} from '../examples/meowdoku/web/studio_scene_builder.js';
+import {defaultStudioTable} from '../examples/meowdoku/web/marble_studio_table.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {shopLightEmissionRecords,defaultShopLights,shopLightEmitterAllocations,writeShopLightEmitterRows as writeRows,studioShopLightGeometry} from '../examples/meowdoku/web/marble_shop_lights.js';
@@ -15,7 +18,7 @@ const ids={metal_silver:4,black_matte_paint:38,marble_clear_glass:14},base=39;
 const data=new Float32Array((base+STUDIO_RUNTIME_MATERIAL_ROWS)*16);
 for(const id of Object.values(ids)){data[id*16+3]=.8;data[id*16+7]=1;}
 data[14*16+5]=1;data[14*16+7]=0;
-const exposure={shopLights:defaultShopLights(),sceneEngines:{version:1,stage:'legacy',room:'legacy'}};
+const exposure={controls:{'room-scale':6},table:defaultStudioTable(),shopLights:defaultShopLights(),sceneEngines:{version:1,stage:'legacy',room:'legacy'}};
 let room=structuredClone(exposure);
 const context=vm.createContext({shopLightEmissionRecords,shopEmissionProfiles,structuredClone,STUDIO_FIXED_MATERIAL_ROWS,STUDIO_LIGHTS,shopLightEmitterAllocations,writeShopLightEmitterRows,
   studioShopLightGeometry,writeStudioFixtureRows,sceneMaterialEngineContract,packStudioScene,
@@ -27,8 +30,10 @@ const context=vm.createContext({shopLightEmissionRecords,shopEmissionProfiles,st
   shopOpaque:null,shopGlass:null,shopTransparentFaces:[],shopMeshKey:null,shopGeometry:null,sceneGlassKey:null,
   computeFixtureRoles:()=>({fixtureRoles:[],roleColor:[],roleStrength:[]}),buildFixtureFaces:()=>[],
   checkerboardFaces:()=>[],backdropRollFaces:()=>[],tableFaces:()=>[],goboFaces:()=>[],lightStandFacesForStudio:()=>[],backdropSupportFacesForStudio:()=>[]});
+installStudioSceneBuilders(context);
 vm.runInContext(source.slice(source.indexOf('function shopLightState('),source.indexOf('function rebuildTable(')),context);
 vm.runInContext(source.slice(source.indexOf('export function sceneForPhoto('),source.includes('// Read-only capture')?source.indexOf('// Read-only capture'):source.indexOf('\nfunction syncMaterial()')).replace('export function','function'),context);
+installScenePacking(context);
 const canonical=structuredClone(context.shopLightGeometryForStudio('exposure'));
 assert.equal(canonical.faces.length,360);
 writeShopLightEmitterRows(data,16,base+12,room.shopLights);
@@ -58,6 +63,10 @@ assert.throws(()=>context.rebuildShopMeshes(),/shop-long:.*does not fit/);
 room=failed;
 exposure.shopLights.fixtures[0].exposureMode='burst';const beforeBurst=data.slice();
 assert.throws(()=>context.sceneForPhoto(),/shop-long:.*timing-packet/);assert.deepEqual(data,beforeBurst);
+const timedBurst=structuredClone(context.sceneForPhoto(true,{timedExposure:true}));
+assert(timedBurst.trigger_emitters.length>0);
+assert(timedBurst.trigger_emitters.every(item=>timedBurst.shop_material_ids.includes(item.material)));
+assert(timedBurst.trigger_emitters.every(item=>item.gain>0));
 exposure.shopLights.fixtures[0].exposureMode='continuous';
 exposure.shopLights.fixtures[0].dimmer=.25;exposure.shopLights.fixtures[0].filter=[.2,.4,.8];
 const continuousPhoto=structuredClone(context.sceneForPhoto());
@@ -76,12 +85,12 @@ const mixedMesh=context.shopLightGeometryForStudio('exposure');
 for(const e of mixedMesh.emitters){const material=mixedPhoto.material_ids[e.triangles[0]];
  assert(e.triangles.every(i=>mixedPhoto.material_ids[i]===material));
  assert(mixedPhoto.emitter_profiles.records.some(r=>r.material===material));}
-delete exposure.shopLights;room={};
+delete exposure.shopLights;room=structuredClone(exposure);
 assert.equal(context.shopLightFacesForStudio('exposure').length,0);
 assert.equal(context.sceneForPhoto().vertices.length,0,'Legacy rigs acquire no shop fixtures');
 assert.doesNotMatch(source,/shopLightPhongSamples|maxSamples:100/);
 assert.match(source,/for \(const role of registeredFixtures\)/);
 assert.match(source,/uNumLights"\),lightPos.length/);
-assert.match(source,/collect\('room','Shop light'/);
+assert.match(buildStudioPhotoFixtures.toString(),/collect\('room','Shop light'/);
 if(source.includes('function captureCurrentStudioScene('))assert.match(source,/shopLightFacesForStudio\("studio",collect\("shop"\)\)/);
 console.log('PASS actual shop bridge: one mesh in Phong/ray, independent shared emitter slots, zero photo emission with intact tubes, exact room ownership, glass partition, A/B byte isolation, legacy empty, placement errors and original timing gate.');

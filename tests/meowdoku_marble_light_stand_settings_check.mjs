@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -88,10 +88,8 @@ const context=vm.createContext({ids,applyLightTools,defaultLightTools,wallRelati
   $:id=>fields[id],STUDIO_LIGHTS,FIXTURE_MAT_BASE:90,studioLighting:null,ids:{polished_silver:39,polished_gold:40},
   studioTableState:()=>defaultStudioTable(),studioRoomBounds,studioRoomScale:()=>Number(fields['room-scale'].value),studioFloorDrop:()=>tableFloorDrop(defaultStudioTable()),
   FLOOR_FIXTURE_INDICES,tableLightRoles,tableLightModifierFaces,rgb:value=>[1,3,5].map(k=>parseInt(value.slice(k,k+2),16)/255)});
-vm.runInContext(source.slice(source.indexOf('const ROOM_FIXTURES ='),source.indexOf('const currentCameraOptions =')),context);
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),context);
-vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('function surfaceMaterial(')),context);
-vm.runInContext(source.slice(source.indexOf('function computeFixtureRoles('),source.indexOf('export function sceneForPhoto(')),context);
+installStudioSceneBuilders(context);
+vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('// Capture actual page values;')),context);
 const roles=structuredClone(vm.runInContext('computeFixtureRoles().fixtureRoles',context));
 const options={bounds,unitMm:304.8,fixtureVertices:role=>structuredClone(context.buildFixtureFaces([role],0).flatMap(face=>face.slice(0,3)))};
 const warnings=lightStandPlacementWarnings(fresh,roles,bounds.floorY,options);
@@ -166,9 +164,10 @@ assert(/\.\.\.standTransparentFaces,(\.\.\.shopTransparentFaces,)?\.\.\.faces/.t
 if(source.includes('function captureCurrentStudioScene('))assert(source.includes('lightStandFacesForStudio("studio",displayed.fixtureRoles,collect("stand"))'),'Actual scene capture reads the same stand builder');
 console.log('PASS actual stand bridge: foot-scale subject locks, identical Phong/ray vertices, catalogue-row remap without emission collision, opaque/transparent partition, and byte-identical A photo payload under B overrides.');
 
+Object.assign(exposureProfile.controls,{'backdrop-layers':1,'backdrop-material':'metal_steel','backdrop-sweep':true});
+exposureProfile.backdrops=defaultBackdropLayers();
 previewProfile=structuredClone(exposureProfile);
-context.backdropRollFaces=(channel,cb)=>backdropFaces({count:1,material:'metal_steel',sweep:true,layers:defaultBackdropLayers(),
-  wallZ:bounds.backZ,floorY:bounds.floorY},context.ids,cb);
+context.backdropRollFaces=(channel,cb)=>context.createStudioSceneGeometry(context.studioBuilderOptions(channel)).backdropRollFaces(cb);
 const holderFaces=structuredClone(context.backdropSupportFacesForStudio('exposure'));
 assert.equal(holderFaces.length,528);const holderPhoto=structuredClone(context.sceneForPhoto());
 context.standMeshKey=null;context.rebuildStandMeshes(resolvedRoles);

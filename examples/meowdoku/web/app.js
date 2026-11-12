@@ -28,7 +28,7 @@ setInterval(() => {
 { const link = document.getElementById("studio-link"), A = window.meowdokuAccess || {};
   if (link && (A.edit || A.dev)) { link.style.display = ""; link.title += A.origin === "lan" ? " (local access)" : " (dev access)"; }
   const logLink = document.getElementById("log-link"); if (logLink && (A.edit || A.dev)) logLink.style.display = "";
-  const ticketsLink = document.getElementById("tickets-link"); if (ticketsLink && (A.edit || A.dev)) ticketsLink.style.display = ""; }     // [LOG] developer pages
+  const ticketsLink = document.getElementById("tickets-link"); if (ticketsLink && A.signed_in) ticketsLink.style.display = ""; }     // [LOG] developer pages
 import { TuringWasmProgram, TuringGraphProgram } from "./turing-wasm-shell.js";
 import { ComputeRuntime, PointCloud, SettleDetector } from "./compute.js";
 import { readPoint, pointCount, speciesTable, speciesOf } from "./particle_styles.js";
@@ -5419,6 +5419,7 @@ document.getElementById("report-ticket")?.addEventListener("click", () => {
 });
 document.getElementById("report-ticket-toy")?.addEventListener("click", () => document.getElementById("report-ticket").click());
 document.getElementById("ticket-cancel")?.addEventListener("click", () => document.getElementById("ticket-dialog").close());
+let pendingIssueReport = null; // Preserve exact content and key after an uncertain response.
 document.getElementById("ticket-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = document.getElementById("ticket-send"), resultLine = document.getElementById("ticket-result");
@@ -5445,11 +5446,16 @@ document.getElementById("ticket-form")?.addEventListener("submit", async (event)
     let body = ticketJSON(report);
     while (new Blob([body]).size > 80000 && report.local_log.length) { report.local_log.shift(); body = ticketJSON(report); }
     if (new Blob([body]).size > 80000) throw new Error("state snapshot exceeds ticket limit");
-    const response = await fetch("/api/tickets", { method: "POST", headers: { "Content-Type": "application/json", "X-Meowdoku-Ticket": "1" }, body });
+    if (!pendingIssueReport || pendingIssueReport.note !== note) {
+      pendingIssueReport = { note, body: JSON.stringify({ title: (note.trim().split("\n")[0] || `Game issue: ${game?.game || "unknown"}`).slice(0, 200),
+        description: note.trim() || "Game diagnostic report", diagnostics: JSON.parse(body), client_key: crypto.randomUUID().replaceAll("-", "") }) };
+    }
+    const response = await fetch("/api/issues", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "X-Meowdoku-Issue": "1" }, body: pendingIssueReport.body });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    pendingIssueReport = null;
     resultLine.textContent = `Report sent. Ticket ${result.id}`;
-  } catch (error) { resultLine.textContent = `Report was not sent: ${error.message}`; }
+  } catch (error) { resultLine.textContent = `No success confirmed: ${error.message}. Your report is kept; retry unchanged to avoid duplicates.`; }
   finally { button.disabled = false; button.textContent = "Send ticket"; }
 });
 // THE LAYOUT LOCK.  While the phone's tilt drives a compute game's gravity, turning the phone must not re-lay the page out:

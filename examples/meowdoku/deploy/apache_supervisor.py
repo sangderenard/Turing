@@ -21,6 +21,7 @@ Tables in accounts.db: service_instances, instance_leases, account_instances (us
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import secrets
@@ -115,6 +116,14 @@ def load_instances(path):
     if isinstance(data, dict):
         data = data.get("instances", [])
     return data if isinstance(data, list) else []
+
+
+def instances_system_events(path):
+    """[CONTROL] The top-level ``system_events`` of the object form of instances.json: where system events are asked
+    for ({"from": <nodus instance>, "prefix": <its task prefix>, "jobs_dir": <that prefix's directory>, "engine_id"})."""
+    data = _read_instances(path)
+    value = data.get("system_events") if isinstance(data, dict) else None
+    return dict(value) if isinstance(value, dict) and value.get("from") and value.get("prefix") and value.get("jobs_dir") else None
 
 
 def instances_state_dir(path):
@@ -310,6 +319,8 @@ class Instance:
                     if self.console_requested():
                         self.console_port = first.get("console_port")
                     ports = first.get("contract_ports") or []
+                    self.contract_ports = {p.get("prefix"): int(p["listen_port"]) for p in ports
+                                           if isinstance(p, dict) and p.get("prefix") and p.get("listen_port")}
                     if ports and isinstance(ports[0], dict) and ports[0].get("listen_port"):
                         self.contract_prefix, self.contract_port = ports[0].get("prefix"), int(ports[0]["listen_port"])
                     return True
@@ -375,7 +386,32 @@ class Instance:
             return []
         canvas = str(_abs(source.spec["nodus"]["canvas"]))
         self.sup.log(f"{self.name}: federating {source_name!r} contract port {source.contract_port} ({source.contract_prefix}) canvas {canvas}")
-        return ["--federation-port", str(source.contract_port), "--federation-canvas", canvas]
+        flags = ["--federation-port", str(source.contract_port), "--federation-canvas", canvas]
+        studio = self.spec.get("studio_prefix")     # [SHOW] the declared Studio prefix on the same host, when this instance names one
+        if studio:
+            port = getattr(source, "contract_ports", {}).get(studio)
+            if port:
+                self.sup.log(f"{self.name}: Studio pictures use {source_name!r} contract port {port} ({studio})")
+                flags += ["--studio-nodus-port", str(port), "--studio-nodus-prefix", studio]
+            else:
+                self.sup.log(f"{self.name}: studio_prefix {studio!r}: the host declares no such contract port; pictures stay off")
+        cron = self.spec.get("cron_prefix")         # [CRON] the declared cron prefix whose tasks this instance performs
+        if cron:
+            port = getattr(source, "contract_ports", {}).get(cron)
+            if port:
+                self.sup.log(f"{self.name}: scheduled tasks come from {source_name!r} contract port {port} ({cron})")
+                flags += ["--cron-port", str(port)]
+            else:
+                self.sup.log(f"{self.name}: cron_prefix {cron!r}: the host declares no such contract port; no scheduled tasks")
+        userlist = self.spec.get("userlist_prefix")  # [CONTROL] the user list as a table: this instance performs its searches
+        if userlist:
+            port = getattr(source, "contract_ports", {}).get(userlist)
+            if port:
+                self.sup.log(f"{self.name}: the user list table is {source_name!r} contract port {port} ({userlist})")
+                flags += ["--userlist-port", str(port)]
+            else:
+                self.sup.log(f"{self.name}: userlist_prefix {userlist!r}: the host declares no such contract port; searched directly")
+        return flags
 
     def poll(self):
         if self.state in ("skipped", "external", "failed", "stopped", "new"):
@@ -450,6 +486,45 @@ class Instance:
         with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
             r.read()
 
+    # ---- [CONTROL] forced by an admin's request (instance_control.py); the supervisor does not ask the instance's leave
+    def force_stop(self, wait=15.0) -> str:
+        """Ask the process to stop, wait, then kill it. Leaves the instance ``stopped``; returns what happened."""
+        if self.state in ("skipped", "external"):
+            return f"not managed here ({self.state})"
+        if self.proc is None or self.proc.poll() is not None:
+            self.state = "stopped"
+            self.record(stopped=time.time())
+            return "was not running"
+        pid = self.proc.pid
+        self.state = "stopping"
+        self.request_stop()
+        end = time.monotonic() + wait
+        while time.monotonic() < end and self.proc.poll() is None:
+            time.sleep(0.2)
+        killed = self.proc.poll() is None
+        if killed:
+            self.proc.kill()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                pass
+        self.remove_console_token()
+        self.return_leases()
+        self.state = "stopped"
+        self.record(stopped=time.time())
+        return f"pid {pid} " + ("did not stop when asked and was killed" if killed else "stopped")
+
+    def force_start(self) -> str:
+        if self.state in ("skipped", "external"):
+            return f"not managed here ({self.state})"
+        if self.proc is not None and self.proc.poll() is None:
+            return f"already running (pid {self.proc.pid})"
+        self.starts, self.backoff = [], 1.0              # an admin's start is not one of the crash restarts
+        self.federation_args = self.resolve_federation()
+        self.take_leases()
+        self.launch()
+        return f"started pid {self.proc.pid}"
+
     def finish_stop(self):
         if self.proc is not None and self.proc.poll() is None:
             self.sup.log(f"{self.name}: did not exit in {STOP_WAIT:.0f}s; terminating")
@@ -473,6 +548,7 @@ class Supervisor:
         self.log_dir = self.paths.logs_dir
         self.stop = threading.Event()
         self.instances = []
+        self.system_events = None       # [CONTROL] {"from", "prefix", "jobs_dir", "engine_id"}: where system events are asked for
         self.secrets_restricted = False
         self._lock_file = None
 
@@ -545,6 +621,7 @@ class Supervisor:
                 signal.signal(getattr(signal, sig), lambda *_: self.stop.set())
         if manage:
             specs = load_instances(self.instances_path)
+            self.system_events = instances_system_events(self.instances_path)
             sources = {s.get("federation_from") for s in specs}
             for spec in sorted(specs, key=lambda s: s.get("name") not in sources):      # a federation source starts before its dependents
                 inst = Instance(spec, self)
@@ -555,6 +632,10 @@ class Supervisor:
                     inst.state = "failed"
                     self.log(f"{inst.name}: start failed: {error!r}")
             while not self.stop.wait(1.0):
+                try:
+                    self.handle_requests()
+                except Exception as error:
+                    self.log(f"request handling error: {error!r}")
                 for inst in self.instances:
                     try:
                         inst.poll()
@@ -565,6 +646,79 @@ class Supervisor:
             self.log("another supervisor owns the instances; this process only logs")
             self.stop.wait()
         return 0
+
+    def handle_requests(self):
+        """[CONTROL] Perform the pending rows of ``instance_requests``. ``*`` means every instance: sources of a
+        federation are started first and stopped last, as at the start and stop of the whole stack."""
+        from meowdoku import instance_control
+        light = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)   # once a second: a plain connection
+        try:
+            news = instance_control.to_announce(light)
+            todo = instance_control.due(light)
+        finally:
+            light.close()
+        for item in news:
+            self.announce(item)
+        if not todo:
+            return
+        sources = {i.spec.get("federation_from") for i in self.instances}
+        first_to_start = sorted(self.instances, key=lambda i: i.name not in sources)
+        for item in todo:
+            targets = [i for i in first_to_start if item["instance"] in (instance_control.ALL, i.name)]
+            if not targets:
+                state, detail = "refused", "no such instance under this supervisor"
+            else:
+                done = []
+                try:
+                    if item["action"] in ("restart", "shutdown"):
+                        for inst in reversed(targets):
+                            done.append(f"{inst.name}: {inst.force_stop()}")
+                    if item["action"] in ("restart", "start"):
+                        for inst in targets:
+                            done.append(f"{inst.name}: {inst.force_start()}")
+                    state, detail = "done", "; ".join(done)
+                except Exception as error:
+                    state, detail = "refused", "; ".join(done + [f"failed: {error!r}"])
+            self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {detail}")
+            with connect(self.db_path) as db:
+                instance_control.finish(db, item["id"], state, detail)
+
+    def announce(self, item):
+        """[CONTROL] Tell every admin about a counted-down request, or its interruption: one task asked of the Nodus
+        task table (nodus tools/task_request.py), performed by the task worker as a broadcast from the system account.
+        The request is marked announced whatever happens: an announcement that cannot be made is logged, not retried,
+        and never holds up the request itself."""
+        from meowdoku import instance_control
+        cancelled = item["state"] == "cancelled"
+        seconds = max(0, int(round(item["due_at"] - time.time())))
+        what = f"{item['action']} of {'every instance' if item['instance'] == instance_control.ALL else item['instance']}"
+        if cancelled:
+            text = f"The {what} (request {item['id']}) was interrupted: {item['detail']}. Nothing will happen."
+        else:
+            text = (f"There will be a {what} in {seconds} seconds (request {item['id']}), asked by {item['requested_name']}"
+                    + (f": {item['reason']}" if item["reason"] else "") + ". Interrupt it to stop it.")
+        outcome = {"outcome": "not configured"}
+        events = self.system_events or {}
+        source = next((i for i in self.instances if i.name == events.get("from") and i.kind == "nodus"), None)
+        port = getattr(source, "contract_ports", {}).get(events.get("prefix")) if source is not None else None
+        if port:
+            try:
+                from meowdoku import studio_product_nodus
+                native = studio_product_nodus.nodus_modules()[0]
+                spec = importlib.util.spec_from_file_location("_supervisor_task_request",
+                                                              studio_product_nodus.DEFAULT_NODUS_TOOLS / "task_request.py")
+                task_request = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(task_request)
+                outcome = task_request.submit(
+                    native, port=port, engine_id=int(events.get("engine_id", 7202)), jobs_dir=events["jobs_dir"],
+                    task="system.broadcast", timeout=5.0,
+                    fields={"text": text, "audience": "admin", "msg_type": "status" if cancelled else "approval_request",
+                            "subject": {"kind": "control", "ref": str(item["id"])}})
+            except Exception as error:
+                outcome = {"outcome": "failed", "error": repr(error)}
+        self.log(f"request {item['id']}: announced ({'interrupted' if cancelled else f'in {seconds} s'}) -> {outcome}")
+        with connect(self.db_path) as db:
+            instance_control.mark_announced(db, item["id"], 2 if cancelled else 1)
 
     def shutdown(self):
         self.log("stopping instances")

@@ -208,6 +208,10 @@ class Accounts:
                 self._conn.commit()
                 return True
             except sqlite3.IntegrityError:
+                # A duplicate claim still begins a write transaction. Release
+                # it before another connection (login guard, operator audit)
+                # needs the shared accounts database.
+                self._conn.rollback()
                 return False
 
     def owner_of(self, asset_type: str, asset_key: str) -> int | None:

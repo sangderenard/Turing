@@ -121,6 +121,34 @@ job keeps clones and map files on disk, which the owner's retention rule
 merge is a design join (registry + import roots + stream lanes + claims), to
 be done once, deliberately, not in passing.
 
+2026-11-12, merge of main (owner: "use careful examination and your better
+judgement to decide"): decided to merge now, before both lines moved
+further. `git merge main` into the branch; conflicts in `DREAM_DOCUMENT.md`
+and `tests/test_repo_world_scan.py` were pure unions. `repo_world_scan.py`
+was joined by hand: main's v1 (extractor registry `EXTRACTOR_MODULES`,
+import roots, `declared_import_roots`, (source, line, target) pair identity,
+schema `repo-world-scan-v1`, `extractor_languages`/`import_roots` fields)
+laid over the branch's `scan_files` core so every lane (disk, GitHub tarball
+stream, `git archive` stream) runs the plugins and reads root declarations
+from the tree itself (`DECLARATION_FILES`, read through the same reader; the
+stream keeps only those bytes plus plugin-matched files). Decisions taken in
+the join: a room's language is the compiler's name when a known suffix
+claims it (`.cpp` -> `cpp`), else the extractor's; the `languages` table
+reports `linking_readers` per compiler language (built-in + overlapping
+plugins) and adds extractor-only rows (c, cmake, html, powershell, shell);
+stream lanes default to the declared roots (`import_roots=None`), the disk
+lane keeps main's explicit `import_roots=()` contract so
+`tools/compile_repo_world_map.py` is unchanged. Tests: 193 passed in 24 s
+across the scan, workspace, sink, work-table, six plugin, compile-job,
+portal-record, dream-document, render and interpreter-limits suites.
+`tests/test_meowdoku_worldmap.py` could not be collected here: it imports
+the server, which refuses without the sibling speaktome REST package
+(environment, not this change). Live: turing main streamed in 39 s, declared
+root `examples` from the stream, meowdoku unresolved 998 -> 0 (design note
+§7). Main's `tools/compile_repo_world_map.py` still clones to a `--work`
+directory; it was not changed to the stream lane here (its contract and
+tests are main's), noted as the remaining on-disk transient.
+
 Not run: the broader abstract_ui suites and any HTML generation. No
 `abstract_ui_*.py` file was edited; nothing in the live page changed.
 

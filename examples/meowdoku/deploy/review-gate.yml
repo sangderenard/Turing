@@ -1,0 +1,59 @@
+# The review gate of a default branch. It asks the service one question about one commit: does the SQL hold an
+# accepted review of exactly this commit (branch_review.py: approved by an admin, or accepted by time-out with no
+# objection)? The service also answers the lock's mode and the advice to print.
+#
+#   lock "mock"     a commit without an accepted review gets a warning and the advice; the check passes.
+#   lock "enforce"  the check fails. Make "review-gate" a required status check of the default branch
+#                   (deploy/Protect-DefaultBranch.ps1) and GitHub then refuses the commit.
+#
+# The mode is one line of deploy/branch_policy.json on the service; this file does not change when it flips.
+#
+# Copy to .github/workflows/review-gate.yml on the DEFAULT branch and set REPOSITORY to the repository's name in the
+# branch policy. pull_request_target runs the workflow file of the base branch, so a branch cannot edit its own
+# check. The job checks out nothing and runs no code from the change.
+name: review-gate
+
+on:
+  push:
+    branches: [DEFAULT_BRANCH]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The full commit id to ask about (default is this ref's commit)
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REPOSITORY: POLICY_NAME
+  SERVICE: https://stichka.duckdns.org:8766
+
+jobs:
+  review-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the service whether this commit has an accepted review
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+        run: |
+          set -eu
+          case "$HEAD" in *[!0-9a-f]*|"") echo "not a commit id"; exit 1;; esac
+          if ! answer=$(curl --fail --silent --show-error --max-time 30 \
+              "$SERVICE/api/reviews/standing?repository=$REPOSITORY&head=$HEAD"); then
+            echo "::warning::The review service did not answer; nothing was checked."
+            exit 0
+          fi
+          if [ "$(echo "$answer" | jq -r '.accepted')" = "true" ]; then
+            echo "Commit $HEAD has an accepted review."
+            exit 0
+          fi
+          echo "$answer" | jq -r '.advice'
+          if [ "$(echo "$answer" | jq -r '.lock')" = "enforce" ]; then
+            echo "::error::Commit $HEAD has no accepted review. Read the steps above."
+            exit 1
+          fi
+          echo "::warning::Mock lock: commit $HEAD has no accepted review and would be refused. Read the steps in the log."

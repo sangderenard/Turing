@@ -1,0 +1,46 @@
+{
+ "source": "tests/test_meowdoku_math_lab.py::test_compile_math_records_each_target 'r = sqrt(x*x + y*y)' batch=1024",
+ "shader": "@group(0) @binding(0) var<storage, read_write> lane0: array<f32>;\n@group(0) @binding(1) var<storage, read_write> head: array<f32>;\n\n@compute @workgroup_size(64, 1, 1)\nfn p0(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>) {\n  let i: u32 = gid.x + gid.y * grid.x * 64u;\n  if (i >= 1024u) { return; }\n  let v_0: f32 = lane0[0u + i];\n  let v_2: f32 = (v_0 * v_0);\n  let v_1: f32 = lane0[1024u + i];\n  let v_5: f32 = (v_1 * v_1);\n  let v_8: f32 = (v_2 + v_5);\n  let v_11: f32 = sqrt(v_8);\n  lane0[2048u + i] = v_11;\n}\n",
+ "abi": {
+  "schema": "turing.math-lab-wgsl.v1",
+  "contract": "fast",
+  "precision": "float32",
+  "name": "user_law",
+  "count": 1024,
+  "workgroup_size": [
+   64,
+   1,
+   1
+  ],
+  "groups": [
+   16,
+   1,
+   1
+  ],
+  "entries": [
+   "p0"
+  ],
+  "slots": 3,
+  "dispatches": 1,
+  "lane_base": 0,
+  "arena_elements": 3072,
+  "bindings": 1,
+  "slots_per_binding": 65536,
+  "storage_bindings_per_pass": 2,
+  "binding_budget": 8,
+  "arguments": [
+   "x",
+   "y"
+  ],
+  "outputs": [
+   "r"
+  ],
+  "feed_slots": {
+   "x": 0,
+   "y": 1
+  },
+  "output_slots": {
+   "r": 2
+  }
+ }
+}

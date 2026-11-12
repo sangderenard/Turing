@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World map</title>
+<style>
+  :root { color-scheme: dark; --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --acc:#7db0ff; --card:#202024; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:96rem; margin:0 auto; padding:1rem 16px 3rem; }
+  a, .link { color:var(--acc); } h1 { font-size:1.3rem; margin:.4rem 0; } h2 { font-size:1rem; margin:.2rem 0; word-break:break-all; } h3 { font-size:.95rem; margin:.8rem 0 .3rem; }
+  .bar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin:.5rem 0; }
+  select, input[type=search], button { font:inherit; padding:.3rem .6rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); max-width:100%; }
+  button { cursor:pointer; } button.link { border:0; background:none; padding:0; text-align:left; color:var(--acc); word-break:break-all; } button.crumb { padding:.1rem .4rem; }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) 22rem; gap:1rem; align-items:start; }
+  @media (max-width:800px) { .layout { grid-template-columns:minmax(0,1fr); } }
+  .stage { background:var(--card); border:1px solid var(--line); border-radius:6px; overflow:hidden; } canvas { display:block; touch-action:none; }
+  #panel { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.5rem 1rem; max-height:78vh; overflow:auto; }
+  .plist { list-style:none; margin:0; padding:0; } .plist li { padding:.15rem 0; border-bottom:1px solid var(--line); }
+  .chip { display:inline-flex; align-items:center; gap:.3rem; margin-right:.7rem; font-size:.85rem; } .chip i { width:.8rem; height:.8rem; display:inline-block; border-radius:2px; }
+  .mut { color:var(--mut); } .bad { color:#ff8a80; } #tip { min-height:1.4em; font:13px ui-monospace, Consolas, monospace; color:var(--mut); }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="/browse">Back to browse</a></nav>
+  <h1>World map</h1>
+  <p id="status" class="mut" role="status">Loading...</p>
+  <div class="bar">
+    <select id="repo" aria-label="Repository"></select>
+    <input id="search" type="search" placeholder="Filter rooms by path" aria-label="Filter rooms by path">
+    <span id="hits" class="mut"></span>
+    <label><input id="links" type="checkbox"> region links (top 200)</label>
+  </div>
+  <div id="crumbs" class="bar"></div>
+  <p id="stats" class="mut"></p>
+  <div id="legend"></div>
+  <div class="layout">
+    <div><div class="stage"><canvas id="map"></canvas></div><div id="tip"></div></div>
+    <aside id="panel"></aside>
+  </div>
+</main>
+<script type="module" src="/worldmap.js"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+</body>
+</html>

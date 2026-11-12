@@ -64,7 +64,11 @@ def _pristine_lowpass_kernel(cutoff_hz: float, order: int = 8) -> tuple[float, .
     frequencies = np.linspace(0, nyquist, fft_size // 2 + 1, dtype=np.float64)
     ratio = (frequencies / max(cutoff_hz, 1e-9)) ** order
     mask = 1.0 / (1.0 + ratio)
-    impulse = np.roll(np.fft.irfft(mask, n=fft_size), fft_size // 2)[:taps]
+    # Keep the centered impulse, not the far-left tail of the shifted FFT.
+    # The old tail crop normalized tiny sidelobes into a 12x gain at 2.6 kHz.
+    centered = np.roll(np.fft.irfft(mask, n=fft_size), fft_size // 2)
+    start = fft_size // 2 - taps // 2
+    impulse = centered[start:start + taps].copy()
     impulse *= np.blackman(taps)
     total = float(impulse.sum())
     if total:
@@ -79,6 +83,7 @@ class EnginePCMKernel:
     entrypoint: str
     reserved_bytes: int
     operation_count: int
+    input_names: tuple[str, ...]
 
     def to_model(self) -> dict[str, Any]:
         return {
@@ -89,6 +94,7 @@ class EnginePCMKernel:
             "binary_bytes": len(self.binary),
             "reserved_bytes": self.reserved_bytes,
             "operation_count": self.operation_count,
+            "input_names": list(self.input_names),
             "firing_weights": list(self.profile.firing_weights),
         }
 
@@ -195,6 +201,8 @@ def _profile_program(profile: EngineSoundProfile) -> FusedProgram:
     program = FusedProgram(version=1, feeds=set(feed_ids), steps=builder.steps,
                            outputs={"pcm": saturated}, meta=meta,
                            extras={"block_size": BLOCK_SIZE, "sample_rate": SAMPLE_RATE,
+                                   "capture_feed_origins": {value: {"binding_name": name}
+                                                            for value, name in zip(feed_ids, INPUT_NAMES)},
                                    "dsp": "dry-times-octave-shadow-then-product-times-second-octave-shadow"})
     program.feed_order = feed_ids
     return program
@@ -211,8 +219,13 @@ def compile_engine_pcm_kernel(profile_identity: str) -> EnginePCMKernel:
     if not module.complete or module.binary is None:
         raise RuntimeError(module.shortfall_report())
     entry = module.api.entry_points[0]
+    # Bind the caller to the emitted parameter identities. First-use order in
+    # this program differs from INPUT_NAMES; positional calls fed 48000 to RPM.
+    input_names = tuple(parameter.name for parameter in entry.parameters if parameter.role == "input")
+    if len(input_names) != len(INPUT_NAMES) or set(input_names) != set(INPUT_NAMES):
+        raise RuntimeError(f"engine PCM input contract mismatch: {input_names}")
     return EnginePCMKernel(profile, module.binary, entry.symbol,
-                           int(module.api.metadata.get("reserved_bytes", 0)), len(program.steps))
+                           int(module.api.metadata.get("reserved_bytes", 0)), len(program.steps), input_names)
 
 
 @lru_cache(maxsize=1)

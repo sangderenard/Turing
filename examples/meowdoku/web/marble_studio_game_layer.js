@@ -2,65 +2,88 @@
 // revisions; the game's existing worker owns its moving bodies and clock.
 // No timer, movement controller, solver, camera override or ray job is created.
 import {createStudioSceneAsset} from './marble_studio_scene_asset.js';
-import {createStudioGameAsset} from './marble_game_asset.js';
+import {prepareStudioAmmunition} from './marble_game_asset.js';
 import {createMechanicalCreatureStudioReturn} from './mechanical_creature_studio_return.js';
+import {validateStudioGameProtocol,validateStudioGameReceipt} from './marble_studio_game_protocol.js';
 
 export function createStudioGameLayerController({capture,report=()=>{},createReturn=createMechanicalCreatureStudioReturn,
-  sceneAsset=createStudioSceneAsset,gameAsset=createStudioGameAsset}) {
+  sceneAsset=createStudioSceneAsset,ammunition=prepareStudioAmmunition}) {
   if(typeof capture!=='function')throw TypeError('The displayed Studio capture function is required.');
-  let host=null,receiver=null,marble=null,busy=false,desired=false,seen=-1,sent=-1,sequence=0,generation=0,
-    failure=null,failureRevision=null,received=0,lastReceipt=null,disconnect=null,phase='off';
+  let host=null,protocol=null,receiver=null,initialized=false,ammunitionStatus=null,busy=false,desired=false,seen=-1,sent=-1,sequence=0,generation=0,
+    poseSequence=0,failure=null,failureRevision=null,received=0,lastReceipt=null,disconnect=null,phase='off',active=true,qualificationKey='';
   const publish=()=>{try{report(read());}catch{/* UI cannot change engine ownership. */}};
   function read(){return {enabled:desired,connected:!!host,busy,authoredRevision:seen,sentRevision:sent,
-    sequence,phase,receivedFrames:received,returned:receiver?.read()??null,receipt:lastReceipt,error:failure};}
+    sequence,phase,protocol,qualification:host?.readQualification?.()??null,ammunition:ammunitionStatus,receivedFrames:received,returned:receiver?.read()??null,receipt:lastReceipt,error:failure};}
   function connect(value){
-    if(!value?.update||!value?.connect||!value?.readSnapshot)throw Error('The original game layer API is unavailable.');
+    if(!['update','connect','readSnapshot','readProtocol'].every(key=>typeof value?.[key]==='function'))throw Error('The original game layer API is unavailable.');
     if(host&&host!==value)throw Error('Stop the existing game layer before replacing its host.');
-    host=value;desired=true;failure=null;
-    disconnect=host.connect(packet=>{if(!receiver)return;try{if(receiver.receive(packet)?.accepted===true){received++;publish();}}
-      catch(error){failure=String(error.message||error);publish();}});publish();
+    if(host===value)return; // Repeated UI activation cannot replace a live sink.
+    const admitted=validateStudioGameProtocol(value.readProtocol()),token=generation;
+    const release=value.connect(packet=>{if(token!==generation||host!==value||!receiver)return;try{if(receiver.receive(packet)?.accepted===true){received++;publish();}}
+      catch(error){failure=String(error.message||error);publish();}});
+    if(typeof release!=='function')throw Error('The original game must provide its connection release.');
+    host=value;protocol=admitted;desired=true;failure=null;disconnect=release;host.setActive?.(active);publish();
   }
   async function send(revision,token){
     busy=true;failure=null;phase='capturing displayed scene';publish();
+    const currentPreparation=()=>{
+      if(!desired||token!==generation)return false;
+      if(seen!==revision){phase='waiting for latest displayed scene';return false;}
+      return true;
+    };
     try {
       // capture() runs at the incumbent Studio frame boundary. All inputs are
       // detached before its first await; later edits cause one newer revision.
       const packet=await capture();
-      if(!desired||token!==generation)return;
+      if(!currentPreparation())return;
       if(packet.revision!==revision)throw Error('Studio changed before its displayed capture.');
       phase='packing exact scene';publish();const asset=await sceneAsset(packet);
-      if(!desired||token!==generation)return;
-      const first=!marble;
-      phase=first?'packing marble ammunition':'preparing environment update';publish();
-      const authoredMarble=first?await gameAsset(packet,{name:'Current Studio marble'}):null;
-      if(!desired||token!==generation)return;
+      if(!currentPreparation())return;
+      const first=!initialized;
+      phase=first?'checking optional marble ammunition':'preparing environment update';publish();
+      const choice=first?await ammunition(packet,{name:'Current Studio marble'}):null;
+      const authoredMarble=choice?.supported?choice.asset:null;
+      if(!currentPreparation())return;
       const source={schema:packet.schema,revision:packet.revision,classIdentity:packet.classIdentity,
         scene:{frame:packet.scene.frame,room:packet.scene.room,parts:packet.scene.parts}};
       const nextSequence=++sequence;
       phase='waiting for original game commit';publish();
-      const receipt=await host.update({asset,source,marbleAsset:authoredMarble,sequence:nextSequence});
+      // Once queued, retain its receipt even if Studio edits again. The game
+      // may already own this complete environment; the next frame sends latest.
+      const acknowledgment=await host.update({asset,source,marbleAsset:authoredMarble,sequence:nextSequence});
       if(!desired||token!==generation)return;
+      const receipt=validateStudioGameReceipt(acknowledgment,{protocol,assetIdentity:asset.identity,classIdentity:source.classIdentity,revision,sequence:nextSequence});
       const environment={buildingIdentity:receipt.building.identity,environmentAssetIdentity:asset.identity,environmentRevision:revision,environmentSequence:nextSequence,
         buildingPlacement:receipt.building.placement,unitM:packet.scene.frame.unitM};
       if(!receiver){
         const current=host.readSnapshot();
-        if(!current?.epoch)throw Error('The original game has not published its first snapshot.');
+        if(current&&current.epoch!==protocol.epoch)throw Error('The original snapshot belongs to a different game session.');
         phase='preparing returned body view';publish();
-        const candidate=await createReturn({epoch:current.epoch,environment,assets:[authoredMarble],fixedQuaternionXYZW:[0,0,0,1]});
+        const candidate=await createReturn({epoch:protocol.epoch,environment,assets:authoredMarble?[authoredMarble]:[],fixedQuaternionXYZW:[0,0,0,1]});
         if(!desired||token!==generation){candidate.dispose();return;}
+        try{if(current&&candidate.receive(current)?.accepted===true)received++;}
+        catch(error){candidate.dispose();throw error;}
         receiver=candidate;
-        if(receiver.receive(current)?.accepted===true)received++;
       }else receiver.setEnvironment(environment);
-      if(first)marble=authoredMarble;sent=revision;lastReceipt=receipt;phase='running';
+      if(first){initialized=true;ammunitionStatus=Object.freeze({supported:choice.supported,identity:authoredMarble?.identity??null,reason:choice.reason});}
+      sent=revision;lastReceipt=receipt;phase='running';
     }catch(error){if(token===generation){failure=String(error.message||error);failureRevision=revision;}}
     finally{if(token===generation){busy=false;publish();}}
   }
-  return {connect,read,
+  return {connect,read,setActive(value){active=Boolean(value);host?.setActive?.(active);},
     draw({gl,view,projection,phase='all'}){if(receiver&&gl)try{receiver.draw({gl,view,projection,phase});}
       catch(error){failure=String(error.message||error);publish();}},
-    frame({revision,gl,view,projection,phase='all'}){
+    frame({revision,subjectPose,gl,view,projection,phase='all'}){
       if(!Number.isSafeInteger(revision)||revision<0)return;
       seen=revision;
+      // Reuse Studio's incumbent display frame to show the original gate. The
+      // game alone decides qualification and starts its own world frame loop.
+      const q=host?.readQualification?.(),key=q?`${q.state}:${Math.floor(q.simulatedSeconds)}`:'';
+      if(key!==qualificationKey){qualificationKey=key;publish();}
+      if(desired&&host&&lastReceipt&&revision===sent&&subjectPose&&typeof host.previewPose==='function')try {
+        host.previewPose({epoch:protocol.epoch,assetIdentity:lastReceipt.identity,revision,
+          environmentSequence:lastReceipt.sequence,sequence:++poseSequence,model:subjectPose});
+      }catch(error){failure=String(error.message||error);publish();}
       if(failure&&failureRevision!==null&&revision!==failureRevision){failure=null;failureRevision=null;}
       if(receiver&&gl)try{receiver.draw({gl,view,projection,phase});}
       catch(error){failure=String(error.message||error);publish();}
@@ -70,7 +93,7 @@ export function createStudioGameLayerController({capture,report=()=>{},createRet
     // A stopped host may still finish an installer. The new generation owns
     // busy/error state; the old promise cannot clear or poison its replacement.
     stop(){generation++;desired=false;busy=false;disconnect?.();disconnect=null;host?.dispose?.();host=null;receiver?.dispose();receiver=null;
-      marble=null;sent=-1;received=0;lastReceipt=null;failure=null;failureRevision=null;phase='off';publish();},
+      protocol=null;poseSequence=0;initialized=false;ammunitionStatus=null;sent=-1;received=0;lastReceipt=null;failure=null;failureRevision=null;phase='off';publish();},
   };
 }
 
@@ -82,23 +105,28 @@ export function mountStudioGameLayer({doc=document,canvas,capture,url='./mechani
   const stop=doc.createElement('button');stop.type='button';stop.textContent='Stop game layer';stop.hidden=true;
   const retry=doc.createElement('button');retry.type='button';retry.textContent='Retry scene update';retry.hidden=true;
   const status=doc.createElement('p');status.id='studio-game-layer-status';status.textContent='Optional. The existing Studio and photo camera stay unchanged until opened.';
+  const ammoNote=doc.createElement('p');ammoNote.id='studio-game-layer-ammunition';ammoNote.hidden=true;
   const inspect=doc.createElement('details'),title=doc.createElement('summary'),receipt=doc.createElement('pre');
   title.textContent='Game synchronization';receipt.id='studio-game-layer-receipt';receipt.style.cssText='max-height:180px;overflow:auto;white-space:pre-wrap;font-size:10px';
-  inspect.append(title,receipt);panel.append(open,back,stop,retry,status,inspect);
+  inspect.append(title,receipt);panel.append(open,back,stop,retry,status,ammoNote,inspect);
   const engine=doc.getElementById('preview-engine');(engine?.closest('fieldset')??engine?.parentElement?.parentElement??doc.body).append(panel);
   let frame=null,visible=false,loading=false;
   const controller=createStudioGameLayerController({capture,report:value=>{
     status.dataset.state=value.error?'failed':value.sentRevision>=0?'ready':value.enabled?'syncing':'off';
-    status.textContent=value.error?'Game update paused: '+value.error:value.sentRevision>=0?
+    status.textContent=value.error?'Game update paused: '+value.error:value.qualification?.state==='failed'?
+      'Original vehicle qualification failed. The original game has withheld the world.':value.qualification?.state==='pending'?
+      `Original vehicle qualification: ${value.qualification.simulatedSeconds.toFixed(1)} s. Waiting for its result.`:value.sentRevision>=0?
       `Scene revision ${value.sentRevision} sent. ${value.receivedFrames} original game frames received. Photo camera unchanged.`:
       value.connected?'Game layer: '+value.phase+'.':loading?'Loading the original game and controls.':'Game layer off. Studio remains unchanged.';
     retry.hidden=!value.error;receipt.textContent=JSON.stringify(value,null,2);
-    if(value.sentRevision>=0&&frame)frame.style.visibility=visible?'visible':'hidden';
+    ammoNote.hidden=value.ammunition?.supported!==false;
+    ammoNote.textContent=ammoNote.hidden?'':'Room imported. Subject is display-only: '+value.ammunition.reason;
+    if(frame)frame.style.visibility=visible&&(value.sentRevision>=0||value.qualification)?'visible':'hidden';
   }});
-  function show(on){visible=on;back.hidden=!on;open.hidden=on;stop.hidden=!frame;
+  function show(on){visible=on;controller.setActive(on);back.hidden=!on;open.hidden=on;stop.hidden=!frame;
     Object.assign(panel.style,on?{position:'fixed',top:'0',left:'0',right:'0',height:'60px',overflow:'auto',zIndex:'230',background:'#15232e',padding:'4px'}:
       {position:'relative',top:'',left:'',right:'',height:'',overflow:'',zIndex:'',background:'',padding:''});
-    if(frame){frame.style.visibility=on&&controller.read().sentRevision>=0?'visible':'hidden';frame.style.pointerEvents=on?'auto':'none';}
+    if(frame){const value=controller.read();frame.style.visibility=on&&(value.sentRevision>=0||value.qualification)?'visible':'hidden';frame.style.pointerEvents=on?'auto':'none';}
     if(!on)canvas.focus?.();}
   open.addEventListener('click',()=>{
     if(frame){show(true);return;}

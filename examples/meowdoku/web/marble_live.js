@@ -20,9 +20,17 @@ export function liveHistoryLimit(edge,aspect,checkpoint=false,blockLimit=MAX_LIV
   if(entries*stateBytes>blockLimit)throw new Error("This GPU cannot fit the history state at this resolution.");
   return Math.max(1,Math.min(Math.floor((MAX_LIVE_HISTORY_BYTES-entries*stateBytes)/(entries*4)),Math.floor(blockLimit/(entries*4))));
 }
+export function liveEmitterSampling(doc) {
+  if(!doc.getElementById('live-emitter-sampling')?.checked)return undefined;
+  const budget=doc.getElementById('live-emitter-ray-budget')?.value,seed=doc.getElementById('live-emitter-seed')?.value;
+  const ray_budget=String(budget??'').trim()?Number(budget):NaN,seedValue=String(seed??'').trim()?Number(seed):NaN;
+  if(!Number.isSafeInteger(ray_budget)||ray_budget<128||ray_budget>65536)throw Error('Emitter ray budget must be an integer from 128 to 65,536.');
+  if(!Number.isSafeInteger(seedValue)||seedValue<0||seedValue>2147483647)throw Error('Emitter seed must be an integer from 0 to 2,147,483,647.');
+  return {version:1,ray_budget,seed:seedValue,refresh_each_sweep:doc.getElementById('live-emitter-refresh')?.checked===true};
+}
 
 export function createLiveRayView({doc=document, canvas, getGeometry, getScene, getPose, getFilmResponse, ensureSaved,
-  getOpticalMode=()=>"legacy", participationFactory=createLiveParticipation}) {
+  getOpticalMode=()=>"legacy", participationFactory=createLiveParticipation, fieldView=null}) {
   const $=id=>doc.getElementById(id), toggle=$("live-rays"), length=$("live-history"), resolution=$("live-resolution"), output=$("live-status");
   const participation=participationFactory(doc);
   const rodWarning=createRodBundleWarning(doc,'live-optical-warning');
@@ -34,16 +42,25 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
   const tint=$("live-tint"),normalization=$("live-normalization"),white=$("live-normalization-white");
   const percentile=$("live-normalization-percentile");
   const batch=$("live-ray-batch"),download=$("live-download");
+  const displayMode=$('live-display-mode'),samplingToggle=$('live-emitter-sampling');
+  const samplingControls=['live-emitter-ray-budget','live-emitter-seed','live-emitter-refresh'].map($);
+  const fieldFeed=()=>displayMode?.value==='field-feed';
   let lastImage=null,startIntent=0;
   let deviceBlock=MAX_LIVE_HISTORY_BYTES,lastWhite=1,displayNormalization=normalization.value;
   const state={enabled:false,generation:0,digest:null,objectDigest:null,timer:null,busy:false,
     revision:0,poseKey:"",imageKey:"",heartbeat:0,restart:false,notBefore:0,sceneVersion:0,disposed:false,stopping:Promise.resolve(),
-    clientIntersections:false,geometryPolicy:null,geometryError:null,controlError:null,displayError:null,cameraError:null,pendingSave:false,pendingMessage:""};
+    clientIntersections:false,receivesField:false,emitterSamplingKey:'',geometryPolicy:null,geometryError:null,controlError:null,displayError:null,cameraError:null,pendingSave:false,pendingMessage:""};
   let session=crypto.randomUUID().replaceAll("-","");
   const text=value=>{output.textContent=value;};
-  const present=on=>{screen.style.opacity=on?"1":"0";screen.setAttribute("aria-hidden",on?"false":"true");};
+  const present=on=>{on=on&&!fieldFeed();screen.style.opacity=on?"1":"0";screen.setAttribute("aria-hidden",on?"false":"true");};
   const blank=()=>{present(false);context.clearRect(0,0,screen.width,screen.height);state.imageKey="";};
-  const show=on=>{screen.hidden=!on;canvas.style.opacity="";if(!on)present(false);canvas.closest(".stage").classList.toggle("live-ray-mode",on);};
+  const show=on=>{on=on&&!fieldFeed();screen.hidden=!on;canvas.style.opacity="";if(!on)present(false);canvas.closest(".stage").classList.toggle("live-ray-mode",on);};
+  const syncSampling=()=>{for(const node of samplingControls)if(node)node.disabled=!samplingToggle?.checked;};
+  const enableFieldFeed=()=>{
+    if(!fieldFeed())return;
+    const receive=$('phong-light-field');if(receive)receive.checked=true;
+    if(samplingToggle)samplingToggle.checked=true;syncSampling();download.disabled=true;
+  };
   const aspect=()=>Math.max(.1,Math.min(10,canvas.clientWidth/Math.max(1,canvas.clientHeight)));
   const syncBudget=()=>{
     const max=liveHistoryLimit(+resolution.value,aspect(),checkpoint.checked,deviceBlock);
@@ -121,16 +138,25 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
       // Recheck after the debounce, before any owned worker is canceled. An
       // incomplete budget edit must leave the previous live scene running.
       if(!state.pendingSave&&!state.controlError&&!state.displayError&&!state.cameraError&&(state.restart||!state.digest)){
-        try{geometryPolicy=photoGeometryPolicy(doc);state.geometryError=null;}
+        try{geometryPolicy=photoGeometryPolicy(doc);liveEmitterSampling(doc);state.geometryError=null;}
         catch(error){state.restart=false;state.geometryError=error.message;text(`Live scene unchanged: ${error.message}`);return;}
       }
       if(!state.pendingSave&&!state.controlError&&!state.displayError&&!state.cameraError&&(state.restart||!state.digest)) {
         const previousDigest=state.digest;
         const pose=requestedPose,live=settings(),clientIntersections=participation.requested();
+        const fieldTicket=fieldView?.capture({saved:true});
+        if(fieldFeed()&&!fieldTicket)throw Error('Live field feed needs a matching field capture. Check the field settings and link the displayed scene to Exposure A.');
+        const emitterSampling=liveEmitterSampling(doc);
         const body=packMarblePhoto(getGeometry(),state.objectDigest,{...getScene(),camera:{...pose,resolution:+resolution.value},
-          resolution:+resolution.value,seconds:3600,transport:"fixed:3",orbitFrames:1,live,clientIntersections,...geometryPolicy,
+          resolution:+resolution.value,seconds:3600,transport:"fixed:3",orbitFrames:1,live,clientIntersections,receiveLightField:!!fieldTicket,
+          ...(fieldTicket?.information?{lightFieldInformation:fieldTicket.information}:{}),
+          ...(fieldTicket?{lightFieldStencil:fieldTicket.stencil,lightFieldGridSize:fieldTicket.gridSize}:{}),...geometryPolicy,
+          ...(fieldTicket?.region==='subject'?{lightFieldRegion:'subject',lightFieldCellSizeM:fieldTicket.cellSizeM,lightFieldMarginM:fieldTicket.marginM}:{}),
+          ...(emitterSampling?{emitterSampling}:{}),
+          ...($('ray-surface-transport')?.checked?{surfaceTransport:'studio-pbr-mixture-v1'}:{}),
+          ...($('live-field-internal-media')?.checked?{lightFieldInternalMedia:true}:{}),
           filmResponse:getFilmResponse(),maxBounces:photoBounceCount(doc),bounceMode:photoBounceMode(doc),gamma:+$("photo-gamma").value/100});
-        text("Preparing the real ray-traced view…");
+        text(fieldFeed()?"Preparing the live light-field feed. Phong remains visible.":"Preparing the real ray-traced view…");
         showGeometryDiagnostic(doc,null);
         // The server validates the entire replacement scene before replacing
         // this session's worker. Do not pre-cancel and defeat that transaction.
@@ -150,8 +176,10 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         }
         state.clientIntersections=clientIntersections;participation.connect(job,clientIntersections);
         state.digest=job.digest;state.restart=false;state.geometryPolicy=geometryPolicy;state.geometryError=null;
+        state.receivesField=!!fieldTicket;state.emitterSamplingKey=JSON.stringify(emitterSampling??null);
         if(job.digest!==previousDigest){state.revision=0;state.poseKey=JSON.stringify({camera:pose,live});}
         state.heartbeat=0;
+        fieldView?.connect(job.digest,fieldTicket,state.revision);
         blank();show(true);
       }
       // A rejected resize may leave UI history capacity sized for a different
@@ -171,6 +199,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         await post("/api/marble_photo/live",{digest,revision:state.revision,camera:pose,live});
         if(!current(generation))return;
         state.poseKey=poseKey;state.heartbeat=Date.now();
+        fieldView?.revise(digest,state.revision);
       }
       const status=await request(`/api/marble_photo?digest=${digest}`);
       if(!current(generation))return;
@@ -184,18 +213,19 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
       if(state.pendingSave||state.geometryError||state.controlError){blank();text(state.pendingSave?state.pendingMessage:state.controlError??`Live scene unchanged: ${state.geometryError}. Phong preview shown.`);return;}
       if(state.displayError){text(state.displayError);return;}
       if(status.state!=="live"||status.live_revision!==state.revision)return;
+      void fieldView?.observe(status,digest);
       // This viewer displays status.image, whose recipe is display_transform.
       // Retouched-image metadata belongs to a different image, not this frame.
       const displayWhite=status.display_transform?.effective_white??status.display_white;
       if(Number.isFinite(displayWhite)&&displayWhite>0)lastWhite=displayWhite;
       const key=`${digest}/${status.image}/${state.revision}`;
-      if(status.image&&key!==state.imageKey){
+      if(!fieldFeed()&&status.image&&key!==state.imageKey){
         const response=await fetch(`/api/marble_photo/image?digest=${digest}&name=${encodeURIComponent(status.image)}`,{cache:"no-store",signal:AbortSignal.timeout(10000)});
         if(response.status===404)return; // superseded between status and image; next poll catches up
         if(!response.ok)throw new Error(`Ray image HTTP ${response.status}`);
         const blob=await response.blob(),bitmap=await createImageBitmap(blob);
         try {
-          if(!current(generation)||state.pendingSave||state.geometryError||state.controlError)return;
+          if(!current(generation)||fieldFeed()||state.pendingSave||state.geometryError||state.controlError)return;
           let latestPose;
           try{latestPose=getPose();}catch(error){state.cameraError=error.message;blank();text(`Live camera unchanged: ${error.message} Previous worker retained.`);return;}
           if(JSON.stringify({camera:latestPose,live:settings()})!==state.poseKey)return;
@@ -205,6 +235,15 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         } finally {bitmap.close();}
       }
       if(Number.isFinite(status.history_block_limit)&&status.history_block_limit>0&&status.history_block_limit!==deviceBlock){deviceBlock=status.history_block_limit;syncBudget();}
+      if(fieldFeed()) {
+        const sequence=status.light_field?.sequence;
+        const noReceivers=['subject','stage','room'].every(name=>!$(`phong-field-${name}`)?.checked);
+        const d=status.light_field?.directional,p=d?.source_populations;
+        const progress=Number.isSafeInteger(p?.count)&&Number.isSafeInteger(d.root_sampling?.recorded_root_jobs)?
+          ` Worker reports ${p.count.toLocaleString()} integrated source populations and ${d.root_sampling.recorded_root_jobs.toLocaleString()} recorded root jobs.`:'';
+        text(`Live field feed: Phong remains visible; ray overlay is off. ${Number.isSafeInteger(sequence)?`Field bundle ${sequence} available.`:'Waiting for a field bundle.'}${progress}${noReceivers?' No receiving categories are selected; ordinary primary Phong remains active.':''} The existing live worker still computes sensor samples.`);
+        return;
+      }
       text(state.geometryError?`Live scene unchanged: ${state.geometryError}`:`Live rays · ${status.width} x ${status.height} · ${status.history_filled}/${status.history_samples} rays per pixel${Number.isFinite(status.ray_batch_size)?` | ${status.ray_batch_size.toLocaleString("en-US")} forward rays/sweep`:""}${Number.isFinite(status.coverage_fraction)?` | ${(100*status.coverage_fraction).toFixed(1)}% sampled`:""} · ${(status.history_bytes/1048576).toFixed(1)} MiB history${status.checkpoint_enabled?` · ${Number(status.total_samples||0).toLocaleString("en-US")} total samples/pixel (${Number(status.checkpoint_samples||0).toLocaleString("en-US")} checkpointed)`:""}`);
     } catch(error) {
       if(current(generation))await stop(`Live rays stopped: ${error.message||error}`);
@@ -215,7 +254,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
     participation.stop();
     state.enabled=false;state.generation++;toggle.checked=false;
     if(state.timer)clearTimeout(state.timer);state.timer=null;
-    const digest=state.digest;state.digest=null;state.restart=false;
+    const digest=state.digest;fieldView?.stop(digest);state.digest=null;state.restart=false;
     show(false);blank();text(message);
     const generation=state.generation;
     const stopping=state.stopping.then(()=>cancel(digest));
@@ -224,22 +263,24 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
   }
   async function start() {
     const intent=++startIntent;
+    enableFieldFeed();
     try{if(ensureSaved)await ensureSaved();}
     catch(error){if(intent===startIntent){toggle.checked=false;text(`Live rays not started: ${error.message||error}`);}return;}
     if(intent!==startIntent||!toggle.checked||state.disposed)return;
-    try{validate();photoGeometryPolicy(doc);state.geometryError=null;}
+    try{validate();photoGeometryPolicy(doc);liveEmitterSampling(doc);state.geometryError=null;}
     catch(error){toggle.checked=false;text(error.message);return;}
     // A later toggle has a new immutable server identity. Even an uncertain
     // old stop response can only name its old digest, never this new session.
     session=crypto.randomUUID().replaceAll("-","");
     state.enabled=true;state.generation++;state.restart=true;state.notBefore=0;
     // Phong keeps drawing below the transparent overlay during preparation.
-    blank();show(true);text("Preparing the real ray-traced view…");
+    blank();show(true);text(fieldFeed()?"Preparing the live light-field feed. Phong remains visible.":"Preparing the real ray-traced view…");
     if(!state.busy)await pump();
   }
   const change=()=>{if(toggle.checked)void start().catch(error=>stop(`Live rays not started: ${error.message||error}`));else void stop();};
   toggle.addEventListener("change",change);
   const restart=()=>{
+    fieldView?.invalidate();
     if(!state.enabled)return;
     blank();
     if(state.pendingSave){state.restart=true;return;}
@@ -248,6 +289,21 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
     state.generation++;state.restart=true;state.notBefore=Date.now()+350;blank();
     if(!state.busy){if(state.timer)clearTimeout(state.timer);schedule();}
   };
+  const modeChange=()=>{
+    enableFieldFeed();blank();show(state.enabled);download.disabled=fieldFeed()||!lastImage;
+    let samplingChanged=false;try{samplingChanged=JSON.stringify(liveEmitterSampling(doc)??null)!==state.emitterSamplingKey;}catch(error){text(error.message);}
+    if(state.enabled&&fieldFeed()&&(!state.receivesField||samplingChanged))restart();
+    else if(state.enabled)text(fieldFeed()?'Live field feed: Phong remains visible; ray overlay is off.':'Live ray overlay enabled. The same worker continues.');
+  };
+  const samplingChange=()=>{
+    syncSampling();let sampling;
+    try{sampling=liveEmitterSampling(doc);}catch(error){text(`Live sampling unchanged: ${error.message}`);return;}
+    if(sampling?.refresh_each_sweep){const receive=$('phong-light-field');if(receive)receive.checked=true;}
+    restart();
+  };
+  displayMode?.addEventListener('change',modeChange);samplingToggle?.addEventListener('change',samplingChange);
+  for(const node of samplingControls)node?.addEventListener('change',samplingChange);
+  $('live-field-internal-media')?.addEventListener('change',restart);
   resolution.addEventListener("change",()=>{
     try{syncBudget();state.geometryError=null;restart();}
     catch(error){state.geometryError=error.message;state.restart=false;text(`Live resolution unchanged: ${error.message}`);}
@@ -283,7 +339,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
     displayNormalization=normalization.value;
     syncDisplay();
   });
-  syncBudget();syncDisplay();
+  syncBudget();syncDisplay();syncSampling();
   // History changes go through the tiny control update, not a scene upload.
   const onPhotoInput=event=>{
     if(event.target.closest("#photo-film-response")||["photo-bounces","photo-bounces-slider","photo-bounce-mode","photo-gamma","photo-triangle-budget","photo-sphere-coverage"].includes(event.target.id))restart();
@@ -299,14 +355,17 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
   doc.defaultView.addEventListener("pagehide",onPageHide);
   return {
     saved(digest){const changed=digest!==state.objectDigest||state.pendingSave;state.objectDigest=digest;state.pendingSave=false;if(changed)restart();},
-    pendingSave(message="Saving object changes. Phong preview shown while rays update."){state.pendingSave=true;state.pendingMessage=message;blank();if(state.enabled)text(message);},
+    pendingSave(message="Saving object changes. Phong preview shown while rays update."){fieldView?.invalidate();state.pendingSave=true;state.pendingMessage=message;blank();if(state.enabled)text(message);},
     cameraChanged(){if(state.enabled)blank();},
     stale(){state.objectDigest=null;if(state.enabled)void stop("Design changed. Save it again before starting live rays.");},
     sceneChanged:restart,
     get enabled(){return state.enabled;},
+    get fieldFeed(){return fieldFeed();},
     stop,
     dispose(){state.disposed=true;void stop();resize.disconnect();doc.removeEventListener("visibilitychange",onHide);
       doc.defaultView.removeEventListener("pagehide",onPageHide);toggle.removeEventListener("change",change);
+      displayMode?.removeEventListener('change',modeChange);samplingToggle?.removeEventListener('change',samplingChange);
+      for(const node of samplingControls)node?.removeEventListener('change',samplingChange);
       $("photo-controls").removeEventListener("input",onPhotoInput);$("photo-controls").removeEventListener("change",onPhotoInput);},
   };
 }

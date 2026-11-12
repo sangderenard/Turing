@@ -33,6 +33,21 @@ assert.deepEqual(hydrated.packet.scene.triangleSources,packet.scene.triangleSour
 assert.deepEqual(hydrated.packet.render.referenceCamera.view,I);
 assert(!('ray' in asset.scene));assert(!('ray' in asset.scene.subject));assert(!('faces' in asset.scene.subject));
 assert.deepEqual(studioSceneMatrix(new Float32Array(I)),I);
+// Capture's real backdrop-holder parts use the current Studio stand pass,
+// including transparent support materials. They are not shop emitters.
+const withHolder=structuredClone(packet),holder={id:'backdrop-holder/support',bodyId:'backdrop-support',
+  firstTriangle:4,triangleCount:2,faces:[face([2,0,0],[2,1,0],[2,0,1]),face([3,0,0],[3,1,0],[3,0,1],1)]};
+withHolder.scene.parts.push(holder);withHolder.scene.triangleSources.push(...holder.faces.map((_,triangle)=>({partId:holder.id,bodyId:holder.bodyId,triangle})));
+const holderAsset=await createStudioSceneAsset(withHolder),holderHydrated=await hydrateStudioSceneAsset(holderAsset),holderPlan=studioSceneDrawPlan(holderHydrated.packet);
+assert.equal(holderPlan.groups[0].faces[0],holderHydrated.packet.scene.parts.at(-1).faces[0]);
+assert.equal(holderPlan.groups[3].faces[1],holderHydrated.packet.scene.parts.at(-1).faces[1]);
+assert.equal(holderPlan.groups[1].faces.length,1,'Backdrop supports must not enter direct-emission draw');
+for(const shape of ['d6','bunny','obj']) {
+  const nonMarble=structuredClone(packet);nonMarble.scene.authoring={object:{design:{'base-shape':shape}}};
+  nonMarble.scene.subject.phong={interiorCount:2,glassCount:0,bubbles:[]};
+  const transferred=await hydrateStudioSceneAsset(await createStudioSceneAsset(nonMarble));
+  assert.deepEqual(transferred.packet.scene.subject.faces,nonMarble.scene.subject.faces);assert.equal(studioSceneDrawPlan(transferred.packet).counts.subjectTriangles,2);
+}
 const placement=[...I];placement[12]=32;placement[13]=1.544;placement[14]=-18;
 const plan=studioSceneDrawPlan(hydrated.packet,{placement});
 assert.deepEqual(plan.groups.map(g=>g.faces.length),[2,1,1,2]);assert.equal(plan.groups[1].emissionDirect,true);
@@ -81,3 +96,5 @@ if(process.argv[2]) {
     exactSourceRoundTrip:true,sharedTransparent:p.groups[3].faces.length};
 }
 console.log(JSON.stringify({pass:true,negativeContracts:negative,losslessSourceDoubles:true,noDuplicatedRayGeometry:true,actual,browserRendering:false}));
+
+export {packet,hydrated};

@@ -1,6 +1,7 @@
 // Studio manager appearance on the original class world's existing render
 // boundary. The original game still owns controls, clocks, worker and contacts.
 import {hydrateStudioSceneAsset,verifyStudioSceneAssetIdentity,createStudioSceneRenderer} from './marble_studio_scene_asset.js';
+import {validateStudioLightTransform} from './marble_studio_subject_renderer.js';
 import {mechanicalCreatureStudioCamera} from './mechanical_creature_studio_camera.js';
 
 const error=(code,message)=>Object.assign(new Error(message),{code});
@@ -19,6 +20,7 @@ export async function installStudioRoom({asset,building,host=globalThis,onStatus
   const previous=host.mechanicalCreatureImportedAppearance;
   if(!previous)throw Error('The original game appearance hook must be installed first.');
   let closed=false,active=null,desired=null,hydrating=null,frame=null,lastFrame=0,drawCount=0,failure=null;
+  let poseSequence=-1,appliedPoseSequence=-1,poseSlot=0,pendingPose=null;const poses=[new Float64Array(16),new Float64Array(16)];
   let latestSequence=-1,latestRevision=-1;const retired=new Set();
   const report=value=>{try{onStatus(value);}catch(e){console.warn('Studio room status observer failed',e);}};
   const disposeRenderer=request=>{if(!request)return;const renderer=request.renderer;request.renderer=null;
@@ -88,7 +90,7 @@ export async function installStudioRoom({asset,building,host=globalThis,onStatus
     assert(receipt?.assetIdentity===request.identity&&receipt.revision===request.sourceRevision&&receipt.sequence===request.sequence,
       'Native environment commit does not match the staged Studio appearance.');
     if(active&&active!==request){if(active.visible)retired.add(active);else disposeRenderer(active);}
-    active=request;request.environment=structuredClone(receipt);request.stage='awaiting-visible-frame';failure=null;
+    active=request;pendingPose=null;poseSequence=-1;appliedPoseSequence=-1;request.environment=structuredClone(receipt);request.stage='awaiting-visible-frame';failure=null;
     report({state:request.stage,identity:request.identity,sequence:request.sequence,sourceRevision:request.sourceRevision,
       environment:request.environment});return true;
   }
@@ -122,7 +124,10 @@ export async function installStudioRoom({asset,building,host=globalThis,onStatus
       }
       if(active&&!active.failed&&active.renderer?.ready){
         const ids=proxyIds(active,context);
-        if(ids){active.proxyIds=ids;for(const id of ids)identities.add(id);
+        if(ids){
+          // Latch once at the incumbent frame boundary, never between passes.
+          if(pendingPose){active.renderer.setSubjectPose(pendingPose);appliedPoseSequence=poseSequence;pendingPose=null;}
+          active.proxyIds=ids;for(const id of ids)identities.add(id);
           frame={request:active,serial:lastFrame,phase:0,gameSnapshotSequence:context.stateLoopRuntime?.latestSequence??null};}
       }
       return identities;
@@ -166,6 +171,18 @@ export async function installStudioRoom({asset,building,host=globalThis,onStatus
   host.mechanicalCreatureImportedAppearance=adapter;report({state:'waiting-for-original-render',identity:initial.identity,sequence:initial.sequence});
   return {
     ready:initial.promise,
+    previewPose({assetIdentity,revision,environmentSequence,sequence,model}) {
+      if(closed||!active||active.failed||!active.visible||host.mechanicalCreatureImportedAppearance!==adapter||
+          assetIdentity!==active.identity||revision!==active.sourceRevision||environmentSequence!==active.sequence)return false;
+      if(!Number.isSafeInteger(sequence)||sequence<=poseSequence)return false;
+      if(!(Array.isArray(model)||ArrayBuffer.isView(model))||model.length!==16||!Array.from(model).every(Number.isFinite)||
+          model[3]!==0||model[7]!==0||model[11]!==0||model[15]!==1)throw Error('Displayed subject pose must be finite affine.');
+      validateStudioLightTransform(model);
+      // Validate the renderer's actual composed Float32 world transform before
+      // publishing a slot (finite source doubles can overflow that upload).
+      active.renderer.validateSubjectPose(model);
+      poseSlot=1-poseSlot;poses[poseSlot].set(model);pendingPose=poses[poseSlot];poseSequence=sequence;return true;
+    },
     update(input) {
       try {
         if(closed)throw error('CLOSED_STUDIO_ROOM','The Studio room is closed.');
@@ -178,12 +195,13 @@ export async function installStudioRoom({asset,building,host=globalThis,onStatus
     readStatus:()=>({closed,ready:!!active?.visible&&!active.failed,identity:active?.identity??null,
       sourceIdentity,sourceRevision:active?.sourceRevision??null,sequence:active?.sequence??null,latestSequence,latestRevision,
       pending:desired&&!desired.settled?{identity:desired.identity,sourceRevision:desired.sourceRevision,sequence:desired.sequence,stage:desired.stage}:null,
+      poseSequence,appliedPoseSequence,poseAuthority:'displayed-Studio-preview-only',
       drawCount,proxyIds:active?.proxyIds.slice()??[],failure,bounds:active?.renderer?.bounds,counts:active?.renderer?.counts,
       environment:active?.environment??null}),
     dispose(){if(closed)return;closed=true;
       if(host.mechanicalCreatureImportedAppearance===adapter)host.mechanicalCreatureImportedAppearance=previous;
       reject(desired,error('CLOSED_STUDIO_ROOM','The Studio room was closed before this update became visible.'),'closed');
       for(const request of new Set([active,desired,hydrating,...retired]))disposeRenderer(request);
-      active=null;frame=null;retired.clear();report({state:'closed'});},
+      active=null;frame=null;pendingPose=null;retired.clear();report({state:'closed'});},
   };
 }

@@ -218,10 +218,25 @@ discovered checkouts are on, unless a written manifest is edited first.
   Bare specifiers are unresolved by rule. Dynamic `import()`, CommonJS
   `require`, and multi-line import statements are not read.
 
-Both extractors are declared; nothing else is inferred. Calls other than
-imports (a function in A calling a function in B) are not references in
+Both built-in extractors are declared; nothing else is inferred. Calls other
+than imports (a function in A calling a function in B) are not references in
 this version; the owner's "calls out of / into a file" is served at module
 granularity first.
+
+**Extractor plugins and import roots (main, 526cae74, joined 2026-11-12).**
+Six more extractors are plugin modules named in `EXTRACTOR_MODULES` (C
+includes, CMake, HTML, dynamic JavaScript, PowerShell, shell), each a module
+with `LANGUAGE`, `SUFFIXES`, optional `FILENAMES` and
+`references(path, text, tracked)`; a plugin that fails to import, raises, or
+returns an untracked target is a scan error, never skipped. Python absolute
+names resolve against the repository root and each declared import root
+(`import_roots=`, CLI `--import-root`, or the declarations the tree itself
+carries in `pyproject.toml`, `repo_world.toml`, `pytest.ini`, `setup.cfg`,
+`tox.ini`: `DECLARATION_FILES`); roots are never guessed. The stream lanes
+read the declarations from the stream (`import_roots=None`). Pair identity
+keys (source, line, target); two kinds on one line to one target are one
+pair. Record schema `repo-world-scan-v1`, with `extractor_languages` and
+`import_roots` beside the branch's `languages` and `claims`.
 
 ### Known languages and the linking state (2026-11-11)
 
@@ -230,17 +245,20 @@ The scan's language vocabulary is the compiler's own table,
 sympy, javascript, glsl, wgsl, cpp, each with its translation route). The
 scanner adds only what that table does not carry, in two named tables in
 `repo_world_scan.py`: `LANGUAGE_SUFFIXES` (which file suffixes name each
-language) and `LINKING_READERS` (which languages have a cross-file reference
-reader here). A startup check refuses a suffix table that names a language
-the compiler table does not. Every scan publishes `languages`, one row per
-known language with its route and `linking` state, so the record set itself
-says that C++ rooms are a known, translatable language with no reader yet
-and therefore no portals. That is why geometry, fftfree and nodus show no
-portals in §7a: not a property of those codebases, a declared absence of a
-C++ linker (`#include` reader) in the scan. When one is written it goes into
-`LINKING_READERS`, and the translation matrix in the root
-`TRANSLATION_MATRIX_SIGNOFF_2026-08-12.md` is the place that records which
-routes exist for the language once linked.
+language) and `LINKING_READERS` (which languages have a built-in cross-file
+reference reader). A startup check refuses a suffix table that names a
+language the compiler table does not. Every scan publishes `languages`, one
+row per known language with its route and its `linking_readers` (the
+built-in reader plus every extractor plugin whose suffixes overlap the
+language's), followed by one row per extractor-only language (c, cmake,
+html, powershell, shell: a reader, no compiler route). Since the join with
+main's extractor registry, C++ rooms are linked by the C include plugin
+(`c-include` pairs), so the empty C++ portal columns in §7a are historical:
+they were measured before that reader existed. A file's `language` is the
+compiler's name when a known suffix claims it (`.cpp` is `cpp`, not the
+plugin's `c`), else the first matching extractor's `LANGUAGE`. The
+translation matrix in the root `TRANSLATION_MATRIX_SIGNOFF_2026-08-12.md`
+remains the place that records which routes exist for a language once linked.
 
 ## 3. The general portal record
 
@@ -376,6 +394,14 @@ worth reading before the world builder lays it out. C++ repositories
 ES-module imports are extracted (gap G).
 
 ## 7. Measurement on this repository (observed, 2026-11-10)
+
+Joined scanner, 2026-11-12 (stream lane + main's extractors and import
+roots): turing main `7813a6a3` streamed from GitHub in 39 s, nothing on disk:
+245 regions, 5,881 rooms, 16,509 portal pairs across 13 reference kinds
+(15,591 python-import, 720 es-module-import, 82 js-url, 50 html-script, 10
+c-include, …), 16,850 unresolved, 0 claimed rooms. The declared import root
+`examples` was read from the stream's `repo_world.toml`, and the `meowdoku.*`
+unresolved count (998 in gap H) is now 0.
 
 Stream lane, 2026-11-11: `python -m src.compiler.repo_world_scan
 sangderenard/turing --ref main` streamed main at `5abc1165` from the GitHub

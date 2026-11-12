@@ -1,3 +1,4 @@
+import * as sceneBuilder from '../examples/meowdoku/web/studio_scene_builder.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -14,9 +15,9 @@ import {defaultStudioScale} from '../examples/meowdoku/web/marble_studio_scale.j
 // No test-only approximate softbox stands in for its actual shared geometry.
 const source=fs.readFileSync(new URL('../examples/meowdoku/web/marble_studio.js',import.meta.url),'utf8');
 const primitives=vm.createContext({STUDIO_LIGHTS,tableLightModifierFaces,ids:{polished_silver:39,polished_gold:40}});
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),primitives);
+Object.assign(primitives,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,primitives.ids??{})});
 const builderStart=source.indexOf('function buildFixtureFaces(');
-vm.runInContext(source.slice(builderStart,source.indexOf('// The ray-traced photo',builderStart)),primitives);
+Object.assign(primitives,sceneBuilder,{buildFixtureFaces:(roles,housing,onPart)=>sceneBuilder.buildStudioFixtureFaces(roles,housing,onPart,primitives.ids??{})});
 const unit=v=>{const n=Math.hypot(...v);return v.map(x=>x/n);};
 const sub=(a,b)=>a.map((v,i)=>v-b[i]);
 const dot=(a,b)=>a.reduce((n,v,i)=>n+v*b[i],0);

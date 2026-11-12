@@ -88,6 +88,49 @@ function prepareMechanicalCreatureStudioBuilding(packet, {
   };
 }
 
+// One descriptor authoring path for startup and later native registry admission.
+// Selecting objects does not register or activate them. The registry clones
+// these records, so callers must obtain admitted box refs from that registry.
+function createMechanicalCreatureStudioWorldObjects(model, definition, selectedIdentities = definition?.proxyIdentities) {
+  if (definition?.schema !== "mechanical-creature-studio-building-v1")
+    throw new TypeError("Unknown Studio building definition");
+  const envelope = model.document_geometry?.boxes.find(box => box.kind === "world-envelope");
+  if (!envelope || !Array.isArray(definition.boxes) || !Array.isArray(selectedIdentities) ||
+      new Set(selectedIdentities).size !== selectedIdentities.length ||
+      selectedIdentities.some(identity => !definition.boxes.some(box => box.identity === identity)))
+    throw new TypeError("Studio object selection requires the original envelope and known unique identities");
+  const selected = new Set(selectedIdentities);
+  return definition.boxes.filter(box => selected.has(box.identity)).map(source => {
+    const box = structuredClone(source);
+    box.parent_identity ||= envelope.identity;
+    box.spatial_container = envelope.identity;
+    const solid = box.geometry_mode === "solid";
+    const semanticParts = solid ? [{identity: `${box.identity}/surface:body`, role: "body", material_role: box.palette_role}] :
+      [{identity: `${box.identity}/surface:floor`, role: "floor", material_role: box.palette_role},
+        ...["south", "north", "west", "east"].map(side => ({identity: `${box.identity}/surface:${side}`,
+          role: "boundary-wall", side, material_role: box.wall_palette_role})),
+        {identity: `${box.identity}/surface:ceiling`, role: "ceiling", material_role: box.wall_palette_role}];
+    return {identity: box.identity, kind: box.kind, parent: box.parent_identity,
+      label: box.label, name: box.label,
+      transform: {position: [box.center[0], box.placement.elevation, box.center[1]],
+        yaw_deg: 0, coordinate_space: "data-world", placed_in: envelope.identity},
+      form: {recipe: solid ? "solid-box" : "boundary-floor-with-openings", half_extent: [...box.half_extent],
+        height: box.height, floor_height: box.floor_height, wall_thickness: box.wall_thickness,
+        radius: 0, openings: structuredClone(box.openings)},
+      material_bindings: solid ? {body: box.palette_role} : {floor: box.palette_role, walls: box.wall_palette_role},
+      capabilities: ["inspect", "publish-mesh", "collide-static"], semantic_parts: semanticParts,
+      physics: {...box.physics, collision_authority: "world-physics"},
+      persistence: {authority: "captured-Studio-asset", revision: 0},
+      extensions: {"abstract_ui.document_geometry": box,
+        "studio.capture": {assetIdentity: definition.assetIdentity, sourceClassIdentity: definition.sourceClassIdentity,
+          revision: definition.sourceRevision, sourcePart: box.studio_source_part || "room",
+          contacts: definition.contacts, entrance: definition.entrance}},
+      interaction: {type: "inspect", destination: box.identity},
+      dependencies: [{relationship: "contained-by", target: box.parent_identity}],
+    };
+  });
+}
+
 function appendMechanicalCreatureStudioBuilding(model, definition) {
   if (definition?.schema !== "mechanical-creature-studio-building-v1")
     throw new TypeError("Unknown Studio building definition");
@@ -106,37 +149,11 @@ function appendMechanicalCreatureStudioBuilding(model, definition) {
   }
   let objectId = Math.max(0, ...specialization.objects.map(row => row.runtime_id));
   let partId = Math.max(0, ...specialization.semantic_parts.map(row => row.runtime_id));
-  const appended = definition.boxes.map(source => {
-    const box = structuredClone(source);
-    box.parent_identity ||= envelope.identity;
-    box.spatial_container = envelope.identity;
-    const solid = box.geometry_mode === "solid";
-    const semanticParts = solid ? [{identity: `${box.identity}/surface:body`, role: "body", material_role: box.palette_role}] :
-      [{identity: `${box.identity}/surface:floor`, role: "floor", material_role: box.palette_role},
-        ...["south", "north", "west", "east"].map(side => ({identity: `${box.identity}/surface:${side}`,
-          role: "boundary-wall", side, material_role: box.wall_palette_role})),
-        {identity: `${box.identity}/surface:ceiling`, role: "ceiling", material_role: box.wall_palette_role}];
-    const object = {identity: box.identity, kind: box.kind, parent: box.parent_identity,
-      label: box.label, name: box.label,
-      transform: {position: [box.center[0], box.placement.elevation, box.center[1]],
-        yaw_deg: 0, coordinate_space: "data-world", placed_in: envelope.identity},
-      form: {recipe: solid ? "solid-box" : "boundary-floor-with-openings", half_extent: [...box.half_extent],
-        height: box.height, floor_height: box.floor_height, wall_thickness: box.wall_thickness,
-        radius: 0, openings: structuredClone(box.openings)},
-      material_bindings: solid ? {body: box.palette_role} : {floor: box.palette_role, walls: box.wall_palette_role},
-      capabilities: ["inspect", "publish-mesh", "collide-static"], semantic_parts: semanticParts,
-      physics: {...box.physics, collision_authority: "world-physics"},
-      persistence: {authority: "captured-Studio-asset", revision: 0},
-      extensions: {"abstract_ui.document_geometry": box,
-        "studio.capture": {assetIdentity: definition.assetIdentity, sourceClassIdentity: definition.sourceClassIdentity,
-          revision: definition.sourceRevision, sourcePart: box.studio_source_part || "room",
-          contacts: definition.contacts, entrance: definition.entrance}},
-      interaction: {type: "inspect", destination: box.identity},
-      dependencies: [{relationship: "contained-by", target: box.parent_identity}],
-    };
+  const appended = createMechanicalCreatureStudioWorldObjects(model, definition).map(object => {
     const runtimeId = ++objectId;
-    return {box, object, specialization: {identity: box.identity, runtime_id: runtimeId},
-      parts: semanticParts.map(part => ({identity: part.identity, runtime_id: ++partId, object_runtime_id: runtimeId}))};
+    return {box: object.extensions["abstract_ui.document_geometry"], object,
+      specialization: {identity: object.identity, runtime_id: runtimeId},
+      parts: object.semantic_parts.map(part => ({identity: part.identity, runtime_id: ++partId, object_runtime_id: runtimeId}))};
   });
   for (const {box, object, specialization: entry, parts} of appended) {
     model.document_geometry.boxes.push(box);
@@ -158,4 +175,68 @@ function appendMechanicalCreatureStudioBuilding(model, definition) {
       dependencies: [{relationship: "contained-by", target: regionIdentity}],
       interaction: {type: "inspect", destination: definition.identity}}]});
   return appended[0].object;
+}
+
+/* Reconcile optional parts already admitted by the startup registration.
+ * This is a pure descriptor operation, not a runtime registry or mesh writer.
+ * The consumer retains original world/box objects and removes inactive boxes
+ * only from the active geometry list, using the game's splice/restore lifecycle.
+ * Native mesh rebuilding then owns picking, contacts and worker publication.
+ */
+function reconcileMechanicalCreatureStudioBuilding(initial, incoming, previous = initial) {
+  const schema = "mechanical-creature-studio-building-v1";
+  if (initial?.schema !== schema || incoming?.schema !== schema ||
+      incoming.identity !== initial.identity || incoming.sourceClassIdentity !== initial.sourceClassIdentity ||
+      incoming.unitM !== initial.unitM || typeof incoming.assetIdentity !== "string" || !incoming.assetIdentity ||
+      !Number.isSafeInteger(incoming.sourceRevision) || incoming.sourceRevision < 0 ||
+      !Array.isArray(initial.placement) || !Array.isArray(incoming.placement) ||
+      initial.placement.length !== 16 || incoming.placement.length !== 16 ||
+      incoming.placement.some((value, index) => !Number.isFinite(value) || value !== initial.placement[index]))
+    throw new TypeError("Studio topology must retain its registered owner, units and placement");
+  const collect = (definition, label) => {
+    if (!Array.isArray(definition.boxes) || !Array.isArray(definition.proxyIdentities) ||
+        definition.boxes.length !== definition.proxyIdentities.length ||
+        new Set(definition.proxyIdentities).size !== definition.proxyIdentities.length)
+      throw new TypeError(`${label} Studio proxy identities must name each box exactly once`);
+    const rows = new Map();
+    for (const box of definition.boxes) {
+      if (typeof box?.identity !== "string" || !box.identity || rows.has(box.identity) ||
+          !definition.proxyIdentities.includes(box.identity) ||
+          box.appearance?.studio_asset_identity !== definition.assetIdentity)
+        throw new TypeError(`${label} Studio box identity or asset ownership disagrees`);
+      rows.set(box.identity, box);
+    }
+    return rows;
+  };
+  const registered = collect(initial, "Registered"), active = collect(incoming, "Incoming");
+  if (previous?.schema !== schema || previous.identity !== initial.identity ||
+      previous.sourceClassIdentity !== initial.sourceClassIdentity || previous.unitM !== initial.unitM ||
+      !Array.isArray(previous.placement) || previous.placement.length !== initial.placement.length ||
+      previous.placement.some((value, index) => value !== initial.placement[index]))
+    throw new TypeError("Previous Studio definition must retain its registered owner and placement");
+  const retained = collect(previous, "Previous");
+  if (retained.size !== registered.size || [...retained.keys()].some(identity => !registered.has(identity)))
+    throw new TypeError("Previous Studio definition must contain the complete registered identity set");
+  if (!registered.has(initial.identity) || !active.has(initial.identity))
+    throw new TypeError("The registered Studio building must remain present");
+  for (const [identity, box] of active) {
+    const authored = registered.get(identity);
+    if (!authored) throw new Error(`Studio structural identity was not registered at startup: ${identity}`);
+    if (box.kind !== authored.kind || box.geometry_mode !== authored.geometry_mode ||
+        box.parent_identity !== authored.parent_identity || box.studio_source_part !== authored.studio_source_part ||
+        box.placement?.custody !== "placed")
+      throw new TypeError(`Studio part must retain its registered shape and ownership: ${identity}`);
+  }
+  const activeProxyIds = [], inactiveProxyIds = [];
+  const definition = structuredClone(incoming);
+  definition.boxes = initial.boxes.map(authored => {
+    const enabled = active.has(authored.identity), box = structuredClone(enabled ? active.get(authored.identity) : retained.get(authored.identity));
+    (enabled ? activeProxyIds : inactiveProxyIds).push(authored.identity);
+    // Visibility is solely activeProxyIds, not a transfer into player inventory.
+    // Retain last admitted geometry and custody for a temporarily absent part.
+    box.appearance = {...box.appearance, studio_asset_identity: incoming.assetIdentity};
+    return box;
+  });
+  definition.proxyIdentities = initial.boxes.map(box => box.identity);
+  return {definition, activeProxyIds, inactiveProxyIds};
 }

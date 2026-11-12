@@ -87,7 +87,7 @@ export function createFilmResponseControls(container, transport, {storage} = {})
   });
   const modeNote = doc.createElement('p');
   const syncTransport = () => {
-    const rgb = transport.value === 'fixed:3';
+    const rgb = transport.value === 'fixed:3' || transport.value === 'fixed:8';
     editors.forEach(e => { e.panel.disabled = !rgb; }); reset.disabled = !rgb;
     modeNote.textContent = rgb ? 'RGB transport samples fixed 650/550/450 nm lines. These controls change sensor sensitivity, not source wavelengths or dye spectra.' :
       'RGB response controls are inactive in monochrome; your RGB settings are retained.';
@@ -95,5 +95,5 @@ export function createFilmResponseControls(container, transport, {storage} = {})
   transport.addEventListener('change', syncTransport); syncTransport(); showWidths(initial);
   container.append(title, note, grid, reset, status, modeNote);
   science = createFilmSciencePreview(container, transport, read);
-  return {getState: read, forTransport: () => transport.value === 'fixed:3' ? read() : undefined, science};
+  return {getState: read, forTransport: () => ['fixed:3','fixed:8'].includes(transport.value) ? read() : undefined, science};
 }

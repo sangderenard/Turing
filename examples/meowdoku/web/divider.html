@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source divider</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf7; --fg:#1d1d1f; --mut:#6b6b70; --line:#d9d6cf; --ok:#17743a; --bad:#b3261e; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17171a; --fg:#ececee; --mut:#9a9aa1; --line:#37373d; --ok:#5fcf86; --bad:#ff8a80; --card:#202024; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:64rem; margin:0 auto; padding:1.2rem 16px 4rem; }
+  h1 { font-size:1.3rem; margin:0 0 .2rem; } h2 { font-size:1.05rem; margin:1.6rem 0 .4rem; }
+  p.lede, .mut { color:var(--mut); }
+  input[type=text] { font:inherit; padding:.35rem .5rem; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; min-width:16rem; }
+  .row { display:flex; flex-wrap:wrap; gap:1rem; align-items:center; margin:.6rem 0; }
+  button { font:inherit; padding:.45rem 1.1rem; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { border-collapse:collapse; width:100%; background:var(--card); }
+  th, td { text-align:left; padding:.3rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--mut); } tr.pick { cursor:pointer; } tr.sel td { font-weight:600; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  code { font:13px ui-monospace, Consolas, monospace; }
+  .note { border-left:3px solid var(--line); padding:.2rem .7rem; margin:.6rem 0; color:var(--mut); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Source divider</h1>
+  <p class="lede">Give the divider a Python source and it becomes one job, divided into pieces. Pieces are tried one at a time, dependencies first, on each chosen backend.</p>
+  <p class="note">The queue is one piece at a time: a job can wait behind other pieces. Repo links are recorded but not fetched yet; this server makes no outbound request, so a linked job stays <code>awaiting_fetch</code>. Upload a .py file (up to 512 KB) or a .zip (up to 20 MB) to start a job now.</p>
+  <p id="gate" class="note" hidden></p>
+  <h2>Submit</h2>
+  <form id="fileform" class="row">
+    <input id="file" type="file" accept=".py,.zip" aria-label="source file or zip">
+    <button id="upload" type="submit">Upload</button>
+  </form>
+  <form id="repoform" class="row">
+    <input id="repo" type="text" placeholder="https://github.com/owner/repo" aria-label="repository link" spellcheck="false">
+    <input id="ref" type="text" placeholder="ref (optional)" aria-label="ref" spellcheck="false" style="min-width:9rem">
+    <button id="record" type="submit">Record link</button>
+  </form>
+  <p id="status" class="mut" role="status"></p>
+  <h2>Jobs</h2>
+  <table id="jobs"><thead><tr><th>job</th><th>source</th><th>state</th><th>pieces</th><th>attempts</th><th>created</th></tr></thead><tbody></tbody></table>
+  <section id="detail" hidden>
+    <h2 id="dtitle"></h2>
+    <p class="row"><span id="dstate" class="mut"></span><button id="cancel" type="button">Cancel job</button></p>
+    <p id="dnote" class="note" hidden></p>
+    <table id="pieces"><thead><tr><th>file</th><th>functions</th><th>state</th><th>backend attempts</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<script type="module" src="divider.js"></script>
+<script type="module" src="/messenger-widget.js" data-messenger="allow"></script>
+<script type="module" src="/site-nav.js" data-site-nav="allow"></script>
+</body>
+</html>

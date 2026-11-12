@@ -25,6 +25,7 @@ function faceDistance2(p,a,b){
 export function snootSphereGuide(role,subject){
  check(role,subject);
  const scope='Exact 12-sided emerging aperture cone versus subject sphere, emitter-center rays only. Extended-source illumination and scene occlusion are not certified.';
+ if(role.grid)return {state:'unverified',scope:'The physical rectangular grid is traced by the renderer; this circular-snoot guide does not certify it.',message:'Physical grid attached; aperture clearance is not certified by the snoot guide.'};
  if(!role.gobo||!(role.shroudLength>0))return {state:'open',scope,message:'No active snoot aperture restriction.'};
  const offset=role.shroudOffset??0,length=role.shroudLength,total=offset+length;
  const mount=role.shroudRadius??role.radius*1.1,exit=role.shroudExitRadius??mount;
@@ -71,13 +72,17 @@ export function kickerSubjectRays(role,subject,unitM=1){
 export function kickerTableClearanceBound(role,subject,table,floorY){
  check(role,subject);
  if(!table.enabled)return {state:'off',minimumHeight:null,message:'Table is off; no table-height bound.'};
- if(!Number.isFinite(role.radius)||role.radius<=0||!Number.isFinite(floorY))throw Error('Guide needs the actual circular emitter radius and floor');
- const dir=unit(role.dir),bottom=role.pos[1]-role.radius*Math.hypot(dir[0],dir[2]);
+ if(!Number.isFinite(floorY))throw Error('Guide needs the actual emitter dimensions and floor');
+ const axes=basis(role.dir),rect=role.round===false||Number.isFinite(role.halfW)&&Number.isFinite(role.halfH);
+ const radius=rect?Math.hypot(role.halfW,role.halfH):role.radius;
+ if(!Number.isFinite(radius)||radius<=0||rect&&(!(role.halfW>0)||!(role.halfH>0)))throw Error('Guide needs the actual emitter dimensions and floor');
+ const vertical=rect?Math.abs(axes[0][1])*role.halfW+Math.abs(axes[1][1])*role.halfH:radius*Math.hypot(axes[2][0],axes[2][2]);
+ const bottom=role.pos[1]-vertical;
  const subjectAbove=subject.center[1]-subject.radius>=TABLE_TOP_Y;
  // Both endpoint sets above the common slab top imply every segment stays
  // above it, by convexity. Legs and skirt are wholly below that same plane.
  // Using the full radius for a proposed height is valid at every aiming angle.
- const minimumHeight=TABLE_TOP_Y-floorY+role.radius;
+ const minimumHeight=TABLE_TOP_Y-floorY+radius;
  return {state:subjectAbove&&bottom>=TABLE_TOP_Y?'clear':'unproven',minimumHeight,emitterBottomY:bottom,
   message:subjectAbove?`Whole-emitter table clearance is sufficient at height ${minimumHeight.toFixed(3)} or higher (conservative bound, any aim). Aperture and other scene objects still apply.`:
    'Subject extends below tabletop; the whole-emitter table-clearance bound does not apply.'};

@@ -1,4 +1,4 @@
-import {installScenePackerInputs} from './meowdoku_scene_packer_harness.mjs';
+import {installScenePackerInputs,installStudioSceneBuilders} from './meowdoku_scene_packer_harness.mjs';
 import {applyLightTools,defaultLightTools,migrateLightTools} from '../examples/meowdoku/web/marble_light_tools.js';
 import {wallRelativeFixtureDefaults} from "../examples/meowdoku/web/marble_light_placement.js";
 import {applyFixtureSizes,defaultFixtureSizes} from "../examples/meowdoku/web/marble_fixture_sizes.js";
@@ -48,9 +48,10 @@ const context=vm.createContext({applyLightTools,defaultLightTools:migrateLightTo
   defaultStudioScale:()=>({version:1,mode:'fixed',unitMm:10}),studioScaleTransform,studioOrbitTarget:[0,0,0],savedPhotoRadius:.01,yaw:-.5,pitch:.2,distance:3.45,
   rgb:v=>[1,3,5].map(k=>parseInt(v.slice(k,k+2),16)/255),
   tables:{pbr:{table:{floats_per_record:16},data:pbr}}});
-vm.runInContext(source.slice(source.indexOf('const ROOM_FIXTURES ='),source.indexOf('const currentCameraOptions =')),context);
-vm.runInContext(source.slice(source.indexOf('function quadFace('),source.indexOf('function digitFaces(')),context);
+installStudioSceneBuilders(context);
 vm.runInContext(source.slice(source.indexOf('function studioRenderState('),source.indexOf('\nfunction syncMaterial()')).replace('export function','function'),context);
+delete context.computeFixtureRoles;delete context.buildFixtureFaces;
+context.shopLightFacesForStudio=()=>[]; // Explicit legacy fixture has no shop/rack catalogue.
 installScenePackerInputs(context);
 const copy=v=>JSON.parse(JSON.stringify(v)),run=code=>copy(vm.runInContext(code,context,{timeout:3000}));
 const initial=run('computeFixtureRoles().fixtureRoles');
@@ -146,7 +147,8 @@ if(!process.argv.includes('--json'))console.log('Actual pose-override geometry i
 const sizeBefore=run('computeFixtureRoles([0,0,0],"exposure")');
 context.customSizes=defaultFixtureSizes();
 const doubled=run('computeFixtureRoles([0,0,0],"exposure",null,customSizes)');
-for(const i of [0,1,5,6,9]){const factor=i===6?8/.6:i===5?4/.6:2;assert.equal(doubled.fixtureRoles[i].halfW,sizeBefore.fixtureRoles[i].halfW*factor);assert.equal(doubled.fixtureRoles[i].halfH,sizeBefore.fixtureRoles[i].halfH*(i===5?2/.6:factor));}
+for(const i of [0,1,5,6,9]){const size=customSize(i);assert.equal(doubled.fixtureRoles[i].halfW,sizeBefore.fixtureRoles[i].halfW*size.width);assert.equal(doubled.fixtureRoles[i].halfH,sizeBefore.fixtureRoles[i].halfH*size.height);}
+function customSize(i){return context.customSizes.lights[i];} // Includes the real table-fitted underlight dimensions.
 const oldSizeFaces=run('buildFixtureFaces(computeFixtureRoles([0,0,0],"exposure").fixtureRoles,99)');
 const newSizeFaces=run('buildFixtureFaces(computeFixtureRoles([0,0,0],"exposure",null,customSizes).fixtureRoles,99)');
 assert.equal(newSizeFaces.length,oldSizeFaces.length);assert.notDeepEqual(newSizeFaces,oldSizeFaces);

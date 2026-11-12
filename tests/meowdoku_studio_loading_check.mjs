@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 for(const path of ['examples/meowdoku/web/marble_studio.js','build/meowdoku/web/marble_studio.js']){
  const source=fs.readFileSync(path,'utf8');
- assert(source.startsWith('// Reuse the server loading panel;'));
+ assert(source.includes('// Reuse the server loading panel;'));
  assert(source.includes('import "./loading_panel.js";'));
  const boot=source.slice(source.indexOf('async function boot() {'),source.indexOf('\nboot();'));
  for(const failure of ['no-gl','fetch','gpu']){

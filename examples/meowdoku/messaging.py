@@ -1,8 +1,9 @@
 """Meowdoku user-to-user messaging: contacts and messages in accounts.db (server.py [MESSAGES], web/messenger-widget.js).
 
-Tables (schema module ``messaging`` 1; this module is their one writer):
+Tables (schema module ``messaging`` 2; this module is their one writer):
     msg_contacts  (user_id, peer_id, state requested|accepted|blocked, created, updated)   DIRECTED rows, one per side
-    msg_messages  (id, sender_id, recipient_id, body, created, read_at)
+    msg_messages  (id, sender_id, recipient_id, body, created, read_at, ..., subject_kind, subject_ref, msg_type)   v2 adds the last three
+    msg_cursor    (user_id, acked_id, updated)   the RECIPIENT's own ack cursor; never returned to any other account
 
 A conversation exists only when BOTH directions are ``accepted``.  ``request_contact(me, X)`` sets MY row for X to accepted and X's row
 for me to requested (pending X's decision); ``respond_contact(me, X, True)`` sets my row accepted.  A row ``blocked`` on either side
@@ -24,6 +25,12 @@ MAX_WAITERS_PER_ACCOUNT each).
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import io
+import json
+import secrets
 import sqlite3
 import sys
 import threading
@@ -42,12 +49,24 @@ MAX_PER_MINUTE, MAX_PER_DAY = 30, 2000
 MAX_CONTACTS, MAX_PENDING = 200, 20
 MAX_WAITERS, MAX_WAITERS_PER_ACCOUNT = 64, 2
 MAX_WAIT_S = 25.0
+SUBJECT_KINDS = ("lease", "job", "ticket", "file", "topic", "control")   # control: ref is an instance_requests id
+MSG_TYPES = ("note", "status", "question", "handoff", "approval_request", "answer")
+MAX_SUBJECT_REF = 200
+HANDLE_TTL = 60
+HANDLE_ACTION = "send"
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16 * 1024 * 1024
+MAX_IMAGE_STORAGE_PER_ACCOUNT = 32 * 1024 * 1024
+MAX_IMAGE_STORAGE_TOTAL = 256 * 1024 * 1024
+MAX_IMAGE_REQUEST = 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 32768
 
 DDL = ("CREATE TABLE IF NOT EXISTS msg_contacts (user_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
        "state TEXT NOT NULL CHECK(state IN ('requested','accepted','blocked')), created REAL NOT NULL, updated REAL NOT NULL, "
        "PRIMARY KEY(user_id, peer_id))",
        "CREATE TABLE IF NOT EXISTS msg_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, "
-       "recipient_id INTEGER NOT NULL, body TEXT NOT NULL, created REAL NOT NULL, read_at REAL, removed_at REAL, removed_by INTEGER)",
+       "recipient_id INTEGER NOT NULL, body TEXT NOT NULL, created REAL NOT NULL, read_at REAL, removed_at REAL, removed_by INTEGER, "
+       "subject_kind TEXT, subject_ref TEXT, msg_type TEXT NOT NULL DEFAULT 'note')",
+       "CREATE TABLE IF NOT EXISTS msg_cursor (user_id INTEGER PRIMARY KEY, acked_id INTEGER NOT NULL, updated REAL NOT NULL)",
        "CREATE TABLE IF NOT EXISTS msg_suspended (user_id INTEGER PRIMARY KEY, by_id INTEGER NOT NULL, created REAL NOT NULL)",
        "CREATE TABLE IF NOT EXISTS msg_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER NOT NULL, action TEXT NOT NULL, "
        "target TEXT NOT NULL, created REAL NOT NULL)",
@@ -62,18 +81,39 @@ class MessagingError(Exception):
 
 
 def connect(db_path) -> sqlite3.Connection:
-    """Own connection to accounts.db (autocommit).  Declares schema module ``messaging`` 1."""
+    """Own connection to accounts.db (autocommit).  Declares schema module ``messaging`` 2 (v1 migrates in place by ADD COLUMN)."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(db_path), timeout=10, isolation_level=None, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     try:
-        _schema_version.declare(db, "messaging", 1)
+        _schema_version.declare(db, "messaging", 2)
     except _schema_version.SchemaVersionError:
         db.close()
         raise
     for ddl in DDL:
         db.execute(ddl)
+    have = {r["name"] for r in db.execute("PRAGMA table_info(msg_messages)")}
+    for column, decl in (("subject_kind", "TEXT"), ("subject_ref", "TEXT"), ("msg_type", "TEXT NOT NULL DEFAULT 'note'")):
+        if column not in have:
+            try:
+                db.execute(f"ALTER TABLE msg_messages ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as error:       # another process on the same database added it first
+                if "duplicate column" not in str(error).lower():
+                    raise
+    _schema_version.declare(db, "messaging_rest", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS msg_handles (digest TEXT PRIMARY KEY, sender_id INTEGER NOT NULL, "
+               "peer_id INTEGER NOT NULL, action TEXT NOT NULL, expires REAL NOT NULL, "
+               "sender_updated REAL NOT NULL, peer_updated REAL NOT NULL)")
+    db.execute("CREATE INDEX IF NOT EXISTS msg_handles_pair ON msg_handles(sender_id, peer_id, expires)")
+    db.execute("CREATE TABLE IF NOT EXISTS msg_send_keys (sender_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
+               "request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, message_id INTEGER NOT NULL, "
+               "PRIMARY KEY(sender_id, peer_id, request_key))")
+    _schema_version.declare(db, "messaging_images", 1)
+    db.execute("CREATE TABLE IF NOT EXISTS msg_image_consent (user_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, "
+               "enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), updated REAL NOT NULL, PRIMARY KEY(user_id, peer_id))")
+    db.execute("CREATE TABLE IF NOT EXISTS msg_images (message_id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL, "
+               "data BLOB NOT NULL, digest TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)")
     return db
 
 
@@ -126,7 +166,15 @@ def _state(db, user_id, peer_id):
     return row["state"] if row else None
 
 
+def _revoke_relationship_handles(db, a, b):
+    db.execute("DELETE FROM msg_handles WHERE (sender_id=? AND peer_id=?) OR (sender_id=? AND peer_id=?)", (a, b, b, a))
+    # A newly accepted/recreated contact never inherits an earlier image opt-in.
+    db.execute("DELETE FROM msg_image_consent WHERE (user_id=? AND peer_id=?) OR (user_id=? AND peer_id=?)", (a, b, b, a))
+
+
 def _put(db, user_id, peer_id, state, now):
+    # Invalidate capabilities with the contact write, even if wall-clock timestamps repeat.
+    _revoke_relationship_handles(db, user_id, peer_id)
     db.execute("INSERT INTO msg_contacts (user_id, peer_id, state, created, updated) VALUES (?,?,?,?,?) "
                "ON CONFLICT(user_id, peer_id) DO UPDATE SET state = excluded.state, updated = excluded.updated",
                (user_id, peer_id, state, now, now))
@@ -134,6 +182,34 @@ def _put(db, user_id, peer_id, state, now):
 
 def _mutual(db, a, b) -> bool:
     return _state(db, a, b) == "accepted" and _state(db, b, a) == "accepted"
+
+
+# ---- the system as a contact ------------------------------------------------------------------------------------------------------
+def system_contact(db, system_id: int, user_id: int, now: float | None = None) -> bool:
+    """Make the system account and one account mutual contacts.  For system broadcasts only: the system is not a
+    person, so this is not a request the account answers and the contact limits do not apply to it.  An account that
+    has BLOCKED the system stays blocked and gets nothing.  True when the two are mutual afterwards."""
+    if system_id == user_id:
+        return False
+    now = time.time() if now is None else now
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if "blocked" in (_state(db, user_id, system_id), _state(db, system_id, user_id)):
+            db.execute("COMMIT")
+            return False
+        for a, b in ((system_id, user_id), (user_id, system_id)):
+            if _state(db, a, b) != "accepted":
+                _put(db, a, b, "accepted", now)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return True
+
+
+def befriend_all(db, system_id: int, user_ids) -> int:
+    """``system_contact`` for each given account; returns how many are mutual with the system afterwards."""
+    return sum(1 for user_id in user_ids if system_contact(db, system_id, int(user_id)))
 
 
 # ---- contacts -------------------------------------------------------------------------------------------------------------------
@@ -177,6 +253,7 @@ def respond_contact(db, me: int, peer_username, accept: bool, now: float | None 
         if accept:
             _put(db, me, pid, "accepted", now)
         else:
+            _revoke_relationship_handles(db, me, pid)
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ?", (me, pid))
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ? AND state = 'accepted'", (pid, me))
         db.execute("COMMIT")
@@ -190,7 +267,13 @@ def block(db, me: int, peer_username, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     peer = _peer(db, peer_username)
     if peer is not None and peer[0] != me:
-        _put(db, me, peer[0], "blocked", now)
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _put(db, me, peer[0], "blocked", now)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     return {"ok": True, "result": "blocked"}
 
 
@@ -200,6 +283,7 @@ def remove(db, me: int, peer_username) -> dict:
     if peer is not None and peer[0] != me:
         db.execute("BEGIN IMMEDIATE")
         try:
+            _revoke_relationship_handles(db, me, peer[0])
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ?", (me, peer[0]))
             db.execute("DELETE FROM msg_contacts WHERE user_id = ? AND peer_id = ? AND state != 'blocked'", (peer[0], me))
             db.execute("COMMIT")
@@ -233,6 +317,55 @@ def contacts(db, me: int) -> dict:
     return out
 
 
+def _relationship_stamp(db, me, peer):
+    rows = db.execute("SELECT user_id, state, updated FROM msg_contacts WHERE "
+                      "(user_id=? AND peer_id=?) OR (user_id=? AND peer_id=?)", (me, peer, peer, me)).fetchall()
+    stamps = {r["user_id"]: r["updated"] for r in rows if r["state"] == "accepted"}
+    return (stamps[me], stamps[peer]) if me in stamps and peer in stamps else None
+
+
+def conversations(db, me: int, now=None) -> dict:
+    """Issue sender-bound, short-lived send handles from existing relationships.
+
+    Only digests are retained. Names label the returned picker; callers do not
+    send a recipient identifier to obtain a handle or to submit its message.
+    """
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        now = time.time() if now is None else now
+        if _suspended(db, me):
+            raise MessagingError("messaging unavailable", 403)
+        out = contacts(db, me)
+        db.execute("DELETE FROM msg_handles WHERE expires <= ?", (now,))
+        for contact in out["contacts"]:
+            peer = _peer(db, contact["username"])[0]
+            stamp = _relationship_stamp(db, me, peer)
+            token = secrets.token_urlsafe(32)
+            expiry = now + HANDLE_TTL
+            # Bound outstanding credentials per relationship while allowing tabs
+            # and concurrent clients to retain separate handles.
+            db.execute("DELETE FROM msg_handles WHERE digest IN (SELECT digest FROM msg_handles "
+                       "WHERE sender_id=? AND peer_id=? ORDER BY expires DESC LIMIT -1 OFFSET 9)", (me, peer))
+            db.execute("INSERT INTO msg_handles VALUES (?,?,?,?,?,?,?)",
+                       (hashlib.sha256(token.encode()).hexdigest(), me, peer, HANDLE_ACTION, expiry, *stamp))
+            contact.update(conversation_handle=token, expires_at=expiry)
+        db.execute("COMMIT")
+        return out
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def _handle_peer(db, me, token, now):
+    if not isinstance(token, str) or not 32 <= len(token) <= 128:
+        raise MessagingError("conversation handle unavailable; refresh conversations", 403)
+    row = db.execute("SELECT * FROM msg_handles WHERE digest=? AND sender_id=? AND action=? AND expires>?",
+                     (hashlib.sha256(token.encode()).hexdigest(), me, HANDLE_ACTION, now)).fetchone()
+    if row is None or _relationship_stamp(db, me, row["peer_id"]) != (row["sender_updated"], row["peer_updated"]):
+        raise MessagingError("conversation handle unavailable; refresh conversations", 403)
+    return row["peer_id"]
+
+
 # ---- messages -------------------------------------------------------------------------------------------------------------------
 def _clean(body) -> str:
     if not isinstance(body, str):
@@ -243,11 +376,141 @@ def _clean(body) -> str:
     return text
 
 
-def _row(db_row, names, admin: bool = False) -> dict:
-    """The one message shape a user sees: exactly id, from, to, created, body, removed (no read state, no ids of accounts)."""
+def _row(db_row, names, admin: bool = False, *, db=None, me=None) -> dict:
+    """The one message shape a user sees: exactly id, from, to, created, body, removed, subject, type (no read/ack state, no account ids)."""
     gone = db_row["removed_at"] is not None
-    return {"id": db_row["id"], "from": names[db_row["sender_id"]], "to": names[db_row["recipient_id"]],
-            "created": db_row["created"], "body": db_row["body"] if (admin or not gone) else "", "removed": gone}
+    result = {"id": db_row["id"], "from": names[db_row["sender_id"]], "to": names[db_row["recipient_id"]],
+            "created": db_row["created"], "body": db_row["body"] if (admin or not gone) else "", "removed": gone,
+            "subject": None if db_row["subject_kind"] is None else {"kind": db_row["subject_kind"], "ref": db_row["subject_ref"]},
+            "type": db_row["msg_type"]}
+    if db is not None and not gone:
+        attachment = db.execute("SELECT length(data) AS size FROM msg_images WHERE message_id=?", (db_row["id"],)).fetchone()
+        if attachment:
+            a, b = db_row["sender_id"], db_row["recipient_id"]
+            unlocked = me in (a, b) and _images_available(db, a, b)
+            result["image"] = ({"locked": False, "url": f"/api/messages/image?id={db_row['id']}",
+                                "mime": "image/png", "bytes": attachment["size"]} if unlocked else {"locked": True})
+    return result
+
+
+def _image_enabled(db, me, peer):
+    row = db.execute("SELECT enabled FROM msg_image_consent WHERE user_id=? AND peer_id=?", (me, peer)).fetchone()
+    return bool(row and row["enabled"])
+
+
+def _images_available(db, a, b):
+    return _mutual(db, a, b) and _image_enabled(db, a, b) and _image_enabled(db, b, a)
+
+
+def _image_status(db, me, peer):
+    enabled, other = _image_enabled(db, me, peer), _image_enabled(db, peer, me)
+    return {"enabled": enabled, "peer_enabled": other, "available": enabled and other,
+            "max_bytes": MAX_IMAGE_BYTES}
+
+
+def image_status(db, me, peer_username):
+    peer = _peer(db, peer_username)
+    if peer is None or not _mutual(db, me, peer[0]):
+        raise MessagingError("you cannot message this user", 403)
+    return _image_status(db, me, peer[0])
+
+
+def image_consent(db, me, conversation_handle, enabled, now=None):
+    """Change only the authenticated participant's explicit choice for this chat."""
+    if type(enabled) is not bool:
+        raise MessagingError("enabled must be a boolean", 400)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        now = time.time() if now is None else now
+        peer = _handle_peer(db, me, conversation_handle, now)
+        if _suspended(db, me) or not _mutual(db, me, peer):
+            raise MessagingError("you cannot message this user", 403)
+        db.execute("INSERT INTO msg_image_consent VALUES (?,?,?,?) ON CONFLICT(user_id, peer_id) "
+                   "DO UPDATE SET enabled=excluded.enabled, updated=excluded.updated", (me, peer, int(enabled), now))
+        result = _image_status(db, me, peer)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    HUB.notify()
+    return result
+
+
+def _decode_image(image):
+    """Only bounded, fully decoded single-frame PNG. Never URLs, paths, HTML or SVG."""
+    if image is None:
+        return None
+    if not isinstance(image, dict) or set(image) != {"data"} or not isinstance(image["data"], str):
+        raise MessagingError("image must contain only base64 PNG data", 400)
+    encoded = image["data"]
+    if len(encoded) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+        raise MessagingError("image exceeds 2 MiB", 413)
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        raise MessagingError("invalid base64 PNG", 400) from None
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise MessagingError("image exceeds 2 MiB", 413)
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise MessagingError("only PNG images are supported", 400)
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            width, height = im.size
+            if im.format != "PNG" or not 0 < width <= 4096 or not 0 < height <= 4096 or width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("image dimensions")
+            if getattr(im, "n_frames", 1) != 1:
+                raise ValueError("animated image")
+            im.verify()
+        with Image.open(io.BytesIO(raw)) as im:
+            im.load()       # CRC/header-only validation is not enough.
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        raise MessagingError("invalid, animated or excessive PNG", 400) from None
+    return raw, hashlib.sha256(raw).hexdigest(), width, height
+
+
+def image_bytes(db, me, message_id):
+    """Session-bound image access, rechecking contact and both choices on every fetch."""
+    row = db.execute("SELECT m.sender_id, m.recipient_id, m.removed_at, i.data FROM msg_messages m "
+                     "JOIN msg_images i ON i.message_id=m.id WHERE m.id=?", (int(message_id),)).fetchone()
+    if (row is None or me not in (row["sender_id"], row["recipient_id"]) or row["removed_at"] is not None
+            or not _images_available(db, row["sender_id"], row["recipient_id"])):
+        raise MessagingError("image unavailable; both participants must enable images in this chat", 403)
+    return bytes(row["data"])
+
+
+def _subject(subject):
+    """(None, None), or (kind, ref) from {"kind": one of SUBJECT_KINDS, "ref": 1..MAX_SUBJECT_REF chars}."""
+    if subject is None:
+        return None, None
+    if not isinstance(subject, dict) or set(subject) != {"kind", "ref"}:
+        raise MessagingError("subject must be {kind, ref}", 400)
+    kind, ref = subject["kind"], subject["ref"]
+    if kind not in SUBJECT_KINDS or not isinstance(ref, str) or not ref.strip() or len(ref) > MAX_SUBJECT_REF or "\x00" in ref:
+        raise MessagingError(f"subject kind must be one of {', '.join(SUBJECT_KINDS)} and ref 1 to {MAX_SUBJECT_REF} characters", 400)
+    return kind, ref
+
+
+def _type(msg_type) -> str:
+    if msg_type is None:
+        return "note"
+    if msg_type not in MSG_TYPES:
+        raise MessagingError(f"type must be one of {', '.join(MSG_TYPES)}", 400)
+    return msg_type
+
+
+def _subject_filter(kind, ref):
+    """(sql fragment, args) for the optional subject_kind / subject_ref filters of thread and since."""
+    sql, args = "", []
+    if kind is not None:
+        if kind not in SUBJECT_KINDS:
+            raise MessagingError(f"subject_kind must be one of {', '.join(SUBJECT_KINDS)}", 400)
+        sql += " AND subject_kind = ?"
+        args.append(kind)
+    if ref is not None:
+        sql += " AND subject_ref = ?"
+        args.append(str(ref))
+    return sql, args
 
 
 def _suspended(db, user_id) -> bool:
@@ -262,24 +525,61 @@ def _names(db, rows) -> dict:
     return {r["id"]: r["username"] for r in db.execute(f"SELECT id, username FROM users WHERE id IN ({marks})", tuple(ids))}
 
 
-def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None) -> dict:
-    now = time.time() if now is None else now
+def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | None = None, subject=None, msg_type=None,
+         conversation_handle=None, idempotency_key=None, image=None) -> dict:
     text = _clean(body)
-    peer = _peer(db, peer_username)
-    if _suspended(db, me) or peer is None or peer[0] == me or not _mutual(db, me, peer[0]):
-        raise MessagingError("you cannot message this user", 403)
+    skind, sref = _subject(subject)
+    mtype = _type(msg_type)
+    using_handle = conversation_handle is not None
+    if image is not None and not using_handle:
+        raise MessagingError("image sends require a conversation handle", 400)
+    attachment = _decode_image(image)
+    if using_handle and (peer_username is not None or not isinstance(idempotency_key, str)
+                         or not 16 <= len(idempotency_key) <= 128):
+        raise MessagingError("handle sends require an idempotency_key (16-128 characters) and no recipient name", 400)
+    fingerprint_values = [text, skind, sref, mtype]
+    if attachment:
+        fingerprint_values.append(attachment[1])
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_values, ensure_ascii=False,
+                                           separators=(",", ":")).encode()).hexdigest()
     db.execute("BEGIN IMMEDIATE")
     try:
-        if not _mutual(db, me, peer[0]):
+        now = time.time() if now is None else now
+        if using_handle:
+            peer_id = _handle_peer(db, me, conversation_handle, now)
+        else:
+            peer = _peer(db, peer_username)
+            peer_id = peer[0] if peer is not None else None
+        if _suspended(db, me) or peer_id is None or peer_id == me or not _mutual(db, me, peer_id):
             raise MessagingError("you cannot message this user", 403)
+        if using_handle:
+            prior = db.execute("SELECT k.fingerprint, m.id, m.created FROM msg_send_keys k "
+                               "JOIN msg_messages m ON m.id=k.message_id WHERE k.sender_id=? AND k.peer_id=? AND k.request_key=?",
+                               (me, peer_id, idempotency_key)).fetchone()
+            if prior is not None:
+                if prior["fingerprint"] != fingerprint:
+                    raise MessagingError("idempotency key already used for different content", 409)
+                db.execute("COMMIT")
+                return {"ok": True, "id": prior["id"], "created": prior["created"]}
+        if attachment and not _image_enabled(db, me, peer_id):
+            raise MessagingError("enable images in this chat before sending an image", 403)
         minute = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 60)).fetchone()[0]
         day = db.execute("SELECT COUNT(*) FROM msg_messages WHERE sender_id = ? AND created > ?", (me, now - 86400)).fetchone()[0]
         if minute >= MAX_PER_MINUTE:
             raise MessagingError(f"at most {MAX_PER_MINUTE} messages per minute", 429)
         if day >= MAX_PER_DAY:
             raise MessagingError(f"at most {MAX_PER_DAY} messages per day", 429)
-        mid = db.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created) VALUES (?,?,?,?)",
-                         (me, peer[0], text, now)).lastrowid
+        if attachment:
+            owned = db.execute("SELECT COALESCE(SUM(length(data)),0) FROM msg_images WHERE sender_id=?", (me,)).fetchone()[0]
+            total = db.execute("SELECT COALESCE(SUM(length(data)),0) FROM msg_images").fetchone()[0]
+            if owned + len(attachment[0]) > MAX_IMAGE_STORAGE_PER_ACCOUNT or total + len(attachment[0]) > MAX_IMAGE_STORAGE_TOTAL:
+                raise MessagingError("image storage quota reached", 429)
+        mid = db.execute("INSERT INTO msg_messages (sender_id, recipient_id, body, created, subject_kind, subject_ref, msg_type) "
+                         "VALUES (?,?,?,?,?,?,?)", (me, peer_id, text, now, skind, sref, mtype)).lastrowid
+        if attachment:
+            db.execute("INSERT INTO msg_images VALUES (?,?,?,?,?,?)", (mid, me, *attachment))
+        if using_handle:
+            db.execute("INSERT INTO msg_send_keys VALUES (?,?,?,?,?)", (me, peer_id, idempotency_key, fingerprint, mid))
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -288,7 +588,7 @@ def send(db, me: int, peer_username, body, now: float | None = None, hub: Hub | 
     return {"ok": True, "id": mid, "created": now}
 
 
-def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
+def thread(db, me: int, peer_username, before_id=None, limit: int = 50, subject_kind=None, subject_ref=None) -> dict:
     """Messages between ``me`` and the peer, oldest first: the newest ``limit`` below ``before_id``.  An unknown peer is an empty thread."""
     limit = max(1, min(int(limit), 200))
     peer = _peer(db, peer_username)
@@ -296,6 +596,9 @@ def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
         return {"messages": [], "more": False}
     args = [me, peer[0], peer[0], me]
     sql = "SELECT * FROM msg_messages WHERE ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))"
+    extra, extra_args = _subject_filter(subject_kind, subject_ref)
+    sql += extra
+    args += extra_args
     if before_id is not None:
         sql += " AND id < ?"
         args.append(int(before_id))
@@ -303,16 +606,17 @@ def thread(db, me: int, peer_username, before_id=None, limit: int = 50) -> dict:
     more = len(rows) > limit
     rows = list(reversed(rows[:limit]))
     names = _names(db, rows)
-    return {"messages": [_row(r, names) for r in rows], "more": more}
+    return {"messages": [_row(r, names, db=db, me=me) for r in rows], "more": more}
 
 
-def since(db, me: int, after_id, limit: int = 200) -> list:
+def since(db, me: int, after_id, limit: int = 200, subject_kind=None, subject_ref=None) -> list:
     """Every message to or from ``me`` with id > after_id, oldest first: the poll primitive."""
     limit = max(1, min(int(limit), 500))
-    rows = db.execute("SELECT * FROM msg_messages WHERE id > ? AND (sender_id = ? OR recipient_id = ?) ORDER BY id LIMIT ?",
-                      (int(after_id or 0), me, me, limit)).fetchall()
+    extra, extra_args = _subject_filter(subject_kind, subject_ref)
+    rows = db.execute("SELECT * FROM msg_messages WHERE id > ? AND (sender_id = ? OR recipient_id = ?)" + extra + " ORDER BY id LIMIT ?",
+                      (int(after_id or 0), me, me, *extra_args, limit)).fetchall()
     names = _names(db, rows)
-    return [_row(r, names) for r in rows]
+    return [_row(r, names, db=db, me=me) for r in rows]
 
 
 def latest_id(db, me: int) -> int:
@@ -320,19 +624,19 @@ def latest_id(db, me: int) -> int:
     return db.execute("SELECT COALESCE(MAX(id), 0) FROM msg_messages WHERE sender_id = ? OR recipient_id = ?", (me, me)).fetchone()[0]
 
 
-def long_poll(db, me: int, after_id, wait: float, hub: Hub | None = None, limit: int = 200) -> list:
+def long_poll(db, me: int, after_id, wait: float, hub: Hub | None = None, limit: int = 200, subject_kind=None, subject_ref=None) -> list:
     hub = hub or HUB
     if int(after_id or 0) < 0:                  # after=-1: no messages, just ``latest_id`` (the caller reports it)
         return []
     wait = max(0.0, min(float(wait), MAX_WAIT_S))
     if wait <= 0:
-        return since(db, me, after_id, limit)
+        return since(db, me, after_id, limit, subject_kind, subject_ref)
     hub.enter(me)
     deadline = time.monotonic() + wait
     try:
         while True:
             seen = hub.seq                      # read BEFORE the query: a send in between shows as a changed seq
-            rows = since(db, me, after_id, limit)
+            rows = since(db, me, after_id, limit, subject_kind, subject_ref)
             if rows:
                 return rows
             remaining = deadline - time.monotonic()
@@ -350,6 +654,39 @@ def mark_read(db, me: int, peer_username, up_to_id) -> dict:
     cur = db.execute("UPDATE msg_messages SET read_at = ? WHERE recipient_id = ? AND sender_id = ? AND id <= ? AND read_at IS NULL",
                      (time.time(), me, peer[0], int(up_to_id)))
     return {"ok": True, "marked": cur.rowcount}
+
+
+# ---- server-kept cursor (the recipient's own state; no function here returns it to anyone else) ----------------------------------
+def _cursor(db, me) -> int:
+    row = db.execute("SELECT acked_id FROM msg_cursor WHERE user_id = ?", (me,)).fetchone()
+    return row["acked_id"] if row else 0
+
+
+def inbox(db, me: int, limit: int = 200) -> dict:
+    """Messages TO ``me`` with id > my acked cursor, oldest first (at most 200), plus the cursor."""
+    limit = max(1, min(int(limit), 200))
+    cursor = _cursor(db, me)
+    rows = db.execute("SELECT * FROM msg_messages WHERE recipient_id = ? AND id > ? ORDER BY id LIMIT ?", (me, cursor, limit)).fetchall()
+    names = _names(db, rows)
+    return {"messages": [_row(r, names, db=db, me=me) for r in rows], "cursor": cursor}
+
+
+def ack(db, me: int, up_to, now: float | None = None) -> dict:
+    """Advance my cursor to ``up_to`` (monotonic; never beyond the latest id addressed to me).  Returns only my own cursor."""
+    now = time.time() if now is None else now
+    if isinstance(up_to, bool) or not isinstance(up_to, int) or up_to < 0:
+        raise MessagingError("up_to must be a non-negative integer", 400)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        top = db.execute("SELECT COALESCE(MAX(id), 0) FROM msg_messages WHERE recipient_id = ?", (me,)).fetchone()[0]
+        cursor = max(_cursor(db, me), min(up_to, top))
+        db.execute("INSERT INTO msg_cursor (user_id, acked_id, updated) VALUES (?,?,?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET acked_id = excluded.acked_id, updated = excluded.updated", (me, cursor, now))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return {"ok": True, "cursor": cursor}
 
 
 # ---- operator oversight (server.py gates these on account_manage) ----------------------------------------------------------------
@@ -374,7 +711,7 @@ def admin_thread(db, actor: int, a_name, b_name, before_id=None, limit: int = 50
     rows = list(reversed(rows[:limit]))
     _audit(db, actor, "read_thread", f"{a[1]}|{b[1]}", now)
     names = _names(db, rows)
-    return {"messages": [_row(r, names, admin=True) for r in rows], "more": more}
+    return {"messages": [_row(r, names, admin=True, db=db, me=actor) for r in rows], "more": more}
 
 
 def admin_remove(db, actor: int, message_id, now: float | None = None) -> dict:

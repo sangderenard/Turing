@@ -283,6 +283,32 @@ class ShaderViewport(Viewport):
         return data
 
 
+_OPENING_PLACEMENT_KEYS = ("side", "offset", "width", "height", "bottom")
+
+
+def _append_declared_openings(box: dict[str, Any], record: Mapping[str, Any]) -> None:
+    """Append the openings a producer declared on ``record`` to ``box``, after the ones the geometry minted.
+
+    A declared opening may name a minted opening of the same box in ``coincident_with``; it then takes that
+    opening's placement (side, offset, width, height, bottom) for every placement key it does not give itself.
+    That is how a door sheet sits in the doorway the geometry already cut, without repeating its numbers.
+    """
+
+    minted = {opening["identity"]: opening for opening in box["openings"]}
+    for declared in record.get("openings", ()):
+        opening = dict(declared)
+        anchor = opening.get("coincident_with")
+        if anchor is not None:
+            if anchor not in minted:
+                raise ValueError(
+                    f"opening {opening.get('identity')!r} is declared coincident with {anchor!r}, "
+                    f"which is not an opening minted on {box['identity']!r}")
+            for key in _OPENING_PLACEMENT_KEYS:
+                if key not in opening and key in minted[anchor]:
+                    opening[key] = minted[anchor][key]
+        box["openings"].append(opening)
+
+
 def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
     """Realize containment with deliberately nonlinear conceptual distance."""
 
@@ -317,6 +343,7 @@ def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
                     "width": 0.72, "height": 0.72,
                 }],
             }]
+            _append_declared_openings(building_boxes[0], building)
             for room in rooms:
                 position = room["position"]
                 room_x = cursor_x + 0.7 + (int(position["column"]) + 0.5) * room_pitch
@@ -340,6 +367,7 @@ def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
                         "width": 0.42, "height": min(0.58, height * 0.78),
                     }],
                 })
+                _append_declared_openings(building_boxes[-1], room)
             building_records.extend(building_boxes)
             # Sibling separation grows faster than the depicted building span.
             cursor_x += width + building_clearance + math.pow(max(width, depth), 0.72)
@@ -369,6 +397,7 @@ def document_geometry(world: Mapping[str, Any]) -> dict[str, Any]:
             }],
             "metaphor": "defensive class compound",
         }
+        _append_declared_openings(courtyard, region)
         region_records.append({"courtyard": courtyard, "contents": building_records})
         cursor_x = region_start + region_width + 6.0 + math.pow(region_width, 0.78)
         maximum_depth = max(maximum_depth, region_total_depth)

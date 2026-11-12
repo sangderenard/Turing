@@ -4,10 +4,12 @@ import {writeStudioFixtureRows} from './marble_studio_scene.js';
 // Tube length is the real emitting span; the housing adds 3 inches overall.
 export const SHOP_LIGHT_MODELS=Object.freeze({
   '8ft-2tube':Object.freeze({lengthFeet:8,tubes:2,widthFeet:.75}),
+  '4ft-2tube':Object.freeze({lengthFeet:4,tubes:2,widthFeet:.75}),
+  '2ft-2tube':Object.freeze({lengthFeet:2,tubes:2,widthFeet:.75}),
   '4ft-4tube':Object.freeze({lengthFeet:4,tubes:4,widthFeet:1.25}),
 });
 export const SHOP_LIGHT_MATERIALS=Object.freeze({backingMaterial:'metal_silver',topMaterial:'black_matte_paint'});
-export const MAX_SHOP_LIGHTS=8;
+export const MAX_SHOP_LIGHTS=128;
 export const SHOP_LED_LAYOUTS=Object.freeze({legacy:'Original 32 emitters',dense:'Dense / selected profile','dense-mixed':'Dense / alternating cool and warm'});
 const mixed=f=>f.source==='led-array'&&f.ledLayout==='dense-mixed';
 const sourceForRow=(f,row)=>mixed(f)?{...f,emitterProfile:row.secondary?'led_warm_white':'led_cool_white'}:f;
@@ -24,7 +26,7 @@ export function shopLightEmissionRecords(value,firstRow,materialIndex,profiles,{
     const f=state.fixtures.find(f=>f.id===row.fixtureId);
     const material=materialIndex.get(row.materialId);if(material===undefined)return [];
     const record=shopLightEmissionProfile(sourceForRow(f,row),profiles);
-    return [{material,profile:record.key,revision:record.revision,gain:f.enabled&&(channel==='studio'||f.exposureMode==='continuous')?f.sourceLevel*f.dimmer:0,filter:[...f.filter]}];
+    return [{material,profile:record.key,revision:record.revision,gain:f.enabled&&(channel==='studio'||f.exposureMode==='continuous')?f.sourceLevel*f.dimmer:0,filter:f.filterOff?null:[...f.filter]}];
   })};
 }
 const SIDES=12,FEET_MM=304.8;
@@ -35,7 +37,7 @@ function feetToUnits(unitMm) {
   return FEET_MM/unitMm;
 }
 export function createShopLight(id,model,{x=0,z=0,yaw=0}={}) {
-  return {id,model,enabled:true,source:'tubes',ledLayout:'dense-mixed',emitterProfile:'fluorescent_cool_white',x,z,yaw,ceilingDropFeet:.5,sourceLevel:1,dimmer:1,filter:[1,1,1],exposureMode:'off'};
+  return {id,model,enabled:true,source:'tubes',ledLayout:'dense-mixed',emitterProfile:'fluorescent_cool_white',x,z,yaw,ceilingDropFeet:.5,sourceLevel:1,dimmer:1,filter:[1,1,1],filterOff:false,exposureMode:'off'};
 }
 export function defaultShopLights(unitMm=FEET_MM) {
   const scale=feetToUnits(unitMm);
@@ -57,13 +59,15 @@ function shopState(value) {
        Math.abs(f.yaw)>180||f.ceilingDropFeet<0||f.dimmer<0||f.dimmer>1||
        !Array.isArray(f.filter)||f.filter.length!==3||!f.filter.every(v=>finite(v)&&v>=0&&v<=1))
       throw new Error(`${f.id}: invalid shop-light position, ceiling drop, dimmer or filter`);
+    if(f.filterOff!==undefined&&typeof f.filterOff!=='boolean')throw Error(`${f.id}: invalid filter-off setting`);
+    if(f.rackBus!==undefined&&!['upper-wall','middle-wall','edge','near-edge','center'].includes(f.rackBus))throw Error(`${f.id}: unknown lighting bus`);
     const ledLayout=f.ledLayout??'legacy';
     if(!Object.hasOwn(SHOP_LED_LAYOUTS,ledLayout))throw Error(`${f.id}: unknown LED layout`);
     const sourceLevel=f.sourceLevel??1;
     if(!finite(sourceLevel)||sourceLevel<0||sourceLevel>400)throw Error(`${f.id}: source level must be between 0 and 400 Studio emission units`);
     if(f.emitterProfile!==undefined&&!Object.hasOwn(SHOP_EMISSION_PROFILES,f.emitterProfile))throw Error(`${f.id}: unknown emission profile`);
-    return {ledLayout,emitterProfile:shopLightProfileKey(f),id:f.id,model:f.model,enabled:f.enabled,source:f.source,x:f.x,z:f.z,yaw:f.yaw,
-      ceilingDropFeet:f.ceilingDropFeet,sourceLevel,dimmer:f.dimmer,filter:[...f.filter],exposureMode:f.exposureMode};
+    return {...(f.rackBus===undefined?{}:{rackBus:f.rackBus}),ledLayout,emitterProfile:shopLightProfileKey(f),id:f.id,model:f.model,enabled:f.enabled,source:f.source,x:f.x,z:f.z,yaw:f.yaw,
+      ceilingDropFeet:f.ceilingDropFeet,sourceLevel,dimmer:f.dimmer,filter:[...f.filter],filterOff:f.filterOff??false,exposureMode:f.exposureMode};
   });
   return {version:1,backingMaterial:value.backingMaterial,topMaterial:value.topMaterial,fixtures};
 }
@@ -90,21 +94,21 @@ export function shopLightEmitterAllocations(value,firstRow) {
 /** Rows append after the caller's existing catalogue/runtime rows. They use the
  * same central emitter writer as Studio fixtures; this module invents no PBR
  * coefficients or lumen calibration. Disabled fixtures retain their row index.
- * Burst exposure remains unavailable until the native timing owner supplies
- * its real packet integration; no constant averaged gain stands in for it. */
-export function writeShopLightEmitterRows(data,stride,firstRow,value,{channel='studio',profiles}={}) {
+ * Burst exposure is admitted only by the timed Studio photo path; this writer
+ * still leaves its steady emission at zero. */
+export function writeShopLightEmitterRows(data,stride,firstRow,value,{channel='studio',profiles,timedExposure=false}={}) {
   const state=shopState(value),allocations=shopLightEmitterAllocations(state,firstRow);
   if(!['studio','exposure'].includes(channel))throw new Error('Shop-light emission needs an explicit Studio/exposure channel');
   if(!index(firstRow)||!Number.isSafeInteger(stride)||stride<16||!data||!index(data.length)||
       data.length%stride||(allocations.length&&data.length<(1+Math.max(...allocations.map(r=>r.materialId)))*stride))
     throw new Error('Allocate distinct shared material rows for every shop fixture before writing emission');
-  if(channel==='exposure')for(const f of state.fixtures)if(f.enabled&&f.dimmer>0&&f.exposureMode==='burst')
+  if(channel==='exposure'&&!timedExposure)for(const f of state.fixtures)if(f.enabled&&f.dimmer>0&&f.exposureMode==='burst')
     throw new Error(`${f.id}: shutter burst requires the authoritative timing-packet integration; no steady flash substitute is available`);
-  // An explicit continuous exposure is the same shared emissive material,
-  // not a timed flash or an averaged substitute for the unavailable burst.
+  // Timed burst power is installed by the camera exposure program, never as
+  // a steady or averaged emitter in this material writer.
   const resolved=allocations.map(row=>{
     const f=state.fixtures.find(f=>f.id===row.fixtureId),profile=shopLightEmissionProfile(sourceForRow(f,row),profiles);
-    const color=profile.filter_rgb_matrix.map(r=>Math.max(0,r.reduce((sum,v,i)=>sum+v*f.filter[i],0)));
+    const color=f.filterOff?[...profile.preview_chromaticity]:profile.filter_rgb_matrix.map(r=>Math.max(0,r.reduce((sum,v,i)=>sum+v*f.filter[i],0)));
     const strength=f.enabled&&(channel==='studio'||f.exposureMode==='continuous')?f.sourceLevel*f.dimmer:0;
     return {row,color,strength};
   });
@@ -236,3 +240,5 @@ export function studioShopLightGeometry(value,ids,emitterRows,{bounds,unitMm}={}
   return {faces,parts,emitters};
 }
 
+
+export {boxFaces as shopLightBoxFaces};

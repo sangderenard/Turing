@@ -46,7 +46,7 @@ function validateScene(packet,samplers) {
     assert(typeof p.id==='string'&&p.id&&!ids.has(p.id)&&typeof p.bodyId==='string'&&p.bodyId,'Unique source part/body IDs are required.');
     ids.add(p.id);
     assert(p.firstTriangle===offset&&p.triangleCount===p.faces?.length,'Studio part source ranges changed.');
-    assert(/^(room|backdrop|table|gobo|fixture|stand|shop)\//.test(p.id),`Unsupported Studio draw owner: ${p.id}.`);
+    assert(/^(room|backdrop|backdrop-holder|table|gobo|fixture|stand|shop)\//.test(p.id),`Unsupported Studio draw owner: ${p.id}.`);
     validateStudioSubjectPacket(packetFor(packet,p.faces,p.id),samplers);
     if(scene.triangleSources)for(let j=0;j<p.faces.length;j++) {
       const s=scene.triangleSources[offset+j];
@@ -188,13 +188,14 @@ export function studioSceneDrawPlan(source,{placement=I,samplers=studioFlatSampl
   const ordinary=[],emissive=[],transparent=[];
   // Match current Studio render(): table/gobos, stands, room, fixtures/shop,
   // subject; furniture/shop + subject glass then shares one world-space sort.
-  const order=p=>/^(table|gobo)\//.test(p.id)?0:p.id.startsWith('stand/')?1:/^(room|backdrop)\//.test(p.id)?2:p.id.startsWith('fixture/')?3:4;
+  const order=p=>/^(table|gobo)\//.test(p.id)?0:/^(stand|backdrop-holder)\//.test(p.id)?1:/^(room|backdrop)\//.test(p.id)?2:p.id.startsWith('fixture/')?3:4;
   const derived=studioSceneEntranceParts(scene,entrance),parts=[...derived.parts].sort((a,b)=>order(a)-order(b));
   for(const part of parts)for(const face of part.faces) {
     const forcedOpaque=/^(room|backdrop|fixture)\//.test(part.id),emission=/^(fixture|shop)\//.test(part.id);
     assert(!forcedOpaque||opaque(face),`Studio ${part.id} uses unconditional opaque draw; this captured material needs a dedicated pass.`);
     if(opaque(face))(emission?emissive:ordinary).push(face);else transparent.push(face);
   }
+  const subjectTransparentFirst=transparent.length;
   transparent.push(...validated.subject.transparent.map(f=>transformedFace(f,scene.subject.model)));
   const groups=[{id:'studio/static-opaque',faces:ordinary,model,phase:'opaque',emissionDirect:false},
     {id:'studio/fixture-emission',faces:emissive,model,phase:'opaque',emissionDirect:true},
@@ -202,7 +203,7 @@ export function studioSceneDrawPlan(source,{placement=I,samplers=studioFlatSampl
     {id:'studio/shared-transparent',faces:transparent,model,phase:'transparent',emissionDirect:false}];
   const partBounds=scene.parts.map(p=>({id:p.id,bodyId:p.bodyId,bounds:bounds(p.faces,model),firstTriangle:p.firstTriangle,triangleCount:p.faces.length}));
   const subjectBounds=bounds(scene.subject.faces,subjectModel);
-  return {packet,groups,placement,model,subjectModel,subjectBounds,partBounds,entrance:derived.entrance,bounds:union([...partBounds.map(p=>p.bounds),subjectBounds]),
+  return {packet,groups,placement,model,subjectModel,subjectBounds,subjectTransparentFirst,subjectTransparent:validated.subject.transparent,partBounds,entrance:derived.entrance,bounds:union([...partBounds.map(p=>p.bounds),subjectBounds]),
     counts:{parts:scene.parts.length,staticTriangles:validated.staticTriangles,subjectTriangles:scene.subject.faces.length,
       renderedStaticTriangles:derived.parts.reduce((n,p)=>n+p.faces.length,0),
       opaqueTriangles:ordinary.length+emissive.length+validated.subject.opaque.length,transparentTriangles:transparent.length,
@@ -218,13 +219,32 @@ export function createStudioSceneRenderer({gl,asset,samplers=asset?.samplers,pla
   try {for(const group of plan.groups)if(group.faces.length)draws.push({...group,
     renderer:createStudioSubjectRenderer({gl,packet:packetFor(plan.packet,group.faces,group.id),samplers})});}
   catch(error){dispose();throw error;}
+  let currentPose=Array.from(plan.packet.scene.subject.model),currentSubjectBounds=plan.subjectBounds;
+  // Bounds are diagnostic queries, not part of the frame upload path.
+  const readSubjectBounds=()=>currentSubjectBounds??(currentSubjectBounds=bounds(plan.packet.scene.subject.faces,plan.subjectModel));
+  function validateSubjectPose(value) {
+    assert(!closed,'Studio scene renderer is closed.');
+    const pose=studioSceneMatrix(value,'Displayed subject pose');validateStudioLightTransform(pose);
+    const model=mul(plan.model,pose);validateStudioLightTransform(model);
+    return {pose,model};
+  }
+  function setSubjectPose(value) {
+    assert(!closed,'Studio scene renderer is closed.');
+    const {pose,model}=validateSubjectPose(value);
+    if(pose.every((v,i)=>v===currentPose[i]))return false;
+    const faces=plan.subjectTransparent.map(f=>transformedFace(f,pose));
+    const transparent=draws.find(d=>d.id==='studio/shared-transparent');
+    if(faces.length)transparent.renderer.updateTransparentRange(plan.subjectTransparentFirst,faces);
+    const opaque=draws.find(d=>d.id===plan.packet.scene.subject.id);if(opaque)opaque.model=model;
+    plan.subjectModel=model;currentPose=pose;currentSubjectBounds=null;return true;
+  }
   function draw({view,projection,phase='all'}={}) {
     assert(!closed,'Studio scene renderer is closed.');assert(['all','opaque','transparent'].includes(phase),'Invalid Studio scene draw phase.');
     for(const d of draws)if(phase==='all'||phase===d.phase)d.renderer.draw({view,projection,model:d.model,
       lightTransform:plan.model,phase:d.phase,emissionDirect:d.emissionDirect});
     return {...plan.counts};
   }
-  return {draw,dispose,identity:asset.identity,bounds:plan.bounds,partBounds:plan.partBounds,
-    subjectPose:Array.from(plan.subjectModel),subjectBounds:plan.subjectBounds,placement:Array.from(plan.placement),
+  return {draw,dispose,setSubjectPose,validateSubjectPose,identity:asset.identity,get bounds(){return union([...plan.partBounds.map(p=>p.bounds),readSubjectBounds()]);},partBounds:plan.partBounds,
+    get subjectPose(){return Array.from(plan.subjectModel);},get subjectBounds(){return readSubjectBounds();},placement:Array.from(plan.placement),
     entrance:plan.entrance,counts:plan.counts,mode:'exact-Studio-static-scene-Phong',get ready(){return !closed&&draws.every(d=>d.renderer.ready);}};
 }

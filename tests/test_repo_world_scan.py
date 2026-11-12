@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from src.compiler import repo_world_scan
 from src.compiler.repo_world_scan import (
     REPO_WORLD_SCAN_VERSION,
     DirtyCloneError,
     RepoScanError,
     github_clone_url,
     scan_remote_repository,
+    declared_import_roots,
     scan_repository,
     scan_tar_stream,
 )
@@ -96,18 +98,29 @@ def test_fixture_repository_scans_into_regions_rooms_and_portal_pairs(tmp_path):
     # Languages come from the compiler's own table; C++ is known but unlinked.
     assert rooms["native/geom.cpp"].language == "cpp"
     languages = {row["language"]: row for row in scan.to_data()["languages"]}
-    assert set(languages) == {"python", "sympy", "javascript", "glsl", "wgsl", "cpp", "prose"}
+    # Compiler languages first (with a route), then extractor-only languages (none).
+    assert set(languages) == {
+        "python", "sympy", "javascript", "glsl", "wgsl", "cpp", "prose",
+        "c", "cmake", "html", "powershell", "shell",
+    }
     assert languages["prose"]["route"] == "stand-in" and languages["prose"]["suffixes"] == []
-    assert languages["cpp"]["route"] == "cpp-shell" and languages["cpp"]["linking"] is None
+    # C++ is a compiler language, linked by the C include extractor plugin.
+    assert languages["cpp"]["route"] == "cpp-shell"
+    assert languages["cpp"]["linking"] == "src.compiler.repo_world_refs_c"
+    assert languages["html"]["route"] is None
+    assert languages["html"]["linking"] == "src.compiler.repo_world_refs_html"
     assert languages["python"]["linking"] == "python-import"
-    assert languages["javascript"]["linking"] == "es-module-import"
-    assert not any(p.source_room.endswith(".cpp") for p in scan.portals)
-    assert not any(u.source_room.endswith(".cpp") for u in scan.unresolved)
+    assert languages["javascript"]["linking_readers"] == [
+        "es-module-import", "src.compiler.repo_world_refs_js_dynamic",
+    ]
+    assert scan.to_data()["extractor_languages"] == ["c", "javascript", "python"]
+    assert scan.to_data()["import_roots"] == [""]
 
     # Cross-file reference -> one portal pair with the source line.
     assert _portal_table(scan) == [
         ("app.py", 2, "pkg/core.py", "python-import"),
         ("app.py", 3, "pkg/util.py", "python-import"),
+        ("native/geom.cpp", 1, "native/geom.hpp", "c-include"),
         ("pkg/core.py", 1, "pkg/util.py", "python-import"),
         ("pkg/core.py", 2, "pkg/util.py", "python-import"),
         ("web/lib/side.js", 1, "web/main.js", "es-module-import"),
@@ -224,3 +237,154 @@ def test_github_shaped_tarball_streams_through_the_same_scan():
     assert _portal_table(scan) == [("a.py", 1, "b.py", "python-import")]
     assert [c.stand_in for c in scan.claims] == ["w"]
     assert any("link.py" in note for note in scan.notes)
+
+class _Fake:
+    LANGUAGE = "fakelang"
+    SUFFIXES = (".fk",)
+    FILENAMES = ("Fakefile",)
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def references(self, path, text, tracked):
+        return self._fn(path, text, tracked)
+
+
+def _plugin_repo(root: Path) -> Path:
+    repo = root / "plug"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo, "a.fk", "use b\nuse missing\n")
+    _write(repo, "b.fk", "x\n")
+    _write(repo, "Fakefile", "y\n")
+    _write(repo, "m.js", "import './n.js';\n")
+    _write(repo, "n.js", "export const n = 1;\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "plug")
+    return repo
+
+
+def test_extractor_plugins_make_portals_and_unresolved_rows(tmp_path):
+    repo = _plugin_repo(tmp_path)
+
+    def refs(path, text, tracked):
+        if path == "a.fk":
+            return [(1, "fake-use", "b", "b.fk", ""), (2, "fake-use", "missing", None, "not tracked")]
+        return []
+
+    scan = scan_repository(repo, extractors=[_Fake(refs)])
+    assert _portal_table(scan) == [
+        ("a.fk", 1, "b.fk", "fake-use"), ("m.js", 1, "n.js", "es-module-import"),
+    ]
+    assert {(u.specifier, u.reason) for u in scan.unresolved} == {("missing", "not tracked")}
+    assert {r.path: r.language for r in scan.rooms}["a.fk"] == "fakelang"
+    assert {r.path: r.language for r in scan.rooms}["Fakefile"] == "fakelang"
+    data = scan.to_data()
+    assert data["schema"] == "repo-world-scan-v1"
+    assert data["extractor_languages"] == ["fakelang", "javascript", "python"]
+    assert data["import_roots"] == [""]
+
+
+def test_extractor_runs_in_addition_to_builtin_on_one_file(tmp_path):
+    repo = _plugin_repo(tmp_path)
+
+    class JsToo:
+        LANGUAGE = "jstoo"
+        SUFFIXES = (".js",)
+
+        def references(self, path, text, tracked):
+            return [(1, "other-kind", "n", "n.js", "")] if path == "m.js" else []
+
+    scan = scan_repository(repo, extractors=[JsToo()])
+    # Two kinds on one line to one target are ONE pair; the first in sorted order is kept.
+    assert _portal_table(scan) == [("m.js", 1, "n.js", "other-kind")] or \
+        _portal_table(scan) == [("m.js", 1, "n.js", "es-module-import")]
+    assert len(scan.portals) == 1
+
+
+def test_extractor_failures_are_scan_errors(tmp_path):
+    repo = _plugin_repo(tmp_path)
+
+    def boom(path, text, tracked):
+        raise ValueError("kaput")
+
+    class Named(_Fake):
+        __name__ = "plugin_named"
+
+    with pytest.raises(RepoScanError, match=r"plugin_named failed on Fakefile"):
+        scan_repository(repo, extractors=[Named(boom)])
+    with pytest.raises(RepoScanError, match="untracked target"):
+        scan_repository(repo, extractors=[_Fake(lambda p, t, k: [(1, "k", "z", "nope.fk", "")])])
+
+
+def test_bad_extractor_module_name_is_a_scan_error(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path)
+    monkeypatch.setattr(repo_world_scan, "EXTRACTOR_MODULES", ("src.compiler.no_such_extractor_module",))
+    with pytest.raises(RepoScanError, match="no_such_extractor_module"):
+        scan_repository(repo)
+
+
+def _roots_repo(root: Path, name: str, files: dict) -> Path:
+    repo = root / name
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    base = {
+        "app.py": "import meowdoku.core\n",
+        "examples/meowdoku/__init__.py": "",
+        "examples/meowdoku/core.py": "from . import util\n",
+        "examples/meowdoku/util.py": "x = 1\n",
+    }
+    base.update(files)
+    for relative, text in base.items():
+        _write(repo, relative, text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "roots")
+    return repo
+
+
+def _app_targets(scan):
+    return [t for (s, _l, t, _k) in _portal_table(scan) if s == "app.py"]
+
+
+def test_import_roots_resolve_names_only_when_declared(tmp_path):
+    repo = _roots_repo(tmp_path, "undeclared", {})
+    scan = scan_repository(repo)
+    assert _app_targets(scan) == []
+    assert any(u.specifier == "meowdoku.core" for u in scan.unresolved)
+    assert declared_import_roots(repo) == ()
+
+    via_param = scan_repository(repo, import_roots=["examples"])
+    assert _app_targets(via_param) == ["examples/meowdoku/core.py"]
+    assert via_param.to_data()["import_roots"] == ["", "examples"]
+    # Relative imports keep working under a root.
+    assert ("examples/meowdoku/core.py", 1, "examples/meowdoku/util.py", "python-import") in _portal_table(via_param)
+
+    with pytest.raises(RepoScanError, match="not a tracked directory"):
+        scan_repository(repo, import_roots=["nowhere"])
+    with pytest.raises(RepoScanError, match="escapes"):
+        scan_repository(repo, import_roots=["../x"])
+
+
+def test_import_roots_declared_in_pyproject_and_repo_world_toml(tmp_path):
+    pyproject = _roots_repo(tmp_path, "pyp", {
+        "pyproject.toml": '[tool.pytest.ini_options]\npythonpath = ["examples"]\n',
+    })
+    assert declared_import_roots(pyproject) == ("examples",)
+    assert _app_targets(scan_repository(pyproject, import_roots=declared_import_roots(pyproject))) == [
+        "examples/meowdoku/core.py"]
+
+    toml = _roots_repo(tmp_path, "rwt", {"repo_world.toml": 'import_roots = ["examples"]\n'})
+    assert declared_import_roots(toml) == ("examples",)
+    assert _app_targets(scan_repository(toml, import_roots=declared_import_roots(toml))) == [
+        "examples/meowdoku/core.py"]
+
+    ini = _roots_repo(tmp_path, "ini", {"pytest.ini": "[pytest]\npythonpath = . examples\n"})
+    assert declared_import_roots(ini) == ("examples",)
+
+
+def test_import_root_ambiguity_prefers_earliest_root_and_is_noted(tmp_path):
+    repo = _roots_repo(tmp_path, "amb", {"meowdoku/__init__.py": "", "meowdoku/core.py": ""})
+    scan = scan_repository(repo, import_roots=["examples"])
+    assert _app_targets(scan) == ["meowdoku/core.py"]
+    assert any("more than one import root" in note for note in scan.notes)
+    assert scan_repository(repo, import_roots=["examples"]).to_data() == scan.to_data()

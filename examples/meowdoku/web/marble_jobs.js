@@ -1,8 +1,14 @@
 import {mountJoinedPhotoParticipation} from './marble_photo_participation.js';
-const ACTIVE = new Set(['queued','preparing','exposing','encoding','live']);
+const ACTIVE = new Set(['queued','preparing','exposing','assembling','encoding','live']);
+export function collationLabel(collation) {
+  if (!collation) return '';
+  const kind = collation.kind === 'tiles' ? 'tiles' : collation.source === 'orbit' ? 'orbit frames' : 'camera poses';
+  return `${collation.completed}/${collation.total} ${kind}`;
+}
 export function jobLabel(job) {
   const queue = job.state === 'queued' && job.queue_position ? ` #${job.queue_position}` : '';
-  return `${job.kind === 'live' ? 'Live' : 'Photo'} · ${job.state || 'unknown'}${queue} · ${String(job.digest).slice(0, 10)}`;
+  const collection = job.collation ? ` · ${collationLabel(job.collation)}` : '';
+  return `${job.kind === 'live' ? 'Live' : 'Photo'} · ${job.state || 'unknown'}${queue}${collection} · ${String(job.digest).slice(0, 10)}`;
 }
 export function jobFileUrl(job, type = 'image') {
   const name = type === 'image' ? (job.retouched_image || job.image) : job.hdr;
@@ -19,6 +25,7 @@ export function mountJobs(root, {doc = document, fetcher = (...args) => globalTh
   const detail = el('div'), participation = el('div');
   root.append(label, refreshButton, library, status, detail, participation);
   let entries = [], selected = new URLSearchParams(globalThis.location?.search || '').get('job'), disposed = false, loading = false, timer, cancelling = false, joining = false, participant = null, participantDigest = null;
+  const expanded = new Set();
   const show = () => {
     detail.replaceChildren();
     const job = entries.find(j => j.digest === select.value); if (!job) return;
@@ -31,6 +38,38 @@ export function mountJobs(root, {doc = document, fetcher = (...args) => globalTh
     }
     const hdr = jobFileUrl(job,'hdr');
     if (hdr) { const link = el('a','Download linear HDR'); link.href = hdr; link.style.marginLeft = '1em'; detail.append(link); }
+    if (job.animation === 'orbit.avi' && /^[a-f0-9]{64}$/.test(job.digest || '')) {
+      const animation = el('a','View orbit animation');
+      animation.href = `/api/marble_photo/animation?digest=${job.digest}`;
+      animation.target = '_blank'; animation.rel = 'noopener'; animation.style.marginLeft = '1em';
+      detail.append(animation);
+    }
+    if (job.collation) {
+      const collection = job.collation;
+      const group = el('details');
+      group.open = expanded.has(job.digest);
+      group.addEventListener('toggle', () => { if (group.open) expanded.add(job.digest); else expanded.delete(job.digest); });
+      group.append(el('summary', `${collationLabel(collection)} · ${collection.state}`));
+      group.append(el('p', collection.kind === 'tiles'
+        ? 'Tiles are sensor windows of this photograph. Completed contributions are combined into one final image; individual tile files are not retained.'
+        : 'Each completed camera frame stays available below. Canceling stops the remaining sequence and keeps completed frames.'));
+      const list = el('ol');
+      for (const child of collection.children || []) {
+        const window = child.window;
+        const description = child.kind === 'tile'
+          ? `Tile ${child.index + 1}${window ? ` (${window.x}, ${window.y}; ${window.width} × ${window.height})` : ''}`
+          : `Frame ${child.index + 1}`;
+        const row = el('li', `${description}: ${child.state}`);
+        for (const type of ['image', 'hdr']) {
+          const childUrl = jobFileUrl({...child, digest: job.digest}, type);
+          if (!childUrl) continue;
+          const link = el('a', type === 'image' ? 'View frame' : 'Download HDR');
+          link.href = childUrl; link.target = '_blank'; link.rel = 'noopener'; link.style.marginLeft = '1em'; row.append(link);
+        }
+        list.append(row);
+      }
+      group.append(list); detail.append(group);
+    }
     if (ACTIVE.has(job.state) && job.can_cancel !== false && job.client_intersections === true) {
       const joinButton = el('button', participantDigest === job.digest && participant?.loop.enabled ? 'Participating on this device' : 'Participate / resume on this device');
       joinButton.type = 'button'; joinButton.disabled = joining || (participantDigest === job.digest && participant?.loop.enabled);
@@ -48,7 +87,7 @@ export function mountJobs(root, {doc = document, fetcher = (...args) => globalTh
         finally { joining = false; if (!disposed) show(); }
       }); detail.append(joinButton);
     }
-    if (ACTIVE.has(job.state) && job.can_cancel !== false) {
+    if (job.can_cancel === true || (ACTIVE.has(job.state) && job.can_cancel !== false)) {
       const cancel = el('button', job.kind === 'live' ? 'Stop this live job' : 'Cancel this job'); cancel.type = 'button'; cancel.disabled = cancelling; cancel.style.marginLeft = '1em';
       cancel.addEventListener('click', async () => {
         if (cancelling) return; cancelling = true; cancel.disabled = true;

@@ -15,11 +15,16 @@
         "--tls-key",
         "build/meowdoku/tls/key.pem",
         "--retain-fountain-products",
-        "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json"
+        "C:/dev/Powershell/turing/build/dot-retained-fountain-20261109/fountain-receipt.json",
+        "--studio-assets",
+        "C:/dev/Powershell/srv/state/content/studio_agent/assets.json",
+        "--studio-defaults",
+        "C:/dev/Powershell/srv/state/content/studio_agent/defaults.json"
       ],
       "leases": [],
       "python": "C:/dev/Powershell/srv/python/python.exe",
-      "site": "stable"
+      "site": "stable",
+      "studio_prefix": "studio.product"
     },
     {
       "name": "meowdoku-dev",
@@ -54,13 +59,23 @@
       "route": "",
       "bind": "127.0.0.1",
       "account": "svc-nodus-messenger",
-      "args": [],
+      "args": [
+        "--compile-host",
+        "gui.proof:7001:C:/dev/Powershell/srv/state/jobs/nodus-compile",
+        "--compile-python",
+        "C:/dev/Powershell/srv/python/python.exe",
+        "--cron",
+        "cron:7201:C:/dev/Powershell/srv/state/jobs/cron"
+      ],
       "leases": [],
       "nodus": {
         "tool": "C:/dev/Powershell/nodus/tools/run_canvas.py",
         "canvas": "build/meowdoku/canvas/messenger.canvas",
         "acquire": [
-          "gui.proof:4"
+          "gui.proof:4:54000",
+          "studio.product:4:7200",
+          "cron:4:36000",
+          "userlist:4:3600"
         ],
         "rate": 60,
         "console_port": 47612,
@@ -71,7 +86,79 @@
         ]
       },
       "python": "C:/dev/Powershell/srv/python/python.exe"
+    },
+    {
+      "name": "task-worker",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-task-worker",
+      "federation_from": "nodus-messenger",
+      "cron_prefix": "cron",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/deploy/task_worker.py",
+        "--state-dir",
+        "C:/dev/Powershell/srv/state",
+        "--web-dir",
+        "C:/dev/Powershell/turing/build/meowdoku/web",
+        "--cron-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/cron",
+        "--backup-dir",
+        "C:/dev/Powershell/srv/backups",
+        "--backup-keep",
+        "1",
+        "--backup-text-only",
+        "--accounts-db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--system-account",
+        "svc-nodus-messenger",
+        "--userlist-jobs-dir",
+        "C:/dev/Powershell/srv/state/jobs/userlist",
+        "--branch-policy",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/branch_policy.json"
+      ],
+      "userlist_prefix": "userlist"
+    },
+    {
+      "name": "udp-router",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "0.0.0.0",
+      "account": "svc-udp-router",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/nodus/build-router/Release/udp_router.exe",
+        "0.0.0.0",
+        "47699"
+      ]
+    },
+    {
+      "name": "relay",
+      "kind": "command",
+      "port": null,
+      "route": "",
+      "bind": "127.0.0.1",
+      "account": "svc-relay",
+      "leases": [],
+      "args": [
+        "C:/dev/Powershell/srv/python/python.exe",
+        "examples/meowdoku/relay.py",
+        "--db",
+        "C:/dev/Powershell/srv/state/sql/accounts.db",
+        "--config",
+        "C:/dev/Powershell/turing/examples/meowdoku/deploy/relay.json"
+      ]
     }
   ],
-  "state_dir": "C:/dev/Powershell/srv/state"
+  "state_dir": "C:/dev/Powershell/srv/state",
+  "system_events": {
+    "from": "nodus-messenger",
+    "prefix": "cron",
+    "jobs_dir": "C:/dev/Powershell/srv/state/jobs/cron",
+    "engine_id": 7202
+  }
 }

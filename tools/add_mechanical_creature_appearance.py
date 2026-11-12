@@ -31,6 +31,13 @@ DRAW_REPLACEMENT = """function drawSceneMeshes(gl,hiddenIdentities=null){
     gl.bindVertexArray(shaderViewer.vehicleVao);gl.drawArrays(gl.TRIANGLES,0,shaderViewer.vehicleVertexCount);
   }
 }"""
+AUTHORED_WORLD_DRAW = """  if (shaderViewer.authoredWorldVao && shaderViewer.authoredWorldSurface) {
+    gl.bindVertexArray(shaderViewer.authoredWorldVao);
+    gl.drawArrays(gl.TRIANGLES, 0, shaderViewer.authoredWorldSurface.mesh.length / 9);
+  }
+"""
+AUTHORED_DRAW_ORIGINAL = DRAW_ORIGINAL[:-1] + AUTHORED_WORLD_DRAW + "}"
+AUTHORED_DRAW_REPLACEMENT = DRAW_REPLACEMENT[:-1] + AUTHORED_WORLD_DRAW + "}"
 COLOR_ORIGINAL = """    drawSceneMeshes(gl);
     drawVehicleWheels(gl,width,height,cameraPosition,cameraFacing,celestial);"""
 COLOR_REPLACEMENT = """    const importedAppearance=prepareMechanicalCreatureImportedAppearance(
@@ -110,6 +117,8 @@ def patches_for_page(behavior: str) -> tuple[tuple[str, str], ...]:
     separator = "\r\n" if "\r\n" in behavior else "\n"
     normalized = behavior.replace("\r\n", "\n")
     pairs = [(before.replace("\r\n", "\n"), after.replace("\r\n", "\n")) for before, after in PATCHES]
+    if AUTHORED_DRAW_ORIGINAL in normalized:
+        pairs[0] = (AUTHORED_DRAW_ORIGINAL, AUTHORED_DRAW_REPLACEMENT)
     if NEWER_COLOR_ORIGINAL in normalized:
         pairs[1] = (NEWER_COLOR_ORIGINAL, NEWER_COLOR_REPLACEMENT)
     return tuple((before.replace("\n", separator), after.replace("\n", separator)) for before, after in pairs)

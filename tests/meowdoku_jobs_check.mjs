@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {jobLabel, jobFileUrl, mountJobs} from '../examples/meowdoku/web/marble_jobs.js';
+import {jobLabel, jobFileUrl, collationLabel, mountJobs} from '../examples/meowdoku/web/marble_jobs.js';
 const digest = 'a'.repeat(64), other = 'b'.repeat(64);
 assert.match(jobLabel({digest,state:'queued',queue_position:2,kind:'photo'}),/queued #2/);
 assert.equal(jobFileUrl({digest,image:'frame 1.png'}),`/api/marble_photo/image?digest=${digest}&name=frame%201.png`);
@@ -52,3 +52,30 @@ await d3.children[1].listeners.click();assert.equal(joinCalls,1);assert.equal(jo
 await j3.refresh();assert.equal(joined,1,'refresh does not recreate a participant');
 active=false;await j3.refresh();assert.equal(destroyed,1,'finished jobs stop device polling');j3.dispose();
 console.log('jobs explicit rejoin: profile-cookie API, no automatic participation, stable refresh, terminal cleanup passed');
+
+// A collection is one owned parent; child links use that parent's authorization.
+assert.equal(collationLabel({kind:'tiles',completed:1,total:4}), '1/4 tiles');
+assert.equal(collationLabel({kind:'camera_pose_sequence',source:'orbit',completed:2,total:8}), '2/8 orbit frames');
+const r4=new Element('section');
+let collection={kind:'tiles',state:'assembling',completed:4,total:4,children:Array.from({length:4},(_,index)=>({index,kind:'tile',state:'complete',window:{x:(index%2)*1024,y:Math.floor(index/2)*1024,width:1024,height:1024}}))};
+let parentState='assembling';
+const j4=mountJobs(r4,{doc,interval:999999,fetcher:async()=>({ok:true,json:async()=>({entries:[{digest,kind:'photo',state:parentState,can_cancel:parentState==='assembling',collation:collection}],queue_available:false})})});
+await new Promise(r=>setTimeout(r,0));
+const d4=r4.children[4];
+assert.match(r4.children[0].children[0].children[0].textContent,/4\/4 tiles/);
+assert.equal(d4.children[1].tag,'details');
+assert.equal(d4.children[1].children[2].children.length,4);
+assert.match(d4.children[1].children[2].children[3].textContent,/1024, 1024; 1024 × 1024/);
+assert.equal(d4.children[1].children[2].children[0].children.length,0,'tile contribution has no invented artifact URL');
+assert.equal(d4.children[2].textContent,'Cancel this job','assembly remains cancellable');
+d4.children[1].open=true;d4.children[1].listeners.toggle();await j4.refresh();
+assert.equal(d4.children[1].open,true,'expanded collection survives refresh');
+collection={kind:'camera_pose_sequence',source:'explicit',state:'interrupted',completed:1,total:2,children:[{index:0,kind:'camera_pose',state:'complete',image:'preview-000001.png',hdr:'exposure-000001.npz'},{index:1,kind:'camera_pose',state:'interrupted'}]};parentState='interrupted';
+await j4.refresh();
+const rows=d4.children[1].children[2].children;
+assert.match(d4.children[1].children[0].textContent,/1\/2 camera poses/);
+assert.equal(rows[0].children[0].href,`/api/marble_photo/image?digest=${digest}&name=preview-000001.png`);
+assert.equal(rows[0].children[1].href,`/api/marble_photo/hdr?digest=${digest}&name=exposure-000001.npz`);
+assert.equal(rows[1].children.length,0);assert.equal(d4.children.length,2,'interrupted group has no cancel or restart action');
+j4.dispose();
+console.log('collated Jobs: one parent, real child results, assembling cancel, interrupted sequence and expansion retention passed');

@@ -164,3 +164,52 @@ continue the guest until a compiled machine-program host is attached.
 What each language route reaches today, what it refuses, and where the C++
 route stops, is measured and pinned in `DREAM_INTERPRETER_LIMITS.md` and
 `tests/test_dream_interpreter_limits.py` (2026-11-11).
+## Writing a document
+
+`render_dream_document(document) -> bytes` is the exact inverse of `parse_dream_document`:
+`parse_dream_document(render_dream_document(d)) == d` for every document it accepts. It refuses, and never alters,
+anything the scanner would not read back unchanged: a payload containing the closing sentinel, a header value that is
+not one restricted-ASCII line, a decoration named like a reserved key, an empty identity or language. Every block is
+written with its `sha256` sentinel. A payload ending in a carriage return is closed with CRLF so the scanner drops the
+pair together and keeps the byte. Any bytes can be carried as a block under `encoding = latin-1`
+(`tests/test_dream_document_render.py`).
+
+## The part-by-part compiler's record
+
+The source divider (`examples/meowdoku/source_divider.py`) takes a dream document in and writes one out.
+
+This record is the COMPILED UNITS stage. It is not the Goal document the owner named on 2026-11-11: the units are
+each buildable alone, and they have not had their linking done (a part that calls another carries that other's text
+inside its own closure). See the SpeakToMe repository, `AGENTS/conceptual_flags/Goal_Document.md`.
+
+The Goal document is written beside it as `<job>/goal.goal` by `write_goal_document`, in the format
+`speaktome.goal-document.v1` (SpeakToMe `speaktome_goal/`, manual page `goal(5)`). There a unit holds only its own
+text; what it takes from another unit is a row of its `link` table; `api`, `build` and `abi` tables say what it
+offers, which lowerings exist and how they are called; each `build` row names the block of this record that holds
+the product's bytes. The record keeps the bytes; the Goal document keeps the joins.
+
+- In: `intake_dream`. Each python block becomes one source file and is divided on its own. Blocks in other languages
+  are not divided; they are carried into the record unchanged. Blocks an earlier pass produced (`role = lowering` or
+  `role = job-record`) are dropped, so a record can be fed back in.
+- Out: `write_dream_record` -> `<job>/record.dream`.
+  - One python block per piece (`role = part`), dependencies first. Its payload is the exact lexical closure of the
+    piece, the cut `partition_authored_source` gives and `run_attempt` compiles, with the blank lines before and after
+    it dropped (`first_line` records where it began). Nothing in a block refers to another block's text, so each part
+    can be built by itself. `outputs` are the functions the piece is for; `inputs` are those of the pieces it depends
+    on, whose definitions are inside the closure.
+  - After a piece, one block per completed lowering (`role = lowering`, `lowers = <piece>`), in the language of the
+    backend (`javascript`, `c`, `llvm`, `fortran`, `wasm`), holding the product byte for byte; its content hash is the
+    product's hash. A wasm product is carried under latin-1.
+  - What was tried and refused is on the piece's header: `attempt.<backend>`, `verdict`, `reason`.
+  - A last `record` block (`language = json`, `role = job-record`) states the job as data.
+- The file is checked by reading it back with `load_dream_document` before it replaces the previous one.
+
+Measured (`tests/test_meowdoku_source_divider.py`): each part of a three-function chain executes standing alone; a
+record given back to the divider, with every part now its own block, rebuilt each function to the same product bytes;
+a shader block added to the input came out unchanged.
+
+Limits: pieces are cut within one block, so a python block that calls a function defined in ANOTHER input block is not
+resolved (the divider follows no cross-file imports yet). A parallel group whose members were divided is dropped and
+named in the record block. `compile_sections` knows `python`, `javascript`, `glsl`, `wgsl`, `sympy` and `cpp`; the
+lowering blocks in `c`, `llvm`, `fortran` and `wasm` are carried as source, not interpreted. The web intake page does
+not accept a dream document yet; the command line does (`submit --dream FILE`).

@@ -69,10 +69,15 @@ LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
 SHADER_FILES = ("/shader.html", "/loading_panel.js", "/loading_anim.js", "/octet_codec.js", "/access.js")
 SHADER_PAGE = "/shader.html"
 # Public sign-in: the only other things the shader tier may reach (server.py _shader_request / _login_post).  Sign-up stays closed.
-SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js")   # the widget renders nothing without the message capability
+SHADER_LOGIN_FILES = ("/login.html", "/login.js", "/messenger-widget.js", "/site-nav.js")   # the widget renders nothing without the message capability
 SHADER_LOGIN_GETS = ("/api/account/me",)
 SHADER_LOGIN_POSTS = ("/api/account/login", "/api/account/logout")
-SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim")
+# GET routing only: the photo handlers still require photo_read and check ownership.
+PHOTO_READ_APIS = ("/api/marble_photo/jobs", "/api/marble_photo/lenses", "/api/marble_photo",
+                   "/api/marble_photo/image", "/api/marble_photo/hdr", "/api/marble_photo/field", "/api/marble_photo/animation")
+# /api/reviews/standing answers accepted true/false for one commit id and how to get a review; the review-gate
+# check on GitHub asks it from outside with no account (branch_review.http_route). It reads no identity and no row's text.
+SHADER_APIS = ("/api/whoami", "/api/ready", "/api/loading_anim", "/api/reviews/standing") + PHOTO_READ_APIS
 
 # /api/action types that act on the whole process (the shared learner, the Lichess client, the pilot weights), not on the caller's table.
 EDIT_ACTIONS = frozenset({"demo_learning", "arena_save", "arena_stop", "arena_resume", "lichess_pause", "lichess_resume", "pilot_arch"})
