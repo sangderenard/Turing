@@ -267,6 +267,43 @@ def memberships(graph, *, book=None):
                     f'retained source control {node} disagrees with activity kind'
                 )
             owners.setdefault(contract[0].row[1], set()).add(node)
+    # Program: ``try: raise BaseException("base") / except Exception: ... /
+    # except BaseException: ...`` (tests/test_source_c_exceptions.py).
+    # Exception ingestion spells each handler test as ``h = not False;
+    # if h: h = __turing_exception_active(e)``. Wrong record: the structural
+    # fold proved that If constant-true, selected its body, posted
+    # source_control_specialization_concordance (function, If) = {selected
+    # 'body', rejected 'orelse'} and removed the If; the control builder
+    # (``_ordinary_conditional_control_programs``) therefore built no block
+    # for it, but this projection still reported the body's
+    # ``exception_active`` as guarded by that If, so the dispatcher installer
+    # found no owner block and refused ("control owner is not retained").
+    # Rule: an owner this graph's fold decided (absent here, listed in the
+    # graph's ``structurally_specialized_conditional_node_ids``) guards
+    # nothing in its selected arm or its test; the node's enclosing owners
+    # are already in its activity fact. A resident node in the rejected arm
+    # contradicts the fold and refuses. The fold's own book row is the
+    # authority for which arm it kept; a receipt without that row refuses.
+    from .concordance_declarations import SOURCE_CONTROL_SPECIALIZATION
+    specialized_here = {
+        int(owner) for owner in target.graph.get(
+            'structurally_specialized_conditional_node_ids', ()
+        ) if int(owner) not in target
+    }
+    decided = {}
+    if specialized_here:
+        function_name = str(target.graph.get('function_name'))
+        page = book.pages.get(SOURCE_CONTROL_SPECIALIZATION.name)
+        for owner in specialized_here & {
+            int(owner) for members in owners.values() for owner in members
+        }:
+            decision = None if page is None else page.latest((function_name, owner))
+            if not isinstance(decision, dict) or decision.get('selected_role') not in {'body', 'orelse'}:
+                raise ValueError(
+                    f'structurally specialized control {owner} has no '
+                    'specialization record naming its selected arm'
+                )
+            decided[owner] = (str(decision['selected_role']), str(decision['rejected_role']))
     result = {}
     for node, contract in bindings.items():
         if contract is None:
@@ -278,7 +315,16 @@ def memberships(graph, *, book=None):
             if len(candidates) > 1:
                 raise ValueError('control owner has multiple resident identities')
             if candidates:
-                guards.append((next(iter(candidates)), arm))
+                owner = next(iter(candidates))
+                if owner in decided:
+                    _selected, rejected = decided[owner]
+                    if str(arm) == rejected:
+                        raise ValueError(
+                            f'node {node} is resident in the rejected {arm} '
+                            f'of structurally decided control {owner}'
+                        )
+                    continue
+                guards.append((owner, arm))
         if guards:
             result[node] = frozenset(guards)
     return result
