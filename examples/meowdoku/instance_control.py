@@ -15,9 +15,10 @@ for permission, so a hung server is still stopped. The row is also the record: w
     start      start an instance that is stopped or failed
 
 ``after_jobs`` (the policy, on by default): a restart or shutdown that is due still waits until no instance it
-names is running a job a restart would interrupt -- the stable server's GPU photo exposure. The supervisor asks each
-server over its admin-token lifecycle op ``busy`` and, while it waits, writes why into ``detail``; the request is
-performed once the last job ends. ``after_jobs=False`` is the old forced request. A start never waits. Anyone who may
+names is running a job a restart would interrupt. Jobs are the server-wide table ``service_jobs`` (service_jobs.py),
+which every runner writes. The supervisor reads it as the restart account (instances.json ``restart_account``, Pale
+Horse), writes why it waits into ``detail``, and when the last job ends performs the request and records that
+account in ``authorized_by``. ``after_jobs=False`` is the old forced request. A start never waits. Anyone who may
 make a request may cancel a waiting one.
 
 ``delay_s`` is a countdown: the request is performed that many seconds after it was made, and until then anyone who
@@ -41,9 +42,9 @@ DDL = ("CREATE TABLE IF NOT EXISTS instance_requests (id INTEGER PRIMARY KEY AUT
        "requested_name TEXT, reason TEXT, requested_at REAL NOT NULL, "
        "state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done','refused','cancelled')), handled_at REAL, "
        "detail TEXT, due_at REAL NOT NULL DEFAULT 0, announced INTEGER NOT NULL DEFAULT 0, "
-       "after_jobs INTEGER NOT NULL DEFAULT 1)")
+       "after_jobs INTEGER NOT NULL DEFAULT 1, authorized_by INTEGER)")
 _COLUMNS = ("id", "instance", "action", "requested_by", "requested_name", "reason", "requested_at", "state", "handled_at",
-            "detail", "due_at", "announced", "after_jobs")
+            "detail", "due_at", "announced", "after_jobs", "authorized_by")
 
 
 class ControlError(Exception):
@@ -61,6 +62,8 @@ def ensure(db) -> None:
     if "'cancelled'" in (row[0] or "") and "announced" in (row[0] or ""):
         if "after_jobs" not in (row[0] or ""):          # added in place: a running supervisor's older code reads on
             db.execute("ALTER TABLE instance_requests ADD COLUMN after_jobs INTEGER NOT NULL DEFAULT 1")
+        if "authorized_by" not in (row[0] or ""):
+            db.execute("ALTER TABLE instance_requests ADD COLUMN authorized_by INTEGER")
         return
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -173,9 +176,11 @@ def waiting(db, request_id, detail) -> None:
     db.execute("UPDATE instance_requests SET detail = ? WHERE id = ? AND state = 'pending'", (str(detail)[:1000], int(request_id)))
 
 
-def finish(db, request_id, state, detail) -> None:
-    db.execute("UPDATE instance_requests SET state = ?, handled_at = ?, detail = ? WHERE id = ? AND state = 'pending'",
-               (state, time.time(), str(detail)[:1000], int(request_id)))
+def finish(db, request_id, state, detail, authorized_by=None) -> None:
+    """Settle a request. ``authorized_by`` is the restart account's user id when it authorized a request that waited for
+    jobs (the supervisor's ``restart_account``); None for a request performed without that check."""
+    db.execute("UPDATE instance_requests SET state = ?, handled_at = ?, detail = ?, authorized_by = ? "
+               "WHERE id = ? AND state = 'pending'", (state, time.time(), str(detail)[:1000], authorized_by, int(request_id)))
 
 
 def recent(db, limit=20) -> list:

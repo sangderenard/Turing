@@ -1,5 +1,7 @@
 {
   "supervisor_python": "C:/dev/Powershell/srv/python/python.exe",
+  "restart_account": "svc-pale-horse",
+  "restart_account_display_name": "Pale Horse",
   "instances": [
     {
       "name": "meowdoku-a",

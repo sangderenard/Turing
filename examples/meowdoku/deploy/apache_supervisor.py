@@ -44,6 +44,7 @@ from meowdoku import authz as authz_mod              # noqa: E402
 from meowdoku import schema_version as _schema_version   # noqa: E402
 from meowdoku import lifecycle as lifecycle_mod      # noqa: E402
 from meowdoku import lowering_library as lib         # noqa: E402
+from meowdoku import service_jobs                     # noqa: E402  (the server-wide job table a restart waits for)
 from meowdoku.state_paths import StatePaths          # noqa: E402
 
 STATE = StatePaths.legacy(ROOT).root                # the old layout: no --state-dir, no "state_dir" in instances.json
@@ -124,6 +125,16 @@ def instances_system_events(path):
     data = _read_instances(path)
     value = data.get("system_events") if isinstance(data, dict) else None
     return dict(value) if isinstance(value, dict) and value.get("from") and value.get("prefix") and value.get("jobs_dir") else None
+
+
+def instances_restart_account(path):
+    """[CONTROL] The top-level ``restart_account`` / ``restart_account_display_name`` of the object form of
+    instances.json: the service account that authorizes a waiting restart or shutdown once the job table shows no
+    running job. (None, None) when it is not declared: requests still wait, but nobody signs the authorization."""
+    data = _read_instances(path)
+    if not isinstance(data, dict) or not isinstance(data.get("restart_account"), str) or not data["restart_account"]:
+        return None, None
+    return data["restart_account"], str(data.get("restart_account_display_name") or data["restart_account"])
 
 
 def instances_state_dir(path):
@@ -473,17 +484,6 @@ class Instance:
         """The Stop-Meowdoku.ps1 request: POST {op:restart,in:N} with the admin token; the server saves sessions and exits 75."""
         self.lifecycle_op({"op": "restart", "in": 1})
 
-    def running_jobs(self):
-        """The jobs this server is running that a restart would interrupt (its admin-token lifecycle op ``busy``).
-        [] for an instance that is not a running Meowdoku server; None when the server could not be asked."""
-        if self.kind != "meowdoku" or self.proc is None or self.proc.poll() is not None:
-            return []
-        try:
-            return list(self.lifecycle_op({"op": "busy"}).get("jobs") or [])
-        except Exception as error:                      # a hung or older server: it cannot say, so it does not hold the request
-            self.sup.log(f"{self.name}: could not ask for running jobs: {error}")
-            return None
-
     def lifecycle_op(self, body):
         """POST one op to this server's /api/admin/lifecycle with its admin token (loopback); its JSON answer."""
         import ssl
@@ -568,6 +568,8 @@ class Supervisor:
         self.stop = threading.Event()
         self.instances = []
         self.system_events = None       # [CONTROL] {"from", "prefix", "jobs_dir", "engine_id"}: where system events are asked for
+        self.restart_account_id = None  # [CONTROL] the service account that authorizes a waiting restart (instances.json)
+        self.restart_display = "the restart account"
         self.secrets_restricted = False
         self._lock_file = None
 
@@ -641,6 +643,13 @@ class Supervisor:
         if manage:
             specs = load_instances(self.instances_path)
             self.system_events = instances_system_events(self.instances_path)
+            account, display = instances_restart_account(self.instances_path)
+            if account:
+                try:
+                    self.restart_account_id = ensure_service_user(account, self.db_path)
+                    self.restart_display = display
+                except Exception as error:              # the requests still wait for jobs; only the signature is missing
+                    self.log(f"restart account {account!r} could not be made: {error}")
             sources = {s.get("federation_from") for s in specs}
             for spec in sorted(specs, key=lambda s: s.get("name") not in sources):      # a federation source starts before its dependents
                 inst = Instance(spec, self)
@@ -684,22 +693,21 @@ class Supervisor:
         first_to_start = sorted(self.instances, key=lambda i: i.name not in sources)
         for item in todo:
             targets = [i for i in first_to_start if item["instance"] in (instance_control.ALL, i.name)]
-            unasked = []
+            authorized = None
             if targets and item.get("after_jobs") and item["action"] in ("restart", "shutdown"):
-                running = []
-                for inst in targets:
-                    jobs = inst.running_jobs()
-                    if jobs is None:
-                        unasked.append(inst.name)
-                    for job in jobs or ():
-                        running.append(f"{inst.name} {job.get('kind')} {str(job.get('digest') or '')[:12]}".strip())
-                if running:                              # the policy: wait for the last job, then perform it
-                    why = "waiting for running jobs: " + ", ".join(running)
+                # The policy: the restart account reads the server-wide job table (service_jobs) and authorizes the
+                # request only when no instance it names runs a job; until then the row waits and says why.
+                with connect(self.db_path) as db:
+                    jobs = service_jobs.running(db, [i.name for i in targets])
+                if jobs:
+                    why = f"{self.restart_display} waits for running jobs: " + ", ".join(
+                        f"{j['instance']} {j['kind']} {str(j['job_id'])[:12]}" for j in jobs)
                     if item.get("detail") != why:
                         self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {why}")
                         with connect(self.db_path) as db:
                             instance_control.waiting(db, item["id"], why)
                     continue
+                authorized = self.restart_account_id
             if not targets:
                 state, detail = "refused", "no such instance under this supervisor"
             else:
@@ -711,14 +719,14 @@ class Supervisor:
                     if item["action"] in ("restart", "start"):
                         for inst in targets:
                             done.append(f"{inst.name}: {inst.force_start()}")
-                    if unasked:
-                        done.append("not asked for running jobs (no answer): " + ", ".join(unasked))
+                    if authorized is not None:
+                        done.insert(0, f"authorized by {self.restart_display}: no running jobs")
                     state, detail = "done", "; ".join(done)
                 except Exception as error:
                     state, detail = "refused", "; ".join(done + [f"failed: {error!r}"])
             self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {detail}")
             with connect(self.db_path) as db:
-                instance_control.finish(db, item["id"], state, detail)
+                instance_control.finish(db, item["id"], state, detail, authorized_by=authorized)
 
     def announce(self, item):
         """[CONTROL] Tell every admin about a counted-down request, or its interruption: one task asked of the Nodus

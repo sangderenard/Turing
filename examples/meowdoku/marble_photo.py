@@ -1362,16 +1362,25 @@ class PhotoJobs:
         self.client_bridge = None
         self.active_digest: str | None = None
         self.process: subprocess.Popen | None = None
+        self.registry = None                    # service_jobs.Registry: set by the server once it knows its instance name
         self._sweep_stop = threading.Event()
         self._sweeper = threading.Thread(target=self._sweep_animations, daemon=True, name="marble-photo-expiry")
         self._sweeper.start()
 
-    def running(self) -> list[dict]:
-        """The exposure this server is computing now: what a restart would interrupt (lifecycle ``busy``)."""
-        with self.lock:
-            if self.active_digest and self.process is not None and self.process.poll() is None:
-                return [{"kind": "marble_photo", "digest": self.active_digest}]
-        return []
+    def _watch(self, digest: str, process: subprocess.Popen) -> None:
+        """The exposure's row of the server-wide job table (service_jobs): written as the worker starts, ended when that
+        process exits however it ends -- complete, error, cancel or kill."""
+        registry = self.registry
+        if registry is None:
+            return
+        registry.begin("marble_photo", digest, label="GPU photo exposure")
+
+        def wait() -> None:
+            try:
+                process.wait()
+            finally:
+                registry.end("marble_photo", digest)
+        threading.Thread(target=wait, daemon=True, name=f"marble-photo-job-{digest[:12]}").start()
 
     def job_directory(self, digest: str) -> Path:
         """Resolve an admitted job inside its owner's private content area.
@@ -1601,6 +1610,7 @@ class PhotoJobs:
                 finally:
                     log.close()
                 self.active_digest = digest
+                self._watch(digest, self.process)
                 return {**status,"client_join":client_join} if client_join is not None else status
 
     def _status_locked(self, digest: str, *, retained_artifact: bool = False) -> dict:

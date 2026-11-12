@@ -185,13 +185,16 @@ def prune(db, state, now: float | None = None) -> int:
     return len(doomed)
 
 
-def work_one(db, state, run=None) -> bool:
-    """Run the oldest queued job to its end.  False when nothing was queued."""
+def work_one(db, state, run=None, registry=None) -> bool:
+    """Run the oldest queued job to its end.  False when nothing was queued.  ``registry`` (service_jobs.Registry) holds
+    the job's row of the server-wide job table while it runs, so a restart waits for it."""
     run = run or math_lab.run_job
     row = db.execute("SELECT * FROM math_jobs WHERE state = 'queued' ORDER BY created, job_id LIMIT 1").fetchone()
     if row is None:
         return False
     db.execute("UPDATE math_jobs SET state='running', started=?, queue_position=0 WHERE job_id=?", (time.time(), row["job_id"]))
+    if registry is not None:
+        registry.begin("math_job", row["job_id"], owner=row["owner_key"], label="math lab job")
     try:
         result = run(row["text"], job_dir(state, row["job_id"]), timeout_s=TIMEOUT_S, targets=tuple(row["targets"].split(",")))
         final, error = result.get("state", "error"), result.get("error")
@@ -202,6 +205,9 @@ def work_one(db, state, run=None) -> bool:
         error = json.dumps(error) if isinstance(error, dict) else error
     except Exception as exc:  # noqa: BLE001 - a job never takes the worker down
         final, error = "error", f"{type(exc).__name__}: {exc}"[:1200]
+    finally:
+        if registry is not None:
+            registry.end("math_job", row["job_id"])
     db.execute("UPDATE math_jobs SET state=?, finished=?, error=? WHERE job_id=?", (final, time.time(), error, row["job_id"]))
     return True
 
@@ -209,8 +215,8 @@ def work_one(db, state, run=None) -> bool:
 class Worker:
     """ONE daemon thread.  ``wake()`` skips the poll wait; ``stop()`` ends it after the current job."""
 
-    def __init__(self, db_path, state, poll_s: float = 0.5, run=None):
-        self.db_path, self.state, self.poll_s, self.run = db_path, state, poll_s, run
+    def __init__(self, db_path, state, poll_s: float = 0.5, run=None, registry=None):
+        self.db_path, self.state, self.poll_s, self.run, self.registry = db_path, state, poll_s, run, registry
         self._stop, self._wake = threading.Event(), threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -236,7 +242,7 @@ class Worker:
         try:
             while not self._stop.is_set():
                 try:
-                    did = work_one(db, self.state, self.run)
+                    did = work_one(db, self.state, self.run, self.registry)
                     prune(db, self.state)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[mathlab] worker error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

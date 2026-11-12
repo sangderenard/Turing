@@ -1139,7 +1139,9 @@ def make_handler(sessions: Sessions):
             try:
                 known = profile_mod.instances(db, HERE / "deploy" / "instances.json", ROOT)
                 if method == "GET":
-                    return self._json({"instances": known, "requests": instance_control.recent(db)})
+                    from meowdoku import service_jobs
+                    return self._json({"instances": known, "requests": instance_control.recent(db),
+                                       "jobs": service_jobs.listing(db)})
                 if cancel:                               # the interrupt: stop a request whose countdown is still running
                     made = instance_control.cancel(db, body.get("id"), user_id=principal.user_id, username=principal.username)
                     print(f"[control] {principal.username} interrupted request {made['id']}", flush=True)
@@ -3220,6 +3222,9 @@ def main(argv: list[str] | None = None) -> int:
         sessions.authz_policy = authz_mod.Policy.beside(sessions.accounts_db)
     sessions.require_cap, sessions.stable_route, sessions.dev_route = args.require_cap, args.stable_route, args.dev_route   # [ROUTE]
     sessions.instance = args.instance
+    from meowdoku import service_jobs                                # [JOBS] the server-wide job table: what a restart waits for
+    sessions.jobs = service_jobs.Registry(sessions.accounts_db, sessions.instance)
+    sessions.marble_photos.registry = sessions.jobs
     sessions.federation_port, sessions.federation_canvas = args.federation_port, args.federation_canvas      # [FEDERATE]
     if args.studio_nodus_port and args.studio_assets:               # [SHOW] settings -> Nodus -> owned photo job
         from meowdoku import studio_agent, studio_pictures
@@ -3247,7 +3252,7 @@ def main(argv: list[str] | None = None) -> int:
     lifecycle_mod.record_launch(lc.paths, args.port, args.bind, web_dir)
     threading.Thread(target=lc.run, name="lifecycle", daemon=True).start()
     if not args.no_mathlab:                                          # [MATHLAB] ONE worker; running jobs from a previous run are requeued once
-        sessions.mathlab_worker = math_jobs_mod.Worker(sessions.accounts_db, state).start()
+        sessions.mathlab_worker = math_jobs_mod.Worker(sessions.accounts_db, state, registry=sessions.jobs).start()
     if site_compiler is not None:
         site_compiler.start()
     scheme = "http"
