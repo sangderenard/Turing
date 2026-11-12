@@ -521,7 +521,15 @@ class Lifecycle:
             return self.cancel()
         if op == "status":
             return self.status()
+        if op == "busy":
+            return self.busy()
         raise LifecycleError("unknown op")
+
+    def busy(self) -> dict[str, Any]:
+        """The running jobs a restart would interrupt. Only on the admin-token op (the supervisor asks it before a
+        restart that waits for jobs); never on the public ``status``, which every page reads."""
+        photos = getattr(self.sessions, "marble_photos", None)
+        return {"jobs": photos.running() if photos is not None else []}
 
 
 def record_launch(paths: dict[str, Path], port: int, host: str, web_dir: Path) -> dict[str, Any]:

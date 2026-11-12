@@ -14,6 +14,12 @@ for permission, so a hung server is still stopped. The row is also the record: w
     shutdown   stop it and leave it stopped until a ``start`` request or the next start of the whole stack
     start      start an instance that is stopped or failed
 
+``after_jobs`` (the policy, on by default): a restart or shutdown that is due still waits until no instance it
+names is running a job a restart would interrupt -- the stable server's GPU photo exposure. The supervisor asks each
+server over its admin-token lifecycle op ``busy`` and, while it waits, writes why into ``detail``; the request is
+performed once the last job ends. ``after_jobs=False`` is the old forced request. A start never waits. Anyone who may
+make a request may cancel a waiting one.
+
 ``delay_s`` is a countdown: the request is performed that many seconds after it was made, and until then anyone who
 may make a request may ``cancel`` it (the interrupt). The supervisor announces a counted-down request, and its
 interruption, once each; ``announced`` records that (0 nothing, 1 the countdown, 2 the interruption).
@@ -34,9 +40,10 @@ DDL = ("CREATE TABLE IF NOT EXISTS instance_requests (id INTEGER PRIMARY KEY AUT
        "action TEXT NOT NULL CHECK(action IN ('restart','shutdown','start')), requested_by INTEGER NOT NULL, "
        "requested_name TEXT, reason TEXT, requested_at REAL NOT NULL, "
        "state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done','refused','cancelled')), handled_at REAL, "
-       "detail TEXT, due_at REAL NOT NULL DEFAULT 0, announced INTEGER NOT NULL DEFAULT 0)")
+       "detail TEXT, due_at REAL NOT NULL DEFAULT 0, announced INTEGER NOT NULL DEFAULT 0, "
+       "after_jobs INTEGER NOT NULL DEFAULT 1)")
 _COLUMNS = ("id", "instance", "action", "requested_by", "requested_name", "reason", "requested_at", "state", "handled_at",
-            "detail", "due_at", "announced")
+            "detail", "due_at", "announced", "after_jobs")
 
 
 class ControlError(Exception):
@@ -52,6 +59,8 @@ def ensure(db) -> None:
         db.execute(DDL)
         return
     if "'cancelled'" in (row[0] or "") and "announced" in (row[0] or ""):
+        if "after_jobs" not in (row[0] or ""):          # added in place: a running supervisor's older code reads on
+            db.execute("ALTER TABLE instance_requests ADD COLUMN after_jobs INTEGER NOT NULL DEFAULT 1")
         return
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -68,14 +77,16 @@ def ensure(db) -> None:
 
 
 def _row(row) -> dict:
-    return dict(zip(_COLUMNS, row))
+    item = dict(zip(_COLUMNS, row))
+    item["after_jobs"] = bool(item["after_jobs"])
+    return item
 
 
 def _select(where: str) -> str:
     return f"SELECT {', '.join(_COLUMNS)} FROM instance_requests {where}"
 
 
-def request(db, *, instance, action, user_id, username, reason=None, delay_s=0, known=()) -> dict:
+def request(db, *, instance, action, user_id, username, reason=None, delay_s=0, known=(), after_jobs=True) -> dict:
     """Record one request. Refused when the instance is unknown, the action is not one of ACTIONS, the countdown is
     out of range, or the same request is already pending (asking twice does not restart twice)."""
     ensure(db)
@@ -89,6 +100,8 @@ def request(db, *, instance, action, user_id, username, reason=None, delay_s=0, 
         raise ControlError(f"reason must be text of at most {MAX_REASON} characters")
     if isinstance(delay_s, bool) or not isinstance(delay_s, (int, float)) or not 0 <= delay_s <= MAX_DELAY_S:
         raise ControlError(f"delay must be 0 to {MAX_DELAY_S:g} seconds")
+    if not isinstance(after_jobs, bool):
+        raise ControlError("after_jobs must be true or false")
     now = time.time()
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -98,8 +111,9 @@ def request(db, *, instance, action, user_id, username, reason=None, delay_s=0, 
             db.execute("ROLLBACK")
             raise ControlError("the same request is already pending", 409)
         cur = db.execute("INSERT INTO instance_requests (instance, action, requested_by, requested_name, reason, requested_at, "
-                         "due_at) VALUES (?,?,?,?,?,?,?)",
-                         (instance, action, user_id, username, (reason or "").strip() or None, now, now + float(delay_s)))
+                         "due_at, after_jobs) VALUES (?,?,?,?,?,?,?,?)",
+                         (instance, action, user_id, username, (reason or "").strip() or None, now, now + float(delay_s),
+                          int(after_jobs)))
         db.execute("COMMIT")
     except ControlError:
         raise
@@ -152,6 +166,11 @@ def to_announce(db) -> list:
 
 def mark_announced(db, request_id, value: int) -> None:
     db.execute("UPDATE instance_requests SET announced = ? WHERE id = ?", (int(value), int(request_id)))
+
+
+def waiting(db, request_id, detail) -> None:
+    """A due request held for running jobs: say why in its row, which stays pending."""
+    db.execute("UPDATE instance_requests SET detail = ? WHERE id = ? AND state = 'pending'", (str(detail)[:1000], int(request_id)))
 
 
 def finish(db, request_id, state, detail) -> None:

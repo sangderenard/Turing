@@ -471,6 +471,21 @@ class Instance:
 
     def post_lifecycle(self):
         """The Stop-Meowdoku.ps1 request: POST {op:restart,in:N} with the admin token; the server saves sessions and exits 75."""
+        self.lifecycle_op({"op": "restart", "in": 1})
+
+    def running_jobs(self):
+        """The jobs this server is running that a restart would interrupt (its admin-token lifecycle op ``busy``).
+        [] for an instance that is not a running Meowdoku server; None when the server could not be asked."""
+        if self.kind != "meowdoku" or self.proc is None or self.proc.poll() is not None:
+            return []
+        try:
+            return list(self.lifecycle_op({"op": "busy"}).get("jobs") or [])
+        except Exception as error:                      # a hung or older server: it cannot say, so it does not hold the request
+            self.sup.log(f"{self.name}: could not ask for running jobs: {error}")
+            return None
+
+    def lifecycle_op(self, body):
+        """POST one op to this server's /api/admin/lifecycle with its admin token (loopback); its JSON answer."""
         import ssl
         import urllib.request
         paths = lifecycle_mod.state_paths(self.paths, int(self.port))
@@ -484,10 +499,11 @@ class Instance:
             if not ca.exists():
                 ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(f"{'https' if tls else 'http'}://127.0.0.1:{self.port}/api/admin/lifecycle",
-                                     data=json.dumps({"op": "restart", "in": 1}).encode(),
+                                     data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json", "X-Meowdoku-Admin": token})
         with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
-            r.read()
+            data = r.read()
+        return json.loads(data or b"{}")
 
     # ---- [CONTROL] forced by an admin's request (instance_control.py); the supervisor does not ask the instance's leave
     def force_stop(self, wait=15.0) -> str:
@@ -668,6 +684,22 @@ class Supervisor:
         first_to_start = sorted(self.instances, key=lambda i: i.name not in sources)
         for item in todo:
             targets = [i for i in first_to_start if item["instance"] in (instance_control.ALL, i.name)]
+            unasked = []
+            if targets and item.get("after_jobs") and item["action"] in ("restart", "shutdown"):
+                running = []
+                for inst in targets:
+                    jobs = inst.running_jobs()
+                    if jobs is None:
+                        unasked.append(inst.name)
+                    for job in jobs or ():
+                        running.append(f"{inst.name} {job.get('kind')} {str(job.get('digest') or '')[:12]}".strip())
+                if running:                              # the policy: wait for the last job, then perform it
+                    why = "waiting for running jobs: " + ", ".join(running)
+                    if item.get("detail") != why:
+                        self.log(f"request {item['id']} by {item['requested_name']!r}: {item['action']} {item['instance']}: {why}")
+                        with connect(self.db_path) as db:
+                            instance_control.waiting(db, item["id"], why)
+                    continue
             if not targets:
                 state, detail = "refused", "no such instance under this supervisor"
             else:
@@ -679,6 +711,8 @@ class Supervisor:
                     if item["action"] in ("restart", "start"):
                         for inst in targets:
                             done.append(f"{inst.name}: {inst.force_start()}")
+                    if unasked:
+                        done.append("not asked for running jobs (no answer): " + ", ".join(unasked))
                     state, detail = "done", "; ".join(done)
                 except Exception as error:
                     state, detail = "refused", "; ".join(done + [f"failed: {error!r}"])

@@ -1082,9 +1082,10 @@ def make_handler(sessions: Sessions):
         # ---- [CONTROL] /api/control/instances: force a shutdown, restart or start of an instance (instance_control.py).
         # Not under /api/admin: the proxy refuses that whole prefix, which belongs to the loopback token endpoints.  This one
         # is authorized by the signed-in account's role, so it is reachable wherever the account is.
-        # GET lists the instances and the recent requests; POST {instance, action, reason?, delay?} records a request that the
+        # GET lists the instances and the recent requests; POST {instance, action, reason?, delay?, after_jobs?} records a request that the
         # supervisor performs within a second or two, or after ``delay`` seconds (a countdown it announces to every admin
-        # through Nodus); POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
+        # through Nodus); a restart or shutdown then waits for running jobs unless after_jobs is false (instance_control.py).
+        # POST .../cancel {id} interrupts a request that has not been performed yet.  Capability: account_manage
         # (the admin role, from anywhere) or lifecycle_admin (an operator on the local network); a signed-in account always.
         def _reviews_route(self, path: str, method: str) -> None:
             """[REVIEWS] changes put up for review before they reach a default branch (branch_review.py)."""
@@ -1146,7 +1147,7 @@ def make_handler(sessions: Sessions):
                 made = instance_control.request(db, instance=body.get("instance"), action=body.get("action"),
                                                 user_id=principal.user_id, username=principal.username,
                                                 reason=body.get("reason"), delay_s=body.get("delay", 0),
-                                                known=[i["name"] for i in known])
+                                                known=[i["name"] for i in known], after_jobs=body.get("after_jobs", True))
                 print(f"[control] {principal.username} asked: {made['action']} {made['instance']} (request {made['id']})", flush=True)
                 return self._json({"request": made}, HTTPStatus.ACCEPTED)
             except instance_control.ControlError as error:

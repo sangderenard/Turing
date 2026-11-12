@@ -1366,6 +1366,13 @@ class PhotoJobs:
         self._sweeper = threading.Thread(target=self._sweep_animations, daemon=True, name="marble-photo-expiry")
         self._sweeper.start()
 
+    def running(self) -> list[dict]:
+        """The exposure this server is computing now: what a restart would interrupt (lifecycle ``busy``)."""
+        with self.lock:
+            if self.active_digest and self.process is not None and self.process.poll() is None:
+                return [{"kind": "marble_photo", "digest": self.active_digest}]
+        return []
+
     def job_directory(self, digest: str) -> Path:
         """Resolve an admitted job inside its owner's private content area.
 
