@@ -415,7 +415,7 @@ def export_assets(out: Path) -> dict:
         "lights": [{"position": list(p), "color": list(c), "intensity": float(i)} for p, c, i in LIGHTS],
         "terrain": export_terrain(),
     }
-    from .material_library_export import export_named_emitter_profiles
+    from meowdoku.material_library_export import export_named_emitter_profiles
     assets["emitterProfiles"]=export_named_emitter_profiles()
     (out / "assets.json").write_text(json.dumps(assets), encoding="utf-8")
     return assets
