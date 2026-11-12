@@ -21,7 +21,7 @@ assert.equal(readConfig({transport:'fixed:1'}).film_response,undefined);
 assert.throws(()=>readConfig({transport:'fixed:1',filmResponse:custom}));
 
 class Element {
-  constructor(tag,doc){this.tagName=tag;this.ownerDocument=doc;this.children=[];this.events={};this.value='';}
+  constructor(tag,doc){this.tagName=tag;this.ownerDocument=doc;this.children=[];this.events={};this.value='';this.classList={toggle(){}};}
   append(...nodes){this.children.push(...nodes);}
   replaceChildren(...nodes){this.children=nodes;}
   setAttribute(k,v){this[k]=v;}
@@ -51,7 +51,7 @@ const fields={};
 const photoDoc={defaultView:{localStorage:storage,location:{search:''}},createElement:tag=>new Element(tag,photoDoc),
   getElementById(id){return id==='photo-lens-controls'?null:(fields[id]??=new Element('div',photoDoc));}};
 for(const [id,value] of Object.entries({'photo-transport':'fixed:3','photo-camera':'builtin','photo-resolution':'128',
-  'photo-seconds':'0.1','photo-orbit-frames':'1','photo-gamma':'100','photo-bounces':'4','photo-bounce-mode':'auto','photo-triangle-budget':'250000','photo-sphere-coverage':'exact'}))photoDoc.getElementById(id).value=value;
+  'photo-seconds':'0.1','photo-substeps':'1800','photo-iso':'100','photo-highlight-clip':'25','photo-orbit-frames':'1','photo-gamma':'100','photo-bounces':'4','photo-bounce-mode':'auto','photo-triangle-budget':'250000','photo-sphere-coverage':'exact'}))photoDoc.getElementById(id).value=value;
 const calls=[],realFetch=globalThis.fetch;
 globalThis.fetch=async(url,options)=>{
   calls.push({url,options});

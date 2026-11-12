@@ -413,6 +413,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     retouchRevision: 0, retouchDebounce: null, retouchPending: null, retouchInFlight: null,
     retouchError: null, statusRequest: 0, appliedStatusRequest: 0, nonSpecularTone: "exponential",
     displayedPhoto: null, displayWhite: null, bakedDisplay: null,
+    previewAvailable: false, previewMode: "open",
     retouchParams: { exposure: 0, gamma: 1, red: 1, green: 1, blue: 1, whitebalance: 0, tint: 0, intensity: 1,
       display_look: "reference", spectral_look: "compressed", normalization: "auto99", normalization_white: 1, normalization_percentile: 99, tone_curve: "exponential",
       saturation: 1, vibrance: 0, black_point: 0,
@@ -430,7 +431,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
         !state.previewHdr || !finalSelected || !state.retouchDigest || state.retouchDigest !== state.lastDigest ||
         state.retouchDebounce || state.retouchPending || state.retouchInFlight || state.retouchError ||
         !shown || shown.digest !== state.lastDigest || shown.hdr !== state.previewHdr ||
-        shown.selectedFrame !== state.selectedFrame || $("photo-panel").hidden) return null;
+        shown.selectedFrame !== state.selectedFrame || state.previewMode !== "open" || $("photo-panel").hidden) return null;
     return {id:`${state.lastDigest}:${state.previewHdr}`,
       url:`/api/marble_photo/hdr?digest=${state.lastDigest}&name=${encodeURIComponent(state.previewHdr)}`,
       revision:JSON.stringify([state.generation,state.displayToken,state.selectedFrame,state.retouchRevision]),
@@ -686,6 +687,30 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     $("photo-play").textContent = "Play orbit";
     notifyHdr();
   };
+  const syncPreview = () => {
+    const minimized = state.previewMode === "minimized";
+    $("photo-panel").hidden = !state.previewAvailable || state.previewMode === "closed";
+    $("photo-panel").classList.toggle("is-minimized", minimized);
+    $("photo-preview-minimize").textContent = minimized ? "Restore" : "Minimize";
+    $("photo-preview-minimize").setAttribute("aria-expanded", String(!minimized));
+    $("photo-preview-minimize").setAttribute("aria-label", minimized ? "Restore photo preview" : "Minimize photo preview");
+    $("photo-preview-show").hidden = !state.previewAvailable || state.previewMode !== "closed";
+  };
+  $("photo-preview-minimize").addEventListener("click", () => {
+    state.previewMode = state.previewMode === "minimized" ? "open" : "minimized";
+    syncPreview(); stopPlayback();
+  });
+  $("photo-preview-close").addEventListener("click", () => {
+    state.previewMode = "closed";
+    syncPreview(); stopPlayback();
+    $("photo-preview-show").focus();
+  });
+  $("photo-preview-show").addEventListener("click", () => {
+    state.previewMode = "open";
+    syncPreview(); notifyHdr();
+    $("photo-preview-minimize").focus();
+  });
+  syncPreview();
   const clearFrames = () => {
     stopPlayback(); state.frames = []; state.selectedFrame = null;
     state.frameImages.clear(); state.displayToken++; state.previewUrl = null; state.previewHdr = null; state.photoComplete = false;
@@ -890,7 +915,8 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
       const usingRetouch = !!value.retouched_image && displayingExposure;
       const displayName = usingRetouch ? value.retouched_image : value.image;
       if (displayName) {
-        $("photo-panel").hidden = false;
+        // Progressive updates must not reopen a preview the user dismissed.
+        state.previewAvailable = true; syncPreview();
         // Retouches normally receive a new filename. Keep epoch in the URL
         // for live workers that still publish successive snapshots by name.
         const imageUrl = usingRetouch
@@ -1045,7 +1071,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     if (!hexDigest.test(value.digest)) throw new Error("photo server returned no digest");
     state.jobDigest = state.lastDigest = value.digest; const generation = ++state.generation;
     fieldView?.connect(value.digest,fieldTicket);
-    $("photo-panel").hidden = false;
+    state.previewAvailable = true; state.previewMode = "open"; syncPreview();
     $("photo-caption").textContent = "Preparing thin-lens photograph…";
     setButtons(); poll(value.digest, generation);
     try { participation.connect(value, options.clientIntersections); }
