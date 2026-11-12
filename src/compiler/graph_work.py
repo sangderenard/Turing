@@ -196,7 +196,8 @@ def ensure_graph_foundation(progress=None) -> None:
         progress("graph-work: compiling authored graph foundation through our source compiler")
     token = _BOOTSTRAPPING.set(True)
     try:
-        directory = Path(__file__).resolve().parents[2] / "build" / "compiler_foundations"
+        from .artifact_locations import compiler_artifact_root
+        directory = compiler_artifact_root() / "build" / "compiler_foundations"
         directory.mkdir(parents=True, exist_ok=True)
         # Independent compiler processes must never rewrite a DLL another
         # process has loaded. Keep each build's existing source/book receipts.

@@ -6,11 +6,12 @@ library_manage, see DEFAULT_POLICY).  A request's PRINCIPAL is (role, user_id, u
 tier come from access.py exactly as today.
 
 CAPABILITIES (names are the whole vocabulary): view_site, play, dev_ui, owner_tools, library_manage, lifecycle_admin, studio_write,
-photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, message.  ``capabilities(principal, policy)`` is the one place they are computed:
+photo_read, photo_submit, share_live, account_manage, deploy_scripts, federate, compile_submit, compile_unstable, message.  ``capabilities(principal, policy)`` is the one place they are computed:
 
     effective = tier_caps[tier] | role_caps[role]
     lifecycle_admin additionally requires origin == 'lan' (the operator's loopback/LAN rule stays)
     account_manage additionally requires role == 'admin'
+    compile_unstable requires a signed-in non-guest account and an explicit role grant; no defaults grant it
     guest gets tier_caps only
 
 Today's "LAN is edit" behaviour is preserved as POLICY (``tier_caps['edit']``, the default), not as code: a policy file can strip it.
@@ -88,7 +89,7 @@ except ImportError:      # loaded by path or run as a script: take the sibling f
     _spec.loader.exec_module(_schema_version)
 
 CAPS = ("view_site", "play", "dev_ui", "owner_tools", "library_manage", "lifecycle_admin", "studio_write", "photo_read", "photo_submit",
-        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "message", "core_git")
+        "share_live", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message", "core_git")
 ROLES = ("admin", "member", "service", "operator", "guest")
 ORIGINS = ("lan", "ip", "dns")
 TIERS = ("shader", "play", "dev", "edit")
@@ -99,7 +100,8 @@ DEFAULT_POLICY = {
         "shader": ["view_site", "photo_read"],
         "play": ["view_site", "play", "photo_read"],
         "dev": ["view_site", "play", "dev_ui", "photo_read"],
-        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "message", "core_git")],
+        "edit": [c for c in CAPS if c not in ("lifecycle_admin", "account_manage", "deploy_scripts", "federate", "compile_submit", "compile_unstable", "message",
+                                              "core_git")],
     },
     "role_caps": {
         "member": ["studio_write", "photo_submit", "share_live", "compile_submit", "message"],
@@ -109,7 +111,8 @@ DEFAULT_POLICY = {
         # operator: a member that may run the deploy scripts (see script_access) and the lifecycle (still LAN-only).
         "operator": ["studio_write", "photo_submit", "share_live", "deploy_scripts", "lifecycle_admin", "federate", "compile_submit", "message",
                      "core_git"],      # core_git: Git in the core through core_git.py; no service account and no tier holds it
-        "admin": list(CAPS),
+        # compile_unstable is granted only explicitly, by a policy file's role list (docs/SITE_UNSTABLE_SOURCE_2026-11-12.md): not even admin holds it by default
+        "admin": [c for c in CAPS if c != "compile_unstable"],
         "guest": [],
     },
 }
@@ -220,6 +223,10 @@ def capabilities(principal: Principal, policy: dict) -> frozenset:
         caps.discard("lifecycle_admin")
     if principal.role != "admin":
         caps.discard("account_manage")
+    # Unstable source attempts require an explicit account-role grant, never an origin tier.
+    if (principal.user_id is None or principal.role == "guest"
+            or "compile_unstable" not in policy["role_caps"].get(principal.role, ())):
+        caps.discard("compile_unstable")
     return frozenset(c for c in caps if c in CAPS)
 
 

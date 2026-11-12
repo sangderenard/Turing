@@ -21357,6 +21357,54 @@ def _normalize_lexical_values(
         parent_fact = book.page(_NAME_BINDING).cell(
             parent_cell.row, parent_cell.column,
         )
+        # An annotated mapping's class crossed this exact closure edge, but
+        # its declared key/value columns did not. Read the storage named by
+        # the binding cell, never an
+        # enclosing same-spelled local (which a parameter may shadow).
+        parent_graph = next((
+            entry.graph for entry in function_table
+            if getattr(entry, "graph", None) is not None
+            and entry.graph.G.graph.get("lexical_read_scope") == parent_cell.row[0]
+        ), None)
+        parent_attributes = (
+            parent_graph.G.nodes[int(parent_fact.value_id)].get("attributes") or {}
+            if parent_graph is not None
+            and int(parent_fact.value_id) in parent_graph.G else {}
+        )
+        mapping_annotation = parent_attributes.get("mapping_value_annotation_cell")
+        mapping_dtypes = tuple(parent_attributes.get(key) for key in (
+            "mapping_key_dtype", "mapping_value_dtype",
+        ))
+        if (
+            parent_attributes.get("aggregate_kind") == "dict"
+            and isinstance(mapping_annotation, _Ref)
+            and all(mapping_dtypes)
+        ):
+            from ...compiler.concordance_declarations import SEQUENCE_ROW_DTYPE
+            from ...compiler.identity_concordance import concord_sequence_row_dtypes
+
+            concord_sequence_row_dtypes(
+                read_scope, {int(value): mapping_dtypes},
+                source="exact closure mapping capture",
+                sources=(capture_cell, parent_cell, input_cell, mapping_annotation),
+                stage=_CANONICAL_RELABEL_STAGE,
+            )
+            mapping_cell = book.latest_ref(SEQUENCE_ROW_DTYPE, (read_scope, int(value)))
+            graph.G.nodes[int(value)].setdefault("attributes", {}).update({
+                **{
+                    key: parent_attributes[key]
+                    for key in (
+                        "mapping_key_dtype", "mapping_value_dtype",
+                        "mapping_key_class_ref", "mapping_value_class_ref",
+                        "mapping_value_aggregate_kind", "mapping_value_tensor",
+                        "mapping_value_python_type", "mapping_value_record",
+                        "mapping_value_column_count", "mapping_value_columns",
+                        "mapping_value_optional",
+                    )
+                    if key in parent_attributes
+                },
+                "mapping_value_annotation_cell": mapping_cell,
+            })
         parent_class_cell = (
             book.latest_ref(
                 _SOURCE_VALUE_CLASS,
@@ -23358,6 +23406,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         return {
             "mapping_key_dtype": str(key["dtype"]),
             "mapping_value_dtype": str(value["dtype"]),
+            # These are authored semantic classes, not classes reconstructed
+            # from physical widths (a string token and an int share int64).
+            **{
+                f"mapping_{role}_class_ref": f"builtins.{column.id}"
+                for role, column in zip(("key", "value"), columns)
+                if isinstance(column, ast.Name)
+                and column.id in {"bool", "int", "float", "str"}
+            },
             **({
                 "mapping_value_aggregate_kind": str(value["aggregate_kind"]),
             } if value.get("aggregate_kind") is not None else {}),
@@ -23497,6 +23553,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     continue
                 contract = _mapping_annotation(annotation)
                 if contract:
+                    span_row = tuple(declaration.get("ast_node_id") or ())
+                    annotation_cell = (
+                        current_identity_book().latest_ref(
+                            _ANNOTATION_DECLARATION,
+                            (span_row[0], str(span_row[1]), str(declaration["name"])),
+                        ) if len(span_row) >= 2 else None
+                    )
+                    if annotation_cell is not None:
+                        contract["mapping_value_annotation_cell"] = annotation_cell
                     contracts[str(declaration["name"])] = contract
                     continue
                 dtypes = sequence_row_dtypes(annotation)

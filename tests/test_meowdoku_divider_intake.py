@@ -265,3 +265,58 @@ def test_limits_five_queued_and_twenty_per_day(live, tmp_path):
         di.accept_upload(paths, "account:9", "m.py", THREE.encode())
     assert caught.value.status == 429 and "20" in caught.value.message
     assert di.accept_upload(paths, "account:10", "m.py", THREE.encode())            # another account is unaffected
+
+
+def test_signed_in_page_api_reaches_nodus_with_same_account_storage(live):
+    """Real existing HTTP/auth/intake/worker/ledger + fake 72-byte Nodus host.
+
+    No compiler runs. Client-supplied ownership headers have no authority.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('compile_bridge_fixture', ROOT / 'tests/test_meowdoku_divider_nodus_bridge.py')
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    FakeHost, ONE, TOOLS = fixture.FakeHost, fixture.ONE, fixture.TOOLS
+    from meowdoku.site_compiler import configure
+    a, b = _signup(live.port, 'compileowner'), _signup(live.port, 'compileother')
+    jobs = live.root / 'user-space' / 'workspaces'
+    jobs.mkdir(parents=True)
+    host = FakeHost(jobs, status=2)
+    config = dict(jobs_dir=str(jobs), port=host.port, service_id=7, backend='llvm',
+                  nodus_tools=str(TOOLS), capacity_bytes=100_000_000, user_quota_bytes=50_000_000,
+                  free_floor_bytes=0, reservation_bytes=1_000_000, review_after_s=3600)
+    config_path = live.root / 'site-compiler.json'
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    worker = configure(live.sessions, config_path).start()
+    try:
+        result = _upload(live, {**a, 'X-Owner-Id': '999'}, 'm.py', ONE.encode())
+        assert result.status == 201, result.json
+        job_id = result.json['job_id']
+        deadline = time.monotonic() + 10
+        while True:
+            result = _call(live.port, f'/api/divider/jobs/{job_id}', headers=a)
+            if result.json.get('storage') and result.json['storage'][0]['status'] == 'complete':
+                break
+            assert time.monotonic() < deadline, (result.json, worker.last_error)
+            time.sleep(.05)
+        assert result.json['backends'] == ['llvm']
+        storage = result.json['storage'][0]
+        assert storage['measured_bytes'] > 0 and storage['charged_bytes'] == 1_000_000
+        request = json.loads((jobs / f"{storage['contract_id']}.request.json").read_text())
+        db = sd.connect(live.sessions.accounts_db)
+        try:
+            owner = db.execute("SELECT id FROM users WHERE username='compileowner'").fetchone()[0]
+            assert request['site_artifact_context']['owner_id'] == owner
+            assert request['site_artifact_context']['workspace_id'] == storage['workspace_id']
+            assert db.execute('SELECT owner_key FROM divider_jobs WHERE job_id=?', (job_id,)).fetchone()[0] == f'account:{owner}'
+        finally:
+            db.close()
+        assert _call(live.port, f'/api/divider/jobs/{job_id}', headers=b).status == 404
+        assert _call(live.port, '/api/divider/jobs', headers=b).json['jobs'] == []
+        assert _upload(live, {}, 'm.py', ONE.encode()).status == 403
+        assert len(host.submits) == 1
+    finally:
+        worker.stop()
+        worker.thread.join(10)
+        host.close()
+        assert not worker.thread.is_alive()

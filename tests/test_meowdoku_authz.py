@@ -23,7 +23,7 @@ USERS_DDL = """
                 created_at REAL NOT NULL
             );
 """
-ALL = set(authz.CAPS)
+ALL = set(authz.CAPS) - {"compile_unstable"}
 
 
 @pytest.fixture

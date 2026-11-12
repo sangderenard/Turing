@@ -28,10 +28,15 @@ Single in flight: run_one never claims while this lease owner still holds an une
 a Cancelled status or an unknown status is NOT a verdict: the lease is left in place (it expires through
 ``source_divider.reclaim_expired`` and the piece is requeued with the next generation, hence a new contract id) and the outcome is
 reported.  Nothing here compiles, imports or runs the piece.
+
+The default request remains the numeric row ABI. An explicitly opted-in upload,
+current account compile_submit + compile_unstable grants, and an enabled operator
+route may instead request source-only emission through the SAME host. Its status
+4 is EmittedNotBuilt, never executable or adopted. No generic runtime ABI or
+root-call samples are invented by that permission.
 """
 from __future__ import annotations
 
-import argparse
 import ast
 import hashlib
 import importlib.util
@@ -56,7 +61,7 @@ BACKEND_NAME = "nodus-row-tool"
 DRIVER_BACKENDS = ("c", "llvm", "fortran")              # turing_row_tool_compiler._BACKENDS
 DEFAULT_NODUS_TOOLS = ROOT.parent / "nodus" / "tools"
 DEFAULT_TIMEOUT_S = 600.0
-STATUS_NAMES = {1: "Adopted", 2: "CompiledNotAdopted", 3: "ExistingProduct", 16: "RequestMissing", 17: "CompileFailed",
+STATUS_NAMES = {1: "Adopted", 2: "CompiledNotAdopted", 3: "ExistingProduct", 4: "EmittedNotBuilt", 16: "RequestMissing", 17: "CompileFailed",
                 18: "AdoptFailed", 19: "Cancelled"}
 _MASK63 = (1 << 63) - 1
 TENSOR_TYPE = "src.common.tensors.abstraction.AbstractTensor"
@@ -78,6 +83,9 @@ class NodusCompileRoute:
     backend: str | None = None                  # driver backend; default = the claimed attempt's backend (must be c|llvm|fortran)
     extraction_contract: Path | None = None     # default source_divider.EXTRACTION_CONTRACT
     turing_root: Path | None = None             # default this repository
+    artifacts: object | None = None            # site-bound compile_artifacts.Artifacts; required before dispatch
+    allow_unstable_source: bool = False        # operator opt-in, not a runtime ABI promise
+    authz_policy: object | None = None         # current Site Policy, rechecked at dispatch
 
     def __post_init__(self):
         self.jobs_dir = Path(self.jobs_dir)
@@ -126,7 +134,7 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def allocate_contract_id(identity: dict, jobs_dir: Path) -> int:
+def allocate_contract_id(identity: dict, jobs_dir: Path, *, before_write=None) -> int:
     """Stable 63-bit id for (job, piece, backend, generation); see the module docstring for the derivation and the collision rule."""
     jobs_dir = Path(jobs_dir)
     key = "\0".join(str(identity[k]) for k in ("job_id", "piece_id", "backend", "generation"))
@@ -139,8 +147,12 @@ def allocate_contract_id(identity: dict, jobs_dir: Path) -> int:
             except (OSError, ValueError):
                 owner = None
             if owner == identity:
+                if before_write is not None:
+                    before_write(candidate)
                 return candidate
-        elif not (jobs_dir / f"{candidate}.request.json").exists() and not (jobs_dir / str(candidate)).exists():
+        elif not any(jobs_dir.glob(f'{candidate}.*')) and not (jobs_dir / str(candidate)).exists():
+            if before_write is not None:
+                before_write(candidate)
             _write_atomic(sidecar, json.dumps(identity))
             return candidate
         candidate = (candidate + 1 & _MASK63) or 1
@@ -217,42 +229,140 @@ def _write_contract(base: Path, path: Path, abi_values: list) -> None:
     _write_atomic(path, yaml.safe_dump(value))
 
 
+class UnstablePermissionDenied(ValueError):
+    """The queued owner's current grant or operator opt-in is absent."""
+
+
+def _unstable_requested(source_root: Path, job_id: str) -> bool:
+    """Read only the incumbent upload receipt, never a source-provided flag."""
+    receipt = Path(source_root) / 'divider' / str(job_id) / 'upload.json'
+    if not receipt.exists():
+        return False
+    metadata = json.loads(receipt.read_text(encoding='utf-8'))
+    if not isinstance(metadata, dict):
+        raise ValueError('upload receipt must be an object')
+    value = metadata.get('unstable_source_only', False)
+    inference = metadata.get('unstable_allow_inference', False)
+    if type(value) is not bool or type(inference) is not bool:
+        raise ValueError('unstable upload receipt flags must be boolean')
+    if inference and not value:
+        raise ValueError('inference admission requires unstable source-only opt-in')
+    return value
+
+
+def _authorize_unstable(db, job_id: str, enabled: bool, policy=None) -> None:
+    """Recheck the existing account owner and ROLE permission at dispatch.
+
+    The upload receipt stores intent, not authority. Revoking a role or policy
+    before dispatch therefore prevents a queued unstable request from running.
+    """
+    from meowdoku import authz
+
+    if enabled is not True:
+        raise UnstablePermissionDenied('unstable source compilation is disabled by the operator')
+    row = db.execute('SELECT owner_key FROM divider_jobs WHERE job_id=?', (job_id,)).fetchone()
+    owner = str(row[0]) if row else ''
+    if (not owner.startswith('account:') or not owner[8:].isdigit()
+            or str(int(owner[8:])) != owner[8:] or int(owner[8:]) <= 0):
+        raise UnstablePermissionDenied('unstable source compilation requires an account-owned Site job')
+    user_id = int(owner[8:])
+    user = db.execute('SELECT id, username FROM users WHERE id=?', (user_id,)).fetchone()
+    if user is None:
+        raise UnstablePermissionDenied('unstable source compilation owner no longer exists')
+    db_path = next(row[2] for row in db.execute('PRAGMA database_list') if row[1] == 'main')
+    principal = authz.principal_from({'id': user[0], 'username': user[1]}, 'dns', 'shader', db_path)
+    current = (policy or authz.Policy.beside(db_path)).get()
+    if not {'compile_submit', 'compile_unstable'} <= authz.capabilities(principal, current):
+        raise UnstablePermissionDenied('this account needs compile_submit and compile_unstable for the queued source-only attempt')
+
+
+def _source_piece(piece_row: dict, source_root: Path):
+    """Validate the authored names without imposing the numeric row ABI.
+
+    The existing divider/compiler owns partition and language admission. This
+    helper neither executes source nor supplies types, samples, or call records.
+    """
+    names = list(piece_row.get('names') or ())
+    if not names or any(not isinstance(name, str) for name in names):
+        raise ValueError('source-only piece requires its authored function names')
+    path = Path(source_root) / str(piece_row['job_id']) / 'source' / str(piece_row['file'])
+    text = path.read_bytes().decode('utf-8-sig')
+    nodes = sd._function_nodes(ast.parse(text))
+    missing = [name for name in names if name not in nodes]
+    if missing:
+        raise ValueError(f'source-only entries are absent from the authored source: {missing}')
+    return names, text
+
+
 def request_for_piece(db, piece_row: dict, *, jobs_dir, source_root=None, driver_backend=None, extraction_contract=None,
-                      turing_root=None):
+                      turing_root=None, artifacts=None, allow_unstable_source=False, authz_policy=None):
     """Write the driver request for one CLAIMED piece -> (contract_id, request_path), or record a refusal and return None.
 
-    ``piece_row`` is the claim_next dict (job_id, piece_id, backend, generation, worker_id, names, file).  The request has the keys
+    ``piece_row`` is the claim_next dict (job_id, piece_id, backend, generation, worker_id, names, file). By default the request has the keys
     the driver reads: row_entry, columns (ordered input.../output), backend, output_dir (= ``<jobs_dir>/<id>``), extraction_contract
     (explicit path), turing_root, product_name, source_text, allow_uncompiled=false.  Refused (never submitted) when:
       - the claimed backend (or ``driver_backend``) is not c|llvm|fortran;
       - the piece has other than one function name, or the name is nested/qualified, async, or a method;
       - a formal is not annotated AbstractTensor (scalar annotations would be rank-0 scalar cores: never produced), or is
         *args/**kwargs/keyword-only; the return annotation is not AbstractTensor; there is no formal;
-      - the source file is unreadable or not parseable."""
+      - the source file is unreadable or not parseable.
+
+    Explicit authorized unstable uploads retain authored source_names and the
+    caller's extraction contract instead of fabricating tensor row columns.
+    The compiler owns language admission; the result is source-only, not a
+    callable generic object/byte transport binding.
+    """
     jobs_dir = Path(jobs_dir)
+    source_root = Path(source_root) if source_root else jobs_dir
     backend = driver_backend or piece_row["backend"]
     reason = None
-    if backend not in DRIVER_BACKENDS:
+    unstable = False
+    if driver_backend is not None and driver_backend != piece_row['backend']:
+        reason, error_type = ('configured Nodus backend does not match the queued attempt backend', 'BackendNotServed')
+    elif backend not in DRIVER_BACKENDS:
         reason, error_type = f"the Nodus driver compiles {DRIVER_BACKENDS}; the attempt backend is {backend!r}", "BackendNotServed"
     else:
         try:
-            entry, text, columns, abi = _express(piece_row, Path(source_root) if source_root else jobs_dir)
+            unstable = _unstable_requested(source_root, piece_row['job_id'])
+            if unstable:
+                _authorize_unstable(db, piece_row['job_id'], allow_unstable_source, authz_policy)
+                source_names, text = _source_piece(piece_row, source_root)
+            else:
+                entry, text, columns, abi = _express(piece_row, source_root)
+        except UnstablePermissionDenied as error:
+            reason, error_type = str(error), 'UnstablePermissionDenied'
         except ValueError as error:
             reason, error_type = str(error), "RequestNotExpressible"
     if reason is not None:
         sd.refuse(db, piece_row["job_id"], piece_row["piece_id"], piece_row["backend"], piece_row["worker_id"],
                   piece_row["generation"], state="refused", stage=f"{BACKEND_NAME}: request", error_type=error_type, error=reason)
         return None
-    contract_id = allocate_contract_id(_identity(piece_row), jobs_dir)
-    request = {"row_entry": entry, "columns": columns, "backend": backend, "output_dir": str(jobs_dir.resolve() / str(contract_id)),
+    if artifacts is None:
+        raise ValueError('site compile requires the account workspace artifact ledger')
+    artifacts.bind(db, jobs_dir)
+    context = {}
+
+    def reserve(contract_id):
+        context.update(artifacts.admit(piece_row, contract_id, hashlib.sha256(text.encode('utf-8')).hexdigest()))
+
+    contract_id = allocate_contract_id(_identity(piece_row), jobs_dir, before_write=reserve)
+    request = {"backend": backend, "output_dir": str(jobs_dir.resolve() / str(contract_id)),
                "extraction_contract": str(Path(extraction_contract or sd.EXTRACTION_CONTRACT).resolve()),
-               "turing_root": str(Path(turing_root or ROOT).resolve()), "product_name": f"div_{contract_id}",
-               "source_text": text, "allow_uncompiled": False}
+               "turing_root": str(Path(turing_root or ROOT).resolve()),
+               "source_text": text, "site_artifact_context": context}
     contract_path = jobs_dir / f"{contract_id}.extraction-contract.yaml"
-    _write_contract(Path(extraction_contract or sd.EXTRACTION_CONTRACT), contract_path, abi)
+    if unstable:
+        request.update(unstable_source_only=True, source_names=source_names)
+        # Retain the real caller-selected contract. Never synthesize f64 tensor
+        # columns or root-call evidence for mixed host source.
+        _write_atomic(contract_path, Path(extraction_contract or sd.EXTRACTION_CONTRACT).read_bytes().decode('utf-8'))
+    else:
+        request.update(row_entry=entry, columns=columns, allow_uncompiled=False, product_name=f'div_{contract_id}')
+        _write_contract(Path(extraction_contract or sd.EXTRACTION_CONTRACT), contract_path, abi)
     request["extraction_contract"] = str(contract_path.resolve())
     path = jobs_dir / f"{contract_id}.request.json"
     _write_atomic(path, json.dumps(request, indent=1))
+    artifacts.reconcile(contract_id)
     return contract_id, path
 
 
@@ -295,7 +405,7 @@ def _wait_readable(peer, seconds):
 
 
 def submit_and_wait(route: NodusCompileRoute, contract_id: int, *, timeout_s: float, poll_s: float = 0.2,
-                    peer_factory=None) -> CompileOutcome:
+                    peer_factory=None, monitor=None, authorize=None) -> CompileOutcome:
     """Submit ONE contract (id, service_id, revision 1, payload 0) and wait for its Route (the Result).  Sleeps in select, never spins.
 
     ``peer_factory(route, producer) -> peer`` (default: nodus EnginePeer over connect_loopback) is the test seam.  A timeout,
@@ -311,11 +421,17 @@ def submit_and_wait(route: NodusCompileRoute, contract_id: int, *, timeout_s: fl
     except (OSError, ValueError, FileNotFoundError) as error:
         return CompileOutcome(None, "ConnectFailed", False, None, {"error": f"{type(error).__name__}: {error}"})
     try:
+        if authorize is not None:
+            authorize()  # current account grant, immediately before submission
         if not peer.submit(contract):
             return CompileOutcome(None, "SubmitRefused", False, None, {"error": "peer did not queue the submit"})
         deadline = started + float(timeout_s)
+        next_measurement = started
         while producer.result is None:
             peer.poll()
+            if monitor is not None and time.monotonic() >= next_measurement:
+                monitor()
+                next_measurement = time.monotonic() + 5.0
             if getattr(peer, "error", None) is not None or getattr(peer, "closed", False):
                 return CompileOutcome(None, "PeerClosed", False, None,
                                       {"error": repr(getattr(peer, "error", None)), "admitted": producer.admitted_seen})
@@ -350,6 +466,47 @@ def _record(db, claim, outcome: CompileOutcome, seconds):
     host = outcome.detail.get("host_result") or {}
     wall = host.get("wall_seconds", seconds)
     note = f"{BACKEND_NAME}: {outcome.status_name}"
+    source_product = outcome.detail.get('source_product')
+    if outcome.detail.get('unstable_source_only'):
+        valid = (isinstance(source_product, dict)
+                 and source_product.get('schema') == 'nodus-turing-source-only-product-v1'
+                 and source_product.get('unstable_source_only') is True
+                 and source_product.get('loadable') is False
+                 and source_product.get('binary') is None
+                 and source_product.get('buffer_abi') is None
+                 and source_product.get('adoption_receipt') is None)
+        attempt = source_product.get('attempt') if valid else None
+        entries = attempt.get('entries') if isinstance(attempt, dict) else None
+        expected = outcome.detail.get('source_expectation')
+        valid = (valid and isinstance(entries, list) and bool(entries)
+                 and all(isinstance(entry, dict) for entry in entries)
+                 and isinstance(expected, dict)
+                 and source_product.get('backend') == expected.get('backend')
+                 and attempt.get('backend') == expected.get('backend')
+                 and source_product.get('source_names') == expected.get('source_names')
+                 and [entry.get('name') for entry in entries] == expected.get('source_names')
+                 and source_product.get('site_artifact_context') == expected.get('site_artifact_context')
+                 and isinstance(source_product.get('source'), dict)
+                 and source_product['source'].get('authored_sha256') == expected.get('authored_sha256'))
+        entries = entries if valid else []
+        if outcome.status_code == 4 and valid and source_product.get('state') == 'emitted-not-built' and entries and all(
+                entry.get('state') == 'complete' and entry.get('note') == 'emitted-not-built' for entry in entries):
+            return ('complete' if sd.complete(db, *key, stage=f'{BACKEND_NAME}: emitted-not-built (unstable source-only)',
+                                            seconds=wall) else 'lost-lease')
+        if outcome.status_code == 17 and valid:
+            failed = next((entry for entry in entries if entry.get('state') != 'complete'), None)
+            if failed is not None:
+                state = 'refused' if failed.get('state') == 'refused' else 'error'
+                ok = sd.refuse(db, *key, state=state,
+                    stage=f"{BACKEND_NAME}: unstable source-only {failed.get('stage', 'compiler')}",
+                    error_type=str(failed.get('error_type') or 'CompileFailed'),
+                    error=str(failed.get('error') or 'source emission failed')[:300], seconds=wall)
+                return state if ok else 'lost-lease'
+        if outcome.status_code in (1, 2, 3, 4):
+            ok = sd.refuse(db, *key, state='error', stage=f'{BACKEND_NAME}: source-only receipt',
+                error_type='SourceOnlyReceiptMismatch',
+                error='source-only outcome lacks a matching emitted-not-built, non-loadable receipt', seconds=wall)
+            return 'error' if ok else 'lost-lease'
     if outcome.status_code in (1, 2, 3):
         # Adopted / CompiledNotAdopted / ExistingProduct: a retained product exists under <jobs_dir>/<id>/
         return "complete" if sd.complete(db, *key, stage=note, seconds=wall) else "lost-lease"
@@ -378,6 +535,10 @@ def run_one(db, route: NodusCompileRoute, *, lease_owner: str, timeout_s: float 
     Returns {"state": "busy"} without claiming when ``lease_owner`` still holds an unexpired lease (single in flight).  Otherwise a
     dict: job_id, piece_id, backend, generation, contract_id, status, recorded (the attempt state written, or None when the lease
     was deliberately left in place), detail."""
+    if route.artifacts is None:
+        raise ValueError('compiler dispatch is site-only and requires its account workspace artifact ledger')
+    route.artifacts.bind(db, route.jobs_dir)
+    route.artifacts.monitor()
     sd.reclaim_expired(db)
     live = db.execute("SELECT job_id, piece_id, backend FROM divider_attempts WHERE state='leased' AND lease_owner=? AND "
                       "lease_deadline > ?", (lease_owner, time.time())).fetchone()
@@ -387,18 +548,58 @@ def run_one(db, route: NodusCompileRoute, *, lease_owner: str, timeout_s: float 
     if claim is None:
         return None
     base = {"job_id": claim["job_id"], "piece_id": claim["piece_id"], "backend": claim["backend"], "generation": claim["generation"]}
-    built = request_for_piece(db, claim, jobs_dir=route.jobs_dir, source_root=route.source_root, driver_backend=route.backend,
-                              extraction_contract=route.extraction_contract, turing_root=route.turing_root)
+    try:
+        built = request_for_piece(db, claim, jobs_dir=route.jobs_dir, source_root=route.source_root, driver_backend=route.backend,
+                                  extraction_contract=route.extraction_contract, turing_root=route.turing_root,
+                                  artifacts=route.artifacts, allow_unstable_source=route.allow_unstable_source,
+                                  authz_policy=route.authz_policy)
+    except Exception as error:
+        # No request is dispatched on accounting, identity or filesystem failure.
+        # A partial preparation keeps its reservation for reconciliation.
+        sd.refuse(db, claim['job_id'], claim['piece_id'], claim['backend'], claim['worker_id'], claim['generation'],
+                  state='error', stage='artifact admission', error_type=type(error).__name__, error=str(error)[:300])
+        return {**base, 'state': 'error', 'contract_id': None, 'status': None, 'recorded': 'error',
+                'detail': {'error_type': type(error).__name__, 'error': str(error)[:300]}}
     if built is None:
         row = _attempt_row(db, claim)
         return {**base, "state": "refused", "contract_id": None, "status": None, "recorded": row["state"],
                 "detail": {"error_type": row["error_type"], "error": row["error"]}}
     contract_id, request_path = built
+    prepared = json.loads(request_path.read_text(encoding='utf-8'))
+    source_only = prepared.get('unstable_source_only') is True
     started = time.monotonic()
-    outcome = submit_and_wait(route, contract_id, timeout_s=timeout_s, poll_s=poll_s, peer_factory=peer_factory)
+    route.artifacts.status(contract_id, 'submitted')
+    try:
+        outcome = submit_and_wait(route, contract_id, timeout_s=timeout_s, poll_s=poll_s, peer_factory=peer_factory,
+                                  monitor=lambda: route.artifacts.reconcile(contract_id),
+                                  authorize=(lambda: _authorize_unstable(db, claim['job_id'],
+                                      route.allow_unstable_source, route.authz_policy)) if source_only else None)
+    except UnstablePermissionDenied as error:
+        sd.refuse(db, claim['job_id'], claim['piece_id'], claim['backend'], claim['worker_id'], claim['generation'],
+                  state='refused', stage=f'{BACKEND_NAME}: dispatch permission',
+                  error_type=type(error).__name__, error=str(error))
+        route.artifacts.status(contract_id, 'refused', finished=True)
+        return {**base, 'state': 'refused', 'contract_id': contract_id, 'status': None, 'recorded': 'refused',
+                'detail': {'error_type': type(error).__name__, 'error': str(error)}}
+    except BaseException:
+        route.artifacts.status(contract_id, 'unfinished')
+        raise
+    if source_only:
+        outcome.detail['unstable_source_only'] = True
+        outcome.detail['source_expectation'] = {
+            'backend': prepared['backend'], 'source_names': prepared['source_names'],
+            'site_artifact_context': prepared['site_artifact_context'],
+            'authored_sha256': hashlib.sha256(prepared['source_text'].encode('utf-8')).hexdigest()}
+        product_path = route.jobs_dir / str(contract_id) / 'nodus-row-tool-product.json'
+        try:
+            outcome.detail['source_product'] = json.loads(product_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as error:
+            outcome.detail['source_product_error'] = type(error).__name__
     recorded = _record(db, claim, outcome, time.monotonic() - started) if outcome.status_code is not None else None
+    route.artifacts.status(contract_id, recorded or 'unfinished', finished=recorded in ('complete', 'refused', 'error'))
     return {**base, "state": recorded or "unfinished", "contract_id": contract_id, "request": str(request_path),
             "status": outcome.status_name, "status_code": outcome.status_code, "recorded": recorded,
+            "unstable_source_only": source_only,
             "result_path": str(outcome.result_path) if outcome.result_path else None, "detail": outcome.detail}
 
 
@@ -411,7 +612,8 @@ def run_pending(db, paths, route: NodusCompileRoute, *, max_pieces: int = 1, lea
     if route.source_root == route.jobs_dir and state.jobs_dir != route.jobs_dir:
         route = NodusCompileRoute(route.host, route.port, route.service_id, route.jobs_dir, route.nodus_tools,
                                   source_root=state.jobs_dir, backend=route.backend, extraction_contract=route.extraction_contract,
-                                  turing_root=route.turing_root)
+                                  turing_root=route.turing_root, artifacts=route.artifacts,
+                                  allow_unstable_source=route.allow_unstable_source, authz_policy=route.authz_policy)
     results = []
     for _ in range(int(max_pieces)):
         result = run_one(db, route, lease_owner=lease_owner, timeout_s=timeout_s, **kwargs)
@@ -428,6 +630,8 @@ def make_hook(paths, route: NodusCompileRoute, *, max_pieces: int = 1, **kwargs)
     accounts.db connection per call; the queue is global, so job_id is not used.  It BLOCKS the calling request thread for up to the
     timeout: install it only where that is acceptable."""
     state = StatePaths.coerce(paths)
+    if route.artifacts is None:
+        raise ValueError('site compile hook requires its account workspace artifact ledger')
 
     def hook(job_id=None):
         db = sd.connect(state.accounts_db)
@@ -440,30 +644,10 @@ def make_hook(paths, route: NodusCompileRoute, *, max_pieces: int = 1, **kwargs)
 
 # ------------------------------------------------------------------------------------------------------------------------ CLI
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("run-once", help="claim one queued piece, compile it through the Nodus host, record the attempt")
-    p.add_argument("--db", required=True, help="accounts db (source_divider tables)")
-    p.add_argument("--jobs-dir", required=True, help="the compile host's jobs dir (<id>.request.json lives here)")
-    p.add_argument("--port", type=int, required=True)
-    p.add_argument("--service-id", type=int, required=True)
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p.add_argument("--nodus-tools", default=None)
-    p.add_argument("--source-root", default=None, help="the divider's jobs dir holding <job_id>/source (default: --jobs-dir)")
-    p.add_argument("--backend", choices=DRIVER_BACKENDS, default=None)
-    p.add_argument("--lease-owner", default="divider-nodus-bridge")
-    args = parser.parse_args(argv)
-    route = NodusCompileRoute(args.host, args.port, args.service_id, Path(args.jobs_dir),
-                              Path(args.nodus_tools) if args.nodus_tools else DEFAULT_NODUS_TOOLS,
-                              source_root=Path(args.source_root) if args.source_root else None, backend=args.backend)
-    db = sd.connect(args.db)
-    try:
-        result = run_one(db, route, lease_owner=args.lease_owner, timeout_s=args.timeout)
-    finally:
-        db.close()
-    print(json.dumps(result if result is not None else {"state": "idle"}, default=str))
-    return 0
+    # The site's authenticated page/API is the sole submission surface. A
+    # caller-selected --db/--owner CLI is not an authenticated site identity.
+    print('Compiler dispatch is site-only. Use the signed-in Source divider page/API.', file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
