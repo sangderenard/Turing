@@ -373,6 +373,16 @@ def _tensor_payload_call(operation: str, arguments: list[ast.expr], source: ast.
         keywords=[],
     )
     call._extraction_contract = _tensor_payload_receipt(operation)
+    # The generated call stands at the replaced pickle call's source location
+    # (copy_location below), where the source ledger holds ``_pickle``'s
+    # receipt.  This record declares that the expansion owns the receipt
+    # above (read by the reducer's receipt stamping), as a dispatcher
+    # operation's record does.
+    call._turing_tensor_payload = {
+        "schema": "turing.python-pickle-tensor-payload.v1",
+        "operation": str(operation),
+        "replaces": f"_pickle.{'dump' if operation == 'save' else 'load'}",
+    }
     return ast.copy_location(call, source)
 
 

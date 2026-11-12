@@ -28691,8 +28691,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # AST special-case expansion owns the generated operation's
             # receipt. Several generated operations can share one original
             # source location; the source ledger cannot distinguish them.
-            receipt = getattr(expression, "_extraction_contract", None) if getattr(
-                expression, "_turing_dispatch_operation", None
+            # Program: the AbstractTensor YoungMan's ``_load_map``: ``with
+            # open(p, 'rb') as f: return AT.tensor(pickle.load(f))`` became
+            # ``__turing_tensor_payload_load(path)`` at ``pickle.load``'s
+            # location.  Wrong record: only a dispatcher operation kept its
+            # receipt, so the ledger re-stamped the payload call with
+            # ``_pickle.load``'s (``native-pickle-object-result``, result
+            # ``opaque_ref``): the graph called tensor_payload.load under
+            # pickle's identity and its ``tensor_region`` result was never
+            # declared.  Rule: a generated tensor-payload call
+            # (``_turing_tensor_payload``) owns its receipt as well.
+            receipt = getattr(expression, "_extraction_contract", None) if (
+                getattr(expression, "_turing_dispatch_operation", None)
+                or getattr(expression, "_turing_tensor_payload", None)
             ) else boundary_by_location.get((
                 int(getattr(expression, "lineno", -1)),
                 int(getattr(expression, "col_offset", -1)),
