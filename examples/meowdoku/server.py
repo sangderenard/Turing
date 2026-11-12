@@ -911,6 +911,24 @@ def make_handler(sessions: Sessions):
                 if path0 != "/api/divider/jobs":
                     return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                unstable = self.headers.get("X-Compile-Unstable")
+                if unstable is not None and unstable != "source-only":
+                    raise divider_intake_mod.DividerError("X-Compile-Unstable must be source-only")
+                unstable_source_only = unstable == "source-only"
+                inference = self.headers.get("X-Compile-Inference")
+                if inference is not None and inference != "allow":
+                    raise divider_intake_mod.DividerError("X-Compile-Inference must be allow")
+                unstable_allow_inference = inference == "allow"
+                if unstable_allow_inference and not unstable_source_only:
+                    raise divider_intake_mod.DividerError("unstable inference requires source-only compilation")
+                if unstable_source_only:
+                    if ctype == "application/json":
+                        raise divider_intake_mod.DividerError("unstable source-only compilation requires an upload, not a repository link")
+                    if self._principal().user_id is None or "compile_unstable" not in self._caps():
+                        raise divider_intake_mod.DividerError("this needs a signed-in account with compile_unstable", 403)
+                    hook = getattr(sessions, "divider_hook", None)
+                    if not callable(hook) or getattr(hook, "allow_unstable_source", False) is not True:
+                        raise divider_intake_mod.DividerError("unstable source-only compilation is not enabled by the operator", 403)
                 if ctype == "application/json":
                     body = self._body_json(4096)
                     if body is None:
@@ -929,7 +947,9 @@ def make_handler(sessions: Sessions):
                         raise divider_intake_mod.DividerError(f"body exceeds {cap} bytes", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                     hook = getattr(sessions, 'divider_hook', None)
                     backends = getattr(hook, 'backends', ('wasm',))
-                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length), backends=backends)
+                    job_id = divider_intake_mod.accept_upload(sessions.state, owner, filename, self.rfile.read(length), backends=backends,
+                                                              unstable_source_only=unstable_source_only,
+                                                              unstable_allow_inference=unstable_allow_inference)
                 else:
                     raise divider_intake_mod.DividerError("expected application/octet-stream or application/json", 415)
             except divider_intake_mod.DividerError as error:

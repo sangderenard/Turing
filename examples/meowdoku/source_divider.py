@@ -7,7 +7,7 @@ read as text and ``ast.parse``d.  Pipeline:
   plan          per file, ``project_compilation_product.authored_compilation_growth_plan`` (cheap AST TRIAGE, not the resolved
                 FunctionTable plan: the real cut decisions are made later by the compiler) -> pieces, dependencies first.  A
                 piece is one unit (an SCC of the call graph): file, qualified names, dependency piece ids, AST node count,
-                ``annotated`` (every formal annotated; an unannotated piece is not attempted: verdict ``needs-annotation``).
+                ``annotated`` (every formal annotated; unannotated pieces default to ``needs-annotation`` unless explicitly admitted).
                 Dependencies are resolved within one file only; cross-file imports are not followed in this slice.
   queue         ``divider_attempts`` (one row per piece x backend) in accounts.db.  ``claim_next`` hands out ONE attempt at a
                 time under BEGIN IMMEDIATE, dependencies first, with a lease generation + deadline.  THIS QUEUE IS WHAT A NODUS
@@ -264,10 +264,13 @@ def _read_source(path: Path):
         return None
 
 
-def plan(db, state, job_id: str) -> list[dict]:
+def plan(db, state, job_id: str, *, allow_unannotated: bool = False) -> list[dict]:
     """Triage every .py file into pieces and queue one attempt per piece x backend (idempotent: an existing plan is returned).
 
+    ``allow_unannotated`` admits source attempts without changing annotation truth or assigning types.
     This is ``authored_compilation_growth_plan``: a cheap AST triage, NOT the resolved plan; written to ``plan.json`` as such."""
+    if type(allow_unannotated) is not bool:
+        raise ValueError("allow_unannotated must be a boolean")
     from src.compiler.project_compilation_product import authored_compilation_growth_plan
     state = StatePaths.coerce(state)
     job = dict(db.execute("SELECT * FROM divider_jobs WHERE job_id=?", (job_id,)).fetchone() or {})
@@ -316,8 +319,8 @@ def plan(db, state, job_id: str) -> list[dict]:
             for backend in backends:
                 db.execute("INSERT OR IGNORE INTO divider_attempts (job_id,piece_id,backend,state,stage,updated) "
                            "VALUES (?,?,?,?,?,?)",
-                           (job_id, r["piece_id"], backend, "queued" if r["annotated"] else "needs-annotation",
-                            None if r["annotated"] else "plan", now))
+                           (job_id, r["piece_id"], backend, "queued" if r["annotated"] or allow_unannotated else "needs-annotation",
+                            None if r["annotated"] or allow_unannotated else "plan", now))
         db.execute("UPDATE divider_jobs SET state='planned' WHERE job_id=?", (job_id,))
         db.execute("COMMIT")
     except BaseException:
@@ -339,8 +342,11 @@ def pieces(db, job_id: str) -> list[dict]:
     return out
 
 
-def submit(db, state, intake: Intake, *, owner_key: str, backends=("wasm",), label: str | None = None) -> str:
+def submit(db, state, intake: Intake, *, owner_key: str, backends=("wasm",), label: str | None = None,
+           allow_unannotated: bool = False) -> str:
     """Register an intaken tree as a job, plan it and queue its attempts.  Returns the job id."""
+    if type(allow_unannotated) is not bool:
+        raise ValueError("allow_unannotated must be a boolean")
     backends = tuple(backends)
     unknown = [b for b in backends if b not in BACKENDS]
     if unknown or not backends:
@@ -349,7 +355,7 @@ def submit(db, state, intake: Intake, *, owner_key: str, backends=("wasm",), lab
                (intake.job_id, owner_key, label, intake.origin, time.time(), "intaken", ",".join(backends)))
     (intake.job_dir / "intake.json").write_text(json.dumps({"kept": intake.kept, "skipped": intake.skipped}, indent=1),
                                                 encoding="utf-8")
-    plan(db, state, intake.job_id)
+    plan(db, state, intake.job_id, allow_unannotated=allow_unannotated)
     return intake.job_id
 
 
@@ -457,7 +463,7 @@ def _first_line(text, limit=300) -> str:
     return (lines[0] if lines else "")[:limit]
 
 
-def _attempt_entry(source: str, name: str, backend: str, out: Path, mark) -> dict:
+def _attempt_entry(source: str, name: str, backend: str, out: Path, mark, *, extraction_contract=None) -> dict:
     """In the child: one entry, one backend.  Returns an entry record; raises with ``mark`` having set the stage."""
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -468,7 +474,8 @@ def _attempt_entry(source: str, name: str, backend: str, out: Path, mark) -> dic
     compile_source, _retained = partition_authored_source(source, name)
     mark("ssa-lowering")
     module, outputs, exports = lower_ast_source_to_ssa(
-        compile_source, name, name=stem, extraction_contract=ExtractionContract(EXTRACTION_CONTRACT), progress_bars=False)
+        compile_source, name, name=stem,
+        extraction_contract=ExtractionContract(extraction_contract or EXTRACTION_CONTRACT), progress_bars=False)
     entry = exports[0]
     mark("emission")
     out.mkdir(parents=True, exist_ok=True)
@@ -539,8 +546,10 @@ def _attempt_main(spec_path: str) -> int:
 
     for name in spec["names"]:
         try:
+            options = ({"extraction_contract": spec["extraction_contract"]}
+                       if spec.get("extraction_contract") else {})
             entries.append(_attempt_entry(source, name, spec["backend"], out / _stem(name) if len(spec["names"]) > 1 else out,
-                                          mark))
+                                          mark, **options))
             if len(spec["names"]) > 1:
                 for key in ("product", "api"):
                     if entries[-1].get(key):

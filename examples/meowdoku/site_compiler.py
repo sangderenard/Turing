@@ -14,7 +14,7 @@ from meowdoku import source_divider, workspace_accounting
 
 
 class SiteCompiler:
-    def __init__(self, state, accounts, config, *, federation_port=None):
+    def __init__(self, state, accounts, config, *, federation_port=None, authz_policy=None):
         if not isinstance(config, dict):
             raise ValueError('site compiler configuration must be an object')
         required = {'jobs_dir', 'service_id', 'capacity_bytes', 'user_quota_bytes',
@@ -23,6 +23,9 @@ class SiteCompiler:
             raise ValueError('missing site compiler settings: ' + ', '.join(sorted(required - config.keys())))
         if config['backend'] not in bridge.DRIVER_BACKENDS:
             raise ValueError('site Nodus backend must be c, llvm or fortran')
+        self.allow_unstable_source = config.get('allow_unstable_source', False)
+        if type(self.allow_unstable_source) is not bool:
+            raise ValueError('allow_unstable_source must be a boolean')
         port = config.get('port', federation_port)
         if type(port) is not int or not 0 < port < 65536 or type(config['service_id']) is not int or config['service_id'] <= 0:
             raise ValueError('site compiler requires a valid contract port and service participant id')
@@ -37,7 +40,8 @@ class SiteCompiler:
                     reservation_bytes=config['reservation_bytes'], review_after_s=config['review_after_s'])
         self.route = bridge.NodusCompileRoute('127.0.0.1', port, config['service_id'], root,
                     nodus_tools=config.get('nodus_tools'), source_root=state.jobs_dir,
-                    backend=config['backend'], turing_root=config.get('turing_root'), artifacts=artifacts)
+                    backend=config['backend'], turing_root=config.get('turing_root'), artifacts=artifacts,
+                    allow_unstable_source=self.allow_unstable_source, authz_policy=authz_policy)
         self.state = state
         self.backends = (config['backend'],)
         self.timeout_s = float(config.get('timeout_s', bridge.DEFAULT_TIMEOUT_S))
@@ -85,6 +89,7 @@ class SiteCompiler:
 
 def configure(sessions, config_path, *, federation_port=None):
     config = json.loads(Path(config_path).read_text(encoding='utf-8'))
-    worker = SiteCompiler(sessions.state, sessions.accounts, config, federation_port=federation_port)
+    worker = SiteCompiler(sessions.state, sessions.accounts, config, federation_port=federation_port,
+                          authz_policy=sessions.authz_policy)
     sessions.divider_hook = worker
     return worker

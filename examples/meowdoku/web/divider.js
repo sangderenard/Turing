@@ -82,7 +82,7 @@ function renderDetail(job) {
       if (a.error_type) bits.push(`${a.error_type}${a.error ? ` (${a.error})` : ''}`);
       return bits.join(' ');
     }).join('; ');
-    const state = piece.annotated ? piece.state : `${piece.state} (needs annotation)`;
+    const state = piece.annotated ? piece.state : `${piece.state} (${job.unstable_allow_inference ? 'unannotated; inference permitted' : 'needs annotation'})`;
     tr.append(cell(piece.file), cell(piece.names.join(', ')), cell(state, stateClass(piece.state)), cell(attempts));
     body.append(tr);
   }
@@ -140,7 +140,13 @@ function init() {
     event.preventDefault();
     const file = $('file').files[0];
     if (!file) { setStatus('choose a .py or .zip file first', true); return; }
-    await submit('/api/divider/jobs', {method: 'POST', headers: {'Content-Type': 'application/octet-stream', 'X-Filename': file.name},
+    if ($('inference').checked && !$('unstable').checked) {
+      setStatus('Type inference requires unstable source-only compilation.', true); return;
+    }
+    const headers = {'Content-Type': 'application/octet-stream', 'X-Filename': file.name};
+    if ($('unstable').checked) headers['X-Compile-Unstable'] = 'source-only';
+    if ($('inference').checked) headers['X-Compile-Inference'] = 'allow';
+    await submit('/api/divider/jobs', {method: 'POST', headers,
                                        body: file}, 'uploading');
   });
   $('repoform').addEventListener('submit', async (event) => {

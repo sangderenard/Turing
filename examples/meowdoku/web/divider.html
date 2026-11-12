@@ -33,6 +33,10 @@
   <h2>Submit</h2>
   <form id="fileform" class="row">
     <input id="file" type="file" accept=".py,.zip" aria-label="source file or zip">
+    <label><input id="unstable" type="checkbox" aria-describedby="unstable-help"> Unstable: source-only compilation</label>
+    <span id="unstable-help" class="mut">Requires explicit account permission and operator enablement. Permits non-AbstractTensor source attempts; it does not create a runnable Nodus ABI. Unannotated pieces need annotations unless inference is explicitly enabled below.</span>
+    <label><input id="inference" type="checkbox" aria-describedby="inference-help"> Unstable: allow type inference</label>
+    <span id="inference-help" class="mut">Requires source-only compilation above. Admits unannotated source for a compiler attempt; type resolution is not guaranteed. No annotations or types are assigned for you.</span>
     <button id="upload" type="submit">Upload</button>
   </form>
   <form id="repoform" class="row">

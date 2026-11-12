@@ -166,9 +166,14 @@ def _new_id(jobs_dir: Path) -> str:
 
 
 # ----------------------------------------------------------------------------------------------------------------------- accept
-def accept_upload(paths, owner_key: str, filename: str, data: bytes, backends=("wasm",)) -> str:
+def accept_upload(paths, owner_key: str, filename: str, data: bytes, backends=("wasm",), *, unstable_source_only: bool = False,
+                  unstable_allow_inference: bool = False) -> str:
     """One .py (<= 512 KiB) or one .zip (<= 20 MiB) -> a source_divider job (planned, attempts queued).  Returns the job id.
     DividerError on refusal; on any failure nothing stays on disk and no row is written."""
+    if type(unstable_source_only) is not bool or type(unstable_allow_inference) is not bool:
+        raise DividerError("unstable compilation options must be booleans")
+    if unstable_allow_inference and not unstable_source_only:
+        raise DividerError("unstable inference requires source-only compilation")
     state = StatePaths.coerce(paths)
     name = _upload_name(filename)
     suffix = name.lower().rsplit(".", 1)[-1] if "." in name else ""
@@ -202,8 +207,10 @@ def accept_upload(paths, owner_key: str, filename: str, data: bytes, backends=("
                 for rel in pys:
                     sd._store(intake, rel, (src / rel).read_bytes())
                 intake.skipped.extend([("(non-source)", report["skipped"])] if report["skipped"] else [])
-                (area / "upload.json").write_text(json.dumps({"filename": name, "bytes": len(data), **report}), encoding="utf-8")
-                sd.submit(db, state, intake, owner_key=owner_key, backends=backends, label=name)
+                (area / "upload.json").write_text(json.dumps({"filename": name, "bytes": len(data), "unstable_source_only": unstable_source_only,
+                                                          "unstable_allow_inference": unstable_allow_inference, **report}), encoding="utf-8")
+                sd.submit(db, state, intake, owner_key=owner_key, backends=backends, label=name,
+                          allow_unannotated=unstable_allow_inference)
             except BaseException:
                 shutil.rmtree(area, ignore_errors=True)
                 shutil.rmtree(state.jobs_dir / job_id, ignore_errors=True)
@@ -312,6 +319,8 @@ def get_job(paths, job_id: str, owner_key: str, admin: bool = False):
                 job[key] = json.loads((area / name).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pass
+        job["unstable_source_only"] = job.get("upload", {}).get("unstable_source_only") is True
+        job["unstable_allow_inference"] = job.get("upload", {}).get("unstable_allow_inference") is True
         if "upload" in job:
             job["upload"] = {"kept": len(job["upload"].get("kept", [])), "skipped": job["upload"].get("skipped", 0)}
         return job

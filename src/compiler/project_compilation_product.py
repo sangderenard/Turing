@@ -2934,22 +2934,53 @@ def _partition_nested_authored_source(
         for name in _defined_names(statement):
             module_definitions[name] = statement
 
-    # A nested function remains in its exact original lexical location. Only
-    # headers of its enclosing class/functions are retained; the nested body
-    # itself supplies the suite, so unrelated outer statements never enter the
-    # worker. This is a compile partition, not a rewritten source authority.
+    # A nested callable can capture aggregate storage declared in an enclosing
+    # function. Keeping only that function's header discarded the declaration
+    # and left IndexedStore without an aggregate contract. Resolve dependencies
+    # in their authored lexical scope, retaining the real declarations rather
+    # than guessing a dtype for the resulting closure input.
+    scopes: list[dict[str, ast.stmt | None]] = [module_definitions]
+    for ancestor in definition.ancestors:
+        if isinstance(ancestor, ast.ClassDef):
+            continue  # A method does not capture its class namespace.
+        bindings: dict[str, ast.stmt | None] = {
+            argument.arg: None
+            for argument in (
+                *ancestor.args.posonlyargs,
+                *ancestor.args.args,
+                *ancestor.args.kwonlyargs,
+                *((ancestor.args.vararg,) if ancestor.args.vararg else ()),
+                *((ancestor.args.kwarg,) if ancestor.args.kwarg else ()),
+            )
+        }
+        for statement in ancestor.body:
+            for name in _defined_names(statement):
+                bindings[name] = statement
+        scopes.append(bindings)
+
+    # Source lines stay in their exact lexical location; unrelated enclosing
+    # statements do not enter the worker. This is a compile partition, not a
+    # rewritten source authority.
     structural_nodes = (*definition.ancestors, definition.node)
     selected[id(definition.node)] = definition.node
-    pending_names = sorted(_loaded_external_names(definition.node), reverse=True)
+    pending_names = [
+        (name, len(scopes) - 1)
+        for name in sorted(_loaded_external_names(definition.node), reverse=True)
+    ]
     while pending_names:
-        name = pending_names.pop()
-        dependency = module_definitions.get(name)
+        name, scope_index = pending_names.pop()
+        while scope_index > 0 and name not in scopes[scope_index]:
+            scope_index -= 1
+        dependency = scopes[scope_index].get(name)
         if dependency is None or dependency in structural_nodes:
             continue
         if id(dependency) in selected:
             continue
         selected[id(dependency)] = dependency
-        pending_names.extend(sorted(_loaded_external_names(dependency), reverse=True))
+        pending_names.extend(
+            (name, scope_index)
+            for name in sorted(_loaded_external_names(dependency), reverse=True)
+        )
 
     retained_lines: set[int] = set()
     selected_names: set[str] = {definition.node.name}
