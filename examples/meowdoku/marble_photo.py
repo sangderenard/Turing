@@ -824,6 +824,17 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             config["camera_trigger_graph"] = RoutingGraph.from_dict(graph).to_dict()
         except (TypeError, ValueError, KeyError) as error:
             raise PhotoError(f"invalid camera trigger graph: {error}") from None
+    if "camera_trigger_generators" in value:
+        if "camera_trigger_graph" not in config:
+            raise PhotoError("camera trigger generators need a routed trigger graph")
+        try:
+            from camera_software.trigger_generators import validate_generators
+            generators = list(validate_generators(value["camera_trigger_generators"]))
+            if any(item["key"] not in config["camera_trigger_graph"]["nodes"] for item in generators):
+                raise ValueError("generator source is missing from the routed trigger graph")
+            config["camera_trigger_generators"] = generators
+        except (TypeError, ValueError, KeyError) as error:
+            raise PhotoError(f"invalid camera trigger generators: {error}") from None
     if fixtures and fixtures.get("trigger_emitters"):
         timing = value.get("camera_trigger_timing", {"shop_cutoff_lead_s": .001, "flash_duration_s": .010})
         if not isinstance(timing, dict) or set(timing) != {"shop_cutoff_lead_s", "flash_duration_s"}:
