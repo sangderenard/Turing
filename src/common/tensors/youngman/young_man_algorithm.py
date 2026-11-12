@@ -1,5 +1,10 @@
 from src.common.tensors import AbstractTensor
 from src.common.tensors.abstraction_methods.random import RANDOM_KIND
+from src.common.tensors.numpy_backend import NumPyTensorOperations
+# The original relies on 0/0 being NaN: a tile whose torque row is zero gets a NaN rotation axis and drops out.
+# The NumPy backend's default division mode gives 0 there, so this module selects the backend's NaN mode. It is a
+# process-wide switch: the compiler's Python dialect refuses to lower while it is set (it spells the 'zero' mode).
+NumPyTensorOperations.DIVIDE_MODE = 'normal'
 class CompositeGeometry:
     def __init__(self, geometry="tetrahedron", precision="float64", device="cuda"):
         self.geometry = geometry
@@ -852,7 +857,7 @@ class YoungManAlgorithm:
                     projected_edges.append((angle, edge))
 
                 # Step 4: Sort edges by their angle
-                projected_edges.sort(key=lambda x: x[0].item() if hasattr(x[0], "item") else x[0])
+                projected_edges.sort(key=lambda x: x[0])
                 sorted_edges = [edge for _, edge in projected_edges]
 
                 # Step 5: Form triangles from sorted edges

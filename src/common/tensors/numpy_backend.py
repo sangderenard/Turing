@@ -872,9 +872,6 @@ class NumPyTensorOperations(AbstractTensor):
     def tolist_(self):
         return self._AbstractTensor__unwrap(self.data).tolist()
 
-    def less_(self, value):
-        return self.data < value
-
     def index_select_(self, dim, indices):
         tensor = self.data
         idx = np.asarray(self._AbstractTensor__unwrap(indices))
