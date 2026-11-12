@@ -374,6 +374,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   if (config.sensor_lanes && !config.exposure_state_frames)
     throw new RangeError('Sensor lanes require captured state frames on the Studio timeline.');
   if (options.cameraTriggerGraph !== undefined) config.camera_trigger_graph = structuredClone(options.cameraTriggerGraph);
+  if (options.cameraTriggerGenerators !== undefined) config.camera_trigger_generators = structuredClone(options.cameraTriggerGenerators);
   if (options.cameraTriggerTiming !== undefined) config.camera_trigger_timing = structuredClone(options.cameraTriggerTiming);
   const json = encoder.encode(JSON.stringify(config));
   const n = faces.length;
@@ -400,7 +401,7 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
   return buffer;
 }
 
-export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null, fieldView = null, exposureClock = null, cameraTriggerGraph = null) {
+export function createMarblePhoto(doc = document, currentCamera = null, prepareExposure = null, fieldView = null, exposureClock = null, cameraTriggerGraph = null, cameraTriggerGenerators = null) {
   const $ = (id) => doc.getElementById(id);
   const lensControls = createStudioLensControls(doc);
   const participation = createPhotoParticipation(doc);
@@ -1022,6 +1023,7 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
     const routing=cameraTriggerGraph?.();
     if(routing?.edges?.some(edge=>Math.abs(edge.w)>1e-12)){
       options.cameraTriggerGraph=routing;
+      options.cameraTriggerGenerators=cameraTriggerGenerators?.();
       const receivers=new Set((routing.edges??[]).filter(edge=>Math.abs(edge.w)>1e-12).map(edge=>edge.dst));
       const triggered=Array.from({length:STUDIO_LIGHTS.length},(_,material)=>material)
         .filter(material=>receivers.has(`studio:${material}`)).map(material=>({material,

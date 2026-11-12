@@ -184,6 +184,22 @@ def test_timed_shop_trigger_metadata_keeps_named_source_identity(photo_payload):
     config=photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',
         exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames),store)[3]
     assert config['fixtures']['trigger_emitters'][0]['gain']==20.0
+    from camera_software.trigger_bus import make_camera_trigger_graph
+    from camera_software.trigger_generators import GENERATOR_KEYS
+    graph=make_camera_trigger_graph(['shop:0'],generator_keys=GENERATOR_KEYS)
+    graph.set_weight('mod:1','shop:0',1)
+    generator={'key':'mod:1','enabled':True,'kind':'sine','frequency_hz':30,
+               'phase_deg':0,'tension':1,'attack_ms':0,'decay_ms':0,'sustain':1,
+               'hold_ms':20,'release_ms':0,'repeat_count':2,
+               'repeat_interval_ms':20,'level':1}
+    routed=photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',
+        exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames,
+        camera_trigger_graph=graph.to_dict(),camera_trigger_generators=[generator]),store)[3]
+    assert routed['camera_trigger_generators']==[generator]
+    with pytest.raises(photos.PhotoError,match='invalid camera trigger generators'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',
+            exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames,
+            camera_trigger_graph=graph.to_dict(),camera_trigger_generators=[{**generator,'frequency_hz':999}]),store)
     bad={**fixture,'trigger_emitters':[{'material':0,'receiver':'other','gain':20.0}]}
     with pytest.raises(photos.PhotoError,match='trigger emitter'):
         photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',

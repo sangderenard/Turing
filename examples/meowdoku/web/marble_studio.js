@@ -84,7 +84,8 @@ const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
   nextTick(callback){exposureClock.waiters.push(callback);},
   completeTick(){for(const callback of this.waiters.splice(0))callback();}};
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock,()=>triggerGrid?.graph());
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock,
+  ()=>triggerGrid?.graph(),()=>triggerGrid?.generators());
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),

@@ -23,7 +23,8 @@ def command(account_id: int, request: dict, spectral_root) -> dict:
             if (not isinstance(receivers, list) or not isinstance(buses, list)
                     or any(not isinstance(k, str) or len(k) > 80 for k in receivers + buses)):
                 raise ValueError("camera routing needs bounded named light buses and receivers")
-            panel = CameraTriggerGrid(receivers, buses, saved=request.get("graph"))
+            panel = CameraTriggerGrid(receivers, buses, saved=request.get("graph"),
+                                      generators=request.get("generators"))
             _panels[account_id] = panel
             return panel.frame()
         if action == "event":
@@ -31,10 +32,18 @@ def command(account_id: int, request: dict, spectral_root) -> dict:
             if panel is None:
                 raise ValueError("open the camera routing grid before sending pointer events")
             return panel.event(request.get("name"), request.get("x", 0), request.get("y", 0),
-                               button=request.get("button", 1), wheel_y=request.get("wheel_y", 0))
+                               button=request.get("button", 1), wheel_y=request.get("wheel_y", 0),
+                               shift=request.get("shift", False))
         if action == "pulse":
             panel = _panels.get(account_id)
             if panel is None:
                 raise ValueError("open the camera routing grid before firing")
             return panel.pulse()
+        if action == "configure":
+            panel = _panels.get(account_id)
+            if panel is None:
+                raise ValueError("open the camera routing grid before configuring generators")
+            from camera_software.trigger_generators import validate_generators
+            panel.generators = validate_generators(request.get("generators"))
+            return {"generators": list(panel.generators)}
         raise ValueError("unknown camera routing grid action")

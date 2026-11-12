@@ -109,6 +109,8 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
   <h2>Lighting</h2>
   <details id="camera-trigger-grid"><summary>Camera flash and light bus routing</summary>
     <p>Original Spectral N×N mixer: columns send to rows. Mix sets amplitude; Delay sets propagation time. Patched light receivers respond to the manual flash in the Phong preview. Light exposure routes currently require a Flash source, nonnegative 0.1 ms delay steps and no delayed cycles.</p>
+    <p>Camera Flash triggers each enabled modulator. Patch mod:1–3 to any light or rack bus in the mixer. Repeat restarts the waveform and its ADSR envelope; sustain sets its held level and hold sets its duration. Scroll for rows, Shift+scroll for columns, Shift+drag for fine delay.</p>
+    <div id="camera-trigger-generators" class="grid"></div>
     <img id="camera-trigger-grid-image" alt="Spectral camera trigger routing matrix" draggable="false">
     <p><button type="button" id="camera-trigger-fire" disabled>Fire flash in Phong</button> <label>Preview slowdown <select id="camera-trigger-preview-speed"><option value="50">50×</option><option value="10">10×</option><option value="1">Real time</option></select></label> <button type="button" id="camera-trigger-reset">Reset routing for current lights</button></p>
     <output id="camera-trigger-grid-status" role="status">Open to load the mixer.</output><br>
