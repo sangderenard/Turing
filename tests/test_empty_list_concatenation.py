@@ -3,9 +3,11 @@
 Shrunk from the string-core structure driver ``structure_queries``, which
 rebuilds a cover's atoms as ``rebuilt = []; ...; rebuilt = rebuilt + ca``.
 The folded ``[]`` is a constant no tensor flattens, so the ``+`` was
-classified coordinator metadata and dropped: its result had no producer,
-became a root formal, and the annotated program read the list back empty
-(silently).  The programs run natively (C and LLVM) and must equal Python.
+classified coordinator metadata and dropped: its result had no producer
+and the program read the list back empty (silently).  The element class of
+``[]`` is the one its declaration posts (``list[int]``): the annotated
+program runs natively (C and LLVM) and must equal Python.  The unannotated
+one has no posted class, and its concatenation refuses by name.
 """
 
 from __future__ import annotations
@@ -43,8 +45,16 @@ UNANNOTATED = ANNOTATED.replace("rebuilt: list[int] = []", "rebuilt = []")
 
 PROGRAMS = {
     "annotated": (ANNOTATED, (0, 1, 3, 4, 9)),
-    "unannotated": (UNANNOTATED, (0, 1, 3, 4, 9)),
 }
+
+UNANNOTATED_LEN = EXPAND + '''
+
+def root(n: int) -> int:
+    rebuilt = []
+    cs, ca = expand(n % 5)
+    rebuilt = rebuilt + ca
+    return cs * 7 + len(rebuilt)
+'''
 
 
 def _python(source, n):
@@ -93,3 +103,12 @@ def test_empty_list_concatenation_matches_python_natively(name, tmp_path):
         llvm_value = prepare_artifact_execution(llvm, feeds).run().buffers[outputs[0]]
         assert int(c_value.reshape(-1)[0]) == expected, (name, "c", n)
         assert int(llvm_value.reshape(-1)[0]) == expected, (name, "llvm", n)
+
+
+@pytest.mark.parametrize(("source", "refusal"), [
+    (UNANNOTATED_LEN, r"list concatenation \d+ .* is planned by no region"),
+    (UNANNOTATED, r"input 'r' in function 'root'\) has no settled dtype"),
+])
+def test_unannotated_empty_list_concatenation_refuses_by_name(source, refusal):
+    with pytest.raises(ValueError, match=refusal):
+        _lowered("unannotated", source)
