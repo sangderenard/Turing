@@ -2926,61 +2926,104 @@ def _partition_nested_authored_source(
     """Keep an exact nested definition and only its lexical source shells."""
 
     module = ast.parse(source)
-    module_definitions: dict[str, ast.stmt] = {}
     selected: dict[int, ast.stmt] = {}
     for statement in module.body:
         if isinstance(statement, ast.ImportFrom) and statement.module == "__future__":
             selected[id(statement)] = statement
-        for name in _defined_names(statement):
-            module_definitions[name] = statement
 
     # A nested callable can capture aggregate storage declared in an enclosing
     # function. Keeping only that function's header discarded the declaration
     # and left IndexedStore without an aggregate contract. Resolve dependencies
     # in their authored lexical scope, retaining the real declarations rather
     # than guessing a dtype for the resulting closure input.
-    scopes: list[dict[str, ast.stmt | None]] = [module_definitions]
-    for ancestor in definition.ancestors:
-        if isinstance(ancestor, ast.ClassDef):
-            continue  # A method does not capture its class namespace.
-        bindings: dict[str, ast.stmt | None] = {
-            argument.arg: None
-            for argument in (
-                *ancestor.args.posonlyargs,
-                *ancestor.args.args,
-                *ancestor.args.kwonlyargs,
-                *((ancestor.args.vararg,) if ancestor.args.vararg else ()),
-                *((ancestor.args.kwarg,) if ancestor.args.kwarg else ()),
-            )
-        }
-        for statement in ancestor.body:
-            for name in _defined_names(statement):
-                bindings[name] = statement
-        scopes.append(bindings)
+    # The same Python symbol-table authority used by authored_closure_contract
+    # distinguishes a real capture from an explicit global/nonlocal. In
+    # particular, an inner ``global storage`` must not select an outer local
+    # with that spelling. A method does not capture its class namespace.
+    root_table = symtable.symtable(source, "<authored-project>", "exec")
+    function_tables = {}
+    pending_tables = list(root_table.get_children())
+    while pending_tables:
+        table = pending_tables.pop()
+        if table.get_type() == "function":
+            function_tables[(table.get_name(), int(table.get_lineno()))] = table
+        pending_tables.extend(table.get_children())
+
+    scope_nodes = [module, *(
+        ancestor for ancestor in definition.ancestors
+        if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )]
+    scope_tables = [root_table, *(
+        function_tables[(node.name, int(node.lineno))]
+        for node in scope_nodes[1:]
+    )]
+
+    def binding_scope(name, scope_index, function_table=None):
+        table = function_table if function_table is not None else scope_tables[scope_index]
+        try:
+            symbol = table.lookup(name)
+        except KeyError:
+            # Function headers are evaluated in the defining scope, not the
+            # function body whose symbol table omits their references.
+            if function_table is not None:
+                return binding_scope(name, scope_index)
+            return binding_scope(name, scope_index - 1) if scope_index else 0
+        if symbol.is_global():
+            return 0
+        if symbol.is_local():
+            return scope_index if function_table is None else None
+        if function_table is not None:
+            return binding_scope(name, scope_index)
+        return binding_scope(name, scope_index - 1) if scope_index else 0
+
+    # Keep the authored binding's write chain, not only its last statement.
+    # ``storage: dict[...] = {}; storage = dict(storage)`` and ``value += 1``
+    # both need their earlier initialization/annotation. Group enclosing
+    # global/nonlocal writes with their real owner, retaining those declarations.
+    def declared_names(node):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            yield from node.names
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            for child in ast.iter_child_nodes(node):
+                yield from declared_names(child)
+
+    bindings: dict[tuple[int, str], list[tuple[int, ast.stmt]]] = {}
+    for scope_index, node in enumerate(scope_nodes):
+        for statement in node.body:
+            # A declaration inside a conditional still applies to the whole
+            # Python scope. Retain its authored containing statement intact.
+            names = (*_defined_names(statement), *declared_names(statement))
+            for name in names:
+                owner = binding_scope(name, scope_index)
+                bindings.setdefault((owner, name), []).append((scope_index, statement))
+
+    def dependencies(statement, scope_index):
+        names = _loaded_external_names(statement)
+        # Keeping ``nonlocal first, second`` requires both owning bindings.
+        names.update(declared_names(statement))
+        table = None
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            table = function_tables[(statement.name, int(statement.lineno))]
+            # Nonlocal/global writes can have Store context only. Their
+            # declarations still require the real owning binding to survive.
+            names.update(symbol.get_name() for symbol in table.get_symbols()
+                         if symbol.is_free() or symbol.is_declared_global())
+        return [(name, owner) for name in sorted(names, reverse=True)
+                if (owner := binding_scope(name, scope_index, table)) is not None]
 
     # Source lines stay in their exact lexical location; unrelated enclosing
     # statements do not enter the worker. This is a compile partition, not a
     # rewritten source authority.
     structural_nodes = (*definition.ancestors, definition.node)
     selected[id(definition.node)] = definition.node
-    pending_names = [
-        (name, len(scopes) - 1)
-        for name in sorted(_loaded_external_names(definition.node), reverse=True)
-    ]
+    pending_names = dependencies(definition.node, len(scope_nodes) - 1)
     while pending_names:
-        name, scope_index = pending_names.pop()
-        while scope_index > 0 and name not in scopes[scope_index]:
-            scope_index -= 1
-        dependency = scopes[scope_index].get(name)
-        if dependency is None or dependency in structural_nodes:
-            continue
-        if id(dependency) in selected:
-            continue
-        selected[id(dependency)] = dependency
-        pending_names.extend(
-            (name, scope_index)
-            for name in sorted(_loaded_external_names(dependency), reverse=True)
-        )
+        name, owner = pending_names.pop()
+        for scope_index, dependency in bindings.get((owner, name), ()):
+            if dependency in structural_nodes or id(dependency) in selected:
+                continue
+            selected[id(dependency)] = dependency
+            pending_names.extend(dependencies(dependency, scope_index))
 
     retained_lines: set[int] = set()
     selected_names: set[str] = {definition.node.name}

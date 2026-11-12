@@ -55,3 +55,20 @@ Job ec8dc8592961, contract7447874525838744298. The old immutable live job
 a7257bbac893 remains untouched. No full suite, runnable generic closure ABI,
 production deployment, or successful compilation of all 377 pieces is claimed.
 Details: docs/SITE_UNSTABLE_SOURCE_2026-11-12.md.
+
+LATER CHECKPOINT: the actual closure edge now transports its source-declared
+mapping column contracts, semantic classes and concordance proof. The planner
+accepts only a matching declared capture into its existing mapping typing
+rule, without choosing a fallback width. The original clears dtype settlement
+and reaches final concordance, which refuses3 generated mapping helpers:
+"elementwise span input has no matching physical span result". The detector
+remains active. Retained root original-source-trial-011a8ab141cc48d188d31c5535060e48
+under the same external UserFiles parent; job791221a8c798, contract6229681601753546779.
+
+192 combined tests passed (35.25s); 33 focused planner/mapping/capture/table
+checks passed; 17 partition selections passed; mapping audit0 findings.
+Global/nonlocal binding ownership and initializer/write-chain regressions are
+fixed using the existing symbol-table authority. No source product emitted,
+built, adopted or rendered. Early ignored pytest and bytecode caches from this
+owned worktree were moved to external user space; compiler trials always kept
+their source products/logs in their account workspaces.

@@ -3084,6 +3084,82 @@ def _planned_scalar_dtypes_from(
             _CALLEE_PLAN_MEMO = None
 
 
+def _declared_mapping_closure_contract(graph: Any, node_id: int):
+    """Read a mapping row declaration transported to this exact capture."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        ANNOTATION_DECLARATION, CANONICAL_VALUE, NAME_BINDING,
+        SEQUENCE_ROW_DTYPE, SOURCE_CLOSURE_CAPTURE, SOURCE_CLOSURE_ENVIRONMENT,
+    )
+    from .identity_concordance import Ref, _canonical_identity_base, current_identity_book
+
+    attributes = graph.G.nodes.get(int(node_id), {}).get("attributes") or {}
+    if attributes.get("binding_kind") != "closure" or attributes.get("aggregate_kind") != "dict":
+        return None
+    receipt = attributes.get("mapping_value_annotation_cell")
+    if not isinstance(receipt, Ref) or receipt.page != SEQUENCE_ROW_DTYPE:
+        return None
+    book = current_identity_book()
+    fact = book.page(receipt.page).cell(receipt.row, receipt.column)
+    if not isinstance(fact, tuple) or len(fact) != 2 or tuple(fact[0]) != tuple(
+        attributes.get(key) for key in ("mapping_key_dtype", "mapping_value_dtype")
+    ):
+        return None
+    captures = tuple(
+        source for source, _stage in book.edges_into(receipt)
+        if source.page == SOURCE_CLOSURE_CAPTURE
+    )
+    if len(captures) != 1:
+        return None
+    environment, parent, binding = book.page(SOURCE_CLOSURE_CAPTURE).cell(
+        captures[0].row, captures[0].column,
+    )
+    if book.page(SOURCE_CLOSURE_ENVIRONMENT).cell(environment.row, environment.column)[0] != parent:
+        return None
+    value = book.page(NAME_BINDING).cell(binding.row, binding.column).value_id
+    formal = book.latest_ref(CANONICAL_VALUE, (binding.row[0], int(value)))
+    if formal is None or _canonical_identity_base(book, formal) != _canonical_identity_base(
+        book, node_identity_cell(graph, int(node_id)),
+    ):
+        return None
+    declarations, seen, pending = set(), set(), [receipt]
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for source, _stage in book.edges_into(current):
+            if source.page == ANNOTATION_DECLARATION:
+                declarations.add(source)
+            elif source.page == SEQUENCE_ROW_DTYPE:
+                pending.append(source)
+    if len(declarations) != 1:
+        return None
+    declaration, = declarations
+    annotation = ast.parse(
+        book.page(ANNOTATION_DECLARATION).cell(declaration.row, declaration.column).annotation,
+        mode="eval",
+    ).body
+    if not (
+        isinstance(annotation, ast.Subscript)
+        and str(
+            annotation.value.id if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr if isinstance(annotation.value, ast.Attribute)
+            else ""
+        ).casefold() in {"dict", "mapping", "mutablemapping"}
+        and isinstance(annotation.slice, ast.Tuple)
+        and len(annotation.slice.elts) == 2
+        and all(isinstance(member, ast.Name) for member in annotation.slice.elts)
+    ):
+        return None
+    if tuple(f"builtins.{member.id}" for member in annotation.slice.elts) != tuple(
+        attributes.get(key) for key in ("mapping_key_class_ref", "mapping_value_class_ref")
+    ):
+        return None
+    return receipt
+
+
 def _planned_scalar_dtypes_from_graph(
     graph: Any,
     *,
@@ -3680,7 +3756,11 @@ def _planned_scalar_dtypes_from_graph(
                            classes.get(str(capture_fact[0]).removeprefix("builtins.")))
                     continue
                 kind = attributes.get("binding_kind")
-                if kind == "parameter":
+                if kind == "parameter" or _declared_mapping_closure_contract(graph, node_id) is not None:
+                    # A declared mapping capture has the same row semantics
+                    # as a mapping formal. The old closure fallthrough skipped
+                    # the collection rule despite its exact declaration and
+                    # capture proof. Consume that rule, not a default dtype.
                     # A table-bound worker capture is an input onto the
                     # parent's exact storage. Its concorded element TYPE
                     # follows the same writer-checked rules as a formal;
@@ -5474,6 +5554,7 @@ def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
     cells.extend(cell for cell in (
         captured_input_contract(graph, int(value_id))[1],
         captured_columns(graph, int(value_id))[1],
+        _declared_mapping_closure_contract(graph, int(value_id)),
     ) if cell is not None)
     try:
         cells.append(node_identity_cell(graph, int(value_id)))

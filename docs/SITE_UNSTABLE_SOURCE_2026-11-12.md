@@ -122,3 +122,42 @@ and native host regression tests pass with aborting adoption/plugin stubs.
 The CPU-only native trial harness is separate from source-product compilation;
 no original-source native/GPU product was linked or rendered. No full-suite or
 production deployment claim is made.
+
+## Declared closure contracts and planner checkpoint
+
+Further tracing found two missing handoffs in the existing compiler. The
+declared mapping column facts existed on the parent binding but were not
+transported to its captured input; the planner then skipped ordinary closure
+inputs before its existing mapping-value-class rule. The repair transports a
+whitelist of declared mapping facts along the actual closure capture edge,
+posts existing `SEQUENCE_ROW_DTYPE` evidence with source provenance, and admits
+only the matching declared capture to the existing mapping typing rule.
+String keys retain their real string semantic class and string-table token
+storage. No scalar width is selected by the admission gate.
+
+Negative tests cover missing capture evidence, shadowed variables, mismatched
+declarations and receipts for another capture. Partition review also corrected
+global/nonlocal ownership and read-modify-write declaration chains using the
+existing Python symbol-table authority. Exact source lines remain unchanged.
+
+The next full original-source trial cleared the dtype failures and reached
+final SSA concordance. It refused three generated mapping helpers (contains,
+store and required lookup) with:
+
+> elementwise span input has no matching physical span result
+
+Retained root:
+`C:/Users/alber/AppData/Local/Nodus/UserFiles/original-source-trial-011a8ab141cc48d188d31c5535060e48`,
+job `791221a8c798`, contract `6229681601753546779`. The manifest records
+`ConcordanceRefusal`, and all adoption counters remain zero. This is still a
+failed source-only attempt, with no emission or runnable product. The detector
+was not disabled; its helper classification/ABI finding is the next boundary
+to investigate.
+
+At this checkpoint 192 combined Turing tests passed (35.25 seconds), 33 focused
+planner/mapping/capture/structural-table tests passed, and the mapping audit
+still had zero findings or unsourced facts/identities. Early test invocations
+created ignored pytest/bytecode caches in the owned worktree; these are test
+caches, not compiler products, and were moved to external user space. Further
+tests should select an external pytest root and cache prefix as well as the
+external temporary directory.
