@@ -388,10 +388,27 @@ room's contention DIAL (separate positions, one per contender's interior).
   1,024 items: one treadmill in the whole workspace, turing `tests/` (1,505
   items); at 256 there would be eleven.
 
+- `src/compiler/repo_world_unit_world.py` (gap D, per unit):
+  `build_unit_world(index, address)` lifts one unit into an `AbstractUIWorld`:
+  the courtyard is a region whose identity is the unit address, every item is
+  a lot with the one raw metaphor (`ruin`) and no rooms yet, folder lots carry
+  island or treadmill doors, and the courtyard's passage leads back to the
+  parent window. The world is the folder's island (`world:<folder>`), so every
+  window of one courtyard is one island. `unit_graph` is its
+  `abstract-ui-div-map-v0` graph, the one model the page draws and the text
+  navigator (`living_data_query.GraphView`) walks; doors, the way out and
+  imports that leave the unit are tracks, so the navigator lists them as exits.
+- `src/compiler/abstract_ui_wilderness.py`: a map's place in the wilderness is
+  a point on the unit sphere in n dimensions (default 8). The embedding is
+  blank on purpose (owner: "we're going to evolve it into doing anything"): the
+  generalized golden-ratio lattice indexed by the identity's SHA-256, carried
+  onto the sphere by the inverse normal CDF. `unit_graph` records it as
+  `wilderness`.
+
 Not built: the browser side of both doors (scrolling the treadmill, turning
-the dial, asking for the window at an offset), a world builder that lifts one
-unit into an `AbstractUIWorld` (gap D, now per unit rather than per
-repository), and a served route that answers a unit by address.
+the dial, asking for the window at an offset), a served route that answers a
+unit by address, entities on the navigator's graph, the courtyard's passage
+into the wilderness, and the wilderness itself.
 
 ## 7a. Measurement of the whole workspace from GitHub (observed, 2026-11-11)
 
