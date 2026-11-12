@@ -1,4 +1,4 @@
-from src.common.tensors import AbstractTensor  # straight torch -> AbstractTensor replacement of speaktome training/notebook/1733612620_CompositeGeometry_Shape_Shuttle_YoungManAlgorithm.py; line for line, nothing else changed
+from src.common.tensors import AbstractTensor
 class CompositeGeometry:
     def __init__(self, geometry="tetrahedron", precision=AbstractTensor.float64, device="cuda"):
         self.geometry = geometry
