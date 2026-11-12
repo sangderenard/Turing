@@ -21,8 +21,8 @@
     and value shape as `c_exception_operation`).
   - The audit reads both pages with one check; a mismatch is reported as
     `llvm-exception-provenance`.
-- Measured with a cold cffi accelerator build (see the next entry), under
-  tests/test_llvm_source_exceptions.py, 5 passed:
+- Measured under tests/test_llvm_source_exceptions.py, 5 passed (a run in
+  which the lowering refusal in the next entry did not occur):
   - try/finally raise (n=4): the LLVM packet is builtins.ValueError
     "authored failure", suppress 0. The C shell reports the same type and
     message.
@@ -48,25 +48,53 @@
   "incompatible broadcast shapes". The packet itself carries the right type
   and message.
 
-2026-11-12 The "nondeterministic" C exception tests depend on the cffi accelerator build (MEASURED, clean detached worktree at 15fe1f3e):
+2026-11-12 "dispatcher operation's control owner is not retained" is a structurally decided If still projected as a guard (TRACED, clean detached worktree at 15fe1f3e):
 
-- `tests/test_source_c_exceptions.py::test_exception_handler_does_not_catch_base_exception_itself`
-  passes when `src/common/tensors/accelerator_backends/__pycache__` is absent,
-  i.e. on the run that builds the cffi module.
-- On the baseline it failed every time it loaded the prebuilt module: 14 of
-  14 repeats, PYTHONHASHSEED 0-3 alike. The failure is FortranEmissionError
-  "dispatcher operation's control owner is not retained"
-  (fortran_c_shell.py:16757, `_install_external_reference_calls`).
-- `repo-cache/` does not matter.
-- So most "flaky" readings are cold-versus-warm accelerator state.
-- Not explained: one pass in four warm runs on this branch's worktree.
-  Nothing removed the cache before that run.
-- With a warm build, the same refusal blocks `if n < 0: raise`, try/except
-  ZeroDivisionError, and BaseException handler programs.
-- Not traced: which accelerated function's answer differs from its Python
-  form.
-- To measure exception tests until then: delete that `__pycache__` and run
-  one pytest process.
+Program: the C test `test_exception_handler_does_not_catch_base_exception_itself`
+(`try: raise BaseException("base") / except Exception: ... / except BaseException: ...`).
+Exception ingestion writes each handler's test as a chain:
+
+    __turing_exception_4 = False
+    __turing_exception_15 = not __turing_exception_4
+    if __turing_exception_15:                  # If 28: predicate is constant True
+        __turing_exception_16 = __turing_exception_active(__turing_exception_2)
+        __turing_exception_15 = __turing_exception_16
+    if __turing_exception_15: ...              # If 43 (match)
+    if __turing_exception_15: ...              # If 45 (handler body)
+
+Chain, each link observed:
+1. `_fold_callsite_structural_values` (glsl_deployment_strategy.py) folds
+   If 28's predicate (node 27) to a Constant. It selects `body`.
+2. It posts `source_control_specialization_concordance[('root', 28)]` =
+   `{selected_role: 'body', rejected_role: 'orelse', proof: 'structural_constant_predicate'}`,
+   adds 28 to `structurally_specialized_conditional_node_ids`, and removes
+   the If node with its local `remove_node`.
+3. `_ordinary_conditional_control_programs` skips every structurally
+   specialized record, by design ("reconstructing this retained source record
+   would put that producer back behind a runtime branch"). So no
+   ConditionalBlock 28 is ever built; 43 and 45 are.
+4. `control_activity.memberships` still projects the `exception_active`
+   inside If 28's body onto owner 28. It does this through its
+   retained-source-control branch (28 is not in the graph), without reading
+   the specialization record. The result is `{(28, 'body'), (61, 'body')}`.
+5. `_install_external_reference_calls` takes the innermost guard, 28, finds
+   no block for it, correctly refuses to hoist to 61, and raises
+   (fortran_c_shell.py:16757).
+
+The two records that disagree: the specialization record (If 28 is decided,
+its body is unconditional) and the activity membership (node guarded by 28's
+body). The fix site is the projection in `control_activity.memberships`:
+- A guard on a structurally specialized owner's selected arm is not a guard.
+  Drop it; the enclosing owners are already in the node's activity fact.
+- A resident node in the rejected arm is a contradiction and must refuse.
+Not changed yet.
+
+Earlier reading corrected: I first blamed the cffi accelerator build (a cold
+`accelerator_backends/__pycache__` passed twice). Hash seed and repo-cache
+also do not decide it. The refusal is structural and present in every
+failing run. The occasional passes are not explained. The exception
+operations' node numbering differs from run to run, which suggests an
+identity-ordered iteration upstream, but that is not traced.
 
 Regression check of this branch (MEASURED; same command on both trees, each in
 one pytest process started with a cold cffi build):
@@ -75,6 +103,5 @@ one pytest process started with a cold cffi build):
 - This branch: 24 failed, 23 passed (8.9 min).
 - The 14 failure names captured from this branch's run all appear in main's
   list. The output was truncated, so the other 10 were not seen.
-- One process builds the accelerator once and then reuses it, which is
-  consistent with the cold/warm dependence above. The C exception file has
-  no stable baseline until that is traced.
+- The C exception file has no stable baseline while the projection above is
+  unfixed.
