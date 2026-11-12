@@ -29423,15 +29423,58 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     ),)
                     if history and int(history[-1]) in callee
                 )
+                # Program: the AbstractTensor YoungMan's ``_load_map``
+                # (claude/youngman-resident young_man_algorithm.py:561):
+                # ``if os.path.exists(p): with open(p, 'rb') as f: return
+                # AbstractTensor.tensor(pickle.load(f)).to(...)`` then
+                # ``return None``.  Wrong record: the positional slot
+                # ``result_0`` has history (22, 23) -- one value per return
+                # site, alternatives, not versions (see
+                # ``positional_output_names``) -- and this pass read
+                # ``history[-1]``, the ``return None`` constant, as THE
+                # returned value.  ``self._load_map(...)`` in
+                # ``_load_geometry_maps`` was concorded ``builtins.NoneType``,
+                # ``maps[map_name] = loaded_map`` stored a None-classed value,
+                # and the planner refused ``maps = {}`` ("region value 6
+                # (Dict ...) has no settled dtype").  Rule: a one-output
+                # call's class is decided over EVERY return site's exact
+                # value (``return_slot_values``): each site must carry a class
+                # and all must agree, or the call gets no class here.
+                site_slot_values = tuple(
+                    tuple(values)
+                    for values in (
+                        callee.graph.get("return_slot_values") or {}
+                    ).values()
+                    if isinstance(values, (tuple, list))
+                )
+                class_value_ids: tuple = returned_value_ids
+                if site_slot_values and len(tuple(
+                    callee.graph.get("function_outputs") or ()
+                )) == 1:
+                    class_value_ids = tuple(dict.fromkeys(
+                        int(values[0])
+                        if len(values) == 1 and values[0] is not None
+                        and int(values[0]) in callee else None
+                        for values in site_slot_values
+                    ))
+                for value_id in class_value_ids:
+                    if value_id is not None:
+                        _concord_aggregate_merge_class(callee, value_id)
                 for value_id in returned_value_ids:
                     _concord_aggregate_merge_class(callee, value_id)
-                returned_facts = tuple(dict.fromkeys(
+                site_facts = tuple(
                     _resolved_source_value_class(callee, value_id)
-                    for value_id in returned_value_ids
-                    if _resolved_source_value_class(
-                        callee, value_id
-                    )[0] is not None
-                ))
+                    if value_id is not None else (None, 1)
+                    for value_id in class_value_ids
+                )
+                if class_value_ids is returned_value_ids:
+                    returned_facts = tuple(dict.fromkeys(
+                        fact for fact in site_facts if fact[0] is not None
+                    ))
+                elif all(fact[0] is not None for fact in site_facts):
+                    returned_facts = tuple(dict.fromkeys(site_facts))
+                else:
+                    returned_facts = ()
                 # Program: ``def compact(n) -> tuple[list[int], bool]:
                 # ... return out, len(out) > 2`` then ``t, big =
                 # compact(n)`` (A6 probe c984).  Wrong record: the call
@@ -29492,7 +29535,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                                     _SOURCE_VALUE_CLASS,
                                     (_source_numeric_scope(callee), value_id),
                                 )
-                                for value_id in returned_value_ids
+                                # Every return site's class cell decided it.
+                                for value_id in class_value_ids
+                                if value_id is not None
                             ),
                         )
                         if cell is not None
