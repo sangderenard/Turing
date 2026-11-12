@@ -33,3 +33,9 @@ Measured:
 Not done: no native payload ABI (packet fields, ownership); LLVM has no exception lowering at all (only C does). Whole
 suite not run. Hazard noted while baselining: background test runs here notify "completed" late and the task output
 file stays empty; four runs overlapped before that was noticed (results above are from single foreground runs).
+
+Added after merging main (325e6a25, a bare-name call of a submitted-text class is a construction): the C exception tests
+are NONDETERMINISTIC on main. test_nested_raise_rethrow_and_finally, run alone six times each: main 15fe1f3e passed 4,
+failed 2; this branch passed 3, failed 3 (the first two runs after the merge both failed); every failure is
+"dispatcher operation's control owner is not retained" (fortran_c_shell.py:16757). A single run's pass/fail list in that
+file is therefore not a baseline; compare failure messages or repeat the run.
