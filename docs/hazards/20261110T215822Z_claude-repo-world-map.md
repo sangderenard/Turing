@@ -141,9 +141,13 @@ lane keeps main's explicit `import_roots=()` contract so
 `tools/compile_repo_world_map.py` is unchanged. Tests: 193 passed in 24 s
 across the scan, workspace, sink, work-table, six plugin, compile-job,
 portal-record, dream-document, render and interpreter-limits suites.
-`tests/test_meowdoku_worldmap.py` could not be collected here: it imports
-the server, which refuses without the sibling speaktome REST package
-(environment, not this change). Live: turing main streamed in 39 s, declared
+`tests/test_meowdoku_worldmap.py` imports the server, whose `rest_api.py`
+locates the speaktome REST package as the checkout's sibling `speaktome`
+folder unless `SPEAKTOME_REPO` names it; this worktree sits under Temp, so
+the default sibling does not exist. With `SPEAKTOME_REPO=C:/dev/Powershell/
+speaktome` it collects and passes: 15 passed in 18.8 s (2026-11-12). An
+earlier wording here called this an environment limitation; it was my
+omission of the documented variable. Live: turing main streamed in 39 s, declared
 root `examples` from the stream, meowdoku unresolved 998 -> 0 (design note
 §7). Main's `tools/compile_repo_world_map.py` still clones to a `--work`
 directory; it was not changed to the stream lane here (its contract and
