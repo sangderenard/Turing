@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 6;
+const VERSION = 7;
 
 function allowed() {
   const here = import.meta.url;
@@ -64,6 +64,8 @@ const CSS = `
 .binding { display: grid; gap: 3px; padding: 7px; margin: 4px 0; border: 1px solid #454556; border-radius: 4px; overflow-wrap: anywhere; }
 .binding span { font-size: 11px; color: #b6b6ca; }
 .binding.active { border-color: #ffd166; background: #80551e; }
+.radio-bands { display: flex; gap: 4px; align-items: center; min-height: 30px; }
+.radio-bands meter { flex: 1; min-width: 0; width: 40px; height: 24px; }
 [hidden] { display: none !important; }
 .note { padding: 4px 10px; color: #ffb3a8; font-size: 12px; }
 `;
@@ -154,6 +156,59 @@ function mountControlSuite(wrap, host, spec) {
   };
 }
 
+// Nodus owns capture/FFT; Python reads its existing UDP relay inbox.
+// This widget shows NRAD bands, not a browser FFT or an invented audio stream.
+function mountRadio(wrap, host) {
+  const chip = el("button", {class: "chip", type: "button", text: "Nodus Radio", "aria-expanded": "false"});
+  const panel = el("section", {class: "suite", hidden: "", "aria-label": "Nodus Radio"});
+  const close = el("button", {class: "chip", type: "button", text: "Close radio"});
+  const title = el("strong", {text: "Nodus Radio"});
+  const status = el("p", {role: "status", text: "Waiting for Nodus"});
+  const bands = el("div", {class: "radio-bands", "aria-label": "Spectral power bands"});
+  panel.append(close, title, status, bands,
+    el("p", {text: "Live spectrum from Nodus. This feed carries levels, not playable audio."}));
+  let generation = 0, timer = null;
+  const dismiss = () => setOpen(false);
+  async function poll(epoch) {
+    try {
+      const data = await getJson("/api/radio");
+      if (epoch !== generation || panel.hidden) return;
+      title.textContent = data.title || "Nodus Radio";
+      status.textContent = data.status === "live" ? "Live · RMS " + Number(data.rms).toFixed(3)
+        : data.status === "stale" ? "Signal stopped · last packet " + Number(data.age_s).toFixed(1) + "s ago"
+        : data.status === "waiting" ? "Waiting for Nodus packets" : "Radio is not broadcasting";
+      bands.replaceChildren();
+      for (const [index, value] of (data.bands || []).slice(0, 128).entries()) {
+        const level = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+        const meter = el("meter", {min: "0", max: "1", value: String(data.status === "live" ? level : 0),
+          "aria-label": "Band " + (index + 1), title: "Band " + (index + 1) + ": " + level.toFixed(3)});
+        bands.append(meter);
+      }
+    } catch (error) {
+      if (epoch !== generation || panel.hidden) return;
+      status.textContent = "Radio unavailable";
+      bands.replaceChildren();
+    }
+    if (epoch === generation && !panel.hidden) timer = setTimeout(() => poll(epoch), 100);
+  }
+  function setOpen(open) {
+    if (open && dismissHeaderPanel && dismissHeaderPanel !== dismiss) dismissHeaderPanel();
+    dismissHeaderPanel = open ? dismiss : (dismissHeaderPanel === dismiss ? null : dismissHeaderPanel);
+    generation++; clearTimeout(timer); timer = null;
+    panel.hidden = !open; chip.setAttribute("aria-expanded", String(open));
+    if (open) poll(generation);
+  }
+  chip.addEventListener("click", () => setOpen(panel.hidden));
+  close.addEventListener("click", () => {setOpen(false); chip.focus();});
+  panel.addEventListener("keydown", event => {
+    if (event.key === "Escape") {event.stopPropagation(); setOpen(false); chip.focus();}
+  });
+  document.addEventListener("pointerdown", event => {if (!event.composedPath().includes(host)) setOpen(false);});
+  window.addEventListener("pagehide", () => setOpen(false));
+  document.addEventListener("visibilitychange", () => {if (document.hidden) setOpen(false);});
+  wrap.append(chip, panel);
+}
+
 async function main() {
   if (!allowed()) { console.info("[site-nav] not loaded: this page's script tag lacks data-site-nav=\"allow\""); return; }
 
@@ -198,6 +253,8 @@ async function main() {
     reserveSpace();
     return;
   }
+
+  if (caps.has("view_site")) mountRadio(actions, host);
 
   if (!new URLSearchParams(location.search).has("viewer")) {
     // Tickets is a small menu: the account's issue tickets, and (dev_ui) the change reviews an admin approves.

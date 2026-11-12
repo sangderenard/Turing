@@ -1952,6 +1952,14 @@ def make_handler(sessions: Sessions):
                     return self._json({"ticket": sessions.tickets.get(ticket_id)} if ticket_id else {"tickets": sessions.tickets.list()})
                 except (ValueError, FileNotFoundError):
                     return self._json({"error": "ticket not found"}, HTTPStatus.NOT_FOUND)
+            if path == "/api/radio":
+                if not self._require("view_site"):
+                    return
+                from meowdoku import nodus_radio
+                try:
+                    return self._json(nodus_radio.snapshot(sessions.state.radio_json, sessions.accounts_db))
+                except (OSError, ValueError, nodus_radio.sqlite3.Error, nodus_radio.relay.RelayError):
+                    return self._json({"status": "unavailable", "title": "Nodus Radio", "bands": [], "audio": False}, 503)
             if path == "/api/whoami":                             # [ACCESS] the page learns its own tier here
                 return self._whoami()
             if path == "/api/reviews" or path.startswith("/api/reviews/"):   # [REVIEWS]
