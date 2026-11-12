@@ -33,7 +33,11 @@ const mixedView=new DataView(mixed);
 const mixedConfig=JSON.parse(new TextDecoder().decode(new Uint8Array(mixed,16,mixedView.getUint32(4,true))));
 assert.equal(mixedConfig.sensor_lanes[1].sensor_transport,'fixed:1');
 milliseconds=0;
-await assert.rejects(recordStudioExposureFrames({sample:()=>({...initial,vertices:[1,0,.2]}),
-  initialFixture:initial,duration:1,now:()=>milliseconds,nextFrame:callback=>queueMicrotask(callback)}),
-  /Fixture geometry changed/);
-console.log('Timed Studio exposure frames retain ordered light states and durations');
+const moving=await recordStudioExposureFrames({
+  sample:()=>({...initial,vertices:milliseconds>=100?[0,0,.2,1,0,.2,0,1,.3]:initial.vertices}),
+  initialFixture:initial,duration:.3,substeps:3,
+  nextFrame:callback=>{milliseconds+=100;queueMicrotask(callback);}});
+assert.equal(moving.length,2);
+assert.deepEqual(moving[1].vertices,[0,0,.2,1,0,.2,0,1,.3]);
+assert.equal(moving[0].vertices,undefined);
+console.log('Timed Studio exposure frames retain ordered light and geometry slices');

@@ -952,11 +952,22 @@ function buildFixtureFaces(fixtureRoles, housingMat, onPart) {
 // world units; the only transform needed is the same linear unit/centre
 // conversion. The rig unit is independent of the saved object's physical
 // radius. Explicit legacy profiles retain their original photo conversion.
+let photoSceneCacheKey=null,photoSceneCacheValue=null;
 export function sceneForPhoto(saved = true,{timedExposure=false}={}) {
-  return buildStudioPhotoFixtures({...studioBuilderOptions("exposure",saved),rayOriginM:OBJECT_CENTER,shopEmissionProfiles,
+  const builder=studioBuilderOptions("exposure",saved);
+  // The exposure clock may advance through many held ticks. Compare the
+  // compact scene inputs before invoking the canonical triangle builders.
+  const key=JSON.stringify([saved,timedExposure,builder.lighting,builder.subject,
+    builder.geometrySubject,builder.materials.pbr.data,shopEmissionProfiles,
+    studioLighting?.strengths.getSolo?.("exposure"),studioSceneRevision,
+    lightField?.responseInformationRequested===true]);
+  if(key===photoSceneCacheKey)return photoSceneCacheValue;
+  const value=buildStudioPhotoFixtures({...builder,rayOriginM:OBJECT_CENTER,shopEmissionProfiles,
     timedExposure,
     ...(lightField?.responseInformationRequested===true?{lightFieldInformation:RESPONSE_INFORMATION}:{}),
     solo:studioLighting?.strengths.getSolo?.("exposure"),getOpticalRecord:id=>opticalControls?.sceneRecord(id)});
+  photoSceneCacheKey=key;photoSceneCacheValue=value;
+  return value;
 }
 let responseSourcesRequested=false;
 function refreshResponseSources() {

@@ -40,16 +40,19 @@ export async function recordStudioExposureFrames({sample, initialFixture, durati
   substeps ??= Math.ceil(duration*60);
   if (!Number.isInteger(substeps) || substeps < Math.ceil(duration*10) || substeps > 216000)
     throw new RangeError("Exposure substeps must give a tick of at most 0.1 s and total at most 216000.");
-  const expectedGeometry=JSON.stringify([initialFixture.vertices,initialFixture.material_ids]);
+  let previousGeometry=JSON.stringify([initialFixture.vertices,initialFixture.material_ids]);
   const frames=[];
   const capture=t=>{
     const fixture=sample();
-    if (!fixture || JSON.stringify([fixture.vertices,fixture.material_ids])!==expectedGeometry)
-      throw new Error("Fixture geometry changed during exposure; capture a new scene.");
-    const key=JSON.stringify([fixture.pbr,fixture.emitter_profiles]);
+    if (!fixture) throw new Error("Studio did not provide a scene at the exposure tick.");
+    const geometry=JSON.stringify([fixture.vertices,fixture.material_ids]);
+    const key=JSON.stringify([geometry,fixture.pbr,fixture.emitter_profiles]);
     if (frames.length && frames[frames.length-1].key===key) return;
     if (frames.length>=4096) throw new Error("Exposure contains more than 4096 changing light states.");
-    frames.push({t0:t,key,pbr:fixture.pbr,emitter_profiles:fixture.emitter_profiles});
+    const changedGeometry=geometry!==previousGeometry;
+    frames.push({t0:t,key,pbr:fixture.pbr,emitter_profiles:fixture.emitter_profiles,
+      ...(changedGeometry?{vertices:fixture.vertices,material_ids:fixture.material_ids}:{})});
+    previousGeometry=geometry;
   };
   capture(0);
   let nextTick=0;
@@ -70,7 +73,8 @@ export async function recordStudioExposureFrames({sample, initialFixture, durati
     nextFrame(step);
   });
   return frames.map((frame,i)=>({t0:frame.t0,t1:i+1<frames.length?frames[i+1].t0:duration,
-    pbr:frame.pbr,emitter_profiles:frame.emitter_profiles}));
+    pbr:frame.pbr,emitter_profiles:frame.emitter_profiles,
+    ...(frame.vertices?{vertices:frame.vertices,material_ids:frame.material_ids}:{})}));
 }
 
 function bounceCount(value) {
@@ -928,6 +932,8 @@ export function createMarblePhoto(doc = document, currentCamera = null, prepareE
           value.state === "preparing" ? "Preparing the saved mesh and thin-lens scene…" :
             value.state === "encoding" ? `Encoding the orbit with Turing's JPEG AVI writer · ${value.encoding_frames || 0}/${value.total_frames || 1} frames${value.encoding_bytes ? ` · ${(value.encoding_bytes / 1048576).toFixed(1)} MiB` : ""}…` :
               `Exposing frame ${(value.frame_index || 0) + 1}/${value.total_frames || 1} on GPU · ${Math.round(value.frame_elapsed_seconds || 0)} s · ${(value.forward_ray_jobs || 0).toLocaleString()} ray jobs`));
+      if (value.stale_geometry_slices)
+        status(`${$("photo-status").textContent} · ${value.stale_geometry_slices} slice(s) used the previous triangles`);
       if (value.state === "complete" || value.state === "error" || value.state === "canceled") {
         state.jobDigest = null; stopPolling(); participation.stop(); setButtons(); notifyHdr(); return;
       }

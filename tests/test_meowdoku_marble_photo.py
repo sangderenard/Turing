@@ -96,6 +96,17 @@ def test_timed_studio_light_frames_keep_one_scene_and_contiguous_shutter(photo_p
     options=dict(transport="fixed:3",exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames)
     config=photos.decode_upload(_wire(digest,vertices,normals,ids,**options),store)[3]
     assert [frame["t1"]-frame["t0"] for frame in config["exposure_state_frames"]]==[.5,1.5]
+    moving=[dict(frame) for frame in frames]
+    moving[1]['vertices']=[0,0,.2,.01,0,.2,0,.01,.3]
+    moving[1]['material_ids']=[0]
+    captured=photos.decode_upload(_wire(digest,vertices,normals,ids,
+        **{**options,'exposure_state_frames':moving}),store)[3]['exposure_state_frames']
+    assert captured[1]['vertices'][-1]==pytest.approx(.3)
+    invalid=[dict(frame) for frame in moving]
+    invalid[1]['vertices']=[float('nan')]*9
+    with pytest.raises(photos.PhotoError,match='geometry slice'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,
+            **{**options,'exposure_state_frames':invalid}),store)
     bad=[dict(frame) for frame in frames];bad[1]["t0"]=.6
     with pytest.raises(photos.PhotoError,match="contiguous"):
         photos.decode_upload(_wire(digest,vertices,normals,ids,**{**options,"exposure_state_frames":bad}),store)

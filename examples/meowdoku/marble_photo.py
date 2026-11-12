@@ -772,7 +772,9 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         frames = []
         cursor = 0.0
         for raw_frame in raw_frames:
-            if not isinstance(raw_frame, dict) or set(raw_frame) != {"t0", "t1", "pbr", "emitter_profiles"}:
+            if (not isinstance(raw_frame, dict) or
+                    set(raw_frame) not in ({"t0", "t1", "pbr", "emitter_profiles"},
+                                           {"t0", "t1", "pbr", "emitter_profiles", "vertices", "material_ids"})):
                 raise PhotoError("invalid timed Studio frame")
             t0, t1 = raw_frame["t0"], raw_frame["t1"]
             if (any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) for t in (t0, t1))
@@ -792,8 +794,21 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                     or any((refs[k]["profile"], refs[k]["revision"]) !=
                            (initial_refs[k]["profile"], initial_refs[k]["revision"]) for k in refs)):
                 raise PhotoError("timed Studio frame changed non-light scene state")
+            geometry = {}
+            if "vertices" in raw_frame:
+                try:
+                    moving = np.asarray(raw_frame["vertices"], np.float32).reshape(-1, 3, 3)
+                    moving_ids = raw_frame["material_ids"]
+                except (ValueError, TypeError, OverflowError):
+                    raise PhotoError("invalid timed Studio geometry slice") from None
+                if (len(moving) > triangle_budget or not np.isfinite(moving).all()
+                        or np.any(np.abs(moving) > 10) or not isinstance(moving_ids, list)
+                        or len(moving_ids) != len(moving)
+                        or any(type(i) is not int or i < 0 or i >= n_mat for i in moving_ids)):
+                    raise PhotoError("invalid timed Studio geometry slice")
+                geometry = {"vertices": moving.ravel().tolist(), "material_ids": moving_ids}
             frames.append({"t0": float(t0), "t1": float(t1), "pbr": current.ravel().tolist(),
-                           "emitter_profiles": {"version": 1, "records": list(refs.values())}})
+                           "emitter_profiles": {"version": 1, "records": list(refs.values())}, **geometry})
             cursor = float(t1)
         if abs(cursor - seconds) > 1e-5:
             raise PhotoError("timed Studio frames must cover the full shutter interval")
