@@ -4008,6 +4008,22 @@ class CorrelationTable:
                                     or not data[6]))):
                             found.append(Finding("ssa-exception-provenance", name, instruction.res.id,
                                                  "exception operation lost its process-graph origin"))
+                        # Each constructor actual of a raised class (field 8)
+                        # is one exact operand identity the record derives
+                        # from, at a position inside the instruction's own
+                        # operands; anything else is a payload rebuilt from a
+                        # proxy.
+                        elif any(
+                            not (isinstance(item, tuple) and len(item) == 3
+                                 and isinstance(item[0], str)
+                                 and isinstance(item[1], int)
+                                 and 0 <= item[1] < len(instruction.args)
+                                 and isinstance(item[2], Ref)
+                                 and item[2] in {x for x, _stage in instruction_book.edges_into(source)})
+                            for item in tuple(data[8] if len(data) > 8 else ())
+                        ):
+                            found.append(Finding("ssa-exception-payload", name, instruction.res.id,
+                                                 "exception constructor payload lost an exact operand identity"))
         for row in book.page(C_OPERATOR_SAFETY).rows():
             data = book.page(C_OPERATOR_SAFETY).latest(row)
             instruction = instructions.get(row)

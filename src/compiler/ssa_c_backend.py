@@ -5523,7 +5523,8 @@ def emit_ssa_module_to_c(
                         if source_book is not emission else source_cell
                     )
                     (operation, exception_type, message, error_code, cause,
-                     cause_argument, suppress_context, _normalization) = source_book.page(
+                     cause_argument, suppress_context, _normalization,
+                     payload) = source_book.page(
                          SOURCE_EXCEPTION_OPERATION
                      ).cell(source_cell.row, source_cell.column)
                     result_id = int(instruction.res.id)
@@ -5536,6 +5537,11 @@ def emit_ssa_module_to_c(
                                     and (cause_argument >= len(instruction.args)
                                          or cause is None)):
                                 raise ValueError("explicit exception cause lost its exact graph operand")
+                            if op == "ExceptionMake" and payload:
+                                # turing_error_packet carries a type and a
+                                # literal message only; constructor actuals
+                                # need a payload ABI the packet does not have.
+                                raise ValueError("raised exception constructor payload requires an owned native payload ABI")
                             message_arguments = len(instruction.args) - (1 if cause_argument is not None else 0)
                             if op == "ExceptionMake" and message_arguments:
                                 raise ValueError("dynamic raised message requires an owned native message ABI")

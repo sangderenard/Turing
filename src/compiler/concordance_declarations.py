@@ -680,7 +680,10 @@ SOURCE_EXCEPTION_OPERATION = declare_page("source_exception_operation", (
     RowField("source", K.PAGE_REF),
 ), tuple)  # (operation, exception type, message, code, explicit cause identity,
             #  cause argument position, suppress implicit context,
-            #  process-operation origin cell)
+            #  process-operation origin cell, constructor payload: one
+            #  (role "arg:i"/"kw:name", operand position, operand identity)
+            #  per actual of a raised class called with more than one actual
+            #  or with a keyword; () otherwise)
 C_EXCEPTION_OPERATION = declare_page("c_exception_operation", (
     RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)  # (semantic operator, input ids, materialization policy)

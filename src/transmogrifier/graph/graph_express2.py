@@ -6023,7 +6023,7 @@ class ProcessGraph(TiledObject):
             book.post(SOURCE_EXCEPTION_OPERATION, (identity,), (
                 "exception_raise", dispatch.get("exception_type"),
                 dispatch.get("exception_message"), int(dispatch.get("error_code", 100)),
-                None, None, bool(dispatch.get("suppress_context", False)), process,
+                None, None, bool(dispatch.get("suppress_context", False)), process, (),
             ), stage=INGESTION,
                 provenance=Derived((identity, process, authored_raise, conversion)),
                 mode=Mode.CONCORD)

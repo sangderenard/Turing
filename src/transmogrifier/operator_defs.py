@@ -148,10 +148,11 @@ operator_signatures = {
         'ExceptionActive': 1, 'ExceptionMatch': 1, 'ExceptionRaise': 1,
         'ExceptionIndexType': 1, 'ExceptionLength': 1,
     }.items()},
-    # A nonliteral raised message is a real dependency operand at ingestion.
-    # Native selection must provide its ownership/rendering ABI or refuse it.
+    # A nonliteral raised message, an explicit cause and every constructor
+    # actual of a raised class are real dependency operands at ingestion.
+    # Native selection must provide their ownership/rendering ABI or refuse it.
     'ExceptionMake': {
-        'min_inputs': 0, 'max_inputs': 1, 'min_outputs': 1, 'max_outputs': 1,
+        'min_inputs': 0, 'max_inputs': None, 'min_outputs': 1, 'max_outputs': 1,
         'concurrency': None, 'allows_inplace': False,
     },
     # Structural concurrency framing. Deploy and Join do not perform numeric

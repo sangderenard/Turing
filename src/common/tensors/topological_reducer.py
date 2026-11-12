@@ -12900,12 +12900,29 @@ def _normalize_lexical_values(
                             if not 0 <= cause_argument < len(operands):
                                 raise ValueError("exception cause operand position is outside the ingested call")
                             cause = node_identity_cell(graph, int(operands[cause_argument][0]))
+                        # A raised class's constructor actuals (ingestion's
+                        # ``exception_payload_arguments``): each role keeps
+                        # the exact identity of the operand at its position,
+                        # the same way the explicit cause does above.
+                        payload = []
+                        for role, position in tuple(operation.get("exception_payload_arguments") or ()):
+                            position = int(position)
+                            if not 0 <= position < len(operands):
+                                raise ValueError("exception payload operand position is outside the ingested call")
+                            payload_cell = node_identity_cell(graph, int(operands[position][0]))
+                            if payload_cell is None:
+                                raise ValueError("exception payload operand has no graph identity")
+                            payload.append((str(role), position, payload_cell))
+                        payload = tuple(payload)
                         exception = book.post(SOURCE_EXCEPTION_OPERATION, (source,), (
                             operation["operation"], operation.get("exception_type"),
                             operation.get("exception_message"), int(operation.get("error_code", 100)),
                             cause, cause_argument, bool(operation.get("suppress_context", False)), cell,
+                            payload,
                         ), stage=REDUCTION,
-                            provenance=_Derived(tuple(filter(None, (source, cell, cause)))),
+                            provenance=_Derived(tuple(filter(None, (
+                                source, cell, cause, *(item[2] for item in payload),
+                            )))),
                             mode=Mode.CONCORD)
                         graph.G.nodes[node_id].setdefault("attributes", {})["exception_operation_cell"] = exception
                     graph.G.nodes[node_id].setdefault("attributes", {})["source_process_cell"] = cell
