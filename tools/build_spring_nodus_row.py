@@ -66,6 +66,7 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
             raise FileNotFoundError("Nodus headers or tensor-core import library are absent")
         cmake = directory / "CMakeLists.txt"
         acceptance = Path(__file__).resolve().parents[1] / "tests" / "spring_nodus_row_acceptance.cpp"
+        demo = Path(__file__).resolve().parents[1] / "tests" / "spring_nodus_row_demo.cpp"
         cmake.write_text("\n".join((
             "cmake_minimum_required(VERSION 3.20)",
             "project(spring_network_nodus_row LANGUAGES CXX)",
@@ -79,6 +80,12 @@ def stage(directory: Path, nodus_root: Path | None = None, nodus_build: Path | N
             f'target_include_directories(spring_nodus_row_acceptance PRIVATE "{(nodus_root / "include").as_posix()}")',
             f'target_link_libraries(spring_nodus_row_acceptance PRIVATE "{core.as_posix()}" ws2_32)',
             'set_target_properties(spring_nodus_row_acceptance PROPERTIES CXX_STANDARD 17 '
+            'RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" '
+            'RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin")',
+            f'add_executable(spring_nodus_row_demo "{demo.as_posix()}")',
+            f'target_include_directories(spring_nodus_row_demo PRIVATE "{(nodus_root / "include").as_posix()}")',
+            f'target_link_libraries(spring_nodus_row_demo PRIVATE "{core.as_posix()}" ws2_32)',
+            'set_target_properties(spring_nodus_row_demo PROPERTIES CXX_STANDARD 17 '
             'RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin" '
             'RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin")',
             "",

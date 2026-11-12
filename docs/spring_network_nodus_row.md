@@ -42,3 +42,13 @@ For a grid sheet, use the four neighbor slots for left/right/up/down. For a rope
 After each successful configure or tick, the row sends `NFAB` v1 UDP datagrams to `239.255.78.68:48768` by default. `NODUS_FABRIC_UDP_HOST` and `NODUS_FABRIC_UDP_PORT` can select a different multicast or unicast destination before row initialization. Multicast TTL is four. Network routing must permit multicast for receivers beyond the local segment.
 
 Every datagram is little endian: `magic:u32`, `version:u16`, `header_bytes:u16` (32), `frame:u64`, `fabric_id:u64`, `chunk:u16`, `chunk_count:u16`, `pair_count:u16`, `reserved:u16`, followed by up to 48 pairs of `node_id:u32, x:f32, y:f32, z:f32`. A receiver joins the destination group, groups packets by `(fabric_id, frame)`, and presents a frame only after all chunks arrive. The identity of a vector is `(fabric_id, node_id)`; `frame` is a row-local publication sequence. UDP is best effort, so dropped chunks should cause that frame to be skipped.
+
+## Local cloth demo
+
+After the build above, run the native plugin driver in the same shell. It configures a 9×9 sheet with its top corners pinned, advances 100 steps, and records only the received UDP packets. The renderer reads that recording; it does not simulate cloth.
+
+```powershell
+$env:PATH = 'C:\Users\alber\nodus-build\free-runtime-build\Release;' + $env:PATH
+& 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\cloth_udp_frames.csv'
+python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\cloth_udp_frames.csv C:\Users\alber\nodus-build\spring-row\cloth_udp_demo.gif
+```
