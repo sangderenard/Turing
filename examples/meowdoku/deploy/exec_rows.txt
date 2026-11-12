@@ -1,0 +1,19 @@
+# The exec rows the service's Nodus host declares (nodus include/exec_row.h). The supervisor hands this file to the
+# nodus-messenger instance as NODUS_EXEC_ROWS (instances.json "env"); each row becomes a tool registry entry a canvas
+# can place by its id. A row works in the service account's own user folder, never in the core.
+
+# The byte-span compressor in waiting, and its other half. zstd 1.5.7, the official release, in the service's tools.
+row exec.zstd.pack
+  name Zstd pack
+  program C:/dev/Powershell/srv/tools/zstd/zstd.exe
+  argument -c
+  directory C:/dev/Powershell/srv/state/content/users/account/2/exec
+  most 2
+
+row exec.zstd.unpack
+  name Zstd unpack
+  program C:/dev/Powershell/srv/tools/zstd/zstd.exe
+  argument -d
+  argument -c
+  directory C:/dev/Powershell/srv/state/content/users/account/2/exec
+  most 2

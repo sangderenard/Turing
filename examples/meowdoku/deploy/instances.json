@@ -85,6 +85,11 @@
           "C:/dev/Powershell/nodus/build-service/Release"
         ]
       },
+      "env": {
+        "NODUS_EXEC_ROWS": "C:/dev/Powershell/turing/examples/meowdoku/deploy/exec_rows.txt",
+        "NODUS_EXEC_CORE_ROOTS": "C:/dev/Powershell",
+        "NODUS_EXEC_WORK_ROOTS": "C:/dev/Powershell/srv/state/content/users"
+      },
       "python": "C:/dev/Powershell/srv/python/python.exe"
     },
     {

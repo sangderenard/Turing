@@ -233,6 +233,9 @@ class Instance:
             env["NODUS_HEADLESS_TEST_DLL"] = n["dll"]
         if n.get("path_prepend"):
             env["PATH"] = os.pathsep.join([str(Path(p)) for p in n["path_prepend"]] + [env.get("PATH", "")])
+        # Optional "env" of the instance: variables its child is started with (e.g. the Nodus exec rows' declarations).
+        for key, value in (self.spec.get("env") or {}).items():
+            env[str(key)] = str(value)
         return env
 
     def check(self):

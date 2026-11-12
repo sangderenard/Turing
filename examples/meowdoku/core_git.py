@@ -139,13 +139,21 @@ def inside_core(policy, path) -> str | None:
 
 
 def exec_refusal(policy, program, working_dir) -> str | None:
-    """Why a program started for a row may not run as asked; None when it may."""
+    """Why a program started for a row may not run as asked; None when it may.
+
+    A working directory inside the core is refused unless it is inside one of the policy's ``work_roots``: the
+    untracked user folders and checkout leases where people are meant to work (nodus include/exec_pipe.h, same rule)."""
     name = Path(str(program)).name.casefold()
     if name in ("git", "git.exe") or name.startswith("git-"):
         return "a row never runs Git; Git in the core is asked for through core_git"
+    target = Path(working_dir).resolve()
+    for work in policy.get("work_roots", ()):
+        root = Path(work).resolve()
+        if target == root or root in target.parents:
+            return None
     held = inside_core(policy, working_dir)
     if held is not None:
-        return f"a row's program never runs with its working directory inside the core ({held})"
+        return f"a row's program never runs with its working directory inside the core ({held}) outside a user folder or checkout lease"
     return None
 
 
