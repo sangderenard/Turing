@@ -72,3 +72,14 @@ fixed using the existing symbol-table authority. No source product emitted,
 built, adopted or rendered. Early ignored pytest and bytecode caches from this
 owned worktree were moved to external user space; compiler trials always kept
 their source products/logs in their account workspaces.
+
+READ-ONLY DIAGNOSIS: authored key:str is a glyph span while the existing mapping
+key column is a scalar string-table token. Frame binding exposes the mismatch
+at scalar Eq/store helpers. No safe dynamic span-to-token insertion/lookup path
+was established. Literal interning is not that conversion, and existing string
+equality requires full contents rather than hashes. No concordance exemption,
+fabricated span result or numeric conversion was added. The retained SSA does
+record sequence_arena_by_reference with shared storage IDs across dictionary
+helpers. This does not prove native aliasing of the original CPython object:
+the source-only Nodus path transports source and a compile-contract ID, not the
+live dictionary. Code checkpoint4010f365 stays isolated/unintegrated.

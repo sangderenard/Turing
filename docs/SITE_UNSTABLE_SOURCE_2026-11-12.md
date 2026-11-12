@@ -161,3 +161,43 @@ created ignored pytest/bytecode caches in the owned worktree; these are test
 caches, not compiler products, and were moved to external user space. Further
 tests should select an external pytest root and cache prefix as well as the
 external temporary directory.
+
+## Verified string-key ABI and reference boundary
+
+The retained original-source log confirms a real representation mismatch.
+Authored `key: str` has rank-one int64 glyph-span storage. The dictionary key
+column instead stores scalar int64 string-table tokens. Frame binding gives
+the scalar helper query formal the caller's span facts, while the helper still
+compares that query with a scalar stored key and expects one boolean. The store
+helper also writes the query directly into its scalar key column.
+
+These contracts come from `fortran_c_shell.py` (string ABI and frame binding),
+`ir_sequence_tables.py` (scalar key helpers), and `identity_concordance.py`
+(elementwise operand/result checking). `_table_query_values` in
+`precompile_to_ssa.py` converts established opaque references to integer handles,
+not string spans to tokens. `ir_string_interning.py` handles actual literals,
+not this runtime parameter. Existing resident-string equality requires exact
+descriptors and full-content comparison and explicitly forbids hash-only
+substitution. No safe dynamic conversion covering lookup and insertion was
+established. The concordance refusal must remain active.
+
+The compiler's reference semantics are stronger than symbol names alone. The
+retained log records `sequence_arena_by_reference`; contains/store/lookup share
+the same column IDs and length, capacity and status-address identities. The
+actual/formal storage receipts connect those exact values. This is shared
+arena-storage intent inside attempted SSA, not a dictionary copy per helper.
+See `ssa_call_input_adapters.py:1715-1746` and the retained log's sequence arena,
+call-input-storage and closure-capture pages. Only declared metadata is copied
+by the new propagation, not runtime dictionary contents.
+
+That does not prove a runtime pointer to the original CPython dictionary. No
+executable was produced or run. The Site sends source/configuration JSON; the
+Nodus FIFO carries the compile contract ID. This route does not bind the live
+dictionary into a Nodus callable. Existing GenericObject/pointer/byte FIFO
+mechanisms were neither replaced nor claimed as newly implemented.
+
+Recommended next boundary: first report the incompatible string-query/key
+contract at the table-call edge, then design/test compatible stored-key
+descriptors, full string equality and insertion using existing compiler
+mechanisms. Do not grow Nodus to compensate for this compiler ABI mismatch.
+Runtime closure publication remains a separate, unproved binding/lifetime task.
