@@ -168,3 +168,11 @@ def test_invalid_live_color_controls_reject_without_mutation(tmp_path, key, valu
 def test_live_filter_requires_boolean(value):
     with pytest.raises(PhotoError):
         live_settings({"display": {"firefly_filter": value}}, {"resolution": 128})
+
+
+def test_live_native_camera_movements_are_saved(tmp_path):
+    jobs,digest,directory=fake_jobs(tmp_path)
+    moves=dict(tilt_shift=[.3,-.2],lens_tilt=[.1,-.15])
+    update_live(jobs,digest,dict(revision=1,camera=moves))
+    camera=json.loads((directory/'live-control.json').read_text())['camera']
+    for key,value in moves.items():assert camera[key]==value

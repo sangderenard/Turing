@@ -4,7 +4,7 @@ import math
 import os
 import time
 
-from .marble_photo import PhotoError, _number, _finite_vectors, _DIGEST
+from .marble_photo import PhotoError, _number, _finite_vectors, _DIGEST, _camera_movements
 from .marble_lens_contract import FOV_MIN_DEGREES, PUPIL_RADIUS_MAX_M, FOCUS_MIN_M, FOCUS_MAX_M, apply_lens_selection
 
 from .marble_camera_back import apply_camera_back
@@ -130,6 +130,8 @@ def update_live(jobs, digest, value):
                                 "aperture_radius_m": (1e-5,PUPIL_RADIUS_MAX_M)}.items():
                 if key in updates:
                     camera[key] = _number(updates[key], *bounds, "camera." + key)
+            if any(key in updates for key in ("tilt_shift", "lens_tilt")):
+                camera.update(_camera_movements({**camera, **updates}))
             try:
                 selection = updates.get("lens_selection", camera.get("lens_selection"))
                 camera = (apply_lens_selection(camera, selection, jobs.spectral_root) if selection is not None
