@@ -30,12 +30,21 @@ try {
  await new Promise(r=>setTimeout(r,50));
  const root=window.testRoot,nav=root.querySelector('nav');
  check(nav.getAttribute('aria-label')==='Site controls','named control region');
+ await new Promise(r=>setTimeout(r,50));
+ const toggle=root.querySelector('.toggle'),actions=root.querySelector('.actions');
+ check(document.getElementById('outside').getBoundingClientRect().top>=nav.getBoundingClientRect().bottom,'page clears expanded header');
+ toggle.click();check(actions.hidden && toggle.textContent==='Show site menu','visible reopen control');
+ check(toggle.getAttribute('aria-expanded')==='false','collapsed accessibility');
+ check(getComputedStyle(actions).display==='none','collapsed links hidden');
+ check(document.getElementById('outside').getBoundingClientRect().top>=nav.getBoundingClientRect().bottom,'page clears collapsed header');
+ toggle.click();check(!actions.hidden && toggle.getAttribute('aria-expanded')==='true','restores header');
  const box=nav.getBoundingClientRect();check(box.right<=innerWidth && box.left>=0,'mobile bounds');
  if(!signed)check(root.querySelector('a').getAttribute('href')==='/login.html','guest sign in');
  else {
   const button=root.querySelector('button[aria-haspopup]'),menu=root.querySelector('.menu');
   check(menu.hidden && getComputedStyle(menu).display==='none','initially closed');
   button.click();check(!menu.hidden,'opens');
+  toggle.click();check(menu.hidden && actions.hidden,'collapse closes account menu');toggle.click();button.click();
   check([...menu.querySelectorAll('button')].some(b=>b.textContent==='Development server' && b.disabled),'unavailable dev disabled');
   nav.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));check(menu.hidden,'escape closes');
   button.click();document.getElementById('outside').dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));check(menu.hidden,'outside closes');
@@ -52,9 +61,9 @@ try {
         server = ThreadingHTTPServer(('127.0.0.1',0), Handler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
-            for state in ['guest','member']:
-                with self.subTest(state=state), tempfile.TemporaryDirectory(prefix='banner-browser-') as profile:
-                    result=subprocess.run([BROWSER,'--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check',f'--user-data-dir={profile}','--window-size=390,844','--virtual-time-budget=2500','--dump-dom',f'http://127.0.0.1:{server.server_port}/?{state}'],capture_output=True,text=True,timeout=30)
+            for state,width in [('guest',390),('member',390),('member',1280)]:
+                with self.subTest(state=state,width=width), tempfile.TemporaryDirectory(prefix='banner-browser-') as profile:
+                    result=subprocess.run([BROWSER,'--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check',f'--user-data-dir={profile}',f'--window-size={width},844','--virtual-time-budget=2500','--dump-dom',f'http://127.0.0.1:{server.server_port}/?{state}'],capture_output=True,text=True,timeout=30)
                     self.assertIn('<pre id="result">PASS</pre>',result.stdout,result.stdout[-3000:]+result.stderr[-1000:])
         finally:
             server.shutdown();server.server_close()
