@@ -163,9 +163,34 @@ class FailureArms:
         message = None
         operands = []
         message_argument = None
-        if isinstance(exception, ast.Call):
-            if exception.keywords or len(exception.args) > 1:
+        payload_arguments = ()
+        if isinstance(exception, ast.Call) and (exception.keywords or len(exception.args) > 1):
+            # Program: Token Orchard's api.py ``raise StringCoreError(status,
+            # byte_token, text_token)`` (string_core acceptance program).
+            # Wrong record: any raise with more than one constructor actual,
+            # or a keyword actual, was refused here, before graph ingestion,
+            # as "dynamic exception payload ownership is not lowered", so the
+            # program never reached the stage that owns that decision.  Rule:
+            # each constructor actual of the raised class is an exact graph
+            # operand, in authored order (positional, then keyword), and the
+            # record names its role and operand position.  Native selection
+            # provides the payload's ownership ABI or refuses it by name, as
+            # it already does for a dynamic message.  Unpacked actuals
+            # (``*args`` / ``**kwargs``) have no authored role and are refused.
+            if (any(isinstance(argument, ast.Starred) for argument in exception.args)
+                    or any(keyword.arg is None for keyword in exception.keywords)):
+                raise ValueError("native try: unpacked exception constructor actuals are not lowered")
+            if not retain_message_operand:
                 raise ValueError("native try: dynamic exception payload ownership is not lowered")
+            roles = []
+            for index, argument in enumerate(exception.args):
+                roles.append((f"arg:{index}", len(operands)))
+                operands.append(_copy_source(argument))
+            for keyword in exception.keywords:
+                roles.append((f"kw:{keyword.arg}", len(operands)))
+                operands.append(_copy_source(keyword.value))
+            payload_arguments = tuple(roles)
+        elif isinstance(exception, ast.Call):
             if exception.args:
                 if isinstance(exception.args[0], ast.Constant):
                     message = str(exception.args[0].value)
@@ -189,6 +214,7 @@ class FailureArms:
             exception_message=message,
             exception_message_argument=message_argument,
             exception_cause_argument=cause_argument,
+            exception_payload_arguments=payload_arguments,
             suppress_context=suppress_context,
             error_code=100,
         )

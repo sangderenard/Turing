@@ -470,3 +470,60 @@ def test_standalone_raise_retains_dynamic_message_as_graph_operand():
     assert not artifact.complete
     assert any('owned native message ABI' in item.reason for item in artifact.shortfalls)
     assert '0 finding(s)' in concordance_report(module)
+
+
+@pytest.mark.parametrize('raise_line, roles', [
+    ('raise StatusError(n, n + 1, n + 2)', ('arg:0', 'arg:1', 'arg:2')),
+    ('raise ValueError("bad", n)', ('arg:0', 'arg:1')),
+    ('raise ValueError(code=n)', ('kw:code',)),
+])
+def test_raised_constructor_payload_is_exact_graph_operands(raise_line, roles):
+    """Token Orchard's ``raise StringCoreError(status, byte_token, text_token)``:
+    every constructor actual is an exact graph operand, the record names each
+    role with its operand identity, and C refuses by name for want of a
+    payload ABI instead of ingestion refusing the whole program."""
+    source = (
+        'class StatusError(RuntimeError):\n'
+        '    pass\n'
+        '\n'
+        'def root(n: int) -> int:\n'
+        '    if n < 0:\n'
+        '        ' + raise_line + '\n'
+        '    return n + 1\n'
+    )
+    module = compile_source(source)
+    from src.compiler.concordance_declarations import SOURCE_EXCEPTION_OPERATION
+    from src.compiler.identity_concordance import Ref
+    book = module.metadata['identity_book']
+    facts = [(row, book.page(SOURCE_EXCEPTION_OPERATION).latest(row))
+             for row in book.page(SOURCE_EXCEPTION_OPERATION).rows()]
+    made = [(row, fact) for row, fact in facts if fact[0] == 'exception_make']
+    assert len(made) == 1
+    row, fact = made[0]
+    payload = fact[8]
+    assert tuple(role for role, _position, _cell in payload) == roles
+    assert tuple(position for _role, position, _cell in payload) == tuple(range(len(roles)))
+    sources = {source for source, _stage in book.edges_into(
+        book.latest_ref(SOURCE_EXCEPTION_OPERATION, row))}
+    assert all(isinstance(cell, Ref) and cell in sources for _role, _position, cell in payload)
+    instructions = [instruction for function in module.functions.values()
+                    for block in function.blocks.values() for instruction in block.instrs
+                    if instruction.op == 'ExceptionMake']
+    assert len(instructions) == 1 and len(instructions[0].args) == len(roles)
+    artifact = emit_ssa_module_to_c(module, 'root__root')
+    assert not artifact.complete
+    assert any('owned native payload ABI' in item.reason for item in artifact.shortfalls)
+    assert '0 finding(s)' in concordance_report(module)
+
+
+def test_unpacked_raised_constructor_actuals_are_refused_at_ingestion():
+    source = (
+        'def root(n: int) -> int:\n'
+        "    values = {'code': n}\n"
+        '    if n < 0:\n'
+        '        raise ValueError(**values)\n'
+        '    return n + 1\n'
+    )
+    with pytest.raises(ValueError, match='unpacked exception constructor actuals'):
+        compile_source(source)
+
