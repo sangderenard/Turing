@@ -18,3 +18,13 @@ CPU verification with the existing service Python:
 Owner request: honest tilt/shift in both Phong and ray tracing, free pointing and
 tripod height. This change covers backend native optical-field transport only;
 frontend controls, projection and pose work is coordinated separately.
+
+Follow-up validation: with SPEAKTOME_REPO and PYTHONPATH explicitly selecting the
+existing sibling dependencies, the marble_photo suite excluding the torch-only
+trigger metadata test passes 26 tests. The excluded test fails on untouched
+canonical too because service Python intentionally has no torch. One transient
+HTTP fixture timeout occurred during an isolated run before explicit dependency
+selection; it did not recur in the corrected 26-test run.
+Spectral companion commit 1797d9f passes 205 analytical-focus/live CPU tests.
+Its old test stub lacked _light_field_information after response-state support;
+that failure was reproduced against canonical before adding the field to the stub.
