@@ -1,0 +1,221 @@
+// Generated from the SymPy spring law's LLVM artifact by build_spring_nodus_row.py.
+// Configuration: F64 [8,256,38] tensor. Tick: F64 scalar tensor (seconds).
+// Field 37 of node zero in each network is the stable fabric identity.
+// Output: F64 [8,256,3] positions. One row instance owns one batch of networks.
+#include "tool_api.h"
+#include "common/tensors/abstraction/tensor_abi.h"
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#pragma comment(lib,"ws2_32.lib")
+
+namespace {
+constexpr int kNetworks=8, kNodes=256, kAxes=3, kFields=38;
+constexpr int kNodeSlots=kNetworks*kNodes, kBatch=kNodeSlots*kAxes;
+using Entry=void (*)(void**,int32_t*);
+class SpringNetworkRow final : public ITool {
+public:
+  const char* id_cstr() const noexcept override {return "spring.network.batched";}
+  const char* name_cstr() const noexcept override {return "Batched spring sheets and ropes";}
+  ToolCaps caps() const override {return ToolCaps::None;}
+  int32_t port_count() const override {return 2;}
+  ToolPortSpec port_spec(int32_t index) const override {
+    if(index==0)return {ToolPortKind::Argument,1};
+    if(index==1)return {ToolPortKind::Return,1};
+    return {};
+  }
+  void initialize(const ToolInitContext&) override {
+    module_=LoadLibraryExA("@DLL@",nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if(!module_)return;
+    entry_=reinterpret_cast<Entry>(GetProcAddress(module_,"@ENTRY@"));
+    reset_=reinterpret_cast<void(*)()>(GetProcAddress(module_,"turing_validation_error_reset"));
+    take_=reinterpret_cast<uint32_t(*)()>(GetProcAddress(module_,"turing_validation_error_take"));
+    if(!entry_||((reset_==nullptr)!=(take_==nullptr))){FreeLibrary(module_);module_=nullptr;entry_=nullptr;}
+    for(auto& column:columns_)column.resize(kBatch);
+    positions_.resize(kBatch);velocities_.resize(kBatch);neighbors_.resize(kNodeSlots);
+    WSADATA wsa{};
+    if(WSAStartup(MAKEWORD(2,2),&wsa)==0){
+      winsock_=true;
+      const char* host=std::getenv("NODUS_FABRIC_UDP_HOST");
+      const char* port=std::getenv("NODUS_FABRIC_UDP_PORT");
+      addrinfo hints{};hints.ai_family=AF_INET;hints.ai_socktype=SOCK_DGRAM;hints.ai_protocol=IPPROTO_UDP;
+      addrinfo* addresses=nullptr;
+      if(getaddrinfo(host&&*host?host:"239.255.78.68",port&&*port?port:"48768",&hints,&addresses)==0){
+        socket_=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+        if(socket_!=INVALID_SOCKET&&addresses->ai_addrlen<=sizeof(destination_)){
+          std::memcpy(&destination_,addresses->ai_addr,addresses->ai_addrlen);
+          destination_bytes_=static_cast<int>(addresses->ai_addrlen);
+          u_long nonblocking=1;ioctlsocket(socket_,FIONBIO,&nonblocking);
+          int ttl=4;setsockopt(socket_,IPPROTO_IP,IP_MULTICAST_TTL,reinterpret_cast<const char*>(&ttl),sizeof(ttl));
+        }
+        freeaddrinfo(addresses);
+      }
+    }
+  }
+  void shutdown() override {if(module_)FreeLibrary(module_);module_=nullptr;entry_=nullptr;ready_=false;
+    if(socket_!=INVALID_SOCKET){closesocket(socket_);socket_=INVALID_SOCKET;}
+    if(winsock_){WSACleanup();winsock_=false;}}
+  void tick(double,HostAPI&) override {}
+  void render(RenderContext&) override {}
+  void execute_stack(ToolStackContext& context) override {
+    context.succeeded=false;
+    if(!context.stack.raw||!entry_)return;
+    auto& stack=*context.stack.raw;
+    nodus::tensors::AbstractTensorHandle input{};
+    if(!raw_stack_pop_abstract_tensor(stack,input))return;
+    auto restore=[&]{raw_stack_push_abstract_tensor(stack,input);};
+    NodusTensorDesc description{};
+    if(nodus_tensor_describe(input.id,&description)!=NODUS_OK||description.dtype!=NODUS_DTYPE_F64){restore();return;}
+    uint64_t shape[3]={kNetworks,kNodes,kAxes};
+    auto output=nodus::tensors::AbstractTensorHandle{nodus_tensor_create(NODUS_DTYPE_F64,3,shape)};
+    if(!output.id){restore();return;}
+    bool okay=false;
+    const bool config=description.rank==3&&description.shape[0]==kNetworks&&description.shape[1]==kNodes&&description.shape[2]==kFields;
+    if(config)
+      okay=configure(input.id,output.id);
+    else if(description.rank==0&&ready_)
+      okay=advance(input.id,output.id);
+    if(!okay||!raw_stack_push_abstract_tensor(stack,output)){
+      nodus_tensor_destroy(output.id);restore();return;
+    }
+    context.succeeded=true;
+    publish();
+  }
+private:
+  bool configure(uint64_t input,uint64_t output){
+    std::vector<double> source(kNodeSlots*kFields);
+    if(nodus_tensor_read(input,0,source.data(),source.size()*sizeof(double))!=static_cast<int64_t>(source.size()*sizeof(double)))return false;
+    double limit=1e9;
+    std::array<uint64_t,kNetworks> fabric_ids{};
+    for(int net=0;net<kNetworks;net++){
+      const double identity=source[(net*kNodes)*kFields+37];
+      if(!std::isfinite(identity)||identity<0||identity>9007199254740991.0||identity!=std::floor(identity))return false;
+      fabric_ids[net]=static_cast<uint64_t>(identity);
+      bool active=false;for(int node=0;node<kNodes;node++)active|=source[(net*kNodes+node)*kFields+6]!=0;
+      if(active){
+        if(!fabric_ids[net])return false;
+        for(int earlier=0;earlier<net;earlier++){
+          bool earlier_active=false;
+          for(int node=0;node<kNodes;node++)earlier_active|=source[(earlier*kNodes+node)*kFields+6]!=0;
+          if(earlier_active&&fabric_ids[earlier]==fabric_ids[net])return false;
+        }
+      }
+    }
+    for(int node=0;node<kNodeSlots;node++){
+      const double* row=source.data()+node*kFields;
+      for(int field=0;field<kFields;field++)if(!std::isfinite(row[field]))return false;
+      if((row[6]!=0&&row[6]!=1)||(row[7]!=0&&row[7]!=1)||row[11]<0||row[12]<0||row[13]<0)return false;
+      int degree=0;
+      for(int edge=0;edge<4;edge++){
+        if(row[33+edge]!=0&&row[33+edge]!=1)return false;
+        if(row[33+edge]){
+          const int index=static_cast<int>(row[17+edge]);
+          if(row[17+edge]!=index||index<0||index>=kNodes)return false;
+          degree++;
+        }
+      }
+      if(row[6]&&!row[7]&&degree&&row[12]&&row[11])
+        limit=std::min(limit,1/std::sqrt(2.0*degree*row[12]*row[11]));
+    }
+    max_dt_=limit;
+    for(int node=0;node<kNodeSlots;node++){
+      const double* row=source.data()+node*kFields;
+      const int net=node/kNodes;
+      for(int edge=0;edge<4;edge++)neighbors_[node][edge]=net*kNodes+(row[33+edge]?static_cast<int>(row[17+edge]):0);
+      for(int axis=0;axis<kAxes;axis++){
+        const int lane=node*kAxes+axis;
+        positions_[lane]=row[axis];velocities_[lane]=row[3+axis];
+        columns_[0][lane]=row[8+axis];columns_[1][lane]=row[13];
+        columns_[7][lane]=row[14+axis];columns_[8][lane]=row[11];
+        columns_[13][lane]=row[6];columns_[14][lane]=row[7];
+        columns_[20][lane]=row[12];
+        for(int edge=0;edge<4;edge++){
+          columns_[3+edge][lane]=row[33+edge];
+          columns_[16+edge][lane]=row[21+edge*3+axis];
+        }
+      }
+    }
+    if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
+    fabric_ids_=fabric_ids;
+    ready_=true;return true;
+  }
+  bool advance(uint64_t input,uint64_t output){
+    double dt=0;
+    if(nodus_tensor_read(input,0,&dt,sizeof(dt))!=sizeof(dt)||!std::isfinite(dt)||dt<=0||dt>max_dt_)return false;
+    std::fill(columns_[2].begin(),columns_[2].end(),dt);
+    std::copy(positions_.begin(),positions_.end(),columns_[15].begin());
+    std::copy(velocities_.begin(),velocities_.end(),columns_[21].begin());
+    for(int node=0;node<kNodeSlots;node++)for(int edge=0;edge<4;edge++){
+      const int other=neighbors_[node][edge];
+      for(int axis=0;axis<kAxes;axis++)
+        columns_[9+edge][node*kAxes+axis]=columns_[3+edge][node*kAxes+axis]?positions_[other*kAxes+axis]:0;
+    }
+    std::array<void*,24> buffers{};
+    for(int i=0;i<24;i++)buffers[i]=columns_[i].data();
+    if(reset_)reset_();entry_(buffers.data(),nullptr);
+    if(take_&&take_()!=0)return false;
+    for(int i=0;i<kBatch;i++)if(!std::isfinite(columns_[22][i])||!std::isfinite(columns_[23][i]))return false;
+    if(nodus_tensor_write(output,0,columns_[22].data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
+    std::copy(columns_[22].begin(),columns_[22].end(),positions_.begin());
+    std::copy(columns_[23].begin(),columns_[23].end(),velocities_.begin());
+    return true;
+  }
+  void publish(){
+    if(socket_==INVALID_SOCKET||!destination_bytes_||!ready_)return;
+    // NFAB v1 little-endian: 32-byte header, then up to 48 (node id, xyz) pairs.
+    // The sequence and chunk fields allow consumers to discard incomplete frames.
+    ++frame_;
+    for(int net=0;net<kNetworks;net++){
+      int active=0;for(int node=0;node<kNodes;node++)if(columns_[13][(net*kNodes+node)*kAxes])active++;
+      if(!active)continue;
+      const uint16_t chunks=static_cast<uint16_t>((active+47)/48);
+      int emitted=0,chunk=0;
+      while(emitted<active){
+        std::array<uint8_t,800> packet{};size_t size=0;
+        auto append=[&](const void* data,size_t bytes){std::memcpy(packet.data()+size,data,bytes);size+=bytes;};
+        const uint32_t magic=0x4241464e;const uint16_t version=1,header=32;
+        const uint16_t part=static_cast<uint16_t>(chunk++),reserved=0;
+        append(&magic,4);append(&version,2);append(&header,2);append(&frame_,8);
+        append(&fabric_ids_[net],8);append(&part,2);append(&chunks,2);
+        const size_t count_offset=size;append(&reserved,2);append(&reserved,2);
+        uint16_t count=0;int skip=emitted;
+        for(int node=0;node<kNodes&&count<48;node++){
+          const int lane=(net*kNodes+node)*kAxes;
+          if(!columns_[13][lane])continue;
+          if(skip>0){--skip;continue;}
+          const uint32_t id=static_cast<uint32_t>(node);
+          const float vector[3]={static_cast<float>(positions_[lane]),static_cast<float>(positions_[lane+1]),static_cast<float>(positions_[lane+2])};
+          append(&id,4);append(vector,sizeof(vector));count++;
+        }
+        std::memcpy(packet.data()+count_offset,&count,2);
+        emitted+=count;
+        sendto(socket_,reinterpret_cast<const char*>(packet.data()),static_cast<int>(size),0,
+               reinterpret_cast<const sockaddr*>(&destination_),destination_bytes_);
+      }
+    }
+  }
+  HMODULE module_=nullptr;
+  Entry entry_=nullptr;void(*reset_)()=nullptr;uint32_t(*take_)()=nullptr;
+  bool ready_=false;double max_dt_=0;
+  std::array<std::vector<double>,24> columns_{};
+  std::vector<double> positions_,velocities_;
+  std::vector<std::array<int,4>> neighbors_;
+  std::array<uint64_t,kNetworks> fabric_ids_{};uint64_t frame_=0;
+  bool winsock_=false;SOCKET socket_=INVALID_SOCKET;
+  sockaddr_storage destination_{};int destination_bytes_=0;
+};
+}
+extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME(){return new SpringNetworkRow();}
+extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* tool){delete tool;}
+extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME(){return __FILE__;}

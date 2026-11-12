@@ -1,0 +1,92 @@
+// Standalone acceptance for the user-space compiled Nodus spring row.
+// argv[1] is the generated row DLL; run with nodus_tensor_core.dll on PATH.
+#include "tool_api.h"
+#include "value_types.h"
+#include "common/tensors/abstraction/tensor_abi.h"
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <vector>
+#pragma comment(lib,"ws2_32.lib")
+
+using nodus::tensors::AbstractTensorHandle;
+static constexpr int Nets=8, Nodes=256, Axes=3, Fields=38;
+
+static bool invoke(ITool* tool,uint64_t input,std::vector<double>& positions){
+  RawStackFrame frame{};
+  if(!raw_stack_init_frame(frame,4096))return false;
+  AbstractTensorHandle source{input},output{};
+  bool okay=raw_stack_push_abstract_tensor(frame,source);
+  ToolStackContext context{};context.stack.raw=&frame;
+  if(okay)tool->execute_stack(context);
+  okay=okay&&context.succeeded&&raw_stack_pop_abstract_tensor(frame,output);
+  if(okay){positions.resize(Nets*Nodes*Axes);okay=nodus_tensor_read(output.id,0,positions.data(),positions.size()*sizeof(double))==
+    static_cast<int64_t>(positions.size()*sizeof(double));}
+  if(output.id)nodus_tensor_destroy(output.id);
+  raw_stack_free_mask(frame);if(frame.backend)gp_mem_backend_release(frame.backend);
+  return okay;
+}
+
+int main(int argc,char** argv){
+  if(argc!=2)return 2;
+  _putenv_s("NODUS_FABRIC_UDP_HOST","127.0.0.1");
+  _putenv_s("NODUS_FABRIC_UDP_PORT","48769");
+  WSADATA wsa{};if(WSAStartup(MAKEWORD(2,2),&wsa))return 2;
+  SOCKET receiver=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+  sockaddr_in address{};address.sin_family=AF_INET;address.sin_port=htons(48769);address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+  DWORD timeout=1000;setsockopt(receiver,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<char*>(&timeout),sizeof(timeout));
+  if(bind(receiver,reinterpret_cast<sockaddr*>(&address),sizeof(address))){std::cerr<<"UDP bind failed\n";return 2;}
+  HMODULE module=LoadLibraryA(argv[1]);if(!module){std::cerr<<"Plugin load failed "<<GetLastError()<<"\n";return 2;}
+  auto create=reinterpret_cast<ITool*(*)()>(GetProcAddress(module,"create_tool"));
+  auto destroy=reinterpret_cast<void(*)(ITool*)>(GetProcAddress(module,"destroy_tool"));
+  if(!create||!destroy)return 2;
+  ITool* tool=create();tool->initialize(ToolInitContext{});
+  uint64_t shape[3]={Nets,Nodes,Fields};
+  uint64_t config=nodus_tensor_create(NODUS_DTYPE_F64,3,shape);
+  std::vector<double> data(Nets*Nodes*Fields);
+  auto cell=[&](int node,int field)->double&{return data[node*Fields+field];};
+  cell(0,37)=42;
+  for(int node=0;node<3;node++){
+    cell(node,0)=node;cell(node,6)=1;cell(node,11)=1;cell(node,12)=10;
+    cell(node,8)=node;cell(node,9)=0;cell(node,10)=0;
+  }
+  cell(0,7)=cell(2,7)=1;
+  cell(1,1)=1;cell(1,17)=0;cell(1,18)=2;
+  cell(1,21)=-1;cell(1,24)=1;
+  cell(1,33)=cell(1,34)=1;
+  cell(3,0)=7;
+  if(!config||nodus_tensor_write(config,0,data.data(),data.size()*sizeof(double))!=
+      static_cast<int64_t>(data.size()*sizeof(double)))return 2;
+  std::vector<double> output;
+  bool configured=invoke(tool,config,output);
+  std::cerr<<"configured="<<configured<<" output_y="<<(output.size()>4?output[4]:-999)<<"\n";
+  bool okay=configured&&std::abs(output[4]-1)<1e-12;
+  uint64_t dt=nodus_tensor_create(NODUS_DTYPE_F64,0,nullptr);
+  double seconds=.1;
+  okay=okay&&dt&&nodus_tensor_write(dt,0,&seconds,sizeof(seconds))==sizeof(seconds);
+  bool stepped=invoke(tool,dt,output);
+  std::cerr<<"stepped="<<stepped<<" output_y="<<(output.size()>4?output[4]:-999)<<"\n";
+  okay=okay&&stepped&&std::abs(output[4]-.8)<1e-12&&
+    std::abs(output[0])<1e-12&&std::abs(output[6]-2)<1e-12&&
+    std::abs(output[9]-7)<1e-12;
+  auto receive=[&](uint64_t wanted_frame,float wanted_y){
+    unsigned char packet[800]{};const int got=recv(receiver,reinterpret_cast<char*>(packet),sizeof(packet),0);
+    uint32_t magic=0,node=0;uint64_t frame=0,identity=0;uint16_t count=0;float y=0;
+    if(got>=80){std::memcpy(&magic,packet,4);std::memcpy(&frame,packet+8,8);
+      std::memcpy(&identity,packet+16,8);std::memcpy(&count,packet+28,2);
+      std::memcpy(&node,packet+48,4);std::memcpy(&y,packet+56,4);}
+    return got==80&&magic==0x4241464e&&frame==wanted_frame&&identity==42&&
+      count==3&&node==1&&std::abs(y-wanted_y)<1e-5f;
+  };
+  okay=okay&&receive(1,1.0f)&&receive(2,.8f);
+  tool->shutdown();destroy(tool);FreeLibrary(module);
+  nodus_tensor_destroy(config);nodus_tensor_destroy(dt);
+  closesocket(receiver);WSACleanup();
+  std::cout<<(okay?"spring row + UDP: PASS":"spring row + UDP: FAIL")<<"\n";
+  return okay?0:1;
+}
