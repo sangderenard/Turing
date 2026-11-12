@@ -130,7 +130,8 @@ for(const [name,lighting,solo]of cases) {
   // wrapper delegates to the imported production builder, with no fake page.
   const wrapperStart=page.indexOf('export function sceneForPhoto('),wrapperEnd=page.indexOf('\n}',wrapperStart)+2;
   const bridge=vm.createContext({buildStudioPhotoFixtures,studioBuilderOptions:()=>options,OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles,
-    studioLighting:{strengths:{getSolo:()=>solo}},opticalControls:null,lightField:null});
+    studioLighting:{strengths:{getSolo:()=>solo}},opticalControls:null,lightField:null,
+    studioSceneRevision:0,photoSceneCacheKey:null,photoSceneCacheValue:null});
   vm.runInContext(page.slice(wrapperStart,wrapperEnd).replace('export function','function'),bridge);
   assert.deepEqual(bridge.sceneForPhoto(true),blob,`${name}: actual page wrapper delegates unchanged`);
   const geometry=createStudioSceneGeometry(options),roles=computeStudioFixtureRoles({...options,ids:materials.ids,fixtureMaterialBase:materials.fixtureMaterialBase,subjectPosition:subject.subjectCenter}).fixtureRoles;
@@ -187,7 +188,7 @@ assert(opticalScene.fixtures.material_engines.volumes.length>0);
 assert.equal(opticalScene.fixtures.material_engines.optical_media.materials.length,1);
 const incomplete=structuredClone(optical);delete incomplete.materialEdits.materials[0].optical;
 assert.throws(()=>buildStudioScene({...valid,lighting:incomplete,materials:opticalMaterials}),/transmittance/);
-assert.match(page,/return buildStudioPhotoFixtures\(/);assert.match(page,/return buildStudioFixtureFaces\(/);
+assert.match(page,/const value=buildStudioPhotoFixtures\(/);assert.match(page,/return buildStudioFixtureFaces\(/);
 assert.match(page,/return computeStudioFixtureRoles\(/);assert.match(page,/initializeStudioFixtureRows\(tables\.pbr\.data/);
 globalThis.fetch=originalFetch;
 console.log('PASS DOM-free shared Studio scene construction, input immutability and page delegation');

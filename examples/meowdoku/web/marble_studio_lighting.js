@@ -30,7 +30,7 @@ export const LIGHTING_PROFILE_FIELDS = ["key-shape", "light-x", "light-y", "ligh
   "light-fill-lower-strength", "fill-lower-filter", "floor-pattern", "floor-material-a", "floor-material-b",
   "light-table-left-strength", "table-left-filter", "light-table-right-strength", "table-right-filter", "light-under-strength", "under-filter",
   "wall-pattern", "wall-material-a", "wall-material-b", "ceiling-pattern", "ceiling-material-a", "ceiling-material-b",
-  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale",
+  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale", "stage-programmer-enabled",
   "key-filter-left-off","key-filter-right-off","background-filter-off","kicker-left-filter-off",
   "kicker-right-filter-off","fill-lower-filter-off","fill-upper-filter-off","table-left-filter-off",
   "table-right-filter-off","under-filter-off"];
@@ -48,7 +48,7 @@ function validateStudioLightingBase(value, fields, materialNames) {
     const el = fields[id];
     // Older profiles retain the former backdrop mounting distance.
     const v = value.controls[id] === undefined ?
-      (id.endsWith('-off') ? false : id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
+      (id.endsWith('-off') || id === 'stage-programmer-enabled' ? false : id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
     if (!el) throw new Error(`Lighting control unavailable: ${id}`);
     if (el.type === "checkbox") {
       if (typeof v !== "boolean") throw new Error(`Invalid ${id}`);
