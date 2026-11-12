@@ -16,6 +16,7 @@ One AbstractTensor input per execution:
 
 - Configuration: float64 `[8, 256, 38]`. This resets the row's private state and emits its initial positions.
 - Tick: float64 scalar containing seconds. This advances one symplectic Euler step with implicit linear drag and emits new positions as float64 `[8, 256, 3]`.
+- Freeze/thaw: float64 `[2]` containing `[1, 1]` to freeze or `[1, 0]` to thaw. Both return the held positions. While frozen, scalar ticks return the same positions without advancing velocity or sending redundant frames. Thaw resumes the stored velocity; neither command resets the fabric.
 
 The 38 configuration fields per node are:
 
@@ -41,7 +42,11 @@ For a grid sheet, use the four neighbor slots for left/right/up/down. For a rope
 
 After each successful configure or tick, the row sends `NFAB` v1 UDP datagrams to `239.255.78.68:48768` by default. `NODUS_FABRIC_UDP_HOST` and `NODUS_FABRIC_UDP_PORT` can select a different multicast or unicast destination before row initialization. Multicast TTL is four. Network routing must permit multicast for receivers beyond the local segment.
 
-Every datagram is little endian: `magic:u32`, `version:u16`, `header_bytes:u16` (32), `frame:u64`, `fabric_id:u64`, `chunk:u16`, `chunk_count:u16`, `pair_count:u16`, `reserved:u16`, followed by up to 48 pairs of `node_id:u32, x:f32, y:f32, z:f32`. A receiver joins the destination group, groups packets by `(fabric_id, frame)`, and presents a frame only after all chunks arrive. The identity of a vector is `(fabric_id, node_id)`; `frame` is a row-local publication sequence. UDP is best effort, so dropped chunks should cause that frame to be skipped.
+Every datagram is little endian: `magic:u32`, `version:u16`, `header_bytes:u16` (32), `frame:u64`, `fabric_id:u64`, `chunk:u16`, `chunk_count:u16`, `pair_count:u16`, `state:u16` (bit 0 frozen), followed by up to 48 pairs of `node_id:u32, x:f32, y:f32, z:f32`. A receiver joins the destination group, groups packets by `(fabric_id, frame)`, and presents a frame only after all chunks arrive. The identity of a vector is `(fabric_id, node_id)`; `frame` is a row-local publication sequence. UDP is best effort, so dropped chunks should cause that frame to be skipped.
+
+## Measured speed
+
+On the local Windows Nodus build, five 100-step runs of the 81-node sheet measured median row times of 59.1, 59.7, 61.7, 62.1 and 64.5 microseconds. This includes the fixed 8×256×3 batch kernel, AbstractTensor handoff, output publication and two UDP sends. Median UDP receive plus CSV writing was about 111 microseconds. These are local measurements, not a deadline guarantee or live-server result.
 
 ## Local cloth demo
 
@@ -52,3 +57,13 @@ $env:PATH = 'C:\Users\alber\nodus-build\free-runtime-build\Release;' + $env:PATH
 & 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\cloth_udp_frames.csv'
 python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\cloth_udp_frames.csv C:\Users\alber\nodus-build\spring-row\cloth_udp_demo.gif
 ```
+
+To use Studio's actual tabletop backdrop wall as the source mesh, export its material assets first, then:
+
+```powershell
+node tools/export_backdrop_fabric.mjs build/meowdoku/web/assets.json C:\Users\alber\nodus-build\spring-row\studio_backdrop_mesh.csv
+& 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_nodus_row_demo.exe' 'C:\Users\alber\nodus-build\spring-row\build\bin\spring_network_nodus_row.dll' 'C:\Users\alber\nodus-build\spring-row\studio_backdrop_udp.csv' 'C:\Users\alber\nodus-build\spring-row\studio_backdrop_mesh.csv' freeze
+python tools/render_spring_udp_demo.py C:\Users\alber\nodus-build\spring-row\studio_backdrop_udp.csv C:\Users\alber\nodus-build\spring-row\studio_backdrop_fabric.gif --pins 72,80
+```
+
+`marble_backdrop_fabric.js` samples the two wall triangles from `backdropFaces` into 81 nodes and 128 triangles without changing their material ID. The same helper packs the fixed Nodus row configuration and accepts returned positions when the Studio scene is rebuilt. The live Studio server does not yet connect a canvas fabric row or subscribe to its UDP stream, so its fabric control currently changes the mesh and saved surface behavior, while the live motion/freeze path is proven by the local native demo. Ellipse, grid, artwork and curved sweep fabric are outside this first wall-mesh lane; cardstock retains those existing shapes.
