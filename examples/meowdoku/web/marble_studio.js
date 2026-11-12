@@ -1562,6 +1562,10 @@ function frame(now=0) {
     const manualFlash=triggerGrid?.levels(performance.now());
     if(manualFlash)for(let i=0;i<roleStrength.length;i++)if(manualFlash.active.has(`studio:${i}`))
       roleStrength[i]*=manualFlash.gains[`studio:${i}`]??0;
+    if(manualFlash)for(let i=0;i<roleColor.length;i++)for(let channel=0;channel<3;channel++){
+      const receiver=`filter:studio:${i}:${'rgb'[channel]}`;
+      if(manualFlash.active.has(receiver))roleColor[i][channel]*=Math.min(1,manualFlash.gains[receiver]??0);
+    }
     rebuildStandMeshes(fixtureRoles);
     const previewShops=structuredClone(shopLightState());
     if(manualFlash){
@@ -1856,7 +1860,8 @@ async function boot() {
     });
     triggerGrid=mountMarbleTriggerGrid({doc:document,getReceivers:()=>[
       ...STUDIO_LIGHTS.map((_,i)=>`studio:${i}`),
-      ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`)]});
+      ...shopLightState().fixtures.map(fixture=>`shop:${fixture.id}`),
+      ...STUDIO_LIGHTS.flatMap((_,i)=>['r','g','b'].map(channel=>`filter:studio:${i}:${channel}`))]});
     mountStageProgrammer();
     $('stage-programmer-enabled').addEventListener('change',()=>{
       rebuildTable();photo.sceneChanged();liveRay?.sceneChanged();

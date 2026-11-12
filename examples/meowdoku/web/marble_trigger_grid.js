@@ -101,20 +101,22 @@ export function mountMarbleTriggerGrid({doc,getReceivers}) {
   picture.addEventListener('pointermove',event=>{if(event.buttons)pointer('move',event);});
   picture.addEventListener('contextmenu',event=>event.preventDefault());
   picture.addEventListener('wheel',event=>{if(!opened)return;event.preventDefault();enqueue({action:'event',name:'wheel',wheel_y:-Math.sign(event.deltaY),shift:event.shiftKey});},{passive:false});
-  fire.addEventListener('click',()=>{chain=chain.then(async()=>{
+  const play=()=>{chain=chain.catch(()=>{}).then(async()=>{
     const value=await request({action:'pulse'});show(value);pulse=value;playbackRate=Number(previewSpeed.value);started=performance.now();
     status.textContent=`Manual flash replaying at ${playbackRate}× slower in Phong; exposure timing is unchanged.`;
-  }).catch(error=>{status.textContent=error.message;});});
+    return {durationMs:value.duration_ms*playbackRate,graph:structuredClone(graph)};
+  });return chain;};
+  fire.addEventListener('click',()=>{play().catch(error=>{status.textContent=error.message;});});
   open();
   return {
     graph:()=>{
       if(!opened||!graph)return undefined;
       const current=["Sync","Flash","Gate",...LIGHTING_BUSES.map(bus=>`rack:${bus.id}`),...getReceivers(),...GENERATOR_KEYS];
-      if(JSON.stringify(current)!==JSON.stringify(graph.nodes))
+      if(current.length!==graph.nodes?.length||current.some(key=>!graph.nodes.includes(key)))
         throw Error('Light receivers changed. Reopen camera flash routing and reset or reconnect the current lights.');
       return structuredClone(graph);
     },
-    generators:()=>structuredClone(currentGenerators()),
+    generators:()=>structuredClone(currentGenerators()),play,
     levels:now=>{
       if(!pulse)return null;
       const index=Math.floor((now-started)/(pulse.step_ms*playbackRate));
