@@ -1,9 +1,24 @@
 // Receive actual forward deposits and traced throughput, never invented lights.
 import {inverseAffine} from './marble_studio_subject_renderer.js';
+import {receiveSceneResponses,SCENE_RESPONSE_SCHEMA} from './marble_scene_responses.js';
+import {RESPONSE_INFORMATION} from './marble_response_lineage.js';
+import {responseApplicationTexture,currentResponseQuery} from './marble_response_application.js';
 
 const DIGEST=/^[0-9a-f]{64}$/, NAME=/^light-field-[0-9a-f]{32}\.bin$/;
 const sha256=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),v=>v.toString(16).padStart(2,'0')).join('');
 export const MAX_FIELD_BYTES=256*256*256*12;
+export const MAX_SCENE_RESPONSE_BYTES=64*1024*1024;
+export function validateSceneResponseReceipt(value,digest,revision) {
+  if(!value||value.schema!==SCENE_RESPONSE_SCHEMA||!DIGEST.test(digest)||value.digest!==digest||
+      value.live_revision!==revision||!Number.isSafeInteger(value.sequence)||value.sequence<1||
+      !/^light-scene-response-[0-9a-f]{32}\.bin$/.test(value.name)||
+      !Number.isSafeInteger(value.byte_length)||value.byte_length<0||value.byte_length>MAX_SCENE_RESPONSE_BYTES||
+      !DIGEST.test(value.sha256)||value.application_ready!==false||
+      value.metadata?.schema!==SCENE_RESPONSE_SCHEMA||value.metadata.payload_bytes!==value.byte_length||
+      value.metadata.payload_sha256!==value.sha256)
+    throw Error('Invalid or stale scene-response receipt.');
+  return structuredClone(value);
+}
 // Dense subject bundles can exceed 85 MiB over the public connection. Newer
 // publications never cancel a transfer; only a changed scene/request does.
 export const fieldTransferTimeoutMs=byteLength=>Math.min(300000,Math.max(30000,15000+Math.ceil(byteLength/(512*1024))*1000));
@@ -154,6 +169,49 @@ export function fieldFromView(view,unitM,origin,boundsMin,boundsMax) {
   return result;
 }
 
+// Preserve the actual arrival evidence separately from RGB display values.
+// Visits are prequantization observations, not energy and not a convergence
+// certificate. Domain IDs remain canonical IDs, never guessed material IDs.
+export function decodeFieldArrivals(buffer,section,{cellBinCount,sourceCount,triangleCount}) {
+  if(!(buffer instanceof ArrayBuffer)||!section||section.format!=='arrival-record-v1'||
+      section.layout!=='sparse-zyx-bin'||section.stride_bytes!==120||
+      JSON.stringify(section.wavelengths_nm)!=='[650,550,450]'||
+      !Number.isSafeInteger(section.count)||section.count<0||section.count>cellBinCount||
+      !Number.isSafeInteger(section.offset_bytes)||section.offset_bytes<0||section.offset_bytes%4||
+      section.byte_length!==section.count*120||section.offset_bytes+section.byte_length>buffer.byteLength)
+    throw Error('Invalid arrival section.');
+  const count=section.count,view=new DataView(buffer),indices=new Uint32Array(count),
+    spectral=new Float32Array(count*12),visits=new Uint32Array(count*3),
+    roundedZero=new Uint32Array(count*3),excluded=new Uint32Array(count*3),context=new Uint32Array(count*8);
+  let previous=-1;
+  for(let i=0;i<count;i++) {
+    const offset=section.offset_bytes+i*120,index=view.getUint32(offset,true);
+    if(index<=previous||index>=cellBinCount)throw Error('Arrival indices must be unique, sorted and in bounds.');
+    indices[i]=index;previous=index;let hasEvidence=false;
+    for(let band=0;band<3;band++) {
+      const base=i*12+band*4;
+      for(let component=0;component<4;component++) {
+        const v=view.getFloat32(offset+4+(band*4+component)*4,true);
+        if(!Number.isFinite(v)||component===0&&v<0)throw Error('Invalid spectral arrival moment.');
+        spectral[base+component]=v;
+      }
+      const j=i*3+band,n=view.getUint32(offset+52+band*4,true),z=view.getUint32(offset+64+band*4,true),e=view.getUint32(offset+76+band*4,true);
+      if(z>n||!n&&spectral.subarray(base,base+4).some(v=>v!==0))throw Error('Arrival counts disagree with spectral evidence.');
+      visits[j]=n;roundedZero[j]=z;excluded[j]=e;hasEvidence ||= n!==0||e!==0;
+    }
+    if(!hasEvidence)throw Error('Empty arrival record.');
+    for(let c=0;c<8;c++)context[i*8+c]=view.getUint32(offset+88+c*4,true);
+    const c=i*8;
+    if(context[c]>context[c+1])throw Error('Invalid arrival medium range.');
+    for(const [at,limit] of [[c+3,sourceCount],[c+5,triangleCount]]) {
+      const lo=context[at],hi=context[at+1];
+      if(lo>hi||lo!==0xffffffff&&lo>=limit||hi!==0xffffffff&&hi>=limit)throw Error('Invalid arrival source or endpoint range.');
+    }
+    if(context[c+7]&~3)throw Error('Unknown arrival path kind.');
+  }
+  return {indices,spectral,visits,roundedZero,excluded,context};
+}
+
 export function decodeLightField(buffer,metadata) {
   if(!(buffer instanceof ArrayBuffer)||buffer.byteLength!==metadata.byte_length)
     throw Error('Incomplete forward-field payload.');
@@ -219,6 +277,34 @@ export function decodeLightField(buffer,metadata) {
     authoredMaterials,authoredMaterialIds:metadata.source_pbr16.material_ids.slice()};
 }
 
+// Exact opt-in copies of already evaluated native expressions. This decoder
+// does not integrate events, replay multipliers, convert spectra or infer an
+// availability alpha. Even NaN payload bits remain evidence, not display data.
+export function decodeEvaluatedResponses(intervalBytes,responseBytes,receipt) {
+  if(receipt?.response_schema!=='native-camera-response-copies-v1'||
+      receipt.response_weighting!=='original_path_throughput_not_availability_premultiplied'||
+      receipt.denominator!=='original_camera_samples_not_response_rows'||receipt.application_ready!==false||
+      !Number.isSafeInteger(receipt.row_count)||receipt.row_count<0||
+      !(intervalBytes instanceof ArrayBuffer)||!(responseBytes instanceof ArrayBuffer)||
+      intervalBytes.byteLength!==receipt.row_count*512||responseBytes.byteLength!==intervalBytes.byteLength||
+      intervalBytes.byteLength+responseBytes.byteLength>MAX_FIELD_BYTES)
+    throw Error('Invalid evaluated response copy buffers.');
+  const copy=bytes=>{const view=new DataView(bytes),out=new Uint32Array(bytes.byteLength/4);
+    for(let i=0;i<out.length;i++)out[i]=view.getUint32(i*4,true);return out;};
+  const intervals=copy(intervalBytes),responses=copy(responseBytes);
+  for(let row=0;row<receipt.row_count;row++) {
+    const offset=row*128,bands=intervals[offset+6],active=intervals[offset+40];
+    if(bands<1||bands>8||active>>>bands)throw Error('Invalid native active wavelength mask.');
+    for(let channel=0;channel<12;channel++) {
+      const presence=responses[offset+96+channel],states=responses[offset+108+channel];
+      if(presence>>>bands||states>>>(bands*2))throw Error('Response evidence exceeds active spectral capacity.');
+      for(let band=0;band<bands;band++)if(((states>>>(2*band))&3)===2)
+        throw Error('Reserved native response source state.');
+    }
+  }
+  return {intervals,responses,receipt:structuredClone(receipt),applicationReady:false};
+}
+
 // IDs are local to each assembled scene. Match exact submitted PBR16 bytes,
 // then follow recorded authored-to-native lineage to the native class masks.
 // Engine-derived native rows are not evidence of an authored material identity.
@@ -246,6 +332,7 @@ export function mapFieldMaterials(decoded,local) {
 
 export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMaterials,fetcher=fetch,onChange=()=>{},fallbackTexture=null}) {
   const toggle=doc.getElementById('phong-light-field'),output=doc.getElementById('phong-light-field-status');
+  const responseControl=doc.getElementById('phong-field-responses');
   const stencilControl=doc.getElementById('phong-field-stencil'),spatialControl=doc.getElementById('phong-field-spatial-linear');
   const transportControl=doc.getElementById('ray-surface-transport');
   const surfaceTransport=()=>transportControl?.checked?'studio-pbr-mixture-v1':null;
@@ -274,6 +361,8 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
   const floatLinear=!!gl.getExtension?.('OES_texture_float_linear');
   const spatialLinear=()=>weightedField(metadata)&&spatialControl?.checked!==false&&floatLinear;
   let epoch=0,source=null,metadata=null,texture=null,pending=null,disposed=false,directionalTextures=null,coverage=null;
+  let sceneResponses=null,sceneReceipt=null,responseTexture=null,responseTextureCount=0;
+  const responseLineageResources=new WeakMap();
   const say=text=>{if(output)output.textContent=text;};
   const describeDivisions=()=>{
     if(!divisionOutput)return;
@@ -288,6 +377,8 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
       'No receiving categories selected. Ordinary primary shading remains active.';
   };
   const drop=()=>{
+    if(responseTexture)gl.deleteTexture(responseTexture);
+    responseTexture=null;responseTextureCount=0;
     if(directionalTextures)for(const t of directionalTextures)gl.deleteTexture(t);
     directionalTextures=null;
     if(texture){
@@ -295,33 +386,84 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
       if(gl.getParameter(gl.TEXTURE_BINDING_3D)===texture)gl.bindTexture(gl.TEXTURE_3D,fallbackTexture);
       gl.deleteTexture(texture);gl.activeTexture(active);
     }
-    texture=null;metadata=null;coverage=null;describeDivisions();
+    texture=null;metadata=null;coverage=null;sceneResponses=null;sceneReceipt=null;describeDivisions();
   };
   const requested=()=>!disposed&&toggle?.checked===true;
+  const responseInformationRequested=()=>requested()&&responseControl?.checked===true;
   const invalidate=(reason='Scene changed. Waiting for matching ray data.')=>{
     epoch++;source=null;pending?.controller.abort();pending=null;drop();if(requested())say(reason);
   };
   const key=context=>getSceneKey(context);
-  const current=s=>requested()&&source===s&&s.epoch===epoch&&key(s.context)===s.key&&stencil()===s.stencil&&gridSize()===s.gridSize&&recordingKey()===s.recordingKey&&s.surfaceTransport===surfaceTransport();
+  const current=s=>requested()&&source===s&&s.epoch===epoch&&key(s.context)===s.key&&stencil()===s.stencil&&gridSize()===s.gridSize&&recordingKey()===s.recordingKey&&s.surfaceTransport===surfaceTransport()&&
+    (s.information===RESPONSE_INFORMATION)===responseInformationRequested();
   const capture=(context={})=>{
     if(!requested())return null;
-    try{return {key:key(context),context:{...context},epoch,stencil:stencil(),gridSize:gridSize(),...recording(),recordingKey:recordingKey(),surfaceTransport:surfaceTransport(),
+    try{return {key:key(context),context:{...context},epoch,...(responseInformationRequested()?{information:RESPONSE_INFORMATION}:{}),stencil:stencil(),gridSize:gridSize(),...recording(),recordingKey:recordingKey(),surfaceTransport:surfaceTransport(),
       materials:getSceneMaterials?structuredClone(getSceneMaterials(context)):null};}
     catch(error){say(`Field not requested: ${error.message}`);return null;}
   };
   const connect=(digest,ticket,revision=0)=>{
     if(!ticket||!requested()||ticket.epoch!==epoch||!DIGEST.test(digest))return;
-    try{if(key(ticket.context)!==ticket.key||ticket.stencil!==stencil()||ticket.gridSize!==gridSize()||ticket.recordingKey!==recordingKey()||ticket.surfaceTransport!==surfaceTransport())return;
+    try{if(key(ticket.context)!==ticket.key||ticket.stencil!==stencil()||ticket.gridSize!==gridSize()||ticket.recordingKey!==recordingKey()||ticket.surfaceTransport!==surfaceTransport()||
+        (ticket.information===RESPONSE_INFORMATION)!==responseInformationRequested())return;
       pending?.controller.abort();pending=null;drop();source={...ticket,digest,revision};
       say("Opted in. Waiting for the ray tracer's field bundle.");
     }catch(error){invalidate(error.message);}
   };
+  const observeSceneResponses=async(status,s)=>{
+    if(!status.scene_responses)return;
+    const next=validateSceneResponseReceipt(status.scene_responses,s.digest,s.revision);
+    if(sceneReceipt&&next.sequence<=sceneReceipt.sequence||pending)return;
+    const controller=new AbortController(),work={controller};pending=work;
+    let timedOut=false;
+    const timer=setTimeout(()=>{timedOut=true;controller.abort();},fieldTransferTimeoutMs(next.byte_length));
+    try {
+      const response=await fetcher(`/api/marble_photo/field?digest=${s.digest}&name=${encodeURIComponent(next.name)}`,
+        {cache:'no-store',signal:controller.signal});
+      if(response.status===404||response.status===409){say('Scene-response publication changed before transfer. Waiting for the next receipt; Phong remains visible.');return;}
+      if(!response.ok)throw Error(`Scene-response HTTP ${response.status}`);
+      const length=response.headers?.get?.('Content-Length');
+      if(length!==null&&length!==undefined&&Number(length)!==next.byte_length)throw Error('Scene-response length changed.');
+      const bytes=await response.arrayBuffer();if(!current(s))return;
+      const decoded=await receiveSceneResponses(next.metadata,bytes,{sceneRevision:next.metadata.scene_revision,
+        information:s.information,maxPayloadBytes:MAX_SCENE_RESPONSE_BYTES});
+      if(!current(s))return;
+      // This is unreachable for the currently published unready v1 schema.
+      // A producer readiness declaration is necessary, never inferred from
+      // positive RGB, retained sample counts, or a successful texture upload.
+      let nextTexture=null,nextCount=0;
+      if(decoded.applicationReady===true) {
+        const packed=responseApplicationTexture(decoded.applicationRows,gl.getParameter(gl.MAX_TEXTURE_SIZE));
+        const active=gl.getParameter(gl.ACTIVE_TEXTURE);gl.activeTexture(gl.TEXTURE0+11);
+        const previous=gl.getParameter(gl.TEXTURE_BINDING_2D),unpack=gl.getParameter(gl.UNPACK_ALIGNMENT);
+        try {
+          nextTexture=gl.createTexture();if(!nextTexture)throw Error('Native response texture allocation failed.');
+          gl.bindTexture(gl.TEXTURE_2D,nextTexture);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+          for(const p of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER])gl.texParameteri(gl.TEXTURE_2D,p,gl.NEAREST);
+          for(const p of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T])gl.texParameteri(gl.TEXTURE_2D,p,gl.CLAMP_TO_EDGE);
+          gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32UI,packed.width,packed.height,0,gl.RGBA_INTEGER,gl.UNSIGNED_INT,packed.words);
+          if(gl.getError()!==gl.NO_ERROR)throw Error('Native response texture upload failed.');nextCount=packed.count;
+        }catch(error){if(nextTexture)gl.deleteTexture(nextTexture);throw error;}
+        finally{gl.pixelStorei(gl.UNPACK_ALIGNMENT,unpack);gl.bindTexture(gl.TEXTURE_2D,previous);gl.activeTexture(active);}
+      }
+      // Atomic replacement is essential: an evicted row must not survive by
+      // merging an older snapshot. No typed flux/deposit is uploaded as RGB.
+      if(responseTexture)gl.deleteTexture(responseTexture);
+      responseTexture=nextTexture;responseTextureCount=nextCount;sceneResponses=decoded;sceneReceipt=next;
+      const r=next.metadata.retention;
+      say(`Native scene responses received: ${r.retained_entries.toLocaleString()} retained entries; ${r.evicted_entries.toLocaleString()} discarded. Typed data only; application is unavailable and Phong remains visible.`);
+    }catch(error){
+      if(timedOut&&error.name==='AbortError')throw Error('Scene-response download timed out. Retrying on the next update.');
+      throw error;
+    }finally{clearTimeout(timer);if(pending===work)pending=null;}
+  };
   const observe=async(status,digest)=>{
     const s=source;if(!s||s.digest!==digest)return;
-    let transferFailed=false;
+    let transferFailed=false,retainingSceneSnapshot=false;
     try {
       if(!current(s)){drop();return;}
       if(['error','canceled'].includes(status.state)){invalidate('Ray job ended without a current field.');return;}
+      if(s.information===RESPONSE_INFORMATION){retainingSceneSnapshot=true;await observeSceneResponses(status,s);return;}
       if(!status.light_field)return;
       const next=validateLightField(status.light_field,digest,s.revision);
       if((next.surface_transport??null)!==s.surfaceTransport)throw Error('Ray field surface transport does not match the captured request.');
@@ -430,8 +572,8 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
       }finally{clearTimeout(timer);if(pending===work)pending=null;}
     }catch(error){
       if(source===s&&s.epoch===epoch&&error.name!=='AbortError'){
-        if(!transferFailed)drop();
-        say(`Field update unavailable: ${error.message}${metadata?' The last received field remains active.':''}`);
+        if(!transferFailed&&!retainingSceneSnapshot)drop();
+        say(`Field update unavailable: ${error.message}${sceneReceipt?' The previous validated scene snapshot is retained.':metadata?' The last received field remains active.':''}`);
       }
     }
   };
@@ -460,53 +602,50 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
     }
     return true;
   };
+  const responseCurrent=()=>{
+    if(!sceneResponses||!sceneReceipt||!source||!responseTexture||sceneResponses.applicationReady!==true)return false;
+    if(gl.isContextLost?.()||!current(source)){drop();return false;}
+    const m=sceneResponses.metadata;
+    return m.application?.ready===true&&m.response_lineage_scene_revision===m.scene_revision&&
+      m.response_lineage?.version==='studio-response-lineage-v1';
+  };
+  const bindResponseLineage=resource=>{
+    gl.vertexAttribI4ui(7,0,0,0,0);
+    if(!responseCurrent()||!resource?.bindResponseLineage)return false;
+    const lineage=sceneResponses.metadata.response_lineage;
+    if(responseLineageResources.get(resource)!==lineage) {
+      if(!resource.bindResponseLineage(lineage))return false;
+      responseLineageResources.set(resource,lineage);
+    }
+    return true;
+  };
   const bindSecondary=(program,view,unitM,origin)=>{
+    const uniform=name=>gl.getUniformLocation(program,name);
+    gl.uniform1i(uniform('uResponseCount'),0);gl.uniform1i(uniform('uResponseQueryContext'),-1);
     try {
-      if(!categoryMask()){gl.uniform1f(gl.getUniformLocation(program,'uFieldGain'),0);return false;}
-      if(!directionalCurrent())return false;
-      const names=['uFieldRadiance','uFieldDirection','uFieldMaterialMask','uFieldGridDepth','uFieldViewFromWorld','uFieldFromView',
-        'uFieldBinCount','uFieldAtlasColumns','uFieldSpatialLinear'];
-      const u=Object.fromEntries(names.map(n=>[n,gl.getUniformLocation(program,n)]));
-      if(Object.values(u).some(v=>v===null))throw Error('Secondary shader lacks directional field uniforms.');
-      const bounds=directionalBounds(metadata);
-      const mapping=fieldFromView(view,unitM,origin,bounds.bounds_min_m,bounds.bounds_max_m);
-      const rotation=new Float32Array([view[0],view[1],view[2],view[4],view[5],view[6],view[8],view[9],view[10]]);
-      if(!Array.from(rotation).every(Number.isFinite))throw Error('Invalid field direction transform.');
+      if(!categoryMask()||!responseCurrent())return false;
+      const metadata=sceneResponses.metadata,index=metadata.indexing,application=metadata.application;
+      if(!index.bounds||!index.dimensions)throw Error('Native application has no declared spatial support.');
+      const inverse=inverseAffine(view),eye=[0,1,2].map(i=>Math.fround(inverse[12+i]*unitM+origin[i]));
+      const query=currentResponseQuery(application,eye,source.revision);
+      const names=['uResponseRows','uResponseCount','uResponseQueryContext','uResponseDimensions','uResponseFromView',
+        'uResponseWorldFromView','uResponseStencil[0]','uResponseBinCount'];
+      if(names.some(n=>uniform(n)===null))throw Error('Secondary shader lacks the native response application contract.');
       const active=gl.getParameter(gl.ACTIVE_TEXTURE);
-      try {for(let i=0;i<3;i++) {
-        gl.activeTexture(gl.TEXTURE0+11+i);gl.bindTexture(i===2?gl.TEXTURE_2D:gl.TEXTURE_3D,directionalTextures[i]);
-      }}finally{gl.activeTexture(active);}
-      gl.uniform1i(u.uFieldRadiance,11);gl.uniform1i(u.uFieldDirection,12);gl.uniform1i(u.uFieldMaterialMask,13);
-      gl.uniform1f(u.uFieldGridDepth,metadata.directional.dimensions[2]);
-      const bins=weightedField(metadata)?metadata.directional.bin_count:6;
-      gl.uniform1i(u.uFieldBinCount,bins);gl.uniform1i(u.uFieldAtlasColumns,fieldAtlasLayout(metadata.directional.dimensions,bins).columns);gl.uniform1i(u.uFieldSpatialLinear,spatialLinear()?1:0);
-      gl.uniformMatrix3fv(u.uFieldViewFromWorld,false,rotation);
-      gl.uniformMatrix4fv(u.uFieldFromView,false,mapping);
-      gl.uniform1i(gl.getUniformLocation(program,'uFieldRestrictToBounds'),1);
-      // The primary is deliberately field-free. Its copied zero gain must not
-      // suppress the directional loop in the immediately following program.
-      gl.uniform1f(gl.getUniformLocation(program,'uFieldGain'),1);
+      try{gl.activeTexture(gl.TEXTURE0+11);gl.bindSampler(11,null);gl.bindTexture(gl.TEXTURE_2D,responseTexture);}
+      finally{gl.activeTexture(active);}
+      gl.uniform1i(uniform('uResponseRows'),11);gl.uniform1i(uniform('uResponseCount'),responseTextureCount);
+      gl.uniform1i(uniform('uResponseQueryContext'),query);gl.uniform3iv(uniform('uResponseDimensions'),index.dimensions);
+      gl.uniformMatrix4fv(uniform('uResponseFromView'),false,fieldFromView(view,unitM,origin,...index.bounds));
+      gl.uniformMatrix3fv(uniform('uResponseWorldFromView'),false,new Float32Array([inverse[0],inverse[1],inverse[2],inverse[4],inverse[5],inverse[6],inverse[8],inverse[9],inverse[10]]));
+      const bins=index.stencil==='axes6-v1'?6:12;
+      gl.uniform3fv(uniform('uResponseStencil[0]'),fieldStencilDirections(bins).flat());gl.uniform1i(uniform('uResponseBinCount'),bins);
       return true;
-    }catch(error){drop();say(`Field unavailable: ${error.message}`);return false;}
+    }catch(error){drop();say(`Native response unavailable: ${error.message}`);return false;}
   };
-  const bindMaterialMask=(program,fallback,view,unitM,origin)=>{
-    let available=false;
-    try {
-      available=categoryMask()!==0&&directionalCurrent();
-      if(available) {
-        const bounds=directionalBounds(metadata);
-        gl.uniformMatrix4fv(gl.getUniformLocation(program,'uFieldFromView'),false,
-          fieldFromView(view,unitM,origin,bounds.bounds_min_m,bounds.bounds_max_m));
-      }
-    }catch(error){available=false;drop();say(`Field unavailable: ${error.message}`);}
-    gl.uniform1i(gl.getUniformLocation(program,'uFieldRestrictToBounds'),available?1:0);
-    const active=gl.getParameter(gl.ACTIVE_TEXTURE);
-    try {gl.activeTexture(gl.TEXTURE0+13);gl.bindSampler(13,null);
-      gl.bindTexture(gl.TEXTURE_2D,available?directionalTextures[2]:fallback);
-      gl.uniform1i(gl.getUniformLocation(program,'uFieldMaterialMask'),13);
-    }finally{gl.activeTexture(active);}
-    return available;
-  };
+  // Legacy material masks are not sampling availability and cannot suppress
+  // any primary contribution. Retained for callers checking old receipts.
+  const bindMaterialMask=()=>false;
   const change=()=>{invalidate();say(requested()?'Opted in for the next RGB still or Live job.':'Ray field off. Ordinary Phong lighting is unchanged.');onChange();};
   const describeDirectional=()=>{
     const bins=weightedField(metadata)?metadata.directional.bin_count:6;
@@ -530,6 +669,7 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
     describeDirectional();
   };
   toggle?.addEventListener('change',change);
+  responseControl?.addEventListener('change',change);
   transportControl?.addEventListener('change',change);
   stencilControl?.addEventListener('change',change);spatialControl?.addEventListener('change',spatialChange);
   gridControl?.addEventListener('change',change);
@@ -537,7 +677,12 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
   regionControl?.addEventListener('change',regionChange);cellControl?.addEventListener('change',change);marginControl?.addEventListener('change',change);
   for(const {control} of categories)control?.addEventListener('change',categoryChange);
   syncRecordingControls();describeDivisions();categoryChange();
-  return {requested,capture,connect,observe,bind,bindSecondary,bindMaterialMask,invalidate,
+  return {requested,capture,connect,observe,bind,bindSecondary,bindMaterialMask,bindResponseLineage,invalidate,
+    get responseInformationRequested(){return responseInformationRequested();},
+    // The raw typed schema cannot authorize suppression of primary Phong.
+    get hasResponses(){try{return responseCurrent();}catch(error){drop();say(`Native response unavailable: ${error.message}`);return false;}},
+    get sceneResponseMetadata(){return sceneReceipt&&structuredClone(sceneReceipt);},
+    get sceneResponseFamilies(){return sceneResponses?.families&&{...sceneResponses.families};},
     get categoryMask(){return categoryMask();},get hasReceivers(){return categoryMask()!==0;},
     get coverage(){return coverage&&{...coverage};},
     get hasDirectional(){try{return directionalCurrent();}catch(error){drop();say(`Field unavailable: ${error.message}`);return false;}},
@@ -546,6 +691,7 @@ export function createStudioLightField({gl,doc=document,getSceneKey,getSceneMate
     stop(digest){if(source?.digest===digest)invalidate('Ray field stopped.');},
     get metadata(){return metadata&&structuredClone(metadata);},
     dispose(){disposed=true;invalidate();toggle?.removeEventListener('change',change);stencilControl?.removeEventListener('change',change);gridControl?.removeEventListener('change',change);spatialControl?.removeEventListener('change',spatialChange);
+      responseControl?.removeEventListener('change',change);
       transportControl?.removeEventListener('change',change);
       regionControl?.removeEventListener('change',regionChange);cellControl?.removeEventListener('change',change);marginControl?.removeEventListener('change',change);
       for(const {control} of categories)control?.removeEventListener('change',categoryChange);}};

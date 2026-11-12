@@ -17,6 +17,7 @@ import { createMarblePhoto, photoCameraFromStudio, validatePhotoFocus, OBJECT_CE
 import { createLiveRayView } from "./marble_live.js";
 import {createStudioLightField} from "./marble_light_field.js";
 import {fieldCategoryEnabled,fieldCategoryRuns,withSceneCategory} from './marble_field_categories.js';
+import {RESPONSE_INFORMATION,copyResponseIdentity,tagSubjectResponseFaces,tagPartResponseFaces,copiedResponseSources,bindResponseIdentity} from './marble_response_lineage.js';
 import {createStudioSecondaryField,secondaryFieldFragment} from "./marble_secondary_field.js";
 import { createObjectAutosave } from "./marble_autosave.js";
 import { prepareObjectSnapshot, objectSnapshotKey } from "./marble_object_snapshot.js";
@@ -50,7 +51,7 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("view"), message = $("message");
 let studioLighting = null;
 let opticalControls = null;
-let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null, fieldMaskFallback = null;
+let liveRay = null, lightField = null, secondaryField = null, fieldPrimary = null;
 // A late-bound facade lets existing photo controls start before WebGL setup.
 const fieldView={capture:context=>lightField?.capture(context),connect:(...args)=>lightField?.connect(...args),
   observe:(...args)=>lightField?.observe(...args),invalidate:()=>lightField?.invalidate(),stop:digest=>lightField?.stop(digest),
@@ -69,13 +70,18 @@ let objectAutosave=null, savedObjectSnapshot=null, objectKey="", objectEditQueue
 // real NEE sources directly from `fixtures`' own emissive PBR geometry
 // below (matching exposure_render_demo.py's canonical _build_tracer_scene
 // pattern for its "orbiters" emissive-sphere demo) -- one source of truth.
-const currentCameraOptions = (snapshot = false, {usePhotoCamera=true}={}) => ({
+const currentCameraOptions = (snapshot = false, {usePhotoCamera=true,timedExposure=false}={}) => ({
   ...studioPhotoCamera(!snapshot,{usePhotoCamera}),
   object_center_m: studioPhotoSubjectCenter(!snapshot),
-  fixtures: sceneForPhoto(!snapshot),
+  fixtures: sceneForPhoto(!snapshot,{timedExposure}),
 });
+const exposureClock={active:false,dt:0,modelNow:0,waiters:[],
+  begin(dt){this.active=true;this.dt=dt;this.modelNow=sim.runtime?.last??performance.now()/1000;},
+  end(){this.active=false;this.waiters.length=0;if(sim.runtime)sim.runtime.last=performance.now()/1000;},
+  nextTick(callback){exposureClock.waiters.push(callback);},
+  completeTick(){for(const callback of this.waiters.splice(0))callback();}};
 const photo = createMarblePhoto(document, currentCameraOptions,
-  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView);
+  () => prepareObjectSnapshot(captureObjectSnapshot()),fieldView,exposureClock);
 const cameraToolbox=mountStudioCameraToolbox({doc:document,photo,canvas,getScene:captureCurrentStudioScene});
 const photographicCameraControls=mountPhotographicCameraBinding({doc:document,binding:photographicCameraBinding,
   captureLinked:()=>studioPhotoCamera($("photo-auto-snapshot")?.checked===false,{usePhotoCamera:false}),
@@ -169,7 +175,14 @@ function mesh(faces) {
   }
   gl.bindVertexArray(null);
   const categories=faces.map(face=>face.sceneCategory??null);
-  return { vao, buffers, count: pos.length/3, categories, categoryRuns:fieldCategoryRuns(categories) };
+  const resource={ vao, buffers, count: pos.length/3, categories, categoryRuns:fieldCategoryRuns(categories) };
+  const responseSources=copiedResponseSources(faces);
+  if(responseSources) {
+    resource.responseSources=responseSources;
+    // Receiver calls this only after checking the exact scene/camera revision.
+    resource.bindResponseLineage=lineage=>bindResponseIdentity(gl,resource,lineage);
+  }
+  return resource;
 }
 function dispose(mesh) {
   if (!mesh) return;
@@ -540,6 +553,7 @@ function setupObjSubjects(run) {
 }
 function repartitionExterior(force=false) {
   if(!lastGeometry)return;
+  tagSubjectResponseFaces(lastGeometry,lightField?.responseInformationRequested===true);
   if(tableOpaque) rebuildTable();
   const classes=new Map();
   for(const face of [...lastGeometry.interior,...lastGeometry.glass]) if(!classes.has(face[3])) {
@@ -714,7 +728,8 @@ function fieldSceneKey({saved=false}={}) {
   const subject=studioSubjectTransform(saved,"exposure"),current=studioSubjectTransform(false,"studio");
   if(profile(subject)!==profile(current))throw Error("The displayed subject size differs from the captured ray scene.");
   return JSON.stringify([objectKey,profile(a),studioLighting.strengths.getSolo("exposure"),
-    yaw,pitch,distance,subject.unitM,subject.subjectCenter]);
+    yaw,pitch,distance,subject.unitM,subject.subjectCenter,
+    ...(lightField?.responseInformationRequested===true?[studioPhotoCamera(saved,{usePhotoCamera:false}).camera,photo.filmResponse()]:[])]);
 }
 let fieldMaterialProjection=null;
 function fieldMaterialRows() {
@@ -798,17 +813,21 @@ function framePhotographicCamera() {
   const scene=photoCameraFromStudio(photoYaw,photoPitch,nextDistance,subject.unitM,subject.fovDegrees,subject.subjectCenter);
   scene.camera=photo.applyLensCamera(scene.camera);return scene;
 }
+function responsePartCallback(prefix,onPart) {
+  if(lightField?.responseInformationRequested!==true)return onPart;
+  return part=>{tagPartResponseFaces(part,`${prefix}/${part.id}`,true);onPart?.(part);};
+}
 function tableFaces(channel="studio",onPart) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).tableFaces(onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).tableFaces(responsePartCallback('table',onPart));
 }
 function goboFaces(channel="studio",onPart) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).goboFaces(onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).goboFaces(responsePartCallback('gobo',onPart));
 }
 function lightStandFacesForStudio(channel="studio",fixtureRoles,onPart) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).lightStandFaces(fixtureRoles,onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).lightStandFaces(fixtureRoles,responsePartCallback('stand',onPart));
 }
 function backdropSupportFacesForStudio(channel="studio",onPart) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropHolderFaces(onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropHolderFaces(responsePartCallback('backdrop-holder',onPart));
 }
 function rebuildStandMeshes(fixtureRoles) {
   const state=studioRenderState("studio")?.lightStands??studioLighting?.lightStands?.getState();
@@ -830,7 +849,10 @@ function shopLightState(channel="studio") {
   return studioRenderState(channel)?.shopLights??studioLighting?.shopLights?.state();
 }
 function shopLightGeometryForStudio(channel="studio") {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).shopLightGeometry();
+  const geometry=createStudioSceneGeometry(studioBuilderOptions(channel)).shopLightGeometry();
+  if(lightField?.responseInformationRequested===true)for(const part of geometry.parts)
+    tagPartResponseFaces(part,`shop/${part.id}`,true);
+  return geometry;
 }
 function shopLightFacesForStudio(channel="studio",onPart) {
   const geometry=shopLightGeometryForStudio(channel);
@@ -869,14 +891,16 @@ function transparentSet(model) {
         model[2]*n[0]+model[6]*n[1]+model[10]*n[2]];
       return p.map(v=>v/Math.hypot(...p));
     };
-    const faces=marbleTransparentFaces.map(([a,b,c,id,ns,gid=0])=>
-      [transformPoint(model,a),transformPoint(model,b),transformPoint(model,c),id,ns.map(normal),gid]);
+    const faces=marbleTransparentFaces.map(face=>{
+      const [a,b,c,id,ns,gid=0]=face;
+      return copyResponseIdentity(face,[transformPoint(model,a),transformPoint(model,b),transformPoint(model,c),id,ns.map(normal),gid]);
+    });
     dispose(sceneGlass); sceneGlass=transparentMesh([...tableTransparentFaces,...standTransparentFaces,...shopTransparentFaces,...withSceneCategory(faces,'subject')]); sceneGlassKey=key;
   }
   return sceneGlass;
 }
 function checkerboardFaces(channel="studio",onSurface) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).roomFaces(onSurface);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).roomFaces(responsePartCallback('room',onSurface));
 }
 function checkerboard() { return mesh(checkerboardFaces()); }
 // A real backdrop roll: a stack of flat material panels mounted just in
@@ -888,7 +912,7 @@ function checkerboard() { return mesh(checkerboardFaces()); }
 // down across the wall/floor bevel and out along the floor, like a real
 // cyclorama, instead of hanging as a flat vertical sheet.
 function backdropRollFaces(channel="studio",onPart) {
-  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropRollFaces(onPart);
+  return createStudioSceneGeometry(studioBuilderOptions(channel)).backdropRollFaces(responsePartCallback('backdrop',onPart));
 }
 function backdropRoll() { return mesh(backdropRollFaces()); }
 // Pure (no WebGL calls) fixture-role builder, shared by the Phong frame()
@@ -898,7 +922,7 @@ function backdropRoll() { return mesh(backdropRollFaces()); }
 function computeFixtureRoles(subjectPosition = [0,0,0], strengthChannel = "studio", poseOverride = null, sizeOverride = null, toolsOverride = null) {
   const lighting={...studioBuilderLighting(strengthChannel)};
   if(poseOverride)lighting.poses=poseOverride;if(sizeOverride)lighting.fixtureSizes=sizeOverride;if(toolsOverride)lighting.lightTools=toolsOverride;
-  return computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase:FIXTURE_MAT_BASE,subjectPosition,solo:studioLighting?.strengths.getSolo?.(strengthChannel)});
+  return computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase:FIXTURE_MAT_BASE,subjectPosition,solo:studioLighting?.strengths.getSolo?.(strengthChannel),emissionProfiles:shopEmissionProfiles});
 }
 // Pure (no WebGL calls) fixture mesh builder: the real 3D housing (box or
 // tube) plus the glowing panel/disc face for each role, shared by frame()'s
@@ -906,7 +930,7 @@ function computeFixtureRoles(subjectPosition = [0,0,0], strengthChannel = "studi
 // which material ID the housing/label faces carry; frame() passes the live
 // FIXTURE_HOUSING_MAT, the photo bridge passes its own compact table index.
 function buildFixtureFaces(fixtureRoles, housingMat, onPart) {
-  return buildStudioFixtureFaces(fixtureRoles,housingMat,onPart,ids);
+  return buildStudioFixtureFaces(fixtureRoles,housingMat,responsePartCallback('fixture',onPart),ids);
 }
 // The ray-traced photo's entire non-marble scene, as one buffer, captured
 // from the exact same pure face-builders frame() itself calls right now --
@@ -928,9 +952,23 @@ function buildFixtureFaces(fixtureRoles, housingMat, onPart) {
 // world units; the only transform needed is the same linear unit/centre
 // conversion. The rig unit is independent of the saved object's physical
 // radius. Explicit legacy profiles retain their original photo conversion.
-export function sceneForPhoto(saved = true) {
+export function sceneForPhoto(saved = true,{timedExposure=false}={}) {
   return buildStudioPhotoFixtures({...studioBuilderOptions("exposure",saved),rayOriginM:OBJECT_CENTER,shopEmissionProfiles,
+    timedExposure,
+    ...(lightField?.responseInformationRequested===true?{lightFieldInformation:RESPONSE_INFORMATION}:{}),
     solo:studioLighting?.strengths.getSolo?.("exposure"),getOpticalRecord:id=>opticalControls?.sceneRecord(id)});
+}
+let responseSourcesRequested=false;
+function refreshResponseSources() {
+  const requested=lightField?.responseInformationRequested===true;
+  if(requested===responseSourcesRequested)return;
+  responseSourcesRequested=requested;
+  // Reuse existing builders at an actual opt-in change. No response buffer is
+  // created here; a validated matching package is required before attribute 7.
+  repartitionExterior(true);
+  dispose(checkerMesh);checkerMesh=checkerboard();
+  dispose(backdropMesh);backdropMesh=backdropRoll();
+  standMeshKey=null;shopMeshKey=null;sceneGlassKey=null;
 }
 // Read-only capture for hidden native preparation. This deliberately does NOT
 // use sceneForPhoto: Exposure is a separate saved profile/canonical pose. No
@@ -1311,11 +1349,14 @@ function controls() {
     .addEventListener(eventName,designChanged,true);
 }
 function frame(now=0) {
-  const dt=lastFrame?Math.min(0.025,(now-lastFrame)/1000):0;lastFrame=now;
+  const dt=exposureClock.active?exposureClock.dt:(lastFrame?Math.min(0.025,(now-lastFrame)/1000):0);
+  lastFrame=now;
+  if(exposureClock.active)exposureClock.modelNow+=dt;
+  const sceneNow=exposureClock.active?exposureClock.modelNow*1000:now;
   const simOn=$("preview-engine").value==="particle";
   if(simOn&&sim.runtime?.ready) {
     if(drive.active&&drive.yaw!==driveViewYaw())driveGravity();
-    sim.runtime.frame(now/1000);
+    sim.runtime.frame(sceneNow/1000);
     if($("preview-motion").value==="flip"&&sim.runtime.shown!=null&&sim.runtime.steps>=sim.nextFlipStep) {
       const hz=+$("preview-hz").value;
       const turn=sim.runtime.startCaseFlip(Math.min(0.7/hz,1/hz),1,$("preview-axis").value);
@@ -1333,13 +1374,15 @@ function frame(now=0) {
   if (canvas.width!==w || canvas.height!==h) { canvas.width=w; canvas.height=h; }
   let dofActive=false,secondaryActive=false;
   const ordinaryPrimary=P;
-  const wantsSecondary=!!(P&&interior&&secondaryField&&lightField?.hasDirectional&&lightField?.hasReceivers&&$("phong-field-secondary")?.checked);
+  const wantsSecondary=!!(P&&interior&&secondaryField&&lightField?.hasResponses&&lightField?.hasReceivers&&$("phong-field-secondary")?.checked);
   if(P&&interior&&$("studio-dof")?.checked)try{studioDof.begin(w,h,{singleSample:wantsSecondary});dofActive=true;}
   catch(error){$("studio-dof").checked=false;dofStatus(`Phong DOF unavailable: ${error.message}`);}
   try {
   if(wantsSecondary) {
     P=fieldPrimary;
-    secondaryActive=secondaryField.begin(w,h);
+    try{secondaryActive=secondaryField.begin(w,h);}
+    catch(error){P=ordinaryPrimary;secondaryActive=false;
+      $("phong-secondary-status").textContent=`Native response application unavailable: ${error.message}`;}
   }
   gl.viewport(0,0,w,h);
   // Inverse of the canonical display curve for the existing backdrop only.
@@ -1358,7 +1401,7 @@ function frame(now=0) {
     const subjectPosition=studioDisplayedSubjectCenter(subject,rollState?.position??null);
     if(!simOn)studioOrbitTarget=[...subjectPosition];
     let object=multiply(translate3(...subjectPosition),multiply(roll,scale3(subject.subjectRadius)));
-    const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,now/1000);
+    const angle=previewMotionAngle($("preview-motion").value,+$("preview-hz").value,+$("preview-phase").value,+$("preview-arc").value,sceneNow/1000);
     const axis=$("preview-axis").value;
     const preview=axis==="x"?rotateX(angle):axis==="z"?rotateZ(angle):rotateY(angle);
     let caseM=identity(),haveParticle=true,particleWorld=null,particleRadius=null,particleObjects=[];
@@ -1378,7 +1421,7 @@ function frame(now=0) {
     // The law position is in the case frame. Apply the same physical case
     // transform as the containing mesh before anchoring the camera to it.
     const chase=follow&&particleWorld?chaseCamera.update({position:particleWorld,radius:particleRadius,
-      sampleSeconds:sim.runtime.shown*sim.runtime.snap*sim.runtime.manifest.law.dt,nowSeconds:now/1000,
+      sampleSeconds:sim.runtime.shown*sim.runtime.snap*sim.runtime.manifest.law.dt,nowSeconds:sceneNow/1000,
       epoch:sim.epoch,steering:drive.active,autoHeading:$("preview-camera").value==="marble"}):null;
     if(chase)cameraDistance=chase.distance;
     const view=chase?chaseViewMatrix(chase):simOn?baseView:multiply(baseView,translate3(...studioOrbitTarget.map(v=>-v)));
@@ -1405,13 +1448,16 @@ function frame(now=0) {
       if(!secondaryActive)field(drawingProgram,"uFieldGain",Number(scalarFieldActive&&enabled));
     };
     const drawOwnedMesh=(resource,category=null)=>{
+      if(secondaryActive)lightField.bindResponseLineage(resource);
       gl.bindVertexArray(resource.vao);
       if(secondaryActive||scalarFieldActive)for(const run of resource.categoryRuns) {
         setFieldCategory(run.category??category);gl.drawArrays(gl.TRIANGLES,run.first,run.count);
       } else gl.drawArrays(gl.TRIANGLES,0,resource.count);
     };
-    const drawOwnedTransparent=(resource,matrix,category=null)=>drawTransparent(resource,matrix,
-      secondaryActive||scalarFieldActive?group=>setFieldCategory(group??category):null);
+    const drawOwnedTransparent=(resource,matrix,category=null)=>{
+      if(secondaryActive)lightField.bindResponseLineage(resource);
+      return drawTransparent(resource,matrix,secondaryActive||scalarFieldActive?group=>setFieldCategory(group??category):null);
+    };
     const drawOpaqueMesh=(resource,matrix,emissionDirect=false,category=null)=>{
       if(!resource?.count)return;
       setTransform(matrix);drawOwnedMesh(resource,category);
@@ -1482,10 +1528,6 @@ function frame(now=0) {
     if(!secondaryActive&&lightField?.hasReceivers)scalarFieldActive=lightField.bind(P,view,subject.unitM,OBJECT_CENTER);
     field(P,"uAmbientFloorGain",0); // no invisible indirect-light floor: pure emitter lighting only
     gl.uniformMatrix3fv(loc(P,"uCatCcmMatrix"),false,new Float32Array([1,0,0,0,1,0,0,0,1]));
-    if(secondaryActive) {
-      if(!lightField.bindMaterialMask(P,fieldMaskFallback,view,subject.unitM,OBJECT_CENTER))throw Error('Directional material identity became stale.');
-      integer(P,"uFieldReplaceSpecular",Number(!$("phong-field-specular")?.checked));
-    }
     integer(P,"uEnableSpecular",1); integer(P,"uEnableEmissionDirect",0); integer(P,"uRenderPass",0);
     integer(P,"uThermalEmission",0); field(P,"uThermalGain",0); field(P,"uThermalRefK",1000); field(P,"uThermalFloorK",720);
     integer(P,"uShadowEnabled",0); integer(P,"uShadowLightCount",0);
@@ -1573,7 +1615,6 @@ function frame(now=0) {
     }
     if(secondaryActive) {
       secondaryField.finish({bind:shader=>lightField.bindSecondary(shader,view,subject.unitM,OBJECT_CENTER),
-        phongSpecular:$("phong-field-specular")?.checked===true,
         drawOpaque(shader){drawingProgram=shader;for(const {resource,matrix,emissionDirect,category}of opaqueDraws){
           integer(shader,"uEnableEmissionDirect",Number(emissionDirect));setTransform(matrix);
           drawOwnedMesh(resource,category);}},
@@ -1610,6 +1651,7 @@ function frame(now=0) {
     phongCapture.fail(error);
     lastStudioFrame=null;message.textContent='Studio preview unavailable: '+(error.message||String(error));
   } finally {secondaryField?.cancel();if(dofActive)studioDof.cancel();P=ordinaryPrimary;if(P)gl.useProgram(P);}
+  exposureClock.completeTick();
   requestAnimationFrame(frame);
 }
 async function boot() {
@@ -1629,7 +1671,7 @@ async function boot() {
     const source=fragment.replace(/^(#version[^\n]*\n)/,"$1#define PLUCK_TRANSMISSION 1\n#define PLUCK_PREMULTIPLIED_GLASS 1\n");
     P=program(vertex,source);
     try {
-      fieldPrimary=program(vertex,source.replace(/^(#version[^\n]*\n)/,'$1#define PLUCK_FIELD_PRIMARY 1\n'));
+      fieldPrimary=program(vertex,source);
       secondaryField=createStudioSecondaryField({gl,primary:fieldPrimary,secondary:program(vertex,secondaryFieldFragment(source))});
     }
     catch(error){$("phong-field-secondary").checked=false;$("phong-field-secondary").disabled=true;
@@ -1724,12 +1766,9 @@ async function boot() {
     for(const shader of [P,fieldPrimary].filter(Boolean)) {
       gl.useProgram(shader);
       for (const [name,unit] of Object.entries({turing_ssbo_pbr:0,turing_ssbo_phong:1,turing_ssbo_enamel:2,turing_ssbo_texstack:3,
-        uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10,uFieldMaterialMask:13})) integer(shader,name,unit);
+        uEmitUv:4,uColorUv:5,uDepthUv:6,uRemitUv:7,uFieldVolume:8,uShadowMaps:9,turing_ssbo_thermal_k:10})) integer(shader,name,unit);
     }
     gl.useProgram(P);
-    fieldMaskFallback=gl.createTexture();gl.activeTexture(gl.TEXTURE0+13);gl.bindTexture(gl.TEXTURE_2D,fieldMaskFallback);
-    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
-    gl.texImage2D(gl.TEXTURE_2D,0,gl.R32UI,1,1,0,gl.RED_INTEGER,gl.UNSIGNED_INT,new Uint32Array(1));
     flatArray(4,[0,255,128,255]); flatArray(5,[255,255,255,255]); flatArray(6,[128,255,255,255]); flatArray(7,[0,0,0,0]);
     const volume=gl.createTexture(); gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_3D,volume);
     gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
@@ -1738,7 +1777,8 @@ async function boot() {
     gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D_ARRAY,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
     gl.texStorage3D(gl.TEXTURE_2D_ARRAY,1,gl.DEPTH_COMPONENT24,1,1,1);
     floatTexture({data:[0],floats_per_record:1},10);
-    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,getSceneMaterials:fieldMaterialRows,onChange:()=>liveRay?.sceneChanged()});
+    lightField=createStudioLightField({gl,doc:document,fallbackTexture:volume,getSceneKey:fieldSceneKey,getSceneMaterials:fieldMaterialRows,onChange:()=>{refreshResponseSources();liveRay?.sceneChanged();}});
+    refreshResponseSources();
     controls(); syncMaterial(); rebuild({invalidatePhoto:false});
     opticalControls=createOpticalMaterialControls({getContext:()=>({geometry:lastGeometry,
       design:readSubjectDesign(),shell:ids[$('shell').value],selectedMaterial:selected(),
@@ -1757,7 +1797,36 @@ async function boot() {
       getFilmResponse:()=>photo.filmResponse()});
     frame();
     initCalibration(document, { saveObject, getGeometry: () => lastGeometry,
-      getCameraOptions: () => ({...currentCameraOptions(), filmResponse:photo.filmResponse()}), gl, canvas });
+      getCameraOptions: () => ({...currentCameraOptions(), filmResponse:photo.filmResponse()}),
+      getCalibrationCameraOptions:()=>{
+        const base={...currentCameraOptions(),filmResponse:photo.filmResponse()};
+        const card=studioLighting.gobos.getState().gobos.find(g=>g.enabled&&g.artwork?.rectangles?.[0]?.id.startsWith('exposure-'));
+        if(!card)throw Error('The exposure card is unavailable');
+        const subject=studioSubjectTransform(false,'exposure'),marble=studioPhotoSubjectCenter(false);
+        const cardCenter=OBJECT_CENTER.map((v,i)=>v+[card.x,card.y,card.z][i]*subject.unitM);
+        const target=cardCenter.map((v,i)=>(v+marble[i])/2);
+        const eye=[target[0],target[1],target[2]+.28];
+        return {...base,camera:{resolution:512,eye_m:eye,target_m:target,
+          fov_degrees:25,aperture_radius_m:.0005,focus_distance_m:.28}};
+      },
+      getSceneRevision:()=>studioSceneRevision,
+      assertStaticCalibrationScene:()=>{
+        if($('preview-motion').value!=='off'||!$('inertia-lock').checked||
+            rollState?.orientation.some((v,i)=>v!==[1,0,0,0][i])||rollState?.position.some(v=>v!==0))
+          throw Error('The two-camera calibration requires a static, unrolled Studio scene');
+      },
+      getGobos:()=>studioLighting.gobos.getState(),
+      getPeanutCameraOptions:(base)=>{
+        const card=studioLighting.gobos.getState().gobos.find(g=>g.enabled&&g.artwork?.rectangles?.[0]?.id.startsWith('exposure-'));
+        if(!card)throw Error('The exposure card is unavailable');
+        const subject=studioSubjectTransform(false,'exposure'),marble=studioPhotoSubjectCenter(false);
+        const target=OBJECT_CENTER.map((v,i)=>v+[card.x,card.y,card.z][i]*subject.unitM);
+        const eye=[marble[0]+Math.max(.03,subject.radiusM*2.5),marble[1],
+          Math.max(marble[2]+.09,target[2]+.15)];
+        return {...base,camera:{resolution:512,eye_m:eye,target_m:target,
+          fov_degrees:30,aperture_radius_m:.0005,
+          focus_distance_m:Math.hypot(...eye.map((v,i)=>v-target[i]))},filmResponse:undefined};
+      },gl, canvas });
   } catch (error) { message.textContent=String(error.message||error); console.error("[marble studio]",error); }
   finally { loading?.done(); loading?.release("boot"); }
 }

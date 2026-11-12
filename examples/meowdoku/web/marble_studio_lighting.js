@@ -30,7 +30,10 @@ export const LIGHTING_PROFILE_FIELDS = ["key-shape", "light-x", "light-y", "ligh
   "light-fill-lower-strength", "fill-lower-filter", "floor-pattern", "floor-material-a", "floor-material-b",
   "light-table-left-strength", "table-left-filter", "light-table-right-strength", "table-right-filter", "light-under-strength", "under-filter",
   "wall-pattern", "wall-material-a", "wall-material-b", "ceiling-pattern", "ceiling-material-a", "ceiling-material-b",
-  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale"];
+  "backdrop-layers", "backdrop-material", "backdrop-sweep", "checker", "window-glass", "room-scale",
+  "key-filter-left-off","key-filter-right-off","background-filter-off","kicker-left-filter-off",
+  "kicker-right-filter-off","fill-lower-filter-off","fill-upper-filter-off","table-left-filter-off",
+  "table-right-filter-off","under-filter-off"];
 
 // Validate against the live catalogue and the actual controls, not a second
 // hand-maintained list of material IDs or slider bounds. No writes until valid.
@@ -45,7 +48,7 @@ function validateStudioLightingBase(value, fields, materialNames) {
     const el = fields[id];
     // Older profiles retain the former backdrop mounting distance.
     const v = value.controls[id] === undefined ?
-      (id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
+      (id.endsWith('-off') ? false : id === "room-scale" ? 1 : legacy ? newFields[id] : undefined) : value.controls[id];
     if (!el) throw new Error(`Lighting control unavailable: ${id}`);
     if (el.type === "checkbox") {
       if (typeof v !== "boolean") throw new Error(`Invalid ${id}`);
@@ -299,7 +302,7 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
   const validate = value => validateStudioLighting(value, fields, materialNames);
   const validateBase = value => validateStudioLightingBase(value, fields, materialNames);
   let roomOverrides={version:1,values:[]}, roomEditor=null, editorChannel='A', calibrationDepth=0;
-  let lightingRacks={...defaultLightingRacks(),shopDimmer:1,houseDimmer:0},rackControls=null;
+  let lightingRacks=defaultLightingRacks(),rackControls=null;
   const lightStands=createLightStandControls($("lighting-profiles"),materialNames,{onChange:()=>{onChange();syncPlacementWarnings();}});
   const shopLights=createShopLightControls($("lighting-profiles"),materialNames,{
     getRoomBounds:()=>studioRoomBounds(Number(fields["room-scale"].value),table?tableFloorDrop(table.getState()):0),
@@ -459,6 +462,13 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
     const subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),table.getState().enabled);
     const half=32/(subject.unitM*1000);
     return {unitMm:subject.unitM*1000,center:[0,table.getState().enabled?-1+half:subject.subjectCenter[1],-subject.subjectRadius-.14]};
+  },exposurePlacement:()=>{
+    const subject=studioScaleTransform(scale.getState(),Number($("radius-mm").value),table.getState().enabled);
+    const half=32/(subject.unitM*1000);
+    return {unitMm:subject.unitM*1000,
+      center:[half+subject.subjectRadius+.02,
+        table.getState().enabled?-1+half:subject.subjectCenter[1],
+        -subject.subjectRadius-.14]};
   }});
   const kickerGuides=lightGuideRole?createKickerHeightGuides(fixtureSizes.element,{
     getSnapshots:()=>{
@@ -547,7 +557,7 @@ export function setupStudioLighting(doc, initialFixtures, materialNames, {onChan
   return {poses, backdrops, strengths, surfaces, table, gobos, scale, fixtureSizes, lightTools:fixtureSizes.tools, lightStands, shopLights, syncBackdropVisibility,
     rackControls,invalidateRenderState,
     renderState:(channel='studio')=>{
-      if(!renderCache){const base=capture();renderCache={exposure:resolveRackProfile(base,lightingRacks),studio:calibrationDepth?base:resolveRackProfile(resolveRoomProfile(base,roomOverrides,validateBase),lightingRacks)};}
+      if(!renderCache){const base=capture(),exposure=resolveRackProfile(base,lightingRacks);renderCache={exposure,studio:calibrationDepth?exposure:resolveRackProfile(resolveRoomProfile(base,roomOverrides,validateBase),lightingRacks)};}
       return renderCache[channel==='exposure'?'exposure':'studio'];
     },
     roomOverrides:roomEditor,

@@ -363,3 +363,138 @@ useful visual convergence are not. This production check used no injected
 instrumentation, so it does not add a fresh all-pass GL-error assertion to the
 earlier shader tests. The live job was canceled through its existing control,
 and the GPU was released. No diagnostic archive was delivered for this check.
+
+## Current correction: copy existing responses, do not reconstruct them
+
+Further renders, exposures and screenshots are prohibited until the requested
+information path is complete. The prior active-field image did not establish
+physical darkness. Its primary shader removed selected Phong contributions
+from material/category flags without sample availability; the secondary shader
+then supplied zero from missing data. Its so-called volume pass sampled only a
+surface position. The browser also reconstructed lighting and material response
+from direction moments, contrary to the clarified consumer contract.
+
+The required implementation copies the existing native ray-tracer response at
+its original evaluation site, immediately before the same integration. The
+second pass applies those recorded results, with actual availability alpha to
+Phong. It must not reconstruct transport, material response, paths, or geometry
+from the package. Empty input means no information, not physical black. All
+additional copies and availability data are explicitly opt-in; ordinary tracing
+must remain unchanged.
+
+Source-only work now observes the original camera lum additions and throughput
+multiplications through identity-return copy functions. Original scalar deposit
+visitation and rounding/clipping/invalid flags accompany the matching query;
+evaluated zero and missing input remain separate. Source-selection and shadow
+outcomes are copied from the original NEE branches without another ray or RNG
+call. The existing sensor-evidence infrastructure owns these extra rows.
+
+Recipient identity now retains the existing original-face and primitive-owner
+lineage through packing, filtering and compaction without changing transparent
+sorting. The final response product, transport, and direct screen application
+are not yet complete. New large-domain observers and duplicated scene-export proposals
+were disconnected from the active path. Optional new per-band continuation is
+not automatically enabled by response-copy opt-in. No new render has validated
+the pending correction.
+
+The retained information must be attached to the scene, with location, direction,
+material/volume identity, sample availability and the original path semantics.
+It includes relevant existing forward, camera, direct-light, reactive and volume
+results. It is not limited to forward rays. Camera contributions remain useful,
+but a camera-pixel response image alone is not the requested scene-attached
+field. Their accumulated path throughput cannot silently be relabeled as a
+local material response, and different estimators cannot be blindly added.
+The source-only camera component publisher is therefore inactive. Work is
+continuing on bounded native response copies and explicit progressive retention;
+discarded or unavailable records must remain unknown rather than become black.
+
+## Source implementation and current execution hold
+
+The current source connects opt-in native terminal responses, original scalar
+cell accumulation columns, and completed camera samples to a bounded typed
+scene store and the existing authenticated field route. Camera samples retain
+the original `lum` and filtered sensor result before pixel integration. Their
+component columns use the same already-evaluated native film coefficients.
+The consumer applies producer-side linear RGB and sample availability directly;
+it does not reconstruct lights or material optics from direction moments.
+
+The three secondary slots use a separate pre-first-hit volume target, opaque
+downstream response, and first-glass downstream response. Nearest-recipient
+and depth matching prevent a complete downstream response from being applied
+again through another layer. Eviction, invalid ownership, unsupported prefixes,
+and missing samples remain unavailable rather than becoming black. Native-only
+and unlocated records have a bounded raw partition, separate from surface
+application eligibility. See `STUDIO_SCENE_RESPONSE_CONSUMER.md` and Spectral's
+`docs/STUDIO_EVALUATED_SCENE_RESPONSES.md` for the current contracts.
+
+Execution is explicitly held before GL setup. CPU and offline source checks
+are not a claim of completed hardware or visual acceptance. A permitted
+context/query/link-only check on NVIDIA GeForce RTX 3060, driver 610.88, found
+16 compute storage blocks and 96 binding points. Its first full forward
+compile/link call did not return and reached 13,940,441,088 bytes of process
+working set. Only that verified preflight process was stopped. No ray dispatch,
+draw, exposure, screenshot, field store, or stream outlet ran during the check.
+The precise driver subphase and allocation cause remain unproved.
+
+The following source-only repair specializes the opt-in prebuilt program for
+its actual forward entry, without changing that entry's operations or the
+separate camera kernel. Unprocessed reactive work is still identified as such.
+Exception cleanup and artifact retirement/lease cleanup were also repaired;
+those separate defects do not explain the blocked first compiler call.
+The service was verified healthy afterward on port 8766, with an independently
+started PID 61124. This work has not been deployed or visually accepted.
+
+The next, protected link-only attempt used the frozen specialized source
+`8718336e6144a90a1da9d40c87b29a9a8457558908fe2f133eadcaf41832048c`.
+It returned from shader compilation in 0.175 seconds, then failed program
+linking in 6.251 seconds with NVIDIA `C9999: out of memory - internal malloc
+failed`. Suspended-child JobObject admission verified 4 GiB process and job
+limits, kill-on-close, a 90-second independent watchdog and an 8 GiB free-RAM
+floor before execution. Minimum sampled free RAM remained about 13.4 GiB.
+Program/context cleanup completed and the job had no active processes.
+Windows reported aggregate peak accounting 28 KiB above its configured cap;
+the receipt preserves that discrepancy rather than rounding it away.
+
+This isolates the observed failure to native program linking, before any
+ray-data allocation, stream outlet or render. It does not establish the
+driver's internal allocation cause. The complete receipt is in Spectral's
+`build/dot-shader-link-only-20261111/protected-attempt/RESULT.md`.
+Execution and application readiness remain held.
+
+Native queue availability is now carried into camera context. The prebuilt
+owner does not drain queued reactive/diffraction work. Pending, dropped or
+unobserved work therefore prevents claiming a complete response; clearing
+scalar epochs cannot erase that uncertainty. All extra recording remains
+explicitly opt-in. The existing field REST route passed 204 CPU/API checks,
+including exact native-only/virtual/unlocated record retention and no extra
+response assets for ordinary requests. These checks are not hardware or
+visual acceptance.
+
+The separately user-authorized observed repeat of the same frozen source ran
+from 20:16:32.718 to 20:16:40.241 UTC. It returned from compilation in 0.053
+seconds and failed linking in 5.965 seconds with the same C9999 internal
+malloc error under the same verified 4 GiB caps. Total child lifetime was
+7.516 seconds. Minimum free RAM remained about 13.18 GiB and recovered after
+normal program/context cleanup; the job had no active processes. No further
+attempt was started. Receipt: Spectral
+`build/dot-shader-link-only-20261111/observed-repeat-20261111T201632640Z`.
+
+The separately authorized single-write epilogue candidate
+`5d40745209cb00a65aff91d1d003618126f1974de8216e2169e7de76db130097`
+reduced the full terminal-record writer from nine sites to one. Its 18
+self-contained CPU/static tests preserve native expressions, outer branch
+outcomes, nested controls, snapshot values, and helper-side state lifetime.
+This is not executed-ray equivalence. The candidate is separate and inactive.
+Its protected native link also failed with C9999 internal malloc at the 4 GiB
+cap: compilation 0.065 seconds, linking 13.974 seconds, total 15.468 seconds.
+Minimum free RAM remained about 12.6 GiB; all owned processes and GL objects
+were cleaned. Receipt: Spectral
+`build/dot-shader-link-only-20261111/single-epilogue-20261111T201945725Z`.
+The reduction did not establish a working or lower-memory native program.
+
+The queue application guard now has 33 passing CPU tests. The server applies
+copied camera/sensor responses only at compatible scene-recipient/view
+contexts. Forward packet power and directionless native scalar rows are
+retained with their original semantics, not relabeled display radiance. This
+is not yet unrestricted view-independent repainting from every forward ray.
+No render, screenshot, exposure or compute dispatch has validated the repair.

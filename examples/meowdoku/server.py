@@ -370,7 +370,8 @@ class Sessions:
         self.readiness = startup_mod.Readiness()          # [LOADING] what is built, building, pending (set up by main(); an empty one never holds a request)
         self.anim = anim_mod.Store(self.state.content_dir)        # [LOADING] build/meowdoku/loading_anim.mla
         self.marble_objects = marble_objects_mod.Store(self.state.marble_objects_dir)
-        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer")
+        self.marble_photos = marble_photo_mod.PhotoJobs(self.state.marble_photos_dir, ROOT.parent / "spectral-analyzer",
+                                                        users_directory=self.state.users_dir)
         from meowdoku.client_ray_process_bridge import ClientRayProcessBridge
         self.client_ray_bridge = ClientRayProcessBridge()
         from meowdoku.living_data_cursor import CursorStore
@@ -1989,31 +1990,43 @@ def make_handler(sessions: Sessions):
                     if path == "/api/marble_photo":
                         return self._json(sessions.marble_photos.status(digest))
                     name = (query.get("name") or [""])[0]
+                    lane_raw = (query.get("lane") or ["0"])[0]
+                    if not lane_raw.isdecimal() or len(lane_raw) > 2:
+                        raise marble_photo_mod.PhotoError("invalid sensor lane", 400)
+                    lane = int(lane_raw)
                     artifact = None
                     if path == "/api/marble_photo/animation":
                         body = sessions.marble_photos.animation(digest)
                         length = len(body)
                     else:
                         artifact = (sessions.marble_photos.open_field(digest, name) if path.endswith("/field") else
-                                    sessions.marble_photos.open_artifact(digest, name, hdr=path.endswith("/hdr")))
-                        length = os.fstat(artifact.fileno()).st_size
+                                    sessions.marble_photos.open_artifact(digest, name,
+                                        hdr=path.endswith("/hdr"), lane=lane))
+                        try:
+                            length = os.fstat(artifact.fileno()).st_size
+                        except BaseException:
+                            artifact.close()
+                            raise
                 except marble_photo_mod.PhotoError as error:
                     return self._json({"error": str(error)}, error.status)
-                self._set_cookie = []
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
-                                 "application/octet-stream" if path in ("/api/marble_photo/hdr", "/api/marble_photo/field") else "image/png")
-                if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
-                    self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
-                self.send_header("Content-Length", str(length))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                if artifact is not None:
-                    with artifact:
+                try:
+                    self._set_cookie = []
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "video/x-msvideo" if path == "/api/marble_photo/animation" else
+                                     "application/octet-stream" if path in ("/api/marble_photo/hdr", "/api/marble_photo/field") else "image/png")
+                    if path in ("/api/marble_photo/hdr", "/api/marble_photo/animation"):
+                        self.send_header("Content-Disposition", f'attachment; filename="{name if path.endswith("/hdr") else "marble-orbit.avi"}"')
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if artifact is not None:
                         while block := artifact.read(1024 * 1024):
                             self.wfile.write(block)
-                else:
-                    self.wfile.write(body)
+                    else:
+                        self.wfile.write(body)
+                finally:
+                    if artifact is not None:
+                        artifact.close()
                 return
             if path == "/api/obj_assets" or path.startswith("/api/obj_assets/"):
                 account = self._account()
@@ -2521,6 +2534,27 @@ def make_handler(sessions: Sessions):
                     return
                 except (ValueError, TypeError) as error:
                     self.close_connection = True
+                    return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
+            if path0 == "/api/marble_photo/calibration_qr":
+                if not self._require("photo_read"):
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 4096:
+                    return self._json({"error": "invalid calibration registration request"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("invalid calibration registration request")
+                    digest, name, lane = body.get("digest"), body.get("name"), body.get("lane", 0)
+                    self._job_authorize(digest)
+                    with sessions.marble_photos.open_artifact(digest, name, lane=lane) as artifact:
+                        png = artifact.read(4 * 1024 * 1024 + 1)
+                    if len(png) > 4 * 1024 * 1024:
+                        raise ValueError("calibration image is too large")
+                    from meowdoku.marble_calibration_qr import register_calibration_qr
+                    return self._json(register_calibration_qr(png, body.get("modules"),
+                        full_card=name.startswith("marker-")))
+                except (ValueError, TypeError, marble_photo_mod.PhotoError) as error:
                     return self._json({"error": str(error)}, getattr(error, "status", HTTPStatus.BAD_REQUEST))
             if path0 in ("/api/marble_photo", "/api/marble_photo/cancel", "/api/marble_photo/live", "/api/marble_photo/retouch", "/api/marble_photo/film_preview") and not self._is_viewer():
                 if not self._require("share_live" if path0 == "/api/marble_photo/live" else "photo_submit"):

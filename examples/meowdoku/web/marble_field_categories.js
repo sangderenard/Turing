@@ -5,7 +5,8 @@ export function fieldCategoryEnabled(mask,category) {
 }
 export function withSceneCategory(faces,category) {
   if(!FIELD_CATEGORY_BITS[category])throw Error('Unknown scene receiver category.');
-  return faces.map(face=>Object.assign([...face],{sceneCategory:category}));
+  return faces.map(face=>Object.assign([...face],{sceneCategory:category},
+    face.responseSource?{responseSource:{...face.responseSource}}:{}));
 }
 export function fieldCategoryRuns(categories,indices=null) {
   const count=indices?indices.length:categories.length*3,runs=[];

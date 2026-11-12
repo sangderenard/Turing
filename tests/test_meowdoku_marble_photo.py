@@ -83,6 +83,102 @@ def test_mrp1_matches_saved_geometry_and_pbr(photo_payload):
         photos.decode_upload(wire[:-1], store)
 
 
+def test_timed_studio_light_frames_keep_one_scene_and_contiguous_shutter(photo_payload):
+    store,digest,vertices,normals,ids=photo_payload
+    base=[0.0]*16;base[3]=1.0;base[7]=1.0
+    fixture={"vertices":[0,0,.2,.01,0,.2,0,.01,.2],"material_ids":[0],
+             "pbr":base,"emissive_material_ids":[0],
+             "emitter_profiles":{"version":1,"records":[]}}
+    first=base.copy();first[8:11]=[1.,.5,0.]
+    second=base.copy();second[8:11]=[0.,0.,0.]
+    frames=[{"t0":0,"t1":.5,"pbr":first,"emitter_profiles":fixture["emitter_profiles"]},
+            {"t0":.5,"t1":2,"pbr":second,"emitter_profiles":fixture["emitter_profiles"]}]
+    options=dict(transport="fixed:3",exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames)
+    config=photos.decode_upload(_wire(digest,vertices,normals,ids,**options),store)[3]
+    assert [frame["t1"]-frame["t0"] for frame in config["exposure_state_frames"]]==[.5,1.5]
+    bad=[dict(frame) for frame in frames];bad[1]["t0"]=.6
+    with pytest.raises(photos.PhotoError,match="contiguous"):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,**{**options,"exposure_state_frames":bad}),store)
+    bad=[dict(frame) for frame in frames];bad[1]["pbr"]=second.copy();bad[1]["pbr"][0]=.8
+    with pytest.raises(photos.PhotoError,match="non-light"):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,**{**options,"exposure_state_frames":bad}),store)
+
+
+def test_simultaneous_sensor_lanes_share_one_timed_shutter_and_visibility(photo_payload):
+    store,digest,vertices,normals,ids=photo_payload
+    base=[0.0]*16;base[3]=base[7]=1.0;base[8:11]=[1.,1.,1.]
+    fixture={'vertices':[0,0,.2,.01,0,.2,0,.01,.2],
+             'material_ids':[0],'pbr':base,'emissive_material_ids':[0],
+             'emitter_profiles':{'version':1,'records':[]}}
+    frame={'t0':0,'t1':.1,'pbr':base,'emitter_profiles':fixture['emitter_profiles']}
+    options=dict(transport='fixed:3',exposure_seconds=.1,fixtures=fixture,
+        exposure_state_frames=[frame],camera_visible=False,
+        sensor_lanes=[{}, {'eye_m':[.1,0,.07], 'sensor_transport':'fixed:1'},
+                      {'eye_m':[-.1,0,.07]}])
+    config=photos.decode_upload(_wire(digest,vertices,normals,ids,**options),store)[3]
+    assert config['camera_visible'] is False
+    assert len(config['sensor_lanes'])==3
+    assert config['sensor_lanes'][0]==config['camera']
+    assert [lane['eye_m'][0] for lane in config['sensor_lanes']]==[0,.1,-.1]
+    assert config['sensor_lanes'][1]['sensor_transport']=='fixed:1'
+    names=('blackCenter','gray18','whiteRing','blackOuter','red','green','blue','yellow')
+    sparse={'version':1,'width':128,'height':128,
+            'regions':{name:([[128,3]] if name=='gray18' else []) for name in names}}
+    mapped=photos.decode_upload(_wire(digest,vertices,normals,ids,
+        **{**options,'camera':{'resolution':128},'calibration_regions':[sparse]*3}),store)[3]
+    assert mapped['calibration_regions'][1]['regions']['gray18']==[[128,3]]
+    bad={**sparse,'regions':{**sparse['regions'],'gray18':[[127,3]]}}
+    with pytest.raises(photos.PhotoError,match='sensor row'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,
+            **{**options,'camera':{'resolution':128},'calibration_regions':[bad]*3}),store)
+    with pytest.raises(photos.PhotoError,match='starting with the main camera'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,
+            **{**options,'sensor_lanes':[{'eye_m':[0,0,.07]}]}),store)
+
+
+def test_sensor_lane_artifacts_require_advertised_lane_and_stay_inside_job(tmp_path):
+    digest='a'*64
+    lane_dir=tmp_path/'lane-01';lane_dir.mkdir()
+    (lane_dir/'preview-000001.png').write_bytes(b'lane image')
+    (lane_dir/'exposure-000001.npz').write_bytes(b'lane hdr')
+    status={'state':'complete','sensor_lanes':[{'index':1,
+        'image':'lane-01/preview-000001.png','hdr':'lane-01/exposure-000001.npz'}]}
+    jobs=object.__new__(photos.PhotoJobs)
+    jobs.lock=threading.Lock();jobs.active_digest=digest
+    jobs.job_directory=lambda value:tmp_path
+    jobs._status_locked=lambda value,**kwargs:status
+    with jobs.open_artifact(digest,'preview-000001.png',lane=1) as stream:
+        assert stream.read()==b'lane image'
+    with jobs.open_artifact(digest,'exposure-000001.npz',hdr=True,lane=1) as stream:
+        assert stream.read()==b'lane hdr'
+    with pytest.raises(photos.PhotoError,match='unavailable'):
+        jobs.open_artifact(digest,'preview-000001.png',lane=2)
+    with pytest.raises(photos.PhotoError,match='invalid photo artifact path'):
+        jobs.open_artifact(digest,'../preview-000001.png',lane=1)
+
+
+def test_timed_shop_trigger_metadata_keeps_named_source_identity(photo_payload):
+    store,digest,vertices,normals,ids=photo_payload
+    sys.path.insert(0,str(ROOT.parent/'spectral-analyzer'))
+    from camera_designer.studio_named_emitters import named_emitter
+    definition,_=named_emitter('fluorescent_cool_white')
+    pbr=[0.0]*16;pbr[3]=pbr[7]=1.0
+    emitter={'material':0,'profile':'fluorescent_cool_white','revision':definition['revision'],
+             'gain':0.0,'filter':[1,1,1]}
+    fixture={'vertices':[0,0,.2,.01,0,.2,0,.01,.2],'material_ids':[0],
+             'pbr':pbr,'emissive_material_ids':[0],'shop_material_ids':[0],
+             'trigger_emitters':[{'material':0,'receiver':'shop:0','gain':20.0}],
+             'emitter_profiles':{'version':1,'records':[emitter]}}
+    frames=[{'t0':0,'t1':2,'pbr':pbr,'emitter_profiles':fixture['emitter_profiles']}]
+    config=photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',
+        exposure_seconds=2,fixtures=fixture,exposure_state_frames=frames),store)[3]
+    assert config['fixtures']['trigger_emitters'][0]['gain']==20.0
+    bad={**fixture,'trigger_emitters':[{'material':0,'receiver':'other','gain':20.0}]}
+    with pytest.raises(photos.PhotoError,match='trigger emitter'):
+        photos.decode_upload(_wire(digest,vertices,normals,ids,transport='fixed:3',
+            exposure_seconds=2,fixtures=bad,exposure_state_frames=frames),store)
+
+
 class _FakeProcess:
     instances = []
 
@@ -169,7 +265,9 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         assert len(_FakeProcess.instances) == 1  # same saved scene reuses its job
         status, body = request("GET", f"/api/marble_photo?digest={digest}")
         assert status == 200 and json.loads(body)["state"] == "preparing"
-        directory = sessions.marble_photos.directory / digest
+        directory = sessions.marble_photos.job_directory(digest)
+        assert directory.is_relative_to(sessions.state.users_dir)
+        assert not (sessions.marble_photos.directory / digest).exists()
         _FakeProcess.instances[0].returncode = 0
         status, body = request("GET", f"/api/marble_photo?digest={digest}")
         assert status == 200 and json.loads(body)["state"] == "error"
@@ -212,7 +310,7 @@ def test_photo_routes_reuse_cancel_and_guard_image(tmp_path, photo_payload, monk
         assert code == 202
         live_digest = json.loads(body)["digest"]
         assert len(_FakeProcess.instances) == 2
-        live_dir = sessions.marble_photos.directory / live_digest
+        live_dir = sessions.marble_photos.job_directory(live_digest)
         control = json.loads((live_dir / "live-control.json").read_text())
         assert control["live"]["history_samples"] == 8 and control["live"]["width"] == 256
         assert request("POST", "/api/marble_photo", wire)[0] == 409  # photo cannot silently replace live
@@ -240,6 +338,10 @@ def test_matching_live_marker_does_not_transfer_ownership(tmp_path,photo_payload
     wire=_wire(digest,vertices,normals,ids,transport='fixed:3',live={'session_id':'f'*32,'history_samples':8,'aspect':2})
     try:
         first=jobs.start(wire,store,owners=['account:1'])
+        private=jobs.job_directory(first['digest'])
+        assert private == tmp_path/'jobs'/'users'/'account'/'1'/'assets'/'marble_photos'/first['digest']
+        assert (private/'config.json').is_file()
+        assert not (jobs.directory/first['digest']).exists()
         process=jobs.process
         altered=_wire(digest,vertices,normals,ids,transport='fixed:3',live={'session_id':'f'*32,'history_samples':16,'aspect':2})
         with pytest.raises(photos.PhotoError,match='another identity'):
@@ -261,7 +363,7 @@ def test_client_job_secret_environment_and_cleanup(tmp_path,photo_payload,monkey
         env=jobs.process.kwargs['env'];secret=env['MEOWDOKU_RAY_BRIDGE_SECRET']
         assert result['client_join']['credential']!=secret
         assert env['MEOWDOKU_RAY_BRIDGE_JOB']==result['digest']
-        config=(jobs.directory/result['digest']/'config.json').read_text()
+        config=(jobs.job_directory(result['digest'])/'config.json').read_text()
         assert secret not in config and result['client_join']['credential'] not in config
         jobs.process.returncode=0
         jobs.status(result['digest'])
@@ -298,7 +400,7 @@ def test_participant_live_renewal_preserves_scene_and_owner(tmp_path,photo_paylo
     wire=_wire(digest,vertices,normals,ids,transport='fixed:3',camera={'resolution':128},client_intersections=True,live={'session_id':'a'*32,'history_samples':8})
     try:
         result=jobs.start(wire,store,owners=['account:1'],client_bridge=bridge,bridge_url='https://127.0.0.1:9000/api/client_rays/engine',bridge_ca=tmp_path/'ca.crt')
-        path=jobs.directory/result['digest']/'live-control.json'
+        path=jobs.job_directory(result['digest'])/'live-control.json'
         before=json.loads(path.read_text());before['expires_at']=time.time()-5
         path.write_text(json.dumps(before))
         jobs.renew_participant_live(result['digest'],'account:2')
@@ -315,7 +417,7 @@ def test_participant_live_renewal_preserves_scene_and_owner(tmp_path,photo_paylo
         assert {k:v for k,v in after.items() if k!='expires_at'}=={k:v for k,v in before.items() if k!='expires_at'}
         jobs.renew_participant_live(result['digest'],'account:1')
         assert json.loads(path.read_text())==after
-        config_path=jobs.directory/result['digest']/'config.json'
+        config_path=jobs.job_directory(result['digest'])/'config.json'
         original=json.loads(config_path.read_text())
         for config in ({**original,'client_intersections':False}, {k:v for k,v in original.items() if k!='live'}):
             config_path.write_text(json.dumps(config))

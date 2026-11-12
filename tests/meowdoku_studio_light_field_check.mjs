@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {prepareOpticalSnapshot,OPTICAL_PROVENANCE} from '../examples/meowdoku/web/marble_optical_authoring.js';
-import {createStudioLightField,validateLightField,decodeLightField,fieldFromView,mapFieldMaterials,fieldStencilDirections,fieldAtlasLayout,fieldCellDimensions,fieldTransferTimeoutMs} from '../examples/meowdoku/web/marble_light_field.js';
+import {createStudioLightField,validateLightField,decodeLightField,fieldFromView,mapFieldMaterials,fieldStencilDirections,fieldAtlasLayout,fieldCellDimensions,fieldTransferTimeoutMs,decodeFieldArrivals,decodeEvaluatedResponses,validateSceneResponseReceipt} from '../examples/meowdoku/web/marble_light_field.js';
 import {packMarblePhoto} from '../examples/meowdoku/web/marble_photo.js';
 
 const A='a'.repeat(64),B='b'.repeat(64),I=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
@@ -73,6 +73,7 @@ function harness(linear=false,categoryBits=1){
   bindSampler(){},texParameteri(){},texImage3D(...args){uploads.push(args);},texImage2D(...args){uploads.push(args);},getError(){const v=error;error=0;return v;},
   getUniformLocation(p,n){return n;},uniform1f(n,v){uniforms[n]=v;},uniform1i(n,v){uniforms[n]=v;},uniformMatrix3fv(n,t,v){uniforms[n]=Array.from(v);},uniformMatrix4fv(n,t,v){uniforms[n]=Array.from(v);}};
  const toggle=new EventTarget();toggle.checked=false;const output={textContent:''};
+ const responses=new EventTarget();responses.checked=false;
  const transport=new EventTarget();transport.checked=false;
  const stencil=new EventTarget();stencil.value='12';const spatial=new EventTarget();spatial.checked=true;
  const grid=new EventTarget();grid.value='64';
@@ -80,6 +81,7 @@ function harness(linear=false,categoryBits=1){
  const categoryControls=Object.fromEntries(['subject','stage','room'].map((name,i)=>{const control=new EventTarget();control.checked=!!(categoryBits&(1<<i));return [name,control];}));
  const categoryOutput={textContent:''},divisionOutput={textContent:''};let changes=0;
  const doc={getElementById:id=>({'phong-light-field':toggle,'phong-light-field-status':output,
+  'phong-field-responses':responses,
   'ray-surface-transport':transport,
   'phong-field-stencil':stencil,'phong-field-spatial-linear':spatial,'phong-field-grid-size':grid,
   'phong-field-region':region,'phong-field-cell-mm':cell,'phong-field-margin-mm':margin,
@@ -89,7 +91,7 @@ function harness(linear=false,categoryBits=1){
  const fallbackTexture={id:'original-zero-volume'};bindings.set(gl.TEXTURE8,fallbackTexture);
  const materials={data:new Float32Array(32),stride:16};materials.data[16]=.5;
  const field=createStudioLightField({gl,doc,fallbackTexture,onChange:()=>changes++,getSceneMaterials:()=>materials,getSceneKey:()=>{if(key==='bad')throw Error('incompatible');return key;},fetcher});
- return {field,toggle,transport,output,stencil,spatial,grid,region,cell,margin,categoryControls,categoryOutput,divisionOutput,gl,uploads,deleted,uniforms,bindings,fallbackTexture,materials,
+ return {field,toggle,responses,transport,output,stencil,spatial,grid,region,cell,margin,categoryControls,categoryOutput,divisionOutput,gl,uploads,deleted,uniforms,bindings,fallbackTexture,materials,
   get changes(){return changes;},get calls(){return calls;},set key(v){key=v;},
   set hook(v){hook=v;},set error(v){error=v;},on(){toggle.checked=true;toggle.dispatchEvent(new Event('change'));},
   off(){toggle.checked=false;toggle.dispatchEvent(new Event('change'));},status(seq=1,rev=0){return {state:'live',light_field:meta(seq,rev)};}};
@@ -260,13 +262,8 @@ async function bundleV6(index=0,previousHash='0'.repeat(64)) {
  const ticket=h.field.capture();assert.equal(ticket.region,'subject');assert.equal(ticket.cellSizeM,.0005);assert.equal(ticket.marginM,.001);
  h.field.connect(A,ticket);h.hook=async()=>({ok:true,status:200,headers:{get:()=>null},arrayBuffer:async()=>b.payload});
  await h.field.observe({state:'live',light_field:b.metadata},A);assert(h.field.hasDirectional,h.output.textContent);
- assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),true);
- assert.deepEqual(h.uniforms.uFieldFromView,Array.from(fieldFromView(I,1,[0,0,0],b.metadata.directional.bounds_min_m,b.metadata.directional.bounds_max_m)),
-  'secondary maps only the bounded directional region');
- assert.equal(h.uniforms.uFieldRestrictToBounds,1);
- assert.equal(h.field.bindMaterialMask({}, {},I,1,[0,0,0]),true);
- assert.deepEqual(h.uniforms.uFieldFromView,Array.from(fieldFromView(I,1,[0,0,0],b.metadata.directional.bounds_min_m,b.metadata.directional.bounds_max_m)),
-  'primary mask uses the same ROI as secondary, retaining ordinary response outside');
+ assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false,'legacy moments are not evaluated material responses');
+ assert.equal(h.field.bindMaterialMask({}, {},I,1,[0,0,0]),false,'material flags are never sampling availability');
  assert.equal(h.field.bind({},I,1,[0,0,0]),true);
  assert.deepEqual(h.uniforms.uFieldFromView,Array.from(fieldFromView(I,1,[0,0,0],b.metadata.bounds_min_m,b.metadata.bounds_max_m)),
   'legacy scalar mapping retains global bounds');
@@ -274,7 +271,7 @@ async function bundleV6(index=0,previousHash='0'.repeat(64)) {
  assert.match(h.divisionOutput.textContent,/0.5 × 0.5 × 0.5 mm/);assert.match(h.divisionOutput.textContent,/Requested margin: 1 mm/);
  assert.match(h.divisionOutput.textContent,/Padded recording bounds/);
  h.margin.value='2';h.margin.dispatchEvent(new Event('change'));assert.equal(h.field.hasDirectional,false);h.field.connect(A,ticket);assert.equal(h.field.metadata,null);
- assert.equal(h.field.bindMaterialMask({},{}),false);assert.equal(h.uniforms.uFieldRestrictToBounds,0);
+ assert.equal(h.field.bindMaterialMask({},{}),false);
  h.cell.value='.01';assert.equal(h.field.capture(),null,'unsupported pitch is refused');h.cell.value='.5';
  h.region.value='scene';h.region.dispatchEvent(new Event('change'));assert.equal(h.grid.disabled,false);assert.equal(h.cell.disabled,true);h.field.dispose();
 }
@@ -285,8 +282,7 @@ for(const [size,bins,columns,slabs] of [[32,6,1,6],[32,12,2,6],[64,6,2,3],[64,12
  assert.equal(ticket.gridSize,size);h.field.connect(A,ticket);
  h.hook=async()=>({ok:true,status:200,headers:{get:()=>null},arrayBuffer:async()=>b.payload});
  await h.field.observe({state:'live',light_field:b.metadata},A);assert(h.field.hasDirectional,h.output.textContent);
- assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),true);assert.equal(h.uniforms.uFieldAtlasColumns,columns);
- assert.equal(h.uniforms.uFieldGridDepth,size);assert.equal(h.uniforms.uFieldSpatialLinear,1);assert.match(h.output.textContent,/root-sweep normalized/);
+ assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false);assert.equal(h.uniforms.uResponseCount,0);assert.match(h.output.textContent,/root-sweep normalized/);
  assert.deepEqual(h.uploads[1].slice(3,6),[size*columns,size,size*slabs]);
  for(const voxel of [0,size-1,size**2,size**3-1])for(let bin=0;bin<bins;bin++) {
   const x=voxel%size,y=Math.floor(voxel/size)%size,z=Math.floor(voxel/(size*size));
@@ -316,7 +312,7 @@ for(const [size,bins,columns,slabs] of [[32,6,1,6],[32,12,2,6],[64,6,2,3],[64,12
   for(const control of Object.values(h.categoryControls))control.checked=false;
   const control=h.categoryControls[name];control.checked=true;control.dispatchEvent(new Event('change'));
   assert.equal(h.field.categoryMask,bit);assert.equal(h.field.hasReceivers,true);assert(h.field.hasDirectional);
-  assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),true);assert.match(h.categoryOutput.textContent,new RegExp(name));
+  assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false);assert.match(h.categoryOutput.textContent,new RegExp(name));
  }
  for(const control of Object.values(h.categoryControls))control.checked=true;
  assert.equal(h.field.categoryMask,7);assert.equal(h.changes,changes,'application-only category changes do not request ray restart');
@@ -350,12 +346,11 @@ for(const bins of [6,12]) {
   const h=harness(linear);h.stencil.value=String(bins);h.on();const ticket=h.field.capture();assert.equal(ticket.stencil,bins);h.field.connect(A,ticket);
   h.hook=async()=>({ok:true,status:200,headers:{get:()=>null},arrayBuffer:async()=>b.payload});
   await h.field.observe({state:'live',light_field:b.metadata},A);assert(h.field.hasDirectional,h.output.textContent);
-  assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),true);assert.equal(h.uniforms.uFieldBinCount,bins);
-  assert.equal(h.uniforms.uFieldAtlasColumns,1);assert.equal(h.uniforms.uFieldSpatialLinear,linear?1:0);
+  assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false);assert.equal(h.uniforms.uResponseCount,0);
   assert.equal(h.uploads[2][2],h.gl.RGBA32F);assert.deepEqual(h.uploads[2].slice(3,6),decoded.atlasDimensions);
   if(!linear)assert.match(h.output.textContent,/unavailable on this GPU/);
   h.spatial.checked=false;h.spatial.dispatchEvent(new Event('change'));assert(h.field.hasDirectional);
-  h.field.bindSecondary({},I,1,[0,0,0]);assert.equal(h.uniforms.uFieldSpatialLinear,0);
+  h.field.bindSecondary({},I,1,[0,0,0]);assert.equal(h.uniforms.uResponseCount,0);
   h.stencil.value=String(bins===6?12:6);h.stencil.dispatchEvent(new Event('change'));assert.equal(h.field.hasDirectional,false);
   h.field.connect(A,ticket);assert.equal(h.field.metadata,null,'stencil changes defeat old capture');h.field.dispose();
  }
@@ -394,17 +389,15 @@ for(const bins of [6,12]) {
  h.hook=async()=>({ok:true,status:200,headers:{get:()=>String(b.payload.byteLength)},arrayBuffer:async()=>b.payload});
  await h.field.observe({state:'live',light_field:b.metadata},A);
  assert.equal(h.field.hasDirectional,true,h.output.textContent);assert.equal(h.uploads.length,4);
- assert.equal(h.field.bindSecondary({},view,2,[1,2,3]),true);
- assert.equal(h.uniforms.uFieldGain,1,'secondary restores gain after primary deliberately set zero');
+ assert.equal(h.field.bindSecondary({},view,2,[1,2,3]),false);
+ assert.equal(h.uniforms.uResponseCount,0,'legacy field cannot suppress ordinary Phong');
  const fallbackMask={id:'zero-material-mask'};
- assert.equal(h.field.bindMaterialMask({},fallbackMask,I,1,[0,0,0]),true);
- assert.equal(h.uniforms.uFieldMaterialMask,13);
- assert.deepEqual(h.uniforms.uFieldViewFromWorld,[0,1,0,-1,0,0,0,0,1]);
- assert.equal(h.uniforms.uFieldRadiance,11);assert.equal(h.uniforms.uFieldDirection,12);assert.equal(h.uniforms.uFieldMaterialMask,13);
+ assert.equal(h.field.bindMaterialMask({},fallbackMask,I,1,[0,0,0]),false);
+ assert.equal(h.uniforms.uFieldMaterialMask,undefined,'no material-ID suppression sampler remains');
  assert.deepEqual(Array.from(h.uploads[3].at(-1)),[3,5]);
  assert.deepEqual(h.uploads[1].slice(3,6),[2,1,6]);
  h.materials.data[0]=.1;assert.equal(h.field.hasDirectional,false,'editing material defeats old bundle');assert.equal(h.deleted.length,4);
- assert.equal(h.field.bindMaterialMask({},fallbackMask),false);assert.equal(h.bindings.get('2d:113'),fallbackMask);
+ assert.equal(h.field.bindMaterialMask({},fallbackMask),false);
  h.field.dispose();
 }
 {
@@ -439,7 +432,7 @@ for(const bins of [6,12]) {
  const h=harness(),b=await bundle();h.on();h.field.connect(A,h.field.capture());
  h.hook=async()=>({ok:true,status:200,headers:{get:()=>null},arrayBuffer:async()=>b.payload});
  await h.field.observe({state:'live',light_field:b.metadata},A);h.gl.isContextLost=()=>true;
- assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false);assert.equal(h.deleted.length,4);h.field.dispose();
+ assert.equal(h.field.bindSecondary({},I,1,[0,0,0]),false);assert.equal(h.field.hasDirectional,false);assert.equal(h.deleted.length,4);h.field.dispose();
 }
 
 {
@@ -495,3 +488,98 @@ for(const options of [{lightFieldStencil:12},{receiveLightField:true,lightFieldS
 for(const options of [{receiveLightField:1},{receiveLightField:true,transport:'fixed:1'},
  {receiveLightField:true,orbitFrames:8},{receiveLightField:true,tiled:{tile_size:1024}}])assert.throws(()=>packMarblePhoto(geometry,A,options));
 console.log('PASS: real-field metadata/coordinates/packing; opt-in, replacement, revision, cancellation, stale response and upload-failure lifecycle');
+
+{
+ const payload=new ArrayBuffer(240),v=new DataView(payload);
+ const section={format:'arrival-record-v1',layout:'sparse-zyx-bin',stride_bytes:120,wavelengths_nm:[650,550,450],offset_bytes:0,byte_length:240,count:2};
+ v.setUint32(0,2,true);v.setUint32(52,1,true);v.setUint32(64,1,true); // Visited, quantized zero is not unvisited.
+ v.setUint32(88,1,true);v.setUint32(92,1,true);v.setUint32(116,1,true);
+ v.setUint32(120,7,true);v.setUint32(120+76,1,true); // Excluded evidence is retained independently.
+ const limits={cellBinCount:12,sourceCount:1,triangleCount:1};
+ const a=decodeFieldArrivals(payload,section,limits);
+ assert.deepEqual([...a.indices],[2,7]);assert.deepEqual([...a.visits],[1,0,0,0,0,0]);assert.equal(a.roundedZero[0],1);assert.equal(a.excluded[3],1);
+ assert(a.spectral.every(x=>x===0));assert.equal(a.context[0],1);
+ for(const [offset,value] of [[120,2],[64,2],[88,2],[116,4]]) {
+  const bad=payload.slice(0);new DataView(bad).setUint32(offset,value,true);assert.throws(()=>decodeFieldArrivals(bad,section,limits));
+ }
+ const bad=payload.slice(0);new DataView(bad).setFloat32(4,NaN,true);assert.throws(()=>decodeFieldArrivals(bad,section,limits));
+ assert.throws(()=>decodeFieldArrivals(payload,{...section,byte_length:120},limits));
+}
+console.log('Arrival spectral moments, independent prequantization visits, excluded evidence and context validation PASS');
+
+{
+ const intervals=new ArrayBuffer(1024),responses=new ArrayBuffer(1024),i=new DataView(intervals),r=new DataView(responses);
+ for(let row=0;row<2;row++) {
+  const o=row*512;i.setUint32(o+6*4,3,true);i.setUint32(o+40*4,7,true);
+  i.setUint32(o+115*4,41,true);i.setUint32(o+4*4,row?99:41,true); // Later hit is never the recipient.
+  i.setUint32(o+15*4,13,true);i.setUint32(o+2*4,2,true); // Same original invocation/sample, not two samples.
+ }
+ r.setUint32(0,0x7fc01234,true);r.setUint32(96*4,1,true); // Preserve exact invalid float bits with evaluated presence.
+ r.setUint32(109*4,1,true);r.setUint32(120*4,2,true); // Absence and rounding stay distinct from presence.
+ const receipt={response_schema:'native-camera-response-copies-v1',response_weighting:'original_path_throughput_not_availability_premultiplied',
+  denominator:'original_camera_samples_not_response_rows',application_ready:false,row_count:2};
+ const d=decodeEvaluatedResponses(intervals,responses,receipt);
+ assert.equal(d.responses[0],0x7fc01234);assert.equal(d.responses[96],1);assert.equal(d.responses[109],1);assert.equal(d.responses[120],2);
+ assert.equal(d.intervals[128+115],41);assert.equal(d.intervals[128+4],99);assert.equal(d.applicationReady,false);
+ r.setUint32(0,0,true);assert.equal(d.responses[0],0x7fc01234,'decoded copies retain original evidence');
+ r.setUint32(108*4,2,true);assert.throws(()=>decodeEvaluatedResponses(intervals,responses,receipt),/Reserved/);
+ assert.throws(()=>decodeEvaluatedResponses(intervals,responses,{...receipt,application_ready:true}));
+ // Proof only: F is already producer-resolved for the original visible recipient.
+ // No raw spectral row is used to construct it, and no attenuation is replayed.
+ const P=[.1,.2,.3],A=.4,B=[.5,.6,.7],F=[.9,.8,.7];
+ for(const c of [0,.25,1])for(let band=0;band<3;band++) {
+  const rgb=c*F[band]+(1-c)*P[band],alpha=c+(1-c)*A;
+  const composite=rgb+(1-alpha)*B[band],expected=c*F[band]+(1-c)*(P[band]+(1-A)*B[band]);
+  assert(Math.abs(composite-expected)<1e-12);
+ }
+ const h=harness();assert.equal(h.field.responseInformationRequested,false);assert.equal(h.field.capture(),null);
+ h.on();assert.equal(h.field.capture().information,undefined,'ordinary field opt-in does not request extra native copies');
+ assert.equal(h.field.responseInformationRequested,false);
+ h.responses.checked=true;h.responses.dispatchEvent(new Event('change'));
+ assert.equal(h.field.capture().information,'evaluated-responses-v1');assert.equal(h.field.responseInformationRequested,true);h.field.dispose();
+}
+console.log('Native response copies preserve bits, provenance and independent evidence; first-recipient complementary blend algebra PASS');
+
+// Exercise the existing receiver, with no rendering page or GPU context. Raw
+// typed snapshots must never take the legacy scalar or directional upload path.
+{
+ const payload=new ArrayBuffer(0),sha=Buffer.from(await crypto.subtle.digest('SHA-256',payload)).toString('hex');
+ const metadata={schema:'studio-scene-responses-v1',scene_revision:B,publication_sequence:0,byte_order:'little',
+  payload_bytes:0,payload_sha256:sha,
+  families:Object.fromEntries([[1,'forward','evaluated-forward-responses-v1'],[2,'reactive','evaluated-forward-responses-v1'],
+   [3,'camera_rhs_summands','native-camera-response-pairs-v1'],[4,'camera_complete_sample','native-camera-scene-sample-v1']].map(([id,name,codec])=>[id,{name,codec}])),
+  contexts:[],sections:[['scene_index',80],['native_rows',512],['camera_rhs_rows',1536],['scalar_cells',24]].map(([name,stride])=>({name,stride,count:0,offset:0})),
+  scalar_snapshot:null,indexing:{semantics:'lookup buckets only; exact positions/directions retained',stencil:'icosahedron12-v1',bounds:null,dimensions:null},
+  retention:{mode:'bounded-fifo',capacity:4,retained_entries:0,evicted_entries:2,duplicate_entries:0,invalidated_entries:0,incomplete_dispatches:0,unavailable_on_eviction:true},
+  complete_retained_snapshot:true,physical_completeness_claim:false,application_ready:false};
+ const receipt={schema:metadata.schema,digest:A,live_revision:0,sequence:1,name:`light-scene-response-${'1'.repeat(32)}.bin`,
+  byte_length:0,sha256:sha,application_ready:false,metadata};
+ assert.equal(validateSceneResponseReceipt(receipt,A,0).name,receipt.name);
+ for(const edit of [{digest:B},{live_revision:1},{name:'../response.bin'},{application_ready:true},{byte_length:64*1024*1024+1}])
+  assert.throws(()=>validateSceneResponseReceipt({...receipt,...edit},A,0));
+ const h=harness();h.on();h.responses.checked=true;h.responses.dispatchEvent(new Event('change'));
+ h.field.connect(A,h.field.capture());
+ h.hook=async url=>{assert.match(url,/\/api\/marble_photo\/field\?digest=.*&name=light-scene-response-/);
+  return {ok:true,status:200,headers:{get:()=> '0'},arrayBuffer:async()=>payload};};
+ await h.field.observe({state:'live',scene_responses:receipt,light_field:meta()},A);
+ assert.equal(h.uploads.length,0,'typed response data never becomes invented radiance');
+ assert.equal(h.field.hasResponses,false,'unready native evidence never suppresses Phong');
+ assert.equal(h.field.sceneResponseMetadata.metadata.retention.evicted_entries,2);
+ assert.match(h.output.textContent,/Typed data only/);
+ await h.field.observe({state:'live',scene_responses:receipt},A);assert.equal(h.calls,1,'one fetch per immutable snapshot');
+ const replacement=structuredClone(receipt);replacement.sequence=2;replacement.metadata.retention.evicted_entries=3;
+ await h.field.observe({state:'live',scene_responses:replacement},A);
+ assert.equal(h.field.sceneResponseMetadata.metadata.retention.evicted_entries,3,'retained snapshots replace, never merge');
+ h.hook=async()=>{throw Error('temporary transfer failure');};
+ await h.field.observe({state:'live',scene_responses:{...replacement,sequence:3}},A);
+ assert.equal(h.field.sceneResponseMetadata.sequence,2,'a transfer failure cannot erase the prior validated same-scene snapshot');
+ assert.match(h.output.textContent,/previous validated scene snapshot/);
+ h.field.revise(A,1);assert.equal(h.field.sceneResponseMetadata,null,'camera revision cannot retain stale query context');
+ await h.field.observe({state:'live',scene_responses:receipt},A);assert.equal(h.calls,3,'stale revision is refused before transfer');
+ h.off();assert.equal(h.field.sceneResponseMetadata,null);h.field.dispose();
+ const host=readFileSync(new URL('../examples/meowdoku/web/marble_studio.js',import.meta.url),'utf8');
+ assert.match(host,/const wantsSecondary=.*lightField\?\.hasResponses/);
+ const html=readFileSync(new URL('../examples/meowdoku/web/marble_studio.html',import.meta.url),'utf8');
+ assert(!/\bchecked\b/.test(html.match(/<input[^>]*id="phong-field-responses"[^>]*>/)[0]));
+}
+console.log('Scene response receiver PASS: explicit extra opt-in, immutable typed snapshots, missing/evicted data keep Phong, no GPU uploads');

@@ -17,6 +17,7 @@ import importlib.util
 from functools import lru_cache
 import json
 import math
+import uuid
 import os
 from pathlib import Path
 import re
@@ -39,6 +40,8 @@ MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 MAX_TRIANGLES = 500_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE = re.compile(r"^preview-[0-9]{6}\.png$")
+_MARKER = re.compile(r"^marker-[0-9]{6}\.png$")
+_SCENE_RESPONSE = re.compile(r"^light-scene-response-[0-9a-f]{32}\.bin$")
 _FIELD = re.compile(r"^light-field-[0-9a-f]{32}\.bin$")
 _FIELD_ESTIMATOR = "track-length-throughput-v1"
 _FIELD_ROOT_ESTIMATOR = "track-length-root-sweep-v1"
@@ -63,6 +66,55 @@ _PROFILED_LUMA = np.array([.2126390058715103, .7151686787677559, .07219231536073
 # and never redraw. Reserved band keeps this from ever colliding with a
 # real per-epoch preview filename.
 _retouch_seq = itertools.count()
+
+
+class _LeasedResponseStream:
+    """Keep a published immutable snapshot protected throughout HTTP streaming."""
+    def __init__(self, stream, directory, name, lock, atomic):
+        self.stream, self.directory, self.name = stream, directory, name
+        self.lock, self.atomic = lock, atomic
+        self.token = uuid.uuid4().hex
+        self.touched = 0.
+        self.closed = False
+
+    def touch_locked(self, release=False):
+        path = (self.directory / self.name).with_suffix('.leases.json')
+        if path.is_symlink(): raise ValueError('invalid scene response lease')
+        try:
+            if path.stat().st_size > 16384: raise ValueError('oversized scene response lease')
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            data = dict(version=1, name=self.name, transfers={})
+        transfers = data.get('transfers')
+        now = time.time()
+        if (data.get('version') != 1 or data.get('name') != self.name or not isinstance(transfers, dict)
+                or len(transfers) > 8 or any(not re.fullmatch(r'[0-9a-f]{32}', key)
+                or type(value) not in (int, float) or not math.isfinite(value) for key, value in transfers.items())):
+            raise ValueError('invalid scene response leases')
+        transfers = {key:value for key,value in transfers.items() if value > now and key != self.token}
+        if not release:
+            if len(transfers) >= 8: raise ValueError('scene response transfer capacity reached')
+            transfers[self.token] = now + 600
+        data['transfers'] = transfers
+        self.atomic(path, json.dumps(data, separators=(',', ':'), allow_nan=False).encode())
+        self.touched = time.monotonic()
+
+    def read(self, size=-1):
+        if time.monotonic() - self.touched >= 60:
+            with self.lock(self.directory): self.touch_locked()
+        return self.stream.read(size)
+
+    def fileno(self): return self.stream.fileno()
+    def __enter__(self): return self
+    def __exit__(self, *args): self.close()
+    def close(self):
+        if self.closed: return
+        self.closed = True
+        self.stream.close()
+        try:
+            with self.lock(self.directory): self.touch_locked(release=True)
+        except (OSError, ValueError, TimeoutError):
+            pass  # An expired protective lease is safe; never remove another transfer.
 
 
 def _retouch_filename() -> str:
@@ -371,9 +423,15 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     if value.get("object_digest") != saved["digest"]:
         raise PhotoError("photo request does not name the saved object")
     seconds = _number(value.get("exposure_seconds", 30), 0.1, 3600, "exposure_seconds")
+    substeps = value.get("exposure_substeps", math.ceil(seconds * 60))
+    if (type(substeps) is not int or substeps < math.ceil(seconds * 10 - 1e-9)
+            or substeps > 216000):
+        raise PhotoError("exposure_substeps must give dt <= 0.1 s and total at most 216000")
+    iso = _number(value.get("exposure_iso", 100), 25, 6400, "exposure_iso")
+    clip = _number(value.get("highlight_clip_percent", 25), 0, 25, "highlight_clip_percent")
     transport = str(value.get("transport", "fixed:1"))
-    if transport not in ("fixed:1", "fixed:3"):
-        raise PhotoError("transport must be fixed:1 or fixed:3")
+    if transport not in ("fixed:1", "fixed:3", "fixed:4", "fixed:8"):
+        raise PhotoError("transport must be fixed:1, fixed:3, fixed:4 or fixed:8")
     if "surface_transport" in value and value["surface_transport"] != _SURFACE_TRANSPORT:
         raise PhotoError("unsupported surface_transport; expected studio-pbr-mixture-v1")
     receive_light_field = value.get("receive_light_field", False)
@@ -382,7 +440,7 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     if receive_light_field and transport != "fixed:3":
         raise PhotoError("receive_light_field requires fixed:3 transport")
     film_response = None
-    if transport == "fixed:3":
+    if transport in ("fixed:3", "fixed:4", "fixed:8"):
         film_response = _film_response(value.get("film_response", {
             "version": 1, "centers_nm": [650, 550, 450], "sigmas_oct": [.06, .06, .06]}))
     elif "film_response" in value:
@@ -426,6 +484,7 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     if type(orbit_frames) is not int or orbit_frames not in (1, 8, 16, 32):
         raise PhotoError("orbit_frames must be 1, 8, 16, or 32")
     poses_in = value.get("camera_poses")
+    lanes_in = value.get("sensor_lanes")
     if "camera_poses" in value:
         if not isinstance(poses_in, list) or not 1 <= len(poses_in) <= 32:
             raise PhotoError("camera_poses must contain 1..32 camera overrides")
@@ -433,7 +492,15 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
             raise PhotoError("camera_poses cannot be combined with orbit, tiles, live view or client intersections")
         if "projection" in camera_in:
             raise PhotoError("camera_poses use only the existing analytical camera projection")
-    if receive_light_field and (tiled or orbit_frames != 1 or poses_in is not None):
+    if "sensor_lanes" in value:
+        if (not isinstance(lanes_in, list) or not 1 <= len(lanes_in) <= 32
+                or lanes_in[0] != {}):
+            raise PhotoError("sensor_lanes must contain 1..32 camera overrides, starting with the main camera")
+        if (poses_in is not None or transport not in ("fixed:3", "fixed:4", "fixed:8") or orbit_frames != 1 or tiled or "live" in value
+                or value.get("client_intersections", False) or receive_light_field
+                or "exposure_state_frames" not in value):
+            raise PhotoError("sensor_lanes require one timed, untiled RGB fixture exposure")
+    if receive_light_field and (tiled or orbit_frames != 1 or poses_in is not None or lanes_in is not None):
         raise PhotoError("receive_light_field requires one non-tiled camera without camera_poses")
     camera = _camera_config(camera_in, resolution, spectral_root)
     checker = {
@@ -511,6 +578,56 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         if not all(math.isfinite(v) for v in pbr_vals):
             raise PhotoError("fixtures.pbr must contain finite values")
         fixtures = {"vertices": verts, "material_ids": mat_ids, "pbr": pbr_vals}
+        emissive_ids = fixtures_in.get("emissive_material_ids")
+        if emissive_ids is not None:
+            if (not isinstance(emissive_ids, list) or len(emissive_ids) > n_mat
+                    or any(type(i) is not int or i < 0 or i >= n_mat for i in emissive_ids)
+                    or len(set(emissive_ids)) != len(emissive_ids)):
+                raise PhotoError("invalid fixtures.emissive_material_ids")
+            fixtures["emissive_material_ids"] = emissive_ids
+        shop_ids = fixtures_in.get("shop_material_ids")
+        trigger_emitters = fixtures_in.get("trigger_emitters")
+        if shop_ids is not None or trigger_emitters is not None:
+            if (not isinstance(shop_ids, list) or not isinstance(trigger_emitters, list)
+                    or len(shop_ids) > n_mat or len(trigger_emitters) > n_mat
+                    or any(type(i) is not int or i not in (emissive_ids or []) for i in shop_ids)
+                    or len(set(shop_ids)) != len(shop_ids)):
+                raise PhotoError("invalid timed Shop emitter identities")
+            seen_materials, seen_receivers = set(), set()
+            for item in trigger_emitters:
+                if (not isinstance(item, dict) or set(item) != {"material", "receiver", "gain"}
+                        or type(item["material"]) is not int or item["material"] not in shop_ids
+                        or item["material"] in seen_materials or not isinstance(item["receiver"], str)
+                        or not re.fullmatch(r"shop:[0-9]+", item["receiver"])
+                        or item["receiver"] in seen_receivers
+                        or isinstance(item["gain"], bool) or not isinstance(item["gain"], (int, float))
+                        or not math.isfinite(item["gain"]) or not 0 <= item["gain"] <= 1e6):
+                    raise PhotoError("invalid timed Shop trigger emitter")
+                seen_materials.add(item["material"]);seen_receivers.add(item["receiver"])
+            fixtures["shop_material_ids"] = shop_ids
+            fixtures["trigger_emitters"] = trigger_emitters
+        if (value.get("light_field_information") == "evaluated-responses-v1"
+                and "response_lineage" in fixtures_in):
+            lineage = fixtures_in["response_lineage"]
+            if (not isinstance(lineage, dict) or set(lineage) != {"version", "parts"}
+                    or lineage.get("version") != "studio-response-lineage-v1"
+                    or not isinstance(lineage.get("parts"), list)
+                    or len(lineage["parts"]) > n_tri):
+                raise PhotoError("invalid fixtures.response_lineage")
+            parts, cursor, sources = [], 0, set()
+            for part in lineage["parts"]:
+                if (not isinstance(part, dict) or set(part) != {"source_id", "start", "count"}
+                        or not isinstance(part["source_id"], str) or not 1 <= len(part["source_id"]) <= 256
+                        or part["source_id"] in sources
+                        or type(part["start"]) is not int or part["start"] != cursor
+                        or type(part["count"]) is not int or not 0 < part["count"] <= n_tri - cursor):
+                    raise PhotoError("fixture response lineage must uniquely cover submitted triangles in order")
+                sources.add(part["source_id"])
+                cursor += part["count"]
+                parts.append(dict(part))
+            if cursor != n_tri:
+                raise PhotoError("fixture response lineage must cover all submitted triangles")
+            fixtures["response_lineage"] = {"version": "studio-response-lineage-v1", "parts": parts}
         if "emitter_profiles" in fixtures_in:
             try:
                 import sys
@@ -522,6 +639,9 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                 fixtures['emitter_profiles']={'version':1,'records':list(validated.values())}
             except (ValueError,TypeError,KeyError) as error:
                 raise PhotoError(str(error)) from None
+        if trigger_emitters and not {item["material"] for item in trigger_emitters}.issubset(
+                {item["material"] for item in fixtures.get("emitter_profiles", {}).get("records", [])}):
+            raise PhotoError("triggered Shop light needs a named emitter source")
         if "material_engines" in fixtures_in:
             from .scene_material_engines import validate_scene_engines
             try:
@@ -544,12 +664,16 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         "extent": 4.0 * _studio_scale,
         "checks": 8,
     }
+    if type(value.get("camera_visible", True)) is not bool:
+        raise PhotoError("camera_visible must be boolean")
     config = {
         "object_digest": saved["digest"],
         "geometry_sha256": saved["geometry_sha256"],
         "exposure_seconds": seconds,
+        "exposure_substeps": substeps,
         "orbit_frames": orbit_frames,
         "transport": transport,
+        **({"optical_outside_policy":"game-transparent-outside-authored-v1"} if transport=="fixed:8" else {}),
         "gamma": gamma,
         "max_bounces": max_bounces,
         "bounce_mode": bounce_mode,
@@ -558,6 +682,7 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         # Server-owned scene convention is part of the immutable job digest.
         # New requests must not reuse images whose demo camera stayed at origin.
         "camera_geometry_version": "native-housing-behind-thin-lens-v1",
+        "camera_visible": value.get("camera_visible", True),
         "camera_focus_semantics": FOCUS_SEMANTICS,
         "scale_m": scale,
         "object_center_m": object_center_m,
@@ -574,8 +699,8 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
     }
     # Omitted and false preserve the pre-existing canonical job digest.
     if "surface_transport" in value:
-        if transport != "fixed:3" or fixtures is None:
-            raise PhotoError("surface_transport requires fixed:3 and authored fixtures")
+        if transport not in ("fixed:3", "fixed:4", "fixed:8") or fixtures is None:
+            raise PhotoError("surface_transport requires RGB transport and authored fixtures")
         config["surface_transport"] = _SURFACE_TRANSPORT
     if receive_light_field:
         config["receive_light_field"] = True
@@ -625,8 +750,76 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         config["film_response"] = film_response
         # Server-owned profile revision participates in the job digest.
         config["output_color_profile"] = "marble-fixed3-cie1931-d65-v1"
+    if "exposure_iso" in value or "highlight_clip_percent" in value:
+        config["exposure_iso"] = iso
+        config["highlight_clip_percent"] = clip
     if fixtures is not None:
         config["fixtures"] = fixtures
+    if "exposure_state_frames" in value:
+        raw_frames = value["exposure_state_frames"]
+        if (fixtures is None or transport not in ("fixed:3", "fixed:4", "fixed:8") or tiled or orbit_frames != 1
+                or "live" in value or participation or receive_light_field
+                or not isinstance(raw_frames, list) or not 1 <= len(raw_frames) <= 4096
+                or "emissive_material_ids" not in fixtures):
+            raise PhotoError("timed Studio exposure requires one ordinary RGB fixture photograph")
+        from camera_designer.studio_named_emitters import validate_named_emitter_refs
+        base = np.asarray(fixtures["pbr"], np.float32).reshape(-1, 16)
+        fixed = np.ones(base.shape, bool)
+        fixed[fixtures["emissive_material_ids"], 8:11] = False
+        initial_refs = validate_named_emitter_refs(fixtures.get("emitter_profiles"), len(base))
+        if not set(initial_refs).issubset(fixtures["emissive_material_ids"]):
+            raise PhotoError("timed emitter profile has no prepared material identity")
+        frames = []
+        cursor = 0.0
+        for raw_frame in raw_frames:
+            if not isinstance(raw_frame, dict) or set(raw_frame) != {"t0", "t1", "pbr", "emitter_profiles"}:
+                raise PhotoError("invalid timed Studio frame")
+            t0, t1 = raw_frame["t0"], raw_frame["t1"]
+            if (any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) for t in (t0, t1))
+                    or abs(t0 - cursor) > 1e-5 or not cursor < t1 <= seconds + 1e-5):
+                raise PhotoError("timed Studio frames must cover contiguous positive intervals")
+            tick = seconds / substeps
+            if (abs(t0 / tick - round(t0 / tick)) > 1e-4
+                    or abs(t1 / tick - round(t1 / tick)) > 1e-4):
+                raise PhotoError("timed Studio frames must end on exposure substep boundaries")
+            try:
+                current = np.asarray(raw_frame["pbr"], np.float32).reshape(base.shape)
+                refs = validate_named_emitter_refs(raw_frame["emitter_profiles"], len(base))
+            except (ValueError, TypeError, OverflowError) as error:
+                raise PhotoError(f"invalid timed Studio light state: {error}") from None
+            if (not np.isfinite(current).all() or not np.array_equal(current[fixed], base[fixed])
+                    or set(refs) != set(initial_refs)
+                    or any((refs[k]["profile"], refs[k]["revision"]) !=
+                           (initial_refs[k]["profile"], initial_refs[k]["revision"]) for k in refs)):
+                raise PhotoError("timed Studio frame changed non-light scene state")
+            frames.append({"t0": float(t0), "t1": float(t1), "pbr": current.ravel().tolist(),
+                           "emitter_profiles": {"version": 1, "records": list(refs.values())}})
+            cursor = float(t1)
+        if abs(cursor - seconds) > 1e-5:
+            raise PhotoError("timed Studio frames must cover the full shutter interval")
+        config["exposure_state_frames"] = frames
+    if "camera_trigger_graph" in value:
+        if "exposure_state_frames" not in config or not fixtures.get("trigger_emitters"):
+            raise PhotoError("camera trigger graph needs timed trigger emitters")
+        graph = value["camera_trigger_graph"]
+        if not isinstance(graph, dict) or len(json.dumps(graph)) > 65536:
+            raise PhotoError("camera trigger graph must be a bounded RoutingGraph object")
+        try:
+            from routing_engine import RoutingGraph
+            config["camera_trigger_graph"] = RoutingGraph.from_dict(graph).to_dict()
+        except (TypeError, ValueError, KeyError) as error:
+            raise PhotoError(f"invalid camera trigger graph: {error}") from None
+    if fixtures and fixtures.get("trigger_emitters"):
+        timing = value.get("camera_trigger_timing", {"shop_cutoff_lead_s": .001, "flash_duration_s": .010})
+        if not isinstance(timing, dict) or set(timing) != {"shop_cutoff_lead_s", "flash_duration_s"}:
+            raise PhotoError("camera trigger timing needs cutoff lead and flash duration")
+        lead = _number(timing["shop_cutoff_lead_s"], 1e-6, 1.0, "shop_cutoff_lead_s")
+        pulse = _number(timing["flash_duration_s"], 1e-6, 1.0, "flash_duration_s")
+        if lead + pulse >= seconds:
+            raise PhotoError("camera trigger timing must fit inside the shutter interval")
+        config["camera_trigger_timing"] = {"shop_cutoff_lead_s": lead, "flash_duration_s": pulse}
+    elif "camera_trigger_timing" in value:
+        raise PhotoError("camera trigger timing needs timed trigger emitters")
     if "live" in value:
         from .marble_live import live_settings
         if transport != "fixed:3" or orbit_frames != 1:
@@ -672,6 +865,13 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
         if any(key in value for key in ("volume_extinction", "volume_extinction_sigma_t_m_inv", "volume_extinction_bounds_m")):
             raise PhotoError("light_field_internal_media cannot be combined with external volume_extinction")
         config["light_field_internal_media"] = True
+    if "light_field_information" in value:
+        if value["light_field_information"] != "evaluated-responses-v1":
+            raise PhotoError("unsupported light_field_information")
+        if (not receive_light_field or config.get("light_field_schema") != "studio.forward-field.v6"
+                or not internal):
+            raise PhotoError("evaluated response information requires an explicit refreshed internal v6 field request")
+        config["light_field_information"] = "evaluated-responses-v1"
     # Optics use the complete image, never a tile's temporary allocation.
     # Live's established shader contract uses the displayed viewport aspect.
     aspect = config["live"]["aspect"] if "live" in config else camera.get("width", resolution) / camera.get("height", resolution)
@@ -702,6 +902,70 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                 raise PhotoError(f"camera_poses[{index}]: {error}") from None
             cameras.append(resolved)
         config["camera_poses"] = cameras
+    if lanes_in is not None:
+        lanes = [config["camera"]]
+        for index, pose in enumerate(lanes_in[1:], 1):
+            if not isinstance(pose, dict) or set(pose) - (_CAMERA_POSE_FIELDS | {"sensor_transport", "sensor_output"}):
+                raise PhotoError(f"sensor_lanes[{index}] has unsupported camera fields")
+            lane_transport = pose.get("sensor_transport", "fixed:3")
+            if lane_transport not in ("fixed:1", "fixed:3", "fixed:4", "fixed:8"):
+                raise PhotoError(f"sensor_lanes[{index}] has unsupported sensor transport")
+            if pose.get("sensor_output", "rgb") not in ("rgb", "mono"):
+                raise PhotoError(f"sensor_lanes[{index}] has unsupported sensor output")
+            pose_in = {**camera_in, **{key: item for key, item in pose.items() if key not in ("sensor_transport", "sensor_output")}}
+            if "fov_degrees" in pose and "back_reference_fov_degrees" not in pose:
+                pose_in.pop("back_reference_fov_degrees", None)
+            elif pose.get("camera_back", True) is None and "fov_degrees" not in pose:
+                pose_in["fov_degrees"] = camera_in.get("back_reference_fov_degrees", camera["fov_degrees"])
+            try:
+                resolved = _camera_config(pose_in, resolution, spectral_root)
+                resolved = apply_camera_back(resolved, pose_in.get("camera_back"), aspect,
+                                             pose_in.get("back_reference_fov_degrees"))
+            except ValueError as error:
+                raise PhotoError(f"sensor_lanes[{index}]: {error}") from None
+            if lane_transport != "fixed:3":
+                resolved["sensor_transport"] = lane_transport
+            if pose.get("sensor_output") == "mono":
+                resolved["sensor_output"] = "mono"
+            lanes.append(resolved)
+        config["sensor_lanes"] = lanes
+    if "calibration_regions" in value:
+        maps = value["calibration_regions"]
+        names = {"blackCenter", "gray18", "whiteRing", "blackOuter",
+                 "red", "green", "blue", "yellow"}
+        if (lanes_in is None or not isinstance(maps, list) or len(maps) != len(config["sensor_lanes"])):
+            raise PhotoError("calibration regions need one map per sensor lane")
+        checked = []
+        for lane, item in enumerate(maps):
+            if (not isinstance(item, dict) or set(item) != {"version", "width", "height", "regions"}
+                    or item["version"] != 1 or item["width"] != resolution or item["height"] != resolution
+                    or not isinstance(item["regions"], dict) or set(item["regions"]) != names):
+                raise PhotoError(f"calibration lane {lane} has an invalid sparse map")
+            regions = {}
+            total = 0
+            for name in sorted(names):
+                runs = item["regions"][name]
+                if not isinstance(runs, list) or len(runs) > 8192:
+                    raise PhotoError("calibration region has too many runs")
+                last_end = -1
+                regions[name] = []
+                for pair in runs:
+                    if (not isinstance(pair, list) or len(pair) != 2 or
+                            any(type(n) is not int for n in pair)):
+                        raise PhotoError("calibration run must have integer start and length")
+                    start, length = pair
+                    if (start < 0 or length < 1 or start <= last_end or
+                            start + length > resolution * resolution or
+                            start // resolution != (start + length - 1) // resolution):
+                        raise PhotoError("calibration run leaves its sensor row or overlaps")
+                    last_end = start + length - 1
+                    total += length
+                    regions[name].append([start, length])
+            if total > resolution * resolution:
+                raise PhotoError("calibration map selects more pixels than the sensor owns")
+            checked.append({"version": 1, "width": resolution, "height": resolution,
+                            "regions": regions})
+        config["calibration_regions"] = checked
     return config, seconds
 
 
@@ -1051,8 +1315,9 @@ def _retonemap_linear(linear: np.ndarray, params: dict, *, colorimetric: bool = 
 class PhotoJobs:
     """One active GPU exposure per server; digest and subprocess own its state."""
 
-    def __init__(self, directory: Path, spectral_root: Path):
+    def __init__(self, directory: Path, spectral_root: Path, *, users_directory: Path | None = None):
         self.directory = Path(directory)
+        self.users_directory = Path(users_directory) if users_directory is not None else self.directory / "users"
         self.spectral_root = Path(spectral_root)
         self.lock = threading.Lock()
         self.client_bridge = None
@@ -1061,6 +1326,27 @@ class PhotoJobs:
         self._sweep_stop = threading.Event()
         self._sweeper = threading.Thread(target=self._sweep_animations, daemon=True, name="marble-photo-expiry")
         self._sweeper.start()
+
+    def job_directory(self, digest: str) -> Path:
+        """Resolve an admitted job inside its owner's private content area.
+
+        Jobs created before account-scoped storage retain their original path.
+        The owner index is written at admission and is never inferred from a
+        client-supplied digest or path.
+        """
+        if not _DIGEST.fullmatch(digest):
+            raise PhotoError("invalid photo digest", 400)
+        legacy = self.directory / digest
+        if legacy.exists():
+            return legacy
+        from . import job_library
+        for owner in job_library.owner_keys(self.directory, digest):
+            kind, _, identity = owner.partition(":")
+            if kind == "account" and identity.isascii() and identity.isdecimal():
+                return self.users_directory / "account" / identity / "assets" / "marble_photos" / digest
+            if kind == "browser" and _DIGEST.fullmatch(identity):
+                return self.users_directory / "browser" / identity / "assets" / "marble_photos" / digest
+        return legacy
 
     def _sweep_animations(self) -> None:
         while not self._sweep_stop.is_set():
@@ -1072,7 +1358,9 @@ class PhotoJobs:
     def _expire_animations_locked(self) -> None:
         if not self.directory.exists():
             return
-        for directory in self.directory.iterdir():
+        legacy = (p for p in self.directory.iterdir() if p.is_dir() and _DIGEST.fullmatch(p.name))
+        scoped = self.users_directory.glob("*/*/assets/marble_photos/*")
+        for directory in (*legacy, *scoped):
             if not directory.is_dir() or not _DIGEST.fullmatch(directory.name):
                 continue
             path = directory / "status.json"
@@ -1097,7 +1385,7 @@ class PhotoJobs:
                     or self.process.poll() is not None
                     or not job_library.allowed(self.directory, digest, (owner,))):
                 return
-            directory = self.directory / digest
+            directory = self.job_directory(digest)
             config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
             if config.get("client_intersections") is not True or "live" not in config:
                 return
@@ -1198,7 +1486,7 @@ class PhotoJobs:
                 # cannot steal each other's live GPU owner. Revisions from one
                 # live session may replace only that session's own worker.
                 if self.process is not None and self.process.poll() is None and self.active_digest:
-                    active_config = json.loads((self.directory / self.active_digest / "config.json").read_text(encoding="utf-8"))
+                    active_config = json.loads((self.job_directory(self.active_digest) / "config.json").read_text(encoding="utf-8"))
                     active_live, requested_live = active_config.get("live"), config.get("live")
                     if bool(active_live) != bool(requested_live):
                         raise PhotoError("GPU is busy: stop the live view or finish the photograph before switching modes", 409)
@@ -1220,8 +1508,8 @@ class PhotoJobs:
                         return status
                 self._stop_locked()
                 self.active_digest = None
-                directory = self.directory / digest
-                directory.mkdir(exist_ok=True)
+                directory = self.job_directory(digest)
+                directory.mkdir(parents=True, exist_ok=True)
                 os.replace(payload, directory / "payload.npz")
                 os.replace(staging / "config.json", directory / "config.json")
                 if collation is not None:
@@ -1271,7 +1559,7 @@ class PhotoJobs:
 
     def _status_locked(self, digest: str, *, retained_artifact: bool = False) -> dict:
         self._cleanup_client_bridge_locked()
-        path = self.directory / digest / "status.json"
+        path = self.job_directory(digest) / "status.json"
         try:
             status = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1289,7 +1577,7 @@ class PhotoJobs:
                     "frames": status.get("frames", []),
                     "error": f"Spectral worker exited with code {process.returncode} before finishing the photo"}
         if status.get("state") == "encoding":
-            temporary = self.directory / digest / "orbit.avi.tmp"
+            temporary = self.job_directory(digest) / "orbit.avi.tmp"
             try:
                 status["encoding_bytes"] = temporary.stat().st_size
             except OSError:
@@ -1302,38 +1590,121 @@ class PhotoJobs:
         with self.lock:
             return self._status_locked(digest)
 
-    def open_artifact(self, digest: str, name: str, *, hdr: bool = False):
+    def open_artifact(self, digest: str, name: str, *, hdr: bool = False, lane: int = 0):
         """Open a verified artifact; callers stream it after existing ownership authorization."""
-        pattern = _HDR if hdr else _IMAGE
-        if not _DIGEST.fullmatch(digest) or not pattern.fullmatch(name):
+        marker = not hdr and bool(_MARKER.fullmatch(name))
+        pattern = _HDR if hdr else _MARKER if marker else _IMAGE
+        if not _DIGEST.fullmatch(digest) or not pattern.fullmatch(name) or type(lane) is not int or not 0 <= lane < 32:
             raise PhotoError("invalid photo artifact path", 400)
         with self.lock:
             status = self._status_locked(digest, retained_artifact=True)
+            if lane:
+                advertised = next((item for item in status.get("sensor_lanes", [])
+                    if isinstance(item, dict) and item.get("index") == lane), None)
+                expected = f"lane-{lane:02d}/{name}"
+                field = "hdr" if hdr else "marker" if marker else "image"
+                if advertised is None or advertised.get(field) != expected:
+                    raise PhotoError("sensor lane artifact is unavailable", 404)
+                directory = self.job_directory(digest) / f"lane-{lane:02d}"
+                path = directory / name
+                if directory.is_symlink() or path.is_symlink() or path.resolve().parent != directory.resolve():
+                    raise PhotoError("sensor lane artifact is unavailable", 404)
+                try:
+                    return path.open("rb")
+                except OSError:
+                    raise PhotoError("sensor lane artifact is unavailable", 404) from None
             if digest != self.active_digest and status.get("state") != "complete":
                 # A canceled/interrupted camera sequence keeps finished frames.
                 # Only recorded child results survive this read-only exception;
                 # a last progressive preview never becomes a completed frame.
-                field = "hdr" if hdr else "image"
-                if name not in {frame.get(field) for frame in status.get("frames", [])}:
+                field = "hdr" if hdr else "marker" if marker else "image"
+                if name not in {frame.get(field) for frame in status.get("frames", [])} and not (marker and status.get("marker") == name):
                     raise PhotoError("completed child artifact is unavailable", 404)
             if hdr:
                 available = {frame.get("hdr") for frame in status.get("frames", [])}
                 if status.get("hdr") != name and name not in available:
                     raise PhotoError("HDR exposure is unavailable", 404)
+            if marker and status.get("marker") != name:
+                raise PhotoError("spectral marker is unavailable", 404)
             try:
-                return (self.directory / digest / name).open("rb")
+                return (self.job_directory(digest) / name).open("rb")
             except OSError:
                 raise PhotoError("photo artifact is unavailable", 404) from None
 
+    def _open_scene_response(self, digest, name):
+        with self.lock:
+            status = self._status_locked(digest)
+            if status.get('state') not in ('exposing', 'live', 'complete'):
+                raise PhotoError('scene response is unavailable', 404)
+            directory = self.job_directory(digest)
+            try:
+                config = json.loads((directory / 'config.json').read_text(encoding='utf-8'))
+                revision = (json.loads((directory / 'live-control.json').read_text(encoding='utf-8'))['revision']
+                            if 'live' in config else 0)
+                current = status.get('scene_responses')
+                if (config.get('receive_light_field') is not True
+                        or config.get('light_field_information') != 'evaluated-responses-v1'
+                        or not isinstance(current, dict) or current.get('digest') != digest
+                        or type(revision) is not int or revision < 0 or current.get('live_revision') != revision):
+                    raise PhotoError('scene response is unavailable', 404)
+                root = str(self.spectral_root)
+                if root not in sys.path: sys.path.insert(0, root)
+                from camera_designer.studio_scene_responses import validate_scene_response_snapshot
+                from camera_designer.studio_scene_response_publish import response_lock, _atomic
+                path = directory / name
+                sidecar = path.with_suffix('.scene.json')
+                if (directory / 'light-response.lock').is_symlink():
+                    raise PhotoError('scene response lock is unavailable', 503)
+                with response_lock(directory):
+                    if (path.is_symlink() or sidecar.is_symlink() or path.resolve().parent != directory.resolve()
+                            or sidecar.stat().st_size > 8 * 1024 * 1024):
+                        raise PhotoError('scene response is unavailable', 404)
+                    receipt = json.loads(sidecar.read_text(encoding='utf-8'))
+                    metadata = receipt.get('metadata')
+                    length = receipt.get('byte_length')
+                    if (receipt.get('schema') != 'studio-scene-responses-v1' or receipt.get('name') != name
+                            or receipt.get('digest') != digest or type(receipt.get('live_revision')) is not int
+                            or receipt['live_revision'] != revision or type(receipt.get('sequence')) is not int
+                            or receipt['sequence'] < 0 or type(length) is not int or not 0 <= length <= 64 * 1024 * 1024
+                            or receipt.get('application_ready') is not False
+                            or not isinstance(metadata, dict) or metadata.get('application_ready') is not False
+                            or metadata.get('scene_revision') != current.get('metadata', {}).get('scene_revision')
+                            or not isinstance(metadata.get('scene_revision'), str) or not metadata['scene_revision']
+                            or receipt.get('sha256') != metadata.get('payload_sha256')
+                            or length != metadata.get('payload_bytes')):
+                        raise PhotoError('invalid scene response receipt', 503)
+                    stream = path.open('rb')
+                    try:
+                        if os.fstat(stream.fileno()).st_size != length:
+                            raise ValueError('scene response length mismatch')
+                        # Validation is serialized under the job lock and bounded to64MiB.
+                        payload = stream.read(length)
+                        validate_scene_response_snapshot(metadata, payload)
+                        del payload
+                        stream.seek(0)
+                        leased = _LeasedResponseStream(stream, directory, name, response_lock, _atomic)
+                        leased.touch_locked()
+                        return leased
+                    except Exception:
+                        stream.close()
+                        raise
+            except PhotoError: raise
+            except FileNotFoundError:
+                raise PhotoError('scene response is unavailable', 404) from None
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, ImportError, TimeoutError) as error:
+                raise PhotoError('invalid scene response artifact: ' + str(error), 503) from None
+
     def open_field(self, digest: str, name: str):
         """Stream only the opted-in job's current, revision-matched field."""
+        if _DIGEST.fullmatch(digest) and _SCENE_RESPONSE.fullmatch(name):
+            return self._open_scene_response(digest, name)
         if not _DIGEST.fullmatch(digest) or not _FIELD.fullmatch(name):
             raise PhotoError("invalid light field artifact path", 400)
         with self.lock:
             status = self._status_locked(digest)
             if status.get("state") not in ("exposing", "live", "complete"):
                 raise PhotoError("light field is unavailable", 404)
-            directory = self.directory / digest
+            directory = self.job_directory(digest)
             try:
                 config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
                 revision = (json.loads((directory / "live-control.json").read_text(encoding="utf-8"))["revision"]
@@ -1409,7 +1780,7 @@ class PhotoJobs:
             if status.get("animation") != "orbit.avi" or time.time() >= float(status.get("animation_expires_at", 0)):
                 raise PhotoError("orbit animation has expired or is unavailable", 404)
             try:
-                return (self.directory / digest / "orbit.avi").read_bytes()
+                return (self.job_directory(digest) / "orbit.avi").read_bytes()
             except OSError:
                 raise PhotoError("orbit animation is unavailable", 404) from None
 
@@ -1430,6 +1801,10 @@ class PhotoJobs:
                    "red": (0, 3), "green": (0, 3), "blue": (0, 3),
                    "whitebalance": (-3, 3), "tint": (-3, 3), "intensity": (0, 3)}
         clean = _display_params(params)
+        spectral_look = params.get("spectral_look", "compressed")
+        if spectral_look not in ("compressed", "nir_red", "uv_violet", "visible_reference"):
+            raise PhotoError("retouch.spectral_look must be a supported eight-band view", 400)
+        clean["spectral_look"] = spectral_look
         for key in allowed:
             if key in params:
                 try:
@@ -1446,7 +1821,7 @@ class PhotoJobs:
             status = self._status_locked(digest)
             if status.get("tiled"):
                 raise PhotoError("Tiled HDR retouch is not available in the interactive editor; download the HDR or set gamma before exposing", 409)
-            directory = self.directory / digest
+            directory = self.job_directory(digest)
             temp = directory / "retouch.json.tmp"
             temp.write_text(json.dumps(clean), encoding="utf-8")
             os.replace(temp, directory / "retouch.json")
@@ -1458,8 +1833,16 @@ class PhotoJobs:
                 try:
                     with np.load(hdr_path) as data:
                         colorimetric = "linear_srgb_exposure" in data and "color_profile_json" in data
+                        if not colorimetric and "linear_rgb_exposure" not in data:
+                            raise PhotoError("monochrome HDR retouch requires the monochrome calibration viewer", 409)
                         field = "linear_srgb_exposure" if colorimetric else "linear_rgb_exposure"
                         linear = np.asarray(data[field], np.float64)
+                        if "linear_spectral_exposure" in data:
+                            root = str(self.spectral_root)
+                            if root not in sys.path: sys.path.insert(0, root)
+                            from camera_designer.studio_spectral_display import project_spectral_exposure
+                            linear, _ = project_spectral_exposure(
+                                np.asarray(data["linear_spectral_exposure"], np.float64), clean["spectral_look"])
                 except OSError as error:
                     raise PhotoError("saved HDR exposure is unavailable", 404) from error
                 display = _retonemap_linear(linear, clean, colorimetric=colorimetric)
@@ -1476,6 +1859,8 @@ class PhotoJobs:
                 status["retouch_params"] = clean
                 if colorimetric:
                     status["retouch_display_transform"] = _display_metadata(linear, clean)
+                    if "spectral_look" in clean and status.get("transport", "").startswith("fixed:8"):
+                        status["retouch_display_transform"]["spectral_look"] = clean["spectral_look"]
                 else:
                     warning = "Legacy HDR has no recorded sensor color profile; new normalization, tone, saturation, vibrance, black-point and firefly controls are not applied."
                     status["retouch_display_transform"] = {"legacy": True, "warning": warning}
@@ -1493,7 +1878,7 @@ class PhotoJobs:
         with self.lock:
             if live_only:
                 try:
-                    config = json.loads((self.directory / digest / "config.json").read_text(encoding="utf-8"))
+                    config = json.loads((self.job_directory(digest) / "config.json").read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     raise PhotoError("live view is unavailable", 404) from None
                 if "live" not in config:
@@ -1504,13 +1889,13 @@ class PhotoJobs:
                 raise PhotoError("photo digest is no longer active", 404)
             self._stop_locked()
             self.active_digest = None
-            directory = self.directory / digest
+            directory = self.job_directory(digest)
             # These are internal scratch stores, not finished PNG/HDR artifacts.
             # Reclaim the disk-backed full sensor only after its owner has exited.
             for name in ("tile-sensor.npy", "tile-output.npy", "tile-srgb.npy", "tile-luma.bin"):
                 (directory / name).unlink(missing_ok=True)
             (directory / "orbit.avi").unlink(missing_ok=True)
-            path = self.directory / digest / "status.json"
+            path = self.job_directory(digest) / "status.json"
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
                 current["state"] = "canceled"

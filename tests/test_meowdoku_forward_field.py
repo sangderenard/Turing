@@ -674,3 +674,340 @@ def test_surface_transport_receipt_matches_immutable_job(field_job, vector):
     with jobs.open_field(digest, NAME) as stream: assert stream.read()
     del config['surface_transport']; save()
     with pytest.raises(photos.PhotoError, match='unexpected'): jobs.open_field(digest, NAME)
+
+
+
+
+
+def test_response_information_is_explicit_opt_in_only(photo_payload):
+    store, digest, vertices, normals, ids = photo_payload
+    def config(options): return photos.decode_upload(_wire(digest, vertices, normals, ids, **options), store)[3]
+    options = emitter_request(); options['light_field_internal_media'] = True
+    old = config(options)
+    assert old['light_field_schema'] == 'studio.forward-field.v6'
+    assert 'light_field_information' not in old
+    new = config(dict(options, light_field_information='evaluated-responses-v1'))
+    assert new == dict(old, light_field_information='evaluated-responses-v1')
+    # A schema name alone cannot activate additional collection or transport.
+    assert config(dict(options, light_field_schema='studio.forward-field.v7')) == old
+
+
+@pytest.mark.parametrize('change', ['missing_internal', 'missing_sampling', 'missing_field', 'wrong_value'])
+def test_response_information_requires_full_explicit_contract(photo_payload, change):
+    store, digest, vertices, normals, ids = photo_payload
+    options = emitter_request(); options.update(light_field_internal_media=True, light_field_information='evaluated-responses-v1')
+    if change == 'missing_internal': options['light_field_internal_media'] = False
+    elif change == 'missing_sampling': del options['emitter_sampling']
+    elif change == 'missing_field': options['receive_light_field'] = False
+    else: options['light_field_information'] = True
+    with pytest.raises(photos.PhotoError): photos.decode_upload(_wire(digest, vertices, normals, ids, **options), store)
+
+
+def test_response_lineage_is_opt_in_and_preserved(photo_payload):
+    store, digest, vertices, normals, ids = photo_payload
+    def config(options): return photos.decode_upload(_wire(digest, vertices, normals, ids, **options), store)[3]
+    options = emitter_request()
+    ordinary = config(options)
+    lineage = {'version': 'studio-response-lineage-v1', 'parts': [{'source_id': 'fixture-1', 'start': 0, 'count': 1}]}
+    options['fixtures']['response_lineage'] = lineage
+    assert config(options) == ordinary
+    options.update(light_field_internal_media=True, light_field_information='evaluated-responses-v1')
+    assert config(options)['fixtures']['response_lineage'] == lineage
+    options['light_field_information'] = 'spectral-arrivals-v1'
+    with pytest.raises(photos.PhotoError): config(options)
+
+
+@pytest.mark.parametrize('parts', [[], [{'source_id':'x','start':1,'count':1}],
+    [{'source_id':'x','start':0,'count':True}], [{'source_id':'','start':0,'count':1}],
+    [{'source_id':'x','start':0,'count':2}], [{'source_id':'x','start':0,'count':1,'extra':1}]])
+def test_response_lineage_rejects_invalid_cover(photo_payload, parts):
+    store, digest, vertices, normals, ids = photo_payload
+    options = emitter_request()
+    options.update(light_field_internal_media=True, light_field_information='evaluated-responses-v1')
+    options['fixtures']['response_lineage'] = {'version':'studio-response-lineage-v1', 'parts':parts}
+    with pytest.raises(photos.PhotoError):
+        photos.decode_upload(_wire(digest, vertices, normals, ids, **options), store)
+
+
+SCENE_NAME = 'light-scene-response-' + '3' * 32 + '.bin'
+
+
+def scene_receipt(digest):
+    import sys
+    import numpy as np
+    if str(photos.SPECTRAL_ROOT) not in sys.path: sys.path.insert(0, str(photos.SPECTRAL_ROOT))
+    from camera_designer.studio_scene_responses import SceneResponseStore
+    store = SceneResponseStore(scene_revision='scene-a', memory_budget_bytes=32768, lineage_provider=lambda: __import__('camera_designer.studio_response_lineage', fromlist=['NativeResponseLineage']).NativeResponseLineage(0).snapshot())
+    store.consume_scalar_cells({'scene_revision':'scene-a', 'scalar_clear_epoch':0, 'snapshot_id':0, 'cell_offset':0, 'total_cells':1, 'final_slab':True}, np.arange(4,dtype='<u4').reshape(1,1,4))
+    manifest, payload = store.snapshot()
+    return dict(schema='studio-scene-responses-v1', digest=digest, live_revision=0, sequence=1,
+        name=SCENE_NAME, byte_length=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+        metadata=manifest, application_ready=False), payload
+
+
+@pytest.fixture
+def scene_job(field_job):
+    jobs, digest, directory, config, status, save = field_job
+    receipt, payload = scene_receipt(digest)
+    config['light_field_information'] = 'evaluated-responses-v1'
+    status['scene_responses'] = receipt
+    def publish():
+        (directory / SCENE_NAME).write_bytes(payload)
+        (directory / SCENE_NAME).with_suffix('.scene.json').write_text(json.dumps(receipt))
+        save()
+    publish()
+    return jobs, digest, directory, config, status, receipt, payload, publish
+
+
+def test_scene_response_stream_lease_and_old_snapshot(scene_job):
+    jobs,digest,directory,config,status,receipt,payload,publish = scene_job
+    status['scene_responses'] = dict(receipt, name='light-scene-response-'+'4'*32+'.bin', sequence=2)
+    publish()
+    lease = (directory / SCENE_NAME).with_suffix('.leases.json')
+    with jobs.open_field(digest,SCENE_NAME) as stream:
+        assert len(json.loads(lease.read_text())['transfers']) == 1
+        assert stream.read() == payload
+    assert json.loads(lease.read_text())['transfers'] == {}
+    del config['light_field_information']; publish()
+    with pytest.raises(photos.PhotoError): jobs.open_field(digest,SCENE_NAME)
+
+
+@pytest.mark.parametrize('bad', ['hash','length','ready','revision','scene','sections','traversal'])
+def test_scene_response_rejects_corrupt_or_stale(scene_job,bad):
+    jobs,digest,directory,config,status,receipt,payload,publish = scene_job
+    if bad=='hash': receipt['sha256']='f'*64
+    elif bad=='length': receipt['byte_length']+=1
+    elif bad=='ready': receipt['metadata']['application_ready']=True
+    elif bad=='revision': receipt['live_revision']=1
+    elif bad=='scene':
+        status['scene_responses']=dict(receipt,metadata=dict(receipt['metadata'],scene_revision='scene-b'))
+    elif bad=='sections': receipt['metadata']['sections'].reverse()
+    publish()
+    if bad=='traversal': name='../'+SCENE_NAME
+    else: name=SCENE_NAME
+    with pytest.raises(photos.PhotoError): jobs.open_field(digest,name)
+
+
+@pytest.mark.parametrize("header_failure", [None, "send_header", "end_headers"])
+def test_scene_response_http_uses_existing_owner_route(tiered, monkeypatch, header_failure):
+    port,set_tier,sessions=tiered
+    set_tier('shader')
+    conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5)
+    conn.request('GET','/api/marble_photo/jobs');response=conn.getresponse();response.read()
+    cookies=[v.split(';')[0] for k,v in response.getheaders() if k.lower()=='set-cookie'];conn.close()
+    token=next(v.split('=',1)[1] for v in cookies if v.startswith(server.COOKIE+'='))
+    headers={'Cookie':'; '.join(cookies)}
+    digest='f'*64;directory=sessions.marble_photos.directory/digest;directory.mkdir(parents=True)
+    receipt,payload=scene_receipt(digest)
+    (directory/'config.json').write_text(json.dumps({'receive_light_field':True,'light_field_information':'evaluated-responses-v1'}))
+    (directory/'status.json').write_text(json.dumps({'digest':digest,'state':'complete','scene_responses':receipt}))
+    (directory/SCENE_NAME).write_bytes(payload)
+    (directory/SCENE_NAME).with_suffix('.scene.json').write_text(json.dumps(receipt))
+    job_library.claim(sessions.marble_photos.directory,digest,['browser:'+hashlib.sha256(token.encode()).hexdigest()])
+    path='/api/marble_photo/field?digest='+digest+'&name='+SCENE_NAME
+    conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5)
+    if header_failure:
+        from http.server import BaseHTTPRequestHandler
+        original=getattr(BaseHTTPRequestHandler,header_failure)
+        def fail_header(handler,*args,**kwargs):
+            if handler.path.startswith('/api/marble_photo/field?'):
+                raise ConnectionResetError('simulated header disconnect')
+            return original(handler,*args,**kwargs)
+        monkeypatch.setattr(BaseHTTPRequestHandler,header_failure,fail_header)
+        conn.request('GET',path,headers=headers)
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError)):
+            conn.getresponse()
+        conn.close()
+        import time
+        lease=(directory/SCENE_NAME).with_suffix('.leases.json')
+        for _ in range(100):
+            if lease.exists() and json.loads(lease.read_text())['transfers']=={}:break
+            time.sleep(.01)
+        assert json.loads(lease.read_text())['transfers']=={}
+        return
+    conn.request('GET',path,headers=headers);response=conn.getresponse()
+    assert response.status==200
+    assert int(response.getheader('Content-Length'))==len(payload)
+    assert response.read()==payload;conn.close()
+    assert _get(port,path)[0]==403
+
+
+def test_scene_response_payload_hash_and_transfer_limit(scene_job):
+    import time
+    jobs,digest,directory,config,status,receipt,payload,publish=scene_job
+    path=directory/SCENE_NAME
+    path.write_bytes(bytes([payload[0]^1])+payload[1:])
+    with pytest.raises(photos.PhotoError,match='hash'):jobs.open_field(digest,SCENE_NAME)
+    publish()
+    path.with_suffix('.leases.json').write_text(json.dumps(dict(version=1,name=SCENE_NAME,
+        transfers={format(i,'032x'):time.time()+600 for i in range(8)})))
+    with pytest.raises(photos.PhotoError,match='capacity'):jobs.open_field(digest,SCENE_NAME)
+
+
+def test_scene_publisher_backpressure_respects_active_api_transfers(field_job):
+    from types import SimpleNamespace
+    jobs,digest,directory,config,status,save=field_job
+    receipt,payload=scene_receipt(digest)
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher
+    publisher=SceneResponsePublisher(directory,digest,interval=0)
+    store=SimpleNamespace(snapshot=lambda:(receipt['metadata'],payload))
+    config['light_field_information']='evaluated-responses-v1'
+    streams=[]
+    try:
+        for i in range(3):
+            item=publisher.publish(store)
+            status['scene_responses']=item;save()
+            streams.append(jobs.open_field(digest,item['name']))
+        latest=publisher.latest
+        assert publisher.publish(store)==latest
+        assert len(list(directory.glob('light-scene-response-*.bin')))==3
+        assert streams[0].read()==payload
+        streams[0].close()
+        assert publisher.publish(store)['name']!=latest['name']
+        assert len(list(directory.glob('light-scene-response-*.bin')))==3
+    finally:
+        for stream in streams:stream.close()
+
+
+@pytest.mark.parametrize('protected', ['none','lease','status','latest','wrong_digest','wrong_hash'])
+def test_scene_retired_artifacts_reconcile_only_verified_owned(field_job,protected):
+    import time
+    jobs,digest,directory,config,status,save=field_job
+    receipt,payload=scene_receipt(digest)
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher,response_lock
+    target=directory/SCENE_NAME
+    retired=target.with_suffix('.scene.retired')
+    target.write_bytes(payload)
+    if protected=='wrong_digest':receipt['digest']='b'*64
+    if protected=='wrong_hash':receipt['sha256']='0'*64
+    retired.write_text(json.dumps(receipt))
+    publisher=SceneResponsePublisher(directory,digest)
+    if protected=='latest':publisher.latest=receipt
+    if protected=='status':status['scene_responses']=receipt;save()
+    if protected=='lease':target.with_suffix('.leases.json').write_text(json.dumps(dict(version=1,name=SCENE_NAME,transfers={'1'*32:time.time()+600})))
+    with response_lock(directory):room=publisher._room_locked()
+    if protected=='none':
+        assert room and not target.exists() and not retired.exists()
+    else:
+        assert target.exists() and retired.exists()
+        if protected.startswith('wrong_'):assert not room
+
+
+def test_scene_failed_retirement_stays_counted_and_recovers(field_job,monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    jobs,digest,directory,config,status,save=field_job
+    receipt,payload=scene_receipt(digest)
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher,response_lock
+    publisher=SceneResponsePublisher(directory,digest,interval=0)
+    store=SimpleNamespace(snapshot=lambda:(receipt['metadata'],payload))
+    items=[publisher.publish(store) for _ in range(3)]
+    victim=directory/items[0]['name'];original=Path.unlink
+    def blocked(path,*args,**kwargs):
+        if path==victim:raise PermissionError('simulated interrupted retirement')
+        return original(path,*args,**kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(Path,'unlink',blocked)
+        assert publisher.publish(store)==items[-1]
+        assert victim.with_suffix('.scene.retired').exists()
+        assert publisher.publish(store)==items[-1]
+        assert len(list(directory.glob('light-scene-response-*.bin')))==3
+    new=publisher.publish(store)
+    assert new['name']!=items[-1]['name']
+    assert not victim.exists() and not victim.with_suffix('.scene.retired').exists()
+    assert len(list(directory.glob('light-scene-response-*.bin')))==3
+
+
+def test_scene_unowned_orphan_binary_blocks_without_deletion(field_job):
+    jobs,digest,directory,config,status,save=field_job
+    scene_receipt(digest)
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher,response_lock
+    orphan=directory/SCENE_NAME;orphan.write_bytes(b'unowned')
+    publisher=SceneResponsePublisher(directory,digest)
+    with response_lock(directory):assert not publisher._room_locked()
+    assert orphan.read_bytes()==b'unowned'
+
+
+def native_partition_store():
+    import numpy as np
+    scene_receipt('a'*64)  # Load the same CPU-only Spectral contract used by the API.
+    from camera_designer.studio_scene_responses import SceneResponseStore
+    from camera_designer.studio_response_lineage import NativeResponseLineage
+    from camera_designer.film_response import normalize_film_response
+    lineage=NativeResponseLineage(1)
+    store=SceneResponseStore(scene_revision='physical',memory_budget_bytes=1024*1024,
+        lineage_provider=lineage.snapshot,bounds=[[0,0,0],[1,1,1]],dimensions=[32,32,32])
+    rows=np.zeros((3,128),dtype='<u4')
+    rows[:,0:2]=[5,1];rows[:,5]=[0,0xffffffff,0]
+    rows[:,30]=1;rows[:,32]=0x80000001;rows[:,64]=0x40000002
+    rows[:,18:24]=np.array([.1,.2,.3,.4,.5,.6],np.float32).view(np.uint32)
+    rows[:,24:30]=np.array([0,1,0,1,0,0],np.float32).view(np.uint32)
+    rows[:,112:114]=[2,0];rows[1:,112]=0
+    metadata=dict(scene_revision='physical',stream_id='native',sequence=0,source_sha256='source',
+        transport_scene_sha256='transport',film_response=normalize_film_response(),primitive_identity_offsets=[112,113])
+    store.consume_forward(metadata,rows)
+    return store,rows
+
+
+@pytest.mark.parametrize('change', ['available','count','capacity','evicted','boolean_count','identity','scheme','absent'])
+def test_api_validates_optional_native_partition_receipt(field_job,change):
+    jobs,digest,directory,config,status,save=field_job
+    store,rows=native_partition_store()
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher
+    receipt=SceneResponsePublisher(directory,digest).publish(store)
+    config['light_field_information']='evaluated-responses-v1';status['scene_responses']=receipt
+    partitions=receipt['metadata']['retention']['partitions']
+    if change=='available':partitions['native_only_application_available']=True
+    elif change=='count':partitions['native_only_retained_entries']+=1
+    elif change=='capacity':partitions['native_only_capacity']+=1
+    elif change=='evicted':partitions['native_only_evicted_entries']+=1
+    elif change=='boolean_count':partitions['native_only_context_discarded_entries']=True
+    elif change=='identity':
+        partitions['native_only_retained_entries']-=1;partitions['surface_retained_entries']+=1
+    elif change=='scheme':partitions['scheme']='other'
+    else:del receipt['metadata']['retention']['partitions']
+    (directory/receipt['name']).with_suffix('.scene.json').write_text(json.dumps(receipt));save()
+    if change=='absent':
+        with jobs.open_field(digest,receipt['name']) as stream:assert len(stream.read())==receipt['byte_length']
+    else:
+        with pytest.raises(photos.PhotoError,match='retention'):jobs.open_field(digest,receipt['name'])
+
+
+def test_native_partition_publisher_to_existing_http_is_bit_exact(tiered):
+    import numpy as np
+    port,set_tier,sessions=tiered;set_tier('shader')
+    conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5)
+    conn.request('GET','/api/marble_photo/jobs');response=conn.getresponse();response.read()
+    cookies=[v.split(';')[0] for k,v in response.getheaders() if k.lower()=='set-cookie'];conn.close()
+    token=next(v.split('=',1)[1] for v in cookies if v.startswith(server.COOKIE+'='))
+    headers={'Cookie':'; '.join(cookies)}
+    digest='d'*64;directory=sessions.marble_photos.directory/digest;directory.mkdir(parents=True)
+    store,rows=native_partition_store()
+    from camera_designer.studio_scene_response_publish import SceneResponsePublisher
+    receipt=SceneResponsePublisher(directory,digest).publish(store)
+    (directory/'config.json').write_text(json.dumps({'receive_light_field':True,'light_field_information':'evaluated-responses-v1'}))
+    (directory/'status.json').write_text(json.dumps({'digest':digest,'state':'complete','scene_responses':receipt}))
+    job_library.claim(sessions.marble_photos.directory,digest,['browser:'+hashlib.sha256(token.encode()).hexdigest()])
+    conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5)
+    conn.request('GET','/api/marble_photo/field?digest='+digest+'&name='+receipt['name'],headers=headers)
+    response=conn.getresponse();assert response.status==200
+    payload=response.read();conn.close()
+    assert payload==(directory/receipt['name']).read_bytes()
+    assert hashlib.sha256(payload).hexdigest()==receipt['sha256']
+    section=receipt['metadata']['sections'][1]
+    np.testing.assert_array_equal(np.frombuffer(payload,'<u4',offset=section['offset'],count=384).reshape(3,128),rows)
+    index=np.frombuffer(payload,'<u4',count=60).reshape(3,20)
+    assert list(index[:,4])==[0,0,0] and list(index[:,11])==[1,0,1]
+    assert list(index[:,6].view('<i4'))==[2,0,0]
+    assert receipt['metadata']['retention']['partitions']['native_only_retained_entries']==3
+    assert receipt['application_ready'] is False
+
+
+def test_absent_information_opt_in_creates_no_scene_assets(field_job):
+    jobs,digest,directory,config,status,save=field_job
+    before=set(directory.iterdir())
+    with jobs.open_field(digest,NAME) as stream:assert stream.read()==bytes(96)
+    with pytest.raises(photos.PhotoError):jobs.open_field(digest,SCENE_NAME)
+    assert set(directory.iterdir())==before
+    assert not list(directory.glob('light-scene-response-*'))
+    assert not (directory/'light-response.lock').exists()

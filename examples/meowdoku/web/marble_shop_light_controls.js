@@ -74,6 +74,7 @@ export function createShopLightControls(container,materialNames,{getUnitMm=()=>3
   field('dimmer','Relative dimmer',{min:0,max:1});
   field('continuousExposure','Continuous light in ray exposures (override)',{type:'checkbox',
    read:f=>f.exposureMode==='continuous',write:(f,value)=>{f.exposureMode=value?'continuous':'off';}});
+  field('filterOff','Filter off · use the light material emission profile directly',{type:'checkbox'});
   for(const [index,channel]of ['R','G','B'].entries())field('filter-'+channel.toLowerCase(),'Filter '+channel,
    {min:0,max:1,read:f=>f.filter[index],write:(f,value)=>{f.filter[index]=value;}});
   const remove=doc.createElement('button');remove.type='button';remove.id='shop-light-remove-'+fixture.id;

@@ -26,7 +26,23 @@ assert.equal(ray.contentType,'application/octet-stream');
 assert.equal(new TextDecoder().decode(ray.bytes.slice(0,4)),'MRP1');
 const view=new DataView(ray.bytes.buffer,ray.bytes.byteOffset,ray.bytes.byteLength);
 const config=JSON.parse(new TextDecoder().decode(ray.bytes.slice(16,16+view.getUint32(4,true))));
-assert.deepEqual(config.fixtures,scene.fixtures);
+for(const key of Object.keys(scene.fixtures))assert.deepEqual(config.fixtures[key],scene.fixtures[key],`Preserve ${key}`);
+assert.equal(config.exposure_state_frames.length,1);
+assert.equal(config.exposure_substeps,6);
+assert.equal(config.exposure_state_frames[0].t1,.1);
+const alteredLighting=structuredClone(settings.lighting);
+alteredLighting.controls['light-strength-left']=Math.max(0,alteredLighting.controls['light-strength-left']-1);
+const timedRay=await buildStudioAgentProduct({...request,operation:'ray-payload',photo:{resolution:128,seconds:.1,
+  exposureSubsteps:6,exposureIso:200,highlightClipPercent:25,
+  lightTimeline:[{tick:3,lighting:alteredLighting}]}},{assets});
+const timedView=new DataView(timedRay.bytes.buffer,timedRay.bytes.byteOffset,timedRay.bytes.byteLength);
+const timedConfig=JSON.parse(new TextDecoder().decode(timedRay.bytes.slice(16,16+timedView.getUint32(4,true))));
+assert.equal(timedConfig.exposure_state_frames.length,2);
+assert(Math.abs(timedConfig.exposure_state_frames[0].t1-.05)<1e-12);
+assert(Math.abs(timedConfig.exposure_state_frames[1].t0-.05)<1e-12);
+assert.equal(timedConfig.exposure_iso,200);
+assert.equal(timedConfig.highlight_clip_percent,25);
+assert.notDeepEqual(timedConfig.exposure_state_frames[0].pbr,timedConfig.exposure_state_frames[1].pbr);
 assert.equal(config.object_snapshot.geometry_sha256,scene.objectSnapshot.geometry_sha256);
 assert.equal(config.exposure_seconds,.1);assert.equal(config.camera.resolution,128);
 const fieldRay=await buildStudioAgentProduct({...request,operation:'ray-payload',photo:{resolution:128,seconds:.1,maxBounces:1,receiveLightField:true}},{assets});
@@ -49,6 +65,7 @@ for(const controls of [{'light-strength-left':-10},{'floor-material-a':'nonexist
     controls:{...settings.lighting.controls,...controls}}}},{assets}),/Invalid|Unavailable/);
 const out=new URL('build/dot-studio-agent-20261111/',root);await mkdir(out,{recursive:true});
 await writeFile(new URL('ray.mrp1',out),ray.bytes);
+await writeFile(new URL('timed-ray.mrp1',out),timedRay.bytes);
 await writeFile(new URL('request.json',out),original);
 await writeFile(new URL('receipt.json',out),JSON.stringify({ok:true,runtime:'Node',browser:false,dom:false,shader:false,
   subject_triangles:scene.geometry.triangleCount,fixture_triangles:scene.fixtures.material_ids.length,

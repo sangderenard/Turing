@@ -1,6 +1,6 @@
 // Advanced studio flags. One closed solid per gobo gives both renderers an
 // unambiguous nearest front/back surface, rather than two coincident sheets.
-import {defaultStudioGrid,validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces,studioGraphPaperArtwork} from './marble_studio_grid.js';
+import {defaultStudioGrid,validateStudioGrid,studioGridCells,createStudioGridControls,validateStudioArtwork,studioArtworkFaces,studioGraphPaperArtwork,studioExposureTargetArtwork} from './marble_studio_grid.js';
 export const MAX_STUDIO_GOBOS = 8;
 export const GOBO_SEGMENTS = 48;
 // Matches the thin tabletop's scale. Even a 1 mm saved-radius scene retains
@@ -13,6 +13,14 @@ const numeric = {width:[0.2,64], height:[0.2,64], x:[-64,64], y:[-64,64], z:[-64
 export function studioGraphPaperGobo({id=1,unitMm=304.8,center=[0,0,-2.5],yaw=0}={}) {
   if(!Number.isFinite(unitMm)||unitMm<1||unitMm>320)throw Error('A 64 mm reference needs a Studio unit between 1 and 320 mm');
   const {artwork}=studioGraphPaperArtwork();
+  return {id,enabled:true,shape:'rectangle',width:64/unitMm,height:64/unitMm,
+    x:center[0],y:center[1],z:center[2],pitch:0,yaw,roll:0,
+    front:'white_plaster',back:'white_plaster',artwork};
+}
+
+export function studioExposureTargetGobo({id=1,unitMm=304.8,center=[0,0,-2.5],yaw=0}={}) {
+  if(!Number.isFinite(unitMm)||unitMm<1||unitMm>320)throw Error('A 64 mm reference needs a Studio unit between 1 and 320 mm');
+  const {artwork}=studioExposureTargetArtwork();
   return {id,enabled:true,shape:'rectangle',width:64/unitMm,height:64/unitMm,
     x:center[0],y:center[1],z:center[2],pitch:0,yaw,roll:0,
     front:'white_plaster',back:'white_plaster',artwork};
@@ -103,20 +111,23 @@ export function createStudioGoboControls(container, materialNames, onChange=()=>
   const add=el('button','studio-gobo-add','Add gobo');add.type='button';
   const addGrid=el('button','studio-gobo-add-grid','Add fine grid behind marble');addGrid.type='button';
   const addReference=el('button','studio-gobo-add-reference','Add graph-paper reference');addReference.type='button';
+  const addExposure=el('button','studio-gobo-add-exposure','Add exposure reference card');addExposure.type='button';
   const referenceMaterials=['white_plaster','black_matte_paint',...studioGraphPaperArtwork().reference.swatches];
+  const exposureMaterials=[...new Set(studioExposureTargetArtwork().artwork.rectangles.map(row=>row.material))];
   let gridEditors=[];
   const rows=el('div','studio-gobo-rows');
   const status=el('p','studio-gobo-status');status.setAttribute('role','status');
   const help=el('p',null,'Free-standing flags in Studio units. Front is +Z at zero rotation; back is -Z. Angles are degrees around world X (pitch), Y (yaw), then Z (roll). Each panel is 0.12 units thick with its front material on the rim. Materials are independent; opaque flags block light in ray photos/live rays. Phong shows the geometry and materials but does not trace their shadows. Lighting profiles save these rows; saved marble objects stay unchanged.');
-  container.append(add,addGrid,addReference,status,rows,help);
+  container.append(add,addGrid,addReference,addExposure,status,rows,help);
   function updateStatus(message='') {
     add.disabled=state.gobos.length>=MAX_STUDIO_GOBOS || !names.length;
     addGrid.disabled=add.disabled;
     addReference.disabled=add.disabled||!referenceMaterials.every(n=>names.includes(n));
+    addExposure.disabled=add.disabled||!exposureMaterials.every(n=>names.includes(n));
     status.textContent=message || `${state.gobos.length} / ${MAX_STUDIO_GOBOS} gobos. ${state.gobos.length?'Uncheck a row to hide it without losing its settings.':'No gobos in this set.'}`;
   }
   function render() {
-    owned.clear();owned.add(add.id);owned.add(addGrid.id);owned.add(addReference.id);rows.replaceChildren();gridEditors=[];
+    owned.clear();owned.add(add.id);owned.add(addGrid.id);owned.add(addReference.id);owned.add(addExposure.id);rows.replaceChildren();gridEditors=[];
     for (const [index,gobo] of state.gobos.entries()) {
       const prefix=`studio-gobo-${gobo.id}`, row=el('fieldset');row.className='grid studio-gobo-row';
       row.append(el('legend',null,`Gobo ${index+1}`));
@@ -164,7 +175,9 @@ export function createStudioGoboControls(container, materialNames, onChange=()=>
         state=validateStudioGobos(next,names);updateStatus();onChange();
       });
       grid.setState(gobo.grid);gridEditors.push(grid);rows.append(row);
-      if(gobo.artwork)row.append(el('p',null,'Reflective reference surface with real material markings. The graph-paper preset is 64 mm square at creation, with 2 mm squares, 8 mm major lines, material swatches and QR payloads STUDIO;2mm;L and STUDIO;2mm;R. Resizing changes the scale. Rotate the front toward the camera.'));
+      if(gobo.artwork)row.append(el('p',null,gobo.artwork.rectangles[0]?.id.startsWith('exposure-')
+        ? '64 mm reflective exposure card: black centre, neutral 18% grey and white rings, four matte color arms and an outer black ring. It rests behind the subject; no patch emits light.'
+        : 'Reflective reference surface with real material markings. The graph-paper preset is 64 mm square at creation, with 2 mm squares, 8 mm major lines, material swatches and QR payloads STUDIO;2mm;L and STUDIO;2mm;R. Resizing changes the scale. Rotate the front toward the camera.'));
     }
     updateStatus();
   }
@@ -187,6 +200,14 @@ export function createStudioGoboControls(container, materialNames, onChange=()=>
     try {
       const next=Math.max(serial,...state.gobos.map(g=>g.id))+1;
       const gobo=studioGraphPaperGobo({id:next,...options.referencePlacement?.()});
+      state=validateStudioGobos({...state,gobos:[...state.gobos,gobo]},names);serial=next;render();onChange();
+    } catch(error){updateStatus(error.message);}
+  });
+  addExposure.addEventListener('click',()=>{
+    if(addExposure.disabled)return;
+    try {
+      const next=Math.max(serial,...state.gobos.map(g=>g.id))+1;
+      const gobo=studioExposureTargetGobo({id:next,...(options.exposurePlacement?.()??options.referencePlacement?.())});
       state=validateStudioGobos({...state,gobos:[...state.gobos,gobo]},names);serial=next;render();onChange();
     } catch(error){updateStatus(error.message);}
   });

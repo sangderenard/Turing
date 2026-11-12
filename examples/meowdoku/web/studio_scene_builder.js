@@ -20,6 +20,7 @@ import {sceneMaterialEngineContract,validateSceneMaterialEdits} from './marble_s
 import {writeStudioFixtureRows} from './marble_studio_scene.js';
 import {validateStudioLighting} from './marble_studio_lighting.js';
 import {studioLightingFields} from './studio_lighting_fields.js';
+import {RESPONSE_INFORMATION,fixtureResponseLineage} from './marble_response_lineage.js';
 const rgb = value => [1,3,5].map(k => parseInt(value.slice(k,k+2),16)/255);
 
 // The three room fixtures that do NOT track the camera: fixed positions in
@@ -164,7 +165,7 @@ export function snootTube(center, dir, radius, length, materialId, groupId=0, se
 // exported for chess/wordle tiles, assets.meshes) placed at a world
 // position, for marking fixture coordinates directly in the scene instead
 // of guessing from screenshots.
-export function computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase,subjectPosition=[0,0,0],solo=null}) {
+export function computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase,subjectPosition=[0,0,0],solo=null,emissionProfiles=null}) {
   const FIXTURE_MAT_BASE=fixtureMaterialBase,control=id=>lighting.controls[id];
   const keyMagX=Math.abs(+control("light-x")/100), keyY=+control("light-y")/100, keyZ=+control("light-z")/100;
   const keyLeft=[-keyMagX, keyY, keyZ], keyRight=[keyMagX, keyY, keyZ];
@@ -181,6 +182,11 @@ export function computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase,subj
   // filter colour, not a hardcoded role constant.
   const roleColor=[keyFilterLeft,keyFilterRight,bgFilter,kickerLeftFilter,kickerRightFilter,fillLowerFilter,fillUpperFilter,
     rgb(control("table-left-filter")),rgb(control("table-right-filter")),rgb(control("under-filter"))];
+  const filterIds=['key-filter-left','key-filter-right','background-filter','kicker-left-filter',
+    'kicker-right-filter','fill-lower-filter','fill-upper-filter','table-left-filter',
+    'table-right-filter','under-filter'];
+  const bare=emissionProfiles?.records?.find(record=>record.key==='led_cool_white')?.preview_chromaticity;
+  for(let i=0;i<roleColor.length;i++)if(control(`${filterIds[i]}-off`))roleColor[i]=bare??[1,1,1];
   const roleStrength=STUDIO_LIGHTS.map(({id,strengthId})=>solo&&solo!==id?0:Number(control(strengthId))/10);
   const keyShape=control("key-shape"), keyIsHard=keyShape==="grid"||keyShape==="snoot";
   const aimAt=(p)=>{const d=p.map((v)=>-v);const n=Math.max(1e-6,Math.hypot(...d));return d.map((v)=>v/n);};
@@ -346,38 +352,39 @@ export const STUDIO_SCENE_PART_GROUP=Object.freeze({
   fixture:'stage',room:'room',backdrop:'room',backdropHolder:'room',
   table:'stage',gobo:'room',lightStand:'stage',shopLight:'room',
 });
-export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySubject=subject,rayOriginM,shopEmissionProfiles,solo=null,getOpticalRecord}) {
+export function buildStudioPhotoFixtures({lighting,materials,subject,geometrySubject=subject,rayOriginM,shopEmissionProfiles,solo=null,getOpticalRecord,lightFieldInformation,timedExposure=false}) {
   const {ids,pbr:sourcePbr,fixtureMaterialBase:FIXTURE_MAT_BASE}=materials;
   const FIXTURE_HOUSING_MAT=FIXTURE_MAT_BASE+STUDIO_LIGHTS.length;
-  const {fixtureRoles,roleColor,roleStrength}=computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase:FIXTURE_MAT_BASE,subjectPosition:subject.subjectCenter,solo});
+  const {fixtureRoles,roleColor,roleStrength}=computeStudioFixtureRoles({lighting,ids,fixtureMaterialBase:FIXTURE_MAT_BASE,subjectPosition:subject.subjectCenter,solo,emissionProfiles:shopEmissionProfiles});
   const geometry=createStudioSceneGeometry({lighting,materials,subject,geometrySubject});
   const parts=[];
-  const collect=(group,prefix,builder)=>{
-    const captured=[];const faces=builder(part=>captured.push({...part,group,label:`${prefix} ${part.id}`}));
+  const collect=(group,prefix,builder,sourcePrefix)=>{
+    const captured=[];const faces=builder(part=>captured.push({...part,group,label:`${prefix} ${part.id}`,
+      ...(lightFieldInformation===RESPONSE_INFORMATION?{responseSourceId:`${sourcePrefix}/${part.id}`}:{})}));
     if(captured.reduce((n,p)=>n+p.faces.length,0)!==faces.length)
       throw new Error(`${prefix}: generated scene parts do not cover the actual triangles.`);
     parts.push(...captured);return faces;
   };
-  collect(STUDIO_SCENE_PART_GROUP.fixture,'Light fixture',cb=>buildStudioFixtureFaces(fixtureRoles,FIXTURE_HOUSING_MAT,cb,ids));
-  collect(STUDIO_SCENE_PART_GROUP.room,'Room',cb=>geometry.roomFaces(cb));
-  collect(STUDIO_SCENE_PART_GROUP.backdrop,'Backdrop',cb=>geometry.backdropRollFaces(cb));
-  collect(STUDIO_SCENE_PART_GROUP.backdropHolder,'Backdrop holder',cb=>geometry.backdropHolderFaces(cb));
-  collect(STUDIO_SCENE_PART_GROUP.table,'Table',cb=>geometry.tableFaces(cb));
-  collect(STUDIO_SCENE_PART_GROUP.gobo,'Gobo',cb=>geometry.goboFaces(cb));
-  collect(STUDIO_SCENE_PART_GROUP.lightStand,'Light stand',cb=>geometry.lightStandFaces(fixtureRoles,cb));
-  collect(STUDIO_SCENE_PART_GROUP.shopLight,'Shop light',cb=>geometry.shopLightFaces(cb));
-  return packStudioPhotoParts({parts,materials,subject,rayOriginM,lighting,roleColor,roleStrength,shopEmissionProfiles,getOpticalRecord});
+  collect(STUDIO_SCENE_PART_GROUP.fixture,'Light fixture',cb=>buildStudioFixtureFaces(fixtureRoles,FIXTURE_HOUSING_MAT,cb,ids),'fixture');
+  collect(STUDIO_SCENE_PART_GROUP.room,'Room',cb=>geometry.roomFaces(cb),'room');
+  collect(STUDIO_SCENE_PART_GROUP.backdrop,'Backdrop',cb=>geometry.backdropRollFaces(cb),'backdrop');
+  collect(STUDIO_SCENE_PART_GROUP.backdropHolder,'Backdrop holder',cb=>geometry.backdropHolderFaces(cb),'backdrop-holder');
+  collect(STUDIO_SCENE_PART_GROUP.table,'Table',cb=>geometry.tableFaces(cb),'table');
+  collect(STUDIO_SCENE_PART_GROUP.gobo,'Gobo',cb=>geometry.goboFaces(cb),'gobo');
+  collect(STUDIO_SCENE_PART_GROUP.lightStand,'Light stand',cb=>geometry.lightStandFaces(fixtureRoles,cb),'stand');
+  collect(STUDIO_SCENE_PART_GROUP.shopLight,'Shop light',cb=>geometry.shopLightFaces(cb),'shop');
+  return packStudioPhotoParts({parts,materials,subject,rayOriginM,lighting,roleColor,roleStrength,shopEmissionProfiles,getOpticalRecord,lightFieldInformation,timedExposure});
 }
 
 // Compact the actual authored parts. This is also the narrow packing seam for
 // CPU tests of individual scene owners; geometry remains owned by the builders.
-export function packStudioPhotoParts({parts,materials,subject,rayOriginM,lighting,roleColor,roleStrength,shopEmissionProfiles,getOpticalRecord}) {
+export function packStudioPhotoParts({parts,materials,subject,rayOriginM,lighting,roleColor,roleStrength,shopEmissionProfiles,getOpticalRecord,lightFieldInformation,timedExposure=false}) {
   const {pbr:sourcePbr,fixtureMaterialBase:FIXTURE_MAT_BASE}=materials;
   // Use the canonical buffer and the same per-light emission writer as Phong.
   // The compact upload only rekeys IDs. It never invents another material row.
   const stride=sourcePbr.stride,data=new Float32Array(sourcePbr.data);
   writeStudioFixtureRows(data,stride,FIXTURE_MAT_BASE,roleColor,roleStrength);
-  writeShopLightEmitterRows(data,stride,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,lighting.shopLights,{channel:"exposure",profiles:shopEmissionProfiles});
+  writeShopLightEmitterRows(data,stride,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,lighting.shopLights,{channel:"exposure",profiles:shopEmissionProfiles,timedExposure});
   const used=[...new Set([...Array.from({length:STUDIO_LIGHTS.length+1},(_,i)=>FIXTURE_MAT_BASE+i),
     ...parts.flatMap(p=>p.faces.map(f=>f[3]))])];
   const materialIndex=new Map(used.map((id,i)=>[id,i]));
@@ -389,7 +396,37 @@ export function packStudioPhotoParts({parts,materials,subject,rayOriginM,lightin
   const material_engines=sceneMaterialEngineContract({engines:lighting.sceneEngines,
     parts,materialIndex,pbr:{data,stride},getOpticalRecord});
   const emitter_profiles=shopLightEmissionRecords(lighting.shopLights,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS,materialIndex,shopEmissionProfiles);
-  return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles};
+  const baseProfile=(shopEmissionProfiles?.records??[]).find(row=>row.key==='led_cool_white');
+  if(!baseProfile)throw Error('The base Studio emitter material profile is unavailable');
+  const filterIds=['key-filter-left','key-filter-right','background-filter','kicker-left-filter',
+    'kicker-right-filter','fill-lower-filter','fill-upper-filter','table-left-filter',
+    'table-right-filter','under-filter'];
+  for(let i=0;i<STUDIO_LIGHTS.length;i++){
+    const material=materialIndex.get(FIXTURE_MAT_BASE+i);
+    if(material===undefined)continue;
+    const filterId=filterIds[i];
+    emitter_profiles.records.push({material,profile:baseProfile.key,revision:baseProfile.revision,
+      gain:roleStrength[i],filter:lighting.controls[`${filterId}-off`]?null:roleColor[i]});
+  }
+  const markerProfile=(shopEmissionProfiles?.records??[]).find(row=>row.key==='studio_calibration_nir850');
+  for(const [name,id]of Object.entries(materials.ids))if(name.endsWith('__nir850')){
+    const material=materialIndex.get(id);
+    if(material===undefined)continue;
+    if(!markerProfile)throw Error('The native 850 nm calibration profile is unavailable');
+    emitter_profiles.records.push({material,profile:markerProfile.key,revision:markerProfile.revision,
+      gain:1,filter:[1,1,1]});
+  }
+  const shopRows=timedExposure?shopLightEmitterAllocations(lighting.shopLights,FIXTURE_MAT_BASE+STUDIO_FIXED_MATERIAL_ROWS):[];
+  const shop_material_ids=shopRows.map(row=>materialIndex.get(row.materialId)).filter(id=>id!==undefined);
+  const trigger_emitters=shopRows.flatMap(row=>{
+    const fixture=lighting.shopLights?.fixtures?.find(value=>value.id===row.fixtureId);
+    const material=materialIndex.get(row.materialId);
+    return fixture?.enabled&&fixture.exposureMode==='burst'&&material!==undefined?
+      [{material,receiver:`shop:${material}`,gain:fixture.sourceLevel*fixture.dimmer}]:[];
+  });
+  const response_lineage=lightFieldInformation===RESPONSE_INFORMATION?fixtureResponseLineage(parts):null;
+  return {vertices,material_ids:materialIds,pbr,material_engines,emitter_profiles,
+    ...(timedExposure?{shop_material_ids,trigger_emitters}:{}),...(response_lineage?{response_lineage}:{})};
 }
 export function initializeStudioFixtureRows(data,pbrStride,FIXTURE_MAT_BASE) {
     const base=(slot)=>(FIXTURE_MAT_BASE+slot)*pbrStride;
@@ -441,7 +478,7 @@ export function studioSceneMaterials(assets,objectSnapshot,lighting) {
  * camera and rayOriginM come from the existing photographic camera owner.
  * Object hashing/preparation and photo packing/submission remain caller-owned.
  */
-export function buildStudioScene({lighting,objectSnapshot,materials,camera,rayOriginM,shopEmissionProfiles,solo=null}) {
+export function buildStudioScene({lighting,objectSnapshot,materials,camera,rayOriginM,shopEmissionProfiles,solo=null,timedExposure=false}) {
   if(lighting?.version!==1||!lighting.controls||!lighting.poses||!lighting.table||!lighting.scale||!lighting.shopLights)
     throw new TypeError('A complete resolved Studio lighting profile is required.');
   if(!objectSnapshot?.geometry_sha256)throw new TypeError('A prepared object snapshot is required.');
@@ -461,6 +498,6 @@ export function buildStudioScene({lighting,objectSnapshot,materials,camera,rayOr
   lighting=validateStudioLighting(lighting,studioLightingFields(names),names);
   const subject=studioScaleTransform(lighting.scale,Number(objectSnapshot.physical['radius-mm']),lighting.table.enabled);
   const records=new Map((lighting.materialEdits?.materials??[]).filter(m=>m.optical).map(m=>[materials.ids[m.name],m.optical]));
-  const fixtures=buildStudioPhotoFixtures({lighting,materials,subject,rayOriginM,shopEmissionProfiles,solo,getOpticalRecord:id=>records.get(id)});
+  const fixtures=buildStudioPhotoFixtures({lighting,materials,subject,rayOriginM,shopEmissionProfiles,solo,timedExposure,getOpticalRecord:id=>records.get(id)});
   return {fixtures,object_center_m:rayOriginM.map((v,i)=>v+subject.subjectCenter[i]*subject.unitM),camera:structuredClone(camera),objectSnapshot};
 }

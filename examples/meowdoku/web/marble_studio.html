@@ -104,19 +104,19 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <div id="studio-scale-controls" class="wide grid"></div>
     <p class="wide">A (exposure) owns these lights and room settings. B (room) follows A unless a setting is unlocked for Phong only. Filters start white; zero strength switches a light off.</p>
     <label>Key Left strength <output id="light-strength-left-out"></output><input id="light-strength-left" type="range" min="0" max="4000" value="220"></label>
-    <label>Key Left filter<input id="key-filter-left" type="color" value="#ffffff"></label>
+    <label>Key Left filter<input id="key-filter-left" type="color" value="#ffffff"></label><label><input id="key-filter-left-off" type="checkbox"> Filter off</label>
     <label>Key Right strength <output id="light-strength-right-out"></output><input id="light-strength-right" type="range" min="0" max="4000" value="0"></label>
-    <label>Key Right filter<input id="key-filter-right" type="color" value="#ffffff"></label>
+    <label>Key Right filter<input id="key-filter-right" type="color" value="#ffffff"></label><label><input id="key-filter-right-off" type="checkbox"> Filter off</label>
     <label>Background strength <output id="light-bg-strength-out"></output><input id="light-bg-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Background filter<input id="background-filter" type="color" value="#ffffff"></label>
+    <label>Background filter<input id="background-filter" type="color" value="#ffffff"></label><label><input id="background-filter-off" type="checkbox"> Filter off</label>
     <label>Kicker Left strength <output id="light-kicker-left-strength-out"></output><input id="light-kicker-left-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Kicker Left filter<input id="kicker-left-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Left filter<input id="kicker-left-filter" type="color" value="#ffffff"></label><label><input id="kicker-left-filter-off" type="checkbox"> Filter off</label>
     <label>Kicker Right strength <output id="light-kicker-right-strength-out"></output><input id="light-kicker-right-strength" type="range" min="0" max="2000" value="15"></label>
-    <label>Kicker Right filter<input id="kicker-right-filter" type="color" value="#ffffff"></label>
+    <label>Kicker Right filter<input id="kicker-right-filter" type="color" value="#ffffff"></label><label><input id="kicker-right-filter-off" type="checkbox"> Filter off</label>
     <label>Fill Lower strength <output id="light-fill-lower-strength-out"></output><input id="light-fill-lower-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Fill Lower filter<input id="fill-lower-filter" type="color" value="#ffffff"></label>
+    <label>Fill Lower filter<input id="fill-lower-filter" type="color" value="#ffffff"></label><label><input id="fill-lower-filter-off" type="checkbox"> Filter off</label>
     <label>Fill Upper strength <output id="light-fill-upper-strength-out"></output><input id="light-fill-upper-strength" type="range" min="0" max="2000" value="0"></label>
-    <label>Fill Upper filter<input id="fill-upper-filter" type="color" value="#ffffff"></label>
+    <label>Fill Upper filter<input id="fill-upper-filter" type="color" value="#ffffff"></label><label><input id="fill-upper-filter-off" type="checkbox"> Filter off</label>
     <label>Left key angle (degrees)<input id="key-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left key radial distance (Studio units)<input id="key-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-left-placement-status" class="wide" role="status"></output>
     <label>Right key angle (degrees)<input id="key-right-arc" type="number" min="-180" max="180" step="0.1"></label><label>Right key radial distance (Studio units)<input id="key-right-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="key-right-placement-status" class="wide" role="status"></output>
     <label>Left kicker angle (degrees)<input id="kicker-left-arc" type="number" min="-180" max="180" step="0.1"></label><label>Left kicker radial distance (Studio units)<input id="kicker-left-radius" type="number" min="0" max="70.71" step="0.01"></label><output id="kicker-left-placement-status" class="wide" role="status"></output>
@@ -127,13 +127,13 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output id="background-placement-status" class="wide" role="status"></output><p class="wide">Kicker inset sets the base radius from the straight subject-back wall line, then its angle sweeps that radius around the subject. Background inset is its distance in front of the back wall. Changing room size updates these readouts without moving saved lights.</p>
     <p class="wide">Key angle zero is the camera-side +Z line; kicker zero is the subject-back −Z line. Positive angles sweep toward each light’s own side; 45° is diagonal and 180° reaches the opposite/front line. Radius is distance from the subject axis. New rigs are fitted near their respective room walls; these views edit saved absolute poses, not automatic wall-following.</p>
     <label>Table stage left strength <output id="light-table-left-strength-out"></output><input id="light-table-left-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Table stage left filter<input id="table-left-filter" type="color" value="#ffffff"></label>
+    <label>Table stage left filter<input id="table-left-filter" type="color" value="#ffffff"></label><label><input id="table-left-filter-off" type="checkbox"> Filter off</label>
     <label>Stage left arc (degrees)<input id="table-left-arc" type="number" min="-180" max="180" step="0.1" value="-86.906" aria-describedby="stage-placement-help table-left-placement-status"></label>
     <label>Stage left elevation (degrees)<input id="table-left-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
     <label>Stage left radius (Studio units)<input id="table-left-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-left-placement-status"></label>
     <output class="wide" id="table-left-placement-status" role="status"></output>
     <label>Table stage right strength <output id="light-table-right-strength-out"></output><input id="light-table-right-strength" type="range" min="0" max="2000" value="60"></label>
-    <label>Table stage right filter<input id="table-right-filter" type="color" value="#ffffff"></label>
+    <label>Table stage right filter<input id="table-right-filter" type="color" value="#ffffff"></label><label><input id="table-right-filter-off" type="checkbox"> Filter off</label>
     <label>Stage right arc (degrees)<input id="table-right-arc" type="number" min="-180" max="180" step="0.1" value="86.906" aria-describedby="stage-placement-help table-right-placement-status"></label>
     <label>Stage right elevation (degrees)<input id="table-right-elevation" type="number" min="-90" max="90" step="0.1" value="0"></label>
     <label>Stage right radius (Studio units)<input id="table-right-radius" type="number" min="0" max="70.71067811865476" step="0.01" value="1.8527" aria-describedby="stage-placement-help table-right-placement-status"></label>
@@ -159,7 +159,7 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output class="wide" id="top-fill-height-status" role="status"></output>
     </fieldset>
     <label>Gridded underlight strength <output id="light-under-strength-out"></output><input id="light-under-strength" type="range" min="0" max="2000" value="15"></label>
-    <label>Gridded underlight filter<input id="under-filter" type="color" value="#ffffff"></label>
+    <label>Gridded underlight filter<input id="under-filter" type="color" value="#ffffff"></label><label><input id="under-filter-off" type="checkbox"> Filter off</label>
     <label class="wide">Underlight height (Studio Y)<input id="underlight-height" type="number" min="-50" max="50" step="0.01" value="-1.60" aria-describedby="underlight-height-help underlight-height-status"></label>
     <p class="wide" id="underlight-height-help">More negative lowers the light. The table top is at Y = -1.00; the fresh underlight default is -1.60. This is the same Y position available in Advanced, saved with the lighting profile.</p>
     <output class="wide" id="underlight-height-status" role="status"></output>
@@ -212,9 +212,15 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output id="object-status" class="wide" role="status">Saved designs are shared with the particle simulator.</output>
   </div>
   <h2>Colour calibration</h2><div class="grid" id="calibration-controls">
+    <button id="calibration-exposure-preset" type="button" class="wide">Set up 500 mock lux exposure calibration</button>
+    <p class="wide">Adds a 64 mm reflective black, 18% grey and white ring card with a matte color cross behind the marble. The static sweep captures the main RGB view and a monochrome thin-lens meter pose beside the subject. Mock lux is a declared Studio scale at the card, not a measured lamp output. The log image presents unchanged linear sensor data; fitted curves remain candidates until verified. Dynamic scenes need paired readings at each timeline slice.</p>
     <label class="wide">Calibration recipe (YAML)<input id="calibration-yaml-upload" type="file" accept=".yaml,.yml,text/yaml"></label>
     <button id="calibration-run" disabled>Run calibration</button>
+    <button id="calibration-watch" type="button" disabled>Watch accumulating calibration</button>
+    <button id="calibration-watch-stop" type="button" disabled>Stop watcher</button>
+    <p class="wide">The watcher registers the chart once, then keeps one static Studio scene accumulating in disjoint RGB and monochrome sensor lanes. Each sensor gets a separate static viewer page; sparse linear chart readings update its response curve on each published slice. The secondary Phong field is optional. Timed captions are view-only and never enter the captured scene.</p>
     <output id="calibration-status" class="wide" role="status">Upload a calibration YAML to run an automatic single-light colour sweep.</output>
+    <div id="calibration-watch-view" class="wide" hidden></div>
     <div id="calibration-gallery" class="wide" hidden></div>
     <button id="calibration-download" class="wide" hidden>Download calibration dataset (JSON)</button>
     <p class="wide">Every case zeroes all ten fixtures and links their Studio/exposure levels, then lights exactly one at its declared colour and strength, captures the live Phong preview, exposes the identical rig through the Spectral ray tracer, and compares both against the colour that was actually asked for -- fully automatic once a recipe is uploaded, no manual slider changes.</p>
@@ -231,6 +237,7 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <label class="wide"><input type="checkbox" id="ray-surface-transport"> Corrected opaque PBR transport for ray photos and Live</label>
     <p class="wide">Uses the corrected diffuse/specular mixture for opaque PBR surfaces. Glass and native conductors keep their existing transport. Changing this setting starts a new Live job; it does not change lights or exposure.</p>
     <label class="wide"><input type="checkbox" id="phong-light-field"> Receive the ray tracer's directional field bundle</label>
+    <label class="wide"><input type="checkbox" id="phong-field-responses"> Copy evaluated native responses into the scene field (required for secondary material passes; extra recording, opt-in)</label>
     <label>Direction stencil <select id="phong-field-stencil"><option value="6">6 axis directions</option><option value="12" selected>12 geodesic directions</option></select></label>
     <label>Recording region <select id="phong-field-region"><option value="scene" selected>Whole scene</option><option value="subject">Bounded subject</option></select></label>
     <label>Subject cell size (mm)<input type="number" id="phong-field-cell-mm" value="0.5" min="0.05" max="10" step="0.05" disabled></label>
@@ -248,10 +255,10 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <p class="wide">The 64 grid has eight times as many spatial cells as 32. New fields average full-coverage pump estimates after correcting each root's replay count; partial-coverage pumps are excluded. Legacy fields remain readable and are labelled unnormalized. This normalization does not remove three-band spectral color limitations.</p>
     <label class="wide"><input type="checkbox" id="phong-field-spatial-linear" checked> Energy-weighted spatial reconstruction (where supported)</label>
     <label class="wide"><input type="checkbox" id="phong-field-secondary" checked> Secondary material passes: volumetric, reflectance, glass</label>
-    <label class="wide"><input type="checkbox" id="phong-field-specular"> Use primary Phong specular instead of field specular</label>
+    <label class="wide"><input type="checkbox" id="phong-field-specular" disabled> Separate Phong specular override (native downstream response is not split for this option)</label>
     <output class="wide" id="phong-light-field-status" role="status">Off. Opt in before starting an RGB still or Live job.</output>
-    <output class="wide" id="phong-secondary-status" role="status">Three material passes run in the same frame after primary opaque visibility, followed by one display conversion. Sorted glass layers are retained.</output>
-    <p class="wide">Uses actual traced energy and propagation vectors in 12 geodesic directions by default, or 6 axis directions for comparison, plus material metadata. Twelve directions double the directional payload and sampling work. Spatial reconstruction interpolates energy-weighted moments where float filtering is supported; otherwise nearest sampling is reported above. Volumetric means the material's thickness, translucence and re-emission response, not invented atmospheric fog. This coarse field is not a lossless scene reflection or a replacement for the photograph. Fresh-population Live integrates successive source populations; older live fields replace each sweep. Still exposures accumulate their field. Older scalar fields retain glow only. Use the static, unrolled pose with Room B linked to Exposure A. Scene, stencil and camera edits hide old data.</p>
+    <output class="wide" id="phong-secondary-status" role="status">Secondary application requires matching, application-ready native responses. Typed-only data leaves ordinary Phong visible.</output>
+    <p class="wide">The response option retains native camera, forward, reactive and volume data with their original meanings and scene identities. Directional energy and scalar deposits are not treated as completed material radiance. The three material pass slots and sorted glass layers are retained, but no pass replaces Phong without a matching evaluated response and sampling availability. Missing, discarded or unsupported data means no information, not black. Legacy scalar mode is a separate glow preview, not completed secondary material shading. Use the static, unrolled pose with Room B linked to Exposure A. Scene and camera edits reject stale data.</p>
   </div>
   <h2>Live ray-traced camera</h2><div class="grid" id="live-ray-controls">
     <label>Live display <select id="live-display-mode"><option value="overlay" selected>Ray-traced image overlay</option><option value="field-feed">Phong with continuous light-field feed (no ray overlay)</option></select></label>
@@ -296,7 +303,7 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
     <output class="wide" id="live-client-status" role="status"></output><div class="wide" id="live-client-participation"></div>
     <label class="wide"><input id="photo-client-intersections" type="checkbox"> Use this device for this exposure’s triangle intersections (experimental)</label>
     <div id="photo-client-participation" class="wide"></div>
-    <details class="wide" open><summary>My jobs</summary><section id="marble-jobs"></section></details>
+    <details class="wide" open><summary>My assets and render jobs</summary><p>Finished stills and orbit animations from Studio, REST and MCP appear here for your signed-in account. Loading screen recordings have their own <a href="studio.html">Loading Studio</a>.</p><section id="marble-jobs" data-preview="true"></section></details>
   </div></section>
   <h2>Thin-lens photograph</h2><div class="grid" id="photo-controls">
     <strong class="wide">Exposure geometry · photos and live rays</strong>
@@ -323,14 +330,20 @@ label:has(input:disabled){opacity:.45} input:disabled{cursor:not-allowed}
       <p class="wide">These controls reuse the existing component-built shader. Focal length changes field of view; scrolling still moves the camera. Prime profiles have fixed focal length. Changes leave an active photograph unchanged.</p>
     </div></details>
     <label>Photo camera<select id="photo-camera"><option value="builtin" selected>Built-in close-up</option><option value="studio">Current Studio orbit and zoom</option></select></label>
+    <label>Camera pattern<select id="photo-camera-pattern"><option value="single" selected>One sensor</option><option value="geodesic-faces">Icosahedron · 20 face-center sensors</option></select></label>
+    <label><input id="photo-camera-visible" type="checkbox" checked> Show camera housing in exposure</label>
     <label>Photo resolution<select id="photo-resolution"><option value="128">128 × 128</option><option value="256">256 × 256</option><option value="512" selected>512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option><option value="8192">8192 × 8192 (tiled)</option><option value="16384">16384 × 16384 (tiled)</option><option value="32768">32768 × 32768 (tiled)</option><option value="custom">Custom size (tiled)</option></select></label>
-    <label>Light transport<select id="photo-transport"><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
+    <label>Light transport<select id="photo-transport"><option value="fixed:8">Eight bands · 365, 395, 450, 550, 590, 650, 850, 940 nm</option><option value="fixed:3" selected>RGB · three spectral layers</option><option value="fixed:1">Monochrome · one spectral layer</option></select></label>
     <label>Oversampling<select id="photo-oversampling"><option value="1">1×</option><option value="2">2× each dimension</option><option value="3">3× each dimension</option><option value="4">4× each dimension</option></select></label>
     <label>Tile size<select id="photo-tile-size"><option value="auto">Automatic (1024)</option><option value="512">512 × 512</option><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option><option value="4096">4096 × 4096</option></select></label>
     <label>Custom width<input id="photo-width" type="number" min="128" max="32768" step="1" value="8192"></label>
     <label>Custom height<input id="photo-height" type="number" min="128" max="32768" step="1" value="8192"></label>
     <p class="hint">Custom, large, or oversampled sizes automatically use server tiles. Automatic tile size is 1024 pixels; choose another size above to override it. Oversampling multiplies both dimensions, then averages linear HDR samples to the requested output size. Internal dimensions are limited to 32768. Use RGB, one frame, and turn off device intersections. Exposure time applies to each tile; preparation and a complete sample pass can take longer. Large outputs require disk space. Tiled HDR retouch is download-only.</p>
     <label>Exposure per frame / tile<select id="photo-seconds"><option value="0.1">0.1 second</option><option value="0.25">0.25 second</option><option value="0.5">0.5 second</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="180">3 minutes</option><option value="600">10 minutes</option><option value="1200">20 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option></select></label>
+    <label>Exposure substeps<input id="photo-substeps" type="number" min="1" max="216000" step="1" value="1800" aria-describedby="photo-substeps-help"></label>
+    <p id="photo-substeps-help" class="wide">One completed Studio tick advances one exposure substep. Model dt is shutter duration divided by substeps; at most 0.1 s per tick. Slow rendering slows the exposure clock. The photo job integrates the same number of sensor sweeps.</p>
+    <label>Simulated ISO<input id="photo-iso" type="number" min="25" max="6400" step="25" value="100"></label>
+    <label>Linear highlight clip, brightest pixels (%)<input id="photo-highlight-clip" type="number" min="0" max="25" step="1" value="25"></label>
     <label>Orbit frames<select id="photo-orbit-frames"><option value="1" selected>Still photo</option><option value="8">8 frames · full turn</option><option value="16">16 frames · full turn</option><option value="32">32 frames · full turn</option></select></label>
     <label>Display gamma <output id="photo-gamma-out">1.00</output><input id="photo-gamma" type="range" min="20" max="500" step="5" value="100"></label>
     <label>Bounce depth<select id="photo-bounce-mode"><option value="auto" selected>Auto (render cap 200)</option><option value="manual">Manual</option></select></label>

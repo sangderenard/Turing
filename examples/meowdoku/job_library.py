@@ -53,6 +53,13 @@ def allowed(directory,digest,owners,*,allow_legacy=True):
     return allow_legacy if row is None else bool(set(json.loads(row[0])).intersection(owners))
 
 
+def owner_keys(directory, digest):
+    """Return the first authenticated identity recorded at admission."""
+    with connect(directory) as db:
+        row = db.execute('SELECT owners FROM job_owners WHERE digest=?', (digest,)).fetchone()
+    return json.loads(row[0]) if row else []
+
+
 def collation_manifest(digest, config, *, tile_contract=None):
     """Describe the existing worker's children, never schedule independent jobs.
 
@@ -110,7 +117,7 @@ def _artifact(directory, name, kind):
 
 def _collation(jobs, digest, config, status):
     """Project actual worker receipts onto immutable parent/child membership."""
-    directory = jobs.directory / digest
+    directory = jobs.job_directory(digest) if hasattr(jobs, 'job_directory') else jobs.directory / digest
     contract = None
     if 'tiled' in config:
         from .marble_photo import _tile_contract
@@ -193,7 +200,7 @@ def entries(jobs,owners,account_digests=()):
     with jobs.lock:
         for digest,created in sorted(selected.items(),key=lambda item:item[1],reverse=True)[:256]:
             if not __import__('re').fullmatch('[a-f0-9]{64}',digest):continue
-            directory=jobs.directory/digest
+            directory=jobs.job_directory(digest) if hasattr(jobs, 'job_directory') else jobs.directory/digest
             try:
                 config=json.loads((directory/'config.json').read_text())
                 status=json.loads((directory/'status.json').read_text())
@@ -203,7 +210,7 @@ def entries(jobs,owners,account_digests=()):
                 elif status.get('state') not in ('complete','error','canceled'):
                     status={**status,'state':'interrupted','error':'Worker is no longer owned by this server; no automatic restart.'}
                 # Explicit UI fields only; never expose payload paths or owner keys.
-                entry={k:status[k] for k in ('state','image','error','frames','hdr','exposure_seconds','geometry_stats','client_work_profile','client_work_state') if k in status}
+                entry={k:status[k] for k in ('state','image','retouched_image','animation','animation_expires_at','error','frames','hdr','exposure_seconds','geometry_stats','client_work_profile','client_work_state') if k in status}
                 try:
                     collation = _collation(jobs, digest, config, status)
                     if collation is not None:

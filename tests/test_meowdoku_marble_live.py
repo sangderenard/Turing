@@ -57,7 +57,8 @@ def fake_jobs(tmp_path, *, live=True):
     settings=live_settings({},camera)
     (directory/"config.json").write_text(json.dumps({"live":settings} if live else {}))
     (directory/"live-control.json").write_text(json.dumps({"camera":camera,"live":settings,"revision":0,"expires_at":0}))
-    return SimpleNamespace(directory=tmp_path,lock=threading.Lock(),active_digest=digest,
+    return SimpleNamespace(directory=tmp_path,job_directory=lambda key: tmp_path/key,
+        lock=threading.Lock(),active_digest=digest,
         process=SimpleNamespace(poll=lambda:None),_status_locked=lambda digest:{}),digest,directory
 
 

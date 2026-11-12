@@ -149,6 +149,7 @@ export function createLiveRayView({doc=document, canvas, getGeometry, getScene, 
         const emitterSampling=liveEmitterSampling(doc);
         const body=packMarblePhoto(getGeometry(),state.objectDigest,{...getScene(),camera:{...pose,resolution:+resolution.value},
           resolution:+resolution.value,seconds:3600,transport:"fixed:3",orbitFrames:1,live,clientIntersections,receiveLightField:!!fieldTicket,
+          ...(fieldTicket?.information?{lightFieldInformation:fieldTicket.information}:{}),
           ...(fieldTicket?{lightFieldStencil:fieldTicket.stencil,lightFieldGridSize:fieldTicket.gridSize}:{}),...geometryPolicy,
           ...(fieldTicket?.region==='subject'?{lightFieldRegion:'subject',lightFieldCellSizeM:fieldTicket.cellSizeM,lightFieldMarginM:fieldTicket.marginM}:{}),
           ...(emitterSampling?{emitterSampling}:{}),

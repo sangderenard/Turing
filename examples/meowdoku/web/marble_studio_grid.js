@@ -72,6 +72,39 @@ export function studioGraphPaperArtwork() {
     qrPayloads:payloads,quietModules:4,swatches,role:'reflective-reference-card'}};
 }
 
+// A reflective 64 mm exposure reference. Material changes are on the same
+// authored surface that the existing Phong and ray scene builders consume.
+// The grid approximates rings without overlapping coplanar artwork faces.
+export function studioExposureTargetArtwork() {
+  const axis=33,rectangles=[];
+  // The invisible NIR QR spans the complete visible chart. Each cell is one
+  // surface with its ordinary paint; dark QR modules select an otherwise
+  // identical native spectral-emitter variant of that paint.
+  const qr=qrWallLayout(qrMatrix('STUDIO-EXPOSURE-v1'));
+  if(qr.total!==33)throw Error('Exposure target QR layout changed');
+  const swatches={right:'reference_red_matte',left:'reference_green_matte',
+    top:'reference_blue_matte',bottom:'reference_yellow_matte'};
+  for(let row=0;row<axis;row++)for(let col=0;col<axis;col++){
+    const x=(col+.5)/axis-.5,y=.5-(row+.5)/axis,r=Math.hypot(x,y);
+    let material='white_plaster';
+    if(r<.11)material='black_matte_paint';
+    else if(r<.23)material='reference_gray18_matte';
+    else if(r<.34)material='white_plaster';
+    else if(r>=.42&&r<.49)material='black_matte_paint';
+    if(Math.abs(y)<.047&&x>.34&&x<.42)material=swatches.right;
+    if(Math.abs(y)<.047&&x<-.34&&x>-.42)material=swatches.left;
+    if(Math.abs(x)<.047&&y>.34&&y<.42)material=swatches.top;
+    if(Math.abs(x)<.047&&y<-.34&&y>-.42)material=swatches.bottom;
+    if(qr.cells[row*axis+col].dark)material+='__nir850';
+    rectangles.push({id:`exposure-r${row}-c${col}`,x,y,width:1/axis,height:1/axis,material});
+  }
+  return {artwork:{version:1,rectangles},reference:{role:'reflective-exposure-target',
+    widthMm:64,heightMm:64,axis,neutralReflectance:{black:.025,gray:.18,white:.90},
+    rings:[.11,.23,.34,.42,.49],swatches,
+    qr:{payload:'STUDIO-EXPOSURE-v1',bounds:[-.5,-.5,.5,.5],modules:qr.total,
+      channel:'nir850',encoding:'emissive-native-profile'}}};
+}
+
 export function defaultStudioGrid() {
   // 16² closed cells leave room for the default rig inside the existing MRP1
   // 2 MiB config bound; denser authored grids still face that global bound.

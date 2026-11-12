@@ -46,7 +46,7 @@ def test_job_owns_snapshot_without_library_entry(photo_payload, tmp_path, monkey
     snapshot = _saved_object(vertices, normals, ids)
     jobs = photos.PhotoJobs(tmp_path / "photos", tmp_path / "spectral")
     result = jobs.start(_wire(None, vertices, normals, ids, object_snapshot=snapshot), NoLibrary())
-    config = json.loads((jobs.directory / result["digest"] / "config.json").read_text())
+    config = json.loads((jobs.job_directory(result["digest"]) / "config.json").read_text())
     assert config["exposure_snapshot"] == snapshot
     assert config["object_digest"] == objects.source_digest(snapshot)
     assert not (tmp_path / "photos" / "objects").exists()

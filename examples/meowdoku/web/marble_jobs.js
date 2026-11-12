@@ -38,6 +38,12 @@ export function mountJobs(root, {doc = document, fetcher = (...args) => globalTh
     }
     const hdr = jobFileUrl(job,'hdr');
     if (hdr) { const link = el('a','Download linear HDR'); link.href = hdr; link.style.marginLeft = '1em'; detail.append(link); }
+    if (job.animation === 'orbit.avi' && /^[a-f0-9]{64}$/.test(job.digest || '')) {
+      const animation = el('a','View orbit animation');
+      animation.href = `/api/marble_photo/animation?digest=${job.digest}`;
+      animation.target = '_blank'; animation.rel = 'noopener'; animation.style.marginLeft = '1em';
+      detail.append(animation);
+    }
     if (job.collation) {
       const collection = job.collation;
       const group = el('details');

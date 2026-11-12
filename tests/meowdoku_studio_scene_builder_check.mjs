@@ -10,6 +10,7 @@ import {studioScaleTransform} from '../examples/meowdoku/web/marble_studio_scale
 import {defaultLightingRacks} from '../examples/meowdoku/web/marble_lighting_racks.js';
 import {STUDIO_LIGHTING_FIELDS,studioLightingFields} from '../examples/meowdoku/web/studio_lighting_fields.js';
 import {LIGHTING_PROFILE_FIELDS} from '../examples/meowdoku/web/marble_studio_lighting.js';
+import {tagPartResponseFaces} from '../examples/meowdoku/web/marble_response_lineage.js';
 
 assert.equal(typeof document,'undefined');assert.equal(typeof window,'undefined');
 const fixture=JSON.parse(fs.readFileSync(new URL('./fixtures/studio_scene_builder_authoring.json',import.meta.url),'utf8'));
@@ -101,8 +102,22 @@ for(const [name,lighting,solo]of cases) {
   const camera=photoCameraFromStudio(-.5,.2,3.45,subject.unitM,subject.fovDegrees,subject.subjectCenter).camera;
   const options={lighting,materials,subject,rayOriginM:OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles,solo};
   const pbrBefore=Array.from(materials.pbr.data),blob=buildStudioPhotoFixtures(options);
+  const {response_lineage,...copiedBlob}=buildStudioPhotoFixtures({...options,lightFieldInformation:'evaluated-responses-v1'});
+  assert.deepEqual(copiedBlob,blob,'opt-in adds identity rows only, without changing native input geometry/materials');
+  let identityCursor=0;const partIds=new Set();
+  for(const part of response_lineage.parts) {
+    assert.equal(part.start,identityCursor);assert(part.count>0);assert(!partIds.has(part.source_id));
+    partIds.add(part.source_id);identityCursor+=part.count;
+  }
+  assert.equal(identityCursor,blob.material_ids.length,'original part identities cover exact fixture upload order');
   if(process.env.STUDIO_SCENE_BASELINE_SOURCE)assert.deepEqual(blob,await legacyScene(options),`${name}: byte-for-byte original page scene`);
-  if(expected[name])assert.equal(hash(blob),expected[name],`${name}: captured original scene hash`);
+  const shopCount=blob.emitter_profiles.records.length-10;
+  const previous={...blob,emitter_profiles:{...blob.emitter_profiles,
+    records:[...blob.emitter_profiles.records.slice(0,shopCount),...blob.emitter_profiles.records.slice(shopCount+10)]}};
+  if(expected[name])assert.equal(hash(previous),expected[name],`${name}: captured original scene geometry and legacy emitter records`);
+  const baseEmitters=blob.emitter_profiles.records.slice(shopCount,shopCount+10);
+  assert.equal(baseEmitters.length,10,'each base light uses a native material emission profile');
+  assert(baseEmitters.every(record=>record.profile==='led_cool_white'));
   assert.equal(blob.vertices.length,blob.material_ids.length*9);
   assert(blob.vertices.every(Number.isFinite));assert(blob.pbr.every(Number.isFinite));
   assert(blob.material_ids.every(id=>Number.isInteger(id)&&id>=0&&id<blob.pbr.length/16));
@@ -115,13 +130,14 @@ for(const [name,lighting,solo]of cases) {
   // wrapper delegates to the imported production builder, with no fake page.
   const wrapperStart=page.indexOf('export function sceneForPhoto('),wrapperEnd=page.indexOf('\n}',wrapperStart)+2;
   const bridge=vm.createContext({buildStudioPhotoFixtures,studioBuilderOptions:()=>options,OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles,
-    studioLighting:{strengths:{getSolo:()=>solo}},opticalControls:null});
+    studioLighting:{strengths:{getSolo:()=>solo}},opticalControls:null,lightField:null});
   vm.runInContext(page.slice(wrapperStart,wrapperEnd).replace('export function','function'),bridge);
   assert.deepEqual(bridge.sceneForPhoto(true),blob,`${name}: actual page wrapper delegates unchanged`);
   const geometry=createStudioSceneGeometry(options),roles=computeStudioFixtureRoles({...options,ids:materials.ids,fixtureMaterialBase:materials.fixtureMaterialBase,subjectPosition:subject.subjectCenter}).fixtureRoles;
   for(const [label,build]of [['room',geometry.roomFaces],['table',geometry.tableFaces],['gobo',geometry.goboFaces],['backdrop',geometry.backdropRollFaces],
     ['holders',geometry.backdropHolderFaces],['stands',cb=>geometry.lightStandFaces(roles,cb)],['shop/racks',geometry.shopLightFaces]]) {
-    const parts=[],faces=build(p=>parts.push(p));assert.equal(parts.reduce((n,p)=>n+p.faces.length,0),faces.length,`${label} part coverage`);
+    const parts=[],faces=build(p=>{parts.push(p);tagPartResponseFaces(p,`${label}/${p.id}`,true);});assert.equal(parts.reduce((n,p)=>n+p.faces.length,0),faces.length,`${label} part coverage`);
+    assert(faces.every(f=>f.responseSource),'original builder callbacks retain identities on the actual returned faces');
     if(name==='furnished')assert(faces.length>0,`${label} actually exercised`);
   }
   console.log(`PASS ${name}: ${blob.material_ids.length} triangles, ${blob.pbr.length/16} material rows, SHA256 ${hash(blob)}`);
@@ -132,6 +148,22 @@ assert.throws(()=>buildStudioScene({lighting:captured,objectSnapshot:authoring.o
 const materials=studioSceneMaterials(assets,prepared.value,captured),subject=studioScaleTransform(captured.scale,10,captured.table.enabled);
 const valid={lighting:captured,objectSnapshot:prepared.value,materials,rayOriginM:OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles,
   camera:photoCameraFromStudio(-.5,.2,3.45,subject.unitM,subject.fovDegrees,subject.subjectCenter).camera};
+const burst=structuredClone(furnished);burst.shopLights.fixtures[0].exposureMode='burst';
+const burstOptions={lighting:burst,materials:studioSceneMaterials(assets,prepared.value,burst),
+  subject:studioScaleTransform(burst.scale,prepared.value.physical['radius-mm'],burst.table.enabled),
+  rayOriginM:OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles};
+assert.throws(()=>buildStudioPhotoFixtures(burstOptions),/timing-packet/);
+const timedBurst=buildStudioPhotoFixtures({...burstOptions,timedExposure:true});
+assert(timedBurst.trigger_emitters.length>0);
+assert(timedBurst.trigger_emitters.every(item=>timedBurst.shop_material_ids.includes(item.material)));
+const unfiltered=structuredClone(captured);unfiltered.controls['key-filter-left-off']=true;
+unfiltered.shopLights.fixtures[0].filterOff=true;
+const unfilteredMaterials=studioSceneMaterials(assets,prepared.value,unfiltered);
+const unfilteredBlob=buildStudioPhotoFixtures({lighting:unfiltered,materials:unfilteredMaterials,
+  subject:studioScaleTransform(unfiltered.scale,prepared.value.physical['radius-mm'],unfiltered.table.enabled),
+  rayOriginM:OBJECT_CENTER,shopEmissionProfiles:assets.emitterProfiles});
+assert(unfilteredBlob.emitter_profiles.records.some(record=>record.filter===null&&record.profile==='led_cool_white'));
+assert(unfilteredBlob.emitter_profiles.records.some(record=>record.filter===null&&record.profile==='fluorescent_cool_white'));
 for(const [mutate,pattern]of [
   [p=>p.controls['light-strength-left']=-10,/Invalid light-strength-left/],
   [p=>p.controls['light-strength-left']=4001,/Invalid light-strength-left/],

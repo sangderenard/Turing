@@ -106,7 +106,7 @@ def update_live(jobs, digest, value):
         status = jobs._status_locked(digest)
         if digest != jobs.active_digest or jobs.process is None or jobs.process.poll() is not None:
             raise PhotoError("live ray view is no longer active", 409)
-        directory = jobs.directory / digest
+        directory = jobs.job_directory(digest)
         config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
         if "live" not in config:
             raise PhotoError("this job is a photograph, not a live ray view", 409)
