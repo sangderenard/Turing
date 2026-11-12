@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 4;
+const VERSION = 5;
 
 function allowed() {
   const here = import.meta.url;
@@ -43,12 +43,14 @@ async function postJson(path, body) {
 const CSS = `
 :host { all: initial; }
 .wrap { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); z-index: 2147483000; font: 13px/1.3 system-ui, sans-serif; color: #e8e8ee; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid #454556; border-radius: 10px; background: #14141eee; }
+.actions { display: contents; }
+.chip.toggle { min-height: 32px; box-sizing: border-box; }
 .label { font-size: 11px; color: #b6b6ca; margin: 0 4px; }
 .chip { all: unset; cursor: pointer; padding: 5px 10px; border-radius: 14px; background: rgba(28,28,36,.82); border: 1px solid rgba(255,255,255,.18);
         color: #e8e8ee; font: inherit; text-decoration: none; display: inline-block; }
 .chip:hover, .chip:focus-visible { background: rgba(48,48,62,.95); outline: 2px solid #7aa2ff; outline-offset: 1px; }
 .chip.quiet { opacity: .55; } .chip.quiet:hover, .chip.quiet:focus-visible { opacity: 1; }
-.menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; background: #1c1c24; border: 1px solid rgba(255,255,255,.18);
+.menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 210px; max-width: calc(100vw - 48px); max-height: 65vh; overflow: auto; background: #1c1c24; border: 1px solid rgba(255,255,255,.18);
         border-radius: 8px; padding: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
 .menu a, .menu button { all: unset; display: block; box-sizing: border-box; width: 100%; padding: 6px 10px; border-radius: 5px; cursor: pointer;
         color: #e8e8ee; font: inherit; }
@@ -156,14 +158,35 @@ async function main() {
   if (!allowed()) { console.info("[site-nav] not loaded: this page's script tag lacks data-site-nav=\"allow\""); return; }
 
   const host = document.createElement("div");
-  host.style.cssText = "all:initial !important;display:block !important";
+  host.style.cssText = "all:initial !important;display:block !important;flex:0 0 auto !important;grid-column:1 / -1 !important";
   const root = host.attachShadow({ mode: "closed" });
   root.append(el("style", { text: CSS }));
   const wrap = el("nav", { class: "wrap", "aria-label": "Site controls" });
-  wrap.append(el("span", { class: "label", text: "Site controls" }));
+  const actions = el("div", {class: "actions", id: "site-actions"});
+  const toggle = el("button", {class: "chip toggle", type: "button",
+    text: "Hide menu", "aria-expanded": "true", "aria-controls": "site-actions"});
+  actions.append(el("span", { class: "label", text: "Site controls" }));
+  wrap.append(actions, toggle);
   root.append(wrap);
-  document.body.append(host);
-  suiteMount = spec => mountControlSuite(wrap, host, spec);
+  // The fixed banner used to cover the page's first controls. Reserve its
+  // measured height in normal flow, including wrapping on narrow screens.
+  document.body.prepend(host);
+  function reserveSpace() {
+    host.style.setProperty("height", Math.ceil(wrap.getBoundingClientRect().bottom + 8) + "px", "important");
+  }
+  toggle.addEventListener("click", () => {
+    const collapse = !actions.hidden;
+    if (collapse) dismissHeaderPanel?.();
+    actions.hidden = collapse;
+    toggle.textContent = collapse ? "Show site menu" : "Hide menu";
+    toggle.setAttribute("aria-expanded", String(!collapse));
+    reserveSpace();
+    toggle.focus();
+  });
+  if (typeof ResizeObserver !== "undefined") new ResizeObserver(reserveSpace).observe(wrap);
+  window.addEventListener("resize", reserveSpace);
+  reserveSpace();
+  suiteMount = spec => mountControlSuite(actions, host, spec);
   for (const record of suites.values()) record.dispose = suiteMount(record.spec);
   window.dispatchEvent(new Event("site-controls-ready"));
   let who;
@@ -171,13 +194,14 @@ async function main() {
   const caps = new Set(who.capabilities || []);
 
   if (!who.signed_in) {
-    wrap.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }));
+    actions.append(el("a", { class: "chip" + (who.shader ? " quiet" : ""), href: "/login.html", text: "Sign in" }));
+    reserveSpace();
     return;
   }
 
   if (!new URLSearchParams(location.search).has("viewer")) {
-    wrap.append(el("a", { class: "chip", href: "/issues.html", text: "Tickets", title: "Your account's issue tickets" }));
-    wrap.append(el("button", { class: "chip", type: "button", text: "Report issue", onclick: () => {
+    actions.append(el("a", { class: "chip", href: "/issues.html", text: "Tickets", title: "Your account's issue tickets" }));
+    actions.append(el("button", { class: "chip", type: "button", text: "Report issue", onclick: () => {
       // Frozen game pages can still own the legacy /api/tickets form. The
       // shared header always opens the account-owned SQL issue interface.
       location.assign("/issues.html?new=1&source=" + encodeURIComponent(location.pathname));
@@ -241,9 +265,10 @@ async function main() {
     chip.setAttribute("aria-expanded", String(open));
   }
   chip.addEventListener("click", () => setOpen(menu.hidden));
-  wrap.addEventListener("keydown", (e) => { if (e.key === "Escape") { setOpen(false); chip.focus(); } });
+  wrap.addEventListener("keydown", (e) => { if (e.key === "Escape" && !menu.hidden) { setOpen(false); chip.focus(); } });
   document.addEventListener("pointerdown", (e) => { if (!menu.hidden && e.target !== host) setOpen(false); });
-  wrap.append(chip, menu);
+  actions.append(chip, menu);
+  reserveSpace();
 }
 
 window.MeowdokuSiteNav = { version: VERSION, registerControlSuite };
