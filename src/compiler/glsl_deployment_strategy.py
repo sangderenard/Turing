@@ -41873,6 +41873,14 @@ def strategize_shell_deployment(
         "propagate-callsite-planner-specializations",
         lambda: _propagate_callsite_planner_specializations(graph),
     )
+    # A field written once reaches its observers through receiver aliases;
+    # its literal needs the specializations just posted
+    # (source_field_state_transfer).
+    from .source_field_state_transfer import post_receiver_field_transfers
+    selection_phase(
+        "post-receiver-field-transfers",
+        lambda: post_receiver_field_transfers(),
+    )
     # A concrete function graph always has literal structural facts that can
     # remove or alias nodes even when there is no callsite-specific scalar
     # specialization. Perform that fixed point before its dispatch regions are
@@ -42009,6 +42017,10 @@ def strategize_shell_deployment(
         selection_phase(
             "propagate-callsite-planner-specializations-after-unroll",
             lambda: _propagate_callsite_planner_specializations(graph),
+        )
+        selection_phase(
+            "post-receiver-field-transfers-after-unroll",
+            lambda: post_receiver_field_transfers(),
         )
         selection_phase(
             "fold-callsite-structural-values-after-unroll",
