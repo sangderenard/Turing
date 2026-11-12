@@ -1,5 +1,6 @@
 // Generated from the SymPy spring law's LLVM artifact by build_spring_nodus_row.py.
-// Configuration: F64 [8,256,38] tensor. Tick: F64 scalar tensor (seconds).
+// Configuration: F64 [8,256,38]. Tick: F64 scalar seconds.
+// Control: F64 [2] = [1, frozen?1:0].
 // Field 37 of node zero in each network is the stable fabric identity.
 // Output: F64 [8,256,3] positions. One row instance owns one batch of networks.
 #include "tool_api.h"
@@ -80,17 +81,21 @@ public:
     uint64_t shape[3]={kNetworks,kNodes,kAxes};
     auto output=nodus::tensors::AbstractTensorHandle{nodus_tensor_create(NODUS_DTYPE_F64,3,shape)};
     if(!output.id){restore();return;}
-    bool okay=false;
+    bool okay=false,publish_frame=true;
     const bool config=description.rank==3&&description.shape[0]==kNetworks&&description.shape[1]==kNodes&&description.shape[2]==kFields;
     if(config)
       okay=configure(input.id,output.id);
-    else if(description.rank==0&&ready_)
+    else if(description.rank==0&&ready_){
+      publish_frame=!frozen_;
       okay=advance(input.id,output.id);
+    }
+    else if(description.rank==1&&description.shape[0]==2&&ready_)
+      okay=control(input.id,output.id);
     if(!okay||!raw_stack_push_abstract_tensor(stack,output)){
       nodus_tensor_destroy(output.id);restore();return;
     }
     context.succeeded=true;
-    publish();
+    if(publish_frame)publish();
   }
 private:
   bool configure(uint64_t input,uint64_t output){
@@ -148,11 +153,14 @@ private:
     }
     if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=kBatch*static_cast<int64_t>(sizeof(double)))return false;
     fabric_ids_=fabric_ids;
-    ready_=true;return true;
+    frozen_=false;ready_=true;return true;
   }
   bool advance(uint64_t input,uint64_t output){
     double dt=0;
     if(nodus_tensor_read(input,0,&dt,sizeof(dt))!=sizeof(dt)||!std::isfinite(dt)||dt<=0||dt>max_dt_)return false;
+    if(frozen_)
+      return nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))==
+        kBatch*static_cast<int64_t>(sizeof(double));
     std::fill(columns_[2].begin(),columns_[2].end(),dt);
     std::copy(positions_.begin(),positions_.end(),columns_[15].begin());
     std::copy(velocities_.begin(),velocities_.end(),columns_[21].begin());
@@ -171,6 +179,15 @@ private:
     std::copy(columns_[23].begin(),columns_[23].end(),velocities_.begin());
     return true;
   }
+  bool control(uint64_t input,uint64_t output){
+    double command[2]{};
+    if(nodus_tensor_read(input,0,command,sizeof(command))!=sizeof(command)||
+       command[0]!=1||(command[1]!=0&&command[1]!=1))return false;
+    if(nodus_tensor_write(output,0,positions_.data(),kBatch*sizeof(double))!=
+       kBatch*static_cast<int64_t>(sizeof(double)))return false;
+    frozen_=command[1]==1;
+    return true;
+  }
   void publish(){
     if(socket_==INVALID_SOCKET||!destination_bytes_||!ready_)return;
     // NFAB v1 little-endian: 32-byte header, then up to 48 (node id, xyz) pairs.
@@ -185,7 +202,7 @@ private:
         std::array<uint8_t,800> packet{};size_t size=0;
         auto append=[&](const void* data,size_t bytes){std::memcpy(packet.data()+size,data,bytes);size+=bytes;};
         const uint32_t magic=0x4241464e;const uint16_t version=1,header=32;
-        const uint16_t part=static_cast<uint16_t>(chunk++),reserved=0;
+        const uint16_t part=static_cast<uint16_t>(chunk++),reserved=frozen_?1:0;
         append(&magic,4);append(&version,2);append(&header,2);append(&frame_,8);
         append(&fabric_ids_[net],8);append(&part,2);append(&chunks,2);
         const size_t count_offset=size;append(&reserved,2);append(&reserved,2);
@@ -207,7 +224,7 @@ private:
   }
   HMODULE module_=nullptr;
   Entry entry_=nullptr;void(*reset_)()=nullptr;uint32_t(*take_)()=nullptr;
-  bool ready_=false;double max_dt_=0;
+  bool ready_=false,frozen_=false;double max_dt_=0;
   std::array<std::vector<double>,24> columns_{};
   std::vector<double> positions_,velocities_;
   std::vector<std::array<int,4>> neighbors_;

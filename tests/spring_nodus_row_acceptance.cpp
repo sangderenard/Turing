@@ -69,23 +69,33 @@ int main(int argc,char** argv){
   uint64_t dt=nodus_tensor_create(NODUS_DTYPE_F64,0,nullptr);
   double seconds=.1;
   okay=okay&&dt&&nodus_tensor_write(dt,0,&seconds,sizeof(seconds))==sizeof(seconds);
+  uint64_t control_shape[1]={2};
+  uint64_t control=nodus_tensor_create(NODUS_DTYPE_F64,1,control_shape);
+  double command[2]={1,1};
+  okay=okay&&control&&nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command);
+  okay=okay&&invoke(tool,control,output)&&std::abs(output[4]-1)<1e-12;
+  okay=okay&&invoke(tool,dt,output)&&std::abs(output[4]-1)<1e-12;
+  command[1]=0;
+  okay=okay&&nodus_tensor_write(control,0,command,sizeof(command))==sizeof(command);
+  okay=okay&&invoke(tool,control,output)&&std::abs(output[4]-1)<1e-12;
   bool stepped=invoke(tool,dt,output);
   std::cerr<<"stepped="<<stepped<<" output_y="<<(output.size()>4?output[4]:-999)<<"\n";
   okay=okay&&stepped&&std::abs(output[4]-.8)<1e-12&&
     std::abs(output[0])<1e-12&&std::abs(output[6]-2)<1e-12&&
     std::abs(output[9]-7)<1e-12;
-  auto receive=[&](uint64_t wanted_frame,float wanted_y){
+  auto receive=[&](uint64_t wanted_frame,float wanted_y,uint16_t frozen){
     unsigned char packet[800]{};const int got=recv(receiver,reinterpret_cast<char*>(packet),sizeof(packet),0);
-    uint32_t magic=0,node=0;uint64_t frame=0,identity=0;uint16_t count=0;float y=0;
+    uint32_t magic=0,node=0;uint64_t frame=0,identity=0;uint16_t count=0,state=0;float y=0;
     if(got>=80){std::memcpy(&magic,packet,4);std::memcpy(&frame,packet+8,8);
       std::memcpy(&identity,packet+16,8);std::memcpy(&count,packet+28,2);
-      std::memcpy(&node,packet+48,4);std::memcpy(&y,packet+56,4);}
+      std::memcpy(&state,packet+30,2);std::memcpy(&node,packet+48,4);std::memcpy(&y,packet+56,4);}
     return got==80&&magic==0x4241464e&&frame==wanted_frame&&identity==42&&
-      count==3&&node==1&&std::abs(y-wanted_y)<1e-5f;
+      count==3&&state==frozen&&node==1&&std::abs(y-wanted_y)<1e-5f;
   };
-  okay=okay&&receive(1,1.0f)&&receive(2,.8f);
+  okay=okay&&receive(1,1.0f,0)&&receive(2,1.0f,1)&&
+    receive(3,1.0f,0)&&receive(4,.8f,0);
   tool->shutdown();destroy(tool);FreeLibrary(module);
-  nodus_tensor_destroy(config);nodus_tensor_destroy(dt);
+  nodus_tensor_destroy(config);nodus_tensor_destroy(dt);nodus_tensor_destroy(control);
   closesocket(receiver);WSACleanup();
   std::cout<<(okay?"spring row + UDP: PASS":"spring row + UDP: FAIL")<<"\n";
   return okay?0:1;
