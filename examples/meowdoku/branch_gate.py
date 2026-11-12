@@ -32,7 +32,8 @@ that is not GitHub, or a question GitHub does not answer, is not a refusal: the 
 reported as a failure.
 
 ``clean_worktrees`` keeps side worktrees off this computer. A repository's own checkout is the reference core; every
-other worktree of it is removed once it has been idle for ``worktree_idle_days``, holds no uncommitted or untracked
+other worktree of it is removed once it has been idle for ``worktree_idle_days`` (counted from when its HEAD last
+really moved, read from the reflog entry, never from file times), holds no uncommitted or untracked
 file, is not locked, and its commit is on the remote. Its local branch goes with it when the remote holds the same
 branch at the same commit. Nothing is lost: the notice of removal (``branch_removed``) names the path, the branch and
 the commit, and the remote keeps the branch. A worktree that fails any of those tests is kept and the reason said.
@@ -236,10 +237,17 @@ def side_worktrees(path, remote="origin") -> list:
             path, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{entry['branch']}", check=False) == entry["head"]
         entry["dirty"], entry["touched"] = 0, None
         if entry["exists"]:
-            entry["dirty"] = len(git(entry["path"], "status", "--porcelain", check=False).splitlines())
-            gitdir = Path(git(entry["path"], "rev-parse", "--absolute-git-dir", check=False) or entry["path"])
-            stamps = [(gitdir / name).stat().st_mtime for name in ("index", "HEAD", "logs/HEAD") if (gitdir / name).exists()]
-            entry["touched"] = max(stamps) if stamps else None
+            # Looking must not count as use: no optional locks, so this status never rewrites the index.
+            entry["dirty"] = len(git(entry["path"], "--no-optional-locks", "status", "--porcelain", check=False).splitlines())
+            # When HEAD last really moved (a checkout, a commit, a reset), from the reflog entry itself. File times
+            # are not evidence: Git's housekeeping rewrites every worktree's reflog and made 49 idle worktrees look
+            # used within the day (2026-11-12).
+            moved = re.search(r"\{(\d+)\}", git(entry["path"], "log", "-g", "-1", "--date=unix", "--format=%gd", "HEAD", check=False))
+            if moved:
+                entry["touched"] = float(moved[1])
+            else:                                # no reflog: the commit's own time
+                stamp = git(entry["path"], "log", "-1", "--format=%ct", "HEAD", check=False)
+                entry["touched"] = float(stamp) if stamp.isdigit() else None
         out.append(entry)
     return out
 

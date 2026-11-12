@@ -422,6 +422,11 @@ def test_side_worktrees_leave_this_computer_with_a_notice_when_nothing_would_be_
     today = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, log=lambda line: None)}
     assert {e["action"] for e in today.values()} == {"keep"} and "used within" in today["pushed"]["reason"]
     later = time.time() + 2 * DAY
+    import os
+    for name in ("index", "HEAD", "logs/HEAD"):      # Git's housekeeping rewrites these; that is not use
+        target = Path(run(trees / "pushed", "rev-parse", "--absolute-git-dir")) / name
+        if target.exists():
+            os.utime(target, (later, later))
     dry = {e["branch"]: e["action"] for e in branch_gate.clean_worktrees(policy, db, apply=False, now=later, log=lambda line: None)}
     assert dry["pushed"] == "would remove" and (trees / "pushed").is_dir()
     done = {e["branch"]: e for e in branch_gate.clean_worktrees(policy, db, apply=True, actor=CLEANER, now=later, log=lambda line: None)}
