@@ -887,6 +887,11 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                 or not internal):
             raise PhotoError("evaluated response information requires an explicit refreshed internal v6 field request")
         config["light_field_information"] = "evaluated-responses-v1"
+    if "light_field_reactive_queue" in value:
+        if (value["light_field_reactive_queue"] != "native-ancestry-v1"
+                or config.get("light_field_information") != "evaluated-responses-v1"):
+            raise PhotoError("reactive queue ancestry requires explicit evaluated response information")
+        config["light_field_reactive_queue"] = "native-ancestry-v1"
     if "light_field_camera_records" in value:
         if (value["light_field_camera_records"] != "interval-responses-v2"
                 or config.get("light_field_information") != "evaluated-responses-v1"):
@@ -1685,7 +1690,14 @@ class PhotoJobs:
                     receipt = json.loads(sidecar.read_text(encoding='utf-8'))
                     metadata = receipt.get('metadata')
                     length = receipt.get('byte_length')
-                    if (receipt.get('schema') not in ('studio-scene-responses-v1', 'studio-scene-responses-v2')
+                    if (not isinstance(metadata, dict) or not isinstance(metadata.get('sections'), list)
+                            or receipt.get('schema') not in ('studio-scene-responses-v1', 'studio-scene-responses-v2', 'studio-scene-responses-v3')
+                            or (receipt.get('schema') == 'studio-scene-responses-v3'
+                                and config.get('light_field_reactive_queue') != 'native-ancestry-v1')
+                            or (receipt.get('schema') == 'studio-scene-responses-v3'
+                                and any(s.get('name') == 'camera_rhs_rows' and isinstance(s.get('count'), int) and s['count'] > 0
+                                        for s in receipt.get('metadata', {}).get('sections', []) if isinstance(s, dict))
+                                and config.get('light_field_camera_records') != 'interval-responses-v2')
                             or (receipt.get('schema') == 'studio-scene-responses-v2'
                                 and config.get('light_field_camera_records') != 'interval-responses-v2')
                             or receipt.get('name') != name

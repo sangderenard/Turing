@@ -2,7 +2,10 @@
 // validation, not a radiance estimator, optical replay, or a pixel image.
 export const SCENE_RESPONSE_SCHEMA='studio-scene-responses-v1';
 export const SCENE_RESPONSE_SCHEMA_V2='studio-scene-responses-v2';
-export const isSceneResponseSchema=value=>value===SCENE_RESPONSE_SCHEMA||value===SCENE_RESPONSE_SCHEMA_V2;
+export const SCENE_RESPONSE_SCHEMA_V3='studio-scene-responses-v3';
+export const isSceneResponseSchema=value=>[SCENE_RESPONSE_SCHEMA,SCENE_RESPONSE_SCHEMA_V2,SCENE_RESPONSE_SCHEMA_V3].includes(value);
+const hasCameraPairs=value=>value===SCENE_RESPONSE_SCHEMA_V2||value===SCENE_RESPONSE_SCHEMA_V3;
+export const FORWARD_ANCESTRY_CONTRACT=Object.freeze({version:'native-queued-ancestry-v1',row_words:128,queue_row_words:24,root_word:3,queue_ordinal_word:2,parent_dispatch_word:101,parent_ray_word:102,parent_bounce_word:103,inverse_replay_word:125,enqueue_cause_word:126,spawn_triangle_word:127,enqueue_causes:Object.freeze({edge_diffraction:1,fluorescence:2}),attachment:'native-parent-dispatch',application_ready:false});
 export const CAMERA_PAIR_CONTRACT=Object.freeze({version:'native-camera-response-pairs-v2',row_words:256,
   interval_schema:'native-camera-intervals-v1',interval_offset_words:0,interval_words:128,
   response_schema:'native-camera-response-copies-v1',response_offset_words:128,response_words:128,
@@ -10,7 +13,7 @@ export const CAMERA_PAIR_CONTRACT=Object.freeze({version:'native-camera-response
 export const SCENE_RESPONSE_BYTES=64*1024*1024;
 export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES,recordIndexBytes=0,cameraQuerySegments=false}={}) {
   if(information!=='evaluated-responses-v1')throw Error('Scene response decoding requires explicit information opt-in.');
-  if(typeof cameraQuerySegments!=='boolean'||cameraQuerySegments&&(!recordIndexBytes||manifest?.schema!==SCENE_RESPONSE_SCHEMA_V2))
+  if(typeof cameraQuerySegments!=='boolean'||cameraQuerySegments&&(!recordIndexBytes||!hasCameraPairs(manifest?.schema)))
     throw Error('Camera query segments require a boolean opt-in, v2 envelope and positive index budget.');
   if(!Number.isSafeInteger(recordIndexBytes)||recordIndexBytes<0||recordIndexBytes>SCENE_RESPONSE_BYTES)
     throw Error('Invalid explicit scene-record index budget.');
@@ -34,6 +37,29 @@ const FAMILY_CODECS=Object.freeze({1:['forward','evaluated-forward-responses-v1'
   2:['reactive','evaluated-forward-responses-v1'],3:['camera_rhs_summands','native-camera-response-pairs-v1'],
   4:['camera_complete_sample','native-camera-scene-sample-v1']});
 
+function exactContract(value,expected) {
+  if(expected!==null&&typeof expected==='object')return value!==null&&typeof value==='object'&&!Array.isArray(value)&&
+    Object.keys(value).length===Object.keys(expected).length&&Object.entries(expected).every(([k,v])=>Object.hasOwn(value,k)&&exactContract(value[k],v));
+  return value===expected;
+}
+function validateForwardAncestry(row,context) {
+  if(!exactContract(context.forward_ancestry_contract,FORWARD_ANCESTRY_CONTRACT))throw Error('Invalid forward ancestry context.');
+  const q=context.dispatch?.native_queue,p=q?.parent_dispatch;
+  if(q?.version!=='native-queued-ancestry-v1'||!p||typeof p!=='object'||
+      ['generation','logical_ray_base','capacity','source_root_count'].some(k=>!integer(q[k]))||
+      ['dispatch_id','population_index','ray_offset','ray_count','total_rays','bounce_limit','seed'].some(k=>!integer(p[k],Number.MAX_SAFE_INTEGER))||
+      !q.capacity||!q.source_root_count||q.generation!==p.dispatch_id||!p.root_sampling||typeof p.root_sampling!=='object'||Array.isArray(p.root_sampling))
+    throw Error('Invalid native parent queue identity.');
+  if(row[1]===1) {
+    if([101,102,103,125,126,127].some(i=>row[i]!==0))throw Error('Forward row cannot invent queued ancestry.');
+  } else if(row[1]===2) {
+    const weight=new Float32Array(row.buffer,row.byteOffset+125*4,1)[0],ray=row[102];
+    if(row[2]>=q.capacity||row[101]!==q.generation||ray<p.ray_offset||ray>=p.ray_offset+p.ray_count||
+        row[3]!==ray%q.source_root_count||row[103]>=p.bounce_limit-1||!Number.isFinite(weight)||weight<0||weight>1||
+        ![1,2].includes(row[126])||row[127]>=0x80000000)throw Error('Queued ancestry disagrees with actual parent dispatch.');
+  } else throw Error('Invalid forward ancestry family.');
+}
+
 export function validateSceneResponseManifest(value) {
   if(!value||!isSceneResponseSchema(value.schema)||value.byte_order!=='little'||
       !HEX.test(value.scene_revision)||!integer(value.publication_sequence,Number.MAX_SAFE_INTEGER)||
@@ -41,7 +67,9 @@ export function validateSceneResponseManifest(value) {
       value.complete_retained_snapshot!==true||value.physical_completeness_claim!==false||
       value.application_ready!==false)
     throw Error('Invalid or unsupported native scene-response manifest.');
-  const pairsV2=value.schema===SCENE_RESPONSE_SCHEMA_V2;
+  const ancestry=value.schema===SCENE_RESPONSE_SCHEMA_V3,pairsV2=hasCameraPairs(value.schema);
+  if(ancestry?!exactContract(value.forward_ancestry_contract,FORWARD_ANCESTRY_CONTRACT):Object.hasOwn(value,'forward_ancestry_contract'))
+    throw Error('Invalid forward ancestry envelope.');
   if(pairsV2) {
     const contract=value.camera_pair_contract;
     if(!contract||typeof contract!=='object'||Array.isArray(contract)||
@@ -50,7 +78,7 @@ export function validateSceneResponseManifest(value) {
       throw Error('Invalid exact camera-pair contract.');
   } else if(Object.hasOwn(value,'camera_pair_contract'))throw Error('Camera-pair contract requires the v2 envelope.');
   for(const [id,[name,codec]]of Object.entries(FAMILY_CODECS))
-    if(value.families?.[id]?.name!==name||value.families[id].codec!==(pairsV2&&id==='3'?'native-camera-response-pairs-v2':codec))
+    if(value.families?.[id]?.name!==name||value.families[id].codec!==(ancestry&&(id==='1'||id==='2')?'evaluated-forward-responses-v2':pairsV2&&id==='3'?'native-camera-response-pairs-v2':codec))
       throw Error('Unknown native scene-response family.');
   const layout=[['scene_index',80],['native_rows',512],['camera_rhs_rows',pairsV2?1024:1536],['scalar_cells',24]];
   if(value.application!==undefined)layout.push(['application_rows',48]);
@@ -133,6 +161,7 @@ export function decodeSceneResponses(buffer,manifest) {
   const [index,nativeRows,cameraRhsRows,scalarCells,applicationRows]=metadata.sections.map(copy),
     references=[new Set(),new Set()],contexts=new Set(metadata.contexts.map(c=>c.id)),usedContexts=new Set(),
     families={forward:0,reactive:0,camera_rhs_summands:0,camera_complete_sample:0};
+  const contextById=new Map(metadata.contexts.map(c=>[c.id,c]));
   for(let i=0;i<index.length;i+=20) {
     const family=index[i],ref=index[i+3],which=family===3?1:0,section=metadata.sections[which?2:1],
       namespace=index[i+4],recipient=index[i+5],primitive=index[i+6],present=index[i+11];
@@ -149,6 +178,11 @@ export function decodeSceneResponses(buffer,manifest) {
     const cell=index.subarray(i+16,i+19),dims=metadata.indexing.dimensions;
     if(!cell.every(v=>v===UINT)&&(!dims||!present||cell.some((v,j)=>v>=dims[j])))
       throw Error('Native response cell exceeds its recorded domain.');
+    if(metadata.schema===SCENE_RESPONSE_SCHEMA_V3&&(family===1||family===2)) {
+      const row=nativeRows.subarray(ref*128,(ref+1)*128);
+      if(row[1]!==family)throw Error('Forward ancestry family mismatch.');
+      validateForwardAncestry(row,contextById.get(index[i+2]));
+    }
     if(family===4) {
       const row=ref*128;
       // Exact producer attachment. A payload cannot be relabelled as another
@@ -157,7 +191,7 @@ export function decodeSceneResponses(buffer,manifest) {
           [8,9,10,12,13,14].some(j=>index[i+j]!==nativeRows[row+j]))
         throw Error('Completed native sample attachment disagrees with its payload.');
     }
-    if(family===3&&metadata.schema===SCENE_RESPONSE_SCHEMA_V2) {
+    if(family===3&&hasCameraPairs(metadata.schema)) {
       const row=ref*256,bands=cameraRhsRows[row+6],mask=cameraRhsRows[row+40];
       // A camera pair is one actual interval and its aligned response row.
       // No raw hit, first-visible hit, or entry origin is promoted to a guessed

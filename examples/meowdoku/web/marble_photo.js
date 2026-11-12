@@ -318,6 +318,11 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
       throw new RangeError('Evaluated response copies require explicit field reception.');
     config.light_field_information=options.lightFieldInformation;
   }
+  if(options.lightFieldReactiveQueue!==undefined) {
+    if(options.lightFieldReactiveQueue!=='native-ancestry-v1'||config.light_field_information!=='evaluated-responses-v1')
+      throw new RangeError('Reactive queue ancestry requires explicit evaluated response information.');
+    config.light_field_reactive_queue=options.lightFieldReactiveQueue;
+  }
   if(options.lightFieldCameraRecords!==undefined) {
     if(options.lightFieldCameraRecords!=='interval-responses-v2'||config.light_field_information!=='evaluated-responses-v1')
       throw new RangeError('Interval camera records require explicit evaluated response information.');

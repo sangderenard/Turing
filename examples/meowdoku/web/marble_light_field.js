@@ -1,6 +1,6 @@
 // Receive actual forward deposits and traced throughput, never invented lights.
 import {inverseAffine} from './marble_studio_subject_renderer.js';
-import {receiveSceneResponses,isSceneResponseSchema,SCENE_RESPONSE_SCHEMA_V2,validateSceneResponseManifest} from './marble_scene_responses.js';
+import {receiveSceneResponses,isSceneResponseSchema,validateSceneResponseManifest} from './marble_scene_responses.js';
 import {RESPONSE_INFORMATION} from './marble_response_lineage.js';
 import {responseApplicationTexture,currentResponseQuery} from './marble_response_application.js';
 
@@ -17,7 +17,7 @@ export function validateSceneResponseReceipt(value,digest,revision) {
       value.metadata?.schema!==value.schema||value.metadata.payload_bytes!==value.byte_length||
       value.metadata.payload_sha256!==value.sha256)
     throw Error('Invalid or stale scene-response receipt.');
-  if(value.schema===SCENE_RESPONSE_SCHEMA_V2)validateSceneResponseManifest(value.metadata);
+  if(value.schema!== 'studio-scene-responses-v1')validateSceneResponseManifest(value.metadata);
   return structuredClone(value);
 }
 // Dense subject bundles can exceed 85 MiB over the public connection. Newer
