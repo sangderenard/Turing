@@ -143,3 +143,87 @@ def declare_island_passage(island_world: AbstractUIWorld, region: str, *, lot: s
     return replace(island_world, regions=tuple(
         replace(candidate, openings=(*candidate.openings, *ends)) if candidate.identity == region else candidate
         for candidate in island_world.regions))
+
+
+# ---- a DIAL door: one doorway, several islands behind it ----------------------------------------------------
+#
+# Owner's design (2026-11-12): a courtyard too big to stand in whole opens with a dial door, like a room's
+# contention dial. The lot keeps ONE doorway; beside it, a dial picks which island the doorway leads into. Each
+# position is an ordinary island door (the same four ends, ``declare_island_door``), all coincident with the
+# one entry, and every `in` end of the lot's side names the dial it belongs to (``dial``), its place on it
+# (``dial_position``) and what the dial shows there (``dial_label``). The browser crosses the end of the position
+# the dial is turned to; the rest of the dial is just records. Each island declares its own half with
+# ``declare_island_passage`` as before, so the way back out needs no dial. Positions are the call's order.
+# For a repository folder the positions are its sub-addressed units (``repo_world_units.UnitIndex.door``).
+
+
+def dial_identity(lot: str) -> str:
+    return f"{lot}/dial"
+
+
+def declare_dial_door(world: AbstractUIWorld, lot: str, positions: Any) -> AbstractUIWorld:
+    """Declare, in the OUTSIDE world, a dial door from ``lot`` into several islands.
+
+    ``positions`` is a sequence of mappings ``{"island": <world identity>, "href": <document>|None, "label": str}``.
+    One position is an ordinary island door, still marked with its dial so a reader sees one shape.
+    """
+
+    positions = list(positions)
+    if not positions:
+        raise ValueError("a dial door needs at least one position")
+    islands = [p["island"] for p in positions]
+    if len(set(islands)) != len(islands):
+        raise ValueError("each dial position leads to a different island")
+    dial = dial_identity(lot)
+    for index, position in enumerate(positions):
+        world = declare_island_door(world, lot, position["island"], href=position.get("href"))
+        door = door_identity(lot, position["island"])
+
+        def mark(opening, index=index, position=position, door=door):
+            if opening.get("pair", "").startswith(door + "/"):
+                return {**opening, "dial": dial, "dial_position": index, "dial_positions": len(positions),
+                        "dial_label": str(position.get("label") or position["island"])}
+            return opening
+
+        world = replace(world, regions=tuple(
+            replace(region, buildings=tuple(
+                replace(b, openings=tuple(mark(o) for o in b.openings)) if b.identity == lot else b
+                for b in region.buildings))
+            for region in world.regions))
+    return world
+
+
+# ---- a TREADMILL door: a courtyard too long to stand in whole -----------------------------------------------
+#
+# Owner's design (2026-11-12): a courtyard is one contiguous separation, so it is not dialled in positions like a
+# room's contention dial. Its door opens on a window that scrolls continuously over an implied continuation that
+# is never allocated: a treadmill, as fast to run through as scrolling a document. It is ONE island door (one
+# pair, one island: the courtyard itself, whose identity every window keeps), and the lot's ends carry the
+# treadmill: how many items the courtyard holds (``length``), how many one window shows (``window``) and the
+# offset the walker arrives at (``offset``, 0 unless the call says). The browser scrolls the offset and asks for
+# the window there; the island declares its half with ``declare_island_passage`` as for any island door. For a
+# repository folder ``length``/``window`` come from ``repo_world_units.UnitIndex.door`` (a ``Treadmill``).
+
+
+def declare_treadmill_door(world: AbstractUIWorld, lot: str, island: str, *, length: int, window: int,
+                           offset: int = 0, href: str | None = None) -> AbstractUIWorld:
+    """Declare, in the OUTSIDE world, a treadmill door from ``lot`` into the courtyard island ``island``."""
+
+    if not (isinstance(length, int) and isinstance(window, int) and isinstance(offset, int)):
+        raise ValueError("length, window and offset are whole numbers of items")
+    if window < 1 or length <= window:
+        raise ValueError("a treadmill is for a courtyard longer than one window; a shorter one has a plain door")
+    if not 0 <= offset < length:
+        raise ValueError(f"offset {offset} is off the treadmill (0 to {length - 1})")
+    world = declare_island_door(world, lot, island, href=href)
+    door = door_identity(lot, island)
+    treadmill = {"length": length, "window": window, "offset": offset}
+
+    def mark(opening):
+        return {**opening, "treadmill": dict(treadmill)} if opening.get("pair", "").startswith(door + "/") else opening
+
+    return replace(world, regions=tuple(
+        replace(region, buildings=tuple(
+            replace(b, openings=tuple(mark(o) for o in b.openings)) if b.identity == lot else b
+            for b in region.buildings))
+        for region in world.regions))

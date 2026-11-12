@@ -360,6 +360,39 @@ Nothing in `abstract_ui_*.py` was edited on this branch.
   scanner needs the repository's declared import roots as an input; it must
   not guess them from directory names.
 
+## 5a. Gap E answered: sub-addressed units behind treadmill doors (owner, 2026-11-12)
+
+A folder is an inner courtyard; its subfolders and files are lots in it. A root
+too big to stand in whole is never laid out at once. Its courtyard is one
+contiguous sequence, so its door is a TREADMILL: it opens on a window that
+scrolls continuously over an implied continuation that is never allocated,
+as fast to run through as scrolling a document. This is different from a
+room's contention DIAL (separate positions, one per contender's interior).
+
+- `src/compiler/repo_world_units.py`: `UnitIndex(scan, capacity)` addresses
+  units by the scan's own identities: `repo:<H>/dir:<path>` for a folder that
+  fits one window, `repo:<H>/dir:<path>@<offset>` for the window of one that
+  does not. A folder's items are its subfolders then its files, in path order;
+  any offset is a valid window, and nothing past the window in view exists.
+  A unit names what leaves it by address only: its way out (the window that
+  shows its own lot in the parent), each subfolder's door (a plain address or
+  a `Treadmill`), and each portal pair that crosses it (the window that shows
+  the other end).
+- `src/compiler/abstract_ui_doorways.py`: `declare_treadmill_door` is one
+  island door whose lot ends carry `treadmill: {length, window, offset}`; every
+  window keeps the courtyard island's identity, so `declare_island_passage`
+  meets it unchanged. `declare_dial_door` is the room's contention dial: one
+  doorway, one island door per position, each end marked `dial`,
+  `dial_position`, `dial_positions`, `dial_label`.
+- Measured on the server's stored maps (2026-11-12) at the default window of
+  1,024 items: one treadmill in the whole workspace, turing `tests/` (1,505
+  items); at 256 there would be eleven.
+
+Not built: the browser side of both doors (scrolling the treadmill, turning
+the dial, asking for the window at an offset), a world builder that lifts one
+unit into an `AbstractUIWorld` (gap D, now per unit rather than per
+repository), and a served route that answers a unit by address.
+
 ## 7a. Measurement of the whole workspace from GitHub (observed, 2026-11-11)
 
 `scan_workspace(manifest)` (clone lane, since replaced by the stream lane):
