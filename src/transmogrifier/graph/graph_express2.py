@@ -7066,6 +7066,13 @@ class ProcessGraph(TiledObject):
             )
             if shell_file_contexts:
                 self.G.graph["shell_file_contexts"] = shell_file_contexts
+            # The pickle scopes the special cases replaced by tensor-payload
+            # host calls (python_special_cases._PickleTensorPayloadLowerer).
+            tensor_payload_scopes = tuple(
+                getattr(tree, "_turing_tensor_payload_scopes", ()) or ()
+            )
+            if tensor_payload_scopes:
+                self.G.graph["tensor_payload_scopes"] = tensor_payload_scopes
             if parent_include is not None and hasattr(parent_include, "receipts"):
                 self.G.graph["extraction_contract_receipts"] = (
                     parent_include.receipts()

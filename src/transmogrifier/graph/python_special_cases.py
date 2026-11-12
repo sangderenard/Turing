@@ -318,6 +318,177 @@ class _ShellFileContextLowerer(ast.NodeTransformer):
         ]
 
 
+#: The resolved identities of pickle's stream protocol (``pickle.dump`` and
+#: ``pickle.load`` are the C functions of ``_pickle``).
+_PICKLE_STREAM_CALLS = {"_pickle.dump": "save", "_pickle.load": "load"}
+
+#: What replaces pickle for a tensor: its handle and its data region, saved
+#: and read by ``src.common.tensors.compression.tensor_payload``.
+_TENSOR_PAYLOAD_MODULE = "src.common.tensors.compression.tensor_payload"
+
+#: The result each payload call declares: ``save`` reports the bytes written;
+#: ``load`` gives a tensor as a handle and a region the caller provides.
+TENSOR_PAYLOAD_RESULTS = {"save": "int64", "load": "tensor_region"}
+
+
+def _tensor_payload_receipt(operation: str) -> dict[str, Any]:
+    """Receipt of one compiler-created tensor-payload host call.
+
+    The payload codec is AbstractTensor code served by the hosting Python
+    shell until it lowers itself; the call crosses the shell's external
+    references exactly as ``_pickle`` did (rule ``native-pickle-object-result``),
+    with the path as a text sequence and a declared tensor result in place of
+    pickle's opaque object handle.
+    """
+
+    sequences = [{"position": 0, "encoding": "unicode-codepoints"}]
+    if operation == "save":
+        sequences.append({"position": 1, "encoding": "tensor-region"})
+    return {
+        "action": "use_native",
+        "rule_id": "python-pickle-stream-is-a-tensor-payload",
+        "identity": f"{_TENSOR_PAYLOAD_MODULE}.{operation}",
+        "classification": "repository_python",
+        "parameters": {
+            "loader": "existing_module",
+            "symbol_resolution": "in_place",
+            "callbacks": "reject",
+            "execution": "shell_io.external_references",
+            "shell_capability": "host_references",
+            "shell_abi": "turing-shell-io-abi.external_references",
+            "external_domain": "host_system",
+            "native_abi": "cpython-c-api",
+            "runtime_owner": "shell",
+            "shell_profiles": ["python", "cpython-c"],
+            "result_dtype": TENSOR_PAYLOAD_RESULTS[operation],
+            "argument_sequences": sequences,
+        },
+    }
+
+
+def _tensor_payload_call(operation: str, arguments: list[ast.expr], source: ast.AST) -> ast.Call:
+    call = ast.Call(
+        func=ast.Name(id=f"__turing_tensor_payload_{operation}", ctx=ast.Load()),
+        args=arguments,
+        keywords=[],
+    )
+    call._extraction_contract = _tensor_payload_receipt(operation)
+    return ast.copy_location(call, source)
+
+
+class _PickleStreamUses(ast.NodeVisitor):
+    """Every use of one lexical stream, and whether each is pickle's."""
+
+    def __init__(self, stream_name: str) -> None:
+        self.stream_name = str(stream_name)
+        self.pickle_calls: list[tuple[ast.Call, str]] = []
+        self.other_use = False
+        self._claimed: set[int] = set()
+
+    def visit_Call(self, node):  # noqa: N802
+        identity = str((extraction_receipt(node) or {}).get("identity") or "")
+        operation = _PICKLE_STREAM_CALLS.get(identity)
+        stream_position = 1 if operation == "save" else 0
+        if (
+            operation is not None
+            and not node.keywords
+            and len(node.args) == stream_position + 1
+            and isinstance(node.args[stream_position], ast.Name)
+            and node.args[stream_position].id == self.stream_name
+        ):
+            self.pickle_calls.append((node, operation))
+            self._claimed.add(id(node.args[stream_position]))
+        self.generic_visit(node)
+
+    def visit_Name(self, node):  # noqa: N802
+        if node.id == self.stream_name and id(node) not in self._claimed:
+            self.other_use = True
+
+
+class _PickleTensorPayloadLowerer(ast.NodeTransformer):
+    """Replace a binary file scope whose stream only pickle uses by payload calls.
+
+    Program: YoungMan's map cache, ``with open(p, 'wb') as f: pickle.dump(m, f)``
+    and ``with open(p, 'rb') as f: return AT.tensor(pickle.load(f))``.  The
+    stream escapes into ``pickle``, so the file lowering keeps the ``With`` and
+    the resource scope is refused (MissingResourceControlTopology).  Pickle's
+    bytes are not the product: a map is a tensor, a handle and a data region.
+    Rule: when every use of the stream is the stream argument of
+    ``_pickle.dump``/``_pickle.load`` (resolved receipts, never spelling), the
+    scope becomes ``tensor_payload.save(path, m)`` / ``tensor_payload.load(path)``
+    host calls and the ``With`` goes.  The path is bound once, before the body,
+    as ``open`` evaluated it once.  Any other stream use keeps the scope as it
+    was, for the file lowering and its explicit refusal.
+    """
+
+    def __init__(self) -> None:
+        self.counter = 0
+        self.lowered: list[dict[str, Any]] = []
+
+    def visit_With(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        if len(node.items) != 1:
+            return node
+        item = node.items[0]
+        if (
+            not _ShellFileContextLowerer._file_context(item.context_expr)
+            or not isinstance(item.optional_vars, ast.Name)
+        ):
+            return node
+        path_mode = _ShellFileContextLowerer._path_and_mode(item.context_expr)
+        if path_mode is None:
+            return node
+        path, mode = path_mode
+        if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value):
+            return node
+        uses = _PickleStreamUses(item.optional_vars.id)
+        for statement in node.body:
+            uses.visit(statement)
+        if uses.other_use or not uses.pickle_calls:
+            return node
+        writing = any(flag in mode.value for flag in "wxa")
+        if any((operation == "save") != writing for _call, operation in uses.pickle_calls):
+            return node                      # pickle.load of a stream opened to write, or the reverse
+        self.counter += 1
+        path_name = f"turing_payload_path_{self.counter}"
+        replacements = {
+            id(call): _tensor_payload_call(
+                operation,
+                [ast.Name(id=path_name, ctx=ast.Load()),
+                 *([copy.deepcopy(call.args[0])] if operation == "save" else [])],
+                call,
+            )
+            for call, operation in uses.pickle_calls
+        }
+
+        class _Replace(ast.NodeTransformer):
+            def visit_Call(self, call):  # noqa: N802
+                replacement = replacements.get(id(call))
+                return replacement if replacement is not None else self.generic_visit(call)
+
+        body = [_Replace().visit(statement) for statement in node.body]
+        self.lowered.append({
+            "schema": "turing.python-pickle-tensor-payload.v1",
+            "rule_id": "python-pickle-stream-is-a-tensor-payload",
+            "open_identity": (extraction_receipt(item.context_expr) or {}).get("identity"),
+            "path": path_name,
+            "stream": item.optional_vars.id,
+            "mode": mode.value,
+            "replaced": tuple(
+                {"identity": f"_pickle.{'dump' if operation == 'save' else 'load'}",
+                 "becomes": f"{_TENSOR_PAYLOAD_MODULE}.{operation}",
+                 "line": int(getattr(call, "lineno", -1)),
+                 "column": int(getattr(call, "col_offset", -1))}
+                for call, operation in uses.pickle_calls
+            ),
+            "source_span": {"line": int(getattr(node, "lineno", -1)), "column": int(getattr(node, "col_offset", -1))},
+        })
+        return [
+            ast.copy_location(ast.Assign(targets=[ast.Name(id=path_name, ctx=ast.Store())], value=path), node),
+            *body,
+        ]
+
+
 def method_receiver_formal(definition: Any) -> str | None:
     """The formal Python binds a method's receiver to, as the source spells it.
 
@@ -338,8 +509,17 @@ def method_receiver_formal(definition: Any) -> str | None:
 
 
 def lower_python_shell_file_contexts(tree: ast.AST) -> ast.AST:
-    """Lower resolved, non-escaping Python file contexts in ``tree``."""
+    """Lower resolved, non-escaping Python file contexts in ``tree``.
 
+    A scope whose stream only pickle uses is a tensor payload first
+    (``_PickleTensorPayloadLowerer``); what remains is lowered to file-broker
+    operations or kept, explicitly, when its stream escapes elsewhere.
+    """
+
+    payloads = _PickleTensorPayloadLowerer()
+    payloads.visit(tree)
+    if payloads.lowered:
+        tree._turing_tensor_payload_scopes = tuple(payloads.lowered)
     lowerer = _ShellFileContextLowerer()
     lowerer.visit(tree)
     if lowerer.lowered:
