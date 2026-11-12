@@ -1633,6 +1633,21 @@ exit:
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
+    # The SSA exception record operators (ExceptionMake/Take/Match/Raise):
+    # the C lane's turing_error_packet ABI of turing_validation_runtime.h,
+    # linked by the same rule as turing_validation_error.
+    "turing_error_packet_init": (
+        "declare void @turing_error_packet_init(ptr, i32, ptr, ptr, i8)"
+    ),
+    "turing_validation_error_take_active": (
+        "declare i32 @turing_validation_error_take_active(ptr)"
+    ),
+    "turing_validation_error_raise_packet": (
+        "declare void @turing_validation_error_raise_packet(ptr)"
+    ),
+    "turing_error_packet_matches": (
+        "declare i32 @turing_error_packet_matches(ptr, ptr)"
+    ),
     # A range loop's induction step saturates (``loop_induction_step``).
     "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
     # Python's ``int.bit_length``, the C backend's ``turing_bit_length``
@@ -2136,6 +2151,12 @@ def _emit_repository_call_module(
 
     emission = emission_book(module, "_emit_repository_call_module")
     recorders: dict[str, _Any] = {}
+    # SSA exception record operators: their literal type/message texts are
+    # module constants (one per distinct text), and any such operator links
+    # turing_validation_runtime exactly as the C lane does.
+    exception_texts: dict[str, str] = {}
+    exception_globals: list[str] = []
+    exception_runtime_used = False
 
     reachable, kernels_used = _internal_call_closure(module, function_name)
     piece_records = _piece_symbols(module)
@@ -6242,6 +6263,198 @@ def _emit_repository_call_module(
                     register_cache.clear()
                 continue
 
+            if operation.startswith("Exception"):
+                # Program: ``raise ValueError("authored failure")`` under
+                # ``try/finally`` (tests/test_source_c_exceptions.py), emitted
+                # to LLVM. Wrong record: the backend-neutral SSA exception
+                # operators (ssa_operator_failure_arms_and_thread_exceptions_
+                # 2026-10-31) were materialized by C alone; this lane reported
+                # ExceptionNone/Make/Take/Active/Raise as "operation has no
+                # repository LLVM emission". Rule: the same operator, read from
+                # the same SOURCE_EXCEPTION_OPERATION fact, materializes the
+                # same turing_validation_runtime packet ABI as the C lane
+                # (ssa_c_backend.py, its ``op.startswith("Exception")`` block),
+                # refuses the same unowned payloads by the same names, and
+                # posts its policy on LLVM_EXCEPTION_OPERATION, which the
+                # audit reads exactly as it reads C_EXCEPTION_OPERATION.
+                from .concordance_declarations import (
+                    LLVM_EXCEPTION_OPERATION, SOURCE_EXCEPTION_OPERATION,
+                )
+                from .identity_concordance import Derived, Mode
+                from .ssa_record_return_state import accepted_ssa_component
+                from .frame_identity_book import _frame_owner_book
+                from ..transmogrifier.dtype_layout import resolve as _resolve_dtype
+                source_cell = instruction.attributes.get("exception_operation_cell")
+                accepted = accepted_ssa_component(function)
+                if source_cell is None or (emission is None and not accepted):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation, "exception operation has no source contract",
+                    ))
+                    continue
+                # An accepted component's exception carries a source Ref owned
+                # by its retained leaf book: import that exact contract into
+                # this emission before deriving the policy (as the C lane).
+                source_book, source_digest = (
+                    _frame_owner_book(function) if accepted else (emission, None)
+                )
+                source_receipt = (
+                    emission.import_cell(source_book, source_cell, source_digest)
+                    if emission is not None and source_book is not emission
+                    else source_cell
+                )
+                fact = tuple(source_book.page(SOURCE_EXCEPTION_OPERATION).cell(
+                    source_cell.row, source_cell.column,
+                ))
+                (_source_operation, exception_type, message, error_code, cause,
+                 cause_argument, suppress_context, _normalization) = fact[:8]
+                # Field 8 (constructor payload), where the record carries it.
+                payload = fact[8] if len(fact) > 8 else ()
+
+                def exception_text(text: str) -> str:
+                    # The bytes of the C lane's ``_trace_text`` literal: a
+                    # newline becomes a space, anything outside printable
+                    # ASCII becomes ``?``; NUL-terminated module constant.
+                    spelled = "".join(
+                        " " if ch == "\n" else ch if 32 <= ord(ch) < 127 else "?"
+                        for ch in str(text)
+                    )
+                    symbol = exception_texts.get(spelled)
+                    if symbol is None:
+                        symbol = f"@turing.exception.text.{len(exception_texts)}"
+                        exception_texts[spelled] = symbol
+                        encoded = "".join(
+                            ch if ch not in {'"', "\\"} else f"\\{ord(ch):02X}"
+                            for ch in spelled
+                        )
+                        exception_globals.append(
+                            f"{symbol} = private unnamed_addr constant "
+                            f"[{len(spelled) + 1} x i8] c\"{encoded}\\00\", align 1"
+                        )
+                        recorder.unit(
+                            UnitKind.DECLARATION, exception_globals[-1],
+                            result=result, spelling=symbol, instruction=instruction,
+                        )
+                    return symbol
+
+                def store_exception_result(register: str, source_type: str) -> None:
+                    if result is None:
+                        return
+                    declared = _value_llvm_type(result)
+                    stored = convert_loaded(
+                        register, source_type, declared, f"exception.{tag}",
+                        target_unsigned=_unsigned_value(result),
+                    )
+                    body.append(
+                        f"  store {declared} {stored}, ptr {pointer(result)}, "
+                        f"align {_align(declared)}"
+                    )
+
+                prefix = f"exception.{tag}"
+                policy = "native_record_and_control_edges"
+                try:
+                    if operation == "ExceptionNone":
+                        store_exception_result("0", "i64")
+                    elif operation in {"ExceptionMake", "ExceptionTake"}:
+                        if (operation == "ExceptionMake" and cause_argument is not None
+                                and (cause_argument >= len(instruction.args)
+                                     or cause is None)):
+                            raise ValueError("explicit exception cause lost its exact graph operand")
+                        if operation == "ExceptionMake" and payload:
+                            raise ValueError("raised exception constructor payload requires an owned native payload ABI")
+                        message_arguments = len(instruction.args) - (1 if cause_argument is not None else 0)
+                        if operation == "ExceptionMake" and message_arguments:
+                            raise ValueError("dynamic raised message requires an owned native message ABI")
+                        if operation == "ExceptionMake" and cause_argument is not None:
+                            raise ValueError("explicit exception cause requires an owned native cause-chain ABI")
+                        # turing_error_packet {u32 code, u64 worker_token,
+                        # worker_function, exception_type, message, u8
+                        # suppress_context}; zeroed as C's ``= {0}``.
+                        packet_type = "{ i32, i64, ptr, ptr, ptr, i8 }"
+                        entry_allocas.append(f"  %{prefix}.packet = alloca {packet_type}, align 8")
+                        body.append(f"  store {packet_type} zeroinitializer, ptr %{prefix}.packet, align 8")
+                        if operation == "ExceptionMake":
+                            type_text = exception_text(exception_type) if exception_type else "null"
+                            message_text = exception_text(message) if message is not None else "null"
+                            body.append(
+                                f"  call void @turing_error_packet_init(ptr %{prefix}.packet, "
+                                f"i32 {int(error_code)}, ptr {type_text}, ptr {message_text}, "
+                                f"i8 {1 if suppress_context else 0})"
+                            )
+                        else:
+                            body.append(
+                                f"  %{prefix}.taken = call i32 "
+                                f"@turing_validation_error_take_active(ptr %{prefix}.packet)"
+                            )
+                        body.append(f"  %{prefix}.handle = ptrtoint ptr %{prefix}.packet to i64")
+                        store_exception_result(f"%{prefix}.handle", "i64")
+                    elif operation in {"ExceptionActive", "ExceptionMatch", "ExceptionRaise"}:
+                        held = load_as(instruction.args[0], "i64", f"{prefix}.held")
+                        body.append(f"  %{prefix}.packet = inttoptr i64 {held} to ptr")
+                        if operation == "ExceptionActive":
+                            # ``held != 0 && packet->code != 0``: the code is
+                            # read only on the non-null edge.
+                            entry_label = block_exit_label[active_block]
+                            body.extend((
+                                f"  %{prefix}.present = icmp ne i64 {held}, 0",
+                                f"  br i1 %{prefix}.present, label %{prefix}.read, label %{prefix}.done",
+                                f"{prefix}.read:",
+                                f"  %{prefix}.code = load i32, ptr %{prefix}.packet, align 8",
+                                f"  %{prefix}.coded = icmp ne i32 %{prefix}.code, 0",
+                                f"  br label %{prefix}.done",
+                                f"{prefix}.done:",
+                                f"  %{prefix}.active = phi i1 [ false, %{entry_label} ], "
+                                f"[ %{prefix}.coded, %{prefix}.read ]",
+                            ))
+                            block_exit_label[active_block] = f"{prefix}.done"
+                            register_cache.clear()
+                            store_exception_result(f"%{prefix}.active", "i1")
+                        elif operation == "ExceptionMatch":
+                            body.extend((
+                                f"  %{prefix}.matches = call i32 @turing_error_packet_matches("
+                                f"ptr %{prefix}.packet, ptr {exception_text(exception_type)})",
+                                f"  %{prefix}.matched = icmp ne i32 %{prefix}.matches, 0",
+                            ))
+                            store_exception_result(f"%{prefix}.matched", "i1")
+                        else:
+                            body.append(
+                                f"  call void @turing_validation_error_raise_packet(ptr %{prefix}.packet)"
+                            )
+                            store_exception_result("0", "i64")
+                    elif operation == "ExceptionIndexType":
+                        actual = instruction.args[0]
+                        layout = _resolve_dtype(str(actual.dtype))
+                        integer_index = (layout is not None and layout.kind in {"int", "uint", "bool"}
+                                         and not tuple(actual.shape or ()))
+                        store_exception_result("true" if integer_index else "false", "i1")
+                    elif operation == "ExceptionLength":
+                        sequence_table = getattr(module, "sequence_tables", {}).get(name)
+                        descriptor = (None if sequence_table is None
+                                      else sequence_table.by_id(int(instruction.args[0].id)))
+                        if descriptor is None:
+                            raise ValueError("protected indexing requires a bounded sequence storage descriptor")
+                        length = values_by_function[name].get(int(descriptor.length_address_id))
+                        if length is None:
+                            raise ValueError("protected indexing has no resident length cell")
+                        store_exception_result(load_as(length, "i64", f"{prefix}.length"), "i64")
+                    else:
+                        raise ValueError("exception operation has no LLVM materialization")
+                except ValueError as error:
+                    if emission is not None:
+                        emission.post(LLVM_EXCEPTION_OPERATION, (source_cell, name, result_id),
+                            (operation, tuple(v.id for v in instruction.args), "refused: " + str(error)),
+                            stage=EMISSION_LLVM, provenance=Derived((source_receipt,)), mode=Mode.CONCORD)
+                    shortfalls.append(LLVMEmissionShortfall(name, operation, str(error)))
+                    continue
+                exception_runtime_used = True
+                if emission is not None:
+                    policy_cell = emission.post(LLVM_EXCEPTION_OPERATION, (source_cell, name, result_id),
+                        (operation, tuple(v.id for v in instruction.args), policy), stage=EMISSION_LLVM,
+                        provenance=Derived((source_receipt,)), mode=Mode.CONCORD)
+                    span.take(UnitKind.STATEMENT, result=result, args=instruction.args,
+                              instruction=instruction, extra_cells=(policy_cell,))
+                    span.pending = None
+                continue
+
             if operation in {"Deploy", "Join"}:
                 # A deployment boundary describes scheduling around the
                 # numerical program, not a computation inside it. One native
@@ -6679,6 +6892,7 @@ def _emit_repository_call_module(
         f'source_filename = "turing.ssa-llvm.{entry_name}"',
         "\n".join(_module_target_lines(module)),
         "\n".join(declarations[symbol] for symbol in sorted(declarations)),
+        "\n".join(exception_globals),
         "\n\n".join(definitions[symbol] for symbol in sorted(definitions)),
         "\n\n".join(annotated_functions),
         "\n".join((
@@ -6793,8 +7007,9 @@ def _emit_repository_call_module(
               for obj in piece.get("linked_objects", ())),
             *lane_objects,
         ))),
-        needs_validation_runtime=any(piece.get("needs_validation_runtime", False)
-                                     for piece in piece_records.values()),
+        needs_validation_runtime=exception_runtime_used or any(
+            piece.get("needs_validation_runtime", False)
+            for piece in piece_records.values()),
         external_slots=external_slot_rows(module, slot_functions),
         llvm_ir=llvm_ir + "\n",
         buffer_order=tuple(buffer_order),
