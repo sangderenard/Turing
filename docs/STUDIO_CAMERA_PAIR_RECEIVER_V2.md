@@ -72,3 +72,46 @@ node tests/meowdoku_camera_pairs_check.mjs --stdin
 Input is JSON with `manifest`, base64 `payload`, and optional `cameraRhsWords`
 containing expected exact uint32 words. It checks the actual receiver without
 HTTP, a browser, a GL context or rendering.
+
+## Optional query-only camera index (2026-11-12)
+
+The existing bounded scene-record index is reused, not a second index.
+`receiveSceneResponses(..., {information:'evaluated-responses-v1',
+recordIndexBytes:1048576, cameraQuerySegments:true, sceneRevision})` additionally
+indexes v2 camera query-parametric segments. Both index and camera options are
+required; cameraQuerySegments is a strict boolean, defaults false, and rejects
+v1 envelopes. No request/UI default is changed.
+
+Support 1 remains copied point, support 2 remains copied forward/reactive finite
+segment. Support 4 is a DERIVED camera query-parametric segment. It references
+the original exact pair row and is not an additional observation. Index stats
+separate cameraQueryRows/cameraQueryUnavailableRows from copied segmentRows.
+
+Camera geometry uses interval origin8:11, direction12:15 and parameter11, with
+current hit4 nonnegative. Require finite origin/direction/positive parameter,
+nonzero direction and finite computed endpoint. Never normalize the direction.
+The endpoint is origin + direction * parameter, NOT copied first-hit116:119.
+The existing half-open clipping/cell walker and all-or-nothing explicit memory
+budget remain in force; zero-length/unrepresentable segments are unavailable.
+
+Status4/7, medium-2, region bits and response unknown/zero remain unchanged.
+Query references say nothing about evaluated surface, valid medium, traversal,
+coverage or energy deposited in a cell. Unknown miss distance stays unknown,
+never extended to domain bounds. Region identifiers require the retained scene
+mapping; neither region nor band masks prove completeness. No energy/RGB or
+outer native-only attachment changes; applicationReady and energyStatements
+remain false. Unindexed records remain available as raw evidence.
+
+CPU checks (no shader compilation, GL, live request or rendering):
+
+    node tests/meowdoku_camera_pairs_check.mjs
+    node tests/meowdoku_scene_record_index_check.mjs
+    node tests/meowdoku_scene_responses_check.mjs
+    node tests/meowdoku_studio_light_field_check.mjs
+    $env:STUDIO_SPECTRAL_TEST_ROOT='C:\Users\alber\spectral-response-retention-20261112'
+    & C:\dev\Powershell\turing\.venv\Scripts\python.exe tests/studio_camera_query_roundtrip.py
+
+The final command serializes two real SceneResponseStore pairs, verifies all
+512 words unchanged, and confirms four query references with no GPU bytes.
+It requires the matching Spectral v2 producer; no runtime/compiler readiness
+is implied. Existing completed camera samples remain the default alternative.

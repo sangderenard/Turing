@@ -13,8 +13,10 @@ if(process.argv.includes('--stdin')) {
   let input='';for await(const chunk of process.stdin)input+=chunk;
   const fixture=JSON.parse(input),bytes=Buffer.from(fixture.payload,'base64');
   const payload=bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);
-  const result=await receiveSceneResponses(fixture.manifest,payload,{...options,sceneRevision:fixture.manifest.scene_revision});
+  const result=await receiveSceneResponses(fixture.manifest,payload,{...options,sceneRevision:fixture.manifest.scene_revision,...(fixture.queryIndex?{recordIndexBytes:1048576,cameraQuerySegments:true}:{})});
   assert.equal(result.metadata.schema,'studio-scene-responses-v2');
+  if(fixture.queryIndex){assert.ok(result.recordIndex);assert.equal(result.recordIndex.energyStatements,false);
+    if(fixture.expectedQueryReferences!==undefined)assert.equal(result.recordIndex.stats.references,fixture.expectedQueryReferences);}
   if(fixture.cameraRhsWords)assert.deepEqual(Array.from(result.cameraRhsRows),fixture.cameraRhsWords);
   assert.equal(result.applicationReady,false);assert.equal(result.memory.gpuBytes,0);
   console.log(JSON.stringify({result:'PASS',pairs:result.families.camera_rhs_summands,
@@ -63,6 +65,42 @@ if(process.argv.includes('--stdin')) {
   assert.equal(result.cameraRhsRows[129],0x80000000);
   assert.equal(result.families.camera_rhs_summands,2);
   assert.equal(result.applicationReady,false);assert.equal(result.memory.gpuBytes,0);
+  const indexedOptions={...options,recordIndexBytes:1048576,cameraQuerySegments:true};
+  const grid={...manifest,indexing:{...manifest.indexing,bounds:[[0,0,0],[4,1,1]],dimensions:[4,1,1]}};
+  async function query(edit=()=>{},opts=indexedOptions) {
+    const copy=payload.slice(0),w=new Uint32Array(copy),f=new Float32Array(copy);
+    f[48]=-1;f[49]=.5;f[50]=.5;f[51]=3;f[52]=2;f[12]=2;
+    // First hit is deliberately nowhere near this current query.
+    f[40+116]=999;w[40+119]=1;edit(w,f);
+    return receiveSceneResponses({...grid,payload_sha256:await sha(copy)},copy,opts);
+  }
+  const q=await query();
+  assert.equal(q.recordIndex.stats.cameraQueryRows,1);
+  assert.equal(q.recordIndex.stats.cameraQueryUnavailableRows,1);
+  assert.equal(q.recordIndex.stats.pointRows,0);
+  for(let x=0;x<4;x++)assert.deepEqual([...q.recordIndex.records([x,0,0])],[{row:0,support:4}]);
+  assert.equal(q.recordIndex.energyStatements,false);
+  assert.equal((await query(()=>{},{...options,recordIndexBytes:1048576})).recordIndex.stats.references,0);
+  assert.equal((await query(()=>{},options)).recordIndex,null);
+  for(const cameraQuerySegments of [null,0,1,'true',{}])
+    await assert.rejects(()=>receiveSceneResponses(grid,payload,{...indexedOptions,cameraQuerySegments}),/boolean opt-in/);
+  await assert.rejects(()=>receiveSceneResponses(grid,payload,{...options,cameraQuerySegments:true}),/positive index budget/);
+  await assert.rejects(()=>receiveSceneResponses({...grid,schema:'studio-scene-responses-v1'},payload,indexedOptions),/v2 envelope/);
+  await assert.rejects(()=>query(()=>{},{...indexedOptions,recordIndexBytes:65536+31}),/budget/);
+  for(const edit of [w=>w[44]=UINT, (w,f)=>f[51]=NaN,(w,f)=>f[51]=Infinity,
+    (w,f)=>f[51]=0,(w,f)=>f[51]=-1,(w,f)=>f[48]=Infinity,
+    (w,f)=>{f[52]=0;f[12]=0;}]) {
+    const invalid=await query(edit);assert.equal(invalid.recordIndex.stats.references,0);
+    assert.equal(invalid.recordIndex.stats.cameraQueryUnavailableRows,2);
+  }
+  for(const status of [0,1,2,4,5,6,7])for(const medium of [0,4,UINT,UINT-1]) {
+    let expected;
+    const retained=await query(w=>{w[40+32]=status;w[40+5]=medium;w[40+48]=0xfedcba98;
+      w[40+80]=0x12345678;expected=Array.from(w.subarray(40));});
+    assert.equal(retained.recordIndex.stats.references,4);
+    assert.deepEqual(Array.from(retained.cameraRhsRows),expected);
+    assert.equal(retained.index[11],0);assert.equal(retained.applicationReady,false);
+  }
   const inherited=Object.create(CAMERA_PAIR_CONTRACT);
   Object.keys(CAMERA_PAIR_CONTRACT).forEach((_,i)=>inherited['unrelated'+i]=0);
   await assert.rejects(()=>receiveSceneResponses({...manifest,camera_pair_contract:inherited},payload,options),/camera-pair contract/);

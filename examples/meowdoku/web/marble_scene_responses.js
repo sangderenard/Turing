@@ -8,8 +8,10 @@ export const CAMERA_PAIR_CONTRACT=Object.freeze({version:'native-camera-response
   response_schema:'native-camera-response-copies-v1',response_offset_words:128,response_words:128,
   alignment:'same-dispatch-row-ordinal',attachment:'native-only-unlocated',application_ready:false});
 export const SCENE_RESPONSE_BYTES=64*1024*1024;
-export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES,recordIndexBytes=0}={}) {
+export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES,recordIndexBytes=0,cameraQuerySegments=false}={}) {
   if(information!=='evaluated-responses-v1')throw Error('Scene response decoding requires explicit information opt-in.');
+  if(typeof cameraQuerySegments!=='boolean'||cameraQuerySegments&&(!recordIndexBytes||manifest?.schema!==SCENE_RESPONSE_SCHEMA_V2))
+    throw Error('Camera query segments require a boolean opt-in, v2 envelope and positive index budget.');
   if(!Number.isSafeInteger(recordIndexBytes)||recordIndexBytes<0||recordIndexBytes>SCENE_RESPONSE_BYTES)
     throw Error('Invalid explicit scene-record index budget.');
   if(!Number.isSafeInteger(maxPayloadBytes)||maxPayloadBytes<0||maxPayloadBytes>SCENE_RESPONSE_BYTES||
@@ -21,7 +23,7 @@ export async function receiveSceneResponses(manifest,payload,{sceneRevision,info
   const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',payload)),v=>v.toString(16).padStart(2,'0')).join('');
   if(digest!==metadata.payload_sha256)throw Error('Scene response payload hash mismatch.');
   const result=decodeSceneResponses(payload,metadata);
-  const recordIndex=recordIndexBytes?indexSceneRecords(result,recordIndexBytes):null;
+  const recordIndex=recordIndexBytes?indexSceneRecords(result,recordIndexBytes,cameraQuerySegments):null;
   return {...result,recordIndex,memory:{payloadBytes:payload.byteLength,decodePeakPayloadBytes:payload.byteLength*2,
     recordIndexBytes:recordIndex?.bytes??0,recordIndexScratchReserve:recordIndex?.scratchReserve??0,gpuBytes:0}};
 }
@@ -198,9 +200,11 @@ export function decodeSceneResponses(buffer,manifest) {
 // A derived lookup over the existing exact records, never a deposition grid.
 // No RGB, weights, sample availability, or payload words are changed. Endpoint
 // support is bit 1; a copied finite forward/reactive segment is bit 2. Segment
-// references are not additional observations and must not be summed per cell.
-function indexSceneRecords(snapshot,budget) {
-  const {metadata,index,nativeRows}=snapshot,rows=index.length/20,stride=Math.max(4,rows*4),
+// Camera query-parametric support is bit 4, explicitly opted in and derived
+// from copied origin + direction * hit parameter, never first-hit position.
+// Segment references are not additional observations and must not be summed per cell.
+function indexSceneRecords(snapshot,budget,cameraQuerySegments) {
+  const {metadata,index,nativeRows,cameraRhsRows}=snapshot,rows=index.length/20,stride=Math.max(8,rows*8),
     {bounds,dimensions}=metadata.indexing,scratchReserve=65536;
   if(budget<scratchReserve)throw Error('Scene-record index budget cannot reserve bounded scratch storage.');
   const shape=dimensions??[0,0,0],cellCount=shape.reduce((a,b)=>a*b,1);
@@ -210,10 +214,11 @@ function indexSceneRecords(snapshot,budget) {
   }))throw Error('Scene-record index needs finite, representable grid spans.');
   if(!Number.isSafeInteger(cellCount*stride))throw Error('Scene-record index key exceeds exact integer storage.');
   const sourceFloats=new Float32Array(nativeRows.buffer,nativeRows.byteOffset,nativeRows.length),
+    cameraFloats=new Float32Array(cameraRhsRows.buffer,cameraRhsRows.byteOffset,cameraRhsRows.length),
     indexFloats=new Float32Array(index.buffer,index.byteOffset,index.length),
     times=new Float64Array(shape.reduce((a,b)=>a+b,2)),cells=new Uint32Array(times.length),
     start=new Float64Array(3),end=new Float64Array(3),delta=new Float64Array(3);
-  const stats={rows,pointRows:0,segmentRows:0,segmentUnavailableRows:0,unindexedRows:0,references:0};
+  const stats={rows,pointRows:0,segmentRows:0,cameraQueryRows:0,cameraQueryUnavailableRows:0,segmentUnavailableRows:0,unindexedRows:0,references:0};
   const linear=p=>(p[2]*shape[1]+p[1])*shape[0]+p[0];
   const pointCell=offset=>{
     if(!bounds||!index[offset+11])return -1;
@@ -226,6 +231,21 @@ function indexSceneRecords(snapshot,budget) {
   };
   function segmentCells(offset) {
     const family=index[offset],base=index[offset+3]*128;
+    if(cameraQuerySegments&&family===3) {
+      const pair=index[offset+3]*256,t=cameraFloats[pair+11];
+      if(!bounds||cameraRhsRows[pair+4]>=0x80000000||!Number.isFinite(t)||t<=0)return -1;
+      let nonzero=false;
+      for(let j=0;j<3;j++) {
+        const o=cameraFloats[pair+8+j],d=cameraFloats[pair+12+j],endpoint=o+d*t,
+          width=bounds[1][j]-bounds[0][j];
+        if(!Number.isFinite(o)||!Number.isFinite(d)||!Number.isFinite(endpoint))return -1;
+        nonzero ||= d!==0;
+        start[j]=(o-bounds[0][j])/width*shape[j];
+        end[j]=(endpoint-bounds[0][j])/width*shape[j];delta[j]=end[j]-start[j];
+        if(!Number.isFinite(start[j])||!Number.isFinite(end[j])||!Number.isFinite(delta[j]))return -1;
+      }
+      return !nonzero||delta.every(v=>v===0)?-1:walkSegment();
+    }
     if(!bounds||(family!==1&&family!==2)||!index[offset+11]||
         ![5,6].includes(nativeRows[base])||nativeRows[base]!==index[offset+1]||
         nativeRows[base+1]!==family||nativeRows[base+5]>=0x80000000||index[offset+15]!==1||
@@ -247,6 +267,9 @@ function indexSceneRecords(snapshot,budget) {
       if(!Number.isFinite(start[j])||!Number.isFinite(end[j])||!Number.isFinite(delta[j]))return -1;
     }
     if(!nonzeroDirection||delta.every(v=>v===0))return -1;
+    return walkSegment();
+  }
+  function walkSegment() {
     let enter=0,leave=1;
     for(let j=0;j<3;j++) {
       if(delta[j]===0) {if(start[j]<0||start[j]>=shape[j])return 0;}
@@ -282,12 +305,14 @@ function indexSceneRecords(snapshot,budget) {
       const offset=row*20,point=pointCell(offset),segments=segmentCells(offset);
       let includedPoint=false,refs=0;
       for(let j=0;j<Math.max(0,segments);j++) {
-        const cell=cells[j],support=cell===point?3:2;
-        includedPoint ||= cell===point;emit(cell*stride+row*4+support);refs++;
+        const cell=cells[j],support=(index[offset]===3?4:2)|(cell===point?1:0);
+        includedPoint ||= cell===point;emit(cell*stride+row*8+support);refs++;
       }
-      if(point>=0&&!includedPoint){emit(point*stride+row*4+1);refs++;}
+      if(point>=0&&!includedPoint){emit(point*stride+row*8+1);refs++;}
       if(measure) {
-        stats.pointRows+=Number(point>=0);stats.segmentRows+=Number(segments>0);
+        stats.pointRows+=Number(point>=0);stats.segmentRows+=Number(segments>0&&index[offset]!==3);
+        stats.cameraQueryRows+=Number(segments>0&&index[offset]===3);
+        stats.cameraQueryUnavailableRows+=Number(cameraQuerySegments&&index[offset]===3&&segments<0);
         stats.segmentUnavailableRows+=Number(segments<0);
         stats.unindexedRows+=Number(refs===0);
       }
@@ -317,13 +342,13 @@ function indexSceneRecords(snapshot,budget) {
     const lower=linear(cell)*stride,upper=lower+stride;let lo=0,hi=keys.length;
     while(lo<hi){const mid=Math.floor((lo+hi)/2);if(keys[mid]<lower)lo=mid+1;else hi=mid;}
     for(let i=lo;i<keys.length&&keys[i]<upper;i++) {
-      const local=keys[i]-lower,row=Math.floor(local/4),support=local%4;
+      const local=keys[i]-lower,row=Math.floor(local/8),support=local%8;
       if(Object.entries(filters).every(([key,value])=>index[row*20+fields[key]]===value))yield {row,support};
     }
   }
   return Object.freeze({records,stats:Object.freeze(stats),bytes:keys.byteLength,scratchReserve,
-    applicationReady:false,energyStatements:false,
-    semantics:'references to exact observations; endpoint=1, finite-segment=2; not deposition or coverage',
+    applicationReady:false,energyStatements:false,cameraQuerySegments,
+    semantics:'references to exact observations; endpoint=1, copied-finite-segment=2, derived-camera-query-segment=4; not deposition or coverage',
     directionSemantics:'filters use the copied record direction/bin, not an inferred segment-entry bin',
-    limitations:'Only delivered records are indexed. Missing/unbounded camera intervals and producer-discarded paths remain unavailable.'});
+    limitations:'Only delivered records are indexed. Camera query geometry does not establish evaluated surface, traversal, valid medium or energy. Missing/unbounded camera intervals and producer-discarded paths remain unavailable.'});
 }
