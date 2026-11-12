@@ -4,7 +4,7 @@
 // capabilities reach (GET /api/whoami), the Stable / Development server switch (GET/POST /api/route, dev_ui only) and Sign out
 // (POST /api/account/logout).  Built with createElement/textContent only, inside a closed Shadow DOM; the server enforces every
 // capability, this only decides what to show.
-const VERSION = 5;
+const VERSION = 6;
 
 function allowed() {
   const here = import.meta.url;
@@ -200,7 +200,24 @@ async function main() {
   }
 
   if (!new URLSearchParams(location.search).has("viewer")) {
-    actions.append(el("a", { class: "chip", href: "/issues.html", text: "Tickets", title: "Your account's issue tickets" }));
+    // Tickets is a small menu: the account's issue tickets, and (dev_ui) the change reviews an admin approves.
+    const ticketsChip = el("button", { class: "chip", type: "button", "aria-haspopup": "true", "aria-expanded": "false",
+      text: "Tickets ▾", title: "Issue tickets and change reviews" });
+    const ticketsMenu = el("div", { class: "menu", role: "menu", hidden: "" });
+    ticketsMenu.append(el("a", { href: "/issues.html", role: "menuitem", text: "Issue tickets" }));
+    if (caps.has("dev_ui")) ticketsMenu.append(el("a", { href: "/reviews.html", role: "menuitem",
+      text: who.role === "admin" ? "Change reviews (approve)" : "Change reviews" }));
+    const dismissTickets = () => setTicketsOpen(false);
+    function setTicketsOpen(open) {
+      if (open && dismissHeaderPanel && dismissHeaderPanel !== dismissTickets) dismissHeaderPanel();
+      dismissHeaderPanel = open ? dismissTickets : (dismissHeaderPanel === dismissTickets ? null : dismissHeaderPanel);
+      ticketsMenu.hidden = !open;
+      ticketsChip.setAttribute("aria-expanded", String(open));
+    }
+    ticketsChip.addEventListener("click", () => setTicketsOpen(ticketsMenu.hidden));
+    wrap.addEventListener("keydown", (e) => { if (e.key === "Escape" && !ticketsMenu.hidden) { setTicketsOpen(false); ticketsChip.focus(); } });
+    document.addEventListener("pointerdown", (e) => { if (!ticketsMenu.hidden && e.target !== host) setTicketsOpen(false); });
+    actions.append(ticketsChip, ticketsMenu);
     actions.append(el("button", { class: "chip", type: "button", text: "Report issue", onclick: () => {
       // Frozen game pages can still own the legacy /api/tickets form. The
       // shared header always opens the account-owned SQL issue interface.
