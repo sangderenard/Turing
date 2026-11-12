@@ -54,11 +54,35 @@ EXPOSED, not caused — a wrong answer the refusal used to hide:
   lives in `root__root__planned_region_0`, called under "no error active".
   So the lost early exit is in the loop region's failure arm, not in this
   projection.
-- Not traced. Four further lowerings of the same program stopped earlier at
-  `carried-name-arm-missing` (`root.sequence[2].body.sequence[4|6].body`),
-  another run-to-run varying refusal upstream. The node numbering of the
-  exception operations changes between runs; the identity-ordered
-  iteration behind that is not found.
+- Traced (one lowering that got past `carried-name-arm-missing`):
+  `root__root__planned_region_0` is a single `entry` block. The loop is
+  unrolled to four `Sub FloorDiv{operator_safety_arms} Add` steps, then the
+  `else` `Add`, then `Ret`. No instruction after any FloorDiv branches.
+- Mechanism: `_division_safety_statement` emits
+  `t = 0; if (d == 0) turing_validation_error(88); else t = q;` and the
+  program continues. `turing_validation_error` only fills the thread-local
+  `active_error` slot (the first error wins). The protected body's trailing
+  `ExceptionTake` consumes it at the region boundary. So for n = 0, i = 0
+  adds the placeholder 0, then i = 1..3 add 12 + 6 + 4, the `else` adds 7,
+  and the take selects the handler (+50) and `finally` (+100): 179.
+- This is the documented, unimplemented part of the design, not a new
+  defect. `docs/compiler_convergence/ssa_operator_failure_arms_and_thread_exceptions_2026-10-31.md`
+  calls the current transport "intermediate": operators report to the error
+  slot and `ExceptionTake` consumes the outcome at the protected boundary.
+  It is "not yet a universal SSA exceptional successor ABI". Its next steps
+  are "failure-exit loop carries", then side-effect stopping, then "protected
+  loops with all cleanup exits". It also says loops inside a protected try
+  "still refuse". No such refusal exists in the source. On main the program
+  refused only through the unrelated dispatcher-owner refusal fixed above.
+- Following from the same emission (not measured): any effect after a
+  failing division inside one protected body also runs, e.g.
+  `try: x = 12 // n; total = total + 5`. The passing tests keep the division
+  as the protected body's last effect.
+- `carried-name-arm-missing` stopped 1 of the 2 lowerings in this trace.
+  Earlier, four further lowerings stopped there
+  (`root.sequence[2].body.sequence[4|6].body`): another run-to-run varying
+  refusal upstream. The node numbering of the exception operations changes
+  between runs; the identity-ordered iteration behind that is not found.
 
 Other remaining failures, unchanged from main: `scalar-physical-layout-unproven`
 in C emission (`try_except_else_finally_in_loop`, `while_loop_handlers...`), and
