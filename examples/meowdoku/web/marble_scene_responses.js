@@ -8,8 +8,10 @@ export const CAMERA_PAIR_CONTRACT=Object.freeze({version:'native-camera-response
   response_schema:'native-camera-response-copies-v1',response_offset_words:128,response_words:128,
   alignment:'same-dispatch-row-ordinal',attachment:'native-only-unlocated',application_ready:false});
 export const SCENE_RESPONSE_BYTES=64*1024*1024;
-export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES}={}) {
+export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES,recordIndexBytes=0}={}) {
   if(information!=='evaluated-responses-v1')throw Error('Scene response decoding requires explicit information opt-in.');
+  if(!Number.isSafeInteger(recordIndexBytes)||recordIndexBytes<0||recordIndexBytes>SCENE_RESPONSE_BYTES)
+    throw Error('Invalid explicit scene-record index budget.');
   if(!Number.isSafeInteger(maxPayloadBytes)||maxPayloadBytes<0||maxPayloadBytes>SCENE_RESPONSE_BYTES||
       !(payload instanceof ArrayBuffer)||payload.byteLength>maxPayloadBytes)
     throw Error('Scene response payload exceeds the explicit memory budget.');
@@ -19,7 +21,9 @@ export async function receiveSceneResponses(manifest,payload,{sceneRevision,info
   const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',payload)),v=>v.toString(16).padStart(2,'0')).join('');
   if(digest!==metadata.payload_sha256)throw Error('Scene response payload hash mismatch.');
   const result=decodeSceneResponses(payload,metadata);
-  return {...result,memory:{payloadBytes:payload.byteLength,decodePeakPayloadBytes:payload.byteLength*2,gpuBytes:0}};
+  const recordIndex=recordIndexBytes?indexSceneRecords(result,recordIndexBytes):null;
+  return {...result,recordIndex,memory:{payloadBytes:payload.byteLength,decodePeakPayloadBytes:payload.byteLength*2,
+    recordIndexBytes:recordIndex?.bytes??0,recordIndexScratchReserve:recordIndex?.scratchReserve??0,gpuBytes:0}};
 }
 const UINT=0xffffffff,HEX=/^[0-9a-f]{64}$/;
 const integer=(v,max=UINT)=>Number.isSafeInteger(v)&&v>=0&&v<=max;
@@ -189,4 +193,137 @@ export function decodeSceneResponses(buffer,manifest) {
     if(appKeys.has(key))throw Error('Duplicate native application support component.');appKeys.add(key);
   }
   return {metadata,index,nativeRows,cameraRhsRows,scalarCells,applicationRows:applicationRows??new Uint32Array(0),families,applicationReady:false};
+}
+
+// A derived lookup over the existing exact records, never a deposition grid.
+// No RGB, weights, sample availability, or payload words are changed. Endpoint
+// support is bit 1; a copied finite forward/reactive segment is bit 2. Segment
+// references are not additional observations and must not be summed per cell.
+function indexSceneRecords(snapshot,budget) {
+  const {metadata,index,nativeRows}=snapshot,rows=index.length/20,stride=Math.max(4,rows*4),
+    {bounds,dimensions}=metadata.indexing,scratchReserve=65536;
+  if(budget<scratchReserve)throw Error('Scene-record index budget cannot reserve bounded scratch storage.');
+  const shape=dimensions??[0,0,0],cellCount=shape.reduce((a,b)=>a*b,1);
+  if(bounds&&shape.some((n,j)=>{
+    const width=bounds[1][j]-bounds[0][j];
+    return !Number.isFinite(width)||width<=0||!Number.isFinite(n/width)||n/width===0;
+  }))throw Error('Scene-record index needs finite, representable grid spans.');
+  if(!Number.isSafeInteger(cellCount*stride))throw Error('Scene-record index key exceeds exact integer storage.');
+  const sourceFloats=new Float32Array(nativeRows.buffer,nativeRows.byteOffset,nativeRows.length),
+    indexFloats=new Float32Array(index.buffer,index.byteOffset,index.length),
+    times=new Float64Array(shape.reduce((a,b)=>a+b,2)),cells=new Uint32Array(times.length),
+    start=new Float64Array(3),end=new Float64Array(3),delta=new Float64Array(3);
+  const stats={rows,pointRows:0,segmentRows:0,segmentUnavailableRows:0,unindexedRows:0,references:0};
+  const linear=p=>(p[2]*shape[1]+p[1])*shape[0]+p[0];
+  const pointCell=offset=>{
+    if(!bounds||!index[offset+11])return -1;
+    for(let j=0;j<3;j++) {
+      const p=(indexFloats[offset+8+j]-bounds[0][j])/(bounds[1][j]-bounds[0][j])*shape[j];
+      if(!Number.isFinite(p)||p<0||p>=shape[j])return -1;
+      end[j]=Math.floor(p);
+    }
+    return linear(end);
+  };
+  function segmentCells(offset) {
+    const family=index[offset],base=index[offset+3]*128;
+    if(!bounds||(family!==1&&family!==2)||!index[offset+11]||
+        ![5,6].includes(nativeRows[base])||nativeRows[base]!==index[offset+1]||
+        nativeRows[base+1]!==family||nativeRows[base+5]>=0x80000000||index[offset+15]!==1||
+        index[offset+7]!==Number(nativeRows[base+30]!==0)||
+        index[offset+6]!==UINT&&index[offset+6]!==nativeRows[base+112]||
+        [0,1,2].some(j=>index[offset+8+j]!==nativeRows[base+21+j]||
+          index[offset+12+j]!==nativeRows[base+27+j]))return -1;
+    // The established 128-word codec copies entry origin/direction at 117/114
+    // and the actual hit at 21. No infinite miss ray, projected endpoint,
+    // inferred bounce, or completed-camera total is turned into an interval.
+    let nonzeroDirection=false;
+    for(let j=0;j<3;j++) {
+      const d=sourceFloats[base+114+j],width=bounds[1][j]-bounds[0][j];
+      if(!Number.isFinite(d)||!Number.isFinite(width)||width<=0)return -1;
+      nonzeroDirection ||= d!==0;
+      start[j]=(sourceFloats[base+117+j]-bounds[0][j])/width*shape[j];
+      end[j]=(sourceFloats[base+21+j]-bounds[0][j])/width*shape[j];
+      delta[j]=end[j]-start[j];
+      if(!Number.isFinite(start[j])||!Number.isFinite(end[j])||!Number.isFinite(delta[j]))return -1;
+    }
+    if(!nonzeroDirection||delta.every(v=>v===0))return -1;
+    let enter=0,leave=1;
+    for(let j=0;j<3;j++) {
+      if(delta[j]===0) {if(start[j]<0||start[j]>=shape[j])return 0;}
+      else {
+        const a=-start[j]/delta[j],b=(shape[j]-start[j])/delta[j];
+        enter=Math.max(enter,Math.min(a,b));leave=Math.min(leave,Math.max(a,b));
+      }
+    }
+    if(!(enter<leave))return 0;
+    let count=0;times[count++]=enter;times[count++]=leave;
+    for(let j=0;j<3;j++)if(delta[j]!==0)for(let plane=1;plane<shape[j];plane++) {
+      const t=(plane-start[j])/delta[j];if(t>enter&&t<leave)times[count++]=t;
+    }
+    times.subarray(0,count).sort();
+    let used=0;
+    for(let i=1;i<count;i++) {
+      const a=times[i-1],b=times[i];if(a===b)continue;
+      const middle=a+(b-a)/2;
+      // Refuse unresolved floating-point intervals rather than inventing a
+      // spatial epsilon, widening support, or returning a partial traversal.
+      if(!(middle>a&&middle<b))return -1;
+      for(let j=0;j<3;j++) {
+        const p=start[j]+delta[j]*middle;
+        if(!Number.isFinite(p)||p<0||p>=shape[j])return -1;
+        end[j]=Math.floor(p);
+      }
+      const cell=linear(end);if(!used||cells[used-1]!==cell)cells[used++]=cell;
+    }
+    return used;
+  }
+  function visit(emit,measure) {
+    for(let row=0;row<rows;row++) {
+      const offset=row*20,point=pointCell(offset),segments=segmentCells(offset);
+      let includedPoint=false,refs=0;
+      for(let j=0;j<Math.max(0,segments);j++) {
+        const cell=cells[j],support=cell===point?3:2;
+        includedPoint ||= cell===point;emit(cell*stride+row*4+support);refs++;
+      }
+      if(point>=0&&!includedPoint){emit(point*stride+row*4+1);refs++;}
+      if(measure) {
+        stats.pointRows+=Number(point>=0);stats.segmentRows+=Number(segments>0);
+        stats.segmentUnavailableRows+=Number(segments<0);
+        stats.unindexedRows+=Number(refs===0);
+      }
+    }
+  }
+  visit(()=>{if(++stats.references*8+scratchReserve>budget)
+    throw Error('Scene-record index exceeds its explicit memory budget; no partial index published.');},true);
+  const keys=new Float64Array(stats.references);let cursor=0;
+  visit(key=>{keys[cursor++]=key;},false);
+  // In-place heapsort keeps index storage bounded; no per-reference JS objects
+  // or unaccounted sort-sized scratch array is allocated.
+  const down=(root,size)=>{
+    while(root*2+1<size) {
+      let child=root*2+1;if(child+1<size&&keys[child]<keys[child+1])child++;
+      if(keys[root]>=keys[child])break;
+      const value=keys[root];keys[root]=keys[child];keys[child]=value;root=child;
+    }
+  };
+  for(let i=Math.floor(keys.length/2)-1;i>=0;i--)down(i,keys.length);
+  for(let i=keys.length-1;i>0;i--){const value=keys[0];keys[0]=keys[i];keys[i]=value;down(0,i);}
+  const fields={family:0,semantic:1,context:2,recipientNamespace:4,recipientOrdinal:5,directionSemantics:15,directionBin:19};
+  function* records(cell,filters={}) {
+    if(!Array.isArray(cell)||cell.length!==3||cell.some((v,j)=>!integer(v)||v>=shape[j]))
+      throw Error('Scene-record lookup cell is outside the declared grid.');
+    for(const [key,value]of Object.entries(filters))if(!Object.hasOwn(fields,key)||!integer(value))
+      throw Error('Unsupported scene-record lookup filter.');
+    const lower=linear(cell)*stride,upper=lower+stride;let lo=0,hi=keys.length;
+    while(lo<hi){const mid=Math.floor((lo+hi)/2);if(keys[mid]<lower)lo=mid+1;else hi=mid;}
+    for(let i=lo;i<keys.length&&keys[i]<upper;i++) {
+      const local=keys[i]-lower,row=Math.floor(local/4),support=local%4;
+      if(Object.entries(filters).every(([key,value])=>index[row*20+fields[key]]===value))yield {row,support};
+    }
+  }
+  return Object.freeze({records,stats:Object.freeze(stats),bytes:keys.byteLength,scratchReserve,
+    applicationReady:false,energyStatements:false,
+    semantics:'references to exact observations; endpoint=1, finite-segment=2; not deposition or coverage',
+    directionSemantics:'filters use the copied record direction/bin, not an inferred segment-entry bin',
+    limitations:'Only delivered records are indexed. Missing/unbounded camera intervals and producer-discarded paths remain unavailable.'});
 }
