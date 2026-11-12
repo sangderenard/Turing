@@ -887,6 +887,11 @@ def _config(value: dict, saved: dict, spectral_root: Path = SPECTRAL_ROOT) -> tu
                 or not internal):
             raise PhotoError("evaluated response information requires an explicit refreshed internal v6 field request")
         config["light_field_information"] = "evaluated-responses-v1"
+    if "light_field_camera_records" in value:
+        if (value["light_field_camera_records"] != "interval-responses-v2"
+                or config.get("light_field_information") != "evaluated-responses-v1"):
+            raise PhotoError("interval camera records require explicit evaluated response information")
+        config["light_field_camera_records"] = "interval-responses-v2"
     # Optics use the complete image, never a tile's temporary allocation.
     # Live's established shader contract uses the displayed viewport aspect.
     aspect = config["live"]["aspect"] if "live" in config else camera.get("width", resolution) / camera.get("height", resolution)
@@ -1680,12 +1685,16 @@ class PhotoJobs:
                     receipt = json.loads(sidecar.read_text(encoding='utf-8'))
                     metadata = receipt.get('metadata')
                     length = receipt.get('byte_length')
-                    if (receipt.get('schema') != 'studio-scene-responses-v1' or receipt.get('name') != name
+                    if (receipt.get('schema') not in ('studio-scene-responses-v1', 'studio-scene-responses-v2')
+                            or (receipt.get('schema') == 'studio-scene-responses-v2'
+                                and config.get('light_field_camera_records') != 'interval-responses-v2')
+                            or receipt.get('name') != name
                             or receipt.get('digest') != digest or type(receipt.get('live_revision')) is not int
                             or receipt['live_revision'] != revision or type(receipt.get('sequence')) is not int
                             or receipt['sequence'] < 0 or type(length) is not int or not 0 <= length <= 64 * 1024 * 1024
                             or receipt.get('application_ready') is not False
                             or not isinstance(metadata, dict) or metadata.get('application_ready') is not False
+                            or metadata.get('schema') != receipt.get('schema')
                             or metadata.get('scene_revision') != current.get('metadata', {}).get('scene_revision')
                             or not isinstance(metadata.get('scene_revision'), str) or not metadata['scene_revision']
                             or receipt.get('sha256') != metadata.get('payload_sha256')

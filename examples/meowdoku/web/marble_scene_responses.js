@@ -1,6 +1,12 @@
 // The native scene store is the authority. These are typed copies and index
 // validation, not a radiance estimator, optical replay, or a pixel image.
 export const SCENE_RESPONSE_SCHEMA='studio-scene-responses-v1';
+export const SCENE_RESPONSE_SCHEMA_V2='studio-scene-responses-v2';
+export const isSceneResponseSchema=value=>value===SCENE_RESPONSE_SCHEMA||value===SCENE_RESPONSE_SCHEMA_V2;
+export const CAMERA_PAIR_CONTRACT=Object.freeze({version:'native-camera-response-pairs-v2',row_words:256,
+  interval_schema:'native-camera-intervals-v1',interval_offset_words:0,interval_words:128,
+  response_schema:'native-camera-response-copies-v1',response_offset_words:128,response_words:128,
+  alignment:'same-dispatch-row-ordinal',attachment:'native-only-unlocated',application_ready:false});
 export const SCENE_RESPONSE_BYTES=64*1024*1024;
 export async function receiveSceneResponses(manifest,payload,{sceneRevision,information,maxPayloadBytes=SCENE_RESPONSE_BYTES}={}) {
   if(information!=='evaluated-responses-v1')throw Error('Scene response decoding requires explicit information opt-in.');
@@ -23,16 +29,24 @@ const FAMILY_CODECS=Object.freeze({1:['forward','evaluated-forward-responses-v1'
   4:['camera_complete_sample','native-camera-scene-sample-v1']});
 
 export function validateSceneResponseManifest(value) {
-  if(!value||value.schema!==SCENE_RESPONSE_SCHEMA||value.byte_order!=='little'||
+  if(!value||!isSceneResponseSchema(value.schema)||value.byte_order!=='little'||
       !HEX.test(value.scene_revision)||!integer(value.publication_sequence,Number.MAX_SAFE_INTEGER)||
       !integer(value.payload_bytes,SCENE_RESPONSE_BYTES)||!HEX.test(value.payload_sha256)||
       value.complete_retained_snapshot!==true||value.physical_completeness_claim!==false||
       value.application_ready!==false)
     throw Error('Invalid or unsupported native scene-response manifest.');
+  const pairsV2=value.schema===SCENE_RESPONSE_SCHEMA_V2;
+  if(pairsV2) {
+    const contract=value.camera_pair_contract;
+    if(!contract||typeof contract!=='object'||Array.isArray(contract)||
+        Object.keys(contract).length!==Object.keys(CAMERA_PAIR_CONTRACT).length||
+        Object.entries(CAMERA_PAIR_CONTRACT).some(([key,expected])=>!Object.hasOwn(contract,key)||contract[key]!==expected))
+      throw Error('Invalid exact camera-pair contract.');
+  } else if(Object.hasOwn(value,'camera_pair_contract'))throw Error('Camera-pair contract requires the v2 envelope.');
   for(const [id,[name,codec]]of Object.entries(FAMILY_CODECS))
-    if(value.families?.[id]?.name!==name||value.families[id].codec!==codec)
+    if(value.families?.[id]?.name!==name||value.families[id].codec!==(pairsV2&&id==='3'?'native-camera-response-pairs-v2':codec))
       throw Error('Unknown native scene-response family.');
-  const layout=[['scene_index',80],['native_rows',512],['camera_rhs_rows',1536],['scalar_cells',24]];
+  const layout=[['scene_index',80],['native_rows',512],['camera_rhs_rows',pairsV2?1024:1536],['scalar_cells',24]];
   if(value.application!==undefined)layout.push(['application_rows',48]);
   if(!Array.isArray(value.sections)||value.sections.length!==layout.length)
     throw Error('Incomplete native scene-response sections.');
@@ -136,6 +150,19 @@ export function decodeSceneResponses(buffer,manifest) {
       if(index[i+1]!==1||index[i+15]!==2||present!==nativeRows[row+11]||primitive!==nativeRows[row+3]||
           [8,9,10,12,13,14].some(j=>index[i+j]!==nativeRows[row+j]))
         throw Error('Completed native sample attachment disagrees with its payload.');
+    }
+    if(family===3&&metadata.schema===SCENE_RESPONSE_SCHEMA_V2) {
+      const row=ref*256,bands=cameraRhsRows[row+6],mask=cameraRhsRows[row+40];
+      // A camera pair is one actual interval and its aligned response row.
+      // No raw hit, first-visible hit, or entry origin is promoted to a guessed
+      // surface recipient or spatial application point by this envelope.
+      if(index[i+1]!==1||namespace!==0||recipient!==UINT||primitive!==cameraRhsRows[row+126]||
+          index[i+7]!==1||present!==0||index[i+15]!==2||
+          [8,9,10].some(j=>index[i+j]!==0)||!cell.every(v=>v===UINT)||
+          [12,13,14].some(j=>index[i+j]!==cameraRhsRows[row+j]))
+        throw Error('Camera pair attachment disagrees with its native-only payload.');
+      if(bands<1||bands>8||mask===0||(mask&~((1<<bands)-1))!==0)
+        throw Error('Invalid native camera-pair active bands.');
     }
     references[which].add(ref);usedContexts.add(index[i+2]);families[FAMILY_CODECS[family][0]]++;
   }

@@ -318,6 +318,11 @@ export function packMarblePhoto(geometry, objectDigest, options = {}) {
       throw new RangeError('Evaluated response copies require explicit field reception.');
     config.light_field_information=options.lightFieldInformation;
   }
+  if(options.lightFieldCameraRecords!==undefined) {
+    if(options.lightFieldCameraRecords!=='interval-responses-v2'||config.light_field_information!=='evaluated-responses-v1')
+      throw new RangeError('Interval camera records require explicit evaluated response information.');
+    config.light_field_camera_records=options.lightFieldCameraRecords;
+  }
   if (options.receiveLightField) {
     if (config.transport !== "fixed:3" || config.orbit_frames !== 1 || tiled || options.cameraPoses)
       throw new RangeError("Forward-field reception requires one ordinary RGB still or Live camera.");
