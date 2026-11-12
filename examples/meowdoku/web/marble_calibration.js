@@ -461,8 +461,14 @@ async function exposeCase(geometry, baseDigest, calib, kase, cameraOptions, tran
       return pollPhotoJob(value.digest,watch?{timeoutMs:12*60*60*1000,
         onStatus:watch.onStatus,canceled:watch.canceled}:{});
     }
-    if(response.status!==409||!String(value.error||'').includes('GPU is busy')||Date.now()>=deadline)
-      throw new Error(value.error || `calibration: expose HTTP ${response.status}`);
+    if(response.status!==409||!String(value.error||'').includes('GPU is busy')||Date.now()>=deadline){
+      let detail=value.error || `calibration: expose HTTP ${response.status}`;
+      if(String(detail).includes('invalid MRP1 header')){
+        const header=new DataView(body);
+        detail+=` (config ${header.getUint32(4,true)} bytes; limit 2097152; triangles ${header.getUint32(8,true)}; reserved ${header.getUint32(12,true)}; payload ${body.byteLength} bytes)`;
+      }
+      throw new Error(detail);
+    }
     await settle(250);
   }
 }
